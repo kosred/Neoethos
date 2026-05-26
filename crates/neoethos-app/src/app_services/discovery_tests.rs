@@ -9,10 +9,14 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 fn sample_request() -> DiscoveryRequest {
+    // GROUP F: route symbol/timeframe through canonical fixture
+    // constants. Same EURUSD/M1 values as before, but if the
+    // operator changes the canonical fixture, this request follows
+    // automatically — no drift between test data and config defaults.
     DiscoveryRequest {
         data_root: PathBuf::from("data"),
-        symbol: "EURUSD".to_string(),
-        base_tf: "M1".to_string(),
+        symbol: neoethos_data::test_fixtures::ctrader_sample_symbol().to_string(),
+        base_tf: neoethos_data::test_fixtures::ctrader_sample_timeframe().to_string(),
         higher_tfs: vec!["M5".to_string(), "M15".to_string()],
         config: neoethos_search::DiscoveryConfig::default(),
         prop_firm_rules: PropFirmRiskRules::default(),

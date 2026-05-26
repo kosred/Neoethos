@@ -3,7 +3,12 @@ pub mod hashing;
 pub mod numeric;
 pub mod series;
 pub mod stats;
-pub mod window_control;
+// F-101 fix (2026-05-25): `pub mod window_control;` removed.
+// The 140-LOC Win32 GUI-automation module had ZERO external callers
+// across the workspace (verified via grep). It was a relic from the
+// pre-Flutter wizard automation that never made it into the new
+// architecture. Deleted per operator directive 2026-05-24 to keep
+// the foundation crate focused.
 
 pub use clock::now_unix_ms;
 

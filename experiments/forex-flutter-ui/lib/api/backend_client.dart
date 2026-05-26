@@ -117,6 +117,20 @@ class BackendClient {
 
   BackendClient._({required Dio dio, required this.config}) : _dio = dio;
 
+  /// Convenience getter for SSE consumers (#237). The Riverpod SSE
+  /// providers construct stream URLs like `$baseUrl/account/snapshot/stream`
+  /// without needing to know about the internal `config` field.
+  String get baseUrl => config.baseUrl;
+
+  /// POST `/account/snapshot/refresh` — force-refresh trigger
+  /// (#241, 2026-05-25). Used by the Dashboard "refresh" button to
+  /// skip the bridge's 5 s safety timer; the resulting fresh
+  /// snapshot arrives over the `/account/snapshot/stream` SSE
+  /// within ~750 ms.
+  Future<void> refreshAccountSnapshot() async {
+    await _dio.post<void>('/account/snapshot/refresh');
+  }
+
   static Dio _buildDefaultDio(BackendConfig cfg) {
     return Dio(BaseOptions(
       baseUrl: cfg.baseUrl,
@@ -222,6 +236,42 @@ class BackendClient {
       );
     }
     return SettingsSnapshot.fromJson(response.data!);
+  }
+
+  /// `GET /settings/knob-catalog` (#238, 2026-05-25) — fetch the
+  /// machine-readable inventory of ~42 runtime knobs. Each entry has
+  /// label, help text, current vs default value, kind (Int/Float/
+  /// Bool/Text/Enum/Path), and per-preset values
+  /// (Conservative/Balanced/Aggressive). The AdvancedSettings UI
+  /// renders one form widget per knob keyed by `kind`.
+  Future<KnobCatalog> fetchKnobCatalog() async {
+    final response =
+        await _dio.get<Map<String, dynamic>>('/settings/knob-catalog');
+    if (response.statusCode != 200 || response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/settings/knob-catalog failed: ${response.statusCode}',
+      );
+    }
+    return KnobCatalog.fromJson(response.data!);
+  }
+
+  /// `GET /settings/presets` — fetch the named preset bundles
+  /// (Conservative / Balanced / Aggressive). Each preset is a
+  /// mapping of knob id → value that the operator can apply with
+  /// one click.
+  Future<KnobPresetCatalog> fetchKnobPresets() async {
+    final response =
+        await _dio.get<Map<String, dynamic>>('/settings/presets');
+    if (response.statusCode != 200 || response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/settings/presets failed: ${response.statusCode}',
+      );
+    }
+    return KnobPresetCatalog.fromJson(response.data!);
   }
 
   /// `POST /settings` — partial-update + persist to config.yaml.
@@ -556,7 +606,7 @@ class BackendClient {
   /// detected from the file extension server-side.
   ///
   /// Returns the path the converted Vortex file landed at (so the UI
-  /// can show "Imported to: <path>") plus the detected format string.
+  /// can show "Imported to: `<path>`") plus the detected format string.
   Future<Map<String, dynamic>> importLocalFile({
     required String sourcePath,
     required String symbol,
@@ -852,6 +902,15 @@ class RiskSnapshot {
   final List<PropFirmPresetSummary> availablePresets;
   /// Whether the prop-firm gate is armed (false when preset == none).
   final bool propFirmRulesEnabled;
+
+  /// **2026-05-25 — task #239**: Risky-Mode 24h re-arm cooldown
+  /// remaining (seconds). `null` when no cooldown is active (the
+  /// kill-switch has not tripped, or the 24 h window already elapsed).
+  /// When non-null, the UI shows a countdown chip + blocks any
+  /// "Arm Risky Mode" interaction with a modal explaining the
+  /// cooldown is enforced and cannot be overridden.
+  final int? riskyModeCooldownRemainingSecs;
+
   const RiskSnapshot({
     required this.riskPerTrade,
     required this.minRiskPerTrade,
@@ -864,6 +923,7 @@ class RiskSnapshot {
     required this.presetDisplayName,
     required this.availablePresets,
     required this.propFirmRulesEnabled,
+    this.riskyModeCooldownRemainingSecs,
   });
 
   factory RiskSnapshot.fromJson(Map<String, dynamic> j) => RiskSnapshot(
@@ -881,6 +941,8 @@ class RiskSnapshot {
                 PropFirmPresetSummary.fromJson(e as Map<String, dynamic>))
             .toList(growable: false),
         propFirmRulesEnabled: (j['propFirmRulesEnabled'] as bool?) ?? true,
+        riskyModeCooldownRemainingSecs:
+            (j['riskyModeCooldownRemainingSecs'] as num?)?.toInt(),
       );
 }
 
@@ -1479,6 +1541,16 @@ class LiveSpotsSnapshot {
         symbolCount: (j['symbolCount'] as num?)?.toInt() ?? 0,
       );
 
+  /// Empty placeholder used by the SSE provider (#237) when the
+  /// stream times out on initial connect. UI renders this as "no
+  /// data yet" without throwing — operator sees a clean loading
+  /// state until the SSE delivers the first event.
+  factory LiveSpotsSnapshot.empty() => const LiveSpotsSnapshot(
+        spots: [],
+        snapshotAtUnixMs: 0,
+        symbolCount: 0,
+      );
+
   /// O(n) lookup by symbol name. The snapshot is small (≤ 8 majors
   /// in v1) so the linear scan is cheap; promoting to a map only
   /// pays off if the subscription set grows beyond ~50.
@@ -1582,5 +1654,127 @@ class PendingAction {
   int secondsUntilExpiry({DateTime? now}) {
     final nowMs = (now ?? DateTime.now().toUtc()).millisecondsSinceEpoch;
     return ((expiresAtUnixMs - nowMs) / 1000).round();
+  }
+}
+
+// ============================================================================
+// Task #238 — AdvancedSettings knob catalog DTOs.
+
+/// One configurable knob. Mirrors the backend `KnobEntry` struct
+/// (see crates/neoethos-app/src/server/knob_catalog.rs).
+class KnobEntry {
+  final String id;
+  final String section;
+  final String label;
+  final String envVar;
+  final String kind; // "Int" | "Float" | "Bool" | "Text" | "Enum" | "Path"
+  final dynamic defaultValue;
+  final dynamic currentValue;
+  final String helpShort;
+  final String helpLong;
+  final dynamic presetConservative;
+  final dynamic presetBalanced;
+  final dynamic presetAggressive;
+  /// Enum: list of valid choices. `null` for non-Enum kinds.
+  final List<String>? enumChoices;
+  /// Numeric ranges (Int/Float). `null` for non-numeric kinds.
+  final double? minValue;
+  final double? maxValue;
+
+  const KnobEntry({
+    required this.id,
+    required this.section,
+    required this.label,
+    required this.envVar,
+    required this.kind,
+    required this.defaultValue,
+    required this.currentValue,
+    required this.helpShort,
+    required this.helpLong,
+    required this.presetConservative,
+    required this.presetBalanced,
+    required this.presetAggressive,
+    this.enumChoices,
+    this.minValue,
+    this.maxValue,
+  });
+
+  factory KnobEntry.fromJson(Map<String, dynamic> j) => KnobEntry(
+        id: j['id'] as String,
+        section: j['section'] as String? ?? 'Other',
+        label: j['label'] as String? ?? (j['id'] as String),
+        envVar: j['envVar'] as String? ?? '',
+        kind: j['kind'] as String? ?? 'Text',
+        defaultValue: j['default'],
+        currentValue: j['current'],
+        helpShort: j['helpShort'] as String? ?? '',
+        helpLong: j['helpLong'] as String? ?? '',
+        presetConservative: j['presetConservative'],
+        presetBalanced: j['presetBalanced'],
+        presetAggressive: j['presetAggressive'],
+        enumChoices: (j['enumChoices'] as List?)?.cast<String>(),
+        minValue: (j['min'] as num?)?.toDouble(),
+        maxValue: (j['max'] as num?)?.toDouble(),
+      );
+
+  /// Whether the current value differs from the active preset.
+  /// Used to render the "dirty dot" indicator next to the knob
+  /// label so the operator can see at a glance which knobs they
+  /// have customised away from the preset baseline.
+  bool isDirtyVs(String activePreset) {
+    final preset = activePreset == 'conservative'
+        ? presetConservative
+        : activePreset == 'aggressive'
+            ? presetAggressive
+            : presetBalanced;
+    return '$currentValue' != '$preset';
+  }
+}
+
+class KnobCatalog {
+  final int schemaVersion;
+  final List<KnobEntry> knobs;
+  const KnobCatalog({required this.schemaVersion, required this.knobs});
+
+  factory KnobCatalog.fromJson(Map<String, dynamic> j) => KnobCatalog(
+        schemaVersion: (j['schemaVersion'] as num?)?.toInt() ?? 1,
+        knobs: ((j['knobs'] as List?) ?? const [])
+            .map((e) => KnobEntry.fromJson(e as Map<String, dynamic>))
+            .toList(growable: false),
+      );
+
+  /// Sections in canonical display order — useful for the left-pane
+  /// section list in the AdvancedSettings screen.
+  List<String> get sections {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final k in knobs) {
+      if (seen.add(k.section)) out.add(k.section);
+    }
+    return out;
+  }
+
+  List<KnobEntry> knobsInSection(String section) =>
+      knobs.where((k) => k.section == section).toList(growable: false);
+}
+
+class KnobPresetCatalog {
+  /// Map preset id ("conservative" / "balanced" / "aggressive") to
+  /// the human-readable display label ("Conservative", ...).
+  final Map<String, String> presets;
+  const KnobPresetCatalog({required this.presets});
+
+  factory KnobPresetCatalog.fromJson(Map<String, dynamic> j) {
+    final map = <String, String>{};
+    final raw = j['presets'] as Map<String, dynamic>?;
+    if (raw != null) {
+      raw.forEach((k, v) => map[k] = v as String);
+    } else {
+      // Backend may have flat shape; tolerate either.
+      j.forEach((k, v) {
+        if (v is String) map[k] = v;
+      });
+    }
+    return KnobPresetCatalog(presets: map);
   }
 }

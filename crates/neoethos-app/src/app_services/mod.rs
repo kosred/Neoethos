@@ -1,6 +1,12 @@
 pub mod api_test;
 pub mod backoff;
 pub mod bootstrap_writer;
+// **F-CORE3 cluster consolidation (2026-05-25)**: canonical registry of
+// every `FOREX_BOT_CTRADER_*` / `FOREX_BOT_PNL_*` / `NEOETHOS_*` env
+// override the app crate honours. Mirror of `neoethos_core::env_overrides`.
+// Call-sites elsewhere consult `env_overrides::*` typed getters instead
+// of reading `std::env::var` directly.
+pub mod env_overrides;
 pub mod broker_config;
 // `broker_control` — RESTORED 2026-05-21. Same wrongful-delete fix
 // as `dxtrade` above. The global OnceLock crossbeam channel is the

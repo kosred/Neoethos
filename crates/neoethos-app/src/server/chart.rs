@@ -1,9 +1,37 @@
 //! GET /chart?symbol=EURUSD&timeframe=M1&limit=200
 //!
-//! Returns OHLC candles + price range for a given symbol/timeframe,
-//! pulled from the local data dir (`data/symbol=<sym>/timeframe=<tf>/
-//! data.parquet|data.vortex`). Read-only — no broker session needed,
-//! so charts render even when cTrader is disconnected.
+//! Returns OHLC candles + price range for a given symbol/timeframe.
+//!
+//! ## G7 broker-passthrough doctrine (operator-approved 2026-05-25)
+//!
+//! Operator directive: "δεχόμαστε ότι στέλνει ο broker αυτό είναι
+//! αλήθεια το άλλο συνθετικό" — we accept what the broker sends as
+//! truth; everything else is synthetic. For chart data this means
+//! the routing priority is:
+//!
+//! 1. **Live broker historical-bars API** — when cTrader session is
+//!    connected, fetch via `ProtoOAGetTrendbarsReq` for the exact
+//!    `symbol × timeframe × period` requested. This is the ONLY
+//!    authoritative source. (Wiring lands in G7 Phase 2 — the
+//!    `live_spots_streamer` ring buffer already serves real-time
+//!    quotes; the historical bars layer is the next slot.)
+//!
+//! 2. **Local Vortex cache** — when cTrader is DISCONNECTED. Marked
+//!    `source: "disk-cache"` in the response so the UI can render a
+//!    "showing cached data, live unavailable" banner. The cache is
+//!    LEGITIMATE for offline replay + backtesting reproducibility
+//!    (operator preserved that use case in the G7 sign-off).
+//!
+//! 3. **Empty + headline** — when neither source is available. The
+//!    UI renders an empty-state with the bootstrap call-to-action.
+//!
+//! The current implementation is **G7 Phase 1**: still disk-only, but
+//! the response shape carries a `source` annotation so the UI can
+//! distinguish disk-cache from broker-passthrough once Phase 2 lands.
+//! No behaviour change for disconnected operators; the UI now knows
+//! the data is *cached* rather than blindly assuming it's live.
+
+use std::path::PathBuf;
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -24,7 +52,39 @@ pub struct ChartQuery {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, serde::Serialize)]
+/// Provenance tag — distinguishes broker-truth from disk-cached
+/// responses. **G7 Phase 1 (2026-05-25)** annotation per the
+/// operator-approved broker-passthrough doctrine: chart data sourced
+/// from the broker WSS is "live" / "broker"; everything from local
+/// Vortex files is "disk-cache" / "empty" so the UI can render the
+/// right banner. Phase 2 plumbs the broker source through.
+///
+/// **Phase 1 variant set**: only `DiskCache` and `Empty` exist today
+/// because the broker historical-bars wiring (`ProtoOAGetTrendbarsReq`)
+/// hasn't landed yet. The `Broker` variant was removed during the
+/// 2026-05-25 verbose-build pass after operator feedback that
+/// `#[allow(dead_code)]` is not a fix — it silences instead of
+/// solving. When Phase 2 lands and `AppApiState` exposes a broker
+/// session handle, REINTRODUCE the variant here AND in the Flutter
+/// `ChartDataSource` enum together, so the producer and consumer
+/// stay in lockstep. Until then the UI only needs to render two
+/// banners ("cached" and "empty") which matches what this endpoint
+/// can emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChartDataSource {
+    /// Data loaded from the local Vortex cache. Use for offline
+    /// replay / backtests. UI should surface a "cached" banner.
+    DiskCache,
+    /// No data available from any source.
+    Empty,
+}
+
+// Clone needed by `chart_cache` (in-RAM LRU cache for repeat-click
+// timeframe switches — 2026-05-25 operator directive). The cache
+// stores DTOs and clones them on get/put so the response path and
+// cache state remain independent.
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartDto {
     pub symbol: String,
@@ -38,9 +98,17 @@ pub struct ChartDto {
     /// Percent change from first open in the window to last close.
     pub price_change_pct: f64,
     pub headline: String,
+    /// **G7 Phase 1 (2026-05-25)** — provenance annotation. Tells
+    /// the UI whether the response is live broker data or a disk
+    /// cache. Default `disk-cache` for current Phase-1 wiring; will
+    /// promote to `broker` in Phase 2 when broker historical-bars
+    /// integration lands.
+    pub source: ChartDataSource,
 }
 
-#[derive(Debug, serde::Serialize)]
+// Clone needed because `CandleDto` is a field of `ChartDto` (which
+// derives Clone — see chart_cache rationale above).
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CandleDto {
     /// Unix timestamp in milliseconds. `None` if the dataset doesn't
@@ -53,7 +121,7 @@ pub struct CandleDto {
     pub volume: f64,
 }
 
-pub async fn chart(State(_state): State<AppApiState>, Query(q): Query<ChartQuery>) -> Response {
+pub async fn chart(State(state): State<AppApiState>, Query(q): Query<ChartQuery>) -> Response {
     let symbol = q
         .symbol
         .unwrap_or_else(|| "EURUSD".to_string())
@@ -66,8 +134,24 @@ pub async fn chart(State(_state): State<AppApiState>, Query(q): Query<ChartQuery
         .to_uppercase();
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT).max(1);
 
+    // **2026-05-25 — chart-cache fast path** (operator directive: TF
+    // switch must be immediate, no 100-500ms disk I/O per click).
+    // Check the in-memory `ChartDto` LRU cache first; on hit, return
+    // without ever touching disk. On miss, fall through to the
+    // existing spawn_blocking path which loads from Vortex AND
+    // populates the cache for the next click.
+    if let Some(cached) = super::chart_cache::get(&symbol, &timeframe, limit) {
+        return Json(cached).into_response();
+    }
+
+    // F-553/F-576 closure (2026-05-25): config path threaded from the
+    // CLI `--config` flag via `AppApiState::config_path()` instead of
+    // hardcoded inside `load_chart`.
+    let config_path = state.config_path().to_path_buf();
+    let symbol_for_cache = symbol.clone();
+    let timeframe_for_cache = timeframe.clone();
     let result = tokio::task::spawn_blocking(move || {
-        load_chart(symbol.clone(), timeframe.clone(), limit).or_else(|err| {
+        load_chart(&config_path, symbol.clone(), timeframe.clone(), limit).or_else(|err| {
             // Returning 404 made Flutter render a generic
             // "Backend unreachable" banner that hid the *real*
             // remedy ("run Data Bootstrap for this symbol /
@@ -90,13 +174,22 @@ pub async fn chart(State(_state): State<AppApiState>, Query(q): Query<ChartQuery
                          Go to Data Bootstrap and download a window \
                          from the broker, then come back. ({err})"
                 ),
+                source: ChartDataSource::Empty,
             })
         })
     })
     .await;
 
     match result {
-        Ok(Ok(dto)) => Json(dto).into_response(),
+        Ok(Ok(dto)) => {
+            // **2026-05-25 — chart-cache populate**: cache the freshly-
+            // loaded DTO so the next click on the same (symbol, TF, limit)
+            // is a ~1 µs in-RAM hit instead of another 100-500 ms disk
+            // read. TTL inside `chart_cache` keeps the cache from
+            // serving stale data once the live bar progresses.
+            super::chart_cache::put(&symbol_for_cache, &timeframe_for_cache, limit, dto.clone());
+            Json(dto).into_response()
+        }
         // load_chart's or_else above always returns Ok, so this arm
         // is only reachable if a future change re-introduces a fatal
         // error path; surface it as 500 so the UI banner makes sense.
@@ -116,9 +209,14 @@ pub async fn chart(State(_state): State<AppApiState>, Query(q): Query<ChartQuery
 }
 
 /// Load OHLC candles for a symbol/timeframe from the local data dir.
-pub fn load_chart(symbol: String, timeframe: String, limit: usize) -> anyhow::Result<ChartDto> {
-    let settings = Settings::from_yaml("config.yaml")
-        .map_err(|e| anyhow::anyhow!("config.yaml not loadable: {e}"))?;
+pub fn load_chart(
+    config_path: &PathBuf,
+    symbol: String,
+    timeframe: String,
+    limit: usize,
+) -> anyhow::Result<ChartDto> {
+    let settings = Settings::from_yaml(config_path)
+        .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
 
     // #154: previously called `load_symbol_dataset` which eagerly loaded
     // ALL discovered timeframes for the symbol (commonly 19+ Vortex
@@ -185,6 +283,16 @@ pub fn load_chart(symbol: String, timeframe: String, limit: usize) -> anyhow::Re
         )
     };
 
+    // G7 Phase 1: every successful disk-load is tagged `DiskCache`.
+    // Phase 2 will branch HERE on broker-connection state and tag
+    // the response `Broker` when the bars came from the live cTrader
+    // historical-bars API.
+    let source = if candles.is_empty() {
+        ChartDataSource::Empty
+    } else {
+        ChartDataSource::DiskCache
+    };
+
     Ok(ChartDto {
         symbol,
         timeframe,
@@ -196,5 +304,6 @@ pub fn load_chart(symbol: String, timeframe: String, limit: usize) -> anyhow::Re
         latest_close,
         price_change_pct,
         headline,
+        source,
     })
 }

@@ -1,0 +1,215 @@
+use crate::utilities::enums::Kernel;
+use aligned_vec::AVec;
+use std::arch::is_x86_feature_detected;
+use std::sync::OnceLock;
+use std::{mem::MaybeUninit, ptr, slice};
+
+static BEST_SINGLE: OnceLock<Kernel> = OnceLock::new();
+static BEST_BATCH: OnceLock<Kernel> = OnceLock::new();
+
+#[inline(always)]
+pub fn detect_best_kernel() -> Kernel {
+    *BEST_SINGLE.get_or_init(|| {
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        {
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("fma") {
+                return Kernel::Avx512;
+            }
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return Kernel::Avx2;
+            }
+        }
+
+        Kernel::Scalar
+    })
+}
+
+#[inline(always)]
+pub fn detect_best_batch_kernel() -> Kernel {
+    *BEST_BATCH.get_or_init(|| match detect_best_kernel() {
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        Kernel::Avx512 => Kernel::Avx512Batch,
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        Kernel::Avx2 => Kernel::Avx2Batch,
+        _ => Kernel::ScalarBatch,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+static BEST_WASM: OnceLock<Kernel> = OnceLock::new();
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+pub fn detect_wasm_kernel() -> Kernel {
+    *BEST_WASM.get_or_init(|| {
+        #[cfg(target_feature = "simd128")]
+        {
+            return Kernel::Scalar;
+        }
+
+        Kernel::Scalar
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+pub fn detect_wasm_kernel() -> Kernel {
+    Kernel::Scalar
+}
+
+#[macro_export]
+macro_rules! skip_if_unsupported {
+    ($kernel:expr, $test_name:expr) => {{
+        use std::arch::is_x86_feature_detected;
+        use $crate::utilities::enums::Kernel;
+
+        #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+        {
+            if matches!(
+                $kernel,
+                Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch
+            ) {
+                eprintln!(
+                    "[{}] skipped {:?} – compiled without `nightly-avx`",
+                    $test_name, $kernel
+                );
+                return Ok(());
+            }
+        }
+
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        {
+            let need: (&'static str, fn() -> bool) = match $kernel {
+                Kernel::Avx512 | Kernel::Avx512Batch => ("AVX-512F + FMA", || {
+                    is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("fma")
+                }),
+                Kernel::Avx2 | Kernel::Avx2Batch => ("AVX2 + FMA", || {
+                    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+                }),
+                _ => ("", || true),
+            };
+
+            if !(need.1)() {
+                eprintln!(
+                    "[{}] skipped {:?} - CPU lacks {}",
+                    $test_name, $kernel, need.0
+                );
+                return Ok(());
+            }
+        }
+    }};
+}
+#[inline(always)]
+pub fn alloc_with_nan_prefix(len: usize, warm: usize) -> Vec<f64> {
+    use std::mem::{self, MaybeUninit};
+
+    let warm = warm.min(len);
+
+    let mut buf: Vec<MaybeUninit<f64>> = Vec::with_capacity(len);
+
+    #[cfg(not(debug_assertions))]
+    {
+        unsafe {
+            buf.set_len(len);
+        }
+        for i in 0..warm {
+            buf[i].write(f64::from_bits(0x7ff8_0000_0000_0000));
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        for _ in 0..warm {
+            buf.push(MaybeUninit::new(f64::from_bits(0x7ff8_0000_0000_0000)));
+        }
+        for _ in warm..len {
+            buf.push(MaybeUninit::new(f64::from_bits(0x11111111_11111111)));
+        }
+    }
+
+    let ptr = buf.as_mut_ptr() as *mut f64;
+    let cap = buf.capacity();
+    mem::forget(buf);
+    unsafe { Vec::from_raw_parts(ptr, len, cap) }
+}
+
+#[inline]
+pub fn init_matrix_prefixes(buf: &mut [MaybeUninit<f64>], cols: usize, warm_prefixes: &[usize]) {
+    assert!(
+        cols != 0 && buf.len() % cols == 0,
+        "`buf` length must be a multiple of `cols`"
+    );
+    let rows = buf.len() / cols;
+    assert_eq!(
+        rows,
+        warm_prefixes.len(),
+        "`warm_prefixes` length must equal number of rows"
+    );
+
+    #[cfg(debug_assertions)]
+    {
+        for cell in buf.iter_mut() {
+            cell.write(f64::from_bits(0x22222222_22222222));
+        }
+    }
+
+    buf.chunks_exact_mut(cols)
+        .zip(warm_prefixes)
+        .for_each(|(row, &warm)| {
+            // NeoEthos patch 2026-05-26: original asserted
+            //   `warm <= cols, "warm prefix exceeds row width"`
+            // which abort-ed callers that wrote row-count-style warm
+            // values (e.g. 14 for SMA-14) into a cols=1 row. The
+            // sibling `alloc_with_nan_prefix` (line 106) already
+            // clamps with `warm.min(len)`; doing the same here keeps
+            // both helpers consistent and the NaN-prefix semantics
+            // ("first `warm` CELLS of THIS row are NaN") intact.
+            let warm = warm.min(cols);
+            for cell in &mut row[..warm] {
+                cell.write(f64::from_bits(0x7ff8_0000_0000_0000));
+            }
+        });
+}
+
+#[inline]
+pub fn make_uninit_matrix(rows: usize, cols: usize) -> Vec<MaybeUninit<f64>> {
+    let total = rows
+        .checked_mul(cols)
+        .expect("rows * cols overflowed usize");
+
+    let mut v: Vec<MaybeUninit<f64>> = Vec::new();
+    v.try_reserve_exact(total)
+        .expect("OOM in make_uninit_matrix");
+
+    #[cfg(not(debug_assertions))]
+    {
+        unsafe {
+            v.set_len(total);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        for _ in 0..total {
+            v.push(MaybeUninit::new(f64::from_bits(0x33333333_33333333)));
+        }
+    }
+    v
+}
+
+#[inline(always)]
+pub fn alloc_uninit_f64(len: usize) -> Vec<f64> {
+    #[cfg(not(debug_assertions))]
+    {
+        let mut v = Vec::<f64>::with_capacity(len);
+        unsafe {
+            v.set_len(len);
+        }
+        v
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        vec![f64::from_bits(0x11111111_11111111); len]
+    }
+}

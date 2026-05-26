@@ -187,17 +187,18 @@ pub(super) fn prop_firm_pre_trade_check(
     // check below) so a misconfigured environment is surfaced even for
     // market orders that carry a stop-loss but no explicit entry price.
     if order.stop_loss.is_some() {
-        std::env::var("FOREX_BOT_PROP_ACCOUNT_CURRENCY")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Risk gate cannot size order: FOREX_BOT_PROP_ACCOUNT_CURRENCY \
-                     is unset. The account currency must be supplied by the broker \
-                     (cTrader trader profile) — no synthetic default allowed."
-                )
-            })?;
+        // **F-565 fix (2026-05-25 — F-CORE3 Phase B)**: was direct
+        // `std::env::var(...)`. Now routes through
+        // `neoethos_core::env_overrides::prop_firm_account_currency()`
+        // — the canonical typed getter. Same behaviour, single
+        // grep-able source for the env-var name.
+        neoethos_core::env_overrides::prop_firm_account_currency().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Risk gate cannot size order: FOREX_BOT_PROP_ACCOUNT_CURRENCY \
+                 is unset. The account currency must be supplied by the broker \
+                 (cTrader trader profile) — no synthetic default allowed."
+            )
+        })?;
         // The full pip-value computation runs inside the entry-price block
         // below; we only validate presence here.
     }
@@ -263,10 +264,10 @@ pub(super) fn prop_firm_pre_trade_check(
         // rather than silently using a possibly-wrong fallback.
         // `FOREX_BOT_PROP_ACCOUNT_CURRENCY` / `FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE`
         // are reserved for operator overrides only — never synthesized.
-        let account_currency = std::env::var("FOREX_BOT_PROP_ACCOUNT_CURRENCY")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        // **F-565 fix (2026-05-25 — F-CORE3 Phase B)**: both env reads
+        // route through the canonical `neoethos_core::env_overrides`
+        // registry.
+        let account_currency = neoethos_core::env_overrides::prop_firm_account_currency()
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Risk gate cannot size order: FOREX_BOT_PROP_ACCOUNT_CURRENCY \
@@ -274,10 +275,8 @@ pub(super) fn prop_firm_pre_trade_check(
                      (cTrader trader profile) — no synthetic default allowed."
                 )
             })?;
-        let quote_to_account_rate = std::env::var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE")
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0);
+        let quote_to_account_rate =
+            neoethos_core::env_overrides::prop_firm_quote_to_account_rate();
         let pip_value_per_lot = metadata.pip_value_in_account(
             &account_currency,
             quote_to_account_rate,

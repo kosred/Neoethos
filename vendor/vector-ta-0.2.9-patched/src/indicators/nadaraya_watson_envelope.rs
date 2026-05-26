@@ -1,0 +1,2998 @@
+#[cfg(all(feature = "python", feature = "cuda"))]
+mod nwe_python_cuda_handle {
+    use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+    use cust::context::Context;
+    use cust::memory::DeviceBuffer;
+    use pyo3::exceptions::PyValueError;
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+    use std::ffi::c_void;
+    use std::sync::Arc;
+
+    #[pyclass(module = "vector_ta", unsendable, name = "NweDeviceArrayF32Py")]
+    pub struct NweDeviceArrayF32Py {
+        pub(crate) buf: Option<DeviceBuffer<f32>>,
+        pub(crate) rows: usize,
+        pub(crate) cols: usize,
+        pub(crate) _ctx: Arc<Context>,
+        pub(crate) device_id: u32,
+    }
+
+    #[pymethods]
+    impl NweDeviceArrayF32Py {
+        #[getter]
+        fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+            let d = PyDict::new(py);
+            d.set_item("shape", (self.rows, self.cols))?;
+            d.set_item("typestr", "<f4")?;
+            d.set_item(
+                "strides",
+                (
+                    self.cols * std::mem::size_of::<f32>(),
+                    std::mem::size_of::<f32>(),
+                ),
+            )?;
+            let ptr = self
+                .buf
+                .as_ref()
+                .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
+                .as_device_ptr()
+                .as_raw() as usize;
+            d.set_item("data", (ptr, false))?;
+            d.set_item("version", 3)?;
+            Ok(d)
+        }
+
+        fn __dlpack_device__(&self) -> (i32, i32) {
+            let mut device_ordinal: i32 = self.device_id as i32;
+            unsafe {
+                let attr = cust::sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
+                let mut value = std::mem::MaybeUninit::<i32>::uninit();
+                let ptr = self
+                    .buf
+                    .as_ref()
+                    .map(|b| b.as_device_ptr().as_raw())
+                    .unwrap_or(0);
+                if ptr != 0 {
+                    let rc = cust::sys::cuPointerGetAttribute(
+                        value.as_mut_ptr() as *mut c_void,
+                        attr,
+                        ptr,
+                    );
+                    if rc == cust::sys::CUresult::CUDA_SUCCESS {
+                        device_ordinal = value.assume_init();
+                    }
+                }
+            }
+            (2, device_ordinal)
+        }
+
+        #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
+        fn __dlpack__<'py>(
+            &mut self,
+            py: Python<'py>,
+            stream: Option<pyo3::PyObject>,
+            max_version: Option<pyo3::PyObject>,
+            dl_device: Option<pyo3::PyObject>,
+            copy: Option<pyo3::PyObject>,
+        ) -> PyResult<PyObject> {
+            let (kdl, alloc_dev) = self.__dlpack_device__();
+
+            if let Some(dev_obj) = dl_device.as_ref() {
+                if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
+                    if dev_ty != kdl || dev_id != alloc_dev {
+                        let wants_copy = copy
+                            .as_ref()
+                            .and_then(|c| c.extract::<bool>(py).ok())
+                            .unwrap_or(false);
+                        if wants_copy {
+                            return Err(PyValueError::new_err(
+                                "device copy not implemented for __dlpack__",
+                            ));
+                        } else {
+                            return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
+                        }
+                    }
+                }
+            }
+
+            let _ = stream;
+
+            let buf = self
+                .buf
+                .take()
+                .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
+
+            let rows = self.rows;
+            let cols = self.cols;
+            let max_version_bound = max_version.map(|obj| obj.into_bound(py));
+
+            export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
+        }
+    }
+
+    pub use NweDeviceArrayF32Py as NweDeviceArrayF32PyAlias;
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+use self::nwe_python_cuda_handle::NweDeviceArrayF32PyAlias;
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::PyDict;
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use wasm_bindgen::prelude::*;
+
+use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
+};
+#[cfg(feature = "python")]
+use crate::utilities::kernel_validation::validate_kernel;
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use core::arch::x86_64::*;
+
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+
+use std::convert::AsRef;
+use std::error::Error;
+use std::mem::MaybeUninit;
+use thiserror::Error;
+
+impl<'a> AsRef<[f64]> for NweInput<'a> {
+    #[inline(always)]
+    fn as_ref(&self) -> &[f64] {
+        match &self.data {
+            NweData::Slice(slice) => slice,
+            NweData::Candles { candles, source } => source_type(candles, source),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum NweData<'a> {
+    Candles {
+        candles: &'a Candles,
+        source: &'a str,
+    },
+    Slice(&'a [f64]),
+}
+
+#[derive(Debug, Clone)]
+pub struct NweOutput {
+    pub upper: Vec<f64>,
+    pub lower: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "wasm"),
+    derive(Serialize, Deserialize)
+)]
+pub struct NweParams {
+    pub bandwidth: Option<f64>,
+    pub multiplier: Option<f64>,
+    pub lookback: Option<usize>,
+}
+
+impl Default for NweParams {
+    fn default() -> Self {
+        Self {
+            bandwidth: Some(8.0),
+            multiplier: Some(3.0),
+            lookback: Some(500),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NweInput<'a> {
+    pub data: NweData<'a>,
+    pub params: NweParams,
+}
+
+impl<'a> NweInput<'a> {
+    #[inline]
+    pub fn from_candles(c: &'a Candles, s: &'a str, p: NweParams) -> Self {
+        Self {
+            data: NweData::Candles {
+                candles: c,
+                source: s,
+            },
+            params: p,
+        }
+    }
+
+    #[inline]
+    pub fn from_slice(sl: &'a [f64], p: NweParams) -> Self {
+        Self {
+            data: NweData::Slice(sl),
+            params: p,
+        }
+    }
+
+    #[inline]
+    pub fn with_default_candles(c: &'a Candles) -> Self {
+        Self::from_candles(c, "close", NweParams::default())
+    }
+
+    #[inline]
+    pub fn get_bandwidth(&self) -> f64 {
+        self.params.bandwidth.unwrap_or(8.0)
+    }
+
+    #[inline]
+    pub fn get_multiplier(&self) -> f64 {
+        self.params.multiplier.unwrap_or(3.0)
+    }
+
+    #[inline]
+    pub fn get_lookback(&self) -> usize {
+        self.params.lookback.unwrap_or(500)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct NweBuilder {
+    bandwidth: Option<f64>,
+    multiplier: Option<f64>,
+    lookback: Option<usize>,
+    kernel: Kernel,
+}
+
+impl Default for NweBuilder {
+    fn default() -> Self {
+        Self {
+            bandwidth: None,
+            multiplier: None,
+            lookback: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl NweBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline(always)]
+    pub fn bandwidth(mut self, h: f64) -> Self {
+        self.bandwidth = Some(h);
+        self
+    }
+
+    #[inline(always)]
+    pub fn multiplier(mut self, m: f64) -> Self {
+        self.multiplier = Some(m);
+        self
+    }
+
+    #[inline(always)]
+    pub fn lookback(mut self, l: usize) -> Self {
+        self.lookback = Some(l);
+        self
+    }
+
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline(always)]
+    pub fn apply(self, c: &Candles) -> Result<NweOutput, NweError> {
+        let p = NweParams {
+            bandwidth: self.bandwidth,
+            multiplier: self.multiplier,
+            lookback: self.lookback,
+        };
+        let i = NweInput::from_candles(c, "close", p);
+        nadaraya_watson_envelope_with_kernel(&i, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn apply_slice(self, d: &[f64]) -> Result<NweOutput, NweError> {
+        let p = NweParams {
+            bandwidth: self.bandwidth,
+            multiplier: self.multiplier,
+            lookback: self.lookback,
+        };
+        let i = NweInput::from_slice(d, p);
+        nadaraya_watson_envelope_with_kernel(&i, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn into_stream(self) -> Result<NweStream, NweError> {
+        let p = NweParams {
+            bandwidth: self.bandwidth,
+            multiplier: self.multiplier,
+            lookback: self.lookback,
+        };
+        NweStream::try_new(p)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum NweError {
+    #[error("nadaraya_watson_envelope: Input data slice is empty")]
+    EmptyInputData,
+
+    #[error("nadaraya_watson_envelope: All values are NaN")]
+    AllValuesNaN,
+
+    #[error("nadaraya_watson_envelope: Invalid bandwidth: {bandwidth}")]
+    InvalidBandwidth { bandwidth: f64 },
+
+    #[error("nadaraya_watson_envelope: Invalid multiplier: {multiplier}")]
+    InvalidMultiplier { multiplier: f64 },
+
+    #[error("nadaraya_watson_envelope: Invalid lookback: {lookback}")]
+    InvalidLookback { lookback: usize },
+
+    #[error("nadaraya_watson_envelope: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+
+    #[error(
+        "nadaraya_watson_envelope: Invalid period: period = {period}, data length = {data_len}"
+    )]
+    InvalidPeriod { period: usize, data_len: usize },
+
+    #[error("nadaraya_watson_envelope: Output length mismatch: expected {expected}, got {got}")]
+    OutputLengthMismatch { expected: usize, got: usize },
+
+    #[error("nadaraya_watson_envelope: Invalid range: start={start}, end={end}, step={step}")]
+    InvalidRange {
+        start: String,
+        end: String,
+        step: String,
+    },
+
+    #[error("nadaraya_watson_envelope: Invalid kernel for batch: {0:?}")]
+    InvalidKernelForBatch(crate::utilities::enums::Kernel),
+}
+
+#[inline(always)]
+fn gaussian_kernel(x: f64, bandwidth: f64) -> f64 {
+    (-x * x / (2.0 * bandwidth * bandwidth)).exp()
+}
+
+#[inline]
+fn nwe_prepare<'a>(
+    input: &'a NweInput,
+) -> Result<(&'a [f64], f64, f64, usize, usize, usize, Vec<f64>, f64), NweError> {
+    let data = input.as_ref();
+    let len = data.len();
+    if len == 0 {
+        return Err(NweError::EmptyInputData);
+    }
+
+    let bandwidth = input.get_bandwidth();
+    if bandwidth <= 0.0 || bandwidth.is_nan() {
+        return Err(NweError::InvalidBandwidth { bandwidth });
+    }
+
+    let multiplier = input.get_multiplier();
+    if multiplier < 0.0 || multiplier.is_nan() {
+        return Err(NweError::InvalidMultiplier { multiplier });
+    }
+
+    let lookback = input.get_lookback();
+    if lookback == 0 {
+        return Err(NweError::InvalidLookback { lookback });
+    }
+
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(NweError::AllValuesNaN)?;
+    const MAE_LEN: usize = 499;
+    let warm_out = first + lookback - 1;
+    let warm_total = warm_out + MAE_LEN - 1;
+
+    if len <= warm_out {
+        return Err(NweError::NotEnoughValidData {
+            needed: lookback,
+            valid: len - first,
+        });
+    }
+
+    let mut w = Vec::with_capacity(lookback);
+    let mut den = 0.0;
+    for k in 0..lookback {
+        let wk = (-(k as f64) * (k as f64) / (2.0 * bandwidth * bandwidth)).exp();
+        w.push(wk);
+        den += wk;
+    }
+
+    Ok((
+        data, bandwidth, multiplier, lookback, warm_out, warm_total, w, den,
+    ))
+}
+
+#[inline]
+pub fn nadaraya_watson_envelope_into_slices(
+    input: &NweInput,
+    upper_out: &mut [f64],
+    lower_out: &mut [f64],
+) -> Result<(), NweError> {
+    let (data, _bw, mult, lookback, warm_out, warm_total, w, den) = nwe_prepare(input)?;
+    let len = data.len();
+    if upper_out.len() != len || lower_out.len() != len {
+        return Err(NweError::OutputLengthMismatch {
+            expected: len,
+            got: upper_out.len().min(lower_out.len()),
+        });
+    }
+
+    nwe_compute_scalar_prepared(
+        data, mult, lookback, warm_out, warm_total, &w, den, upper_out, lower_out, true,
+    );
+    Ok(())
+}
+
+#[inline]
+pub fn nadaraya_watson_envelope_into_slices_no_prefix(
+    input: &NweInput,
+    upper_out: &mut [f64],
+    lower_out: &mut [f64],
+) -> Result<usize, NweError> {
+    let (data, _bw, mult, lookback, warm_out, warm_total, w, den) = nwe_prepare(input)?;
+    let len = data.len();
+    if upper_out.len() != len || lower_out.len() != len {
+        return Err(NweError::OutputLengthMismatch {
+            expected: len,
+            got: upper_out.len().min(lower_out.len()),
+        });
+    }
+
+    nwe_compute_scalar_prepared(
+        data, mult, lookback, warm_out, warm_total, &w, den, upper_out, lower_out, false,
+    );
+    Ok(warm_total)
+}
+
+#[inline]
+fn nwe_compute_scalar_prepared(
+    data: &[f64],
+    mult: f64,
+    lookback: usize,
+    warm_out: usize,
+    warm_total: usize,
+    w: &[f64],
+    den: f64,
+    upper_out: &mut [f64],
+    lower_out: &mut [f64],
+    write_prefix: bool,
+) {
+    let len = data.len();
+    let nan = f64::from_bits(0x7ff8_0000_0000_0000);
+
+    if write_prefix {
+        let prefix_end = warm_total.min(len);
+        for v in &mut upper_out[..prefix_end] {
+            *v = nan;
+        }
+        for v in &mut lower_out[..prefix_end] {
+            *v = nan;
+        }
+    }
+
+    if warm_total >= len {
+        return;
+    }
+
+    let first = warm_out + 1 - lookback;
+    if data[first..].iter().all(|x| !x.is_nan()) {
+        nwe_compute_scalar_no_nan(
+            data, mult, lookback, warm_out, warm_total, w, den, upper_out, lower_out,
+        );
+    } else {
+        nwe_compute_scalar_nan_checked(
+            data, mult, lookback, warm_out, warm_total, w, den, upper_out, lower_out, nan,
+        );
+    }
+}
+
+#[inline]
+fn nwe_compute_scalar_no_nan(
+    data: &[f64],
+    mult: f64,
+    lookback: usize,
+    warm_out: usize,
+    warm_total: usize,
+    w: &[f64],
+    den: f64,
+    upper_out: &mut [f64],
+    lower_out: &mut [f64],
+) {
+    const MAE_LEN: usize = 499;
+
+    let mut rbuf = vec![0.0; MAE_LEN];
+    let mut rsum = 0.0f64;
+    let mut rhead = 0usize;
+    let scale = mult / (MAE_LEN as f64);
+    let dptr = data.as_ptr();
+    let wptr = w.as_ptr();
+    let mut t = warm_out;
+
+    while t < data.len() {
+        let mut num = 0.0f64;
+        let mut k = 0usize;
+        unsafe {
+            while k < lookback {
+                num += *dptr.add(t - k) * *wptr.add(k);
+                k += 1;
+            }
+        }
+
+        let y = num / den;
+        let resid = unsafe { (*dptr.add(t) - y).abs() };
+
+        let old = rbuf[rhead];
+        rsum -= old;
+        rbuf[rhead] = resid;
+        rsum += resid;
+
+        rhead += 1;
+        if rhead == MAE_LEN {
+            rhead = 0;
+        }
+
+        if t >= warm_total {
+            let mae = rsum * scale;
+            upper_out[t] = y + mae;
+            lower_out[t] = y - mae;
+        }
+
+        t += 1;
+    }
+}
+
+#[inline]
+fn nwe_compute_scalar_nan_checked(
+    data: &[f64],
+    mult: f64,
+    lookback: usize,
+    warm_out: usize,
+    warm_total: usize,
+    w: &[f64],
+    den: f64,
+    upper_out: &mut [f64],
+    lower_out: &mut [f64],
+    nan: f64,
+) {
+    const MAE_LEN: usize = 499;
+
+    let mut rbuf = vec![nan; MAE_LEN];
+    let mut rsum = 0.0f64;
+    let mut r_nan_cnt = MAE_LEN;
+    let mut rhead = 0usize;
+    let scale = mult / (MAE_LEN as f64);
+    let dptr = data.as_ptr();
+    let wptr = w.as_ptr();
+    let mut t = warm_out;
+
+    while t < data.len() {
+        let mut num = 0.0f64;
+        let mut any_nan = false;
+        let mut k = 0usize;
+
+        unsafe {
+            while k < lookback {
+                let x = *dptr.add(t - k);
+                if x.is_nan() {
+                    any_nan = true;
+                    break;
+                }
+                num += x * *wptr.add(k);
+                k += 1;
+            }
+        }
+
+        let y = if any_nan { f64::NAN } else { num / den };
+        let xt = unsafe { *dptr.add(t) };
+        let resid = if !xt.is_nan() && !y.is_nan() {
+            (xt - y).abs()
+        } else {
+            f64::NAN
+        };
+
+        let old = rbuf[rhead];
+        if old.is_nan() {
+            r_nan_cnt = r_nan_cnt.saturating_sub(1);
+        } else {
+            rsum -= old;
+        }
+
+        rbuf[rhead] = resid;
+        if resid.is_nan() {
+            r_nan_cnt += 1;
+        } else {
+            rsum += resid;
+        }
+
+        rhead += 1;
+        if rhead == MAE_LEN {
+            rhead = 0;
+        }
+
+        if t >= warm_total {
+            if !y.is_nan() && r_nan_cnt == 0 {
+                let mae = rsum * scale;
+                upper_out[t] = y + mae;
+                lower_out[t] = y - mae;
+            } else {
+                upper_out[t] = nan;
+                lower_out[t] = nan;
+            }
+        }
+
+        t += 1;
+    }
+}
+
+#[inline]
+pub fn nadaraya_watson_envelope(input: &NweInput) -> Result<NweOutput, NweError> {
+    let (data, _bw, mult, lookback, warm_out, warm_total, w, den) = nwe_prepare(input)?;
+    let len = data.len();
+    let mut upper = alloc_with_nan_prefix(len, warm_total);
+    let mut lower = alloc_with_nan_prefix(len, warm_total);
+    nwe_compute_scalar_prepared(
+        data, mult, lookback, warm_out, warm_total, &w, den, &mut upper, &mut lower, false,
+    );
+    Ok(NweOutput { upper, lower })
+}
+
+pub fn nadaraya_watson_envelope_with_kernel(
+    input: &NweInput,
+    kernel: Kernel,
+) -> Result<NweOutput, NweError> {
+    let chosen = match kernel {
+        Kernel::Auto => detect_best_kernel(),
+        k => k,
+    };
+
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    unsafe {
+        match chosen {
+            Kernel::Avx512 => {
+                let len = input.as_ref().len();
+                let mut upper = alloc_with_nan_prefix(len, 0);
+                let mut lower = alloc_with_nan_prefix(len, 0);
+                nadaraya_watson_envelope_into_slices_avx512(input, &mut upper, &mut lower)?;
+                Ok(NweOutput { upper, lower })
+            }
+            Kernel::Avx2 => {
+                let len = input.as_ref().len();
+                let mut upper = alloc_with_nan_prefix(len, 0);
+                let mut lower = alloc_with_nan_prefix(len, 0);
+                nadaraya_watson_envelope_into_slices_avx2(input, &mut upper, &mut lower)?;
+                Ok(NweOutput { upper, lower })
+            }
+            _ => nadaraya_watson_envelope(input),
+        }
+    }
+    #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+    {
+        let _ = chosen;
+        nadaraya_watson_envelope(input)
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+#[inline]
+pub fn nadaraya_watson_envelope_into(
+    input: &NweInput,
+    upper_out: &mut [f64],
+    lower_out: &mut [f64],
+) -> Result<(), NweError> {
+    let len = input.as_ref().len();
+    if upper_out.len() != len || lower_out.len() != len {
+        return Err(NweError::OutputLengthMismatch {
+            expected: len,
+            got: upper_out.len().min(lower_out.len()),
+        });
+    }
+
+    let chosen = detect_best_kernel();
+
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    unsafe {
+        match chosen {
+            Kernel::Avx512 => {
+                return nadaraya_watson_envelope_into_slices_avx512(input, upper_out, lower_out)
+            }
+            Kernel::Avx2 => {
+                return nadaraya_watson_envelope_into_slices_avx2(input, upper_out, lower_out)
+            }
+            _ => {
+                return nadaraya_watson_envelope_into_slices(input, upper_out, lower_out);
+            }
+        }
+    }
+
+    #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+    {
+        let _ = chosen;
+        nadaraya_watson_envelope_into_slices(input, upper_out, lower_out)
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx2")]
+#[target_feature(enable = "fma")]
+pub unsafe fn nadaraya_watson_envelope_into_slices_avx2(
+    input: &NweInput,
+    upper_out: &mut [f64],
+    lower_out: &mut [f64],
+) -> Result<(), NweError> {
+    use core::arch::x86_64::*;
+    let (data, _bw, mult, lookback, warm_out, warm_total, w, den) = nwe_prepare(input)?;
+    let len = data.len();
+
+    if upper_out.len() != len || lower_out.len() != len {
+        return Err(NweError::OutputLengthMismatch {
+            expected: len,
+            got: upper_out.len().min(lower_out.len()),
+        });
+    }
+
+    let nan = f64::from_bits(0x7ff8_0000_0000_0000);
+    let prefix_end = warm_total.min(len);
+    for v in &mut upper_out[..prefix_end] {
+        *v = nan;
+    }
+    for v in &mut lower_out[..prefix_end] {
+        *v = nan;
+    }
+    if warm_total >= len {
+        return Ok(());
+    }
+
+    const MAE_LEN: usize = 499;
+    let mut rbuf = vec![nan; MAE_LEN];
+    let mut rsum = 0.0f64;
+    let mut r_nan_cnt = MAE_LEN;
+    let mut rhead = 0usize;
+
+    let dptr = data.as_ptr();
+    let wptr = w.as_ptr();
+
+    let mut t = warm_out;
+    while t < len {
+        let mut vacc = _mm256_setzero_pd();
+        let mut any_nan = false;
+        let mut k = 0usize;
+
+        while k + 4 <= lookback {
+            let x = _mm256_loadu_pd(dptr.add(t - k - 3));
+
+            let wv = _mm256_loadu_pd(wptr.add(k));
+            let wrev = _mm256_permute4x64_pd(wv, 0x1B);
+
+            let ord = _mm256_cmp_pd(x, x, _CMP_ORD_Q);
+            if _mm256_movemask_pd(ord) != 0xF {
+                any_nan = true;
+                break;
+            }
+            vacc = _mm256_fmadd_pd(x, wrev, vacc);
+            k += 4;
+        }
+
+        let mut num = 0.0f64;
+        if !any_nan {
+            let hi = _mm256_extractf128_pd(vacc, 1);
+            let lo = _mm256_castpd256_pd128(vacc);
+            let sum2 = _mm_add_pd(hi, lo);
+            let shuf = _mm_permute_pd(sum2, 0x1);
+            let sum1 = _mm_add_sd(sum2, shuf);
+            num = _mm_cvtsd_f64(sum1);
+
+            while k < lookback {
+                let x = *dptr.add(t - k);
+                if x != x {
+                    any_nan = true;
+                    break;
+                }
+                num = x.mul_add(*wptr.add(k), num);
+                k += 1;
+            }
+        }
+
+        let y = if any_nan { f64::NAN } else { num / den };
+
+        let xt = *dptr.add(t);
+        let resid = if xt == xt && y == y {
+            (xt - y).abs()
+        } else {
+            f64::NAN
+        };
+
+        let old = *rbuf.get_unchecked(rhead);
+        if old == old {
+            rsum -= old;
+        } else {
+            r_nan_cnt = r_nan_cnt.saturating_sub(1);
+        }
+        *rbuf.get_unchecked_mut(rhead) = resid;
+        if resid == resid {
+            rsum += resid;
+        } else {
+            r_nan_cnt += 1;
+        }
+        rhead += 1;
+        if rhead == MAE_LEN {
+            rhead = 0;
+        }
+
+        if t >= warm_total {
+            if y == y && r_nan_cnt == 0 {
+                let mae = (rsum / (MAE_LEN as f64)) * mult;
+                *upper_out.get_unchecked_mut(t) = y + mae;
+                *lower_out.get_unchecked_mut(t) = y - mae;
+            } else {
+                *upper_out.get_unchecked_mut(t) = nan;
+                *lower_out.get_unchecked_mut(t) = nan;
+            }
+        }
+
+        t += 1;
+    }
+
+    Ok(())
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "fma")]
+pub unsafe fn nadaraya_watson_envelope_into_slices_avx512(
+    input: &NweInput,
+    upper_out: &mut [f64],
+    lower_out: &mut [f64],
+) -> Result<(), NweError> {
+    use core::arch::x86_64::*;
+    let (data, _bw, mult, lookback, warm_out, warm_total, w, den) = nwe_prepare(input)?;
+    let len = data.len();
+    if upper_out.len() != len || lower_out.len() != len {
+        return Err(NweError::OutputLengthMismatch {
+            expected: len,
+            got: upper_out.len().min(lower_out.len()),
+        });
+    }
+
+    let nan = f64::from_bits(0x7ff8_0000_0000_0000);
+    let prefix_end = warm_total.min(len);
+    for v in &mut upper_out[..prefix_end] {
+        *v = nan;
+    }
+    for v in &mut lower_out[..prefix_end] {
+        *v = nan;
+    }
+    if warm_total >= len {
+        return Ok(());
+    }
+
+    const MAE_LEN: usize = 499;
+    let mut rbuf = vec![nan; MAE_LEN];
+    let mut rsum = 0.0f64;
+    let mut r_nan_cnt = MAE_LEN;
+    let mut rhead = 0usize;
+
+    let dptr = data.as_ptr();
+    let wptr = w.as_ptr();
+
+    let idx = _mm512_set_epi64(0, 1, 2, 3, 4, 5, 6, 7);
+
+    let mut t = warm_out;
+    while t < len {
+        let mut vacc = _mm512_setzero_pd();
+        let mut any_nan = false;
+        let mut k = 0usize;
+
+        while k + 8 <= lookback {
+            let x = _mm512_loadu_pd(dptr.add(t - k - 7));
+
+            let wv = _mm512_loadu_pd(wptr.add(k));
+            let wrev = _mm512_permutexvar_pd(idx, wv);
+
+            let mask = _mm512_cmp_pd_mask(x, x, _CMP_ORD_Q);
+            if mask != 0xFF {
+                any_nan = true;
+                break;
+            }
+            vacc = _mm512_fmadd_pd(x, wrev, vacc);
+            k += 8;
+        }
+
+        let mut num = 0.0f64;
+        if !any_nan {
+            let lo = _mm512_castpd512_pd256(vacc);
+            let hi = _mm512_extractf64x4_pd(vacc, 1);
+            let sum256 = _mm256_add_pd(lo, hi);
+            let hi128 = _mm256_extractf128_pd(sum256, 1);
+            let lo128 = _mm256_castpd256_pd128(sum256);
+            let sum128 = _mm_add_pd(hi128, lo128);
+            let shuf = _mm_permute_pd(sum128, 0x1);
+            let sum1 = _mm_add_sd(sum128, shuf);
+            num = _mm_cvtsd_f64(sum1);
+
+            while k < lookback {
+                let x = *dptr.add(t - k);
+                if x != x {
+                    any_nan = true;
+                    break;
+                }
+                num = x.mul_add(*wptr.add(k), num);
+                k += 1;
+            }
+        }
+
+        let y = if any_nan { f64::NAN } else { num / den };
+
+        let xt = *dptr.add(t);
+        let resid = if xt == xt && y == y {
+            (xt - y).abs()
+        } else {
+            f64::NAN
+        };
+
+        let old = *rbuf.get_unchecked(rhead);
+        if old == old {
+            rsum -= old;
+        } else {
+            r_nan_cnt = r_nan_cnt.saturating_sub(1);
+        }
+        *rbuf.get_unchecked_mut(rhead) = resid;
+        if resid == resid {
+            rsum += resid;
+        } else {
+            r_nan_cnt += 1;
+        }
+        rhead += 1;
+        if rhead == MAE_LEN {
+            rhead = 0;
+        }
+
+        if t >= warm_total {
+            if y == y && r_nan_cnt == 0 {
+                let mae = (rsum / (MAE_LEN as f64)) * mult;
+                *upper_out.get_unchecked_mut(t) = y + mae;
+                *lower_out.get_unchecked_mut(t) = y - mae;
+            } else {
+                *upper_out.get_unchecked_mut(t) = nan;
+                *lower_out.get_unchecked_mut(t) = nan;
+            }
+        }
+
+        t += 1;
+    }
+
+    Ok(())
+}
+
+pub struct NweStream {
+    lookback: usize,
+
+    weights: Vec<f64>,
+    w_rev: Vec<f64>,
+    den: f64,
+    inv_den: f64,
+
+    ring: Vec<f64>,
+    ring2: Vec<f64>,
+
+    head: usize,
+    filled: bool,
+
+    mae_len: usize,
+    resid_ring: Vec<f64>,
+    resid_head: usize,
+    resid_filled: bool,
+    resid_sum: f64,
+    resid_nan_count: usize,
+
+    multiplier: f64,
+    mae_scale: f64,
+}
+
+impl NweStream {
+    pub fn try_new(params: NweParams) -> Result<Self, NweError> {
+        let bandwidth = params.bandwidth.unwrap_or(8.0);
+        let multiplier = params.multiplier.unwrap_or(3.0);
+        let lookback = params.lookback.unwrap_or(500);
+
+        if bandwidth <= 0.0 || bandwidth.is_nan() {
+            return Err(NweError::InvalidBandwidth { bandwidth });
+        }
+
+        if multiplier < 0.0 || multiplier.is_nan() {
+            return Err(NweError::InvalidMultiplier { multiplier });
+        }
+
+        if lookback == 0 {
+            return Err(NweError::InvalidLookback { lookback });
+        }
+
+        let mut weights = vec![0.0; lookback];
+        let mut den = 0.0;
+        for k in 0..lookback {
+            let wk = (-(k as f64) * (k as f64) / (2.0 * bandwidth * bandwidth)).exp();
+            weights[k] = wk;
+            den += wk;
+        }
+
+        let mut w_rev = vec![0.0; lookback];
+        for i in 0..lookback {
+            w_rev[i] = weights[lookback - 1 - i];
+        }
+        let inv_den = 1.0 / den;
+
+        let nan = f64::NAN;
+
+        Ok(Self {
+            lookback,
+            weights,
+            w_rev,
+            den,
+            inv_den,
+
+            ring: vec![nan; lookback],
+            ring2: vec![nan; 2 * lookback],
+
+            head: 0,
+            filled: false,
+
+            mae_len: 499,
+            resid_ring: vec![nan; 499],
+            resid_head: 0,
+            resid_filled: false,
+            resid_sum: 0.0,
+            resid_nan_count: 499,
+
+            multiplier,
+            mae_scale: if 499 > 0 { multiplier / 499.0 } else { 0.0 },
+        })
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, value: f64) -> Option<(f64, f64)> {
+        let pos = self.head;
+        self.ring[pos] = value;
+        self.ring2[pos] = value;
+        self.ring2[pos + self.lookback] = value;
+
+        self.head = pos + 1;
+        if self.head == self.lookback {
+            self.head = 0;
+            self.filled = true;
+        }
+
+        let y = if self.filled {
+            let slice = &self.ring2[self.head..self.head + self.lookback];
+            let w = &self.w_rev;
+
+            let mut acc = 0.0;
+            let mut any_nan = false;
+            for i in 0..self.lookback {
+                let x = slice[i];
+                if x.is_nan() {
+                    any_nan = true;
+                    break;
+                }
+                acc = x.mul_add(w[i], acc);
+            }
+            if any_nan {
+                f64::NAN
+            } else {
+                acc * self.inv_den
+            }
+        } else {
+            f64::NAN
+        };
+
+        let resid = if !value.is_nan() && !y.is_nan() {
+            (value - y).abs()
+        } else {
+            f64::NAN
+        };
+
+        let old = self.resid_ring[self.resid_head];
+        if old.is_nan() {
+            self.resid_nan_count = self.resid_nan_count.saturating_sub(1);
+        } else {
+            self.resid_sum -= old;
+        }
+
+        self.resid_ring[self.resid_head] = resid;
+        if resid.is_nan() {
+            self.resid_nan_count += 1;
+        } else {
+            self.resid_sum += resid;
+        }
+
+        self.resid_head += 1;
+        if self.resid_head == self.mae_len {
+            self.resid_head = 0;
+            self.resid_filled = true;
+        }
+
+        if self.filled && self.resid_filled && self.resid_nan_count == 0 && !y.is_nan() {
+            let mae = self.resid_sum * self.mae_scale;
+            Some((y + mae, y - mae))
+        } else {
+            None
+        }
+    }
+
+    pub fn reset(&mut self) {
+        let nan = f64::NAN;
+        self.ring.fill(nan);
+        self.ring2.fill(nan);
+        self.head = 0;
+        self.filled = false;
+
+        self.resid_ring.fill(nan);
+        self.resid_head = 0;
+        self.resid_filled = false;
+        self.resid_sum = 0.0;
+        self.resid_nan_count = self.mae_len;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NweBatchRange {
+    pub bandwidth: (f64, f64, f64),
+    pub multiplier: (f64, f64, f64),
+    pub lookback: (usize, usize, usize),
+}
+
+impl Default for NweBatchRange {
+    fn default() -> Self {
+        Self {
+            bandwidth: (8.0, 8.0, 0.0),
+            multiplier: (3.0, 3.0, 0.0),
+            lookback: (500, 749, 1),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NweBatchOutput {
+    pub values_upper: Vec<f64>,
+    pub values_lower: Vec<f64>,
+    pub combos: Vec<NweParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl NweBatchOutput {
+    pub fn row_for_params(&self, p: &NweParams) -> Option<usize> {
+        self.combos.iter().position(|c| {
+            c.bandwidth.unwrap_or(8.0) == p.bandwidth.unwrap_or(8.0)
+                && c.multiplier.unwrap_or(3.0) == p.multiplier.unwrap_or(3.0)
+                && c.lookback.unwrap_or(500) == p.lookback.unwrap_or(500)
+        })
+    }
+
+    pub fn values_upper_for(&self, p: &NweParams) -> Option<&[f64]> {
+        self.row_for_params(p).map(|row| {
+            let start = row * self.cols;
+            &self.values_upper[start..start + self.cols]
+        })
+    }
+
+    pub fn values_lower_for(&self, p: &NweParams) -> Option<&[f64]> {
+        self.row_for_params(p).map(|row| {
+            let start = row * self.cols;
+            &self.values_lower[start..start + self.cols]
+        })
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct NweBatchBuilder {
+    bandwidth: (f64, f64, f64),
+    multiplier: (f64, f64, f64),
+    lookback: (usize, usize, usize),
+    kernel: Kernel,
+}
+
+impl Default for NweBatchBuilder {
+    fn default() -> Self {
+        Self {
+            kernel: Kernel::Auto,
+            ..Self::new_from_range(NweBatchRange::default())
+        }
+    }
+}
+
+impl NweBatchBuilder {
+    #[inline(always)]
+    fn new_from_range(r: NweBatchRange) -> Self {
+        Self {
+            bandwidth: r.bandwidth,
+            multiplier: r.multiplier,
+            lookback: r.lookback,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl NweBatchBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline(always)]
+    pub fn bandwidth_range(mut self, start: f64, end: f64, step: f64) -> Self {
+        self.bandwidth = (start, end, step);
+        self
+    }
+
+    #[inline(always)]
+    pub fn bandwidth_static(mut self, value: f64) -> Self {
+        self.bandwidth = (value, value, 0.0);
+        self
+    }
+
+    #[inline(always)]
+    pub fn multiplier_range(mut self, start: f64, end: f64, step: f64) -> Self {
+        self.multiplier = (start, end, step);
+        self
+    }
+
+    #[inline(always)]
+    pub fn multiplier_static(mut self, value: f64) -> Self {
+        self.multiplier = (value, value, 0.0);
+        self
+    }
+
+    #[inline(always)]
+    pub fn lookback_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.lookback = (start, end, step);
+        self
+    }
+
+    #[inline(always)]
+    pub fn lookback_static(mut self, value: usize) -> Self {
+        self.lookback = (value, value, 0);
+        self
+    }
+
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline(always)]
+    pub fn apply_candles(self, c: &Candles, source: &str) -> Result<NweBatchOutput, NweError> {
+        let data = source_type(c, source);
+        self.apply_slice(data)
+    }
+
+    #[inline(always)]
+    pub fn apply_slice(self, data: &[f64]) -> Result<NweBatchOutput, NweError> {
+        let sweep = NweBatchRange {
+            bandwidth: self.bandwidth,
+            multiplier: self.multiplier,
+            lookback: self.lookback,
+        };
+        nwe_batch_with_kernel(data, &sweep, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn with_default_candles(c: &Candles) -> Result<NweBatchOutput, NweError> {
+        Self::new().apply_candles(c, "close")
+    }
+
+    #[inline(always)]
+    pub fn with_default_slice(data: &[f64], k: Kernel) -> Result<NweBatchOutput, NweError> {
+        Self::new().kernel(k).apply_slice(data)
+    }
+}
+
+#[inline(always)]
+fn expand_grid(r: &NweBatchRange) -> Result<Vec<NweParams>, NweError> {
+    fn axis_usize((start, end, step): (usize, usize, usize)) -> Result<Vec<usize>, NweError> {
+        if step == 0 || start == end {
+            return Ok(vec![start]);
+        }
+        if start < end {
+            return Ok((start..=end).step_by(step.max(1)).collect());
+        }
+        let mut v = Vec::new();
+        let mut x = start as isize;
+        let end_i = end as isize;
+        let st = (step as isize).max(1);
+        while x >= end_i {
+            v.push(x as usize);
+            x -= st;
+        }
+        if v.is_empty() {
+            return Err(NweError::InvalidRange {
+                start: start.to_string(),
+                end: end.to_string(),
+                step: step.to_string(),
+            });
+        }
+        Ok(v)
+    }
+
+    fn axis_f64((start, end, step): (f64, f64, f64)) -> Result<Vec<f64>, NweError> {
+        if step.abs() < 1e-12 || (start - end).abs() < 1e-12 {
+            return Ok(vec![start]);
+        }
+        let st = step.abs();
+        if start < end {
+            let mut v = Vec::new();
+            let mut x = start;
+            while x <= end + 1e-12 {
+                v.push(x);
+                x += st;
+            }
+            if v.is_empty() {
+                return Err(NweError::InvalidRange {
+                    start: start.to_string(),
+                    end: end.to_string(),
+                    step: step.to_string(),
+                });
+            }
+            return Ok(v);
+        }
+        let mut v = Vec::new();
+        let mut x = start;
+        while x + 1e-12 >= end {
+            v.push(x);
+            x -= st;
+        }
+        if v.is_empty() {
+            return Err(NweError::InvalidRange {
+                start: start.to_string(),
+                end: end.to_string(),
+                step: step.to_string(),
+            });
+        }
+        Ok(v)
+    }
+
+    let bandwidths = axis_f64(r.bandwidth)?;
+    let multipliers = axis_f64(r.multiplier)?;
+    let lookbacks = axis_usize(r.lookback)?;
+
+    let cap = bandwidths
+        .len()
+        .checked_mul(multipliers.len())
+        .and_then(|x| x.checked_mul(lookbacks.len()))
+        .ok_or_else(|| NweError::InvalidRange {
+            start: "cap".into(),
+            end: "overflow".into(),
+            step: "mul".into(),
+        })?;
+
+    let mut out = Vec::with_capacity(cap);
+    for &b in &bandwidths {
+        for &m in &multipliers {
+            for &l in &lookbacks {
+                out.push(NweParams {
+                    bandwidth: Some(b),
+                    multiplier: Some(m),
+                    lookback: Some(l),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[inline(always)]
+fn nwe_batch_inner_into(
+    data: &[f64],
+    sweep: &NweBatchRange,
+    out_upper: &mut [f64],
+    out_lower: &mut [f64],
+) -> Result<Vec<NweParams>, NweError> {
+    let combos = expand_grid(sweep)?;
+    let rows = combos.len();
+    let cols = data.len();
+
+    let mut warm_upper = Vec::with_capacity(rows);
+    for prm in &combos {
+        let tmp = NweInput::from_slice(data, prm.clone());
+        match nwe_prepare(&tmp) {
+            Ok((_d, _bw, _m, _lookback, _warm_out, warm_total, _w, _den)) => {
+                warm_upper.push(warm_total.min(cols));
+            }
+            Err(_) => {
+                warm_upper.push(cols);
+            }
+        }
+    }
+
+    let out_upper_mu = unsafe {
+        core::slice::from_raw_parts_mut(
+            out_upper.as_mut_ptr() as *mut MaybeUninit<f64>,
+            out_upper.len(),
+        )
+    };
+    let out_lower_mu = unsafe {
+        core::slice::from_raw_parts_mut(
+            out_lower.as_mut_ptr() as *mut MaybeUninit<f64>,
+            out_lower.len(),
+        )
+    };
+    init_matrix_prefixes(out_upper_mu, cols, &warm_upper);
+    init_matrix_prefixes(out_lower_mu, cols, &warm_upper);
+
+    for (row, prm) in combos.iter().enumerate() {
+        let start = row * cols;
+        let u_row = &mut out_upper[start..start + cols];
+        let l_row = &mut out_lower[start..start + cols];
+        let input = NweInput::from_slice(data, prm.clone());
+
+        let _ = nadaraya_watson_envelope_into_slices(&input, u_row, l_row);
+    }
+
+    Ok(combos)
+}
+
+pub fn nadaraya_watson_envelope_batch_with_kernel(
+    data: &[f64],
+    sweep: &NweBatchRange,
+    kernel: Kernel,
+) -> Result<NweBatchOutput, NweError> {
+    nwe_batch_with_kernel(data, sweep, kernel)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn nwe_batch_par_slice(
+    data: &[f64],
+    sweep: &NweBatchRange,
+    k: Kernel,
+) -> Result<NweBatchOutput, NweError> {
+    let _batch_k = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        _ => {
+            return Err(NweError::InvalidKernelForBatch(k));
+        }
+    };
+
+    use rayon::prelude::*;
+
+    let combos = expand_grid(sweep)?;
+    let rows = combos.len();
+    let cols = data.len();
+    if cols == 0 {
+        return Err(NweError::EmptyInputData);
+    }
+
+    let _ = rows
+        .checked_mul(cols)
+        .ok_or_else(|| NweError::InvalidRange {
+            start: rows.to_string(),
+            end: cols.to_string(),
+            step: "rows*cols".into(),
+        })?;
+
+    let mut upper_mu = make_uninit_matrix(rows, cols);
+    let mut lower_mu = make_uninit_matrix(rows, cols);
+
+    let warms: Vec<usize> = combos
+        .iter()
+        .map(|p| {
+            let tmp = NweInput::from_slice(data, p.clone());
+            match nwe_prepare(&tmp) {
+                Ok((_d, _bw, _m, _lb, _warm_out, warm_total, _w, _den)) => warm_total.min(cols),
+                Err(_) => cols,
+            }
+        })
+        .collect();
+
+    init_matrix_prefixes(&mut upper_mu, cols, &warms);
+    init_matrix_prefixes(&mut lower_mu, cols, &warms);
+
+    let mut upper_guard = core::mem::ManuallyDrop::new(upper_mu);
+    let mut lower_guard = core::mem::ManuallyDrop::new(lower_mu);
+    let upper_slice: &mut [f64] = unsafe {
+        core::slice::from_raw_parts_mut(upper_guard.as_mut_ptr() as *mut f64, upper_guard.len())
+    };
+    let lower_slice: &mut [f64] = unsafe {
+        core::slice::from_raw_parts_mut(lower_guard.as_mut_ptr() as *mut f64, lower_guard.len())
+    };
+
+    upper_slice
+        .par_chunks_mut(cols)
+        .zip(lower_slice.par_chunks_mut(cols))
+        .zip(combos.par_iter())
+        .for_each(|((u_row, l_row), prm)| {
+            let input = NweInput::from_slice(data, prm.clone());
+
+            let _ = nadaraya_watson_envelope_into_slices(&input, u_row, l_row);
+        });
+
+    let values_upper = unsafe {
+        Vec::from_raw_parts(
+            upper_guard.as_mut_ptr() as *mut f64,
+            upper_guard.len(),
+            upper_guard.capacity(),
+        )
+    };
+    let values_lower = unsafe {
+        Vec::from_raw_parts(
+            lower_guard.as_mut_ptr() as *mut f64,
+            lower_guard.len(),
+            lower_guard.capacity(),
+        )
+    };
+
+    Ok(NweBatchOutput {
+        values_upper,
+        values_lower,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn nwe_batch_par_slice(
+    data: &[f64],
+    sweep: &NweBatchRange,
+    kernel: Kernel,
+) -> Result<NweBatchOutput, NweError> {
+    nwe_batch_with_kernel(data, sweep, kernel)
+}
+
+pub fn nwe_batch_with_kernel(
+    data: &[f64],
+    sweep: &NweBatchRange,
+    k: Kernel,
+) -> Result<NweBatchOutput, NweError> {
+    let _batch_k = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        _ => {
+            return Err(NweError::InvalidKernelForBatch(k));
+        }
+    };
+
+    let combos = expand_grid(sweep)?;
+    let rows = combos.len();
+    let cols = data.len();
+    if cols == 0 {
+        return Err(NweError::EmptyInputData);
+    }
+
+    let _ = rows
+        .checked_mul(cols)
+        .ok_or_else(|| NweError::InvalidRange {
+            start: rows.to_string(),
+            end: cols.to_string(),
+            step: "rows*cols".into(),
+        })?;
+
+    let mut upper_mu = make_uninit_matrix(rows, cols);
+    let mut lower_mu = make_uninit_matrix(rows, cols);
+
+    let mut upper_guard = core::mem::ManuallyDrop::new(upper_mu);
+    let mut lower_guard = core::mem::ManuallyDrop::new(lower_mu);
+    let upper_slice: &mut [f64] = unsafe {
+        core::slice::from_raw_parts_mut(upper_guard.as_mut_ptr() as *mut f64, upper_guard.len())
+    };
+    let lower_slice: &mut [f64] = unsafe {
+        core::slice::from_raw_parts_mut(lower_guard.as_mut_ptr() as *mut f64, lower_guard.len())
+    };
+
+    let combos_final = nwe_batch_inner_into(data, sweep, upper_slice, lower_slice)?;
+
+    let values_upper = unsafe {
+        Vec::from_raw_parts(
+            upper_guard.as_mut_ptr() as *mut f64,
+            upper_guard.len(),
+            upper_guard.capacity(),
+        )
+    };
+    let values_lower = unsafe {
+        Vec::from_raw_parts(
+            lower_guard.as_mut_ptr() as *mut f64,
+            lower_guard.len(),
+            lower_guard.capacity(),
+        )
+    };
+
+    Ok(NweBatchOutput {
+        values_upper,
+        values_lower,
+        combos: combos_final,
+        rows,
+        cols,
+    })
+}
+
+#[inline(always)]
+pub fn nwe_batch_slice(
+    data: &[f64],
+    sweep: &NweBatchRange,
+    k: Kernel,
+) -> Result<NweBatchOutput, NweError> {
+    nwe_batch_with_kernel(data, sweep, k)
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "nadaraya_watson_envelope")]
+#[pyo3(signature = (data, bandwidth=8.0, multiplier=3.0, lookback=500, kernel=None))]
+pub fn nadaraya_watson_envelope_py<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray1<'py, f64>,
+    bandwidth: f64,
+    multiplier: f64,
+    lookback: usize,
+    kernel: Option<&str>,
+) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+    let slice_in = data.as_slice()?;
+    let _kern = validate_kernel(kernel, false)?;
+
+    let params = NweParams {
+        bandwidth: Some(bandwidth),
+        multiplier: Some(multiplier),
+        lookback: Some(lookback),
+    };
+    let input = NweInput::from_slice(slice_in, params);
+
+    let len = slice_in.len();
+
+    let mut upper = alloc_with_nan_prefix(len, 0);
+    let mut lower = alloc_with_nan_prefix(len, 0);
+
+    py.allow_threads(|| nadaraya_watson_envelope_into_slices(&input, &mut upper, &mut lower))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok((upper.into_pyarray(py), lower.into_pyarray(py)))
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "nadaraya_watson_envelope_batch")]
+#[pyo3(signature = (
+    data,
+    bandwidth_range=(8.0, 8.0, 0.0),
+    multiplier_range=(3.0, 3.0, 0.0),
+    lookback_range=(500, 500, 0),
+    kernel=None
+))]
+pub fn nadaraya_watson_envelope_batch_py<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray1<'py, f64>,
+    bandwidth_range: (f64, f64, f64),
+    multiplier_range: (f64, f64, f64),
+    lookback_range: (usize, usize, usize),
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let slice_in = data.as_slice()?;
+    let kern = validate_kernel(kernel, true)?;
+
+    let sweep = NweBatchRange {
+        bandwidth: bandwidth_range,
+        multiplier: multiplier_range,
+        lookback: lookback_range,
+    };
+
+    let result = py
+        .allow_threads(|| nadaraya_watson_envelope_batch_with_kernel(slice_in, &sweep, kern))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let dict = PyDict::new(py);
+
+    let bandwidths: Vec<f64> = result
+        .combos
+        .iter()
+        .map(|c| c.bandwidth.unwrap_or(8.0))
+        .collect();
+    let multipliers: Vec<f64> = result
+        .combos
+        .iter()
+        .map(|c| c.multiplier.unwrap_or(3.0))
+        .collect();
+    let lookbacks: Vec<usize> = result
+        .combos
+        .iter()
+        .map(|c| c.lookback.unwrap_or(500))
+        .collect();
+
+    dict.set_item(
+        "upper",
+        result
+            .values_upper
+            .into_pyarray(py)
+            .reshape((result.rows, result.cols))?,
+    )?;
+    dict.set_item(
+        "lower",
+        result
+            .values_lower
+            .into_pyarray(py)
+            .reshape((result.rows, result.cols))?,
+    )?;
+    dict.set_item("bandwidths", bandwidths.into_pyarray(py))?;
+    dict.set_item("multipliers", multipliers.into_pyarray(py))?;
+    dict.set_item("lookbacks", lookbacks.into_pyarray(py))?;
+
+    Ok(dict.into())
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "NweStream")]
+pub struct NweStreamPy {
+    inner: NweStream,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl NweStreamPy {
+    #[new]
+    #[pyo3(signature = (bandwidth=8.0, multiplier=3.0, lookback=500))]
+    pub fn new(bandwidth: f64, multiplier: f64, lookback: usize) -> PyResult<Self> {
+        let params = NweParams {
+            bandwidth: Some(bandwidth),
+            multiplier: Some(multiplier),
+            lookback: Some(lookback),
+        };
+
+        let inner = NweStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        Ok(Self { inner })
+    }
+
+    pub fn update(&mut self, value: f64) -> Option<(f64, f64)> {
+        self.inner.update(value)
+    }
+
+    pub fn reset(&mut self) {
+        self.inner.reset()
+    }
+}
+
+#[cfg(feature = "python")]
+pub fn register_nadaraya_watson_envelope_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(nadaraya_watson_envelope_py, m)?)?;
+    m.add_function(wrap_pyfunction!(nadaraya_watson_envelope_batch_py, m)?)?;
+    m.add_class::<NweStreamPy>()?;
+    #[cfg(feature = "cuda")]
+    {
+        m.add_function(wrap_pyfunction!(
+            nadaraya_watson_envelope_cuda_batch_dev_py,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            nadaraya_watson_envelope_cuda_many_series_one_param_dev_py,
+            m
+        )?)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::{cuda_available, CudaNwe};
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "nadaraya_watson_envelope_cuda_batch_dev")]
+#[pyo3(signature = (data_f32, bandwidth_range=(8.0,8.0,0.0), multiplier_range=(3.0,3.0,0.0), lookback_range=(500,500,0), device_id=0))]
+pub fn nadaraya_watson_envelope_cuda_batch_dev_py<'py>(
+    py: Python<'py>,
+    data_f32: numpy::PyReadonlyArray1<'py, f32>,
+    bandwidth_range: (f64, f64, f64),
+    multiplier_range: (f64, f64, f64),
+    lookback_range: (usize, usize, usize),
+    device_id: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let slice = data_f32.as_slice()?;
+    let sweep = NweBatchRange {
+        bandwidth: bandwidth_range,
+        multiplier: multiplier_range,
+        lookback: lookback_range,
+    };
+    let dict = PyDict::new(py);
+    let (pair, combos, ctx, dev_id) = py.allow_threads(|| {
+        let cuda = CudaNwe::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let ctx = cuda.context_arc();
+        let dev_id = cuda.device_id();
+        let (pair, combos) = cuda
+            .nwe_batch_dev(slice, &sweep)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok::<_, pyo3::PyErr>((pair, combos, ctx, dev_id))
+    })?;
+    dict.set_item(
+        "upper",
+        Py::new(
+            py,
+            NweDeviceArrayF32PyAlias {
+                buf: Some(pair.upper.buf),
+                rows: pair.upper.rows,
+                cols: pair.upper.cols,
+                _ctx: ctx.clone(),
+                device_id: dev_id,
+            },
+        )?,
+    )?;
+    dict.set_item(
+        "lower",
+        Py::new(
+            py,
+            NweDeviceArrayF32PyAlias {
+                buf: Some(pair.lower.buf),
+                rows: pair.lower.rows,
+                cols: pair.lower.cols,
+                _ctx: ctx,
+                device_id: dev_id,
+            },
+        )?,
+    )?;
+
+    use numpy::IntoPyArray;
+    let bws: Vec<f64> = combos.iter().map(|c| c.bandwidth.unwrap_or(8.0)).collect();
+    let mps: Vec<f64> = combos.iter().map(|c| c.multiplier.unwrap_or(3.0)).collect();
+    let lbs: Vec<usize> = combos.iter().map(|c| c.lookback.unwrap_or(500)).collect();
+    dict.set_item("bandwidths", bws.into_pyarray(py))?;
+    dict.set_item("multipliers", mps.into_pyarray(py))?;
+    dict.set_item("lookbacks", lbs.into_pyarray(py))?;
+    dict.set_item("rows", combos.len())?;
+    dict.set_item("cols", slice.len())?;
+    Ok(dict)
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "nadaraya_watson_envelope_cuda_many_series_one_param_dev")]
+#[pyo3(signature = (data_tm_f32, bandwidth, multiplier, lookback, device_id=0))]
+pub fn nadaraya_watson_envelope_cuda_many_series_one_param_dev_py<'py>(
+    py: Python<'py>,
+    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
+    bandwidth: f64,
+    multiplier: f64,
+    lookback: usize,
+    device_id: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    use numpy::PyUntypedArrayMethods;
+    let shape = data_tm_f32.shape();
+    if shape.len() != 2 {
+        return Err(PyValueError::new_err("expected 2D time-major array"));
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    let flat = data_tm_f32.as_slice()?;
+    let params = NweParams {
+        bandwidth: Some(bandwidth),
+        multiplier: Some(multiplier),
+        lookback: Some(lookback),
+    };
+    let (pair, ctx, dev_id) = py.allow_threads(|| {
+        let cuda = CudaNwe::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let ctx = cuda.context_arc();
+        let dev_id = cuda.device_id();
+        let pair = cuda
+            .nwe_many_series_one_param_time_major_dev(flat, cols, rows, &params)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok::<_, pyo3::PyErr>((pair, ctx, dev_id))
+    })?;
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "upper",
+        Py::new(
+            py,
+            NweDeviceArrayF32PyAlias {
+                buf: Some(pair.upper.buf),
+                rows: pair.upper.rows,
+                cols: pair.upper.cols,
+                _ctx: ctx.clone(),
+                device_id: dev_id,
+            },
+        )?,
+    )?;
+    dict.set_item(
+        "lower",
+        Py::new(
+            py,
+            NweDeviceArrayF32PyAlias {
+                buf: Some(pair.lower.buf),
+                rows: pair.lower.rows,
+                cols: pair.lower.cols,
+                _ctx: ctx,
+                device_id: dev_id,
+            },
+        )?,
+    )?;
+    dict.set_item("rows", rows)?;
+    dict.set_item("cols", cols)?;
+    dict.set_item("bandwidth", bandwidth)?;
+    dict.set_item("multiplier", multiplier)?;
+    dict.set_item("lookback", lookback)?;
+    Ok(dict)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct NweJsResult {
+    pub upper: Vec<f64>,
+    pub lower: Vec<f64>,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct NweJsFlat {
+    pub values: Vec<f64>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = nadaraya_watson_envelope)]
+pub fn nadaraya_watson_envelope_unified_js(
+    data: &[f64],
+    bandwidth: f64,
+    multiplier: f64,
+    lookback: usize,
+) -> Result<JsValue, JsValue> {
+    let params = NweParams {
+        bandwidth: Some(bandwidth),
+        multiplier: Some(multiplier),
+        lookback: Some(lookback),
+    };
+    let input = NweInput::from_slice(data, params);
+
+    let result = nadaraya_watson_envelope(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let js_result = NweJsResult {
+        upper: result.upper,
+        lower: result.lower,
+    };
+
+    serde_wasm_bindgen::to_value(&js_result).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nadaraya_watson_envelope_js(
+    data: &[f64],
+    bandwidth: f64,
+    multiplier: f64,
+    lookback: usize,
+) -> Result<Vec<f64>, JsValue> {
+    let params = NweParams {
+        bandwidth: Some(bandwidth),
+        multiplier: Some(multiplier),
+        lookback: Some(lookback),
+    };
+    let input = NweInput::from_slice(data, params);
+
+    let result = nadaraya_watson_envelope(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let mut output = Vec::with_capacity(data.len() * 2);
+    output.extend_from_slice(&result.upper);
+    output.extend_from_slice(&result.lower);
+
+    Ok(output)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = nadaraya_watson_envelope_flat)]
+pub fn nadaraya_watson_envelope_flat_js(
+    data: &[f64],
+    bandwidth: f64,
+    multiplier: f64,
+    lookback: usize,
+) -> Result<JsValue, JsValue> {
+    let params = NweParams {
+        bandwidth: Some(bandwidth),
+        multiplier: Some(multiplier),
+        lookback: Some(lookback),
+    };
+    let input = NweInput::from_slice(data, params);
+
+    let mut upper = vec![0.0; data.len()];
+    let mut lower = vec![0.0; data.len()];
+    nadaraya_watson_envelope_into_slices(&input, &mut upper, &mut lower)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let mut values = Vec::with_capacity(2 * data.len());
+    values.extend_from_slice(&upper);
+    values.extend_from_slice(&lower);
+
+    serde_wasm_bindgen::to_value(&NweJsFlat {
+        values,
+        rows: 2,
+        cols: data.len(),
+    })
+    .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = nadaraya_watson_envelope_into_flat)]
+pub fn nadaraya_watson_envelope_into_flat(
+    data_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    bandwidth: f64,
+    multiplier: f64,
+    lookback: usize,
+) -> Result<(), JsValue> {
+    if data_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("null pointer"));
+    }
+    unsafe {
+        let data = core::slice::from_raw_parts(data_ptr, len);
+        let out = core::slice::from_raw_parts_mut(out_ptr, 2 * len);
+        let (upper, lower) = out.split_at_mut(len);
+
+        let params = NweParams {
+            bandwidth: Some(bandwidth),
+            multiplier: Some(multiplier),
+            lookback: Some(lookback),
+        };
+        let input = NweInput::from_slice(data, params);
+        nadaraya_watson_envelope_into_slices(&input, upper, lower)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nadaraya_watson_envelope_into(
+    data_ptr: *const f64,
+    upper_ptr: *mut f64,
+    lower_ptr: *mut f64,
+    len: usize,
+    bandwidth: f64,
+    multiplier: f64,
+    lookback: usize,
+) -> Result<(), JsValue> {
+    if data_ptr.is_null() || upper_ptr.is_null() || lower_ptr.is_null() {
+        return Err(JsValue::from_str(
+            "null pointer passed to nadaraya_watson_envelope_into",
+        ));
+    }
+
+    unsafe {
+        let data = core::slice::from_raw_parts(data_ptr, len);
+        let upper_out = core::slice::from_raw_parts_mut(upper_ptr, len);
+        let lower_out = core::slice::from_raw_parts_mut(lower_ptr, len);
+
+        let params = NweParams {
+            bandwidth: Some(bandwidth),
+            multiplier: Some(multiplier),
+            lookback: Some(lookback),
+        };
+        let input = NweInput::from_slice(data, params);
+
+        nadaraya_watson_envelope_into_slices(&input, upper_out, lower_out)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nadaraya_watson_envelope_alloc(len: usize) -> *mut f64 {
+    let mut v = Vec::<f64>::with_capacity(2 * len);
+    let ptr = v.as_mut_ptr();
+    core::mem::forget(v);
+    ptr
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nadaraya_watson_envelope_free(ptr: *mut f64, len: usize) {
+    unsafe {
+        let _ = Vec::from_raw_parts(ptr, 0, 2 * len);
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub struct NweContext {
+    stream: NweStream,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+impl NweContext {
+    #[wasm_bindgen(constructor)]
+    pub fn new(bandwidth: f64, multiplier: f64, lookback: usize) -> Result<NweContext, JsValue> {
+        let params = NweParams {
+            bandwidth: Some(bandwidth),
+            multiplier: Some(multiplier),
+            lookback: Some(lookback),
+        };
+
+        let stream = NweStream::try_new(params).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(NweContext { stream })
+    }
+
+    #[wasm_bindgen]
+    pub fn update(&mut self, value: f64) -> Option<Vec<f64>> {
+        self.stream
+            .update(value)
+            .map(|(upper, lower)| vec![upper, lower])
+    }
+
+    #[wasm_bindgen]
+    pub fn update_batch(&mut self, values: &[f64]) -> Vec<f64> {
+        let mut results = Vec::with_capacity(values.len() * 2);
+
+        for &value in values {
+            if let Some((upper, lower)) = self.stream.update(value) {
+                results.push(upper);
+                results.push(lower);
+            } else {
+                results.push(f64::NAN);
+                results.push(f64::NAN);
+            }
+        }
+
+        results
+    }
+
+    #[wasm_bindgen]
+    pub fn reset(&mut self) {
+        self.stream.reset();
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct NweBatchJsOutput {
+    pub upper: Vec<f64>,
+    pub lower: Vec<f64>,
+    pub rows: usize,
+    pub cols: usize,
+    pub bandwidths: Vec<f64>,
+    pub multipliers: Vec<f64>,
+    pub lookbacks: Vec<usize>,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = nadaraya_watson_envelope_batch)]
+pub fn nadaraya_watson_envelope_batch_unified_js(
+    data: &[f64],
+    bandwidth_range: Vec<f64>,
+    multiplier_range: Vec<f64>,
+    lookback_range: Vec<usize>,
+) -> Result<JsValue, JsValue> {
+    if bandwidth_range.len() != 3 || multiplier_range.len() != 3 || lookback_range.len() != 3 {
+        return Err(JsValue::from_str(
+            "All ranges must have exactly 3 elements [start, end, step]",
+        ));
+    }
+
+    let sweep = NweBatchRange {
+        bandwidth: (bandwidth_range[0], bandwidth_range[1], bandwidth_range[2]),
+        multiplier: (
+            multiplier_range[0],
+            multiplier_range[1],
+            multiplier_range[2],
+        ),
+        lookback: (lookback_range[0], lookback_range[1], lookback_range[2]),
+    };
+
+    let result =
+        nadaraya_watson_envelope_batch_with_kernel(data, &sweep, detect_best_batch_kernel())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let bandwidths: Vec<f64> = result
+        .combos
+        .iter()
+        .map(|c| c.bandwidth.unwrap_or(8.0))
+        .collect();
+    let multipliers: Vec<f64> = result
+        .combos
+        .iter()
+        .map(|c| c.multiplier.unwrap_or(3.0))
+        .collect();
+    let lookbacks: Vec<usize> = result
+        .combos
+        .iter()
+        .map(|c| c.lookback.unwrap_or(500))
+        .collect();
+
+    let js_output = NweBatchJsOutput {
+        upper: result.values_upper,
+        lower: result.values_lower,
+        rows: result.rows,
+        cols: result.cols,
+        bandwidths,
+        multipliers,
+        lookbacks,
+    };
+
+    serde_wasm_bindgen::to_value(&js_output).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nadaraya_watson_envelope_output_into_js(
+    data: &[f64],
+    bandwidth: f64,
+    multiplier: f64,
+    lookback: usize,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = nadaraya_watson_envelope_js(data, bandwidth, multiplier, lookback)?;
+    crate::write_wasm_f64_output("nadaraya_watson_envelope_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nadaraya_watson_envelope_flat_output_into_js(
+    data: &[f64],
+    bandwidth: f64,
+    multiplier: f64,
+    lookback: usize,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = nadaraya_watson_envelope_flat_js(data, bandwidth, multiplier, lookback)?;
+    crate::write_wasm_object_f64_outputs(
+        "nadaraya_watson_envelope_flat_output_into_js",
+        &value,
+        out,
+    )
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nadaraya_watson_envelope_batch_unified_output_into_js(
+    data: &[f64],
+    bandwidth_range: Vec<f64>,
+    multiplier_range: Vec<f64>,
+    lookback_range: Vec<usize>,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = nadaraya_watson_envelope_batch_unified_js(
+        data,
+        bandwidth_range,
+        multiplier_range,
+        lookback_range,
+    )?;
+    crate::write_wasm_selected_object_f64_outputs(
+        "nadaraya_watson_envelope_batch_unified_output_into_js",
+        &value,
+        out,
+    )
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nadaraya_watson_envelope_unified_output_into_js(
+    data: &[f64],
+    bandwidth: f64,
+    multiplier: f64,
+    lookback: usize,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = nadaraya_watson_envelope_unified_js(data, bandwidth, multiplier, lookback)?;
+    crate::write_wasm_object_f64_outputs(
+        "nadaraya_watson_envelope_unified_output_into_js",
+        &value,
+        out,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_csv;
+    use paste::paste;
+    use std::error::Error;
+
+    fn check_nwe_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let params = NweParams {
+            bandwidth: None,
+            multiplier: None,
+            lookback: None,
+        };
+        let input = NweInput::from_candles(&candles, "close", params);
+        let output = nadaraya_watson_envelope_with_kernel(&input, kernel)?;
+        assert_eq!(output.upper.len(), candles.close.len());
+        assert_eq!(output.lower.len(), candles.close.len());
+
+        Ok(())
+    }
+
+    fn check_nwe_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let input = NweInput::from_candles(&candles, "close", NweParams::default());
+        let result = nadaraya_watson_envelope_with_kernel(&input, kernel)?;
+
+        let expected_upper = [
+            62141.41569185,
+            62108.86018850,
+            62069.70106389,
+            62045.52821051,
+            61980.68541380,
+        ];
+        let expected_lower = [
+            56560.88881720,
+            56530.68399610,
+            56490.03377396,
+            56465.39492722,
+            56394.51167599,
+        ];
+
+        let len = result.upper.len();
+        let start = len.saturating_sub(5);
+
+        for (i, (&upper, &lower)) in result.upper[start..]
+            .iter()
+            .zip(result.lower[start..].iter())
+            .enumerate()
+        {
+            let diff_upper = (upper - expected_upper[i]).abs();
+            let diff_lower = (lower - expected_lower[i]).abs();
+            assert!(
+                diff_upper < 1e-6,
+                "[{}] NWE {:?} upper mismatch at idx {}: got {}, expected {}",
+                test_name,
+                kernel,
+                i,
+                upper,
+                expected_upper[i]
+            );
+            assert!(
+                diff_lower < 1e-6,
+                "[{}] NWE {:?} lower mismatch at idx {}: got {}, expected {}",
+                test_name,
+                kernel,
+                i,
+                lower,
+                expected_lower[i]
+            );
+        }
+        Ok(())
+    }
+
+    fn check_nwe_warmup_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let data = (0..1000)
+            .map(|i| 50000.0 + (i as f64).sin() * 100.0)
+            .collect::<Vec<_>>();
+        let input = NweInput::from_slice(&data, NweParams::default());
+        let result = nadaraya_watson_envelope_with_kernel(&input, kernel)?;
+
+        const WARMUP: usize = 499 + 498;
+
+        for i in 0..WARMUP {
+            assert!(
+                result.upper[i].is_nan(),
+                "[{}] Upper should be NaN at {} during warmup",
+                test_name,
+                i
+            );
+            assert!(
+                result.lower[i].is_nan(),
+                "[{}] Lower should be NaN at {} during warmup",
+                test_name,
+                i
+            );
+        }
+
+        if data.len() > WARMUP {
+            assert!(
+                !result.upper[WARMUP].is_nan(),
+                "[{}] Upper should not be NaN at {}",
+                test_name,
+                WARMUP
+            );
+            assert!(
+                !result.lower[WARMUP].is_nan(),
+                "[{}] Lower should not be NaN at {}",
+                test_name,
+                WARMUP
+            );
+        }
+
+        Ok(())
+    }
+
+    fn check_nwe_zero_bandwidth(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data = vec![1.0, 2.0, 3.0];
+        let params = NweParams {
+            bandwidth: Some(0.0),
+            multiplier: Some(3.0),
+            lookback: Some(500),
+        };
+        let input = NweInput::from_slice(&data, params);
+        let result = nadaraya_watson_envelope_with_kernel(&input, kernel);
+        assert!(matches!(result, Err(NweError::InvalidBandwidth { .. })));
+        Ok(())
+    }
+
+    fn check_nwe_negative_multiplier(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data = vec![1.0, 2.0, 3.0];
+        let params = NweParams {
+            bandwidth: Some(8.0),
+            multiplier: Some(-1.0),
+            lookback: Some(500),
+        };
+        let input = NweInput::from_slice(&data, params);
+        let result = nadaraya_watson_envelope_with_kernel(&input, kernel);
+        assert!(matches!(result, Err(NweError::InvalidMultiplier { .. })));
+        Ok(())
+    }
+
+    fn check_nwe_zero_lookback(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data = vec![1.0, 2.0, 3.0];
+        let params = NweParams {
+            bandwidth: Some(8.0),
+            multiplier: Some(3.0),
+            lookback: Some(0),
+        };
+        let input = NweInput::from_slice(&data, params);
+        let result = nadaraya_watson_envelope_with_kernel(&input, kernel);
+        assert!(matches!(result, Err(NweError::InvalidLookback { .. })));
+        Ok(())
+    }
+
+    fn check_nwe_empty_input(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let input = NweInput::from_slice(&[], NweParams::default());
+        let result = nadaraya_watson_envelope_with_kernel(&input, kernel);
+        assert!(matches!(result, Err(NweError::EmptyInputData)));
+        Ok(())
+    }
+
+    fn check_nwe_all_nan(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data = vec![f64::NAN; 10];
+        let input = NweInput::from_slice(&data, NweParams::default());
+        let result = nadaraya_watson_envelope_with_kernel(&input, kernel);
+        assert!(matches!(result, Err(NweError::AllValuesNaN)));
+        Ok(())
+    }
+
+    fn check_nwe_very_small_dataset(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let data = vec![42.0];
+        let input = NweInput::from_slice(&data, NweParams::default());
+        let result = nadaraya_watson_envelope_with_kernel(&input, kernel)?;
+        assert!(result.upper[0].is_nan());
+        assert!(result.lower[0].is_nan());
+
+        Ok(())
+    }
+
+    fn check_nwe_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file)?;
+
+        let input = NweInput::with_default_candles(&candles);
+        let result = nadaraya_watson_envelope_with_kernel(&input, kernel)?;
+
+        assert_eq!(result.upper.len(), candles.close.len());
+        assert_eq!(result.lower.len(), candles.close.len());
+
+        let first_valid = result
+            .upper
+            .iter()
+            .position(|x| !x.is_nan())
+            .expect("[{}] No valid upper values found");
+
+        assert!(
+            result.upper[first_valid] > result.lower[first_valid],
+            "[{}] Upper not greater than lower at first valid index",
+            test_name
+        );
+
+        Ok(())
+    }
+
+    fn check_nwe_lookback_exceeds_data(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let params = NweParams {
+            bandwidth: Some(8.0),
+            multiplier: Some(3.0),
+            lookback: Some(10),
+        };
+
+        let input = NweInput::from_slice(&data, params);
+        let result = nadaraya_watson_envelope_with_kernel(&input, kernel);
+
+        assert!(
+            matches!(result, Err(NweError::NotEnoughValidData { .. })),
+            "[{}] Expected NotEnoughValidData error when lookback > data length",
+            test_name
+        );
+
+        Ok(())
+    }
+
+    fn check_nwe_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let data = (0..1100)
+            .map(|i| 50000.0 + (i as f64 * 0.1).sin() * 1000.0)
+            .collect::<Vec<_>>();
+
+        let params = NweParams {
+            bandwidth: Some(2.0),
+            multiplier: Some(2.0),
+            lookback: Some(50),
+        };
+
+        let input1 = NweInput::from_slice(&data, params.clone());
+        let result1 = nadaraya_watson_envelope_with_kernel(&input1, kernel)?;
+
+        let non_nan_upper: Vec<f64> = result1
+            .upper
+            .iter()
+            .filter(|&&x| !x.is_nan())
+            .copied()
+            .collect();
+
+        if non_nan_upper.len() > 100 {
+            let input2 = NweInput::from_slice(&non_nan_upper, params);
+            let result2 = nadaraya_watson_envelope_with_kernel(&input2, kernel)?;
+
+            assert!(result2.upper.iter().any(|&x| !x.is_nan()));
+        }
+
+        Ok(())
+    }
+
+    fn check_nwe_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let mut data = vec![42.0; 1100];
+        data[100] = f64::NAN;
+        data[200] = f64::NAN;
+        data[300] = f64::NAN;
+
+        let params = NweParams {
+            bandwidth: Some(2.0),
+            multiplier: Some(1.0),
+            lookback: Some(50),
+        };
+
+        let input = NweInput::from_slice(&data, params);
+        let result = nadaraya_watson_envelope_with_kernel(&input, kernel)?;
+
+        assert_eq!(result.upper.len(), data.len());
+        assert_eq!(result.lower.len(), data.len());
+
+        Ok(())
+    }
+
+    fn check_nwe_streaming(test_name: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        let data = (0..1100)
+            .map(|i| 50000.0 + (i as f64 * 0.1).sin() * 1000.0)
+            .collect::<Vec<_>>();
+
+        let params = NweParams {
+            bandwidth: Some(8.0),
+            multiplier: Some(3.0),
+            lookback: Some(500),
+        };
+
+        let input = NweInput::from_slice(&data, params.clone());
+        let batch_result = nadaraya_watson_envelope(&input)?;
+
+        let mut stream = NweStream::try_new(params)?;
+        let mut stream_upper = Vec::new();
+        let mut stream_lower = Vec::new();
+
+        for &value in &data {
+            if let Some((upper, lower)) = stream.update(value) {
+                stream_upper.push(upper);
+                stream_lower.push(lower);
+            }
+        }
+
+        let batch_start = batch_result
+            .upper
+            .iter()
+            .position(|&x| !x.is_nan())
+            .unwrap_or(batch_result.upper.len());
+
+        if !stream_upper.is_empty() && batch_start < batch_result.upper.len() {
+            let batch_end = batch_result.upper.len();
+            let stream_end = stream_upper.len();
+            let compare_len = stream_end.min(batch_end - batch_start);
+
+            if compare_len > 0 {
+                let batch_slice = &batch_result.upper[batch_end - compare_len..];
+                let stream_slice = &stream_upper[stream_end - compare_len..];
+
+                for (i, (&b, &s)) in batch_slice.iter().zip(stream_slice.iter()).enumerate() {
+                    let diff = (b - s).abs();
+                    assert!(
+                        diff < 1e-6 || (b.is_nan() && s.is_nan()),
+                        "[{}] Streaming mismatch at {}: batch={}, stream={}",
+                        test_name,
+                        i,
+                        b,
+                        s
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let output = NweBatchBuilder::new()
+            .kernel(kernel)
+            .apply_candles(&c, "close")?;
+
+        let def = NweParams::default();
+        let upper_row = output
+            .values_upper_for(&def)
+            .expect("default upper row missing");
+        let lower_row = output
+            .values_lower_for(&def)
+            .expect("default lower row missing");
+
+        assert_eq!(upper_row.len(), c.close.len());
+        assert_eq!(lower_row.len(), c.close.len());
+
+        let expected_upper = [
+            62141.41569185,
+            62108.86018850,
+            62069.70106389,
+            62045.52821051,
+            61980.68541380,
+        ];
+        let expected_lower = [
+            56560.88881720,
+            56530.68399610,
+            56490.03377396,
+            56465.39492722,
+            56394.51167599,
+        ];
+
+        let start = upper_row.len().saturating_sub(5);
+        for (i, &val) in upper_row[start..].iter().enumerate() {
+            let diff = (val - expected_upper[i]).abs();
+            assert!(
+                diff < 1e-6,
+                "[{}] Batch upper mismatch at {}: {} vs {}",
+                test_name,
+                i,
+                val,
+                expected_upper[i]
+            );
+        }
+
+        for (i, &val) in lower_row[start..].iter().enumerate() {
+            let diff = (val - expected_lower[i]).abs();
+            assert!(
+                diff < 1e-6,
+                "[{}] Batch lower mismatch at {}: {} vs {}",
+                test_name,
+                i,
+                val,
+                expected_lower[i]
+            );
+        }
+
+        Ok(())
+    }
+
+    fn check_batch_sweep(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let data = (0..1100)
+            .map(|i| 50000.0 + (i as f64 * 0.1).sin() * 1000.0)
+            .collect::<Vec<_>>();
+
+        let output = NweBatchBuilder::new()
+            .kernel(kernel)
+            .bandwidth_range(6.0, 10.0, 2.0)
+            .multiplier_range(2.0, 4.0, 1.0)
+            .lookback_range(400, 500, 100)
+            .apply_slice(&data)?;
+
+        assert_eq!(output.rows, 18);
+        assert_eq!(output.cols, data.len());
+        assert_eq!(output.combos.len(), 18);
+
+        Ok(())
+    }
+
+    macro_rules! generate_all_nwe_tests {
+        ($($test_fn:ident),*) => {
+            paste::paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _scalar>]), Kernel::Scalar);
+                    }
+                )*
+
+
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _avx2>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx2>]), Kernel::Avx2);
+                    }
+
+                    #[test]
+                    fn [<$test_fn _avx512>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx512>]), Kernel::Avx512);
+                    }
+                )*
+            }
+        }
+    }
+
+    macro_rules! gen_batch_tests {
+        ($fn_name:ident) => {
+            paste::paste! {
+                #[test]
+                fn [<$fn_name _scalar>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                }
+
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test]
+                fn [<$fn_name _avx2>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                }
+
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test]
+                fn [<$fn_name _avx512>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                }
+
+                #[test]
+                fn [<$fn_name _auto>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _auto>]), Kernel::Auto);
+                }
+            }
+        };
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_nwe_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+        let res =
+            nadaraya_watson_envelope_with_kernel(&NweInput::with_default_candles(&c), kernel)?;
+        for (i, &v) in res.upper.iter().chain(res.lower.iter()).enumerate() {
+            if v.is_nan() {
+                continue;
+            }
+            let b = v.to_bits();
+            assert!(
+                b != 0x11111111_11111111 && b != 0x22222222_22222222 && b != 0x33333333_33333333,
+                "[{}] poison at {}",
+                test_name,
+                i
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+        let sweep = NweBatchRange {
+            bandwidth: (8.0, 10.0, 2.0),
+            multiplier: (2.0, 3.0, 1.0),
+            lookback: (400, 500, 100),
+        };
+        let res = nwe_batch_with_kernel(source_type(&c, "close"), &sweep, kernel)?;
+
+        for &v in res.values_upper.iter().chain(res.values_lower.iter()) {
+            if v.is_nan() {
+                continue;
+            }
+            let b = v.to_bits();
+            assert!(
+                b != 0x11111111_11111111 && b != 0x22222222_22222222 && b != 0x33333333_33333333,
+                "[{}] batch poison",
+                test_name
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_par_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+        let sweep = NweBatchRange {
+            bandwidth: (8.0, 10.0, 2.0),
+            multiplier: (2.0, 3.0, 1.0),
+            lookback: (400, 500, 100),
+        };
+        let res = nwe_batch_par_slice(source_type(&c, "close"), &sweep, kernel)?;
+        for &v in res.values_upper.iter().chain(res.values_lower.iter()) {
+            if v.is_nan() {
+                continue;
+            }
+            let b = v.to_bits();
+            assert!(
+                b != 0x11111111_11111111 && b != 0x22222222_22222222 && b != 0x33333333_33333333,
+                "[{}] batch-par poison",
+                test_name
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "proptest")]
+    fn check_nwe_property(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        use proptest::prelude::*;
+        skip_if_unsupported!(kernel, test_name);
+
+        proptest!(|(
+            data in prop::collection::vec(0.1f64..10000.0, 10..1000),
+            bandwidth in 0.1f64..50.0,
+            multiplier in 0.1f64..10.0,
+            lookback in 2usize..100
+        )| {
+
+            let params = NweParams {
+                bandwidth: Some(bandwidth),
+                multiplier: Some(multiplier),
+                lookback: Some(lookback.min(data.len())),
+            };
+
+            let input = NweInput::from_slice(&data, params);
+            if let Ok(result) = nadaraya_watson_envelope_with_kernel(&input, kernel) {
+                for (i, (&u, &l)) in result.upper.iter().zip(result.lower.iter()).enumerate() {
+                    if !u.is_nan() && !l.is_nan() {
+                        prop_assert!(
+                            u >= l,
+                            "Upper[{}] = {} should be >= Lower[{}] = {}",
+                            i, u, i, l
+                        );
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    generate_all_nwe_tests!(
+        check_nwe_partial_params,
+        check_nwe_accuracy,
+        check_nwe_warmup_period,
+        check_nwe_zero_bandwidth,
+        check_nwe_negative_multiplier,
+        check_nwe_zero_lookback,
+        check_nwe_empty_input,
+        check_nwe_all_nan,
+        check_nwe_very_small_dataset,
+        check_nwe_default_candles,
+        check_nwe_lookback_exceeds_data,
+        check_nwe_reinput,
+        check_nwe_nan_handling,
+        check_nwe_streaming
+    );
+
+    #[cfg(debug_assertions)]
+    generate_all_nwe_tests!(
+        check_nwe_no_poison,
+        check_batch_no_poison,
+        check_batch_par_no_poison
+    );
+
+    #[cfg(feature = "proptest")]
+    generate_all_nwe_tests!(check_nwe_property);
+
+    gen_batch_tests!(check_batch_default_row);
+    gen_batch_tests!(check_batch_sweep);
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+    #[test]
+    fn test_nadaraya_watson_envelope_into_matches_api() -> Result<(), Box<dyn Error>> {
+        let len = 600usize;
+        let data: Vec<f64> = (0..len)
+            .map(|i| {
+                let x = i as f64;
+                10000.0 + (x * 0.01).sin() * 50.0 + x * 0.005
+            })
+            .collect();
+
+        let params = NweParams {
+            bandwidth: Some(8.0),
+            multiplier: Some(3.0),
+            lookback: Some(50),
+        };
+        let input = NweInput::from_slice(&data, params);
+
+        let baseline = nadaraya_watson_envelope_with_kernel(&input, Kernel::Auto)?;
+
+        let mut upper = vec![0.0; len];
+        let mut lower = vec![0.0; len];
+        nadaraya_watson_envelope_into(&input, &mut upper, &mut lower)?;
+
+        assert_eq!(upper.len(), baseline.upper.len());
+        assert_eq!(lower.len(), baseline.lower.len());
+
+        fn eq_or_both_nan_eps(a: f64, b: f64) -> bool {
+            if a.is_nan() && b.is_nan() {
+                true
+            } else {
+                (a - b).abs() <= 1e-12
+            }
+        }
+
+        for (i, (&u_into, &u_api)) in upper.iter().zip(baseline.upper.iter()).enumerate() {
+            assert!(
+                eq_or_both_nan_eps(u_into, u_api),
+                "upper diverged at {}: into={} api={}",
+                i,
+                u_into,
+                u_api
+            );
+        }
+        for (i, (&l_into, &l_api)) in lower.iter().zip(baseline.lower.iter()).enumerate() {
+            assert!(
+                eq_or_both_nan_eps(l_into, l_api),
+                "lower diverged at {}: into={} api={}",
+                i,
+                l_into,
+                l_api
+            );
+        }
+
+        Ok(())
+    }
+}

@@ -1,56 +1,91 @@
-// Riverpod state for the cTrader live spot stream (#137).
+// Riverpod state for the cTrader live spot stream (#137 / #237).
 //
-// Polls `/live/spots` every 1 s so any consumer (chart
-// current-candle overlay, trade-watch PnL, live-price ticker)
-// gets sub-2 s freshness via a simple `.watch` on this provider.
+// **2026-05-25 - task #237 SSE migration**: rewritten from the
+// previous `Timer.periodic(Duration(seconds: 1))` polling shape to
+// consume the `/live/spots/stream` SSE endpoint. End-to-end latency
+// drops from ~1 s -> ~5 ms (the backend broadcast channel hop).
+// Chart current-candle overlay, position PnL, and the live-price
+// ticker now update at near tick-rate (50-200 ms typical for active
+// majors) without burning CPU on every Flutter frame.
 //
-// The backend streamer pushes ticks into its own cache at
-// whatever cadence cTrader sends them (50–200 ms typical for
-// active majors). 1 s polling here is fast enough to feel
-// "live" in the UI without burning CPU on every Flutter frame.
+// Reconnect / lifecycle behaviour (research-derived):
+//   - Exponential backoff: 500 ms -> 1 s -> 2 s -> ... -> cap 30 s.
+//   - `Last-Event-ID` header on every reconnect.
+//   - `ref.keepAlive()` so screen switches don't kill the stream.
+//   - One `EventFlux.spawn()` per stream (NEVER the singleton).
 //
-// The provider is `autoDispose` so navigating off any consuming
-// screen halts the timer. Multiple screens watching at the same
-// time share the same provider instance via Riverpod's caching,
-// so we don't end up with 3 parallel poll loops if e.g. Chart +
-// Markets + TradeWatch all subscribe simultaneously.
+// Multi-consumer note: chart + markets + trade_watch all watch this
+// provider. Riverpod's caching ensures they share ONE SSE
+// connection, not three.
 
 import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
+import '../api/sse_client.dart';
 import 'account_provider.dart';
 
 class LiveSpotsNotifier extends AsyncNotifier<LiveSpotsSnapshot> {
-  Timer? _timer;
+  SseSubscription<LiveSpotsSnapshot>? _sub;
   bool _disposed = false;
 
   @override
   Future<LiveSpotsSnapshot> build() async {
+    // App-tied connection so screen-to-screen navigation doesn't
+    // tear down the stream + open a new one (the old polling
+    // notifier was autoDispose precisely to avoid that, but SSE
+    // is cheap to keep open continuously and reconnect cost dwarfs
+    // the screen-switch frequency anyway).
+    ref.keepAlive();
     ref.onDispose(() {
       _disposed = true;
-      _timer?.cancel();
-      _timer = null;
+      _sub?.disconnect();
+      _sub = null;
     });
 
-    _timer ??= Timer.periodic(
-      const Duration(seconds: 1),
-      (_) => _refresh(),
-    );
-
-    return _fetchOnce();
-  }
-
-  Future<LiveSpotsSnapshot> _fetchOnce() async {
     final client = ref.read(backendClientProvider);
-    return client.fetchLiveSpots();
-  }
+    final baseUrl = client.baseUrl;
 
-  Future<void> _refresh() async {
-    final next = await AsyncValue.guard(_fetchOnce);
-    if (_disposed) return;
-    state = next;
+    // Priming GET so the UI gets ticks RIGHT AWAY (the SSE warmup
+    // takes ~50-200 ms; for the chart screen that's noticeable).
+    LiveSpotsSnapshot? initial;
+    try {
+      initial = await client.fetchLiveSpots();
+    } catch (_) {
+      // SSE will fill in shortly.
+      initial = null;
+    }
+
+    _sub = SseSubscription<LiveSpotsSnapshot>(
+      config: SseConfig(
+        url: '$baseUrl/live/spots/stream',
+        tag: 'live-spots',
+      ),
+      parse: (json) => LiveSpotsSnapshot.fromJson(json),
+      onEvent: (snapshot) {
+        if (_disposed) return;
+        state = AsyncData(snapshot);
+      },
+      onError: (e, st) {
+        if (_disposed) return;
+        state = AsyncError(e, st);
+      },
+    );
+    _sub!.connect();
+
+    if (initial != null) return initial;
+
+    final completer = Completer<LiveSpotsSnapshot>();
+    final subscription = _sub!.events.listen((snapshot) {
+      if (!completer.isCompleted) completer.complete(snapshot);
+    });
+    final result = await completer.future.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () => LiveSpotsSnapshot.empty(),
+    );
+    await subscription.cancel();
+    return result;
   }
 }
 

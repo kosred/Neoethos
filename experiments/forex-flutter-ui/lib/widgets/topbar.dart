@@ -37,18 +37,32 @@ class TopBar extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final asyncSnapshot = ref.watch(accountSnapshotProvider);
+    final brokerStatus = ref.watch(brokerStatusProvider);
     final engines = ref.watch(enginesProvider).valueOrNull;
     final discoveryOn = (engines?.discovery.toLowerCase() ?? 'idle') == 'running';
     final trainingOn = (engines?.training.toLowerCase() ?? 'idle') == 'running';
 
-    // Connection-state badge. We collapse the four AsyncValue states
-    // into the three badge tints the design system supports.
-    final (badgeLabel, badgeKind) = switch (asyncSnapshot) {
-      AsyncData() => ('LIVE', _BadgeKind.live),
-      AsyncError(error: final e) when e is BrokerNotReadyException =>
-        ('CONNECTING', _BadgeKind.idle),
+    // **2026-05-26 fix (Κωνσταντίνος)**: badge previously always said
+    // "LIVE" whenever AccountSnapshot had data, regardless of whether
+    // the broker session was Demo or Live. Now reads /broker/status's
+    // `environment` field directly: shows "DEMO" for Demo accounts,
+    // "LIVE" only for real-money accounts. Account-snapshot
+    // availability still drives the CONNECTING/OFFLINE states for
+    // back-compat with the no-broker-status case.
+    final (badgeLabel, badgeKind) = switch (brokerStatus) {
+      AsyncData(value: final b) when b.connected =>
+        b.environment.toLowerCase() == 'live'
+            ? ('LIVE', _BadgeKind.live)
+            : ('DEMO', _BadgeKind.idle),
+      AsyncData() => ('OFFLINE', _BadgeKind.offline),
       AsyncError() => ('OFFLINE', _BadgeKind.offline),
-      _ => ('CONNECTING', _BadgeKind.idle),
+      _ => switch (asyncSnapshot) {
+          AsyncData() => ('CONNECTING', _BadgeKind.idle),
+          AsyncError(error: final e) when e is BrokerNotReadyException =>
+            ('CONNECTING', _BadgeKind.idle),
+          AsyncError() => ('OFFLINE', _BadgeKind.offline),
+          _ => ('CONNECTING', _BadgeKind.idle),
+        },
     };
 
     final snap = asyncSnapshot.valueOrNull;
@@ -150,12 +164,13 @@ class TopBar extends ConsumerWidget {
             icon: const Icon(Icons.monitor_heart_outlined,
                 color: ForexAiTokens.textMuted),
           ),
-          IconButton(
-            onPressed: () {},
-            tooltip: 'Notifications (TODO)',
-            icon: const Icon(Icons.notifications_none,
-                color: ForexAiTokens.textMuted),
-          ),
+          // **2026-05-25 — task #241**: dead "Notifications (TODO)"
+          // button removed. The Backend diagnostics icon above is the
+          // canonical "something happened, see what" entry-point; the
+          // PendingActionsBanner handles LLM-proposed trades; the
+          // BackendHealthBanner handles connectivity. A separate
+          // top-level notifications inbox would be 4th-tier UX clutter
+          // until we have a real notification stream to populate it.
         ],
       ),
     );

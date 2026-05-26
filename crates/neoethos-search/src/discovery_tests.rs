@@ -1,8 +1,10 @@
-// TODO(real-data): the `sample_*` helpers below build deterministic
-// alternating feature signals and a 10-bar OHLCV ramp. Replace them
-// with a cTrader historical sample (e.g. 10 closing prints of EURUSD
-// M1 + a real feature extracted by the production pipeline) so the
-// discovery tests assert against the broker payload shape.
+// GROUP F remediation 2026-05-25: the synthetic 10-bar alternating
+// signal + ramp generators were retired in favour of the canonical
+// real-data fixture in `neoethos_data::test_fixtures`. The fixture
+// is a 100-bar EURUSD M1 sample seeded from a real cTrader Open API
+// capture, which gives every test more realistic warm-up (longest
+// indicator window is Hurst-100) and uniform behaviour across the
+// workspace. See task #224.
 use super::*;
 
 /// Task #66 — env-var tests in this file mutate process-global
@@ -26,57 +28,17 @@ fn env_var_test_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 use crate::FilteringConfig;
-use ndarray::Array2;
 
+/// GROUP F: route the discovery tests through the canonical EURUSD
+/// M1 fixture from `neoethos_data::test_fixtures` instead of the
+/// 10-bar synthetic ramp. The fixture's 100-bar window satisfies
+/// every indicator warm-up the discovery pipeline runs.
 fn sample_feature_frame() -> FeatureFrame {
-    let start = 1_704_067_200_000_i64;
-    FeatureFrame {
-        timestamps: (0..10).map(|idx| start + idx * 60_000).collect(),
-        names: vec!["signal".to_string()],
-        data: Array2::from_shape_vec(
-            (10, 1),
-            vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
-        )
-        .expect("feature frame shape should be valid"),
-    }
+    neoethos_data::test_fixtures::ctrader_sample_feature_frame()
 }
 
 fn sample_ohlcv() -> Ohlcv {
-    let start = 1_704_067_200_000_i64;
-    let close: Vec<f64> = vec![
-        1.1000, 1.1010, 1.1020, 1.1015, 1.1030, 1.1025, 1.1040, 1.1035, 1.1050, 1.1045,
-    ];
-    let open: Vec<f64> = close
-        .iter()
-        .enumerate()
-        .map(|(idx, value)| {
-            if idx == 0 {
-                *value - 0.0005
-            } else {
-                close[idx - 1]
-            }
-        })
-        .collect();
-    let high: Vec<f64> = open
-        .iter()
-        .zip(close.iter())
-        .map(|(open, close)| open.max(*close) + 0.0004)
-        .collect();
-    let low: Vec<f64> = open
-        .iter()
-        .zip(close.iter())
-        .map(|(open, close)| open.min(*close) - 0.0004)
-        .collect();
-    let volume: Vec<f64> = (0..10).map(|idx| 1000.0 + (idx as f64 * 25.0)).collect();
-
-    Ohlcv {
-        timestamp: Some((0..10).map(|idx| start + idx * 60_000).collect()),
-        open,
-        high,
-        low,
-        close,
-        volume: Some(volume),
-    }
+    neoethos_data::test_fixtures::ctrader_sample_ohlcv()
 }
 
 fn profitable_gene(strategy_id: &str) -> Gene {
@@ -118,6 +80,7 @@ fn empty_portfolio_is_an_explicit_error() {
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     };
 
     let err = ensure_non_empty_portfolio(&result, "EURUSD M1")
@@ -140,6 +103,7 @@ fn non_empty_portfolio_is_accepted() {
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     };
 
     ensure_non_empty_portfolio(&result, "EURUSD M1").expect("expected non-empty portfolio to pass");
@@ -178,12 +142,14 @@ fn finalize_candidates_with_progress_emits_filter_and_portfolio_milestones() {
     let candidates = vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")];
     let mut progress_events = Vec::new();
 
+    let mut funnel = crate::funnel_profile::FunnelProfile::new("EURUSD", "M1");
     let result = finalize_candidates_with_progress(
         candidates,
         &features,
         &ohlcv,
         &config,
         features.names.clone(),
+        &mut funnel,
         |event| progress_events.push(event),
     )
     .expect("candidate finalization should succeed");
@@ -238,6 +204,7 @@ fn portfolio_export_requires_validation_gates() {
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     };
     let path = temp_path("portfolio-gates");
 
@@ -260,6 +227,7 @@ fn portfolio_export_succeeds_when_prop_firm_window_passed_even_without_walkforwa
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     };
     // The prop-firm window-pass gate is the canonical export path
     // when active; walkforward and CPCV are intentionally unset.
@@ -396,6 +364,7 @@ fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     };
     result.validation_gates.walkforward_passed = true;
     result.validation_gates.cpcv_passed = true;
@@ -422,6 +391,7 @@ fn discovery_profile_exports_validation_gate_status() {
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     };
     result.validation_gates.walkforward_passed = true;
     result.validation_gates.cpcv_passed = true;
@@ -502,6 +472,7 @@ fn save_canonical_backtest_artifacts_writes_one_file_per_strategy() {
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     };
 
     let written = save_canonical_backtest_artifacts(&dir, &result)
@@ -538,6 +509,7 @@ fn save_walkforward_validation_artifacts_writes_one_file_per_strategy() {
         )],
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     };
 
     let written = save_walkforward_validation_artifacts(&dir, &result)
@@ -569,6 +541,7 @@ fn save_canonical_backtest_artifacts_skips_when_empty() {
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     };
 
     let written = save_canonical_backtest_artifacts(&dir, &result)
@@ -600,6 +573,10 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
         prefilter_insample_frac: f64::NAN,
         funnel_stage1_pct: 5.0,
         stage1_window: Stage1Window::Earliest,
+        // Tests opt-out of the 10y minimum: synthetic fixtures don't carry
+        // 10 years of bars. The pre-flight check honours min_history_years == 0
+        // as the explicit "skip" sentinel (see ensure_sufficient_history).
+        min_history_years: 0,
     };
     assert!((overrides.resolved_prefilter_insample_frac() - 0.70).abs() < 1e-9);
     assert!((overrides.resolved_funnel_stage1_pct() - 1.0).abs() < 1e-9);
@@ -609,6 +586,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
         prefilter_insample_frac: 0.0,
         funnel_stage1_pct: 0.0001,
         stage1_window: Stage1Window::Earliest,
+        min_history_years: 0,
     };
     assert!((too_small.resolved_prefilter_insample_frac() - 0.70).abs() < 1e-9);
     assert!((too_small.resolved_funnel_stage1_pct() - 0.01).abs() < 1e-9);
@@ -634,6 +612,8 @@ fn discovery_profile_exports_runtime_override_resolution() {
         prefilter_insample_frac: 0.6,
         funnel_stage1_pct: 0.5,
         stage1_window: Stage1Window::Earliest,
+        // Tests opt-out of the 10y minimum (synthetic fixtures, no real data).
+        min_history_years: 0,
     };
     let result = DiscoveryResult {
         portfolio: vec![profitable_gene("alpha-1")],
@@ -646,6 +626,7 @@ fn discovery_profile_exports_runtime_override_resolution() {
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     };
 
     let profile = build_discovery_profile(&config, &result);
@@ -735,6 +716,7 @@ fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: artifacts,
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     };
 
     let written = save_forward_test_validation_artifacts(&dir, &result)
@@ -776,6 +758,7 @@ fn discovery_profile_exports_forward_test_artifact_count() {
             scope, summary,
         )],
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     };
     result.validation_gates.walkforward_passed = true;
     result.validation_gates.cpcv_passed = true;
@@ -822,6 +805,7 @@ fn empty_discovery_result_with_gates(
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
     }
 }
 
@@ -1003,6 +987,7 @@ fn save_prop_firm_validation_artifacts_writes_one_file_per_strategy() {
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: vec![prop_firm_artifact_with_pass_flag("fnv64:abc", true)],
+        funnel_profile: None,
     };
 
     let written = save_prop_firm_validation_artifacts(&dir, &result)
@@ -1045,6 +1030,7 @@ fn populated_discovery_result(
         prop_firm_validation_artifacts: (0..prop_firm_count)
             .map(|idx| prop_firm_artifact_with_pass_flag(&format!("prop-{idx}"), true))
             .collect(),
+        funnel_profile: None,
     }
 }
 

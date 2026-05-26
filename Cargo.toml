@@ -35,7 +35,7 @@ ndarray     = { version = "0.17.2", features = ["rayon"] }
 rayon       = "1.11.0"
 # reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
 # In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
-reqwest     = { version = "0.13.3", default-features = false, features = ["rustls", "json", "query", "form"] }
+reqwest     = { version = "0.13.3", default-features = true, features = ["rustls", "json", "query", "form", "cookies"] }
 rand        = "0.9.2"
 nalgebra    = "0.33.0"
 polars      = { version = "0.52.0", features = ["lazy", "dtype-datetime", "timezones"] }
@@ -55,15 +55,23 @@ thiserror   = "2.0.16"
 #   - `strip = "symbols"` — drop DWARF + Windows debug symbols. Stack
 #       traces in panic messages are kept (panic infrastructure is
 #       separate); only symbol *names* go. ~30% size win on Windows.
-#   - `panic = "abort"`  — no `catch_unwind` machinery in the binary;
-#       any panic aborts the process. We never call `catch_unwind` and
-#       the tokio runtime is configured to fail fast on worker panics,
-#       so this is purely a code-size + perf win.
+#   - `panic = "unwind"` — **MUST** be unwind, not abort. The comment
+#       below the previous line claimed "we never call catch_unwind"
+#       but `crates/neoethos-data/src/core/hpc_ta.rs:89,194` DOES call
+#       it as the documented #212 fix for vector-ta-0.2.9's
+#       "warm prefix exceeds row width" panic. Under panic=abort,
+#       catch_unwind is a no-op and the panic kills the entire backend
+#       process the moment Discovery touches a marginal (indicator,
+#       row_count) combination. Live-repro 2026-05-26 confirmed the
+#       backend crashing on every Discovery start because of this
+#       contradiction. Cost of unwind: ~3-5% perf overhead on the
+#       happy path + ~10 MB binary growth — acceptable trade for not
+#       killing the process on a recoverable indicator panic.
 [profile.release]
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+panic = "unwind"
 
 # Build dependencies (build.rs scripts, proc-macros) should keep their
 # default profile — they run during the build, never ship. Override
@@ -82,3 +90,13 @@ lightgbm3-sys = { path = "vendor/lightgbm3-sys" }
 # patch sklears-core again, regenerate the vendor copy at the version
 # the crate graph actually resolves to.
 rlkit = { path = "vendor/rlkit" }
+# **vector-ta 2026-05-26**: patched local copy with a one-line fix to
+# `utilities/helpers.rs:159` — replaced
+#   `assert!(warm <= cols, "warm prefix exceeds row width");`
+# with a `let warm = warm.min(cols);` clamp. The original asserted
+# semantic was inconsistent with the sibling `alloc_with_nan_prefix`
+# (line 106) which already clamps, and aborted the discovery worker
+# whenever a single-output indicator (cols=1) emitted a row-count-
+# style warm value. Reported upstream to VectorAlpha-dev/VectorTA;
+# remove this patch entry once the upstream crate ships a fix.
+vector-ta = { path = "vendor/vector-ta-0.2.9-patched" }

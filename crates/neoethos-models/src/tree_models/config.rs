@@ -167,11 +167,52 @@ pub fn gpu_count() -> usize {
         Some(count)
     }
 
+    /// GROUP H remediation (operator directive 2026-05-25): subprocess
+    /// timeout so a broken-NVML or zombie-rocm-smi cannot hang the
+    /// startup GPU probe forever. Spawns the subprocess on a separate
+    /// thread and waits up to `timeout`. If the subprocess hangs, the
+    /// main thread continues with `None` and the GPU probe falls back
+    /// to env-var detection or 0. The subprocess MAY continue running
+    /// in the background but the process is not blocked.
+    fn run_subprocess_with_timeout(
+        mut cmd: std::process::Command,
+        timeout: std::time::Duration,
+    ) -> Option<std::process::Output> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(cmd.output());
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(output)) => Some(output),
+            Ok(Err(err)) => {
+                tracing::debug!(
+                    target: "neoethos_models::tree_config",
+                    error = %err,
+                    "GPU-detect subprocess failed to spawn"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "neoethos_models::tree_config",
+                    timeout_ms = timeout.as_millis() as u64,
+                    "GPU-detect subprocess timed out; treating as no-GPU"
+                );
+                None
+            }
+        }
+    }
+
+    /// Maximum time we wait for an external GPU-probe subprocess
+    /// (`nvidia-smi`, `rocminfo`, `rocm-smi`) before assuming the host
+    /// has no working accelerator. 2 seconds is generous — healthy
+    /// hosts answer in <100 ms.
+    const GPU_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
     fn nvidia_smi_gpu_count() -> Option<usize> {
-        let output = Command::new("nvidia-smi")
-            .args(["--query-gpu=name", "--format=csv,noheader"])
-            .output()
-            .ok()?;
+        let mut cmd = Command::new("nvidia-smi");
+        cmd.args(["--query-gpu=name", "--format=csv,noheader"]);
+        let output = run_subprocess_with_timeout(cmd, GPU_PROBE_TIMEOUT)?;
         if !output.status.success() {
             return None;
         }
@@ -194,7 +235,7 @@ pub fn gpu_count() -> usize {
     }
 
     fn rocm_gpu_count() -> Option<usize> {
-        let rocminfo = Command::new("rocminfo").output().ok();
+        let rocminfo = run_subprocess_with_timeout(Command::new("rocminfo"), GPU_PROBE_TIMEOUT);
         if let Some(output) = rocminfo
             && output.status.success()
             && let Ok(stdout) = String::from_utf8(output.stdout)
@@ -203,10 +244,9 @@ pub fn gpu_count() -> usize {
             return Some(count);
         }
 
-        let rocm_smi = Command::new("rocm-smi")
-            .arg("--showproductname")
-            .output()
-            .ok();
+        let mut rocm_smi_cmd = Command::new("rocm-smi");
+        rocm_smi_cmd.arg("--showproductname");
+        let rocm_smi = run_subprocess_with_timeout(rocm_smi_cmd, GPU_PROBE_TIMEOUT);
         if let Some(output) = rocm_smi
             && output.status.success()
             && let Ok(stdout) = String::from_utf8(output.stdout)

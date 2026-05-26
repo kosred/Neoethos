@@ -204,16 +204,29 @@ impl TradingSession {
         }
         // 12. live spots subscribed + 13. live trendbars subscribed —
         //    presence of `ctrader_live_spot_cache` means the streaming
-        //    backend returned at least one tick. Stale cache (>30s)
-        //    flags as InFlight to alert the operator.
+        //    backend returned at least one tick.
+        //
+        // **F-225/F-226 closure (2026-05-25 — operator directive)**:
+        // tightened the stale threshold from 30s to 5s. The
+        // operator's principle is "live tick IS live, not 5 seconds
+        // behind, certainly not 30." Major forex pairs tick every
+        // ~100-500ms during liquid hours; even quiet pairs (e.g. AUD
+        // crosses at 3am NY) rarely go >5s between ticks. A 30s
+        // window let the indicator stay "Ok" through a quarter-minute
+        // broker stall — exactly the masked problem the operator
+        // flagged. 5s = generous enough to absorb a single missed
+        // packet on a low-liquidity pair, tight enough to surface
+        // real stalls immediately.
+        const LIVE_SPOT_FRESH_THRESHOLD: std::time::Duration =
+            std::time::Duration::from_secs(5);
         if let Some(live) = self.ctrader_live_spot_cache.as_ref() {
             let age = live.refreshed_at.elapsed();
-            if age < std::time::Duration::from_secs(30) {
+            if age < LIVE_SPOT_FRESH_THRESHOLD {
                 mark(
                     &mut sm,
                     12,
                     CTraderStepStatus::Ok,
-                    Some(format!("last tick {}s ago", age.as_secs())),
+                    Some(format!("last tick {}ms ago", age.as_millis())),
                 );
                 mark(&mut sm, 13, CTraderStepStatus::Ok, None);
             } else {
@@ -225,12 +238,21 @@ impl TradingSession {
                 );
             }
         }
-        // 14. chart updated — the cache has a `refreshed_at` Instant;
-        //    fresh within the 1s live-update window means we are
-        //    actively rendering live ticks.
+        // 14. chart updated — the cache has a `refreshed_at` Instant.
+        //
+        // **F-225/F-226 closure (2026-05-25 — operator directive)**:
+        // tightened from 5s to 1500ms. The operator's principle is:
+        // live tick MUST be real-time, not a polling fallback. A 5s
+        // window let the diagnostic show "OK" even when ticks were
+        // stalling — exactly the masked problem the operator flagged.
+        // 1500ms = generous enough to absorb a single TCP retransmit
+        // hiccup but tight enough that any sustained stall flips the
+        // indicator to "Idle" instead of falsely staying "Ok".
+        const LIVE_CHART_FRESH_THRESHOLD: std::time::Duration =
+            std::time::Duration::from_millis(1500);
         if let Some(cache) = self.market_chart_cache.as_ref() {
             let age = cache.refreshed_at.elapsed();
-            if age < std::time::Duration::from_secs(5) {
+            if age < LIVE_CHART_FRESH_THRESHOLD {
                 mark(
                     &mut sm,
                     14,

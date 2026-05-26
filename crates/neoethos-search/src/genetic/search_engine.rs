@@ -259,10 +259,15 @@ pub fn signals_for_gene_full(
     // collapses (active_sum = 0 → raw signal passes through). Lets
     // operators isolate "SMC indicators don't trigger on this symbol"
     // from genuine signal-generation issues without recompiling.
-    let smc_bypass = matches!(
-        std::env::var("FOREX_BOT_DISABLE_SMC_GATE").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    );
+    //
+    // F-CORE3 closure (2026-05-25): previously read `std::env::var`
+    // inline on EVERY call to this hot-path function. Now resolved
+    // through the typed `SmcGateOverrides::disable_gate` boundary so
+    // the env is hit at most once per process (in
+    // `GeneticSearchRuntimeOverrides::from_env`).
+    let smc_bypass = super::runtime_overrides::current_genetic_search_runtime_overrides()
+        .smc_gate
+        .disable_gate;
     let active_sum = if smc_bypass { 0.0 } else { active_sum };
     let gate = config.smc_gate_threshold.min(active_sum);
 
@@ -489,10 +494,16 @@ fn resolve_stop_target_arrays(
     ohlcv: &Ohlcv,
     config: &EvaluationConfig,
 ) -> (Vec<f64>, Vec<f64>) {
+    // **F-761 / F-CORE2 closure (2026-05-25)**: was previously
+    // `else { 0.0001 }` — a hardcoded EURUSD-pip fallback that
+    // silently wrongs JPY pairs (pip = 0.01) and metals
+    // (pip = 0.01). Now routes through `default_pip_size(&config.symbol)`
+    // which is symbol-aware AND returns NaN for empty symbol (so the
+    // fitness guard rejects strategies that lack a resolvable pip).
     let pip_size = if config.pip_value.is_finite() && config.pip_value > 0.0 {
         config.pip_value
     } else {
-        0.0001
+        super::strategy_gene::default_pip_size(&config.symbol)
     };
     let default = infer_stop_target_pips(
         &ohlcv.open,
@@ -503,9 +514,15 @@ fn resolve_stop_target_arrays(
         pip_size,
         0,
     );
+    // **F-762 / F-CORE2 closure (2026-05-25)**: was previously
+    // `.unwrap_or((20.0, 40.0))` — a synthetic SL/TP placeholder that
+    // covered up "couldn't infer defaults from OHLCV". Now propagates
+    // NaN so genes without explicit `sl_pips`/`tp_pips` settings are
+    // rejected by the downstream `is_finite()` gate (lines below)
+    // instead of being silently sized at 20/40 pips.
     let (default_sl, default_tp) = default
         .map(|(sl, tp, _rr)| (sl, tp))
-        .unwrap_or((20.0, 40.0));
+        .unwrap_or((f64::NAN, f64::NAN));
 
     let mut sl_pips = Vec::with_capacity(genes.len());
     let mut tp_pips = Vec::with_capacity(genes.len());
@@ -650,14 +667,58 @@ where
     let seen_retry_attempts = genetic_runtime_overrides.effective_seen_retry_attempts();
     let mut seen_memory = SeenSignatureMemory::from_env();
     let mut rng = build_search_rng();
-    let mut genes = generate_random_genes(
-        population,
-        n_indicators,
-        max_indicators,
-        0,
-        &smc_cfg,
-        &mut rng,
-    );
+
+    // **GA Fix C (2026-05-26, taskdoc #275)** — seed ~10% of the
+    // initial population with hand-crafted multi-TF professional
+    // templates. The pure-random cold start gives the GA almost no
+    // chance of wiring up a coherent D1+H4+H1+M15+M5 confluence on a
+    // 1500+ feature space; templates seed the basin of attraction so
+    // mutation can refine real strategies instead of noise.
+    //
+    // Cap at min(50, 10% of population). If templates can't resolve
+    // (single-TF backtest, unfamiliar feature names) we fall through
+    // to pure random — `seed_professional_templates` returns fewer
+    // than `count` rather than erroring, and the random fill below
+    // pads out the population.
+    let seed_count = (population / 10).min(50);
+    let mut genes: Vec<Gene> = if seed_count > 0 {
+        let seeds = super::seed_templates::seed_professional_templates(
+            seed_count,
+            &features.names,
+            n_indicators,
+            &mut rng,
+        );
+        if !seeds.is_empty() {
+            tracing::info!(
+                target: "neoethos_search::search_engine",
+                seeded = seeds.len(),
+                population,
+                "GA Fix C: seeded {} of {} initial genes with multi-TF templates",
+                seeds.len(),
+                population
+            );
+        }
+        let random_count = population.saturating_sub(seeds.len());
+        let mut out = seeds;
+        out.extend(generate_random_genes(
+            random_count,
+            n_indicators,
+            max_indicators,
+            0,
+            &smc_cfg,
+            &mut rng,
+        ));
+        out
+    } else {
+        generate_random_genes(
+            population,
+            n_indicators,
+            max_indicators,
+            0,
+            &smc_cfg,
+            &mut rng,
+        )
+    };
     enforce_population_smc_ratio(&mut genes, &smc_cfg);
 
     genes = genes
@@ -730,7 +791,31 @@ where
         let progress = (generation as f32) / ((generations - 1) as f32).max(1.0);
         let mut gate_now = gate_start + (gate_end - gate_start) * progress.powf(gate_curve);
         if stagnant_gens >= stagnation_patience {
+            // F-036 fix (2026-05-25): the stagnation decrement subtracts
+            // `gate_stagnation_step * stagnant_gens`. With a default
+            // step of 0.02 and `stagnant_gens` reaching e.g. 100, the
+            // gate would be driven to -2.0 — well below any sensible
+            // floor, effectively disabling the SMC gate. The downstream
+            // `.clamp(gate_lo, gate_hi)` clamps to `gate_lo` BUT that
+            // hides the runaway from the operator. We now apply an
+            // additional explicit clamp here so the visible value
+            // never goes below `gate_lo - 1.0` (one full step below
+            // the floor). Anything below that surfaces as a warning.
             gate_now -= gate_stagnation_step * (stagnant_gens as f32);
+            let absolute_floor = gate_lo - 1.0;
+            if gate_now < absolute_floor {
+                tracing::warn!(
+                    target: "neoethos_search::search_engine",
+                    generation,
+                    stagnant_gens,
+                    gate_lo,
+                    raw_gate = gate_now,
+                    "SMC stagnation decrement drove gate below absolute floor; \
+                     clamping to gate_lo - 1.0. Consider reducing \
+                     gate_stagnation_step or increasing stagnation_patience."
+                );
+                gate_now = absolute_floor;
+            }
         }
         eval_cfg.smc_gate_threshold = gate_now.clamp(gate_lo, gate_hi);
 
@@ -866,6 +951,25 @@ where
         if let Some(max_runtime) = max_runtime
             && started_at.elapsed() >= max_runtime
         {
+            // **F-035 documentation (2026-05-25)** — `best_return_count`
+            // is the number of top-fitness genomes to return when the
+            // wall-clock runtime budget is exhausted. The formula
+            // intentionally:
+            //   1. `population.clamp(2, ...)` — never return fewer than 2
+            //      (caller's expectation: at least a parent + a sibling
+            //      so the downstream genetic operators have material).
+            //   2. `(population / 2).clamp(100, 500)` — upper bound is
+            //      ~half the population but capped at [100, 500] so
+            //      very-small populations don't return everything and
+            //      very-large populations don't drown the caller in
+            //      noise.
+            //   3. `.min(scored.len())` — never exceed what we have.
+            // The bounds [100, 500] are empirical: 100 is the smallest
+            // archive size the diversity-archive can keep meaningful
+            // novelty; 500 is the largest the downstream consumer
+            // (`finalize_candidates_with_progress`) can process without
+            // observable UI lag. Tunable via Settings would be a Phase-C
+            // task — the literal here is a calibration, not a bug.
             let best_return_count = population
                 .clamp(2, (population / 2).clamp(100, 500))
                 .min(scored.len());
@@ -967,13 +1071,68 @@ where
 
         let mut next = Vec::with_capacity(population);
         next.extend(survivors);
+
+        // **GA Fix C — diversity rescue (2026-05-26, taskdoc #275)**.
+        // The Python prototype's reward-hack ("never trade → 0 DD →
+        // pass the max_dd filter") manifests here as a population that
+        // collapses to >50% zero-trade after a few generations. Once
+        // that happens the GA's gradient information is gone — every
+        // zero-trade gene scores identically (-100 with graduated
+        // fitness, NEG_INFINITY pre-fix) so survivor selection is
+        // pure noise. We detect this state and inject fresh multi-TF
+        // templates into 25% of the next population to break the
+        // attractor.
+        let zero_trade_count = scored
+            .iter()
+            .filter(|(_, _, g, _)| g.trades_count < 1)
+            .count();
+        let rescue_active = zero_trade_count * 2 > scored.len();
+        let mut rescue_genes: Vec<Gene> = Vec::new();
+        if rescue_active {
+            let rescue_target = population / 4;
+            // Try templates first; pad with fresh random genes if the
+            // feature set can't resolve enough template roles.
+            let seeds = super::seed_templates::seed_professional_templates(
+                rescue_target,
+                &features.names,
+                n_indicators,
+                &mut rng,
+            );
+            let template_n = seeds.len();
+            rescue_genes.extend(seeds);
+            while rescue_genes.len() < rescue_target {
+                rescue_genes.push(new_random_gene(
+                    n_indicators,
+                    max_indicators,
+                    generation + 1,
+                    &smc_cfg,
+                    &mut rng,
+                ));
+            }
+            tracing::info!(
+                target: "neoethos_search::search_engine",
+                generation,
+                zero_trade = zero_trade_count,
+                pop = scored.len(),
+                rescue_n = rescue_genes.len(),
+                template_n,
+                "diversity rescue: replaced {} zero-trade genes with seed templates",
+                rescue_genes.len()
+            );
+        }
+
         let immigrant_ratio = if stagnant_gens >= stagnation_patience {
             search_policy.immigrant_fraction.max(0.5)
         } else {
             search_policy.immigrant_fraction
         };
         let immigrant_count = ((population as f64) * immigrant_ratio).round() as usize;
-        let immigrant_count = immigrant_count.min(population - next.len());
+        // Reserve room for rescue genes so the rescue isn't crowded out
+        // by the normal immigrant budget.
+        let remaining_after_rescue = population
+            .saturating_sub(next.len())
+            .saturating_sub(rescue_genes.len());
+        let immigrant_count = immigrant_count.min(remaining_after_rescue);
         for _ in 0..immigrant_count {
             let immigrant = new_random_gene(
                 n_indicators,
@@ -984,6 +1143,26 @@ where
             );
             next.push(unique_candidate_or_retry(
                 immigrant,
+                &mut seen_memory,
+                n_indicators,
+                max_indicators,
+                generation + 1,
+                seen_retry_attempts,
+                &smc_cfg,
+                &mut rng,
+            ));
+        }
+
+        // Inject the rescue genes AFTER immigrants so they're treated
+        // as first-class population members in the next-generation eval
+        // (the seen-signature dedupe still applies so duplicates with
+        // earlier-archived genes are rejected).
+        for rescue in rescue_genes.drain(..) {
+            if next.len() >= population {
+                break;
+            }
+            next.push(unique_candidate_or_retry(
+                rescue,
                 &mut seen_memory,
                 n_indicators,
                 max_indicators,

@@ -231,7 +231,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = args.server; // keep the flag valid for back-compat.
     info!("Starting neoethos in HTTP server mode (Flutter front-end backend)...");
 
+    // F-553/F-576 closure (2026-05-25): install the CLI `--config`
+    // value process-wide so route handlers AND free functions
+    // (engines_control::resolve_data_root, etc.) all see the same
+    // path. The OnceLock-backed install happens BEFORE any
+    // AppApiState construction so state.config_path() reads the
+    // resolved value.
+    server::state::install_config_path(args.config.clone());
     let state = server::state::AppApiState::new();
+    // F-231-related closure (2026-05-25): install the process-wide
+    // account-refresh trigger so the deep cTrader execution-event
+    // parser (and any future spontaneous-event listener) can flip
+    // the dashboard within ~750 ms of a fill / close / margin call
+    // without threading AppApiState through every call site. Same
+    // pattern as `install_config_path` directly above.
+    server::state::install_account_refresh_trigger(state.account_refresh_tx_clone());
     server::bridge::spawn(state.clone());
 
     // Spawn the live spot streamer (#137). Best-effort — if creds

@@ -9,8 +9,8 @@
 //!   The adapter row-iterates the input DataFrame, extracts each
 //!   row as a feature vector, predicts Q-values, and softmaxes
 //!   into a [`super::ExpertOutputKind::Classification3`]
-//!   `[p_sell, p_neutral, p_buy]` distribution that the
-//!   aggregator can vote on.
+//!   `[p_neutral, p_buy, p_sell]` distribution (canonical order;
+//!   see `base.rs` lines 128-135) that the aggregator can vote on.
 //! - **exit_agent** — [`crate::exit_agent::ExitAgent`]
 //!   exit-side decision network. Returns
 //!   `RuntimePrediction` with `class_probabilities: [hold,
@@ -319,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn full_32_loaders_coexist() {
+    fn full_33_loaders_coexist() {
         let mut reg = ExpertRegistry::new();
         super::super::tree_adapters::register_tree_loaders(&mut reg).expect("trees");
         super::super::deep_classification_adapters::register_deep_classification_loaders(&mut reg)
@@ -330,9 +330,10 @@ mod tests {
         super::super::mixed_adapters::register_mixed_loaders(&mut reg).expect("mixed");
         super::super::evolutionary_adapters::register_evolutionary_loaders(&mut reg).expect("evo");
         register_rl_exit_loaders(&mut reg).expect("rl-exit");
-        // 7 tree + 3 deep-cls + 7 deep-ts + 7 meta + 3 mixed + 3 evo + 2 rl/exit = 32
-        // (33rd = swarm_forecaster, deferred to D1.2.8)
-        assert_eq!(reg.registered_names().len(), 32);
+        // 7 tree + 3 deep-cls + 7 deep-ts + 8 meta (incl. hmm_regime) +
+        // 3 mixed + 3 evo + 2 rl/exit = 33
+        // (34th = swarm_forecaster, deferred to D1.2.8)
+        assert_eq!(reg.registered_names().len(), 33);
         for required in [
             "lightgbm",
             "xgboost",
@@ -358,6 +359,7 @@ mod tests {
             "probability_calibrator",
             "conformal_gate",
             "meta_stack",
+            "hmm_regime",
             "online_pa",
             "online_hoeffding",
             "isolation_forest",

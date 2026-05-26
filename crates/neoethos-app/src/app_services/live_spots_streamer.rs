@@ -182,11 +182,21 @@ pub fn try_spawn_with_defaults_blocking() -> bool {
             .iter()
             .find(|s| s.symbol_name.eq_ignore_ascii_case(want))
         {
-            let digits = if s.symbol_name.to_ascii_uppercase().ends_with("JPY") {
-                3
-            } else {
-                5
-            };
+            // GROUP D remediation (operator directive 2026-05-25):
+            // route pip-digits through the canonical
+            // `neoethos_core::symbol_metadata` registry instead of
+            // hand-rolling the JPY heuristic. Defends against
+            // silent-wrong-digits for symbols outside the simple
+            // "ends with JPY" rule (e.g. XAUUSD = 2 digits, BTCUSD = 1).
+            let digits = neoethos_core::symbol_metadata::resolve(&s.symbol_name)
+                .map(|meta| meta.digits as i32)
+                .unwrap_or_else(|| {
+                    if s.symbol_name.to_ascii_uppercase().ends_with("JPY") {
+                        3
+                    } else {
+                        5
+                    }
+                });
             resolved.push(StreamedSymbol {
                 symbol_id: s.symbol_id,
                 symbol_name: s.symbol_name.clone(),
@@ -345,6 +355,17 @@ fn run_blocking(config: LiveSpotsStreamerConfig) -> Result<()> {
             }
             Message::Frame(_) => continue,
         };
+
+        // **2026-05-25 — real-data fixture capture** (operator
+        // directive). No-op when `NEOETHOS_CAPTURE_FIXTURES_DIR` is
+        // unset (production default). When set, writes every parsed
+        // payload to disk so the `TODO(real-data)` tests can be
+        // backed by captured fixtures from a live cTrader session.
+        // Best-effort; never blocks the stream.
+        crate::app_services::env_overrides::capture_fixture(
+            "OpenApiSpotFrame",
+            payload_text.as_bytes(),
+        );
 
         let envelope = parse_open_api_envelope(&payload_text)?;
         match envelope.payload_type {

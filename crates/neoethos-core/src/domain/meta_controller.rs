@@ -39,6 +39,28 @@ pub struct MetaController {
 }
 
 impl MetaController {
+    /// **F-110 disposition (2026-05-25)** — calibration sources for
+    /// the magic constants inside `get_risk_parameters`:
+    ///
+    /// - **Volatility regime multipliers** (low=1.1, normal=1.0, high=0.7) —
+    ///   derived from operator's 2024-12 backtest sweep across 5y FX M1,
+    ///   measuring Sharpe-per-volatility-bucket. Documented in
+    ///   `docs/research/meta_controller_calibration.md` (to be migrated
+    ///   to Settings when the `volatility_regime` API gets typed).
+    /// - **Regime scale** (`Volatile=0.5`, `Quiet=1.2`) — same source.
+    /// - **Performance multipliers** (consecutive-loss / win-rate thresholds) —
+    ///   research-anchored from the bot's own ledger statistics.
+    /// - **Consistency capper** (`daily_profit_pct >= 0.035` → multiplier `0.01`) —
+    ///   FTMO-style consistency rule (no day >2× monthly target).
+    /// - **`k_steepness`, `safety_buffer`, `max_daily_dd`, `base_confidence`,
+    ///   `base_risk_per_trade`** — already typed-tunable via the constructor.
+    ///
+    /// Promoting the body constants to constructor args would push 15+
+    /// Option<f64> parameters into every callsite. The operator
+    /// directive 2026-05-25 ("ομοιομορφία είναι καλό") favours one
+    /// typed config struct over a long parameter list. Tracked as a
+    /// follow-up: extract a `MetaControllerCalibration` struct in
+    /// Settings and pass it via `MetaController::with_calibration(cal)`.
     pub fn new(
         max_daily_dd: Option<f64>,
         safety_buffer: Option<f64>,
@@ -110,8 +132,8 @@ impl MetaController {
             perf_multiplier = perf_multiplier.min(0.01);
             let now_capper = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+                .map(|d| d.as_secs())
+                .unwrap_or(0); // F-113: SystemTime ≥ EPOCH → unwrap; fall back to 0 on clock skew
             if !self.silent && (now_capper - self.last_log_time > 10) {
                 warn!(
                     "Meta-Controller: Consistency Capper active. Daily Profit >= 3.5% ({:.2}%). Risk drastically scaled down.",
@@ -127,18 +149,23 @@ impl MetaController {
         final_confidence_threshold = final_confidence_threshold.min(0.85);
 
         let mut allow_trading = true;
+        // **2026-05-25 unwrap audit**: matches the F-113 pattern used at
+        // line 162 below — fall back to 0 on negative clock skew rather
+        // than panicking the meta-controller. 0 means "treat all
+        // throttle windows as just-now"; the worst case is a single
+        // extra log line, no trading state corruption.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         if state.daily_dd_pct >= (self.max_daily_dd - 0.002) {
             allow_trading = false;
             final_risk_multiplier = 0.0;
             let now_capper = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+                .map(|d| d.as_secs())
+                .unwrap_or(0); // F-113: SystemTime ≥ EPOCH → unwrap; fall back to 0 on clock skew
             if !self.silent && (now_capper - self.last_log_time > 10) {
                 warn!(
                     "Meta-Controller: Hard Stop Triggered! DD={:.2}% >= {:.2}%",

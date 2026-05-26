@@ -28,9 +28,39 @@ class DashboardScreen extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const ViewHeader(
-          title: 'Operator Overview',
-          subtitle: 'Equity · open positions · engine status',
+        // **2026-05-25 — task #241**: header row with the refresh
+        // button on the right. The backend's `/account/snapshot/refresh`
+        // skips the bridge's 5 s safety timer; the resulting fresh
+        // snapshot arrives over the SSE within ~750 ms so the
+        // operator sees the new state nearly instantly.
+        Row(
+          children: [
+            const Expanded(
+              child: ViewHeader(
+                title: 'Operator Overview',
+                subtitle: 'Equity · open positions · engine status',
+              ),
+            ),
+            IconButton(
+              tooltip: 'Force refresh from broker (skip the 5 s safety timer)',
+              icon: snapshot.isLoading
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: ForexAiTokens.textMuted,
+                      ),
+                    )
+                  : const Icon(Icons.refresh,
+                      color: ForexAiTokens.textMuted, size: 20),
+              onPressed: snapshot.isLoading
+                  ? null
+                  : () => ref
+                      .read(accountSnapshotProvider.notifier)
+                      .refreshNow(),
+            ),
+          ],
         ),
         if (snapshot.hasError) _ErrorBanner(error: snapshot.error!),
         _StatRow(snapshot: snapshot),

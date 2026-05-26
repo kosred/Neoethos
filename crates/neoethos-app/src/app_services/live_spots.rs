@@ -27,6 +27,7 @@ use neoethos_core::utils::now_unix_ms;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
+use tokio::sync::broadcast;
 
 /// One row in the cache. Mirrors enough of
 /// `CTraderLiveChartUpdate` for the UI's needs without dragging
@@ -74,6 +75,37 @@ fn cache() -> &'static RwLock<HashMap<i64, SpotTick>> {
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// **2026-05-25 — operator directive "push, not poll"**:
+/// broadcast channel that fires on every cache update. The SSE
+/// endpoint `/live/spots/stream` subscribes here and forwards each
+/// tick to the Flutter UI as it arrives. Push latency is now
+/// bounded by network RTT (~1-5 ms on localhost / LAN) instead of
+/// the polling interval (~1000 ms before).
+///
+/// Capacity 1024 = generous buffer for slow consumers. If a Flutter
+/// client falls behind by more than 1024 ticks, oldest ticks drop
+/// — but since the cache always has the latest-known value per
+/// symbol, the client can resync via `GET /live/spots` once it
+/// catches up. So a dropped broadcast is never a correctness issue,
+/// only a UX latency blip on the affected symbol.
+const SPOT_BROADCAST_CAPACITY: usize = 1024;
+static SPOT_BROADCAST: OnceLock<broadcast::Sender<SpotTick>> = OnceLock::new();
+
+fn broadcaster() -> &'static broadcast::Sender<SpotTick> {
+    SPOT_BROADCAST.get_or_init(|| broadcast::channel(SPOT_BROADCAST_CAPACITY).0)
+}
+
+/// Subscribe to the live-tick broadcast stream. Each call returns a
+/// fresh receiver; multiple Flutter clients can subscribe
+/// simultaneously without interfering. The receiver yields one
+/// `SpotTick` per broadcast frame.
+///
+/// The SSE handler in `server/live_spots.rs::stream` calls this and
+/// adapts the receiver into an `axum::response::sse::Sse` stream.
+pub fn subscribe() -> broadcast::Receiver<SpotTick> {
+    broadcaster().subscribe()
+}
+
 /// Insert / overwrite the cached row for [symbol_id]. Called by
 /// the streamer on every parsed spot event.
 pub fn update_tick(
@@ -93,8 +125,14 @@ pub fn update_tick(
         broker_timestamp_ms,
     };
     if let Ok(mut g) = cache().write() {
-        g.insert(symbol_id, tick);
+        g.insert(symbol_id, tick.clone());
     }
+    // **2026-05-25 — push-fanout to subscribers**. `send` returns
+    // `Err` when there are zero active subscribers; that's fine
+    // (early in process lifetime, no Flutter SSE client connected
+    // yet) — we discard the error and the cache write above still
+    // serves the polling GET path.
+    let _ = broadcaster().send(tick);
 }
 
 /// Snapshot every cached tick. Newest-by-symbol; ordering is by

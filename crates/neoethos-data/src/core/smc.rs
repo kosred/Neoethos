@@ -532,15 +532,17 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
         }
 
         // BOS: Break of Structure (simpler than MSS, no sweep required)
-        if !swing_highs.is_empty() {
-            let recent_high = *swing_highs.last().unwrap();
+        //
+        // **2026-05-25 unwrap audit**: the `!is_empty()` guard makes
+        // `last().unwrap()` logically safe, but per the no-panic
+        // doctrine we pattern-match instead. Same downstream behaviour.
+        if let Some(&recent_high) = swing_highs.last() {
             if close > recent_high && recent_high > last_confirmed_high {
                 bos[i] = 1.0;
                 last_confirmed_high = recent_high;
             }
         }
-        if !swing_lows.is_empty() {
-            let recent_low = *swing_lows.last().unwrap();
+        if let Some(&recent_low) = swing_lows.last() {
             if close < recent_low && recent_low < last_confirmed_low {
                 bos[i] = -1.0;
                 last_confirmed_low = recent_low;
@@ -627,9 +629,12 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
         }
 
         // Swing Range %
-        if !swing_highs.is_empty() && !swing_lows.is_empty() {
-            let sh = *swing_highs.last().unwrap();
-            let sl = *swing_lows.last().unwrap();
+        //
+        // **2026-05-25 unwrap audit**: pattern-match instead of guarded
+        // `.last().unwrap()`. The `if let Some(...) = a.zip(b)` idiom
+        // collapses the two `last()` calls into one pattern so we don't
+        // duplicate the emptiness check.
+        if let (Some(&sh), Some(&sl)) = (swing_highs.last(), swing_lows.last()) {
             swing_range_pct[i] = if close > 1e-10 {
                 (sh - sl).abs() / close
             } else {

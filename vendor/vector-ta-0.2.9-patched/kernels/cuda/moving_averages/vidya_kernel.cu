@@ -1,0 +1,359 @@
+#ifndef _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
+#define _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
+#endif
+
+#include <cuda_runtime.h>
+#include <math.h>
+#include <math_constants.h>
+
+extern "C" __global__
+void vidya_batch_f32(const float* __restrict__ prices,
+                     const int*   __restrict__ short_periods,
+                     const int*   __restrict__ long_periods,
+                     const float* __restrict__ alphas,
+                     int series_len,
+                     int first_valid,
+                     int n_combos,
+                     float* __restrict__ out) {
+    const int combo = blockIdx.x;
+    if (combo >= n_combos || series_len <= 0) return;
+
+    const int sp = short_periods[combo];
+    const int lp = long_periods[combo];
+    const float alpha = alphas[combo];
+    const int base = combo * series_len;
+
+
+    bool invalid = (sp < 2) || (lp < sp) || (lp < 2) || (alpha < 0.0f) || (alpha > 1.0f) ||
+                   (first_valid < 0) || (first_valid >= series_len) ||
+                   (lp > (series_len - first_valid));
+
+    if (invalid) {
+        for (int i = threadIdx.x; i < series_len; i += blockDim.x) {
+            out[base + i] = CUDART_NAN_F;
+        }
+        return;
+    }
+
+    const int warm_end = first_valid + lp;
+    const int idx_m2 = warm_end - 2;
+    const int idx_m1 = warm_end - 1;
+    const int warmup_prefix = idx_m2;
+
+
+    for (int i = threadIdx.x; i < warmup_prefix; i += blockDim.x) {
+        out[base + i] = CUDART_NAN_F;
+    }
+
+    if (threadIdx.x != 0) return;
+
+
+    double long_sum = 0.0;
+    double long_sum2 = 0.0;
+    double short_sum = 0.0;
+    double short_sum2 = 0.0;
+
+    const int short_head = warm_end - sp;
+    for (int i = first_valid; i < short_head; ++i) {
+        const double x = static_cast<double>(prices[i]);
+        long_sum += x;
+        long_sum2 += x * x;
+    }
+    for (int i = short_head; i < warm_end; ++i) {
+        const double x = static_cast<double>(prices[i]);
+        long_sum += x;
+        long_sum2 += x * x;
+        short_sum += x;
+        short_sum2 += x * x;
+    }
+
+
+    float val = prices[idx_m2];
+    out[base + idx_m2] = val;
+
+    if (idx_m1 < series_len) {
+        const double short_inv = 1.0 / static_cast<double>(sp);
+        const double long_inv  = 1.0 / static_cast<double>(lp);
+        const double short_mean = short_sum * short_inv;
+        const double long_mean  = long_sum * long_inv;
+        const double short_var = short_sum2 * short_inv - short_mean * short_mean;
+        const double long_var  = long_sum2 * long_inv - long_mean * long_mean;
+        const double short_std = sqrt(fmax(0.0, short_var));
+        const double long_std  = sqrt(fmax(0.0, long_var));
+        double k = (long_std == 0.0) ? 0.0 : (short_std / long_std);
+        k *= static_cast<double>(alpha);
+
+        const float x = prices[idx_m1];
+        val = fmaf(x - val, static_cast<float>(k), val);
+        out[base + idx_m1] = val;
+    }
+
+
+    for (int t = warm_end; t < series_len; ++t) {
+        const double x_new = static_cast<double>(prices[t]);
+        const double x_new2 = x_new * x_new;
+
+
+        long_sum += x_new;
+        long_sum2 += x_new2;
+        short_sum += x_new;
+        short_sum2 += x_new2;
+
+
+        const double x_long_out = static_cast<double>(prices[t - lp]);
+        const double x_short_out = static_cast<double>(prices[t - sp]);
+        long_sum -= x_long_out;
+        long_sum2 -= x_long_out * x_long_out;
+        short_sum -= x_short_out;
+        short_sum2 -= x_short_out * x_short_out;
+
+        const double short_inv = 1.0 / static_cast<double>(sp);
+        const double long_inv  = 1.0 / static_cast<double>(lp);
+        const double short_mean = short_sum * short_inv;
+        const double long_mean  = long_sum * long_inv;
+        const double short_var = short_sum2 * short_inv - short_mean * short_mean;
+        const double long_var  = long_sum2 * long_inv - long_mean * long_mean;
+        const double short_std = sqrt(fmax(0.0, short_var));
+        const double long_std  = sqrt(fmax(0.0, long_var));
+        double k = (long_std == 0.0) ? 0.0 : (short_std / long_std);
+        k *= static_cast<double>(alpha);
+
+        const float x = prices[t];
+        val = fmaf(x - val, static_cast<float>(k), val);
+        out[base + t] = val;
+    }
+}
+
+
+extern "C" __global__ __launch_bounds__(32)
+void vidya_batch_prefix_f32(const float* __restrict__ prices,
+                            const double* __restrict__ prefix_sum,
+                            const double* __restrict__ prefix_sum2,
+                            const int*   __restrict__ short_periods,
+                            const int*   __restrict__ long_periods,
+                            const float* __restrict__ alphas,
+                            int series_len,
+                            int first_valid,
+                            int n_combos,
+                            float* __restrict__ out) {
+    constexpr int WARP = 32;
+
+    const int combo = blockIdx.x;
+    if (combo >= n_combos || series_len <= 0) return;
+
+    const int sp = short_periods[combo];
+    const int lp = long_periods[combo];
+    const float alpha = alphas[combo];
+    const int base = combo * series_len;
+
+    const bool invalid =
+        (sp < 2) || (lp < sp) || (lp < 2) || (alpha < 0.0f) || (alpha > 1.0f) ||
+        (first_valid < 0) || (first_valid >= series_len) ||
+        (lp > (series_len - first_valid));
+
+    if (invalid) {
+        for (int i = threadIdx.x; i < series_len; i += blockDim.x) {
+            out[base + i] = CUDART_NAN_F;
+        }
+        return;
+    }
+
+    const int warm_end = first_valid + lp;
+    const int idx_m2 = warm_end - 2;
+    const int idx_m1 = warm_end - 1;
+    const int warmup_prefix = idx_m2;
+
+    for (int i = threadIdx.x; i < warmup_prefix; i += blockDim.x) {
+        out[base + i] = CUDART_NAN_F;
+    }
+
+    if (threadIdx.x == 0) {
+        out[base + idx_m2] = prices[idx_m2];
+    }
+
+    const int lane = threadIdx.x;
+    if (lane >= WARP) return;
+
+    float prev = prices[idx_m2];
+    const double sp_inv = 1.0 / static_cast<double>(sp);
+    const double lp_inv = 1.0 / static_cast<double>(lp);
+
+    int chunk_start = idx_m1;
+    for (; (chunk_start + (WARP - 1)) < series_len; chunk_start += WARP) {
+        const int t = chunk_start + lane;
+        const int tp1 = t + 1;
+
+        const double long_sum = prefix_sum[tp1] - prefix_sum[tp1 - lp];
+        const double long_sum2 = prefix_sum2[tp1] - prefix_sum2[tp1 - lp];
+        const double short_sum = prefix_sum[tp1] - prefix_sum[tp1 - sp];
+        const double short_sum2 = prefix_sum2[tp1] - prefix_sum2[tp1 - sp];
+
+        const double short_mean = short_sum * sp_inv;
+        const double long_mean  = long_sum * lp_inv;
+        double short_var = fma(-short_mean, short_mean, short_sum2 * sp_inv);
+        double long_var  = fma(-long_mean,  long_mean,  long_sum2  * lp_inv);
+        short_var = fmax(0.0, short_var);
+        long_var  = fmax(0.0, long_var);
+
+        float k = 0.0f;
+        if (long_var > 0.0 && short_var > 0.0) {
+            const float ratio = static_cast<float>(short_var / long_var);
+            k = alpha * sqrtf(ratio);
+        }
+
+        float a = 1.0f - k;
+        float b = k * prices[t];
+
+        const unsigned m = 0xFFFFFFFFu;
+        #pragma unroll
+        for (int off = 1; off < WARP; off <<= 1) {
+            const float a_up = __shfl_up_sync(m, a, off);
+            const float b_up = __shfl_up_sync(m, b, off);
+            if (lane >= off) {
+                b = fmaf(a, b_up, b);
+                a = a * a_up;
+            }
+        }
+
+        const float x = fmaf(a, prev, b);
+        out[base + t] = x;
+
+        prev = __shfl_sync(m, x, WARP - 1);
+    }
+
+    if (lane == 0) {
+        float val = prev;
+        for (int t = chunk_start; t < series_len; ++t) {
+            const int tp1 = t + 1;
+            const double long_sum = prefix_sum[tp1] - prefix_sum[tp1 - lp];
+            const double long_sum2 = prefix_sum2[tp1] - prefix_sum2[tp1 - lp];
+            const double short_sum = prefix_sum[tp1] - prefix_sum[tp1 - sp];
+            const double short_sum2 = prefix_sum2[tp1] - prefix_sum2[tp1 - sp];
+
+            const double short_mean = short_sum * sp_inv;
+            const double long_mean  = long_sum * lp_inv;
+            double short_var = fma(-short_mean, short_mean, short_sum2 * sp_inv);
+            double long_var  = fma(-long_mean,  long_mean,  long_sum2  * lp_inv);
+            short_var = fmax(0.0, short_var);
+            long_var  = fmax(0.0, long_var);
+
+            float k = 0.0f;
+            if (long_var > 0.0 && short_var > 0.0) {
+                const float ratio = static_cast<float>(short_var / long_var);
+                k = alpha * sqrtf(ratio);
+            }
+
+            const float x = prices[t];
+            val = fmaf(x - val, k, val);
+            out[base + t] = val;
+        }
+    }
+}
+
+extern "C" __global__
+void vidya_many_series_one_param_f32(const float* __restrict__ prices_tm,
+                                     const int*   __restrict__ first_valids,
+                                     int short_period,
+                                     int long_period,
+                                     float alpha,
+                                     int num_series,
+                                     int series_len,
+                                     float* __restrict__ out_tm) {
+    const int series_idx = blockIdx.x;
+    if (series_idx >= num_series || series_len <= 0) return;
+
+    const int sp = short_period;
+    const int lp = long_period;
+    int first_valid = first_valids[series_idx];
+    if (first_valid < 0) first_valid = 0;
+    if (first_valid >= series_len) return;
+
+    const bool invalid = (sp < 2) || (lp < sp) || (lp < 2) || (alpha < 0.0f) || (alpha > 1.0f) ||
+                         (lp > (series_len - first_valid));
+    const int stride = num_series;
+
+    if (invalid) {
+        for (int t = threadIdx.x; t < series_len; t += blockDim.x) {
+            out_tm[t * stride + series_idx] = CUDART_NAN_F;
+        }
+        return;
+    }
+
+    const int warm_end = first_valid + lp;
+    const int idx_m2 = warm_end - 2;
+    const int idx_m1 = warm_end - 1;
+
+
+    for (int t = threadIdx.x; t < idx_m2; t += blockDim.x) {
+        out_tm[t * stride + series_idx] = CUDART_NAN_F;
+    }
+
+    if (threadIdx.x != 0) return;
+
+
+    double long_sum = 0.0;
+    double long_sum2 = 0.0;
+    double short_sum = 0.0;
+    double short_sum2 = 0.0;
+    const int short_head = warm_end - sp;
+    for (int i = first_valid; i < short_head; ++i) {
+        const double x = static_cast<double>(prices_tm[i * stride + series_idx]);
+        long_sum += x;
+        long_sum2 += x * x;
+    }
+    for (int i = short_head; i < warm_end; ++i) {
+        const double x = static_cast<double>(prices_tm[i * stride + series_idx]);
+        long_sum += x;
+        long_sum2 += x * x;
+        short_sum += x;
+        short_sum2 += x * x;
+    }
+
+    float val = prices_tm[idx_m2 * stride + series_idx];
+    out_tm[idx_m2 * stride + series_idx] = val;
+
+    if (idx_m1 < series_len) {
+        const double short_inv = 1.0 / static_cast<double>(sp);
+        const double long_inv  = 1.0 / static_cast<double>(lp);
+        const double short_mean = short_sum * short_inv;
+        const double long_mean  = long_sum * long_inv;
+        const double short_var = short_sum2 * short_inv - (short_mean * short_mean);
+        const double long_var  = long_sum2 * long_inv - (long_mean * long_mean);
+        const double short_std = sqrt(fmax(0.0, short_var));
+        const double long_std  = sqrt(fmax(0.0, long_var));
+        double k = (long_std == 0.0) ? 0.0 : (short_std / long_std);
+        k *= static_cast<double>(alpha);
+        const float x = prices_tm[idx_m1 * stride + series_idx];
+        val = fmaf(x - val, static_cast<float>(k), val);
+        out_tm[idx_m1 * stride + series_idx] = val;
+    }
+
+    for (int t = warm_end; t < series_len; ++t) {
+        const double x_new = static_cast<double>(prices_tm[t * stride + series_idx]);
+        const double x_new2 = x_new * x_new;
+        long_sum += x_new;
+        long_sum2 += x_new2;
+        short_sum += x_new;
+        short_sum2 += x_new2;
+        const double x_long_out = static_cast<double>(prices_tm[(t - lp) * stride + series_idx]);
+        const double x_short_out = static_cast<double>(prices_tm[(t - sp) * stride + series_idx]);
+        long_sum -= x_long_out;
+        long_sum2 -= x_long_out * x_long_out;
+        short_sum -= x_short_out;
+        short_sum2 -= x_short_out * x_short_out;
+
+        const double short_inv = 1.0 / static_cast<double>(sp);
+        const double long_inv  = 1.0 / static_cast<double>(lp);
+        const double short_mean = short_sum * short_inv;
+        const double long_mean  = long_sum * long_inv;
+        const double short_var = short_sum2 * short_inv - short_mean * short_mean;
+        const double long_var  = long_sum2 * long_inv - long_mean * long_mean;
+        const double short_std = sqrt(fmax(0.0, short_var));
+        const double long_std  = sqrt(fmax(0.0, long_var));
+        double k = (long_std == 0.0) ? 0.0 : (short_std / long_std);
+        k *= static_cast<double>(alpha);
+        const float x = prices_tm[t * stride + series_idx];
+        val = fmaf(x - val, static_cast<float>(k), val);
+        out_tm[t * stride + series_idx] = val;
+    }
+}

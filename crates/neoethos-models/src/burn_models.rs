@@ -17,7 +17,7 @@ use burn::module::{Module, ModuleMapper, Param};
 use burn::nn;
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::backend::Backend;
+use burn::tensor::backend::{Backend, BackendTypes};
 use burn::tensor::{DType, FloatDType, TensorData};
 #[cfg(not(feature = "burn-wgpu-backend"))]
 use burn_ndarray::NdArray;
@@ -48,10 +48,18 @@ pub type TrainBackend = Autodiff<NdArray>;
 pub type InferBackend = NdArray;
 
 #[cfg(feature = "burn-wgpu-backend")]
-fn initialize_wgpu_runtime(device: &<InferBackend as Backend>::Device, policy_key: &str) {
+fn initialize_wgpu_runtime(device: &<InferBackend as BackendTypes>::Device, policy_key: &str) {
     static INIT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let initialized = INIT.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut initialized = initialized.lock().expect("wgpu init cache poisoned");
+    // **2026-05-25 unwrap audit**: a poisoned mutex here means an
+    // earlier wgpu init thread panicked. Recover the inner HashSet
+    // instead of cascading the panic — at worst we re-initialise a
+    // device that was already set up (idempotent), at best we mark a
+    // device as initialised that hadn't completed. Either way the
+    // operator's process keeps running.
+    let mut initialized = initialized
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let init_key = format!("{policy_key}::{device:?}");
     if initialized.insert(init_key) {
         init_setup::<graphics::Vulkan>(device, Default::default());
@@ -270,7 +278,7 @@ fn resolve_wgpu_device_policy(normalized: &str) -> (WgpuDevice, String, String) 
 
 pub fn resolve_infer_device(
     policy: &str,
-) -> (<InferBackend as Backend>::Device, BurnDeviceSelection) {
+) -> (<InferBackend as BackendTypes>::Device, BurnDeviceSelection) {
     let requested_policy = normalize_burn_device_policy(policy);
     #[cfg(feature = "burn-wgpu-backend")]
     {
@@ -289,7 +297,7 @@ pub fn resolve_infer_device(
     #[cfg(not(feature = "burn-wgpu-backend"))]
     {
         (
-            <InferBackend as Backend>::Device::default(),
+            <InferBackend as BackendTypes>::Device::default(),
             BurnDeviceSelection {
                 requested_policy,
                 effective_policy: "cpu".to_string(),
@@ -301,7 +309,7 @@ pub fn resolve_infer_device(
 
 pub fn resolve_train_device(
     policy: &str,
-) -> (<TrainBackend as Backend>::Device, BurnDeviceSelection) {
+) -> (<TrainBackend as BackendTypes>::Device, BurnDeviceSelection) {
     let requested_policy = normalize_burn_device_policy(policy);
     #[cfg(feature = "burn-wgpu-backend")]
     {
@@ -320,7 +328,7 @@ pub fn resolve_train_device(
     #[cfg(not(feature = "burn-wgpu-backend"))]
     {
         (
-            <TrainBackend as Backend>::Device::default(),
+            <TrainBackend as BackendTypes>::Device::default(),
             BurnDeviceSelection {
                 requested_policy,
                 effective_policy: "cpu".to_string(),
@@ -330,11 +338,11 @@ pub fn resolve_train_device(
     }
 }
 
-pub fn default_infer_device() -> <InferBackend as Backend>::Device {
+pub fn default_infer_device() -> <InferBackend as BackendTypes>::Device {
     resolve_infer_device("auto").0
 }
 
-pub fn default_train_device() -> <TrainBackend as Backend>::Device {
+pub fn default_train_device() -> <TrainBackend as BackendTypes>::Device {
     resolve_train_device("auto").0
 }
 
@@ -531,7 +539,10 @@ fn array2_to_tensor_with_dtype<B: Backend>(
 ) -> Tensor<B, 2> {
     let (rows, cols) = (data.nrows(), data.ncols());
     let flat: Vec<f32> = data.iter().copied().collect();
-    Tensor::from_data_dtype(TensorData::new(flat, [rows, cols]), device, dtype)
+    // burn 0.21: from_data_dtype removed; new signature takes
+    // `impl Into<TensorCreationOptions<B>>` and the `(&device, dtype)`
+    // tuple has a From impl that builds the options. Equivalent semantics.
+    Tensor::from_data(TensorData::new(flat, [rows, cols]), (device, dtype))
 }
 
 /// Convert ndarray::Array2<f32> to Burn Tensor<B, 2>
@@ -1753,10 +1764,10 @@ fn cross_entropy_loss<B: Backend>(
         .one_hot(n_classes)
         .float()
         .cast(float_dtype(logits_dtype));
-    let weights = Tensor::<B, 1>::from_data_dtype(
+    // burn 0.21 migration: from_data_dtype → from_data + options tuple.
+    let weights = Tensor::<B, 1>::from_data(
         TensorData::new(class_weights.to_vec(), [n_classes]),
-        device,
-        logits_dtype,
+        (device, logits_dtype),
     );
     let weighted = log_probs * one_hot * weights.unsqueeze_dim(0);
     weighted.sum().neg() / (batch_size as f32)
@@ -2097,14 +2108,26 @@ where
             best_model_snapshot = Some(model.clone());
         }
 
-        // Validation on holdout (sequential, no shuffle)
+        // Validation on holdout (sequential, no shuffle).
+        //
+        // **2026-05-25 unwrap audit**: `val_is_empty` is computed
+        // upstream from the same `val_range.is_empty()` predicate that
+        // gates `x_val_array`/`y_val_labels` initialisation — so the
+        // `Some(_)` arms are guaranteed when this branch fires. Even
+        // so, per the no-panic doctrine we pattern-match. A future
+        // regression that decouples `val_is_empty` from the array
+        // existence will now skip the validation phase silently
+        // instead of crashing mid-epoch.
         if !val_is_empty {
-            let x_val = x_val_array
-                .as_ref()
-                .expect("validation array must exist when validation range is non-empty");
-            let y_val = y_val_labels
-                .as_ref()
-                .expect("validation labels must exist when validation range is non-empty");
+            let (Some(x_val), Some(y_val)) = (x_val_array.as_ref(), y_val_labels.as_ref())
+            else {
+                tracing::warn!(
+                    target: "neoethos_models::burn",
+                    "validation phase skipped: x_val_array/y_val_labels are None despite \
+                     val_is_empty=false (upstream invariant violated)"
+                );
+                continue;
+            };
             let x_val = array2_to_tensor_with_dtype::<B>(x_val, device, training_dtype);
             let y_val = labels_to_tensor::<B>(y_val, device);
             let val_logits = BurnForward::forward_pass(&model, x_val);
@@ -2396,7 +2419,7 @@ mod tests {
             effective_policy: "gpu".to_string(),
             execution_backend: "wgpu_discrete_gpu".to_string(),
         };
-        let device = <TrainBackend as Backend>::Device::default();
+        let device = <TrainBackend as BackendTypes>::Device::default();
         let (precision, reason) = resolve_burn_training_precision_for_backend::<TrainBackend>(
             &selection,
             &device,
@@ -2421,7 +2444,7 @@ mod tests {
             effective_policy: "cpu".to_string(),
             execution_backend: "ndarray_cpu".to_string(),
         };
-        let device = <TrainBackend as Backend>::Device::default();
+        let device = <TrainBackend as BackendTypes>::Device::default();
         let (precision, reason) = resolve_burn_training_precision_for_backend::<TrainBackend>(
             &selection,
             &device,

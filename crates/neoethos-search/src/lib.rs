@@ -1,5 +1,9 @@
 mod artifact_io;
-pub mod challenge;
+// `pub mod challenge;` — DELETED 2026-05-26 (operator directive: dual-mode product).
+// `ChallengeOptimizer` had zero callers in the workspace; the prop-firm risk
+// allocation it scaffolded is handled downstream by the prop-firm validation
+// gates in `crates/neoethos-search/src/discovery.rs` + dual-mode separation
+// (PropFirm vs Risky). 161 LOC removed.
 pub mod checkpoint;
 // SL/TP-faithful CUDA eval/backtest kernel via cubecl 0.9. The CPU
 // fallback ships as the default no-gpu build — `evaluate_population_core`
@@ -13,23 +17,47 @@ pub mod checkpoint;
 #[cfg(feature = "gpu")]
 mod cubecl_eval;
 pub mod discovery;
-mod scheduler_assignment;
+// `mod scheduler_assignment;` — DELETED 2026-05-25 (verbose-build pass):
+// the file was a 19-LOC orphan with zero callers. The scheduler-driven
+// GPU routing it scaffolded is dispatched directly via `BackendKind`
+// matching at the `cubecl_eval` boundary; the conversion helper this
+// module shipped was never wired. If the scheduler-driven routing
+// lands later, reintroduce a fresh helper at that time.
 
 pub mod eval;
 pub mod export_state;
 pub mod funnel_profile;
-pub mod gauntlet;
+// `pub mod gauntlet;` — DELETED 2026-05-26 (operator directive: dual-mode product).
+// `StrategyGauntlet` had zero callers in the workspace; the quality floors
+// (win-rate, profit-factor, drawdown caps) it scaffolded are now enforced by
+// `FilteringConfig` in `genetic::strategy_gene` + the prop-firm validation
+// gates in `discovery.rs`. 194 LOC removed.
 pub mod genetic;
 pub mod orchestration;
 pub mod parity;
 pub mod portfolio;
 pub mod quality;
+// **Scoring unification — Phase A (operator-approved 2026-05-25)**
+// Shared "ingredient" functions + four canonical named scoring formulas
+// (ga_fitness / archive_score / window_score / quality_score). The
+// audit's six divergent scoring functions migrate to this layout in
+// Phase B; Phase C unifies the weight tables (gated by
+// `ScoringVersion` bump to 2). See `scoring/mod.rs` for the full
+// migration plan + doctrine references.
+pub mod scoring;
+// **Regime classifier consolidation — Phase A (operator-approved 2026-05-25)**
+// F-013 + F-048 + F-064 cluster: three divergent regime systems
+// (feature-bucket, time-window, ADX/Hurst/EMA) consolidate onto the
+// F-064 cascade as canonical. Phase B migrates the other two callers
+// to consume `regime::infer_regime_canonical` + the typed `Regime`
+// enum. See `regime/mod.rs` for the migration plan.
+pub mod regime;
 pub mod stop_target;
 #[cfg(feature = "strategy-db")]
 pub mod strategy_db;
 pub mod validation;
 
-pub use challenge::{ChallengeOptimizer, ChallengeTarget};
+// `pub use challenge::{ChallengeOptimizer, ChallengeTarget};` — DELETED 2026-05-26.
 pub use discovery::{
     DiscoveryConfig, DiscoveryPerKindEvidenceHashes, DiscoveryProgress, DiscoveryResult,
     DiscoveryRunProfile, DiscoveryRuntimeOverrides, DiscoveryValidationGates, LoggedStrategyTrades,
@@ -39,9 +67,9 @@ pub use discovery::{
     discovery_validation_evidence_manifest_excluding_live_sim, ensure_non_empty_portfolio,
     ensure_portfolio_export_ready, live_validation_evidence_from_discovery, run_discovery_cycle,
     run_discovery_cycle_with_progress, save_canonical_backtest_artifacts,
-    save_discovery_profile_json, save_forward_test_validation_artifacts, save_portfolio_json,
-    save_promotion_summary_json, save_prop_firm_validation_artifacts, save_quality_report_json,
-    save_trade_log_json, save_walkforward_validation_artifacts,
+    save_discovery_profile_json, save_forward_test_validation_artifacts, save_funnel_json,
+    save_portfolio_json, save_promotion_summary_json, save_prop_firm_validation_artifacts,
+    save_quality_report_json, save_trade_log_json, save_walkforward_validation_artifacts,
 };
 pub use eval::{
     BacktestMetrics, BacktestRuntimeOverrides, BacktestSettings,
@@ -49,7 +77,7 @@ pub use eval::{
     install_backtest_runtime_overrides, install_backtest_runtime_overrides_from_env,
     simulate_trades_core,
 };
-pub use gauntlet::{GauntletConfig, StrategyGauntlet};
+// `pub use gauntlet::{GauntletConfig, StrategyGauntlet};` — DELETED 2026-05-26.
 pub use genetic::{
     ArchiveScoringOverrides, CostProfileRuntimeOverrides, EvaluationConfig, EvolutionSearchPolicy,
     FilteringConfig, Gene, GeneticSearchRuntimeOverrides, ParentSelectionPolicy, SearchResult,

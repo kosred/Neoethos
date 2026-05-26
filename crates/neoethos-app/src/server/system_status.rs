@@ -147,10 +147,12 @@ pub struct DataBootstrapDto {
     pub last_touched_unix_ms: Option<u64>,
 }
 
-pub async fn data_bootstrap(State(_state): State<AppApiState>) -> Response {
-    let result = tokio::task::spawn_blocking(|| {
-        let settings = Settings::from_yaml("config.yaml")
-            .map_err(|e| anyhow::anyhow!("config.yaml not loadable: {e}"))?;
+pub async fn data_bootstrap(State(state): State<AppApiState>) -> Response {
+    // F-553/F-576 closure (2026-05-25): config path threaded from CLI.
+    let config_path = state.config_path().to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        let settings = Settings::from_yaml(&config_path)
+            .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
         let dir = settings.system.data_dir.clone();
         scan_data_dir(dir)
     })

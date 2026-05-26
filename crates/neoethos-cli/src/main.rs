@@ -1074,8 +1074,10 @@ fn canonical_user_config_dir() -> std::path::PathBuf {
     // Test-seam env var: matches `BROKER_CREDENTIALS_PATH_ENV_VAR` in
     // neoethos-app so an operator running a sandboxed CLI session sees
     // the same override path the GUI does.
-    if let Ok(custom) = std::env::var("NEOETHOS_BROKER_CREDENTIALS_PATH")
-        && !custom.trim().is_empty()
+    // **F-CORE3 closure (2026-05-25)**: routed through the canonical
+    // `neoethos_core::env_overrides::broker_credentials_path_override`
+    // typed getter — single grep-able source for the env-var name.
+    if let Some(custom) = neoethos_core::env_overrides::broker_credentials_path_override()
         && let Some(parent) = std::path::Path::new(&custom).parent()
     {
         return parent.to_path_buf();
@@ -1308,15 +1310,42 @@ fn resolve_cli_settings(args: &[String]) -> Result<Option<neoethos_core::Setting
 }
 
 fn default_symbol(settings: Option<&neoethos_core::Settings>) -> String {
-    settings
-        .map(|settings| settings.system.symbol.clone())
-        .unwrap_or_else(|| "EURUSD".to_string())
+    // **F-648 / F-CORE2 closure (2026-05-25)**: previously fell back to
+    // `"EURUSD"` when settings was None — a synthetic default that the
+    // no-synthetic-data directive forbids. Now returns the configured
+    // symbol when settings loaded, empty string otherwise. Downstream
+    // code rejects empty symbols (see `default_pip_size` returning NaN
+    // for empty input → fitness guard rejects) so the operator gets a
+    // clear "symbol required" error instead of silent EURUSD execution.
+    match settings {
+        Some(settings) => settings.system.symbol.clone(),
+        None => {
+            tracing::error!(
+                target: "neoethos_cli::defaults",
+                "No --symbol supplied and config.yaml could not be loaded; \
+                 cannot synthesise a default per F-CORE2 doctrine — supply \
+                 --symbol explicitly or ensure config.yaml is reachable."
+            );
+            String::new()
+        }
+    }
 }
 
 fn default_base_tf(settings: Option<&neoethos_core::Settings>) -> String {
-    settings
-        .map(|settings| settings.system.base_timeframe.clone())
-        .unwrap_or_else(|| "M1".to_string())
+    // **F-648 / F-CORE2 closure (2026-05-25)**: previously fell back to
+    // `"M1"` when settings was None. Same fix as `default_symbol`.
+    match settings {
+        Some(settings) => settings.system.base_timeframe.clone(),
+        None => {
+            tracing::error!(
+                target: "neoethos_cli::defaults",
+                "No --timeframe supplied and config.yaml could not be loaded; \
+                 cannot synthesise a default per F-CORE2 doctrine — supply \
+                 --timeframe explicitly or ensure config.yaml is reachable."
+            );
+            String::new()
+        }
+    }
 }
 
 fn default_higher_tfs_csv(settings: Option<&neoethos_core::Settings>) -> String {
@@ -1343,6 +1372,11 @@ fn default_higher_tfs_csv(settings: Option<&neoethos_core::Settings>) -> String 
 }
 
 fn default_batch_timeframes_csv(settings: Option<&neoethos_core::Settings>) -> String {
+    // **F-648 / F-CORE2 closure (2026-05-25)**: previously fell back to
+    // `"M1,M5,M15,H1,H4"` when settings was None — a synthetic default
+    // that the no-synthetic-data directive forbids. Now returns empty
+    // when settings can't load; downstream sweep code surfaces a clear
+    // "no timeframes specified" error.
     if let Some(settings) = settings {
         let mut timeframes = vec![settings.system.base_timeframe.clone()];
         let higher_timeframes = if settings.system.multi_resolution_enabled
@@ -1360,7 +1394,13 @@ fn default_batch_timeframes_csv(settings: Option<&neoethos_core::Settings>) -> S
         return timeframes.join(",");
     }
 
-    "M1,M5,M15,H1,H4".to_string()
+    tracing::error!(
+        target: "neoethos_cli::defaults",
+        "No --timeframes supplied and config.yaml could not be loaded; \
+         cannot synthesise a default per F-CORE2 doctrine — supply \
+         --timeframes explicitly or ensure config.yaml is reachable."
+    );
+    String::new()
 }
 
 fn parse_flag(args: &[String], name: &str) -> Option<String> {
@@ -1634,11 +1674,20 @@ fn section_record(
 }
 
 fn system_time_string() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_secs();
-    format!("unix:{seconds}")
+    // F-282 + F-656 fix (2026-05-25): match the neoethos-app pattern —
+    // never panic on pre-1970 clock; emit a sentinel + structured warn
+    // so the operator sees the clock skew without losing the whole CLI.
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => format!("unix:{}", d.as_secs()),
+        Err(err) => {
+            tracing::warn!(
+                target: "neoethos_cli::main",
+                error = %err,
+                "system clock is before UNIX epoch; falling back to sentinel"
+            );
+            "unix:pre-1970".to_string()
+        }
+    }
 }
 
 #[cfg(test)]

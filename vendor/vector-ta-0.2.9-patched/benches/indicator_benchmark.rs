@@ -1,0 +1,6300 @@
+extern crate vector_ta;
+
+use anyhow::anyhow;
+use criterion::{
+    black_box, criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion, Throughput,
+};
+use once_cell::sync::Lazy;
+use paste::paste;
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use std::arch::is_x86_feature_detected;
+use std::time::Duration;
+use vector_ta::utilities::enums::Kernel;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[ctor::ctor]
+fn __install_broken_pipe_panic_hook() {
+    use std::panic;
+
+    let default = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("");
+
+        let is_stdout_broken_pipe = msg.contains("failed printing to stdout")
+            && (msg.contains("The pipe is being closed")
+                || msg.contains("Broken pipe")
+                || msg.contains("os error 232")
+                || msg.contains("os error 32"));
+
+        if is_stdout_broken_pipe {
+            std::process::exit(0);
+        }
+
+        default(info);
+    }));
+}
+
+use vector_ta::indicators::moving_averages::{
+    alma::{alma_with_kernel, AlmaBatchBuilder, AlmaInput},
+    buff_averages::{
+        buff_averages, buff_averages_with_kernel, BuffAveragesBatchBuilder, BuffAveragesInput,
+    },
+    cwma::{cwma_with_kernel, CwmaBatchBuilder, CwmaInput},
+    dema::{dema_with_kernel, DemaBatchBuilder, DemaInput},
+    dma::{dma_with_kernel, DmaBatchBuilder, DmaInput},
+    edcf::{edcf_with_kernel, EdcfBatchBuilder, EdcfInput},
+    ehlers_ecema::{
+        ehlers_ecema as ehlers_ecema_raw, ehlers_ecema_with_kernel, EhlersEcemaBatchBuilder,
+        EhlersEcemaInput,
+    },
+    ehlers_itrend::{ehlers_itrend_with_kernel, EhlersITrendBatchBuilder, EhlersITrendInput},
+    ehlers_kama::{
+        ehlers_kama as ehlers_kama_raw, ehlers_kama_with_kernel, EhlersKamaBatchBuilder,
+        EhlersKamaInput,
+    },
+    ehlers_pma::{
+        ehlers_pma as ehlers_pma_raw, ehlers_pma_with_kernel, EhlersPmaBuilder, EhlersPmaInput,
+    },
+    ehlers_undersampled_double_moving_average::{
+        ehlers_undersampled_double_moving_average as ehlers_undersampled_double_moving_average_raw,
+        ehlers_undersampled_double_moving_average_with_kernel,
+        EhlersUndersampledDoubleMovingAverageInput,
+    },
+    ehma::{ehma as ehma_raw, ehma_with_kernel, EhmaBatchBuilder, EhmaInput},
+    elastic_volume_weighted_moving_average::{
+        elastic_volume_weighted_moving_average as elastic_volume_weighted_moving_average_raw,
+        elastic_volume_weighted_moving_average_with_kernel,
+        ElasticVolumeWeightedMovingAverageInput,
+    },
+    ema::{ema as ema_raw, ema_with_kernel, EmaBatchBuilder, EmaInput},
+    ema_deviation_corrected_t3::{
+        ema_deviation_corrected_t3 as ema_deviation_corrected_t3_raw,
+        ema_deviation_corrected_t3_with_kernel, EmaDeviationCorrectedT3Input,
+    },
+    epma::{epma as epma_raw, epma_with_kernel, EpmaBatchBuilder, EpmaInput},
+    frama::{frama_with_kernel, FramaBatchBuilder, FramaInput},
+    fwma::{fwma as fwma_raw, fwma_with_kernel, FwmaBatchBuilder, FwmaInput},
+    gaussian::{
+        gaussian as gaussian_raw, gaussian_with_kernel, GaussianBatchBuilder, GaussianInput,
+    },
+    highpass::{highpass_with_kernel, HighPassBatchBuilder, HighPassInput},
+    highpass_2_pole::{highpass_2_pole_with_kernel, HighPass2BatchBuilder, HighPass2Input},
+    hma::{hma_with_kernel, HmaBatchBuilder, HmaInput},
+    hwma::{hwma_with_kernel, HwmaBatchBuilder, HwmaInput},
+    jma::{jma_with_kernel, JmaBatchBuilder, JmaInput},
+    jsa::{jsa_with_kernel, JsaBatchBuilder, JsaInput},
+    kama::{kama_with_kernel, KamaBatchBuilder, KamaInput},
+    linreg::{linreg_with_kernel, LinRegBatchBuilder, LinRegInput},
+    maaq::{maaq_with_kernel, MaaqBatchBuilder, MaaqInput},
+    mama::{mama_with_kernel, MamaBatchBuilder, MamaInput},
+    mwdx::{mwdx_with_kernel, MwdxBatchBuilder, MwdxInput},
+    nama::{nama_with_kernel, NamaBatchBuilder, NamaInput},
+    nma::{nma_with_kernel, NmaBatchBuilder, NmaInput},
+    pwma::{pwma_with_kernel, PwmaBatchBuilder, PwmaInput},
+    reflex::{reflex_with_kernel, ReflexBatchBuilder, ReflexInput},
+    sama::{sama_with_kernel, SamaBatchBuilder, SamaInput},
+    sinwma::{sinwma_with_kernel, SinWmaBatchBuilder, SinWmaInput},
+    sma::{sma_with_kernel, SmaBatchBuilder, SmaInput},
+    smma::{smma_with_kernel, SmmaBatchBuilder, SmmaInput},
+    sqwma::{sqwma_with_kernel, SqwmaBatchBuilder, SqwmaInput},
+    srwma::{srwma_with_kernel, SrwmaBatchBuilder, SrwmaInput},
+    supersmoother::{supersmoother_with_kernel, SuperSmootherBatchBuilder, SuperSmootherInput},
+    supersmoother_3_pole::{
+        supersmoother_3_pole_with_kernel, SuperSmoother3PoleBatchBuilder, SuperSmoother3PoleInput,
+    },
+    swma::{swma_with_kernel, SwmaBatchBuilder, SwmaInput},
+    tema::{tema_with_kernel, TemaBatchBuilder, TemaInput},
+    tilson::{tilson_with_kernel, TilsonBatchBuilder, TilsonInput},
+    tradjema::{tradjema_with_kernel, TradjemaInput},
+    trendflex::{trendflex_with_kernel, TrendFlexBatchBuilder, TrendFlexInput},
+    trima::{trima_with_kernel, TrimaBatchBuilder, TrimaInput},
+    uma::{uma_with_kernel, UmaBatchBuilder, UmaInput},
+    volume_adjusted_ma::{
+        VolumeAdjustedMa, VolumeAdjustedMaBatchBuilder, VolumeAdjustedMaInput,
+        VolumeAdjustedMa_with_kernel,
+    },
+    vpwma::{vpwma_with_kernel, VpwmaBatchBuilder, VpwmaInput},
+    vwma::{vwma_with_kernel, VwmaInput, VwmaParams},
+    wilders::{wilders_with_kernel, WildersBatchBuilder, WildersInput},
+    wma::{wma_with_kernel, WmaBatchBuilder, WmaInput},
+    zlema::{zlema_with_kernel, ZlemaBatchBuilder, ZlemaInput},
+};
+
+use vector_ta::indicators::{
+    bandpass::{
+        bandpass as bandpass_raw, bandpass_with_kernel, BandPassBatchBuilder, BandPassInput,
+    },
+    cci_cycle::{cci_cycle, cci_cycle_with_kernel, CciCycleBatchBuilder, CciCycleInput},
+    fvg_positioning_average::{
+        fvg_positioning_average as fvg_positioning_average_raw,
+        fvg_positioning_average_with_kernel, FvgPositioningAverageInput,
+    },
+    fvg_trailing_stop::{fvg_trailing_stop, fvg_trailing_stop_with_kernel, FvgTrailingStopInput},
+    halftrend::{
+        halftrend, halftrend_with_kernel, HalfTrendBatchBuilder, HalfTrendData, HalfTrendInput,
+    },
+    net_myrsi::{net_myrsi, net_myrsi_with_kernel, NetMyrsiBatchBuilder, NetMyrsiInput},
+    reverse_rsi::{reverse_rsi, reverse_rsi_with_kernel, ReverseRsiBatchBuilder, ReverseRsiInput},
+};
+
+use vector_ta::indicators::moving_averages::volatility_adjusted_ma::{
+    vama, vama_with_kernel, VamaBatchBuilder, VamaInput as VamaInputMv,
+};
+
+use vector_ta::indicators::correl_hl::correl_hl_with_kernel;
+use vector_ta::indicators::{
+    acosc::{acosc as acosc_raw, AcoscInput},
+    ad::{ad as ad_raw, ad_with_kernel, AdInput},
+    adosc::{adosc as adosc_raw, AdoscInput},
+    adx::{adx as adx_raw, adx_with_kernel, AdxBatchBuilder, AdxInput},
+    adxr::{adxr as adxr_raw, adxr_with_kernel, AdxrInput},
+    alligator::{alligator as alligator_raw, AlligatorInput},
+    alphatrend::{alphatrend as alphatrend_raw, alphatrend_with_kernel, AlphaTrendInput},
+    ao::{ao as ao_raw, AoInput},
+    apo::{apo as apo_raw, apo_with_kernel, ApoBatchBuilder, ApoInput},
+    aroon::{aroon as aroon_raw, AroonInput},
+    aroonosc::{aroon_osc as aroon_osc_raw, AroonOscInput},
+    aso::{aso_with_kernel, AsoBatchBuilder, AsoData, AsoInput},
+    atr::{atr as atr_raw, AtrInput},
+    avsl::{avsl_with_kernel, AvslBatchBuilder, AvslInput},
+    bollinger_bands::{
+        bollinger_bands as bollinger_bands_raw, bollinger_bands_with_kernel,
+        BollingerBandsBatchBuilder, BollingerBandsInput,
+    },
+    bollinger_bands_width::{
+        bollinger_bands_width as bollinger_bands_width_raw, bollinger_bands_width_with_kernel,
+        BollingerBandsWidthBatchBuilder, BollingerBandsWidthInput,
+    },
+    bop::{bop as bop_raw, BopInput},
+    cci::{cci as cci_raw, cci_with_kernel, CciInput},
+    cfo::{cfo as cfo_raw, cfo_with_kernel, CfoBatchBuilder, CfoInput},
+    cg::{cg as cg_raw, cg_with_kernel, CgInput},
+    chande::{chande as chande_raw, ChandeInput},
+    chandelier_exit::{chandelier_exit_with_kernel, CeBatchBuilder, ChandelierExitInput},
+    chop::{chop as chop_raw, ChopInput},
+    cksp::{cksp as cksp_raw, cksp_with_kernel, CkspBatchBuilder, CkspInput},
+    cmo::{cmo as cmo_raw, cmo_with_kernel, CmoBatchBuilder, CmoInput},
+    coppock::{coppock as coppock_raw, CoppockInput},
+    cora_wave::{cora_wave as cora_wave_raw, CoraWaveBatchBuilder, CoraWaveInput},
+    correl_hl::{correl_hl as correl_hl_raw, CorrelHlBatchBuilder, CorrelHlData, CorrelHlInput},
+    correlation_cycle::{
+        correlation_cycle as correlation_cycle_raw, correlation_cycle_with_kernel,
+        CorrelationCycleBatchBuilder, CorrelationCycleInput,
+    },
+    cvi::{cvi as cvi_raw, cvi_with_kernel, CviBatchBuilder, CviInput},
+    damiani_volatmeter::{damiani_volatmeter as damiani_volatmeter_raw, DamianiVolatmeterInput},
+    dec_osc::{dec_osc as dec_osc_raw, DecOscInput},
+    decycler::{decycler as decycler_raw, DecyclerInput},
+    demand_index::{demand_index as demand_index_raw, DemandIndexInput},
+    deviation::{deviation_with_kernel, DeviationBatchBuilder, DeviationInput},
+    devstop::{devstop as devstop_raw, DevStopInput},
+    di::{di as di_raw, DiInput},
+    dm::{dm as dm_raw, DmBatchBuilder, DmInput},
+    donchian::{donchian as donchian_raw, donchian_with_kernel, DonchianInput},
+    donchian_channel_width::{
+        donchian_channel_width as donchian_channel_width_raw, donchian_channel_width_with_kernel,
+        DonchianChannelWidthInput,
+    },
+    dpo::{dpo as dpo_raw, dpo_with_kernel, DpoBatchBuilder, DpoInput},
+    dti::{dti as dti_raw, dti_with_kernel, DtiInput},
+    dx::{dx as dx_raw, dx_with_kernel, DxBatchBuilder, DxInput},
+    dynamic_momentum_index::{
+        dynamic_momentum_index as dynamic_momentum_index_raw, dynamic_momentum_index_with_kernel,
+        DynamicMomentumIndexInput,
+    },
+    efi::{efi as efi_raw, efi_with_kernel, EfiInput},
+    ehlers_adaptive_cg::{
+        ehlers_adaptive_cg as ehlers_adaptive_cg_raw, ehlers_adaptive_cg_with_kernel,
+        EhlersAdaptiveCgInput,
+    },
+    ehlers_adaptive_cyber_cycle::{
+        ehlers_adaptive_cyber_cycle as ehlers_adaptive_cyber_cycle_raw,
+        ehlers_adaptive_cyber_cycle_with_kernel, EhlersAdaptiveCyberCycleInput,
+    },
+    ehlers_autocorrelation_periodogram::{
+        ehlers_autocorrelation_periodogram as ehlers_autocorrelation_periodogram_raw,
+        ehlers_autocorrelation_periodogram_with_kernel, EhlersAutocorrelationPeriodogramInput,
+    },
+    ehlers_data_sampling_relative_strength_indicator::{
+        ehlers_data_sampling_relative_strength_indicator as ehlers_data_sampling_relative_strength_indicator_raw,
+        ehlers_data_sampling_relative_strength_indicator_with_kernel,
+        EhlersDataSamplingRelativeStrengthIndicatorInput,
+    },
+    ehlers_detrending_filter::{
+        ehlers_detrending_filter as ehlers_detrending_filter_raw,
+        ehlers_detrending_filter_with_kernel, EhlersDetrendingFilterInput,
+    },
+    ehlers_fm_demodulator::{
+        ehlers_fm_demodulator as ehlers_fm_demodulator_raw, ehlers_fm_demodulator_with_kernel,
+        EhlersFmDemodulatorInput,
+    },
+    ehlers_linear_extrapolation_predictor::{
+        ehlers_linear_extrapolation_predictor as ehlers_linear_extrapolation_predictor_raw,
+        ehlers_linear_extrapolation_predictor_with_kernel, EhlersLinearExtrapolationPredictorInput,
+    },
+    ehlers_simple_cycle_indicator::{
+        ehlers_simple_cycle_indicator as ehlers_simple_cycle_indicator_raw,
+        ehlers_simple_cycle_indicator_with_kernel, EhlersSimpleCycleIndicatorInput,
+    },
+    ehlers_smoothed_adaptive_momentum::{
+        ehlers_smoothed_adaptive_momentum as ehlers_smoothed_adaptive_momentum_raw,
+        ehlers_smoothed_adaptive_momentum_with_kernel, EhlersSmoothedAdaptiveMomentumInput,
+    },
+    emd::{emd as emd_raw, emd_with_kernel, EmdInput},
+    emd_trend::{emd_trend as emd_trend_raw, emd_trend_with_kernel, EmdTrendInput},
+    emv::{emv as emv_raw, emv_with_kernel, EmvBatchBuilder, EmvData, EmvInput},
+    er::{er as er_raw, er_with_kernel, ErBatchBuilder, ErInput},
+    eri::{eri as eri_raw, eri_with_kernel, EriBatchBuilder, EriData, EriInput},
+    evasive_supertrend::{
+        evasive_supertrend as evasive_supertrend_raw, evasive_supertrend_with_kernel,
+        EvasiveSuperTrendInput,
+    },
+    ewma_volatility::{
+        ewma_volatility as ewma_volatility_raw, ewma_volatility_with_kernel, EwmaVolatilityInput,
+    },
+    exponential_trend::{
+        exponential_trend as exponential_trend_raw, exponential_trend_with_kernel,
+        ExponentialTrendInput,
+    },
+    fibonacci_entry_bands::{
+        fibonacci_entry_bands as fibonacci_entry_bands_raw, fibonacci_entry_bands_with_kernel,
+        FibonacciEntryBandsInput,
+    },
+    fibonacci_trailing_stop::{
+        fibonacci_trailing_stop as fibonacci_trailing_stop_raw,
+        fibonacci_trailing_stop_with_kernel, FibonacciTrailingStopInput,
+    },
+    fisher::{fisher as fisher_raw, fisher_with_kernel, FisherInput},
+    forward_backward_exponential_oscillator::{
+        forward_backward_exponential_oscillator as forward_backward_exponential_oscillator_raw,
+        forward_backward_exponential_oscillator_with_kernel,
+        ForwardBackwardExponentialOscillatorInput,
+    },
+    fosc::{fosc as fosc_raw, fosc_with_kernel, FoscInput},
+    fractal_dimension_index::{
+        fractal_dimension_index as fractal_dimension_index_raw,
+        fractal_dimension_index_with_kernel, FractalDimensionIndexInput,
+    },
+    garman_klass_volatility::{
+        garman_klass_volatility as garman_klass_volatility_raw,
+        garman_klass_volatility_with_kernel, GarmanKlassVolatilityInput,
+    },
+    gatorosc::{gatorosc as gatorosc_raw, GatorOscInput},
+    geometric_bias_oscillator::{
+        geometric_bias_oscillator as geometric_bias_oscillator_raw,
+        geometric_bias_oscillator_with_kernel, GeometricBiasOscillatorInput,
+    },
+    gmma_oscillator::{
+        gmma_oscillator as gmma_oscillator_raw, gmma_oscillator_with_kernel, GmmaOscillatorInput,
+    },
+    gopalakrishnan_range_index::{
+        gopalakrishnan_range_index as gopalakrishnan_range_index_raw,
+        gopalakrishnan_range_index_with_kernel, GopalakrishnanRangeIndexInput,
+    },
+    grover_llorens_cycle_oscillator::{
+        grover_llorens_cycle_oscillator as grover_llorens_cycle_oscillator_raw,
+        grover_llorens_cycle_oscillator_with_kernel, GroverLlorensCycleOscillatorInput,
+    },
+    half_causal_estimator::{
+        half_causal_estimator as half_causal_estimator_raw, half_causal_estimator_with_kernel,
+        HalfCausalEstimatorInput, HalfCausalEstimatorParams,
+    },
+    ift_rsi::{ift_rsi as ift_rsi_raw, ift_rsi_with_kernel, IftRsiInput},
+    kaufmanstop::{
+        kaufmanstop as kaufmanstop_raw, kaufmanstop_with_kernel, KaufmanstopBatchBuilder,
+        KaufmanstopData, KaufmanstopInput,
+    },
+    kdj::{kdj as kdj_raw, kdj_with_kernel, KdjInput},
+    keltner::{keltner as keltner_raw, keltner_with_kernel, KeltnerInput},
+    kst::{kst as kst_raw, KstBatchBuilder, KstInput},
+    kurtosis::{
+        kurtosis as kurtosis_raw, kurtosis_with_kernel, KurtosisBatchBuilder, KurtosisInput,
+    },
+    kvo::{kvo as kvo_raw, kvo_with_kernel, KvoBatchBuilder, KvoInput},
+    linearreg_angle::{
+        linearreg_angle as linearreg_angle_raw, linearreg_angle_with_kernel,
+        Linearreg_angleBatchBuilder, Linearreg_angleInput,
+    },
+    linearreg_intercept::{
+        linearreg_intercept as linearreg_intercept_raw, LinearRegInterceptInput,
+    },
+    linearreg_slope::{
+        linearreg_slope as linearreg_slope_raw, linearreg_slope_with_kernel,
+        LinearRegSlopeBatchBuilder, LinearRegSlopeInput,
+    },
+    lpc::{lpc as lpc_raw, LpcInput},
+    lrsi::{lrsi as lrsi_raw, LrsiInput},
+    mab::{mab as mab_raw, mab_with_kernel, MabInput},
+    macd::{macd as macd_raw, MacdInput},
+    macz::{macz_with_kernel, MaczBatchBuilder, MaczInput},
+    marketefi::{marketefi as marketfi_raw, marketefi_with_kernel, MarketefiInput},
+    mass::{mass as mass_raw, MassInput},
+    mean_ad::{mean_ad as mean_ad_raw, MeanAdInput},
+    medium_ad::{medium_ad as medium_ad_raw, MediumAdInput},
+    medprice::{medprice as medprice_raw, MedpriceInput},
+    mfi::{mfi as mfi_raw, MfiBatchBuilder, MfiData, MfiInput},
+    midpoint::{midpoint as midpoint_raw, MidpointInput},
+    midprice::{midprice as midprice_raw, MidpriceBatchBuilder, MidpriceData, MidpriceInput},
+    minmax::{minmax as minmax_raw, MinmaxInput},
+    mod_god_mode::{mod_god_mode as mod_god_mode_raw, mod_god_mode_with_kernel, ModGodModeInput},
+    mom::{mom as mom_raw, mom_with_kernel, MomBatchBuilder, MomInput},
+    msw::{msw as msw_raw, MswInput},
+    nadaraya_watson_envelope::{
+        nadaraya_watson_envelope as nadaraya_watson_envelope_raw,
+        nadaraya_watson_envelope_with_kernel, NweInput,
+    },
+    natr::{natr as natr_raw, natr_with_kernel, NatrBatchBuilder, NatrInput},
+    nvi::{nvi as nvi_raw, nvi_with_kernel, NviInput},
+    obv::{obv as obv_raw, ObvInput},
+    ott::{ott as ott_raw, ott_with_kernel, OttBatchBuilder, OttInput},
+    otto::{otto as otto_raw, OttoBatchBuilder, OttoInput},
+    pattern_recognition::{
+        pattern_recognition as pattern_recognition_raw, PatternRecognitionInput,
+    },
+    percentile_nearest_rank::{
+        percentile_nearest_rank_with_kernel, PercentileNearestRankBatchBuilder,
+        PercentileNearestRankInput,
+    },
+    pfe::{pfe as pfe_raw, PfeBatchBuilder, PfeInput},
+    pivot::{pivot as pivot_raw, pivot_with_kernel, PivotBatchBuilder, PivotData, PivotInput},
+    pma::{pma as pma_raw, pma_with_kernel, PmaBatchBuilder, PmaInput},
+    ppo::{ppo as ppo_raw, ppo_with_kernel, PpoInput},
+    prb::{prb as prb_raw, PrbBatchBuilder, PrbInput},
+    pvi::{pvi as pvi_raw, pvi_with_kernel, PviBatchBuilder, PviInput},
+    qqe::{qqe as qqe_raw, QqeInput},
+    qstick::{
+        qstick as qstick_raw, qstick_with_kernel, QstickBatchBuilder, QstickData, QstickInput,
+    },
+    range_filter::{range_filter_with_kernel, RangeFilterBatchBuilder, RangeFilterInput},
+    roc::{roc as roc_raw, roc_with_kernel, RocBatchBuilder, RocInput},
+    rocp::{rocp as rocp_raw, RocpInput},
+    rocr::{rocr as rocr_raw, rocr_with_kernel, RocrInput},
+    rsi::{rsi as rsi_raw, rsi_with_kernel, RsiBatchBuilder, RsiInput},
+    rsmk::{rsmk as rsmk_raw, RsmkInput},
+    rsx::{rsx as rsx_raw, rsx_with_kernel, RsxBatchBuilder, RsxInput},
+    rvi::{rvi as rvi_raw, rvi_with_kernel, RviInput},
+    safezonestop::{
+        safezonestop as safezonestop_raw, safezonestop_with_kernel, SafeZoneStopBatchBuilder,
+        SafeZoneStopData, SafeZoneStopInput,
+    },
+    sar::{sar as sar_raw, sar_with_kernel, SarBatchBuilder, SarInput},
+    squeeze_momentum::{
+        squeeze_momentum as squeeze_momentum_raw, SqueezeMomentumBatchBuilder, SqueezeMomentumInput,
+    },
+    srsi::{srsi as srsi_raw, srsi_with_kernel, SrsiBatchBuilder, SrsiInput},
+    stc::{stc as stc_raw, StcInput},
+    stddev::{stddev as stddev_raw, StdDevBatchBuilder, StdDevInput},
+    stoch::{stoch as stoch_raw, stoch_with_kernel, StochBatchBuilder, StochInput},
+    stochf::{stochf as stochf_raw, stochf_with_kernel, StochfInput},
+    supertrend::{
+        supertrend as supertrend_raw, supertrend_with_kernel, SuperTrendBatchBuilder,
+        SuperTrendInput,
+    },
+    trix::{trix_with_kernel, TrixBatchBuilder, TrixInput},
+    tsf::{tsf as tsf_raw, tsf_with_kernel, TsfInput},
+    tsi::{tsi as tsi_raw, TsiInput},
+    ttm_squeeze::{ttm_squeeze as ttm_squeeze_raw, TtmSqueezeInput},
+    ttm_trend::{ttm_trend as ttm_trend_raw, ttm_trend_with_kernel, TtmTrendInput},
+    ui::{ui as ui_raw, ui_with_kernel, UiInput},
+    ultosc::{
+        ultosc as ultosc_raw, ultosc_with_kernel, UltOscBatchBuilder, UltOscBatchRange, UltOscData,
+        UltOscInput,
+    },
+    var::{var as var_raw, var_with_kernel, VarBatchBuilder, VarInput},
+    vi::{vi as vi_raw, ViBatchBuilder, ViInput},
+    vidya::{vidya_with_kernel, VidyaBatchBuilder, VidyaInput},
+    vlma::{vlma_with_kernel, VlmaBatchBuilder, VlmaInput},
+    vosc::{vosc as vosc_raw, vosc_with_kernel, VoscBatchBuilder, VoscInput},
+    voss::{voss as voss_raw, VossInput},
+    vpci::{vpci as vpci_raw, vpci_with_kernel, VpciBatchBuilder, VpciData, VpciInput},
+    vpt::{vpt as vpt_raw, vpt_with_kernel, VptInput},
+    vwap::{vwap as vwap_raw, VwapInput},
+    vwmacd::{vwmacd as vwmacd_raw, VwmacdInput},
+    wad::{wad as wad_raw, WadInput},
+    wavetrend::{
+        wavetrend as wavetrend_raw, wavetrend_with_kernel, WavetrendBatchBuilder, WavetrendInput,
+    },
+    wclprice::{wclprice as wclprice_raw, wclprice_with_kernel, WclpriceInput},
+    willr::{willr as willr_raw, WillrBatchBuilder, WillrInput},
+    wto::{wto_with_kernel, WtoBatchBuilder, WtoInput},
+    yang_zhang_volatility::{
+        yang_zhang_volatility as yang_zhang_volatility_raw, yang_zhang_volatility_with_kernel,
+        YangZhangVolatilityBatchBuilder, YangZhangVolatilityInput,
+    },
+    zscore::{zscore as zscore_raw, zscore_with_kernel, ZscoreBatchBuilder, ZscoreInput},
+};
+
+use vector_ta::indicators::dvdiqqe::{dvdiqqe_with_kernel, DvdiqqeInput};
+
+use vector_ta::indicators::stc::stc_with_kernel;
+
+use vector_ta::indicators::dm::dm_with_kernel;
+
+use vector_ta::utilities::data_loader::{read_candles_from_csv, source_type, Candles};
+
+static CANDLES_10K: Lazy<Candles> =
+    Lazy::new(|| read_candles_from_csv("src/data/10kCandles.csv").expect("10 k candles csv"));
+static CANDLES_100K: Lazy<Candles> = Lazy::new(|| {
+    read_candles_from_csv("src/data/bitfinex btc-usd 100,000 candles ends 09-01-24.csv")
+        .expect("100 k candles csv")
+});
+static CANDLES_1M: Lazy<Candles> =
+    Lazy::new(|| read_candles_from_csv("src/data/1MillionCandles.csv").expect("1 M candles csv"));
+
+trait InputLen {
+    fn with_len(len: usize) -> Self;
+}
+
+pub type AcoscInputS = AcoscInput<'static>;
+pub type AdInputS = AdInput<'static>;
+pub type AdoscInputS = AdoscInput<'static>;
+pub type AdxInputS = AdxInput<'static>;
+pub type AdxrInputS = AdxrInput<'static>;
+pub type AlligatorInputS = AlligatorInput<'static>;
+pub type AlphaTrendInputS = AlphaTrendInput<'static>;
+pub type AlmaInputS = AlmaInput<'static>;
+pub type MaczInputS = MaczInput<'static>;
+pub type AoInputS = AoInput<'static>;
+pub type ApoInputS = ApoInput<'static>;
+pub type AroonInputS = AroonInput<'static>;
+pub type AroonOscInputS = AroonOscInput<'static>;
+pub type AtrInputS = AtrInput<'static>;
+pub type BandPassInputS = BandPassInput<'static>;
+pub type BollingerBandsInputS = BollingerBandsInput<'static>;
+pub type BollingerBandsWidthInputS = BollingerBandsWidthInput<'static>;
+pub type BopInputS = BopInput<'static>;
+pub type BuffAveragesInputS = BuffAveragesInput<'static>;
+pub type CciInputS = CciInput<'static>;
+pub type CfoInputS = CfoInput<'static>;
+pub type CgInputS = CgInput<'static>;
+pub type ChandeInputS = ChandeInput<'static>;
+pub type ChandelierExitInputS = ChandelierExitInput<'static>;
+pub type ChopInputS = ChopInput<'static>;
+pub type CkspInputS = CkspInput<'static>;
+pub type CmoInputS = CmoInput<'static>;
+pub type CoppockInputS = CoppockInput<'static>;
+pub type CoraWaveInputS = CoraWaveInput<'static>;
+pub type CorrelHlInputS = CorrelHlInput<'static>;
+pub type CorrelationCycleInputS = CorrelationCycleInput<'static>;
+pub type CviInputS = CviInput<'static>;
+pub type CwmaInputS = CwmaInput<'static>;
+pub type DamianiVolatmeterInputS = DamianiVolatmeterInput<'static>;
+pub type DecOscInputS = DecOscInput<'static>;
+pub type DecyclerInputS = DecyclerInput<'static>;
+pub type DemandIndexInputS = DemandIndexInput<'static>;
+pub type DemaInputS = DemaInput<'static>;
+pub type DevStopInputS = DevStopInput<'static>;
+pub type DiInputS = DiInput<'static>;
+pub type DmInputS = DmInput<'static>;
+pub type DonchianInputS = DonchianInput<'static>;
+pub type DonchianChannelWidthInputS = DonchianChannelWidthInput<'static>;
+pub type DpoInputS = DpoInput<'static>;
+pub type DtiInputS = DtiInput<'static>;
+pub type DxInputS = DxInput<'static>;
+pub type DynamicMomentumIndexInputS = DynamicMomentumIndexInput<'static>;
+pub type EdcfInputS = EdcfInput<'static>;
+pub type EhlersAdaptiveCgInputS = EhlersAdaptiveCgInput<'static>;
+pub type EhlersAdaptiveCyberCycleInputS = EhlersAdaptiveCyberCycleInput<'static>;
+pub type EhlersAutocorrelationPeriodogramInputS = EhlersAutocorrelationPeriodogramInput<'static>;
+pub type EhlersDataSamplingRelativeStrengthIndicatorInputS =
+    EhlersDataSamplingRelativeStrengthIndicatorInput<'static>;
+pub type EhlersDetrendingFilterInputS = EhlersDetrendingFilterInput<'static>;
+pub type EhlersFmDemodulatorInputS = EhlersFmDemodulatorInput<'static>;
+pub type EhlersLinearExtrapolationPredictorInputS =
+    EhlersLinearExtrapolationPredictorInput<'static>;
+pub type EhlersSimpleCycleIndicatorInputS = EhlersSimpleCycleIndicatorInput<'static>;
+pub type EhlersSmoothedAdaptiveMomentumInputS = EhlersSmoothedAdaptiveMomentumInput<'static>;
+pub type EfiInputS = EfiInput<'static>;
+pub type EhlersEcemaInputS = EhlersEcemaInput<'static>;
+pub type EhlersITrendInputS = EhlersITrendInput<'static>;
+pub type EhlersPmaInputS = EhlersPmaInput<'static>;
+pub type EhlersKamaInputS = EhlersKamaInput<'static>;
+pub type EhlersUndersampledDoubleMovingAverageInputS =
+    EhlersUndersampledDoubleMovingAverageInput<'static>;
+pub type ElasticVolumeWeightedMovingAverageInputS =
+    ElasticVolumeWeightedMovingAverageInput<'static>;
+pub type EmaDeviationCorrectedT3InputS = EmaDeviationCorrectedT3Input<'static>;
+pub type EmaInputS = EmaInput<'static>;
+pub type EmdInputS = EmdInput<'static>;
+pub type EmdTrendInputS = EmdTrendInput<'static>;
+pub type EmvInputS = EmvInput<'static>;
+pub type EpmaInputS = EpmaInput<'static>;
+pub type ErInputS = ErInput<'static>;
+pub type EriInputS = EriInput<'static>;
+pub type EvasiveSuperTrendInputS = EvasiveSuperTrendInput<'static>;
+pub type EwmaVolatilityInputS = EwmaVolatilityInput<'static>;
+pub type ExponentialTrendInputS = ExponentialTrendInput<'static>;
+pub type FibonacciEntryBandsInputS = FibonacciEntryBandsInput<'static>;
+pub type FibonacciTrailingStopInputS = FibonacciTrailingStopInput<'static>;
+pub type FisherInputS = FisherInput<'static>;
+pub type ForwardBackwardExponentialOscillatorInputS =
+    ForwardBackwardExponentialOscillatorInput<'static>;
+pub type FoscInputS = FoscInput<'static>;
+pub type FractalDimensionIndexInputS = FractalDimensionIndexInput<'static>;
+pub type FvgPositioningAverageInputS = FvgPositioningAverageInput<'static>;
+pub type FramaInputS = FramaInput<'static>;
+pub type FwmaInputS = FwmaInput<'static>;
+pub type GarmanKlassVolatilityInputS = GarmanKlassVolatilityInput<'static>;
+pub type GatorOscInputS = GatorOscInput<'static>;
+pub type GeometricBiasOscillatorInputS = GeometricBiasOscillatorInput<'static>;
+pub type GmmaOscillatorInputS = GmmaOscillatorInput<'static>;
+pub type GopalakrishnanRangeIndexInputS = GopalakrishnanRangeIndexInput<'static>;
+pub type GroverLlorensCycleOscillatorInputS = GroverLlorensCycleOscillatorInput<'static>;
+pub type HalfCausalEstimatorInputS = HalfCausalEstimatorInput<'static>;
+pub type GaussianInputS = GaussianInput<'static>;
+pub type HighPassInputS = HighPassInput<'static>;
+pub type HighPass2InputS = HighPass2Input<'static>;
+pub type HmaInputS = HmaInput<'static>;
+pub type HwmaInputS = HwmaInput<'static>;
+pub type IftRsiInputS = IftRsiInput<'static>;
+pub type JmaInputS = JmaInput<'static>;
+pub type JsaInputS = JsaInput<'static>;
+pub type KamaInputS = KamaInput<'static>;
+pub type KaufmanstopInputS = KaufmanstopInput<'static>;
+pub type KdjInputS = KdjInput<'static>;
+pub type KeltnerInputS = KeltnerInput<'static>;
+pub type KstInputS = KstInput<'static>;
+pub type KurtosisInputS = KurtosisInput<'static>;
+pub type KvoInputS = KvoInput<'static>;
+pub type LinearregAngleInputS = Linearreg_angleInput<'static>;
+pub type LinearRegInterceptInputS = LinearRegInterceptInput<'static>;
+pub type LinearRegSlopeInputS = LinearRegSlopeInput<'static>;
+pub type LinRegInputS = LinRegInput<'static>;
+pub type LpcInputS = LpcInput<'static>;
+pub type LrsiInputS = LrsiInput<'static>;
+pub type MaaqInputS = MaaqInput<'static>;
+pub type MabInputS = MabInput<'static>;
+pub type MacdInputS = MacdInput<'static>;
+pub type MamaInputS = MamaInput<'static>;
+pub type MarketefiInputS = MarketefiInput<'static>;
+pub type MassInputS = MassInput<'static>;
+pub type MeanAdInputS = MeanAdInput<'static>;
+pub type MediumAdInputS = MediumAdInput<'static>;
+pub type MedpriceInputS = MedpriceInput<'static>;
+pub type MfiInputS = MfiInput<'static>;
+pub type MidpointInputS = MidpointInput<'static>;
+pub type MidpriceInputS = MidpriceInput<'static>;
+pub type MinmaxInputS = MinmaxInput<'static>;
+pub type ModGodModeInputS = ModGodModeInput<'static>;
+pub type MomInputS = MomInput<'static>;
+pub type MswInputS = MswInput<'static>;
+pub type MwdxInputS = MwdxInput<'static>;
+pub type NatrInputS = NatrInput<'static>;
+pub type NweInputS = NweInput<'static>;
+pub type NmaInputS = NmaInput<'static>;
+pub type NviInputS = NviInput<'static>;
+pub type ObvInputS = ObvInput<'static>;
+pub type OttoInputS = OttoInput<'static>;
+pub type OttInputS = OttInput<'static>;
+pub type PatternRecognitionInputS = PatternRecognitionInput<'static>;
+pub type PfeInputS = PfeInput<'static>;
+pub type PercentileNearestRankInputS = PercentileNearestRankInput<'static>;
+pub type PivotInputS = PivotInput<'static>;
+pub type PmaInputS = PmaInput<'static>;
+pub type PpoInputS = PpoInput<'static>;
+pub type PrbInputS = PrbInput<'static>;
+pub type PviInputS = PviInput<'static>;
+pub type PwmaInputS = PwmaInput<'static>;
+pub type QqeInputS = QqeInput<'static>;
+pub type QstickInputS = QstickInput<'static>;
+pub type ReflexInputS = ReflexInput<'static>;
+pub type RocInputS = RocInput<'static>;
+pub type RocpInputS = RocpInput<'static>;
+pub type RocrInputS = RocrInput<'static>;
+pub type RsiInputS = RsiInput<'static>;
+pub type RsmkInputS = RsmkInput<'static>;
+pub type RsxInputS = RsxInput<'static>;
+pub type RviInputS = RviInput<'static>;
+pub type SafeZoneStopInputS = SafeZoneStopInput<'static>;
+pub type SarInputS = SarInput<'static>;
+pub type SinWmaInputS = SinWmaInput<'static>;
+pub type SmaInputS = SmaInput<'static>;
+pub type SmmaInputS = SmmaInput<'static>;
+pub type SqueezeMomentumInputS = SqueezeMomentumInput<'static>;
+pub type SqwmaInputS = SqwmaInput<'static>;
+pub type SrsiInputS = SrsiInput<'static>;
+pub type SrwmaInputS = SrwmaInput<'static>;
+pub type StcInputS = StcInput<'static>;
+pub type StdDevInputS = StdDevInput<'static>;
+pub type StochInputS = StochInput<'static>;
+pub type StochfInputS = StochfInput<'static>;
+pub type SuperSmootherInputS = SuperSmootherInput<'static>;
+pub type SupertrendInputS = SuperTrendInput<'static>;
+pub type SuperSmoother3PoleInputS = SuperSmoother3PoleInput<'static>;
+pub type SwmaInputS = SwmaInput<'static>;
+pub type TemaInputS = TemaInput<'static>;
+pub type TilsonInputS = TilsonInput<'static>;
+pub type TradjemaInputS = TradjemaInput<'static>;
+pub type TrendFlexInputS = TrendFlexInput<'static>;
+pub type TrimaInputS = TrimaInput<'static>;
+pub type UmaInputS = UmaInput<'static>;
+pub type TrixInputS = TrixInput<'static>;
+pub type TsfInputS = TsfInput<'static>;
+pub type TsiInputS = TsiInput<'static>;
+pub type TtmSqueezeInputS = TtmSqueezeInput<'static>;
+pub type TtmTrendInputS = TtmTrendInput<'static>;
+pub type UiInputS = UiInput<'static>;
+pub type UltOscInputS = UltOscInput<'static>;
+pub type VarInputS = VarInput<'static>;
+pub type ViInputS = ViInput<'static>;
+pub type VidyaInputS = VidyaInput<'static>;
+pub type VlmaInputS = VlmaInput<'static>;
+pub type VolumeAdjustedMaInputS = VolumeAdjustedMaInput<'static>;
+pub type VoscInputS = VoscInput<'static>;
+pub type VossInputS = VossInput<'static>;
+pub type VpciInputS = VpciInput<'static>;
+pub type VptInputS = VptInput<'static>;
+pub type VpwmaInputS = VpwmaInput<'static>;
+pub type VwapInputS = VwapInput<'static>;
+pub type VwmaInputS = VwmaInput<'static>;
+pub type VwmacdInputS = VwmacdInput<'static>;
+pub type WadInputS = WadInput<'static>;
+pub type WavetrendInputS = WavetrendInput<'static>;
+pub type WclpriceInputS = WclpriceInput<'static>;
+pub type WildersInputS = WildersInput<'static>;
+pub type WillrInputS = WillrInput<'static>;
+pub type WmaInputS = WmaInput<'static>;
+pub type ZlemaInputS = ZlemaInput<'static>;
+pub type DeviationInputS = DeviationInput<'static>;
+
+pub type AsoInputS = AsoInput<'static>;
+
+pub type DvdiqqeInputS = DvdiqqeInput<'static>;
+
+pub type AvslInputS = AvslInput<'static>;
+pub type DmaInputS = DmaInput<'static>;
+pub type EhmaInputS = EhmaInput<'static>;
+pub type RangeFilterInputS = RangeFilterInput<'static>;
+pub type SamaInputS = SamaInput<'static>;
+pub type WtoInputS = WtoInput<'static>;
+pub type NamaInputS = NamaInput<'static>;
+pub type VamaInputS = VamaInputMv<'static>;
+pub type HalfTrendInputS = HalfTrendInput<'static>;
+pub type NetMyrsiInputS = NetMyrsiInput<'static>;
+pub type CciCycleInputS = CciCycleInput<'static>;
+pub type FvgTrailingStopInputS = FvgTrailingStopInput<'static>;
+pub type ReverseRsiInputS = ReverseRsiInput<'static>;
+pub type ZscoreInputS = ZscoreInput<'static>;
+pub type YangZhangVolatilityInputS = YangZhangVolatilityInput<'static>;
+
+macro_rules! impl_input_len {
+     ($($ty:ty),* $(,)?) => {
+         $(
+             impl InputLen for $ty {
+                 fn with_len(len: usize) -> Self {
+                     match len {
+                         10_000    => Self::with_default_candles(&*CANDLES_10K),
+                         100_000   => Self::with_default_candles(&*CANDLES_100K),
+                         1_000_000 => Self::with_default_candles(&*CANDLES_1M),
+                         _ => panic!("unsupported len {len}"),
+                     }
+                 }
+             }
+         )*
+     };
+ }
+
+fn pretty_len(len: usize) -> &'static str {
+    match len {
+        10_000 => "10k",
+        100_000 => "100k",
+        1_000_000 => "1M",
+        _ => panic!("unsupported len {len}"),
+    }
+}
+
+const SIZES: [usize; 3] = [10_000, 100_000, 1_000_000];
+
+#[inline(always)]
+fn label_kernel_supported(label: &str) -> bool {
+    if label.contains("avx512") {
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        {
+            return is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("fma");
+        }
+        #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+        {
+            return false;
+        }
+    }
+
+    if label.contains("avx2") {
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        {
+            return is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        }
+        #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+#[derive(Clone, Copy)]
+struct BenchConfig {
+    batch_all_sizes: bool,
+    measurement_ms: u64,
+    warmup_ms: u64,
+    sample_size: usize,
+    only_batch: bool,
+    batch_sizes_mask: u8,
+}
+
+fn env_bool(name: &str) -> bool {
+    let Ok(v) = std::env::var(name) else {
+        return false;
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => true,
+        _ => false,
+    }
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    let v = std::env::var(name).ok()?;
+    v.trim().replace('_', "").parse::<u64>().ok()
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    let v = std::env::var(name).ok()?;
+    v.trim().replace('_', "").parse::<usize>().ok()
+}
+
+fn env_batch_sizes_mask() -> u8 {
+    let Ok(v) = std::env::var("INDICATOR_BENCH_BATCH_SIZES") else {
+        return 0;
+    };
+    let mut mask = 0u8;
+    for tok in v
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty())
+    {
+        match tok.trim().to_ascii_lowercase().as_str() {
+            "10k" | "10000" => mask |= 1 << 0,
+            "100k" | "100000" => mask |= 1 << 1,
+            "1m" | "1000000" => mask |= 1 << 2,
+            _ => {}
+        }
+    }
+    mask
+}
+
+fn bench_config() -> BenchConfig {
+    static CFG: std::sync::OnceLock<BenchConfig> = std::sync::OnceLock::new();
+    *CFG.get_or_init(|| BenchConfig {
+        batch_all_sizes: env_bool("INDICATOR_BENCH_BATCH_ALL_SIZES"),
+        measurement_ms: env_u64("INDICATOR_BENCH_MEASUREMENT_MS").unwrap_or(900),
+        warmup_ms: env_u64("INDICATOR_BENCH_WARMUP_MS").unwrap_or(150),
+        sample_size: env_usize("INDICATOR_BENCH_SAMPLE_SIZE").unwrap_or(10),
+        only_batch: env_bool("INDICATOR_BENCH_ONLY_BATCH"),
+        batch_sizes_mask: env_batch_sizes_mask(),
+    })
+}
+
+fn bench_one<F, In>(
+    group: &mut BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    label: &str,
+    fun: F,
+    len: usize,
+    window: Option<u64>,
+) where
+    F: Fn(&In) -> anyhow::Result<()> + Copy + 'static,
+    In: InputLen + 'static,
+{
+    if !label_kernel_supported(label) {
+        return;
+    }
+
+    let cfg = bench_config();
+    let is_batch = label.contains("batch");
+    if cfg.only_batch && !is_batch {
+        return;
+    }
+    if is_batch {
+        if cfg.batch_sizes_mask != 0 {
+            let bit = match len {
+                10_000 => 1 << 0,
+                100_000 => 1 << 1,
+                1_000_000 => 1 << 2,
+                _ => 0,
+            };
+            if bit == 0 || (cfg.batch_sizes_mask & bit) == 0 {
+                return;
+            }
+        } else if !cfg.batch_all_sizes && len != SIZES[0] {
+            return;
+        }
+    }
+
+    let bytes_per_iter = match window {
+        Some(w) => (len as u64) * (w + 1) * std::mem::size_of::<f64>() as u64,
+        None => (len as u64) * std::mem::size_of::<f64>() as u64,
+    };
+    group.throughput(Throughput::Bytes(bytes_per_iter));
+
+    group.measurement_time(Duration::from_millis(cfg.measurement_ms));
+    group.warm_up_time(Duration::from_millis(cfg.warmup_ms));
+    group.sample_size(cfg.sample_size);
+
+    let input = In::with_len(len);
+    group.bench_with_input(
+        BenchmarkId::new(label, pretty_len(len)),
+        &input,
+        move |b, input| b.iter(|| fun(black_box(input)).unwrap()),
+    );
+}
+macro_rules! bench_scalars {
+    ( $( $fun:ident => $typ:ty ),* $(,)? ) => {
+        paste::paste! {
+            $(
+                fn [<bench_ $fun>](c: &mut Criterion) {
+                    let mut group = c.benchmark_group(stringify!($fun));
+                    for &len in &SIZES {
+                        bench_one::<_, $typ>(&mut group, "scalar", $fun, len, None);
+                    }
+                    group.finish();
+                }
+            )*
+            criterion_group!(benches_scalar, $( [<bench_ $fun>] ),*);
+        }
+    };
+}
+
+macro_rules! bench_variants {
+    ($root:ident => $typ:ty; $elements:expr; $( $vfun:ident ),+ $(,)? ) => {
+        paste::paste! {
+            fn [<bench_ $root>](c: &mut Criterion) {
+                let mut group = c.benchmark_group(stringify!($root));
+                for &len in &SIZES {
+                    $(
+                        bench_one::<_, $typ>(
+                            &mut group,
+                            stringify!($vfun),
+                            $vfun,
+                            len,
+                            $elements
+                        );
+                    )+
+                }
+                group.finish();
+            }
+            criterion_group!([<benches_ $root>], [<bench_ $root>]);
+        }
+    };
+}
+
+macro_rules! make_kernel_wrappers {
+     ( $stem:ident, $base:path, $ityp:ty ; $( $k:ident ),+ $(,)? ) => {
+         paste! {
+             $(
+                 #[inline(always)]
+                 fn [<$stem _ $k:lower>](input: &$ityp) -> anyhow::Result<()> {
+                     $base(input, Kernel::$k)
+                         .map(|_| ())
+                         .map_err(|e| anyhow!(e.to_string()))
+                 }
+             )+
+         }
+     };
+ }
+
+#[macro_export]
+macro_rules! bench_wrappers {
+      ( $( ($bench_fn:ident, $raw_fn:ident, $input_ty:ty) ),+ $(,)?) => {
+          $(
+              #[inline(always)]
+              fn $bench_fn(input: &$input_ty) -> anyhow::Result<()> {
+                  $raw_fn(input)
+                      .map(|_| ())
+                      .map_err(|e| anyhow::anyhow!(e.to_string()))
+              }
+          )+
+      };
+  }
+
+macro_rules! make_batch_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty ; $( $k:ident ),+ $(,)? ) => {
+        paste::paste! {
+            $(
+                #[inline(always)]
+                fn [<$stem _ $k:lower>](input: &$ityp) -> anyhow::Result<()> {
+                    let slice: &[f64] = input.as_ref();
+                    <$builder>::new()
+                        .kernel(Kernel::$k)
+                        .apply_slice(slice)?;
+                    Ok(())
+                }
+            )+
+        }
+    };
+}
+
+macro_rules! make_hl_batch_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $data:path ) => {
+        make_hl_batch_wrappers!($stem, $builder, $ityp, $data, apply_slices);
+    };
+    ( $stem:ident, $builder:path, $ityp:ty, $data:path, $apply:ident ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let (high, low) = match &input.data {
+                    $data::Candles { candles } => (&candles.high[..], &candles.low[..]),
+                    $data::Slices { high, low } => (*high, *low),
+                };
+                <$builder>::new()
+                    .kernel(Kernel::ScalarBatch)
+                    .$apply(high, low)
+                    .map(|_| ())
+                    .map_err(|e| anyhow!(e.to_string()))
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (high, low) = match &input.data {
+                    $data::Candles { candles } => (&candles.high[..], &candles.low[..]),
+                    $data::Slices { high, low } => (*high, *low),
+                };
+                <$builder>::new()
+                    .kernel(Kernel::Avx2Batch)
+                    .$apply(high, low)
+                    .map(|_| ())
+                    .map_err(|e| anyhow!(e.to_string()))
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (high, low) = match &input.data {
+                    $data::Candles { candles } => (&candles.high[..], &candles.low[..]),
+                    $data::Slices { high, low } => (*high, *low),
+                };
+                <$builder>::new()
+                    .kernel(Kernel::Avx512Batch)
+                    .$apply(high, low)
+                    .map(|_| ())
+                    .map_err(|e| anyhow!(e.to_string()))
+            }
+        }
+    };
+}
+
+macro_rules! make_hlc_batch_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $data:path ) => {
+        make_hlc_batch_wrappers!($stem, $builder, $ityp, $data, apply_slices);
+    };
+    ( $stem:ident, $builder:path, $ityp:ty, $data:path, $apply:ident ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let (high, low, close) = match &input.data {
+                    $data::Candles { candles } => (&candles.high[..], &candles.low[..], &candles.close[..]),
+                    $data::Slices { high, low, close } => (*high, *low, *close),
+                };
+                <$builder>::new()
+                    .kernel(Kernel::ScalarBatch)
+                    .$apply(high, low, close)
+                    .map(|_| ())
+                    .map_err(|e| anyhow!(e.to_string()))
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (high, low, close) = match &input.data {
+                    $data::Candles { candles } => (&candles.high[..], &candles.low[..], &candles.close[..]),
+                    $data::Slices { high, low, close } => (*high, *low, *close),
+                };
+                <$builder>::new()
+                    .kernel(Kernel::Avx2Batch)
+                    .$apply(high, low, close)
+                    .map(|_| ())
+                    .map_err(|e| anyhow!(e.to_string()))
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (high, low, close) = match &input.data {
+                    $data::Candles { candles } => (&candles.high[..], &candles.low[..], &candles.close[..]),
+                    $data::Slices { high, low, close } => (*high, *low, *close),
+                };
+                <$builder>::new()
+                    .kernel(Kernel::Avx512Batch)
+                    .$apply(high, low, close)
+                    .map(|_| ())
+                    .map_err(|e| anyhow!(e.to_string()))
+            }
+        }
+    };
+}
+
+macro_rules! make_ohlc_batch_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $data:path ) => {
+        make_ohlc_batch_wrappers!($stem, $builder, $ityp, $data, apply_slices);
+    };
+    ( $stem:ident, $builder:path, $ityp:ty, $data:path, $apply:ident ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let (high, low, close, open) = match input.as_ref() {
+                    $data::Candles { candles } => (
+                        &candles.high[..],
+                        &candles.low[..],
+                        &candles.close[..],
+                        &candles.open[..],
+                    ),
+                    $data::Slices { high, low, close, open } => (*high, *low, *close, *open),
+                };
+                <$builder>::new()
+                    .kernel(Kernel::ScalarBatch)
+                    .$apply(high, low, close, open)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (high, low, close, open) = match input.as_ref() {
+                    $data::Candles { candles } => (
+                        &candles.high[..],
+                        &candles.low[..],
+                        &candles.close[..],
+                        &candles.open[..],
+                    ),
+                    $data::Slices { high, low, close, open } => (*high, *low, *close, *open),
+                };
+                <$builder>::new()
+                    .kernel(Kernel::Avx2Batch)
+                    .$apply(high, low, close, open)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (high, low, close, open) = match input.as_ref() {
+                    $data::Candles { candles } => (
+                        &candles.high[..],
+                        &candles.low[..],
+                        &candles.close[..],
+                        &candles.open[..],
+                    ),
+                    $data::Slices { high, low, close, open } => (*high, *low, *close, *open),
+                };
+                <$builder>::new()
+                    .kernel(Kernel::Avx512Batch)
+                    .$apply(high, low, close, open)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! make_ohlcv_batch_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $data:path ) => {
+        make_ohlcv_batch_wrappers!($stem, $builder, $ityp, $data, apply_slices);
+    };
+    ( $stem:ident, $builder:path, $ityp:ty, $data:path, $apply:ident ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let (high, low, close, volume) = match &input.data {
+                    $data::Candles { candles } => (
+                        &candles.high[..],
+                        &candles.low[..],
+                        &candles.close[..],
+                        &candles.volume[..],
+                    ),
+                    $data::Slices { high, low, close, volume } => (*high, *low, *close, *volume),
+                };
+                <$builder>::new()
+                    .kernel(Kernel::ScalarBatch)
+                    .$apply(high, low, close, volume)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (high, low, close, volume) = match &input.data {
+                    $data::Candles { candles } => (
+                        &candles.high[..],
+                        &candles.low[..],
+                        &candles.close[..],
+                        &candles.volume[..],
+                    ),
+                    $data::Slices { high, low, close, volume } => (*high, *low, *close, *volume),
+                };
+                <$builder>::new()
+                    .kernel(Kernel::Avx2Batch)
+                    .$apply(high, low, close, volume)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (high, low, close, volume) = match &input.data {
+                    $data::Candles { candles } => (
+                        &candles.high[..],
+                        &candles.low[..],
+                        &candles.close[..],
+                        &candles.volume[..],
+                    ),
+                    $data::Slices { high, low, close, volume } => (*high, *low, *close, *volume),
+                };
+                <$builder>::new()
+                    .kernel(Kernel::Avx512Batch)
+                    .$apply(high, low, close, volume)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! make_pair_from_input_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $pair_expr:expr ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b) = $pair_expr(input)?;
+                <$builder>::new().kernel(Kernel::ScalarBatch).apply_slices(a, b)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b) = $pair_expr(input)?;
+                <$builder>::new().kernel(Kernel::Avx2Batch).apply_slices(a, b)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b) = $pair_expr(input)?;
+                <$builder>::new()
+                    .kernel(Kernel::Avx512Batch)
+                    .apply_slices(a, b)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! make_pair_with_builder_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $pair_expr:expr, $cfg:expr ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b) = $pair_expr(input)?;
+                let builder = { let tmp = <$builder>::new().kernel(Kernel::ScalarBatch); ($cfg)(tmp) };
+                builder.apply_slices(a, b)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b) = $pair_expr(input)?;
+                let builder = { let tmp = <$builder>::new().kernel(Kernel::Avx2Batch); ($cfg)(tmp) };
+                builder.apply_slices(a, b)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b) = $pair_expr(input)?;
+                let builder = { let tmp = <$builder>::new().kernel(Kernel::Avx512Batch); ($cfg)(tmp) };
+                builder.apply_slices(a, b)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! make_triple_with_builder_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $extract:expr, $cfg:expr ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b, c) = $extract(input)?;
+                let builder = { let tmp = <$builder>::new().kernel(Kernel::ScalarBatch); ($cfg)(tmp) };
+                builder.apply_slices(a, b, c)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b, c) = $extract(input)?;
+                let builder = { let tmp = <$builder>::new().kernel(Kernel::Avx2Batch); ($cfg)(tmp) };
+                builder.apply_slices(a, b, c)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b, c) = $extract(input)?;
+                let builder = { let tmp = <$builder>::new().kernel(Kernel::Avx512Batch); ($cfg)(tmp) };
+                builder.apply_slices(a, b, c)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! make_triple_with_builder_and_method_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $extract:expr, $cfg:expr, $method:ident ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b, c) = $extract(input)?;
+                let builder = { let tmp = <$builder>::new().kernel(Kernel::ScalarBatch); ($cfg)(tmp) };
+                builder.$method(a, b, c)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b, c) = $extract(input)?;
+                let builder = { let tmp = <$builder>::new().kernel(Kernel::Avx2Batch); ($cfg)(tmp) };
+                builder.$method(a, b, c)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b, c) = $extract(input)?;
+                let builder = { let tmp = <$builder>::new().kernel(Kernel::Avx512Batch); ($cfg)(tmp) };
+                builder.$method(a, b, c)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! make_triple_with_arg_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $extract:expr, $arg:expr, $apply:ident ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b, c) = $extract(input)?;
+                let arg = $arg;
+                <$builder>::new().kernel(Kernel::ScalarBatch).$apply(a, b, c, &arg)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b, c) = $extract(input)?;
+                let arg = $arg;
+                <$builder>::new().kernel(Kernel::Avx2Batch).$apply(a, b, c, &arg)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a, b, c) = $extract(input)?;
+                let arg = $arg;
+                <$builder>::new().kernel(Kernel::Avx512Batch).$apply(a, b, c, &arg)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! make_quad_with_method_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $extract:expr, $apply:ident ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a,b,c,d) = $extract(input)?;
+                <$builder>::new().kernel(Kernel::ScalarBatch).$apply(a,b,c,d)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a,b,c,d) = $extract(input)?;
+                <$builder>::new().kernel(Kernel::Avx2Batch).$apply(a,b,c,d)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a,b,c,d) = $extract(input)?;
+                <$builder>::new().kernel(Kernel::Avx512Batch).$apply(a,b,c,d)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! make_single_apply_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $apply:ident ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let data: &[f64] = input.as_ref();
+                <$builder>::new().kernel(Kernel::ScalarBatch).$apply(data)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let data: &[f64] = input.as_ref();
+                <$builder>::new().kernel(Kernel::Avx2Batch).$apply(data)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let data: &[f64] = input.as_ref();
+                <$builder>::new().kernel(Kernel::Avx512Batch).$apply(data)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! make_single_slice_with_arg_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $arg:expr, $apply:ident ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let slice: &[f64] = input.as_ref();
+                <$builder>::new().kernel(Kernel::ScalarBatch).$apply(slice, $arg)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let slice: &[f64] = input.as_ref();
+                <$builder>::new().kernel(Kernel::Avx2Batch).$apply(slice, $arg)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let slice: &[f64] = input.as_ref();
+                <$builder>::new().kernel(Kernel::Avx512Batch).$apply(slice, $arg)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! make_quad_from_input_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $data:path, $extract:expr ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a,b,c,d) = $extract(input)?;
+                <$builder>::new().kernel(Kernel::ScalarBatch).apply_slices(a,b,c,d)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a,b,c,d) = $extract(input)?;
+                <$builder>::new().kernel(Kernel::Avx2Batch).apply_slices(a,b,c,d)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a,b,c,d) = $extract(input)?;
+                <$builder>::new().kernel(Kernel::Avx512Batch).apply_slices(a,b,c,d)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! make_triple_from_input_wrappers {
+    ( $stem:ident, $builder:path, $ityp:ty, $extract:expr ) => {
+        paste::paste! {
+            #[inline(always)]
+            fn [<$stem _scalarbatch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a,b,c) = $extract(input)?;
+                <$builder>::new().kernel(Kernel::ScalarBatch).apply_slices(a,b,c)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx2batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a,b,c) = $extract(input)?;
+                <$builder>::new().kernel(Kernel::Avx2Batch).apply_slices(a,b,c)?;
+                Ok(())
+            }
+            #[inline(always)]
+            fn [<$stem _avx512batch>](input: &$ityp) -> anyhow::Result<()> {
+                let (a,b,c) = $extract(input)?;
+                <$builder>::new().kernel(Kernel::Avx512Batch).apply_slices(a,b,c)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+impl InputLen for MaczInputS {
+    fn with_len(len: usize) -> Self {
+        match len {
+            10_000 => MaczInput::with_default_candles(&*CANDLES_10K),
+            100_000 => MaczInput::with_default_candles(&*CANDLES_100K),
+            1_000_000 => MaczInput::with_default_candles(&*CANDLES_1M),
+            _ => panic!("unsupported len {len}"),
+        }
+    }
+}
+
+impl InputLen for RsmkInputS {
+    fn with_len(len: usize) -> Self {
+        match len {
+            10_000 => RsmkInput::with_default_candles(&*CANDLES_10K, &*CANDLES_10K),
+            100_000 => RsmkInput::with_default_candles(&*CANDLES_100K, &*CANDLES_100K),
+            1_000_000 => RsmkInput::with_default_candles(&*CANDLES_1M, &*CANDLES_1M),
+            _ => panic!("unsupported len {len}"),
+        }
+    }
+}
+
+impl InputLen for VwmaInputS {
+    fn with_len(len: usize) -> Self {
+        match len {
+            10_000 => VwmaInput::from_candles(&*CANDLES_10K, "close", VwmaParams::default()),
+            100_000 => VwmaInput::from_candles(&*CANDLES_100K, "close", VwmaParams::default()),
+            1_000_000 => VwmaInput::from_candles(&*CANDLES_1M, "close", VwmaParams::default()),
+            _ => panic!("unsupported len {len}"),
+        }
+    }
+}
+
+impl InputLen for HalfCausalEstimatorInputS {
+    fn with_len(len: usize) -> Self {
+        let candles = match len {
+            10_000 => &*CANDLES_10K,
+            100_000 => &*CANDLES_100K,
+            1_000_000 => &*CANDLES_1M,
+            _ => panic!("unsupported len {len}"),
+        };
+        HalfCausalEstimatorInput::from_slice(
+            &candles.volume,
+            HalfCausalEstimatorParams {
+                slots_per_day: Some(60),
+                ..HalfCausalEstimatorParams::default()
+            },
+        )
+    }
+}
+
+impl_input_len!(
+    AsoInputS,
+    AcoscInputS,
+    AdInputS,
+    AdoscInputS,
+    AdxInputS,
+    AdxrInputS,
+    AlligatorInputS,
+    AlmaInputS,
+    AlphaTrendInputS,
+    AoInputS,
+    ApoInputS,
+    AroonInputS,
+    AroonOscInputS,
+    AtrInputS,
+    BandPassInputS,
+    BollingerBandsInputS,
+    BollingerBandsWidthInputS,
+    BopInputS,
+    CciInputS,
+    CfoInputS,
+    CgInputS,
+    ChandeInputS,
+    ChandelierExitInputS,
+    ChopInputS,
+    CkspInputS,
+    CmoInputS,
+    CoppockInputS,
+    CoraWaveInputS,
+    CorrelHlInputS,
+    CorrelationCycleInputS,
+    CviInputS,
+    CwmaInputS,
+    DamianiVolatmeterInputS,
+    DecOscInputS,
+    DecyclerInputS,
+    DemandIndexInputS,
+    DemaInputS,
+    DevStopInputS,
+    DiInputS,
+    DmInputS,
+    DonchianInputS,
+    DonchianChannelWidthInputS,
+    DpoInputS,
+    DtiInputS,
+    DxInputS,
+    DynamicMomentumIndexInputS,
+    EdcfInputS,
+    EhlersAdaptiveCgInputS,
+    EhlersAdaptiveCyberCycleInputS,
+    EhlersAutocorrelationPeriodogramInputS,
+    EhlersDataSamplingRelativeStrengthIndicatorInputS,
+    EhlersDetrendingFilterInputS,
+    EhlersFmDemodulatorInputS,
+    EhlersLinearExtrapolationPredictorInputS,
+    EhlersSimpleCycleIndicatorInputS,
+    EhlersSmoothedAdaptiveMomentumInputS,
+    EfiInputS,
+    EhlersEcemaInputS,
+    EhlersITrendInputS,
+    EhlersPmaInputS,
+    EhlersKamaInputS,
+    EhlersUndersampledDoubleMovingAverageInputS,
+    ElasticVolumeWeightedMovingAverageInputS,
+    EmaDeviationCorrectedT3InputS,
+    EmaInputS,
+    EmdInputS,
+    EmdTrendInputS,
+    EmvInputS,
+    EpmaInputS,
+    ErInputS,
+    EriInputS,
+    EvasiveSuperTrendInputS,
+    EwmaVolatilityInputS,
+    ExponentialTrendInputS,
+    FibonacciEntryBandsInputS,
+    FibonacciTrailingStopInputS,
+    FisherInputS,
+    ForwardBackwardExponentialOscillatorInputS,
+    FoscInputS,
+    FractalDimensionIndexInputS,
+    FvgPositioningAverageInputS,
+    FramaInputS,
+    FwmaInputS,
+    GarmanKlassVolatilityInputS,
+    GatorOscInputS,
+    GeometricBiasOscillatorInputS,
+    GmmaOscillatorInputS,
+    GopalakrishnanRangeIndexInputS,
+    GroverLlorensCycleOscillatorInputS,
+    GaussianInputS,
+    HighPassInputS,
+    HighPass2InputS,
+    HmaInputS,
+    HwmaInputS,
+    IftRsiInputS,
+    JmaInputS,
+    JsaInputS,
+    KamaInputS,
+    KaufmanstopInputS,
+    KdjInputS,
+    KeltnerInputS,
+    KstInputS,
+    KurtosisInputS,
+    KvoInputS,
+    LinearregAngleInputS,
+    LinearRegInterceptInputS,
+    LinearRegSlopeInputS,
+    LinRegInputS,
+    LpcInputS,
+    LrsiInputS,
+    MaaqInputS,
+    MabInputS,
+    MacdInputS,
+    MamaInputS,
+    MarketefiInputS,
+    MassInputS,
+    MeanAdInputS,
+    MediumAdInputS,
+    MedpriceInputS,
+    MfiInputS,
+    MidpointInputS,
+    MidpriceInputS,
+    MinmaxInputS,
+    MomInputS,
+    MswInputS,
+    MwdxInputS,
+    NatrInputS,
+    NmaInputS,
+    NviInputS,
+    ObvInputS,
+    OttoInputS,
+    OttInputS,
+    PatternRecognitionInputS,
+    PercentileNearestRankInputS,
+    PfeInputS,
+    PivotInputS,
+    PmaInputS,
+    PpoInputS,
+    PrbInputS,
+    PviInputS,
+    PwmaInputS,
+    QstickInputS,
+    ReflexInputS,
+    RocInputS,
+    RocpInputS,
+    RocrInputS,
+    RsiInputS,
+    RsxInputS,
+    RviInputS,
+    SafeZoneStopInputS,
+    SarInputS,
+    SinWmaInputS,
+    SmaInputS,
+    SmmaInputS,
+    SqueezeMomentumInputS,
+    SqwmaInputS,
+    SrsiInputS,
+    SrwmaInputS,
+    StcInputS,
+    StdDevInputS,
+    StochInputS,
+    StochfInputS,
+    SuperSmootherInputS,
+    SupertrendInputS,
+    SuperSmoother3PoleInputS,
+    SwmaInputS,
+    TemaInputS,
+    TilsonInputS,
+    TradjemaInputS,
+    TrendFlexInputS,
+    TrimaInputS,
+    TrixInputS,
+    TsfInputS,
+    TsiInputS,
+    TtmTrendInputS,
+    UiInputS,
+    UltOscInputS,
+    UmaInputS,
+    VarInputS,
+    ViInputS,
+    VidyaInputS,
+    VlmaInputS,
+    VoscInputS,
+    VossInputS,
+    VpciInputS,
+    VptInputS,
+    VpwmaInputS,
+    VwapInputS,
+    VwmacdInputS,
+    WadInputS,
+    WavetrendInputS,
+    WclpriceInputS,
+    WildersInputS,
+    WillrInputS,
+    WmaInputS,
+    ZlemaInputS,
+    ZscoreInputS,
+    YangZhangVolatilityInputS,
+    AvslInputS,
+    DmaInputS,
+    EhmaInputS,
+    RangeFilterInputS,
+    SamaInputS,
+    WtoInputS,
+    NamaInputS,
+    ModGodModeInputS,
+    NweInputS,
+    QqeInputS,
+    TtmSqueezeInputS,
+    BuffAveragesInputS,
+    VolumeAdjustedMaInputS,
+    NetMyrsiInputS,
+    CciCycleInputS,
+    FvgTrailingStopInputS,
+    HalfTrendInputS,
+    ReverseRsiInputS,
+    VamaInputS
+);
+
+bench_wrappers! {
+    (acosc_bench, acosc_raw, AcoscInputS),
+    (ad_bench, ad_raw, AdInputS),
+    (adosc_bench, adosc_raw, AdoscInputS),
+    (adx_bench, adx_raw, AdxInputS),
+    (adxr_bench, adxr_raw, AdxrInputS),
+    (alligator_bench, alligator_raw, AlligatorInputS),
+    (alphatrend_bench, alphatrend_raw, AlphaTrendInputS),
+    (ao_bench, ao_raw, AoInputS),
+    (apo_bench, apo_raw, ApoInputS),
+    (aroon_bench, aroon_raw, AroonInputS),
+    (aroon_osc_bench, aroon_osc_raw, AroonOscInputS),
+    (atr_bench, atr_raw, AtrInputS),
+    (bandpass_bench, bandpass_raw, BandPassInputS),
+    (bollinger_bands_bench, bollinger_bands_raw, BollingerBandsInputS),
+    (bollinger_bands_width_bench, bollinger_bands_width_raw, BollingerBandsWidthInputS),
+    (bop_bench, bop_raw, BopInputS),
+    (cci_bench, cci_raw, CciInputS),
+    (cfo_bench, cfo_raw, CfoInputS),
+    (cg_bench, cg_raw, CgInputS),
+    (chande_bench, chande_raw, ChandeInputS),
+    (chop_bench, chop_raw, ChopInputS),
+    (cksp_bench, cksp_raw, CkspInputS),
+    (cmo_bench, cmo_raw, CmoInputS),
+    (coppock_bench, coppock_raw, CoppockInputS),
+    (cora_wave_bench, cora_wave_raw, CoraWaveInputS),
+    (correl_hl_bench, correl_hl_raw, CorrelHlInputS),
+    (correlation_cycle_bench, correlation_cycle_raw, CorrelationCycleInputS),
+    (cvi_bench, cvi_raw, CviInputS),
+    (damiani_volatmeter_bench, damiani_volatmeter_raw, DamianiVolatmeterInputS),
+    (dec_osc_bench, dec_osc_raw, DecOscInputS),
+    (decycler_bench, decycler_raw, DecyclerInputS),
+    (devstop_bench, devstop_raw, DevStopInputS),
+    (di_bench, di_raw, DiInputS),
+    (dm_bench, dm_raw, DmInputS),
+    (donchian_bench, donchian_raw, DonchianInputS),
+    (
+        donchian_channel_width_bench,
+        donchian_channel_width_raw,
+        DonchianChannelWidthInputS
+    ),
+    (dpo_bench, dpo_raw, DpoInputS),
+    (dti_bench, dti_raw, DtiInputS),
+    (dx_bench, dx_raw, DxInputS),
+    (
+        dynamic_momentum_index_bench,
+        dynamic_momentum_index_raw,
+        DynamicMomentumIndexInputS
+    ),
+    (efi_bench, efi_raw, EfiInputS),
+    (
+        ehlers_adaptive_cg_bench,
+        ehlers_adaptive_cg_raw,
+        EhlersAdaptiveCgInputS
+    ),
+    (
+        ehlers_adaptive_cyber_cycle_bench,
+        ehlers_adaptive_cyber_cycle_raw,
+        EhlersAdaptiveCyberCycleInputS
+    ),
+    (
+        ehlers_autocorrelation_periodogram_bench,
+        ehlers_autocorrelation_periodogram_raw,
+        EhlersAutocorrelationPeriodogramInputS
+    ),
+    (
+        ehlers_data_sampling_relative_strength_indicator_bench,
+        ehlers_data_sampling_relative_strength_indicator_raw,
+        EhlersDataSamplingRelativeStrengthIndicatorInputS
+    ),
+    (
+        ehlers_detrending_filter_bench,
+        ehlers_detrending_filter_raw,
+        EhlersDetrendingFilterInputS
+    ),
+    (
+        ehlers_fm_demodulator_bench,
+        ehlers_fm_demodulator_raw,
+        EhlersFmDemodulatorInputS
+    ),
+    (
+        ehlers_linear_extrapolation_predictor_bench,
+        ehlers_linear_extrapolation_predictor_raw,
+        EhlersLinearExtrapolationPredictorInputS
+    ),
+    (
+        ehlers_simple_cycle_indicator_bench,
+        ehlers_simple_cycle_indicator_raw,
+        EhlersSimpleCycleIndicatorInputS
+    ),
+    (
+        ehlers_smoothed_adaptive_momentum_bench,
+        ehlers_smoothed_adaptive_momentum_raw,
+        EhlersSmoothedAdaptiveMomentumInputS
+    ),
+    (ehlers_ecema_bench, ehlers_ecema_raw, EhlersEcemaInputS),
+    (ehlers_kama_bench, ehlers_kama_raw, EhlersKamaInputS),
+    (ehlers_pma_bench, ehlers_pma_raw, EhlersPmaInputS),
+    (
+        ehlers_undersampled_double_moving_average_bench,
+        ehlers_undersampled_double_moving_average_raw,
+        EhlersUndersampledDoubleMovingAverageInputS
+    ),
+    (
+        elastic_volume_weighted_moving_average_bench,
+        elastic_volume_weighted_moving_average_raw,
+        ElasticVolumeWeightedMovingAverageInputS
+    ),
+    (
+        ema_deviation_corrected_t3_bench,
+        ema_deviation_corrected_t3_raw,
+        EmaDeviationCorrectedT3InputS
+    ),
+    (emd_bench, emd_raw, EmdInputS),
+    (emd_trend_bench, emd_trend_raw, EmdTrendInputS),
+    (emv_bench, emv_raw, EmvInputS),
+    (epma_bench, epma_raw, EpmaInputS),
+    (er_bench, er_raw, ErInputS),
+    (eri_bench, eri_raw, EriInputS),
+    (
+        evasive_supertrend_bench,
+        evasive_supertrend_raw,
+        EvasiveSuperTrendInputS
+    ),
+    (
+        ewma_volatility_bench,
+        ewma_volatility_raw,
+        EwmaVolatilityInputS
+    ),
+    (
+        exponential_trend_bench,
+        exponential_trend_raw,
+        ExponentialTrendInputS
+    ),
+    (
+        fibonacci_entry_bands_bench,
+        fibonacci_entry_bands_raw,
+        FibonacciEntryBandsInputS
+    ),
+    (
+        fibonacci_trailing_stop_bench,
+        fibonacci_trailing_stop_raw,
+        FibonacciTrailingStopInputS
+    ),
+    (ehma_bench, ehma_raw, EhmaInputS),
+    (ema_bench, ema_raw, EmaInputS),
+    (fisher_bench, fisher_raw, FisherInputS),
+    (
+        forward_backward_exponential_oscillator_bench,
+        forward_backward_exponential_oscillator_raw,
+        ForwardBackwardExponentialOscillatorInputS
+    ),
+    (fosc_bench, fosc_raw, FoscInputS),
+    (
+        fractal_dimension_index_bench,
+        fractal_dimension_index_raw,
+        FractalDimensionIndexInputS
+    ),
+    (fwma_bench, fwma_raw, FwmaInputS),
+    (
+        garman_klass_volatility_bench,
+        garman_klass_volatility_raw,
+        GarmanKlassVolatilityInputS
+    ),
+    (gatorosc_bench, gatorosc_raw, GatorOscInputS),
+    (gaussian_bench, gaussian_raw, GaussianInputS),
+    (
+        geometric_bias_oscillator_bench,
+        geometric_bias_oscillator_raw,
+        GeometricBiasOscillatorInputS
+    ),
+    (
+        gmma_oscillator_bench,
+        gmma_oscillator_raw,
+        GmmaOscillatorInputS
+    ),
+    (
+        gopalakrishnan_range_index_bench,
+        gopalakrishnan_range_index_raw,
+        GopalakrishnanRangeIndexInputS
+    ),
+    (
+        grover_llorens_cycle_oscillator_bench,
+        grover_llorens_cycle_oscillator_raw,
+        GroverLlorensCycleOscillatorInputS
+    ),
+    (
+        half_causal_estimator_bench,
+        half_causal_estimator_raw,
+        HalfCausalEstimatorInputS
+    ),
+    (ift_rsi_bench, ift_rsi_raw, IftRsiInputS),
+    (kaufmanstop_bench, kaufmanstop_raw, KaufmanstopInputS),
+    (kdj_bench, kdj_raw, KdjInputS),
+    (keltner_bench, keltner_raw, KeltnerInputS),
+    (kst_bench, kst_raw, KstInputS),
+    (kurtosis_bench, kurtosis_raw, KurtosisInputS),
+    (kvo_bench, kvo_raw, KvoInputS),
+    (linearreg_angle_bench, linearreg_angle_raw, LinearregAngleInputS),
+    (linearreg_intercept_bench, linearreg_intercept_raw, LinearRegInterceptInputS),
+    (linearreg_slope_bench, linearreg_slope_raw, LinearRegSlopeInputS),
+    (lpc_bench, lpc_raw, LpcInputS),
+    (lrsi_bench, lrsi_raw, LrsiInputS),
+    (mab_bench, mab_raw, MabInputS),
+    (macd_bench, macd_raw, MacdInputS),
+    (marketfi_bench, marketfi_raw, MarketefiInputS),
+    (mass_bench, mass_raw, MassInputS),
+    (mean_ad_bench, mean_ad_raw, MeanAdInputS),
+    (medium_ad_bench, medium_ad_raw, MediumAdInputS),
+    (medprice_bench, medprice_raw, MedpriceInputS),
+    (mfi_bench, mfi_raw, MfiInputS),
+    (midpoint_bench, midpoint_raw, MidpointInputS),
+    (midprice_bench, midprice_raw, MidpriceInputS),
+    (minmax_bench, minmax_raw, MinmaxInputS),
+    (mom_bench, mom_raw, MomInputS),
+    (msw_bench, msw_raw, MswInputS),
+    (natr_bench, natr_raw, NatrInputS),
+    (nvi_bench, nvi_raw, NviInputS),
+    (obv_bench, obv_raw, ObvInputS),
+    (ott_bench, ott_raw, OttInputS),
+    (otto_bench, otto_raw, OttoInputS),
+    (pattern_recognition_bench, pattern_recognition_raw, PatternRecognitionInputS),
+    (pfe_bench, pfe_raw, PfeInputS),
+    (pivot_bench, pivot_raw, PivotInputS),
+    (pma_bench, pma_raw, PmaInputS),
+    (ppo_bench, ppo_raw, PpoInputS),
+    (prb_bench, prb_raw, PrbInputS),
+    (pvi_bench, pvi_raw, PviInputS),
+    (qstick_bench, qstick_raw, QstickInputS),
+    (roc_bench, roc_raw, RocInputS),
+    (rocp_bench, rocp_raw, RocpInputS),
+    (rocr_bench, rocr_raw, RocrInputS),
+    (rsi_bench, rsi_raw, RsiInputS),
+    (rsmk_bench, rsmk_raw, RsmkInputS),
+    (rsx_bench, rsx_raw, RsxInputS),
+    (rvi_bench, rvi_raw, RviInputS),
+    (safezonestop_bench, safezonestop_raw, SafeZoneStopInputS),
+    (sar_bench, sar_raw, SarInputS),
+    (squeeze_momentum_bench, squeeze_momentum_raw, SqueezeMomentumInputS),
+    (srsi_bench, srsi_raw, SrsiInputS),
+    (stc_bench, stc_raw, StcInputS),
+    (stddev_bench, stddev_raw, StdDevInputS),
+    (stoch_bench, stoch_raw, StochInputS),
+    (stochf_bench, stochf_raw, StochfInputS),
+    (supertrend_bench, supertrend_raw, SupertrendInputS),
+    (tsf_bench, tsf_raw, TsfInputS),
+    (tsi_bench, tsi_raw, TsiInputS),
+    (ttm_trend_bench, ttm_trend_raw, TtmTrendInputS),
+    (ttm_squeeze_bench, ttm_squeeze_raw, TtmSqueezeInputS),
+    (ui_bench, ui_raw, UiInputS),
+    (ultosc_bench, ultosc_raw, UltOscInputS),
+    (var_bench, var_raw, VarInputS),
+    (vi_bench, vi_raw, ViInputS),
+    (vosc_bench, vosc_raw, VoscInputS),
+    (voss_bench, voss_raw, VossInputS),
+    (vpci_bench, vpci_raw, VpciInputS),
+    (vpt_bench, vpt_raw, VptInputS),
+    (vwap_bench, vwap_raw, VwapInputS),
+    (vwmacd_bench, vwmacd_raw, VwmacdInputS),
+    (wad_bench, wad_raw, WadInputS),
+    (wavetrend_bench, wavetrend_raw, WavetrendInputS),
+    (wclprice_bench, wclprice_raw, WclpriceInputS),
+    (willr_bench, willr_raw, WillrInputS),
+    (zscore_bench, zscore_raw, ZscoreInputS),
+    (
+        yang_zhang_volatility_bench,
+        yang_zhang_volatility_raw,
+        YangZhangVolatilityInputS
+    ),
+
+    (mod_god_mode_bench, mod_god_mode_raw, ModGodModeInputS),
+    (nadaraya_watson_envelope_bench, nadaraya_watson_envelope_raw, NweInputS),
+    (qqe_bench, qqe_raw, QqeInputS),
+    (buff_averages_bench, buff_averages, BuffAveragesInputS),
+    (volume_adjusted_ma_bench, VolumeAdjustedMa, VolumeAdjustedMaInputS),
+    (net_myrsi_bench, net_myrsi, NetMyrsiInputS),
+    (cci_cycle_bench, cci_cycle, CciCycleInputS),
+    (
+        fvg_positioning_average_bench,
+        fvg_positioning_average_raw,
+        FvgPositioningAverageInputS
+    ),
+    (fvg_trailing_stop_bench, fvg_trailing_stop, FvgTrailingStopInputS),
+    (halftrend_bench, halftrend, HalfTrendInputS),
+    (reverse_rsi_bench, reverse_rsi, ReverseRsiInputS),
+    (demand_index_bench, demand_index_raw, DemandIndexInputS),
+    (vama_bench, vama, VamaInputS),
+}
+
+bench_scalars!(
+    acosc_bench => AcoscInputS,
+    ad_bench    => AdInputS,
+    adosc_bench => AdoscInputS,
+    adx_bench   => AdxInputS,
+    adxr_bench  => AdxrInputS,
+    alligator_bench => AlligatorInputS,
+    alphatrend_bench => AlphaTrendInputS,
+
+    ao_bench   => AoInputS,
+    apo_bench  => ApoInputS,
+
+    aroon_bench        => AroonInputS,
+    aroon_osc_bench    => AroonOscInputS,
+    atr_bench          => AtrInputS,
+    bandpass_bench     => BandPassInputS,
+
+    bollinger_bands_bench => BollingerBandsInputS,
+    bollinger_bands_width_bench => BollingerBandsWidthInputS,
+    bop_bench         => BopInputS,
+    cci_bench         => CciInputS,
+    cfo_bench         => CfoInputS,
+    cg_bench          => CgInputS,
+    chande_bench      => ChandeInputS,
+    chop_bench        => ChopInputS,
+    cksp_bench        => CkspInputS,
+    cmo_bench         => CmoInputS,
+    coppock_bench     => CoppockInputS,
+    cora_wave_bench   => CoraWaveInputS,
+    correl_hl_bench   => CorrelHlInputS,
+    correlation_cycle_bench => CorrelationCycleInputS,
+    cvi_bench         => CviInputS,
+    damiani_volatmeter_bench => DamianiVolatmeterInputS,
+    dec_osc_bench     => DecOscInputS,
+    decycler_bench    => DecyclerInputS,
+    demand_index_bench => DemandIndexInputS,
+    devstop_bench     => DevStopInputS,
+    di_bench          => DiInputS,
+    dm_bench          => DmInputS,
+    donchian_bench    => DonchianInputS,
+    donchian_channel_width_bench => DonchianChannelWidthInputS,
+    dpo_bench         => DpoInputS,
+    dti_bench         => DtiInputS,
+    dx_bench          => DxInputS,
+    dynamic_momentum_index_bench => DynamicMomentumIndexInputS,
+    efi_bench         => EfiInputS,
+    ehlers_adaptive_cg_bench => EhlersAdaptiveCgInputS,
+    ehlers_adaptive_cyber_cycle_bench => EhlersAdaptiveCyberCycleInputS,
+    ehlers_autocorrelation_periodogram_bench => EhlersAutocorrelationPeriodogramInputS,
+    ehlers_data_sampling_relative_strength_indicator_bench => EhlersDataSamplingRelativeStrengthIndicatorInputS,
+    ehlers_detrending_filter_bench => EhlersDetrendingFilterInputS,
+    ehlers_fm_demodulator_bench => EhlersFmDemodulatorInputS,
+    ehlers_linear_extrapolation_predictor_bench => EhlersLinearExtrapolationPredictorInputS,
+    ehlers_simple_cycle_indicator_bench => EhlersSimpleCycleIndicatorInputS,
+    ehlers_smoothed_adaptive_momentum_bench => EhlersSmoothedAdaptiveMomentumInputS,
+    ehlers_ecema_bench => EhlersEcemaInputS,
+    ehlers_kama_bench => EhlersKamaInputS,
+    ehlers_pma_bench => EhlersPmaInputS,
+    ehlers_undersampled_double_moving_average_bench => EhlersUndersampledDoubleMovingAverageInputS,
+    elastic_volume_weighted_moving_average_bench => ElasticVolumeWeightedMovingAverageInputS,
+    ema_deviation_corrected_t3_bench => EmaDeviationCorrectedT3InputS,
+    emd_bench         => EmdInputS,
+    emd_trend_bench   => EmdTrendInputS,
+    emv_bench         => EmvInputS,
+    epma_bench        => EpmaInputS,
+    er_bench          => ErInputS,
+    eri_bench         => EriInputS,
+    evasive_supertrend_bench => EvasiveSuperTrendInputS,
+    ewma_volatility_bench => EwmaVolatilityInputS,
+    exponential_trend_bench => ExponentialTrendInputS,
+    fibonacci_entry_bands_bench => FibonacciEntryBandsInputS,
+    fibonacci_trailing_stop_bench => FibonacciTrailingStopInputS,
+    ehma_bench        => EhmaInputS,
+    ema_bench         => EmaInputS,
+    fisher_bench      => FisherInputS,
+    forward_backward_exponential_oscillator_bench => ForwardBackwardExponentialOscillatorInputS,
+    fosc_bench        => FoscInputS,
+    fractal_dimension_index_bench => FractalDimensionIndexInputS,
+    fwma_bench        => FwmaInputS,
+    garman_klass_volatility_bench => GarmanKlassVolatilityInputS,
+    gatorosc_bench    => GatorOscInputS,
+    gaussian_bench    => GaussianInputS,
+    geometric_bias_oscillator_bench => GeometricBiasOscillatorInputS,
+    gmma_oscillator_bench => GmmaOscillatorInputS,
+    gopalakrishnan_range_index_bench => GopalakrishnanRangeIndexInputS,
+    grover_llorens_cycle_oscillator_bench => GroverLlorensCycleOscillatorInputS,
+    half_causal_estimator_bench => HalfCausalEstimatorInputS,
+    ift_rsi_bench     => IftRsiInputS,
+    kaufmanstop_bench => KaufmanstopInputS,
+    kdj_bench         => KdjInputS,
+    keltner_bench     => KeltnerInputS,
+    kst_bench         => KstInputS,
+    kurtosis_bench    => KurtosisInputS,
+    kvo_bench         => KvoInputS,
+
+    linearreg_angle_bench     => LinearregAngleInputS,
+    linearreg_intercept_bench => LinearRegInterceptInputS,
+    linearreg_slope_bench     => LinearRegSlopeInputS,
+    lpc_bench                 => LpcInputS,
+    lrsi_bench                => LrsiInputS,
+
+    mab_bench  => MabInputS,
+    macd_bench => MacdInputS,
+    marketfi_bench  => MarketefiInputS,
+    mass_bench      => MassInputS,
+    mean_ad_bench   => MeanAdInputS,
+    medium_ad_bench => MediumAdInputS,
+    medprice_bench  => MedpriceInputS,
+    mfi_bench       => MfiInputS,
+    midpoint_bench  => MidpointInputS,
+    midprice_bench  => MidpriceInputS,
+    minmax_bench    => MinmaxInputS,
+    mod_god_mode_bench => ModGodModeInputS,
+    mom_bench       => MomInputS,
+    msw_bench       => MswInputS,
+    nadaraya_watson_envelope_bench => NweInputS,
+
+    natr_bench   => NatrInputS,
+    nvi_bench    => NviInputS,
+    obv_bench    => ObvInputS,
+    ott_bench    => OttInputS,
+    otto_bench   => OttoInputS,
+    pattern_recognition_bench => PatternRecognitionInputS,
+    pfe_bench    => PfeInputS,
+    pivot_bench  => PivotInputS,
+    pma_bench    => PmaInputS,
+    ppo_bench    => PpoInputS,
+    prb_bench    => PrbInputS,
+    pvi_bench    => PviInputS,
+    qqe_bench    => QqeInputS,
+    qstick_bench => QstickInputS,
+    roc_bench    => RocInputS,
+    rocp_bench   => RocpInputS,
+    rocr_bench   => RocrInputS,
+    rsi_bench    => RsiInputS,
+    rsmk_bench   => RsmkInputS,
+    rsx_bench    => RsxInputS,
+    rvi_bench    => RviInputS,
+    safezonestop_bench => SafeZoneStopInputS,
+    sar_bench    => SarInputS,
+    squeeze_momentum_bench => SqueezeMomentumInputS,
+    srsi_bench   => SrsiInputS,
+    stc_bench    => StcInputS,
+    stddev_bench => StdDevInputS,
+    stoch_bench  => StochInputS,
+    stochf_bench => StochfInputS,
+    supertrend_bench => SupertrendInputS,
+    tsf_bench    => TsfInputS,
+    tsi_bench    => TsiInputS,
+    ttm_squeeze_bench => TtmSqueezeInputS,
+    ttm_trend_bench => TtmTrendInputS,
+    ui_bench     => UiInputS,
+    ultosc_bench => UltOscInputS,
+    var_bench    => VarInputS,
+    vi_bench     => ViInputS,
+    vosc_bench   => VoscInputS,
+    voss_bench   => VossInputS,
+    vpci_bench   => VpciInputS,
+    vpt_bench    => VptInputS,
+    vwap_bench   => VwapInputS,
+    vwmacd_bench => VwmacdInputS,
+    wad_bench    => WadInputS,
+    wavetrend_bench => WavetrendInputS,
+    wclprice_bench => WclpriceInputS,
+    willr_bench     => WillrInputS,
+    zscore_bench    => ZscoreInputS,
+    yang_zhang_volatility_bench => YangZhangVolatilityInputS,
+
+    buff_averages_bench => BuffAveragesInputS,
+    volume_adjusted_ma_bench => VolumeAdjustedMaInputS,
+    net_myrsi_bench => NetMyrsiInputS,
+    cci_cycle_bench => CciCycleInputS,
+    fvg_positioning_average_bench => FvgPositioningAverageInputS,
+    fvg_trailing_stop_bench => FvgTrailingStopInputS,
+    halftrend_bench => HalfTrendInputS,
+    reverse_rsi_bench => ReverseRsiInputS,
+    vama_bench => VamaInputS
+);
+
+bench_variants!(
+    vpt => VptInputS; None;
+    vpt_scalar,
+    vpt_avx2,
+    vpt_avx512,
+);
+
+bench_variants!(
+    willr => WillrInputS; None;
+    willr_scalar,
+    willr_avx2,
+    willr_avx512,
+);
+
+make_kernel_wrappers!(alma, alma_with_kernel, AlmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(bandpass, bandpass_with_kernel, BandPassInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(vpt, vpt_with_kernel, VptInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(
+    willr,
+    vector_ta::indicators::willr::willr_with_kernel,
+    WillrInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(
+    acosc,
+    vector_ta::indicators::acosc::acosc_with_kernel,
+    AcoscInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(roc, roc_with_kernel, RocInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(cfo, cfo_with_kernel, CfoInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(ad, ad_with_kernel, AdInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(
+    adosc,
+    vector_ta::indicators::adosc::adosc_with_kernel,
+    AdoscInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(
+    ao,
+    vector_ta::indicators::ao::ao_with_kernel,
+    AoInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(atr, vector_ta::indicators::atr::atr_with_kernel, AtrInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(dvdiqqe, dvdiqqe_with_kernel, DvdiqqeInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(macd, vector_ta::indicators::macd::macd_with_kernel, MacdInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(
+    vwmacd,
+    vector_ta::indicators::vwmacd::vwmacd_with_kernel,
+    VwmacdInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(msw, vector_ta::indicators::msw::msw_with_kernel, MswInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(adx, adx_with_kernel, AdxInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(buff_averages, buff_averages_with_kernel, BuffAveragesInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(correl_hl, correl_hl_with_kernel, CorrelHlInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(zscore, zscore_with_kernel, ZscoreInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(
+    yang_zhang_volatility,
+    yang_zhang_volatility_with_kernel,
+    YangZhangVolatilityInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(var, var_with_kernel, VarInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(cmo, cmo_with_kernel, CmoInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(srsi, srsi_with_kernel, SrsiInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(rsi, rsi_with_kernel, RsiInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(er, er_with_kernel, ErInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(ttm_trend, ttm_trend_with_kernel, TtmTrendInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(macz, macz_with_kernel, MaczInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(mom, mom_with_kernel, MomInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(lpc, vector_ta::indicators::lpc::lpc_with_kernel, LpcInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(lrsi, vector_ta::indicators::lrsi::lrsi_with_kernel, LrsiInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(
+    wad,
+    vector_ta::indicators::wad::wad_with_kernel,
+    WadInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(vosc, vosc_with_kernel, VoscInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(vpci, vpci_with_kernel, VpciInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(aso, aso_with_kernel, AsoInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(cwma, cwma_with_kernel, CwmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(natr, natr_with_kernel, NatrInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(marketfi, marketefi_with_kernel, MarketefiInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(efi, efi_with_kernel, EfiInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(dema, dema_with_kernel, DemaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(cci, cci_with_kernel, CciInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(edcf, edcf_with_kernel, EdcfInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(ehlers_ecema, ehlers_ecema_with_kernel, EhlersEcemaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(ehlers_itrend, ehlers_itrend_with_kernel, EhlersITrendInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(ehlers_pma, ehlers_pma_with_kernel, EhlersPmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(ehlers_kama, ehlers_kama_with_kernel, EhlersKamaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(
+    ehlers_undersampled_double_moving_average,
+    ehlers_undersampled_double_moving_average_with_kernel,
+    EhlersUndersampledDoubleMovingAverageInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(
+    elastic_volume_weighted_moving_average,
+    elastic_volume_weighted_moving_average_with_kernel,
+    ElasticVolumeWeightedMovingAverageInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(
+    ema_deviation_corrected_t3,
+    ema_deviation_corrected_t3_with_kernel,
+    EmaDeviationCorrectedT3InputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(emd, emd_with_kernel, EmdInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(emd_trend, emd_trend_with_kernel, EmdTrendInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(ema, ema_with_kernel, EmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(epma, epma_with_kernel, EpmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(pma, pma_with_kernel, PmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(frama, frama_with_kernel, FramaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(fwma, fwma_with_kernel, FwmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(
+    garman_klass_volatility,
+    garman_klass_volatility_with_kernel,
+    GarmanKlassVolatilityInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(gaussian, gaussian_with_kernel, GaussianInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(gopalakrishnan_range_index, gopalakrishnan_range_index_with_kernel, GopalakrishnanRangeIndexInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(grover_llorens_cycle_oscillator, grover_llorens_cycle_oscillator_with_kernel, GroverLlorensCycleOscillatorInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(half_causal_estimator, half_causal_estimator_with_kernel, HalfCausalEstimatorInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(highpass_2_pole, highpass_2_pole_with_kernel, HighPass2InputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(highpass, highpass_with_kernel, HighPassInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(hma, hma_with_kernel, HmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(hwma, hwma_with_kernel, HwmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(jma, jma_with_kernel, JmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(jsa, jsa_with_kernel, JsaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(kama, kama_with_kernel, KamaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(linreg, linreg_with_kernel, LinRegInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(linearreg_angle, linearreg_angle_with_kernel, LinearregAngleInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(
+    linearreg_intercept,
+    vector_ta::indicators::linearreg_intercept::linearreg_intercept_with_kernel,
+    LinearRegInterceptInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(maaq, maaq_with_kernel, MaaqInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(mab, mab_with_kernel, MabInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(mama, mama_with_kernel, MamaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(mwdx, mwdx_with_kernel, MwdxInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(nma, nma_with_kernel, NmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(pwma, pwma_with_kernel, PwmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(reflex, reflex_with_kernel, ReflexInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(sinwma, sinwma_with_kernel, SinWmaInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(mod_god_mode, mod_god_mode_with_kernel, ModGodModeInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(fisher, fisher_with_kernel, FisherInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(
+    forward_backward_exponential_oscillator,
+    forward_backward_exponential_oscillator_with_kernel,
+    ForwardBackwardExponentialOscillatorInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(fosc, fosc_with_kernel, FoscInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(
+    fractal_dimension_index,
+    fractal_dimension_index_with_kernel,
+    FractalDimensionIndexInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(
+    fvg_positioning_average,
+    fvg_positioning_average_with_kernel,
+    FvgPositioningAverageInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(dpo, dpo_with_kernel, DpoInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(dx, dx_with_kernel, DxInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(
+    dynamic_momentum_index,
+    dynamic_momentum_index_with_kernel,
+    DynamicMomentumIndexInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(
+    ehlers_adaptive_cg,
+    ehlers_adaptive_cg_with_kernel,
+    EhlersAdaptiveCgInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(
+    ehlers_adaptive_cyber_cycle,
+    ehlers_adaptive_cyber_cycle_with_kernel,
+    EhlersAdaptiveCyberCycleInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(
+    ehlers_autocorrelation_periodogram,
+    ehlers_autocorrelation_periodogram_with_kernel,
+    EhlersAutocorrelationPeriodogramInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(
+    ehlers_data_sampling_relative_strength_indicator,
+    ehlers_data_sampling_relative_strength_indicator_with_kernel,
+    EhlersDataSamplingRelativeStrengthIndicatorInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(
+    ehlers_detrending_filter,
+    ehlers_detrending_filter_with_kernel,
+    EhlersDetrendingFilterInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(
+    ehlers_fm_demodulator,
+    ehlers_fm_demodulator_with_kernel,
+    EhlersFmDemodulatorInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(
+    ehlers_linear_extrapolation_predictor,
+    ehlers_linear_extrapolation_predictor_with_kernel,
+    EhlersLinearExtrapolationPredictorInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(
+    ehlers_simple_cycle_indicator,
+    ehlers_simple_cycle_indicator_with_kernel,
+    EhlersSimpleCycleIndicatorInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(
+    ehlers_smoothed_adaptive_momentum,
+    ehlers_smoothed_adaptive_momentum_with_kernel,
+    EhlersSmoothedAdaptiveMomentumInputS;
+    Scalar,Avx2,Avx512
+);
+make_batch_wrappers!(dpo_batch, DpoBatchBuilder, DpoInputS; ScalarBatch,Avx2Batch,Avx512Batch);
+make_kernel_wrappers!(kaufmanstop, kaufmanstop_with_kernel, KaufmanstopInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(cksp, cksp_with_kernel, CkspInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(sma, sma_with_kernel, SmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(smma, smma_with_kernel, SmmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(sqwma, sqwma_with_kernel, SqwmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(srwma, srwma_with_kernel, SrwmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(supersmoother, supersmoother_with_kernel, SuperSmootherInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(supersmoother_3_pole, supersmoother_3_pole_with_kernel, SuperSmoother3PoleInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(swma, swma_with_kernel, SwmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(tema, tema_with_kernel, TemaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(tilson, tilson_with_kernel, TilsonInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(tradjema, tradjema_with_kernel, TradjemaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(trendflex, trendflex_with_kernel, TrendFlexInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(trima, trima_with_kernel, TrimaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(uma, uma_with_kernel, UmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(chandelier_exit, chandelier_exit_with_kernel, ChandelierExitInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(percentile_nearest_rank, percentile_nearest_rank_with_kernel, PercentileNearestRankInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(vidya, vidya_with_kernel, VidyaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(volume_adjusted_ma, VolumeAdjustedMa_with_kernel, VolumeAdjustedMaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(vlma, vlma_with_kernel, VlmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(vpwma, vpwma_with_kernel, VpwmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(vwap, vector_ta::indicators::vwap::vwap_with_kernel, VwapInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(vwma, vwma_with_kernel, VwmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(wclprice, wclprice_with_kernel, WclpriceInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(wilders, wilders_with_kernel, WildersInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(wma, wma_with_kernel, WmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(zlema, zlema_with_kernel, ZlemaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(sar, sar_with_kernel, SarInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(
+    safezonestop,
+    safezonestop_with_kernel,
+    SafeZoneStopInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(ppo, ppo_with_kernel, PpoInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(kurtosis, kurtosis_with_kernel, KurtosisInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(adxr, adxr_with_kernel, AdxrInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(
+    alligator,
+    vector_ta::indicators::alligator::alligator_with_kernel,
+    AlligatorInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(stoch, stoch_with_kernel, StochInputS; Scalar,Avx2,Avx512);
+
+make_hlc_batch_wrappers!(
+    supertrend_batch,
+    SuperTrendBatchBuilder,
+    SupertrendInputS,
+    vector_ta::indicators::supertrend::SuperTrendData
+);
+
+make_hlc_batch_wrappers!(
+    stoch_batch,
+    StochBatchBuilder,
+    StochInputS,
+    vector_ta::indicators::stoch::StochData
+);
+make_hl_batch_wrappers!(
+    sar_batch,
+    SarBatchBuilder,
+    SarInputS,
+    vector_ta::indicators::sar::SarData
+);
+
+make_pair_from_input_wrappers!(
+    safezonestop_batch,
+    SafeZoneStopBatchBuilder,
+    SafeZoneStopInputS,
+    |input: &SafeZoneStopInputS| -> anyhow::Result<(&[f64], &[f64])> {
+        let (high, low) = match &input.data {
+            SafeZoneStopData::Candles { candles, .. } => (&candles.high[..], &candles.low[..]),
+            SafeZoneStopData::Slices { high, low, .. } => (*high, *low),
+        };
+        Ok((high, low))
+    }
+);
+make_hl_batch_wrappers!(
+    fisher_batch,
+    vector_ta::indicators::fisher::FisherBatchBuilder,
+    FisherInputS,
+    vector_ta::indicators::fisher::FisherData
+);
+make_kernel_wrappers!(deviation, deviation_with_kernel, DeviationInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(correlation_cycle, correlation_cycle_with_kernel, CorrelationCycleInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(stochf, stochf_with_kernel, StochfInputS; Scalar,Avx2,Avx512);
+
+make_hlc_batch_wrappers!(
+    stochf_batch,
+    vector_ta::indicators::stochf::StochfBatchBuilder,
+    StochfInputS,
+    vector_ta::indicators::stochf::StochfData
+);
+
+make_hl_batch_wrappers!(
+    correl_hl_batch,
+    CorrelHlBatchBuilder,
+    CorrelHlInputS,
+    CorrelHlData
+);
+
+make_ohlcv_batch_wrappers!(emv_batch, EmvBatchBuilder, EmvInputS, EmvData);
+
+make_triple_from_input_wrappers!(
+    eri_batch,
+    EriBatchBuilder,
+    EriInputS,
+    |input: &EriInputS| -> anyhow::Result<(&[f64], &[f64], &[f64])> {
+        let (h, l, s) = match &input.data {
+            EriData::Candles { candles, source } => (
+                &candles.high[..],
+                &candles.low[..],
+                source_type(candles, source),
+            ),
+            EriData::Slices { high, low, source } => (*high, *low, *source),
+        };
+        Ok((h, l, s))
+    }
+);
+
+make_triple_from_input_wrappers!(
+    halftrend_batch,
+    HalfTrendBatchBuilder,
+    HalfTrendInputS,
+    |input: &HalfTrendInputS| -> anyhow::Result<(&[f64], &[f64], &[f64])> {
+        let (h, l, c) = match &input.data {
+            HalfTrendData::Candles(candles) => {
+                (&candles.high[..], &candles.low[..], &candles.close[..])
+            }
+            HalfTrendData::Slices { high, low, close } => (*high, *low, *close),
+        };
+        Ok((h, l, c))
+    }
+);
+
+make_hl_batch_wrappers!(
+    kaufmanstop_batch,
+    KaufmanstopBatchBuilder,
+    KaufmanstopInputS,
+    KaufmanstopData
+);
+
+make_batch_wrappers!(
+    kurtosis_batch,
+    KurtosisBatchBuilder,
+    KurtosisInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    linearreg_angle_batch,
+    Linearreg_angleBatchBuilder,
+    LinearregAngleInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_hlc_batch_wrappers!(
+    ttm_squeeze_batch,
+    vector_ta::indicators::ttm_squeeze::TtmSqueezeBatchBuilder,
+    TtmSqueezeInputS,
+    vector_ta::indicators::ttm_squeeze::TtmSqueezeData
+);
+
+bench_variants!(
+    ttm_squeeze_batch => TtmSqueezeInputS; None;
+    ttm_squeeze_batch_scalarbatch,
+    ttm_squeeze_batch_avx2batch,
+    ttm_squeeze_batch_avx512batch,
+);
+
+bench_variants!(
+    acosc => AcoscInputS; None;
+    acosc_scalar,
+    acosc_avx2,
+    acosc_avx512
+);
+
+bench_variants!(
+    safezonestop => SafeZoneStopInputS; None;
+    safezonestop_scalar,
+    safezonestop_avx2,
+    safezonestop_avx512,
+);
+
+make_kernel_wrappers!(
+    bollinger_bands_width,
+    bollinger_bands_width_with_kernel,
+    BollingerBandsWidthInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(pvi, pvi_with_kernel, PviInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(dti, dti_with_kernel, DtiInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(emv, emv_with_kernel, EmvInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(rvi, rvi_with_kernel, RviInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(nvi, nvi_with_kernel, NviInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(trix, trix_with_kernel, TrixInputS; Scalar,Avx2,Avx512);
+
+bench_variants!(
+    rvi => RviInputS; None;
+    rvi_scalar,
+    rvi_avx2,
+    rvi_avx512,
+);
+
+make_kernel_wrappers!(
+    mean_ad,
+    vector_ta::indicators::mean_ad::mean_ad_with_kernel,
+    MeanAdInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(
+    medium_ad,
+    vector_ta::indicators::medium_ad::medium_ad_with_kernel,
+    MediumAdInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_batch_wrappers!(
+    mean_ad_batch,
+    vector_ta::indicators::mean_ad::MeanAdBatchBuilder,
+    MeanAdInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_kernel_wrappers!(pivot, pivot_with_kernel, PivotInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(rocp, vector_ta::indicators::rocp::rocp_with_kernel, RocpInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(stc, stc_with_kernel, StcInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(
+    damiani_volatmeter,
+    vector_ta::indicators::damiani_volatmeter::damiani_volatmeter_with_kernel,
+    DamianiVolatmeterInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(tsf, tsf_with_kernel, TsfInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(tsi, vector_ta::indicators::tsi::tsi_with_kernel, TsiInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(rocr, rocr_with_kernel, RocrInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(ott, ott_with_kernel, OttInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(
+    linearreg_slope,
+    linearreg_slope_with_kernel,
+    LinearRegSlopeInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(apo, apo_with_kernel, ApoInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(
+    bollinger_bands,
+    bollinger_bands_with_kernel,
+    BollingerBandsInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(avsl, avsl_with_kernel, AvslInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(dma, dma_with_kernel, DmaInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(dm, dm_with_kernel, DmInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(ehma, ehma_with_kernel, EhmaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(range_filter, range_filter_with_kernel, RangeFilterInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(sama, sama_with_kernel, SamaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(wto, wto_with_kernel, WtoInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(nama, nama_with_kernel, NamaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(net_myrsi, net_myrsi_with_kernel, NetMyrsiInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(cci_cycle, cci_cycle_with_kernel, CciCycleInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(fvg_trailing_stop, fvg_trailing_stop_with_kernel, FvgTrailingStopInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(halftrend, halftrend_with_kernel, HalfTrendInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(ift_rsi, ift_rsi_with_kernel, IftRsiInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(kdj, kdj_with_kernel, KdjInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(keltner, keltner_with_kernel, KeltnerInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(kvo, kvo_with_kernel, KvoInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(reverse_rsi, reverse_rsi_with_kernel, ReverseRsiInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(vama, vama_with_kernel, VamaInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(wavetrend, wavetrend_with_kernel, WavetrendInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(donchian, donchian_with_kernel, DonchianInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(
+    donchian_channel_width,
+    donchian_channel_width_with_kernel,
+    DonchianChannelWidthInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(rsx, rsx_with_kernel, RsxInputS; Scalar,Avx2,Avx512);
+
+make_batch_wrappers!(
+    rsx_batch, RsxBatchBuilder, RsxInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    roc_batch, RocBatchBuilder, RocInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+#[inline(always)]
+fn cci_batch_scalarbatch(input: &CciInputS) -> anyhow::Result<()> {
+    let slice: &[f64] = input.as_ref();
+    vector_ta::indicators::cci::CciBatchBuilder::new()
+        .kernel(Kernel::ScalarBatch)
+        .apply_slice(slice)?;
+    Ok(())
+}
+#[inline(always)]
+fn cci_batch_avx2batch(input: &CciInputS) -> anyhow::Result<()> {
+    let slice: &[f64] = input.as_ref();
+    vector_ta::indicators::cci::CciBatchBuilder::new()
+        .kernel(Kernel::Avx2Batch)
+        .apply_slice(slice)?;
+    Ok(())
+}
+#[inline(always)]
+fn cci_batch_avx512batch(input: &CciInputS) -> anyhow::Result<()> {
+    let slice: &[f64] = input.as_ref();
+    vector_ta::indicators::cci::CciBatchBuilder::new()
+        .kernel(Kernel::Avx512Batch)
+        .apply_slice(slice)?;
+    Ok(())
+}
+bench_variants!(
+    cci_batch => CciInputS; None;
+    cci_batch_scalarbatch,
+    cci_batch_avx2batch,
+    cci_batch_avx512batch
+);
+
+make_kernel_wrappers!(cg, cg_with_kernel, CgInputS; Scalar,Avx2,Avx512);
+
+bench_variants!(
+    cg => CgInputS; Some(227);
+    cg_scalar,
+    cg_avx2,
+    cg_avx512,
+);
+
+bench_variants!(
+    ad => AdInputS; None;
+    ad_scalar,
+    ad_avx2,
+    ad_avx512,
+);
+
+bench_variants!(
+    bollinger_bands => BollingerBandsInputS; Some(20);
+    bollinger_bands_scalar,
+    bollinger_bands_avx2,
+    bollinger_bands_avx512,
+);
+
+bench_variants!(
+    aso => AsoInputS; Some(10);
+    aso_scalar,
+    aso_avx2,
+    aso_avx512,
+);
+
+make_kernel_wrappers!(alphatrend, alphatrend_with_kernel, AlphaTrendInputS; Scalar,Avx2,Avx512);
+bench_variants!(
+    alphatrend => AlphaTrendInputS; None;
+    alphatrend_scalar,
+    alphatrend_avx2,
+    alphatrend_avx512,
+);
+
+bench_variants!(
+    ttm_trend => TtmTrendInputS; None;
+    ttm_trend_scalar,
+    ttm_trend_avx2,
+    ttm_trend_avx512,
+);
+
+make_pair_from_input_wrappers!(
+    ttm_trend_batch,
+    vector_ta::indicators::ttm_trend::TtmTrendBatchBuilder,
+    TtmTrendInputS,
+    |input: &TtmTrendInputS| -> anyhow::Result<(&[f64], &[f64])> {
+        use vector_ta::indicators::ttm_trend::TtmTrendData;
+        let (src, cls): (&[f64], &[f64]) = match &input.data {
+            TtmTrendData::Slices { source, close } => (*source, *close),
+            TtmTrendData::Candles { candles, source } => {
+                (source_type(candles, source), source_type(candles, "close"))
+            }
+        };
+        Ok((src, cls))
+    }
+);
+bench_variants!(
+    ttm_trend_batch => TtmTrendInputS; None;
+    ttm_trend_batch_scalarbatch,
+    ttm_trend_batch_avx2batch,
+    ttm_trend_batch_avx512batch,
+);
+
+bench_variants!(
+    vpci => VpciInputS; None;
+    vpci_scalar,
+    vpci_avx2,
+    vpci_avx512,
+);
+
+bench_variants!(
+    tsi => TsiInputS; None;
+    tsi_scalar,
+    tsi_avx2,
+    tsi_avx512,
+);
+
+make_kernel_wrappers!(supertrend, supertrend_with_kernel, SupertrendInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(cvi, cvi_with_kernel, CviInputS; Scalar,Avx2,Avx512);
+
+make_batch_wrappers!(
+    bollinger_bands_batch, BollingerBandsBatchBuilder, BollingerBandsInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    tsi_batch, vector_ta::indicators::tsi::TsiBatchBuilder, TsiInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+bench_variants!(
+    tsi_batch => TsiInputS; None;
+    tsi_batch_scalarbatch,
+    tsi_batch_avx2batch,
+    tsi_batch_avx512batch
+);
+
+bench_variants!(
+    bollinger_bands_batch => BollingerBandsInputS; None;
+    bollinger_bands_batch_scalarbatch,
+    bollinger_bands_batch_avx2batch,
+    bollinger_bands_batch_avx512batch,
+);
+
+bench_variants!(
+    aso_batch => AsoInputS; None;
+    aso_batch_scalarbatch,
+    aso_batch_avx2batch,
+    aso_batch_avx512batch,
+);
+
+make_pair_from_input_wrappers!(
+    vpci_batch,
+    VpciBatchBuilder,
+    VpciInputS,
+    |input: &VpciInputS| -> anyhow::Result<(&[f64], &[f64])> {
+        let (close, volume) = match &input.data {
+            VpciData::Candles {
+                candles,
+                close_source,
+                volume_source,
+            } => (
+                source_type(candles, close_source),
+                source_type(candles, volume_source),
+            ),
+            VpciData::Slices { close, volume } => (*close, *volume),
+        };
+        Ok((close, volume))
+    }
+);
+
+bench_variants!(
+    vpci_batch => VpciInputS; None;
+    vpci_batch_scalarbatch,
+    vpci_batch_avx2batch,
+    vpci_batch_avx512batch,
+);
+
+make_kernel_wrappers!(ui, ui_with_kernel, UiInputS; Scalar,Avx2,Avx512);
+
+make_kernel_wrappers!(
+    gatorosc,
+    vector_ta::indicators::gatorosc::gatorosc_with_kernel,
+    GatorOscInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(
+    geometric_bias_oscillator,
+    geometric_bias_oscillator_with_kernel,
+    GeometricBiasOscillatorInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(
+    gmma_oscillator,
+    gmma_oscillator_with_kernel,
+    GmmaOscillatorInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(
+    obv,
+    vector_ta::indicators::obv::obv_with_kernel,
+    ObvInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(
+    coppock,
+    vector_ta::indicators::coppock::coppock_with_kernel,
+    CoppockInputS;
+    Scalar,Avx2,Avx512
+);
+
+make_kernel_wrappers!(
+    bop,
+    vector_ta::indicators::bop::bop_with_kernel,
+    BopInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(ultosc, ultosc_with_kernel, UltOscInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(qstick, qstick_with_kernel, QstickInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(nadaraya_watson_envelope, nadaraya_watson_envelope_with_kernel, NweInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(eri, eri_with_kernel, EriInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(
+    evasive_supertrend,
+    evasive_supertrend_with_kernel,
+    EvasiveSuperTrendInputS;
+    Scalar,Avx2,Avx512
+);
+make_kernel_wrappers!(ewma_volatility, ewma_volatility_with_kernel, EwmaVolatilityInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(exponential_trend, exponential_trend_with_kernel, ExponentialTrendInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(fibonacci_entry_bands, fibonacci_entry_bands_with_kernel, FibonacciEntryBandsInputS; Scalar,Avx2,Avx512);
+make_kernel_wrappers!(fibonacci_trailing_stop, fibonacci_trailing_stop_with_kernel, FibonacciTrailingStopInputS; Scalar,Avx2,Avx512);
+
+make_batch_wrappers!(
+    vosc_batch, VoscBatchBuilder, VoscInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_pair_with_builder_wrappers!(
+    mfi_batch,
+    MfiBatchBuilder,
+    MfiInputS,
+    |input: &MfiInputS| -> anyhow::Result<(&[f64], &[f64])> {
+        let (tp, vol) = match &input.data {
+            MfiData::Candles { candles, source } => {
+                (source_type(candles, source), &candles.volume[..])
+            }
+            MfiData::Slices {
+                typical_price,
+                volume,
+            } => (*typical_price, *volume),
+        };
+        Ok((tp, vol))
+    },
+    |b: MfiBatchBuilder| b.period_range(5, 200, 5)
+);
+
+make_pair_with_builder_wrappers!(
+    midprice_batch,
+    MidpriceBatchBuilder,
+    MidpriceInputS,
+    |input: &MidpriceInputS| -> anyhow::Result<(&[f64], &[f64])> {
+        let (high, low) = match &input.data {
+            MidpriceData::Candles {
+                candles,
+                high_src,
+                low_src,
+            } => (
+                source_type(candles, high_src),
+                source_type(candles, low_src),
+            ),
+            MidpriceData::Slices { high, low } => (*high, *low),
+        };
+        Ok((high, low))
+    },
+    |b: MidpriceBatchBuilder| b.period_range(10, 30, 5)
+);
+
+make_triple_with_builder_wrappers!(
+    adx_batch,
+    AdxBatchBuilder,
+    AdxInputS,
+    |input: &AdxInputS| -> anyhow::Result<(&[f64], &[f64], &[f64])> {
+        use vector_ta::indicators::adx::AdxData;
+        let (h, l, c) = match &input.data {
+            AdxData::Candles { candles } => (
+                source_type(candles, "high"),
+                source_type(candles, "low"),
+                source_type(candles, "close"),
+            ),
+            AdxData::Slices { high, low, close } => (*high, *low, *close),
+        };
+        Ok((h, l, c))
+    },
+    |b: AdxBatchBuilder| b
+);
+
+make_triple_with_builder_wrappers!(
+    adx_batch_dev_250,
+    AdxBatchBuilder,
+    AdxInputS,
+    |input: &AdxInputS| -> anyhow::Result<(&[f64], &[f64], &[f64])> {
+        use vector_ta::indicators::adx::AdxData;
+        let (h, l, c) = match &input.data {
+            AdxData::Candles { candles } => (
+                source_type(candles, "high"),
+                source_type(candles, "low"),
+                source_type(candles, "close"),
+            ),
+            AdxData::Slices { high, low, close } => (*high, *low, *close),
+        };
+        Ok((h, l, c))
+    },
+    |b: AdxBatchBuilder| b.period_range(8, 2000, 8)
+);
+
+make_triple_with_builder_and_method_wrappers!(
+    dx_batch,
+    DxBatchBuilder,
+    DxInputS,
+    |input: &DxInputS| -> anyhow::Result<(&[f64], &[f64], &[f64])> {
+        use vector_ta::indicators::dx::DxData;
+        let (h, l, c) = match &input.data {
+            DxData::Candles { candles } => (
+                source_type(candles, "high"),
+                source_type(candles, "low"),
+                source_type(candles, "close"),
+            ),
+            DxData::HlcSlices { high, low, close } => (*high, *low, *close),
+        };
+        Ok((h, l, c))
+    },
+    |b: DxBatchBuilder| b,
+    apply_hlc
+);
+
+make_batch_wrappers!(
+    apo_batch, ApoBatchBuilder, ApoInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+bench_variants!(
+    apo_batch => ApoInputS; None;
+    apo_batch_scalarbatch,
+    apo_batch_avx2batch,
+    apo_batch_avx512batch,
+);
+
+make_batch_wrappers!(
+    alma_batch, AlmaBatchBuilder, AlmaInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_ohlcv_batch_wrappers!(
+    adosc_batch,
+    vector_ta::indicators::adosc::AdoscBatchBuilder,
+    AdoscInputS,
+    vector_ta::indicators::adosc::AdoscData
+);
+
+make_batch_wrappers!(
+    ao_batch,
+    vector_ta::indicators::ao::AoBatchBuilder,
+    AoInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    ott_batch, OttBatchBuilder, OttInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    cora_wave_batch, CoraWaveBatchBuilder, CoraWaveInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    wavetrend_batch, WavetrendBatchBuilder, WavetrendInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    linearreg_intercept_batch,
+    vector_ta::indicators::linearreg_intercept::LinearRegInterceptBatchBuilder,
+    LinearRegInterceptInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    zscore_batch, ZscoreBatchBuilder, ZscoreInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_ohlcv_batch_wrappers!(
+    kvo_batch,
+    KvoBatchBuilder,
+    KvoInputS,
+    vector_ta::indicators::kvo::KvoData
+);
+
+make_hlc_batch_wrappers!(
+    cksp_batch,
+    CkspBatchBuilder,
+    CkspInputS,
+    vector_ta::indicators::cksp::CkspData
+);
+
+impl InputLen for DeviationInputS {
+    fn with_len(len: usize) -> Self {
+        match len {
+            10_000 => DeviationInput::with_default_candles(&*CANDLES_10K),
+            100_000 => DeviationInput::with_default_candles(&*CANDLES_100K),
+            1_000_000 => DeviationInput::with_default_candles(&*CANDLES_1M),
+            _ => panic!("unsupported len {len}"),
+        }
+    }
+}
+
+make_hlc_batch_wrappers!(
+    squeeze_momentum_batch,
+    SqueezeMomentumBatchBuilder,
+    SqueezeMomentumInputS,
+    vector_ta::indicators::squeeze_momentum::SqueezeMomentumData
+);
+
+make_batch_wrappers!(
+    linearreg_slope_batch, LinearRegSlopeBatchBuilder, LinearRegSlopeInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_pair_with_builder_wrappers!(
+    qstick_batch,
+    QstickBatchBuilder,
+    QstickInputS,
+    |input: &QstickInputS| -> anyhow::Result<(&[f64], &[f64])> {
+        let (open, close) = match &input.data {
+            QstickData::Candles {
+                candles,
+                open_source,
+                close_source,
+            } => (
+                source_type(candles, open_source),
+                source_type(candles, close_source),
+            ),
+            QstickData::Slices { open, close } => (*open, *close),
+        };
+        Ok((open, close))
+    },
+    |b: QstickBatchBuilder| b.period_range(5, 50, 5)
+);
+
+make_triple_with_arg_wrappers!(
+    ultosc_batch,
+    UltOscBatchBuilder,
+    UltOscInputS,
+    |input: &UltOscInputS| -> anyhow::Result<(&[f64], &[f64], &[f64])> {
+        let (h, l, c) = match &input.data {
+            UltOscData::Candles { candles, .. } => {
+                (&candles.high[..], &candles.low[..], &candles.close[..])
+            }
+            UltOscData::Slices { high, low, close } => (*high, *low, *close),
+        };
+        Ok((h, l, c))
+    },
+    UltOscBatchRange {
+        timeperiod1: (5, 9, 2),
+        timeperiod2: (12, 16, 2),
+        timeperiod3: (26, 30, 2)
+    },
+    apply_slice
+);
+
+#[inline(always)]
+fn buff_averages_pair(input: &BuffAveragesInputS) -> anyhow::Result<(&[f64], &[f64])> {
+    use vector_ta::indicators::moving_averages::buff_averages::BuffAveragesData;
+    let price: &[f64] = input.as_ref();
+    let volume: &[f64] = match (&input.volume, &input.data) {
+        (Some(v), _) => *v,
+        (None, BuffAveragesData::Candles { candles, .. }) => &candles.volume[..],
+        _ => return Err(anyhow!("buff_averages_batch requires volume data")),
+    };
+    Ok((price, volume))
+}
+
+make_pair_from_input_wrappers!(
+    buff_averages_batch,
+    BuffAveragesBatchBuilder,
+    BuffAveragesInputS,
+    buff_averages_pair
+);
+
+make_pair_from_input_wrappers!(
+    pvi_batch,
+    PviBatchBuilder,
+    PviInputS,
+    |input: &PviInputS| -> anyhow::Result<(&[f64], &[f64])> {
+        use vector_ta::indicators::pvi::PviData;
+        let (close, volume) = match &input.data {
+            PviData::Candles {
+                candles,
+                close_source,
+                volume_source,
+            } => (
+                source_type(candles, close_source),
+                source_type(candles, volume_source),
+            ),
+            PviData::Slices { close, volume } => (*close, *volume),
+        };
+        Ok((close, volume))
+    }
+);
+
+make_quad_from_input_wrappers!(
+    aso_batch,
+    AsoBatchBuilder,
+    AsoInputS,
+    vector_ta::indicators::aso::AsoData,
+    |input: &AsoInputS| -> anyhow::Result<(&[f64], &[f64], &[f64], &[f64])> {
+        let (o, h, l, c) = match &input.data {
+            AsoData::Candles { candles, .. } => (
+                &candles.open[..],
+                &candles.high[..],
+                &candles.low[..],
+                &candles.close[..],
+            ),
+            AsoData::Slices {
+                open,
+                high,
+                low,
+                close,
+            } => (*open, *high, *low, *close),
+        };
+        Ok((o, h, l, c))
+    }
+);
+
+make_batch_wrappers!(
+    macz_batch, MaczBatchBuilder, MaczInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    cwma_batch, CwmaBatchBuilder, CwmaInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    coppock_batch, vector_ta::indicators::coppock::CoppockBatchBuilder, CoppockInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+bench_variants!(
+    coppock_batch => CoppockInputS; None;
+    coppock_batch_scalarbatch,
+    coppock_batch_avx2batch,
+    coppock_batch_avx512batch
+);
+
+bench_variants!(
+    adosc => AdoscInputS; None;
+    adosc_scalar,
+    adosc_avx2,
+    adosc_avx512
+);
+
+bench_variants!(
+    adosc_batch => AdoscInputS; None;
+    adosc_batch_scalarbatch,
+    adosc_batch_avx2batch,
+    adosc_batch_avx512batch
+);
+
+bench_variants!(
+    roc_batch => RocInputS; None;
+    roc_batch_scalarbatch,
+    roc_batch_avx2batch,
+    roc_batch_avx512batch
+);
+
+bench_variants!(
+    bop => BopInputS; None;
+    bop_scalar,
+    bop_avx2,
+    bop_avx512
+);
+
+bench_variants!(
+    atr => AtrInputS; None;
+    atr_scalar,
+    atr_avx2,
+    atr_avx512
+);
+
+make_hlc_batch_wrappers!(
+    atr_batch,
+    vector_ta::indicators::atr::AtrBatchBuilder,
+    AtrInputS,
+    vector_ta::indicators::atr::AtrData
+);
+
+make_hlc_batch_wrappers!(
+    wad_batch,
+    vector_ta::indicators::wad::WadBatchBuilder,
+    WadInputS,
+    vector_ta::indicators::wad::WadData
+);
+bench_variants!(
+    atr_batch => AtrInputS; None;
+    atr_batch_scalarbatch,
+    atr_batch_avx2batch,
+    atr_batch_avx512batch
+);
+
+bench_variants!(
+    wad_batch => WadInputS; None;
+    wad_batch_scalarbatch,
+    wad_batch_avx2batch,
+    wad_batch_avx512batch,
+);
+
+make_batch_wrappers!(
+    dema_batch, DemaBatchBuilder, DemaInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    stc_batch, vector_ta::indicators::stc::StcBatchBuilder, StcInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    edcf_batch, EdcfBatchBuilder, EdcfInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    ehlers_ecema_batch, EhlersEcemaBatchBuilder, EhlersEcemaInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    ehlers_itrend_batch, EhlersITrendBatchBuilder, EhlersITrendInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    ehlers_pma_batch, EhlersPmaBuilder, EhlersPmaInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    stddev_batch, StdDevBatchBuilder, StdDevInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    ehlers_kama_batch, EhlersKamaBatchBuilder, EhlersKamaInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    ema_batch, EmaBatchBuilder, EmaInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    er_batch, ErBatchBuilder, ErInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    epma_batch, EpmaBatchBuilder, EpmaInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    pma_batch, PmaBatchBuilder, PmaInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    frama_batch, FramaBatchBuilder, FramaInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    fwma_batch, FwmaBatchBuilder, FwmaInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    gaussian_batch, GaussianBatchBuilder, GaussianInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_ohlc_batch_wrappers!(
+    pivot_batch,
+    PivotBatchBuilder,
+    PivotInputS,
+    PivotData,
+    apply_slice
+);
+
+impl InputLen for DvdiqqeInputS {
+    fn with_len(len: usize) -> Self {
+        match len {
+            10_000 => DvdiqqeInput::with_default_candles(&*CANDLES_10K),
+            100_000 => DvdiqqeInput::with_default_candles(&*CANDLES_100K),
+            1_000_000 => DvdiqqeInput::with_default_candles(&*CANDLES_1M),
+            _ => panic!("unsupported len {len}"),
+        }
+    }
+}
+
+bench_variants!(
+    pivot_batch => PivotInputS; None;
+    pivot_batch_scalarbatch,
+    pivot_batch_avx2batch,
+    pivot_batch_avx512batch,
+);
+
+bench_variants!(
+    coppock => CoppockInputS; None;
+    coppock_scalar,
+    coppock_avx2,
+    coppock_avx512
+);
+
+make_batch_wrappers!(highpass_2_pole_batch, HighPass2BatchBuilder, HighPass2InputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(highpass_batch, HighPassBatchBuilder, HighPassInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(hma_batch, HmaBatchBuilder, HmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(hwma_batch, HwmaBatchBuilder, HwmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(jma_batch, JmaBatchBuilder, JmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(jsa_batch, JsaBatchBuilder, JsaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(kama_batch, KamaBatchBuilder, KamaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(linreg_batch, LinRegBatchBuilder, LinRegInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(maaq_batch, MaaqBatchBuilder, MaaqInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(mama_batch, MamaBatchBuilder, MamaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(mwdx_batch, MwdxBatchBuilder, MwdxInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(nma_batch, NmaBatchBuilder, NmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(pwma_batch, PwmaBatchBuilder, PwmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(reflex_batch, ReflexBatchBuilder, ReflexInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(sinwma_batch, SinWmaBatchBuilder, SinWmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(sma_batch, SmaBatchBuilder, SmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(smma_batch, SmmaBatchBuilder, SmmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(sqwma_batch, SqwmaBatchBuilder, SqwmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(srwma_batch, SrwmaBatchBuilder, SrwmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(supersmoother_batch, SuperSmootherBatchBuilder, SuperSmootherInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(supersmoother_3_pole_batch, SuperSmoother3PoleBatchBuilder, SuperSmoother3PoleInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(swma_batch, SwmaBatchBuilder, SwmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(tema_batch, TemaBatchBuilder, TemaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(tilson_batch, TilsonBatchBuilder, TilsonInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(prb_batch, PrbBatchBuilder, PrbInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_hlc_batch_wrappers!(
+    tradjema_batch,
+    vector_ta::indicators::moving_averages::tradjema::TradjemaBatchBuilder,
+    TradjemaInputS,
+    vector_ta::indicators::moving_averages::tradjema::TradjemaData
+);
+
+make_batch_wrappers!(trendflex_batch, TrendFlexBatchBuilder, TrendFlexInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(trima_batch, TrimaBatchBuilder, TrimaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(pfe_batch, PfeBatchBuilder, PfeInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+
+make_single_slice_with_arg_wrappers!(uma_batch, UmaBatchBuilder, UmaInputS, None, apply_slice);
+
+make_hlc_batch_wrappers!(
+    willr_batch,
+    WillrBatchBuilder,
+    WillrInputS,
+    vector_ta::indicators::willr::WillrData
+);
+make_batch_wrappers!(vidya_batch, VidyaBatchBuilder, VidyaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(vlma_batch, VlmaBatchBuilder, VlmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(mom_batch, MomBatchBuilder, MomInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+
+make_pair_from_input_wrappers!(
+    cvi_batch,
+    CviBatchBuilder,
+    CviInputS,
+    |input: &CviInputS| -> anyhow::Result<(&[f64], &[f64])> {
+        use vector_ta::indicators::cvi::CviData;
+        let pair = match &input.data {
+            CviData::Candles(c) => (&c.high[..], &c.low[..]),
+            CviData::Slices { high, low } => (*high, *low),
+        };
+        Ok(pair)
+    }
+);
+
+make_pair_from_input_wrappers!(
+    volume_adjusted_ma_batch,
+    VolumeAdjustedMaBatchBuilder,
+    VolumeAdjustedMaInputS,
+    |input: &VolumeAdjustedMaInputS| -> anyhow::Result<(&[f64], &[f64])> {
+        use vector_ta::indicators::moving_averages::volume_adjusted_ma::VolumeAdjustedMaData;
+        let (data, volume) = match &input.data {
+            VolumeAdjustedMaData::Candles { candles, source } => {
+                (source_type(candles, source), &candles.volume[..])
+            }
+            VolumeAdjustedMaData::Slice { data, volume } => (*data, *volume),
+        };
+        Ok((data, volume))
+    }
+);
+
+make_batch_wrappers!(vpwma_batch, VpwmaBatchBuilder, VpwmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(wilders_batch, WildersBatchBuilder, WildersInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(wma_batch, WmaBatchBuilder, WmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(zlema_batch, ZlemaBatchBuilder, ZlemaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_hlc_batch_wrappers!(
+    vi_batch,
+    ViBatchBuilder,
+    ViInputS,
+    vector_ta::indicators::vi::ViData
+);
+
+make_quad_with_method_wrappers!(
+    keltner_batch,
+    vector_ta::indicators::keltner::KeltnerBatchBuilder,
+    KeltnerInputS,
+    |input: &KeltnerInputS| -> anyhow::Result<(&[f64], &[f64], &[f64], &[f64])> {
+        use vector_ta::indicators::keltner::KeltnerData;
+        let (h, l, c, s) = match &input.data {
+            KeltnerData::Candles { candles, source } => (
+                candles.high.as_slice(),
+                candles.low.as_slice(),
+                candles.close.as_slice(),
+                source_type(candles, source),
+            ),
+            KeltnerData::Slice(h, l, c, s) => (*h, *l, *c, *s),
+        };
+        Ok((h, l, c, s))
+    },
+    apply_slice
+);
+make_quad_with_method_wrappers!(
+    yang_zhang_volatility_batch,
+    YangZhangVolatilityBatchBuilder,
+    YangZhangVolatilityInputS,
+    |input: &YangZhangVolatilityInputS| -> anyhow::Result<(&[f64], &[f64], &[f64], &[f64])> {
+        let (o, h, l, c) = match &input.data {
+            vector_ta::indicators::yang_zhang_volatility::YangZhangVolatilityData::Candles {
+                candles,
+            } => (
+                candles.open.as_slice(),
+                candles.high.as_slice(),
+                candles.low.as_slice(),
+                candles.close.as_slice(),
+            ),
+            vector_ta::indicators::yang_zhang_volatility::YangZhangVolatilityData::Slices {
+                open,
+                high,
+                low,
+                close,
+            } => (*open, *high, *low, *close),
+        };
+        Ok((o, h, l, c))
+    },
+    apply_slices
+);
+make_batch_wrappers!(trix_batch, TrixBatchBuilder, TrixInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+
+make_hlc_batch_wrappers!(
+    chandelier_exit_batch,
+    CeBatchBuilder,
+    ChandelierExitInputS,
+    vector_ta::indicators::chandelier_exit::ChandelierExitData
+);
+
+make_single_apply_wrappers!(
+    percentile_nearest_rank_batch,
+    PercentileNearestRankBatchBuilder,
+    PercentileNearestRankInputS,
+    apply
+);
+
+make_batch_wrappers!(otto_batch, OttoBatchBuilder, OttoInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(var_batch, VarBatchBuilder, VarInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+
+make_hlc_batch_wrappers!(
+    natr_batch,
+    NatrBatchBuilder,
+    NatrInputS,
+    vector_ta::indicators::natr::NatrData
+);
+
+make_hl_batch_wrappers!(
+    donchian_batch,
+    vector_ta::indicators::donchian::DonchianBatchBuilder,
+    DonchianInputS,
+    vector_ta::indicators::donchian::DonchianData
+);
+
+paste::paste! {
+
+make_triple_from_input_wrappers!(
+    avsl_batch,
+    AvslBatchBuilder,
+    AvslInputS,
+    |input: &AvslInputS| -> anyhow::Result<(&[f64], &[f64], &[f64])> {
+        use vector_ta::indicators::avsl::AvslData;
+        let (close, low, vol) = match &input.data {
+            AvslData::Candles { candles, .. } => (&candles.close[..], &candles.low[..], &candles.volume[..]),
+            AvslData::Slices { close, low, volume } => (*close, *low, *volume),
+        };
+        Ok((close, low, vol))
+    }
+);
+}
+make_batch_wrappers!(dma_batch, DmaBatchBuilder, DmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(ehma_batch, EhmaBatchBuilder, EhmaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(range_filter_batch, RangeFilterBatchBuilder, RangeFilterInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(sama_batch, SamaBatchBuilder, SamaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(wto_batch, WtoBatchBuilder, WtoInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(nama_batch, NamaBatchBuilder, NamaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(net_myrsi_batch, NetMyrsiBatchBuilder, NetMyrsiInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(cci_cycle_batch, CciCycleBatchBuilder, CciCycleInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(cmo_batch, CmoBatchBuilder, CmoInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+
+make_batch_wrappers!(reverse_rsi_batch, ReverseRsiBatchBuilder, ReverseRsiInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(vama_batch, VamaBatchBuilder, VamaInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+make_batch_wrappers!(decycler_batch, vector_ta::indicators::decycler::DecyclerBatchBuilder, DecyclerInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+
+bench_variants!(
+    bandpass => BandPassInputS; None;
+    bandpass_scalar,
+    bandpass_avx2,
+    bandpass_avx512
+);
+make_batch_wrappers!(deviation_batch, DeviationBatchBuilder, DeviationInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+
+make_batch_wrappers!(
+    correlation_cycle_batch, CorrelationCycleBatchBuilder, CorrelationCycleInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+make_batch_wrappers!(
+    bollinger_bands_width_batch,
+    BollingerBandsWidthBatchBuilder,
+    BollingerBandsWidthInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+make_batch_wrappers!(srsi_batch, SrsiBatchBuilder, SrsiInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+
+make_batch_wrappers!(
+    damiani_volatmeter_batch,
+    vector_ta::indicators::damiani_volatmeter::DamianiVolatmeterBatchBuilder,
+    DamianiVolatmeterInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+make_batch_wrappers!(kst_batch, KstBatchBuilder, KstInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+
+bench_variants!(
+    alma_batch => AlmaInputS; Some(250);
+    alma_batch_scalarbatch,
+    alma_batch_avx2batch,
+    alma_batch_avx512batch
+);
+
+bench_variants!(
+    ao => AoInputS; None;
+    ao_scalar,
+    ao_avx2,
+    ao_avx512
+);
+
+bench_variants!(
+    ao_batch => AoInputS; None;
+    ao_batch_scalarbatch,
+    ao_batch_avx2batch,
+    ao_batch_avx512batch
+);
+
+bench_variants!(
+    damiani_volatmeter_batch => DamianiVolatmeterInputS; None;
+    damiani_volatmeter_batch_scalarbatch,
+    damiani_volatmeter_batch_avx2batch,
+    damiani_volatmeter_batch_avx512batch
+);
+
+bench_variants!(
+    macd => MacdInputS; None;
+    macd_scalar,
+    macd_avx2,
+    macd_avx512,
+);
+
+bench_variants!(
+    damiani_volatmeter => DamianiVolatmeterInputS; None;
+    damiani_volatmeter_scalar,
+    damiani_volatmeter_avx2,
+    damiani_volatmeter_avx512,
+);
+
+bench_variants!(
+    er => ErInputS; None;
+    er_scalar,
+    er_avx2,
+    er_avx512,
+);
+
+bench_variants!(
+    lpc => LpcInputS; None;
+    lpc_scalar,
+    lpc_avx2,
+    lpc_avx512,
+);
+
+bench_variants!(
+    lrsi => LrsiInputS; None;
+    lrsi_scalar,
+    lrsi_avx2,
+    lrsi_avx512,
+);
+
+make_batch_wrappers!(
+    macd_batch, vector_ta::indicators::macd::MacdBatchBuilder, MacdInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+bench_variants!(
+    macd_batch => MacdInputS; None;
+    macd_batch_scalarbatch,
+    macd_batch_avx2batch,
+    macd_batch_avx512batch
+);
+bench_variants!(
+    adx_batch => AdxInputS; Some(14);
+    adx_batch_scalarbatch,
+    adx_batch_avx2batch,
+    adx_batch_avx512batch,
+);
+
+bench_variants!(
+    adx_batch_dev_250 => AdxInputS; None;
+    adx_batch_dev_250_scalarbatch,
+    adx_batch_dev_250_avx2batch,
+    adx_batch_dev_250_avx512batch,
+);
+
+bench_variants!(
+    buff_averages_batch => BuffAveragesInputS; None;
+    buff_averages_batch_scalarbatch,
+    buff_averages_batch_avx2batch,
+    buff_averages_batch_avx512batch
+);
+
+make_batch_wrappers!(bandpass_batch, BandPassBatchBuilder, BandPassInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+bench_variants!(
+    bandpass_batch => BandPassInputS; None;
+    bandpass_batch_scalarbatch,
+    bandpass_batch_avx2batch,
+    bandpass_batch_avx512batch
+);
+
+bench_variants!(
+    decycler_batch => DecyclerInputS; None;
+    decycler_batch_scalarbatch,
+    decycler_batch_avx2batch,
+    decycler_batch_avx512batch
+);
+
+bench_variants!(
+    linearreg_angle => LinearregAngleInputS; Some(14);
+    linearreg_angle_scalar,
+    linearreg_angle_avx2,
+    linearreg_angle_avx512,
+);
+
+bench_variants!(
+    linearreg_angle_batch => LinearregAngleInputS; Some(14);
+    linearreg_angle_batch_scalarbatch,
+    linearreg_angle_batch_avx2batch,
+    linearreg_angle_batch_avx512batch,
+);
+
+bench_variants!(
+    cmo => CmoInputS; Some(14);
+    cmo_scalar,
+    cmo_avx2,
+    cmo_avx512,
+);
+
+bench_variants!(
+    zscore_batch => ZscoreInputS; Some(14);
+    zscore_batch_scalarbatch,
+    zscore_batch_avx2batch,
+    zscore_batch_avx512batch
+);
+
+bench_variants!(
+    yang_zhang_volatility_batch => YangZhangVolatilityInputS; Some(14);
+    yang_zhang_volatility_batch_scalarbatch,
+    yang_zhang_volatility_batch_avx2batch,
+    yang_zhang_volatility_batch_avx512batch
+);
+
+bench_variants!(
+    sar => SarInputS; None;
+    sar_scalar,
+    sar_avx2,
+    sar_avx512
+);
+
+bench_variants!(
+    correl_hl => CorrelHlInputS; None;
+    correl_hl_scalar,
+    correl_hl_avx2,
+    correl_hl_avx512
+);
+
+bench_variants!(
+    correl_hl_batch => CorrelHlInputS; Some(9);
+    correl_hl_batch_scalarbatch,
+    correl_hl_batch_avx2batch,
+    correl_hl_batch_avx512batch,
+);
+
+bench_variants!(
+    natr => NatrInputS; None;
+    natr_scalar,
+    natr_avx2,
+    natr_avx512
+);
+
+bench_variants!(
+    efi => EfiInputS; None;
+    efi_scalar,
+    efi_avx2,
+    efi_avx512
+);
+
+bench_variants!(
+    fisher => FisherInputS; None;
+    fisher_scalar,
+    fisher_avx2,
+    fisher_avx512,
+);
+
+bench_variants!(
+    fisher_batch => FisherInputS; None;
+    fisher_batch_scalarbatch,
+    fisher_batch_avx2batch,
+    fisher_batch_avx512batch
+);
+
+bench_variants!(
+    marketfi => MarketefiInputS; None;
+    marketfi_scalar,
+    marketfi_avx2,
+    marketfi_avx512
+);
+
+bench_variants!(
+    var_batch => VarInputS; Some(14);
+    var_batch_scalarbatch,
+    var_batch_avx2batch,
+    var_batch_avx512batch
+);
+
+bench_variants!(
+    correlation_cycle => CorrelationCycleInputS; None;
+    correlation_cycle_scalar,
+    correlation_cycle_avx2,
+    correlation_cycle_avx512,
+);
+
+bench_variants!(
+    bollinger_bands_width => BollingerBandsWidthInputS; None;
+    bollinger_bands_width_scalar,
+    bollinger_bands_width_avx2,
+    bollinger_bands_width_avx512
+);
+
+bench_variants!(
+    correlation_cycle_batch => CorrelationCycleInputS; None;
+    correlation_cycle_batch_scalarbatch,
+    correlation_cycle_batch_avx2batch,
+    correlation_cycle_batch_avx512batch
+);
+
+bench_variants!(
+    bollinger_bands_width_batch => BollingerBandsWidthInputS; None;
+    bollinger_bands_width_batch_scalarbatch,
+    bollinger_bands_width_batch_avx2batch,
+    bollinger_bands_width_batch_avx512batch
+);
+
+bench_variants!(
+    kvo_batch => KvoInputS; Some(200);
+    kvo_batch_scalarbatch,
+    kvo_batch_avx2batch,
+    kvo_batch_avx512batch
+);
+
+bench_variants!(
+    squeeze_momentum_batch => SqueezeMomentumInputS; Some(3);
+    squeeze_momentum_batch_scalarbatch,
+    squeeze_momentum_batch_avx2batch,
+    squeeze_momentum_batch_avx512batch
+);
+
+bench_variants!(
+    pvi => PviInputS; None;
+    pvi_scalar,
+    pvi_avx2,
+    pvi_avx512,
+);
+
+bench_variants!(
+    dti => DtiInputS; None;
+    dti_scalar,
+    dti_avx2,
+    dti_avx512,
+);
+
+bench_variants!(
+    pvi_batch => PviInputS; Some(227);
+    pvi_batch_scalarbatch,
+    pvi_batch_avx2batch,
+    pvi_batch_avx512batch,
+);
+
+bench_variants!(
+    er_batch => ErInputS; None;
+    er_batch_scalarbatch,
+    er_batch_avx2batch,
+    er_batch_avx512batch
+);
+
+bench_variants!(
+    linearreg_slope_batch => LinearRegSlopeInputS; Some(14);
+    linearreg_slope_batch_scalarbatch,
+    linearreg_slope_batch_avx2batch,
+    linearreg_slope_batch_avx512batch
+);
+
+bench_variants!(
+    rocr => RocrInputS; None;
+    rocr_scalar,
+    rocr_avx2,
+    rocr_avx512
+);
+
+make_single_apply_wrappers!(
+    rocr_batch,
+    vector_ta::indicators::rocr::RocrBatchBuilder,
+    RocrInputS,
+    apply_slice
+);
+bench_variants!(
+    rocr_batch => RocrInputS; None;
+    rocr_batch_scalarbatch,
+    rocr_batch_avx2batch,
+    rocr_batch_avx512batch,
+);
+
+bench_variants!(
+    roc => RocInputS; None;
+    roc_scalar,
+    roc_avx2,
+    roc_avx512
+);
+
+bench_variants!(
+    dm => DmInputS; None;
+    dm_scalar,
+    dm_avx2,
+    dm_avx512
+);
+
+make_hl_batch_wrappers!(
+    dm_batch,
+    DmBatchBuilder,
+    DmInputS,
+    vector_ta::indicators::dm::DmData
+);
+
+bench_variants!(
+    dm_batch => DmInputS; Some(14);
+    dm_batch_scalarbatch,
+    dm_batch_avx2batch,
+    dm_batch_avx512batch,
+);
+
+bench_variants!(
+    linearreg_slope => LinearRegSlopeInputS; Some(14);
+    linearreg_slope_scalar,
+    linearreg_slope_avx2,
+    linearreg_slope_avx512
+);
+
+bench_variants!(
+    ott => OttInputS; None;
+    ott_scalar,
+    ott_avx2,
+    ott_avx512
+);
+
+bench_variants!(
+    stddev_batch => StdDevInputS; Some(5);
+    stddev_batch_scalarbatch,
+    stddev_batch_avx2batch,
+    stddev_batch_avx512batch
+);
+
+bench_variants!(
+    macz_batch => MaczInputS; Some(232);
+    macz_batch_scalarbatch,
+    macz_batch_avx2batch,
+    macz_batch_avx512batch
+);
+
+bench_variants!(
+    ott_batch => OttInputS; None;
+    ott_batch_scalarbatch,
+    ott_batch_avx2batch,
+    ott_batch_avx512batch
+);
+
+bench_variants!(
+    cora_wave_batch => CoraWaveInputS; None;
+    cora_wave_batch_scalarbatch,
+    cora_wave_batch_avx2batch,
+    cora_wave_batch_avx512batch,
+);
+
+bench_variants!(
+    kst_batch => KstInputS; None;
+    kst_batch_scalarbatch,
+    kst_batch_avx2batch,
+    kst_batch_avx512batch
+);
+
+bench_variants!(
+    cwma_batch => CwmaInputS; Some(250);
+    cwma_batch_scalarbatch,
+    cwma_batch_avx2batch,
+    cwma_batch_avx512batch,
+);
+
+bench_variants!(
+   dema_batch => DemaInputS; Some(250);
+   dema_batch_scalarbatch,
+   dema_batch_avx2batch,
+   dema_batch_avx512batch,
+);
+
+bench_variants!(
+   edcf_batch => EdcfInputS; Some(250);
+   edcf_batch_scalarbatch,
+   edcf_batch_avx2batch,
+   edcf_batch_avx512batch,
+);
+
+bench_variants!(
+    sar_batch => SarInputS; None;
+    sar_batch_scalarbatch,
+    sar_batch_avx2batch,
+    sar_batch_avx512batch
+);
+
+bench_variants!(
+    natr_batch => NatrInputS; None;
+    natr_batch_scalarbatch,
+    natr_batch_avx2batch,
+    natr_batch_avx512batch
+);
+
+bench_variants!(
+    ehlers_ecema => EhlersEcemaInputS; None;
+    ehlers_ecema_scalar,
+    ehlers_ecema_avx2,
+    ehlers_ecema_avx512,
+);
+
+bench_variants!(
+    ehlers_fm_demodulator => EhlersFmDemodulatorInputS; None;
+    ehlers_fm_demodulator_scalar,
+    ehlers_fm_demodulator_avx2,
+    ehlers_fm_demodulator_avx512,
+);
+
+bench_variants!(
+    ehlers_linear_extrapolation_predictor => EhlersLinearExtrapolationPredictorInputS; None;
+    ehlers_linear_extrapolation_predictor_scalar,
+    ehlers_linear_extrapolation_predictor_avx2,
+    ehlers_linear_extrapolation_predictor_avx512,
+);
+
+bench_variants!(
+    ehlers_simple_cycle_indicator => EhlersSimpleCycleIndicatorInputS; None;
+    ehlers_simple_cycle_indicator_scalar,
+    ehlers_simple_cycle_indicator_avx2,
+    ehlers_simple_cycle_indicator_avx512,
+);
+
+bench_variants!(
+    ehlers_smoothed_adaptive_momentum => EhlersSmoothedAdaptiveMomentumInputS; None;
+    ehlers_smoothed_adaptive_momentum_scalar,
+    ehlers_smoothed_adaptive_momentum_avx2,
+    ehlers_smoothed_adaptive_momentum_avx512,
+);
+
+bench_variants!(
+    ehlers_undersampled_double_moving_average => EhlersUndersampledDoubleMovingAverageInputS; None;
+    ehlers_undersampled_double_moving_average_scalar,
+    ehlers_undersampled_double_moving_average_avx2,
+    ehlers_undersampled_double_moving_average_avx512,
+);
+
+bench_variants!(
+    elastic_volume_weighted_moving_average => ElasticVolumeWeightedMovingAverageInputS; None;
+    elastic_volume_weighted_moving_average_scalar,
+    elastic_volume_weighted_moving_average_avx2,
+    elastic_volume_weighted_moving_average_avx512,
+);
+
+bench_variants!(
+    ehlers_ecema_batch => EhlersEcemaInputS; Some(250);
+    ehlers_ecema_batch_scalarbatch,
+    ehlers_ecema_batch_avx2batch,
+    ehlers_ecema_batch_avx512batch,
+);
+
+bench_variants!(
+    ehlers_itrend_batch => EhlersITrendInputS; Some(250);
+    ehlers_itrend_batch_scalarbatch,
+    ehlers_itrend_batch_avx2batch,
+    ehlers_itrend_batch_avx512batch,
+);
+
+bench_variants!(
+    ehlers_pma_batch => EhlersPmaInputS; Some(250);
+    ehlers_pma_batch_scalarbatch,
+    ehlers_pma_batch_avx2batch,
+    ehlers_pma_batch_avx512batch,
+);
+
+bench_variants!(
+    ehlers_kama_batch => EhlersKamaInputS; Some(20);
+    ehlers_kama_batch_scalarbatch,
+    ehlers_kama_batch_avx2batch,
+    ehlers_kama_batch_avx512batch,
+);
+
+bench_variants!(
+    ema_batch => EmaInputS; Some(250);
+    ema_batch_scalarbatch,
+    ema_batch_avx2batch,
+    ema_batch_avx512batch,
+);
+
+bench_variants!(
+    stc_batch => StcInputS; None;
+    stc_batch_scalarbatch,
+    stc_batch_avx2batch,
+    stc_batch_avx512batch,
+);
+
+bench_variants!(
+    epma_batch => EpmaInputS; Some(250);
+    epma_batch_scalarbatch,
+    epma_batch_avx2batch,
+    epma_batch_avx512batch,
+);
+
+bench_variants!(
+    pma_batch => PmaInputS; Some(227);
+    pma_batch_scalarbatch,
+    pma_batch_avx2batch,
+    pma_batch_avx512batch,
+);
+
+bench_variants!(
+    frama_batch => FramaInputS; Some(250);
+    frama_batch_scalarbatch,
+    frama_batch_avx2batch,
+    frama_batch_avx512batch,
+);
+
+bench_variants!(
+    fwma_batch => FwmaInputS; Some(250);
+    fwma_batch_scalarbatch,
+    fwma_batch_avx2batch,
+    fwma_batch_avx512batch,
+);
+
+bench_variants!(
+    gaussian_batch => GaussianInputS; Some(250);
+    gaussian_batch_scalarbatch,
+    gaussian_batch_avx2batch,
+    gaussian_batch_avx512batch,
+);
+
+bench_variants!(
+    highpass_2_pole_batch => HighPass2InputS; Some(250);
+    highpass_2_pole_batch_scalarbatch,
+    highpass_2_pole_batch_avx2batch,
+    highpass_2_pole_batch_avx512batch,
+);
+
+bench_variants!(
+    apo => ApoInputS; None;
+    apo_scalar,
+    apo_avx2,
+    apo_avx512,
+);
+
+bench_variants!(
+    highpass_batch => HighPassInputS; Some(250);
+    highpass_batch_scalarbatch,
+    highpass_batch_avx2batch,
+    highpass_batch_avx512batch,
+);
+
+bench_variants!(
+    hma_batch => HmaInputS; Some(250);
+    hma_batch_scalarbatch,
+    hma_batch_avx2batch,
+    hma_batch_avx512batch,
+);
+
+bench_variants!(
+    stc => StcInputS; None;
+    stc_scalar,
+    stc_avx2,
+    stc_avx512,
+);
+
+bench_variants!(
+    rocp => RocpInputS; None;
+    rocp_scalar,
+    rocp_avx2,
+    rocp_avx512,
+);
+
+bench_variants!(
+    hwma_batch => HwmaInputS; Some(250);
+    hwma_batch_scalarbatch,
+    hwma_batch_avx2batch,
+    hwma_batch_avx512batch,
+);
+
+bench_variants!(
+    jma_batch => JmaInputS; Some(250);
+    jma_batch_scalarbatch,
+    jma_batch_avx2batch,
+    jma_batch_avx512batch,
+);
+
+bench_variants!(
+    jsa_batch => JsaInputS; Some(250);
+    jsa_batch_scalarbatch,
+    jsa_batch_avx2batch,
+    jsa_batch_avx512batch,
+);
+
+bench_variants!(
+    kama_batch => KamaInputS; Some(250);
+    kama_batch_scalarbatch,
+    kama_batch_avx2batch,
+    kama_batch_avx512batch,
+);
+
+bench_variants!(
+    linreg_batch => LinRegInputS; Some(250);
+    linreg_batch_scalarbatch,
+    linreg_batch_avx2batch,
+    linreg_batch_avx512batch,
+);
+
+bench_variants!(
+    linearreg_intercept => LinearRegInterceptInputS; None;
+    linearreg_intercept_scalar,
+    linearreg_intercept_avx2,
+    linearreg_intercept_avx512,
+);
+
+bench_variants!(
+    linearreg_intercept_batch => LinearRegInterceptInputS; Some(227);
+    linearreg_intercept_batch_scalarbatch,
+    linearreg_intercept_batch_avx2batch,
+    linearreg_intercept_batch_avx512batch,
+);
+
+bench_variants!(
+    maaq_batch => MaaqInputS; Some(250);
+    maaq_batch_scalarbatch,
+    maaq_batch_avx2batch,
+    maaq_batch_avx512batch,
+);
+
+bench_variants!(
+    mama_batch => MamaInputS; Some(250);
+    mama_batch_scalarbatch,
+    mama_batch_avx2batch,
+    mama_batch_avx512batch,
+);
+
+bench_variants!(
+    mwdx_batch => MwdxInputS; Some(250);
+    mwdx_batch_scalarbatch,
+    mwdx_batch_avx2batch,
+    mwdx_batch_avx512batch,
+);
+
+bench_variants!(
+    nma_batch => NmaInputS; Some(250);
+    nma_batch_scalarbatch,
+    nma_batch_avx2batch,
+    nma_batch_avx512batch,
+);
+
+bench_variants!(
+    pwma_batch => PwmaInputS; Some(250);
+    pwma_batch_scalarbatch,
+    pwma_batch_avx2batch,
+    pwma_batch_avx512batch,
+);
+
+bench_variants!(
+    reflex_batch => ReflexInputS; Some(250);
+    reflex_batch_scalarbatch,
+    reflex_batch_avx2batch,
+    reflex_batch_avx512batch,
+);
+
+bench_variants!(
+    sinwma_batch => SinWmaInputS; Some(250);
+    sinwma_batch_scalarbatch,
+    sinwma_batch_avx2batch,
+    sinwma_batch_avx512batch,
+);
+
+bench_variants!(
+    sma_batch => SmaInputS; Some(250);
+    sma_batch_scalarbatch,
+    sma_batch_avx2batch,
+    sma_batch_avx512batch,
+);
+
+bench_variants!(
+    smma_batch => SmmaInputS; Some(250);
+    smma_batch_scalarbatch,
+    smma_batch_avx2batch,
+    smma_batch_avx512batch,
+);
+
+bench_variants!(
+    sqwma_batch => SqwmaInputS; Some(250);
+    sqwma_batch_scalarbatch,
+    sqwma_batch_avx2batch,
+    sqwma_batch_avx512batch,
+);
+
+bench_variants!(
+    srwma_batch => SrwmaInputS; Some(250);
+    srwma_batch_scalarbatch,
+    srwma_batch_avx2batch,
+    srwma_batch_avx512batch,
+);
+
+bench_variants!(
+    supersmoother_batch => SuperSmootherInputS; Some(250);
+    supersmoother_batch_scalarbatch,
+    supersmoother_batch_avx2batch,
+    supersmoother_batch_avx512batch,
+);
+
+bench_variants!(
+    supersmoother_3_pole_batch => SuperSmoother3PoleInputS; Some(250);
+    supersmoother_3_pole_batch_scalarbatch,
+    supersmoother_3_pole_batch_avx2batch,
+    supersmoother_3_pole_batch_avx512batch,
+);
+
+bench_variants!(
+    swma_batch => SwmaInputS; Some(250);
+    swma_batch_scalarbatch,
+    swma_batch_avx2batch,
+    swma_batch_avx512batch,
+);
+
+bench_variants!(
+    tema_batch => TemaInputS; Some(250);
+    tema_batch_scalarbatch,
+    tema_batch_avx2batch,
+    tema_batch_avx512batch,
+);
+
+bench_variants!(
+    tilson_batch => TilsonInputS; Some(250);
+    tilson_batch_scalarbatch,
+    tilson_batch_avx2batch,
+    tilson_batch_avx512batch,
+);
+
+bench_variants!(
+    tradjema_batch => TradjemaInputS; Some(250);
+    tradjema_batch_scalarbatch,
+    tradjema_batch_avx2batch,
+    tradjema_batch_avx512batch,
+);
+
+bench_variants!(
+    trendflex_batch => TrendFlexInputS; Some(250);
+    trendflex_batch_scalarbatch,
+    trendflex_batch_avx2batch,
+    trendflex_batch_avx512batch,
+);
+
+bench_variants!(
+    trima_batch => TrimaInputS; Some(250);
+    trima_batch_scalarbatch,
+    trima_batch_avx2batch,
+    trima_batch_avx512batch,
+);
+
+bench_variants!(
+    cfo => CfoInputS; Some(14);
+    cfo_scalar,
+    cfo_avx2,
+    cfo_avx512,
+);
+
+make_batch_wrappers!(
+    cfo_batch, CfoBatchBuilder, CfoInputS;
+    ScalarBatch, Avx2Batch, Avx512Batch
+);
+
+bench_variants!(
+    cfo_batch => CfoInputS; Some(14);
+    cfo_batch_scalarbatch,
+    cfo_batch_avx2batch,
+    cfo_batch_avx512batch,
+);
+
+bench_variants!(
+    uma_batch => UmaInputS; Some(250);
+    uma_batch_scalarbatch,
+    uma_batch_avx2batch,
+    uma_batch_avx512batch,
+);
+
+bench_variants!(
+    vidya_batch => VidyaInputS; Some(227);
+    vidya_batch_scalarbatch,
+    vidya_batch_avx2batch,
+    vidya_batch_avx512batch,
+);
+
+bench_variants!(
+    vlma_batch => VlmaInputS; Some(227);
+    vlma_batch_scalarbatch,
+    vlma_batch_avx2batch,
+    vlma_batch_avx512batch,
+);
+
+bench_variants!(
+    volume_adjusted_ma_batch => VolumeAdjustedMaInputS; None;
+    volume_adjusted_ma_batch_scalarbatch,
+    volume_adjusted_ma_batch_avx2batch,
+    volume_adjusted_ma_batch_avx512batch,
+);
+
+bench_variants!(
+    vpwma_batch => VpwmaInputS; Some(250);
+    vpwma_batch_scalarbatch,
+    vpwma_batch_avx2batch,
+    vpwma_batch_avx512batch,
+);
+
+bench_variants!(
+    vi_batch => ViInputS; Some(227);
+    vi_batch_scalarbatch,
+    vi_batch_avx2batch,
+    vi_batch_avx512batch,
+);
+
+bench_variants!(
+    willr_batch => WillrInputS; Some(227);
+    willr_batch_scalarbatch,
+    willr_batch_avx2batch,
+    willr_batch_avx512batch,
+);
+
+bench_variants!(
+    wilders_batch => WildersInputS; Some(250);
+    wilders_batch_scalarbatch,
+    wilders_batch_avx2batch,
+    wilders_batch_avx512batch,
+);
+
+bench_variants!(
+    wma_batch => WmaInputS; Some(250);
+    wma_batch_scalarbatch,
+    wma_batch_avx2batch,
+    wma_batch_avx512batch,
+);
+
+bench_variants!(
+    mom_batch => MomInputS; None;
+    mom_batch_scalarbatch,
+    mom_batch_avx2batch,
+    mom_batch_avx512batch,
+);
+
+bench_variants!(
+    zlema_batch => ZlemaInputS; Some(250);
+    zlema_batch_scalarbatch,
+    zlema_batch_avx2batch,
+    zlema_batch_avx512batch,
+);
+
+bench_variants!(
+    keltner_batch => KeltnerInputS; Some(227);
+    keltner_batch_scalarbatch,
+    keltner_batch_avx2batch,
+    keltner_batch_avx512batch,
+);
+
+bench_variants!(
+    trix => TrixInputS; None;
+    trix_scalar,
+    trix_avx2,
+    trix_avx512,
+);
+
+bench_variants!(
+    obv => ObvInputS; None;
+    obv_scalar,
+    obv_avx2,
+    obv_avx512,
+);
+bench_variants!(
+    trix_batch => TrixInputS; None;
+    trix_batch_scalarbatch,
+    trix_batch_avx2batch,
+    trix_batch_avx512batch,
+);
+
+bench_variants!(
+    chandelier_exit_batch => ChandelierExitInputS; Some(227);
+    chandelier_exit_batch_scalarbatch,
+    chandelier_exit_batch_avx2batch,
+    chandelier_exit_batch_avx512batch,
+);
+
+bench_variants!(
+    otto_batch => OttoInputS; Some(227);
+    otto_batch_scalarbatch,
+    otto_batch_avx2batch,
+    otto_batch_avx512batch,
+);
+
+bench_variants!(
+    percentile_nearest_rank_batch => PercentileNearestRankInputS; Some(227);
+    percentile_nearest_rank_batch_scalarbatch,
+    percentile_nearest_rank_batch_avx2batch,
+    percentile_nearest_rank_batch_avx512batch,
+);
+
+bench_variants!(
+    avsl_batch => AvslInputS; Some(200);
+    avsl_batch_scalarbatch,
+    avsl_batch_avx2batch,
+    avsl_batch_avx512batch,
+);
+
+bench_variants!(
+    dma_batch => DmaInputS; Some(200);
+    dma_batch_scalarbatch,
+    dma_batch_avx2batch,
+    dma_batch_avx512batch,
+);
+
+bench_variants!(
+    range_filter_batch => RangeFilterInputS; Some(200);
+    range_filter_batch_scalarbatch,
+    range_filter_batch_avx2batch,
+    range_filter_batch_avx512batch,
+);
+
+bench_variants!(
+    ehma_batch => EhmaInputS; Some(200);
+    ehma_batch_scalarbatch,
+    ehma_batch_avx2batch,
+    ehma_batch_avx512batch,
+);
+
+bench_variants!(
+    sama_batch => SamaInputS; Some(200);
+    sama_batch_scalarbatch,
+    sama_batch_avx2batch,
+    sama_batch_avx512batch,
+);
+
+bench_variants!(
+    wto_batch => WtoInputS; Some(200);
+    wto_batch_scalarbatch,
+    wto_batch_avx2batch,
+    wto_batch_avx512batch,
+);
+
+bench_variants!(
+    nama_batch => NamaInputS; Some(30);
+    nama_batch_scalarbatch,
+    nama_batch_avx2batch,
+    nama_batch_avx512batch,
+);
+
+bench_variants!(
+    alma => AlmaInputS; None;
+    alma_scalar,
+    alma_avx2,
+    alma_avx512,
+);
+
+bench_variants!(
+    adx => AdxInputS; Some(14);
+    adx_scalar,
+    adx_avx2,
+    adx_avx512,
+);
+
+bench_variants!(
+    nadaraya_watson_envelope => NweInputS; None;
+    nadaraya_watson_envelope_scalar,
+    nadaraya_watson_envelope_avx2,
+    nadaraya_watson_envelope_avx512,
+);
+
+bench_variants!(
+    buff_averages => BuffAveragesInputS; None;
+    buff_averages_scalar,
+    buff_averages_avx2,
+    buff_averages_avx512,
+);
+
+bench_variants!(
+    eri => EriInputS; None;
+    eri_scalar,
+    eri_avx2,
+    eri_avx512,
+);
+
+bench_variants!(
+    evasive_supertrend => EvasiveSuperTrendInputS; None;
+    evasive_supertrend_scalar,
+    evasive_supertrend_avx2,
+    evasive_supertrend_avx512,
+);
+
+bench_variants!(
+    ewma_volatility => EwmaVolatilityInputS; None;
+    ewma_volatility_scalar,
+    ewma_volatility_avx2,
+    ewma_volatility_avx512,
+);
+
+bench_variants!(
+    exponential_trend => ExponentialTrendInputS; None;
+    exponential_trend_scalar,
+    exponential_trend_avx2,
+    exponential_trend_avx512,
+);
+
+bench_variants!(
+    fibonacci_entry_bands => FibonacciEntryBandsInputS; None;
+    fibonacci_entry_bands_scalar,
+    fibonacci_entry_bands_avx2,
+    fibonacci_entry_bands_avx512,
+);
+
+bench_variants!(
+    fibonacci_trailing_stop => FibonacciTrailingStopInputS; None;
+    fibonacci_trailing_stop_scalar,
+    fibonacci_trailing_stop_avx2,
+    fibonacci_trailing_stop_avx512,
+);
+
+bench_variants!(
+    eri_batch => EriInputS; Some(13);
+    eri_batch_scalarbatch,
+    eri_batch_avx2batch,
+    eri_batch_avx512batch,
+);
+
+bench_variants!(
+    zscore => ZscoreInputS; Some(14);
+    zscore_scalar,
+    zscore_avx2,
+    zscore_avx512,
+);
+
+bench_variants!(
+    yang_zhang_volatility => YangZhangVolatilityInputS; Some(14);
+    yang_zhang_volatility_scalar,
+    yang_zhang_volatility_avx2,
+    yang_zhang_volatility_avx512,
+);
+
+bench_variants!(
+    var => VarInputS; Some(14);
+    var_scalar,
+    var_avx2,
+    var_avx512,
+);
+
+bench_variants!(
+    wad => WadInputS; None;
+    wad_scalar,
+    wad_avx2,
+    wad_avx512,
+);
+
+bench_variants!(
+    mab => MabInputS; None;
+    mab_scalar,
+    mab_avx2,
+    mab_avx512,
+);
+
+bench_variants!(
+    macz => MaczInputS; None;
+    macz_scalar,
+    macz_avx2,
+    macz_avx512,
+);
+
+bench_variants!(
+    emv => EmvInputS; None;
+    emv_scalar,
+    emv_avx2,
+    emv_avx512,
+);
+
+bench_variants!(
+    emv_batch => EmvInputS; None;
+    emv_batch_scalarbatch,
+    emv_batch_avx2batch,
+    emv_batch_avx512batch,
+);
+
+bench_variants!(
+   cwma => CwmaInputS; None;
+   cwma_scalar,
+   cwma_avx2,
+   cwma_avx512,
+);
+
+bench_variants!(
+   dema => DemaInputS; None;
+   dema_scalar,
+   dema_avx2,
+   dema_avx512,
+);
+
+bench_variants!(
+    edcf => EdcfInputS; None;
+    edcf_scalar,
+    edcf_avx2,
+    edcf_avx512,
+);
+
+bench_variants!(
+    ehlers_itrend => EhlersITrendInputS; None;
+    ehlers_itrend_scalar,
+    ehlers_itrend_avx2,
+    ehlers_itrend_avx512,
+);
+
+bench_variants!(
+    ehlers_pma => EhlersPmaInputS; None;
+    ehlers_pma_scalar,
+    ehlers_pma_avx2,
+    ehlers_pma_avx512,
+);
+
+bench_variants!(
+    ehlers_kama => EhlersKamaInputS; None;
+    ehlers_kama_scalar,
+    ehlers_kama_avx2,
+    ehlers_kama_avx512,
+);
+
+bench_variants!(
+    ema => EmaInputS; None;
+    ema_scalar,
+    ema_avx2,
+    ema_avx512,
+);
+
+bench_variants!(
+    ema_deviation_corrected_t3 => EmaDeviationCorrectedT3InputS; None;
+    ema_deviation_corrected_t3_scalar,
+    ema_deviation_corrected_t3_avx2,
+    ema_deviation_corrected_t3_avx512,
+);
+
+bench_variants!(
+    emd => EmdInputS; None;
+    emd_scalar,
+    emd_avx2,
+    emd_avx512,
+);
+
+bench_variants!(
+    emd_trend => EmdTrendInputS; None;
+    emd_trend_scalar,
+    emd_trend_avx2,
+    emd_trend_avx512,
+);
+
+bench_variants!(
+    epma => EpmaInputS; None;
+    epma_scalar,
+    epma_avx2,
+    epma_avx512,
+);
+
+bench_variants!(
+    pma => PmaInputS; None;
+    pma_scalar,
+    pma_avx2,
+    pma_avx512,
+);
+
+bench_variants!(
+    frama => FramaInputS; None;
+    frama_scalar,
+    frama_avx2,
+    frama_avx512,
+);
+
+bench_variants!(
+    fwma => FwmaInputS; None;
+    fwma_scalar,
+    fwma_avx2,
+    fwma_avx512,
+);
+
+bench_variants!(
+    garman_klass_volatility => GarmanKlassVolatilityInputS; None;
+    garman_klass_volatility_scalar,
+    garman_klass_volatility_avx2,
+    garman_klass_volatility_avx512,
+);
+
+bench_variants!(
+    gaussian => GaussianInputS; None;
+    gaussian_scalar,
+    gaussian_avx2,
+    gaussian_avx512,
+);
+
+bench_variants!(
+    pivot => PivotInputS; None;
+    pivot_scalar,
+    pivot_avx2,
+    pivot_avx512,
+);
+
+bench_variants!(
+    highpass_2_pole => HighPass2InputS; None;
+    highpass_2_pole_scalar,
+    highpass_2_pole_avx2,
+    highpass_2_pole_avx512,
+);
+
+bench_variants!(
+    highpass => HighPassInputS; None;
+    highpass_scalar,
+    highpass_avx2,
+    highpass_avx512,
+);
+
+bench_variants!(
+    hma => HmaInputS; None;
+    hma_scalar,
+    hma_avx2,
+    hma_avx512,
+);
+
+bench_variants!(
+    hwma => HwmaInputS; None;
+    hwma_scalar,
+    hwma_avx2,
+    hwma_avx512,
+);
+
+bench_variants!(
+    jma => JmaInputS; None;
+    jma_scalar,
+    jma_avx2,
+    jma_avx512,
+);
+
+bench_variants!(
+    jsa => JsaInputS; None;
+    jsa_scalar,
+    jsa_avx2,
+    jsa_avx512,
+);
+
+bench_variants!(
+    kama => KamaInputS; None;
+    kama_scalar,
+    kama_avx2,
+    kama_avx512,
+);
+
+bench_variants!(
+    linreg => LinRegInputS; None;
+    linreg_scalar,
+    linreg_avx2,
+    linreg_avx512,
+);
+
+bench_variants!(
+    maaq => MaaqInputS; None;
+    maaq_scalar,
+    maaq_avx2,
+    maaq_avx512,
+);
+
+bench_variants!(
+    mama => MamaInputS; None;
+    mama_scalar,
+    mama_avx2,
+    mama_avx512,
+);
+
+bench_variants!(
+    mwdx => MwdxInputS; None;
+    mwdx_scalar,
+    mwdx_avx2,
+    mwdx_avx512,
+);
+
+bench_variants!(
+    nma => NmaInputS; None;
+    nma_scalar,
+    nma_avx2,
+    nma_avx512,
+);
+
+bench_variants!(
+    pwma => PwmaInputS; None;
+    pwma_scalar,
+    pwma_avx2,
+    pwma_avx512,
+);
+
+bench_variants!(
+    reflex => ReflexInputS; None;
+    reflex_scalar,
+    reflex_avx2,
+    reflex_avx512,
+);
+
+bench_variants!(
+    sinwma => SinWmaInputS; None;
+    sinwma_scalar,
+    sinwma_avx2,
+    sinwma_avx512,
+);
+
+bench_variants!(
+    sma => SmaInputS; None;
+    sma_scalar,
+    sma_avx2,
+    sma_avx512,
+);
+
+bench_variants!(
+    smma => SmmaInputS; None;
+    smma_scalar,
+    smma_avx2,
+    smma_avx512,
+);
+
+bench_variants!(
+    sqwma => SqwmaInputS; None;
+    sqwma_scalar,
+    sqwma_avx2,
+    sqwma_avx512,
+);
+
+bench_variants!(
+    srwma => SrwmaInputS; None;
+    srwma_scalar,
+    srwma_avx2,
+    srwma_avx512,
+);
+
+bench_variants!(
+    supersmoother => SuperSmootherInputS; None;
+    supersmoother_scalar,
+    supersmoother_avx2,
+    supersmoother_avx512,
+);
+
+bench_variants!(
+    supersmoother_3_pole => SuperSmoother3PoleInputS; None;
+    supersmoother_3_pole_scalar,
+    supersmoother_3_pole_avx2,
+    supersmoother_3_pole_avx512,
+);
+
+bench_variants!(
+    swma => SwmaInputS; None;
+    swma_scalar,
+    swma_avx2,
+    swma_avx512,
+);
+
+bench_variants!(
+    tema => TemaInputS; None;
+    tema_scalar,
+    tema_avx2,
+    tema_avx512,
+);
+
+bench_variants!(
+    tilson => TilsonInputS; None;
+    tilson_scalar,
+    tilson_avx2,
+    tilson_avx512,
+);
+
+bench_variants!(
+    tradjema => TradjemaInputS; None;
+    tradjema_scalar,
+    tradjema_avx2,
+    tradjema_avx512,
+);
+
+bench_variants!(
+    trendflex => TrendFlexInputS; None;
+    trendflex_scalar,
+    trendflex_avx2,
+    trendflex_avx512,
+);
+
+bench_variants!(
+    trima => TrimaInputS; None;
+    trima_scalar,
+    trima_avx2,
+    trima_avx512,
+);
+
+bench_variants!(
+    uma => UmaInputS; None;
+    uma_scalar,
+    uma_avx2,
+    uma_avx512,
+);
+
+bench_variants!(
+    chandelier_exit => ChandelierExitInputS; None;
+    chandelier_exit_scalar,
+    chandelier_exit_avx2,
+    chandelier_exit_avx512,
+);
+
+bench_variants!(
+    percentile_nearest_rank => PercentileNearestRankInputS; None;
+    percentile_nearest_rank_scalar,
+    percentile_nearest_rank_avx2,
+    percentile_nearest_rank_avx512,
+);
+
+bench_variants!(
+    vidya => VidyaInputS; None;
+    vidya_scalar,
+    vidya_avx2,
+    vidya_avx512,
+);
+
+bench_variants!(
+    vlma => VlmaInputS; None;
+    vlma_scalar,
+    vlma_avx2,
+    vlma_avx512,
+);
+
+bench_variants!(
+    volume_adjusted_ma => VolumeAdjustedMaInputS; None;
+    volume_adjusted_ma_scalar,
+    volume_adjusted_ma_avx2,
+    volume_adjusted_ma_avx512,
+);
+
+bench_variants!(
+    vpwma => VpwmaInputS; None;
+    vpwma_scalar,
+    vpwma_avx2,
+    vpwma_avx512,
+);
+
+bench_variants!(
+    vwap => VwapInputS; None;
+    vwap_scalar,
+    vwap_avx2,
+    vwap_avx512,
+);
+
+bench_variants!(
+    vwma => VwmaInputS; None;
+    vwma_scalar,
+    vwma_avx2,
+    vwma_avx512,
+);
+
+bench_variants!(
+    wilders => WildersInputS; None;
+    wilders_scalar,
+    wilders_avx2,
+    wilders_avx512,
+);
+
+bench_variants!(
+    stoch => StochInputS; None;
+    stoch_scalar,
+    stoch_avx2,
+    stoch_avx512,
+);
+
+bench_variants!(
+    stoch_batch => StochInputS; Some(14);
+    stoch_batch_scalarbatch,
+    stoch_batch_avx2batch,
+    stoch_batch_avx512batch,
+);
+
+bench_variants!(
+    wclprice => WclpriceInputS; None;
+    wclprice_scalar,
+    wclprice_avx2,
+    wclprice_avx512,
+);
+
+bench_variants!(
+    wma => WmaInputS; None;
+    wma_scalar,
+    wma_avx2,
+    wma_avx512,
+);
+
+bench_variants!(
+    zlema => ZlemaInputS; None;
+    zlema_scalar,
+    zlema_avx2,
+    zlema_avx512,
+);
+
+bench_variants!(
+    vosc => VoscInputS; None;
+    vosc_scalar,
+    vosc_avx2,
+    vosc_avx512,
+);
+
+bench_variants!(
+    donchian => DonchianInputS; None;
+    donchian_scalar,
+    donchian_avx2,
+    donchian_avx512,
+);
+
+bench_variants!(
+    donchian_channel_width => DonchianChannelWidthInputS; None;
+    donchian_channel_width_scalar,
+    donchian_channel_width_avx2,
+    donchian_channel_width_avx512,
+);
+
+bench_variants!(
+    donchian_batch => DonchianInputS; Some(20);
+    donchian_batch_scalarbatch,
+    donchian_batch_avx2batch,
+    donchian_batch_avx512batch,
+);
+
+bench_variants!(
+    stochf => StochfInputS; None;
+    stochf_scalar,
+    stochf_avx2,
+    stochf_avx512,
+);
+
+bench_variants!(
+    stochf_batch => StochfInputS; Some(5);
+    stochf_batch_scalarbatch,
+    stochf_batch_avx2batch,
+    stochf_batch_avx512batch,
+);
+
+bench_variants!(
+    avsl => AvslInputS; None;
+    avsl_scalar,
+    avsl_avx2,
+    avsl_avx512,
+);
+
+bench_variants!(
+    dma => DmaInputS; None;
+    dma_scalar,
+    dma_avx2,
+    dma_avx512,
+);
+
+bench_variants!(
+    range_filter => RangeFilterInputS; None;
+    range_filter_scalar,
+    range_filter_avx2,
+    range_filter_avx512,
+);
+
+bench_variants!(
+    ehma => EhmaInputS; None;
+    ehma_scalar,
+    ehma_avx2,
+    ehma_avx512,
+);
+
+bench_variants!(
+    sama => SamaInputS; None;
+    sama_scalar,
+    sama_avx2,
+    sama_avx512,
+);
+
+bench_variants!(
+    wto => WtoInputS; None;
+    wto_scalar,
+    wto_avx2,
+    wto_avx512,
+);
+
+bench_variants!(
+    wavetrend => WavetrendInputS; None;
+    wavetrend_scalar,
+    wavetrend_avx2,
+    wavetrend_avx512,
+);
+
+bench_variants!(
+    dpo => DpoInputS; None;
+    dpo_scalar,
+    dpo_avx2,
+    dpo_avx512,
+);
+
+bench_variants!(
+    dpo_batch => DpoInputS; None;
+    dpo_batch_scalarbatch,
+    dpo_batch_avx2batch,
+    dpo_batch_avx512batch,
+);
+
+bench_variants!(
+    safezonestop_batch => SafeZoneStopInputS; None;
+    safezonestop_batch_scalarbatch,
+    safezonestop_batch_avx2batch,
+    safezonestop_batch_avx512batch,
+);
+
+bench_variants!(
+    forward_backward_exponential_oscillator => ForwardBackwardExponentialOscillatorInputS; None;
+    forward_backward_exponential_oscillator_scalar,
+    forward_backward_exponential_oscillator_avx2,
+    forward_backward_exponential_oscillator_avx512,
+);
+
+bench_variants!(
+    fosc => FoscInputS; None;
+    fosc_scalar,
+    fosc_avx2,
+    fosc_avx512,
+);
+
+bench_variants!(
+    fractal_dimension_index => FractalDimensionIndexInputS; None;
+    fractal_dimension_index_scalar,
+    fractal_dimension_index_avx2,
+    fractal_dimension_index_avx512,
+);
+
+bench_variants!(
+    wavetrend_batch => WavetrendInputS; None;
+    wavetrend_batch_scalarbatch,
+    wavetrend_batch_avx2batch,
+    wavetrend_batch_avx512batch,
+);
+
+bench_variants!(
+    tsf => TsfInputS; None;
+    tsf_scalar,
+    tsf_avx2,
+    tsf_avx512,
+);
+
+bench_variants!(
+    vosc_batch => VoscInputS; Some(227);
+    vosc_batch_scalarbatch,
+    vosc_batch_avx2batch,
+    vosc_batch_avx512batch,
+);
+
+bench_variants!(
+    nama => NamaInputS; None;
+    nama_scalar,
+    nama_avx2,
+    nama_avx512,
+);
+
+bench_variants!(
+    deviation => DeviationInputS; Some(9);
+    deviation_scalar,
+    deviation_avx2,
+    deviation_avx512,
+);
+
+bench_variants!(
+    deviation_batch => DeviationInputS; Some(9);
+    deviation_batch_scalarbatch,
+    deviation_batch_avx2batch,
+    deviation_batch_avx512batch,
+);
+
+bench_variants!(
+    mom => MomInputS; None;
+    mom_scalar,
+    mom_avx2,
+    mom_avx512,
+);
+
+bench_variants!(
+    supertrend => SupertrendInputS; Some(10);
+    supertrend_scalar,
+    supertrend_avx2,
+    supertrend_avx512,
+);
+
+bench_variants!(
+    supertrend_batch => SupertrendInputS; Some(10);
+    supertrend_batch_scalarbatch,
+    supertrend_batch_avx2batch,
+    supertrend_batch_avx512batch,
+);
+
+bench_variants!(
+    rsx => RsxInputS; None;
+    rsx_scalar,
+    rsx_avx2,
+    rsx_avx512,
+);
+
+bench_variants!(
+    rsx_batch => RsxInputS; None;
+    rsx_batch_scalarbatch,
+    rsx_batch_avx2batch,
+    rsx_batch_avx512batch
+);
+
+bench_variants!(
+    net_myrsi => NetMyrsiInputS; None;
+    net_myrsi_scalar,
+    net_myrsi_avx2,
+    net_myrsi_avx512,
+);
+
+bench_variants!(
+    net_myrsi_batch => NetMyrsiInputS; Some(37);
+    net_myrsi_batch_scalarbatch,
+    net_myrsi_batch_avx2batch,
+    net_myrsi_batch_avx512batch
+);
+
+bench_variants!(
+    cci_cycle => CciCycleInputS; None;
+    cci_cycle_scalar,
+    cci_cycle_avx2,
+    cci_cycle_avx512,
+);
+
+bench_variants!(
+    cci_cycle_batch => CciCycleInputS; Some(227);
+    cci_cycle_batch_scalarbatch,
+    cci_cycle_batch_avx2batch,
+    cci_cycle_batch_avx512batch
+);
+
+bench_variants!(
+    fvg_positioning_average => FvgPositioningAverageInputS; None;
+    fvg_positioning_average_scalar,
+    fvg_positioning_average_avx2,
+    fvg_positioning_average_avx512,
+);
+
+bench_variants!(
+    fvg_trailing_stop => FvgTrailingStopInputS; None;
+    fvg_trailing_stop_scalar,
+    fvg_trailing_stop_avx2,
+    fvg_trailing_stop_avx512,
+);
+
+bench_variants!(
+    halftrend => HalfTrendInputS; None;
+    halftrend_scalar,
+    halftrend_avx2,
+    halftrend_avx512,
+);
+
+bench_variants!(
+    halftrend_batch => HalfTrendInputS; Some(100);
+    halftrend_batch_scalarbatch,
+    halftrend_batch_avx2batch,
+    halftrend_batch_avx512batch,
+);
+
+bench_variants!(
+    ift_rsi => IftRsiInputS; None;
+    ift_rsi_scalar,
+    ift_rsi_avx2,
+    ift_rsi_avx512,
+);
+
+bench_variants!(
+    kdj => KdjInputS; None;
+    kdj_scalar,
+    kdj_avx2,
+    kdj_avx512,
+);
+
+bench_variants!(
+    keltner => KeltnerInputS; None;
+    keltner_scalar,
+    keltner_avx2,
+    keltner_avx512,
+);
+
+bench_variants!(
+    kvo => KvoInputS; None;
+    kvo_scalar,
+    kvo_avx2,
+    kvo_avx512,
+);
+
+bench_variants!(
+    reverse_rsi => ReverseRsiInputS; None;
+    reverse_rsi_scalar,
+    reverse_rsi_avx2,
+    reverse_rsi_avx512,
+);
+
+bench_variants!(
+    mean_ad => MeanAdInputS; None;
+    mean_ad_scalar,
+    mean_ad_avx2,
+    mean_ad_avx512,
+);
+
+bench_variants!(
+    medium_ad => MediumAdInputS; None;
+    medium_ad_scalar,
+    medium_ad_avx2,
+    medium_ad_avx512,
+);
+
+bench_variants!(
+    mean_ad_batch => MeanAdInputS; Some(5);
+    mean_ad_batch_scalarbatch,
+    mean_ad_batch_avx2batch,
+    mean_ad_batch_avx512batch,
+);
+
+bench_variants!(
+    msw => MswInputS; None;
+    msw_scalar,
+    msw_avx2,
+    msw_avx512,
+);
+
+bench_variants!(
+    reverse_rsi_batch => ReverseRsiInputS; Some(27);
+    reverse_rsi_batch_scalarbatch,
+    reverse_rsi_batch_avx2batch,
+    reverse_rsi_batch_avx512batch
+);
+
+bench_variants!(
+    vama => VamaInputS; None;
+    vama_scalar,
+    vama_avx2,
+    vama_avx512,
+);
+
+bench_variants!(
+    vama_batch => VamaInputS; Some(250);
+    vama_batch_scalarbatch,
+    vama_batch_avx2batch,
+    vama_batch_avx512batch
+);
+
+bench_variants!(
+    ppo => PpoInputS; None;
+    ppo_scalar,
+    ppo_avx2,
+    ppo_avx512,
+);
+
+bench_variants!(
+    kurtosis => KurtosisInputS; None;
+    kurtosis_scalar,
+    kurtosis_avx2,
+    kurtosis_avx512,
+);
+
+bench_variants!(
+    kurtosis_batch => KurtosisInputS; Some(5);
+    kurtosis_batch_scalarbatch,
+    kurtosis_batch_avx2batch,
+    kurtosis_batch_avx512batch,
+);
+
+bench_variants!(
+    adxr => AdxrInputS; None;
+    adxr_scalar,
+    adxr_avx2,
+    adxr_avx512,
+);
+
+bench_variants!(
+    alligator => AlligatorInputS; None;
+    alligator_scalar,
+    alligator_avx2,
+    alligator_avx512,
+);
+
+bench_variants!(
+    cci => CciInputS; Some(14);
+    cci_scalar,
+    cci_avx2,
+    cci_avx512,
+);
+
+bench_variants!(
+    kaufmanstop => KaufmanstopInputS; None;
+    kaufmanstop_scalar,
+    kaufmanstop_avx2,
+    kaufmanstop_avx512,
+);
+
+bench_variants!(
+    kaufmanstop_batch => KaufmanstopInputS; Some(22);
+    kaufmanstop_batch_scalarbatch,
+    kaufmanstop_batch_avx2batch,
+    kaufmanstop_batch_avx512batch,
+);
+
+bench_variants!(
+    cksp => CkspInputS; None;
+    cksp_scalar,
+    cksp_avx2,
+    cksp_avx512,
+);
+
+bench_variants!(
+    mod_god_mode => ModGodModeInputS; None;
+    mod_god_mode_scalar,
+    mod_god_mode_avx2,
+    mod_god_mode_avx512,
+);
+
+bench_variants!(
+    cksp_batch => CkspInputS; None;
+    cksp_batch_scalarbatch,
+    cksp_batch_avx2batch,
+    cksp_batch_avx512batch
+);
+
+bench_variants!(
+    prb_batch => PrbInputS; None;
+    prb_batch_scalarbatch,
+    prb_batch_avx2batch,
+    prb_batch_avx512batch
+);
+
+make_kernel_wrappers!(
+    aroon,
+    vector_ta::indicators::aroon::aroon_with_kernel,
+    AroonInputS;
+    Scalar, Avx2, Avx512
+);
+
+bench_variants!(
+    aroon => AroonInputS; Some(14);
+    aroon_scalar,
+    aroon_avx2,
+    aroon_avx512
+);
+
+make_pair_from_input_wrappers!(
+    aroon_batch,
+    vector_ta::indicators::aroon::AroonBatchBuilder,
+    AroonInputS,
+    |input: &AroonInputS| -> anyhow::Result<(&[f64], &[f64])> {
+        let (high, low) = match &input.data {
+            vector_ta::indicators::aroon::AroonData::Candles { candles } => {
+                (&candles.high[..], &candles.low[..])
+            }
+            vector_ta::indicators::aroon::AroonData::SlicesHL { high, low } => (*high, *low),
+        };
+        Ok((high, low))
+    }
+);
+
+bench_variants!(
+    aroon_batch => AroonInputS; Some(14);
+    aroon_batch_scalarbatch,
+    aroon_batch_avx2batch,
+    aroon_batch_avx512batch
+);
+
+make_kernel_wrappers!(
+    aroon_osc,
+    vector_ta::indicators::aroonosc::aroon_osc_with_kernel,
+    AroonOscInputS;
+    Scalar, Avx2, Avx512
+);
+
+bench_variants!(
+    aroon_osc => AroonOscInputS; Some(14);
+    aroon_osc_scalar,
+    aroon_osc_avx2,
+    aroon_osc_avx512
+);
+
+make_pair_from_input_wrappers!(
+    aroon_osc_batch,
+    vector_ta::indicators::aroonosc::AroonOscBatchBuilder,
+    AroonOscInputS,
+    |input: &AroonOscInputS| -> anyhow::Result<(&[f64], &[f64])> {
+        Ok((input.get_high(), input.get_low()))
+    }
+);
+
+bench_variants!(
+    aroon_osc_batch => AroonOscInputS; Some(14);
+    aroon_osc_batch_scalarbatch,
+    aroon_osc_batch_avx2batch,
+    aroon_osc_batch_avx512batch
+);
+
+bench_variants!(
+    cmo_batch => CmoInputS; Some(14);
+    cmo_batch_scalarbatch,
+    cmo_batch_avx2batch,
+    cmo_batch_avx512batch
+);
+
+bench_variants!(
+    srsi => SrsiInputS; Some(14);
+    srsi_scalar,
+    srsi_avx2,
+    srsi_avx512,
+);
+
+bench_variants!(
+    srsi_batch => SrsiInputS; Some(14);
+    srsi_batch_scalarbatch,
+    srsi_batch_avx2batch,
+    srsi_batch_avx512batch
+);
+
+bench_variants!(
+    pfe_batch => PfeInputS; Some(10);
+    pfe_batch_scalarbatch,
+    pfe_batch_avx2batch,
+    pfe_batch_avx512batch
+);
+
+bench_variants!(
+    nvi => NviInputS; None;
+    nvi_scalar,
+    nvi_avx2,
+    nvi_avx512,
+);
+
+bench_variants!(
+    cvi => CviInputS; None;
+    cvi_scalar,
+    cvi_avx2,
+    cvi_avx512,
+);
+
+bench_variants!(
+    cvi_batch => CviInputS; Some(20);
+    cvi_batch_scalarbatch,
+    cvi_batch_avx2batch,
+    cvi_batch_avx512batch,
+);
+
+bench_variants!(
+    gatorosc => GatorOscInputS; None;
+    gatorosc_scalar,
+    gatorosc_avx2,
+    gatorosc_avx512,
+);
+
+bench_variants!(
+    geometric_bias_oscillator => GeometricBiasOscillatorInputS; None;
+    geometric_bias_oscillator_scalar,
+    geometric_bias_oscillator_avx2,
+    geometric_bias_oscillator_avx512,
+);
+
+bench_variants!(
+    gmma_oscillator => GmmaOscillatorInputS; None;
+    gmma_oscillator_scalar,
+    gmma_oscillator_avx2,
+    gmma_oscillator_avx512,
+);
+
+bench_variants!(
+    gopalakrishnan_range_index => GopalakrishnanRangeIndexInputS; None;
+    gopalakrishnan_range_index_scalar,
+    gopalakrishnan_range_index_avx2,
+    gopalakrishnan_range_index_avx512,
+);
+
+bench_variants!(
+    grover_llorens_cycle_oscillator => GroverLlorensCycleOscillatorInputS; None;
+    grover_llorens_cycle_oscillator_scalar,
+    grover_llorens_cycle_oscillator_avx2,
+    grover_llorens_cycle_oscillator_avx512,
+);
+
+bench_variants!(
+    half_causal_estimator => HalfCausalEstimatorInputS; None;
+    half_causal_estimator_scalar,
+    half_causal_estimator_avx2,
+    half_causal_estimator_avx512,
+);
+
+bench_variants!(
+    ui => UiInputS; None;
+    ui_scalar,
+    ui_avx2,
+    ui_avx512,
+);
+
+bench_variants!(
+    dvdiqqe => DvdiqqeInputS; None;
+    dvdiqqe_scalar,
+    dvdiqqe_avx2,
+    dvdiqqe_avx512,
+);
+
+make_batch_wrappers!(
+    ui_batch,
+    vector_ta::indicators::ui::UiBatchBuilder,
+    UiInputS;
+    ScalarBatch,
+    Avx2Batch,
+    Avx512Batch
+);
+bench_variants!(
+    ui_batch => UiInputS; Some(27);
+    ui_batch_scalarbatch,
+    ui_batch_avx2batch,
+    ui_batch_avx512batch
+);
+
+make_hlc_batch_wrappers!(
+    di_batch,
+    vector_ta::indicators::di::DiBatchBuilder,
+    DiInputS,
+    vector_ta::indicators::di::DiData
+);
+bench_variants!(
+    di_batch => DiInputS; Some(27);
+    di_batch_scalarbatch,
+    di_batch_avx2batch,
+    di_batch_avx512batch
+);
+
+make_batch_wrappers!(
+    msw_batch,
+    vector_ta::indicators::msw::MswBatchBuilder,
+    MswInputS;
+    ScalarBatch,
+    Avx2Batch,
+    Avx512Batch
+);
+bench_variants!(
+    msw_batch => MswInputS; Some(27);
+    msw_batch_scalarbatch,
+    msw_batch_avx2batch,
+    msw_batch_avx512batch
+);
+
+make_batch_wrappers!(
+    medium_ad_batch,
+    vector_ta::indicators::medium_ad::MediumAdBatchBuilder,
+    MediumAdInputS;
+    ScalarBatch,
+    Avx2Batch,
+    Avx512Batch
+);
+bench_variants!(
+    medium_ad_batch => MediumAdInputS; Some(27);
+    medium_ad_batch_scalarbatch,
+    medium_ad_batch_avx2batch,
+    medium_ad_batch_avx512batch
+);
+
+bench_variants!(
+    ultosc => UltOscInputS; None;
+    ultosc_scalar,
+    ultosc_avx2,
+    ultosc_avx512,
+);
+
+bench_variants!(
+    qstick => QstickInputS; None;
+    qstick_scalar,
+    qstick_avx2,
+    qstick_avx512,
+);
+
+bench_variants!(
+    rsi => RsiInputS; None;
+    rsi_scalar,
+    rsi_avx2,
+    rsi_avx512,
+);
+
+bench_variants!(
+    ultosc_batch => UltOscInputS; Some(28);
+    ultosc_batch_scalarbatch,
+    ultosc_batch_avx2batch,
+    ultosc_batch_avx512batch,
+);
+
+bench_variants!(
+    qstick_batch => QstickInputS; Some(5);
+    qstick_batch_scalarbatch,
+    qstick_batch_avx2batch,
+    qstick_batch_avx512batch,
+);
+
+bench_variants!(
+    vwmacd => VwmacdInputS; None;
+    vwmacd_scalar,
+    vwmacd_avx2,
+    vwmacd_avx512,
+);
+
+make_batch_wrappers!(rsi_batch, RsiBatchBuilder, RsiInputS; ScalarBatch, Avx2Batch, Avx512Batch);
+bench_variants!(
+    rsi_batch => RsiInputS; Some(14);
+    rsi_batch_scalarbatch,
+    rsi_batch_avx2batch,
+    rsi_batch_avx512batch,
+);
+
+bench_variants!(
+    mfi_batch => MfiInputS; Some(14);
+    mfi_batch_scalarbatch,
+    mfi_batch_avx2batch,
+    mfi_batch_avx512batch,
+);
+
+bench_variants!(
+    midprice_batch => MidpriceInputS; Some(14);
+    midprice_batch_scalarbatch,
+    midprice_batch_avx2batch,
+    midprice_batch_avx512batch,
+);
+
+bench_variants!(
+    dx_batch => DxInputS; Some(14);
+    dx_batch_scalarbatch,
+    dx_batch_avx2batch,
+    dx_batch_avx512batch,
+);
+
+bench_variants!(
+    dx => DxInputS; Some(14);
+    dx_scalar,
+    dx_avx2,
+    dx_avx512,
+);
+
+bench_variants!(
+    dynamic_momentum_index => DynamicMomentumIndexInputS; Some(30);
+    dynamic_momentum_index_scalar,
+    dynamic_momentum_index_avx2,
+    dynamic_momentum_index_avx512,
+);
+
+bench_variants!(
+    ehlers_adaptive_cg => EhlersAdaptiveCgInputS; Some(100);
+    ehlers_adaptive_cg_scalar,
+    ehlers_adaptive_cg_avx2,
+    ehlers_adaptive_cg_avx512,
+);
+
+bench_variants!(
+    ehlers_adaptive_cyber_cycle => EhlersAdaptiveCyberCycleInputS; Some(3);
+    ehlers_adaptive_cyber_cycle_scalar,
+    ehlers_adaptive_cyber_cycle_avx2,
+    ehlers_adaptive_cyber_cycle_avx512,
+);
+
+bench_variants!(
+    ehlers_autocorrelation_periodogram => EhlersAutocorrelationPeriodogramInputS; Some(2);
+    ehlers_autocorrelation_periodogram_scalar,
+    ehlers_autocorrelation_periodogram_avx2,
+    ehlers_autocorrelation_periodogram_avx512,
+);
+
+bench_variants!(
+    ehlers_data_sampling_relative_strength_indicator => EhlersDataSamplingRelativeStrengthIndicatorInputS; Some(3);
+    ehlers_data_sampling_relative_strength_indicator_scalar,
+    ehlers_data_sampling_relative_strength_indicator_avx2,
+    ehlers_data_sampling_relative_strength_indicator_avx512,
+);
+
+bench_variants!(
+    ehlers_detrending_filter => EhlersDetrendingFilterInputS; Some(2);
+    ehlers_detrending_filter_scalar,
+    ehlers_detrending_filter_avx2,
+    ehlers_detrending_filter_avx512,
+);
+
+criterion_main!(
+    benches_scalar,
+    benches_safezonestop,
+    benches_roc,
+    benches_roc_batch,
+    benches_adxr,
+    benches_alligator,
+    benches_bandpass,
+    benches_cci,
+    benches_cci_batch,
+    benches_cci_cycle,
+    benches_cci_cycle_batch,
+    benches_correl_hl,
+    benches_correl_hl_batch,
+    benches_sar,
+    benches_safezonestop_batch,
+    benches_natr,
+    benches_efi,
+    benches_marketfi,
+    benches_natr_batch,
+    benches_sar_batch,
+    benches_stoch,
+    benches_stoch_batch,
+    benches_fisher,
+    benches_fisher_batch,
+    benches_fvg_positioning_average,
+    benches_fvg_trailing_stop,
+    benches_garman_klass_volatility,
+    benches_gatorosc,
+    benches_halftrend,
+    benches_halftrend_batch,
+    benches_ift_rsi,
+    benches_kdj,
+    benches_keltner,
+    benches_keltner_batch,
+    benches_kvo,
+    benches_lrsi,
+    benches_lpc,
+    benches_mean_ad,
+    benches_mean_ad_batch,
+    benches_medium_ad,
+    benches_medium_ad_batch,
+    benches_range_filter,
+    benches_range_filter_batch,
+    benches_acosc,
+    benches_cfo,
+    benches_cfo_batch,
+    benches_correlation_cycle,
+    benches_correlation_cycle_batch,
+    benches_kaufmanstop,
+    benches_kaufmanstop_batch,
+    benches_cksp,
+    benches_cksp_batch,
+    benches_aso,
+    benches_alphatrend,
+    benches_vpci,
+    benches_vpci_batch,
+    benches_bollinger_bands,
+    benches_bop,
+    benches_cg,
+    benches_ttm_trend,
+    benches_ttm_trend_batch,
+    benches_ad,
+    benches_cmo,
+    benches_cmo_batch,
+    benches_coppock,
+    benches_coppock_batch,
+    benches_cvi,
+    benches_cvi_batch,
+    benches_damiani_volatmeter,
+    benches_damiani_volatmeter_batch,
+    benches_linearreg_angle,
+    benches_linearreg_angle_batch,
+    benches_nvi,
+    benches_pvi,
+    benches_dti,
+    benches_pvi_batch,
+    benches_aso_batch,
+    benches_mom,
+    benches_mom_batch,
+    benches_rsx,
+    benches_rsx_batch,
+    benches_ao,
+    benches_ao_batch,
+    benches_atr,
+    benches_atr_batch,
+    benches_er,
+    benches_obv,
+    benches_trix,
+    benches_rvi,
+    benches_stc,
+    benches_trix_batch,
+    benches_apo,
+    benches_apo_batch,
+    benches_rocr,
+    benches_rocr_batch,
+    benches_dm,
+    benches_dm_batch,
+    benches_linearreg_slope,
+    benches_ott,
+    benches_ultosc,
+    benches_qstick,
+    benches_tsi,
+    benches_rsi,
+    benches_mfi_batch,
+    benches_midprice_batch,
+    benches_rsi_batch,
+    benches_dx,
+    benches_dx_batch,
+    benches_dynamic_momentum_index,
+    benches_ehlers_adaptive_cg,
+    benches_ehlers_adaptive_cyber_cycle,
+    benches_ehlers_autocorrelation_periodogram,
+    benches_ehlers_data_sampling_relative_strength_indicator,
+    benches_ehlers_detrending_filter,
+    benches_adx,
+    benches_adx_batch,
+    benches_adx_batch_dev_250,
+    benches_ultosc_batch,
+    benches_qstick_batch,
+    benches_tsi_batch,
+    benches_alma,
+    benches_adosc,
+    benches_nadaraya_watson_envelope,
+    benches_alma_batch,
+    benches_mod_god_mode,
+    benches_adosc_batch,
+    benches_macd,
+    benches_macd_batch,
+    benches_buff_averages,
+    benches_buff_averages_batch,
+    benches_bandpass_batch,
+    benches_decycler_batch,
+    benches_zscore,
+    benches_yang_zhang_volatility,
+    benches_mab,
+    benches_eri,
+    benches_evasive_supertrend,
+    benches_ewma_volatility,
+    benches_exponential_trend,
+    benches_fibonacci_entry_bands,
+    benches_fibonacci_trailing_stop,
+    benches_eri_batch,
+    benches_zscore_batch,
+    benches_yang_zhang_volatility_batch,
+    benches_var,
+    benches_var_batch,
+    benches_deviation,
+    benches_deviation_batch,
+    benches_supertrend,
+    benches_supertrend_batch,
+    benches_bollinger_bands_batch,
+    benches_linearreg_slope_batch,
+    benches_stddev_batch,
+    benches_macz,
+    benches_emv,
+    benches_emv_batch,
+    benches_macz_batch,
+    benches_cwma,
+    benches_cwma_batch,
+    benches_cora_wave_batch,
+    benches_dema,
+    benches_dema_batch,
+    benches_edcf,
+    benches_edcf_batch,
+    benches_ehlers_ecema,
+    benches_ehlers_fm_demodulator,
+    benches_ehlers_linear_extrapolation_predictor,
+    benches_ehlers_simple_cycle_indicator,
+    benches_ehlers_smoothed_adaptive_momentum,
+    benches_ehlers_undersampled_double_moving_average,
+    benches_elastic_volume_weighted_moving_average,
+    benches_ehlers_ecema_batch,
+    benches_ehlers_itrend,
+    benches_ehlers_itrend_batch,
+    benches_ehlers_pma,
+    benches_pma,
+    benches_ehlers_pma_batch,
+    benches_ehlers_kama,
+    benches_ehlers_kama_batch,
+    benches_ema,
+    benches_ema_deviation_corrected_t3,
+    benches_emd,
+    benches_emd_trend,
+    benches_ema_batch,
+    benches_epma,
+    benches_epma_batch,
+    benches_pma_batch,
+    benches_frama,
+    benches_frama_batch,
+    benches_fwma,
+    benches_fwma_batch,
+    benches_gaussian,
+    benches_gaussian_batch,
+    benches_geometric_bias_oscillator,
+    benches_gmma_oscillator,
+    benches_gopalakrishnan_range_index,
+    benches_grover_llorens_cycle_oscillator,
+    benches_half_causal_estimator,
+    benches_pivot,
+    benches_pivot_batch,
+    benches_highpass_2_pole,
+    benches_highpass_2_pole_batch,
+    benches_highpass,
+    benches_highpass_batch,
+    benches_hma,
+    benches_hma_batch,
+    benches_hwma,
+    benches_hwma_batch,
+    benches_jma,
+    benches_jma_batch,
+    benches_jsa,
+    benches_jsa_batch,
+    benches_kama,
+    benches_kama_batch,
+    benches_linreg,
+    benches_linreg_batch,
+    benches_linearreg_intercept,
+    benches_linearreg_intercept_batch,
+    benches_maaq,
+    benches_maaq_batch,
+    benches_mama,
+    benches_mama_batch,
+    benches_mwdx,
+    benches_msw,
+    benches_msw_batch,
+    benches_mwdx_batch,
+    benches_nma,
+    benches_nma_batch,
+    benches_pwma,
+    benches_pwma_batch,
+    benches_reflex,
+    benches_reflex_batch,
+    benches_sinwma,
+    benches_sinwma_batch,
+    benches_sma,
+    benches_sma_batch,
+    benches_smma,
+    benches_smma_batch,
+    benches_sqwma,
+    benches_sqwma_batch,
+    benches_srwma,
+    benches_srwma_batch,
+    benches_supersmoother,
+    benches_supersmoother_batch,
+    benches_supersmoother_3_pole,
+    benches_supersmoother_3_pole_batch,
+    benches_swma,
+    benches_swma_batch,
+    benches_tema,
+    benches_tema_batch,
+    benches_tilson,
+    benches_tilson_batch,
+    benches_tradjema,
+    benches_tradjema_batch,
+    benches_trendflex,
+    benches_trendflex_batch,
+    benches_trima,
+    benches_trima_batch,
+    benches_uma,
+    benches_uma_batch,
+    benches_chandelier_exit,
+    benches_percentile_nearest_rank,
+    benches_vidya,
+    benches_vidya_batch,
+    benches_vlma,
+    benches_vlma_batch,
+    benches_volume_adjusted_ma,
+    benches_volume_adjusted_ma_batch,
+    benches_dma,
+    benches_dma_batch,
+    benches_vama,
+    benches_vama_batch,
+    benches_sama,
+    benches_sama_batch,
+    benches_er_batch,
+    benches_vpwma,
+    benches_vwap,
+    benches_vpwma_batch,
+    benches_prb_batch,
+    benches_squeeze_momentum_batch,
+    benches_srsi,
+    benches_srsi_batch,
+    benches_pfe_batch,
+    benches_kst_batch,
+    benches_willr,
+    benches_willr_batch,
+    benches_vwmacd,
+    benches_vwma,
+    benches_wavetrend,
+    benches_nama,
+    benches_wto,
+    benches_wavetrend_batch,
+    benches_dpo,
+    benches_dpo_batch,
+    benches_forward_backward_exponential_oscillator,
+    benches_fosc,
+    benches_fractal_dimension_index,
+    benches_wto_batch,
+    benches_nama_batch,
+    benches_di_batch,
+    benches_vosc,
+    benches_vosc_batch,
+    benches_wilders,
+    benches_wclprice,
+    benches_wilders_batch,
+    benches_ott_batch,
+    benches_wad,
+    benches_wma,
+    benches_wma_batch,
+    benches_wad_batch,
+    benches_zlema,
+    benches_zlema_batch,
+    benches_stochf,
+    benches_stochf_batch,
+    benches_vi_batch,
+    benches_tsf,
+    benches_chandelier_exit,
+    benches_chandelier_exit_batch,
+    benches_otto_batch,
+    benches_percentile_nearest_rank,
+    benches_percentile_nearest_rank_batch,
+    benches_ppo,
+    benches_donchian,
+    benches_donchian_channel_width,
+    benches_donchian_batch,
+    benches_kurtosis,
+    benches_kurtosis_batch,
+    benches_net_myrsi,
+    benches_net_myrsi_batch,
+    benches_kvo_batch,
+    benches_bollinger_bands_width,
+    benches_bollinger_bands_width_batch,
+    benches_aroon,
+    benches_aroon_batch,
+    benches_aroon_osc,
+    benches_aroon_osc_batch,
+    benches_avsl,
+    benches_avsl_batch,
+    benches_ehma,
+    benches_ehma_batch,
+    benches_vpt,
+    benches_reverse_rsi,
+    benches_reverse_rsi_batch,
+    benches_ttm_squeeze_batch
+);

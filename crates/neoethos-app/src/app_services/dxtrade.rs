@@ -250,10 +250,21 @@ pub struct DxTradeAuthSession {
     /// [`parse_timeout_seconds`]); falls back to
     /// [`DXTRADE_DEFAULT_SESSION_TTL_SECONDS`] when unparseable.
     pub expires_at_unix: i64,
-    /// Account code chosen for execution. Picked from the broker
-    /// settings (first enabled, or first overall) — the official
-    /// `/login` endpoint does NOT take an account; account lives
-    /// in the URL path for trading endpoints.
+    /// Account code chosen for execution.
+    ///
+    /// **F-595 documentation (2026-05-25)**: the picker logic is
+    /// "first enabled, OR first overall when nothing enabled". This
+    /// may surprise an operator who expects "fail when nothing
+    /// enabled" — the rationale is that a freshly-configured DXtrade
+    /// broker often has all accounts disabled by default in the
+    /// wizard, and refusing to pick ANY would break the
+    /// auto-discovery happy path on first run. Operators who want
+    /// strict "enabled-only" semantics flip the dx_strict_account
+    /// flag (Settings field) and the picker bails with a clear
+    /// "no enabled accounts" error.
+    ///
+    /// The official `/login` endpoint does NOT take an account;
+    /// account lives in the URL path for trading endpoints.
     pub account_id: String,
     /// Platform base URL the token was issued against, with any
     /// trailing slash stripped. Carried on the session so D3.2

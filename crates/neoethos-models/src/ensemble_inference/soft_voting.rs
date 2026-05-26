@@ -3,8 +3,9 @@
 //! Phase D1.3. This aggregator runs every loaded expert's
 //! [`super::ExpertModel::predict`] in turn and combines their
 //! Classification3 outputs by **weighted-average** of the
-//! `[p_sell, p_neutral, p_buy]` vectors. The result is one
-//! `[p_sell, p_neutral, p_buy]` per input row, ready for the
+//! `[p_neutral, p_buy, p_sell]` vectors (canonical order — see
+//! `base.rs` lines 128-135). The result is one
+//! `[p_neutral, p_buy, p_sell]` per input row, ready for the
 //! producer's `dispatch_auto_trade_signal` gate chain.
 //!
 //! ## Why "soft voting" and not "MoE"

@@ -6,16 +6,19 @@ edition.workspace = true
 [dependencies]
 anyhow = "1.0.100"
 chrono = "0.4.44"
-cubecl = { version = "0.9.0", optional = true, default-features = false, features = ["std", "cuda"] }
+# cubecl 0.10 — pure defaults; runtime selection happens downstream.
+# See neoethos-models/Cargo.toml for the full reasoning (AMD Vulkan
+# SPIR-V driver crash avoidance).
+cubecl = { version = "0.10.0", optional = true }
 ndarray = { version = "0.17.2", features = ["rayon"] }
-half = { version = "2.5", optional = true, default-features = false, features = ["alloc", "num-traits"] }
+half = { version = "2.5", optional = true, default-features = true, features = ["alloc", "num-traits"] }
 itertools = "0.14.0"
 rand = "0.9.2"
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 statrs = "0.18.0"
-tracing = "0.1.41"
+tracing = "0.1.42"  # aligned with workspace.dependencies (2026-05-26)
 neoethos-data = { path = "../neoethos-data" }
 neoethos-core = { path = "../neoethos-core" }
 duckdb = { version = "1.1.1", optional = true, features = ["bundled"] }

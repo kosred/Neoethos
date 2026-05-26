@@ -13,7 +13,13 @@ ndarray = { version = "0.17.2", features = ["rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
-vector-ta = { version = "0.2.4" }
+# Pin aligned 2026-05-26 with workspace `[patch.crates-io]` which redirects
+# this dep to `vendor/vector-ta-0.2.9-patched/`. The previous `0.2.4` pin was
+# silently overridden by the patch entry (verified via `cargo tree -i vector-ta`
+# which has always shown 0.2.9). Bumping the literal makes the intent obvious
+# to anyone reading this file and prevents a future patch removal from silently
+# downgrading the binary.
+vector-ta = { version = "0.2.9" }
 memmap2 = "0.9.5"
 # Recursive filesystem walk used by core::discover. Latest stable
 # (verified on crates.io 2026-05-14): 2.5.0.

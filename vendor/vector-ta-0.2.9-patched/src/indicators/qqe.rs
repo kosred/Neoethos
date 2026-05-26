@@ -1,0 +1,2521 @@
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::{PyDict, PyList};
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use wasm_bindgen::prelude::*;
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::{cuda_available, CudaQqe};
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::indicators::moving_averages::alma::{make_device_array_py, DeviceArrayF32Py};
+use crate::indicators::moving_averages::ema::{ema, EmaInput, EmaParams};
+use crate::indicators::rsi::{rsi, RsiInput, RsiParams};
+use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
+};
+#[cfg(feature = "python")]
+use crate::utilities::kernel_validation::validate_kernel;
+use aligned_vec::{AVec, CACHELINE_ALIGN};
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use core::arch::x86_64::*;
+
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+
+use std::convert::AsRef;
+use std::error::Error;
+use std::mem::MaybeUninit;
+use thiserror::Error;
+
+impl<'a> AsRef<[f64]> for QqeInput<'a> {
+    #[inline(always)]
+    fn as_ref(&self) -> &[f64] {
+        match &self.data {
+            QqeData::Slice(slice) => slice,
+            QqeData::Candles { candles, source } => qqe_source(candles, source),
+        }
+    }
+}
+
+#[inline(always)]
+fn qqe_source<'a>(candles: &'a Candles, source: &str) -> &'a [f64] {
+    match source {
+        "open" => candles.open.as_slice(),
+        "high" => candles.high.as_slice(),
+        "low" => candles.low.as_slice(),
+        "close" => candles.close.as_slice(),
+        "volume" => candles.volume.as_slice(),
+        "hl2" => candles.hl2.as_slice(),
+        "hlc3" => candles.hlc3.as_slice(),
+        "ohlc4" => candles.ohlc4.as_slice(),
+        "hlcc4" | "hlcc" => candles.hlcc4.as_slice(),
+        _ => source_type(candles, source),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum QqeData<'a> {
+    Candles {
+        candles: &'a Candles,
+        source: &'a str,
+    },
+    Slice(&'a [f64]),
+}
+
+#[derive(Debug, Clone)]
+pub struct QqeOutput {
+    pub fast: Vec<f64>,
+    pub slow: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "wasm"),
+    derive(Serialize, Deserialize)
+)]
+pub struct QqeParams {
+    pub rsi_period: Option<usize>,
+    pub smoothing_factor: Option<usize>,
+    pub fast_factor: Option<f64>,
+}
+
+impl Default for QqeParams {
+    fn default() -> Self {
+        Self {
+            rsi_period: Some(14),
+            smoothing_factor: Some(5),
+            fast_factor: Some(4.236),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QqeInput<'a> {
+    pub data: QqeData<'a>,
+    pub params: QqeParams,
+}
+
+impl<'a> QqeInput<'a> {
+    #[inline]
+    pub fn from_candles(c: &'a Candles, s: &'a str, p: QqeParams) -> Self {
+        Self {
+            data: QqeData::Candles {
+                candles: c,
+                source: s,
+            },
+            params: p,
+        }
+    }
+
+    #[inline]
+    pub fn from_slice(sl: &'a [f64], p: QqeParams) -> Self {
+        Self {
+            data: QqeData::Slice(sl),
+            params: p,
+        }
+    }
+
+    #[inline]
+    pub fn with_default_candles(c: &'a Candles) -> Self {
+        Self::from_candles(c, "close", QqeParams::default())
+    }
+
+    #[inline]
+    pub fn get_rsi_period(&self) -> usize {
+        self.params.rsi_period.unwrap_or(14)
+    }
+
+    #[inline]
+    pub fn get_smoothing_factor(&self) -> usize {
+        self.params.smoothing_factor.unwrap_or(5)
+    }
+
+    #[inline]
+    pub fn get_fast_factor(&self) -> f64 {
+        self.params.fast_factor.unwrap_or(4.236)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct QqeBuilder {
+    rsi_period: Option<usize>,
+    smoothing_factor: Option<usize>,
+    fast_factor: Option<f64>,
+    kernel: Kernel,
+}
+
+impl Default for QqeBuilder {
+    fn default() -> Self {
+        Self {
+            rsi_period: None,
+            smoothing_factor: None,
+            fast_factor: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl QqeBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline(always)]
+    pub fn rsi_period(mut self, val: usize) -> Self {
+        self.rsi_period = Some(val);
+        self
+    }
+
+    #[inline(always)]
+    pub fn smoothing_factor(mut self, val: usize) -> Self {
+        self.smoothing_factor = Some(val);
+        self
+    }
+
+    #[inline(always)]
+    pub fn fast_factor(mut self, val: f64) -> Self {
+        self.fast_factor = Some(val);
+        self
+    }
+
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline(always)]
+    pub fn apply(self, c: &Candles) -> Result<QqeOutput, QqeError> {
+        let p = QqeParams {
+            rsi_period: self.rsi_period,
+            smoothing_factor: self.smoothing_factor,
+            fast_factor: self.fast_factor,
+        };
+        let i = QqeInput::from_candles(c, "close", p);
+        qqe_with_kernel(&i, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn apply_slice(self, d: &[f64]) -> Result<QqeOutput, QqeError> {
+        let p = QqeParams {
+            rsi_period: self.rsi_period,
+            smoothing_factor: self.smoothing_factor,
+            fast_factor: self.fast_factor,
+        };
+        let i = QqeInput::from_slice(d, p);
+        qqe_with_kernel(&i, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn into_stream(self) -> Result<QqeStream, QqeError> {
+        let p = QqeParams {
+            rsi_period: self.rsi_period,
+            smoothing_factor: self.smoothing_factor,
+            fast_factor: self.fast_factor,
+        };
+        QqeStream::try_new(p)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum QqeError {
+    #[error("qqe: Input data slice is empty.")]
+    EmptyInputData,
+
+    #[error("qqe: All values are NaN.")]
+    AllValuesNaN,
+
+    #[error("qqe: Invalid period: period = {period}, data length = {data_len}")]
+    InvalidPeriod { period: usize, data_len: usize },
+
+    #[error("qqe: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+
+    #[error("qqe: Output slice length mismatch: expected = {expected}, got = {got}")]
+    OutputLengthMismatch { expected: usize, got: usize },
+
+    #[error("qqe: Invalid range: start = {start}, end = {end}, step = {step}")]
+    InvalidRange {
+        start: usize,
+        end: usize,
+        step: usize,
+    },
+
+    #[error("qqe: Invalid kernel type for batch operation: {0:?}")]
+    InvalidKernelForBatch(Kernel),
+
+    #[error("qqe: Error in dependent indicator: {message}")]
+    DependentIndicatorError { message: String },
+}
+
+#[inline]
+pub fn qqe(input: &QqeInput) -> Result<QqeOutput, QqeError> {
+    qqe_with_kernel(input, Kernel::Auto)
+}
+
+pub fn qqe_with_kernel(input: &QqeInput, kernel: Kernel) -> Result<QqeOutput, QqeError> {
+    let (data, rsi_p, ema_p, fast_k, first, chosen) = qqe_prepare(input, kernel)?;
+    let warm = first + rsi_p + ema_p - 2;
+
+    if chosen == Kernel::Scalar && rsi_p == 14 && ema_p == 5 && fast_k == 4.236 {
+        let mut fast = alloc_with_nan_prefix(data.len(), warm);
+        let mut slow = alloc_with_nan_prefix(data.len(), warm);
+        unsafe {
+            qqe_scalar_classic(data, rsi_p, ema_p, fast_k, first, &mut fast, &mut slow)?;
+        }
+        return Ok(QqeOutput { fast, slow });
+    }
+
+    let mut fast = alloc_with_nan_prefix(data.len(), warm);
+    let mut slow = alloc_with_nan_prefix(data.len(), warm);
+
+    qqe_into_slices(&mut fast, &mut slow, input, chosen)?;
+    Ok(QqeOutput { fast, slow })
+}
+
+fn qqe_scalar(
+    data: &[f64],
+    rsi_p: usize,
+    ema_p: usize,
+    fast_k: f64,
+    first: usize,
+    fast_warm: usize,
+) -> Result<QqeOutput, QqeError> {
+    let mut fast = alloc_with_nan_prefix(data.len(), fast_warm);
+    let mut slow = alloc_with_nan_prefix(data.len(), fast_warm);
+
+    if rsi_p == 14 && ema_p == 5 && fast_k == 4.236 {
+        unsafe {
+            qqe_scalar_classic(data, rsi_p, ema_p, fast_k, first, &mut fast, &mut slow)?;
+        }
+    } else {
+        qqe_into_slices(
+            &mut fast,
+            &mut slow,
+            &QqeInput::from_slice(
+                data,
+                QqeParams {
+                    rsi_period: Some(rsi_p),
+                    smoothing_factor: Some(ema_p),
+                    fast_factor: Some(fast_k),
+                },
+            ),
+            Kernel::Scalar,
+        )?;
+    }
+    Ok(QqeOutput { fast, slow })
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn qqe_avx2(
+    data: &[f64],
+    rsi_p: usize,
+    ema_p: usize,
+    fast_k: f64,
+    first: usize,
+    fast_warm: usize,
+) -> Result<QqeOutput, QqeError> {
+    qqe_scalar(data, rsi_p, ema_p, fast_k, first, fast_warm)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn qqe_avx512(
+    data: &[f64],
+    rsi_p: usize,
+    ema_p: usize,
+    fast_k: f64,
+    first: usize,
+    fast_warm: usize,
+) -> Result<QqeOutput, QqeError> {
+    qqe_scalar(data, rsi_p, ema_p, fast_k, first, fast_warm)
+}
+
+#[inline]
+pub fn qqe_into_slices(
+    dst_fast: &mut [f64],
+    dst_slow: &mut [f64],
+    input: &QqeInput,
+    kern: Kernel,
+) -> Result<(), QqeError> {
+    use crate::indicators::moving_averages::ema::ema_into_slice;
+    use crate::indicators::rsi::rsi_into_slice;
+
+    let (data, rsi_p, ema_p, fast_k, first, chosen) = qqe_prepare(input, kern)?;
+    if dst_fast.len() != data.len() || dst_slow.len() != data.len() {
+        let got = core::cmp::min(dst_fast.len(), dst_slow.len());
+        return Err(QqeError::OutputLengthMismatch {
+            expected: data.len(),
+            got,
+        });
+    }
+    let warm = first + rsi_p + ema_p - 2;
+
+    if chosen == Kernel::Scalar && rsi_p == 14 && ema_p == 5 && fast_k == 4.236 {
+        let prefix = warm.min(dst_fast.len());
+        for v in &mut dst_fast[..prefix] {
+            *v = f64::NAN;
+        }
+        for v in &mut dst_slow[..prefix] {
+            *v = f64::NAN;
+        }
+        unsafe {
+            qqe_scalar_classic(data, rsi_p, ema_p, fast_k, first, dst_fast, dst_slow)?;
+        }
+        return Ok(());
+    }
+
+    let mut tmp_mu = make_uninit_matrix(1, data.len());
+    let tmp: &mut [f64] =
+        unsafe { core::slice::from_raw_parts_mut(tmp_mu.as_mut_ptr() as *mut f64, data.len()) };
+
+    let rsi_in = RsiInput::from_slice(
+        data,
+        RsiParams {
+            period: Some(rsi_p),
+        },
+    );
+    rsi_into_slice(tmp, &rsi_in, chosen).map_err(|e| QqeError::DependentIndicatorError {
+        message: e.to_string(),
+    })?;
+
+    let ema_in = EmaInput::from_slice(
+        tmp,
+        EmaParams {
+            period: Some(ema_p),
+        },
+    );
+    ema_into_slice(dst_fast, &ema_in, chosen).map_err(|e| QqeError::DependentIndicatorError {
+        message: e.to_string(),
+    })?;
+
+    for v in &mut dst_slow[..warm] {
+        *v = f64::NAN;
+    }
+
+    qqe_compute_slow_from(dst_fast, fast_k, warm, dst_slow);
+    Ok(())
+}
+
+#[inline]
+pub fn qqe_into_pair(
+    dst: (&mut [f64], &mut [f64]),
+    input: &QqeInput,
+    kern: Kernel,
+) -> Result<(), QqeError> {
+    qqe_into_slices(dst.0, dst.1, input, kern)
+}
+
+#[inline]
+pub fn qqe_into_slice(
+    dst_fast: &mut [f64],
+    dst_slow: &mut [f64],
+    input: &QqeInput,
+    kern: Kernel,
+) -> Result<(), QqeError> {
+    qqe_into_slices(dst_fast, dst_slow, input, kern)
+}
+
+#[inline(always)]
+fn qqe_prepare<'a>(
+    input: &'a QqeInput,
+    kernel: Kernel,
+) -> Result<(&'a [f64], usize, usize, f64, usize, Kernel), QqeError> {
+    let data: &[f64] = input.as_ref();
+    let len = data.len();
+
+    if len == 0 {
+        return Err(QqeError::EmptyInputData);
+    }
+
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(QqeError::AllValuesNaN)?;
+
+    let rsi_period = input.get_rsi_period();
+    let smoothing_factor = input.get_smoothing_factor();
+    let fast_factor = input.get_fast_factor();
+
+    if rsi_period == 0 || rsi_period > len {
+        return Err(QqeError::InvalidPeriod {
+            period: rsi_period,
+            data_len: len,
+        });
+    }
+
+    if smoothing_factor == 0 || smoothing_factor > len {
+        return Err(QqeError::InvalidPeriod {
+            period: smoothing_factor,
+            data_len: len,
+        });
+    }
+
+    let needed = rsi_period + smoothing_factor;
+    if len - first < needed {
+        return Err(QqeError::NotEnoughValidData {
+            needed,
+            valid: len - first,
+        });
+    }
+
+    let chosen = qqe_single_kernel(kernel, len, rsi_period, smoothing_factor, fast_factor);
+
+    Ok((
+        data,
+        rsi_period,
+        smoothing_factor,
+        fast_factor,
+        first,
+        chosen,
+    ))
+}
+
+#[inline(always)]
+fn qqe_single_kernel(
+    kernel: Kernel,
+    len: usize,
+    rsi_period: usize,
+    smoothing_factor: usize,
+    fast_factor: f64,
+) -> Kernel {
+    match kernel {
+        Kernel::Auto => {
+            if rsi_period == 14 && smoothing_factor == 5 && fast_factor == 4.236 {
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                {
+                    return Kernel::Avx2;
+                }
+                #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+                {
+                    return if len <= 20_000 {
+                        Kernel::Scalar
+                    } else if len <= 200_000 {
+                        Kernel::Avx512
+                    } else {
+                        Kernel::Avx2
+                    };
+                }
+            }
+            detect_best_kernel()
+        }
+        k => k,
+    }
+}
+
+#[inline]
+fn qqe_compute_slow_from(qqef: &[f64], fast_factor: f64, start: usize, qqes: &mut [f64]) {
+    let len = qqef.len();
+    debug_assert!(start < len);
+
+    qqes[start] = qqef[start];
+
+    let alpha = 1.0 / 14.0;
+    let mut wwma = 0.0;
+    let mut atrrsi = 0.0;
+
+    for i in (start + 1)..len {
+        let tr = (qqef[i] - qqef[i - 1]).abs();
+        wwma = alpha * tr + (1.0 - alpha) * wwma;
+        atrrsi = alpha * wwma + (1.0 - alpha) * atrrsi;
+
+        let qup = qqef[i] + atrrsi * fast_factor;
+        let qdn = qqef[i] - atrrsi * fast_factor;
+
+        let prev = qqes[i - 1];
+
+        if qup < prev {
+            qqes[i] = qup;
+        } else if qqef[i] > prev && qqef[i - 1] < prev {
+            qqes[i] = qdn;
+        } else if qdn > prev {
+            qqes[i] = qdn;
+        } else if qqef[i] < prev && qqef[i - 1] > prev {
+            qqes[i] = qup;
+        } else {
+            qqes[i] = prev;
+        }
+    }
+}
+
+#[inline(always)]
+pub unsafe fn qqe_scalar_classic(
+    data: &[f64],
+    rsi_period: usize,
+    smoothing_factor: usize,
+    fast_factor: f64,
+    first: usize,
+    dst_fast: &mut [f64],
+    dst_slow: &mut [f64],
+) -> Result<(), QqeError> {
+    let len = data.len();
+    if dst_fast.len() != len || dst_slow.len() != len {
+        let got = core::cmp::min(dst_fast.len(), dst_slow.len());
+        return Err(QqeError::OutputLengthMismatch { expected: len, got });
+    }
+
+    let rsi_start = first + rsi_period;
+    if rsi_start >= len {
+        return Ok(());
+    }
+    let warm = first + rsi_period + smoothing_factor - 2;
+    let ema_warmup_end = (rsi_start + smoothing_factor).min(len);
+
+    let inv_rsi = 1.0 / rsi_period as f64;
+    let beta_rsi = 1.0 - inv_rsi;
+
+    let mut avg_gain = 0.0f64;
+    let mut avg_loss = 0.0f64;
+    let mut any_nan = false;
+
+    let init_end = (first + rsi_period).min(len - 1);
+    {
+        let mut i = first + 1;
+        while i <= init_end {
+            let delta = *data.get_unchecked(i) - *data.get_unchecked(i - 1);
+            if !delta.is_finite() {
+                any_nan = true;
+                break;
+            }
+            if delta > 0.0 {
+                avg_gain += delta;
+            } else if delta < 0.0 {
+                avg_loss -= delta;
+            }
+            i += 1;
+        }
+    }
+
+    if any_nan {
+        return Ok(());
+    }
+
+    avg_gain *= inv_rsi;
+    avg_loss *= inv_rsi;
+
+    let mut rsi = if avg_gain + avg_loss == 0.0 {
+        50.0
+    } else {
+        100.0 * avg_gain / (avg_gain + avg_loss)
+    };
+
+    *dst_fast.get_unchecked_mut(rsi_start) = rsi;
+
+    if warm <= rsi_start {
+        *dst_slow.get_unchecked_mut(rsi_start) = rsi;
+    }
+
+    let mut mean = rsi;
+    let ema_alpha = 2.0 / (smoothing_factor as f64 + 1.0);
+    let ema_beta = 1.0 - ema_alpha;
+
+    const ATR_ALPHA: f64 = 1.0 / 14.0;
+    const ATR_BETA: f64 = 1.0 - ATR_ALPHA;
+    let mut wwma = 0.0f64;
+    let mut atrrsi = 0.0f64;
+    let mut last_fast = rsi;
+
+    let mut prev_ema = rsi;
+    let mut i = rsi_start + 1;
+    while i < len {
+        let delta = *data.get_unchecked(i) - *data.get_unchecked(i - 1);
+        let gain = if delta > 0.0 { delta } else { 0.0 };
+        let loss = if delta < 0.0 { -delta } else { 0.0 };
+        avg_gain = inv_rsi * gain + beta_rsi * avg_gain;
+        avg_loss = inv_rsi * loss + beta_rsi * avg_loss;
+
+        rsi = if avg_gain + avg_loss == 0.0 {
+            50.0
+        } else {
+            100.0 * avg_gain / (avg_gain + avg_loss)
+        };
+
+        let fast_i = if i < ema_warmup_end {
+            let n = (i - rsi_start + 1) as f64;
+            mean = ((n - 1.0) * mean + rsi) / n;
+
+            prev_ema = mean;
+            mean
+        } else {
+            prev_ema = ema_beta.mul_add(prev_ema, ema_alpha * rsi);
+            prev_ema
+        };
+        *dst_fast.get_unchecked_mut(i) = fast_i;
+
+        if i == warm {
+            *dst_slow.get_unchecked_mut(i) = fast_i;
+            last_fast = fast_i;
+        } else if i > warm {
+            let tr = (fast_i - last_fast).abs();
+            wwma = ATR_ALPHA * tr + ATR_BETA * wwma;
+            atrrsi = ATR_ALPHA * wwma + ATR_BETA * atrrsi;
+
+            let qup = fast_i + atrrsi * fast_factor;
+            let qdn = fast_i - atrrsi * fast_factor;
+
+            let prev_slow = *dst_slow.get_unchecked(i - 1);
+            let prev_fast = *dst_fast.get_unchecked(i - 1);
+            let slow_i = if qup < prev_slow {
+                qup
+            } else if fast_i > prev_slow && prev_fast < prev_slow {
+                qdn
+            } else if qdn > prev_slow {
+                qdn
+            } else if fast_i < prev_slow && prev_fast > prev_slow {
+                qup
+            } else {
+                prev_slow
+            };
+            *dst_slow.get_unchecked_mut(i) = slow_i;
+            last_fast = fast_i;
+        }
+
+        i += 1;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct QqeStream {
+    rsi_period: usize,
+    smoothing_factor: usize,
+    fast_factor: f64,
+
+    rsi_alpha: f64,
+    rsi_beta: f64,
+    ema_alpha: f64,
+    ema_beta: f64,
+    atr_alpha: f64,
+    atr_beta: f64,
+
+    have_prev: bool,
+    prev_price: f64,
+    deltas: usize,
+
+    sum_gain: f64,
+    sum_loss: f64,
+
+    avg_gain: f64,
+    avg_loss: f64,
+
+    rsi_count: usize,
+    running_mean: f64,
+    prev_ema: f64,
+
+    anchored: bool,
+    prev_fast: f64,
+    prev_slow: f64,
+    wwma: f64,
+    atrrsi: f64,
+}
+
+impl QqeStream {
+    #[inline]
+    pub fn try_new(params: QqeParams) -> Result<Self, QqeError> {
+        let rsi_period = params.rsi_period.unwrap_or(14);
+        let smoothing_factor = params.smoothing_factor.unwrap_or(5);
+        let fast_factor = params.fast_factor.unwrap_or(4.236);
+
+        if rsi_period == 0 || smoothing_factor == 0 {
+            return Err(QqeError::InvalidPeriod {
+                period: 0,
+                data_len: 0,
+            });
+        }
+
+        let rsi_alpha = 1.0 / rsi_period as f64;
+        let rsi_beta = 1.0 - rsi_alpha;
+        let ema_alpha = 2.0 / (smoothing_factor as f64 + 1.0);
+        let ema_beta = 1.0 - ema_alpha;
+        let atr_alpha = 1.0 / 14.0;
+        let atr_beta = 1.0 - atr_alpha;
+
+        Ok(Self {
+            rsi_period,
+            smoothing_factor,
+            fast_factor,
+
+            rsi_alpha,
+            rsi_beta,
+            ema_alpha,
+            ema_beta,
+            atr_alpha,
+            atr_beta,
+
+            have_prev: false,
+            prev_price: 0.0,
+            deltas: 0,
+
+            sum_gain: 0.0,
+            sum_loss: 0.0,
+
+            avg_gain: 0.0,
+            avg_loss: 0.0,
+
+            rsi_count: 0,
+            running_mean: 0.0,
+            prev_ema: f64::NAN,
+
+            anchored: false,
+            prev_fast: 0.0,
+            prev_slow: 0.0,
+            wwma: 0.0,
+            atrrsi: 0.0,
+        })
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, value: f64) -> Option<(f64, f64)> {
+        if !self.have_prev {
+            self.have_prev = true;
+            self.prev_price = value;
+            return None;
+        }
+
+        let delta = value - self.prev_price;
+        self.prev_price = value;
+        self.deltas += 1;
+
+        if self.deltas <= self.rsi_period {
+            if delta > 0.0 {
+                self.sum_gain += delta;
+            } else {
+                self.sum_loss -= delta;
+            }
+
+            if self.deltas < self.rsi_period {
+                return None;
+            }
+
+            self.avg_gain = self.sum_gain * self.rsi_alpha;
+            self.avg_loss = self.sum_loss * self.rsi_alpha;
+
+            let denom = self.avg_gain + self.avg_loss;
+            let rsi = if denom == 0.0 {
+                50.0
+            } else {
+                100.0 * self.avg_gain / denom
+            };
+
+            self.rsi_count = 1;
+            self.running_mean = rsi;
+            self.prev_ema = rsi;
+            self.prev_fast = rsi;
+
+            let anchor_count = self.smoothing_factor.saturating_sub(1);
+            if self.rsi_count >= anchor_count && !self.anchored {
+                self.prev_slow = rsi;
+                self.anchored = true;
+            }
+            return Some((rsi, if self.anchored { self.prev_slow } else { rsi }));
+        }
+
+        let gain = if delta > 0.0 { delta } else { 0.0 };
+        let loss = if delta < 0.0 { -delta } else { 0.0 };
+
+        self.avg_gain = self.rsi_beta.mul_add(self.avg_gain, self.rsi_alpha * gain);
+        self.avg_loss = self.rsi_beta.mul_add(self.avg_loss, self.rsi_alpha * loss);
+
+        let denom = self.avg_gain + self.avg_loss;
+        let rsi = if denom == 0.0 {
+            50.0
+        } else {
+            100.0 * self.avg_gain / denom
+        };
+
+        self.rsi_count += 1;
+
+        let fast = if self.rsi_count <= self.smoothing_factor {
+            let n = self.rsi_count as f64;
+            self.running_mean = ((n - 1.0) * self.running_mean + rsi) / n;
+            self.prev_ema = self.running_mean;
+            self.running_mean
+        } else {
+            self.prev_ema = self.ema_beta.mul_add(self.prev_ema, self.ema_alpha * rsi);
+            self.prev_ema
+        };
+
+        let anchor_count = self.smoothing_factor.saturating_sub(1);
+        if !self.anchored && self.rsi_count >= anchor_count {
+            self.prev_slow = fast;
+            self.prev_fast = fast;
+            self.anchored = true;
+            return Some((fast, fast));
+        }
+
+        if self.anchored {
+            let tr = (fast - self.prev_fast).abs();
+            self.wwma = self.atr_beta.mul_add(self.wwma, self.atr_alpha * tr);
+            self.atrrsi = self
+                .atr_beta
+                .mul_add(self.atrrsi, self.atr_alpha * self.wwma);
+
+            let qup = fast + self.atrrsi * self.fast_factor;
+            let qdn = fast - self.atrrsi * self.fast_factor;
+
+            let prev = self.prev_slow;
+            let slow = if qup < prev {
+                qup
+            } else if fast > prev && self.prev_fast < prev {
+                qdn
+            } else if qdn > prev {
+                qdn
+            } else if fast < prev && self.prev_fast > prev {
+                qup
+            } else {
+                prev
+            };
+
+            self.prev_slow = slow;
+            self.prev_fast = fast;
+            Some((fast, slow))
+        } else {
+            self.prev_fast = fast;
+            Some((fast, fast))
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct QqeBatchRange {
+    pub rsi_period: (usize, usize, usize),
+    pub smoothing_factor: (usize, usize, usize),
+    pub fast_factor: (f64, f64, f64),
+}
+
+impl Default for QqeBatchRange {
+    fn default() -> Self {
+        Self {
+            rsi_period: (14, 263, 1),
+            smoothing_factor: (5, 5, 0),
+            fast_factor: (4.236, 4.236, 0.0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct QqeBatchBuilder {
+    range: QqeBatchRange,
+    kernel: Kernel,
+}
+
+impl QqeBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline]
+    pub fn rsi_period_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.rsi_period = (start, end, step);
+        self
+    }
+
+    #[inline]
+    pub fn rsi_period_static(mut self, val: usize) -> Self {
+        self.range.rsi_period = (val, val, 0);
+        self
+    }
+
+    #[inline]
+    pub fn smoothing_factor_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.smoothing_factor = (start, end, step);
+        self
+    }
+
+    #[inline]
+    pub fn smoothing_factor_static(mut self, val: usize) -> Self {
+        self.range.smoothing_factor = (val, val, 0);
+        self
+    }
+
+    #[inline]
+    pub fn fast_factor_range(mut self, start: f64, end: f64, step: f64) -> Self {
+        self.range.fast_factor = (start, end, step);
+        self
+    }
+
+    #[inline]
+    pub fn fast_factor_static(mut self, val: f64) -> Self {
+        self.range.fast_factor = (val, val, 0.0);
+        self
+    }
+
+    pub fn apply_slice(self, data: &[f64]) -> Result<QqeBatchOutput, QqeError> {
+        qqe_batch_with_kernel(data, &self.range, self.kernel)
+    }
+
+    pub fn with_default_slice(data: &[f64], k: Kernel) -> Result<QqeBatchOutput, QqeError> {
+        QqeBatchBuilder::new().kernel(k).apply_slice(data)
+    }
+
+    pub fn apply_candles(self, c: &Candles, src: &str) -> Result<QqeBatchOutput, QqeError> {
+        let slice = source_type(c, src);
+        self.apply_slice(slice)
+    }
+
+    pub fn with_default_candles(c: &Candles) -> Result<QqeBatchOutput, QqeError> {
+        QqeBatchBuilder::new()
+            .kernel(Kernel::Auto)
+            .apply_candles(c, "close")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct QqeBatchOutput {
+    pub fast_values: Vec<f64>,
+    pub slow_values: Vec<f64>,
+    pub combos: Vec<QqeParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl QqeBatchOutput {
+    pub fn row_for_params(&self, p: &QqeParams) -> Option<usize> {
+        self.combos.iter().position(|c| {
+            c.rsi_period.unwrap_or(14) == p.rsi_period.unwrap_or(14)
+                && c.smoothing_factor.unwrap_or(5) == p.smoothing_factor.unwrap_or(5)
+                && (c.fast_factor.unwrap_or(4.236) - p.fast_factor.unwrap_or(4.236)).abs() < 1e-12
+        })
+    }
+
+    pub fn values_for(&self, p: &QqeParams) -> Option<(&[f64], &[f64])> {
+        self.row_for_params(p).map(|row| {
+            let start = row * self.cols;
+            let end = start + self.cols;
+            (&self.fast_values[start..end], &self.slow_values[start..end])
+        })
+    }
+}
+
+fn expand_grid(r: &QqeBatchRange) -> Vec<QqeParams> {
+    fn axis_usize((s, e, st): (usize, usize, usize)) -> Vec<usize> {
+        if st == 0 || s == e {
+            return vec![s];
+        }
+        if s < e {
+            return (s..=e).step_by(st.max(1)).collect();
+        }
+        let mut v = Vec::new();
+        let step = st.max(1);
+        let mut cur = s;
+        while cur >= e {
+            v.push(cur);
+            if cur < step {
+                break;
+            }
+            cur -= step;
+            if cur == usize::MAX {
+                break;
+            }
+        }
+        v
+    }
+
+    fn axis_f64((s, e, st): (f64, f64, f64)) -> Vec<f64> {
+        let step = if st.is_sign_negative() { -st } else { st };
+        if step.abs() < 1e-12 || (s - e).abs() < 1e-12 {
+            return vec![s];
+        }
+        let mut v = Vec::new();
+        if s <= e {
+            let mut x = s;
+            while x <= e + 1e-12 {
+                v.push(x);
+                x += step;
+            }
+        } else {
+            let mut x = s;
+            while x + 1e-12 >= e {
+                v.push(x);
+                x -= step;
+            }
+        }
+        v
+    }
+
+    let rs = axis_usize(r.rsi_period);
+    let sm = axis_usize(r.smoothing_factor);
+    let ff = axis_f64(r.fast_factor);
+    let cap = rs
+        .len()
+        .checked_mul(sm.len())
+        .and_then(|x| x.checked_mul(ff.len()))
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(cap);
+
+    for &rp in &rs {
+        for &sp in &sm {
+            for &fk in &ff {
+                out.push(QqeParams {
+                    rsi_period: Some(rp),
+                    smoothing_factor: Some(sp),
+                    fast_factor: Some(fk),
+                });
+            }
+        }
+    }
+    out
+}
+
+pub fn qqe_batch_with_kernel(
+    data: &[f64],
+    sweep: &QqeBatchRange,
+    k: Kernel,
+) -> Result<QqeBatchOutput, QqeError> {
+    use crate::indicators::moving_averages::ema::ema_into_slice;
+    use crate::indicators::rsi::rsi_into_slice;
+
+    let combos = expand_grid(sweep);
+    if combos.is_empty() {
+        return Err(QqeError::InvalidRange {
+            start: sweep.rsi_period.0,
+            end: sweep.rsi_period.1,
+            step: sweep.rsi_period.2,
+        });
+    }
+    let cols = data.len();
+    if cols == 0 {
+        return Err(QqeError::EmptyInputData);
+    }
+
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(QqeError::AllValuesNaN)?;
+    let worst_needed = combos
+        .iter()
+        .map(|c| c.rsi_period.unwrap() + c.smoothing_factor.unwrap())
+        .max()
+        .unwrap();
+    if cols - first < worst_needed {
+        return Err(QqeError::NotEnoughValidData {
+            needed: worst_needed,
+            valid: cols - first,
+        });
+    }
+
+    let actual = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        _ => return Err(QqeError::InvalidKernelForBatch(k)),
+    };
+    let simd = match actual {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => unreachable!(),
+    };
+
+    let rows = combos.len();
+    let total = rows.checked_mul(cols).ok_or(QqeError::InvalidRange {
+        start: sweep.rsi_period.0,
+        end: sweep.rsi_period.1,
+        step: sweep.rsi_period.2,
+    })?;
+    let mut fast_mu = make_uninit_matrix(rows, cols);
+    let mut slow_mu = make_uninit_matrix(rows, cols);
+
+    let warm: Vec<usize> = combos
+        .iter()
+        .map(|c| first + c.rsi_period.unwrap() + c.smoothing_factor.unwrap() - 2)
+        .collect();
+
+    init_matrix_prefixes(&mut fast_mu, cols, &warm);
+    init_matrix_prefixes(&mut slow_mu, cols, &warm);
+
+    let fast_out: &mut [f64] =
+        unsafe { core::slice::from_raw_parts_mut(fast_mu.as_mut_ptr() as *mut f64, total) };
+    let slow_out: &mut [f64] =
+        unsafe { core::slice::from_raw_parts_mut(slow_mu.as_mut_ptr() as *mut f64, total) };
+
+    let mut tmp_mu = make_uninit_matrix(1, cols);
+    let tmp: &mut [f64] =
+        unsafe { core::slice::from_raw_parts_mut(tmp_mu.as_mut_ptr() as *mut f64, cols) };
+
+    for (row, combo) in combos.iter().enumerate() {
+        let rsi_p = combo.rsi_period.unwrap();
+        let ema_p = combo.smoothing_factor.unwrap();
+        let fast_k = combo.fast_factor.unwrap();
+        let start = warm[row];
+
+        let dst_fast = &mut fast_out[row * cols..(row + 1) * cols];
+        let dst_slow = &mut slow_out[row * cols..(row + 1) * cols];
+
+        let rsi_in = RsiInput::from_slice(
+            data,
+            RsiParams {
+                period: Some(rsi_p),
+            },
+        );
+        rsi_into_slice(tmp, &rsi_in, simd).map_err(|e| QqeError::DependentIndicatorError {
+            message: e.to_string(),
+        })?;
+
+        let ema_in = EmaInput::from_slice(
+            tmp,
+            EmaParams {
+                period: Some(ema_p),
+            },
+        );
+        ema_into_slice(dst_fast, &ema_in, simd).map_err(|e| QqeError::DependentIndicatorError {
+            message: e.to_string(),
+        })?;
+
+        qqe_compute_slow_from(dst_fast, fast_k, start, dst_slow);
+    }
+
+    let fast_values =
+        unsafe { Vec::from_raw_parts(fast_mu.as_mut_ptr() as *mut f64, total, total) };
+    let slow_values =
+        unsafe { Vec::from_raw_parts(slow_mu.as_mut_ptr() as *mut f64, total, total) };
+    core::mem::forget(fast_mu);
+    core::mem::forget(slow_mu);
+
+    Ok(QqeBatchOutput {
+        fast_values,
+        slow_values,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+fn qqe_batch_inner(
+    data: &[f64],
+    sweep: &QqeBatchRange,
+    kern: Kernel,
+    parallel: bool,
+) -> Result<QqeBatchOutput, QqeError> {
+    let combos = expand_grid(sweep);
+    if combos.is_empty() {
+        return Err(QqeError::InvalidRange {
+            start: sweep.rsi_period.0,
+            end: sweep.rsi_period.1,
+            step: sweep.rsi_period.2,
+        });
+    }
+    let cols = data.len();
+    if cols == 0 {
+        return Err(QqeError::EmptyInputData);
+    }
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(QqeError::AllValuesNaN)?;
+    let worst_needed = combos
+        .iter()
+        .map(|c| c.rsi_period.unwrap() + c.smoothing_factor.unwrap())
+        .max()
+        .unwrap();
+    if cols - first < worst_needed {
+        return Err(QqeError::NotEnoughValidData {
+            needed: worst_needed,
+            valid: cols - first,
+        });
+    }
+
+    let rows = combos.len();
+    let total = rows.checked_mul(cols).ok_or(QqeError::InvalidRange {
+        start: sweep.rsi_period.0,
+        end: sweep.rsi_period.1,
+        step: sweep.rsi_period.2,
+    })?;
+    let mut fast_mu = make_uninit_matrix(rows, cols);
+    let mut slow_mu = make_uninit_matrix(rows, cols);
+
+    let warm: Vec<usize> = combos
+        .iter()
+        .map(|c| first + c.rsi_period.unwrap() + c.smoothing_factor.unwrap() - 2)
+        .collect();
+    init_matrix_prefixes(&mut fast_mu, cols, &warm);
+    init_matrix_prefixes(&mut slow_mu, cols, &warm);
+
+    let actual = match kern {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        _ => return Err(QqeError::InvalidKernelForBatch(kern)),
+    };
+    let simd = match actual {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => unreachable!(),
+    };
+
+    let do_row = |row: usize, f_mu: &mut [MaybeUninit<f64>], s_mu: &mut [MaybeUninit<f64>]| {
+        use crate::indicators::moving_averages::ema::ema_into_slice;
+        use crate::indicators::rsi::rsi_into_slice;
+
+        let mut tmp_mu = make_uninit_matrix(1, cols);
+        let tmp: &mut [f64] =
+            unsafe { core::slice::from_raw_parts_mut(tmp_mu.as_mut_ptr() as *mut f64, cols) };
+
+        let rsi_p = combos[row].rsi_period.unwrap();
+        let ema_p = combos[row].smoothing_factor.unwrap();
+        let fast_k = combos[row].fast_factor.unwrap();
+        let start = warm[row];
+
+        let dst_fast =
+            unsafe { core::slice::from_raw_parts_mut(f_mu.as_mut_ptr() as *mut f64, cols) };
+        let dst_slow =
+            unsafe { core::slice::from_raw_parts_mut(s_mu.as_mut_ptr() as *mut f64, cols) };
+
+        let rsi_in = RsiInput::from_slice(
+            data,
+            RsiParams {
+                period: Some(rsi_p),
+            },
+        );
+        rsi_into_slice(tmp, &rsi_in, simd).map_err(|e| QqeError::DependentIndicatorError {
+            message: e.to_string(),
+        })?;
+
+        let ema_in = EmaInput::from_slice(
+            tmp,
+            EmaParams {
+                period: Some(ema_p),
+            },
+        );
+        ema_into_slice(dst_fast, &ema_in, simd).map_err(|e| QqeError::DependentIndicatorError {
+            message: e.to_string(),
+        })?;
+
+        qqe_compute_slow_from(dst_fast, fast_k, start, dst_slow);
+
+        Ok::<(), QqeError>(())
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::*;
+            fast_mu
+                .par_chunks_mut(cols)
+                .zip(slow_mu.par_chunks_mut(cols))
+                .enumerate()
+                .try_for_each(|(row, (f_mu, s_mu))| do_row(row, f_mu, s_mu))?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (row, (f_mu, s_mu)) in fast_mu
+                .chunks_mut(cols)
+                .zip(slow_mu.chunks_mut(cols))
+                .enumerate()
+            {
+                do_row(row, f_mu, s_mu)?;
+            }
+        }
+    } else {
+        for (row, (f_mu, s_mu)) in fast_mu
+            .chunks_mut(cols)
+            .zip(slow_mu.chunks_mut(cols))
+            .enumerate()
+        {
+            do_row(row, f_mu, s_mu)?;
+        }
+    }
+
+    let fast_values =
+        unsafe { Vec::from_raw_parts(fast_mu.as_mut_ptr() as *mut f64, total, total) };
+    let slow_values =
+        unsafe { Vec::from_raw_parts(slow_mu.as_mut_ptr() as *mut f64, total, total) };
+    core::mem::forget(fast_mu);
+    core::mem::forget(slow_mu);
+
+    Ok(QqeBatchOutput {
+        fast_values,
+        slow_values,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+#[inline(always)]
+pub fn qqe_batch_slice(
+    data: &[f64],
+    sweep: &QqeBatchRange,
+    kern: Kernel,
+) -> Result<QqeBatchOutput, QqeError> {
+    qqe_batch_inner(data, sweep, kern, false)
+}
+
+#[inline(always)]
+pub fn qqe_batch_par_slice(
+    data: &[f64],
+    sweep: &QqeBatchRange,
+    kern: Kernel,
+) -> Result<QqeBatchOutput, QqeError> {
+    qqe_batch_inner(data, sweep, kern, true)
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "qqe")]
+#[pyo3(signature = (data, rsi_period=14, smoothing_factor=5, fast_factor=4.236, kernel=None))]
+pub fn qqe_py<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray1<'py, f64>,
+    rsi_period: usize,
+    smoothing_factor: usize,
+    fast_factor: f64,
+    kernel: Option<&str>,
+) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+    let slice_in = data.as_slice()?;
+    let kern = validate_kernel(kernel, false)?;
+    let params = QqeParams {
+        rsi_period: Some(rsi_period),
+        smoothing_factor: Some(smoothing_factor),
+        fast_factor: Some(fast_factor),
+    };
+    let input = QqeInput::from_slice(slice_in, params);
+
+    let result = py
+        .allow_threads(|| qqe_with_kernel(&input, kern))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok((result.fast.into_pyarray(py), result.slow.into_pyarray(py)))
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "QqeStream")]
+pub struct QqeStreamPy {
+    stream: QqeStream,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl QqeStreamPy {
+    #[new]
+    fn new(rsi_period: usize, smoothing_factor: usize, fast_factor: f64) -> PyResult<Self> {
+        let params = QqeParams {
+            rsi_period: Some(rsi_period),
+            smoothing_factor: Some(smoothing_factor),
+            fast_factor: Some(fast_factor),
+        };
+        let stream =
+            QqeStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(QqeStreamPy { stream })
+    }
+
+    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
+        self.stream.update(value)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "qqe_batch")]
+#[pyo3(signature = (data, rsi_period_range, smoothing_factor_range, fast_factor_range, kernel=None))]
+pub fn qqe_batch_py<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray1<'py, f64>,
+    rsi_period_range: (usize, usize, usize),
+    smoothing_factor_range: (usize, usize, usize),
+    fast_factor_range: (f64, f64, f64),
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    use numpy::{IntoPyArray, PyArray2, PyArrayMethods};
+    let slice_in = data.as_slice()?;
+    let sweep = QqeBatchRange {
+        rsi_period: rsi_period_range,
+        smoothing_factor: smoothing_factor_range,
+        fast_factor: fast_factor_range,
+    };
+    let kern = validate_kernel(kernel, true)?;
+
+    let combos = expand_grid(&sweep);
+    if combos.is_empty() {
+        return Err(PyValueError::new_err("Empty parameter combination"));
+    }
+    let rows = combos.len();
+    let cols = slice_in.len();
+
+    let fast_arr = unsafe { PyArray2::<f64>::new(py, [rows, cols], false) };
+    let slow_arr = unsafe { PyArray2::<f64>::new(py, [rows, cols], false) };
+    let fast_slice = unsafe { fast_arr.as_slice_mut()? };
+    let slow_slice = unsafe { slow_arr.as_slice_mut()? };
+
+    let first = slice_in.iter().position(|x| !x.is_nan()).unwrap_or(0);
+    let warm: Vec<usize> = combos
+        .iter()
+        .map(|c| first + c.rsi_period.unwrap() + c.smoothing_factor.unwrap() - 2)
+        .collect();
+
+    let mut tmp_mu = make_uninit_matrix(1, cols);
+    let tmp: &mut [f64] =
+        unsafe { core::slice::from_raw_parts_mut(tmp_mu.as_mut_ptr() as *mut f64, cols) };
+
+    use crate::indicators::moving_averages::ema::ema_into_slice;
+    use crate::indicators::rsi::rsi_into_slice;
+
+    let simd = match kern {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => Kernel::Scalar,
+    };
+
+    py.allow_threads(|| -> PyResult<()> {
+        for (row, combo) in combos.iter().enumerate() {
+            let rsi_p = combo.rsi_period.unwrap();
+            let ema_p = combo.smoothing_factor.unwrap();
+            let fast_k = combo.fast_factor.unwrap();
+            let start = warm[row];
+
+            let dst_fast = &mut fast_slice[row * cols..(row + 1) * cols];
+            let dst_slow = &mut slow_slice[row * cols..(row + 1) * cols];
+
+            rsi_into_slice(
+                tmp,
+                &RsiInput::from_slice(
+                    slice_in,
+                    RsiParams {
+                        period: Some(rsi_p),
+                    },
+                ),
+                simd,
+            )
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+            ema_into_slice(
+                dst_fast,
+                &EmaInput::from_slice(
+                    tmp,
+                    EmaParams {
+                        period: Some(ema_p),
+                    },
+                ),
+                simd,
+            )
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+            for v in &mut dst_fast[..start] {
+                *v = f64::NAN;
+            }
+            for v in &mut dst_slow[..start] {
+                *v = f64::NAN;
+            }
+
+            qqe_compute_slow_from(dst_fast, fast_k, start, dst_slow);
+        }
+        Ok(())
+    })?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("fast", fast_arr)?;
+    dict.set_item("slow", slow_arr)?;
+    dict.set_item(
+        "rsi_periods",
+        combos
+            .iter()
+            .map(|c| c.rsi_period.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    dict.set_item(
+        "smoothing_factors",
+        combos
+            .iter()
+            .map(|c| c.smoothing_factor.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    dict.set_item(
+        "fast_factors",
+        combos
+            .iter()
+            .map(|c| c.fast_factor.unwrap())
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    Ok(dict)
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "qqe_cuda_batch_dev")]
+#[pyo3(signature = (data_f32, rsi_period_range, smoothing_factor_range, fast_factor_range, device_id=0))]
+pub fn qqe_cuda_batch_dev_py<'py>(
+    py: Python<'py>,
+    data_f32: numpy::PyReadonlyArray1<'py, f32>,
+    rsi_period_range: (usize, usize, usize),
+    smoothing_factor_range: (usize, usize, usize),
+    fast_factor_range: (f64, f64, f64),
+    device_id: usize,
+) -> PyResult<(DeviceArrayF32Py, Bound<'py, pyo3::types::PyDict>)> {
+    use numpy::IntoPyArray;
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let slice = data_f32.as_slice()?;
+    let sweep = QqeBatchRange {
+        rsi_period: rsi_period_range,
+        smoothing_factor: smoothing_factor_range,
+        fast_factor: fast_factor_range,
+    };
+    let (inner, combos) = py.allow_threads(|| {
+        let cuda = CudaQqe::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        cuda.qqe_batch_dev(slice, &sweep)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+    let handle = make_device_array_py(device_id, inner)?;
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item(
+        "rsi_periods",
+        combos
+            .iter()
+            .map(|c| c.rsi_period.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    dict.set_item(
+        "smoothing_factors",
+        combos
+            .iter()
+            .map(|c| c.smoothing_factor.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    dict.set_item(
+        "fast_factors",
+        combos
+            .iter()
+            .map(|c| c.fast_factor.unwrap() as f64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    dict.set_item("rows", 2 * combos.len())?;
+    dict.set_item("cols", slice.len())?;
+    Ok((handle, dict))
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "qqe_cuda_many_series_one_param_dev")]
+#[pyo3(signature = (data_tm_f32, rsi_period, smoothing_factor, fast_factor, device_id=0))]
+pub fn qqe_cuda_many_series_one_param_dev_py<'py>(
+    py: Python<'py>,
+    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
+    rsi_period: usize,
+    smoothing_factor: usize,
+    fast_factor: f64,
+    device_id: usize,
+) -> PyResult<DeviceArrayF32Py> {
+    use numpy::PyUntypedArrayMethods;
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let shape = data_tm_f32.shape();
+    if shape.len() != 2 {
+        return Err(PyValueError::new_err("expected 2D array (rows x cols)"));
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    let flat = data_tm_f32.as_slice()?;
+    let params = QqeParams {
+        rsi_period: Some(rsi_period),
+        smoothing_factor: Some(smoothing_factor),
+        fast_factor: Some(fast_factor),
+    };
+    let inner = py.allow_threads(|| {
+        let cuda = CudaQqe::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        cuda.qqe_many_series_one_param_time_major_dev(flat, cols, rows, &params)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+    let handle = make_device_array_py(device_id, inner)?;
+    Ok(handle)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct QqeJsResult {
+    pub values: Vec<f64>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn qqe_js(
+    data: &[f64],
+    rsi_period: usize,
+    smoothing_factor: usize,
+    fast_factor: f64,
+) -> Result<JsValue, JsValue> {
+    let params = QqeParams {
+        rsi_period: Some(rsi_period),
+        smoothing_factor: Some(smoothing_factor),
+        fast_factor: Some(fast_factor),
+    };
+    let input = QqeInput::from_slice(data, params);
+
+    let mut values = vec![f64::NAN; data.len() * 2];
+
+    let (fast_slice, slow_slice) = values.split_at_mut(data.len());
+
+    qqe_into_slices(fast_slice, slow_slice, &input, detect_best_kernel())
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let result = QqeJsResult {
+        values,
+        rows: 2,
+        cols: data.len(),
+    };
+
+    serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn qqe_unified_js(
+    data: &[f64],
+    rsi_period: usize,
+    smoothing_factor: usize,
+    fast_factor: f64,
+) -> Result<Vec<f64>, JsValue> {
+    let params = QqeParams {
+        rsi_period: Some(rsi_period),
+        smoothing_factor: Some(smoothing_factor),
+        fast_factor: Some(fast_factor),
+    };
+    let input = QqeInput::from_slice(data, params);
+
+    let mut result = vec![f64::NAN; data.len() * 2];
+
+    let (fast_slice, slow_slice) = result.split_at_mut(data.len());
+
+    qqe_into_slices(fast_slice, slow_slice, &input, detect_best_kernel())
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    Ok(result)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn qqe_alloc(len: usize) -> *mut f64 {
+    let mut vec = Vec::<f64>::with_capacity(len * 2);
+    let ptr = vec.as_mut_ptr();
+    std::mem::forget(vec);
+    ptr
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn qqe_free(ptr: *mut f64, len: usize) {
+    unsafe {
+        let _ = Vec::from_raw_parts(ptr, 0, len * 2);
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn qqe_into(
+    in_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    rsi_period: usize,
+    smoothing_factor: usize,
+    fast_factor: f64,
+) -> Result<(), JsValue> {
+    if in_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("null pointer passed to qqe_into"));
+    }
+    unsafe {
+        let data = std::slice::from_raw_parts(in_ptr, len);
+        let params = QqeParams {
+            rsi_period: Some(rsi_period),
+            smoothing_factor: Some(smoothing_factor),
+            fast_factor: Some(fast_factor),
+        };
+        let input = QqeInput::from_slice(data, params);
+
+        if in_ptr == out_ptr {
+            let mut tmp = vec![f64::NAN; len * 2];
+            let (tmp_fast, tmp_slow) = tmp.split_at_mut(len);
+            qqe_into_slices(tmp_fast, tmp_slow, &input, detect_best_kernel())
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let dst = std::slice::from_raw_parts_mut(out_ptr, len * 2);
+            dst.copy_from_slice(&tmp);
+        } else {
+            let dst = std::slice::from_raw_parts_mut(out_ptr, len * 2);
+            let (dst_fast, dst_slow) = dst.split_at_mut(len);
+            qqe_into_slices(dst_fast, dst_slow, &input, detect_best_kernel())
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct QqeBatchConfig {
+    pub rsi_period_range: (usize, usize, usize),
+    pub smoothing_factor_range: (usize, usize, usize),
+    pub fast_factor_range: (f64, f64, f64),
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize)]
+pub struct QqeBatchJsOutput {
+    pub fast_values: Vec<f64>,
+    pub slow_values: Vec<f64>,
+    pub combos: Vec<QqeParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = qqe_batch)]
+pub fn qqe_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
+    let config: QqeBatchConfig = serde_wasm_bindgen::from_value(config)
+        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
+
+    let sweep = QqeBatchRange {
+        rsi_period: config.rsi_period_range,
+        smoothing_factor: config.smoothing_factor_range,
+        fast_factor: config.fast_factor_range,
+    };
+
+    let kernel = detect_best_batch_kernel();
+    let result = qqe_batch_with_kernel(data, &sweep, kernel)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let output = QqeBatchJsOutput {
+        fast_values: result.fast_values,
+        slow_values: result.slow_values,
+        combos: result.combos,
+        rows: result.rows,
+        cols: result.cols,
+    };
+
+    serde_wasm_bindgen::to_value(&output).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn qqe_batch_into(
+    in_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    rsi_period_start: usize,
+    rsi_period_end: usize,
+    rsi_period_step: usize,
+    smoothing_start: usize,
+    smoothing_end: usize,
+    smoothing_step: usize,
+    fast_factor_start: f64,
+    fast_factor_end: f64,
+    fast_factor_step: f64,
+) -> Result<usize, JsValue> {
+    if in_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("null pointer passed to qqe_batch_into"));
+    }
+    unsafe {
+        let data = core::slice::from_raw_parts(in_ptr, len);
+        let sweep = QqeBatchRange {
+            rsi_period: (rsi_period_start, rsi_period_end, rsi_period_step),
+            smoothing_factor: (smoothing_start, smoothing_end, smoothing_step),
+            fast_factor: (fast_factor_start, fast_factor_end, fast_factor_step),
+        };
+        let combos = expand_grid(&sweep);
+        let rows = combos.len();
+        if rows == 0 {
+            return Err(JsValue::from_str("Empty parameter combination"));
+        }
+
+        let total = rows * len * 2;
+        let dst = core::slice::from_raw_parts_mut(out_ptr, total);
+        let (dst_fast_all, dst_slow_all) = dst.split_at_mut(rows * len);
+
+        let mut tmp_mu = make_uninit_matrix(1, len);
+        let tmp: &mut [f64] = core::slice::from_raw_parts_mut(tmp_mu.as_mut_ptr() as *mut f64, len);
+
+        let simd = match detect_best_batch_kernel() {
+            Kernel::Avx512Batch => Kernel::Avx512,
+            Kernel::Avx2Batch => Kernel::Avx2,
+            Kernel::ScalarBatch => Kernel::Scalar,
+            _ => Kernel::Scalar,
+        };
+
+        use crate::indicators::moving_averages::ema::ema_into_slice;
+        use crate::indicators::rsi::rsi_into_slice;
+
+        let first = data.iter().position(|x| !x.is_nan()).unwrap_or(0);
+
+        for (row, combo) in combos.iter().enumerate() {
+            let rsi_p = combo.rsi_period.unwrap();
+            let ema_p = combo.smoothing_factor.unwrap();
+            let fast_k = combo.fast_factor.unwrap();
+
+            let start = first + rsi_p + ema_p - 2;
+
+            let dst_fast = &mut dst_fast_all[row * len..(row + 1) * len];
+            let dst_slow = &mut dst_slow_all[row * len..(row + 1) * len];
+
+            rsi_into_slice(
+                tmp,
+                &RsiInput::from_slice(
+                    data,
+                    RsiParams {
+                        period: Some(rsi_p),
+                    },
+                ),
+                simd,
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+            ema_into_slice(
+                dst_fast,
+                &EmaInput::from_slice(
+                    tmp,
+                    EmaParams {
+                        period: Some(ema_p),
+                    },
+                ),
+                simd,
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+            for v in &mut dst_fast[..start] {
+                *v = f64::NAN;
+            }
+            for v in &mut dst_slow[..start] {
+                *v = f64::NAN;
+            }
+
+            qqe_compute_slow_from(dst_fast, fast_k, start, dst_slow);
+        }
+        Ok(rows)
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn qqe_unified_output_into_js(
+    data: &[f64],
+    rsi_period: usize,
+    smoothing_factor: usize,
+    fast_factor: f64,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = qqe_unified_js(data, rsi_period, smoothing_factor, fast_factor)?;
+    crate::write_wasm_f64_output("qqe_unified_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn qqe_output_into_js(
+    data: &[f64],
+    rsi_period: usize,
+    smoothing_factor: usize,
+    fast_factor: f64,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = qqe_js(data, rsi_period, smoothing_factor, fast_factor)?;
+    crate::write_wasm_object_f64_outputs("qqe_output_into_js", &value, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn qqe_batch_unified_output_into_js(
+    data: &[f64],
+    config: JsValue,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = qqe_batch_unified_js(data, config)?;
+    crate::write_wasm_selected_object_f64_outputs("qqe_batch_unified_output_into_js", &value, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_csv;
+    use paste::paste;
+    #[cfg(feature = "proptest")]
+    use proptest::prelude::*;
+    use std::error::Error;
+
+    fn check_qqe_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let input = QqeInput::from_candles(&candles, "close", QqeParams::default());
+        let result = qqe_with_kernel(&input, kernel)?;
+
+        let expected_fast = [
+            42.68548144,
+            42.68200826,
+            42.32797706,
+            42.50623375,
+            41.34014948,
+        ];
+
+        let expected_slow = [
+            36.49339135,
+            36.59103557,
+            36.59103557,
+            36.64790896,
+            36.64790896,
+        ];
+
+        let start = result.fast.len().saturating_sub(5);
+
+        for (i, (&fast_val, &slow_val)) in result.fast[start..]
+            .iter()
+            .zip(result.slow[start..].iter())
+            .enumerate()
+        {
+            let fast_diff = (fast_val - expected_fast[i]).abs();
+            let slow_diff = (slow_val - expected_slow[i]).abs();
+
+            assert!(
+                fast_diff < 1e-6,
+                "[{}] QQE fast {:?} mismatch at idx {}: got {}, expected {}",
+                test_name,
+                kernel,
+                i,
+                fast_val,
+                expected_fast[i]
+            );
+
+            assert!(
+                slow_diff < 1e-6,
+                "[{}] QQE slow {:?} mismatch at idx {}: got {}, expected {}",
+                test_name,
+                kernel,
+                i,
+                slow_val,
+                expected_slow[i]
+            );
+        }
+        Ok(())
+    }
+
+    fn check_qqe_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let default_params = QqeParams {
+            rsi_period: None,
+            smoothing_factor: None,
+            fast_factor: None,
+        };
+        let input = QqeInput::from_candles(&candles, "close", default_params);
+        let output = qqe_with_kernel(&input, kernel)?;
+        assert_eq!(output.fast.len(), candles.close.len());
+        assert_eq!(output.slow.len(), candles.close.len());
+
+        Ok(())
+    }
+
+    fn check_qqe_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let input = QqeInput::with_default_candles(&candles);
+        match input.data {
+            QqeData::Candles { source, .. } => assert_eq!(source, "close"),
+            _ => panic!("[{}] Expected QqeData::Candles", test_name),
+        }
+        let output = qqe_with_kernel(&input, kernel)?;
+        assert_eq!(output.fast.len(), candles.close.len());
+        assert_eq!(output.slow.len(), candles.close.len());
+
+        Ok(())
+    }
+
+    fn check_qqe_zero_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let input_data = [10.0, 20.0, 30.0];
+        let params = QqeParams {
+            rsi_period: Some(0),
+            smoothing_factor: None,
+            fast_factor: None,
+        };
+        let input = QqeInput::from_slice(&input_data, params);
+        let res = qqe_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] QQE should fail with zero period",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_qqe_period_exceeds_length(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data_small = [10.0, 20.0, 30.0];
+        let params = QqeParams {
+            rsi_period: Some(10),
+            smoothing_factor: None,
+            fast_factor: None,
+        };
+        let input = QqeInput::from_slice(&data_small, params);
+        let res = qqe_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] QQE should fail with period exceeding length",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_qqe_very_small_dataset(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let single_point = [42.0];
+        let params = QqeParams::default();
+        let input = QqeInput::from_slice(&single_point, params);
+        let res = qqe_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] QQE should fail with insufficient data",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_qqe_empty_input(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let empty: [f64; 0] = [];
+        let params = QqeParams::default();
+        let input = QqeInput::from_slice(&empty, params);
+        let res = qqe_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] QQE should fail with empty input",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_qqe_all_nan(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let nan_data = [f64::NAN, f64::NAN, f64::NAN];
+        let params = QqeParams::default();
+        let input = QqeInput::from_slice(&nan_data, params);
+        let res = qqe_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] QQE should fail with all NaN values",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_qqe_batch(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data: Vec<f64> = (0..100).map(|i| 50.0 + (i as f64).sin() * 10.0).collect();
+
+        let sweep = QqeBatchRange {
+            rsi_period: (10, 20, 5),
+            smoothing_factor: (3, 5, 1),
+            fast_factor: (3.0, 5.0, 1.0),
+        };
+
+        let result = qqe_batch_with_kernel(&data, &sweep, kernel)?;
+
+        assert_eq!(result.combos.len(), 27);
+        assert_eq!(result.rows, 27);
+        assert_eq!(result.cols, 100);
+        assert_eq!(result.fast_values.len(), 27 * 100);
+        assert_eq!(result.slow_values.len(), 27 * 100);
+
+        Ok(())
+    }
+
+    fn check_qqe_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let mut stream = QqeStream::try_new(QqeParams::default())?;
+
+        let data: Vec<f64> = (0..50).map(|i| 50.0 + (i as f64).sin() * 10.0).collect();
+        let mut results = Vec::new();
+
+        for &val in &data {
+            if let Some(result) = stream.update(val) {
+                results.push(result);
+            }
+        }
+
+        assert!(
+            !results.is_empty(),
+            "[{}] Should have streaming results",
+            test_name
+        );
+
+        for (fast, slow) in &results {
+            assert!(
+                !fast.is_nan(),
+                "[{}] Fast value should not be NaN",
+                test_name
+            );
+            assert!(
+                !slow.is_nan(),
+                "[{}] Slow value should not be NaN",
+                test_name
+            );
+        }
+
+        Ok(())
+    }
+
+    fn check_qqe_into_slices(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data: Vec<f64> = (0..100).map(|i| 50.0 + (i as f64).sin() * 10.0).collect();
+        let params = QqeParams::default();
+        let input = QqeInput::from_slice(&data, params);
+
+        let mut dst_fast = vec![0.0; data.len()];
+        let mut dst_slow = vec![0.0; data.len()];
+
+        qqe_into_slices(&mut dst_fast, &mut dst_slow, &input, kernel)?;
+
+        let regular = qqe_with_kernel(&input, kernel)?;
+
+        for i in 0..data.len() {
+            if dst_fast[i].is_nan() && regular.fast[i].is_nan() {
+            } else {
+                assert_eq!(
+                    dst_fast[i], regular.fast[i],
+                    "[{}] Fast mismatch at {}",
+                    test_name, i
+                );
+            }
+
+            if dst_slow[i].is_nan() && regular.slow[i].is_nan() {
+            } else {
+                assert_eq!(
+                    dst_slow[i], regular.slow[i],
+                    "[{}] Slow mismatch at {}",
+                    test_name, i
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn check_qqe_poison_sentinel(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let test_data = vec![
+            50.0, 51.0, 52.0, 51.5, 50.5, 49.5, 50.0, 51.0, 52.0, 53.0, 52.5, 51.5, 50.5, 51.0,
+            52.0, 53.0, 54.0, 53.5, 52.5, 51.5, 50.5, 51.5, 52.5, 53.5, 54.5, 55.0, 54.5, 53.5,
+            52.5, 51.5,
+        ];
+
+        {
+            const POISON: f64 = f64::from_bits(0xDEADBEEF_DEADBEEF);
+            let mut fast = vec![POISON; test_data.len()];
+            let mut slow = vec![POISON; test_data.len()];
+
+            let params = QqeParams::default();
+            let input = QqeInput::from_slice(&test_data, params);
+
+            qqe_into_slices(&mut fast[..], &mut slow[..], &input, kernel)?;
+
+            for (i, &val) in fast.iter().enumerate() {
+                assert!(
+                    val.is_nan() || (val.is_finite() && val != POISON),
+                    "[{}] Uninitialized memory detected in fast at index {}: {:?}",
+                    test_name,
+                    i,
+                    val
+                );
+            }
+
+            for (i, &val) in slow.iter().enumerate() {
+                assert!(
+                    val.is_nan() || (val.is_finite() && val != POISON),
+                    "[{}] Uninitialized memory detected in slow at index {}: {:?}",
+                    test_name,
+                    i,
+                    val
+                );
+            }
+        }
+
+        {
+            let sweep = QqeBatchRange {
+                rsi_period: (10, 14, 2),
+                smoothing_factor: (3, 5, 2),
+                fast_factor: (3.0, 4.0, 1.0),
+            };
+
+            let batch_out = qqe_batch_with_kernel(&test_data, &sweep, kernel)?;
+
+            for (i, &val) in batch_out.fast_values.iter().enumerate() {
+                assert!(
+                    val.is_nan() || val.is_finite(),
+                    "[{}] Invalid value in batch fast at index {}: {:?}",
+                    test_name,
+                    i,
+                    val
+                );
+            }
+
+            for (i, &val) in batch_out.slow_values.iter().enumerate() {
+                assert!(
+                    val.is_nan() || val.is_finite(),
+                    "[{}] Invalid value in batch slow at index {}: {:?}",
+                    test_name,
+                    i,
+                    val
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn check_qqe_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+        let p = QqeParams::default();
+
+        let out1 = qqe_with_kernel(&QqeInput::from_candles(&c, "close", p.clone()), kernel)?;
+
+        let out2 = qqe_with_kernel(&QqeInput::from_slice(&out1.fast, p), kernel)?;
+
+        assert_eq!(out1.fast.len(), out2.fast.len());
+        assert_eq!(out1.slow.len(), out2.slow.len());
+        Ok(())
+    }
+
+    fn check_qqe_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let p = QqeParams::default();
+        let res = qqe_with_kernel(&QqeInput::from_candles(&c, "close", p.clone()), kernel)?;
+        let first = c.close.iter().position(|x| !x.is_nan()).unwrap_or(0);
+        let warm = first + p.rsi_period.unwrap_or(14) + p.smoothing_factor.unwrap_or(5) - 2;
+
+        for (i, &v) in res.fast.iter().enumerate().skip(warm) {
+            assert!(!v.is_nan(), "[{}] fast NaN @ {}", test_name, i);
+        }
+        for (i, &v) in res.slow.iter().enumerate().skip(warm) {
+            assert!(!v.is_nan(), "[{}] slow NaN @ {}", test_name, i);
+        }
+        Ok(())
+    }
+
+    fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let out = QqeBatchBuilder::new()
+            .kernel(kernel)
+            .apply_candles(&c, "close")?;
+        let def = QqeParams::default();
+        let row = out.row_for_params(&def).expect("default row missing");
+
+        let start = row * out.cols;
+        assert_eq!(
+            out.fast_values[start..start + out.cols].len(),
+            c.close.len()
+        );
+        assert_eq!(
+            out.slow_values[start..start + out.cols].len(),
+            c.close.len()
+        );
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+        let out = QqeBatchBuilder::new()
+            .kernel(kernel)
+            .rsi_period_range(10, 14, 2)
+            .smoothing_factor_range(3, 5, 1)
+            .fast_factor_range(3.0, 5.0, 1.0)
+            .apply_candles(&c, "close")?;
+
+        for (idx, &v) in out.fast_values.iter().enumerate() {
+            if v.is_nan() {
+                continue;
+            }
+            let b = v.to_bits();
+            assert!(
+                b != 0x1111_1111_1111_1111
+                    && b != 0x2222_2222_2222_2222
+                    && b != 0x3333_3333_3333_3333,
+                "[{}] poison in fast @ {}",
+                test_name,
+                idx
+            );
+        }
+        for (idx, &v) in out.slow_values.iter().enumerate() {
+            if v.is_nan() {
+                continue;
+            }
+            let b = v.to_bits();
+            assert!(
+                b != 0x1111_1111_1111_1111
+                    && b != 0x2222_2222_2222_2222
+                    && b != 0x3333_3333_3333_3333,
+                "[{}] poison in slow @ {}",
+                test_name,
+                idx
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_batch_no_poison(_test_name: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    #[cfg(feature = "proptest")]
+    fn check_qqe_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use proptest::prelude::*;
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (1usize..=64).prop_flat_map(|rsi_p| {
+            (1usize..=32).prop_flat_map(move |ema_p| {
+                let need = rsi_p + ema_p + 8;
+                (
+                    prop::collection::vec(
+                        (-1e6f64..1e6f64).prop_filter("finite", |x| x.is_finite()),
+                        need..400,
+                    ),
+                    Just(rsi_p),
+                    Just(ema_p),
+                    0.5f64..8.0f64,
+                )
+            })
+        });
+
+        proptest::test_runner::TestRunner::default().run(
+            &strat,
+            |(data, rsi_p, ema_p, fast_k)| {
+                let p = QqeParams {
+                    rsi_period: Some(rsi_p),
+                    smoothing_factor: Some(ema_p),
+                    fast_factor: Some(fast_k),
+                };
+                let input = QqeInput::from_slice(&data, p);
+
+                let ref_out = qqe_with_kernel(&input, Kernel::Scalar).unwrap();
+
+                let mut f = vec![0.0; data.len()];
+                let mut s = vec![0.0; data.len()];
+                qqe_into_slices(&mut f, &mut s, &input, Kernel::Scalar).unwrap();
+
+                for i in 0..data.len() {
+                    let a = ref_out.fast[i];
+                    let b = f[i];
+                    if a.is_nan() {
+                        prop_assert!(b.is_nan());
+                    } else {
+                        prop_assert!((a - b).abs() <= 1e-9);
+                    }
+
+                    let c = ref_out.slow[i];
+                    let d = s[i];
+                    if c.is_nan() {
+                        prop_assert!(d.is_nan());
+                    } else {
+                        prop_assert!((c - d).abs() <= 1e-9);
+                    }
+
+                    if !a.is_nan() {
+                        prop_assert!(a >= 0.0 && a <= 100.0);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    macro_rules! generate_all_qqe_tests {
+        ($($test_fn:ident),+ $(,)?) => {
+
+            paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _scalar>]), Kernel::Scalar);
+                    }
+                )*
+
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _avx2>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx2>]), Kernel::Avx2);
+                    }
+
+                    #[test]
+                    fn [<$test_fn _avx512>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx512>]), Kernel::Avx512);
+                    }
+                )*
+
+                #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _simd128>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _simd128>]), Kernel::Scalar);
+                    }
+                )*
+            }
+        };
+    }
+
+    generate_all_qqe_tests!(
+        check_qqe_accuracy,
+        check_qqe_partial_params,
+        check_qqe_default_candles,
+        check_qqe_zero_period,
+        check_qqe_period_exceeds_length,
+        check_qqe_very_small_dataset,
+        check_qqe_empty_input,
+        check_qqe_all_nan,
+        check_qqe_batch,
+        check_qqe_streaming,
+        check_qqe_into_slices,
+        check_qqe_poison_sentinel,
+        check_qqe_reinput,
+        check_qqe_nan_handling,
+        check_batch_default_row,
+        check_batch_no_poison,
+    );
+
+    #[cfg(feature = "proptest")]
+    generate_all_qqe_tests!(check_qqe_property);
+}

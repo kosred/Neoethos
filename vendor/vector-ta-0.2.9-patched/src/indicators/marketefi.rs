@@ -1,0 +1,2054 @@
+use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
+};
+#[cfg(feature = "python")]
+use crate::utilities::kernel_validation::validate_kernel;
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use core::arch::x86_64::*;
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray1};
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::PyDict;
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use serde::{Deserialize, Serialize};
+use std::convert::AsRef;
+use std::error::Error;
+use std::mem::MaybeUninit;
+use thiserror::Error;
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use wasm_bindgen::prelude::*;
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::moving_averages::DeviceArrayF32;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::{cuda_available, CudaMarketefi};
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::utilities::dlpack_cuda::DeviceArrayF32Py as SharedDeviceArrayF32Py;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use cust::context::Context;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use std::sync::Arc;
+
+#[derive(Debug, Clone)]
+pub enum MarketefiData<'a> {
+    Candles {
+        candles: &'a Candles,
+        source_high: &'a str,
+        source_low: &'a str,
+        source_volume: &'a str,
+    },
+    Slices {
+        high: &'a [f64],
+        low: &'a [f64],
+        volume: &'a [f64],
+    },
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "wasm"),
+    derive(Serialize, Deserialize)
+)]
+pub struct MarketefiParams;
+
+impl Default for MarketefiParams {
+    fn default() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MarketefiInput<'a> {
+    pub data: MarketefiData<'a>,
+    pub params: MarketefiParams,
+}
+
+impl<'a> MarketefiInput<'a> {
+    #[inline]
+    pub fn from_candles(
+        candles: &'a Candles,
+        source_high: &'a str,
+        source_low: &'a str,
+        source_volume: &'a str,
+        params: MarketefiParams,
+    ) -> Self {
+        Self {
+            data: MarketefiData::Candles {
+                candles,
+                source_high,
+                source_low,
+                source_volume,
+            },
+            params,
+        }
+    }
+    #[inline]
+    pub fn from_slices(
+        high: &'a [f64],
+        low: &'a [f64],
+        volume: &'a [f64],
+        params: MarketefiParams,
+    ) -> Self {
+        Self {
+            data: MarketefiData::Slices { high, low, volume },
+            params,
+        }
+    }
+    #[inline]
+    pub fn with_default_candles(candles: &'a Candles) -> Self {
+        Self::from_candles(candles, "high", "low", "volume", MarketefiParams::default())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MarketefiOutput {
+    pub values: Vec<f64>,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct MarketefiBuilder {
+    kernel: Kernel,
+}
+
+impl MarketefiBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+    #[inline(always)]
+    pub fn apply(self, c: &Candles) -> Result<MarketefiOutput, MarketefiError> {
+        let i = MarketefiInput::with_default_candles(c);
+        marketefi_with_kernel(&i, self.kernel)
+    }
+    #[inline(always)]
+    pub fn apply_slices(
+        self,
+        high: &[f64],
+        low: &[f64],
+        volume: &[f64],
+    ) -> Result<MarketefiOutput, MarketefiError> {
+        let i = MarketefiInput::from_slices(high, low, volume, MarketefiParams::default());
+        marketefi_with_kernel(&i, self.kernel)
+    }
+    #[inline(always)]
+    pub fn into_stream(self) -> MarketefiStream {
+        MarketefiStream::new()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum MarketefiError {
+    #[error("marketefi: Input data slice is empty.")]
+    EmptyInputData,
+    #[error("marketefi: All values are NaN.")]
+    AllValuesNaN,
+    #[error("marketefi: Invalid period: period = {period}, data length = {data_len}")]
+    InvalidPeriod { period: usize, data_len: usize },
+    #[error("marketefi: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+    #[error("marketefi: Mismatched data length among high, low, and volume.")]
+    MismatchedDataLength,
+    #[error("marketefi: Output length mismatch: expected {expected}, got {got}")]
+    OutputLengthMismatch { expected: usize, got: usize },
+    #[error("marketefi: Invalid range: start={start}, end={end}, step={step}")]
+    InvalidRange {
+        start: String,
+        end: String,
+        step: String,
+    },
+    #[error("marketefi: Invalid kernel for batch: {0:?}")]
+    InvalidKernelForBatch(Kernel),
+    #[error("marketefi: Zero or NaN volume at a valid index.")]
+    ZeroOrNaNVolume,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+impl From<MarketefiError> for JsValue {
+    fn from(err: MarketefiError) -> Self {
+        JsValue::from_str(&err.to_string())
+    }
+}
+
+#[inline]
+pub fn marketefi(input: &MarketefiInput) -> Result<MarketefiOutput, MarketefiError> {
+    marketefi_with_kernel(input, Kernel::Auto)
+}
+
+#[inline(always)]
+fn marketefi_source<'a>(candles: &'a Candles, source: &str) -> &'a [f64] {
+    match source {
+        "open" => &candles.open,
+        "high" => &candles.high,
+        "low" => &candles.low,
+        "close" => &candles.close,
+        "volume" => &candles.volume,
+        "hl2" => &candles.hl2,
+        "hlc3" => &candles.hlc3,
+        "ohlc4" => &candles.ohlc4,
+        "hlcc4" | "hlcc" => &candles.hlcc4,
+        _ => source_type(candles, source),
+    }
+}
+
+#[inline(always)]
+fn marketefi_first_valid(high: &[f64], low: &[f64], volume: &[f64]) -> Option<usize> {
+    let len = high.len();
+    unsafe {
+        let hp = high.as_ptr();
+        let lp = low.as_ptr();
+        let vp = volume.as_ptr();
+        let mut i = 0usize;
+        while i < len {
+            let h = *hp.add(i);
+            let l = *lp.add(i);
+            let v = *vp.add(i);
+            if !(h.is_nan() || l.is_nan() || v.is_nan()) {
+                return Some(i);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+#[inline(always)]
+fn marketefi_prepare<'a>(
+    input: &'a MarketefiInput<'a>,
+    kernel: Kernel,
+) -> Result<(&'a [f64], &'a [f64], &'a [f64], usize, Kernel), MarketefiError> {
+    let (high, low, volume) = match &input.data {
+        MarketefiData::Candles {
+            candles,
+            source_high,
+            source_low,
+            source_volume,
+        } => (
+            marketefi_source(candles, source_high),
+            marketefi_source(candles, source_low),
+            marketefi_source(candles, source_volume),
+        ),
+        MarketefiData::Slices { high, low, volume } => (*high, *low, *volume),
+    };
+
+    if high.is_empty() || low.is_empty() || volume.is_empty() {
+        return Err(MarketefiError::EmptyInputData);
+    }
+    if high.len() != low.len() || low.len() != volume.len() {
+        return Err(MarketefiError::MismatchedDataLength);
+    }
+
+    let len = high.len();
+    let first = marketefi_first_valid(high, low, volume).ok_or(MarketefiError::AllValuesNaN)?;
+
+    let chosen = match kernel {
+        Kernel::Auto => match detect_best_kernel() {
+            Kernel::Avx512 => Kernel::Avx2,
+            other => other,
+        },
+        k => k,
+    };
+    Ok((high, low, volume, first, chosen))
+}
+
+#[inline(always)]
+fn marketefi_compute_into(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first: usize,
+    kernel: Kernel,
+    out: &mut [f64],
+) {
+    unsafe {
+        match kernel {
+            Kernel::Scalar | Kernel::ScalarBatch => marketefi_scalar(high, low, volume, first, out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => marketefi_avx2(high, low, volume, first, out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => marketefi_avx512(high, low, volume, first, out),
+            _ => marketefi_scalar(high, low, volume, first, out),
+        }
+    }
+}
+
+#[inline(always)]
+fn marketefi_compute_into_any_valid(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first: usize,
+    kernel: Kernel,
+    out: &mut [f64],
+) -> bool {
+    unsafe {
+        match kernel {
+            Kernel::Scalar | Kernel::ScalarBatch => {
+                marketefi_scalar_any_valid(high, low, volume, first, out)
+            }
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => {
+                marketefi_avx2_any_valid(high, low, volume, first, out)
+            }
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => {
+                marketefi_avx512_any_valid(high, low, volume, first, out)
+            }
+            _ => marketefi_scalar_any_valid(high, low, volume, first, out),
+        }
+    }
+}
+
+#[inline]
+pub fn marketefi_into_slice(
+    dst: &mut [f64],
+    input: &MarketefiInput,
+    kern: Kernel,
+) -> Result<(), MarketefiError> {
+    let (h, l, v, first, chosen) = marketefi_prepare(input, kern)?;
+    if dst.len() != h.len() {
+        return Err(MarketefiError::OutputLengthMismatch {
+            expected: h.len(),
+            got: dst.len(),
+        });
+    }
+
+    let any_valid = marketefi_compute_into_any_valid(h, l, v, first, chosen, dst);
+    for x in &mut dst[..first] {
+        *x = f64::NAN;
+    }
+
+    if !any_valid {
+        return Err(MarketefiError::NotEnoughValidData {
+            needed: 1,
+            valid: 0,
+        });
+    }
+    Ok(())
+}
+
+pub fn marketefi_with_kernel(
+    input: &MarketefiInput,
+    kernel: Kernel,
+) -> Result<MarketefiOutput, MarketefiError> {
+    let (h, l, v, first, chosen) = marketefi_prepare(input, kernel)?;
+    let mut out = alloc_with_nan_prefix(h.len(), first);
+    let any_valid = marketefi_compute_into_any_valid(h, l, v, first, chosen, &mut out);
+
+    if !any_valid {
+        return Err(MarketefiError::NotEnoughValidData {
+            needed: 1,
+            valid: 0,
+        });
+    }
+
+    Ok(MarketefiOutput { values: out })
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+#[inline]
+pub fn marketefi_into(input: &MarketefiInput, out: &mut [f64]) -> Result<(), MarketefiError> {
+    let (h, l, v, first, chosen) = marketefi_prepare(input, Kernel::Auto)?;
+    if out.len() != h.len() {
+        return Err(MarketefiError::OutputLengthMismatch {
+            expected: h.len(),
+            got: out.len(),
+        });
+    }
+
+    for x in &mut out[..first] {
+        *x = f64::from_bits(0x7ff8_0000_0000_0000);
+    }
+
+    let any_valid = marketefi_compute_into_any_valid(h, l, v, first, chosen, out);
+
+    if !any_valid {
+        return Err(MarketefiError::NotEnoughValidData {
+            needed: 1,
+            valid: 0,
+        });
+    }
+    Ok(())
+}
+
+#[inline]
+fn marketefi_scalar_any_valid(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first_valid: usize,
+    out: &mut [f64],
+) -> bool {
+    let n = high.len();
+    if first_valid >= n {
+        return false;
+    }
+
+    let mut any_valid = false;
+    let qnan = f64::from_bits(0x7ff8_0000_0000_0000);
+
+    unsafe {
+        let hp = high.as_ptr();
+        let lp = low.as_ptr();
+        let vp = volume.as_ptr();
+        let op = out.as_mut_ptr();
+
+        let mut i = first_valid;
+        while i + 4 <= n {
+            let v0 = *vp.add(i);
+            if v0 == 0.0 {
+                *op.add(i) = qnan;
+            } else {
+                let res0 = (*hp.add(i) - *lp.add(i)) / v0;
+                if res0.is_nan() {
+                    *op.add(i) = qnan;
+                } else {
+                    *op.add(i) = res0;
+                    any_valid = true;
+                }
+            }
+
+            let v1 = *vp.add(i + 1);
+            if v1 == 0.0 {
+                *op.add(i + 1) = qnan;
+            } else {
+                let res1 = (*hp.add(i + 1) - *lp.add(i + 1)) / v1;
+                if res1.is_nan() {
+                    *op.add(i + 1) = qnan;
+                } else {
+                    *op.add(i + 1) = res1;
+                    any_valid = true;
+                }
+            }
+
+            let v2 = *vp.add(i + 2);
+            if v2 == 0.0 {
+                *op.add(i + 2) = qnan;
+            } else {
+                let res2 = (*hp.add(i + 2) - *lp.add(i + 2)) / v2;
+                if res2.is_nan() {
+                    *op.add(i + 2) = qnan;
+                } else {
+                    *op.add(i + 2) = res2;
+                    any_valid = true;
+                }
+            }
+
+            let v3 = *vp.add(i + 3);
+            if v3 == 0.0 {
+                *op.add(i + 3) = qnan;
+            } else {
+                let res3 = (*hp.add(i + 3) - *lp.add(i + 3)) / v3;
+                if res3.is_nan() {
+                    *op.add(i + 3) = qnan;
+                } else {
+                    *op.add(i + 3) = res3;
+                    any_valid = true;
+                }
+            }
+
+            i += 4;
+        }
+
+        while i < n {
+            let v = *vp.add(i);
+            if v == 0.0 {
+                *op.add(i) = qnan;
+            } else {
+                let res = (*hp.add(i) - *lp.add(i)) / v;
+                if res.is_nan() {
+                    *op.add(i) = qnan;
+                } else {
+                    *op.add(i) = res;
+                    any_valid = true;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    any_valid
+}
+
+#[inline]
+pub fn marketefi_scalar(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first_valid: usize,
+    out: &mut [f64],
+) {
+    let _ = marketefi_scalar_any_valid(high, low, volume, first_valid, out);
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub fn marketefi_avx512(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first_valid: usize,
+    out: &mut [f64],
+) {
+    #[target_feature(enable = "avx512f")]
+    unsafe fn avx512_body(
+        high: &[f64],
+        low: &[f64],
+        volume: &[f64],
+        first: usize,
+        out: &mut [f64],
+    ) {
+        let n = high.len();
+        let hp = high.as_ptr();
+        let lp = low.as_ptr();
+        let vp = volume.as_ptr();
+        let op = out.as_mut_ptr();
+
+        let mut i = first;
+        let vnan = _mm512_set1_pd(f64::NAN);
+        let vzero = _mm512_set1_pd(0.0);
+
+        while i + 8 <= n {
+            let h = _mm512_loadu_pd(hp.add(i));
+            let l = _mm512_loadu_pd(lp.add(i));
+            let v = _mm512_loadu_pd(vp.add(i));
+
+            let mh = _mm512_cmp_pd_mask(h, h, _CMP_ORD_Q);
+            let ml = _mm512_cmp_pd_mask(l, l, _CMP_ORD_Q);
+            let mv = _mm512_cmp_pd_mask(v, v, _CMP_ORD_Q);
+            let mnz = _mm512_cmp_pd_mask(v, vzero, _CMP_NEQ_OQ);
+            let mvalid = mh & ml & mv & mnz;
+
+            let diff = _mm512_sub_pd(h, l);
+
+            let mut y = _mm512_rcp14_pd(v);
+
+            let two = _mm512_set1_pd(2.0);
+            let t1 = _mm512_mul_pd(v, y);
+            let t2 = _mm512_sub_pd(two, t1);
+            y = _mm512_mul_pd(y, t2);
+
+            let t1b = _mm512_mul_pd(v, y);
+            let t2b = _mm512_sub_pd(two, t1b);
+            y = _mm512_mul_pd(y, t2b);
+
+            let res = _mm512_mul_pd(diff, y);
+
+            let outv = _mm512_mask_mov_pd(vnan, mvalid, res);
+            _mm512_storeu_pd(op.add(i), outv);
+            i += 8;
+        }
+
+        while i < n {
+            let h = *hp.add(i);
+            let l = *lp.add(i);
+            let v = *vp.add(i);
+            *op.add(i) = if v != 0.0 && !(h.is_nan() | l.is_nan() | v.is_nan()) {
+                (h - l) / v
+            } else {
+                f64::NAN
+            };
+            i += 1;
+        }
+    }
+
+    unsafe { avx512_body(high, low, volume, first_valid, out) }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+fn marketefi_avx512_any_valid(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first_valid: usize,
+    out: &mut [f64],
+) -> bool {
+    #[target_feature(enable = "avx512f")]
+    unsafe fn avx512_body_any(
+        high: &[f64],
+        low: &[f64],
+        volume: &[f64],
+        first: usize,
+        out: &mut [f64],
+    ) -> bool {
+        let n = high.len();
+        let hp = high.as_ptr();
+        let lp = low.as_ptr();
+        let vp = volume.as_ptr();
+        let op = out.as_mut_ptr();
+
+        let mut i = first;
+        let mut any_valid = false;
+        let vnan = _mm512_set1_pd(f64::NAN);
+        let vzero = _mm512_set1_pd(0.0);
+
+        while i + 8 <= n {
+            let h = _mm512_loadu_pd(hp.add(i));
+            let l = _mm512_loadu_pd(lp.add(i));
+            let v = _mm512_loadu_pd(vp.add(i));
+
+            let mh = _mm512_cmp_pd_mask(h, h, _CMP_ORD_Q);
+            let ml = _mm512_cmp_pd_mask(l, l, _CMP_ORD_Q);
+            let mv = _mm512_cmp_pd_mask(v, v, _CMP_ORD_Q);
+            let mnz = _mm512_cmp_pd_mask(v, vzero, _CMP_NEQ_OQ);
+            let mvalid = mh & ml & mv & mnz;
+            if mvalid != 0 {
+                any_valid = true;
+            }
+
+            let diff = _mm512_sub_pd(h, l);
+
+            let mut y = _mm512_rcp14_pd(v);
+            let two = _mm512_set1_pd(2.0);
+            let t1 = _mm512_mul_pd(v, y);
+            let t2 = _mm512_sub_pd(two, t1);
+            y = _mm512_mul_pd(y, t2);
+            let t1b = _mm512_mul_pd(v, y);
+            let t2b = _mm512_sub_pd(two, t1b);
+            y = _mm512_mul_pd(y, t2b);
+
+            let res = _mm512_mul_pd(diff, y);
+            let outv = _mm512_mask_mov_pd(vnan, mvalid, res);
+            _mm512_storeu_pd(op.add(i), outv);
+            i += 8;
+        }
+
+        while i < n {
+            let h = *hp.add(i);
+            let l = *lp.add(i);
+            let v = *vp.add(i);
+            if v != 0.0 && !(h.is_nan() | l.is_nan() | v.is_nan()) {
+                *op.add(i) = (h - l) / v;
+                any_valid = true;
+            } else {
+                *op.add(i) = f64::NAN;
+            }
+            i += 1;
+        }
+
+        any_valid
+    }
+
+    unsafe { avx512_body_any(high, low, volume, first_valid, out) }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub fn marketefi_avx2(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first_valid: usize,
+    out: &mut [f64],
+) {
+    #[target_feature(enable = "avx2")]
+    unsafe fn avx2_body(high: &[f64], low: &[f64], volume: &[f64], first: usize, out: &mut [f64]) {
+        let n = high.len();
+        let hp = high.as_ptr();
+        let lp = low.as_ptr();
+        let vp = volume.as_ptr();
+        let op = out.as_mut_ptr();
+
+        let mut i = first;
+        let vzero = _mm256_set1_pd(0.0);
+        let vnan = _mm256_set1_pd(f64::NAN);
+
+        while i + 4 <= n {
+            let h = _mm256_loadu_pd(hp.add(i));
+            let l = _mm256_loadu_pd(lp.add(i));
+            let v = _mm256_loadu_pd(vp.add(i));
+
+            let ord_h = _mm256_cmp_pd(h, h, _CMP_ORD_Q);
+            let ord_l = _mm256_cmp_pd(l, l, _CMP_ORD_Q);
+            let ord_v = _mm256_cmp_pd(v, v, _CMP_ORD_Q);
+            let nz_v = _mm256_cmp_pd(v, vzero, _CMP_NEQ_OQ);
+            let valid = _mm256_and_pd(_mm256_and_pd(ord_h, ord_l), _mm256_and_pd(ord_v, nz_v));
+
+            let diff = _mm256_sub_pd(h, l);
+            let res = _mm256_div_pd(diff, v);
+            let outv = _mm256_blendv_pd(vnan, res, valid);
+
+            _mm256_storeu_pd(op.add(i), outv);
+            i += 4;
+        }
+
+        while i < n {
+            let h = *hp.add(i);
+            let l = *lp.add(i);
+            let v = *vp.add(i);
+            *op.add(i) = if v != 0.0 && !(h.is_nan() | l.is_nan() | v.is_nan()) {
+                (h - l) / v
+            } else {
+                f64::NAN
+            };
+            i += 1;
+        }
+    }
+
+    unsafe { avx2_body(high, low, volume, first_valid, out) }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+fn marketefi_avx2_any_valid(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first_valid: usize,
+    out: &mut [f64],
+) -> bool {
+    #[target_feature(enable = "avx2")]
+    unsafe fn avx2_body_any(
+        high: &[f64],
+        low: &[f64],
+        volume: &[f64],
+        first: usize,
+        out: &mut [f64],
+    ) -> bool {
+        let n = high.len();
+        let hp = high.as_ptr();
+        let lp = low.as_ptr();
+        let vp = volume.as_ptr();
+        let op = out.as_mut_ptr();
+
+        let mut i = first;
+        let mut any_valid = false;
+        let vzero = _mm256_set1_pd(0.0);
+        let vnan = _mm256_set1_pd(f64::NAN);
+
+        while i + 4 <= n {
+            let h = _mm256_loadu_pd(hp.add(i));
+            let l = _mm256_loadu_pd(lp.add(i));
+            let v = _mm256_loadu_pd(vp.add(i));
+
+            let ord_h = _mm256_cmp_pd(h, h, _CMP_ORD_Q);
+            let ord_l = _mm256_cmp_pd(l, l, _CMP_ORD_Q);
+            let ord_v = _mm256_cmp_pd(v, v, _CMP_ORD_Q);
+            let nz_v = _mm256_cmp_pd(v, vzero, _CMP_NEQ_OQ);
+            let valid = _mm256_and_pd(_mm256_and_pd(ord_h, ord_l), _mm256_and_pd(ord_v, nz_v));
+
+            if _mm256_movemask_pd(valid) != 0 {
+                any_valid = true;
+            }
+
+            let diff = _mm256_sub_pd(h, l);
+            let res = _mm256_div_pd(diff, v);
+            let outv = _mm256_blendv_pd(vnan, res, valid);
+
+            _mm256_storeu_pd(op.add(i), outv);
+            i += 4;
+        }
+
+        while i < n {
+            let h = *hp.add(i);
+            let l = *lp.add(i);
+            let v = *vp.add(i);
+            if v != 0.0 && !(h.is_nan() | l.is_nan() | v.is_nan()) {
+                *op.add(i) = (h - l) / v;
+                any_valid = true;
+            } else {
+                *op.add(i) = f64::NAN;
+            }
+            i += 1;
+        }
+
+        any_valid
+    }
+
+    unsafe { avx2_body_any(high, low, volume, first_valid, out) }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub fn marketefi_avx512_short(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first_valid: usize,
+    out: &mut [f64],
+) {
+    marketefi_avx512(high, low, volume, first_valid, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub fn marketefi_avx512_long(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first_valid: usize,
+    out: &mut [f64],
+) {
+    marketefi_avx512(high, low, volume, first_valid, out)
+}
+
+#[inline(always)]
+pub fn marketefi_row_scalar(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first: usize,
+    out: &mut [f64],
+) {
+    marketefi_scalar(high, low, volume, first, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn marketefi_row_avx2(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first: usize,
+    out: &mut [f64],
+) {
+    marketefi_scalar(high, low, volume, first, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn marketefi_row_avx512(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first: usize,
+    out: &mut [f64],
+) {
+    marketefi_scalar(high, low, volume, first, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn marketefi_row_avx512_short(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first: usize,
+    out: &mut [f64],
+) {
+    marketefi_scalar(high, low, volume, first, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn marketefi_row_avx512_long(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    first: usize,
+    out: &mut [f64],
+) {
+    marketefi_scalar(high, low, volume, first, out)
+}
+
+#[derive(Clone, Debug)]
+pub struct MarketefiBatchRange;
+
+impl Default for MarketefiBatchRange {
+    fn default() -> Self {
+        Self
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MarketefiBatchBuilder {
+    kernel: Kernel,
+}
+
+impl MarketefiBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+    pub fn apply_slices(
+        self,
+        high: &[f64],
+        low: &[f64],
+        volume: &[f64],
+    ) -> Result<MarketefiBatchOutput, MarketefiError> {
+        marketefi_batch_with_kernel(high, low, volume, self.kernel)
+    }
+    pub fn with_default_candles(c: &Candles) -> Result<MarketefiBatchOutput, MarketefiError> {
+        let high = source_type(c, "high");
+        let low = source_type(c, "low");
+        let volume = source_type(c, "volume");
+        MarketefiBatchBuilder::new()
+            .kernel(Kernel::Auto)
+            .apply_slices(high, low, volume)
+    }
+}
+
+pub fn marketefi_batch_with_kernel(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    kernel: Kernel,
+) -> Result<MarketefiBatchOutput, MarketefiError> {
+    let k = match kernel {
+        Kernel::Auto => detect_best_batch_kernel(),
+        x if x.is_batch() => x,
+        other => return Err(MarketefiError::InvalidKernelForBatch(other)),
+    };
+    marketefi_batch_par_slice(high, low, volume, k)
+}
+
+#[derive(Clone, Debug)]
+pub struct MarketefiBatchOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<MarketefiParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[inline(always)]
+pub fn marketefi_batch_slice(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    kernel: Kernel,
+) -> Result<MarketefiBatchOutput, MarketefiError> {
+    marketefi_batch_inner(high, low, volume, kernel, false)
+}
+
+#[inline(always)]
+pub fn marketefi_batch_par_slice(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    kernel: Kernel,
+) -> Result<MarketefiBatchOutput, MarketefiError> {
+    marketefi_batch_inner(high, low, volume, kernel, true)
+}
+
+#[inline(always)]
+fn marketefi_batch_inner_into(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    kernel: Kernel,
+    _parallel: bool,
+    out: &mut [f64],
+) -> Result<(), MarketefiError> {
+    if high.is_empty() || low.is_empty() || volume.is_empty() {
+        return Err(MarketefiError::EmptyInputData);
+    }
+    if high.len() != low.len() || low.len() != volume.len() {
+        return Err(MarketefiError::MismatchedDataLength);
+    }
+
+    let cols = high.len();
+    let first = (0..cols)
+        .find(|&i| !(high[i].is_nan() || low[i].is_nan() || volume[i].is_nan()))
+        .ok_or(MarketefiError::AllValuesNaN)?;
+
+    let out_mu = unsafe {
+        core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut MaybeUninit<f64>, out.len())
+    };
+    init_matrix_prefixes(out_mu, cols, &[first]);
+
+    let chosen = match kernel {
+        Kernel::Auto => detect_best_batch_kernel(),
+        k => k,
+    };
+
+    let row = unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut f64, cols) };
+    marketefi_compute_into(
+        high,
+        low,
+        volume,
+        first,
+        match chosen {
+            Kernel::Avx512Batch => Kernel::Avx512,
+            Kernel::Avx2Batch => Kernel::Avx2,
+            Kernel::ScalarBatch => Kernel::Scalar,
+            _ => chosen,
+        },
+        row,
+    );
+
+    Ok(())
+}
+
+#[inline(always)]
+fn marketefi_batch_inner(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    kernel: Kernel,
+    parallel: bool,
+) -> Result<MarketefiBatchOutput, MarketefiError> {
+    let cols = high.len();
+
+    let combos = expand_grid(&MarketefiBatchRange::default());
+    let rows = combos.len();
+
+    rows.checked_mul(cols)
+        .ok_or_else(|| MarketefiError::InvalidRange {
+            start: rows.to_string(),
+            end: cols.to_string(),
+            step: "rows*cols overflow".to_string(),
+        })?;
+
+    let mut buf_mu = make_uninit_matrix(rows, cols);
+
+    let first = (0..cols)
+        .find(|&i| !(high[i].is_nan() || low[i].is_nan() || volume[i].is_nan()))
+        .ok_or(MarketefiError::AllValuesNaN)?;
+    init_matrix_prefixes(&mut buf_mu, cols, &[first]);
+
+    let mut guard = core::mem::ManuallyDrop::new(buf_mu);
+    let out_f64: &mut [f64] =
+        unsafe { core::slice::from_raw_parts_mut(guard.as_mut_ptr() as *mut f64, guard.len()) };
+    marketefi_batch_inner_into(high, low, volume, kernel, parallel, out_f64)?;
+
+    let values = unsafe {
+        Vec::from_raw_parts(
+            guard.as_mut_ptr() as *mut f64,
+            guard.len(),
+            guard.capacity(),
+        )
+    };
+    Ok(MarketefiBatchOutput {
+        values,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+#[inline(always)]
+pub fn expand_grid(_: &MarketefiBatchRange) -> Vec<MarketefiParams> {
+    vec![MarketefiParams]
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MarketefiStream;
+
+impl MarketefiStream {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, high: f64, low: f64, volume: f64) -> Option<f64> {
+        if high.is_nan() || low.is_nan() || volume.is_nan() || volume == 0.0 {
+            None
+        } else {
+            let diff = high - low;
+            Some(diff / volume)
+        }
+    }
+
+    #[inline(always)]
+    pub fn update_fast(&mut self, high: f64, low: f64, volume: f64) -> Option<f64> {
+        if high.is_nan() || low.is_nan() || volume.is_nan() || volume == 0.0 {
+            None
+        } else {
+            let diff = high - low;
+            Some(diff * approx_recip_nr2_f64(volume))
+        }
+    }
+
+    #[inline(always)]
+    pub fn update_unchecked(&mut self, high: f64, low: f64, volume: f64) -> f64 {
+        debug_assert!(!high.is_nan() && !low.is_nan() && !volume.is_nan() && volume != 0.0);
+        (high - low) / volume
+    }
+}
+
+#[inline(always)]
+fn approx_recip_nr2_f64(x: f64) -> f64 {
+    const F32_MIN_NORM: f64 = f32::MIN_POSITIVE as f64;
+    if x.abs() < F32_MIN_NORM {
+        return 1.0 / x;
+    }
+
+    let mut y = (1.0f32 / (x as f32)) as f64;
+
+    y *= (-x).mul_add(y, 2.0);
+    y *= (-x).mul_add(y, 2.0);
+    y
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "marketefi")]
+#[pyo3(signature = (high, low, volume, kernel=None))]
+pub fn marketefi_py<'py>(
+    py: Python<'py>,
+    high: numpy::PyReadonlyArray1<'py, f64>,
+    low: numpy::PyReadonlyArray1<'py, f64>,
+    volume: numpy::PyReadonlyArray1<'py, f64>,
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
+    use numpy::{IntoPyArray, PyArrayMethods};
+
+    let high_slice = high.as_slice()?;
+    let low_slice = low.as_slice()?;
+    let volume_slice = volume.as_slice()?;
+    let kern = validate_kernel(kernel, false)?;
+
+    let input = MarketefiInput::from_slices(
+        high_slice,
+        low_slice,
+        volume_slice,
+        MarketefiParams::default(),
+    );
+
+    let result_vec: Vec<f64> = py
+        .allow_threads(|| marketefi_with_kernel(&input, kern).map(|o| o.values))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok(result_vec.into_pyarray(py))
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "MarketefiStream")]
+pub struct MarketefiStreamPy {
+    stream: MarketefiStream,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl MarketefiStreamPy {
+    #[new]
+    fn new() -> PyResult<Self> {
+        Ok(MarketefiStreamPy {
+            stream: MarketefiStream::new(),
+        })
+    }
+
+    fn update(&mut self, high: f64, low: f64, volume: f64) -> Option<f64> {
+        self.stream.update(high, low, volume)
+    }
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyclass(module = "vector_ta", name = "MarketefiDeviceArrayF32", unsendable)]
+pub struct MarketefiDeviceArrayF32Py {
+    pub(crate) inner: SharedDeviceArrayF32Py,
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pymethods]
+impl MarketefiDeviceArrayF32Py {
+    #[getter]
+    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.inner.__cuda_array_interface__(py)
+    }
+
+    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
+        self.inner.__dlpack_device__()
+    }
+
+    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
+    fn __dlpack__<'py>(
+        &mut self,
+        py: Python<'py>,
+        stream: Option<PyObject>,
+        max_version: Option<PyObject>,
+        dl_device: Option<PyObject>,
+        copy: Option<PyObject>,
+    ) -> PyResult<PyObject> {
+        self.inner
+            .__dlpack__(py, stream, max_version, dl_device, copy)
+    }
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+impl MarketefiDeviceArrayF32Py {
+    fn new_from_rust(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
+        let shared = SharedDeviceArrayF32Py {
+            inner,
+            _ctx: Some(ctx_guard),
+            device_id: Some(device_id),
+        };
+        Self { inner: shared }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "marketefi_batch")]
+#[pyo3(signature = (high, low, volume, kernel=None))]
+pub fn marketefi_batch_py<'py>(
+    py: Python<'py>,
+    high: numpy::PyReadonlyArray1<'py, f64>,
+    low: numpy::PyReadonlyArray1<'py, f64>,
+    volume: numpy::PyReadonlyArray1<'py, f64>,
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+    use pyo3::types::PyDict;
+
+    let h = high.as_slice()?;
+    let l = low.as_slice()?;
+    let v = volume.as_slice()?;
+    let k = validate_kernel(kernel, true)?;
+
+    let rows = 1usize;
+    let cols = h.len();
+    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
+    let out_slice = unsafe { out_arr.as_slice_mut()? };
+
+    py.allow_threads(|| marketefi_batch_inner_into(h, l, v, k, true, out_slice))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
+    Ok(dict)
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "marketefi_cuda_batch_dev")]
+#[pyo3(signature = (high_f32, low_f32, volume_f32, device_id=0))]
+pub fn marketefi_cuda_batch_dev_py(
+    py: Python<'_>,
+    high_f32: numpy::PyReadonlyArray1<'_, f32>,
+    low_f32: numpy::PyReadonlyArray1<'_, f32>,
+    volume_f32: numpy::PyReadonlyArray1<'_, f32>,
+    device_id: usize,
+) -> PyResult<MarketefiDeviceArrayF32Py> {
+    use numpy::PyArrayMethods;
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let h = high_f32.as_slice()?;
+    let l = low_f32.as_slice()?;
+    let v = volume_f32.as_slice()?;
+    if h.len() != l.len() || l.len() != v.len() {
+        return Err(PyValueError::new_err(
+            "high, low, volume must have same length",
+        ));
+    }
+    let (inner, ctx_guard, dev_id) = py.allow_threads(|| -> PyResult<_> {
+        let cuda =
+            CudaMarketefi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let ctx = cuda.context_arc();
+        let dev = cuda.device_id();
+        let inner = cuda
+            .marketefi_batch_dev(h, l, v)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok((inner, ctx, dev))
+    })?;
+    Ok(MarketefiDeviceArrayF32Py::new_from_rust(
+        inner, ctx_guard, dev_id,
+    ))
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "marketefi_cuda_many_series_one_param_dev")]
+#[pyo3(signature = (high_tm_f32, low_tm_f32, volume_tm_f32, device_id=0))]
+pub fn marketefi_cuda_many_series_one_param_dev_py(
+    py: Python<'_>,
+    high_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
+    low_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
+    volume_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
+    device_id: usize,
+) -> PyResult<MarketefiDeviceArrayF32Py> {
+    use numpy::{PyArrayMethods, PyUntypedArrayMethods};
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let h = high_tm_f32.as_slice()?;
+    let l = low_tm_f32.as_slice()?;
+    let v = volume_tm_f32.as_slice()?;
+    let shp_h = high_tm_f32.shape();
+    let shp_l = low_tm_f32.shape();
+    let shp_v = volume_tm_f32.shape();
+    if shp_h.len() != 2 || shp_h != shp_l || shp_h != shp_v {
+        return Err(PyValueError::new_err(
+            "high_tm, low_tm, volume_tm must have same 2D shape",
+        ));
+    }
+    let rows = shp_h[0];
+    let cols = shp_h[1];
+    let (inner, ctx_guard, dev_id) = py.allow_threads(|| -> PyResult<_> {
+        let cuda =
+            CudaMarketefi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let ctx = cuda.context_arc();
+        let dev = cuda.device_id();
+        let inner = cuda
+            .marketefi_many_series_one_param_time_major_dev(h, l, v, cols, rows)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok((inner, ctx, dev))
+    })?;
+    Ok(MarketefiDeviceArrayF32Py::new_from_rust(
+        inner, ctx_guard, dev_id,
+    ))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn marketefi_output_into_js(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = marketefi_js(high, low, volume)?;
+    crate::write_wasm_f64_output("marketefi_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn marketefi_batch_output_into_js(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    _config: JsValue,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = marketefi_batch_js(high, low, volume, _config)?;
+    crate::write_wasm_selected_object_f64_outputs("marketefi_batch_output_into_js", &value, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_csv;
+    use paste::paste;
+    #[cfg(feature = "proptest")]
+    use proptest::prelude::*;
+
+    #[test]
+    fn test_marketefi_into_matches_api() -> Result<(), Box<dyn Error>> {
+        let len = 256;
+        let mut high = vec![f64::NAN; len];
+        let mut low = vec![f64::NAN; len];
+        let mut volume = vec![f64::NAN; len];
+
+        for i in 10..len {
+            let base = 100.0 + (i as f64) * 0.1;
+            let spread = 0.5 + (i % 7) as f64 * 0.05;
+            high[i] = base + spread;
+            low[i] = base - spread * 0.3;
+            volume[i] = if i % 53 == 0 {
+                0.0
+            } else {
+                1000.0 + (i as f64)
+            };
+        }
+
+        let input = MarketefiInput::from_slices(&high, &low, &volume, MarketefiParams::default());
+
+        let baseline = marketefi_with_kernel(&input, Kernel::Auto)?;
+
+        let mut out = vec![0.0; len];
+        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+        {
+            marketefi_into(&input, &mut out)?;
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+        {
+            marketefi_into_slice(&mut out, &input, Kernel::Auto)?;
+        }
+
+        assert_eq!(out.len(), baseline.values.len());
+        for (a, b) in out.iter().zip(baseline.values.iter()) {
+            let eq = (a.is_nan() && b.is_nan()) || (a == b);
+            assert!(eq, "mismatch: got {a:?}, expected {b:?}");
+        }
+        Ok(())
+    }
+
+    fn check_marketefi_accuracy(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = MarketefiInput::with_default_candles(&candles);
+        let res = marketefi_with_kernel(&input, kernel)?;
+        assert_eq!(res.values.len(), candles.close.len());
+        let expected_last_five = [
+            2.8460112192104607,
+            3.020938522420525,
+            3.0474861329079292,
+            3.691017115591989,
+            2.247810963176202,
+        ];
+        let start = res.values.len() - 5;
+        for (i, &v) in res.values[start..].iter().enumerate() {
+            let exp = expected_last_five[i];
+            assert!(
+                (v - exp).abs() < 1e-6,
+                "[{}] marketefi mismatch at {}: got {}, exp {}",
+                test,
+                start + i,
+                v,
+                exp
+            );
+        }
+        Ok(())
+    }
+
+    fn check_marketefi_nan_handling(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+        let high = [f64::NAN, 2.0, 3.0];
+        let low = [f64::NAN, 1.0, 2.0];
+        let vol = [f64::NAN, 1.0, 1.0];
+        let input = MarketefiInput::from_slices(&high, &low, &vol, MarketefiParams::default());
+        let res = marketefi_with_kernel(&input, kernel)?;
+        assert!(res.values[0].is_nan());
+        assert_eq!(res.values[1], 1.0 / 1.0);
+        Ok(())
+    }
+
+    fn check_marketefi_empty_data(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+        let input = MarketefiInput::from_slices(&[], &[], &[], MarketefiParams::default());
+        let res = marketefi_with_kernel(&input, kernel);
+        assert!(res.is_err());
+        Ok(())
+    }
+
+    fn check_marketefi_streaming(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+        let high = [3.0, 4.0, 5.0];
+        let low = [2.0, 3.0, 3.0];
+        let vol = [1.0, 2.0, 2.0];
+        let mut stream = MarketefiStream::new();
+        let mut vals = Vec::new();
+        for i in 0..high.len() {
+            vals.push(stream.update(high[i], low[i], vol[i]).unwrap_or(f64::NAN));
+        }
+        let input = MarketefiInput::from_slices(&high, &low, &vol, MarketefiParams::default());
+        let res = marketefi_with_kernel(&input, kernel)?;
+        for (a, b) in vals.iter().zip(res.values.iter()) {
+            if a.is_nan() && b.is_nan() {
+                continue;
+            }
+            assert!((a - b).abs() < 1e-8);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "proptest")]
+    #[allow(clippy::float_cmp)]
+    fn check_marketefi_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (50usize..400, 0usize..7, any::<u64>()).prop_map(|(len, scenario, seed)| {
+            let mut rng_state = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let mut next_f64 = || {
+                rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (rng_state as f64) / (u64::MAX as f64)
+            };
+
+            let mut high = Vec::with_capacity(len);
+            let mut low = Vec::with_capacity(len);
+            let mut volume = Vec::with_capacity(len);
+
+            match scenario {
+                0 => {
+                    for _ in 0..len {
+                        let base = 50.0 + next_f64() * 450.0;
+                        let spread = 0.1 + next_f64() * 10.0;
+                        high.push(base + spread);
+                        low.push(base);
+                        volume.push(100.0 + next_f64() * 10000.0);
+                    }
+                }
+                1 => {
+                    let price = 100.0 + next_f64() * 200.0;
+                    for _ in 0..len {
+                        high.push(price);
+                        low.push(price);
+                        volume.push(1000.0 + next_f64() * 1000.0);
+                    }
+                }
+                2 => {
+                    let mut base = 100.0;
+                    for i in 0..len {
+                        let trend = 0.5 * (i as f64 / len as f64);
+                        base += trend;
+                        let volatility = 0.5 + (i as f64 / len as f64) * 5.0;
+                        high.push(base + volatility);
+                        low.push(base - volatility * 0.5);
+                        volume.push(500.0 + next_f64() * 5000.0 + i as f64 * 10.0);
+                    }
+                }
+                3 => {
+                    for _ in 0..len {
+                        let base = 50.0 + next_f64() * 100.0;
+                        let spread = 0.1 + next_f64() * 5.0;
+                        high.push(base + spread);
+                        low.push(base);
+                        volume.push(0.001 + next_f64() * 1.0);
+                    }
+                }
+                4 => {
+                    for _ in 0..len {
+                        let base = 1000.0 + next_f64() * 9000.0;
+                        let spread = 10.0 + next_f64() * 100.0;
+                        high.push(base + spread);
+                        low.push(base);
+                        volume.push(1e6 + next_f64() * 1e7);
+                    }
+                }
+                5 => {
+                    for i in 0..len {
+                        let base = 100.0 + next_f64() * 100.0;
+                        let spread = 1.0 + next_f64() * 5.0;
+                        high.push(base + spread);
+                        low.push(base);
+
+                        if i % 5 == 0 {
+                            volume.push(0.0);
+                        } else {
+                            volume.push(100.0 + next_f64() * 1000.0);
+                        }
+                    }
+                }
+                _ => {
+                    for _ in 0..len {
+                        let base = 100.0 + next_f64() * 200.0;
+                        let spread = 1.0 + next_f64() * 10.0;
+
+                        if next_f64() < 0.3 {
+                            high.push(base - spread);
+                            low.push(base);
+                        } else {
+                            high.push(base + spread);
+                            low.push(base);
+                        }
+                        volume.push(500.0 + next_f64() * 5000.0);
+                    }
+                }
+            }
+
+            (high, low, volume, scenario)
+        });
+
+        proptest::test_runner::TestRunner::default().run(
+            &strat,
+            |(high, low, volume, scenario)| {
+                let input =
+                    MarketefiInput::from_slices(&high, &low, &volume, MarketefiParams::default());
+
+                let output = marketefi_with_kernel(&input, kernel)?;
+
+                let ref_output = marketefi_with_kernel(&input, Kernel::Scalar)?;
+
+                prop_assert_eq!(
+                    output.values.len(),
+                    high.len(),
+                    "Output length mismatch: got {}, expected {}",
+                    output.values.len(),
+                    high.len()
+                );
+
+                let first_valid = (0..high.len())
+                    .find(|&i| !high[i].is_nan() && !low[i].is_nan() && !volume[i].is_nan());
+
+                if let Some(first) = first_valid {
+                    for i in 0..first {
+                        prop_assert!(
+                            output.values[i].is_nan(),
+                            "Expected NaN before first valid index {} but got {} at index {}",
+                            first,
+                            output.values[i],
+                            i
+                        );
+                    }
+                }
+
+                for i in 0..high.len() {
+                    let expected = if high[i].is_nan()
+                        || low[i].is_nan()
+                        || volume[i].is_nan()
+                        || volume[i] == 0.0
+                    {
+                        f64::NAN
+                    } else {
+                        (high[i] - low[i]) / volume[i]
+                    };
+
+                    let actual = output.values[i];
+
+                    if expected.is_nan() {
+                        prop_assert!(
+                            actual.is_nan(),
+                            "Expected NaN at index {} but got {}",
+                            i,
+                            actual
+                        );
+                    } else {
+                        prop_assert!(
+                            (actual - expected).abs() < 1e-10,
+                            "Calculation mismatch at index {}: expected {}, got {}",
+                            i,
+                            expected,
+                            actual
+                        );
+                    }
+                }
+
+                for i in 0..output.values.len() {
+                    let out_val = output.values[i];
+                    let ref_val = ref_output.values[i];
+
+                    if out_val.is_nan() && ref_val.is_nan() {
+                        continue;
+                    }
+
+                    prop_assert!(
+                        (out_val - ref_val).abs() < 1e-10,
+                        "Kernel mismatch at index {}: kernel={}, reference={}",
+                        i,
+                        out_val,
+                        ref_val
+                    );
+                }
+
+                if scenario == 1 {
+                    for i in 0..output.values.len() {
+                        if !high[i].is_nan()
+                            && !low[i].is_nan()
+                            && !volume[i].is_nan()
+                            && volume[i] != 0.0
+                        {
+                            prop_assert!(
+                                (output.values[i] - 0.0).abs() < 1e-10,
+                                "When high=low, expected 0.0 but got {} at index {}",
+                                output.values[i],
+                                i
+                            );
+                        }
+                    }
+                }
+
+                if scenario == 5 {
+                    for i in 0..output.values.len() {
+                        if volume[i] == 0.0 {
+                            prop_assert!(
+                                output.values[i].is_nan(),
+                                "Expected NaN for zero volume at index {} but got {}",
+                                i,
+                                output.values[i]
+                            );
+                        }
+                    }
+                }
+
+                if scenario == 6 {
+                    for i in 0..output.values.len() {
+                        if !high[i].is_nan()
+                            && !low[i].is_nan()
+                            && !volume[i].is_nan()
+                            && volume[i] != 0.0
+                        {
+                            if high[i] < low[i] {
+                                prop_assert!(output.values[i] < 0.0,
+									"Expected negative value when high < low at index {}, but got {}", i, output.values[i]);
+                            }
+                        }
+                    }
+                }
+
+                for (i, &val) in output.values.iter().enumerate() {
+                    if val.is_nan() {
+                        continue;
+                    }
+
+                    let bits = val.to_bits();
+
+                    prop_assert!(
+                        bits != 0x11111111_11111111,
+                        "Found alloc_with_nan_prefix poison value at index {}",
+                        i
+                    );
+                    prop_assert!(
+                        bits != 0x22222222_22222222,
+                        "Found init_matrix_prefixes poison value at index {}",
+                        i
+                    );
+                    prop_assert!(
+                        bits != 0x33333333_33333333,
+                        "Found make_uninit_matrix poison value at index {}",
+                        i
+                    );
+                }
+
+                Ok(())
+            },
+        )?;
+
+        Ok(())
+    }
+
+    macro_rules! generate_all_marketefi_tests {
+        ($($test_fn:ident),*) => {
+            paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar);
+                    }
+                )*
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _avx2_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2);
+                    }
+                    #[test]
+                    fn [<$test_fn _avx512_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512);
+                    }
+                )*
+            }
+        }
+    }
+    generate_all_marketefi_tests!(
+        check_marketefi_accuracy,
+        check_marketefi_nan_handling,
+        check_marketefi_empty_data,
+        check_marketefi_streaming,
+        check_marketefi_no_poison
+    );
+
+    #[cfg(feature = "proptest")]
+    generate_all_marketefi_tests!(check_marketefi_property);
+
+    #[test]
+    fn test_marketefi_into_slice() -> Result<(), Box<dyn Error>> {
+        let high = vec![100.0, 105.0, 110.0, 108.0, 112.0];
+        let low = vec![95.0, 98.0, 102.0, 104.0, 106.0];
+        let volume = vec![1000.0, 1500.0, 2000.0, 1200.0, 1800.0];
+
+        let input = MarketefiInput::from_slices(&high, &low, &volume, MarketefiParams::default());
+
+        let mut dst = vec![0.0; high.len()];
+        marketefi_into_slice(&mut dst, &input, Kernel::Scalar)?;
+
+        let output = marketefi(&input)?;
+
+        assert_eq!(dst.len(), output.values.len());
+        for i in 0..dst.len() {
+            if dst[i].is_nan() && output.values[i].is_nan() {
+                continue;
+            }
+            assert!(
+                (dst[i] - output.values[i]).abs() < 1e-10,
+                "Mismatch at index {}: into_slice={}, regular={}",
+                i,
+                dst[i],
+                output.values[i]
+            );
+        }
+
+        for i in 0..high.len() {
+            let expected = (high[i] - low[i]) / volume[i];
+            assert!(
+                (dst[i] - expected).abs() < 1e-10,
+                "Incorrect calculation at index {}: got={}, expected={}",
+                i,
+                dst[i],
+                expected
+            );
+        }
+
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_marketefi_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let params = MarketefiParams::default();
+        let input = MarketefiInput::from_candles(&candles, "high", "low", "volume", params.clone());
+        let output = marketefi_with_kernel(&input, kernel)?;
+
+        for (i, &val) in output.values.iter().enumerate() {
+            if val.is_nan() {
+                continue;
+            }
+
+            let bits = val.to_bits();
+
+            if bits == 0x11111111_11111111 {
+                panic!(
+                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {}",
+                    test_name, val, bits, i
+                );
+            }
+
+            if bits == 0x22222222_22222222 {
+                panic!(
+                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {}",
+                    test_name, val, bits, i
+                );
+            }
+
+            if bits == 0x33333333_33333333 {
+                panic!(
+                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {}",
+                    test_name, val, bits, i
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_marketefi_no_poison(_test_name: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let out = MarketefiBatchBuilder::new().kernel(kernel).apply_slices(
+            source_type(&candles, "high"),
+            source_type(&candles, "low"),
+            source_type(&candles, "volume"),
+        )?;
+        let expected_last_five = [
+            2.8460112192104607,
+            3.020938522420525,
+            3.0474861329079292,
+            3.691017115591989,
+            2.247810963176202,
+        ];
+        let row = &out.values;
+        let start = row.len() - 5;
+        for (i, &v) in row[start..].iter().enumerate() {
+            let exp = expected_last_five[i];
+            assert!(
+                (v - exp).abs() < 1e-8,
+                "[{test}] batch row mismatch at {i}: {v} vs {exp}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let output = MarketefiBatchBuilder::new().kernel(kernel).apply_slices(
+            source_type(&c, "high"),
+            source_type(&c, "low"),
+            source_type(&c, "volume"),
+        )?;
+
+        for (idx, &val) in output.values.iter().enumerate() {
+            if val.is_nan() {
+                continue;
+            }
+
+            let bits = val.to_bits();
+            let row = idx / output.cols;
+            let col = idx % output.cols;
+
+            if bits == 0x11111111_11111111 {
+                panic!(
+                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+					at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
+            }
+
+            if bits == 0x22222222_22222222 {
+                panic!(
+                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) \
+					at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
+            }
+
+            if bits == 0x33333333_33333333 {
+                panic!(
+                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) \
+					at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_batch_no_poison(_test: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    macro_rules! gen_batch_tests {
+        ($fn_name:ident) => {
+            paste! {
+                #[test] fn [<$fn_name _scalar>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx2>]()        {
+                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx512>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                }
+                #[test] fn [<$fn_name _auto_detect>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                }
+            }
+        };
+    }
+    gen_batch_tests!(check_batch_default_row);
+    gen_batch_tests!(check_batch_no_poison);
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn marketefi_js(high: &[f64], low: &[f64], volume: &[f64]) -> Result<Vec<f64>, JsValue> {
+    let input = MarketefiInput::from_slices(high, low, volume, MarketefiParams::default());
+
+    let mut output = vec![0.0; high.len()];
+
+    marketefi_into_slice(&mut output, &input, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    Ok(output)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn marketefi_alloc(len: usize) -> *mut f64 {
+    let mut vec = Vec::<f64>::with_capacity(len);
+    let ptr = vec.as_mut_ptr();
+    std::mem::forget(vec);
+    ptr
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn marketefi_free(ptr: *mut f64, len: usize) {
+    if !ptr.is_null() {
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, 0, len);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn marketefi_into(
+    high_ptr: *const f64,
+    low_ptr: *const f64,
+    volume_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+) -> Result<(), JsValue> {
+    if high_ptr.is_null() || low_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("null pointer passed to marketefi_into"));
+    }
+
+    unsafe {
+        let high = std::slice::from_raw_parts(high_ptr, len);
+        let low = std::slice::from_raw_parts(low_ptr, len);
+        let volume = std::slice::from_raw_parts(volume_ptr, len);
+
+        let input = MarketefiInput::from_slices(high, low, volume, MarketefiParams::default());
+
+        if high_ptr == out_ptr || low_ptr == out_ptr || volume_ptr == out_ptr {
+            let mut temp = vec![0.0; len];
+            marketefi_into_slice(&mut temp, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            out.copy_from_slice(&temp);
+        } else {
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            marketefi_into_slice(out, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct MarketefiBatchConfig {}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct MarketefiBatchJsOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<MarketefiParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = marketefi_batch)]
+pub fn marketefi_batch_js(
+    high: &[f64],
+    low: &[f64],
+    volume: &[f64],
+    _config: JsValue,
+) -> Result<JsValue, JsValue> {
+    let result = marketefi_batch_with_kernel(high, low, volume, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let output = MarketefiBatchJsOutput {
+        values: result.values,
+        combos: result.combos,
+        rows: result.rows,
+        cols: result.cols,
+    };
+
+    serde_wasm_bindgen::to_value(&output)
+        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn marketefi_batch_into(
+    high_ptr: *const f64,
+    low_ptr: *const f64,
+    volume_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+) -> Result<usize, JsValue> {
+    if high_ptr.is_null() || low_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str(
+            "null pointer passed to marketefi_batch_into",
+        ));
+    }
+    unsafe {
+        let h = core::slice::from_raw_parts(high_ptr, len);
+        let l = core::slice::from_raw_parts(low_ptr, len);
+        let v = core::slice::from_raw_parts(volume_ptr, len);
+        let out = core::slice::from_raw_parts_mut(out_ptr, len);
+
+        marketefi_batch_inner_into(h, l, v, Kernel::Auto, false, out)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(1)
+    }
+}

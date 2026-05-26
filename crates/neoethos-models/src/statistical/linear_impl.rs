@@ -2,9 +2,10 @@ use anyhow::{Context, Result, bail};
 use ndarray::{Array1, Array2, Axis};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use neoethos_core::BackendKind;
+use neoethos_core::storage::json::{DirBackupWriteConfig, write_dir_with_backup};
 
 use crate::base::{
     ExpertModel, build_runtime_prediction_with_details, canonical_three_class_label_mapping,
@@ -82,72 +83,23 @@ fn split_train_val_indices(rows: usize) -> (Vec<usize>, Vec<usize>) {
     (train, val)
 }
 
-fn staged_linear_artifact_dir(path: &Path) -> PathBuf {
-    path.with_extension("tmp_linear_artifact")
-}
-
-fn backup_linear_artifact_dir(path: &Path) -> PathBuf {
-    path.with_extension("bak_linear_artifact")
-}
-
-fn cleanup_linear_artifact_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("remove linear artifact directory {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn replace_linear_artifact_dir(staged_path: &Path, target_path: &Path) -> Result<()> {
-    let backup_path = backup_linear_artifact_dir(target_path);
-    cleanup_linear_artifact_dir(&backup_path)?;
-    if target_path.exists() {
-        std::fs::rename(target_path, &backup_path).with_context(|| {
-            format!(
-                "move previous linear artifact into backup {}",
-                backup_path.display()
-            )
-        })?;
-    }
-    if let Err(error) = std::fs::rename(staged_path, target_path) {
-        if backup_path.exists() {
-            if let Err(restore_err) = std::fs::rename(&backup_path, target_path) {
-                tracing::error!(
-                    target: "neoethos_models::artifact",
-                    backup = %backup_path.display(),
-                    target = %target_path.display(),
-                    error = %restore_err,
-                    "failed to restore backup after staged-rename failure;                      artifact directory may be in an inconsistent state"
-                );
-            }
-        }
-        bail!(
-            "rename staged linear artifact into {} failed: {}",
-            target_path.display(),
-            error
-        );
-    }
-    cleanup_linear_artifact_dir(&backup_path)?;
-    Ok(())
-}
-
+/// GROUP E remediation 2026-05-25: 5 hand-rolled functions replaced
+/// with a single delegation to the canonical `write_dir_with_backup`
+/// helper in `neoethos-core::storage::json`. Saves ~60 LOC of duplicate
+/// staged-tmp+backup logic (this file is one of 4).
 fn with_staged_linear_artifact_dir<F>(path: &Path, writer: F) -> Result<()>
 where
     F: FnOnce(&Path) -> Result<()>,
 {
-    let staged_path = staged_linear_artifact_dir(path);
-    cleanup_linear_artifact_dir(&staged_path)?;
-    std::fs::create_dir_all(&staged_path).with_context(|| {
-        format!(
-            "create staged linear artifact dir {}",
-            staged_path.display()
-        )
-    })?;
-    if let Err(error) = writer(&staged_path) {
-        let _ = cleanup_linear_artifact_dir(&staged_path);
-        return Err(error);
-    }
-    replace_linear_artifact_dir(&staged_path, path)
+    write_dir_with_backup(
+        path,
+        DirBackupWriteConfig {
+            artifact_label: "linear artifact",
+            temp_extension: "tmp_linear_artifact",
+            backup_extension: "bak_linear_artifact",
+        },
+        writer,
+    )
 }
 
 fn logits_from_features(

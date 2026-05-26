@@ -755,10 +755,18 @@ fn training_record(operation: &str, status: &str, message: String) -> SectionedR
 }
 
 fn system_time_string() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch");
-    format!("{}.{:09}Z", now.as_secs(), now.subsec_nanos())
+    // F-282 fix (2026-05-25): never panic on pre-1970 clock skew.
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(now) => format!("{}.{:09}Z", now.as_secs(), now.subsec_nanos()),
+        Err(err) => {
+            tracing::warn!(
+                target: "neoethos_app::training",
+                error = %err,
+                "system clock is before UNIX epoch; falling back to sentinel"
+            );
+            "pre-1970.000000000Z".to_string()
+        }
+    }
 }
 
 #[cfg(test)]

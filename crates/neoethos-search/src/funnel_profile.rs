@@ -71,6 +71,12 @@ pub struct FunnelProfile {
     pub timeframe: String,
     pub started_at: String,
     pub finished_at: String,
+    /// 2026-05-26 operator directive (dual-mode product): which mode this run
+    /// used. Either "PropFirm" (steady ~4%/month, respects FTMO DD caps) or
+    /// "Risky" (aggressive €100→€100k, Kelly-aligned ~30% per trade). Empty
+    /// when constructed via `FunnelProfile::new` (caller must set this).
+    #[serde(default)]
+    pub mode: String,
     /// Each canonical pipeline stage (16 total per spec). Stages
     /// the run didn't reach get count_in/out=0.
     pub stages: Vec<FunnelStage>,
@@ -88,11 +94,21 @@ impl FunnelProfile {
             timeframe: timeframe.into(),
             started_at: now_iso8601(),
             finished_at: String::new(),
+            mode: String::new(),
             stages: canonical_empty_stages(),
             bottleneck_stage: String::new(),
             bottleneck_rejected: 0,
             outcome: "pending".to_string(),
         }
+    }
+
+    /// 2026-05-26 operator directive (dual-mode product): record which trading
+    /// mode produced this funnel. The save path is the same JSON file, but
+    /// downstream diagnostics (UI panel, post-mortem scripts) need to know
+    /// whether the rejection pattern was generated under PropFirm or Risky
+    /// thresholds before drawing conclusions.
+    pub fn set_mode(&mut self, mode: impl Into<String>) {
+        self.mode = mode.into();
     }
 
     pub fn record_stage(&mut self, name: &str, count_in: usize, count_out: usize) {

@@ -2,6 +2,11 @@ pub mod broker_config;
 pub mod config;
 pub mod contracts;
 pub mod domain;
+// F-150 fix (2026-05-25 — F-CORE3 consolidation): canonical env-var
+// registry for neoethos-core. Phase A introduces typed getters; Phase
+// B migrates the 6 existing call sites (config / symbol_metadata /
+// system / logging / broker_config / resolved_config) to use them.
+pub mod env_overrides;
 pub mod logging;
 pub mod resolved_config;
 pub mod schema_version;

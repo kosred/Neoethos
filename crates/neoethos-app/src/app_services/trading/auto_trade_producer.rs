@@ -58,9 +58,10 @@
 //! REJECTED by the operator on the 2026-05-17 directive grounds:
 //! hardcoded textbook indicators applied to live forex without
 //! cost-aware backtest validation are near-certain ruin in seconds.
-//! The bot's job is to DISCOVER strategies through the 33-model
+//! The bot's job is to DISCOVER strategies through the 34-model
 //! training stack (see `neoethos_models::runtime::capabilities::KNOWN_MODEL_NAMES`
-//! and `crates/neoethos-models/src/training_orchestrator.rs`); it
+//! — 34th = `hmm_regime` added 2026-05-25 — and
+//! `crates/neoethos-models/src/training_orchestrator.rs`); it
 //! must NOT trade on a hand-picked indicator until the ensemble has
 //! produced + validated a signal source.
 //!
@@ -429,7 +430,7 @@ pub enum ProducerOutcome {
 // was wrong and the operator-directive 2026-05-17 rejected it: a
 // hardcoded textbook indicator applied to live forex without cost-
 // aware backtest validation is near-certain ruin in seconds. The
-// bot must DISCOVER strategies through the 33-model training stack;
+// bot must DISCOVER strategies through the 34-model training stack;
 // it must NOT trade until that stack has produced + validated a
 // signal source.
 //

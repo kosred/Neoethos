@@ -1,0 +1,1020 @@
+#![cfg(feature = "cuda")]
+#[cfg(all(feature = "python", feature = "cuda"))]
+use pyo3::types::PyDictMethods;
+
+use super::alma_wrapper::DeviceArrayF32;
+use crate::indicators::moving_averages::epma::{EpmaBatchRange, EpmaParams};
+use cust::context::Context;
+use cust::device::Device;
+use cust::function::{BlockSize, GridSize};
+use cust::memory::{
+    mem_get_info, AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer,
+};
+use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::prelude::*;
+use cust::stream::{Stream, StreamFlags};
+use std::env;
+use std::ffi::c_void;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use thiserror::Error;
+
+const EPMA_TILE: u32 = 8;
+
+#[derive(Clone, Copy, Debug)]
+pub enum BatchKernelPolicy {
+    Auto,
+    Plain { block_x: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ManySeriesKernelPolicy {
+    Auto,
+    OneD { block_x: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CudaEpmaPolicy {
+    pub batch: BatchKernelPolicy,
+    pub many_series: ManySeriesKernelPolicy,
+}
+
+impl Default for CudaEpmaPolicy {
+    fn default() -> Self {
+        Self {
+            batch: BatchKernelPolicy::Auto,
+            many_series: ManySeriesKernelPolicy::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BatchKernelSelected {
+    Plain { block_x: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ManySeriesKernelSelected {
+    OneD { block_x: u32 },
+}
+
+#[derive(Debug, Error)]
+pub enum CudaEpmaError {
+    #[error(transparent)]
+    Cuda(#[from] cust::error::CudaError),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    #[error("missing kernel symbol: {name}")]
+    MissingKernelSymbol { name: &'static str },
+    #[error(
+        "out of memory: required={required} bytes, free={free} bytes, headroom={headroom} bytes"
+    )]
+    OutOfMemory {
+        required: usize,
+        free: usize,
+        headroom: usize,
+    },
+    #[error("launch config too large (grid=({gx},{gy},{gz}), block=({bx},{by},{bz}))")]
+    LaunchConfigTooLarge {
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
+    },
+    #[error("arithmetic overflow in size computation: {context}")]
+    SizeOverflow { context: &'static str },
+    #[error("invalid policy: {0}")]
+    InvalidPolicy(&'static str),
+    #[error("device mismatch: buffer device {buf}, current {current}")]
+    DeviceMismatch { buf: u32, current: u32 },
+    #[error("not implemented")]
+    NotImplemented,
+}
+
+pub struct CudaEpma {
+    module: Module,
+    stream: Stream,
+    _context: Arc<Context>,
+    device_id: u32,
+    policy: CudaEpmaPolicy,
+    last_batch: Option<BatchKernelSelected>,
+    last_many: Option<ManySeriesKernelSelected>,
+    debug_batch_logged: bool,
+    debug_many_logged: bool,
+}
+
+impl CudaEpma {
+    pub fn new(device_id: usize) -> Result<Self, CudaEpmaError> {
+        cust::init(CudaFlags::empty())?;
+        let device = Device::get_device(device_id as u32)?;
+        let context = Arc::new(Context::new(device)?);
+
+        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/epma_kernel.ptx"));
+
+        let jit_opts = &[
+            ModuleJitOption::DetermineTargetFromContext,
+            ModuleJitOption::OptLevel(OptLevel::O4),
+        ];
+        let module = crate::load_cuda_embedded_module!("epma_kernel")?;
+        let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
+
+        Ok(Self {
+            module,
+            stream,
+            _context: context,
+            device_id: device_id as u32,
+            policy: CudaEpmaPolicy::default(),
+            last_batch: None,
+            last_many: None,
+            debug_batch_logged: false,
+            debug_many_logged: false,
+        })
+    }
+
+    pub fn context_arc(&self) -> Arc<Context> {
+        self._context.clone()
+    }
+
+    pub fn new_with_policy(
+        device_id: usize,
+        policy: CudaEpmaPolicy,
+    ) -> Result<Self, CudaEpmaError> {
+        let mut s = Self::new(device_id)?;
+        s.policy = policy;
+        Ok(s)
+    }
+    pub fn set_policy(&mut self, policy: CudaEpmaPolicy) {
+        self.policy = policy;
+    }
+    pub fn policy(&self) -> &CudaEpmaPolicy {
+        &self.policy
+    }
+    pub fn selected_batch_kernel(&self) -> Option<BatchKernelSelected> {
+        self.last_batch
+    }
+    pub fn selected_many_series_kernel(&self) -> Option<ManySeriesKernelSelected> {
+        self.last_many
+    }
+
+    pub fn synchronize(&self) -> Result<(), CudaEpmaError> {
+        self.stream.synchronize().map_err(CudaEpmaError::from)
+    }
+
+    fn mem_check_enabled() -> bool {
+        match env::var("CUDA_MEM_CHECK") {
+            Ok(v) => v != "0" && v.to_lowercase() != "false",
+            Err(_) => true,
+        }
+    }
+
+    fn device_mem_info() -> Option<(usize, usize)> {
+        mem_get_info().ok()
+    }
+
+    #[inline]
+    fn will_fit_checked(required_bytes: usize, headroom_bytes: usize) -> Result<(), CudaEpmaError> {
+        if !Self::mem_check_enabled() {
+            return Ok(());
+        }
+        if let Some((free, _total)) = Self::device_mem_info() {
+            if required_bytes.saturating_add(headroom_bytes) > free {
+                return Err(CudaEpmaError::OutOfMemory {
+                    required: required_bytes,
+                    free,
+                    headroom: headroom_bytes,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn will_fit(required_bytes: usize, headroom_bytes: usize) -> bool {
+        if !Self::mem_check_enabled() {
+            return true;
+        }
+        if let Some((free, _total)) = Self::device_mem_info() {
+            required_bytes.saturating_add(headroom_bytes) <= free
+        } else {
+            true
+        }
+    }
+
+    #[inline]
+    fn maybe_log_batch_debug(&self) {
+        static GLOBAL_ONCE: AtomicBool = AtomicBool::new(false);
+        if self.debug_batch_logged {
+            return;
+        }
+        if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(sel) = self.last_batch {
+                let per_s = std::env::var("BENCH_DEBUG_SCOPE").ok().as_deref() == Some("scenario");
+                if per_s || !GLOBAL_ONCE.swap(true, Ordering::Relaxed) {
+                    eprintln!("[DEBUG] EPMA batch selected kernel: {:?}", sel);
+                }
+                unsafe {
+                    (*(self as *const _ as *mut CudaEpma)).debug_batch_logged = true;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn maybe_log_many_debug(&self) {
+        static GLOBAL_ONCE: AtomicBool = AtomicBool::new(false);
+        if self.debug_many_logged {
+            return;
+        }
+        if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(sel) = self.last_many {
+                let per_s = std::env::var("BENCH_DEBUG_SCOPE").ok().as_deref() == Some("scenario");
+                if per_s || !GLOBAL_ONCE.swap(true, Ordering::Relaxed) {
+                    eprintln!("[DEBUG] EPMA many-series selected kernel: {:?}", sel);
+                }
+                unsafe {
+                    (*(self as *const _ as *mut CudaEpma)).debug_many_logged = true;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn grid_y_chunks(n: usize) -> impl Iterator<Item = (usize, usize)> {
+        const MAX_GRID_Y: usize = 65_535;
+        (0..n).step_by(MAX_GRID_Y).map(move |start| {
+            let len = (n - start).min(MAX_GRID_Y);
+            (start, len)
+        })
+    }
+
+    fn axis_usize(axis: (usize, usize, usize)) -> Vec<usize> {
+        let (start, end, step) = axis;
+        if step == 0 {
+            return vec![start];
+        }
+        let (lo, hi) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        (lo..=hi).step_by(step).collect()
+    }
+
+    fn expand_range(range: &EpmaBatchRange) -> Vec<EpmaParams> {
+        let periods = Self::axis_usize(range.period);
+        let offsets = Self::axis_usize(range.offset);
+        let mut combos = Vec::with_capacity(periods.len() * offsets.len());
+        for &p in &periods {
+            for &o in &offsets {
+                combos.push(EpmaParams {
+                    period: Some(p),
+                    offset: Some(o),
+                });
+            }
+        }
+        combos
+    }
+
+    fn prepare_batch_inputs(
+        data_f32: &[f32],
+        sweep: &EpmaBatchRange,
+    ) -> Result<(Vec<EpmaParams>, usize, usize, usize), CudaEpmaError> {
+        if data_f32.is_empty() {
+            return Err(CudaEpmaError::InvalidInput("empty data".into()));
+        }
+        let first_valid = data_f32
+            .iter()
+            .position(|x| !x.is_nan())
+            .ok_or_else(|| CudaEpmaError::InvalidInput("all values are NaN".into()))?;
+
+        let combos = Self::expand_range(sweep);
+        if combos.is_empty() {
+            return Err(CudaEpmaError::InvalidInput(
+                "no parameter combinations".into(),
+            ));
+        }
+
+        let series_len = data_f32.len();
+        let mut max_period = 0usize;
+        for prm in &combos {
+            let period = prm.period.unwrap_or(0);
+            let offset = prm.offset.unwrap_or(usize::MAX);
+            if period < 2 {
+                return Err(CudaEpmaError::InvalidInput(format!(
+                    "invalid period {} (must be >= 2)",
+                    period
+                )));
+            }
+            if offset >= period {
+                return Err(CudaEpmaError::InvalidInput(format!(
+                    "offset {} must be < period {}",
+                    offset, period
+                )));
+            }
+            if period > series_len {
+                return Err(CudaEpmaError::InvalidInput(format!(
+                    "period {} exceeds data length {}",
+                    period, series_len
+                )));
+            }
+            let needed = period + offset + 1;
+            let valid = series_len - first_valid;
+            if valid < needed {
+                return Err(CudaEpmaError::InvalidInput(format!(
+                    "not enough valid data: need >= {}, valid = {}",
+                    needed, valid
+                )));
+            }
+            max_period = max_period.max(period);
+        }
+
+        Ok((combos, first_valid, series_len, max_period))
+    }
+
+    fn launch_batch_kernel(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        d_periods: &DeviceBuffer<i32>,
+        d_offsets: &DeviceBuffer<i32>,
+        series_len: usize,
+        n_combos: usize,
+        first_valid: usize,
+        _max_period: usize,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaEpmaError> {
+        let block_x = match self.policy.batch {
+            BatchKernelPolicy::Auto => 256,
+            BatchKernelPolicy::Plain { block_x } => block_x.max(32).min(1024),
+        } as u32;
+        let func = self.module.get_function("epma_batch_f32").map_err(|_| {
+            CudaEpmaError::MissingKernelSymbol {
+                name: "epma_batch_f32",
+            }
+        })?;
+
+        for (start_combo, len_combo) in Self::grid_y_chunks(n_combos) {
+            let bx_times_tile = block_x.saturating_mul(EPMA_TILE);
+            let grid_x = ((series_len as u32 + bx_times_tile - 1) / bx_times_tile).max(1);
+            let grid: GridSize = (grid_x, len_combo as u32, 1).into();
+            let block: BlockSize = (block_x, 1, 1).into();
+
+            unsafe {
+                let mut prices_ptr = d_prices.as_device_ptr().as_raw();
+
+                let mut periods_ptr = d_periods.as_device_ptr().add(start_combo).as_raw();
+                let mut offsets_ptr = d_offsets.as_device_ptr().add(start_combo).as_raw();
+                let mut series_len_i = series_len as i32;
+                let mut combos_i = len_combo as i32;
+                let mut first_valid_i = first_valid as i32;
+
+                let mut out_ptr = d_out.as_device_ptr().add(start_combo * series_len).as_raw();
+                let args: &mut [*mut c_void] = &mut [
+                    &mut prices_ptr as *mut _ as *mut c_void,
+                    &mut periods_ptr as *mut _ as *mut c_void,
+                    &mut offsets_ptr as *mut _ as *mut c_void,
+                    &mut series_len_i as *mut _ as *mut c_void,
+                    &mut combos_i as *mut _ as *mut c_void,
+                    &mut first_valid_i as *mut _ as *mut c_void,
+                    &mut out_ptr as *mut _ as *mut c_void,
+                ];
+
+                self.stream
+                    .launch(&func, grid, block, 0, args)
+                    .map_err(CudaEpmaError::from)?;
+            }
+        }
+        unsafe {
+            let this = self as *const _ as *mut CudaEpma;
+            (*this).last_batch = Some(BatchKernelSelected::Plain { block_x });
+        }
+        self.maybe_log_batch_debug();
+        Ok(())
+    }
+
+    #[inline]
+    fn checked_mul_usize(
+        a: usize,
+        b: usize,
+        context: &'static str,
+    ) -> Result<usize, CudaEpmaError> {
+        a.checked_mul(b)
+            .ok_or(CudaEpmaError::SizeOverflow { context })
+    }
+    #[inline]
+    fn checked_add_usize(
+        a: usize,
+        b: usize,
+        context: &'static str,
+    ) -> Result<usize, CudaEpmaError> {
+        a.checked_add(b)
+            .ok_or(CudaEpmaError::SizeOverflow { context })
+    }
+
+    fn run_batch_kernel(
+        &self,
+        data_f32: &[f32],
+        combos: &[EpmaParams],
+        first_valid: usize,
+        series_len: usize,
+        max_period: usize,
+    ) -> Result<DeviceArrayF32, CudaEpmaError> {
+        let n_combos = combos.len();
+        let mut periods_i32 = vec![0i32; n_combos];
+        let mut offsets_i32 = vec![0i32; n_combos];
+        for (idx, prm) in combos.iter().enumerate() {
+            periods_i32[idx] = prm.period.unwrap() as i32;
+            offsets_i32[idx] = prm.offset.unwrap() as i32;
+        }
+
+        let sz_f32 = std::mem::size_of::<f32>();
+        let sz_i32 = std::mem::size_of::<i32>();
+        let prices_bytes = Self::checked_mul_usize(series_len, sz_f32, "prices_bytes")?;
+        let periods_bytes = Self::checked_mul_usize(n_combos, sz_i32, "periods_bytes")?;
+        let offsets_bytes = Self::checked_mul_usize(n_combos, sz_i32, "offsets_bytes")?;
+        let out_elems = Self::checked_mul_usize(n_combos, series_len, "out_elems")?;
+        let out_bytes = Self::checked_mul_usize(out_elems, sz_f32, "out_bytes")?;
+        let required = Self::checked_add_usize(
+            Self::checked_add_usize(
+                Self::checked_add_usize(prices_bytes, periods_bytes, "bytes_sum_0")?,
+                offsets_bytes,
+                "bytes_sum_1",
+            )?,
+            out_bytes,
+            "bytes_sum_2",
+        )?;
+        let headroom = 64 * 1024 * 1024;
+        Self::will_fit_checked(required, headroom)?;
+
+        let d_prices = DeviceBuffer::from_slice(data_f32)?;
+        let d_periods = DeviceBuffer::from_slice(&periods_i32)?;
+        let d_offsets = DeviceBuffer::from_slice(&offsets_i32)?;
+        let mut d_out: DeviceBuffer<f32> = unsafe { DeviceBuffer::uninitialized(out_elems) }?;
+
+        self.launch_batch_kernel(
+            &d_prices,
+            &d_periods,
+            &d_offsets,
+            series_len,
+            n_combos,
+            first_valid,
+            max_period,
+            &mut d_out,
+        )?;
+
+        self.stream.synchronize()?;
+
+        Ok(DeviceArrayF32 {
+            buf: d_out,
+            rows: n_combos,
+            cols: series_len,
+        })
+    }
+
+    pub fn epma_batch_dev(
+        &self,
+        data_f32: &[f32],
+        sweep: &EpmaBatchRange,
+    ) -> Result<DeviceArrayF32, CudaEpmaError> {
+        let (combos, first_valid, series_len, max_period) =
+            Self::prepare_batch_inputs(data_f32, sweep)?;
+        self.run_batch_kernel(data_f32, &combos, first_valid, series_len, max_period)
+    }
+
+    pub fn epma_batch_into_host_f32(
+        &self,
+        data_f32: &[f32],
+        sweep: &EpmaBatchRange,
+        out: &mut [f32],
+    ) -> Result<(), CudaEpmaError> {
+        let (combos, first_valid, series_len, max_period) =
+            Self::prepare_batch_inputs(data_f32, sweep)?;
+        if out.len() != combos.len() * series_len {
+            return Err(CudaEpmaError::InvalidInput(format!(
+                "out slice wrong length: got {}, expected {}",
+                out.len(),
+                combos.len() * series_len
+            )));
+        }
+        let arr = self.run_batch_kernel(data_f32, &combos, first_valid, series_len, max_period)?;
+        arr.buf.copy_to(out).map_err(CudaEpmaError::from)
+    }
+
+    pub fn epma_batch_into_pinned_host_f32(
+        &self,
+        data_pinned: &LockedBuffer<f32>,
+        sweep: &crate::indicators::moving_averages::epma::EpmaBatchRange,
+        out_pinned: &mut LockedBuffer<f32>,
+    ) -> Result<(), CudaEpmaError> {
+        let data_f32: &[f32] = data_pinned.as_slice();
+        let (combos, first_valid, series_len, max_period) =
+            Self::prepare_batch_inputs(data_f32, sweep)?;
+
+        if out_pinned.len() != combos.len() * series_len {
+            return Err(CudaEpmaError::InvalidInput(format!(
+                "out pinned buffer wrong length: got {}, expected {}",
+                out_pinned.len(),
+                combos.len() * series_len
+            )));
+        }
+
+        let n_combos = combos.len();
+        let mut periods_i32 = vec![0i32; n_combos];
+        let mut offsets_i32 = vec![0i32; n_combos];
+        for (idx, prm) in combos.iter().enumerate() {
+            periods_i32[idx] = prm.period.unwrap() as i32;
+            offsets_i32[idx] = prm.offset.unwrap() as i32;
+        }
+
+        let mut d_prices: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized(series_len) }.map_err(CudaEpmaError::from)?;
+        let d_periods = DeviceBuffer::from_slice(&periods_i32).map_err(CudaEpmaError::from)?;
+        let d_offsets = DeviceBuffer::from_slice(&offsets_i32).map_err(CudaEpmaError::from)?;
+        let mut d_out: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized(n_combos * series_len) }
+                .map_err(CudaEpmaError::from)?;
+
+        unsafe {
+            d_prices
+                .async_copy_from(data_pinned.as_slice(), &self.stream)
+                .map_err(CudaEpmaError::from)?;
+        }
+
+        self.launch_batch_kernel(
+            &d_prices,
+            &d_periods,
+            &d_offsets,
+            series_len,
+            n_combos,
+            first_valid,
+            max_period,
+            &mut d_out,
+        )?;
+
+        unsafe {
+            d_out
+                .async_copy_to(out_pinned.as_mut_slice(), &self.stream)
+                .map_err(CudaEpmaError::from)?;
+        }
+
+        self.stream.synchronize().map_err(CudaEpmaError::from)
+    }
+
+    pub fn epma_batch_device(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        d_periods: &DeviceBuffer<i32>,
+        d_offsets: &DeviceBuffer<i32>,
+        series_len: usize,
+        n_combos: usize,
+        first_valid: usize,
+        max_period: usize,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaEpmaError> {
+        if n_combos == 0 {
+            return Err(CudaEpmaError::InvalidInput("n_combos must be > 0".into()));
+        }
+        self.launch_batch_kernel(
+            d_prices,
+            d_periods,
+            d_offsets,
+            series_len,
+            n_combos,
+            first_valid,
+            max_period,
+            d_out,
+        )
+    }
+
+    fn prepare_many_series_inputs(
+        data_tm_f32: &[f32],
+        cols: usize,
+        rows: usize,
+        params: &EpmaParams,
+    ) -> Result<(Vec<i32>, usize, usize), CudaEpmaError> {
+        if cols == 0 || rows == 0 {
+            return Err(CudaEpmaError::InvalidInput(
+                "matrix dimensions must be positive".into(),
+            ));
+        }
+        if data_tm_f32.len() != cols * rows {
+            return Err(CudaEpmaError::InvalidInput(format!(
+                "expected {} elements, got {}",
+                cols * rows,
+                data_tm_f32.len()
+            )));
+        }
+        let period = params.period.unwrap_or(0);
+        let offset = params.offset.unwrap_or(usize::MAX);
+        if period < 2 {
+            return Err(CudaEpmaError::InvalidInput(format!(
+                "invalid period {} (must be >= 2)",
+                period
+            )));
+        }
+        if offset >= period {
+            return Err(CudaEpmaError::InvalidInput(format!(
+                "offset {} must be < period {}",
+                offset, period
+            )));
+        }
+
+        let mut first_valids = vec![0i32; cols];
+        let needed = period + offset + 1;
+        for series in 0..cols {
+            let mut found = None;
+            for t in 0..rows {
+                let v = data_tm_f32[t * cols + series];
+                if !v.is_nan() {
+                    found = Some(t);
+                    break;
+                }
+            }
+            let fv = found.ok_or_else(|| {
+                CudaEpmaError::InvalidInput(format!("series {} is entirely NaN", series))
+            })?;
+            let valid = rows - fv;
+            if valid < needed {
+                return Err(CudaEpmaError::InvalidInput(format!(
+                    "series {} lacks data: need >= {}, valid = {}",
+                    series, needed, valid
+                )));
+            }
+            first_valids[series] = fv as i32;
+        }
+
+        Ok((first_valids, period, offset))
+    }
+
+    fn launch_many_series_kernel(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        period: usize,
+        offset: usize,
+        cols: usize,
+        rows: usize,
+        d_first_valids: &DeviceBuffer<i32>,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaEpmaError> {
+        if period < 2 {
+            return Err(CudaEpmaError::InvalidInput("period must be >= 2".into()));
+        }
+        if offset >= period {
+            return Err(CudaEpmaError::InvalidInput(format!(
+                "offset {} must be < period {}",
+                offset, period
+            )));
+        }
+
+        let block_x = match self.policy.many_series {
+            ManySeriesKernelPolicy::Auto => 256,
+            ManySeriesKernelPolicy::OneD { block_x } => block_x.max(32).min(1024),
+        } as u32;
+
+        let bx_times_tile = block_x.saturating_mul(EPMA_TILE);
+        let grid_x = ((rows as u32 + bx_times_tile - 1) / bx_times_tile).max(1);
+        let grid: GridSize = (grid_x, cols as u32, 1).into();
+        let block: BlockSize = (block_x, 1, 1).into();
+
+        let func = self
+            .module
+            .get_function("epma_many_series_one_param_time_major_f32")
+            .map_err(|_| CudaEpmaError::MissingKernelSymbol {
+                name: "epma_many_series_one_param_time_major_f32",
+            })?;
+
+        unsafe {
+            let mut prices_ptr = d_prices.as_device_ptr().as_raw();
+            let mut period_i = period as i32;
+            let mut offset_i = offset as i32;
+            let mut cols_i = cols as i32;
+            let mut rows_i = rows as i32;
+            let mut first_ptr = d_first_valids.as_device_ptr().as_raw();
+            let mut out_ptr = d_out.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut prices_ptr as *mut _ as *mut c_void,
+                &mut period_i as *mut _ as *mut c_void,
+                &mut offset_i as *mut _ as *mut c_void,
+                &mut cols_i as *mut _ as *mut c_void,
+                &mut rows_i as *mut _ as *mut c_void,
+                &mut first_ptr as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+
+            self.stream
+                .launch(&func, grid, block, 0, args)
+                .map_err(CudaEpmaError::from)?;
+        }
+        unsafe {
+            let this = self as *const _ as *mut CudaEpma;
+            (*this).last_many = Some(ManySeriesKernelSelected::OneD { block_x });
+        }
+        self.maybe_log_many_debug();
+        Ok(())
+    }
+
+    fn run_many_series_kernel(
+        &self,
+        data_tm_f32: &[f32],
+        cols: usize,
+        rows: usize,
+        first_valids: &[i32],
+        period: usize,
+        offset: usize,
+    ) -> Result<DeviceArrayF32, CudaEpmaError> {
+        let total = Self::checked_mul_usize(cols, rows, "tm_total")?;
+        let sz_f32 = std::mem::size_of::<f32>();
+        let sz_i32 = std::mem::size_of::<i32>();
+        let prices_bytes = Self::checked_mul_usize(total, sz_f32, "tm_prices_bytes")?;
+        let first_bytes = Self::checked_mul_usize(cols, sz_i32, "tm_first_bytes")?;
+        let out_bytes = Self::checked_mul_usize(total, sz_f32, "tm_out_bytes")?;
+        let required = Self::checked_add_usize(
+            Self::checked_add_usize(prices_bytes, first_bytes, "tm_bytes_sum0")?,
+            out_bytes,
+            "tm_bytes_sum1",
+        )?;
+        let headroom = 64 * 1024 * 1024;
+        Self::will_fit_checked(required, headroom)?;
+
+        let d_prices = DeviceBuffer::from_slice(data_tm_f32)?;
+        let d_first_valids = DeviceBuffer::from_slice(first_valids)?;
+        let mut d_out: DeviceBuffer<f32> = unsafe { DeviceBuffer::uninitialized(total) }?;
+
+        self.launch_many_series_kernel(
+            &d_prices,
+            period,
+            offset,
+            cols,
+            rows,
+            &d_first_valids,
+            &mut d_out,
+        )?;
+
+        self.stream.synchronize()?;
+
+        Ok(DeviceArrayF32 {
+            buf: d_out,
+            rows,
+            cols,
+        })
+    }
+
+    pub fn epma_many_series_one_param_time_major_dev(
+        &self,
+        data_tm_f32: &[f32],
+        cols: usize,
+        rows: usize,
+        params: &EpmaParams,
+    ) -> Result<DeviceArrayF32, CudaEpmaError> {
+        let (first_valids, period, offset) =
+            Self::prepare_many_series_inputs(data_tm_f32, cols, rows, params)?;
+        self.run_many_series_kernel(data_tm_f32, cols, rows, &first_valids, period, offset)
+    }
+
+    pub fn epma_many_series_one_param_time_major_into_host_f32(
+        &self,
+        data_tm_f32: &[f32],
+        cols: usize,
+        rows: usize,
+        params: &EpmaParams,
+        out: &mut [f32],
+    ) -> Result<(), CudaEpmaError> {
+        if out.len() != cols * rows {
+            return Err(CudaEpmaError::InvalidInput(format!(
+                "out slice wrong length: got {}, expected {}",
+                out.len(),
+                cols * rows
+            )));
+        }
+        let arr =
+            self.epma_many_series_one_param_time_major_dev(data_tm_f32, cols, rows, params)?;
+        arr.buf.copy_to(out).map_err(CudaEpmaError::from)
+    }
+
+    pub fn epma_many_series_one_param_time_major_device(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        period: i32,
+        offset: i32,
+        num_series: i32,
+        series_len: i32,
+        d_first_valids: &DeviceBuffer<i32>,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaEpmaError> {
+        if period < 2 || offset >= period {
+            return Err(CudaEpmaError::InvalidInput(format!(
+                "period {}, offset {} invalid",
+                period, offset
+            )));
+        }
+        if num_series <= 0 || series_len <= 0 {
+            return Err(CudaEpmaError::InvalidInput(
+                "matrix dimensions must be positive".into(),
+            ));
+        }
+        self.launch_many_series_kernel(
+            d_prices,
+            period as usize,
+            offset as usize,
+            num_series as usize,
+            series_len as usize,
+            d_first_valids,
+            d_out,
+        )
+    }
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+impl super::alma_wrapper::DeviceArrayF32 {
+    pub fn cai_v3_dict<'py>(
+        &self,
+        py: pyo3::Python<'py>,
+    ) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
+        let d = pyo3::types::PyDict::new(py);
+        let ptr = self.buf.as_device_ptr().as_raw() as usize;
+        let row_stride = self
+            .cols
+            .checked_mul(std::mem::size_of::<f32>())
+            .unwrap_or(0);
+        let col_stride = std::mem::size_of::<f32>();
+        d.set_item("shape", (self.rows, self.cols))?;
+        d.set_item("strides", (row_stride as isize, col_stride as isize))?;
+        d.set_item("typestr", "<f4")?;
+        d.set_item("data", (ptr, false))?;
+        d.set_item("version", 3)?;
+        Ok(d)
+    }
+}
+
+pub mod benches {
+    use super::*;
+    use crate::cuda::bench::helpers::{gen_series, gen_time_major_prices};
+    use crate::cuda::bench::{CudaBenchScenario, CudaBenchState};
+    use crate::indicators::moving_averages::epma::EpmaParams;
+
+    const ONE_SERIES_LEN: usize = 1_000_000;
+    const PARAM_SWEEP: usize = 250;
+    const MANY_SERIES_COLS: usize = 250;
+    const MANY_SERIES_LEN: usize = 1_000_000;
+
+    fn bytes_one_series_many_params() -> usize {
+        let in_bytes = ONE_SERIES_LEN * std::mem::size_of::<f32>();
+        let out_bytes = ONE_SERIES_LEN * PARAM_SWEEP * std::mem::size_of::<f32>();
+        in_bytes + out_bytes + 64 * 1024 * 1024
+    }
+    fn bytes_many_series_one_param() -> usize {
+        let elems = MANY_SERIES_COLS * MANY_SERIES_LEN;
+        let in_bytes = elems * std::mem::size_of::<f32>();
+        let first_bytes = MANY_SERIES_COLS * std::mem::size_of::<i32>();
+        let out_bytes = elems * std::mem::size_of::<f32>();
+        in_bytes + first_bytes + out_bytes + 64 * 1024 * 1024
+    }
+
+    struct EpmaBatchDevState {
+        cuda: CudaEpma,
+        d_prices: DeviceBuffer<f32>,
+        d_periods: DeviceBuffer<i32>,
+        d_offsets: DeviceBuffer<i32>,
+        series_len: usize,
+        n_combos: usize,
+        first_valid: usize,
+        max_period: usize,
+        d_out: DeviceBuffer<f32>,
+    }
+    impl CudaBenchState for EpmaBatchDevState {
+        fn launch(&mut self) {
+            self.cuda
+                .launch_batch_kernel(
+                    &self.d_prices,
+                    &self.d_periods,
+                    &self.d_offsets,
+                    self.series_len,
+                    self.n_combos,
+                    self.first_valid,
+                    self.max_period,
+                    &mut self.d_out,
+                )
+                .expect("epma batch kernel");
+            self.cuda.stream.synchronize().expect("epma sync");
+        }
+    }
+
+    fn prep_one_series_many_params() -> Box<dyn CudaBenchState> {
+        let cuda = CudaEpma::new(0).expect("cuda epma");
+        let price = gen_series(ONE_SERIES_LEN);
+        let sweep = EpmaBatchRange {
+            period: (10, 10 + PARAM_SWEEP - 1, 1),
+            offset: (4, 4, 0),
+        };
+        let (combos, first_valid, series_len, max_period) =
+            CudaEpma::prepare_batch_inputs(&price, &sweep).expect("epma prepare batch inputs");
+        let n_combos = combos.len();
+        let mut periods_i32 = vec![0i32; n_combos];
+        let mut offsets_i32 = vec![0i32; n_combos];
+        for (idx, prm) in combos.iter().enumerate() {
+            periods_i32[idx] = prm.period.unwrap() as i32;
+            offsets_i32[idx] = prm.offset.unwrap() as i32;
+        }
+
+        let d_prices = DeviceBuffer::from_slice(&price).expect("d_prices");
+        let d_periods = DeviceBuffer::from_slice(&periods_i32).expect("d_periods");
+        let d_offsets = DeviceBuffer::from_slice(&offsets_i32).expect("d_offsets");
+        let d_out: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized(series_len * n_combos) }.expect("d_out");
+        cuda.stream.synchronize().expect("sync after prep");
+
+        Box::new(EpmaBatchDevState {
+            cuda,
+            d_prices,
+            d_periods,
+            d_offsets,
+            series_len,
+            n_combos,
+            first_valid,
+            max_period,
+            d_out,
+        })
+    }
+
+    struct EpmaManyDevState {
+        cuda: CudaEpma,
+        d_prices_tm: DeviceBuffer<f32>,
+        d_first_valids: DeviceBuffer<i32>,
+        cols: usize,
+        rows: usize,
+        period: usize,
+        offset: usize,
+        d_out_tm: DeviceBuffer<f32>,
+    }
+    impl CudaBenchState for EpmaManyDevState {
+        fn launch(&mut self) {
+            self.cuda
+                .launch_many_series_kernel(
+                    &self.d_prices_tm,
+                    self.period,
+                    self.offset,
+                    self.cols,
+                    self.rows,
+                    &self.d_first_valids,
+                    &mut self.d_out_tm,
+                )
+                .expect("epma many-series kernel");
+            self.cuda.stream.synchronize().expect("epma sync");
+        }
+    }
+
+    fn prep_many_series_one_param() -> Box<dyn CudaBenchState> {
+        let cuda = CudaEpma::new(0).expect("cuda epma");
+        let cols = MANY_SERIES_COLS;
+        let rows = MANY_SERIES_LEN;
+        let data_tm = gen_time_major_prices(cols, rows);
+        let params = EpmaParams {
+            period: Some(64),
+            offset: Some(4),
+        };
+        let (first_valids, period, offset) =
+            CudaEpma::prepare_many_series_inputs(&data_tm, cols, rows, &params)
+                .expect("epma prepare many-series inputs");
+
+        let d_prices_tm = DeviceBuffer::from_slice(&data_tm).expect("d_prices_tm");
+        let d_first_valids = DeviceBuffer::from_slice(&first_valids).expect("d_first_valids");
+        let d_out_tm: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized(cols * rows) }.expect("d_out_tm");
+        cuda.stream.synchronize().expect("sync after prep");
+
+        Box::new(EpmaManyDevState {
+            cuda,
+            d_prices_tm,
+            d_first_valids,
+            cols,
+            rows,
+            period,
+            offset,
+            d_out_tm,
+        })
+    }
+
+    pub fn bench_profiles() -> Vec<CudaBenchScenario> {
+        vec![
+            CudaBenchScenario::new(
+                "epma",
+                "one_series_many_params",
+                "epma_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series_many_params()),
+            CudaBenchScenario::new(
+                "epma",
+                "many_series_one_param",
+                "epma_cuda_many_series_one_param",
+                "250x1m",
+                prep_many_series_one_param,
+            )
+            .with_sample_size(5)
+            .with_mem_required(bytes_many_series_one_param()),
+        ]
+    }
+}

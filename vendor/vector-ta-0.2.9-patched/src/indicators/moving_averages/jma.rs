@@ -1,0 +1,2762 @@
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::cuda_available;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::moving_averages::CudaJma;
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::moving_averages::jma_wrapper::DeviceArrayF32Jma;
+
+use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
+};
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use core::arch::x86_64::*;
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+use std::convert::AsRef;
+use std::error::Error;
+use std::mem::MaybeUninit;
+use thiserror::Error;
+
+impl<'a> AsRef<[f64]> for JmaInput<'a> {
+    #[inline(always)]
+    fn as_ref(&self) -> &[f64] {
+        match &self.data {
+            JmaData::Slice(slice) => slice,
+            JmaData::Candles { candles, source } => match *source {
+                "open" => &candles.open,
+                "high" => &candles.high,
+                "low" => &candles.low,
+                "close" => &candles.close,
+                "volume" => &candles.volume,
+                "hl2" => &candles.hl2,
+                "hlc3" => &candles.hlc3,
+                "ohlc4" => &candles.ohlc4,
+                "hlcc4" | "hlcc" => &candles.hlcc4,
+                _ => source_type(candles, source),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum JmaData<'a> {
+    Candles {
+        candles: &'a Candles,
+        source: &'a str,
+    },
+    Slice(&'a [f64]),
+}
+
+#[derive(Debug, Clone)]
+pub struct JmaOutput {
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "wasm"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+pub struct JmaParams {
+    pub period: Option<usize>,
+    pub phase: Option<f64>,
+    pub power: Option<u32>,
+}
+
+impl Default for JmaParams {
+    fn default() -> Self {
+        Self {
+            period: Some(7),
+            phase: Some(50.0),
+            power: Some(2),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JmaInput<'a> {
+    pub data: JmaData<'a>,
+    pub params: JmaParams,
+}
+
+impl<'a> JmaInput<'a> {
+    #[inline]
+    pub fn from_candles(c: &'a Candles, s: &'a str, p: JmaParams) -> Self {
+        Self {
+            data: JmaData::Candles {
+                candles: c,
+                source: s,
+            },
+            params: p,
+        }
+    }
+    #[inline]
+    pub fn from_slice(sl: &'a [f64], p: JmaParams) -> Self {
+        Self {
+            data: JmaData::Slice(sl),
+            params: p,
+        }
+    }
+    #[inline]
+    pub fn with_default_candles(c: &'a Candles) -> Self {
+        Self::from_candles(c, "close", JmaParams::default())
+    }
+    #[inline]
+    pub fn get_period(&self) -> usize {
+        self.params.period.unwrap_or(7)
+    }
+    #[inline]
+    pub fn get_phase(&self) -> f64 {
+        self.params.phase.unwrap_or(50.0)
+    }
+    #[inline]
+    pub fn get_power(&self) -> u32 {
+        self.params.power.unwrap_or(2)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct JmaBuilder {
+    period: Option<usize>,
+    phase: Option<f64>,
+    power: Option<u32>,
+    kernel: Kernel,
+}
+
+impl Default for JmaBuilder {
+    fn default() -> Self {
+        Self {
+            period: None,
+            phase: None,
+            power: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl JmaBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[inline(always)]
+    pub fn period(mut self, n: usize) -> Self {
+        self.period = Some(n);
+        self
+    }
+    #[inline(always)]
+    pub fn phase(mut self, x: f64) -> Self {
+        self.phase = Some(x);
+        self
+    }
+    #[inline(always)]
+    pub fn power(mut self, p: u32) -> Self {
+        self.power = Some(p);
+        self
+    }
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline(always)]
+    pub fn apply(self, c: &Candles) -> Result<JmaOutput, JmaError> {
+        let p = JmaParams {
+            period: self.period,
+            phase: self.phase,
+            power: self.power,
+        };
+        let i = JmaInput::from_candles(c, "close", p);
+        jma_with_kernel(&i, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn apply_slice(self, d: &[f64]) -> Result<JmaOutput, JmaError> {
+        let p = JmaParams {
+            period: self.period,
+            phase: self.phase,
+            power: self.power,
+        };
+        let i = JmaInput::from_slice(d, p);
+        jma_with_kernel(&i, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn into_stream(self) -> Result<JmaStream, JmaError> {
+        let p = JmaParams {
+            period: self.period,
+            phase: self.phase,
+            power: self.power,
+        };
+        JmaStream::try_new(p)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum JmaError {
+    #[error("jma: All values are NaN.")]
+    AllValuesNaN,
+    #[error("jma: Empty input data.")]
+    EmptyInputData,
+    #[error("jma: Invalid period: period = {period}, data length = {data_len}")]
+    InvalidPeriod { period: usize, data_len: usize },
+    #[error("jma: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+    #[error("jma: Invalid phase: {phase}")]
+    InvalidPhase { phase: f64 },
+    #[error("jma: Output length mismatch: expected = {expected}, got = {got}")]
+    OutputLengthMismatch { expected: usize, got: usize },
+    #[error("jma: Invalid range (usize): start={start}, end={end}, step={step}")]
+    InvalidRangeUsize {
+        start: usize,
+        end: usize,
+        step: usize,
+    },
+    #[error("jma: Invalid range (f64): start={start}, end={end}, step={step}")]
+    InvalidRangeF64 { start: f64, end: f64, step: f64 },
+    #[error("jma: Invalid kernel for batch: {0:?}")]
+    InvalidKernelForBatch(Kernel),
+    #[error("jma: Invalid input: {0}")]
+    InvalidInput(String),
+}
+
+#[inline]
+pub fn jma(input: &JmaInput) -> Result<JmaOutput, JmaError> {
+    jma_with_kernel(input, Kernel::Auto)
+}
+
+pub fn jma_with_kernel(input: &JmaInput, kernel: Kernel) -> Result<JmaOutput, JmaError> {
+    let data: &[f64] = input.as_ref();
+    let len = data.len();
+    if len == 0 {
+        return Err(JmaError::EmptyInputData);
+    }
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(JmaError::AllValuesNaN)?;
+    let period = input.get_period();
+    let phase = input.get_phase();
+    let power = input.get_power();
+
+    if period == 0 || period > len {
+        return Err(JmaError::InvalidPeriod {
+            period,
+            data_len: len,
+        });
+    }
+    if (len - first) < period {
+        return Err(JmaError::NotEnoughValidData {
+            needed: period,
+            valid: len - first,
+        });
+    }
+    if phase.is_nan() || phase.is_infinite() {
+        return Err(JmaError::InvalidPhase { phase });
+    }
+
+    let chosen = choose_jma_kernel(kernel);
+
+    let mut out = alloc_with_nan_prefix(len, first);
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => {
+                jma_scalar(data, period, phase, power, first, &mut out)
+            }
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => {
+                jma_avx2(data, period, phase, power, first, &mut out)
+            }
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => {
+                jma_avx512(data, period, phase, power, first, &mut out)
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(JmaOutput { values: out })
+}
+
+pub fn jma_with_kernel_into(
+    input: &JmaInput,
+    kernel: Kernel,
+    out: &mut [f64],
+) -> Result<(), JmaError> {
+    let data: &[f64] = input.as_ref();
+    let len = data.len();
+
+    if out.len() != len {
+        return Err(JmaError::OutputLengthMismatch {
+            expected: len,
+            got: out.len(),
+        });
+    }
+    if len == 0 {
+        return Err(JmaError::EmptyInputData);
+    }
+
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(JmaError::AllValuesNaN)?;
+    let period = input.get_period();
+    let phase = input.get_phase();
+    let power = input.get_power();
+
+    if period == 0 || period > len {
+        return Err(JmaError::InvalidPeriod {
+            period,
+            data_len: len,
+        });
+    }
+    if (len - first) < period {
+        return Err(JmaError::NotEnoughValidData {
+            needed: period,
+            valid: len - first,
+        });
+    }
+    if phase.is_nan() || phase.is_infinite() {
+        return Err(JmaError::InvalidPhase { phase });
+    }
+
+    let chosen = choose_jma_kernel(kernel);
+
+    let qnan = f64::from_bits(0x7ff8_0000_0000_0000);
+    out[..first].fill(qnan);
+
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => {
+                jma_scalar(data, period, phase, power, first, out)
+            }
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => jma_avx2(data, period, phase, power, first, out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => {
+                jma_avx512(data, period, phase, power, first, out)
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+pub fn jma_into(input: &JmaInput, out: &mut [f64]) -> Result<(), JmaError> {
+    jma_with_kernel_into(input, Kernel::Auto, out)
+}
+
+#[inline(always)]
+fn choose_jma_kernel(kernel: Kernel) -> Kernel {
+    match kernel {
+        Kernel::Auto => {
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            {
+                if std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("fma")
+                {
+                    return Kernel::Avx2;
+                }
+            }
+            Kernel::Scalar
+        }
+        other => other,
+    }
+}
+
+#[inline]
+pub fn jma_scalar(
+    data: &[f64],
+    period: usize,
+    phase: f64,
+    power: u32,
+    first_valid: usize,
+    output: &mut [f64],
+) {
+    assert_eq!(data.len(), output.len());
+    assert!(first_valid < data.len());
+
+    let pr = if phase < -100.0 {
+        0.5
+    } else if phase > 100.0 {
+        2.5
+    } else {
+        phase / 100.0 + 1.5
+    };
+
+    let beta = {
+        let num = 0.45 * (period as f64 - 1.0);
+        num / (num + 2.0)
+    };
+    let one_minus_beta = 1.0 - beta;
+
+    let alpha = beta.powi(power as i32);
+    let one_minus_alpha = 1.0 - alpha;
+    let alpha_sq = alpha * alpha;
+    let oma_sq = one_minus_alpha * one_minus_alpha;
+
+    let mut e0 = data[first_valid];
+    let mut e1 = 0.0;
+    let mut e2 = 0.0;
+    let mut j_prev = data[first_valid];
+
+    output[first_valid] = j_prev;
+
+    let n = data.len();
+    unsafe {
+        let mut p = data.as_ptr().add(first_valid + 1);
+        let mut q = output.as_mut_ptr().add(first_valid + 1);
+        let end_ptr = data.as_ptr().add(n);
+
+        while p.add(3) < end_ptr {
+            let x0 = *p;
+            e0 = one_minus_alpha.mul_add(x0, alpha * e0);
+            e1 = (x0 - e0).mul_add(one_minus_beta, beta * e1);
+            let d0 = e0 + pr * e1 - j_prev;
+            e2 = d0.mul_add(oma_sq, alpha_sq * e2);
+            j_prev += e2;
+            *q = j_prev;
+            p = p.add(1);
+            q = q.add(1);
+
+            let x1 = *p;
+            e0 = one_minus_alpha.mul_add(x1, alpha * e0);
+            e1 = (x1 - e0).mul_add(one_minus_beta, beta * e1);
+            let d1 = e0 + pr * e1 - j_prev;
+            e2 = d1.mul_add(oma_sq, alpha_sq * e2);
+            j_prev += e2;
+            *q = j_prev;
+            p = p.add(1);
+            q = q.add(1);
+
+            let x2 = *p;
+            e0 = one_minus_alpha.mul_add(x2, alpha * e0);
+            e1 = (x2 - e0).mul_add(one_minus_beta, beta * e1);
+            let d2 = e0 + pr * e1 - j_prev;
+            e2 = d2.mul_add(oma_sq, alpha_sq * e2);
+            j_prev += e2;
+            *q = j_prev;
+            p = p.add(1);
+            q = q.add(1);
+
+            let x3 = *p;
+            e0 = one_minus_alpha.mul_add(x3, alpha * e0);
+            e1 = (x3 - e0).mul_add(one_minus_beta, beta * e1);
+            let d3 = e0 + pr * e1 - j_prev;
+            e2 = d3.mul_add(oma_sq, alpha_sq * e2);
+            j_prev += e2;
+            *q = j_prev;
+            p = p.add(1);
+            q = q.add(1);
+        }
+
+        while p < end_ptr {
+            let x = *p;
+            e0 = one_minus_alpha.mul_add(x, alpha * e0);
+            e1 = (x - e0).mul_add(one_minus_beta, beta * e1);
+            let d = e0 + pr * e1 - j_prev;
+            e2 = d.mul_add(oma_sq, alpha_sq * e2);
+            j_prev += e2;
+            *q = j_prev;
+
+            p = p.add(1);
+            q = q.add(1);
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+pub unsafe fn jma_avx2(
+    data: &[f64],
+    period: usize,
+    phase: f64,
+    power: u32,
+    first_valid: usize,
+    output: &mut [f64],
+) {
+    assert_eq!(data.len(), output.len());
+    assert!(first_valid < data.len());
+
+    let pr = if phase < -100.0 {
+        0.5
+    } else if phase > 100.0 {
+        2.5
+    } else {
+        phase / 100.0 + 1.5
+    };
+
+    let beta = {
+        let num = 0.45 * (period as f64 - 1.0);
+        num / (num + 2.0)
+    };
+    let one_minus_beta = 1.0 - beta;
+
+    let alpha = beta.powi(power as i32);
+    let one_minus_alpha = 1.0 - alpha;
+    let alpha_sq = alpha * alpha;
+    let oma_sq = one_minus_alpha * one_minus_alpha;
+
+    let mut e0 = data[first_valid];
+    let mut e1 = 0.0;
+    let mut e2 = 0.0;
+    let mut j_prev = e0;
+
+    output[first_valid] = j_prev;
+
+    let n = data.len();
+    unsafe {
+        let mut p = data.as_ptr().add(first_valid + 1);
+        let mut q = output.as_mut_ptr().add(first_valid + 1);
+        let end_ptr = data.as_ptr().add(n);
+
+        while p.add(3) < end_ptr {
+            let x0 = *p;
+            e0 = one_minus_alpha.mul_add(x0, alpha * e0);
+            e1 = (x0 - e0).mul_add(one_minus_beta, beta * e1);
+            let d0 = e0 + pr * e1 - j_prev;
+            e2 = d0.mul_add(oma_sq, alpha_sq * e2);
+            j_prev += e2;
+            *q = j_prev;
+            p = p.add(1);
+            q = q.add(1);
+
+            let x1 = *p;
+            e0 = one_minus_alpha.mul_add(x1, alpha * e0);
+            e1 = (x1 - e0).mul_add(one_minus_beta, beta * e1);
+            let d1 = e0 + pr * e1 - j_prev;
+            e2 = d1.mul_add(oma_sq, alpha_sq * e2);
+            j_prev += e2;
+            *q = j_prev;
+            p = p.add(1);
+            q = q.add(1);
+
+            let x2 = *p;
+            e0 = one_minus_alpha.mul_add(x2, alpha * e0);
+            e1 = (x2 - e0).mul_add(one_minus_beta, beta * e1);
+            let d2 = e0 + pr * e1 - j_prev;
+            e2 = d2.mul_add(oma_sq, alpha_sq * e2);
+            j_prev += e2;
+            *q = j_prev;
+            p = p.add(1);
+            q = q.add(1);
+
+            let x3 = *p;
+            e0 = one_minus_alpha.mul_add(x3, alpha * e0);
+            e1 = (x3 - e0).mul_add(one_minus_beta, beta * e1);
+            let d3 = e0 + pr * e1 - j_prev;
+            e2 = d3.mul_add(oma_sq, alpha_sq * e2);
+            j_prev += e2;
+            *q = j_prev;
+            p = p.add(1);
+            q = q.add(1);
+        }
+
+        while p < end_ptr {
+            let x = *p;
+            e0 = one_minus_alpha.mul_add(x, alpha * e0);
+            e1 = (x - e0).mul_add(one_minus_beta, beta * e1);
+            let d = e0 + pr * e1 - j_prev;
+            e2 = d.mul_add(oma_sq, alpha_sq * e2);
+            j_prev += e2;
+            *q = j_prev;
+
+            p = p.add(1);
+            q = q.add(1);
+        }
+    }
+}
+
+#[inline(always)]
+fn jma_consts(period: usize, phase: f64, power: u32) -> (f64, f64, f64, f64, f64, f64, f64) {
+    let pr = if phase < -100.0 {
+        0.5
+    } else if phase > 100.0 {
+        2.5
+    } else {
+        phase / 100.0 + 1.5
+    };
+
+    let beta = {
+        let num = 0.45 * (period as f64 - 1.0);
+        num / (num + 2.0)
+    };
+    let alpha = beta.powi(power as i32);
+    (
+        pr,
+        beta,
+        alpha,
+        alpha * alpha,
+        (1.0 - alpha) * (1.0 - alpha),
+        1.0 - alpha,
+        1.0 - beta,
+    )
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512dq,avx512vl,fma")]
+#[inline]
+pub unsafe fn jma_avx512(
+    data: &[f64],
+    period: usize,
+    phase: f64,
+    power: u32,
+    first_valid: usize,
+    out: &mut [f64],
+) {
+    debug_assert!(data.len() == out.len() && first_valid < data.len());
+
+    let (pr, beta, alpha, alpha_sq, oma_sq, one_minus_alpha, one_minus_beta) =
+        jma_consts(period, phase, power);
+
+    let pr_v = _mm512_set1_pd(pr);
+    let oma_sq_v = _mm512_set1_pd(oma_sq);
+    let alpha_sq_v = _mm512_set1_pd(alpha_sq);
+    let one_minus_alpha_v = _mm512_set1_pd(one_minus_alpha);
+    let alpha_v = _mm512_set1_pd(alpha);
+    let one_minus_beta_v = _mm512_set1_pd(one_minus_beta);
+    let beta_v = _mm512_set1_pd(beta);
+
+    let mut e0 = data[first_valid];
+    let mut e1 = 0.0;
+    let mut e2 = 0.0;
+    let mut j_prev = e0;
+
+    out[first_valid] = j_prev;
+
+    let mut i = first_valid + 1;
+    let n = data.len();
+
+    while i + 7 < n {
+        macro_rules! step {
+            ($idx:expr) => {{
+                let price = *data.get_unchecked(i + $idx);
+                e0 = one_minus_alpha.mul_add(price, alpha * e0);
+                e1 = (price - e0).mul_add(one_minus_beta, beta * e1);
+                let diff = e0 + pr * e1 - j_prev;
+                e2 = diff.mul_add(oma_sq, alpha_sq * e2);
+                j_prev += e2;
+                *out.get_unchecked_mut(i + $idx) = j_prev;
+            }};
+        }
+
+        step!(0);
+        step!(1);
+        step!(2);
+        step!(3);
+        step!(4);
+        step!(5);
+        step!(6);
+        step!(7);
+
+        i += 8;
+    }
+
+    while i < n {
+        let price = *data.get_unchecked(i);
+        e0 = one_minus_alpha.mul_add(price, alpha * e0);
+        e1 = (price - e0).mul_add(one_minus_beta, beta * e1);
+        let diff = e0 + pr * e1 - j_prev;
+        e2 = diff.mul_add(oma_sq, alpha_sq * e2);
+        j_prev += e2;
+
+        *out.get_unchecked_mut(i) = j_prev;
+        i += 1;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JmaStream {
+    period: usize,
+    phase: f64,
+    power: u32,
+
+    alpha: f64,
+    beta: f64,
+    phase_ratio: f64,
+    one_minus_alpha: f64,
+    one_minus_beta: f64,
+    alpha_sq: f64,
+    oma_sq: f64,
+
+    initialized: bool,
+    e0: f64,
+    e1: f64,
+    e2: f64,
+    jma_prev: f64,
+}
+
+impl JmaStream {
+    #[inline(always)]
+    pub fn try_new(params: JmaParams) -> Result<Self, JmaError> {
+        let period = params.period.unwrap_or(7);
+        if period == 0 {
+            return Err(JmaError::InvalidPeriod {
+                period,
+                data_len: 0,
+            });
+        }
+        let phase = params.phase.unwrap_or(50.0);
+        if phase.is_nan() || phase.is_infinite() {
+            return Err(JmaError::InvalidPhase { phase });
+        }
+        let power = params.power.unwrap_or(2);
+
+        let clamped = phase.max(-100.0).min(100.0);
+        let phase_ratio = clamped / 100.0 + 1.5;
+
+        let numerator = 0.45 * (period as f64 - 1.0);
+        let denominator = numerator + 2.0;
+        let beta = if denominator.abs() < f64::EPSILON {
+            0.0
+        } else {
+            numerator / denominator
+        };
+
+        let alpha = pow_u32(beta, power);
+
+        let one_minus_alpha = 1.0 - alpha;
+        let one_minus_beta = 1.0 - beta;
+        let alpha_sq = alpha * alpha;
+        let oma_sq = one_minus_alpha * one_minus_alpha;
+
+        Ok(Self {
+            period,
+            phase,
+            power,
+            alpha,
+            beta,
+            phase_ratio,
+            one_minus_alpha,
+            one_minus_beta,
+            alpha_sq,
+            oma_sq,
+            initialized: false,
+            e0: f64::NAN,
+            e1: 0.0,
+            e2: 0.0,
+            jma_prev: f64::NAN,
+        })
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, value: f64) -> Option<f64> {
+        if !self.initialized {
+            if value.is_nan() {
+                return None;
+            }
+            self.initialized = true;
+            self.e0 = value;
+            self.e1 = 0.0;
+            self.e2 = 0.0;
+            self.jma_prev = value;
+            return Some(value);
+        }
+
+        self.e0 = self.one_minus_alpha * value + self.alpha * self.e0;
+        self.e1 = (value - self.e0) * self.one_minus_beta + self.beta * self.e1;
+        let diff = self.e0 + self.phase_ratio * self.e1 - self.jma_prev;
+        self.e2 = diff * self.oma_sq + self.alpha_sq * self.e2;
+        self.jma_prev += self.e2;
+        Some(self.jma_prev)
+    }
+
+    #[inline(always)]
+    pub fn update_fma(&mut self, value: f64) -> Option<f64> {
+        if !self.initialized {
+            if value.is_nan() {
+                return None;
+            }
+            self.initialized = true;
+            self.e0 = value;
+            self.e1 = 0.0;
+            self.e2 = 0.0;
+            self.jma_prev = value;
+            return Some(value);
+        }
+
+        self.e0 = self.one_minus_alpha.mul_add(value, self.alpha * self.e0);
+        self.e1 = (value - self.e0).mul_add(self.one_minus_beta, self.beta * self.e1);
+        let diff = self.e0 + self.phase_ratio * self.e1 - self.jma_prev;
+        self.e2 = diff.mul_add(self.oma_sq, self.alpha_sq * self.e2);
+        self.jma_prev += self.e2;
+        Some(self.jma_prev)
+    }
+}
+
+#[inline(always)]
+fn pow_u32(mut base: f64, mut exp: u32) -> f64 {
+    let mut acc = 1.0;
+    while exp != 0 {
+        if (exp & 1) != 0 {
+            acc *= base;
+        }
+        base *= base;
+        exp >>= 1;
+    }
+    acc
+}
+
+#[derive(Clone, Debug)]
+pub struct JmaBatchRange {
+    pub period: (usize, usize, usize),
+    pub phase: (f64, f64, f64),
+    pub power: (u32, u32, u32),
+}
+
+impl Default for JmaBatchRange {
+    fn default() -> Self {
+        Self {
+            period: (7, 256, 1),
+            phase: (50.0, 50.0, 0.0),
+            power: (2, 2, 0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct JmaBatchBuilder {
+    range: JmaBatchRange,
+    kernel: Kernel,
+}
+
+impl JmaBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+    #[inline]
+    pub fn period_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.period = (start, end, step);
+        self
+    }
+    #[inline]
+    pub fn period_static(mut self, p: usize) -> Self {
+        self.range.period = (p, p, 0);
+        self
+    }
+    #[inline]
+    pub fn phase_range(mut self, start: f64, end: f64, step: f64) -> Self {
+        self.range.phase = (start, end, step);
+        self
+    }
+    #[inline]
+    pub fn phase_static(mut self, x: f64) -> Self {
+        self.range.phase = (x, x, 0.0);
+        self
+    }
+    #[inline]
+    pub fn power_range(mut self, start: u32, end: u32, step: u32) -> Self {
+        self.range.power = (start, end, step);
+        self
+    }
+    #[inline]
+    pub fn power_static(mut self, p: u32) -> Self {
+        self.range.power = (p, p, 0);
+        self
+    }
+    pub fn apply_slice(self, data: &[f64]) -> Result<JmaBatchOutput, JmaError> {
+        jma_batch_with_kernel(data, &self.range, self.kernel)
+    }
+    pub fn with_default_slice(data: &[f64], k: Kernel) -> Result<JmaBatchOutput, JmaError> {
+        JmaBatchBuilder::new().kernel(k).apply_slice(data)
+    }
+    pub fn apply_candles(self, c: &Candles, src: &str) -> Result<JmaBatchOutput, JmaError> {
+        let slice = source_type(c, src);
+        self.apply_slice(slice)
+    }
+    pub fn with_default_candles(c: &Candles) -> Result<JmaBatchOutput, JmaError> {
+        JmaBatchBuilder::new()
+            .kernel(Kernel::Auto)
+            .apply_candles(c, "close")
+    }
+}
+
+pub fn jma_batch_with_kernel(
+    data: &[f64],
+    sweep: &JmaBatchRange,
+    k: Kernel,
+) -> Result<JmaBatchOutput, JmaError> {
+    let kernel = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        other => return Err(JmaError::InvalidKernelForBatch(other)),
+    };
+    let simd = match kernel {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => unreachable!(),
+    };
+    jma_batch_par_slice(data, sweep, simd)
+}
+
+#[derive(Clone, Debug)]
+pub struct JmaBatchOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<JmaParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl JmaBatchOutput {
+    pub fn row_for_params(&self, p: &JmaParams) -> Option<usize> {
+        self.combos.iter().position(|c| {
+            c.period.unwrap_or(7) == p.period.unwrap_or(7)
+                && (c.phase.unwrap_or(50.0) - p.phase.unwrap_or(50.0)).abs() < 1e-12
+                && c.power.unwrap_or(2) == p.power.unwrap_or(2)
+        })
+    }
+    pub fn values_for(&self, p: &JmaParams) -> Option<&[f64]> {
+        self.row_for_params(p).map(|row| {
+            let start = row * self.cols;
+            &self.values[start..start + self.cols]
+        })
+    }
+}
+
+#[inline(always)]
+fn expand_grid(r: &JmaBatchRange) -> Vec<JmaParams> {
+    fn axis_usize((start, end, step): (usize, usize, usize)) -> Vec<usize> {
+        if step == 0 || start == end {
+            return vec![start];
+        }
+        let mut v = Vec::new();
+        if start < end {
+            let mut x = start;
+            while x <= end {
+                v.push(x);
+                match x.checked_add(step) {
+                    Some(n) => x = n,
+                    None => break,
+                }
+            }
+        } else {
+            let mut x = start;
+            while x >= end {
+                v.push(x);
+                if x < end + step {
+                    break;
+                }
+                x -= step;
+            }
+        }
+        v
+    }
+    fn axis_f64((start, end, step): (f64, f64, f64)) -> Vec<f64> {
+        const EPS: f64 = 1e-12;
+        if step.abs() < EPS || (start - end).abs() < EPS {
+            return vec![start];
+        }
+        let s = step.abs();
+        let mut v = Vec::new();
+        if start < end {
+            let mut x = start;
+            while x <= end + EPS {
+                v.push(x);
+                x += s;
+            }
+        } else {
+            let mut x = start;
+            while x >= end - EPS {
+                v.push(x);
+                x -= s;
+            }
+        }
+        v
+    }
+    fn axis_u32((start, end, step): (u32, u32, u32)) -> Vec<u32> {
+        if step == 0 || start == end {
+            return vec![start];
+        }
+        let mut v = Vec::new();
+        if start < end {
+            let mut x = start;
+            while x <= end {
+                v.push(x);
+                x = x.saturating_add(step);
+                if x == *v.last().unwrap() {
+                    break;
+                }
+            }
+        } else {
+            let mut x = start;
+            while x >= end {
+                v.push(x);
+                if x < end + step {
+                    break;
+                }
+                x = x.saturating_sub(step);
+                if x == *v.last().unwrap() {
+                    break;
+                }
+            }
+        }
+        v
+    }
+    let periods = axis_usize(r.period);
+    let phases = axis_f64(r.phase);
+    let powers = axis_u32(r.power);
+    let mut out = Vec::with_capacity(periods.len() * phases.len() * powers.len());
+    for &p in &periods {
+        for &ph in &phases {
+            for &po in &powers {
+                out.push(JmaParams {
+                    period: Some(p),
+                    phase: Some(ph),
+                    power: Some(po),
+                });
+            }
+        }
+    }
+    out
+}
+
+#[inline(always)]
+pub fn jma_batch_slice(
+    data: &[f64],
+    sweep: &JmaBatchRange,
+    kern: Kernel,
+) -> Result<JmaBatchOutput, JmaError> {
+    jma_batch_inner(data, sweep, kern, false)
+}
+
+#[inline(always)]
+pub fn jma_batch_par_slice(
+    data: &[f64],
+    sweep: &JmaBatchRange,
+    kern: Kernel,
+) -> Result<JmaBatchOutput, JmaError> {
+    jma_batch_inner(data, sweep, kern, true)
+}
+
+#[inline(always)]
+fn jma_batch_inner(
+    data: &[f64],
+    sweep: &JmaBatchRange,
+    kern: Kernel,
+    parallel: bool,
+) -> Result<JmaBatchOutput, JmaError> {
+    let combos = expand_grid(sweep);
+    if combos.is_empty() {
+        return Err(JmaError::InvalidInput("no parameter combinations".into()));
+    }
+    let cols = data.len();
+    if cols == 0 {
+        return Err(JmaError::EmptyInputData);
+    }
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(JmaError::AllValuesNaN)?;
+    let max_p = combos.iter().map(|c| c.period.unwrap()).max().unwrap();
+    if data.len() - first < max_p {
+        return Err(JmaError::NotEnoughValidData {
+            needed: max_p,
+            valid: data.len() - first,
+        });
+    }
+    let rows = combos.len();
+
+    let warm: Vec<usize> = vec![first; rows];
+
+    let _cap = rows
+        .checked_mul(cols)
+        .ok_or_else(|| JmaError::InvalidInput("rows * cols overflow".into()))?;
+    let mut raw = make_uninit_matrix(rows, cols);
+    init_matrix_prefixes(&mut raw, cols, &warm);
+
+    let do_row = |row: usize, dst_mu: &mut [MaybeUninit<f64>]| unsafe {
+        let prm = &combos[row];
+        let period = prm.period.unwrap();
+        let phase = prm.phase.unwrap();
+        let power = prm.power.unwrap();
+
+        let out_row =
+            core::slice::from_raw_parts_mut(dst_mu.as_mut_ptr() as *mut f64, dst_mu.len());
+
+        match kern {
+            Kernel::Scalar => jma_row_scalar(data, first, period, phase, power, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 => jma_row_avx2(data, first, period, phase, power, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 => jma_row_avx512(data, first, period, phase, power, out_row),
+            _ => unreachable!(),
+        }
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            raw.par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(row, slice)| do_row(row, slice));
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (row, slice) in raw.chunks_mut(cols).enumerate() {
+                do_row(row, slice);
+            }
+        }
+    } else {
+        for (row, slice) in raw.chunks_mut(cols).enumerate() {
+            do_row(row, slice);
+        }
+    }
+
+    let mut guard = core::mem::ManuallyDrop::new(raw);
+    let values = unsafe {
+        Vec::from_raw_parts(
+            guard.as_mut_ptr() as *mut f64,
+            guard.len(),
+            guard.capacity(),
+        )
+    };
+
+    Ok(JmaBatchOutput {
+        values,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+#[inline(always)]
+fn jma_batch_inner_into(
+    data: &[f64],
+    sweep: &JmaBatchRange,
+    kern: Kernel,
+    parallel: bool,
+    out: &mut [f64],
+) -> Result<(Vec<JmaParams>, usize, usize), JmaError> {
+    let combos = expand_grid(sweep);
+    if combos.is_empty() {
+        return Err(JmaError::InvalidInput("no parameter combinations".into()));
+    }
+    let cols = data.len();
+    if cols == 0 {
+        return Err(JmaError::EmptyInputData);
+    }
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(JmaError::AllValuesNaN)?;
+    let max_p = combos.iter().map(|c| c.period.unwrap()).max().unwrap();
+    if cols - first < max_p {
+        return Err(JmaError::NotEnoughValidData {
+            needed: max_p,
+            valid: cols - first,
+        });
+    }
+    let rows = combos.len();
+
+    let expected = rows
+        .checked_mul(cols)
+        .ok_or_else(|| JmaError::InvalidInput("rows * cols overflow".into()))?;
+    if out.len() != expected {
+        return Err(JmaError::OutputLengthMismatch {
+            expected,
+            got: out.len(),
+        });
+    }
+
+    let warm: Vec<usize> = vec![first; rows];
+    let out_uninit = unsafe {
+        std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut MaybeUninit<f64>, out.len())
+    };
+    init_matrix_prefixes(out_uninit, cols, &warm);
+
+    let do_row = |row: usize, out_row: &mut [f64]| unsafe {
+        let prm = &combos[row];
+        let period = prm.period.unwrap();
+        let phase = prm.phase.unwrap();
+        let power = prm.power.unwrap();
+
+        match kern {
+            Kernel::Scalar => jma_row_scalar(data, first, period, phase, power, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 => jma_row_avx2(data, first, period, phase, power, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 => jma_row_avx512(data, first, period, phase, power, out_row),
+            _ => unreachable!(),
+        }
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            out.par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(row, slice)| do_row(row, slice));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (row, slice) in out.chunks_mut(cols).enumerate() {
+                do_row(row, slice);
+            }
+        }
+    } else {
+        for (row, slice) in out.chunks_mut(cols).enumerate() {
+            do_row(row, slice);
+        }
+    }
+
+    Ok((combos, rows, cols))
+}
+
+#[inline(always)]
+unsafe fn jma_row_scalar(
+    data: &[f64],
+    first: usize,
+    period: usize,
+    phase: f64,
+    power: u32,
+    out: &mut [f64],
+) {
+    jma_scalar(data, period, phase, power, first, out);
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn jma_row_avx2(
+    data: &[f64],
+    first: usize,
+    period: usize,
+    phase: f64,
+    power: u32,
+    out: &mut [f64],
+) {
+    jma_avx2(data, period, phase, power, first, out);
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn jma_row_avx512(
+    data: &[f64],
+    first: usize,
+    period: usize,
+    phase: f64,
+    power: u32,
+    out: &mut [f64],
+) {
+    jma_avx512(data, period, phase, power, first, out);
+}
+
+#[inline(always)]
+pub fn expand_grid_jma(r: &JmaBatchRange) -> Vec<JmaParams> {
+    expand_grid(r)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn jma_output_into_js(
+    data: &[f64],
+    period: usize,
+    phase: f64,
+    power: u32,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = jma_js(data, period, phase, power)?;
+    crate::write_wasm_f64_output("jma_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn jma_batch_output_into_js(
+    data: &[f64],
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+    phase_start: f64,
+    phase_end: f64,
+    phase_step: f64,
+    power_start: u32,
+    power_end: u32,
+    power_step: u32,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = jma_batch_js(
+        data,
+        period_start,
+        period_end,
+        period_step,
+        phase_start,
+        phase_end,
+        phase_step,
+        power_start,
+        power_end,
+        power_step,
+    )?;
+    crate::write_wasm_f64_output("jma_batch_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn jma_batch_unified_output_into_js(
+    data: &[f64],
+    config: JsValue,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = jma_batch_unified_js(data, config)?;
+    crate::write_wasm_selected_object_f64_outputs("jma_batch_unified_output_into_js", &value, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_csv;
+    #[cfg(feature = "proptest")]
+    use proptest::prelude::*;
+
+    fn check_jma_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let default_params = JmaParams {
+            period: None,
+            phase: None,
+            power: None,
+        };
+        let input = JmaInput::from_candles(&candles, "close", default_params);
+        let output = jma_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+
+        Ok(())
+    }
+
+    fn check_jma_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = JmaInput::from_candles(&candles, "close", JmaParams::default());
+        let result = jma_with_kernel(&input, kernel)?;
+        let expected_last_five = [
+            59305.04794668568,
+            59261.270455005455,
+            59156.791263606865,
+            59128.30656791065,
+            58918.89223153998,
+        ];
+        let start = result.values.len().saturating_sub(5);
+        for (i, &val) in result.values[start..].iter().enumerate() {
+            let diff = (val - expected_last_five[i]).abs();
+            assert!(
+                diff < 1e-6,
+                "[{}] JMA {:?} mismatch at idx {}: got {}, expected {}",
+                test_name,
+                kernel,
+                i,
+                val,
+                expected_last_five[i]
+            );
+        }
+        Ok(())
+    }
+
+    fn check_jma_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = JmaInput::with_default_candles(&candles);
+        match input.data {
+            JmaData::Candles { source, .. } => assert_eq!(source, "close"),
+            _ => panic!("Expected JmaData::Candles"),
+        }
+        let output = jma_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_jma_zero_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let input_data = [10.0, 20.0, 30.0];
+        let params = JmaParams {
+            period: Some(0),
+            phase: None,
+            power: None,
+        };
+        let input = JmaInput::from_slice(&input_data, params);
+        let res = jma_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] JMA should fail with zero period",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_jma_period_exceeds_length(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data_small = [10.0, 20.0, 30.0];
+        let params = JmaParams {
+            period: Some(10),
+            phase: None,
+            power: None,
+        };
+        let input = JmaInput::from_slice(&data_small, params);
+        let res = jma_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] JMA should fail with period exceeding length",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_jma_very_small_dataset(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let single_point = [42.0];
+        let params = JmaParams {
+            period: Some(7),
+            phase: None,
+            power: None,
+        };
+        let input = JmaInput::from_slice(&single_point, params);
+        let res = jma_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] JMA should fail with insufficient data",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_jma_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let first_params = JmaParams {
+            period: Some(7),
+            phase: None,
+            power: None,
+        };
+        let first_input = JmaInput::from_candles(&candles, "close", first_params);
+        let first_result = jma_with_kernel(&first_input, kernel)?;
+        let second_params = JmaParams {
+            period: Some(7),
+            phase: None,
+            power: None,
+        };
+        let second_input = JmaInput::from_slice(&first_result.values, second_params);
+        let second_result = jma_with_kernel(&second_input, kernel)?;
+        assert_eq!(second_result.values.len(), first_result.values.len());
+        Ok(())
+    }
+
+    fn check_jma_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = JmaInput::from_candles(
+            &candles,
+            "close",
+            JmaParams {
+                period: Some(7),
+                phase: None,
+                power: None,
+            },
+        );
+        let res = jma_with_kernel(&input, kernel)?;
+        assert_eq!(res.values.len(), candles.close.len());
+        if res.values.len() > 240 {
+            for (i, &val) in res.values[240..].iter().enumerate() {
+                assert!(
+                    !val.is_nan(),
+                    "[{}] Found unexpected NaN at out-index {}",
+                    test_name,
+                    240 + i
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn check_jma_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let period = 7;
+        let phase = 50.0;
+        let power = 2;
+        let input = JmaInput::from_candles(
+            &candles,
+            "close",
+            JmaParams {
+                period: Some(period),
+                phase: Some(phase),
+                power: Some(power),
+            },
+        );
+        let batch_output = jma_with_kernel(&input, kernel)?.values;
+        let mut stream = JmaStream::try_new(JmaParams {
+            period: Some(period),
+            phase: Some(phase),
+            power: Some(power),
+        })?;
+        let mut stream_values = Vec::with_capacity(candles.close.len());
+        for &price in &candles.close {
+            match stream.update(price) {
+                Some(jma_val) => stream_values.push(jma_val),
+                None => stream_values.push(f64::NAN),
+            }
+        }
+        assert_eq!(batch_output.len(), stream_values.len());
+        for (i, (&b, &s)) in batch_output.iter().zip(stream_values.iter()).enumerate() {
+            if b.is_nan() && s.is_nan() {
+                continue;
+            }
+            let diff = (b - s).abs();
+            assert!(
+                diff < 1e-8,
+                "[{}] JMA streaming f64 mismatch at idx {}: batch={}, stream={}, diff={}",
+                test_name,
+                i,
+                b,
+                s,
+                diff
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_jma_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let test_params = vec![
+            JmaParams::default(),
+            JmaParams {
+                period: Some(3),
+                phase: Some(0.0),
+                power: Some(1),
+            },
+            JmaParams {
+                period: Some(3),
+                phase: Some(50.0),
+                power: Some(2),
+            },
+            JmaParams {
+                period: Some(3),
+                phase: Some(100.0),
+                power: Some(3),
+            },
+            JmaParams {
+                period: Some(7),
+                phase: Some(25.0),
+                power: Some(1),
+            },
+            JmaParams {
+                period: Some(7),
+                phase: Some(50.0),
+                power: Some(2),
+            },
+            JmaParams {
+                period: Some(7),
+                phase: Some(75.0),
+                power: Some(3),
+            },
+            JmaParams {
+                period: Some(10),
+                phase: Some(0.0),
+                power: Some(2),
+            },
+            JmaParams {
+                period: Some(14),
+                phase: Some(100.0),
+                power: Some(2),
+            },
+            JmaParams {
+                period: Some(20),
+                phase: Some(50.0),
+                power: Some(1),
+            },
+            JmaParams {
+                period: Some(30),
+                phase: Some(50.0),
+                power: Some(2),
+            },
+            JmaParams {
+                period: Some(50),
+                phase: Some(50.0),
+                power: Some(3),
+            },
+            JmaParams {
+                period: Some(1),
+                phase: Some(0.0),
+                power: Some(1),
+            },
+            JmaParams {
+                period: Some(100),
+                phase: Some(100.0),
+                power: Some(5),
+            },
+            JmaParams {
+                period: Some(10),
+                phase: Some(-100.0),
+                power: Some(2),
+            },
+            JmaParams {
+                period: Some(10),
+                phase: Some(200.0),
+                power: Some(2),
+            },
+        ];
+
+        for (param_idx, params) in test_params.iter().enumerate() {
+            let input = JmaInput::from_candles(&candles, "close", params.clone());
+            let output = jma_with_kernel(&input, kernel)?;
+
+            for (i, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+                        with params: period={}, phase={}, power={}",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(7),
+                        params.phase.unwrap_or(50.0),
+                        params.power.unwrap_or(2)
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+                        with params: period={}, phase={}, power={}",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(7),
+                        params.phase.unwrap_or(50.0),
+                        params.power.unwrap_or(2)
+                    );
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+                        with params: period={}, phase={}, power={}",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(7),
+                        params.phase.unwrap_or(50.0),
+                        params.power.unwrap_or(2)
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_jma_no_poison(_test_name: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    #[cfg(feature = "proptest")]
+    #[allow(clippy::float_cmp)]
+    fn check_jma_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use proptest::prelude::*;
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (2usize..=100).prop_flat_map(|period| {
+            (
+                prop::collection::vec(
+                    (-1e6f64..1e6f64).prop_filter("finite", |x| x.is_finite()),
+                    period..400,
+                ),
+                Just(period),
+                -100f64..=100f64,
+                1u32..=10,
+            )
+        });
+
+        proptest::test_runner::TestRunner::default()
+			.run(&strat, |(data, period, phase, power)| {
+				let params = JmaParams {
+					period: Some(period),
+					phase: Some(phase),
+					power: Some(power),
+				};
+				let input = JmaInput::from_slice(&data, params);
+
+				let JmaOutput { values: out } = jma_with_kernel(&input, kernel).unwrap();
+				let JmaOutput { values: ref_out } = jma_with_kernel(&input, Kernel::Scalar).unwrap();
+
+
+				prop_assert_eq!(out.len(), data.len());
+
+
+				let first_valid = data.iter().position(|x| !x.is_nan()).unwrap_or(data.len());
+
+
+				for i in 0..first_valid.min(out.len()) {
+					prop_assert!(
+						out[i].is_nan(),
+						"idx {}: expected NaN before first valid input, got {}", i, out[i]
+					);
+				}
+
+
+				if first_valid < out.len() {
+					prop_assert!(
+						out[first_valid].is_finite(),
+						"JMA should output a finite value at first_valid index {}", first_valid
+					);
+				}
+
+
+				for i in (first_valid + 1)..data.len() {
+					if data[i].is_finite() && !data[first_valid..=i].iter().any(|x| x.is_nan()) {
+						prop_assert!(
+							out[i].is_finite(),
+							"idx {}: expected finite value, got {}", i, out[i]
+						);
+					}
+				}
+
+
+				let warmup_estimate = first_valid + period;
+				if warmup_estimate + 20 < data.len() {
+					let window_start = warmup_estimate;
+					let window_end = (warmup_estimate + 50).min(data.len());
+
+					let input_slice = &data[window_start..window_end];
+					let output_slice = &out[window_start..window_end];
+
+					if input_slice.iter().all(|x| x.is_finite()) && output_slice.iter().all(|x| x.is_finite()) {
+						let input_mean: f64 = input_slice.iter().sum::<f64>() / input_slice.len() as f64;
+						let output_mean: f64 = output_slice.iter().sum::<f64>() / output_slice.len() as f64;
+
+						let input_var: f64 = input_slice.iter()
+							.map(|x| (x - input_mean).powi(2))
+							.sum::<f64>() / input_slice.len() as f64;
+						let output_var: f64 = output_slice.iter()
+							.map(|x| (x - output_mean).powi(2))
+							.sum::<f64>() / output_slice.len() as f64;
+
+
+						if input_var > 1e-10 {
+							prop_assert!(
+								output_var <= input_var * 1.1,
+								"JMA should smooth data: input_var={}, output_var={}, period={}, phase={}, power={}",
+								input_var, output_var, period, phase, power
+							);
+						}
+					}
+				}
+
+
+				if period == 1 {
+
+					for i in first_valid..data.len().min(first_valid + 20) {
+						if data[i].is_finite() && out[i].is_finite() {
+							prop_assert!(
+								(out[i] - data[i]).abs() <= data[i].abs() * 0.1 + 1e-6,
+								"period=1 should closely track input: idx={}, data={}, out={}, diff={}",
+								i, data[i], out[i], (out[i] - data[i]).abs()
+							);
+						}
+					}
+				}
+
+
+				let warmup_estimate = first_valid + period;
+				if data[first_valid..].windows(2).all(|w| (w[0] - w[1]).abs() < 1e-10) && warmup_estimate + 5 < data.len() {
+					let constant_val = data[first_valid];
+					for i in (warmup_estimate + 5)..data.len() {
+						if out[i].is_finite() {
+							prop_assert!(
+								(out[i] - constant_val).abs() <= 1e-6,
+								"constant input should produce constant output: idx={}, expected={}, got={}",
+								i, constant_val, out[i]
+							);
+						}
+					}
+				}
+
+
+				if kernel != Kernel::Scalar {
+					for i in first_valid..data.len() {
+						if out[i].is_finite() && ref_out[i].is_finite() {
+							let y_bits = out[i].to_bits();
+							let r_bits = ref_out[i].to_bits();
+							let diff_bits = if y_bits > r_bits {
+								y_bits - r_bits
+							} else {
+								r_bits - y_bits
+							};
+
+
+							let abs_diff = (out[i] - ref_out[i]).abs();
+							let rel_diff = if ref_out[i].abs() > 1e-10 {
+								abs_diff / ref_out[i].abs()
+							} else {
+								abs_diff
+							};
+
+							prop_assert!(
+								diff_bits <= 1000 || abs_diff < 1e-9 || rel_diff < 1e-12,
+								"kernel consistency failed at idx {}: {:?}={}, Scalar={}, diff_bits={}, abs_diff={}, rel_diff={}",
+								i, kernel, out[i], ref_out[i], diff_bits, abs_diff, rel_diff
+							);
+						}
+					}
+				}
+
+
+				let warmup_estimate = first_valid + period;
+				if phase.abs() > 10.0 && warmup_estimate + 30 < data.len() {
+					let params_neutral = JmaParams {
+						period: Some(period),
+						phase: Some(0.0),
+						power: Some(power),
+					};
+					let input_neutral = JmaInput::from_slice(&data, params_neutral);
+					if let Ok(JmaOutput { values: out_neutral }) = jma_with_kernel(&input_neutral, kernel) {
+
+						let check_start = warmup_estimate + 10;
+						let check_end = (warmup_estimate + 30).min(data.len() - 1);
+
+
+						let mut lead_count = 0;
+						let mut lag_count = 0;
+
+						for i in check_start..check_end {
+							if data[i].is_finite() && data[i-1].is_finite() &&
+							   out[i].is_finite() && out_neutral[i].is_finite() {
+								let data_change = data[i] - data[i-1];
+								if data_change.abs() > 1e-10 {
+									let phase_diff = out[i] - out_neutral[i];
+									if data_change > 0.0 {
+
+										if phase > 0.0 && phase_diff > 0.0 {
+											lead_count += 1;
+										} else if phase < 0.0 && phase_diff < 0.0 {
+											lag_count += 1;
+										}
+									} else {
+
+										if phase > 0.0 && phase_diff < 0.0 {
+											lead_count += 1;
+										} else if phase < 0.0 && phase_diff > 0.0 {
+											lag_count += 1;
+										}
+									}
+								}
+							}
+						}
+
+
+						if phase > 10.0 {
+							prop_assert!(
+								lead_count > 0,
+								"Positive phase should show leading behavior: phase={}, lead_count={}",
+								phase, lead_count
+							);
+						} else if phase < -10.0 {
+							prop_assert!(
+								lag_count > 0,
+								"Negative phase should show lagging behavior: phase={}, lag_count={}",
+								phase, lag_count
+							);
+						}
+					}
+				}
+
+
+				let warmup_estimate2 = first_valid + period;
+				if power > 1 && warmup_estimate2 + 20 < data.len() {
+					let params_low_power = JmaParams {
+						period: Some(period),
+						phase: Some(phase),
+						power: Some(1),
+					};
+					let input_low_power = JmaInput::from_slice(&data, params_low_power);
+					if let Ok(JmaOutput { values: out_low_power }) = jma_with_kernel(&input_low_power, kernel) {
+
+						let check_start = warmup_estimate2;
+						let check_end = (warmup_estimate2 + 30).min(data.len());
+
+						let mut high_power_responsiveness = 0.0;
+						let mut low_power_responsiveness = 0.0;
+						let mut count = 0;
+
+						for i in check_start..check_end {
+							if data[i].is_finite() && out[i].is_finite() && out_low_power[i].is_finite() {
+								high_power_responsiveness += (out[i] - data[i]).abs();
+								low_power_responsiveness += (out_low_power[i] - data[i]).abs();
+								count += 1;
+							}
+						}
+
+						if count > 0 {
+							high_power_responsiveness /= count as f64;
+							low_power_responsiveness /= count as f64;
+
+
+							if low_power_responsiveness > high_power_responsiveness * 1.5 {
+								prop_assert!(
+									high_power_responsiveness <= low_power_responsiveness,
+									"Higher power should be more responsive: power={} resp={}, power=1 resp={}",
+									power, high_power_responsiveness, low_power_responsiveness
+								);
+							}
+						}
+					}
+				}
+
+				Ok(())
+			})
+			.unwrap();
+
+        Ok(())
+    }
+
+    #[cfg(not(feature = "proptest"))]
+    fn check_jma_property(_test_name: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    macro_rules! generate_all_jma_tests {
+        ($($test_fn:ident),*) => {
+            paste::paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar);
+                    }
+                )*
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _avx2_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2);
+                    }
+                    #[test]
+                    fn [<$test_fn _avx512_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512);
+                    }
+                )*
+            }
+        }
+    }
+
+    generate_all_jma_tests!(
+        check_jma_partial_params,
+        check_jma_accuracy,
+        check_jma_default_candles,
+        check_jma_zero_period,
+        check_jma_period_exceeds_length,
+        check_jma_very_small_dataset,
+        check_jma_reinput,
+        check_jma_nan_handling,
+        check_jma_streaming,
+        check_jma_property,
+        check_jma_no_poison
+    );
+
+    fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let output = JmaBatchBuilder::new()
+            .kernel(kernel)
+            .apply_candles(&c, "close")?;
+
+        let def = JmaParams::default();
+        let row = output.values_for(&def).expect("default row missing");
+
+        assert_eq!(row.len(), c.close.len());
+
+        let expected = [
+            59305.04794668568,
+            59261.270455005455,
+            59156.791263606865,
+            59128.30656791065,
+            58918.89223153998,
+        ];
+        let start = row.len() - 5;
+        for (i, &v) in row[start..].iter().enumerate() {
+            assert!(
+                (v - expected[i]).abs() < 1e-6,
+                "[{test}] default-row mismatch at idx {i}: {v} vs {expected:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let batch_configs = vec![
+            (5, 20, 5, 0.0, 100.0, 50.0, 1, 3, 1),
+            (1, 10, 3, -100.0, 200.0, 100.0, 1, 5, 2),
+            (50, 100, 25, -50.0, 50.0, 25.0, 2, 4, 1),
+            (14, 14, 1, -100.0, 200.0, 50.0, 1, 5, 1),
+            (1, 1, 1, 0.0, 0.0, 1.0, 1, 1, 1),
+            (10, 30, 10, 50.0, 50.0, 1.0, 1, 5, 2),
+            (5, 50, 5, -50.0, 150.0, 25.0, 1, 3, 1),
+            (7, 21, 7, -100.0, 100.0, 40.0, 2, 2, 1),
+            (80, 100, 20, 100.0, 200.0, 50.0, 4, 5, 1),
+        ];
+
+        for (idx, config) in batch_configs.iter().enumerate() {
+            let output = JmaBatchBuilder::new()
+                .kernel(kernel)
+                .period_range(config.0, config.1, config.2)
+                .phase_range(config.3, config.4, config.5)
+                .power_range(config.6, config.7, config.8)
+                .apply_candles(&c, "close")?;
+
+            for (val_idx, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+                let row = val_idx / output.cols;
+                let col = val_idx % output.cols;
+                let combo = &output.combos[row];
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {}) \
+                        in batch config #{}: period_range=({},{},{}), phase_range=({},{},{}), power_range=({},{},{}) \
+                        combo params: period={}, phase={}, power={}",
+                        test, val, bits, row, col, val_idx, idx,
+                        config.0, config.1, config.2, config.3, config.4, config.5, config.6, config.7, config.8,
+                        combo.period.unwrap_or(7), combo.phase.unwrap_or(50.0), combo.power.unwrap_or(2)
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {}) \
+                        in batch config #{}: period_range=({},{},{}), phase_range=({},{},{}), power_range=({},{},{}) \
+                        combo params: period={}, phase={}, power={}",
+						test,
+						val,
+						bits,
+						row,
+						col,
+						val_idx,
+						idx,
+						config.0,
+						config.1,
+						config.2,
+						config.3,
+						config.4,
+						config.5,
+						config.6,
+						config.7,
+						config.8,
+						combo.period.unwrap_or(7),
+						combo.phase.unwrap_or(50.0),
+						combo.power.unwrap_or(2)
+					);
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {}) \
+                        in batch config #{}: period_range=({},{},{}), phase_range=({},{},{}), power_range=({},{},{}) \
+                        combo params: period={}, phase={}, power={}",
+						test,
+						val,
+						bits,
+						row,
+						col,
+						val_idx,
+						idx,
+						config.0,
+						config.1,
+						config.2,
+						config.3,
+						config.4,
+						config.5,
+						config.6,
+						config.7,
+						config.8,
+						combo.period.unwrap_or(7),
+						combo.phase.unwrap_or(50.0),
+						combo.power.unwrap_or(2)
+					);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_batch_no_poison(_test: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    macro_rules! gen_batch_tests {
+        ($fn_name:ident) => {
+            paste::paste! {
+                #[test] fn [<$fn_name _scalar>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx2>]()        {
+                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx512>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                }
+                #[test] fn [<$fn_name _auto_detect>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                }
+            }
+        };
+    }
+    gen_batch_tests!(check_batch_default_row);
+    gen_batch_tests!(check_batch_no_poison);
+
+    #[test]
+    fn test_jma_into_matches_api() -> Result<(), Box<dyn Error>> {
+        let len = 256usize;
+        let mut data = Vec::with_capacity(len);
+        for _ in 0..5 {
+            data.push(f64::from_bits(0x7ff8_0000_0000_0000));
+        }
+        for i in 0..(len - 5) {
+            let x = i as f64;
+
+            data.push((x * 0.1).sin() * 10.0 + x * 0.01);
+        }
+
+        let input = JmaInput::from_slice(&data, JmaParams::default());
+
+        let baseline = jma(&input)?.values;
+
+        let mut out = vec![0.0; data.len()];
+
+        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+        {
+            jma_into(&input, &mut out)?;
+
+            assert_eq!(out.len(), baseline.len());
+            for (a, b) in out.iter().zip(baseline.iter()) {
+                if a.is_nan() || b.is_nan() {
+                    assert!(a.is_nan() && b.is_nan());
+                } else {
+                    assert_eq!(a, b);
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "python")]
+use crate::utilities::kernel_validation::validate_kernel;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use numpy::PyUntypedArrayMethods;
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::PyDict;
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "jma")]
+#[pyo3(signature = (data, period, phase=50.0, power=2, kernel=None))]
+pub fn jma_py<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray1<'py, f64>,
+    period: usize,
+    phase: f64,
+    power: u32,
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let slice_in = data.as_slice()?;
+    let kern = validate_kernel(kernel, false)?;
+
+    let params = JmaParams {
+        period: Some(period),
+        phase: Some(phase),
+        power: Some(power),
+    };
+    let jma_in = JmaInput::from_slice(slice_in, params);
+
+    let result_vec: Vec<f64> = py
+        .allow_threads(|| jma_with_kernel(&jma_in, kern).map(|o| o.values))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok(result_vec.into_pyarray(py))
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "jma_batch")]
+#[pyo3(signature = (data, period_range, phase_range=(50.0, 50.0, 0.0), power_range=(2, 2, 0), kernel=None))]
+pub fn jma_batch_py<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray1<'py, f64>,
+    period_range: (usize, usize, usize),
+    phase_range: (f64, f64, f64),
+    power_range: (u32, u32, u32),
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let slice_in = data.as_slice()?;
+    let kern = validate_kernel(kernel, true)?;
+
+    let sweep = JmaBatchRange {
+        period: period_range,
+        phase: phase_range,
+        power: power_range,
+    };
+
+    let combos = expand_grid(&sweep);
+    if combos.is_empty() {
+        return Err(PyValueError::new_err("Invalid parameter ranges"));
+    }
+
+    let rows = combos.len();
+    let cols = slice_in.len();
+
+    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
+    let slice_out = unsafe { out_arr.as_slice_mut()? };
+
+    let (combos_result, _, _) = py
+        .allow_threads(|| {
+            let kernel = match kern {
+                Kernel::Auto => detect_best_batch_kernel(),
+                k => k,
+            };
+
+            let simd = match kernel {
+                Kernel::Avx512Batch => Kernel::Avx512,
+                Kernel::Avx2Batch => Kernel::Avx2,
+                Kernel::ScalarBatch => Kernel::Scalar,
+                _ => kernel,
+            };
+
+            jma_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
+
+    dict.set_item(
+        "periods",
+        combos_result
+            .iter()
+            .map(|p| p.period.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    dict.set_item(
+        "phases",
+        combos_result
+            .iter()
+            .map(|p| p.phase.unwrap())
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    dict.set_item(
+        "powers",
+        combos_result
+            .iter()
+            .map(|p| p.power.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+
+    Ok(dict)
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "jma_cuda_batch_dev")]
+#[pyo3(signature = (data_f32, period_range, phase_range=(50.0, 50.0, 0.0), power_range=(2, 2, 0), device_id=0))]
+pub fn jma_cuda_batch_dev_py(
+    py: Python<'_>,
+    data_f32: PyReadonlyArray1<'_, f32>,
+    period_range: (usize, usize, usize),
+    phase_range: (f64, f64, f64),
+    power_range: (u32, u32, u32),
+    device_id: usize,
+) -> PyResult<JmaDeviceArrayF32Py> {
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+
+    let slice_in = data_f32.as_slice()?;
+    let sweep = JmaBatchRange {
+        period: period_range,
+        phase: phase_range,
+        power: power_range,
+    };
+
+    let inner = py.allow_threads(|| {
+        let cuda = CudaJma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        cuda.jma_batch_dev(slice_in, &sweep)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+
+    Ok(JmaDeviceArrayF32Py { inner: Some(inner) })
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "jma_cuda_many_series_one_param_dev")]
+#[pyo3(signature = (prices_tm_f32, period, phase=50.0, power=2, device_id=0))]
+pub fn jma_cuda_many_series_one_param_dev_py(
+    py: Python<'_>,
+    prices_tm_f32: PyReadonlyArray2<'_, f32>,
+    period: usize,
+    phase: f64,
+    power: u32,
+    device_id: usize,
+) -> PyResult<JmaDeviceArrayF32Py> {
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+
+    let shape = prices_tm_f32.shape();
+    if shape.len() != 2 {
+        return Err(PyValueError::new_err("prices matrix must be 2-dimensional"));
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    let prices_flat = prices_tm_f32.as_slice()?;
+    let params = JmaParams {
+        period: Some(period),
+        phase: Some(phase),
+        power: Some(power),
+    };
+
+    let inner = py.allow_threads(|| {
+        let cuda = CudaJma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        cuda.jma_many_series_one_param_time_major_dev(prices_flat, cols, rows, &params)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+
+    Ok(JmaDeviceArrayF32Py { inner: Some(inner) })
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyclass(module = "vector_ta", unsendable)]
+pub struct JmaDeviceArrayF32Py {
+    pub(crate) inner: Option<DeviceArrayF32Jma>,
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pymethods]
+impl JmaDeviceArrayF32Py {
+    #[getter]
+    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
+        let d = PyDict::new(py);
+        d.set_item("shape", (inner.rows, inner.cols))?;
+        d.set_item("typestr", "<f4")?;
+        d.set_item(
+            "strides",
+            (
+                inner.cols * std::mem::size_of::<f32>(),
+                std::mem::size_of::<f32>(),
+            ),
+        )?;
+        d.set_item("data", (inner.device_ptr() as usize, false))?;
+
+        d.set_item("version", 3)?;
+        Ok(d)
+    }
+
+    fn __dlpack_device__(&self) -> (i32, i32) {
+        let dev = self.inner.as_ref().map(|h| h.device_id as i32).unwrap_or(0);
+        (2, dev)
+    }
+
+    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
+    fn __dlpack__<'py>(
+        &mut self,
+        py: Python<'py>,
+        stream: Option<pyo3::PyObject>,
+        max_version: Option<pyo3::PyObject>,
+        dl_device: Option<pyo3::PyObject>,
+        copy: Option<pyo3::PyObject>,
+    ) -> PyResult<PyObject> {
+        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+
+        let (kdl, alloc_dev) = self.__dlpack_device__();
+
+        if let Some(dev_obj) = dl_device.as_ref() {
+            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
+                if dev_ty != kdl || dev_id != alloc_dev {
+                    let wants_copy = copy
+                        .as_ref()
+                        .and_then(|c| c.extract::<bool>(py).ok())
+                        .unwrap_or(false);
+                    if wants_copy {
+                        return Err(PyValueError::new_err(
+                            "device copy not implemented for __dlpack__",
+                        ));
+                    } else {
+                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
+                    }
+                }
+            }
+        }
+
+        let _ = stream;
+
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
+
+        let rows = inner.rows;
+        let cols = inner.cols;
+        let buf = inner.buf;
+
+        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
+
+        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "JmaStream")]
+pub struct JmaStreamPy {
+    inner: JmaStream,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl JmaStreamPy {
+    #[new]
+    #[pyo3(signature = (period, phase=50.0, power=2))]
+    fn new(period: usize, phase: f64, power: u32) -> PyResult<Self> {
+        let params = JmaParams {
+            period: Some(period),
+            phase: Some(phase),
+            power: Some(power),
+        };
+
+        let stream = JmaStream::try_new(params)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        Ok(Self { inner: stream })
+    }
+
+    fn update(&mut self, value: f64) -> Option<f64> {
+        self.inner.update(value)
+    }
+}
+
+#[inline]
+pub fn jma_into_slice(dst: &mut [f64], input: &JmaInput, kern: Kernel) -> Result<(), JmaError> {
+    let data: &[f64] = match &input.data {
+        JmaData::Candles { candles, source } => source_type(candles, source),
+        JmaData::Slice(sl) => sl,
+    };
+
+    if dst.len() != data.len() {
+        return Err(JmaError::OutputLengthMismatch {
+            expected: data.len(),
+            got: dst.len(),
+        });
+    }
+
+    jma_with_kernel_into(input, kern, dst)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use wasm_bindgen::prelude::*;
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn jma_js(data: &[f64], period: usize, phase: f64, power: u32) -> Result<Vec<f64>, JsValue> {
+    let params = JmaParams {
+        period: Some(period),
+        phase: Some(phase),
+        power: Some(power),
+    };
+    let input = JmaInput::from_slice(data, params);
+
+    let mut output = vec![0.0; data.len()];
+
+    jma_into_slice(&mut output, &input, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    Ok(output)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn jma_alloc(len: usize) -> *mut f64 {
+    let mut vec = Vec::<f64>::with_capacity(len);
+    let ptr = vec.as_mut_ptr();
+    std::mem::forget(vec);
+    ptr
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn jma_free(ptr: *mut f64, len: usize) {
+    if !ptr.is_null() {
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, 0, len);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn jma_into(
+    in_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    period: usize,
+    phase: f64,
+    power: u32,
+) -> Result<(), JsValue> {
+    if in_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("null pointer passed to jma_into"));
+    }
+
+    unsafe {
+        let data = std::slice::from_raw_parts(in_ptr, len);
+
+        if period == 0 || period > len {
+            return Err(JsValue::from_str("Invalid period"));
+        }
+
+        let params = JmaParams {
+            period: Some(period),
+            phase: Some(phase),
+            power: Some(power),
+        };
+        let input = JmaInput::from_slice(data, params);
+
+        if in_ptr == out_ptr {
+            let mut temp = vec![0.0; len];
+            jma_into_slice(&mut temp, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            out.copy_from_slice(&temp);
+        } else {
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            jma_into_slice(out, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct JmaBatchConfig {
+    pub period_range: (usize, usize, usize),
+    pub phase_range: (f64, f64, f64),
+    pub power_range: (u32, u32, u32),
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct JmaBatchJsOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<JmaParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = jma_batch)]
+pub fn jma_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
+    let config: JmaBatchConfig = serde_wasm_bindgen::from_value(config)
+        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
+
+    let sweep = JmaBatchRange {
+        period: config.period_range,
+        phase: config.phase_range,
+        power: config.power_range,
+    };
+
+    let simd = match detect_best_batch_kernel() {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => Kernel::Scalar,
+    };
+
+    let output = jma_batch_inner(data, &sweep, simd, false)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let js_output = JmaBatchJsOutput {
+        values: output.values,
+        combos: output.combos,
+        rows: output.rows,
+        cols: output.cols,
+    };
+
+    serde_wasm_bindgen::to_value(&js_output)
+        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+#[deprecated(since = "1.0.0", note = "Use jma_batch instead")]
+pub fn jma_batch_js(
+    data: &[f64],
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+    phase_start: f64,
+    phase_end: f64,
+    phase_step: f64,
+    power_start: u32,
+    power_end: u32,
+    power_step: u32,
+) -> Result<Vec<f64>, JsValue> {
+    let sweep = JmaBatchRange {
+        period: (period_start, period_end, period_step),
+        phase: (phase_start, phase_end, phase_step),
+        power: (power_start, power_end, power_step),
+    };
+
+    jma_batch_inner(data, &sweep, Kernel::Scalar, false)
+        .map(|output| output.values)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn jma_batch_metadata_js(
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+    phase_start: f64,
+    phase_end: f64,
+    phase_step: f64,
+    power_start: u32,
+    power_end: u32,
+    power_step: u32,
+) -> Vec<f64> {
+    let mut metadata = Vec::new();
+
+    let mut current_period = period_start;
+    while current_period <= period_end {
+        let mut current_phase = phase_start;
+        while current_phase <= phase_end || (phase_step == 0.0 && current_phase == phase_start) {
+            let mut current_power = power_start;
+            while current_power <= power_end || (power_step == 0 && current_power == power_start) {
+                metadata.push(current_period as f64);
+                metadata.push(current_phase);
+                metadata.push(current_power as f64);
+
+                if power_step == 0 {
+                    break;
+                }
+                current_power += power_step;
+            }
+            if phase_step == 0.0 {
+                break;
+            }
+            current_phase += phase_step;
+        }
+        if period_step == 0 {
+            break;
+        }
+        current_period += period_step;
+    }
+
+    metadata
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn jma_batch_into(
+    in_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+    phase_start: f64,
+    phase_end: f64,
+    phase_step: f64,
+    power_start: u32,
+    power_end: u32,
+    power_step: u32,
+) -> Result<usize, JsValue> {
+    if in_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("null pointer passed to jma_batch_into"));
+    }
+
+    unsafe {
+        let data = std::slice::from_raw_parts(in_ptr, len);
+
+        let sweep = JmaBatchRange {
+            period: (period_start, period_end, period_step),
+            phase: (phase_start, phase_end, phase_step),
+            power: (power_start, power_end, power_step),
+        };
+
+        let combos = expand_grid_jma(&sweep);
+        let rows = combos.len();
+        let cols = len;
+
+        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
+
+        jma_batch_inner_into(data, &sweep, Kernel::Scalar, false, out)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(rows)
+    }
+}

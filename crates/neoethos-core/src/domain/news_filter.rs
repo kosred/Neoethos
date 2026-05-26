@@ -82,26 +82,74 @@ impl NewsFilter {
         )
     }
 
-    /// Run synchronously (should be spawned in a dedicated blocking thread by the app)
+    /// Run synchronously (should be spawned in a dedicated blocking thread by the app).
+    ///
+    /// **F-106 fix (2026-05-25 — operator directive: safety-critical
+    /// gate must fail CLOSED, not OPEN)**.
+    ///
+    /// History: previous revision returned `Ok("SAFE")` on FOUR distinct
+    /// error paths:
+    /// 1. Empty `api_key` when the filter is enabled — operator config
+    ///    bug, silently bypassed the gate
+    /// 2. Missing `api_key` when the filter is enabled — same
+    /// 3. JSON parsed but no `choices[0].message.content` field — LLM
+    ///    response corruption, silently bypassed
+    /// 4. Falls through end of function — defense-in-depth open
+    ///
+    /// During a high-impact news event (NFP, CPI, FOMC) a SAFE return
+    /// when the filter cannot reach the LLM means trading proceeds
+    /// while the bot believes there's no news risk. For Prop-firm Mode
+    /// that's a rule-violation risk (most firms ban trading 5min around
+    /// red folder news). For Risky Mode the operator-signed §6.4
+    /// acknowledgement assumes the news-blackout gate is active.
+    ///
+    /// New behaviour: every fail-open path returns `Err(...)` instead.
+    /// Caller (gemma_news_watcher / risk_gate) decides whether to:
+    /// - PAUSE new entries until the error clears (preferred for live
+    ///   trading), OR
+    /// - log + continue if the operator explicitly opted into
+    ///   "treat-LLM-failure-as-SAFE" via a typed config knob (currently
+    ///   not exposed — operator must add it deliberately).
+    ///
+    /// The ONLY remaining `Ok("SAFE")` path is the one where the filter
+    /// is explicitly DISABLED — that's the operator's signed opt-out and
+    /// is honoured.
     pub fn poll_llm_news_sentiment(
         &mut self,
         currency_pair: &str,
     ) -> Result<String, anyhow::Error> {
         if !self.enabled {
+            // Operator's signed opt-out — gate is off by design.
             return Ok("SAFE".to_string());
         }
 
         // `expose_secret()` is the deliberate API that surfaces the
         // secret only at the point of use; every call-site is grep-able.
+        // F-106: when the filter IS enabled but the API key is missing
+        // or empty, that's an operator-config error — fail LOUD, not
+        // silent. The previous Ok("SAFE") path silently bypassed the
+        // news gate during e.g. NFP releases.
         let api_key: &str = match self.api_key.as_ref() {
             Some(s) => {
                 let revealed: &str = s.expose_secret();
                 if revealed.trim().is_empty() {
-                    return Ok("SAFE".to_string());
+                    return Err(anyhow::anyhow!(
+                        "LLM news filter is ENABLED but api_key is empty. \
+                         Refusing to silently bypass the news-blackout gate. \
+                         Either set a valid api_key or disable the filter \
+                         explicitly via `enabled = false`."
+                    ));
                 }
                 revealed
             }
-            None => return Ok("SAFE".to_string()),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "LLM news filter is ENABLED but api_key is missing. \
+                     Refusing to silently bypass the news-blackout gate. \
+                     Either provide an api_key or disable the filter \
+                     explicitly via `enabled = false`."
+                ));
+            }
         };
 
         let prompt = format!(
@@ -111,6 +159,18 @@ impl NewsFilter {
 
         let client = reqwest::blocking::Client::new();
 
+        // F-107 fix (2026-05-25): endpoints + model names are still
+        // hardcoded HERE because this domain-layer filter is the
+        // single canonical place they live. The previous audit
+        // concern was that they were *duplicated* between this file
+        // and the app/news_sources module — that duplication was
+        // resolved when the news watcher migrated to call this
+        // helper. The values stay near the API call so a future
+        // OpenAI / Perplexity migration is one PR, not a
+        // multi-file grep-and-replace.
+        // `llm_provider` defaults to "openai" — anything else falls
+        // back to Perplexity. Allowed values are documented in
+        // `config.yaml`'s `news.llm_provider` field.
         let (endpoint, model) = if self.llm_provider == "openai" {
             ("https://api.openai.com/v1/chat/completions", "gpt-4o-mini")
         } else {
@@ -133,26 +193,57 @@ impl NewsFilter {
             .send()
             .map_err(|e| anyhow::anyhow!("LLM HTTP Request Failed: {}", e))?;
 
-        if res.status().is_success() {
-            let json: Value = res.json()?;
-            if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
-                let status = if content.to_uppercase().contains("BLACKOUT") {
-                    "BLACKOUT"
-                } else {
-                    "SAFE"
-                };
-                self.current_status = status.to_string();
-                return Ok(status.to_string());
-            }
-        } else {
+        if !res.status().is_success() {
             let status = res.status();
             let text = res.text().unwrap_or_default();
             return Err(anyhow::anyhow!("LLM API returned {}: {}", status, text));
         }
 
-        Ok("SAFE".to_string())
+        let json: Value = res.json().map_err(|e| {
+            anyhow::anyhow!(
+                "LLM news filter: response body was not valid JSON ({}). \
+                 Refusing to assume SAFE — fail-closed per F-106.",
+                e
+            )
+        })?;
+        // F-106: if the JSON does not contain the expected content path,
+        // the LLM response is corrupt / malformed. Previously we fell
+        // through to Ok("SAFE") here — that's a fail-open inversion.
+        let content = json["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "LLM news filter: response JSON lacks `choices[0].message.content`. \
+                     Refusing to assume SAFE — fail-closed per F-106. Raw JSON: {}",
+                    json
+                )
+            })?;
+        let status = if content.to_uppercase().contains("BLACKOUT") {
+            "BLACKOUT"
+        } else {
+            "SAFE"
+        };
+        self.current_status = status.to_string();
+        Ok(status.to_string())
     }
 
+    /// **F-105 documentation (2026-05-25)** — the `currency_pair` and
+    /// `current_timestamp_ms` arguments are intentionally unused at this
+    /// layer. The blackout decision is made by `poll_llm_news_sentiment`
+    /// (called by the caller's scheduler), which updates
+    /// `self.current_status`. This function is the cheap-read accessor:
+    /// it returns whatever the last poll concluded.
+    ///
+    /// The arguments are kept in the signature so callers can pass them
+    /// through (chrome / risk-gate code that needs the pair + ts for
+    /// logging context). Renaming to `_currency_pair` / `_current_timestamp_ms`
+    /// silences the unused-arg warnings without breaking the call sites.
+    ///
+    /// History: an earlier revision was meant to compute a window-based
+    /// "is this timestamp inside `blackout_minutes_before`/`_after` of a
+    /// known macro event" check using those args. That window-based path
+    /// was retired (LLM-side check is more accurate and timezone-safe)
+    /// but the signature stayed.
     pub fn is_blackout_active(&self, _currency_pair: &str, _current_timestamp_ms: i64) -> bool {
         if !self.enabled {
             return false;

@@ -447,10 +447,10 @@ impl ProductionCTraderExecutionBackend {
         // timeout the I/O error bubbles up, the caller drops the session,
         // and the next `execute_via_session` retry re-authenticates.
         // Override via `FOREX_BOT_CTRADER_READ_TIMEOUT_SECS` (0 disables).
-        let read_timeout_secs: u64 = std::env::var("FOREX_BOT_CTRADER_READ_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30);
+        // F-CORE3 closure (2026-05-25): routed through the canonical
+        // `env_overrides::ctrader_read_timeout_secs` getter so the var
+        // is grep-able from one place + clamped consistently.
+        let read_timeout_secs: u64 = crate::app_services::env_overrides::ctrader_read_timeout_secs();
         if read_timeout_secs > 0 {
             let timeout = std::time::Duration::from_secs(read_timeout_secs);
             let apply_result = match socket.get_ref() {
@@ -632,6 +632,19 @@ impl CTraderExecutionBackend for ProductionCTraderExecutionBackend {
             &outcome,
         );
         crate::app_services::live_journal::record_live_outcome_best_effort(&entry);
+        // **2026-05-25 — operator directive "uniform push everywhere"
+        // + F-231 closure**: a successful order placement / cancel /
+        // close has just changed the account state (margin, free
+        // margin, position list, possibly equity if it was a close).
+        // Fire the global refresh trigger so the bridge runs an
+        // immediate `refresh_once` and pushes the new snapshot to
+        // every SSE subscriber within ~750 ms — instead of the
+        // operator waiting up to 5 s for the bridge safety timer.
+        //
+        // This is the synchronous-request path. The future
+        // spontaneous-event listener (margin call from the broker,
+        // SL/TP hit without our request) will call the same trigger.
+        crate::server::state::trigger_global_account_refresh();
         Ok(outcome)
     }
 }
@@ -678,22 +691,21 @@ impl CTraderExecutionBackend for StubCTraderExecutionBackend {
 /// `execute_via_session` call. Tunable via `FOREX_BOT_CTRADER_MAX_ATTEMPTS`
 /// (clamped to `[1, 5]`; default 3). The default is deliberately small —
 /// retry safety relies on the broker deduping by `clientOrderId`.
+///
+/// **F-CORE3 closure (2026-05-25)**: thin shim over the canonical
+/// `env_overrides::ctrader_max_attempts` typed getter. Kept as a
+/// local function so existing call-sites don't need to re-import.
 fn ctrader_max_attempts() -> u32 {
-    std::env::var("FOREX_BOT_CTRADER_MAX_ATTEMPTS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(3)
-        .clamp(1, 5)
+    crate::app_services::env_overrides::ctrader_max_attempts()
 }
 
 /// Base backoff in ms for retries; tunable via
 /// `FOREX_BOT_CTRADER_BACKOFF_BASE_MS` (clamped to `[10, 2000]`; default 200).
+///
+/// **F-CORE3 closure (2026-05-25)**: thin shim over the canonical
+/// `env_overrides::ctrader_backoff_base_ms` typed getter.
 fn ctrader_backoff_base_ms() -> u64 {
-    std::env::var("FOREX_BOT_CTRADER_BACKOFF_BASE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(200)
-        .clamp(10, 2_000)
+    crate::app_services::env_overrides::ctrader_backoff_base_ms()
 }
 
 /// Sleep before the n-th retry attempt (n >= 1).
@@ -989,9 +1001,8 @@ fn validate_execution_outcome(
         );
     }
     if matches!(outcome.status, CTraderExecutionStatus::PartialFill) {
-        let allow_partial = std::env::var("FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL")
-            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+        // F-CORE3 closure (2026-05-25): canonical getter.
+        let allow_partial = crate::app_services::env_overrides::ctrader_allow_partial_fill();
         if !allow_partial {
             anyhow::bail!(
                 "cTrader execution returned PartialFill (deal_id={:?}, requested={:?}, filled={:?}); \

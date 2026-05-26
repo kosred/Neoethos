@@ -1,0 +1,2886 @@
+use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
+};
+use aligned_vec::{AVec, CACHELINE_ALIGN};
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use core::arch::x86_64::*;
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+use std::convert::AsRef;
+use std::error::Error;
+use std::mem::MaybeUninit;
+use thiserror::Error;
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
+#[cfg(feature = "python")]
+use crate::utilities::kernel_validation::validate_kernel;
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::PyDict;
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use wasm_bindgen::prelude::*;
+
+#[derive(Debug, Clone)]
+pub enum KvoData<'a> {
+    Candles {
+        candles: &'a Candles,
+    },
+    Slices {
+        high: &'a [f64],
+        low: &'a [f64],
+        close: &'a [f64],
+        volume: &'a [f64],
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct KvoOutput {
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "wasm"),
+    derive(Serialize, Deserialize)
+)]
+pub struct KvoParams {
+    pub short_period: Option<usize>,
+    pub long_period: Option<usize>,
+}
+
+impl Default for KvoParams {
+    fn default() -> Self {
+        Self {
+            short_period: Some(2),
+            long_period: Some(5),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct KvoInput<'a> {
+    pub data: KvoData<'a>,
+    pub params: KvoParams,
+}
+
+impl<'a> KvoInput<'a> {
+    #[inline]
+    pub fn from_candles(candles: &'a Candles, params: KvoParams) -> Self {
+        Self {
+            data: KvoData::Candles { candles },
+            params,
+        }
+    }
+
+    #[inline]
+    pub fn from_slices(
+        high: &'a [f64],
+        low: &'a [f64],
+        close: &'a [f64],
+        volume: &'a [f64],
+        params: KvoParams,
+    ) -> Self {
+        Self {
+            data: KvoData::Slices {
+                high,
+                low,
+                close,
+                volume,
+            },
+            params,
+        }
+    }
+
+    #[inline]
+    pub fn with_default_candles(candles: &'a Candles) -> Self {
+        Self::from_candles(candles, KvoParams::default())
+    }
+
+    #[inline]
+    pub fn get_short_period(&self) -> usize {
+        self.params.short_period.unwrap_or(2)
+    }
+
+    #[inline]
+    pub fn get_long_period(&self) -> usize {
+        self.params.long_period.unwrap_or(5)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct KvoBuilder {
+    short_period: Option<usize>,
+    long_period: Option<usize>,
+    kernel: Kernel,
+}
+
+impl Default for KvoBuilder {
+    fn default() -> Self {
+        Self {
+            short_period: None,
+            long_period: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl KvoBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[inline(always)]
+    pub fn short_period(mut self, n: usize) -> Self {
+        self.short_period = Some(n);
+        self
+    }
+    #[inline(always)]
+    pub fn long_period(mut self, n: usize) -> Self {
+        self.long_period = Some(n);
+        self
+    }
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline(always)]
+    pub fn apply(self, c: &Candles) -> Result<KvoOutput, KvoError> {
+        let params = KvoParams {
+            short_period: self.short_period,
+            long_period: self.long_period,
+        };
+        let input = KvoInput::from_candles(c, params);
+        kvo_with_kernel(&input, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn apply_slices(
+        self,
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        volume: &[f64],
+    ) -> Result<KvoOutput, KvoError> {
+        let params = KvoParams {
+            short_period: self.short_period,
+            long_period: self.long_period,
+        };
+        let input = KvoInput::from_slices(high, low, close, volume, params);
+        kvo_with_kernel(&input, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn into_stream(self) -> Result<KvoStream, KvoError> {
+        let params = KvoParams {
+            short_period: self.short_period,
+            long_period: self.long_period,
+        };
+        KvoStream::try_new(params)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum KvoError {
+    #[error("kvo: Empty data provided.")]
+    EmptyInputData,
+    #[error("kvo: All values are NaN.")]
+    AllValuesNaN,
+    #[error("kvo: Invalid period settings: short={short}, long={long}")]
+    InvalidPeriod { short: usize, long: usize },
+    #[error("kvo: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+    #[error("kvo: Output buffer length mismatch: expected {expected}, got {got}")]
+    OutputLengthMismatch { expected: usize, got: usize },
+    #[error("kvo: Input length mismatch: expected {expected}, got {got}")]
+    InputLengthMismatch { expected: usize, got: usize },
+    #[error("kvo: Invalid range: start={start}, end={end}, step={step}")]
+    InvalidRange {
+        start: usize,
+        end: usize,
+        step: usize,
+    },
+    #[error("kvo: Invalid kernel for batch: {0:?}")]
+    InvalidKernelForBatch(Kernel),
+}
+
+#[inline]
+pub fn kvo(input: &KvoInput) -> Result<KvoOutput, KvoError> {
+    kvo_with_kernel(input, Kernel::Auto)
+}
+
+#[inline(always)]
+fn kvo_slices<'a>(input: &'a KvoInput<'a>) -> (&'a [f64], &'a [f64], &'a [f64], &'a [f64]) {
+    match &input.data {
+        KvoData::Candles { candles } => {
+            (&candles.high, &candles.low, &candles.close, &candles.volume)
+        }
+        KvoData::Slices {
+            high,
+            low,
+            close,
+            volume,
+        } => (*high, *low, *close, *volume),
+    }
+}
+
+#[inline(always)]
+fn validate_kvo_lengths(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+) -> Result<(), KvoError> {
+    if high.is_empty() || low.is_empty() || close.is_empty() || volume.is_empty() {
+        return Err(KvoError::EmptyInputData);
+    }
+    let len = high.len();
+    if low.len() != len {
+        return Err(KvoError::InputLengthMismatch {
+            expected: len,
+            got: low.len(),
+        });
+    }
+    if close.len() != len {
+        return Err(KvoError::InputLengthMismatch {
+            expected: len,
+            got: close.len(),
+        });
+    }
+    if volume.len() != len {
+        return Err(KvoError::InputLengthMismatch {
+            expected: len,
+            got: volume.len(),
+        });
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn kvo_single_kernel(kernel: Kernel) -> Kernel {
+    match kernel {
+        Kernel::Auto => Kernel::Scalar,
+        other => other.to_non_batch(),
+    }
+}
+
+pub fn kvo_with_kernel(input: &KvoInput, kernel: Kernel) -> Result<KvoOutput, KvoError> {
+    let (high, low, close, volume) = kvo_slices(input);
+    validate_kvo_lengths(high, low, close, volume)?;
+
+    let short_period = input.get_short_period();
+    let long_period = input.get_long_period();
+    if short_period < 1 || long_period < short_period {
+        return Err(KvoError::InvalidPeriod {
+            short: short_period,
+            long: long_period,
+        });
+    }
+
+    let first_valid_idx = high
+        .iter()
+        .zip(low.iter())
+        .zip(close.iter())
+        .zip(volume.iter())
+        .position(|(((h, l), c), v)| !h.is_nan() && !l.is_nan() && !c.is_nan() && !v.is_nan());
+    let first_valid_idx = match first_valid_idx {
+        Some(idx) => idx,
+        None => return Err(KvoError::AllValuesNaN),
+    };
+
+    let valid = high.len() - first_valid_idx;
+    if valid < 2 {
+        return Err(KvoError::NotEnoughValidData { needed: 2, valid });
+    }
+
+    let mut out = alloc_with_nan_prefix(high.len(), first_valid_idx + 1);
+    let chosen = kvo_single_kernel(kernel);
+
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => kvo_scalar(
+                high,
+                low,
+                close,
+                volume,
+                short_period,
+                long_period,
+                first_valid_idx,
+                &mut out,
+            ),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => kvo_avx2(
+                high,
+                low,
+                close,
+                volume,
+                short_period,
+                long_period,
+                first_valid_idx,
+                &mut out,
+            ),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => kvo_avx512(
+                high,
+                low,
+                close,
+                volume,
+                short_period,
+                long_period,
+                first_valid_idx,
+                &mut out,
+            ),
+            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+            Kernel::Avx2 | Kernel::Avx512 => kvo_scalar(
+                high,
+                low,
+                close,
+                volume,
+                short_period,
+                long_period,
+                first_valid_idx,
+                &mut out,
+            ),
+            _ => unreachable!(),
+        }
+    }
+    Ok(KvoOutput { values: out })
+}
+
+#[inline]
+pub fn kvo_compute_into(out: &mut [f64], input: &KvoInput, kernel: Kernel) -> Result<(), KvoError> {
+    let (high, low, close, volume) = kvo_slices(input);
+    validate_kvo_lengths(high, low, close, volume)?;
+
+    if out.len() != high.len() {
+        return Err(KvoError::OutputLengthMismatch {
+            expected: high.len(),
+            got: out.len(),
+        });
+    }
+
+    let short_period = input.get_short_period();
+    let long_period = input.get_long_period();
+    if short_period < 1 || long_period < short_period {
+        return Err(KvoError::InvalidPeriod {
+            short: short_period,
+            long: long_period,
+        });
+    }
+
+    let first_valid_idx = high
+        .iter()
+        .zip(low.iter())
+        .zip(close.iter())
+        .zip(volume.iter())
+        .position(|(((h, l), c), v)| !h.is_nan() && !l.is_nan() && !c.is_nan() && !v.is_nan());
+    let first_valid_idx = match first_valid_idx {
+        Some(idx) => idx,
+        None => return Err(KvoError::AllValuesNaN),
+    };
+
+    let valid = high.len() - first_valid_idx;
+    if valid < 2 {
+        return Err(KvoError::NotEnoughValidData { needed: 2, valid });
+    }
+
+    let chosen = kvo_single_kernel(kernel);
+
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => kvo_scalar(
+                high,
+                low,
+                close,
+                volume,
+                short_period,
+                long_period,
+                first_valid_idx,
+                out,
+            ),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => kvo_avx2(
+                high,
+                low,
+                close,
+                volume,
+                short_period,
+                long_period,
+                first_valid_idx,
+                out,
+            ),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => kvo_avx512(
+                high,
+                low,
+                close,
+                volume,
+                short_period,
+                long_period,
+                first_valid_idx,
+                out,
+            ),
+            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+            Kernel::Avx2 | Kernel::Avx512 => kvo_scalar(
+                high,
+                low,
+                close,
+                volume,
+                short_period,
+                long_period,
+                first_valid_idx,
+                out,
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    for v in &mut out[..=first_valid_idx] {
+        *v = f64::NAN;
+    }
+
+    Ok(())
+}
+
+#[inline]
+pub fn kvo_into_slice(dst: &mut [f64], input: &KvoInput, kern: Kernel) -> Result<(), KvoError> {
+    kvo_compute_into(dst, input, kern)
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+#[inline]
+pub fn kvo_into(input: &KvoInput, out: &mut [f64]) -> Result<(), KvoError> {
+    kvo_compute_into(out, input, Kernel::Auto)
+}
+
+#[inline]
+pub unsafe fn kvo_scalar(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    short_period: usize,
+    long_period: usize,
+    first_valid_idx: usize,
+    out: &mut [f64],
+) {
+    if short_period == 2 && long_period == 5 {
+        kvo_scalar_default_2_5(high, low, close, volume, first_valid_idx, out);
+        return;
+    }
+
+    let short_alpha = 2.0 / (short_period as f64 + 1.0);
+    let long_alpha = 2.0 / (long_period as f64 + 1.0);
+
+    let hp = high.as_ptr();
+    let lp = low.as_ptr();
+    let cp = close.as_ptr();
+    let vp = volume.as_ptr();
+    let outp = out.as_mut_ptr();
+
+    let mut trend: i32 = -1;
+    let mut sign = -1.0f64;
+    let mut cm: f64 = 0.0;
+
+    let mut prev_hlc =
+        *hp.add(first_valid_idx) + *lp.add(first_valid_idx) + *cp.add(first_valid_idx);
+    let mut prev_dm = *hp.add(first_valid_idx) - *lp.add(first_valid_idx);
+
+    let mut short_ema = 0.0f64;
+    let mut long_ema = 0.0f64;
+
+    let mut i = first_valid_idx + 1;
+    let len = high.len();
+
+    if i < len {
+        let h = *hp.add(i);
+        let l = *lp.add(i);
+        let c = *cp.add(i);
+        let v = *vp.add(i);
+
+        let hlc = h + l + c;
+        let dm = h - l;
+
+        if hlc > prev_hlc && trend != 1 {
+            trend = 1;
+            cm = prev_dm;
+            sign = 1.0;
+        } else if hlc < prev_hlc && trend != 0 {
+            trend = 0;
+            cm = prev_dm;
+            sign = -1.0;
+        }
+        cm += dm;
+
+        let temp = ((dm / cm) * 2.0 - 1.0).abs();
+        let vf = v * temp * 100.0 * sign;
+
+        short_ema = vf;
+        long_ema = vf;
+
+        *outp.add(i) = short_ema - long_ema;
+
+        prev_hlc = hlc;
+        prev_dm = dm;
+        i += 1;
+    }
+
+    while i < len {
+        let h = *hp.add(i);
+        let l = *lp.add(i);
+        let c = *cp.add(i);
+        let v = *vp.add(i);
+
+        let hlc = h + l + c;
+        let dm = h - l;
+
+        if hlc > prev_hlc && trend != 1 {
+            trend = 1;
+            cm = prev_dm;
+            sign = 1.0;
+        } else if hlc < prev_hlc && trend != 0 {
+            trend = 0;
+            cm = prev_dm;
+            sign = -1.0;
+        }
+        cm += dm;
+
+        let temp = ((dm / cm) * 2.0 - 1.0).abs();
+        let vf = v * temp * 100.0 * sign;
+
+        short_ema += (vf - short_ema) * short_alpha;
+        long_ema += (vf - long_ema) * long_alpha;
+
+        *outp.add(i) = short_ema - long_ema;
+
+        prev_hlc = hlc;
+        prev_dm = dm;
+        i += 1;
+    }
+}
+
+#[inline(always)]
+unsafe fn kvo_scalar_default_2_5(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    first_valid_idx: usize,
+    out: &mut [f64],
+) {
+    let hp = high.as_ptr();
+    let lp = low.as_ptr();
+    let cp = close.as_ptr();
+    let vp = volume.as_ptr();
+    let outp = out.as_mut_ptr();
+
+    let mut trend: i32 = -1;
+    let mut sign = -1.0f64;
+    let mut cm: f64 = 0.0;
+
+    let mut prev_hlc =
+        *hp.add(first_valid_idx) + *lp.add(first_valid_idx) + *cp.add(first_valid_idx);
+    let mut prev_dm = *hp.add(first_valid_idx) - *lp.add(first_valid_idx);
+
+    let mut short_ema = 0.0f64;
+    let mut long_ema = 0.0f64;
+
+    let mut i = first_valid_idx + 1;
+    let len = high.len();
+
+    if i < len {
+        let h = *hp.add(i);
+        let l = *lp.add(i);
+        let c = *cp.add(i);
+        let v = *vp.add(i);
+
+        let hlc = h + l + c;
+        let dm = h - l;
+
+        if hlc > prev_hlc && trend != 1 {
+            trend = 1;
+            cm = prev_dm;
+            sign = 1.0;
+        } else if hlc < prev_hlc && trend != 0 {
+            trend = 0;
+            cm = prev_dm;
+            sign = -1.0;
+        }
+        cm += dm;
+
+        let temp = ((dm / cm) * 2.0 - 1.0).abs();
+        let vf = v * temp * 100.0 * sign;
+
+        short_ema = vf;
+        long_ema = vf;
+
+        *outp.add(i) = short_ema - long_ema;
+
+        prev_hlc = hlc;
+        prev_dm = dm;
+        i += 1;
+    }
+
+    while i < len {
+        let h = *hp.add(i);
+        let l = *lp.add(i);
+        let c = *cp.add(i);
+        let v = *vp.add(i);
+
+        let hlc = h + l + c;
+        let dm = h - l;
+
+        if hlc > prev_hlc && trend != 1 {
+            trend = 1;
+            cm = prev_dm;
+            sign = 1.0;
+        } else if hlc < prev_hlc && trend != 0 {
+            trend = 0;
+            cm = prev_dm;
+            sign = -1.0;
+        }
+        cm += dm;
+
+        let temp = ((dm / cm) * 2.0 - 1.0).abs();
+        let vf = v * temp * 100.0 * sign;
+
+        short_ema += (vf - short_ema) * (2.0 / 3.0);
+        long_ema += (vf - long_ema) * (1.0 / 3.0);
+
+        *outp.add(i) = short_ema - long_ema;
+
+        prev_hlc = hlc;
+        prev_dm = dm;
+        i += 1;
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn kvo_avx2(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    short_period: usize,
+    long_period: usize,
+    first_valid_idx: usize,
+    out: &mut [f64],
+) {
+    kvo_scalar(
+        high,
+        low,
+        close,
+        volume,
+        short_period,
+        long_period,
+        first_valid_idx,
+        out,
+    )
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn kvo_avx512(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    short_period: usize,
+    long_period: usize,
+    first_valid_idx: usize,
+    out: &mut [f64],
+) {
+    if short_period <= 32 && long_period <= 32 {
+        kvo_avx512_short(
+            high,
+            low,
+            close,
+            volume,
+            short_period,
+            long_period,
+            first_valid_idx,
+            out,
+        )
+    } else {
+        kvo_avx512_long(
+            high,
+            low,
+            close,
+            volume,
+            short_period,
+            long_period,
+            first_valid_idx,
+            out,
+        )
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn kvo_avx512_short(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    short_period: usize,
+    long_period: usize,
+    first_valid_idx: usize,
+    out: &mut [f64],
+) {
+    kvo_scalar(
+        high,
+        low,
+        close,
+        volume,
+        short_period,
+        long_period,
+        first_valid_idx,
+        out,
+    )
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn kvo_avx512_long(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    short_period: usize,
+    long_period: usize,
+    first_valid_idx: usize,
+    out: &mut [f64],
+) {
+    kvo_scalar(
+        high,
+        low,
+        close,
+        volume,
+        short_period,
+        long_period,
+        first_valid_idx,
+        out,
+    )
+}
+
+#[derive(Clone, Debug)]
+pub struct KvoBatchRange {
+    pub short_period: (usize, usize, usize),
+    pub long_period: (usize, usize, usize),
+}
+
+impl Default for KvoBatchRange {
+    fn default() -> Self {
+        Self {
+            short_period: (2, 2, 0),
+            long_period: (5, 254, 1),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct KvoBatchBuilder {
+    range: KvoBatchRange,
+    kernel: Kernel,
+}
+
+impl KvoBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline]
+    pub fn short_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.short_period = (start, end, step);
+        self
+    }
+    #[inline]
+    pub fn short_static(mut self, v: usize) -> Self {
+        self.range.short_period = (v, v, 0);
+        self
+    }
+    #[inline]
+    pub fn long_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.long_period = (start, end, step);
+        self
+    }
+    #[inline]
+    pub fn long_static(mut self, v: usize) -> Self {
+        self.range.long_period = (v, v, 0);
+        self
+    }
+
+    pub fn apply_slices(
+        self,
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        volume: &[f64],
+    ) -> Result<KvoBatchOutput, KvoError> {
+        kvo_batch_with_kernel(high, low, close, volume, &self.range, self.kernel)
+    }
+    pub fn with_default_slices(
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        volume: &[f64],
+        k: Kernel,
+    ) -> Result<KvoBatchOutput, KvoError> {
+        KvoBatchBuilder::new()
+            .kernel(k)
+            .apply_slices(high, low, close, volume)
+    }
+
+    pub fn apply_candles(self, c: &Candles) -> Result<KvoBatchOutput, KvoError> {
+        let high = source_type(c, "high");
+        let low = source_type(c, "low");
+        let close = source_type(c, "close");
+        let volume = source_type(c, "volume");
+        self.apply_slices(high, low, close, volume)
+    }
+
+    pub fn with_default_candles(c: &Candles, k: Kernel) -> Result<KvoBatchOutput, KvoError> {
+        KvoBatchBuilder::new().kernel(k).apply_candles(c)
+    }
+}
+
+pub fn kvo_batch_with_kernel(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    sweep: &KvoBatchRange,
+    k: Kernel,
+) -> Result<KvoBatchOutput, KvoError> {
+    let kernel = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        other => return Err(KvoError::InvalidKernelForBatch(other)),
+    };
+    let simd = match kernel {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => unreachable!(),
+    };
+    kvo_batch_par_slice(high, low, close, volume, sweep, simd)
+}
+
+#[derive(Clone, Debug)]
+pub struct KvoBatchOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<KvoParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+impl KvoBatchOutput {
+    pub fn row_for_params(&self, p: &KvoParams) -> Option<usize> {
+        self.combos.iter().position(|c| {
+            c.short_period.unwrap_or(2) == p.short_period.unwrap_or(2)
+                && c.long_period.unwrap_or(5) == p.long_period.unwrap_or(5)
+        })
+    }
+    pub fn values_for(&self, p: &KvoParams) -> Option<&[f64]> {
+        self.row_for_params(p).map(|row| {
+            let start = row * self.cols;
+            &self.values[start..start + self.cols]
+        })
+    }
+}
+
+#[inline(always)]
+fn expand_grid(r: &KvoBatchRange) -> Result<Vec<KvoParams>, KvoError> {
+    fn axis((start, end, step): (usize, usize, usize)) -> Result<Vec<usize>, KvoError> {
+        if step == 0 || start == end {
+            return Ok(vec![start]);
+        }
+        let mut out = Vec::new();
+        if start < end {
+            let mut v = start;
+            loop {
+                out.push(v);
+                let next =
+                    v.checked_add(step)
+                        .ok_or(KvoError::InvalidRange { start, end, step })?;
+                if next > end {
+                    break;
+                }
+                v = next;
+            }
+        } else {
+            let mut v = start;
+            loop {
+                out.push(v);
+                if v == end {
+                    break;
+                }
+                if v < step {
+                    break;
+                }
+                let next =
+                    v.checked_sub(step)
+                        .ok_or(KvoError::InvalidRange { start, end, step })?;
+                if next < end {
+                    break;
+                }
+                v = next;
+            }
+        }
+        Ok(out)
+    }
+    let shorts = axis(r.short_period)?;
+    let longs = axis(r.long_period)?;
+    let cap = shorts
+        .len()
+        .checked_mul(longs.len())
+        .ok_or(KvoError::InvalidRange {
+            start: r.short_period.0,
+            end: r.long_period.1,
+            step: r.short_period.2.max(r.long_period.2),
+        })?;
+    let mut out = Vec::with_capacity(cap);
+    for &s in &shorts {
+        for &l in &longs {
+            if s >= 1 && l >= s {
+                out.push(KvoParams {
+                    short_period: Some(s),
+                    long_period: Some(l),
+                });
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(KvoError::InvalidRange {
+            start: r.short_period.0,
+            end: r.long_period.1,
+            step: r.short_period.2.max(r.long_period.2),
+        });
+    }
+    Ok(out)
+}
+
+#[inline(always)]
+pub fn kvo_batch_slice(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    sweep: &KvoBatchRange,
+    kern: Kernel,
+) -> Result<KvoBatchOutput, KvoError> {
+    kvo_batch_inner(high, low, close, volume, sweep, kern, false)
+}
+#[inline(always)]
+pub fn kvo_batch_par_slice(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    sweep: &KvoBatchRange,
+    kern: Kernel,
+) -> Result<KvoBatchOutput, KvoError> {
+    kvo_batch_inner(high, low, close, volume, sweep, kern, true)
+}
+
+#[inline]
+pub fn kvo_batch_into_slice(
+    out: &mut [f64],
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    sweep: &KvoBatchRange,
+    kern: Kernel,
+    parallel: bool,
+) -> Result<Vec<KvoParams>, KvoError> {
+    let len = high.len();
+    if low.len() != len || close.len() != len || volume.len() != len {
+        return Err(KvoError::OutputLengthMismatch {
+            expected: len,
+            got: out.len(),
+        });
+    }
+
+    let combos = expand_grid(sweep)?;
+    let expected_size = combos
+        .len()
+        .checked_mul(len)
+        .ok_or(KvoError::InvalidRange {
+            start: sweep.short_period.0,
+            end: sweep.long_period.1,
+            step: sweep.short_period.2.max(sweep.long_period.2),
+        })?;
+
+    if out.len() != expected_size {
+        return Err(KvoError::OutputLengthMismatch {
+            expected: expected_size,
+            got: out.len(),
+        });
+    }
+
+    kvo_batch_inner_into(high, low, close, volume, sweep, kern, parallel, out)
+}
+
+#[inline(always)]
+fn kvo_batch_inner(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    sweep: &KvoBatchRange,
+    kern: Kernel,
+    parallel: bool,
+) -> Result<KvoBatchOutput, KvoError> {
+    let combos = expand_grid(sweep)?;
+    let cols = high.len();
+    let rows = combos.len();
+
+    let mut buf_mu = make_uninit_matrix(rows, cols);
+
+    let first = high
+        .iter()
+        .zip(low)
+        .zip(close)
+        .zip(volume)
+        .position(|(((h, l), c), v)| !h.is_nan() && !l.is_nan() && !c.is_nan() && !v.is_nan())
+        .ok_or(KvoError::AllValuesNaN)?;
+    let warm: Vec<usize> = combos.iter().map(|_| first + 1).collect();
+    init_matrix_prefixes(&mut buf_mu, cols, &warm);
+
+    let mut guard = core::mem::ManuallyDrop::new(buf_mu);
+    let out_slice: &mut [f64] =
+        unsafe { core::slice::from_raw_parts_mut(guard.as_mut_ptr() as *mut f64, guard.len()) };
+
+    let simd = match kern {
+        Kernel::Auto => detect_best_kernel(),
+        k => k,
+    };
+    let combos_back =
+        kvo_batch_inner_into(high, low, close, volume, sweep, simd, parallel, out_slice)?;
+
+    let values = unsafe {
+        Vec::from_raw_parts(
+            guard.as_mut_ptr() as *mut f64,
+            guard.len(),
+            guard.capacity(),
+        )
+    };
+
+    Ok(KvoBatchOutput {
+        values,
+        combos: combos_back,
+        rows,
+        cols,
+    })
+}
+
+#[inline(always)]
+unsafe fn kvo_row_scalar(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    first: usize,
+    short_period: usize,
+    long_period: usize,
+    out: &mut [f64],
+) {
+    kvo_scalar(
+        high,
+        low,
+        close,
+        volume,
+        short_period,
+        long_period,
+        first,
+        out,
+    )
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn kvo_row_avx2(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    first: usize,
+    short_period: usize,
+    long_period: usize,
+    out: &mut [f64],
+) {
+    kvo_scalar(
+        high,
+        low,
+        close,
+        volume,
+        short_period,
+        long_period,
+        first,
+        out,
+    )
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn kvo_row_avx512(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    first: usize,
+    short_period: usize,
+    long_period: usize,
+    out: &mut [f64],
+) {
+    if short_period <= 32 && long_period <= 32 {
+        kvo_row_avx512_short(
+            high,
+            low,
+            close,
+            volume,
+            first,
+            short_period,
+            long_period,
+            out,
+        )
+    } else {
+        kvo_row_avx512_long(
+            high,
+            low,
+            close,
+            volume,
+            first,
+            short_period,
+            long_period,
+            out,
+        )
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn kvo_row_avx512_short(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    first: usize,
+    short_period: usize,
+    long_period: usize,
+    out: &mut [f64],
+) {
+    kvo_scalar(
+        high,
+        low,
+        close,
+        volume,
+        short_period,
+        long_period,
+        first,
+        out,
+    )
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn kvo_row_avx512_long(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    first: usize,
+    short_period: usize,
+    long_period: usize,
+    out: &mut [f64],
+) {
+    kvo_scalar(
+        high,
+        low,
+        close,
+        volume,
+        short_period,
+        long_period,
+        first,
+        out,
+    )
+}
+
+#[derive(Debug, Clone)]
+pub struct KvoStream {
+    short_period: usize,
+    long_period: usize,
+    short_alpha: f64,
+    long_alpha: f64,
+
+    prev_hlc: f64,
+    prev_dm: f64,
+    cm: f64,
+    trend: i32,
+    sign: f64,
+
+    short_ema: f64,
+    long_ema: f64,
+
+    first: bool,
+    seeded: bool,
+}
+
+impl KvoStream {
+    pub fn try_new(params: KvoParams) -> Result<Self, KvoError> {
+        let short_period = params.short_period.unwrap_or(2);
+        let long_period = params.long_period.unwrap_or(5);
+        if short_period < 1 || long_period < short_period {
+            return Err(KvoError::InvalidPeriod {
+                short: short_period,
+                long: long_period,
+            });
+        }
+        Ok(Self {
+            short_period,
+            long_period,
+            short_alpha: 2.0 / (short_period as f64 + 1.0),
+            long_alpha: 2.0 / (long_period as f64 + 1.0),
+            prev_hlc: 0.0,
+            prev_dm: 0.0,
+            cm: 0.0,
+            trend: -1,
+            sign: -1.0,
+            short_ema: 0.0,
+            long_ema: 0.0,
+            first: true,
+            seeded: false,
+        })
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, high: f64, low: f64, close: f64, volume: f64) -> Option<f64> {
+        if self.first {
+            self.prev_hlc = high + low + close;
+            self.prev_dm = high - low;
+            self.first = false;
+            return None;
+        }
+
+        let hlc = high + low + close;
+        let dm = high - low;
+
+        if hlc > self.prev_hlc {
+            if self.trend != 1 {
+                self.trend = 1;
+                self.cm = self.prev_dm;
+                self.sign = 1.0;
+            }
+        } else if hlc < self.prev_hlc {
+            if self.trend != 0 {
+                self.trend = 0;
+                self.cm = self.prev_dm;
+                self.sign = -1.0;
+            }
+        }
+        self.cm += dm;
+
+        let temp = ((dm / self.cm) * 2.0 - 1.0).abs();
+        let vf = volume * temp * 100.0 * self.sign;
+
+        if !self.seeded {
+            self.short_ema = vf;
+            self.long_ema = vf;
+            self.seeded = true;
+        } else {
+            self.short_ema += (vf - self.short_ema) * self.short_alpha;
+            self.long_ema += (vf - self.long_ema) * self.long_alpha;
+        }
+
+        self.prev_hlc = hlc;
+        self.prev_dm = dm;
+
+        Some(self.short_ema - self.long_ema)
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn kvo_output_into_js(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    short_period: usize,
+    long_period: usize,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = kvo_js(high, low, close, volume, short_period, long_period)?;
+    crate::write_wasm_f64_output("kvo_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn kvo_batch_output_into_js(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    config: JsValue,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = kvo_batch_js(high, low, close, volume, config)?;
+    crate::write_wasm_selected_object_f64_outputs("kvo_batch_output_into_js", &value, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_csv;
+    #[cfg(feature = "proptest")]
+    use proptest::prelude::*;
+
+    fn check_kvo_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let default_params = KvoParams {
+            short_period: None,
+            long_period: None,
+        };
+        let input = KvoInput::from_candles(&candles, default_params);
+        let output = kvo_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+
+        Ok(())
+    }
+
+    fn check_kvo_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = KvoInput::from_candles(&candles, KvoParams::default());
+        let result = kvo_with_kernel(&input, kernel)?;
+        let expected_last_five = [
+            -246.42698280402647,
+            530.8651474164992,
+            237.2148311016648,
+            608.8044103976362,
+            -6339.615516805162,
+        ];
+        let start = result.values.len().saturating_sub(5);
+        for (i, &val) in result.values[start..].iter().enumerate() {
+            let diff = (val - expected_last_five[i]).abs();
+            assert!(
+                diff < 1e-1,
+                "[{}] KVO {:?} mismatch at idx {}: got {}, expected {}",
+                test_name,
+                kernel,
+                i,
+                val,
+                expected_last_five[i]
+            );
+        }
+        Ok(())
+    }
+
+    fn check_kvo_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = KvoInput::with_default_candles(&candles);
+        match input.data {
+            KvoData::Candles { .. } => {}
+            _ => panic!("Expected KvoData::Candles"),
+        }
+        let output = kvo_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_kvo_zero_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let params = KvoParams {
+            short_period: Some(0),
+            long_period: Some(5),
+        };
+        let input = KvoInput::from_candles(&candles, params);
+        let res = kvo_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] KVO should fail with zero short period",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_kvo_period_invalid(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let params = KvoParams {
+            short_period: Some(5),
+            long_period: Some(2),
+        };
+        let input = KvoInput::from_candles(&candles, params);
+        let res = kvo_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] KVO should fail with long_period < short_period",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_kvo_very_small_dataset(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let mut candles = read_candles_from_csv(file_path)?;
+        candles.high.truncate(1);
+        candles.low.truncate(1);
+        candles.close.truncate(1);
+        candles.volume.truncate(1);
+        let input = KvoInput::from_candles(&candles, KvoParams::default());
+        let res = kvo_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] KVO should fail with insufficient data",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_kvo_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let first_params = KvoParams {
+            short_period: Some(2),
+            long_period: Some(5),
+        };
+        let first_input = KvoInput::from_candles(&candles, first_params);
+        let first_result = kvo_with_kernel(&first_input, kernel)?;
+        let second_params = KvoParams {
+            short_period: Some(2),
+            long_period: Some(5),
+        };
+        let second_input = KvoInput::from_slices(
+            &candles.high,
+            &candles.low,
+            &candles.close,
+            &first_result.values,
+            second_params,
+        );
+        let _ = kvo_with_kernel(&second_input, kernel);
+        Ok(())
+    }
+
+    fn check_kvo_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = KvoInput::from_candles(&candles, KvoParams::default());
+        let res = kvo_with_kernel(&input, kernel)?;
+        assert_eq!(res.values.len(), candles.close.len());
+        if res.values.len() > 240 {
+            for (i, &val) in res.values[240..].iter().enumerate() {
+                assert!(
+                    !val.is_nan(),
+                    "[{}] Found unexpected NaN at out-index {}",
+                    test_name,
+                    240 + i
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn check_kvo_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let short = 2;
+        let long = 5;
+
+        let input = KvoInput::from_candles(
+            &candles,
+            KvoParams {
+                short_period: Some(short),
+                long_period: Some(long),
+            },
+        );
+        let batch_output = kvo_with_kernel(&input, kernel)?.values;
+
+        let mut stream = KvoStream::try_new(KvoParams {
+            short_period: Some(short),
+            long_period: Some(long),
+        })?;
+        let mut stream_values = Vec::with_capacity(candles.close.len());
+        for ((&h, &l), (&c, &v)) in candles
+            .high
+            .iter()
+            .zip(&candles.low)
+            .zip(candles.close.iter().zip(&candles.volume))
+        {
+            match stream.update(h, l, c, v) {
+                Some(val) => stream_values.push(val),
+                None => stream_values.push(f64::NAN),
+            }
+        }
+        assert_eq!(batch_output.len(), stream_values.len());
+        for (i, (&b, &s)) in batch_output.iter().zip(stream_values.iter()).enumerate() {
+            if b.is_nan() && s.is_nan() {
+                continue;
+            }
+            let diff = (b - s).abs();
+            assert!(
+                diff < 1e-9,
+                "[{}] KVO streaming f64 mismatch at idx {}: batch={}, stream={}, diff={}",
+                test_name,
+                i,
+                b,
+                s,
+                diff
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_kvo_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let test_params = vec![
+            KvoParams::default(),
+            KvoParams {
+                short_period: Some(1),
+                long_period: Some(1),
+            },
+            KvoParams {
+                short_period: Some(1),
+                long_period: Some(2),
+            },
+            KvoParams {
+                short_period: Some(2),
+                long_period: Some(2),
+            },
+            KvoParams {
+                short_period: Some(3),
+                long_period: Some(5),
+            },
+            KvoParams {
+                short_period: Some(5),
+                long_period: Some(10),
+            },
+            KvoParams {
+                short_period: Some(10),
+                long_period: Some(20),
+            },
+            KvoParams {
+                short_period: Some(20),
+                long_period: Some(50),
+            },
+            KvoParams {
+                short_period: Some(50),
+                long_period: Some(100),
+            },
+            KvoParams {
+                short_period: Some(100),
+                long_period: Some(200),
+            },
+            KvoParams {
+                short_period: Some(2),
+                long_period: Some(100),
+            },
+            KvoParams {
+                short_period: Some(1),
+                long_period: Some(200),
+            },
+        ];
+
+        for (param_idx, params) in test_params.iter().enumerate() {
+            let input = KvoInput::from_candles(&candles, params.clone());
+            let output = kvo_with_kernel(&input, kernel)?;
+
+            for (i, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+						 with params: short_period={}, long_period={} (param set {})",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.short_period.unwrap_or(2),
+                        params.long_period.unwrap_or(5),
+                        param_idx
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+						 with params: short_period={}, long_period={} (param set {})",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.short_period.unwrap_or(2),
+                        params.long_period.unwrap_or(5),
+                        param_idx
+                    );
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+						 with params: short_period={}, long_period={} (param set {})",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.short_period.unwrap_or(2),
+                        params.long_period.unwrap_or(5),
+                        param_idx
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_kvo_no_poison(_test_name: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    #[cfg(feature = "proptest")]
+    #[allow(clippy::float_cmp)]
+    fn check_kvo_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (2usize..=10, 5usize..=20).prop_flat_map(|(short, long)| {
+            (
+                prop::collection::vec(
+                    (
+                        (100.0f64..10000.0f64).prop_filter("finite", |x| x.is_finite()),
+                        0.01f64..0.1f64,
+                        (100.0f64..1_000_000.0f64)
+                            .prop_filter("positive", |x| *x > 0.0 && x.is_finite()),
+                    ),
+                    50..=500,
+                ),
+                Just(short),
+                Just(long.max(short)),
+            )
+        });
+
+        proptest::test_runner::TestRunner::default()
+            .run(&strat, |(price_data, short_period, long_period)| {
+                let mut high = Vec::with_capacity(price_data.len());
+                let mut low = Vec::with_capacity(price_data.len());
+                let mut close = Vec::with_capacity(price_data.len());
+                let mut volume = Vec::with_capacity(price_data.len());
+
+                for (base_price, volatility, vol) in &price_data {
+                    let range = base_price * volatility;
+                    let h = base_price + range * 0.5;
+                    let l = base_price - range * 0.5;
+                    let c = l + (h - l) * 0.6;
+
+                    high.push(h);
+                    low.push(l);
+                    close.push(c);
+                    volume.push(*vol);
+                }
+
+                let params = KvoParams {
+                    short_period: Some(short_period),
+                    long_period: Some(long_period),
+                };
+                let input = KvoInput::from_slices(&high, &low, &close, &volume, params.clone());
+
+                let result = kvo_with_kernel(&input, kernel)?;
+                let reference = kvo_with_kernel(&input, Kernel::Scalar)?;
+
+                for i in 0..result.values.len() {
+                    let val = result.values[i];
+                    let ref_val = reference.values[i];
+
+                    if val.is_nan() && ref_val.is_nan() {
+                        continue;
+                    }
+
+                    if val.is_finite() && ref_val.is_finite() {
+                        let ulp_diff = val.to_bits().abs_diff(ref_val.to_bits());
+                        prop_assert!(
+                            (val - ref_val).abs() <= 1e-9 || ulp_diff <= 8,
+                            "[{}] Kernel mismatch at idx {}: {} vs {} (ULP={})",
+                            test_name,
+                            i,
+                            val,
+                            ref_val,
+                            ulp_diff
+                        );
+                    } else {
+                        prop_assert_eq!(
+                            val.is_finite(),
+                            ref_val.is_finite(),
+                            "[{}] Finite mismatch at idx {}: {} vs {}",
+                            test_name,
+                            i,
+                            val,
+                            ref_val
+                        );
+                    }
+                }
+
+                let first_valid_idx = high
+                    .iter()
+                    .zip(low.iter())
+                    .zip(close.iter())
+                    .zip(volume.iter())
+                    .position(|(((h, l), c), v)| {
+                        !h.is_nan() && !l.is_nan() && !c.is_nan() && !v.is_nan()
+                    })
+                    .unwrap_or(0);
+
+                for i in 0..result.values.len() {
+                    if i < first_valid_idx + 1 {
+                        prop_assert!(
+                            result.values[i].is_nan(),
+                            "[{}] Expected NaN during warmup at idx {}, got {}",
+                            test_name,
+                            i,
+                            result.values[i]
+                        );
+                    }
+                }
+
+                if result.values.len() > first_valid_idx + 1 {
+                    for i in (first_valid_idx + 1)..result.values.len() {
+                        prop_assert!(
+                            result.values[i].is_finite(),
+                            "[{}] Expected finite value after warmup at idx {}, got {}",
+                            test_name,
+                            i,
+                            result.values[i]
+                        );
+                    }
+                }
+
+                let all_same_price = high.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-10)
+                    && low.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-10)
+                    && close.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-10);
+                let all_same_volume = volume.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-10);
+
+                if all_same_price && all_same_volume && result.values.len() > 100 {
+                    let last_values = &result.values[result.values.len() - 10..];
+                    for val in last_values {
+                        if val.is_finite() {
+                            prop_assert!(
+                                val.abs() < 0.1,
+                                "[{}] Constant data should produce near-zero oscillator, got {}",
+                                test_name,
+                                val
+                            );
+                        }
+                    }
+                }
+
+                if short_period <= 2 && result.values.len() > first_valid_idx + 20 {
+                    let valid_values: Vec<f64> = result.values[(first_valid_idx + 2)..]
+                        .iter()
+                        .filter(|v| v.is_finite())
+                        .copied()
+                        .collect();
+
+                    if valid_values.len() > 10 {
+                        let changes: Vec<f64> = valid_values
+                            .windows(2)
+                            .map(|w| (w[1] - w[0]).abs())
+                            .collect();
+
+                        let avg_change = changes.iter().sum::<f64>() / changes.len() as f64;
+
+                        if !all_same_price {
+                            prop_assert!(
+                                avg_change > 1e-12,
+                                "[{}] Short period {} should produce some oscillator movement",
+                                test_name,
+                                short_period
+                            );
+                        }
+                    }
+                }
+
+                if result.values.len() > first_valid_idx + 20 {
+                    let trend_start = result.values.len().saturating_sub(20);
+                    let trend_end = result.values.len();
+
+                    if trend_start > first_valid_idx + 1 {
+                        let mut hlc_values = Vec::new();
+                        for i in trend_start..trend_end {
+                            hlc_values.push(high[i] + low[i] + close[i]);
+                        }
+
+                        let mut up_moves = 0;
+                        let mut down_moves = 0;
+                        for window in hlc_values.windows(2) {
+                            if window[1] > window[0] * 1.001 {
+                                up_moves += 1;
+                            } else if window[1] < window[0] * 0.999 {
+                                down_moves += 1;
+                            }
+                        }
+
+                        let avg_volume = volume[trend_start..trend_end].iter().sum::<f64>() / 20.0;
+                        if avg_volume > 1000.0 {
+                            let last_oscillator_values =
+                                &result.values[trend_end.saturating_sub(5)..trend_end];
+                            let avg_oscillator = last_oscillator_values
+                                .iter()
+                                .filter(|v| v.is_finite())
+                                .sum::<f64>()
+                                / last_oscillator_values.len() as f64;
+
+                            if up_moves > 15 && down_moves < 3 {
+                                prop_assert!(
+									avg_oscillator > -100.0,
+									"[{}] Strong uptrend should not produce strongly negative oscillator: {}",
+									test_name, avg_oscillator
+								);
+                            } else if down_moves > 15 && up_moves < 3 {
+                                prop_assert!(
+									avg_oscillator < 100.0,
+									"[{}] Strong downtrend should not produce strongly positive oscillator: {}",
+									test_name, avg_oscillator
+								);
+                            }
+                        }
+                    }
+                }
+
+                prop_assert!(
+                    long_period >= short_period,
+                    "[{}] Long period {} should be >= short period {}",
+                    test_name,
+                    long_period,
+                    short_period
+                );
+
+                let mut small_vol = volume.clone();
+                for v in &mut small_vol {
+                    *v *= 1e-10;
+                }
+
+                let small_vol_input =
+                    KvoInput::from_slices(&high, &low, &close, &small_vol, params.clone());
+                if let Ok(small_vol_result) = kvo_with_kernel(&small_vol_input, kernel) {
+                    for i in (first_valid_idx + 1)..result.values.len() {
+                        if result.values[i].is_finite() && small_vol_result.values[i].is_finite() {
+                            prop_assert!(
+								small_vol_result.values[i].abs() <= result.values[i].abs() * 1e-8 + 1e-10,
+								"[{}] Small volume should produce smaller oscillator at idx {}: {} vs {}",
+								test_name, i, small_vol_result.values[i], result.values[i]
+							);
+                        }
+                    }
+                }
+
+                if result.values.len() > first_valid_idx + 10 {
+                    let mut cm = 0.0;
+                    let mut trend = -1;
+                    let mut prev_hlc =
+                        high[first_valid_idx] + low[first_valid_idx] + close[first_valid_idx];
+
+                    for i in (first_valid_idx + 1)..(first_valid_idx + 10).min(high.len()) {
+                        let hlc = high[i] + low[i] + close[i];
+                        let dm = high[i] - low[i];
+
+                        if hlc > prev_hlc && trend != 1 {
+                            trend = 1;
+                            cm = high[i - 1] - low[i - 1];
+                        } else if hlc < prev_hlc && trend != 0 {
+                            trend = 0;
+                            cm = high[i - 1] - low[i - 1];
+                        }
+                        cm += dm;
+
+                        if cm > 1e-10 {
+                            let vf_component = (dm / cm * 2.0 - 1.0).abs();
+                            prop_assert!(
+								vf_component <= 1.0 + 1e-9,
+								"[{}] Volume force component out of bounds at idx {}: {} (dm={}, cm={})",
+								test_name, i, vf_component, dm, cm
+							);
+                        }
+
+                        prev_hlc = hlc;
+                    }
+                }
+
+                Ok(())
+            })
+            .unwrap();
+
+        Ok(())
+    }
+
+    macro_rules! generate_all_kvo_tests {
+        ($($test_fn:ident),*) => {
+            paste::paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar);
+                    }
+                )*
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _avx2_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2);
+                    }
+                    #[test]
+                    fn [<$test_fn _avx512_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512);
+                    }
+                )*
+            }
+        }
+    }
+
+    generate_all_kvo_tests!(
+        check_kvo_partial_params,
+        check_kvo_accuracy,
+        check_kvo_default_candles,
+        check_kvo_zero_period,
+        check_kvo_period_invalid,
+        check_kvo_very_small_dataset,
+        check_kvo_reinput,
+        check_kvo_nan_handling,
+        check_kvo_streaming,
+        check_kvo_no_poison
+    );
+
+    #[cfg(feature = "proptest")]
+    generate_all_kvo_tests!(check_kvo_property);
+
+    fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+        let output = KvoBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
+        let def = KvoParams::default();
+        let row = output.values_for(&def).expect("default row missing");
+        assert_eq!(row.len(), c.close.len());
+        let expected = [
+            -246.42698280402647,
+            530.8651474164992,
+            237.2148311016648,
+            608.8044103976362,
+            -6339.615516805162,
+        ];
+        let start = row.len() - 5;
+        for (i, &v) in row[start..].iter().enumerate() {
+            assert!(
+                (v - expected[i]).abs() < 1e-1,
+                "[{test}] default-row mismatch at idx {i}: {v} vs {expected:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let test_configs = vec![
+            (1, 5, 1, 2, 10, 2),
+            (2, 10, 2, 5, 20, 5),
+            (5, 25, 5, 10, 50, 10),
+            (1, 3, 1, 1, 5, 1),
+            (10, 20, 2, 20, 40, 4),
+            (2, 2, 0, 5, 50, 5),
+            (1, 10, 1, 20, 20, 0),
+        ];
+
+        for (cfg_idx, &(short_start, short_end, short_step, long_start, long_end, long_step)) in
+            test_configs.iter().enumerate()
+        {
+            let output = KvoBatchBuilder::new()
+                .kernel(kernel)
+                .short_range(short_start, short_end, short_step)
+                .long_range(long_start, long_end, long_step)
+                .apply_candles(&c)?;
+
+            for (idx, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+                let row = idx / output.cols;
+                let col = idx % output.cols;
+                let combo = &output.combos[row];
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+						 at row {} col {} (flat index {}) with params: short_period={}, long_period={}",
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.short_period.unwrap_or(2),
+                        combo.long_period.unwrap_or(5)
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+						 at row {} col {} (flat index {}) with params: short_period={}, long_period={}",
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.short_period.unwrap_or(2),
+                        combo.long_period.unwrap_or(5)
+                    );
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+						 at row {} col {} (flat index {}) with params: short_period={}, long_period={}",
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.short_period.unwrap_or(2),
+                        combo.long_period.unwrap_or(5)
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_batch_no_poison(_test: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    macro_rules! gen_batch_tests {
+        ($fn_name:ident) => {
+            paste::paste! {
+                #[test] fn [<$fn_name _scalar>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx2>]()        {
+                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx512>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                }
+                #[test] fn [<$fn_name _auto_detect>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                }
+            }
+        };
+    }
+    gen_batch_tests!(check_batch_default_row);
+    gen_batch_tests!(check_batch_no_poison);
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+    #[test]
+    fn test_kvo_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
+        let len = 512usize;
+        let mut high = Vec::with_capacity(len);
+        let mut low = Vec::with_capacity(len);
+        let mut close = Vec::with_capacity(len);
+        let mut volume = Vec::with_capacity(len);
+
+        for i in 0..len {
+            let base = 100.0 + (i as f64) * 0.05 + ((i % 13) as f64) * 0.01;
+            let spread = 0.5 + ((i % 7) as f64) * 0.03;
+            let lo = base - spread;
+            let hi = base + spread;
+            let frac = ((i % 97) as f64) / 96.0;
+            let cl = lo + (hi - lo) * frac;
+            let vol = 1_000.0 + ((i * 37) % 10_000) as f64;
+
+            low.push(lo);
+            high.push(hi);
+            close.push(cl);
+            volume.push(vol);
+        }
+
+        let input = KvoInput::from_slices(&high, &low, &close, &volume, KvoParams::default());
+
+        let baseline = kvo(&input)?.values;
+
+        let mut out = vec![0.0; len];
+        kvo_into(&input, &mut out)?;
+
+        assert_eq!(baseline.len(), out.len());
+
+        #[inline]
+        fn eq_or_both_nan(a: f64, b: f64) -> bool {
+            (a.is_nan() && b.is_nan()) || (a == b) || (a - b).abs() <= 1e-12
+        }
+
+        for (i, (&a, &b)) in baseline.iter().zip(out.iter()).enumerate() {
+            assert!(
+                eq_or_both_nan(a, b),
+                "KVO parity mismatch at index {}: api={}, into={}",
+                i,
+                a,
+                b
+            );
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "kvo")]
+#[pyo3(signature = (high, low, close, volume, short_period=None, long_period=None, kernel=None))]
+pub fn kvo_py<'py>(
+    py: Python<'py>,
+    high: PyReadonlyArray1<'py, f64>,
+    low: PyReadonlyArray1<'py, f64>,
+    close: PyReadonlyArray1<'py, f64>,
+    volume: PyReadonlyArray1<'py, f64>,
+    short_period: Option<usize>,
+    long_period: Option<usize>,
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let high_slice = high.as_slice()?;
+    let low_slice = low.as_slice()?;
+    let close_slice = close.as_slice()?;
+    let volume_slice = volume.as_slice()?;
+    let kern = validate_kernel(kernel, false)?;
+
+    let params = KvoParams {
+        short_period,
+        long_period,
+    };
+    let input = KvoInput::from_slices(high_slice, low_slice, close_slice, volume_slice, params);
+
+    let result_vec: Vec<f64> = py
+        .allow_threads(|| kvo_with_kernel(&input, kern).map(|o| o.values))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok(result_vec.into_pyarray(py))
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "KvoStream")]
+pub struct KvoStreamPy {
+    stream: KvoStream,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl KvoStreamPy {
+    #[new]
+    fn new(short_period: Option<usize>, long_period: Option<usize>) -> PyResult<Self> {
+        let params = KvoParams {
+            short_period,
+            long_period,
+        };
+        let stream =
+            KvoStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(KvoStreamPy { stream })
+    }
+
+    fn update(&mut self, high: f64, low: f64, close: f64, volume: f64) -> Option<f64> {
+        self.stream.update(high, low, close, volume)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "kvo_batch")]
+#[pyo3(signature = (high, low, close, volume, short_range, long_range, kernel=None))]
+pub fn kvo_batch_py<'py>(
+    py: Python<'py>,
+    high: numpy::PyReadonlyArray1<'py, f64>,
+    low: numpy::PyReadonlyArray1<'py, f64>,
+    close: numpy::PyReadonlyArray1<'py, f64>,
+    volume: numpy::PyReadonlyArray1<'py, f64>,
+    short_range: (usize, usize, usize),
+    long_range: (usize, usize, usize),
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+
+    let h = high.as_slice()?;
+    let l = low.as_slice()?;
+    let c = close.as_slice()?;
+    let v = volume.as_slice()?;
+
+    let sweep = KvoBatchRange {
+        short_period: short_range,
+        long_period: long_range,
+    };
+    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let rows = combos.len();
+    let cols = h.len();
+
+    let total = rows
+        .checked_mul(cols)
+        .ok_or_else(|| PyValueError::new_err("rows * cols overflow"))?;
+    let arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
+    let out_flat: &mut [f64] = unsafe { arr.as_slice_mut()? };
+
+    let kern = validate_kernel(kernel, true)?;
+    let simd = match kern {
+        Kernel::Auto => detect_best_kernel(),
+        k => k,
+    };
+
+    py.allow_threads(|| kvo_batch_inner_into(h, l, c, v, &sweep, simd, true, out_flat))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("values", arr.reshape((rows, cols))?)?;
+    dict.set_item(
+        "shorts",
+        combos
+            .iter()
+            .map(|p| p.short_period.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    dict.set_item(
+        "longs",
+        combos
+            .iter()
+            .map(|p| p.long_period.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+
+    Ok(dict)
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "kvo_cuda_batch_dev")]
+#[pyo3(signature = (high_f32, low_f32, close_f32, volume_f32, short_range, long_range, device_id=0))]
+pub fn kvo_cuda_batch_dev_py<'py>(
+    py: Python<'py>,
+    high_f32: numpy::PyReadonlyArray1<'py, f32>,
+    low_f32: numpy::PyReadonlyArray1<'py, f32>,
+    close_f32: numpy::PyReadonlyArray1<'py, f32>,
+    volume_f32: numpy::PyReadonlyArray1<'py, f32>,
+    short_range: (usize, usize, usize),
+    long_range: (usize, usize, usize),
+    device_id: usize,
+) -> PyResult<(DeviceArrayF32Py, Bound<'py, PyDict>)> {
+    use crate::cuda::cuda_available;
+    use crate::cuda::CudaKvo;
+
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+
+    let h = high_f32.as_slice()?;
+    let l = low_f32.as_slice()?;
+    let c = close_f32.as_slice()?;
+    let v = volume_f32.as_slice()?;
+    if h.len() != l.len() || h.len() != c.len() || h.len() != v.len() {
+        return Err(PyValueError::new_err("inputs must have equal length"));
+    }
+
+    let sweep = KvoBatchRange {
+        short_period: short_range,
+        long_period: long_range,
+    };
+    let (inner, combos) = py.allow_threads(|| {
+        let cuda = CudaKvo::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        cuda.kvo_batch_dev(h, l, c, v, &sweep)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+    let dev = make_device_array_py(device_id, inner)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "shorts",
+        combos
+            .iter()
+            .map(|p| p.short_period.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    dict.set_item(
+        "longs",
+        combos
+            .iter()
+            .map(|p| p.long_period.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+
+    Ok((dev, dict))
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "kvo_cuda_many_series_one_param_dev")]
+#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, volume_tm_f32, cols, rows, short_period, long_period, device_id=0))]
+pub fn kvo_cuda_many_series_one_param_dev_py<'py>(
+    py: Python<'py>,
+    high_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
+    low_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
+    close_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
+    volume_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
+    cols: usize,
+    rows: usize,
+    short_period: usize,
+    long_period: usize,
+    device_id: usize,
+) -> PyResult<DeviceArrayF32Py> {
+    use crate::cuda::cuda_available;
+    use crate::cuda::CudaKvo;
+
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+
+    let h = high_tm_f32.as_slice()?;
+    let l = low_tm_f32.as_slice()?;
+    let c = close_tm_f32.as_slice()?;
+    let v = volume_tm_f32.as_slice()?;
+    if h.len() != l.len() || h.len() != c.len() || h.len() != v.len() {
+        return Err(PyValueError::new_err("inputs must have equal length"));
+    }
+    let elems = cols
+        .checked_mul(rows)
+        .ok_or_else(|| PyValueError::new_err("cols * rows overflow"))?;
+    if elems != h.len() {
+        return Err(PyValueError::new_err("cols*rows must equal data length"));
+    }
+
+    let params = KvoParams {
+        short_period: Some(short_period),
+        long_period: Some(long_period),
+    };
+    let inner = py.allow_threads(|| {
+        let cuda = CudaKvo::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        cuda.kvo_many_series_one_param_time_major_dev(h, l, c, v, cols, rows, &params)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+    let dev = make_device_array_py(device_id, inner)?;
+
+    Ok(dev)
+}
+
+#[inline(always)]
+fn kvo_batch_inner_into(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    sweep: &KvoBatchRange,
+    kern: Kernel,
+    parallel: bool,
+    out: &mut [f64],
+) -> Result<Vec<KvoParams>, KvoError> {
+    let combos = expand_grid(sweep)?;
+
+    let first = high
+        .iter()
+        .zip(low)
+        .zip(close)
+        .zip(volume)
+        .position(|(((h, l), c), v)| !h.is_nan() && !l.is_nan() && !c.is_nan() && !v.is_nan())
+        .ok_or(KvoError::AllValuesNaN)?;
+
+    let valid = high.len() - first;
+    if valid < 2 {
+        return Err(KvoError::NotEnoughValidData { needed: 2, valid });
+    }
+
+    let rows = combos.len();
+    let cols = high.len();
+    let expected = rows.checked_mul(cols).ok_or(KvoError::InvalidRange {
+        start: sweep.short_period.0,
+        end: sweep.long_period.1,
+        step: sweep.short_period.2.max(sweep.long_period.2),
+    })?;
+    if out.len() != expected {
+        return Err(KvoError::OutputLengthMismatch {
+            expected,
+            got: out.len(),
+        });
+    }
+
+    let out_mu: &mut [MaybeUninit<f64>] = unsafe {
+        std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut MaybeUninit<f64>, out.len())
+    };
+    let warm: Vec<usize> = combos.iter().map(|_| first + 1).collect();
+    init_matrix_prefixes(out_mu, cols, &warm);
+
+    let actual = match kern {
+        Kernel::Auto => detect_best_kernel(),
+        k => k,
+    };
+
+    #[inline(always)]
+    fn precompute_vf(
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        volume: &[f64],
+        first: usize,
+    ) -> Vec<f64> {
+        let len = high.len();
+        let mut vf = vec![f64::NAN; len];
+        if len <= first + 1 {
+            return vf;
+        }
+
+        unsafe {
+            let hp = high.as_ptr();
+            let lp = low.as_ptr();
+            let cp = close.as_ptr();
+            let vp = volume.as_ptr();
+
+            let mut trend: i32 = -1;
+            let mut cm: f64 = 0.0;
+            let mut prev_hlc = *hp.add(first) + *lp.add(first) + *cp.add(first);
+            let mut prev_dm = *hp.add(first) - *lp.add(first);
+
+            let mut i = first + 1;
+            while i < len {
+                let h = *hp.add(i);
+                let l = *lp.add(i);
+                let c = *cp.add(i);
+                let v = *vp.add(i);
+
+                let hlc = h + l + c;
+                let dm = h - l;
+
+                if hlc > prev_hlc && trend != 1 {
+                    trend = 1;
+                    cm = prev_dm;
+                } else if hlc < prev_hlc && trend != 0 {
+                    trend = 0;
+                    cm = prev_dm;
+                }
+                cm += dm;
+
+                let temp = ((dm / cm) * 2.0 - 1.0).abs();
+                let sign = if trend == 1 { 1.0 } else { -1.0 };
+                vf[i] = v * temp * 100.0 * sign;
+
+                prev_hlc = hlc;
+                prev_dm = dm;
+                i += 1;
+            }
+        }
+        vf
+    }
+
+    let vf = precompute_vf(high, low, close, volume, first);
+
+    let do_row = |row: usize, dst_mu: &mut [MaybeUninit<f64>]| {
+        let s = combos[row].short_period.unwrap();
+        let l = combos[row].long_period.unwrap();
+
+        let short_alpha = 2.0 / (s as f64 + 1.0);
+        let long_alpha = 2.0 / (l as f64 + 1.0);
+
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(dst_mu.as_mut_ptr() as *mut f64, dst_mu.len())
+        };
+
+        let mut short_ema = 0.0f64;
+        let mut long_ema = 0.0f64;
+
+        if first + 1 < cols {
+            let seed = vf[first + 1];
+            short_ema = seed;
+            long_ema = seed;
+            dst[first + 1] = 0.0;
+            for i in (first + 2)..cols {
+                let vfi = vf[i];
+                short_ema += (vfi - short_ema) * short_alpha;
+                long_ema += (vfi - long_ema) * long_alpha;
+                dst[i] = short_ema - long_ema;
+            }
+        }
+
+        let _ = actual;
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::*;
+            out_mu
+                .par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(r, row)| do_row(r, row));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (r, row) in out_mu.chunks_mut(cols).enumerate() {
+                do_row(r, row);
+            }
+        }
+    } else {
+        for (r, row) in out_mu.chunks_mut(cols).enumerate() {
+            do_row(r, row);
+        }
+    }
+
+    Ok(combos)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[inline]
+fn kvo_wasm_into_slice(
+    dst: &mut [f64],
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    short_period: usize,
+    long_period: usize,
+    kern: Kernel,
+) -> Result<(), KvoError> {
+    if dst.len() != high.len()
+        || dst.len() != low.len()
+        || dst.len() != close.len()
+        || dst.len() != volume.len()
+    {
+        return Err(KvoError::OutputLengthMismatch {
+            expected: high.len(),
+            got: dst.len(),
+        });
+    }
+
+    let params = KvoParams {
+        short_period: Some(short_period),
+        long_period: Some(long_period),
+    };
+    let input = KvoInput {
+        data: KvoData::Slices {
+            high,
+            low,
+            close,
+            volume,
+        },
+        params,
+    };
+
+    kvo_compute_into(dst, &input, kern)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn kvo_js(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    short_period: usize,
+    long_period: usize,
+) -> Result<Vec<f64>, JsValue> {
+    let mut output = vec![0.0; high.len()];
+
+    kvo_wasm_into_slice(
+        &mut output,
+        high,
+        low,
+        close,
+        volume,
+        short_period,
+        long_period,
+        detect_best_kernel(),
+    )
+    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    Ok(output)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn kvo_into(
+    high_ptr: *const f64,
+    low_ptr: *const f64,
+    close_ptr: *const f64,
+    volume_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    short_period: usize,
+    long_period: usize,
+) -> Result<(), JsValue> {
+    if high_ptr.is_null()
+        || low_ptr.is_null()
+        || close_ptr.is_null()
+        || volume_ptr.is_null()
+        || out_ptr.is_null()
+    {
+        return Err(JsValue::from_str("Null pointer provided"));
+    }
+
+    unsafe {
+        let high = std::slice::from_raw_parts(high_ptr, len);
+        let low = std::slice::from_raw_parts(low_ptr, len);
+        let close = std::slice::from_raw_parts(close_ptr, len);
+        let volume = std::slice::from_raw_parts(volume_ptr, len);
+
+        if high_ptr == out_ptr
+            || low_ptr == out_ptr
+            || close_ptr == out_ptr
+            || volume_ptr == out_ptr
+        {
+            let mut temp = vec![0.0; len];
+            kvo_wasm_into_slice(
+                &mut temp,
+                high,
+                low,
+                close,
+                volume,
+                short_period,
+                long_period,
+                detect_best_kernel(),
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            out.copy_from_slice(&temp);
+        } else {
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            kvo_wasm_into_slice(
+                out,
+                high,
+                low,
+                close,
+                volume,
+                short_period,
+                long_period,
+                detect_best_kernel(),
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn kvo_alloc(len: usize) -> *mut f64 {
+    let mut vec = Vec::<f64>::with_capacity(len);
+    let ptr = vec.as_mut_ptr();
+    std::mem::forget(vec);
+    ptr
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn kvo_free(ptr: *mut f64, len: usize) {
+    if !ptr.is_null() {
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, 0, len);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct KvoBatchConfig {
+    pub short_period_range: (usize, usize, usize),
+    pub long_period_range: (usize, usize, usize),
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct KvoBatchJsOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<KvoParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = kvo_batch)]
+pub fn kvo_batch_js(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+    config: JsValue,
+) -> Result<JsValue, JsValue> {
+    let config: KvoBatchConfig = serde_wasm_bindgen::from_value(config)
+        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
+
+    let sweep = KvoBatchRange {
+        short_period: config.short_period_range,
+        long_period: config.long_period_range,
+    };
+
+    let output = kvo_batch_inner(
+        high,
+        low,
+        close,
+        volume,
+        &sweep,
+        detect_best_kernel(),
+        false,
+    )
+    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let js_output = KvoBatchJsOutput {
+        values: output.values,
+        combos: output.combos,
+        rows: output.rows,
+        cols: output.cols,
+    };
+
+    serde_wasm_bindgen::to_value(&js_output)
+        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn kvo_batch_into(
+    high_ptr: *const f64,
+    low_ptr: *const f64,
+    close_ptr: *const f64,
+    volume_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    short_period_start: usize,
+    short_period_end: usize,
+    short_period_step: usize,
+    long_period_start: usize,
+    long_period_end: usize,
+    long_period_step: usize,
+) -> Result<usize, JsValue> {
+    if high_ptr.is_null()
+        || low_ptr.is_null()
+        || close_ptr.is_null()
+        || volume_ptr.is_null()
+        || out_ptr.is_null()
+    {
+        return Err(JsValue::from_str("Null pointer provided"));
+    }
+
+    if short_period_start == 0 || long_period_start == 0 {
+        return Err(JsValue::from_str("Period cannot be zero"));
+    }
+
+    if short_period_step == 0 || long_period_step == 0 {
+        return Err(JsValue::from_str("Step cannot be zero"));
+    }
+
+    unsafe {
+        let high = std::slice::from_raw_parts(high_ptr, len);
+        let low = std::slice::from_raw_parts(low_ptr, len);
+        let close = std::slice::from_raw_parts(close_ptr, len);
+        let volume = std::slice::from_raw_parts(volume_ptr, len);
+
+        let sweep = KvoBatchRange {
+            short_period: (short_period_start, short_period_end, short_period_step),
+            long_period: (long_period_start, long_period_end, long_period_step),
+        };
+
+        let aliased = high_ptr == out_ptr
+            || low_ptr == out_ptr
+            || close_ptr == out_ptr
+            || volume_ptr == out_ptr;
+
+        if aliased {
+            let output = kvo_batch_inner(
+                high,
+                low,
+                close,
+                volume,
+                &sweep,
+                detect_best_kernel(),
+                false,
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+            let total_size = output.values.len();
+            let out = std::slice::from_raw_parts_mut(out_ptr, total_size);
+            out.copy_from_slice(&output.values);
+
+            Ok(output.rows)
+        } else {
+            let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let rows = combos.len();
+            let total_size = rows
+                .checked_mul(len)
+                .ok_or_else(|| JsValue::from_str("rows * len overflow"))?;
+
+            let out = std::slice::from_raw_parts_mut(out_ptr, total_size);
+
+            kvo_batch_inner_into(
+                high,
+                low,
+                close,
+                volume,
+                &sweep,
+                detect_best_kernel(),
+                false,
+                out,
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+            Ok(rows)
+        }
+    }
+}

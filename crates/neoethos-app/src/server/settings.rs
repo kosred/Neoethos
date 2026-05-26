@@ -26,10 +26,15 @@ use std::path::PathBuf;
 use super::state::AppApiState;
 
 /// Path to the canonical `config.yaml` this server reads + writes.
-/// Hardcoded for now — the binary's CWD is the workspace root in dev
-/// and the installer's `app_dir` in production. Pulling this into an
-/// env var is part of the next-phase SoT refactor.
-const CONFIG_PATH: &str = "config.yaml";
+///
+// **F-553 + F-576 closure (2026-05-25)**: the per-file `const CONFIG_PATH`
+// was removed in favour of the process-wide install on
+// `server::state::current_config_path()` so the operator's CLI
+// `--config` flag propagates. Local helper keeps the call-sites
+// readable without re-introducing the duplication.
+fn config_path() -> std::path::PathBuf {
+    super::state::current_config_path()
+}
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,7 +66,7 @@ pub struct SettingsUpdateDto {
 }
 
 pub async fn settings(State(_state): State<AppApiState>) -> Response {
-    let settings = match Settings::from_yaml(CONFIG_PATH) {
+    let settings = match Settings::from_yaml(config_path()) {
         Ok(s) => s,
         Err(err) => {
             tracing::warn!(
@@ -88,7 +93,7 @@ pub async fn settings(State(_state): State<AppApiState>) -> Response {
 /// the typed `/settings` DTO can't enumerate (#193). The response is
 /// `{"yaml": "<file contents>", "path": "<absolute path>"}`.
 pub async fn settings_raw_yaml(State(_state): State<AppApiState>) -> Response {
-    let path = std::path::PathBuf::from(CONFIG_PATH);
+    let path = config_path();
     let absolute = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
     match std::fs::read_to_string(&path) {
         Ok(yaml) => Json(serde_json::json!({
@@ -120,7 +125,7 @@ pub async fn update_settings(
     State(_state): State<AppApiState>,
     Json(payload): Json<SettingsUpdateDto>,
 ) -> Response {
-    let mut settings = match Settings::from_yaml(CONFIG_PATH) {
+    let mut settings = match Settings::from_yaml(config_path()) {
         Ok(s) => s,
         Err(err) => {
             tracing::warn!(
@@ -193,7 +198,7 @@ pub async fn update_settings(
             Err(resp) => return resp.into_response(),
         }
     }
-    if let Err(err) = settings.save(CONFIG_PATH) {
+    if let Err(err) = settings.save(config_path()) {
         tracing::error!(
             target: "neoethos_app::server::settings",
             error = %err,

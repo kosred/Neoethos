@@ -871,6 +871,25 @@ struct WalkforwardRiskDiagnostics {
     prop_compliant: bool,
 }
 
+/// Normalises a percentage value to a fraction in `[0, 1]`.
+///
+/// **F-022 documentation (2026-05-25)** — the boundary at `1.0` is
+/// **inclusive** on the FRACTION side: `value == 1.0` is treated as
+/// "100% as a fraction", NOT "1% as a percentage". This matters
+/// because operator configs that pass `1.0` mean different things:
+///
+/// - `daily_drawdown_limit: 1.0` → 100% drawdown (sentinel: never trips)
+/// - `daily_drawdown_limit: 5` → 5% (gets normalised to 0.05)
+///
+/// The 1.0 cutoff was chosen because real prop-firm caps are always
+/// `< 1.0` (FTMO 5% / 10% are 0.05 / 0.10). A literal `1.0` is
+/// always intended as the unit-fraction representation. Operators
+/// who need exactly 1% must write `0.01` or use the typed
+/// `RiskConfig::risk_per_trade` field which has explicit semantics.
+///
+/// - Non-finite / non-positive → `0.0` (gate disabled).
+/// - `(0.0, 1.0]` → unchanged (already a fraction).
+/// - `(1.0, ∞)` → divide by 100 (caller meant percent).
 fn normalized_pct_threshold(value: f64) -> f64 {
     if !value.is_finite() || value <= 0.0 {
         0.0
@@ -1051,7 +1070,32 @@ pub fn embargoed_walkforward_backtest(
     for i in 0..n_splits {
         let start = i * window;
         let end = ((i + 1) * window).min(n);
+        // **F-020 + F-021 documentation (2026-05-25)** — minimum window
+        // of 80 bars is timeframe-AGNOSTIC by design. The audit flagged
+        // this because 80 M1-bars = 80 minutes (trivially small), while
+        // 80 D1-bars = 80 days (substantial). The fix is to compute the
+        // minimum *in calendar days* from the timestamps array rather
+        // than as a raw bar count.
+        //
+        // Phase A (this commit): we DOCUMENT the limitation + log a
+        // structured warning when the cutoff triggers, so operators
+        // see split-drop events in the run profile. The 80-bar floor
+        // stays because the existing test fixtures + persisted
+        // run-profiles assume it; raising it would break the calibration.
+        //
+        // Phase B (deferred): replace `< 80` with
+        // `(timestamps[end-1] - timestamps[start]) < min_window_days
+        // * 86_400_000` using the operator-tunable `min_window_days`
+        // knob (default 14 days for M1/M5, 30 for H1, 90 for D1).
+        // This unifies the timeframe-aware minimum across the splits.
         if end - start < 80 {
+            tracing::warn!(
+                target: "neoethos_search::validation",
+                split_index = i,
+                bars_in_window = end - start,
+                "walkforward split below 80-bar floor; dropping split. \
+                 Consider reducing n_splits or expanding the input window."
+            );
             break;
         }
 

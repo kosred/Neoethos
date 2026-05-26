@@ -8,6 +8,7 @@ use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::dtype::NativePType;
 
 pub mod core;
+pub mod test_fixtures;
 // Re-export the canonical timeframe list so callers using neoethos-data
 // can grab it without pulling in neoethos-core directly.
 pub use crate::core::discover::{

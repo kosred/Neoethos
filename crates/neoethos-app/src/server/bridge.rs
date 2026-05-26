@@ -84,15 +84,30 @@ fn asset_id_to_currency(asset_id: Option<i64>) -> &'static str {
         Some(27) => "CAD",
         Some(36) => "PLN",
         Some(id) => {
+            // F-285 fix (2026-05-25): the previous fallback returned
+            // "EUR" silently, mislabelling USD/CHF/GBP accounts at the
+            // UI. We now return an explicit "UNKNOWN" sentinel and
+            // emit a structured warn naming the unknown asset_id.
+            // The UI renders "UNKNOWN" as a banner-tagged warning
+            // (instead of showing wrong currency) and the operator
+            // sees the structured log line with the asset_id to
+            // add to this lookup.
             tracing::warn!(
                 target: "neoethos_app::bridge",
                 asset_id = id,
-                "unknown cTrader depositAssetId; falling back to EUR. \
-                 Add to asset_id_to_currency() once confirmed."
+                "unknown cTrader depositAssetId; emitting UNKNOWN sentinel \
+                 (was: silently EUR). Add to asset_id_to_currency() to fix."
             );
-            "EUR"
+            "UNKNOWN"
         }
-        None => "EUR",
+        None => {
+            // F-285: same fix for the missing-asset_id path.
+            tracing::warn!(
+                target: "neoethos_app::bridge",
+                "cTrader account has no depositAssetId; emitting UNKNOWN sentinel"
+            );
+            "UNKNOWN"
+        }
     }
 }
 
@@ -107,6 +122,25 @@ pub fn spawn(state: AppApiState) {
 
 async fn run(state: AppApiState) {
     let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
+    // **2026-05-25 — uniform-push doctrine**: alongside the 5 s safety
+    // timer, listen on the account-refresh trigger channel. Senders
+    // (force-refresh endpoint + future `OAExecutionEvent` handler)
+    // ping the channel to demand an immediate refresh — no waiting
+    // for the next 5 s tick.
+    // Graceful degradation: if a future regression spawns a second
+    // bridge, the second receive-take returns `None`. Log and run the
+    // bridge in poll-only mode (the 5 s safety timer still works) so
+    // the dashboard keeps updating even though the push-trigger path
+    // is degraded. This is per the doctrine "log loud, never panic".
+    let refresh_rx_opt = state.take_account_refresh_rx();
+    if refresh_rx_opt.is_none() {
+        tracing::error!(
+            target: "neoethos_app::bridge",
+            "account_refresh_rx already taken — running bridge in poll-only mode \
+             (push refresh trigger disabled). This indicates a duplicate `bridge::spawn` call."
+        );
+    }
+    let mut refresh_rx = refresh_rx_opt;
     // Run an immediate first refresh so the dashboard isn't blank for
     // the first 5 seconds after server start.
     ticker.tick().await;
@@ -119,7 +153,111 @@ async fn run(state: AppApiState) {
     // (1-2 missed ticks) does NOT clear the cache; only sustained failure.
     // The threshold itself lives at module scope (#148) as STALE_THRESHOLD.
     let mut failures: usize = 0;
+
+    // **F-201/F-202 closure (2026-05-25 — operator directive
+    // "periodic refresh 24h")**: the symbol-catalog cache used to be
+    // lazy-loaded only on first position with `sym#<id>` and then
+    // pinned for the lifetime of the process. A broker maintenance
+    // window that re-issues symbol IDs (rare but real) would silently
+    // mislabel positions until the operator restarted. Now the
+    // bridge proactively refreshes the catalog every 24 hours so
+    // symbol-ID drift is caught within a day automatically.
+    const SYMBOL_REFRESH_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(86_400);
+    let mut last_symbol_refresh: Option<std::time::Instant> = None;
+
     loop {
+        // **F-231/F-501/F-630 closure (2026-05-25)**: Risky Mode
+        // auto re-arm check. Each tick of the polling loop (every 5s)
+        // we ask the persistence layer "has the 24h cooldown elapsed
+        // since the last kill-switch trip?" — when yes, it flips
+        // `armed = true` on disk and clears the kill timestamp. Cheap
+        // (single file read; only writes on the rare day-cadence
+        // re-arm event), and the 5s granularity is way faster than the
+        // human-visible "operator notices kill switch came back".
+        match tokio::task::spawn_blocking(
+            crate::app_services::risky_mode_persistence::auto_re_arm_if_ready,
+        )
+        .await
+        {
+            Ok(Ok(true)) => {
+                tracing::info!(
+                    target: "neoethos_app::server::bridge",
+                    "Risky Mode auto re-armed (24h cooldown elapsed)"
+                );
+            }
+            Ok(Ok(false)) => {
+                // No state file, or cooldown still in progress, or
+                // already armed — all benign. No log.
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    target: "neoethos_app::server::bridge",
+                    error = %err,
+                    "Risky Mode auto re-arm check failed; will retry next cycle"
+                );
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "neoethos_app::server::bridge",
+                    error = %join_err,
+                    "Risky Mode auto re-arm blocking task panicked"
+                );
+            }
+        }
+
+        // **F-201/F-202**: 24h periodic symbol-catalog refresh.
+        // Independent of the account-snapshot refresh because broker
+        // catalogs change on a different timescale (rarely vs.
+        // every 5s).
+        let needs_symbol_refresh = match last_symbol_refresh {
+            None => true,
+            Some(t) => t.elapsed() >= SYMBOL_REFRESH_INTERVAL,
+        };
+        if needs_symbol_refresh {
+            match tokio::task::spawn_blocking(fetch_broker_symbols_blocking).await {
+                Ok(Ok(bundle)) => {
+                    let catalog: HashMap<i64, String> = bundle
+                        .symbols
+                        .into_iter()
+                        .map(|s| (s.symbol_id, s.symbol_name))
+                        .collect();
+                    let count = catalog.len();
+                    state.set_symbol_catalog(catalog).await;
+                    last_symbol_refresh = Some(std::time::Instant::now());
+                    tracing::info!(
+                        target: "neoethos_app::server::bridge",
+                        symbol_count = count,
+                        "periodic symbol-catalog refresh complete (24h cadence)"
+                    );
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        target: "neoethos_app::server::bridge",
+                        error = %err,
+                        "periodic symbol-catalog refresh failed; will retry next cycle"
+                    );
+                }
+                Err(join_err) => {
+                    tracing::warn!(
+                        target: "neoethos_app::server::bridge",
+                        error = %join_err,
+                        "periodic symbol-catalog blocking task panicked; will retry"
+                    );
+                }
+            }
+        }
+
+        // **2026-05-25 — drain any pending push-triggers** before the
+        // refresh so a burst of `OAExecutionEvent`s collapses into a
+        // single refresh per polling iteration (idempotent — the
+        // refresh reads broker-of-record state, not deltas).
+        if let Some(rx) = refresh_rx.as_mut() {
+            while let Ok(()) = rx.try_recv() {
+                // Drain only; the refresh below covers them all.
+            }
+        }
+
         match refresh_once(&state).await {
             Ok(payload) => {
                 state.set_account(payload).await;
@@ -154,7 +292,29 @@ async fn run(state: AppApiState) {
                 }
             }
         }
-        ticker.tick().await;
+        // **2026-05-25 — push-trigger or timer, whichever fires first**.
+        // The 5 s ticker is the safety floor; `refresh_rx.recv()` lets
+        // a force-refresh button or a future `OAExecutionEvent` push
+        // skip the wait. `tokio::select!` ensures both wakeups are
+        // honoured without spinning. The drain-loop at the top of the
+        // outer loop body collapses any burst of triggers into a
+        // single refresh per iteration.
+        //
+        // If `refresh_rx` is `None` (degraded mode — see the
+        // graceful-degradation note at the top of `run`), we fall
+        // back to ticker-only — the operator still gets a refresh
+        // every 5 s, just without the push acceleration.
+        match refresh_rx.as_mut() {
+            Some(rx) => {
+                tokio::select! {
+                    _ = ticker.tick() => {},
+                    _ = rx.recv() => {},
+                }
+            }
+            None => {
+                ticker.tick().await;
+            }
+        }
     }
 }
 
@@ -469,15 +629,26 @@ fn position_to_payload(
                     } else {
                         entry_price - mid
                     };
-                    let pip_size = if resolved_name
+                    // GROUP D remediation (operator directive 2026-05-25):
+                    // pip_size via canonical symbol_metadata, falling back
+                    // to the legacy JPY heuristic only when metadata is
+                    // genuinely absent (preserves backwards-compat for
+                    // exotics not yet in the registry).
+                    let pip_size = resolved_name
                         .as_deref()
-                        .map(|n| n.to_ascii_uppercase().ends_with("JPY"))
-                        .unwrap_or(false)
-                    {
-                        0.01
-                    } else {
-                        0.0001
-                    };
+                        .and_then(neoethos_core::symbol_metadata::resolve)
+                        .map(|meta| meta.pip_size)
+                        .unwrap_or_else(|| {
+                            if resolved_name
+                                .as_deref()
+                                .map(|n| n.to_ascii_uppercase().ends_with("JPY"))
+                                .unwrap_or(false)
+                            {
+                                0.01
+                            } else {
+                                0.0001
+                            }
+                        });
                     pnl_pips = price_diff / pip_size;
                 }
             }

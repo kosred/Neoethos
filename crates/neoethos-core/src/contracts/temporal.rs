@@ -226,6 +226,24 @@ fn require_match(
 }
 
 fn stable_contract_hash<T: Serialize>(value: &T) -> String {
-    let bytes = serde_json::to_vec(value).expect("contract policy serialization must be stable");
-    format!("fnv64:{:016x}", crate::utils::fnv1a64(&bytes))
+    // **2026-05-25 unwrap audit**: `serde_json::to_vec` only fails for
+    // serializers that produce non-JSON-representable values (e.g.
+    // maps with non-string keys, custom `Serialize` impls returning
+    // an error). All current contract policy types are plain
+    // `#[derive(Serialize)]` structs so this is logically infallible.
+    // We still pattern-match per the no-panic doctrine: a future
+    // contract field that uses an unsupported map key would now hash
+    // to a distinguishable "fnv64:UNHASHABLE-<error>" sentinel
+    // instead of panicking the temporal-validation pipeline.
+    match serde_json::to_vec(value) {
+        Ok(bytes) => format!("fnv64:{:016x}", crate::utils::fnv1a64(&bytes)),
+        Err(err) => {
+            tracing::error!(
+                target: "neoethos_core::contracts::temporal",
+                error = %err,
+                "contract policy serialization failed — emitting sentinel hash"
+            );
+            format!("fnv64:UNHASHABLE-{}", crate::utils::fnv1a64(err.to_string().as_bytes()))
+        }
+    }
 }

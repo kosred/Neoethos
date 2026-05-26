@@ -19,10 +19,16 @@
 //! Unavailable` so the Flutter side can render a meaningful error
 //! state instead of an empty json blob.
 
+use std::convert::Infallible;
+use std::time::Duration;
+
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use futures::stream::{Stream, StreamExt};
+use tokio_stream::wrappers::BroadcastStream;
 
 #[cfg(test)]
 use super::state::PositionPayload;
@@ -99,6 +105,75 @@ impl From<AccountSnapshotPayload> for AccountSnapshotDto {
             fetched_at_unix_ms: Some(p.fetched_at_unix_ms),
             positions: p.positions.into_iter().map(Into::into).collect(),
         }
+    }
+}
+
+/// **2026-05-25 — operator directive "uniform push everywhere"**:
+/// `GET /account/snapshot/stream` — Server-Sent Events that pushes
+/// every account update (balance, equity, free margin, positions,
+/// PnL) the moment the bridge writes a fresh snapshot to the cache.
+///
+/// Replaces the Flutter 1Hz polling of `/account/snapshot` with a
+/// real-time push channel. Latency = network RTT (~1-5 ms) instead
+/// of poll interval (~1000 ms).
+///
+/// Mirror of `live_spots::stream` for ticks. Same SSE wire shape:
+/// `event: account` + JSON payload per snapshot, plus a 15 s
+/// keep-alive so HTTP proxies don't idle-close the connection.
+///
+/// The polling `/account/snapshot` route is kept as a fallback for
+/// cold-start (Flutter calls it once on mount before switching to
+/// the SSE stream) and for HTTP clients without SSE support.
+///
+/// **Architectural note**: positions are part of the
+/// `AccountSnapshotPayload` shape so the same stream covers
+/// balance + equity + open positions. A separate `/positions/stream`
+/// would be redundant; one channel serves the Dashboard's full view.
+pub async fn stream(
+    State(state): State<AppApiState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let receiver = state.subscribe_account();
+    let stream = BroadcastStream::new(receiver).filter_map(|res| async move {
+        let payload = res.ok()?;
+        let dto = AccountSnapshotDto::from(payload);
+        let json = serde_json::to_string(&dto).ok()?;
+        Some(Ok(Event::default().event("account").data(json)))
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
+/// `POST /account/snapshot/refresh` — operator-triggered immediate
+/// account refresh. Pings the bridge's `account_refresh_rx` channel
+/// so the next polling iteration fires NOW instead of waiting up to
+/// 5 s for the timer. Returns the freshly-cached snapshot (or 503
+/// if the cache is still empty after the refresh, e.g. broker
+/// session not yet established).
+///
+/// **2026-05-25 — operator directive "uniform push everywhere"**:
+/// same trigger channel that the future `OAExecutionEvent` handler
+/// will use; exposing it as an HTTP endpoint gives the operator a
+/// "force refresh" button in the UI without any extra plumbing.
+pub async fn refresh(State(state): State<AppApiState>) -> Response {
+    state.trigger_account_refresh();
+    // Give the bridge a couple of polling iterations to react before
+    // returning the (likely refreshed) snapshot. This is generous
+    // enough that the bridge's refresh-once round trip + cache write
+    // typically completes within the wait.
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    match state.account().await {
+        Some(payload) => Json(AccountSnapshotDto::from(payload)).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "broker session not ready",
+                "code": "broker_not_ready",
+            })),
+        )
+            .into_response(),
     }
 }
 

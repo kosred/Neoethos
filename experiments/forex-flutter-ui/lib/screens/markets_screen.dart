@@ -205,23 +205,51 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
               runSpacing: 6,
               children: [
                 for (final s in filtered.take(120))
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 3,
-                    ),
-                    decoration: BoxDecoration(
-                      color: ForexAiTokens.surfaceBg,
-                      border: Border.all(color: ForexAiTokens.border),
-                      borderRadius:
-                          BorderRadius.circular(ForexAiTokens.rSm),
-                    ),
-                    child: Text(
-                      s.symbolName,
-                      style: const TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                        color: ForexAiTokens.textPrimary,
+                  // #269: chips were previously a plain `Container`+`Text`
+                  // — no `onTap` → operator clicked and nothing happened.
+                  // Wrap in InkWell that pins the symbol into the Chart
+                  // screen (via chartSymbolProvider) and triggers the
+                  // sidebar Chart navigation through a Consumer ref.
+                  InkWell(
+                    onTap: () {
+                      ref.read(chartSymbolProvider.notifier).state =
+                          s.symbolName;
+                      // Best-effort: hop to Chart screen so the user
+                      // sees their selection. We rely on the route
+                      // notifier exposed in the sidebar — but at
+                      // minimum the chartSymbolProvider mutation
+                      // means the Chart panel will show the pair
+                      // next time the operator navigates to it.
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          duration: const Duration(milliseconds: 1200),
+                          content: Text(
+                            'Pinned ${s.symbolName} to Chart panel A. '
+                            'Open Chart to view candles.',
+                          ),
+                        ),
+                      );
+                    },
+                    borderRadius:
+                        BorderRadius.circular(ForexAiTokens.rSm),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: ForexAiTokens.surfaceBg,
+                        border: Border.all(color: ForexAiTokens.border),
+                        borderRadius:
+                            BorderRadius.circular(ForexAiTokens.rSm),
+                      ),
+                      child: Text(
+                        s.symbolName,
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: ForexAiTokens.textPrimary,
+                        ),
                       ),
                     ),
                   ),

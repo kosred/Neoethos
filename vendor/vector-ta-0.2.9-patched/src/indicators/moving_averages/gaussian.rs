@@ -1,0 +1,3001 @@
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::cuda_available;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::moving_averages::gaussian_wrapper::DeviceArrayF32Py;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::moving_averages::CudaGaussian;
+use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_uninit_f64, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use std::arch::x86_64::*;
+use std::f64::consts::PI;
+use std::mem::MaybeUninit;
+use thiserror::Error;
+
+const LANES_AVX512: usize = 8;
+const LANES_AVX2: usize = 4;
+
+#[inline(always)]
+fn gaussian_source<'a>(candles: &'a Candles, source: &str) -> &'a [f64] {
+    match source {
+        "close" => candles.close.as_slice(),
+        "open" => candles.open.as_slice(),
+        "high" => candles.high.as_slice(),
+        "low" => candles.low.as_slice(),
+        "volume" => candles.volume.as_slice(),
+        "hl2" => candles.hl2.as_slice(),
+        "hlc3" => candles.hlc3.as_slice(),
+        "ohlc4" => candles.ohlc4.as_slice(),
+        "hlcc4" => candles.hlcc4.as_slice(),
+        _ => source_type(candles, source),
+    }
+}
+
+impl<'a> AsRef<[f64]> for GaussianInput<'a> {
+    #[inline(always)]
+    fn as_ref(&self) -> &[f64] {
+        match &self.data {
+            GaussianData::Slice(slice) => slice,
+            GaussianData::Candles { candles, source } => gaussian_source(candles, source),
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn gaussian_output_into_js(
+    data: &[f64],
+    period: usize,
+    poles: usize,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = gaussian_js(data, period, poles)?;
+    crate::write_wasm_f64_output("gaussian_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn gaussian_batch_output_into_js(
+    data: &[f64],
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+    poles_start: usize,
+    poles_end: usize,
+    poles_step: usize,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = gaussian_batch_js(
+        data,
+        period_start,
+        period_end,
+        period_step,
+        poles_start,
+        poles_end,
+        poles_step,
+    )?;
+    crate::write_wasm_f64_output("gaussian_batch_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn gaussian_batch_unified_output_into_js(
+    data: &[f64],
+    config: JsValue,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = gaussian_batch_unified_js(data, config)?;
+    crate::write_wasm_selected_object_f64_outputs(
+        "gaussian_batch_unified_output_into_js",
+        &value,
+        out,
+    )
+}
+
+#[cfg(test)]
+mod tests_into {
+    use super::*;
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+    #[test]
+    fn test_gaussian_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
+        let mut data = Vec::with_capacity(256);
+
+        for _ in 0..8 {
+            data.push(f64::NAN);
+        }
+
+        for i in 0..(256 - 8) {
+            let x = i as f64;
+            data.push(x * 0.1 + (x * 0.07).sin());
+        }
+
+        let input = GaussianInput::from_slice(&data, GaussianParams::default());
+
+        let base = gaussian(&input)?.values;
+
+        let mut out = vec![0.0f64; data.len()];
+        gaussian_into(&input, &mut out)?;
+
+        assert_eq!(base.len(), out.len());
+
+        fn eq_or_both_nan(a: f64, b: f64) -> bool {
+            (a.is_nan() && b.is_nan()) || (a - b).abs() <= 1e-12
+        }
+        for i in 0..base.len() {
+            assert!(
+                eq_or_both_nan(base[i], out[i]),
+                "mismatch at idx {}: base={}, out={}",
+                i,
+                base[i],
+                out[i]
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum GaussianData<'a> {
+    Candles {
+        candles: &'a Candles,
+        source: &'a str,
+    },
+    Slice(&'a [f64]),
+}
+
+#[derive(Debug, Clone)]
+pub struct GaussianOutput {
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "wasm"),
+    derive(Serialize, Deserialize)
+)]
+pub struct GaussianParams {
+    pub period: Option<usize>,
+    pub poles: Option<usize>,
+}
+
+impl Default for GaussianParams {
+    fn default() -> Self {
+        Self {
+            period: Some(14),
+            poles: Some(4),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GaussianInput<'a> {
+    pub data: GaussianData<'a>,
+    pub params: GaussianParams,
+}
+
+impl<'a> GaussianInput<'a> {
+    pub fn from_candles(c: &'a Candles, s: &'a str, p: GaussianParams) -> Self {
+        Self {
+            data: GaussianData::Candles {
+                candles: c,
+                source: s,
+            },
+            params: p,
+        }
+    }
+    pub fn from_slice(sl: &'a [f64], p: GaussianParams) -> Self {
+        Self {
+            data: GaussianData::Slice(sl),
+            params: p,
+        }
+    }
+    pub fn with_default_candles(c: &'a Candles) -> Self {
+        Self::from_candles(c, "close", GaussianParams::default())
+    }
+    pub fn get_period(&self) -> usize {
+        self.params.period.unwrap_or(14)
+    }
+    pub fn get_poles(&self) -> usize {
+        self.params.poles.unwrap_or(4)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct GaussianBuilder {
+    period: Option<usize>,
+    poles: Option<usize>,
+    kernel: Kernel,
+}
+
+impl Default for GaussianBuilder {
+    fn default() -> Self {
+        Self {
+            period: None,
+            poles: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl GaussianBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn period(mut self, n: usize) -> Self {
+        self.period = Some(n);
+        self
+    }
+    pub fn poles(mut self, k: usize) -> Self {
+        self.poles = Some(k);
+        self
+    }
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+    pub fn apply(self, c: &Candles) -> Result<GaussianOutput, GaussianError> {
+        let p = GaussianParams {
+            period: self.period,
+            poles: self.poles,
+        };
+        let i = GaussianInput::from_candles(c, "close", p);
+        gaussian_with_kernel(&i, self.kernel)
+    }
+    pub fn apply_slice(self, d: &[f64]) -> Result<GaussianOutput, GaussianError> {
+        let p = GaussianParams {
+            period: self.period,
+            poles: self.poles,
+        };
+        let i = GaussianInput::from_slice(d, p);
+        gaussian_with_kernel(&i, self.kernel)
+    }
+    pub fn into_stream(self) -> Result<GaussianStream, GaussianError> {
+        let p = GaussianParams {
+            period: self.period,
+            poles: self.poles,
+        };
+        GaussianStream::try_new(p)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GaussianError {
+    #[error("gaussian: Input data slice is empty.")]
+    EmptyInputData,
+    #[error("gaussian: No data provided to Gaussian filter.")]
+    NoData,
+    #[error("gaussian: Invalid period: period = {period}, data length = {data_len}")]
+    InvalidPeriod { period: usize, data_len: usize },
+    #[error("gaussian: Invalid number of poles: expected 1..4, got {poles}")]
+    InvalidPoles { poles: usize },
+    #[error("gaussian: Period is longer than the data. period={period}, data_len={data_len}")]
+    PeriodLongerThanData { period: usize, data_len: usize },
+    #[error("gaussian: All values are NaN.")]
+    AllValuesNaN,
+    #[error("gaussian: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+    #[error("gaussian: Period too small. Period must be >= 2 for meaningful Gaussian filtering. Got period={period}")]
+    DegeneratePeriod { period: usize },
+    #[error("gaussian: Period of 1 causes degenerate filter (alpha=0). This produces constant zero output. Use period >= 2.")]
+    PeriodOneDegenerate,
+    #[error("gaussian: output length mismatch: expected {expected}, got {got}")]
+    OutputLengthMismatch { expected: usize, got: usize },
+    #[error("gaussian: invalid range: start={start}, end={end}, step={step}")]
+    InvalidRange {
+        start: usize,
+        end: usize,
+        step: usize,
+    },
+    #[error("gaussian: invalid kernel for batch API: {0:?}")]
+    InvalidKernelForBatch(Kernel),
+    #[error("gaussian: size overflow (rows={rows}, cols={cols})")]
+    SizeOverflow { rows: usize, cols: usize },
+}
+
+#[inline]
+pub fn gaussian(input: &GaussianInput) -> Result<GaussianOutput, GaussianError> {
+    gaussian_with_kernel(input, Kernel::Auto)
+}
+
+#[inline(always)]
+fn has_fma() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::is_x86_feature_detected!("fma")
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+#[inline(always)]
+pub fn gaussian_scalar(data: &[f64], period: usize, poles: usize, out: &mut [f64]) {
+    debug_assert_eq!(data.len(), out.len());
+
+    if has_fma() {
+        unsafe { gaussian_scalar_fma(data, period, poles, out) }
+    } else {
+        gaussian_scalar_fallback(data, period, poles, out)
+    }
+}
+
+#[cfg_attr(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature(enable = "fma")
+)]
+unsafe fn gaussian_scalar_fma(data: &[f64], period: usize, poles: usize, out: &mut [f64]) {
+    use core::f64::consts::PI;
+
+    let beta = {
+        let num = 1.0 - (2.0 * PI / period as f64).cos();
+        let den = (2.0f64).powf(1.0 / poles as f64) - 1.0;
+        num / den
+    };
+    let alpha = {
+        let tmp = beta * beta + 2.0 * beta;
+        -beta + tmp.sqrt()
+    };
+
+    match poles {
+        1 => gaussian_poles1_fma(data, alpha, out),
+        2 => gaussian_poles2_fma(data, alpha, out),
+        3 => gaussian_poles3_fma(data, alpha, out),
+        4 => gaussian_poles4_fma(data, alpha, out),
+        _ => core::hint::unreachable_unchecked(),
+    }
+}
+
+fn gaussian_scalar_fallback(data: &[f64], period: usize, poles: usize, out: &mut [f64]) {
+    use core::f64::consts::PI;
+
+    let beta = {
+        let num = 1.0 - (2.0 * PI / period as f64).cos();
+        let den = (2.0f64).powf(1.0 / poles as f64) - 1.0;
+        num / den
+    };
+    let alpha = {
+        let tmp = beta * beta + 2.0 * beta;
+        -beta + tmp.sqrt()
+    };
+
+    unsafe {
+        match poles {
+            1 => gaussian_poles1_fma(data, alpha, out),
+            2 => gaussian_poles2_fma(data, alpha, out),
+            3 => gaussian_poles3_fma(data, alpha, out),
+            4 => gaussian_poles4_fma(data, alpha, out),
+            _ => core::hint::unreachable_unchecked(),
+        }
+    }
+}
+
+pub fn gaussian_with_kernel(
+    input: &GaussianInput,
+    kernel: Kernel,
+) -> Result<GaussianOutput, GaussianError> {
+    let data: &[f64] = input.as_ref();
+
+    let len = data.len();
+    let period = input.get_period();
+    let poles = input.get_poles();
+
+    if len == 0 {
+        return Err(GaussianError::NoData);
+    }
+
+    if period == 1 {
+        return Err(GaussianError::PeriodOneDegenerate);
+    }
+
+    if period < 2 {
+        return Err(GaussianError::DegeneratePeriod { period });
+    }
+
+    if period > len {
+        return Err(GaussianError::PeriodLongerThanData {
+            period,
+            data_len: len,
+        });
+    }
+
+    if !(1..=4).contains(&poles) {
+        return Err(GaussianError::InvalidPoles { poles });
+    }
+
+    let first_valid = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(GaussianError::AllValuesNaN)?;
+    if len - first_valid < period {
+        return Err(GaussianError::NotEnoughValidData {
+            needed: period,
+            valid: len - first_valid,
+        });
+    }
+
+    let chosen = match kernel {
+        Kernel::Auto => Kernel::Scalar,
+        other => other,
+    };
+    let mut out = alloc_uninit_f64(len);
+
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => gaussian_scalar(data, period, poles, &mut out),
+
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => gaussian_avx2(data, period, poles, &mut out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => gaussian_avx512(data, period, poles, &mut out),
+            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+            Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
+                gaussian_scalar(data, period, poles, &mut out)
+            }
+
+            Kernel::Auto => unreachable!(),
+        }
+    }
+
+    Ok(GaussianOutput { values: out })
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn gaussian_avx2(data: &[f64], period: usize, poles: usize, out: &mut [f64]) {
+    gaussian_scalar(data, period, poles, out);
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn gaussian_avx512(data: &[f64], period: usize, poles: usize, out: &mut [f64]) {
+    gaussian_scalar(data, period, poles, out);
+}
+
+#[inline(always)]
+unsafe fn gaussian_poles1_fma(inp: &[f64], alpha: f64, out: &mut [f64]) {
+    let c0 = alpha;
+    let c1 = 1.0 - alpha;
+
+    let mut prev = 0.0;
+    for i in 0..inp.len() {
+        let x = *inp.get_unchecked(i);
+        prev = c1.mul_add(prev, c0 * x);
+        *out.get_unchecked_mut(i) = prev;
+    }
+}
+
+#[inline(always)]
+unsafe fn gaussian_poles2_fma(inp: &[f64], alpha: f64, out: &mut [f64]) {
+    let a2 = alpha * alpha;
+    let one = 1.0 - alpha;
+    let c0 = a2;
+    let c1 = 2.0 * one;
+    let c2 = -(one * one);
+
+    let mut prev1 = 0.0;
+    let mut prev0 = 0.0;
+
+    for i in 0..inp.len() {
+        let x = *inp.get_unchecked(i);
+        let y = c2.mul_add(prev0, c1.mul_add(prev1, c0 * x));
+        prev0 = prev1;
+        prev1 = y;
+        *out.get_unchecked_mut(i) = y;
+    }
+}
+
+#[inline(always)]
+unsafe fn gaussian_poles3_fma(inp: &[f64], alpha: f64, out: &mut [f64]) {
+    let a3 = alpha * alpha * alpha;
+    let one = 1.0 - alpha;
+    let one2 = one * one;
+
+    let c0 = a3;
+    let c1 = 3.0 * one;
+    let c2 = -3.0 * one2;
+    let c3 = one2 * one;
+
+    let mut p2 = 0.0;
+    let mut p1 = 0.0;
+    let mut p0 = 0.0;
+
+    for i in 0..inp.len() {
+        let x = *inp.get_unchecked(i);
+        let y = c3.mul_add(p0, c2.mul_add(p1, c1.mul_add(p2, c0 * x)));
+        p0 = p1;
+        p1 = p2;
+        p2 = y;
+        *out.get_unchecked_mut(i) = y;
+    }
+}
+
+#[inline(always)]
+unsafe fn gaussian_poles4_fma(inp: &[f64], alpha: f64, out: &mut [f64]) {
+    let a4 = alpha * alpha * alpha * alpha;
+    let one = 1.0 - alpha;
+    let one2 = one * one;
+    let one3 = one2 * one;
+
+    let c0 = a4;
+    let c1 = 4.0 * one;
+    let c2 = -6.0 * one2;
+    let c3 = 4.0 * one3;
+    let c4 = -(one3 * one);
+
+    let mut p3 = 0.0;
+    let mut p2 = 0.0;
+    let mut p1 = 0.0;
+    let mut p0 = 0.0;
+
+    for i in 0..inp.len() {
+        let x = *inp.get_unchecked(i);
+        let y = c4.mul_add(p0, c3.mul_add(p1, c2.mul_add(p2, c1.mul_add(p3, c0 * x))));
+        p0 = p1;
+        p1 = p2;
+        p2 = p3;
+        p3 = y;
+        *out.get_unchecked_mut(i) = y;
+    }
+}
+
+#[inline(always)]
+fn gaussian_poles1(data: &[f64], n: usize, alpha: f64) -> Vec<f64> {
+    let c0 = alpha;
+    let c1 = 1.0 - alpha;
+    let mut fil = vec![0.0; 1 + n];
+    for i in 0..n {
+        fil[i + 1] = c0 * data[i] + c1 * fil[i];
+    }
+    fil[1..1 + n].to_vec()
+}
+#[inline(always)]
+fn gaussian_poles2(data: &[f64], n: usize, alpha: f64) -> Vec<f64> {
+    let a2 = alpha * alpha;
+    let one_a = 1.0 - alpha;
+    let c0 = a2;
+    let c1 = 2.0 * one_a;
+    let c2 = -(one_a * one_a);
+    let mut fil = vec![0.0; 2 + n];
+    for i in 0..n {
+        fil[i + 2] = c0 * data[i] + c1 * fil[i + 1] + c2 * fil[i];
+    }
+    fil[2..2 + n].to_vec()
+}
+#[inline(always)]
+fn gaussian_poles3(data: &[f64], n: usize, alpha: f64) -> Vec<f64> {
+    let a3 = alpha * alpha * alpha;
+    let one_a = 1.0 - alpha;
+    let one_a2 = one_a * one_a;
+    let c0 = a3;
+    let c1 = 3.0 * one_a;
+    let c2 = -3.0 * one_a2;
+    let c3 = one_a2 * one_a;
+    let mut fil = vec![0.0; 3 + n];
+    for i in 0..n {
+        fil[i + 3] = c0 * data[i] + c1 * fil[i + 2] + c2 * fil[i + 1] + c3 * fil[i];
+    }
+    fil[3..3 + n].to_vec()
+}
+#[inline(always)]
+fn gaussian_poles4(data: &[f64], n: usize, alpha: f64) -> Vec<f64> {
+    let a4 = alpha * alpha * alpha * alpha;
+    let one_a = 1.0 - alpha;
+    let one_a2 = one_a * one_a;
+    let one_a3 = one_a2 * one_a;
+    let c0 = a4;
+    let c1 = 4.0 * one_a;
+    let c2 = -6.0 * one_a2;
+    let c3 = 4.0 * one_a3;
+    let c4 = -(one_a3 * one_a);
+    let mut fil = vec![0.0; 4 + n];
+    for i in 0..n {
+        fil[i + 4] =
+            c0 * data[i] + c1 * fil[i + 3] + c2 * fil[i + 2] + c3 * fil[i + 1] + c4 * fil[i];
+    }
+    fil[4..4 + n].to_vec()
+}
+
+#[derive(Debug, Clone)]
+pub struct GaussianStream {
+    period: usize,
+    poles: u8,
+    alpha: f64,
+    one_minus: f64,
+
+    c: [f64; 5],
+
+    y: [f64; 4],
+
+    idx: usize,
+    init: bool,
+}
+
+impl GaussianStream {
+    #[inline]
+    pub fn try_new(params: GaussianParams) -> Result<Self, GaussianError> {
+        let period = params.period.unwrap_or(14);
+        let poles = params.poles.unwrap_or(4);
+
+        if period == 1 {
+            return Err(GaussianError::PeriodOneDegenerate);
+        }
+        if period < 2 {
+            return Err(GaussianError::DegeneratePeriod { period });
+        }
+        if !(1..=4).contains(&poles) {
+            return Err(GaussianError::InvalidPoles { poles });
+        }
+
+        let inv_n = 1.0 / (period as f64);
+        let theta = core::f64::consts::PI * 2.0 * inv_n;
+        let one_minus_cos = {
+            let s = (0.5 * theta).sin();
+            2.0 * (s * s)
+        };
+
+        #[inline(always)]
+        fn denom_for_poles(k: usize) -> f64 {
+            match k {
+                1 => 1.0,
+                2 => core::f64::consts::SQRT_2 - 1.0,
+                3 => 0.259_921_049_894_873_2,
+                4 => 0.189_207_115_002_721_06,
+                _ => unreachable!(),
+            }
+        }
+        let beta = one_minus_cos / denom_for_poles(poles);
+
+        let alpha = if beta == 0.0 {
+            0.0
+        } else {
+            let r = (beta * beta + 2.0 * beta).sqrt();
+            (2.0 * beta) / (beta + r)
+        };
+
+        let one_minus = 1.0 - alpha;
+
+        let a = alpha;
+        let a2 = a * a;
+        let a3 = a2 * a;
+        let a4 = a2 * a2;
+        let o = one_minus;
+        let o2 = o * o;
+        let o3 = o2 * o;
+        let o4 = o2 * o2;
+
+        let mut c = [0.0; 5];
+        match poles {
+            1 => {
+                c[0] = a;
+                c[1] = o;
+            }
+            2 => {
+                c[0] = a2;
+                c[1] = 2.0 * o;
+                c[2] = -o2;
+            }
+            3 => {
+                c[0] = a3;
+                c[1] = 3.0 * o;
+                c[2] = -3.0 * o2;
+                c[3] = o3;
+            }
+            4 => {
+                c[0] = a4;
+                c[1] = 4.0 * o;
+                c[2] = -6.0 * o2;
+                c[3] = 4.0 * o3;
+                c[4] = -o4;
+            }
+            _ => unreachable!(),
+        }
+
+        Ok(Self {
+            period,
+            poles: poles as u8,
+            alpha,
+            one_minus,
+            c,
+            y: [0.0; 4],
+            idx: 0,
+            init: true,
+        })
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, x: f64) -> f64 {
+        let p = self.poles;
+        let c = self.c;
+        let mut y0 = self.y[0];
+        let mut y1 = self.y[1];
+        let mut y2 = self.y[2];
+        let mut y3 = self.y[3];
+
+        let y = match p {
+            1 => self.alpha.mul_add(x, self.one_minus * y0),
+            2 => c[2].mul_add(y1, c[1].mul_add(y0, c[0] * x)),
+            3 => c[3].mul_add(y2, c[2].mul_add(y1, c[1].mul_add(y0, c[0] * x))),
+            _ => c[4].mul_add(
+                y3,
+                c[3].mul_add(y2, c[2].mul_add(y1, c[1].mul_add(y0, c[0] * x))),
+            ),
+        };
+
+        self.y[3] = y2;
+        self.y[2] = y1;
+        self.y[1] = y0;
+        self.y[0] = y;
+
+        self.idx = self.idx.wrapping_add(1);
+        y
+    }
+
+    #[inline]
+    pub fn update_many(&mut self, xs: &[f64], out: &mut [f64]) {
+        debug_assert_eq!(xs.len(), out.len());
+        for (i, &x) in xs.iter().enumerate() {
+            out[i] = self.update(x);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GaussianBatchRange {
+    pub period: (usize, usize, usize),
+    pub poles: (usize, usize, usize),
+}
+
+impl Default for GaussianBatchRange {
+    fn default() -> Self {
+        Self {
+            period: (14, 263, 1),
+            poles: (4, 4, 0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GaussianBatchBuilder {
+    range: GaussianBatchRange,
+    kernel: Kernel,
+}
+
+impl GaussianBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+    pub fn period_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.period = (start, end, step);
+        self
+    }
+    pub fn period_static(mut self, p: usize) -> Self {
+        self.range.period = (p, p, 0);
+        self
+    }
+    pub fn poles_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.poles = (start, end, step);
+        self
+    }
+    pub fn poles_static(mut self, p: usize) -> Self {
+        self.range.poles = (p, p, 0);
+        self
+    }
+    pub fn apply_slice(self, data: &[f64]) -> Result<GaussianBatchOutput, GaussianError> {
+        gaussian_batch_with_kernel(data, &self.range, self.kernel)
+    }
+    pub fn apply_candles(
+        self,
+        c: &Candles,
+        src: &str,
+    ) -> Result<GaussianBatchOutput, GaussianError> {
+        let slice = gaussian_source(c, src);
+        self.apply_slice(slice)
+    }
+    pub fn with_default_slice(
+        data: &[f64],
+        k: Kernel,
+    ) -> Result<GaussianBatchOutput, GaussianError> {
+        GaussianBatchBuilder::new().kernel(k).apply_slice(data)
+    }
+    pub fn with_default_candles(c: &Candles) -> Result<GaussianBatchOutput, GaussianError> {
+        GaussianBatchBuilder::new()
+            .kernel(Kernel::Auto)
+            .apply_candles(c, "close")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GaussianBatchOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<GaussianParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl GaussianBatchOutput {
+    pub fn row_for_params(&self, p: &GaussianParams) -> Option<usize> {
+        self.combos.iter().position(|c| {
+            c.period.unwrap_or(14) == p.period.unwrap_or(14)
+                && c.poles.unwrap_or(4) == p.poles.unwrap_or(4)
+        })
+    }
+    pub fn values_for(&self, p: &GaussianParams) -> Option<&[f64]> {
+        self.row_for_params(p).map(|row| {
+            let start = row * self.cols;
+            &self.values[start..start + self.cols]
+        })
+    }
+}
+
+#[inline(always)]
+fn expand_grid(r: &GaussianBatchRange) -> Result<Vec<GaussianParams>, GaussianError> {
+    #[inline(always)]
+    fn axis_usize((start, end, step): (usize, usize, usize)) -> Result<Vec<usize>, GaussianError> {
+        if step == 0 || start == end {
+            return Ok(vec![start]);
+        }
+        let (lo, hi) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let v: Vec<usize> = (lo..=hi).step_by(step).collect();
+        if v.is_empty() {
+            return Err(GaussianError::InvalidRange { start, end, step });
+        }
+        Ok(v)
+    }
+    let periods = axis_usize(r.period)?;
+    let poles = axis_usize(r.poles)?;
+    let mut out = Vec::with_capacity(periods.len().saturating_mul(poles.len()));
+    for &p in &periods {
+        for &k in &poles {
+            out.push(GaussianParams {
+                period: Some(p),
+                poles: Some(k),
+            });
+        }
+    }
+    Ok(out)
+}
+
+pub fn gaussian_batch_with_kernel(
+    data: &[f64],
+    sweep: &GaussianBatchRange,
+    k: Kernel,
+) -> Result<GaussianBatchOutput, GaussianError> {
+    let kernel = match k {
+        Kernel::Auto => match detect_best_batch_kernel() {
+            Kernel::Avx512Batch => Kernel::Avx2Batch,
+            other => other,
+        },
+        other if other.is_batch() => other,
+        other => return Err(GaussianError::InvalidKernelForBatch(other)),
+    };
+    let simd = match kernel {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => unreachable!(),
+    };
+    gaussian_batch_par_slice(data, sweep, simd)
+}
+
+#[inline(always)]
+pub fn gaussian_batch_slice(
+    data: &[f64],
+    sweep: &GaussianBatchRange,
+    kern: Kernel,
+) -> Result<GaussianBatchOutput, GaussianError> {
+    gaussian_batch_inner(data, sweep, kern, false)
+}
+
+#[inline(always)]
+pub fn gaussian_batch_par_slice(
+    data: &[f64],
+    sweep: &GaussianBatchRange,
+    kern: Kernel,
+) -> Result<GaussianBatchOutput, GaussianError> {
+    gaussian_batch_inner(data, sweep, kern, true)
+}
+
+#[inline]
+pub fn gaussian_into_slice(
+    dst: &mut [f64],
+    input: &GaussianInput,
+    kern: Kernel,
+) -> Result<(), GaussianError> {
+    let data = input.as_ref();
+
+    if dst.len() != data.len() {
+        return Err(GaussianError::OutputLengthMismatch {
+            expected: data.len(),
+            got: dst.len(),
+        });
+    }
+
+    gaussian_with_kernel_into(input, kern, dst)
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+#[inline]
+pub fn gaussian_into(input: &GaussianInput, out: &mut [f64]) -> Result<(), GaussianError> {
+    let data = input.as_ref();
+    if out.len() != data.len() {
+        return Err(GaussianError::OutputLengthMismatch {
+            expected: data.len(),
+            got: out.len(),
+        });
+    }
+
+    gaussian_with_kernel_into(input, Kernel::Auto, out)
+}
+
+#[inline(always)]
+fn gaussian_with_kernel_into(
+    input: &GaussianInput,
+    kernel: Kernel,
+    out: &mut [f64],
+) -> Result<(), GaussianError> {
+    let (data, period, poles, _, chosen) = gaussian_prepare(input, kernel)?;
+
+    gaussian_compute_into(data, period, poles, chosen, out);
+
+    Ok(())
+}
+
+#[inline(always)]
+fn gaussian_prepare<'a>(
+    input: &'a GaussianInput,
+    kernel: Kernel,
+) -> Result<(&'a [f64], usize, usize, usize, Kernel), GaussianError> {
+    let data: &[f64] = input.as_ref();
+    let len = data.len();
+
+    if len == 0 {
+        return Err(GaussianError::NoData);
+    }
+
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(GaussianError::AllValuesNaN)?;
+
+    let period = input.params.period.unwrap_or(14);
+    let poles = input.params.poles.unwrap_or(4);
+
+    if period == 1 {
+        return Err(GaussianError::PeriodOneDegenerate);
+    }
+
+    if period < 2 {
+        return Err(GaussianError::DegeneratePeriod { period });
+    }
+
+    if period > len {
+        return Err(GaussianError::PeriodLongerThanData {
+            period,
+            data_len: len,
+        });
+    }
+
+    if !(1..=4).contains(&poles) {
+        return Err(GaussianError::InvalidPoles { poles });
+    }
+
+    if len - first < period {
+        return Err(GaussianError::NotEnoughValidData {
+            needed: period,
+            valid: len - first,
+        });
+    }
+
+    let chosen = match kernel {
+        Kernel::Auto => Kernel::Scalar,
+        other => other,
+    };
+
+    Ok((data, period, poles, first, chosen))
+}
+
+#[inline(always)]
+fn gaussian_compute_into(
+    data: &[f64],
+    period: usize,
+    poles: usize,
+    kernel: Kernel,
+    out: &mut [f64],
+) {
+    unsafe {
+        match kernel {
+            Kernel::Scalar | Kernel::ScalarBatch => gaussian_scalar(data, period, poles, out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => gaussian_avx2(data, period, poles, out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => gaussian_avx512(data, period, poles, out),
+            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+            Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
+                gaussian_scalar(data, period, poles, out)
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[inline(always)]
+fn alpha_from(period: usize, poles: usize) -> f64 {
+    let beta = {
+        let numerator = 1.0 - (2.0 * PI / period as f64).cos();
+        let denominator = (2.0_f64).powf(1.0 / poles as f64) - 1.0;
+        numerator / denominator
+    };
+    let tmp = beta * beta + 2.0 * beta;
+    -beta + tmp.sqrt()
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,fma")]
+#[inline]
+unsafe fn gaussian_rows8_avx512(
+    data: &[f64],
+    params: &[GaussianParams],
+    out_rows: &mut [f64],
+    cols: usize,
+) {
+    debug_assert_eq!(params.len(), LANES_AVX512);
+    debug_assert_eq!(out_rows.len(), LANES_AVX512 * cols);
+
+    let mut alpha_arr = [0.0f64; LANES_AVX512];
+    let mut pole_arr = [0u32; LANES_AVX512];
+    for (lane, prm) in params.iter().enumerate() {
+        let p = prm.period.unwrap_or(14);
+        let k = prm.poles.unwrap_or(4);
+        alpha_arr[lane] = alpha_from(p, k);
+        pole_arr[lane] = k as u32;
+    }
+
+    let alpha_v = _mm512_loadu_pd(alpha_arr.as_ptr());
+    let one_minus_v = _mm512_sub_pd(_mm512_set1_pd(1.0), alpha_v);
+
+    let mask_for = |stage: u32| -> __mmask8 {
+        let mut m: u8 = 0;
+        for lane in 0..LANES_AVX512 {
+            if pole_arr[lane] > stage {
+                m |= 1 << lane;
+            }
+        }
+        m as __mmask8
+    };
+    let m0 = mask_for(0);
+    let m1 = mask_for(1);
+    let m2 = mask_for(2);
+    let m3 = mask_for(3);
+
+    let mut st0 = _mm512_setzero_pd();
+    let mut st1 = _mm512_setzero_pd();
+    let mut st2 = _mm512_setzero_pd();
+    let mut st3 = _mm512_setzero_pd();
+
+    for (t, &x_n) in data.iter().enumerate() {
+        let x_vec = _mm512_set1_pd(x_n);
+
+        let y0 = _mm512_fmadd_pd(alpha_v, x_vec, _mm512_mul_pd(one_minus_v, st0));
+        st0 = _mm512_mask_mov_pd(st0, m0, y0);
+
+        let y1 = _mm512_fmadd_pd(alpha_v, st0, _mm512_mul_pd(one_minus_v, st1));
+        st1 = _mm512_mask_mov_pd(st1, m1, y1);
+
+        let y2 = _mm512_fmadd_pd(alpha_v, st1, _mm512_mul_pd(one_minus_v, st2));
+        st2 = _mm512_mask_mov_pd(st2, m2, y2);
+
+        let y3 = _mm512_fmadd_pd(alpha_v, st2, _mm512_mul_pd(one_minus_v, st3));
+        st3 = _mm512_mask_mov_pd(st3, m3, y3);
+
+        let mut y = st0;
+        y = _mm512_mask_mov_pd(y, m1, st1);
+        y = _mm512_mask_mov_pd(y, m2, st2);
+        y = _mm512_mask_mov_pd(y, m3, st3);
+
+        let mut tmp = [0.0f64; LANES_AVX512];
+        _mm512_storeu_pd(tmp.as_mut_ptr(), y);
+        for lane in 0..LANES_AVX512 {
+            out_rows[lane * cols + t] = tmp[lane];
+        }
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn gaussian_batch_tile_avx2(
+    data: &[f64],
+    combos: &[GaussianParams],
+    out_mu: &mut [core::mem::MaybeUninit<f64>],
+    cols: usize,
+) {
+    let out = core::slice::from_raw_parts_mut(out_mu.as_mut_ptr() as *mut f64, out_mu.len());
+
+    let mut row = 0;
+    while row + LANES_AVX2 <= combos.len() {
+        gaussian_rows4_avx2(
+            data,
+            &combos[row..row + LANES_AVX2],
+            &mut out[row * cols..(row + LANES_AVX2) * cols],
+            cols,
+        );
+        row += LANES_AVX2;
+    }
+    for r in row..combos.len() {
+        gaussian_row_scalar(data, &combos[r], &mut out[r * cols..(r + 1) * cols]);
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn gaussian_rows4_avx2(
+    data: &[f64],
+    params: &[GaussianParams],
+    out_rows: &mut [f64],
+    cols: usize,
+) {
+    debug_assert_eq!(params.len(), LANES_AVX2);
+    debug_assert_eq!(out_rows.len(), LANES_AVX2 * cols);
+
+    let mut alpha_arr = [0.0f64; LANES_AVX2];
+    let mut pole_arr = [0u32; LANES_AVX2];
+    for (l, prm) in params.iter().enumerate() {
+        alpha_arr[l] = alpha_from(prm.period.unwrap_or(14), prm.poles.unwrap_or(4));
+        pole_arr[l] = prm.poles.unwrap_or(4) as u32;
+    }
+    let alpha_v = _mm256_loadu_pd(alpha_arr.as_ptr());
+    let one_minus_v = _mm256_sub_pd(_mm256_set1_pd(1.0), alpha_v);
+
+    let mut st0 = _mm256_setzero_pd();
+    let mut st1 = _mm256_setzero_pd();
+    let mut st2 = _mm256_setzero_pd();
+    let mut st3 = _mm256_setzero_pd();
+
+    let mut y0a = [0.0; LANES_AVX2];
+    let mut y1a = [0.0; LANES_AVX2];
+    let mut y2a = [0.0; LANES_AVX2];
+    let mut y3a = [0.0; LANES_AVX2];
+
+    for (t, &x_n) in data.iter().enumerate() {
+        let x_v = _mm256_set1_pd(x_n);
+
+        let y0_v = _mm256_fmadd_pd(alpha_v, x_v, _mm256_mul_pd(one_minus_v, st0));
+        st0 = y0_v;
+
+        let y1_v = _mm256_fmadd_pd(alpha_v, st0, _mm256_mul_pd(one_minus_v, st1));
+        st1 = y1_v;
+
+        let y2_v = _mm256_fmadd_pd(alpha_v, st1, _mm256_mul_pd(one_minus_v, st2));
+        st2 = y2_v;
+
+        let y3_v = _mm256_fmadd_pd(alpha_v, st2, _mm256_mul_pd(one_minus_v, st3));
+        st3 = y3_v;
+
+        _mm256_storeu_pd(y0a.as_mut_ptr(), y0_v);
+        _mm256_storeu_pd(y1a.as_mut_ptr(), y1_v);
+        _mm256_storeu_pd(y2a.as_mut_ptr(), y2_v);
+        _mm256_storeu_pd(y3a.as_mut_ptr(), y3_v);
+
+        for lane in 0..LANES_AVX2 {
+            let final_y = match pole_arr[lane] {
+                1 => y0a[lane],
+                2 => y1a[lane],
+                3 => y2a[lane],
+                _ => y3a[lane],
+            };
+            out_rows[lane * cols + t] = final_y;
+        }
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,fma")]
+#[inline]
+unsafe fn gaussian_batch_tile_avx512(
+    data: &[f64],
+    combos: &[GaussianParams],
+    out_mu: &mut [core::mem::MaybeUninit<f64>],
+    cols: usize,
+) {
+    let out = core::slice::from_raw_parts_mut(out_mu.as_mut_ptr() as *mut f64, out_mu.len());
+
+    let mut row = 0;
+    while row + LANES_AVX512 <= combos.len() {
+        gaussian_rows8_avx512(
+            data,
+            &combos[row..row + LANES_AVX512],
+            &mut out[row * cols..(row + LANES_AVX512) * cols],
+            cols,
+        );
+        row += LANES_AVX512;
+    }
+
+    for r in row..combos.len() {
+        gaussian_row_scalar(data, &combos[r], &mut out[r * cols..(r + 1) * cols]);
+    }
+}
+
+#[inline(always)]
+fn gaussian_batch_inner(
+    data: &[f64],
+    sweep: &GaussianBatchRange,
+    kern: Kernel,
+    parallel: bool,
+) -> Result<GaussianBatchOutput, GaussianError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    use rayon::prelude::*;
+    use std::{arch::is_x86_feature_detected, mem::MaybeUninit};
+
+    let combos = expand_grid(sweep)?;
+    if combos.is_empty() || data.is_empty() {
+        return Err(GaussianError::NoData);
+    }
+    let cols = data.len();
+    let rows = combos.len();
+
+    let _total = rows
+        .checked_mul(cols)
+        .ok_or(GaussianError::SizeOverflow { rows, cols })?;
+
+    let first_valid = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(GaussianError::AllValuesNaN)?;
+
+    for c in &combos {
+        let period = c.period.unwrap_or(14);
+        let poles = c.poles.unwrap_or(4);
+
+        if period == 1 {
+            return Err(GaussianError::PeriodOneDegenerate);
+        }
+
+        if period < 2 {
+            return Err(GaussianError::DegeneratePeriod { period });
+        }
+
+        if period > cols {
+            return Err(GaussianError::PeriodLongerThanData {
+                period,
+                data_len: cols,
+            });
+        }
+        if !(1..=4).contains(&poles) {
+            return Err(GaussianError::InvalidPoles { poles });
+        }
+        if cols - first_valid < period {
+            return Err(GaussianError::NotEnoughValidData {
+                needed: period,
+                valid: cols - first_valid,
+            });
+        }
+    }
+
+    let warm: Vec<usize> = combos
+        .iter()
+        .map(|c| {
+            let p = c.period.unwrap_or(14);
+            (first_valid + p).min(cols)
+        })
+        .collect();
+
+    let mut raw = make_uninit_matrix(rows, cols);
+    init_matrix_prefixes(&mut raw, cols, &warm);
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let have_avx512 = cfg!(target_feature = "avx512f") && is_x86_feature_detected!("avx512f");
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let have_avx512 = false;
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let have_avx2 = cfg!(target_feature = "avx2") && is_x86_feature_detected!("avx2");
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let have_avx2 = false;
+
+    let chosen = match kern {
+        Kernel::Avx512 if have_avx512 => Kernel::Avx512,
+        Kernel::Avx2 if have_avx2 => Kernel::Avx2,
+        _ => Kernel::Scalar,
+    };
+
+    type RowRunner = unsafe fn(&[f64], &GaussianParams, &mut [f64]);
+
+    let row_runner: RowRunner = match chosen {
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        Kernel::Avx512 => gaussian_row_avx512,
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        Kernel::Avx2 => gaussian_row_avx2,
+        _ => gaussian_row_scalar,
+    };
+
+    #[inline(always)]
+    unsafe fn compute_row(
+        row_idx: usize,
+        dst_mu: &mut [MaybeUninit<f64>],
+        combos: &[GaussianParams],
+        data: &[f64],
+        cols: usize,
+        runner: RowRunner,
+    ) {
+        let out = std::slice::from_raw_parts_mut(dst_mu.as_mut_ptr() as *mut f64, cols);
+        runner(data, &combos[row_idx], out);
+    }
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            match chosen {
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                Kernel::Avx512 => {
+                    let tiles = rows / LANES_AVX512;
+
+                    raw.par_chunks_exact_mut(cols * LANES_AVX512)
+                        .zip(combos.par_chunks_exact(LANES_AVX512))
+                        .for_each(|(dst_blk, prm_blk)| unsafe {
+                            gaussian_batch_tile_avx512(data, prm_blk, dst_blk, cols);
+                        });
+
+                    raw[tiles * cols * LANES_AVX512..]
+                        .par_chunks_mut(cols)
+                        .enumerate()
+                        .for_each(|(i, dst)| unsafe {
+                            compute_row(
+                                tiles * LANES_AVX512 + i,
+                                dst,
+                                &combos,
+                                data,
+                                cols,
+                                row_runner,
+                            );
+                        });
+                }
+
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                Kernel::Avx2 => {
+                    let tiles = rows / LANES_AVX2;
+
+                    raw.par_chunks_exact_mut(cols * LANES_AVX2)
+                        .zip(combos.par_chunks_exact(LANES_AVX2))
+                        .for_each(|(dst_blk, prm_blk)| unsafe {
+                            gaussian_batch_tile_avx2(data, prm_blk, dst_blk, cols);
+                        });
+
+                    raw[tiles * cols * LANES_AVX2..]
+                        .par_chunks_mut(cols)
+                        .enumerate()
+                        .for_each(|(i, dst)| unsafe {
+                            compute_row(
+                                tiles * LANES_AVX2 + i,
+                                dst,
+                                &combos,
+                                data,
+                                cols,
+                                row_runner,
+                            );
+                        });
+                }
+
+                _ => {
+                    raw.par_chunks_mut(cols)
+                        .enumerate()
+                        .for_each(|(row, dst)| unsafe {
+                            compute_row(row, dst, &combos, data, cols, row_runner);
+                        });
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (row, dst) in raw.chunks_mut(cols).enumerate() {
+                unsafe {
+                    compute_row(row, dst, &combos, data, cols, row_runner);
+                }
+            }
+        }
+    } else {
+        match chosen {
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 => {
+                let tiles = rows / LANES_AVX512;
+                unsafe {
+                    gaussian_batch_tile_avx512(
+                        data,
+                        &combos[..tiles * LANES_AVX512],
+                        &mut raw[..tiles * cols * LANES_AVX512],
+                        cols,
+                    );
+                }
+                for (i, dst) in raw[tiles * cols * LANES_AVX512..]
+                    .chunks_mut(cols)
+                    .enumerate()
+                {
+                    unsafe {
+                        compute_row(
+                            tiles * LANES_AVX512 + i,
+                            dst,
+                            &combos,
+                            data,
+                            cols,
+                            row_runner,
+                        );
+                    }
+                }
+            }
+
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 => {
+                let tiles = rows / LANES_AVX2;
+                unsafe {
+                    gaussian_batch_tile_avx2(
+                        data,
+                        &combos[..tiles * LANES_AVX2],
+                        &mut raw[..tiles * cols * LANES_AVX2],
+                        cols,
+                    );
+                }
+                for (i, dst) in raw[tiles * cols * LANES_AVX2..]
+                    .chunks_mut(cols)
+                    .enumerate()
+                {
+                    unsafe {
+                        compute_row(tiles * LANES_AVX2 + i, dst, &combos, data, cols, row_runner);
+                    }
+                }
+            }
+
+            _ => {
+                for (row, dst) in raw.chunks_mut(cols).enumerate() {
+                    unsafe {
+                        compute_row(row, dst, &combos, data, cols, row_runner);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut guard = core::mem::ManuallyDrop::new(raw);
+    let values = unsafe {
+        Vec::from_raw_parts(
+            guard.as_mut_ptr() as *mut f64,
+            guard.len(),
+            guard.capacity(),
+        )
+    };
+    Ok(GaussianBatchOutput {
+        values,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+#[inline(always)]
+pub unsafe fn gaussian_row_scalar(data: &[f64], prm: &GaussianParams, out: &mut [f64]) {
+    gaussian_scalar(data, prm.period.unwrap_or(14), prm.poles.unwrap_or(4), out);
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+pub unsafe fn gaussian_row_avx2(data: &[f64], prm: &GaussianParams, out: &mut [f64]) {
+    gaussian_row_scalar(data, prm, out);
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,fma")]
+#[inline]
+pub unsafe fn gaussian_row_avx512(data: &[f64], prm: &GaussianParams, out: &mut [f64]) {
+    gaussian_row_scalar(data, prm, out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_csv;
+    use proptest::prelude::*;
+
+    fn check_gaussian_partial_params(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let default_params = GaussianParams {
+            period: None,
+            poles: None,
+        };
+        let input = GaussianInput::from_candles(&candles, "close", default_params);
+        let output = gaussian_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_gaussian_accuracy(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let params = GaussianParams {
+            period: Some(14),
+            poles: Some(4),
+        };
+        let input = GaussianInput::from_candles(&candles, "close", params);
+        let result = gaussian_with_kernel(&input, kernel)?;
+        let expected_last_five = [
+            59221.90637814869,
+            59236.15215167245,
+            59207.10087088464,
+            59178.48276885589,
+            59085.36983209433,
+        ];
+        let start = result.values.len().saturating_sub(5);
+        for (i, &val) in result.values[start..].iter().enumerate() {
+            let diff = (val - expected_last_five[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "[{}] Gaussian {:?} mismatch at idx {}: got {}, expected {}",
+                test_name,
+                kernel,
+                i,
+                val,
+                expected_last_five[i]
+            );
+        }
+        Ok(())
+    }
+
+    fn check_gaussian_default_candles(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = GaussianInput::with_default_candles(&candles);
+        match input.data {
+            GaussianData::Candles { source, .. } => assert_eq!(source, "close"),
+            _ => panic!("Expected GaussianData::Candles"),
+        }
+        let output = gaussian_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_gaussian_zero_period(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data = [1.0, 2.0, 3.0];
+        let params = GaussianParams {
+            period: Some(0),
+            poles: Some(2),
+        };
+        let input = GaussianInput::from_slice(&data, params);
+        let res = gaussian_with_kernel(&input, kernel);
+        assert!(
+            matches!(res, Err(GaussianError::DegeneratePeriod { .. })),
+            "[{test_name}] expected DegeneratePeriod error for period=0"
+        );
+        Ok(())
+    }
+
+    fn check_gaussian_empty_input(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let empty: [f64; 0] = [];
+        let input = GaussianInput::from_slice(&empty, GaussianParams::default());
+        let res = gaussian_with_kernel(&input, kernel);
+        assert!(
+            matches!(res, Err(GaussianError::NoData)),
+            "[{test_name}] expected NoData error"
+        );
+        Ok(())
+    }
+
+    fn check_gaussian_invalid_poles(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data = [1.0, 2.0, 3.0, 4.0];
+        let params = GaussianParams {
+            period: Some(2),
+            poles: Some(5),
+        };
+        let input = GaussianInput::from_slice(&data, params);
+        let res = gaussian_with_kernel(&input, kernel);
+        assert!(
+            matches!(res, Err(GaussianError::InvalidPoles { .. })),
+            "[{test_name}] expected InvalidPoles error"
+        );
+        Ok(())
+    }
+
+    fn check_gaussian_all_nan(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data = [f64::NAN; 5];
+        let params = GaussianParams {
+            period: Some(3),
+            poles: None,
+        };
+        let input = GaussianInput::from_slice(&data, params);
+        let res = gaussian_with_kernel(&input, kernel);
+        assert!(
+            matches!(res, Err(GaussianError::AllValuesNaN)),
+            "[{test_name}] expected AllValuesNaN error"
+        );
+        Ok(())
+    }
+
+    fn check_gaussian_period_exceeds_length(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data_small = [10.0, 20.0, 30.0];
+        let params = GaussianParams {
+            period: Some(10),
+            poles: None,
+        };
+        let input = GaussianInput::from_slice(&data_small, params);
+        let res = gaussian_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] Gaussian should fail with period exceeding length",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_gaussian_very_small_dataset(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let single_point = [42.0];
+        let params = GaussianParams {
+            period: Some(14),
+            poles: None,
+        };
+        let input = GaussianInput::from_slice(&single_point, params);
+        let res = gaussian_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] Gaussian should fail with insufficient data",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_gaussian_reinput(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let first_params = GaussianParams {
+            period: Some(14),
+            poles: Some(4),
+        };
+        let first_input = GaussianInput::from_candles(&candles, "close", first_params);
+        let first_result = gaussian_with_kernel(&first_input, kernel)?;
+        assert_eq!(first_result.values.len(), candles.close.len());
+        let second_params = GaussianParams {
+            period: Some(7),
+            poles: Some(2),
+        };
+        let second_input = GaussianInput::from_slice(&first_result.values, second_params);
+        let second_result = gaussian_with_kernel(&second_input, kernel)?;
+        assert_eq!(second_result.values.len(), first_result.values.len());
+
+        for i in 10..second_result.values.len() {
+            assert!(
+                !second_result.values[i].is_nan(),
+                "NaN found at index {}",
+                i
+            );
+        }
+        Ok(())
+    }
+
+    fn check_gaussian_nan_handling(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = GaussianInput::from_candles(&candles, "close", GaussianParams::default());
+        let res = gaussian_with_kernel(&input, kernel)?;
+        assert_eq!(res.values.len(), candles.close.len());
+
+        let skip = input.params.poles.unwrap_or(4);
+        for val in res.values.iter().skip(skip) {
+            assert!(
+                val.is_finite(),
+                "[{}] Gaussian output should be finite once settled.",
+                test_name
+            );
+        }
+        Ok(())
+    }
+
+    fn check_gaussian_streaming(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let period = 14;
+        let poles = 4;
+        let input = GaussianInput::from_candles(
+            &candles,
+            "close",
+            GaussianParams {
+                period: Some(period),
+                poles: Some(poles),
+            },
+        );
+        let batch_output = gaussian_with_kernel(&input, kernel)?.values;
+        let mut stream = GaussianStream::try_new(GaussianParams {
+            period: Some(period),
+            poles: Some(poles),
+        })?;
+        let mut stream_values = Vec::with_capacity(candles.close.len());
+        for &price in &candles.close {
+            stream_values.push(stream.update(price));
+        }
+        assert_eq!(batch_output.len(), stream_values.len());
+        let skip = poles;
+        for (i, (&b, &s)) in batch_output
+            .iter()
+            .zip(stream_values.iter())
+            .enumerate()
+            .skip(skip)
+        {
+            if b.is_nan() && s.is_nan() {
+                continue;
+            }
+            let diff = (b - s).abs();
+            assert!(
+                diff < 1e-9,
+                "[{}] Gaussian streaming f64 mismatch at idx {}: batch={}, stream={}, diff={}",
+                test_name,
+                i,
+                b,
+                s,
+                diff
+            );
+        }
+        Ok(())
+    }
+
+    fn check_gaussian_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (2usize..=50).prop_flat_map(|period| {
+            (
+                prop::collection::vec(
+                    (-1e6f64..1e6f64).prop_filter("finite", |x| x.is_finite()),
+                    period..400,
+                ),
+                Just(period),
+                1usize..=4,
+            )
+        });
+
+        proptest::test_runner::TestRunner::default()
+            .run(&strat, |(data, period, poles)| {
+                let params = GaussianParams {
+                    period: Some(period),
+                    poles: Some(poles),
+                };
+                let input = GaussianInput::from_slice(&data, params);
+
+                let GaussianOutput { values: out } = gaussian_with_kernel(&input, kernel).unwrap();
+                let GaussianOutput { values: ref_out } =
+                    gaussian_with_kernel(&input, Kernel::Scalar).unwrap();
+
+                prop_assert_eq!(out.len(), data.len());
+
+                let first_valid = data.iter().position(|x| !x.is_nan()).unwrap_or(data.len());
+
+                let expected_warmup = first_valid + period;
+
+                for i in 0..first_valid {
+                    prop_assert!(
+                        out[i].is_nan(),
+                        "idx {}: expected NaN for NaN input, got {}",
+                        i,
+                        out[i]
+                    );
+                }
+
+                for i in first_valid..data.len() {
+                    if data[i].is_finite() && !data[first_valid..=i].iter().any(|x| x.is_nan()) {
+                        prop_assert!(
+                            out[i].is_finite(),
+                            "idx {}: expected finite value, got {}",
+                            i,
+                            out[i]
+                        );
+                    }
+                }
+
+                let stability_point = first_valid + period * 2;
+                if period > 1 && stability_point + 20 < data.len() {
+                    let window_start = stability_point;
+                    let window_end = (stability_point + 50).min(data.len());
+
+                    let input_slice = &data[window_start..window_end];
+                    let output_slice = &out[window_start..window_end];
+
+                    if input_slice.len() > 10
+                        && input_slice.iter().all(|x| x.is_finite())
+                        && output_slice.iter().all(|x| x.is_finite())
+                    {
+                        let input_mean: f64 =
+                            input_slice.iter().sum::<f64>() / input_slice.len() as f64;
+                        let output_mean: f64 =
+                            output_slice.iter().sum::<f64>() / output_slice.len() as f64;
+
+                        let input_var: f64 = input_slice
+                            .iter()
+                            .map(|x| (x - input_mean).powi(2))
+                            .sum::<f64>()
+                            / input_slice.len() as f64;
+                        let output_var: f64 = output_slice
+                            .iter()
+                            .map(|x| (x - output_mean).powi(2))
+                            .sum::<f64>()
+                            / output_slice.len() as f64;
+
+                        if input_var > 1e-10 {
+                            prop_assert!(
+								output_var <= input_var + 1e-15,
+								"Gaussian filter MUST reduce variance: input_var={}, output_var={}, period={}, poles={}",
+								input_var, output_var, period, poles
+							);
+                        }
+                    }
+                }
+
+                if period < 2 {
+                    prop_assert!(
+                        false,
+                        "Test should not generate period < 2, but got period={}",
+                        period
+                    );
+                }
+
+                let stability_check = first_valid + period * 3;
+                if data[first_valid..]
+                    .windows(2)
+                    .all(|w| (w[0] - w[1]).abs() < 1e-10)
+                    && stability_check < data.len()
+                {
+                    let constant_val = data[first_valid];
+                    for i in stability_check..data.len() {
+                        if out[i].is_finite() {
+                            prop_assert!(
+								(out[i] - constant_val).abs() <= 1e-12,
+								"constant input MUST produce constant output: idx={}, expected={}, got={}, diff={}",
+								i, constant_val, out[i], (out[i] - constant_val).abs()
+							);
+                        }
+                    }
+                }
+
+                if kernel != Kernel::Scalar {
+                    for i in first_valid..data.len() {
+                        if out[i].is_finite() && ref_out[i].is_finite() {
+                            let y_bits = out[i].to_bits();
+                            let r_bits = ref_out[i].to_bits();
+                            let diff_bits = if y_bits > r_bits {
+                                y_bits - r_bits
+                            } else {
+                                r_bits - y_bits
+                            };
+
+                            prop_assert!(
+								diff_bits <= 10 || (out[i] - ref_out[i]).abs() < 1e-14,
+								"kernel consistency failed at idx {}: {:?}={}, Scalar={}, diff_bits={}, abs_diff={}",
+								i, kernel, out[i], ref_out[i], diff_bits, (out[i] - ref_out[i]).abs()
+							);
+                        }
+                    }
+                }
+
+                if stability_point + 30 < data.len() {
+                    match poles {
+                        1 => {
+                            let check_start = (first_valid + period * 2).min(data.len() / 2);
+                            let check_end = data.len();
+
+                            if check_end > check_start + 10 {
+                                let input_slice = &data[check_start..check_end];
+                                let output_slice = &out[check_start..check_end];
+
+                                if input_slice.iter().all(|x| x.is_finite())
+                                    && output_slice.iter().all(|x| x.is_finite())
+                                {
+                                    let input_mean =
+                                        input_slice.iter().sum::<f64>() / input_slice.len() as f64;
+                                    let output_mean = output_slice.iter().sum::<f64>()
+                                        / output_slice.len() as f64;
+
+                                    let input_var = input_slice
+                                        .iter()
+                                        .map(|x| (x - input_mean).powi(2))
+                                        .sum::<f64>()
+                                        / input_slice.len() as f64;
+                                    let output_var = output_slice
+                                        .iter()
+                                        .map(|x| (x - output_mean).powi(2))
+                                        .sum::<f64>()
+                                        / output_slice.len() as f64;
+
+                                    if input_var > 1e-10 {
+                                        prop_assert!(
+											output_var <= input_var,
+											"1-pole filter should reduce variance: input_var={}, output_var={}",
+											input_var, output_var
+										);
+                                    }
+                                }
+                            }
+                        }
+                        2 | 3 | 4 => {
+                            let params_1pole = GaussianParams {
+                                period: Some(period),
+                                poles: Some(1),
+                            };
+                            let input_1pole = GaussianInput::from_slice(&data, params_1pole);
+                            if let Ok(GaussianOutput { values: out_1pole }) =
+                                gaussian_with_kernel(&input_1pole, kernel)
+                            {
+                                let window_start = stability_point;
+                                let window_end = (stability_point + 30).min(data.len() - 1);
+
+                                if window_end > window_start + 5 {
+                                    let accel_multi: f64 = (window_start + 2..window_end)
+                                        .map(|i| {
+                                            if out[i - 2].is_finite()
+                                                && out[i - 1].is_finite()
+                                                && out[i].is_finite()
+                                            {
+                                                ((out[i] - out[i - 1]) - (out[i - 1] - out[i - 2]))
+                                                    .abs()
+                                            } else {
+                                                0.0
+                                            }
+                                        })
+                                        .sum::<f64>();
+
+                                    let accel_1pole: f64 = (window_start + 2..window_end)
+                                        .map(|i| {
+                                            if out_1pole[i - 2].is_finite()
+                                                && out_1pole[i - 1].is_finite()
+                                                && out_1pole[i].is_finite()
+                                            {
+                                                ((out_1pole[i] - out_1pole[i - 1])
+                                                    - (out_1pole[i - 1] - out_1pole[i - 2]))
+                                                    .abs()
+                                            } else {
+                                                0.0
+                                            }
+                                        })
+                                        .sum::<f64>();
+
+                                    let non_zero_count =
+                                        data.iter().filter(|&&x| x.abs() > 1e-10).count();
+                                    if accel_1pole > 1e-10
+                                        && accel_multi > 1e-10
+                                        && non_zero_count > 5
+                                    {
+                                        prop_assert!(
+											accel_multi <= accel_1pole * 1.1,
+											"{}-pole filter should be smoother than 1-pole: accel_{}pole={}, accel_1pole={}",
+											poles, poles, accel_multi, accel_1pole
+										);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                Ok(())
+            })
+            .unwrap();
+
+        Ok(())
+    }
+
+    macro_rules! generate_all_gaussian_tests {
+        ($($test_fn:ident),*) => {
+            paste::paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar);
+                    }
+                    #[test]
+                    fn [<$test_fn _avx2_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2);
+                    }
+                    #[test]
+                    fn [<$test_fn _avx512_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512);
+                    }
+                )*
+            }
+        }
+    }
+
+    fn check_gaussian_edge_cases(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        {
+            let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+            let params = GaussianParams {
+                period: Some(1),
+                poles: Some(1),
+            };
+            let input = GaussianInput::from_slice(&data, params);
+            let result = gaussian_with_kernel(&input, kernel);
+
+            assert!(
+                result.is_err(),
+                "[{}] Period=1 should return error, but got Ok",
+                test_name
+            );
+
+            if let Err(e) = result {
+                match e {
+                    GaussianError::PeriodOneDegenerate => {}
+                    _ => panic!("[{}] Wrong error type for period=1: {:?}", test_name, e),
+                }
+            }
+        }
+
+        {
+            let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+            let params = GaussianParams {
+                period: Some(data.len()),
+                poles: Some(2),
+            };
+            let input = GaussianInput::from_slice(&data, params);
+            let result = gaussian_with_kernel(&input, kernel)?;
+            assert_eq!(result.values.len(), data.len());
+
+            for i in 0..data.len() {
+                assert!(
+                    result.values[i].is_finite() || result.values[i].is_nan(),
+                    "[{}] Output should be finite or NaN at index {}, got {}",
+                    test_name,
+                    i,
+                    result.values[i]
+                );
+            }
+        }
+
+        {
+            let data = vec![42.0];
+            let params = GaussianParams {
+                period: Some(1),
+                poles: Some(1),
+            };
+            let input = GaussianInput::from_slice(&data, params);
+            let result = gaussian_with_kernel(&input, kernel);
+
+            assert!(
+                result.is_err(),
+                "[{}] Single data point with period=1 should return error",
+                test_name
+            );
+        }
+
+        {
+            let data = vec![0.0; 10];
+            let params = GaussianParams {
+                period: Some(3),
+                poles: Some(2),
+            };
+            let input = GaussianInput::from_slice(&data, params);
+            let result = gaussian_with_kernel(&input, kernel)?;
+
+            for i in 3..result.values.len() {
+                assert!(
+                    result.values[i].abs() < 1e-15 || result.values[i].is_nan(),
+                    "[{}] All-zero input should produce zero output at index {}: got {}",
+                    test_name,
+                    i,
+                    result.values[i]
+                );
+            }
+        }
+
+        {
+            let data = vec![1.0, 2.0, 3.0];
+            let params = GaussianParams {
+                period: Some(5),
+                poles: Some(2),
+            };
+            let input = GaussianInput::from_slice(&data, params);
+            let result = gaussian_with_kernel(&input, kernel);
+
+            assert!(
+                result.is_err(),
+                "[{}] Period > data.len() should return error, but got Ok",
+                test_name
+            );
+
+            if let Err(e) = result {
+                match e {
+                    GaussianError::InvalidPeriod { .. }
+                    | GaussianError::PeriodLongerThanData { .. } => {}
+                    _ => panic!(
+                        "[{}] Wrong error type for period > data.len(): {:?}",
+                        test_name, e
+                    ),
+                }
+            }
+        }
+
+        {
+            let data = vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
+            let params = GaussianParams {
+                period: Some(2),
+                poles: Some(4),
+            };
+            let input = GaussianInput::from_slice(&data, params);
+            let result = gaussian_with_kernel(&input, kernel)?;
+
+            let start = 2;
+            if result.values.len() > start + 2 {
+                let slice = &result.values[start..];
+                let valid_values: Vec<f64> =
+                    slice.iter().filter(|x| x.is_finite()).copied().collect();
+
+                if valid_values.len() > 2 {
+                    let mean = valid_values.iter().sum::<f64>() / valid_values.len() as f64;
+                    let variance = valid_values.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+                        / valid_values.len() as f64;
+
+                    assert!(
+                        variance < 0.6,
+                        "[{}] 4-pole filter should smooth alternating input: variance={}",
+                        test_name,
+                        variance
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_gaussian_no_poison(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let test_cases = vec![
+            GaussianParams {
+                period: Some(14),
+                poles: Some(4),
+            },
+            GaussianParams {
+                period: Some(10),
+                poles: Some(1),
+            },
+            GaussianParams {
+                period: Some(30),
+                poles: Some(2),
+            },
+            GaussianParams {
+                period: Some(20),
+                poles: Some(3),
+            },
+            GaussianParams {
+                period: Some(50),
+                poles: Some(4),
+            },
+            GaussianParams {
+                period: Some(5),
+                poles: Some(1),
+            },
+            GaussianParams {
+                period: Some(100),
+                poles: Some(4),
+            },
+            GaussianParams {
+                period: None,
+                poles: None,
+            },
+        ];
+
+        for params in test_cases {
+            let input = GaussianInput::from_candles(&candles, "close", params);
+            let output = gaussian_with_kernel(&input, kernel)?;
+
+            for (i, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+                         with params period={:?}, poles={:?}",
+                        test_name, val, bits, i, params.period, params.poles
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+                         with params period={:?}, poles={:?}",
+                        test_name, val, bits, i, params.period, params.poles
+                    );
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+                         with params period={:?}, poles={:?}",
+                        test_name, val, bits, i, params.period, params.poles
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_gaussian_no_poison(
+        _test_name: &str,
+        _kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    generate_all_gaussian_tests!(
+        check_gaussian_partial_params,
+        check_gaussian_accuracy,
+        check_gaussian_default_candles,
+        check_gaussian_zero_period,
+        check_gaussian_period_exceeds_length,
+        check_gaussian_very_small_dataset,
+        check_gaussian_empty_input,
+        check_gaussian_invalid_poles,
+        check_gaussian_all_nan,
+        check_gaussian_reinput,
+        check_gaussian_nan_handling,
+        check_gaussian_streaming,
+        check_gaussian_property,
+        check_gaussian_edge_cases,
+        check_gaussian_no_poison
+    );
+
+    fn check_batch_default_row(
+        test: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+        let output = GaussianBatchBuilder::new()
+            .kernel(kernel)
+            .apply_candles(&c, "close")?;
+        let def = GaussianParams::default();
+        let row = output.values_for(&def).expect("default row missing");
+        assert_eq!(row.len(), c.close.len());
+        let expected = [
+            59221.90637814869,
+            59236.15215167245,
+            59207.10087088464,
+            59178.48276885589,
+            59085.36983209433,
+        ];
+        let start = row.len() - 5;
+        for (i, &v) in row[start..].iter().enumerate() {
+            assert!(
+                (v - expected[i]).abs() < 1e-4,
+                "[{test}] default-row mismatch at idx {i}: {v} vs {expected:?}"
+            );
+        }
+        Ok(())
+    }
+
+    macro_rules! gen_batch_tests {
+        ($fn_name:ident) => {
+            paste::paste! {
+                #[test] fn [<$fn_name _scalar>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                }
+                #[test] fn [<$fn_name _avx2>]()        {
+                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                }
+                #[test] fn [<$fn_name _avx512>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                }
+                #[test] fn [<$fn_name _auto_detect>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                }
+            }
+        };
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let batch_configs = vec![
+            ((10, 30, 10), (1, 4, 1)),
+            ((5, 5, 0), (1, 1, 0)),
+            ((100, 120, 20), (2, 4, 2)),
+            ((7, 21, 7), (1, 3, 2)),
+            ((15, 45, 15), (1, 4, 3)),
+            ((3, 12, 3), (1, 2, 1)),
+        ];
+
+        for ((p_start, p_end, p_step), (poles_start, poles_end, poles_step)) in batch_configs {
+            let output = GaussianBatchBuilder::new()
+                .kernel(kernel)
+                .period_range(p_start, p_end, p_step)
+                .poles_range(poles_start, poles_end, poles_step)
+                .apply_candles(&c, "close")?;
+
+            for (idx, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+                let row = idx / output.cols;
+                let col = idx % output.cols;
+                let combo = &output.combos[row];
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} \
+                         (flat index {}) with params period={:?}, poles={:?}",
+						test, val, bits, row, col, idx, combo.period, combo.poles
+					);
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} \
+                         (flat index {}) with params period={:?}, poles={:?}",
+						test, val, bits, row, col, idx, combo.period, combo.poles
+					);
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} \
+                         (flat index {}) with params period={:?}, poles={:?}",
+						test, val, bits, row, col, idx, combo.period, combo.poles
+					);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_batch_no_poison(
+        _test: &str,
+        _kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    gen_batch_tests!(check_batch_default_row);
+    gen_batch_tests!(check_batch_no_poison);
+}
+
+#[cfg(feature = "python")]
+use crate::utilities::kernel_validation::validate_kernel;
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::PyDict;
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use wasm_bindgen::prelude::*;
+
+#[inline(always)]
+fn gaussian_batch_inner_into(
+    data: &[f64],
+    sweep: &GaussianBatchRange,
+    kern: Kernel,
+    parallel: bool,
+    out: &mut [f64],
+) -> Result<Vec<GaussianParams>, GaussianError> {
+    let combos = expand_grid(sweep)?;
+    if combos.is_empty() || data.is_empty() {
+        return Err(GaussianError::NoData);
+    }
+    let cols = data.len();
+    let rows = combos.len();
+    let expected = rows
+        .checked_mul(cols)
+        .ok_or(GaussianError::SizeOverflow { rows, cols })?;
+    if out.len() != expected {
+        return Err(GaussianError::OutputLengthMismatch {
+            expected,
+            got: out.len(),
+        });
+    }
+
+    let first_valid = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(GaussianError::AllValuesNaN)?;
+
+    for c in &combos {
+        let period = c.period.unwrap_or(14);
+        let poles = c.poles.unwrap_or(4);
+
+        if period == 1 {
+            return Err(GaussianError::PeriodOneDegenerate);
+        }
+
+        if period < 2 {
+            return Err(GaussianError::DegeneratePeriod { period });
+        }
+
+        if period > cols {
+            return Err(GaussianError::PeriodLongerThanData {
+                period,
+                data_len: cols,
+            });
+        }
+        if !(1..=4).contains(&poles) {
+            return Err(GaussianError::InvalidPoles { poles });
+        }
+        if cols - first_valid < period {
+            return Err(GaussianError::NotEnoughValidData {
+                needed: period,
+                valid: cols - first_valid,
+            });
+        }
+    }
+
+    let warm: Vec<usize> = combos
+        .iter()
+        .map(|c| {
+            let w = first_valid + c.period.unwrap_or(14);
+            w.min(cols)
+        })
+        .collect();
+
+    let raw = unsafe {
+        std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut MaybeUninit<f64>, out.len())
+    };
+
+    unsafe { init_matrix_prefixes(raw, cols, &warm) };
+
+    let chosen = match kern {
+        Kernel::Auto => Kernel::Scalar,
+        other => other,
+    };
+
+    type RowRunner = unsafe fn(&[f64], &GaussianParams, &mut [f64]);
+    let row_runner: RowRunner = match chosen {
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        Kernel::Avx512 => gaussian_row_avx512,
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        Kernel::Avx2 => gaussian_row_avx2,
+        _ => gaussian_row_scalar,
+    };
+
+    let do_row = |row: usize, dst_mu: &mut [MaybeUninit<f64>]| unsafe {
+        let dst = std::slice::from_raw_parts_mut(dst_mu.as_mut_ptr() as *mut f64, dst_mu.len());
+        row_runner(data, &combos[row], dst);
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            raw.par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(row, slice)| do_row(row, slice));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (row, slice) in raw.chunks_mut(cols).enumerate() {
+                do_row(row, slice);
+            }
+        }
+    } else {
+        for (row, slice) in raw.chunks_mut(cols).enumerate() {
+            do_row(row, slice);
+        }
+    }
+
+    Ok(combos)
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "gaussian")]
+#[pyo3(signature = (data, period, poles, kernel=None))]
+pub fn gaussian_py<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray1<'py, f64>,
+    period: usize,
+    poles: usize,
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+
+    let slice_in = data.as_slice()?;
+    let kern = validate_kernel(kernel, false)?;
+
+    let params = GaussianParams {
+        period: Some(period),
+        poles: Some(poles),
+    };
+    let gaussian_in = GaussianInput::from_slice(slice_in, params);
+
+    let result_vec: Vec<f64> = py
+        .allow_threads(|| gaussian_with_kernel(&gaussian_in, kern).map(|o| o.values))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok(result_vec.into_pyarray(py))
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "GaussianStream")]
+pub struct GaussianStreamPy {
+    stream: GaussianStream,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl GaussianStreamPy {
+    #[new]
+    fn new(period: usize, poles: usize) -> PyResult<Self> {
+        let params = GaussianParams {
+            period: Some(period),
+            poles: Some(poles),
+        };
+        let stream =
+            GaussianStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(GaussianStreamPy { stream })
+    }
+
+    fn update(&mut self, value: f64) -> Option<f64> {
+        Some(self.stream.update(value))
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "gaussian_batch")]
+#[pyo3(signature = (data, period_range, poles_range, kernel=None))]
+pub fn gaussian_batch_py<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray1<'py, f64>,
+    period_range: (usize, usize, usize),
+    poles_range: (usize, usize, usize),
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+    use pyo3::types::PyDict;
+
+    let slice_in = data.as_slice()?;
+    let kern = validate_kernel(kernel, true)?;
+
+    let sweep = GaussianBatchRange {
+        period: period_range,
+        poles: poles_range,
+    };
+
+    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let rows = combos.len();
+    let cols = slice_in.len();
+
+    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
+    let slice_out = unsafe { out_arr.as_slice_mut()? };
+
+    let combos = py
+        .allow_threads(|| {
+            let kernel = match kern {
+                Kernel::Auto => match detect_best_batch_kernel() {
+                    Kernel::Avx512Batch => Kernel::Avx2Batch,
+                    other => other,
+                },
+                k => k,
+            };
+            let simd = match kernel {
+                Kernel::Avx512Batch => Kernel::Avx512,
+                Kernel::Avx2Batch => Kernel::Avx2,
+                Kernel::ScalarBatch => Kernel::Scalar,
+                _ => unreachable!(),
+            };
+            gaussian_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
+    dict.set_item(
+        "periods",
+        combos
+            .iter()
+            .map(|p| p.period.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    dict.set_item(
+        "poles",
+        combos
+            .iter()
+            .map(|p| p.poles.unwrap_or(4) as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+
+    Ok(dict)
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "gaussian_cuda_batch_dev")]
+#[pyo3(signature = (data_f32, period_range, poles_range, device_id=0))]
+pub fn gaussian_cuda_batch_dev_py(
+    py: Python<'_>,
+    data_f32: numpy::PyReadonlyArray1<'_, f32>,
+    period_range: (usize, usize, usize),
+    poles_range: (usize, usize, usize),
+    device_id: usize,
+) -> PyResult<DeviceArrayF32Py> {
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+
+    let slice = data_f32.as_slice()?;
+    let sweep = GaussianBatchRange {
+        period: period_range,
+        poles: poles_range,
+    };
+
+    let cuda = CudaGaussian::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let stream = cuda.stream_handle();
+    let dev_id = cuda.device_id();
+    let ctx_guard = cuda.context_arc();
+    let inner = py
+        .allow_threads(|| cuda.gaussian_batch_dev(slice, &sweep))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok(DeviceArrayF32Py::new_from_rust(
+        inner, stream, ctx_guard, dev_id,
+    ))
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "gaussian_cuda_many_series_one_param_dev")]
+#[pyo3(signature = (prices_tm_f32, period, poles, device_id=0))]
+pub fn gaussian_cuda_many_series_one_param_dev_py(
+    py: Python<'_>,
+    prices_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
+    period: usize,
+    poles: usize,
+    device_id: usize,
+) -> PyResult<DeviceArrayF32Py> {
+    use numpy::PyUntypedArrayMethods;
+
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+
+    let shape = prices_tm_f32.shape();
+    let rows = shape[0];
+    let cols = shape[1];
+
+    let flat = prices_tm_f32.as_slice()?;
+    let params = GaussianParams {
+        period: Some(period),
+        poles: Some(poles),
+    };
+
+    let cuda = CudaGaussian::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let stream = cuda.stream_handle();
+    let dev_id = cuda.device_id();
+    let ctx_guard = cuda.context_arc();
+    let inner = py
+        .allow_threads(|| {
+            cuda.gaussian_many_series_one_param_time_major_dev(flat, cols, rows, &params)
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok(DeviceArrayF32Py::new_from_rust(
+        inner, stream, ctx_guard, dev_id,
+    ))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn gaussian_js(data: &[f64], period: usize, poles: usize) -> Result<Vec<f64>, JsValue> {
+    let params = GaussianParams {
+        period: Some(period),
+        poles: Some(poles),
+    };
+    let input = GaussianInput::from_slice(data, params);
+
+    let mut output = vec![0.0; data.len()];
+
+    gaussian_into_slice(&mut output, &input, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    Ok(output)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn gaussian_into(
+    in_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    period: usize,
+    poles: usize,
+) -> Result<(), JsValue> {
+    if in_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("null pointer passed to gaussian_into"));
+    }
+
+    unsafe {
+        let data = std::slice::from_raw_parts(in_ptr, len);
+
+        if period == 1 {
+            return Err(JsValue::from_str("Period of 1 causes degenerate filter"));
+        }
+        if period < 2 {
+            return Err(JsValue::from_str(&format!(
+                "Period must be >= 2, got {}",
+                period
+            )));
+        }
+        if period > len {
+            return Err(JsValue::from_str(&format!(
+                "Period {} is longer than data length {}",
+                period, len
+            )));
+        }
+
+        if !(1..=4).contains(&poles) {
+            return Err(JsValue::from_str("Invalid poles (must be 1-4)"));
+        }
+
+        let params = GaussianParams {
+            period: Some(period),
+            poles: Some(poles),
+        };
+        let input = GaussianInput::from_slice(data, params);
+
+        if in_ptr == out_ptr {
+            let mut temp = vec![0.0; len];
+            gaussian_into_slice(&mut temp, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            out.copy_from_slice(&temp);
+        } else {
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            gaussian_into_slice(out, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn gaussian_alloc(len: usize) -> *mut f64 {
+    let mut vec = Vec::<f64>::with_capacity(len);
+    let ptr = vec.as_mut_ptr();
+    std::mem::forget(vec);
+    ptr
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn gaussian_free(ptr: *mut f64, len: usize) {
+    if !ptr.is_null() {
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, 0, len);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn gaussian_batch_js(
+    data: &[f64],
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+    poles_start: usize,
+    poles_end: usize,
+    poles_step: usize,
+) -> Result<Vec<f64>, JsValue> {
+    let sweep = GaussianBatchRange {
+        period: (period_start, period_end, period_step),
+        poles: (poles_start, poles_end, poles_step),
+    };
+
+    gaussian_batch_inner(data, &sweep, Kernel::Auto, false)
+        .map(|output| output.values)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn gaussian_batch_metadata_js(
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+    poles_start: usize,
+    poles_end: usize,
+    poles_step: usize,
+) -> Result<Vec<f64>, JsValue> {
+    let sweep = GaussianBatchRange {
+        period: (period_start, period_end, period_step),
+        poles: (poles_start, poles_end, poles_step),
+    };
+
+    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let metadata: Vec<f64> = combos
+        .iter()
+        .flat_map(|combo| {
+            vec![
+                combo.period.unwrap_or(14) as f64,
+                combo.poles.unwrap_or(4) as f64,
+            ]
+        })
+        .collect();
+
+    Ok(metadata)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct GaussianBatchConfig {
+    pub period_range: (usize, usize, usize),
+    pub poles_range: (usize, usize, usize),
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct GaussianBatchJsOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<GaussianParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = gaussian_batch)]
+pub fn gaussian_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
+    let config: GaussianBatchConfig = serde_wasm_bindgen::from_value(config)
+        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
+
+    let sweep = GaussianBatchRange {
+        period: config.period_range,
+        poles: config.poles_range,
+    };
+
+    let output = gaussian_batch_inner(data, &sweep, Kernel::Auto, false)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let js_output = GaussianBatchJsOutput {
+        values: output.values,
+        combos: output.combos,
+        rows: output.rows,
+        cols: output.cols,
+    };
+
+    serde_wasm_bindgen::to_value(&js_output)
+        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn gaussian_batch_into(
+    in_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+    poles_start: usize,
+    poles_end: usize,
+    poles_step: usize,
+) -> Result<usize, JsValue> {
+    if in_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str(
+            "null pointer passed to gaussian_batch_into",
+        ));
+    }
+
+    unsafe {
+        let data = std::slice::from_raw_parts(in_ptr, len);
+
+        let sweep = GaussianBatchRange {
+            period: (period_start, period_end, period_step),
+            poles: (poles_start, poles_end, poles_step),
+        };
+
+        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let rows = combos.len();
+        let cols = len;
+
+        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
+
+        gaussian_batch_inner_into(data, &sweep, Kernel::Auto, false, out)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(rows)
+    }
+}

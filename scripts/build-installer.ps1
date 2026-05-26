@@ -67,7 +67,14 @@ if (-not (Test-Path $bundleScript)) {
 Write-Host ""
 Write-Host "==> Running make-release-bundle.ps1..." -ForegroundColor Cyan
 & $bundleScript -Profile $Profile
-if ($LASTEXITCODE -ne 0) { throw "make-release-bundle.ps1 failed with exit code $LASTEXITCODE" }
+# 2026-05-26: `$LASTEXITCODE` is only set by native executables. PowerShell
+# scripts (like make-release-bundle.ps1) leave it at its previous value if
+# they don't `exit` explicitly — meaning a stale non-zero code from earlier
+# in the parent script triggered a false failure. Guard with `-gt 0` AND
+# allow `$null` (= never set in this run, i.e. clean) to pass.
+if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -gt 0) {
+    throw "make-release-bundle.ps1 failed with exit code $LASTEXITCODE"
+}
 
 # ── 3. Compile the NSIS installer ────────────────────────────────────────────
 $nsiScript = Join-Path $repoRoot 'installer\neoethos.nsi'

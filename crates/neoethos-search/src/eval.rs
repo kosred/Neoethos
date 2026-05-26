@@ -3,7 +3,6 @@ use crate::cubecl_eval::{
     cuda_eval_backtest_kernel_enabled, cuda_eval_signal_kernel_enabled,
     try_evaluate_population_cuda, try_generate_signal_rows_cuda,
 };
-use crate::genetic::strategy_gene::infer_market_cost_profile;
 use crate::quality::Trade;
 use ndarray::ArrayView2;
 use rayon::prelude::*;
@@ -39,11 +38,11 @@ static RAYON_INIT: Once = Once::new();
 
 fn init_rayon() {
     RAYON_INIT.call_once(|| {
-        let threads = env::var("FOREX_BOT_RUST_THREADS")
-            .ok()
-            .or_else(|| env::var("RAYON_NUM_THREADS").ok())
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&v| v > 0);
+        // F-695 closure (2026-05-25 — F-CORE3): resolved through the
+        // typed `BacktestRuntimeOverrides::rayon_threads` boundary so
+        // the env vars (`FOREX_BOT_RUST_THREADS` /
+        // `RAYON_NUM_THREADS`) are read once at process startup.
+        let threads = current_backtest_runtime_overrides().rayon_threads;
         if let Some(n) = threads {
             // `build_global` errors if the global pool was already built
             // (e.g. another crate touched rayon first); that's expected
@@ -163,8 +162,32 @@ pub struct BacktestMetrics {
     pub max_daily_drawdown: f64,
 }
 
+/// **F-001 documentation (2026-05-25)** — index-7 slot is *deliberately
+/// reserved* and MUST be passed through as 0.0 on the round-trip.
+///
+/// History: an earlier revision used index 7 for `average_trade_pnl`
+/// (computed inline in the kernel). That metric was dropped from the
+/// struct but the `[f64; 11]` array shape was kept to avoid breaking
+/// the GPU kernel's per-gene output stride (which writes 11 floats per
+/// gene). Any caller that hand-rolls a `[f64; 11]` MUST write `0.0` at
+/// index 7 or the round-trip via [`BacktestMetrics::from_metric_array`]
+/// will silently misinterpret subsequent fields.
+///
+/// Callers should prefer the named-field constructor + `to_metric_array`
+/// rather than hand-rolling the array. The constant below documents the
+/// reserved slot for grep-discoverability.
+pub const BACKTEST_METRICS_RESERVED_INDEX_7: usize = 7;
+
 impl BacktestMetrics {
+    /// Index of the deliberately-reserved slot in the array form. See
+    /// [`BACKTEST_METRICS_RESERVED_INDEX_7`] for history.
+    pub const RESERVED_INDEX_7: usize = BACKTEST_METRICS_RESERVED_INDEX_7;
+
     pub fn from_metric_array(metrics: [f64; 11]) -> Self {
+        // metrics[7] is the reserved-slot (F-001 / 2026-05-25 doc fix).
+        // Old kernel revision used it for average_trade_pnl; that field
+        // was dropped but the array width was kept to preserve the GPU
+        // output stride. We do not read index 7 here.
         Self {
             net_profit: metrics[0],
             sharpe: metrics[1],
@@ -184,6 +207,9 @@ impl BacktestMetrics {
     }
 
     pub fn to_metric_array(self) -> [f64; 11] {
+        // Index 7 is the reserved slot (F-001 — see struct-level doc).
+        // Always 0.0 — DO NOT repurpose without updating every caller
+        // that hand-rolls a [f64; 11] expecting this slot to stay zero.
         [
             self.net_profit,
             self.sharpe,
@@ -192,7 +218,7 @@ impl BacktestMetrics {
             self.win_rate,
             self.profit_factor,
             self.expectancy,
-            0.0,
+            0.0, // F-001: reserved index 7 — see BACKTEST_METRICS_RESERVED_INDEX_7
             self.trade_count as f64,
             self.consistency,
             self.max_daily_drawdown,
@@ -214,15 +240,14 @@ impl From<BacktestMetrics> for [f64; 11] {
 
 impl Default for BacktestSettings {
     fn default() -> Self {
-        // TODO(real-data): `Default::default()` synthesizes cost-profile
-        // fields (pip_value, spread, commission) using the empty-symbol
-        // fallback in `infer_market_cost_profile` — i.e. EURUSD pip math
-        // on a USD account. Every backtest entry point should pass a
-        // real symbol via `for_symbol(...)` so this default is only
-        // used by code that never actually evaluates a strategy
-        // (struct-construction in tests, etc.). Remove this synthetic
-        // fallback once all call sites have migrated.
-        let profile = infer_market_cost_profile("", "", None, None, None);
+        // GROUP C remediation (operator directive 2026-05-25): the
+        // previous code called `infer_market_cost_profile("", "", ...)`
+        // which silently fell back to EURUSD/USD. We now emit NaN
+        // sentinels so any caller that uses Default::default() WITHOUT
+        // then binding a real symbol via `for_symbol(...)` will be
+        // caught by the downstream NaN-fitness guard. Production
+        // backtests MUST construct via `for_symbol(...)` — see
+        // [`BacktestSettings::for_symbol`].
         Self {
             sl_pips: 20.0,
             tp_pips: 40.0,
@@ -233,12 +258,59 @@ impl Default for BacktestSettings {
             trailing_enabled: false,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
-            pip_value: profile.pip_value,
-            spread_pips: profile.spread_pips,
-            commission_per_trade: profile.commission_per_trade,
-            pip_value_per_lot: profile.pip_value_per_lot,
+            pip_value: f64::NAN,
+            spread_pips: f64::NAN,
+            commission_per_trade: f64::NAN,
+            pip_value_per_lot: f64::NAN,
             kill_zones_enabled: false,
             session_spread_profile: None,
+        }
+    }
+}
+
+impl BacktestSettings {
+    /// **F-003 fix** (2026-05-25 — operator directive: kill the EURUSD-
+    /// fallback path).
+    ///
+    /// Real-data backtest entry point. Resolves the per-symbol cost
+    /// profile via [`crate::genetic::strategy_gene::infer_market_cost_profile`]
+    /// and populates `pip_value`, `pip_value_per_lot`, `spread_pips`,
+    /// `commission_per_trade` from it. Non-cost knobs (sl_pips, tp_pips,
+    /// trailing, etc.) inherit from `Default::default()` — callers can
+    /// override post-construction with struct-update syntax.
+    ///
+    /// **Mirrors** [`crate::genetic::strategy_gene::EvaluationConfig::for_symbol`]
+    /// — the audit identified the latter as the template for this method.
+    /// The two together kill the F-002 / F-012 / F-025 / F-033 / F-050
+    /// EURUSD-leak chain (audit GROUP C extension).
+    ///
+    /// ## Behaviour on empty / missing inputs
+    ///
+    /// `infer_market_cost_profile` returns NaN sentinels for empty
+    /// symbol / account_currency. Callers that fail to supply those will
+    /// get a `BacktestSettings` with NaN cost fields, which the
+    /// downstream NaN-fitness guard (see audit GROUP C remediation
+    /// 2026-05-25) catches loudly. No silent EURUSD fallback.
+    pub fn for_symbol(
+        symbol: &str,
+        account_currency: &str,
+        price_hint: Option<f64>,
+        spread_pips_override: Option<f64>,
+        commission_override: Option<f64>,
+    ) -> Self {
+        let profile = crate::genetic::strategy_gene::infer_market_cost_profile(
+            symbol,
+            account_currency,
+            price_hint,
+            spread_pips_override,
+            commission_override,
+        );
+        Self {
+            pip_value: profile.pip_value,
+            pip_value_per_lot: profile.pip_value_per_lot,
+            spread_pips: profile.spread_pips,
+            commission_per_trade: profile.commission_per_trade,
+            ..Self::default()
         }
     }
 }
@@ -257,6 +329,16 @@ pub struct BacktestRuntimeOverrides {
     /// Maximum number of monthly PnL buckets retained for consistency math.
     /// Must be non-zero.
     pub month_capacity: usize,
+    /// Explicit rayon thread-pool size override. `None` → use rayon's
+    /// default (one worker per logical core). `Some(n)` pins the global
+    /// pool to `n` threads.
+    ///
+    /// **F-695 closure (2026-05-25 — F-CORE3)**: previously read inline
+    /// inside `init_rayon` via `env::var("FOREX_BOT_RUST_THREADS")` +
+    /// `env::var("RAYON_NUM_THREADS")`. Now consolidated to this typed
+    /// boundary so the env is read once at process startup through
+    /// `BacktestRuntimeOverrides::from_env`.
+    pub rayon_threads: Option<usize>,
 }
 
 impl Default for BacktestRuntimeOverrides {
@@ -264,6 +346,7 @@ impl Default for BacktestRuntimeOverrides {
         Self {
             initial_equity: 100_000.0,
             month_capacity: 240,
+            rayon_threads: None,
         }
     }
 }
@@ -287,6 +370,18 @@ impl BacktestRuntimeOverrides {
             .filter(|v| *v > 0)
         {
             overrides.month_capacity = value;
+        }
+        // F-695 closure (2026-05-25 — F-CORE3): rayon thread count. The
+        // primary env var matches the audit-recommended NeoEthos naming;
+        // the rayon-stdlib `RAYON_NUM_THREADS` is honoured as a fallback
+        // so existing deployment scripts keep working unchanged.
+        if let Some(value) = env::var("FOREX_BOT_RUST_THREADS")
+            .ok()
+            .or_else(|| env::var("RAYON_NUM_THREADS").ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+        {
+            overrides.rayon_threads = Some(value);
         }
         overrides
     }
@@ -944,10 +1039,15 @@ fn synthesize_signals_cpu(
         .sum();
     // Hard bypass — see `signals_for_gene_full` in search_engine.rs.
     // Lets the GA's evaluation path also skip SMC gating when set.
-    let smc_bypass = matches!(
-        std::env::var("FOREX_BOT_DISABLE_SMC_GATE").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    );
+    //
+    // F-CORE3 closure (2026-05-25): previously read `std::env::var`
+    // inline on EVERY gene during per-gene signal synthesis (i.e.
+    // population × generations env reads per discovery run). Now
+    // resolved through the typed `SmcGateOverrides::disable_gate`
+    // boundary so the env is hit at most once per process.
+    let smc_bypass = crate::genetic::current_genetic_search_runtime_overrides()
+        .smc_gate
+        .disable_gate;
     let active_sum = if smc_bypass { 0.0 } else { active_sum };
     let gate = gate_threshold.min(active_sum);
 

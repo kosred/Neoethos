@@ -3,6 +3,28 @@ use ndarray::Array2;
 use std::collections::HashMap;
 
 /// Portfolio Strategy Manager and Correlation Risk Math.
+///
+/// **F-117 disambiguation (2026-05-25)** — this is the **LIVE TRADING**
+/// portfolio manager. It is intentionally distinct from
+/// `neoethos_search::portfolio::PortfolioOptimizer` (which is the
+/// **DISCOVERY-TIME** allocator). The two structs look superficially
+/// similar but solve different problems:
+///
+/// | Aspect | `PortfolioManager` (this) | `PortfolioOptimizer` (search crate) |
+/// |--------|---------------------------|--------------------------------------|
+/// | Lifecycle | Live trading runtime | Discovery / backtest validation |
+/// | Input | Realised returns matrix | Per-strategy metrics + correlations |
+/// | Output | `HashMap<name, weight>` (cumulative) | `AllocationResult` per asset (Kelly + risk budget) |
+/// | Decisions used | "Should I open another correlated position?" | "Which N strategies make the discovered portfolio?" |
+/// | Threshold knob | `correlation_threshold` (open-position gate) | `corr_threshold` (discovery-time exclusion) |
+///
+/// The original audit (F-117) flagged the name collision as a refactor
+/// candidate. After investigation the operator's directive 2026-05-25
+/// kept them separate: they encode different math + different
+/// lifecycles. The shared core (Pearson correlation calculation) is
+/// duplicated but ~30 LOC — extracting it into a shared helper would
+/// add an inter-crate import for marginal gain. Tracked as a Phase-C
+/// candidate when / if a third correlation user appears.
 pub struct PortfolioManager {
     max_exposure: f64,
     correlation_threshold: f64,

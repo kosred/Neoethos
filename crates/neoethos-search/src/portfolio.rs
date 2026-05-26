@@ -178,13 +178,48 @@ impl PortfolioOptimizer {
             };
 
             for (i, s) in names.iter().enumerate() {
-                let win_rate = *win_map
-                    .get(s)
-                    .expect("ranked allocation names should always resolve to win-rate metrics");
+                // F-053 fix (2026-05-25 — task #218 unwrap audit):
+                // the previous code `.expect()`-panicked on any name
+                // without win-rate / metrics — the panic was a runtime
+                // crash in the portfolio-allocation path. Following
+                // the same pattern as `sharpe_map.get(s).copied()
+                // .unwrap_or_else(...)` above (lines 147-155), we now
+                // fall back to a zero-weight / zero-Kelly allocation
+                // and emit a structured warning. The downstream
+                // `.max(0.0)` already filters zero-Kelly allocations.
+                let win_rate = win_map.get(s).copied().unwrap_or_else(|| {
+                    tracing::warn!(
+                        target: "neoethos_search::portfolio",
+                        strategy = %s,
+                        "ranked allocation name has no win-rate metric; \
+                         falling back to zero-weight allocation"
+                    );
+                    0.0
+                });
+                let metrics = match metrics_map.get(s) {
+                    Some(m) => m,
+                    None => {
+                        tracing::warn!(
+                            target: "neoethos_search::portfolio",
+                            strategy = %s,
+                            "ranked allocation name has no source metrics; \
+                             falling back to zero-weight allocation"
+                        );
+                        weights.insert(
+                            s.clone(),
+                            AllocationResult {
+                                symbol: s.clone(),
+                                weight: 0.0,
+                                kelly_size: 0.0,
+                                risk_budget: 0.0,
+                                correlation_score: avg_corr[i],
+                                sharpe: 0.0,
+                            },
+                        );
+                        continue;
+                    }
+                };
                 // Proper Kelly criterion: f* = p - (1-p)/b where b = avg_win / avg_loss
-                let metrics = metrics_map
-                    .get(s)
-                    .expect("allocation names should always resolve to source metrics");
                 let avg_win = metrics.avg_win_pct.max(0.0);
                 let avg_loss_mag = metrics.avg_loss_pct.abs().max(1e-9);
                 let b = avg_win / avg_loss_mag;

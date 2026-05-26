@@ -17,12 +17,20 @@ use std::sync::OnceLock;
 /// `end` along a power curve of exponent `curve`, and relaxes by
 /// `stagnation_step` per stagnant generation once the patience window has
 /// been exceeded.
+///
+/// `disable_gate` is the operator's hard-bypass escape hatch (legacy
+/// `FOREX_BOT_DISABLE_SMC_GATE=1` env var, now read once at startup
+/// through this typed boundary): when set, the gate collapses (active
+/// SMC sum forced to 0) so the raw signal passes through. Lets operators
+/// isolate "SMC indicators don't trigger on this symbol" from genuine
+/// signal-generation issues without recompiling.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SmcGateOverrides {
     pub start: f32,
     pub end: f32,
     pub curve: f32,
     pub stagnation_step: f32,
+    pub disable_gate: bool,
 }
 
 impl Default for SmcGateOverrides {
@@ -32,6 +40,7 @@ impl Default for SmcGateOverrides {
             end: 0.35,
             curve: 1.0,
             stagnation_step: 0.03,
+            disable_gate: false,
         }
     }
 }
@@ -211,6 +220,15 @@ impl GeneticSearchRuntimeOverrides {
         if let Some(step) = env_f32_finite("FOREX_BOT_PROP_SMC_GATE_STAGNATION_STEP") {
             overrides.smc_gate.stagnation_step = step;
         }
+        // Hard bypass: legacy `FOREX_BOT_DISABLE_SMC_GATE=1` env var.
+        // F-CORE3 closure (2026-05-25): previously read inline inside
+        // `signals_for_gene_full` (search_engine.rs) and the GA's
+        // per-gene signal-synthesis loop (eval.rs::synthesize_signals_cpu).
+        // Now consolidated to this typed boundary so the env is hit at
+        // most once per process.
+        if env_truthy("FOREX_BOT_DISABLE_SMC_GATE") {
+            overrides.smc_gate.disable_gate = true;
+        }
 
         // Archive scoring thresholds.
         if let Some(mode) = env_string_lowercase("FOREX_BOT_PROP_ARCHIVE_MODE") {
@@ -255,6 +273,7 @@ impl GeneticSearchRuntimeOverrides {
             end: self.smc_gate.end,
             curve: self.smc_gate.resolved_curve(),
             stagnation_step: self.smc_gate.resolved_stagnation_step(),
+            disable_gate: self.smc_gate.disable_gate,
         }
     }
 
@@ -322,6 +341,13 @@ impl GeneticSearchRuntimeOverrides {
 /// `COMMISSION` env vars used to populate. Each field is `None` when no
 /// override has been installed; production callers that pass explicit
 /// values continue to bypass these fallbacks.
+///
+/// `reject_pip_fallback` mirrors the legacy `FOREX_BOT_REJECT_PIP_FALLBACK=1`
+/// env var (F-CORE3 closure, 2026-05-25): when set, the cross-pair
+/// pip-value fallback `bail!()`s instead of silently returning the
+/// quote-currency pip value. Previously read inline inside
+/// `reject_cross_pair_fallback()` (strategy_gene.rs); now consolidated
+/// at this typed boundary so the env is hit at most once per process.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CostProfileRuntimeOverrides {
     pub symbol: Option<String>,
@@ -331,6 +357,7 @@ pub struct CostProfileRuntimeOverrides {
     pub pip_value_per_lot: Option<f64>,
     pub spread_pips: Option<f64>,
     pub commission_per_trade: Option<f64>,
+    pub reject_pip_fallback: bool,
 }
 
 impl CostProfileRuntimeOverrides {
@@ -355,6 +382,12 @@ impl CostProfileRuntimeOverrides {
         }
         if let Some(value) = env_f64_non_negative_finite("FOREX_BOT_PROP_COMMISSION") {
             self.commission_per_trade = Some(value);
+        }
+        // F-CORE3 closure (2026-05-25): legacy `FOREX_BOT_REJECT_PIP_FALLBACK=1`
+        // was previously read inline inside `reject_cross_pair_fallback()`
+        // in `strategy_gene.rs`; now consolidated to this typed boundary.
+        if env_truthy("FOREX_BOT_REJECT_PIP_FALLBACK") {
+            self.reject_pip_fallback = true;
         }
     }
 }
@@ -543,6 +576,18 @@ fn env_string_lowercase(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Canonical boolean env-var parser. Returns true for `"1" | "true" | "TRUE"`
+/// (matching the historical inline checks in `signals_for_gene_full`,
+/// `synthesize_signals_cpu`, and `reject_cross_pair_fallback`). Empty
+/// or missing means false. Any unparsed value is treated as false so
+/// typos don't accidentally enable bypass behaviour.
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
 static GENETIC_SEARCH_RUNTIME_OVERRIDES: OnceLock<GeneticSearchRuntimeOverrides> = OnceLock::new();
 
 /// Install process-wide genetic search runtime overrides. Returns
@@ -657,6 +702,7 @@ mod tests {
                 end: 0.2,
                 curve: 0.0,
                 stagnation_step: f32::NAN,
+                disable_gate: false,
             },
             ..GeneticSearchRuntimeOverrides::default()
         };
@@ -670,6 +716,7 @@ mod tests {
                 end: 0.3,
                 curve: 2.5,
                 stagnation_step: 0.05,
+                disable_gate: false,
             },
             ..GeneticSearchRuntimeOverrides::default()
         };

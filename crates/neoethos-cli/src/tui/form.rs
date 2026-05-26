@@ -185,11 +185,18 @@ pub fn make_discover_form(default_root: &str) -> FormState {
 // ─── Train form ────────────────────────────────────────────────────────
 
 pub fn make_train_form(default_root: &str) -> FormState {
+    // **F-641 / F-CORE2 closure (2026-05-25)**: the Symbol field used
+    // to default to "EURUSD" — a synthetic per-symbol assumption that
+    // the no-synthetic-data directive forbids. Now empty so the
+    // operator has to pick from the Symbols page (which enumerates
+    // what's actually on disk via `collect_inventory`). The TUI form's
+    // submit handler rejects empty Symbol with a clear validation
+    // error rather than silently training on the default.
     FormState::new(vec![
         Field::new(
             "Symbol",
-            "EURUSD",
-            "Single symbol to train. Pick from Symbols page.",
+            "",
+            "Single symbol to train. Pick from Symbols page (required).",
         ),
         Field::new("Base TF", "M30", "Base timeframe. Default: M30"),
         Field::new("Data root", default_root, "Path to data/ directory"),

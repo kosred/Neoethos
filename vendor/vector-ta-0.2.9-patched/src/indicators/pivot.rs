@@ -1,0 +1,3638 @@
+use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
+};
+use aligned_vec::{AVec, CACHELINE_ALIGN};
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use core::arch::x86_64::*;
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+use std::convert::AsRef;
+use thiserror::Error;
+
+#[cfg(feature = "python")]
+use crate::utilities::kernel_validation::validate_kernel;
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::PyDict;
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use wasm_bindgen::prelude::*;
+
+const N_LEVELS: usize = 9;
+
+#[inline(always)]
+fn first_valid_ohlc(high: &[f64], low: &[f64], close: &[f64]) -> Option<usize> {
+    let len = high.len();
+    for i in 0..len {
+        if !(high[i].is_nan() || low[i].is_nan() || close[i].is_nan()) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+#[inline(always)]
+fn pivot_compute_into(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    first: usize,
+    k: Kernel,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) {
+    unsafe {
+        #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+        {
+            let _ = k;
+            pivot_scalar(
+                high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+            );
+        }
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        match k {
+            Kernel::Scalar | Kernel::ScalarBatch => pivot_scalar(
+                high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+            ),
+            Kernel::Avx2 | Kernel::Avx2Batch => pivot_avx2(
+                high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+            ),
+            Kernel::Avx512 | Kernel::Avx512Batch => pivot_avx512(
+                high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+            ),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PivotData<'a> {
+    Candles {
+        candles: &'a Candles,
+    },
+    Slices {
+        high: &'a [f64],
+        low: &'a [f64],
+        close: &'a [f64],
+        open: &'a [f64],
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct PivotParams {
+    pub mode: Option<usize>,
+}
+impl Default for PivotParams {
+    fn default() -> Self {
+        Self { mode: Some(3) }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PivotInput<'a> {
+    pub data: PivotData<'a>,
+    pub params: PivotParams,
+}
+impl<'a> PivotInput<'a> {
+    #[inline]
+    pub fn from_candles(candles: &'a Candles, params: PivotParams) -> Self {
+        Self {
+            data: PivotData::Candles { candles },
+            params,
+        }
+    }
+    #[inline]
+    pub fn from_slices(
+        high: &'a [f64],
+        low: &'a [f64],
+        close: &'a [f64],
+        open: &'a [f64],
+        params: PivotParams,
+    ) -> Self {
+        Self {
+            data: PivotData::Slices {
+                high,
+                low,
+                close,
+                open,
+            },
+            params,
+        }
+    }
+    #[inline]
+    pub fn with_default_candles(candles: &'a Candles) -> Self {
+        Self::from_candles(candles, PivotParams::default())
+    }
+    #[inline]
+    pub fn get_mode(&self) -> usize {
+        self.params
+            .mode
+            .unwrap_or_else(|| PivotParams::default().mode.unwrap())
+    }
+}
+impl<'a> AsRef<PivotData<'a>> for PivotInput<'a> {
+    fn as_ref(&self) -> &PivotData<'a> {
+        &self.data
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PivotOutput {
+    pub r4: Vec<f64>,
+    pub r3: Vec<f64>,
+    pub r2: Vec<f64>,
+    pub r1: Vec<f64>,
+    pub pp: Vec<f64>,
+    pub s1: Vec<f64>,
+    pub s2: Vec<f64>,
+    pub s3: Vec<f64>,
+    pub s4: Vec<f64>,
+}
+
+#[derive(Debug, Error)]
+pub enum PivotError {
+    #[error("pivot: One or more required fields is empty.")]
+    EmptyData,
+    #[error("pivot: All values are NaN.")]
+    AllValuesNaN,
+    #[error("pivot: Not enough valid data after the first valid index.")]
+    NotEnoughValidData,
+    #[error("pivot: Output slice length mismatch (expected {expected}, got {got}).")]
+    OutputLengthMismatch { expected: usize, got: usize },
+    #[error("pivot: Invalid range: start={start}, end={end}, step={step}.")]
+    InvalidRange {
+        start: usize,
+        end: usize,
+        step: usize,
+    },
+    #[error("pivot: Invalid kernel for batch path: {0:?}.")]
+    InvalidKernelForBatch(Kernel),
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct PivotBuilder {
+    mode: Option<usize>,
+    kernel: Kernel,
+}
+impl Default for PivotBuilder {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+impl PivotBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[inline(always)]
+    pub fn mode(mut self, mode: usize) -> Self {
+        self.mode = Some(mode);
+        self
+    }
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+    #[inline(always)]
+    pub fn apply(self, candles: &Candles) -> Result<PivotOutput, PivotError> {
+        let params = PivotParams { mode: self.mode };
+        let input = PivotInput::from_candles(candles, params);
+        pivot_with_kernel(&input, self.kernel)
+    }
+    #[inline(always)]
+    pub fn apply_slices(
+        self,
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        open: &[f64],
+    ) -> Result<PivotOutput, PivotError> {
+        let params = PivotParams { mode: self.mode };
+        let input = PivotInput::from_slices(high, low, close, open, params);
+        pivot_with_kernel(&input, self.kernel)
+    }
+}
+
+#[inline]
+pub fn pivot(input: &PivotInput) -> Result<PivotOutput, PivotError> {
+    pivot_with_kernel(input, Kernel::Auto)
+}
+
+#[inline(always)]
+fn pivot_refs<'a>(input: &'a PivotInput<'a>) -> (&'a [f64], &'a [f64], &'a [f64], &'a [f64]) {
+    match &input.data {
+        PivotData::Candles { candles } => (
+            candles.high.as_slice(),
+            candles.low.as_slice(),
+            candles.close.as_slice(),
+            candles.open.as_slice(),
+        ),
+        PivotData::Slices {
+            high,
+            low,
+            close,
+            open,
+        } => (*high, *low, *close, *open),
+    }
+}
+
+pub fn pivot_with_kernel(input: &PivotInput, kernel: Kernel) -> Result<PivotOutput, PivotError> {
+    let (high, low, close, open) = pivot_refs(input);
+    let len = high.len();
+    if high.is_empty() || low.is_empty() || close.is_empty() {
+        return Err(PivotError::EmptyData);
+    }
+    if low.len() != len || close.len() != len || open.len() != len {
+        return Err(PivotError::EmptyData);
+    }
+    let mode = input.get_mode();
+
+    let mut first_valid_idx = None;
+    for i in 0..len {
+        let h = high[i];
+        let l = low[i];
+        let c = close[i];
+        if !(h.is_nan() || l.is_nan() || c.is_nan()) {
+            first_valid_idx = Some(i);
+            break;
+        }
+    }
+    let first_valid_idx = match first_valid_idx {
+        Some(idx) => idx,
+        None => return Err(PivotError::AllValuesNaN),
+    };
+    if first_valid_idx >= len {
+        return Err(PivotError::NotEnoughValidData);
+    }
+
+    let mut r4 = alloc_with_nan_prefix(len, first_valid_idx);
+    let mut r3 = alloc_with_nan_prefix(len, first_valid_idx);
+    let mut r2 = alloc_with_nan_prefix(len, first_valid_idx);
+    let mut r1 = alloc_with_nan_prefix(len, first_valid_idx);
+    let mut pp = alloc_with_nan_prefix(len, first_valid_idx);
+    let mut s1 = alloc_with_nan_prefix(len, first_valid_idx);
+    let mut s2 = alloc_with_nan_prefix(len, first_valid_idx);
+    let mut s3 = alloc_with_nan_prefix(len, first_valid_idx);
+    let mut s4 = alloc_with_nan_prefix(len, first_valid_idx);
+
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    let chosen = match kernel {
+        Kernel::Auto => detect_best_kernel(),
+        other => other,
+    };
+    #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+    let chosen = match kernel {
+        Kernel::Auto => Kernel::Scalar,
+        other => other,
+    };
+    pivot_compute_into(
+        high,
+        low,
+        close,
+        open,
+        mode,
+        first_valid_idx,
+        chosen,
+        &mut r4,
+        &mut r3,
+        &mut r2,
+        &mut r1,
+        &mut pp,
+        &mut s1,
+        &mut s2,
+        &mut s3,
+        &mut s4,
+    );
+    Ok(PivotOutput {
+        r4,
+        r3,
+        r2,
+        r1,
+        pp,
+        s1,
+        s2,
+        s3,
+        s4,
+    })
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+#[inline]
+pub fn pivot_into(
+    input: &PivotInput,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) -> Result<(), PivotError> {
+    let (high, low, close, open) = pivot_refs(input);
+
+    let len = high.len();
+    if high.is_empty() || low.is_empty() || close.is_empty() {
+        return Err(PivotError::EmptyData);
+    }
+    if low.len() != len || close.len() != len || open.len() != len {
+        return Err(PivotError::EmptyData);
+    }
+    let expected = len;
+    let first_mismatch = [
+        r4.len(),
+        r3.len(),
+        r2.len(),
+        r1.len(),
+        pp.len(),
+        s1.len(),
+        s2.len(),
+        s3.len(),
+        s4.len(),
+    ]
+    .into_iter()
+    .find(|&got| got != expected);
+    if let Some(got) = first_mismatch {
+        return Err(PivotError::OutputLengthMismatch { expected, got });
+    }
+
+    let mode = input.get_mode();
+
+    let first_valid_idx = first_valid_ohlc(high, low, close).ok_or(PivotError::AllValuesNaN)?;
+    if first_valid_idx >= len {
+        return Err(PivotError::NotEnoughValidData);
+    }
+
+    let qnan = f64::from_bits(0x7ff8_0000_0000_0000);
+    for i in 0..first_valid_idx {
+        r4[i] = qnan;
+        r3[i] = qnan;
+        r2[i] = qnan;
+        r1[i] = qnan;
+        pp[i] = qnan;
+        s1[i] = qnan;
+        s2[i] = qnan;
+        s3[i] = qnan;
+        s4[i] = qnan;
+    }
+
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    let chosen = detect_best_kernel();
+    #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+    let chosen = Kernel::Scalar;
+    pivot_compute_into(
+        high,
+        low,
+        close,
+        open,
+        mode,
+        first_valid_idx,
+        chosen,
+        r4,
+        r3,
+        r2,
+        r1,
+        pp,
+        s1,
+        s2,
+        s3,
+        s4,
+    );
+
+    Ok(())
+}
+
+#[inline]
+pub fn pivot_into_slices(
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+    input: &PivotInput,
+    kern: Kernel,
+) -> Result<(), PivotError> {
+    let (high, low, close, open) = pivot_refs(input);
+
+    let len = high.len();
+    if high.is_empty() || low.is_empty() || close.is_empty() {
+        return Err(PivotError::EmptyData);
+    }
+    if low.len() != len || close.len() != len || open.len() != len {
+        return Err(PivotError::EmptyData);
+    }
+    let expected = len;
+    let first_mismatch = [
+        r4.len(),
+        r3.len(),
+        r2.len(),
+        r1.len(),
+        pp.len(),
+        s1.len(),
+        s2.len(),
+        s3.len(),
+        s4.len(),
+    ]
+    .into_iter()
+    .find(|&got| got != expected);
+    if let Some(got) = first_mismatch {
+        return Err(PivotError::OutputLengthMismatch { expected, got });
+    }
+
+    let mode = input.get_mode();
+
+    let mut first_valid_idx = None;
+    for i in 0..len {
+        let h = high[i];
+        let l = low[i];
+        let c = close[i];
+        if !(h.is_nan() || l.is_nan() || c.is_nan()) {
+            first_valid_idx = Some(i);
+            break;
+        }
+    }
+    let first_valid_idx = match first_valid_idx {
+        Some(idx) => idx,
+        None => return Err(PivotError::AllValuesNaN),
+    };
+    if first_valid_idx >= len {
+        return Err(PivotError::NotEnoughValidData);
+    }
+
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    let chosen = match kern {
+        Kernel::Auto => detect_best_kernel(),
+        other => other,
+    };
+    #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+    let chosen = match kern {
+        Kernel::Auto => Kernel::Scalar,
+        other => other,
+    };
+
+    pivot_compute_into(
+        high,
+        low,
+        close,
+        open,
+        mode,
+        first_valid_idx,
+        chosen,
+        r4,
+        r3,
+        r2,
+        r1,
+        pp,
+        s1,
+        s2,
+        s3,
+        s4,
+    );
+
+    for i in 0..first_valid_idx {
+        r4[i] = f64::NAN;
+        r3[i] = f64::NAN;
+        r2[i] = f64::NAN;
+        r1[i] = f64::NAN;
+        pp[i] = f64::NAN;
+        s1[i] = f64::NAN;
+        s2[i] = f64::NAN;
+        s3[i] = f64::NAN;
+        s4[i] = f64::NAN;
+    }
+
+    Ok(())
+}
+
+#[inline]
+pub unsafe fn pivot_scalar(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    first: usize,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) {
+    let len = high.len();
+    if first >= len {
+        return;
+    }
+
+    let nan = f64::NAN;
+
+    match mode {
+        0 => {
+            for i in first..len {
+                let h = high[i];
+                let l = low[i];
+                let c = close[i];
+                if h.is_nan() || l.is_nan() || c.is_nan() {
+                    r4[i] = nan;
+                    r3[i] = nan;
+                    r2[i] = nan;
+                    r1[i] = nan;
+                    pp[i] = nan;
+                    s1[i] = nan;
+                    s2[i] = nan;
+                    s3[i] = nan;
+                    s4[i] = nan;
+                    continue;
+                }
+                let d = h - l;
+                let p = (h + l + c) * (1.0 / 3.0);
+                let t2 = p + p;
+                pp[i] = p;
+                r1[i] = t2 - l;
+                r2[i] = p + d;
+                s1[i] = t2 - h;
+                s2[i] = p - d;
+                r3[i] = nan;
+                r4[i] = nan;
+                s3[i] = nan;
+                s4[i] = nan;
+            }
+        }
+
+        1 => {
+            for i in first..len {
+                let h = high[i];
+                let l = low[i];
+                let c = close[i];
+                if h.is_nan() || l.is_nan() || c.is_nan() {
+                    r4[i] = nan;
+                    r3[i] = nan;
+                    r2[i] = nan;
+                    r1[i] = nan;
+                    pp[i] = nan;
+                    s1[i] = nan;
+                    s2[i] = nan;
+                    s3[i] = nan;
+                    s4[i] = nan;
+                    continue;
+                }
+                let d = h - l;
+                let p = (h + l + c) * (1.0 / 3.0);
+                let d38 = d * 0.382_f64;
+                let d62 = d * 0.618_f64;
+                pp[i] = p;
+                r1[i] = p + d38;
+                r2[i] = p + d62;
+                r3[i] = p + d;
+                s1[i] = p - d38;
+                s2[i] = p - d62;
+                s3[i] = p - d;
+                r4[i] = nan;
+                s4[i] = nan;
+            }
+        }
+
+        2 => {
+            for i in first..len {
+                let h = high[i];
+                let l = low[i];
+                let c = close[i];
+                let o = open[i];
+                if h.is_nan() || l.is_nan() || c.is_nan() {
+                    r4[i] = nan;
+                    r3[i] = nan;
+                    r2[i] = nan;
+                    r1[i] = nan;
+                    pp[i] = nan;
+                    s1[i] = nan;
+                    s2[i] = nan;
+                    s3[i] = nan;
+                    s4[i] = nan;
+                    continue;
+                }
+                let p = if c < o {
+                    (h + (l + l) + c) * 0.25
+                } else if c > o {
+                    ((h + h) + l + c) * 0.25
+                } else {
+                    (h + l + (c + c)) * 0.25
+                };
+                pp[i] = p;
+                let num = if c < o {
+                    (h + (l + l) + c) * 0.5
+                } else if c > o {
+                    ((h + h) + l + c) * 0.5
+                } else {
+                    (h + l + (c + c)) * 0.5
+                };
+                r1[i] = num - l;
+                s1[i] = num - h;
+                r2[i] = nan;
+                r3[i] = nan;
+                r4[i] = nan;
+                s2[i] = nan;
+                s3[i] = nan;
+                s4[i] = nan;
+            }
+        }
+
+        3 => {
+            const C1: f64 = 0.0916_f64;
+            const C2: f64 = 0.183_f64;
+            const C3: f64 = 0.275_f64;
+            const C4: f64 = 0.55_f64;
+            let hp = high.as_ptr();
+            let lp = low.as_ptr();
+            let cp = close.as_ptr();
+            let r4p = r4.as_mut_ptr();
+            let r3p = r3.as_mut_ptr();
+            let r2p = r2.as_mut_ptr();
+            let r1p = r1.as_mut_ptr();
+            let ppp = pp.as_mut_ptr();
+            let s1p = s1.as_mut_ptr();
+            let s2p = s2.as_mut_ptr();
+            let s3p = s3.as_mut_ptr();
+            let s4p = s4.as_mut_ptr();
+            let mut i = first;
+            while i < len {
+                let h = *hp.add(i);
+                let l = *lp.add(i);
+                let c = *cp.add(i);
+                if h.is_nan() || l.is_nan() || c.is_nan() {
+                    *r4p.add(i) = nan;
+                    *r3p.add(i) = nan;
+                    *r2p.add(i) = nan;
+                    *r1p.add(i) = nan;
+                    *ppp.add(i) = nan;
+                    *s1p.add(i) = nan;
+                    *s2p.add(i) = nan;
+                    *s3p.add(i) = nan;
+                    *s4p.add(i) = nan;
+                    i += 1;
+                    continue;
+                }
+                let d = h - l;
+                let p = (h + l + c) * (1.0 / 3.0);
+                *ppp.add(i) = p;
+                let d1 = d * C1;
+                let d2 = d * C2;
+                let d3 = d * C3;
+                let d4 = d * C4;
+                *r1p.add(i) = d1 + c;
+                *r2p.add(i) = d2 + c;
+                *r3p.add(i) = d3 + c;
+                *r4p.add(i) = d4 + c;
+                *s1p.add(i) = c - d1;
+                *s2p.add(i) = c - d2;
+                *s3p.add(i) = c - d3;
+                *s4p.add(i) = c - d4;
+                i += 1;
+            }
+        }
+
+        4 => {
+            for i in first..len {
+                let h = high[i];
+                let l = low[i];
+                let c = close[i];
+                let o = open[i];
+                if h.is_nan() || l.is_nan() || c.is_nan() {
+                    r4[i] = nan;
+                    r3[i] = nan;
+                    r2[i] = nan;
+                    r1[i] = nan;
+                    pp[i] = nan;
+                    s1[i] = nan;
+                    s2[i] = nan;
+                    s3[i] = nan;
+                    s4[i] = nan;
+                    continue;
+                }
+                let d = h - l;
+                let p = (h + l + (o + o)) * 0.25;
+                pp[i] = p;
+                let t2p = p + p;
+                let t2l = l + l;
+                let t2h = h + h;
+                let r3v = (t2p - t2l) + h;
+                r3[i] = r3v;
+                r4[i] = r3v + d;
+                r2[i] = p + d;
+                r1[i] = t2p - l;
+                s1[i] = t2p - h;
+                s2[i] = p - d;
+                let s3v = (l + t2p) - t2h;
+                s3[i] = s3v;
+                s4[i] = s3v - d;
+            }
+        }
+
+        _ => {}
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn pivot_avx2(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    first: usize,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) {
+    use core::arch::x86_64::*;
+
+    let len = high.len();
+    if first >= len {
+        return;
+    }
+
+    let hp = high.as_ptr();
+    let lp = low.as_ptr();
+    let cp = close.as_ptr();
+    let op = open.as_ptr();
+
+    let r4p = r4.as_mut_ptr();
+    let r3p = r3.as_mut_ptr();
+    let r2p = r2.as_mut_ptr();
+    let r1p = r1.as_mut_ptr();
+    let ppp = pp.as_mut_ptr();
+    let s1p = s1.as_mut_ptr();
+    let s2p = s2.as_mut_ptr();
+    let s3p = s3.as_mut_ptr();
+    let s4p = s4.as_mut_ptr();
+
+    let v_nan = _mm256_set1_pd(f64::NAN);
+    let v_third = _mm256_set1_pd(1.0 / 3.0);
+    let v_quart = _mm256_set1_pd(0.25);
+    let v_half = _mm256_set1_pd(0.5);
+    let v_one = _mm256_set1_pd(1.0);
+    let v_c0916 = _mm256_set1_pd(0.0916);
+    let v_c0183 = _mm256_set1_pd(0.183);
+    let v_c0275 = _mm256_set1_pd(0.275);
+    let v_c0550 = _mm256_set1_pd(0.55);
+    let v_c0382 = _mm256_set1_pd(0.382);
+    let v_c0618 = _mm256_set1_pd(0.618);
+    let v_neg1 = _mm256_set1_pd(-1.0);
+    let v_n0382 = _mm256_set1_pd(-0.382);
+    let v_n0618 = _mm256_set1_pd(-0.618);
+
+    let mut i = first;
+    let end4 = first + ((len - first) & !3);
+
+    #[inline(always)]
+    unsafe fn valid_mask_avx2(h: __m256d, l: __m256d, c: __m256d) -> __m256d {
+        let ord_h = _mm256_cmp_pd(h, h, _CMP_ORD_Q);
+        let ord_l = _mm256_cmp_pd(l, l, _CMP_ORD_Q);
+        let ord_c = _mm256_cmp_pd(c, c, _CMP_ORD_Q);
+        _mm256_and_pd(_mm256_and_pd(ord_h, ord_l), ord_c)
+    }
+
+    #[inline(always)]
+    unsafe fn blendv(a: __m256d, b: __m256d, mask: __m256d) -> __m256d {
+        _mm256_blendv_pd(a, b, mask)
+    }
+
+    match mode {
+        0 => {
+            while i < end4 {
+                let h = _mm256_loadu_pd(hp.add(i));
+                let l = _mm256_loadu_pd(lp.add(i));
+                let c = _mm256_loadu_pd(cp.add(i));
+                let vld = valid_mask_avx2(h, l, c);
+
+                let p = _mm256_mul_pd(_mm256_add_pd(_mm256_add_pd(h, l), c), v_third);
+                let d = _mm256_sub_pd(h, l);
+                let t2 = _mm256_add_pd(p, p);
+
+                let r1v = _mm256_sub_pd(t2, l);
+                let r2v = _mm256_fmadd_pd(d, v_one, p);
+                let s1v = _mm256_sub_pd(t2, h);
+                let s2v = _mm256_fmadd_pd(d, v_neg1, p);
+
+                _mm256_storeu_pd(ppp.add(i), blendv(v_nan, p, vld));
+                _mm256_storeu_pd(r1p.add(i), blendv(v_nan, r1v, vld));
+                _mm256_storeu_pd(r2p.add(i), blendv(v_nan, r2v, vld));
+                _mm256_storeu_pd(s1p.add(i), blendv(v_nan, s1v, vld));
+                _mm256_storeu_pd(s2p.add(i), blendv(v_nan, s2v, vld));
+                _mm256_storeu_pd(r3p.add(i), v_nan);
+                _mm256_storeu_pd(r4p.add(i), v_nan);
+                _mm256_storeu_pd(s3p.add(i), v_nan);
+                _mm256_storeu_pd(s4p.add(i), v_nan);
+
+                i += 4;
+            }
+        }
+        1 => {
+            while i < end4 {
+                let h = _mm256_loadu_pd(hp.add(i));
+                let l = _mm256_loadu_pd(lp.add(i));
+                let c = _mm256_loadu_pd(cp.add(i));
+                let vld = valid_mask_avx2(h, l, c);
+
+                let p = _mm256_mul_pd(_mm256_add_pd(_mm256_add_pd(h, l), c), v_third);
+                let d = _mm256_sub_pd(h, l);
+                let r1v = _mm256_fmadd_pd(d, v_c0382, p);
+                let r2v = _mm256_fmadd_pd(d, v_c0618, p);
+                let r3v = _mm256_fmadd_pd(d, v_one, p);
+                let s1v = _mm256_fmadd_pd(d, v_n0382, p);
+                let s2v = _mm256_fmadd_pd(d, v_n0618, p);
+                let s3v = _mm256_fmadd_pd(d, v_neg1, p);
+
+                _mm256_storeu_pd(ppp.add(i), blendv(v_nan, p, vld));
+                _mm256_storeu_pd(r1p.add(i), blendv(v_nan, r1v, vld));
+                _mm256_storeu_pd(r2p.add(i), blendv(v_nan, r2v, vld));
+                _mm256_storeu_pd(r3p.add(i), blendv(v_nan, r3v, vld));
+                _mm256_storeu_pd(s1p.add(i), blendv(v_nan, s1v, vld));
+                _mm256_storeu_pd(s2p.add(i), blendv(v_nan, s2v, vld));
+                _mm256_storeu_pd(s3p.add(i), blendv(v_nan, s3v, vld));
+                _mm256_storeu_pd(r4p.add(i), v_nan);
+                _mm256_storeu_pd(s4p.add(i), v_nan);
+
+                i += 4;
+            }
+        }
+        2 => {
+            while i < end4 {
+                let h = _mm256_loadu_pd(hp.add(i));
+                let l = _mm256_loadu_pd(lp.add(i));
+                let c = _mm256_loadu_pd(cp.add(i));
+                let o = _mm256_loadu_pd(op.add(i));
+                let vld = valid_mask_avx2(h, l, c);
+
+                let mlt = _mm256_cmp_pd(c, o, _CMP_LT_OQ);
+                let mgt = _mm256_cmp_pd(c, o, _CMP_GT_OQ);
+
+                let p_lt = _mm256_mul_pd(
+                    _mm256_add_pd(_mm256_add_pd(h, _mm256_add_pd(l, l)), c),
+                    v_quart,
+                );
+                let p_gt = _mm256_mul_pd(
+                    _mm256_add_pd(_mm256_add_pd(_mm256_add_pd(h, h), l), c),
+                    v_quart,
+                );
+                let p_eq = _mm256_mul_pd(
+                    _mm256_add_pd(_mm256_add_pd(h, l), _mm256_add_pd(c, c)),
+                    v_quart,
+                );
+
+                let mut p = blendv(p_eq, p_gt, mgt);
+                p = blendv(p, p_lt, mlt);
+                _mm256_storeu_pd(ppp.add(i), blendv(v_nan, p, vld));
+
+                let n_lt = _mm256_mul_pd(
+                    _mm256_add_pd(_mm256_add_pd(h, _mm256_add_pd(l, l)), c),
+                    v_half,
+                );
+                let n_gt = _mm256_mul_pd(
+                    _mm256_add_pd(_mm256_add_pd(_mm256_add_pd(h, h), l), c),
+                    v_half,
+                );
+                let n_eq = _mm256_mul_pd(
+                    _mm256_add_pd(_mm256_add_pd(h, l), _mm256_add_pd(c, c)),
+                    v_half,
+                );
+
+                let mut n = blendv(n_eq, n_gt, mgt);
+                n = blendv(n, n_lt, mlt);
+
+                let r1v = _mm256_sub_pd(n, l);
+                let s1v = _mm256_sub_pd(n, h);
+
+                _mm256_storeu_pd(r1p.add(i), blendv(v_nan, r1v, vld));
+                _mm256_storeu_pd(s1p.add(i), blendv(v_nan, s1v, vld));
+                _mm256_storeu_pd(r2p.add(i), v_nan);
+                _mm256_storeu_pd(r3p.add(i), v_nan);
+                _mm256_storeu_pd(r4p.add(i), v_nan);
+                _mm256_storeu_pd(s2p.add(i), v_nan);
+                _mm256_storeu_pd(s3p.add(i), v_nan);
+                _mm256_storeu_pd(s4p.add(i), v_nan);
+
+                i += 4;
+            }
+        }
+        3 => {
+            while i < end4 {
+                let h = _mm256_loadu_pd(hp.add(i));
+                let l = _mm256_loadu_pd(lp.add(i));
+                let c = _mm256_loadu_pd(cp.add(i));
+                let vld = valid_mask_avx2(h, l, c);
+
+                let p = _mm256_mul_pd(_mm256_add_pd(_mm256_add_pd(h, l), c), v_third);
+                _mm256_storeu_pd(ppp.add(i), blendv(v_nan, p, vld));
+
+                let d = _mm256_sub_pd(h, l);
+                let d1 = _mm256_mul_pd(d, v_c0916);
+                let d2 = _mm256_mul_pd(d, v_c0183);
+                let d3 = _mm256_mul_pd(d, v_c0275);
+                let d4 = _mm256_mul_pd(d, v_c0550);
+
+                let r1v = _mm256_fmadd_pd(d, v_c0916, c);
+                let r2v = _mm256_fmadd_pd(d, v_c0183, c);
+                let r3v = _mm256_fmadd_pd(d, v_c0275, c);
+                let r4v = _mm256_fmadd_pd(d, v_c0550, c);
+
+                let s1v = _mm256_fmadd_pd(d, _mm256_sub_pd(_mm256_setzero_pd(), v_c0916), c);
+                let s2v = _mm256_fmadd_pd(d, _mm256_sub_pd(_mm256_setzero_pd(), v_c0183), c);
+                let s3v = _mm256_fmadd_pd(d, _mm256_sub_pd(_mm256_setzero_pd(), v_c0275), c);
+                let s4v = _mm256_fmadd_pd(d, _mm256_sub_pd(_mm256_setzero_pd(), v_c0550), c);
+
+                _mm256_storeu_pd(r1p.add(i), blendv(v_nan, r1v, vld));
+                _mm256_storeu_pd(r2p.add(i), blendv(v_nan, r2v, vld));
+                _mm256_storeu_pd(r3p.add(i), blendv(v_nan, r3v, vld));
+                _mm256_storeu_pd(r4p.add(i), blendv(v_nan, r4v, vld));
+                _mm256_storeu_pd(s1p.add(i), blendv(v_nan, s1v, vld));
+                _mm256_storeu_pd(s2p.add(i), blendv(v_nan, s2v, vld));
+                _mm256_storeu_pd(s3p.add(i), blendv(v_nan, s3v, vld));
+                _mm256_storeu_pd(s4p.add(i), blendv(v_nan, s4v, vld));
+
+                i += 4;
+            }
+        }
+        4 => {
+            while i < end4 {
+                let h = _mm256_loadu_pd(hp.add(i));
+                let l = _mm256_loadu_pd(lp.add(i));
+                let c = _mm256_loadu_pd(cp.add(i));
+                let o = _mm256_loadu_pd(op.add(i));
+                let vld = valid_mask_avx2(h, l, c);
+
+                let p = _mm256_mul_pd(
+                    _mm256_add_pd(_mm256_add_pd(h, l), _mm256_add_pd(o, o)),
+                    v_quart,
+                );
+                let t2p = _mm256_add_pd(p, p);
+                let t2l = _mm256_add_pd(l, l);
+                let t2h = _mm256_add_pd(h, h);
+                let d = _mm256_sub_pd(h, l);
+
+                let r3v = _mm256_add_pd(_mm256_sub_pd(t2p, t2l), h);
+                let r4v = _mm256_fmadd_pd(d, v_one, r3v);
+                let r2v = _mm256_fmadd_pd(d, v_one, p);
+                let r1v = _mm256_sub_pd(t2p, l);
+
+                let s1v = _mm256_sub_pd(t2p, h);
+                let s2v = _mm256_fmadd_pd(d, v_neg1, p);
+                let s3v = _mm256_sub_pd(_mm256_add_pd(l, t2p), t2h);
+                let s4v = _mm256_fmadd_pd(d, v_neg1, s3v);
+
+                _mm256_storeu_pd(ppp.add(i), blendv(v_nan, p, vld));
+                _mm256_storeu_pd(r1p.add(i), blendv(v_nan, r1v, vld));
+                _mm256_storeu_pd(r2p.add(i), blendv(v_nan, r2v, vld));
+                _mm256_storeu_pd(r3p.add(i), blendv(v_nan, r3v, vld));
+                _mm256_storeu_pd(r4p.add(i), blendv(v_nan, r4v, vld));
+                _mm256_storeu_pd(s1p.add(i), blendv(v_nan, s1v, vld));
+                _mm256_storeu_pd(s2p.add(i), blendv(v_nan, s2v, vld));
+                _mm256_storeu_pd(s3p.add(i), blendv(v_nan, s3v, vld));
+                _mm256_storeu_pd(s4p.add(i), blendv(v_nan, s4v, vld));
+
+                i += 4;
+            }
+        }
+        _ => {}
+    }
+
+    if i < len {
+        pivot_scalar(
+            high, low, close, open, mode, i, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+        );
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn pivot_avx512(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    first: usize,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) {
+    if high.len() <= 32 {
+        pivot_avx512_short(
+            high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+        )
+    } else {
+        pivot_avx512_long(
+            high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+        )
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn pivot_avx512_short(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    first: usize,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) {
+    pivot_avx512_long(
+        high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+    )
+}
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512f,fma")]
+pub unsafe fn pivot_avx512_long(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    first: usize,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) {
+    use core::arch::x86_64::*;
+
+    let len = high.len();
+    if first >= len {
+        return;
+    }
+
+    let hp = high.as_ptr();
+    let lp = low.as_ptr();
+    let cp = close.as_ptr();
+    let op = open.as_ptr();
+
+    let r4p = r4.as_mut_ptr();
+    let r3p = r3.as_mut_ptr();
+    let r2p = r2.as_mut_ptr();
+    let r1p = r1.as_mut_ptr();
+    let ppp = pp.as_mut_ptr();
+    let s1p = s1.as_mut_ptr();
+    let s2p = s2.as_mut_ptr();
+    let s3p = s3.as_mut_ptr();
+    let s4p = s4.as_mut_ptr();
+
+    let v_nan = _mm512_set1_pd(f64::NAN);
+    let v_third = _mm512_set1_pd(1.0 / 3.0);
+    let v_quart = _mm512_set1_pd(0.25);
+    let v_half = _mm512_set1_pd(0.5);
+    let v_one = _mm512_set1_pd(1.0);
+    let v_c0916 = _mm512_set1_pd(0.0916);
+    let v_c0183 = _mm512_set1_pd(0.183);
+    let v_c0275 = _mm512_set1_pd(0.275);
+    let v_c0550 = _mm512_set1_pd(0.55);
+    let v_c0382 = _mm512_set1_pd(0.382);
+    let v_c0618 = _mm512_set1_pd(0.618);
+    let v_neg1 = _mm512_set1_pd(-1.0);
+    let v_n0382 = _mm512_set1_pd(-0.382);
+    let v_n0618 = _mm512_set1_pd(-0.618);
+
+    let mut i = first;
+    let step = 8;
+
+    #[inline(always)]
+    unsafe fn valid_mask_avx512(h: __m512d, l: __m512d, c: __m512d) -> u8 {
+        let mh = _mm512_cmp_pd_mask(h, h, _CMP_ORD_Q);
+        let ml = _mm512_cmp_pd_mask(l, l, _CMP_ORD_Q);
+        let mc = _mm512_cmp_pd_mask(c, c, _CMP_ORD_Q);
+        mh & ml & mc
+    }
+
+    match mode {
+        0 => {
+            while i + step <= len {
+                let h = _mm512_loadu_pd(hp.add(i));
+                let l = _mm512_loadu_pd(lp.add(i));
+                let c = _mm512_loadu_pd(cp.add(i));
+                let mk = valid_mask_avx512(h, l, c);
+
+                let p = _mm512_mul_pd(_mm512_add_pd(_mm512_add_pd(h, l), c), v_third);
+                let d = _mm512_sub_pd(h, l);
+                let t2 = _mm512_add_pd(p, p);
+
+                let r1v = _mm512_sub_pd(t2, l);
+                let r2v = _mm512_fmadd_pd(d, v_one, p);
+                let s1v = _mm512_sub_pd(t2, h);
+                let s2v = _mm512_fmadd_pd(d, v_neg1, p);
+
+                _mm512_storeu_pd(ppp.add(i), _mm512_mask_blend_pd(mk, v_nan, p));
+                _mm512_storeu_pd(r1p.add(i), _mm512_mask_blend_pd(mk, v_nan, r1v));
+                _mm512_storeu_pd(r2p.add(i), _mm512_mask_blend_pd(mk, v_nan, r2v));
+                _mm512_storeu_pd(s1p.add(i), _mm512_mask_blend_pd(mk, v_nan, s1v));
+                _mm512_storeu_pd(s2p.add(i), _mm512_mask_blend_pd(mk, v_nan, s2v));
+                _mm512_storeu_pd(r3p.add(i), v_nan);
+                _mm512_storeu_pd(r4p.add(i), v_nan);
+                _mm512_storeu_pd(s3p.add(i), v_nan);
+                _mm512_storeu_pd(s4p.add(i), v_nan);
+
+                i += step;
+            }
+        }
+        1 => {
+            while i + step <= len {
+                let h = _mm512_loadu_pd(hp.add(i));
+                let l = _mm512_loadu_pd(lp.add(i));
+                let c = _mm512_loadu_pd(cp.add(i));
+                let mk = valid_mask_avx512(h, l, c);
+
+                let p = _mm512_mul_pd(_mm512_add_pd(_mm512_add_pd(h, l), c), v_third);
+                let d = _mm512_sub_pd(h, l);
+                let r1v = _mm512_fmadd_pd(d, v_c0382, p);
+                let r2v = _mm512_fmadd_pd(d, v_c0618, p);
+                let r3v = _mm512_fmadd_pd(d, v_one, p);
+                let s1v = _mm512_fmadd_pd(d, v_n0382, p);
+                let s2v = _mm512_fmadd_pd(d, v_n0618, p);
+                let s3v = _mm512_fmadd_pd(d, v_neg1, p);
+
+                _mm512_storeu_pd(ppp.add(i), _mm512_mask_blend_pd(mk, v_nan, p));
+                _mm512_storeu_pd(r1p.add(i), _mm512_mask_blend_pd(mk, v_nan, r1v));
+                _mm512_storeu_pd(r2p.add(i), _mm512_mask_blend_pd(mk, v_nan, r2v));
+                _mm512_storeu_pd(r3p.add(i), _mm512_mask_blend_pd(mk, v_nan, r3v));
+                _mm512_storeu_pd(s1p.add(i), _mm512_mask_blend_pd(mk, v_nan, s1v));
+                _mm512_storeu_pd(s2p.add(i), _mm512_mask_blend_pd(mk, v_nan, s2v));
+                _mm512_storeu_pd(s3p.add(i), _mm512_mask_blend_pd(mk, v_nan, s3v));
+                _mm512_storeu_pd(r4p.add(i), v_nan);
+                _mm512_storeu_pd(s4p.add(i), v_nan);
+
+                i += step;
+            }
+        }
+        2 => {
+            while i + step <= len {
+                let h = _mm512_loadu_pd(hp.add(i));
+                let l = _mm512_loadu_pd(lp.add(i));
+                let c = _mm512_loadu_pd(cp.add(i));
+                let o = _mm512_loadu_pd(op.add(i));
+                let mk = valid_mask_avx512(h, l, c);
+
+                let mlt = _mm512_cmp_pd_mask(c, o, _CMP_LT_OQ);
+                let mgt = _mm512_cmp_pd_mask(c, o, _CMP_GT_OQ);
+                let meq = (!mlt) & (!mgt);
+
+                let p_lt = _mm512_mul_pd(
+                    _mm512_add_pd(_mm512_add_pd(h, _mm512_add_pd(l, l)), c),
+                    v_quart,
+                );
+                let p_gt = _mm512_mul_pd(
+                    _mm512_add_pd(_mm512_add_pd(_mm512_add_pd(h, h), l), c),
+                    v_quart,
+                );
+                let p_eq = _mm512_mul_pd(
+                    _mm512_add_pd(_mm512_add_pd(h, l), _mm512_add_pd(c, c)),
+                    v_quart,
+                );
+
+                let mut p = p_eq;
+                p = _mm512_mask_blend_pd(mgt, p, p_gt);
+                p = _mm512_mask_blend_pd(mlt, p, p_lt);
+                _mm512_storeu_pd(ppp.add(i), _mm512_mask_blend_pd(mk, v_nan, p));
+
+                let n_lt = _mm512_mul_pd(
+                    _mm512_add_pd(_mm512_add_pd(h, _mm512_add_pd(l, l)), c),
+                    v_half,
+                );
+                let n_gt = _mm512_mul_pd(
+                    _mm512_add_pd(_mm512_add_pd(_mm512_add_pd(h, h), l), c),
+                    v_half,
+                );
+                let n_eq = _mm512_mul_pd(
+                    _mm512_add_pd(_mm512_add_pd(h, l), _mm512_add_pd(c, c)),
+                    v_half,
+                );
+
+                let mut n = n_eq;
+                n = _mm512_mask_blend_pd(mgt, n, n_gt);
+                n = _mm512_mask_blend_pd(mlt, n, n_lt);
+
+                let r1v = _mm512_sub_pd(n, l);
+                let s1v = _mm512_sub_pd(n, h);
+
+                _mm512_storeu_pd(r1p.add(i), _mm512_mask_blend_pd(mk, v_nan, r1v));
+                _mm512_storeu_pd(s1p.add(i), _mm512_mask_blend_pd(mk, v_nan, s1v));
+                _mm512_storeu_pd(r2p.add(i), v_nan);
+                _mm512_storeu_pd(r3p.add(i), v_nan);
+                _mm512_storeu_pd(r4p.add(i), v_nan);
+                _mm512_storeu_pd(s2p.add(i), v_nan);
+                _mm512_storeu_pd(s3p.add(i), v_nan);
+                _mm512_storeu_pd(s4p.add(i), v_nan);
+
+                i += step;
+            }
+        }
+        3 => {
+            while i + step <= len {
+                let h = _mm512_loadu_pd(hp.add(i));
+                let l = _mm512_loadu_pd(lp.add(i));
+                let c = _mm512_loadu_pd(cp.add(i));
+                let mk = valid_mask_avx512(h, l, c);
+
+                let p = _mm512_mul_pd(_mm512_add_pd(_mm512_add_pd(h, l), c), v_third);
+                _mm512_storeu_pd(ppp.add(i), _mm512_mask_blend_pd(mk, v_nan, p));
+
+                let d = _mm512_sub_pd(h, l);
+                let d1 = _mm512_mul_pd(d, v_c0916);
+                let d2 = _mm512_mul_pd(d, v_c0183);
+                let d3 = _mm512_mul_pd(d, v_c0275);
+                let d4 = _mm512_mul_pd(d, v_c0550);
+
+                let r1v = _mm512_fmadd_pd(d, v_c0916, c);
+                let r2v = _mm512_fmadd_pd(d, v_c0183, c);
+                let r3v = _mm512_fmadd_pd(d, v_c0275, c);
+                let r4v = _mm512_fmadd_pd(d, v_c0550, c);
+
+                let s1v = _mm512_fmadd_pd(d, _mm512_sub_pd(_mm512_setzero_pd(), v_c0916), c);
+                let s2v = _mm512_fmadd_pd(d, _mm512_sub_pd(_mm512_setzero_pd(), v_c0183), c);
+                let s3v = _mm512_fmadd_pd(d, _mm512_sub_pd(_mm512_setzero_pd(), v_c0275), c);
+                let s4v = _mm512_fmadd_pd(d, _mm512_sub_pd(_mm512_setzero_pd(), v_c0550), c);
+
+                _mm512_storeu_pd(r1p.add(i), _mm512_mask_blend_pd(mk, v_nan, r1v));
+                _mm512_storeu_pd(r2p.add(i), _mm512_mask_blend_pd(mk, v_nan, r2v));
+                _mm512_storeu_pd(r3p.add(i), _mm512_mask_blend_pd(mk, v_nan, r3v));
+                _mm512_storeu_pd(r4p.add(i), _mm512_mask_blend_pd(mk, v_nan, r4v));
+                _mm512_storeu_pd(s1p.add(i), _mm512_mask_blend_pd(mk, v_nan, s1v));
+                _mm512_storeu_pd(s2p.add(i), _mm512_mask_blend_pd(mk, v_nan, s2v));
+                _mm512_storeu_pd(s3p.add(i), _mm512_mask_blend_pd(mk, v_nan, s3v));
+                _mm512_storeu_pd(s4p.add(i), _mm512_mask_blend_pd(mk, v_nan, s4v));
+
+                i += step;
+            }
+        }
+        4 => {
+            while i + step <= len {
+                let h = _mm512_loadu_pd(hp.add(i));
+                let l = _mm512_loadu_pd(lp.add(i));
+                let c = _mm512_loadu_pd(cp.add(i));
+                let o = _mm512_loadu_pd(op.add(i));
+                let mk = valid_mask_avx512(h, l, c);
+
+                let p = _mm512_mul_pd(
+                    _mm512_add_pd(_mm512_add_pd(h, l), _mm512_add_pd(o, o)),
+                    v_quart,
+                );
+                let t2p = _mm512_add_pd(p, p);
+                let t2l = _mm512_add_pd(l, l);
+                let t2h = _mm512_add_pd(h, h);
+                let d = _mm512_sub_pd(h, l);
+
+                let r3v = _mm512_add_pd(_mm512_sub_pd(t2p, t2l), h);
+                let r4v = _mm512_fmadd_pd(d, v_one, r3v);
+                let r2v = _mm512_fmadd_pd(d, v_one, p);
+                let r1v = _mm512_sub_pd(t2p, l);
+
+                let s1v = _mm512_sub_pd(t2p, h);
+                let s2v = _mm512_fmadd_pd(d, v_neg1, p);
+                let s3v = _mm512_sub_pd(_mm512_add_pd(l, t2p), t2h);
+                let s4v = _mm512_fmadd_pd(d, v_neg1, s3v);
+
+                _mm512_storeu_pd(ppp.add(i), _mm512_mask_blend_pd(mk, v_nan, p));
+                _mm512_storeu_pd(r1p.add(i), _mm512_mask_blend_pd(mk, v_nan, r1v));
+                _mm512_storeu_pd(r2p.add(i), _mm512_mask_blend_pd(mk, v_nan, r2v));
+                _mm512_storeu_pd(r3p.add(i), _mm512_mask_blend_pd(mk, v_nan, r3v));
+                _mm512_storeu_pd(r4p.add(i), _mm512_mask_blend_pd(mk, v_nan, r4v));
+                _mm512_storeu_pd(s1p.add(i), _mm512_mask_blend_pd(mk, v_nan, s1v));
+                _mm512_storeu_pd(s2p.add(i), _mm512_mask_blend_pd(mk, v_nan, s2v));
+                _mm512_storeu_pd(s3p.add(i), _mm512_mask_blend_pd(mk, v_nan, s3v));
+                _mm512_storeu_pd(s4p.add(i), _mm512_mask_blend_pd(mk, v_nan, s4v));
+
+                i += step;
+            }
+        }
+        _ => {}
+    }
+
+    if i < len {
+        pivot_scalar(
+            high, low, close, open, mode, i, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+        );
+    }
+}
+
+#[inline(always)]
+pub unsafe fn pivot_row_scalar(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    first: usize,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) {
+    pivot_scalar(
+        high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+    )
+}
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn pivot_row_avx2(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    first: usize,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) {
+    pivot_avx2(
+        high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+    )
+}
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn pivot_row_avx512(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    first: usize,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) {
+    pivot_avx512(
+        high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+    )
+}
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn pivot_row_avx512_short(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    first: usize,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) {
+    pivot_avx512_short(
+        high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+    )
+}
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn pivot_row_avx512_long(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    first: usize,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) {
+    pivot_avx512_long(
+        high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+    )
+}
+
+#[inline(always)]
+unsafe fn pivot_rows_scalar_into(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    first: usize,
+    r4: &mut [f64],
+    r3: &mut [f64],
+    r2: &mut [f64],
+    r1: &mut [f64],
+    pp: &mut [f64],
+    s1: &mut [f64],
+    s2: &mut [f64],
+    s3: &mut [f64],
+    s4: &mut [f64],
+) {
+    pivot_scalar(
+        high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+    )
+}
+
+#[inline(always)]
+fn pivot_batch_inner_into(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    sweep: &PivotBatchRange,
+    kern: Kernel,
+    parallel: bool,
+    out: &mut [f64],
+) -> Result<Vec<PivotParams>, PivotError> {
+    let combos = expand_grid(sweep)?;
+    if combos.is_empty() {
+        let (start, end, step) = sweep.mode;
+        return Err(PivotError::InvalidRange { start, end, step });
+    }
+    let cols = high.len();
+    if cols == 0 || low.len() != cols || close.len() != cols || open.len() != cols {
+        return Err(PivotError::EmptyData);
+    }
+
+    let first = first_valid_ohlc(high, low, close).ok_or(PivotError::AllValuesNaN)?;
+    if first >= cols {
+        return Err(PivotError::NotEnoughValidData);
+    }
+
+    let rows = combos
+        .len()
+        .checked_mul(N_LEVELS)
+        .ok_or(PivotError::InvalidRange {
+            start: combos.len(),
+            end: N_LEVELS,
+            step: 0,
+        })?;
+    let expected_len = rows.checked_mul(cols).ok_or(PivotError::InvalidRange {
+        start: rows,
+        end: cols,
+        step: 0,
+    })?;
+    if out.len() != expected_len {
+        return Err(PivotError::OutputLengthMismatch {
+            expected: expected_len,
+            got: out.len(),
+        });
+    }
+
+    let warm: Vec<usize> = vec![first; rows];
+
+    let out_mu = unsafe {
+        let mu = std::slice::from_raw_parts_mut(
+            out.as_mut_ptr() as *mut std::mem::MaybeUninit<f64>,
+            out.len(),
+        );
+        init_matrix_prefixes(mu, cols, &warm);
+        mu
+    };
+
+    let chosen = match kern {
+        Kernel::Auto => detect_best_batch_kernel(),
+        k => k,
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::*;
+            use std::sync::atomic::{AtomicPtr, Ordering};
+
+            let out_ptr = AtomicPtr::new(out.as_mut_ptr());
+            let out_len = out.len();
+
+            (0..combos.len()).into_par_iter().for_each(|ci| {
+                let mode = combos[ci].mode.unwrap_or(3);
+
+                let base = ci * N_LEVELS * cols;
+                unsafe {
+                    let ptr = out_ptr.load(Ordering::Relaxed);
+                    let mu = std::slice::from_raw_parts_mut(
+                        ptr as *mut std::mem::MaybeUninit<f64>,
+                        out_len,
+                    );
+                    let mut rows_mu = mu[base..base + N_LEVELS * cols].chunks_mut(cols);
+                    let mut cast = |mu: &mut [std::mem::MaybeUninit<f64>]| {
+                        std::slice::from_raw_parts_mut(mu.as_mut_ptr() as *mut f64, mu.len())
+                    };
+                    let r4_mu = rows_mu.next().unwrap();
+                    let r3_mu = rows_mu.next().unwrap();
+                    let r2_mu = rows_mu.next().unwrap();
+                    let r1_mu = rows_mu.next().unwrap();
+                    let pp_mu = rows_mu.next().unwrap();
+                    let s1_mu = rows_mu.next().unwrap();
+                    let s2_mu = rows_mu.next().unwrap();
+                    let s3_mu = rows_mu.next().unwrap();
+                    let s4_mu = rows_mu.next().unwrap();
+
+                    let r4 = cast(r4_mu);
+                    let r3 = cast(r3_mu);
+                    let r2 = cast(r2_mu);
+                    let r1 = cast(r1_mu);
+                    let pp = cast(pp_mu);
+                    let s1 = cast(s1_mu);
+                    let s2 = cast(s2_mu);
+                    let s3 = cast(s3_mu);
+                    let s4 = cast(s4_mu);
+
+                    match chosen {
+                        Kernel::Scalar | Kernel::ScalarBatch => pivot_rows_scalar_into(
+                            high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+                        ),
+                        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                        Kernel::Avx2 | Kernel::Avx2Batch => pivot_row_avx2(
+                            high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+                        ),
+                        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                        Kernel::Avx512 | Kernel::Avx512Batch => pivot_row_avx512(
+                            high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+                        ),
+                        _ => unreachable!(),
+                    }
+                }
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut row_chunks = out_mu.chunks_mut(cols);
+            for p in &combos {
+                let mode = p.mode.unwrap_or(3);
+                unsafe {
+                    let r4_mu = row_chunks.next().unwrap();
+                    let r3_mu = row_chunks.next().unwrap();
+                    let r2_mu = row_chunks.next().unwrap();
+                    let r1_mu = row_chunks.next().unwrap();
+                    let pp_mu = row_chunks.next().unwrap();
+                    let s1_mu = row_chunks.next().unwrap();
+                    let s2_mu = row_chunks.next().unwrap();
+                    let s3_mu = row_chunks.next().unwrap();
+                    let s4_mu = row_chunks.next().unwrap();
+
+                    let mut cast = |mu: &mut [std::mem::MaybeUninit<f64>]| {
+                        std::slice::from_raw_parts_mut(mu.as_mut_ptr() as *mut f64, mu.len())
+                    };
+                    let (r4, r3, r2, r1, pp, s1, s2, s3, s4) = (
+                        cast(r4_mu),
+                        cast(r3_mu),
+                        cast(r2_mu),
+                        cast(r1_mu),
+                        cast(pp_mu),
+                        cast(s1_mu),
+                        cast(s2_mu),
+                        cast(s3_mu),
+                        cast(s4_mu),
+                    );
+
+                    pivot_rows_scalar_into(
+                        high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+                    );
+                }
+            }
+        }
+    } else {
+        let mut row_chunks = out_mu.chunks_mut(cols);
+        for p in &combos {
+            let mode = p.mode.unwrap_or(3);
+            unsafe {
+                let r4_mu = row_chunks.next().unwrap();
+                let r3_mu = row_chunks.next().unwrap();
+                let r2_mu = row_chunks.next().unwrap();
+                let r1_mu = row_chunks.next().unwrap();
+                let pp_mu = row_chunks.next().unwrap();
+                let s1_mu = row_chunks.next().unwrap();
+                let s2_mu = row_chunks.next().unwrap();
+                let s3_mu = row_chunks.next().unwrap();
+                let s4_mu = row_chunks.next().unwrap();
+
+                let mut cast = |mu: &mut [std::mem::MaybeUninit<f64>]| {
+                    std::slice::from_raw_parts_mut(mu.as_mut_ptr() as *mut f64, mu.len())
+                };
+                let (r4, r3, r2, r1, pp, s1, s2, s3, s4) = (
+                    cast(r4_mu),
+                    cast(r3_mu),
+                    cast(r2_mu),
+                    cast(r1_mu),
+                    cast(pp_mu),
+                    cast(s1_mu),
+                    cast(s2_mu),
+                    cast(s3_mu),
+                    cast(s4_mu),
+                );
+
+                pivot_rows_scalar_into(
+                    high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+                );
+            }
+        }
+    }
+    Ok(combos)
+}
+
+#[derive(Clone, Debug)]
+pub struct PivotBatchRange {
+    pub mode: (usize, usize, usize),
+}
+impl Default for PivotBatchRange {
+    fn default() -> Self {
+        Self { mode: (3, 3, 1) }
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct PivotBatchBuilder {
+    range: PivotBatchRange,
+    kernel: Kernel,
+}
+impl PivotBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+    #[inline]
+    pub fn mode_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.mode = (start, end, step);
+        self
+    }
+    #[inline]
+    pub fn mode_static(mut self, m: usize) -> Self {
+        self.range.mode = (m, m, 1);
+        self
+    }
+    pub fn apply_slice(
+        self,
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        open: &[f64],
+    ) -> Result<PivotBatchOutput, PivotError> {
+        pivot_batch_with_kernel(high, low, close, open, &self.range, self.kernel)
+    }
+    pub fn apply_candles(self, candles: &Candles) -> Result<PivotBatchOutput, PivotError> {
+        let high = source_type(candles, "high");
+        let low = source_type(candles, "low");
+        let close = source_type(candles, "close");
+        let open = source_type(candles, "open");
+        self.apply_slice(high, low, close, open)
+    }
+    pub fn with_default_candles(candles: &Candles) -> Result<PivotBatchOutput, PivotError> {
+        PivotBatchBuilder::new()
+            .kernel(Kernel::Auto)
+            .apply_candles(candles)
+    }
+}
+
+pub fn pivot_batch_with_kernel(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    sweep: &PivotBatchRange,
+    k: Kernel,
+) -> Result<PivotBatchOutput, PivotError> {
+    let kernel = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        _ => return Err(PivotError::InvalidKernelForBatch(k)),
+    };
+    pivot_batch_inner(high, low, close, open, sweep, kernel)
+}
+
+#[derive(Clone, Debug)]
+pub struct PivotBatchOutput {
+    pub levels: Vec<[Vec<f64>; 9]>,
+    pub combos: Vec<PivotParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct PivotBatchFlatOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<PivotParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+pub fn pivot_batch_flat_with_kernel(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    sweep: &PivotBatchRange,
+    k: Kernel,
+) -> Result<PivotBatchFlatOutput, PivotError> {
+    let kernel = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        _ => return Err(PivotError::InvalidKernelForBatch(k)),
+    };
+    let combos = expand_grid(sweep)?;
+    if combos.is_empty() {
+        let (start, end, step) = sweep.mode;
+        return Err(PivotError::InvalidRange { start, end, step });
+    }
+    let cols = high.len();
+    let rows = combos
+        .len()
+        .checked_mul(N_LEVELS)
+        .ok_or(PivotError::InvalidRange {
+            start: combos.len(),
+            end: N_LEVELS,
+            step: 0,
+        })?;
+    let _ = rows.checked_mul(cols).ok_or(PivotError::InvalidRange {
+        start: rows,
+        end: cols,
+        step: 0,
+    })?;
+
+    let mut buf_mu = make_uninit_matrix(rows, cols);
+    let warm: Vec<usize> =
+        vec![first_valid_ohlc(high, low, close).ok_or(PivotError::AllValuesNaN)?; rows];
+    init_matrix_prefixes(&mut buf_mu, cols, &warm);
+
+    let mut guard = core::mem::ManuallyDrop::new(buf_mu);
+    let out: &mut [f64] =
+        unsafe { core::slice::from_raw_parts_mut(guard.as_mut_ptr() as *mut f64, guard.len()) };
+
+    pivot_batch_inner_into(high, low, close, open, sweep, kernel, true, out)?;
+
+    let values = unsafe {
+        Vec::from_raw_parts(
+            guard.as_mut_ptr() as *mut f64,
+            guard.len(),
+            guard.capacity(),
+        )
+    };
+    Ok(PivotBatchFlatOutput {
+        values,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+fn expand_grid(r: &PivotBatchRange) -> Result<Vec<PivotParams>, PivotError> {
+    fn axis_usize((start, end, step): (usize, usize, usize)) -> Result<Vec<usize>, PivotError> {
+        if step == 0 || start == end {
+            return Ok(vec![start]);
+        }
+        let mut vals = Vec::new();
+        if start < end {
+            let mut cur = start;
+            while cur <= end {
+                vals.push(cur);
+                cur = cur
+                    .checked_add(step)
+                    .ok_or(PivotError::InvalidRange { start, end, step })?;
+            }
+        } else {
+            let mut cur = start;
+            while cur >= end {
+                vals.push(cur);
+                cur = cur
+                    .checked_sub(step)
+                    .ok_or(PivotError::InvalidRange { start, end, step })?;
+                if cur == 0 && end > 0 {
+                    break;
+                }
+                if let Some(&last) = vals.last() {
+                    if last == cur {
+                        break;
+                    }
+                }
+            }
+            if let Some(&last) = vals.last() {
+                if last < end {
+                    vals.pop();
+                }
+            }
+        }
+        if vals.is_empty() {
+            return Err(PivotError::InvalidRange { start, end, step });
+        }
+        Ok(vals)
+    }
+
+    let modes = axis_usize(r.mode)?;
+    let mut v = Vec::with_capacity(modes.len());
+    for m in modes {
+        v.push(PivotParams { mode: Some(m) });
+    }
+    Ok(v)
+}
+fn pivot_batch_inner(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    sweep: &PivotBatchRange,
+    kernel: Kernel,
+) -> Result<PivotBatchOutput, PivotError> {
+    let combos = expand_grid(sweep)?;
+    if combos.is_empty() {
+        let (start, end, step) = sweep.mode;
+        return Err(PivotError::InvalidRange { start, end, step });
+    }
+    let len = high.len();
+    let mut levels = Vec::with_capacity(combos.len());
+    for p in &combos {
+        let mode = p.mode.unwrap_or(3);
+        let mut first = None;
+        for i in 0..len {
+            if !(high[i].is_nan() || low[i].is_nan() || close[i].is_nan()) {
+                first = Some(i);
+                break;
+            }
+        }
+        let first = first.unwrap_or(len);
+
+        let mut r4 = alloc_with_nan_prefix(len, first);
+        let mut r3 = alloc_with_nan_prefix(len, first);
+        let mut r2 = alloc_with_nan_prefix(len, first);
+        let mut r1 = alloc_with_nan_prefix(len, first);
+        let mut pp = alloc_with_nan_prefix(len, first);
+        let mut s1 = alloc_with_nan_prefix(len, first);
+        let mut s2 = alloc_with_nan_prefix(len, first);
+        let mut s3 = alloc_with_nan_prefix(len, first);
+        let mut s4 = alloc_with_nan_prefix(len, first);
+        unsafe {
+            match kernel {
+                Kernel::Scalar | Kernel::ScalarBatch => pivot_row_scalar(
+                    high, low, close, open, mode, first, &mut r4, &mut r3, &mut r2, &mut r1,
+                    &mut pp, &mut s1, &mut s2, &mut s3, &mut s4,
+                ),
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                Kernel::Avx2 | Kernel::Avx2Batch => pivot_row_avx2(
+                    high, low, close, open, mode, first, &mut r4, &mut r3, &mut r2, &mut r1,
+                    &mut pp, &mut s1, &mut s2, &mut s3, &mut s4,
+                ),
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                Kernel::Avx512 | Kernel::Avx512Batch => pivot_row_avx512(
+                    high, low, close, open, mode, first, &mut r4, &mut r3, &mut r2, &mut r1,
+                    &mut pp, &mut s1, &mut s2, &mut s3, &mut s4,
+                ),
+                _ => unreachable!(),
+            }
+        }
+        levels.push([r4, r3, r2, r1, pp, s1, s2, s3, s4]);
+    }
+    let rows = combos.len();
+    let cols = high.len();
+    Ok(PivotBatchOutput {
+        levels,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+pub struct PivotStream {
+    mode: usize,
+}
+
+impl PivotStream {
+    pub fn new(mode: usize) -> Self {
+        Self { mode }
+    }
+
+    pub fn try_new(params: PivotParams) -> Result<Self, PivotError> {
+        let mode = params.mode.unwrap_or(3);
+        if mode > 4 {
+            return Err(PivotError::EmptyData);
+        }
+        Ok(Self { mode })
+    }
+
+    #[inline(always)]
+    pub fn update(
+        &mut self,
+        high: f64,
+        low: f64,
+        close: f64,
+        open: f64,
+    ) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64, f64)> {
+        const C1: f64 = 0.0916;
+        const C2: f64 = 0.183;
+        const C3: f64 = 0.275;
+        const C4: f64 = 0.55;
+
+        const INV3: f64 = 1.0 / 3.0;
+        const INV4: f64 = 0.25;
+        const INV2: f64 = 0.5;
+
+        match self.mode {
+            0 => {
+                if high.is_nan() || low.is_nan() || close.is_nan() {
+                    return None;
+                }
+                let d = high - low;
+                let p = (high + low + close) * INV3;
+                let t2 = p + p;
+
+                let r1 = t2 - low;
+                let r2 = d.mul_add(1.0, p);
+                let s1 = t2 - high;
+                let s2 = (-d).mul_add(1.0, p);
+
+                Some((f64::NAN, f64::NAN, r2, r1, p, s1, s2, f64::NAN, f64::NAN))
+            }
+
+            1 => {
+                if high.is_nan() || low.is_nan() || close.is_nan() {
+                    return None;
+                }
+                let d = high - low;
+                let p = (high + low + close) * INV3;
+
+                let r1 = d.mul_add(0.382, p);
+                let r2 = d.mul_add(0.618, p);
+                let r3 = d.mul_add(1.000, p);
+                let s1 = d.mul_add(-0.382, p);
+                let s2 = d.mul_add(-0.618, p);
+                let s3 = d.mul_add(-1.000, p);
+
+                Some((f64::NAN, r3, r2, r1, p, s1, s2, s3, f64::NAN))
+            }
+
+            2 => {
+                if high.is_nan() || low.is_nan() || close.is_nan() || open.is_nan() {
+                    return None;
+                }
+
+                let x_lt = high + low + low + close;
+                let x_gt = high + high + low + close;
+                let x_eq = high + low + close + close;
+
+                let lt: f64 = if close < open { 1.0 } else { 0.0 };
+                let gt: f64 = if close > open { 1.0 } else { 0.0 };
+                let eq: f64 = 1.0 - lt - gt;
+
+                let x = lt.mul_add(x_lt, gt.mul_add(x_gt, eq * x_eq));
+                let pp = x * INV4;
+                let half = x * INV2;
+
+                let r1 = half - low;
+                let s1 = half - high;
+
+                Some((
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                    r1,
+                    pp,
+                    s1,
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                ))
+            }
+
+            3 => {
+                if high.is_nan() || low.is_nan() || close.is_nan() {
+                    return None;
+                }
+                let d = high - low;
+                let p = (high + low + close) * INV3;
+
+                let r1 = d.mul_add(C1, close);
+                let r2 = d.mul_add(C2, close);
+                let r3 = d.mul_add(C3, close);
+                let r4 = d.mul_add(C4, close);
+                let s1 = (-C1).mul_add(d, close);
+                let s2 = (-C2).mul_add(d, close);
+                let s3 = (-C3).mul_add(d, close);
+                let s4 = (-C4).mul_add(d, close);
+
+                Some((r4, r3, r2, r1, p, s1, s2, s3, s4))
+            }
+
+            4 => {
+                if high.is_nan() || low.is_nan() || close.is_nan() || open.is_nan() {
+                    return None;
+                }
+                let d = high - low;
+                let p = (high + low + open + open) * INV4;
+                let t2 = p + p;
+
+                let r1 = t2 - low;
+                let r2 = d.mul_add(1.0, p);
+                let r3 = high + (p - low) * 2.0;
+                let r4 = (high - low).mul_add(1.0, r3);
+
+                let s1 = t2 - high;
+                let s2 = (-d).mul_add(1.0, p);
+                let s3 = low - (high - p) * 2.0;
+                let s4 = (-(high - low)).mul_add(1.0, s3);
+
+                Some((r4, r3, r2, r1, p, s1, s2, s3, s4))
+            }
+
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "pivot")]
+#[pyo3(signature = (high, low, close, open, mode=3, kernel=None))]
+pub fn pivot_py<'py>(
+    py: Python<'py>,
+    high: PyReadonlyArray1<'py, f64>,
+    low: PyReadonlyArray1<'py, f64>,
+    close: PyReadonlyArray1<'py, f64>,
+    open: PyReadonlyArray1<'py, f64>,
+    mode: usize,
+    kernel: Option<&str>,
+) -> PyResult<(
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+)> {
+    use numpy::{IntoPyArray, PyArrayMethods};
+
+    let high_slice = high.as_slice()?;
+    let low_slice = low.as_slice()?;
+    let close_slice = close.as_slice()?;
+    let open_slice = open.as_slice()?;
+
+    let kern = validate_kernel(kernel, false)?;
+
+    let params = PivotParams { mode: Some(mode) };
+    let input = PivotInput::from_slices(high_slice, low_slice, close_slice, open_slice, params);
+
+    let result = py
+        .allow_threads(|| pivot_with_kernel(&input, kern))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok((
+        result.r4.into_pyarray(py),
+        result.r3.into_pyarray(py),
+        result.r2.into_pyarray(py),
+        result.r1.into_pyarray(py),
+        result.pp.into_pyarray(py),
+        result.s1.into_pyarray(py),
+        result.s2.into_pyarray(py),
+        result.s3.into_pyarray(py),
+        result.s4.into_pyarray(py),
+    ))
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::pivot_wrapper::CudaPivot;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::indicators::moving_averages::alma::{make_device_array_py, DeviceArrayF32Py};
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "pivot_cuda_batch_dev")]
+#[pyo3(signature = (high_f32, low_f32, close_f32, open_f32, mode_range, device_id=0))]
+pub fn pivot_cuda_batch_dev_py<'py>(
+    py: Python<'py>,
+    high_f32: numpy::PyReadonlyArray1<'py, f32>,
+    low_f32: numpy::PyReadonlyArray1<'py, f32>,
+    close_f32: numpy::PyReadonlyArray1<'py, f32>,
+    open_f32: numpy::PyReadonlyArray1<'py, f32>,
+    mode_range: (usize, usize, usize),
+    device_id: usize,
+) -> PyResult<(DeviceArrayF32Py, Bound<'py, PyDict>)> {
+    use crate::cuda::cuda_available;
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let h = high_f32.as_slice()?;
+    let l = low_f32.as_slice()?;
+    let c = close_f32.as_slice()?;
+    let o = open_f32.as_slice()?;
+    let sweep = PivotBatchRange { mode: mode_range };
+    let (inner, combos) = py.allow_threads(|| {
+        let cuda = CudaPivot::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        cuda.pivot_batch_dev(h, l, c, o, &sweep)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "modes",
+        combos
+            .iter()
+            .map(|p| p.mode.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    let handle = make_device_array_py(device_id, inner)?;
+    Ok((handle, dict))
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "pivot_cuda_many_series_one_param_dev")]
+#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, open_tm_f32, cols, rows, mode, device_id=0))]
+pub fn pivot_cuda_many_series_one_param_dev_py(
+    py: Python<'_>,
+    high_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
+    low_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
+    close_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
+    open_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
+    cols: usize,
+    rows: usize,
+    mode: usize,
+    device_id: usize,
+) -> PyResult<DeviceArrayF32Py> {
+    use crate::cuda::cuda_available;
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let h = high_tm_f32.as_slice()?;
+    let l = low_tm_f32.as_slice()?;
+    let c = close_tm_f32.as_slice()?;
+    let o = open_tm_f32.as_slice()?;
+    let inner = py.allow_threads(|| {
+        let cuda = CudaPivot::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        cuda.pivot_many_series_one_param_time_major_dev(h, l, c, o, cols, rows, mode)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+    let handle = make_device_array_py(device_id, inner)?;
+    Ok(handle)
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "PivotStream")]
+pub struct PivotStreamPy {
+    inner: PivotStream,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PivotStreamPy {
+    #[new]
+    fn new(mode: Option<usize>) -> PyResult<Self> {
+        let params = PivotParams { mode };
+        let inner =
+            PivotStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PivotStreamPy { inner })
+    }
+
+    fn update(
+        &mut self,
+        high: f64,
+        low: f64,
+        close: f64,
+        open: f64,
+    ) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64, f64)> {
+        self.inner.update(high, low, close, open)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "pivot_batch")]
+#[pyo3(signature = (high, low, close, open, mode_range, kernel=None))]
+pub fn pivot_batch_py<'py>(
+    py: Python<'py>,
+    high: PyReadonlyArray1<'py, f64>,
+    low: PyReadonlyArray1<'py, f64>,
+    close: PyReadonlyArray1<'py, f64>,
+    open: PyReadonlyArray1<'py, f64>,
+    mode_range: (usize, usize, usize),
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+
+    let (h, l, c, o) = (
+        high.as_slice()?,
+        low.as_slice()?,
+        close.as_slice()?,
+        open.as_slice()?,
+    );
+    let sweep = PivotBatchRange { mode: mode_range };
+    let kern = validate_kernel(kernel, true)?;
+
+    let flat = py
+        .allow_threads(|| pivot_batch_flat_with_kernel(h, l, c, o, &sweep, kern))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let combos = flat.combos.len();
+    let cols = flat.cols;
+    let vals = flat.values;
+
+    let arr = unsafe { PyArray1::<f64>::new(py, [vals.len()], false) };
+    unsafe {
+        arr.as_slice_mut()?.copy_from_slice(&vals);
+    }
+
+    let dict = PyDict::new(py);
+    let names = ["r4", "r3", "r2", "r1", "pp", "s1", "s2", "s3", "s4"];
+
+    for (li, name) in names.iter().enumerate() {
+        let level_arr = unsafe { PyArray1::<f64>::new(py, [combos * cols], false) };
+        let level_slice = unsafe { level_arr.as_slice_mut()? };
+
+        for combo_idx in 0..combos {
+            let base_idx = combo_idx * N_LEVELS * cols;
+            let level_base = li * cols;
+            for col_idx in 0..cols {
+                level_slice[combo_idx * cols + col_idx] = vals[base_idx + level_base + col_idx];
+            }
+        }
+
+        dict.set_item(*name, level_arr.reshape((combos, cols))?)?;
+    }
+
+    dict.set_item(
+        "modes",
+        flat.combos
+            .iter()
+            .map(|p| p.mode.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    dict.set_item("rows_per_level", combos)?;
+    dict.set_item("cols", cols)?;
+    Ok(dict)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn pivot_js(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+) -> Result<Vec<f64>, JsValue> {
+    let len = high.len();
+    if low.len() != len || close.len() != len || open.len() != len {
+        return Err(JsValue::from_str(
+            "pivot: Input arrays must have the same length",
+        ));
+    }
+
+    let params = PivotParams { mode: Some(mode) };
+    let input = PivotInput::from_slices(high, low, close, open, params);
+    let out =
+        pivot_with_kernel(&input, Kernel::Auto).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let cols = high.len();
+    let mut values = Vec::with_capacity(N_LEVELS * cols);
+    values.extend_from_slice(&out.r4);
+    values.extend_from_slice(&out.r3);
+    values.extend_from_slice(&out.r2);
+    values.extend_from_slice(&out.r1);
+    values.extend_from_slice(&out.pp);
+    values.extend_from_slice(&out.s1);
+    values.extend_from_slice(&out.s2);
+    values.extend_from_slice(&out.s3);
+    values.extend_from_slice(&out.s4);
+    Ok(values)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn pivot_into(
+    high_ptr: *const f64,
+    low_ptr: *const f64,
+    close_ptr: *const f64,
+    open_ptr: *const f64,
+    r4_ptr: *mut f64,
+    r3_ptr: *mut f64,
+    r2_ptr: *mut f64,
+    r1_ptr: *mut f64,
+    pp_ptr: *mut f64,
+    s1_ptr: *mut f64,
+    s2_ptr: *mut f64,
+    s3_ptr: *mut f64,
+    s4_ptr: *mut f64,
+    len: usize,
+    mode: usize,
+) -> Result<(), JsValue> {
+    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || open_ptr.is_null() {
+        return Err(JsValue::from_str("Null input pointer provided"));
+    }
+
+    if r4_ptr.is_null()
+        || r3_ptr.is_null()
+        || r2_ptr.is_null()
+        || r1_ptr.is_null()
+        || pp_ptr.is_null()
+        || s1_ptr.is_null()
+        || s2_ptr.is_null()
+        || s3_ptr.is_null()
+        || s4_ptr.is_null()
+    {
+        return Err(JsValue::from_str("Null output pointer provided"));
+    }
+
+    unsafe {
+        let high = std::slice::from_raw_parts(high_ptr, len);
+        let low = std::slice::from_raw_parts(low_ptr, len);
+        let close = std::slice::from_raw_parts(close_ptr, len);
+        let open = std::slice::from_raw_parts(open_ptr, len);
+
+        let params = PivotParams { mode: Some(mode) };
+        let input = PivotInput::from_slices(high, low, close, open, params);
+
+        let input_ptrs = [
+            high_ptr as *const u8,
+            low_ptr as *const u8,
+            close_ptr as *const u8,
+            open_ptr as *const u8,
+        ];
+        let output_ptrs = [
+            r4_ptr as *const u8,
+            r3_ptr as *const u8,
+            r2_ptr as *const u8,
+            r1_ptr as *const u8,
+            pp_ptr as *const u8,
+            s1_ptr as *const u8,
+            s2_ptr as *const u8,
+            s3_ptr as *const u8,
+            s4_ptr as *const u8,
+        ];
+
+        let has_aliasing = input_ptrs
+            .iter()
+            .any(|&inp| output_ptrs.iter().any(|&out| inp == out));
+
+        if has_aliasing {
+            let mut temp = vec![0.0; len * 9];
+
+            let (r4_temp, rest) = temp.split_at_mut(len);
+            let (r3_temp, rest) = rest.split_at_mut(len);
+            let (r2_temp, rest) = rest.split_at_mut(len);
+            let (r1_temp, rest) = rest.split_at_mut(len);
+            let (pp_temp, rest) = rest.split_at_mut(len);
+            let (s1_temp, rest) = rest.split_at_mut(len);
+            let (s2_temp, rest) = rest.split_at_mut(len);
+            let (s3_temp, s4_temp) = rest.split_at_mut(len);
+
+            pivot_into_slices(
+                r4_temp,
+                r3_temp,
+                r2_temp,
+                r1_temp,
+                pp_temp,
+                s1_temp,
+                s2_temp,
+                s3_temp,
+                s4_temp,
+                &input,
+                Kernel::Auto,
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+            let r4_out = std::slice::from_raw_parts_mut(r4_ptr, len);
+            let r3_out = std::slice::from_raw_parts_mut(r3_ptr, len);
+            let r2_out = std::slice::from_raw_parts_mut(r2_ptr, len);
+            let r1_out = std::slice::from_raw_parts_mut(r1_ptr, len);
+            let pp_out = std::slice::from_raw_parts_mut(pp_ptr, len);
+            let s1_out = std::slice::from_raw_parts_mut(s1_ptr, len);
+            let s2_out = std::slice::from_raw_parts_mut(s2_ptr, len);
+            let s3_out = std::slice::from_raw_parts_mut(s3_ptr, len);
+            let s4_out = std::slice::from_raw_parts_mut(s4_ptr, len);
+
+            r4_out.copy_from_slice(r4_temp);
+            r3_out.copy_from_slice(r3_temp);
+            r2_out.copy_from_slice(r2_temp);
+            r1_out.copy_from_slice(r1_temp);
+            pp_out.copy_from_slice(pp_temp);
+            s1_out.copy_from_slice(s1_temp);
+            s2_out.copy_from_slice(s2_temp);
+            s3_out.copy_from_slice(s3_temp);
+            s4_out.copy_from_slice(s4_temp);
+        } else {
+            let r4_out = std::slice::from_raw_parts_mut(r4_ptr, len);
+            let r3_out = std::slice::from_raw_parts_mut(r3_ptr, len);
+            let r2_out = std::slice::from_raw_parts_mut(r2_ptr, len);
+            let r1_out = std::slice::from_raw_parts_mut(r1_ptr, len);
+            let pp_out = std::slice::from_raw_parts_mut(pp_ptr, len);
+            let s1_out = std::slice::from_raw_parts_mut(s1_ptr, len);
+            let s2_out = std::slice::from_raw_parts_mut(s2_ptr, len);
+            let s3_out = std::slice::from_raw_parts_mut(s3_ptr, len);
+            let s4_out = std::slice::from_raw_parts_mut(s4_ptr, len);
+
+            pivot_into_slices(
+                r4_out,
+                r3_out,
+                r2_out,
+                r1_out,
+                pp_out,
+                s1_out,
+                s2_out,
+                s3_out,
+                s4_out,
+                &input,
+                Kernel::Auto,
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn pivot_alloc(len: usize) -> *mut f64 {
+    let mut vec = Vec::<f64>::with_capacity(len);
+    let ptr = vec.as_mut_ptr();
+    std::mem::forget(vec);
+    ptr
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn pivot_free(ptr: *mut f64, len: usize) {
+    if !ptr.is_null() {
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, 0, len);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct PivotBatchConfig {
+    pub mode_range: (usize, usize, usize),
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct PivotBatchFlatJsOutput {
+    pub values: Vec<f64>,
+    pub modes: Vec<usize>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = pivot_batch)]
+pub fn pivot_batch_js(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    config: JsValue,
+) -> Result<JsValue, JsValue> {
+    let cfg: PivotBatchConfig =
+        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let sweep = PivotBatchRange {
+        mode: cfg.mode_range,
+    };
+    let flat = pivot_batch_flat_with_kernel(high, low, close, open, &sweep, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let modes = flat.combos.iter().map(|p| p.mode.unwrap()).collect();
+    let out = PivotBatchFlatJsOutput {
+        values: flat.values,
+        modes,
+        rows: flat.rows,
+        cols: flat.cols,
+    };
+    serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn pivot_output_into_js(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = pivot_js(high, low, close, open, mode)?;
+    crate::write_wasm_f64_output("pivot_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn pivot_batch_output_into_js(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    config: JsValue,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = pivot_batch_js(high, low, close, open, config)?;
+    crate::write_wasm_selected_object_f64_outputs("pivot_batch_output_into_js", &value, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::enums::Kernel;
+    use paste::paste;
+
+    fn check_pivot_default_mode_camarilla(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let params = PivotParams { mode: None };
+        let input = PivotInput::from_candles(&candles, params);
+        let result = pivot_with_kernel(&input, kernel)?;
+
+        assert_eq!(result.r4.len(), candles.close.len());
+        assert_eq!(result.r3.len(), candles.close.len());
+        assert_eq!(result.r2.len(), candles.close.len());
+        assert_eq!(result.r1.len(), candles.close.len());
+        assert_eq!(result.pp.len(), candles.close.len());
+        assert_eq!(result.s1.len(), candles.close.len());
+        assert_eq!(result.s2.len(), candles.close.len());
+        assert_eq!(result.s3.len(), candles.close.len());
+        assert_eq!(result.s4.len(), candles.close.len());
+
+        let last_five_r4 = &result.r4[result.r4.len().saturating_sub(5)..];
+        let expected_r4 = [59466.5, 59357.55, 59243.6, 59334.85, 59170.35];
+        for (i, &val) in last_five_r4.iter().enumerate() {
+            let exp = expected_r4[i];
+            assert!(
+                (val - exp).abs() < 1e-1,
+                "Camarilla r4 mismatch at index {}, expected {}, got {}",
+                i,
+                exp,
+                val
+            );
+        }
+        Ok(())
+    }
+
+    fn check_pivot_nan_values(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let high = [10.0, f64::NAN, 30.0];
+        let low = [9.0, 8.5, f64::NAN];
+        let close = [9.5, 9.0, 29.0];
+        let open = [9.1, 8.8, 28.5];
+
+        let params = PivotParams { mode: Some(3) };
+        let input = PivotInput::from_slices(&high, &low, &close, &open, params);
+        let result = pivot_with_kernel(&input, kernel)?;
+        assert_eq!(result.pp.len(), high.len());
+        Ok(())
+    }
+
+    fn check_pivot_no_data(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let high: [f64; 0] = [];
+        let low: [f64; 0] = [];
+        let close: [f64; 0] = [];
+        let open: [f64; 0] = [];
+        let params = PivotParams { mode: Some(3) };
+        let input = PivotInput::from_slices(&high, &low, &close, &open, params);
+        let result = pivot_with_kernel(&input, kernel);
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(
+                e.to_string().contains("One or more required fields"),
+                "Expected 'EmptyData' error, got: {}",
+                e
+            );
+        }
+        Ok(())
+    }
+
+    fn check_pivot_all_nan(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let high = [f64::NAN, f64::NAN];
+        let low = [f64::NAN, f64::NAN];
+        let close = [f64::NAN, f64::NAN];
+        let open = [f64::NAN, f64::NAN];
+        let params = PivotParams { mode: Some(3) };
+        let input = PivotInput::from_slices(&high, &low, &close, &open, params);
+        let result = pivot_with_kernel(&input, kernel);
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(
+                e.to_string().contains("All values are NaN"),
+                "Expected 'AllValuesNaN' error, got: {}",
+                e
+            );
+        }
+        Ok(())
+    }
+
+    fn check_pivot_fibonacci_mode(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file)?;
+        let params = PivotParams { mode: Some(1) };
+        let input = PivotInput::from_candles(&candles, params);
+        let output = pivot_with_kernel(&input, kernel)?;
+        assert_eq!(output.r3.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_pivot_standard_mode(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file)?;
+        let params = PivotParams { mode: Some(0) };
+        let input = PivotInput::from_candles(&candles, params);
+        let output = pivot_with_kernel(&input, kernel)?;
+        assert_eq!(output.r2.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_pivot_demark_mode(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file)?;
+        let params = PivotParams { mode: Some(2) };
+        let input = PivotInput::from_candles(&candles, params);
+        let output = pivot_with_kernel(&input, kernel)?;
+        assert_eq!(output.r1.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_pivot_woodie_mode(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file)?;
+        let params = PivotParams { mode: Some(4) };
+        let input = PivotInput::from_candles(&candles, params);
+        let output = pivot_with_kernel(&input, kernel)?;
+        assert_eq!(output.r4.len(), candles.close.len());
+        Ok(())
+    }
+
+    #[cfg(feature = "proptest")]
+    #[allow(clippy::float_cmp)]
+    fn check_pivot_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use proptest::prelude::*;
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (10usize..=200).prop_flat_map(|len| {
+            prop_oneof![
+                prop::collection::vec(
+                    (100f64..10000f64).prop_filter("finite", |x| x.is_finite()),
+                    len,
+                )
+                .prop_flat_map(move |base_prices| {
+                    let ohlc_strat = prop::collection::vec(
+                        (0f64..1f64, 0f64..1f64, 0f64..1f64, 0f64..1f64),
+                        len,
+                    );
+
+                    (ohlc_strat, 0usize..=4).prop_map(move |(factors, mode)| {
+                        let mut high_data = Vec::with_capacity(len);
+                        let mut low_data = Vec::with_capacity(len);
+                        let mut close_data = Vec::with_capacity(len);
+                        let mut open_data = Vec::with_capacity(len);
+
+                        for (i, base) in base_prices.iter().enumerate() {
+                            let (high_factor, low_factor, close_factor, open_factor) = factors[i];
+
+                            let range = base * 0.1;
+                            let low = base - range * low_factor;
+                            let high = base + range * high_factor;
+                            let open = low + (high - low) * open_factor;
+                            let close = low + (high - low) * close_factor;
+
+                            high_data.push(high);
+                            low_data.push(low);
+                            open_data.push(open);
+                            close_data.push(close);
+                        }
+
+                        (high_data, low_data, close_data, open_data, mode)
+                    })
+                }),
+                (100f64..1000f64, 0usize..=4).prop_map(move |(price, mode)| {
+                    let data = vec![price; len];
+                    (data.clone(), data.clone(), data.clone(), data, mode)
+                }),
+                (100f64..1000f64, 0usize..=4).prop_map(move |(base, mode)| {
+                    let mut high_data = Vec::with_capacity(len);
+                    let mut low_data = Vec::with_capacity(len);
+                    let mut close_data = Vec::with_capacity(len);
+                    let mut open_data = Vec::with_capacity(len);
+
+                    for _ in 0..len {
+                        let epsilon = 1e-10;
+                        let low = base;
+                        let high = base + epsilon;
+                        let open = base + epsilon * 0.3;
+                        let close = base + epsilon * 0.7;
+
+                        high_data.push(high);
+                        low_data.push(low);
+                        open_data.push(open);
+                        close_data.push(close);
+                    }
+
+                    (high_data, low_data, close_data, open_data, mode)
+                }),
+            ]
+        });
+
+        proptest::test_runner::TestRunner::default().run(
+            &strat,
+            |(high, low, close, open, mode)| {
+                let params = PivotParams { mode: Some(mode) };
+                let input = PivotInput::from_slices(&high, &low, &close, &open, params);
+
+                let output = pivot_with_kernel(&input, kernel)?;
+                let ref_output = pivot_with_kernel(&input, Kernel::Scalar)?;
+
+                prop_assert_eq!(output.pp.len(), high.len());
+                prop_assert_eq!(output.r1.len(), high.len());
+                prop_assert_eq!(output.s1.len(), high.len());
+
+                for i in 0..high.len() {
+                    let h = high[i];
+                    let l = low[i];
+                    let c = close[i];
+                    let o = open[i];
+
+                    if h.is_nan() || l.is_nan() || c.is_nan() || o.is_nan() {
+                        continue;
+                    }
+
+                    let pp = output.pp[i];
+                    let r4 = output.r4[i];
+                    let r3 = output.r3[i];
+                    let r2 = output.r2[i];
+                    let r1 = output.r1[i];
+                    let s1 = output.s1[i];
+                    let s2 = output.s2[i];
+                    let s3 = output.s3[i];
+                    let s4 = output.s4[i];
+
+                    let tolerance = 1e-9;
+                    let range = h - l;
+
+                    match mode {
+                        0 => {
+                            let expected_pp = (h + l + c) / 3.0;
+                            prop_assert!(
+                                (pp - expected_pp).abs() < tolerance,
+                                "Standard PP at {}: {} vs {}",
+                                i,
+                                pp,
+                                expected_pp
+                            );
+
+                            let expected_r1 = 2.0 * pp - l;
+                            prop_assert!(
+                                (r1 - expected_r1).abs() < tolerance,
+                                "Standard R1 at {}: {} vs {}",
+                                i,
+                                r1,
+                                expected_r1
+                            );
+
+                            let expected_r2 = pp + range;
+                            prop_assert!(
+                                (r2 - expected_r2).abs() < tolerance,
+                                "Standard R2 at {}: {} vs {}",
+                                i,
+                                r2,
+                                expected_r2
+                            );
+
+                            let expected_s1 = 2.0 * pp - h;
+                            prop_assert!(
+                                (s1 - expected_s1).abs() < tolerance,
+                                "Standard S1 at {}: {} vs {}",
+                                i,
+                                s1,
+                                expected_s1
+                            );
+
+                            let expected_s2 = pp - range;
+                            prop_assert!(
+                                (s2 - expected_s2).abs() < tolerance,
+                                "Standard S2 at {}: {} vs {}",
+                                i,
+                                s2,
+                                expected_s2
+                            );
+
+                            prop_assert!(r3.is_nan(), "Standard R3 should be NaN at {}", i);
+                            prop_assert!(r4.is_nan(), "Standard R4 should be NaN at {}", i);
+                            prop_assert!(s3.is_nan(), "Standard S3 should be NaN at {}", i);
+                            prop_assert!(s4.is_nan(), "Standard S4 should be NaN at {}", i);
+
+                            prop_assert!(s2 <= s1 + tolerance, "S2 > S1 at {}", i);
+                            prop_assert!(s1 <= pp + tolerance, "S1 > PP at {}", i);
+                            prop_assert!(pp <= r1 + tolerance, "PP > R1 at {}", i);
+                            prop_assert!(r1 <= r2 + tolerance, "R1 > R2 at {}", i);
+                        }
+                        1 => {
+                            let expected_pp = (h + l + c) / 3.0;
+                            prop_assert!(
+                                (pp - expected_pp).abs() < tolerance,
+                                "Fibonacci PP at {}: {} vs {}",
+                                i,
+                                pp,
+                                expected_pp
+                            );
+
+                            let expected_r1 = pp + 0.382 * range;
+                            let expected_r2 = pp + 0.618 * range;
+                            let expected_r3 = pp + 1.0 * range;
+                            let expected_s1 = pp - 0.382 * range;
+                            let expected_s2 = pp - 0.618 * range;
+                            let expected_s3 = pp - 1.0 * range;
+
+                            prop_assert!(
+                                (r1 - expected_r1).abs() < tolerance,
+                                "Fibonacci R1 at {}: {} vs {}",
+                                i,
+                                r1,
+                                expected_r1
+                            );
+                            prop_assert!(
+                                (r2 - expected_r2).abs() < tolerance,
+                                "Fibonacci R2 at {}: {} vs {}",
+                                i,
+                                r2,
+                                expected_r2
+                            );
+                            prop_assert!(
+                                (r3 - expected_r3).abs() < tolerance,
+                                "Fibonacci R3 at {}: {} vs {}",
+                                i,
+                                r3,
+                                expected_r3
+                            );
+                            prop_assert!(
+                                (s1 - expected_s1).abs() < tolerance,
+                                "Fibonacci S1 at {}: {} vs {}",
+                                i,
+                                s1,
+                                expected_s1
+                            );
+                            prop_assert!(
+                                (s2 - expected_s2).abs() < tolerance,
+                                "Fibonacci S2 at {}: {} vs {}",
+                                i,
+                                s2,
+                                expected_s2
+                            );
+                            prop_assert!(
+                                (s3 - expected_s3).abs() < tolerance,
+                                "Fibonacci S3 at {}: {} vs {}",
+                                i,
+                                s3,
+                                expected_s3
+                            );
+
+                            prop_assert!(r4.is_nan(), "Fibonacci R4 should be NaN at {}", i);
+                            prop_assert!(s4.is_nan(), "Fibonacci S4 should be NaN at {}", i);
+
+                            prop_assert!(s3 <= s2 + tolerance, "S3 > S2 at {}", i);
+                            prop_assert!(s2 <= s1 + tolerance, "S2 > S1 at {}", i);
+                            prop_assert!(s1 <= pp + tolerance, "S1 > PP at {}", i);
+                            prop_assert!(pp <= r1 + tolerance, "PP > R1 at {}", i);
+                            prop_assert!(r1 <= r2 + tolerance, "R1 > R2 at {}", i);
+                            prop_assert!(r2 <= r3 + tolerance, "R2 > R3 at {}", i);
+                        }
+                        2 => {
+                            let expected_pp = if c < o {
+                                (h + 2.0 * l + c) / 4.0
+                            } else if c > o {
+                                (2.0 * h + l + c) / 4.0
+                            } else {
+                                (h + l + 2.0 * c) / 4.0
+                            };
+                            prop_assert!(
+                                (pp - expected_pp).abs() < tolerance,
+                                "Demark PP at {}: {} vs {}",
+                                i,
+                                pp,
+                                expected_pp
+                            );
+
+                            let expected_r1 = if c < o {
+                                (h + 2.0 * l + c) / 2.0 - l
+                            } else if c > o {
+                                (2.0 * h + l + c) / 2.0 - l
+                            } else {
+                                (h + l + 2.0 * c) / 2.0 - l
+                            };
+                            let expected_s1 = if c < o {
+                                (h + 2.0 * l + c) / 2.0 - h
+                            } else if c > o {
+                                (2.0 * h + l + c) / 2.0 - h
+                            } else {
+                                (h + l + 2.0 * c) / 2.0 - h
+                            };
+
+                            prop_assert!(
+                                (r1 - expected_r1).abs() < tolerance,
+                                "Demark R1 at {}: {} vs {}",
+                                i,
+                                r1,
+                                expected_r1
+                            );
+                            prop_assert!(
+                                (s1 - expected_s1).abs() < tolerance,
+                                "Demark S1 at {}: {} vs {}",
+                                i,
+                                s1,
+                                expected_s1
+                            );
+
+                            prop_assert!(r2.is_nan(), "Demark R2 should be NaN at {}", i);
+                            prop_assert!(r3.is_nan(), "Demark R3 should be NaN at {}", i);
+                            prop_assert!(r4.is_nan(), "Demark R4 should be NaN at {}", i);
+                            prop_assert!(s2.is_nan(), "Demark S2 should be NaN at {}", i);
+                            prop_assert!(s3.is_nan(), "Demark S3 should be NaN at {}", i);
+                            prop_assert!(s4.is_nan(), "Demark S4 should be NaN at {}", i);
+                        }
+                        3 => {
+                            let expected_pp = (h + l + c) / 3.0;
+                            prop_assert!(
+                                (pp - expected_pp).abs() < tolerance,
+                                "Camarilla PP at {}: {} vs {}",
+                                i,
+                                pp,
+                                expected_pp
+                            );
+
+                            let expected_r4 = 0.55 * range + c;
+                            let expected_r3 = 0.275 * range + c;
+                            let expected_r2 = 0.183 * range + c;
+                            let expected_r1 = 0.0916 * range + c;
+                            let expected_s1 = c - 0.0916 * range;
+                            let expected_s2 = c - 0.183 * range;
+                            let expected_s3 = c - 0.275 * range;
+                            let expected_s4 = c - 0.55 * range;
+
+                            prop_assert!(
+                                (r4 - expected_r4).abs() < tolerance,
+                                "Camarilla R4 at {}: {} vs {}",
+                                i,
+                                r4,
+                                expected_r4
+                            );
+                            prop_assert!(
+                                (r3 - expected_r3).abs() < tolerance,
+                                "Camarilla R3 at {}: {} vs {}",
+                                i,
+                                r3,
+                                expected_r3
+                            );
+                            prop_assert!(
+                                (r2 - expected_r2).abs() < tolerance,
+                                "Camarilla R2 at {}: {} vs {}",
+                                i,
+                                r2,
+                                expected_r2
+                            );
+                            prop_assert!(
+                                (r1 - expected_r1).abs() < tolerance,
+                                "Camarilla R1 at {}: {} vs {}",
+                                i,
+                                r1,
+                                expected_r1
+                            );
+                            prop_assert!(
+                                (s1 - expected_s1).abs() < tolerance,
+                                "Camarilla S1 at {}: {} vs {}",
+                                i,
+                                s1,
+                                expected_s1
+                            );
+                            prop_assert!(
+                                (s2 - expected_s2).abs() < tolerance,
+                                "Camarilla S2 at {}: {} vs {}",
+                                i,
+                                s2,
+                                expected_s2
+                            );
+                            prop_assert!(
+                                (s3 - expected_s3).abs() < tolerance,
+                                "Camarilla S3 at {}: {} vs {}",
+                                i,
+                                s3,
+                                expected_s3
+                            );
+                            prop_assert!(
+                                (s4 - expected_s4).abs() < tolerance,
+                                "Camarilla S4 at {}: {} vs {}",
+                                i,
+                                s4,
+                                expected_s4
+                            );
+
+                            prop_assert!(s4 <= s3 + tolerance, "S4 > S3 at {}", i);
+                            prop_assert!(s3 <= s2 + tolerance, "S3 > S2 at {}", i);
+                            prop_assert!(s2 <= s1 + tolerance, "S2 > S1 at {}", i);
+                            prop_assert!(r1 <= r2 + tolerance, "R1 > R2 at {}", i);
+                            prop_assert!(r2 <= r3 + tolerance, "R2 > R3 at {}", i);
+                            prop_assert!(r3 <= r4 + tolerance, "R3 > R4 at {}", i);
+                        }
+                        4 => {
+                            let expected_pp = (h + l + 2.0 * o) / 4.0;
+                            prop_assert!(
+                                (pp - expected_pp).abs() < tolerance,
+                                "Woodie PP at {}: {} vs {}",
+                                i,
+                                pp,
+                                expected_pp
+                            );
+
+                            let expected_r1 = 2.0 * pp - l;
+                            let expected_r2 = pp + range;
+                            let expected_r3 = h + 2.0 * (pp - l);
+                            let expected_r4 = expected_r3 + range;
+                            let expected_s1 = 2.0 * pp - h;
+                            let expected_s2 = pp - range;
+                            let expected_s3 = l - 2.0 * (h - pp);
+                            let expected_s4 = expected_s3 - range;
+
+                            prop_assert!(
+                                (r1 - expected_r1).abs() < tolerance,
+                                "Woodie R1 at {}: {} vs {}",
+                                i,
+                                r1,
+                                expected_r1
+                            );
+                            prop_assert!(
+                                (r2 - expected_r2).abs() < tolerance,
+                                "Woodie R2 at {}: {} vs {}",
+                                i,
+                                r2,
+                                expected_r2
+                            );
+                            prop_assert!(
+                                (r3 - expected_r3).abs() < tolerance,
+                                "Woodie R3 at {}: {} vs {}",
+                                i,
+                                r3,
+                                expected_r3
+                            );
+                            prop_assert!(
+                                (r4 - expected_r4).abs() < tolerance,
+                                "Woodie R4 at {}: {} vs {}",
+                                i,
+                                r4,
+                                expected_r4
+                            );
+                            prop_assert!(
+                                (s1 - expected_s1).abs() < tolerance,
+                                "Woodie S1 at {}: {} vs {}",
+                                i,
+                                s1,
+                                expected_s1
+                            );
+                            prop_assert!(
+                                (s2 - expected_s2).abs() < tolerance,
+                                "Woodie S2 at {}: {} vs {}",
+                                i,
+                                s2,
+                                expected_s2
+                            );
+                            prop_assert!(
+                                (s3 - expected_s3).abs() < tolerance,
+                                "Woodie S3 at {}: {} vs {}",
+                                i,
+                                s3,
+                                expected_s3
+                            );
+                            prop_assert!(
+                                (s4 - expected_s4).abs() < tolerance,
+                                "Woodie S4 at {}: {} vs {}",
+                                i,
+                                s4,
+                                expected_s4
+                            );
+
+                            prop_assert!(s4 <= s3 + tolerance, "S4 > S3 at {}", i);
+                            prop_assert!(s3 <= s2 + tolerance, "S3 > S2 at {}", i);
+                            prop_assert!(s2 <= s1 + tolerance, "S2 > S1 at {}", i);
+                            prop_assert!(r1 <= r2 + tolerance, "R1 > R2 at {}", i);
+                            prop_assert!(r2 <= r3 + tolerance, "R2 > R3 at {}", i);
+                            prop_assert!(r3 <= r4 + tolerance, "R3 > R4 at {}", i);
+                        }
+                        _ => {}
+                    }
+
+                    prop_assert!(
+                        (pp - ref_output.pp[i]).abs() < tolerance,
+                        "PP kernel mismatch at {}",
+                        i
+                    );
+                    prop_assert!(
+                        (r1 - ref_output.r1[i]).abs() < tolerance
+                            || (r1.is_nan() && ref_output.r1[i].is_nan()),
+                        "R1 kernel mismatch at {}",
+                        i
+                    );
+                    prop_assert!(
+                        (s1 - ref_output.s1[i]).abs() < tolerance
+                            || (s1.is_nan() && ref_output.s1[i].is_nan()),
+                        "S1 kernel mismatch at {}",
+                        i
+                    );
+
+                    #[cfg(debug_assertions)]
+                    {
+                        let check_poison = |val: f64, name: &str| {
+                            if !val.is_nan() {
+                                let bits = val.to_bits();
+                                prop_assert_ne!(
+                                    bits,
+                                    0x11111111_11111111,
+                                    "{} poison at {}",
+                                    name,
+                                    i
+                                );
+                                prop_assert_ne!(
+                                    bits,
+                                    0x22222222_22222222,
+                                    "{} poison at {}",
+                                    name,
+                                    i
+                                );
+                                prop_assert_ne!(
+                                    bits,
+                                    0x33333333_33333333,
+                                    "{} poison at {}",
+                                    name,
+                                    i
+                                );
+                            }
+                            Ok(())
+                        };
+
+                        check_poison(pp, "PP")?;
+                        check_poison(r4, "R4")?;
+                        check_poison(r3, "R3")?;
+                        check_poison(r2, "R2")?;
+                        check_poison(r1, "R1")?;
+                        check_poison(s1, "S1")?;
+                        check_poison(s2, "S2")?;
+                        check_poison(s3, "S3")?;
+                        check_poison(s4, "S4")?;
+                    }
+                }
+
+                Ok(())
+            },
+        )?;
+
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_pivot_no_poison(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let test_params = vec![
+            PivotParams::default(),
+            PivotParams { mode: Some(0) },
+            PivotParams { mode: Some(1) },
+            PivotParams { mode: Some(2) },
+            PivotParams { mode: Some(3) },
+            PivotParams { mode: Some(4) },
+        ];
+
+        for (param_idx, params) in test_params.iter().enumerate() {
+            let input = PivotInput::from_candles(&candles, params.clone());
+            let output = pivot_with_kernel(&input, kernel)?;
+
+            let arrays = vec![
+                ("r4", &output.r4),
+                ("r3", &output.r3),
+                ("r2", &output.r2),
+                ("r1", &output.r1),
+                ("pp", &output.pp),
+                ("s1", &output.s1),
+                ("s2", &output.s2),
+                ("s3", &output.s3),
+                ("s4", &output.s4),
+            ];
+
+            for (array_name, values) in arrays {
+                for (i, &val) in values.iter().enumerate() {
+                    if val.is_nan() {
+                        continue;
+                    }
+
+                    let bits = val.to_bits();
+
+                    if bits == 0x11111111_11111111 {
+                        panic!(
+							"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+							 in array {} with params: {:?} (param set {})",
+							test_name, val, bits, i, array_name, params, param_idx
+						);
+                    }
+
+                    if bits == 0x22222222_22222222 {
+                        panic!(
+							"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+							 in array {} with params: {:?} (param set {})",
+							test_name, val, bits, i, array_name, params, param_idx
+						);
+                    }
+
+                    if bits == 0x33333333_33333333 {
+                        panic!(
+							"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+							 in array {} with params: {:?} (param set {})",
+							test_name, val, bits, i, array_name, params, param_idx
+						);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_pivot_no_poison(
+        _test_name: &str,
+        _kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    fn check_pivot_batch_default_row(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file)?;
+        let output = PivotBatchBuilder::new()
+            .kernel(kernel)
+            .apply_candles(&candles)?;
+        let default = PivotParams::default();
+        let def_idx = output
+            .combos
+            .iter()
+            .position(|p| p.mode == default.mode)
+            .expect("default row missing");
+        for arr in &output.levels[def_idx] {
+            assert_eq!(arr.len(), candles.close.len());
+        }
+        Ok(())
+    }
+
+    macro_rules! generate_all_pivot_tests {
+        ($($test_fn:ident),*) => {
+            paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar>]() { let _ = $test_fn(stringify!([<$test_fn _scalar>]), Kernel::Scalar); }
+                )*
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _avx2>]() { let _ = $test_fn(stringify!([<$test_fn _avx2>]), Kernel::Avx2); }
+                    #[test]
+                    fn [<$test_fn _avx512>]() { let _ = $test_fn(stringify!([<$test_fn _avx512>]), Kernel::Avx512); }
+                )*
+                $(
+                    #[test]
+                    fn [<$test_fn _auto_detect>]() { let _ = $test_fn(stringify!([<$test_fn _auto_detect>]), Kernel::Auto); }
+                )*
+            }
+        }
+    }
+
+    generate_all_pivot_tests!(
+        check_pivot_default_mode_camarilla,
+        check_pivot_nan_values,
+        check_pivot_no_data,
+        check_pivot_all_nan,
+        check_pivot_fibonacci_mode,
+        check_pivot_standard_mode,
+        check_pivot_demark_mode,
+        check_pivot_woodie_mode,
+        check_pivot_batch_default_row,
+        check_pivot_no_poison
+    );
+
+    #[cfg(feature = "proptest")]
+    generate_all_pivot_tests!(check_pivot_property);
+
+    fn check_batch_default_row(
+        test: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file)?;
+
+        let output = PivotBatchBuilder::new()
+            .kernel(kernel)
+            .apply_candles(&candles)?;
+
+        let def = PivotParams::default();
+        let row = output
+            .combos
+            .iter()
+            .position(|p| p.mode == def.mode)
+            .expect("default row missing");
+        let levels = &output.levels[row];
+
+        for arr in levels.iter() {
+            assert_eq!(arr.len(), candles.close.len());
+        }
+
+        let expected_r4 = [59466.5, 59357.55, 59243.6, 59334.85, 59170.35];
+        let r4 = &levels[0];
+        let last_five_r4 = &r4[r4.len().saturating_sub(5)..];
+        for (i, &val) in last_five_r4.iter().enumerate() {
+            let exp = expected_r4[i];
+            assert!(
+                (val - exp).abs() < 1e-1,
+                "[{test}] Camarilla r4 mismatch at idx {i}: {val} vs {exp:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let test_configs = vec![
+            (0, 2, 1),
+            (0, 4, 1),
+            (0, 4, 2),
+            (1, 3, 1),
+            (3, 4, 1),
+            (2, 2, 1),
+            (0, 0, 1),
+        ];
+
+        for (cfg_idx, &(mode_start, mode_end, mode_step)) in test_configs.iter().enumerate() {
+            let output = PivotBatchBuilder::new()
+                .kernel(kernel)
+                .mode_range(mode_start, mode_end, mode_step)
+                .apply_candles(&c)?;
+
+            for (row_idx, levels) in output.levels.iter().enumerate() {
+                let combo = &output.combos[row_idx];
+
+                for (level_idx, level_array) in levels.iter().enumerate() {
+                    let level_name = match level_idx {
+                        0 => "r4",
+                        1 => "r3",
+                        2 => "r2",
+                        3 => "r1",
+                        4 => "pp",
+                        5 => "s1",
+                        6 => "s2",
+                        7 => "s3",
+                        8 => "s4",
+                        _ => "unknown",
+                    };
+
+                    for (col, &val) in level_array.iter().enumerate() {
+                        if val.is_nan() {
+                            continue;
+                        }
+
+                        let bits = val.to_bits();
+
+                        if bits == 0x11111111_11111111 {
+                            panic!(
+								"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+								 at row {} col {} in array {} with params: {:?}",
+								test, cfg_idx, val, bits, row_idx, col, level_name, combo
+							);
+                        }
+
+                        if bits == 0x22222222_22222222 {
+                            panic!(
+								"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+								 at row {} col {} in array {} with params: {:?}",
+								test, cfg_idx, val, bits, row_idx, col, level_name, combo
+							);
+                        }
+
+                        if bits == 0x33333333_33333333 {
+                            panic!(
+								"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+								 at row {} col {} in array {} with params: {:?}",
+								test, cfg_idx, val, bits, row_idx, col, level_name, combo
+							);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_batch_no_poison(
+        _test: &str,
+        _kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    macro_rules! gen_batch_tests {
+        ($fn_name:ident) => {
+            paste! {
+                #[test] fn [<$fn_name _scalar>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx2>]()        {
+                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx512>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                }
+                #[test] fn [<$fn_name _auto_detect>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                }
+            }
+        };
+    }
+
+    gen_batch_tests!(check_batch_default_row);
+    gen_batch_tests!(check_batch_no_poison);
+
+    #[test]
+    fn test_pivot_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file)?;
+        let params = PivotParams::default();
+        let input = PivotInput::from_candles(&candles, params);
+
+        let base = pivot(&input)?;
+
+        let len = candles.close.len();
+
+        let mut r4 = vec![0.0; len];
+        let mut r3 = vec![0.0; len];
+        let mut r2 = vec![0.0; len];
+        let mut r1 = vec![0.0; len];
+        let mut pp = vec![0.0; len];
+        let mut s1 = vec![0.0; len];
+        let mut s2 = vec![0.0; len];
+        let mut s3 = vec![0.0; len];
+        let mut s4 = vec![0.0; len];
+
+        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+        {
+            pivot_into(
+                &input, &mut r4, &mut r3, &mut r2, &mut r1, &mut pp, &mut s1, &mut s2, &mut s3,
+                &mut s4,
+            )?;
+
+            assert_eq!(r4.len(), base.r4.len());
+            assert_eq!(r3.len(), base.r3.len());
+            assert_eq!(r2.len(), base.r2.len());
+            assert_eq!(r1.len(), base.r1.len());
+            assert_eq!(pp.len(), base.pp.len());
+            assert_eq!(s1.len(), base.s1.len());
+            assert_eq!(s2.len(), base.s2.len());
+            assert_eq!(s3.len(), base.s3.len());
+            assert_eq!(s4.len(), base.s4.len());
+
+            fn eq_or_both_nan(a: f64, b: f64) -> bool {
+                (a.is_nan() && b.is_nan()) || (a == b)
+            }
+
+            for i in 0..len {
+                assert!(eq_or_both_nan(r4[i], base.r4[i]), "r4 mismatch at {i}");
+                assert!(eq_or_both_nan(r3[i], base.r3[i]), "r3 mismatch at {i}");
+                assert!(eq_or_both_nan(r2[i], base.r2[i]), "r2 mismatch at {i}");
+                assert!(eq_or_both_nan(r1[i], base.r1[i]), "r1 mismatch at {i}");
+                assert!(eq_or_both_nan(pp[i], base.pp[i]), "pp mismatch at {i}");
+                assert!(eq_or_both_nan(s1[i], base.s1[i]), "s1 mismatch at {i}");
+                assert!(eq_or_both_nan(s2[i], base.s2[i]), "s2 mismatch at {i}");
+                assert!(eq_or_both_nan(s3[i], base.s3[i]), "s3 mismatch at {i}");
+                assert!(eq_or_both_nan(s4[i], base.s4[i]), "s4 mismatch at {i}");
+            }
+        }
+
+        Ok(())
+    }
+}

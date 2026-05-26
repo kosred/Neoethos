@@ -140,7 +140,7 @@ impl RuntimeDeepModel {
         &self,
         features: &Array2<f32>,
         batch_size: usize,
-        device: &<InferBackend as burn::tensor::backend::Backend>::Device,
+        device: &<InferBackend as burn::tensor::backend::BackendTypes>::Device,
     ) -> Result<Array2<f32>> {
         match self {
             Self::Mlp(model) => {
@@ -769,7 +769,7 @@ impl BurnDeepExpert {
     fn resolve_runtime_infer_device(
         &self,
     ) -> (
-        <InferBackend as burn::tensor::backend::Backend>::Device,
+        <InferBackend as burn::tensor::backend::BackendTypes>::Device,
         BurnDeviceSelection,
     ) {
         let requested_device = self.configured_requested_device_policy();
@@ -778,7 +778,7 @@ impl BurnDeepExpert {
 
     fn runtime_model_dtype(
         &self,
-        device: &<InferBackend as burn::tensor::backend::Backend>::Device,
+        device: &<InferBackend as burn::tensor::backend::BackendTypes>::Device,
     ) -> Result<DType> {
         match self
             .configured_requested_training_precision()

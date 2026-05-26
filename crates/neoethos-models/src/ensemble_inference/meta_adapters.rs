@@ -1,6 +1,6 @@
-//! [`super::ExpertModel`] adapters for the 7 META family experts.
+//! [`super::ExpertModel`] adapters for the 8 META family experts.
 //!
-//! Phase D1.2.4. Covers:
+//! Phase D1.2.4 (+ HMM Phase 2 wired 2026-05-25). Covers:
 //! - **elasticnet** ([`ElasticNetExpert`]) — sparse linear classifier
 //! - **logistic** ([`LogisticExpert`]) — plain logistic regression
 //! - **bayes_logit** ([`BayesianLogitExpert`]) — Bayesian logistic
@@ -8,8 +8,10 @@
 //! - **probability_calibrator** ([`ProbabilityCalibrationExpert`])
 //! - **conformal_gate** ([`ConformalPredictionExpert`])
 //! - **meta_stack** ([`MetaDecisionStack`]) — full meta pipeline
+//! - **hmm_regime** ([`RegimeHmmExpert`]) — 3-state HMM regime classifier
+//!   (34th model added 2026-05-25)
 //!
-//! All seven emit 3-class probabilities → [`super::ExpertOutputKind::Classification3`].
+//! All eight emit 3-class probabilities → [`super::ExpertOutputKind::Classification3`].
 //!
 //! ## Send + Sync
 //!
@@ -35,6 +37,7 @@ use crate::ensemble::{
     CalibrationMethod, ConformalPredictionExpert, MetaBlender, MetaDecisionStack,
     ProbabilityCalibrationExpert,
 };
+use crate::forecasting::RegimeHmmExpert;
 use crate::runtime::capabilities::ModelFamily;
 use crate::statistical::{BayesianLogitExpert, ElasticNetExpert, LogisticExpert};
 
@@ -482,10 +485,92 @@ impl ExpertLoader for MetaStackLoader {
 }
 
 // ---------------------------------------------------------------------------
+// hmm_regime — 3-state Hidden Markov Model regime classifier
+// (34th model, added 2026-05-25; HMM Phase 2 wiring)
+// ---------------------------------------------------------------------------
+
+/// [`ExpertModel`] adapter for [`RegimeHmmExpert`].
+///
+/// The HMM lives in `crate::forecasting::hmm_regime` and emits a
+/// 3-class posterior `[P(range/neutral), P(bullish/buy),
+/// P(bearish/sell)]` per bar — the canonical
+/// [`ExpertOutputKind::Classification3`] convention. It complements
+/// the rule-based regime classifier in
+/// `neoethos-search::stop_target::infer_regime` (which returns hard
+/// votes) with a smooth posterior trained by Baum-Welch EM.
+///
+/// Marked [`ModelFamily::Meta`] (matching `save_to_path` /
+/// `hmm_runtime_prediction` in `hmm_regime.rs`) because it sits in
+/// the regime-vote layer rather than producing trade signals
+/// directly — the soft voter consumes it as one of N classification
+/// voters.
+///
+/// **DataFrame contract**: requires `close`, `high`, `low` columns.
+/// The first row's posterior is a uniform prior `[1/3, 1/3, 1/3]`
+/// (no previous bar → no log-return). Rows 1..N use the trained
+/// Forward-algorithm posterior. See
+/// [`RegimeHmmExpert::predict_proba_from_dataframe`] for details.
+pub struct HmmRegimeAdapter {
+    inner: RegimeHmmExpert,
+}
+
+impl HmmRegimeAdapter {
+    pub fn new(inner: RegimeHmmExpert) -> Self {
+        Self { inner }
+    }
+    pub fn inner(&self) -> &RegimeHmmExpert {
+        &self.inner
+    }
+}
+
+impl ExpertModel for HmmRegimeAdapter {
+    fn name(&self) -> &str {
+        "hmm_regime"
+    }
+    fn family(&self) -> ModelFamily {
+        ModelFamily::Meta
+    }
+    fn output_kind(&self) -> ExpertOutputKind {
+        ExpertOutputKind::Classification3
+    }
+    fn feature_columns(&self) -> &[String] {
+        self.inner.feature_columns()
+    }
+    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+        let probs = self
+            .inner
+            .predict_proba_from_dataframe(df)
+            .with_context(|| "hmm_regime predict_proba_from_dataframe failed")?;
+        classification3_per_row(&probs)
+    }
+}
+
+/// Loader for [`HmmRegimeAdapter`].
+///
+/// Loads from `<artifact_dir>/hmm_regime.json` — the canonical
+/// artifact file written by [`RegimeHmmExpert::save_to_path`].
+pub struct HmmRegimeLoader;
+impl ExpertLoader for HmmRegimeLoader {
+    fn name(&self) -> &str {
+        "hmm_regime"
+    }
+    fn load(&self, artifact_dir: &Path) -> Result<Box<dyn ExpertModel>> {
+        let inner = RegimeHmmExpert::load_from_artifact(artifact_dir).with_context(|| {
+            format!(
+                "RegimeHmmExpert::load_from_artifact({}) failed",
+                artifact_dir.display()
+            )
+        })?;
+        Ok(Box::new(HmmRegimeAdapter::new(inner)))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Convenience: register-all-meta-loaders
 // ---------------------------------------------------------------------------
 
-/// Register every meta-family loader (7 canonical names).
+/// Register every meta-family loader (8 canonical names — 7 META
+/// originals + `hmm_regime` added 2026-05-25 as the 34th model).
 pub fn register_meta_loaders(registry: &mut super::ExpertRegistry) -> Result<()> {
     registry.register(Box::new(ElasticNetLoader))?;
     registry.register(Box::new(LogisticLoader))?;
@@ -494,6 +579,7 @@ pub fn register_meta_loaders(registry: &mut super::ExpertRegistry) -> Result<()>
     registry.register(Box::new(ProbabilityCalibratorLoader))?;
     registry.register(Box::new(ConformalGateLoader))?;
     registry.register(Box::new(MetaStackLoader))?;
+    registry.register(Box::new(HmmRegimeLoader))?;
     Ok(())
 }
 
@@ -562,10 +648,11 @@ mod tests {
         assert_eq!(ProbabilityCalibratorLoader.name(), "probability_calibrator");
         assert_eq!(ConformalGateLoader.name(), "conformal_gate");
         assert_eq!(MetaStackLoader.name(), "meta_stack");
+        assert_eq!(HmmRegimeLoader.name(), "hmm_regime");
     }
 
     #[test]
-    fn register_meta_loaders_installs_seven_names() {
+    fn register_meta_loaders_installs_eight_names() {
         let mut reg = ExpertRegistry::new();
         register_meta_loaders(&mut reg).expect("register");
         let mut names = reg.registered_names();
@@ -576,6 +663,7 @@ mod tests {
                 "bayes_logit",
                 "conformal_gate",
                 "elasticnet",
+                "hmm_regime",
                 "logistic",
                 "meta_blender",
                 "meta_stack",
@@ -592,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn full_24_tree_deep_meta_loaders_coexist() {
+    fn full_25_tree_deep_meta_loaders_coexist() {
         let mut reg = ExpertRegistry::new();
         super::super::tree_adapters::register_tree_loaders(&mut reg).expect("trees");
         super::super::deep_classification_adapters::register_deep_classification_loaders(&mut reg)
@@ -600,7 +688,41 @@ mod tests {
         super::super::deep_timeseries_adapters::register_deep_timeseries_loaders(&mut reg)
             .expect("deep-ts");
         register_meta_loaders(&mut reg).expect("meta");
-        // 7 tree + 3 deep-cls + 7 deep-ts + 7 meta = 24
-        assert_eq!(reg.registered_names().len(), 24);
+        // 7 tree + 3 deep-cls + 7 deep-ts + 8 meta = 25
+        assert_eq!(reg.registered_names().len(), 25);
+    }
+
+    #[test]
+    fn hmm_adapter_reports_correct_metadata() {
+        // Build a minimal RegimeHmmExpert via the canonical training
+        // entry point — small synthetic data is fine because we are
+        // testing adapter metadata, not training quality.
+        use crate::forecasting::HmmRegimeConfig;
+        use ndarray::Array2;
+        let n = 600;
+        let mut obs = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            // Deterministic ramp so EM has something to fit.
+            obs[(i, 0)] = ((i % 7) as f64 - 3.0) * 0.0005;
+            obs[(i, 1)] = -7.0 + ((i % 5) as f64) * 0.1;
+        }
+        let cfg = HmmRegimeConfig {
+            min_training_bars: 500,
+            ..HmmRegimeConfig::default()
+        };
+        let expert = RegimeHmmExpert::train(
+            &obs,
+            vec!["log_return".to_string(), "log_volatility".to_string()],
+            cfg,
+        )
+        .expect("train HMM");
+        let adapter = HmmRegimeAdapter::new(expert);
+        assert_eq!(adapter.name(), "hmm_regime");
+        assert_eq!(adapter.family(), ModelFamily::Meta);
+        assert_eq!(adapter.output_kind(), ExpertOutputKind::Classification3);
+        assert_eq!(
+            adapter.feature_columns(),
+            &["log_return".to_string(), "log_volatility".to_string()]
+        );
     }
 }

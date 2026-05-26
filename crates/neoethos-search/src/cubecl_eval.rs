@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use anyhow::{Context, Result, bail};
 use cubecl::cuda::{CudaDevice, CudaRuntime};
 use cubecl::prelude::*;
@@ -9,6 +11,131 @@ use crate::eval::{BacktestSettings, SmcRow};
 
 const SMC_WIDTH: usize = 11;
 const BACKTEST_CORE_METRIC_WIDTH: usize = 7;
+
+// ─── F-CORE3 consolidation — CUDA env-var registry ──────────────────
+//
+// **2026-05-25**: the 7 inline `std::env::var(...)` reads previously
+// scattered across `requested_eval_precision`, `cuda_eval_signal_kernel_enabled`,
+// `cuda_eval_backtest_kernel_enabled`, `signal_kernel_units`,
+// `backtest_kernel_units`, and `cuda_device_id` now route through this
+// typed registry. Same canonical pattern as
+// `crates/neoethos-app/src/app_services/env_overrides.rs` and
+// `crates/neoethos-search/src/genetic/runtime_overrides.rs`.
+//
+// The `CudaEnvKnobs` struct is built once on first access via
+// `cuda_env_knobs()` (lazy OnceLock) so the env-var reads happen at
+// most once per process. Mirrors the audit-baseline `HardwareRuntimeOverrides`
+// shape.
+//
+// Knobs covered (env-var name → typed field):
+// - `FOREX_BOT_SEARCH_EVAL_PRECISION` / `FOREX_BOT_TRAIN_PRECISION` /
+//   `FOREX_TRAIN_PRECISION` → `requested_precision: TrainingPrecision`
+// - `FOREX_BOT_SEARCH_EVAL_CUDA_KERNEL` → `eval_kernel_enabled: bool`
+// - `FOREX_BOT_SEARCH_BACKTEST_CUDA_KERNEL` → `backtest_kernel_enabled: bool`
+// - `FOREX_BOT_SEARCH_EVAL_KERNEL_UNITS` → `eval_kernel_units_override: Option<u32>`
+// - `FOREX_BOT_SEARCH_BACKTEST_KERNEL_UNITS` → `backtest_kernel_units_override: Option<u32>`
+// - `FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE` → `cuda_device_id: usize`
+//
+// Vulkan note: the wgpu-vulkan backend is wired via feature
+// aggregation (`vulkan` cargo feature). It doesn't read any of these
+// env vars — the cubecl runtime selects Vulkan at compile time when
+// the `vulkan` feature is on. No env-knob registry needed for Vulkan
+// today; if one becomes necessary it'd live in a sibling
+// `wgpu_eval.rs` file with the same typed-registry pattern.
+
+#[derive(Debug, Clone, Copy)]
+struct CudaEnvKnobs {
+    requested_precision: TrainingPrecision,
+    eval_kernel_enabled: bool,
+    backtest_kernel_enabled: bool,
+    eval_kernel_units_override: Option<u32>,
+    backtest_kernel_units_override: Option<u32>,
+    cuda_device_id: usize,
+}
+
+impl CudaEnvKnobs {
+    fn from_env() -> Self {
+        Self {
+            requested_precision: read_requested_precision_from_env(),
+            eval_kernel_enabled: read_kernel_enabled_from_env(
+                "FOREX_BOT_SEARCH_EVAL_CUDA_KERNEL",
+            ),
+            backtest_kernel_enabled: read_kernel_enabled_from_env(
+                "FOREX_BOT_SEARCH_BACKTEST_CUDA_KERNEL",
+            ),
+            eval_kernel_units_override: read_kernel_units_from_env(
+                "FOREX_BOT_SEARCH_EVAL_KERNEL_UNITS",
+            ),
+            // Backtest units fall back to eval units when the explicit
+            // backtest knob is unset — preserves the original semantics
+            // (`signal_kernel_units` and `backtest_kernel_units` both
+            // honoured EVAL_KERNEL_UNITS as the umbrella default).
+            backtest_kernel_units_override: read_kernel_units_from_env(
+                "FOREX_BOT_SEARCH_BACKTEST_KERNEL_UNITS",
+            )
+            .or_else(|| read_kernel_units_from_env("FOREX_BOT_SEARCH_EVAL_KERNEL_UNITS")),
+            cuda_device_id: read_cuda_device_id_from_env(),
+        }
+    }
+}
+
+static CUDA_ENV_KNOBS: OnceLock<CudaEnvKnobs> = OnceLock::new();
+
+fn cuda_env_knobs() -> CudaEnvKnobs {
+    *CUDA_ENV_KNOBS.get_or_init(CudaEnvKnobs::from_env)
+}
+
+fn read_requested_precision_from_env() -> TrainingPrecision {
+    [
+        "FOREX_BOT_SEARCH_EVAL_PRECISION",
+        "FOREX_BOT_TRAIN_PRECISION",
+        "FOREX_TRAIN_PRECISION",
+    ]
+    .iter()
+    .find_map(|key| std::env::var(key).ok())
+    .and_then(|value| parse_training_precision(&value))
+    .unwrap_or(TrainingPrecision::Fp32)
+}
+
+fn read_kernel_enabled_from_env(name: &str) -> bool {
+    !matches!(
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "off" | "disable" | "disabled")
+    )
+}
+
+fn read_kernel_units_from_env(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn read_cuda_device_id_from_env() -> usize {
+    match std::env::var("FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE") {
+        // Not set: pick device 0 silently — the canonical default.
+        Err(_) => 0,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) => value,
+            Err(_) => {
+                // The user explicitly set the env var but it did not
+                // parse as a usize ("auto", "all", "GPU0" — typos like
+                // these used to silently fall back to device 0,
+                // running the search on the wrong card without telling
+                // anyone. Now we shout, then default.
+                tracing::warn!(
+                    target: "neoethos_search::gpu",
+                    raw = %raw,
+                    "FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE is set but not a valid \
+                     non-negative integer; falling back to device 0."
+                );
+                0
+            }
+        },
+    }
+}
 
 #[cube(launch)]
 fn synthesize_signals_kernel<F: Float + CubeElement>(
@@ -487,15 +614,8 @@ fn parse_training_precision(value: &str) -> Option<TrainingPrecision> {
 }
 
 fn requested_eval_precision() -> TrainingPrecision {
-    [
-        "FOREX_BOT_SEARCH_EVAL_PRECISION",
-        "FOREX_BOT_TRAIN_PRECISION",
-        "FOREX_TRAIN_PRECISION",
-    ]
-    .iter()
-    .find_map(|key| std::env::var(key).ok())
-    .and_then(|value| parse_training_precision(&value))
-    .unwrap_or(TrainingPrecision::Fp32)
+    // F-CORE3 closure: typed boundary via `cuda_env_knobs()`.
+    cuda_env_knobs().requested_precision
 }
 
 fn prefers_bf16(requested: TrainingPrecision) -> bool {
@@ -506,68 +626,46 @@ fn prefers_bf16(requested: TrainingPrecision) -> bool {
 }
 
 pub(crate) fn cuda_eval_signal_kernel_enabled() -> bool {
-    !matches!(
-        std::env::var("FOREX_BOT_SEARCH_EVAL_CUDA_KERNEL")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase()),
-        Some(value) if matches!(value.as_str(), "0" | "false" | "off" | "disable" | "disabled")
-    )
+    // F-CORE3 closure: typed boundary via `cuda_env_knobs()`.
+    cuda_env_knobs().eval_kernel_enabled
 }
 
 pub(crate) fn cuda_eval_backtest_kernel_enabled() -> bool {
-    !matches!(
-        std::env::var("FOREX_BOT_SEARCH_BACKTEST_CUDA_KERNEL")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase()),
-        Some(value) if matches!(value.as_str(), "0" | "false" | "off" | "disable" | "disabled")
-    )
+    // F-CORE3 closure: typed boundary via `cuda_env_knobs()`.
+    cuda_env_knobs().backtest_kernel_enabled
 }
 
-fn signal_kernel_units(client: &ComputeClient<CudaRuntime>) -> u32 {
+// **2026-05-25 — task #261**: switched from concrete `CudaRuntime` to a
+// generic `R: Runtime` parameter so these helpers (and the kernel-launch
+// fns below) compile against any cubecl runtime — CUDA (NVIDIA), Vulkan
+// (cross-vendor via cubecl-wgpu/spirv), and ROCm/HIP. The CUDA-specific
+// env knobs stay because they're plain numbers (kernel unit count,
+// device id) — semantically valid for any backend; the `cuda_` prefix
+// just reflects the env-var name and is a follow-up cosmetic rename.
+fn signal_kernel_units<R: Runtime>(client: &ComputeClient<R>) -> u32 {
     let max_units = client.properties().hardware.max_units_per_cube.max(1);
-    std::env::var("FOREX_BOT_SEARCH_EVAL_KERNEL_UNITS")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
+    cuda_env_knobs()
+        .eval_kernel_units_override
         .unwrap_or(max_units)
         .min(max_units)
         .max(1)
 }
 
-fn backtest_kernel_units(client: &ComputeClient<CudaRuntime>) -> u32 {
+fn backtest_kernel_units<R: Runtime>(client: &ComputeClient<R>) -> u32 {
     let max_units = client.properties().hardware.max_units_per_cube.max(1);
-    std::env::var("FOREX_BOT_SEARCH_BACKTEST_KERNEL_UNITS")
-        .ok()
-        .or_else(|| std::env::var("FOREX_BOT_SEARCH_EVAL_KERNEL_UNITS").ok())
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
+    cuda_env_knobs()
+        .backtest_kernel_units_override
         .unwrap_or(max_units)
         .min(max_units)
         .max(1)
 }
 
 fn cuda_device_id() -> usize {
-    match std::env::var("FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE") {
-        // Not set: pick device 0 silently — the canonical default.
-        Err(_) => 0,
-        Ok(raw) => match raw.trim().parse::<usize>() {
-            Ok(value) => value,
-            Err(_) => {
-                // The user explicitly set the env var but it did not
-                // parse as a usize ("auto", "all", "GPU0" — typos like
-                // these used to silently fall back to device 0,
-                // running the search on the wrong card without telling
-                // anyone. Now we shout, then default.
-                tracing::warn!(
-                    target: "neoethos_search::gpu",
-                    raw = %raw,
-                    "FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE is set but not a valid \
-                     non-negative integer; falling back to device 0."
-                );
-                0
-            }
-        },
-    }
+    // F-CORE3 closure: typed boundary via `cuda_env_knobs()`. The
+    // tracing::warn for unparseable values fires once at first read
+    // (inside `read_cuda_device_id_from_env`) rather than on every
+    // kernel launch.
+    cuda_env_knobs().cuda_device_id
 }
 
 fn flatten_i32_rows(rows: &[SmcRow]) -> Vec<i32> {
@@ -584,8 +682,136 @@ fn flatten_i32_flags(rows: &[SmcRow]) -> Vec<i32> {
     flatten_i32_rows(rows)
 }
 
-fn launch_signal_kernel<F>(
-    client: &ComputeClient<CudaRuntime>,
+/// Host-side validation that every index the kernel will compute stays
+/// within its array. This is the contract `synthesize_signals_kernel`
+/// implicitly assumes; without these checks a single bad GA gene
+/// silently reads garbage memory in the CUDA kernel, which produces
+/// **wrong trading signals** with no error (panics in CUDA kernels
+/// surface as CUDA driver errors or simply corrupt data — both far
+/// worse than a clean `Err` for a real-money trading system).
+///
+/// Invariants (mirroring `synthesize_signals_kernel`):
+///   1. `gene_offsets.len() == n_genes + 1` (CSR layout, last entry is total)
+///   2. `gene_offsets` is monotonically non-decreasing
+///   3. `gene_offsets[n_genes] as usize <= gene_indices.len()` and ≤ gene_weights.len()
+///   4. every `gene_indices[i]` is in `[0, indicators_flat.len() / n_samples)`
+///   5. `long_thr.len() == n_genes` and `short_thr.len() == n_genes`
+///   6. `gene_smc_flags.len() == n_genes * SMC_WIDTH`
+///   7. `smc_data.len() == n_samples * SMC_WIDTH`
+///   8. `smc_weights.len() == SMC_WIDTH`
+///   9. `indicators_flat.len() % n_samples == 0`
+fn validate_signal_kernel_inputs<F>(
+    indicators_flat: &[F],
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[F],
+    long_thr: &[F],
+    short_thr: &[F],
+    smc_data: &[i32],
+    gene_smc_flags: &[i32],
+    smc_weights: &[F],
+    n_genes: usize,
+    n_samples: usize,
+) -> Result<()> {
+    if gene_offsets.len() != n_genes + 1 {
+        bail!(
+            "gene_offsets length {} must equal n_genes + 1 = {}",
+            gene_offsets.len(),
+            n_genes + 1
+        );
+    }
+    if long_thr.len() != n_genes {
+        bail!("long_thr length {} must equal n_genes {}", long_thr.len(), n_genes);
+    }
+    if short_thr.len() != n_genes {
+        bail!("short_thr length {} must equal n_genes {}", short_thr.len(), n_genes);
+    }
+    if gene_smc_flags.len() != n_genes * SMC_WIDTH {
+        bail!(
+            "gene_smc_flags length {} must equal n_genes * SMC_WIDTH = {}",
+            gene_smc_flags.len(),
+            n_genes * SMC_WIDTH
+        );
+    }
+    if smc_weights.len() != SMC_WIDTH {
+        bail!(
+            "smc_weights length {} must equal SMC_WIDTH = {}",
+            smc_weights.len(),
+            SMC_WIDTH
+        );
+    }
+    if smc_data.len() != n_samples * SMC_WIDTH {
+        bail!(
+            "smc_data length {} must equal n_samples * SMC_WIDTH = {}",
+            smc_data.len(),
+            n_samples * SMC_WIDTH
+        );
+    }
+    if n_samples == 0 {
+        bail!("n_samples must be > 0");
+    }
+    if indicators_flat.len() % n_samples != 0 {
+        bail!(
+            "indicators_flat length {} must be a multiple of n_samples {}",
+            indicators_flat.len(),
+            n_samples
+        );
+    }
+    let n_indicators = indicators_flat.len() / n_samples;
+    let total_entries = gene_offsets[n_genes];
+    if total_entries < 0 {
+        bail!("gene_offsets[n_genes] = {} must be non-negative", total_entries);
+    }
+    if (total_entries as usize) > gene_indices.len() {
+        bail!(
+            "gene_offsets[n_genes] = {} exceeds gene_indices length {}",
+            total_entries,
+            gene_indices.len()
+        );
+    }
+    if (total_entries as usize) > gene_weights.len() {
+        bail!(
+            "gene_offsets[n_genes] = {} exceeds gene_weights length {}",
+            total_entries,
+            gene_weights.len()
+        );
+    }
+    // Monotonicity: gene_offsets[g] <= gene_offsets[g+1] for every g.
+    for g in 0..n_genes {
+        if gene_offsets[g] > gene_offsets[g + 1] {
+            bail!(
+                "gene_offsets must be non-decreasing: gene_offsets[{}]={} > gene_offsets[{}]={}",
+                g,
+                gene_offsets[g],
+                g + 1,
+                gene_offsets[g + 1]
+            );
+        }
+        if gene_offsets[g] < 0 {
+            bail!("gene_offsets[{}] = {} is negative", g, gene_offsets[g]);
+        }
+    }
+    // Every gene_indices entry must reference a valid indicator row.
+    // Checking up to `total_entries` because anything past that isn't read.
+    let used_entries = total_entries as usize;
+    for (i, &idx) in gene_indices.iter().take(used_entries).enumerate() {
+        if idx < 0 {
+            bail!("gene_indices[{}] = {} is negative", i, idx);
+        }
+        if (idx as usize) >= n_indicators {
+            bail!(
+                "gene_indices[{}] = {} exceeds n_indicators = {} (indicators_flat.len()/n_samples)",
+                i,
+                idx,
+                n_indicators
+            );
+        }
+    }
+    Ok(())
+}
+
+fn launch_signal_kernel<R: Runtime, F>(
+    client: &ComputeClient<R>,
     indicators_flat: &[F],
     gene_offsets: &[i32],
     gene_indices: &[i32],
@@ -607,6 +833,26 @@ where
         return Ok(Vec::new());
     }
 
+    // **CRITICAL for real-money trading**: validate every kernel input
+    // BEFORE handing buffers to the GPU. Bad GA-evolved indices silently
+    // read garbage memory in CUDA, producing wrong trading signals with
+    // no error path. The check is O(n_genes + total_entries) — negligible
+    // next to the kernel's own work.
+    validate_signal_kernel_inputs(
+        indicators_flat,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        smc_data,
+        gene_smc_flags,
+        smc_weights,
+        n_genes,
+        n_samples,
+    )
+    .context("signal kernel input validation failed")?;
+
     let indicators_handle = client.create_from_slice(F::as_bytes(indicators_flat));
     let gene_offsets_handle = client.create_from_slice(i32::as_bytes(gene_offsets));
     let gene_indices_handle = client.create_from_slice(i32::as_bytes(gene_indices));
@@ -620,7 +866,7 @@ where
 
     let units = signal_kernel_units(client);
     let cubes = (total as u32).div_ceil(units);
-    synthesize_signals_kernel::launch::<F, CudaRuntime>(
+    synthesize_signals_kernel::launch::<F, R>(
         client,
         CubeCount::Static(cubes, 1, 1),
         CubeDim::new_1d(units),
@@ -842,8 +1088,8 @@ fn normalize_prices_to_pips(prices: &[f64], pip_value: f64) -> Vec<f32> {
         .collect()
 }
 
-fn launch_backtest_kernel(
-    client: &ComputeClient<CudaRuntime>,
+fn launch_backtest_kernel<R: Runtime>(
+    client: &ComputeClient<R>,
     close_pips: &[f32],
     high_pips: &[f32],
     low_pips: &[f32],
@@ -892,7 +1138,7 @@ fn launch_backtest_kernel(
 
     let units = backtest_kernel_units(client);
     let cubes = (n_genes as u32).div_ceil(units);
-    backtest_population_kernel::launch::<CudaRuntime>(
+    backtest_population_kernel::launch::<R>(
         client,
         CubeCount::Static(cubes, 1, 1),
         CubeDim::new_1d(units),

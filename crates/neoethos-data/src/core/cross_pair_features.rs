@@ -2,7 +2,7 @@
 //! symbols together.
 //!
 //! Phase F3. Adds inter-symbol relationship features to the
-//! feature pipeline. The 33-model ensemble can already learn
+//! feature pipeline. The 34-model ensemble can already learn
 //! per-symbol indicators (RSI, MACD, regime, etc.); adding
 //! cross-pair features lets it ALSO learn:
 //!

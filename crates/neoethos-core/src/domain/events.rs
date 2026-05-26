@@ -57,10 +57,50 @@ pub struct PreparedDatasetLite {
     // Keeping it minimal for now.
 }
 
+/// **F-099 fix (2026-05-25)** — typed trade side. Replaces the
+/// previous untyped `String` field with a serde-tagged enum so that
+/// stringly-typed "buy " (with trailing space) / "Buy" / "BUY"
+/// inconsistencies are caught at deserialisation rather than silently
+/// mis-routing fills downstream.
+///
+/// Serialised as lowercase strings (`"buy"`, `"sell"`) for backward
+/// compatibility with existing on-disk event ledgers — old data still
+/// loads, new data is normalised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TradeSide {
+    Buy,
+    Sell,
+}
+
+impl TradeSide {
+    /// Lowercase string form ("buy" / "sell") — matches serde
+    /// representation. Used by callers that still need a `String` for
+    /// legacy interop.
+    pub fn as_lowercase(self) -> &'static str {
+        match self {
+            Self::Buy => "buy",
+            Self::Sell => "sell",
+        }
+    }
+
+    /// Lenient parse used by the on-disk-ledger migration: accepts
+    /// any case + trims whitespace. Returns `None` for unknown
+    /// inputs so the caller can decide whether to bail or skip.
+    pub fn from_lenient(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "buy" | "long" => Some(Self::Buy),
+            "sell" | "short" => Some(Self::Sell),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeEvent {
     pub symbol: String,
-    pub side: String, // "buy" / "sell"
+    /// Trade direction. Typed enum per F-099 fix (2026-05-25).
+    pub side: TradeSide,
     pub volume: f64,
     pub open_price: f64,
     pub open_time: DateTime<Utc>,
@@ -73,13 +113,38 @@ pub struct TradeEvent {
     pub magic: i64,
 }
 
+/// **F-099 fix (2026-05-25)** — typed risk severity. Same pattern as
+/// [`TradeSide`]: replaces an untyped `String` so that
+/// "critical"/"CRITICAL"/"Critical" cannot drift across producers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RiskSeverity {
+    Info,
+    Warn,
+    Error,
+    Critical,
+}
+
+impl RiskSeverity {
+    pub fn from_lenient(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "info" | "notice" => Some(Self::Info),
+            "warn" | "warning" => Some(Self::Warn),
+            "error" | "err" => Some(Self::Error),
+            "critical" | "crit" | "fatal" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskEvent {
     pub event_id: String,
     pub timestamp: DateTime<Utc>,
     pub category: String,
     pub message: String,
-    pub severity: String,
+    /// Typed severity per F-099 fix (2026-05-25). Was `String` before.
+    pub severity: RiskSeverity,
     pub context: serde_json::Value,
 }
 
@@ -87,7 +152,7 @@ impl RiskEvent {
     pub fn new(
         category: impl Into<String>,
         message: impl Into<String>,
-        severity: impl Into<String>,
+        severity: RiskSeverity,
         context: Option<serde_json::Value>,
     ) -> Self {
         Self {
@@ -95,7 +160,7 @@ impl RiskEvent {
             timestamp: Utc::now(),
             category: category.into(),
             message: message.into(),
-            severity: severity.into(),
+            severity,
             context: context.unwrap_or(serde_json::json!({})),
         }
     }

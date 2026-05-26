@@ -43,25 +43,50 @@ final settingsProvider = FutureProvider.autoDispose<SettingsSnapshot>((ref) {
 /// provider (autoDispose still applies — leaving the screen halts
 /// polling). The first fetch happens synchronously below.
 final enginesProvider = FutureProvider.autoDispose<EnginesSnapshot>((ref) async {
-  final client = ref.read(backendClientProvider);
-  final snapshot = await client.fetchEngines();
-
-  // Schedule next tick. A one-shot Timer + invalidateSelf gives us
-  // "poll, await, repeat" — each invalidation re-runs this whole
-  // body, including scheduling the *next* timer. `onDispose` cancels
-  // the pending timer so navigating away halts polling cleanly.
+  // **2026-05-26 fix (Κωνσταντίνος)**: schedule the next-tick timer
+  // BEFORE the await. Old order (timer after await) silently broke
+  // polling when the backend was mid-restart: fetchEngines threw,
+  // control left the function, timer never got created → provider
+  // wedged in AsyncError forever, UI permanently showed "—".
   final timer = Timer(const Duration(seconds: 2), () {
     ref.invalidateSelf();
   });
   ref.onDispose(timer.cancel);
 
-  return snapshot;
+  final client = ref.read(backendClientProvider);
+  return await client.fetchEngines();
 });
 
 /// `/broker/status` — current broker session state.
-final brokerStatusProvider = FutureProvider.autoDispose<BrokerStatus>((ref) {
+///
+/// **2026-05-26 — task #267 fix**: was previously a one-shot
+/// `FutureProvider.autoDispose` — cached the COLD-START response forever
+/// while the StatusBar was mounted (which is always). If the broker hadn't
+/// finished its first cTrader handshake when the UI first read the
+/// provider, `connected:false` got cached and the status bar showed
+/// "Broker · offline" indefinitely, even though /broker/status was
+/// reporting connected:true within a few seconds.
+///
+/// Fix: schedule a self-invalidation every 3 seconds, mirroring the
+/// `enginesProvider` polling pattern. autoDispose still applies — the
+/// timer dies with the provider when the StatusBar tree unmounts.
+/// 3 s strikes a balance between responsiveness (cold-connect transitions
+/// surface within one window) and load (a tiny GET that's already
+/// in-process).
+final brokerStatusProvider = FutureProvider.autoDispose<BrokerStatus>((ref) async {
+  // **2026-05-26 fix #2 (Κωνσταντίνος)**: same trap as enginesProvider —
+  // timer must be scheduled BEFORE the await. If the backend restarts
+  // (watchdog respawn, OAuth re-auth), the in-flight fetchBrokerStatus
+  // throws → control leaves function before timer creation → polling
+  // stops forever. Status bar then stuck on "connecting" indefinitely
+  // even though backend reports connected:true on subsequent fetches.
+  final timer = Timer(const Duration(seconds: 3), () {
+    ref.invalidateSelf();
+  });
+  ref.onDispose(timer.cancel);
+
   final client = ref.read(backendClientProvider);
-  return client.fetchBrokerStatus();
+  return await client.fetchBrokerStatus();
 });
 
 /// `/intelligence` — model artifacts + discovery targets + walkforward.

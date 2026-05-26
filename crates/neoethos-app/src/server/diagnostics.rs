@@ -80,8 +80,12 @@ pub struct ReportResponse {
 /// here when we eventually rotate to a shared inbox.
 pub const REPORT_EMAIL: &str = "konstantinoskokkinos1982@gmail.com";
 
-pub async fn report(State(_state): State<AppApiState>, Json(req): Json<ReportRequest>) -> Response {
-    match tokio::task::spawn_blocking(move || build_bundle(&req)).await {
+pub async fn report(State(state): State<AppApiState>, Json(req): Json<ReportRequest>) -> Response {
+    // F-553/F-576 closure (2026-05-25): config path threaded from CLI
+    // so the report bundle includes the *actual* config the operator
+    // launched with, not the literal `"config.yaml"` next to CWD.
+    let config_path = state.config_path().to_path_buf();
+    match tokio::task::spawn_blocking(move || build_bundle(&req, &config_path)).await {
         Ok(Ok(resp)) => Json(resp).into_response(),
         Ok(Err(err)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -98,7 +102,7 @@ pub async fn report(State(_state): State<AppApiState>, Json(req): Json<ReportReq
     }
 }
 
-fn build_bundle(req: &ReportRequest) -> anyhow::Result<ReportResponse> {
+fn build_bundle(req: &ReportRequest, config_path: &PathBuf) -> anyhow::Result<ReportResponse> {
     // 1. Pick the destination — Desktop is what every Windows user
     //    knows how to find. Falls back to home dir if Desktop
     //    isn't discoverable (rare).
@@ -147,13 +151,12 @@ fn build_bundle(req: &ReportRequest) -> anyhow::Result<ReportResponse> {
     }
 
     // 2d. config.yaml — no secrets, ships verbatim.
-    let config_path = PathBuf::from("config.yaml");
     if config_path.exists() {
-        match std::fs::read(&config_path) {
+        match std::fs::read(config_path) {
             Ok(bytes) => entries.push(("04_config.yaml".to_string(), bytes)),
             Err(err) => entries.push((
                 "04_config.yaml.error".to_string(),
-                format!("could not read config.yaml: {err}").into_bytes(),
+                format!("could not read {}: {err}", config_path.display()).into_bytes(),
             )),
         }
     }

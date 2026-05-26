@@ -17,6 +17,15 @@ dependencies:
   # State management — Riverpod chosen over BLoC because the screen
   # graph is small (14 panels) and Riverpod's compile-time-safe
   # providers fit the "thin client over a Rust backend" model.
+  # NOTE 2026-05-26: kept on ^2.5.1. Tried bumping to ^3.0.0 and discovered
+  # 35 hard breaks in `flutter analyze`:
+  #   - `StateProvider` and `AutoDisposeFutureProvider(Family)` were
+  #     removed (not just deprecated) — every legacy provider must
+  #     migrate to `Notifier` / `NotifierProvider` with new constructors.
+  #   - `AsyncValue<T>.valueOrNull` was removed (~12 call sites).
+  #   - `Override` was renamed.
+  # This is a structural migration across 30+ files, not a version pin
+  # bump. Tracked for a dedicated session.
   flutter_riverpod: ^2.5.1
 
   # REST
@@ -35,17 +44,35 @@ dependencies:
   fl_chart: ^0.68.0
 
   # Date / time formatting + duration helpers.
-  intl: ^0.19.0
+  # 2026-05-26: bumped 0.19.0 → 0.20.0. CHANGELOG confirms no breaking
+  # changes for `DateFormat` (yyyy-MM-dd HH:mm, HH:mm:ss, MMM d patterns)
+  # or `NumberFormat` (#,##0, +#,##0.0;-#,##0.0 patterns) — only Dart
+  # SDK constraint update + internal bug fixes. All 12 call sites in
+  # `lib/` use standard ICU patterns that resolve identically.
+  intl: ^0.20.0
 
   # Logging - flows into the backend log stream eventually.
   logger: ^2.4.0
+
+  # Server-Sent Events client (#237, 2026-05-25). The Rust backend
+  # exposes `/account/snapshot/stream` + `/live/spots/stream` so the
+  # Flutter UI gets push updates (5-750 ms latency) instead of
+  # polling every 1-5 s. `eventflux` is the canonical Flutter SSE
+  # client in 2026: built on `http`, supports exponential backoff
+  # with per-retry header refresh (for auth token rotation), and has
+  # explicit Windows/macOS/Linux desktop support. We deliberately
+  # skipped `flutter_client_sse` (eventflux's stale grandparent, no
+  # built-in reconnect) and `dio` + custom transformer (dio buffers
+  # the full response in some configurations - bursty data, defeats
+  # the latency win we're chasing here).
+  eventflux: ^2.2.1
 
   cupertino_icons: ^1.0.8
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^4.0.0
+  flutter_lints: ^6.0.0  # 2026-05-26 bumped from ^4.0.0 — pulls latest lint rule set; new warnings get triaged on next `flutter analyze` pass
   mocktail: ^1.0.4
 
 flutter:

@@ -129,10 +129,9 @@ pub fn show_double_click_help_dialog_if_orphaned(server_url: &str) {
         return;
     }
     // Skip when the Flutter shell launched us.
-    if std::env::var("NEOETHOS_LAUNCHED_BY_FLUTTER")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-    {
+    // **F-CORE3 closure (2026-05-25)**: routed through the canonical
+    // `env_overrides::launched_by_flutter` typed getter.
+    if crate::env_overrides::launched_by_flutter() {
         return;
     }
     #[cfg(windows)]
@@ -508,10 +507,11 @@ fn build_env_filter(level: Level) -> EnvFilter {
 /// 3. Fallback: relative `./logs` (only if `dirs::data_dir()` returns None,
 ///    which is rare — typically only on exotic configurations with no HOME).
 pub fn default_log_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var("LOG_DIR") {
-        if !custom.is_empty() {
-            return PathBuf::from(custom);
-        }
+    // **F-CORE3 closure (2026-05-25)**: routed through the canonical
+    // `env_overrides::log_dir_override` typed getter so the env-var
+    // name lives in one grep-able place.
+    if let Some(custom) = crate::env_overrides::log_dir_override() {
+        return PathBuf::from(custom);
     }
     dirs::data_dir()
         .map(|d| d.join("neoethos").join("logs"))

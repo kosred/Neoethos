@@ -1,0 +1,2571 @@
+#[cfg(all(feature = "python", feature = "cuda"))]
+use numpy::PyUntypedArrayMethods;
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray1};
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::PyDict;
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use wasm_bindgen::prelude::*;
+
+use crate::utilities::data_loader::Candles;
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
+};
+#[cfg(feature = "python")]
+use crate::utilities::kernel_validation::validate_kernel;
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use core::arch::x86_64::*;
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+use std::mem::{ManuallyDrop, MaybeUninit};
+#[cfg(all(feature = "python", feature = "cuda"))]
+use std::sync::Arc;
+use thiserror::Error;
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::moving_averages::DeviceArrayF32;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use cust::context::Context;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use cust::memory::DeviceBuffer;
+
+#[derive(Debug, Clone)]
+pub enum CorrelHlData<'a> {
+    Candles { candles: &'a Candles },
+    Slices { high: &'a [f64], low: &'a [f64] },
+}
+
+#[derive(Debug, Clone)]
+pub struct CorrelHlOutput {
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CorrelHlParams {
+    pub period: Option<usize>,
+}
+
+impl Default for CorrelHlParams {
+    fn default() -> Self {
+        Self { period: Some(9) }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CorrelHlInput<'a> {
+    pub data: CorrelHlData<'a>,
+    pub params: CorrelHlParams,
+}
+
+impl<'a> CorrelHlInput<'a> {
+    #[inline]
+    pub fn from_candles(candles: &'a Candles, params: CorrelHlParams) -> Self {
+        Self {
+            data: CorrelHlData::Candles { candles },
+            params,
+        }
+    }
+
+    #[inline]
+    pub fn from_slices(high: &'a [f64], low: &'a [f64], params: CorrelHlParams) -> Self {
+        Self {
+            data: CorrelHlData::Slices { high, low },
+            params,
+        }
+    }
+
+    #[inline]
+    pub fn with_default_candles(candles: &'a Candles) -> Self {
+        Self::from_candles(candles, CorrelHlParams::default())
+    }
+
+    #[inline]
+    pub fn get_period(&self) -> usize {
+        self.params.period.unwrap_or(9)
+    }
+
+    #[inline(always)]
+    pub fn as_refs(&'a self) -> Result<(&'a [f64], &'a [f64]), CorrelHlError> {
+        match &self.data {
+            CorrelHlData::Candles { candles } => Ok((&candles.high, &candles.low)),
+            CorrelHlData::Slices { high, low } => Ok((*high, *low)),
+        }
+    }
+
+    #[inline(always)]
+    pub fn period_or_default(&self) -> usize {
+        self.params.period.unwrap_or(9)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct CorrelHlBuilder {
+    period: Option<usize>,
+    kernel: Kernel,
+}
+
+impl Default for CorrelHlBuilder {
+    fn default() -> Self {
+        Self {
+            period: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl CorrelHlBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[inline(always)]
+    pub fn period(mut self, n: usize) -> Self {
+        self.period = Some(n);
+        self
+    }
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline(always)]
+    pub fn apply(self, candles: &Candles) -> Result<CorrelHlOutput, CorrelHlError> {
+        let params = CorrelHlParams {
+            period: self.period,
+        };
+        let input = CorrelHlInput::from_candles(candles, params);
+        correl_hl_with_kernel(&input, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn apply_slices(self, high: &[f64], low: &[f64]) -> Result<CorrelHlOutput, CorrelHlError> {
+        let params = CorrelHlParams {
+            period: self.period,
+        };
+        let input = CorrelHlInput::from_slices(high, low, params);
+        correl_hl_with_kernel(&input, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn into_stream(self) -> Result<CorrelHlStream, CorrelHlError> {
+        let params = CorrelHlParams {
+            period: self.period,
+        };
+        CorrelHlStream::try_new(params)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum CorrelHlError {
+    #[error("correl_hl: Empty data (high or low).")]
+    EmptyInputData,
+    #[error("correl_hl: Invalid period: period = {period}, data length = {data_len}")]
+    InvalidPeriod { period: usize, data_len: usize },
+    #[error("correl_hl: Data length mismatch between high and low.")]
+    DataLengthMismatch,
+    #[error("correl_hl: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+    #[error("correl_hl: All values are NaN in high or low.")]
+    AllValuesNaN,
+    #[error("correl_hl: Candle field error: {field}")]
+    CandleFieldError { field: &'static str },
+    #[error("correl_hl: Output length mismatch (expected {expected}, got {got})")]
+    OutputLengthMismatch { expected: usize, got: usize },
+    #[error("correl_hl: invalid input: {0}")]
+    InvalidInput(&'static str),
+
+    #[error("correl_hl: invalid range: start={start} end={end} step={step}")]
+    InvalidRange {
+        start: usize,
+        end: usize,
+        step: usize,
+    },
+    #[error("correl_hl: invalid kernel for batch path: {0:?}")]
+    InvalidKernelForBatch(Kernel),
+}
+
+#[inline]
+pub fn correl_hl(input: &CorrelHlInput) -> Result<CorrelHlOutput, CorrelHlError> {
+    correl_hl_with_kernel(input, Kernel::Auto)
+}
+
+#[inline(always)]
+fn correl_hl_prepare<'a>(
+    input: &'a CorrelHlInput,
+    kernel: Kernel,
+) -> Result<(&'a [f64], &'a [f64], usize, usize, Kernel), CorrelHlError> {
+    let (high, low) = input.as_refs()?;
+    if high.is_empty() || low.is_empty() {
+        return Err(CorrelHlError::EmptyInputData);
+    }
+    if high.len() != low.len() {
+        return Err(CorrelHlError::DataLengthMismatch);
+    }
+
+    let period = input.period_or_default();
+    if period == 0 || period > high.len() {
+        return Err(CorrelHlError::InvalidPeriod {
+            period,
+            data_len: high.len(),
+        });
+    }
+
+    let first = high
+        .iter()
+        .zip(low.iter())
+        .position(|(&h, &l)| !h.is_nan() && !l.is_nan())
+        .ok_or(CorrelHlError::AllValuesNaN)?;
+
+    if high.len() - first < period {
+        return Err(CorrelHlError::NotEnoughValidData {
+            needed: period,
+            valid: high.len() - first,
+        });
+    }
+
+    let chosen = match kernel {
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        Kernel::Auto => Kernel::Scalar,
+        #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+        Kernel::Auto => detect_best_kernel(),
+        k => k,
+    };
+    Ok((high, low, period, first, chosen))
+}
+
+#[inline(always)]
+fn correl_hl_compute_into(
+    high: &[f64],
+    low: &[f64],
+    period: usize,
+    first: usize,
+    kern: Kernel,
+    out: &mut [f64],
+) {
+    unsafe {
+        match kern {
+            Kernel::Scalar | Kernel::ScalarBatch => correl_hl_scalar(high, low, period, first, out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => correl_hl_avx2(high, low, period, first, out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => correl_hl_avx512(high, low, period, first, out),
+            _ => correl_hl_scalar(high, low, period, first, out),
+        }
+    }
+}
+
+pub fn correl_hl_with_kernel(
+    input: &CorrelHlInput,
+    kernel: Kernel,
+) -> Result<CorrelHlOutput, CorrelHlError> {
+    let (high, low, period, first, chosen) = correl_hl_prepare(input, kernel)?;
+    let warm = first + period - 1;
+    let mut out = alloc_with_nan_prefix(high.len(), warm);
+    correl_hl_compute_into(high, low, period, first, chosen, &mut out);
+    Ok(CorrelHlOutput { values: out })
+}
+
+#[inline]
+pub fn correl_hl_into_slice(
+    dst: &mut [f64],
+    input: &CorrelHlInput,
+    kernel: Kernel,
+) -> Result<(), CorrelHlError> {
+    let (high, low, period, first, chosen) = correl_hl_prepare(input, kernel)?;
+    if dst.len() != high.len() {
+        return Err(CorrelHlError::OutputLengthMismatch {
+            expected: high.len(),
+            got: dst.len(),
+        });
+    }
+    correl_hl_compute_into(high, low, period, first, chosen, dst);
+    let warm = first + period - 1;
+    for v in &mut dst[..warm] {
+        *v = f64::from_bits(0x7ff8_0000_0000_0000);
+    }
+    Ok(())
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+#[inline]
+pub fn correl_hl_into(out: &mut [f64], input: &CorrelHlInput) -> Result<(), CorrelHlError> {
+    let (high, low, period, first, chosen) = correl_hl_prepare(input, Kernel::Auto)?;
+    if out.len() != high.len() {
+        return Err(CorrelHlError::OutputLengthMismatch {
+            expected: high.len(),
+            got: out.len(),
+        });
+    }
+
+    correl_hl_compute_into(high, low, period, first, chosen, out);
+    let warm = first + period - 1;
+    let warm_cap = warm.min(out.len());
+    for v in &mut out[..warm_cap] {
+        *v = f64::from_bits(0x7ff8_0000_0000_0000);
+    }
+
+    Ok(())
+}
+
+#[inline]
+pub fn correl_hl_scalar(high: &[f64], low: &[f64], period: usize, first: usize, out: &mut [f64]) {
+    let mut sum_h = 0.0_f64;
+    let mut sum_h2 = 0.0_f64;
+    let mut sum_l = 0.0_f64;
+    let mut sum_l2 = 0.0_f64;
+    let mut sum_hl = 0.0_f64;
+
+    let inv_pf = 1.0 / (period as f64);
+
+    #[inline(always)]
+    fn corr_from_sums(
+        sum_h: f64,
+        sum_h2: f64,
+        sum_l: f64,
+        sum_l2: f64,
+        sum_hl: f64,
+        inv_pf: f64,
+    ) -> f64 {
+        let cov = sum_hl - (sum_h * sum_l) * inv_pf;
+        let var_h = sum_h2 - (sum_h * sum_h) * inv_pf;
+        let var_l = sum_l2 - (sum_l * sum_l) * inv_pf;
+        if var_h <= 0.0 || var_l <= 0.0 {
+            0.0
+        } else {
+            cov / (var_h.sqrt() * var_l.sqrt())
+        }
+    }
+
+    let init_start = first;
+    let init_end = first + period;
+    let mut j = init_start;
+
+    while j + 4 <= init_end {
+        let h0 = high[j + 0];
+        let l0 = low[j + 0];
+        let h1 = high[j + 1];
+        let l1 = low[j + 1];
+        let h2 = high[j + 2];
+        let l2 = low[j + 2];
+        let h3 = high[j + 3];
+        let l3 = low[j + 3];
+
+        sum_h += h0 + h1 + h2 + h3;
+        sum_l += l0 + l1 + l2 + l3;
+        sum_h2 += h0 * h0 + h1 * h1 + h2 * h2 + h3 * h3;
+        sum_l2 += l0 * l0 + l1 * l1 + l2 * l2 + l3 * l3;
+        sum_hl += h0 * l0 + h1 * l1 + h2 * l2 + h3 * l3;
+        j += 4;
+    }
+    while j < init_end {
+        let h = high[j];
+        let l = low[j];
+        sum_h += h;
+        sum_l += l;
+        sum_h2 += h * h;
+        sum_l2 += l * l;
+        sum_hl += h * l;
+        j += 1;
+    }
+
+    let warm = init_end - 1;
+    out[warm] = corr_from_sums(sum_h, sum_h2, sum_l, sum_l2, sum_hl, inv_pf);
+
+    let n = high.len();
+    for i in init_end..n {
+        let old_idx = i - period;
+        let new_idx = i;
+        let old_h = high[old_idx];
+        let old_l = low[old_idx];
+        let new_h = high[new_idx];
+        let new_l = low[new_idx];
+
+        if old_h.is_nan() || old_l.is_nan() || new_h.is_nan() || new_l.is_nan() {
+            let start = i + 1 - period;
+            let end = i + 1;
+            sum_h = 0.0;
+            sum_l = 0.0;
+            sum_h2 = 0.0;
+            sum_l2 = 0.0;
+            sum_hl = 0.0;
+            let mut k = start;
+            while k + 4 <= end {
+                let h0 = high[k + 0];
+                let l0 = low[k + 0];
+                let h1 = high[k + 1];
+                let l1 = low[k + 1];
+                let h2 = high[k + 2];
+                let l2 = low[k + 2];
+                let h3 = high[k + 3];
+                let l3 = low[k + 3];
+                sum_h += h0 + h1 + h2 + h3;
+                sum_l += l0 + l1 + l2 + l3;
+                sum_h2 += h0 * h0 + h1 * h1 + h2 * h2 + h3 * h3;
+                sum_l2 += l0 * l0 + l1 * l1 + l2 * l2 + l3 * l3;
+                sum_hl += h0 * l0 + h1 * l1 + h2 * l2 + h3 * l3;
+                k += 4;
+            }
+            while k < end {
+                let h = high[k];
+                let l = low[k];
+                sum_h += h;
+                sum_l += l;
+                sum_h2 += h * h;
+                sum_l2 += l * l;
+                sum_hl += h * l;
+                k += 1;
+            }
+        } else {
+            sum_h += new_h - old_h;
+            sum_l += new_l - old_l;
+            sum_h2 += new_h * new_h - old_h * old_h;
+            sum_l2 += new_l * new_l - old_l * old_l;
+            let old_hl = old_h * old_l;
+            sum_hl = new_h.mul_add(new_l, sum_hl - old_hl);
+        }
+
+        out[i] = corr_from_sums(sum_h, sum_h2, sum_l, sum_l2, sum_hl, inv_pf);
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub fn correl_hl_avx2(high: &[f64], low: &[f64], period: usize, first: usize, out: &mut [f64]) {
+    unsafe {
+        #[inline(always)]
+        unsafe fn hsum256_pd(v: __m256d) -> f64 {
+            let hi: __m128d = _mm256_extractf128_pd(v, 1);
+            let lo: __m128d = _mm256_castpd256_pd128(v);
+            let sum2 = _mm_add_pd(lo, hi);
+            let shuf = _mm_unpackhi_pd(sum2, sum2);
+            let sum1 = _mm_add_sd(sum2, shuf);
+            _mm_cvtsd_f64(sum1)
+        }
+
+        #[inline(always)]
+        unsafe fn sum_window_avx2(
+            high: &[f64],
+            low: &[f64],
+            start: usize,
+            end: usize,
+        ) -> (f64, f64, f64, f64, f64) {
+            let mut v_h = _mm256_setzero_pd();
+            let mut v_l = _mm256_setzero_pd();
+            let mut v_h2 = _mm256_setzero_pd();
+            let mut v_l2 = _mm256_setzero_pd();
+            let mut v_hl = _mm256_setzero_pd();
+
+            let mut i = start;
+            let ptr_h = high.as_ptr();
+            let ptr_l = low.as_ptr();
+
+            while i + 4 <= end {
+                let mh = _mm256_loadu_pd(ptr_h.add(i));
+                let ml = _mm256_loadu_pd(ptr_l.add(i));
+                v_h = _mm256_add_pd(v_h, mh);
+                v_l = _mm256_add_pd(v_l, ml);
+                let mh2 = _mm256_mul_pd(mh, mh);
+                let ml2 = _mm256_mul_pd(ml, ml);
+                v_h2 = _mm256_add_pd(v_h2, mh2);
+                v_l2 = _mm256_add_pd(v_l2, ml2);
+                let mhl = _mm256_mul_pd(mh, ml);
+                v_hl = _mm256_add_pd(v_hl, mhl);
+                i += 4;
+            }
+
+            let mut sum_h = hsum256_pd(v_h);
+            let mut sum_l = hsum256_pd(v_l);
+            let mut sum_h2 = hsum256_pd(v_h2);
+            let mut sum_l2 = hsum256_pd(v_l2);
+            let mut sum_hl = hsum256_pd(v_hl);
+
+            while i < end {
+                let h = *high.get_unchecked(i);
+                let l = *low.get_unchecked(i);
+                sum_h += h;
+                sum_l += l;
+                sum_h2 += h * h;
+                sum_l2 += l * l;
+                sum_hl += h * l;
+                i += 1;
+            }
+            (sum_h, sum_h2, sum_l, sum_l2, sum_hl)
+        }
+
+        #[inline(always)]
+        fn corr_from_sums(
+            sum_h: f64,
+            sum_h2: f64,
+            sum_l: f64,
+            sum_l2: f64,
+            sum_hl: f64,
+            inv_pf: f64,
+        ) -> f64 {
+            let cov = sum_hl - (sum_h * sum_l) * inv_pf;
+            let varh = sum_h2 - (sum_h * sum_h) * inv_pf;
+            let varl = sum_l2 - (sum_l * sum_l) * inv_pf;
+            if varh <= 0.0 || varl <= 0.0 {
+                0.0
+            } else {
+                cov / (varh.sqrt() * varl.sqrt())
+            }
+        }
+
+        let inv_pf = 1.0 / (period as f64);
+        let init_start = first;
+        let init_end = first + period;
+
+        let (mut sum_h, mut sum_h2, mut sum_l, mut sum_l2, mut sum_hl) =
+            sum_window_avx2(high, low, init_start, init_end);
+
+        let warm = init_end - 1;
+        out[warm] = corr_from_sums(sum_h, sum_h2, sum_l, sum_l2, sum_hl, inv_pf);
+
+        let n = high.len();
+        for i in init_end..n {
+            let old_idx = i - period;
+            let new_idx = i;
+            let old_h = *high.get_unchecked(old_idx);
+            let old_l = *low.get_unchecked(old_idx);
+            let new_h = *high.get_unchecked(new_idx);
+            let new_l = *low.get_unchecked(new_idx);
+
+            if old_h.is_nan() || old_l.is_nan() || new_h.is_nan() || new_l.is_nan() {
+                let (sh, sh2, sl, sl2, shl) = sum_window_avx2(high, low, i + 1 - period, i + 1);
+                sum_h = sh;
+                sum_h2 = sh2;
+                sum_l = sl;
+                sum_l2 = sl2;
+                sum_hl = shl;
+            } else {
+                sum_h += new_h - old_h;
+                sum_l += new_l - old_l;
+                sum_h2 += new_h * new_h - old_h * old_h;
+                sum_l2 += new_l * new_l - old_l * old_l;
+                let old_hl = old_h * old_l;
+                sum_hl = new_h.mul_add(new_l, sum_hl - old_hl);
+            }
+
+            out[i] = corr_from_sums(sum_h, sum_h2, sum_l, sum_l2, sum_hl, inv_pf);
+        }
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub fn correl_hl_avx512(high: &[f64], low: &[f64], period: usize, first: usize, out: &mut [f64]) {
+    if period <= 32 {
+        unsafe { correl_hl_avx512_short(high, low, period, first, out) }
+    } else {
+        unsafe { correl_hl_avx512_long(high, low, period, first, out) }
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn correl_hl_avx512_short(
+    high: &[f64],
+    low: &[f64],
+    period: usize,
+    first: usize,
+    out: &mut [f64],
+) {
+    correl_hl_avx512_long(high, low, period, first, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn correl_hl_avx512_long(
+    high: &[f64],
+    low: &[f64],
+    period: usize,
+    first: usize,
+    out: &mut [f64],
+) {
+    #[inline(always)]
+    unsafe fn hsum256_pd(v: __m256d) -> f64 {
+        let hi: __m128d = _mm256_extractf128_pd(v, 1);
+        let lo: __m128d = _mm256_castpd256_pd128(v);
+        let sum2 = _mm_add_pd(lo, hi);
+        let shuf = _mm_unpackhi_pd(sum2, sum2);
+        let sum1 = _mm_add_sd(sum2, shuf);
+        _mm_cvtsd_f64(sum1)
+    }
+
+    #[inline(always)]
+    unsafe fn hsum512_pd(v: __m512d) -> f64 {
+        let lo256: __m256d = _mm512_castpd512_pd256(v);
+        let hi256: __m256d = _mm512_extractf64x4_pd(v, 1);
+        hsum256_pd(_mm256_add_pd(lo256, hi256))
+    }
+
+    #[inline(always)]
+    unsafe fn sum_window_avx512(
+        high: &[f64],
+        low: &[f64],
+        start: usize,
+        end: usize,
+    ) -> (f64, f64, f64, f64, f64) {
+        let mut v_h = _mm512_setzero_pd();
+        let mut v_l = _mm512_setzero_pd();
+        let mut v_h2 = _mm512_setzero_pd();
+        let mut v_l2 = _mm512_setzero_pd();
+        let mut v_hl = _mm512_setzero_pd();
+
+        let ptr_h = high.as_ptr();
+        let ptr_l = low.as_ptr();
+
+        let mut i = start;
+        while i + 8 <= end {
+            let mh = _mm512_loadu_pd(ptr_h.add(i));
+            let ml = _mm512_loadu_pd(ptr_l.add(i));
+            v_h = _mm512_add_pd(v_h, mh);
+            v_l = _mm512_add_pd(v_l, ml);
+            let mh2 = _mm512_mul_pd(mh, mh);
+            let ml2 = _mm512_mul_pd(ml, ml);
+            v_h2 = _mm512_add_pd(v_h2, mh2);
+            v_l2 = _mm512_add_pd(v_l2, ml2);
+            let mhl = _mm512_mul_pd(mh, ml);
+            v_hl = _mm512_add_pd(v_hl, mhl);
+            i += 8;
+        }
+
+        let rem = (end - i) as i32;
+        if rem != 0 {
+            let mask: __mmask8 = ((1u16 << rem) - 1) as __mmask8;
+            let mh = _mm512_maskz_loadu_pd(mask, ptr_h.add(i));
+            let ml = _mm512_maskz_loadu_pd(mask, ptr_l.add(i));
+            v_h = _mm512_add_pd(v_h, mh);
+            v_l = _mm512_add_pd(v_l, ml);
+            v_h2 = _mm512_add_pd(v_h2, _mm512_mul_pd(mh, mh));
+            v_l2 = _mm512_add_pd(v_l2, _mm512_mul_pd(ml, ml));
+            v_hl = _mm512_add_pd(v_hl, _mm512_mul_pd(mh, ml));
+        }
+
+        (
+            hsum512_pd(v_h),
+            hsum512_pd(v_h2),
+            hsum512_pd(v_l),
+            hsum512_pd(v_l2),
+            hsum512_pd(v_hl),
+        )
+    }
+
+    #[inline(always)]
+    fn corr_from_sums(
+        sum_h: f64,
+        sum_h2: f64,
+        sum_l: f64,
+        sum_l2: f64,
+        sum_hl: f64,
+        inv_pf: f64,
+    ) -> f64 {
+        let cov = sum_hl - (sum_h * sum_l) * inv_pf;
+        let varh = sum_h2 - (sum_h * sum_h) * inv_pf;
+        let varl = sum_l2 - (sum_l * sum_l) * inv_pf;
+        if varh <= 0.0 || varl <= 0.0 {
+            0.0
+        } else {
+            cov / (varh.sqrt() * varl.sqrt())
+        }
+    }
+
+    let inv_pf = 1.0 / (period as f64);
+    let init_start = first;
+    let init_end = first + period;
+
+    let (mut sum_h, mut sum_h2, mut sum_l, mut sum_l2, mut sum_hl) =
+        sum_window_avx512(high, low, init_start, init_end);
+
+    let warm = init_end - 1;
+    out[warm] = corr_from_sums(sum_h, sum_h2, sum_l, sum_l2, sum_hl, inv_pf);
+
+    let n = high.len();
+    for i in init_end..n {
+        let old_idx = i - period;
+        let new_idx = i;
+        let old_h = *high.get_unchecked(old_idx);
+        let old_l = *low.get_unchecked(old_idx);
+        let new_h = *high.get_unchecked(new_idx);
+        let new_l = *low.get_unchecked(new_idx);
+
+        if old_h.is_nan() || old_l.is_nan() || new_h.is_nan() || new_l.is_nan() {
+            let (sh, sh2, sl, sl2, shl) = sum_window_avx512(high, low, i + 1 - period, i + 1);
+            sum_h = sh;
+            sum_h2 = sh2;
+            sum_l = sl;
+            sum_l2 = sl2;
+            sum_hl = shl;
+        } else {
+            sum_h += new_h - old_h;
+            sum_l += new_l - old_l;
+            sum_h2 += new_h * new_h - old_h * old_h;
+            sum_l2 += new_l * new_l - old_l * old_l;
+            let old_hl = old_h * old_l;
+            sum_hl = new_h.mul_add(new_l, sum_hl - old_hl);
+        }
+
+        out[i] = corr_from_sums(sum_h, sum_h2, sum_l, sum_l2, sum_hl, inv_pf);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CorrelHlStream {
+    period: usize,
+    buffer_high: Vec<f64>,
+    buffer_low: Vec<f64>,
+    head: usize,
+    len: usize,
+    nan_in_win: usize,
+
+    sum_h: f64,
+    sum_h2: f64,
+    sum_l: f64,
+    sum_l2: f64,
+    sum_hl: f64,
+
+    inv_pf: f64,
+}
+
+impl CorrelHlStream {
+    #[inline]
+    pub fn try_new(params: CorrelHlParams) -> Result<Self, CorrelHlError> {
+        let period = params.period.unwrap_or(9);
+        if period == 0 {
+            return Err(CorrelHlError::InvalidPeriod {
+                period,
+                data_len: 0,
+            });
+        }
+
+        Ok(Self {
+            period,
+            buffer_high: vec![f64::NAN; period],
+            buffer_low: vec![f64::NAN; period],
+            head: 0,
+            len: 0,
+            nan_in_win: 0,
+            sum_h: 0.0,
+            sum_h2: 0.0,
+            sum_l: 0.0,
+            sum_l2: 0.0,
+            sum_hl: 0.0,
+            inv_pf: 1.0 / (period as f64),
+        })
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, h: f64, l: f64) -> Option<f64> {
+        if self.len == self.period {
+            let old_h = self.buffer_high[self.head];
+            let old_l = self.buffer_low[self.head];
+
+            if old_h.is_nan() || old_l.is_nan() {
+                if self.nan_in_win > 0 {
+                    self.nan_in_win -= 1;
+                }
+            } else {
+                self.sum_h -= old_h;
+                self.sum_l -= old_l;
+                self.sum_h2 -= old_h * old_h;
+                self.sum_l2 -= old_l * old_l;
+                self.sum_hl -= old_h * old_l;
+            }
+        }
+
+        self.buffer_high[self.head] = h;
+        self.buffer_low[self.head] = l;
+
+        if h.is_nan() || l.is_nan() {
+            self.nan_in_win += 1;
+        } else {
+            self.sum_h += h;
+            self.sum_l += l;
+            self.sum_h2 += h * h;
+            self.sum_l2 += l * l;
+            self.sum_hl += h * l;
+        }
+
+        self.head += 1;
+        if self.head == self.period {
+            self.head = 0;
+        }
+        if self.len < self.period {
+            self.len += 1;
+        }
+
+        if self.len < self.period {
+            return None;
+        }
+        if self.nan_in_win != 0 {
+            return Some(f64::NAN);
+        }
+
+        let cov = self.sum_hl - (self.sum_h * self.sum_l) * self.inv_pf;
+        let var_h = self.sum_h2 - (self.sum_h * self.sum_h) * self.inv_pf;
+        let var_l = self.sum_l2 - (self.sum_l * self.sum_l) * self.inv_pf;
+
+        if var_h <= 0.0 || var_l <= 0.0 {
+            return Some(0.0);
+        }
+
+        let denom = (var_h * var_l).sqrt();
+        Some(cov / denom)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CorrelHlBatchRange {
+    pub period: (usize, usize, usize),
+}
+
+impl Default for CorrelHlBatchRange {
+    fn default() -> Self {
+        Self {
+            period: (9, 258, 1),
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct CorrelHlBatchConfig {
+    pub period_range: (usize, usize, usize),
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct CorrelHlBatchJsOutput {
+    pub values: Vec<f64>,
+    pub periods: Vec<usize>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CorrelHlBatchBuilder {
+    range: CorrelHlBatchRange,
+    kernel: Kernel,
+}
+
+impl CorrelHlBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline]
+    pub fn period_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.period = (start, end, step);
+        self
+    }
+    #[inline]
+    pub fn period_static(mut self, p: usize) -> Self {
+        self.range.period = (p, p, 0);
+        self
+    }
+
+    pub fn apply_slices(
+        self,
+        high: &[f64],
+        low: &[f64],
+    ) -> Result<CorrelHlBatchOutput, CorrelHlError> {
+        correl_hl_batch_with_kernel(high, low, &self.range, self.kernel)
+    }
+
+    pub fn apply_candles(self, c: &Candles) -> Result<CorrelHlBatchOutput, CorrelHlError> {
+        self.apply_slices(&c.high, &c.low)
+    }
+}
+
+pub fn expand_grid(r: &CorrelHlBatchRange) -> Result<Vec<CorrelHlParams>, CorrelHlError> {
+    fn axis_usize((start, end, step): (usize, usize, usize)) -> Result<Vec<usize>, CorrelHlError> {
+        if step == 0 || start == end {
+            return Ok(vec![start]);
+        }
+        if start < end {
+            let mut v = Vec::new();
+            let mut x = start;
+            while x <= end {
+                v.push(x);
+                match x.checked_add(step) {
+                    Some(nx) if nx > x => x = nx,
+                    _ => break,
+                }
+            }
+            if v.is_empty() {
+                return Err(CorrelHlError::InvalidRange { start, end, step });
+            }
+            Ok(v)
+        } else {
+            let mut v = Vec::new();
+            let mut x = start;
+            while x >= end {
+                v.push(x);
+                if x < end + step {
+                    break;
+                }
+                x = x.saturating_sub(step);
+                if x == 0 {
+                    break;
+                }
+            }
+            if v.is_empty() {
+                return Err(CorrelHlError::InvalidRange { start, end, step });
+            }
+            Ok(v)
+        }
+    }
+    let periods = axis_usize(r.period)?;
+    if periods.is_empty() {
+        return Err(CorrelHlError::InvalidRange {
+            start: r.period.0,
+            end: r.period.1,
+            step: r.period.2,
+        });
+    }
+    let mut out = Vec::with_capacity(periods.len());
+    for &p in &periods {
+        out.push(CorrelHlParams { period: Some(p) });
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Debug)]
+pub struct CorrelHlBatchOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<CorrelHlParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl CorrelHlBatchOutput {
+    pub fn row_for_params(&self, p: &CorrelHlParams) -> Option<usize> {
+        self.combos
+            .iter()
+            .position(|c| c.period.unwrap_or(9) == p.period.unwrap_or(9))
+    }
+
+    pub fn values_for(&self, p: &CorrelHlParams) -> Option<&[f64]> {
+        self.row_for_params(p).map(|row| {
+            let start = row * self.cols;
+            &self.values[start..start + self.cols]
+        })
+    }
+}
+
+pub fn correl_hl_batch_with_kernel(
+    high: &[f64],
+    low: &[f64],
+    sweep: &CorrelHlBatchRange,
+    k: Kernel,
+) -> Result<CorrelHlBatchOutput, CorrelHlError> {
+    let kernel = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        other => return Err(CorrelHlError::InvalidKernelForBatch(other)),
+    };
+
+    let simd = match kernel {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => unreachable!(),
+    };
+    correl_hl_batch_par_slice(high, low, sweep, simd)
+}
+
+#[inline(always)]
+pub fn correl_hl_batch_slice(
+    high: &[f64],
+    low: &[f64],
+    sweep: &CorrelHlBatchRange,
+    kern: Kernel,
+) -> Result<CorrelHlBatchOutput, CorrelHlError> {
+    correl_hl_batch_inner(high, low, sweep, kern, false)
+}
+
+#[inline(always)]
+pub fn correl_hl_batch_par_slice(
+    high: &[f64],
+    low: &[f64],
+    sweep: &CorrelHlBatchRange,
+    kern: Kernel,
+) -> Result<CorrelHlBatchOutput, CorrelHlError> {
+    correl_hl_batch_inner(high, low, sweep, kern, true)
+}
+
+#[inline(always)]
+fn correl_hl_batch_inner(
+    high: &[f64],
+    low: &[f64],
+    sweep: &CorrelHlBatchRange,
+    kern: Kernel,
+    parallel: bool,
+) -> Result<CorrelHlBatchOutput, CorrelHlError> {
+    let combos = expand_grid(sweep)?;
+
+    let first = high
+        .iter()
+        .zip(low.iter())
+        .position(|(&h, &l)| !h.is_nan() && !l.is_nan())
+        .ok_or(CorrelHlError::AllValuesNaN)?;
+
+    let max_p = combos.iter().map(|c| c.period.unwrap()).max().unwrap();
+    if high.len() - first < max_p {
+        return Err(CorrelHlError::NotEnoughValidData {
+            needed: max_p,
+            valid: high.len() - first,
+        });
+    }
+
+    let rows = combos.len();
+    let cols = high.len();
+
+    rows.checked_mul(cols)
+        .ok_or(CorrelHlError::InvalidInput("rows*cols overflow"))?;
+
+    let warm: Vec<usize> = combos
+        .iter()
+        .map(|c| first + c.period.unwrap() - 1)
+        .collect();
+
+    let mut buf_mu = make_uninit_matrix(rows, cols);
+
+    init_matrix_prefixes(&mut buf_mu, cols, &warm);
+
+    let mut buf_guard = ManuallyDrop::new(buf_mu);
+    let values_slice: &mut [f64] = unsafe {
+        core::slice::from_raw_parts_mut(buf_guard.as_mut_ptr() as *mut f64, buf_guard.len())
+    };
+
+    let n = high.len();
+    let mut ps_h = vec![0.0f64; n + 1];
+    let mut ps_h2 = vec![0.0f64; n + 1];
+    let mut ps_l = vec![0.0f64; n + 1];
+    let mut ps_l2 = vec![0.0f64; n + 1];
+    let mut ps_hl = vec![0.0f64; n + 1];
+    let mut ps_nan = vec![0i32; n + 1];
+    for i in 0..n {
+        let h = high[i];
+        let l = low[i];
+        let (ph, ph2, pl, pl2, phl) = (ps_h[i], ps_h2[i], ps_l[i], ps_l2[i], ps_hl[i]);
+        if h.is_nan() || l.is_nan() {
+            ps_h[i + 1] = ph;
+            ps_h2[i + 1] = ph2;
+            ps_l[i + 1] = pl;
+            ps_l2[i + 1] = pl2;
+            ps_hl[i + 1] = phl;
+            ps_nan[i + 1] = ps_nan[i] + 1;
+        } else {
+            ps_h[i + 1] = ph + h;
+            ps_h2[i + 1] = ph2 + h * h;
+            ps_l[i + 1] = pl + l;
+            ps_l2[i + 1] = pl2 + l * l;
+            ps_hl[i + 1] = phl + h * l;
+            ps_nan[i + 1] = ps_nan[i];
+        }
+    }
+
+    let do_row = |row: usize, out_row: &mut [f64]| {
+        let p = combos[row].period.unwrap();
+        let inv_pf = 1.0 / (p as f64);
+        let warm = first + p - 1;
+        for i in warm..n {
+            let end = i + 1;
+            let start = end - p;
+            let nan_w = ps_nan[end] - ps_nan[start];
+            if nan_w != 0 {
+                out_row[i] = f64::NAN;
+            } else {
+                let sum_h = ps_h[end] - ps_h[start];
+                let sum_l = ps_l[end] - ps_l[start];
+                let sum_h2 = ps_h2[end] - ps_h2[start];
+                let sum_l2 = ps_l2[end] - ps_l2[start];
+                let sum_hl = ps_hl[end] - ps_hl[start];
+                let cov = sum_hl - (sum_h * sum_l) * inv_pf;
+                let var_h = sum_h2 - (sum_h * sum_h) * inv_pf;
+                let var_l = sum_l2 - (sum_l * sum_l) * inv_pf;
+                if var_h <= 0.0 || var_l <= 0.0 {
+                    out_row[i] = 0.0;
+                } else {
+                    out_row[i] = cov / (var_h.sqrt() * var_l.sqrt());
+                }
+            }
+        }
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            values_slice
+                .par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(row, slice)| do_row(row, slice));
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (row, slice) in values_slice.chunks_mut(cols).enumerate() {
+                do_row(row, slice);
+            }
+        }
+    } else {
+        for (row, slice) in values_slice.chunks_mut(cols).enumerate() {
+            do_row(row, slice);
+        }
+    }
+
+    let values = unsafe {
+        Vec::from_raw_parts(
+            buf_guard.as_mut_ptr() as *mut f64,
+            buf_guard.len(),
+            buf_guard.capacity(),
+        )
+    };
+
+    Ok(CorrelHlBatchOutput {
+        values,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+#[inline(always)]
+fn correl_hl_batch_inner_into(
+    high: &[f64],
+    low: &[f64],
+    sweep: &CorrelHlBatchRange,
+    kern: Kernel,
+    parallel: bool,
+    out: &mut [f64],
+) -> Result<Vec<CorrelHlParams>, CorrelHlError> {
+    let combos = expand_grid(sweep)?;
+
+    let first = high
+        .iter()
+        .zip(low.iter())
+        .position(|(&h, &l)| !h.is_nan() && !l.is_nan())
+        .ok_or(CorrelHlError::AllValuesNaN)?;
+
+    let max_p = combos.iter().map(|c| c.period.unwrap()).max().unwrap();
+    if high.len() - first < max_p {
+        return Err(CorrelHlError::NotEnoughValidData {
+            needed: max_p,
+            valid: high.len() - first,
+        });
+    }
+
+    let rows = combos.len();
+    let cols = high.len();
+
+    let total = rows
+        .checked_mul(cols)
+        .ok_or(CorrelHlError::InvalidInput("rows*cols overflow"))?;
+    if out.len() != total {
+        return Err(CorrelHlError::OutputLengthMismatch {
+            expected: total,
+            got: out.len(),
+        });
+    }
+
+    let warm: Vec<usize> = combos
+        .iter()
+        .map(|c| first + c.period.unwrap() - 1)
+        .collect();
+    let out_mu: &mut [MaybeUninit<f64>] = unsafe {
+        core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut MaybeUninit<f64>, out.len())
+    };
+    init_matrix_prefixes(out_mu, cols, &warm);
+
+    let n = high.len();
+    let mut ps_h = vec![0.0f64; n + 1];
+    let mut ps_h2 = vec![0.0f64; n + 1];
+    let mut ps_l = vec![0.0f64; n + 1];
+    let mut ps_l2 = vec![0.0f64; n + 1];
+    let mut ps_hl = vec![0.0f64; n + 1];
+    let mut ps_nan = vec![0i32; n + 1];
+    for i in 0..n {
+        let h = high[i];
+        let l = low[i];
+        let (prev_h, prev_h2, prev_l, prev_l2, prev_hl) =
+            (ps_h[i], ps_h2[i], ps_l[i], ps_l2[i], ps_hl[i]);
+        if h.is_nan() || l.is_nan() {
+            ps_h[i + 1] = prev_h;
+            ps_h2[i + 1] = prev_h2;
+            ps_l[i + 1] = prev_l;
+            ps_l2[i + 1] = prev_l2;
+            ps_hl[i + 1] = prev_hl;
+            ps_nan[i + 1] = ps_nan[i] + 1;
+        } else {
+            ps_h[i + 1] = prev_h + h;
+            ps_h2[i + 1] = prev_h2 + h * h;
+            ps_l[i + 1] = prev_l + l;
+            ps_l2[i + 1] = prev_l2 + l * l;
+            ps_hl[i + 1] = prev_hl + h * l;
+            ps_nan[i + 1] = ps_nan[i];
+        }
+    }
+
+    let do_row = |row: usize, dst_mu: &mut [MaybeUninit<f64>]| {
+        let p = combos[row].period.unwrap();
+        let inv_pf = 1.0 / (p as f64);
+        let dst: &mut [f64] = unsafe {
+            core::slice::from_raw_parts_mut(dst_mu.as_mut_ptr() as *mut f64, dst_mu.len())
+        };
+
+        let warm = first + p - 1;
+        for i in warm..n {
+            let end = i + 1;
+            let start = end - p;
+            let nan_w = ps_nan[end] - ps_nan[start];
+            if nan_w != 0 {
+                dst[i] = f64::NAN;
+            } else {
+                let sum_h = ps_h[end] - ps_h[start];
+                let sum_l = ps_l[end] - ps_l[start];
+                let sum_h2 = ps_h2[end] - ps_h2[start];
+                let sum_l2 = ps_l2[end] - ps_l2[start];
+                let sum_hl = ps_hl[end] - ps_hl[start];
+                let cov = sum_hl - (sum_h * sum_l) * inv_pf;
+                let var_h = sum_h2 - (sum_h * sum_h) * inv_pf;
+                let var_l = sum_l2 - (sum_l * sum_l) * inv_pf;
+                if var_h <= 0.0 || var_l <= 0.0 {
+                    dst[i] = 0.0;
+                } else {
+                    dst[i] = cov / (var_h.sqrt() * var_l.sqrt());
+                }
+            }
+        }
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            out_mu
+                .par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(r, s)| do_row(r, s));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (r, s) in out_mu.chunks_mut(cols).enumerate() {
+                do_row(r, s);
+            }
+        }
+    } else {
+        for (r, s) in out_mu.chunks_mut(cols).enumerate() {
+            do_row(r, s);
+        }
+    }
+
+    Ok(combos)
+}
+
+#[inline(always)]
+unsafe fn correl_hl_row_scalar(
+    high: &[f64],
+    low: &[f64],
+    first: usize,
+    period: usize,
+    out: &mut [f64],
+) {
+    correl_hl_scalar(high, low, period, first, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn correl_hl_row_avx2(
+    high: &[f64],
+    low: &[f64],
+    first: usize,
+    period: usize,
+    out: &mut [f64],
+) {
+    correl_hl_avx2(high, low, period, first, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn correl_hl_row_avx512(
+    high: &[f64],
+    low: &[f64],
+    first: usize,
+    period: usize,
+    out: &mut [f64],
+) {
+    if period <= 32 {
+        correl_hl_row_avx512_short(high, low, first, period, out)
+    } else {
+        correl_hl_row_avx512_long(high, low, first, period, out)
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn correl_hl_row_avx512_short(
+    high: &[f64],
+    low: &[f64],
+    first: usize,
+    period: usize,
+    out: &mut [f64],
+) {
+    correl_hl_avx512_short(high, low, period, first, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn correl_hl_row_avx512_long(
+    high: &[f64],
+    low: &[f64],
+    first: usize,
+    period: usize,
+    out: &mut [f64],
+) {
+    correl_hl_avx512_long(high, low, period, first, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn correl_hl_js(high: &[f64], low: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
+    let params = CorrelHlParams {
+        period: Some(period),
+    };
+    let input = CorrelHlInput::from_slices(high, low, params);
+
+    let mut output = vec![0.0; high.len()];
+
+    correl_hl_into_slice(&mut output, &input, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    Ok(output)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn correl_hl_into(
+    high_ptr: *const f64,
+    low_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    period: usize,
+) -> Result<(), JsValue> {
+    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("Null pointer provided"));
+    }
+
+    unsafe {
+        let high = std::slice::from_raw_parts(high_ptr, len);
+        let low = std::slice::from_raw_parts(low_ptr, len);
+        let params = CorrelHlParams {
+            period: Some(period),
+        };
+        let input = CorrelHlInput::from_slices(high, low, params);
+
+        if high_ptr == out_ptr || low_ptr == out_ptr {
+            let mut temp = vec![0.0; len];
+            correl_hl_into_slice(&mut temp, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            out.copy_from_slice(&temp);
+        } else {
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            correl_hl_into_slice(out, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn correl_hl_alloc(len: usize) -> *mut f64 {
+    let mut vec = Vec::<f64>::with_capacity(len);
+    let ptr = vec.as_mut_ptr();
+    std::mem::forget(vec);
+    ptr
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn correl_hl_free(ptr: *mut f64, len: usize) {
+    if !ptr.is_null() {
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, 0, len);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = correl_hl_batch)]
+pub fn correl_hl_batch_js(high: &[f64], low: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
+    let config: CorrelHlBatchConfig = serde_wasm_bindgen::from_value(config)
+        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
+
+    let sweep = CorrelHlBatchRange {
+        period: config.period_range,
+    };
+
+    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let rows = combos.len();
+    let cols = high.len();
+    let total = rows
+        .checked_mul(cols)
+        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
+    let mut values = vec![0.0f64; total];
+
+    correl_hl_batch_inner_into(high, low, &sweep, Kernel::Auto, false, &mut values)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let periods: Vec<usize> = combos.iter().map(|c| c.period.unwrap()).collect();
+
+    let js_output = CorrelHlBatchJsOutput {
+        values,
+        periods,
+        rows,
+        cols,
+    };
+
+    serde_wasm_bindgen::to_value(&js_output)
+        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn correl_hl_batch_into(
+    high_ptr: *const f64,
+    low_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+) -> Result<usize, JsValue> {
+    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("Null pointer provided"));
+    }
+
+    unsafe {
+        let high = std::slice::from_raw_parts(high_ptr, len);
+        let low = std::slice::from_raw_parts(low_ptr, len);
+
+        let sweep = CorrelHlBatchRange {
+            period: (period_start, period_end, period_step),
+        };
+
+        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let rows = combos.len();
+
+        let total = rows
+            .checked_mul(len)
+            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
+        let out_slice = std::slice::from_raw_parts_mut(out_ptr, total);
+
+        correl_hl_batch_inner_into(high, low, &sweep, Kernel::Auto, false, out_slice)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(rows)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "correl_hl")]
+#[pyo3(signature = (high, low, period, kernel=None))]
+pub fn correl_hl_py<'py>(
+    py: Python<'py>,
+    high: numpy::PyReadonlyArray1<'py, f64>,
+    low: numpy::PyReadonlyArray1<'py, f64>,
+    period: usize,
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
+    use numpy::{IntoPyArray, PyArrayMethods};
+
+    let high_slice = high.as_slice()?;
+    let low_slice = low.as_slice()?;
+    let kern = validate_kernel(kernel, false)?;
+
+    let params = CorrelHlParams {
+        period: Some(period),
+    };
+    let input = CorrelHlInput::from_slices(high_slice, low_slice, params);
+
+    let result_vec: Vec<f64> = py
+        .allow_threads(|| correl_hl_with_kernel(&input, kern).map(|o| o.values))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok(result_vec.into_pyarray(py))
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "CorrelHlStream")]
+pub struct CorrelHlStreamPy {
+    stream: CorrelHlStream,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl CorrelHlStreamPy {
+    #[new]
+    fn new(period: usize) -> PyResult<Self> {
+        let params = CorrelHlParams {
+            period: Some(period),
+        };
+        let stream =
+            CorrelHlStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(CorrelHlStreamPy { stream })
+    }
+
+    fn update(&mut self, high: f64, low: f64) -> Option<f64> {
+        self.stream.update(high, low)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "correl_hl_batch")]
+#[pyo3(signature = (high, low, period_range, kernel=None))]
+pub fn correl_hl_batch_py<'py>(
+    py: Python<'py>,
+    high: numpy::PyReadonlyArray1<'py, f64>,
+    low: numpy::PyReadonlyArray1<'py, f64>,
+    period_range: (usize, usize, usize),
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+    use pyo3::types::PyDict;
+
+    let high_slice = high.as_slice()?;
+    let low_slice = low.as_slice()?;
+
+    let sweep = CorrelHlBatchRange {
+        period: period_range,
+    };
+
+    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let rows = combos.len();
+    let cols = high_slice.len();
+
+    let total = rows
+        .checked_mul(cols)
+        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
+    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
+    let slice_out = unsafe { out_arr.as_slice_mut()? };
+
+    let kern = validate_kernel(kernel, true)?;
+
+    let combos = py
+        .allow_threads(|| {
+            let kernel = match kern {
+                Kernel::Auto => detect_best_batch_kernel(),
+                k => k,
+            };
+            let simd = match kernel {
+                Kernel::Avx512Batch => Kernel::Avx512,
+                Kernel::Avx2Batch => Kernel::Avx2,
+                Kernel::ScalarBatch => Kernel::Scalar,
+                _ => unreachable!(),
+            };
+            correl_hl_batch_inner_into(high_slice, low_slice, &sweep, simd, true, slice_out)
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
+    dict.set_item(
+        "periods",
+        combos
+            .iter()
+            .map(|p| p.period.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+
+    Ok(dict)
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyclass(module = "vector_ta", name = "CorrelHlDeviceArrayF32", unsendable)]
+pub struct CorrelHlDeviceArrayF32Py {
+    pub(crate) inner: DeviceArrayF32,
+    _ctx_guard: Arc<Context>,
+    _device_id: u32,
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pymethods]
+impl CorrelHlDeviceArrayF32Py {
+    #[getter]
+    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let inner = &self.inner;
+        let d = PyDict::new(py);
+        let itemsize = std::mem::size_of::<f32>();
+        d.set_item("shape", (inner.rows, inner.cols))?;
+        d.set_item("typestr", "<f4")?;
+        d.set_item("strides", (inner.cols * itemsize, itemsize))?;
+        d.set_item("data", (inner.device_ptr() as usize, false))?;
+        d.set_item("version", 3)?;
+        Ok(d)
+    }
+
+    fn __dlpack_device__(&self) -> (i32, i32) {
+        (2, self._device_id as i32)
+    }
+
+    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
+    fn __dlpack__<'py>(
+        &mut self,
+        py: Python<'py>,
+        stream: Option<usize>,
+        max_version: Option<(u32, u32)>,
+        dl_device: Option<(i32, i32)>,
+        copy: Option<bool>,
+    ) -> PyResult<PyObject> {
+        use pyo3::ffi as pyffi;
+        use std::ffi::{c_void, CString};
+
+        #[repr(C)]
+        struct DLDevice {
+            device_type: i32,
+            device_id: i32,
+        }
+        #[repr(C)]
+        struct DLDataType {
+            code: u8,
+            bits: u8,
+            lanes: u16,
+        }
+        #[repr(C)]
+        struct DLTensor {
+            data: *mut c_void,
+            device: DLDevice,
+            ndim: i32,
+            dtype: DLDataType,
+            shape: *mut i64,
+            strides: *mut i64,
+            byte_offset: u64,
+        }
+        #[repr(C)]
+        struct DLManagedTensor {
+            dl_tensor: DLTensor,
+            manager_ctx: *mut c_void,
+            deleter: Option<unsafe extern "C" fn(*mut DLManagedTensor)>,
+        }
+        #[repr(C)]
+        struct DLManagedTensorVersioned {
+            manager: *mut DLManagedTensor,
+            version: u32,
+        }
+
+        #[repr(C)]
+        struct ManagerCtx {
+            shape: *mut i64,
+            strides: *mut i64,
+            _shape: Box<[i64; 2]>,
+            _strides: Box<[i64; 2]>,
+            _self_ref: PyObject,
+            _arr: DeviceArrayF32,
+            _ctx: Arc<Context>,
+        }
+
+        unsafe extern "C" fn deleter(p: *mut DLManagedTensor) {
+            if p.is_null() {
+                return;
+            }
+            let mt = Box::from_raw(p);
+            let ctx_ptr = mt.manager_ctx as *mut ManagerCtx;
+            if !ctx_ptr.is_null() {
+                let _ = Box::from_raw(ctx_ptr);
+            }
+        }
+
+        let dummy =
+            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let inner = std::mem::replace(
+            &mut self.inner,
+            DeviceArrayF32 {
+                buf: dummy,
+                rows: 0,
+                cols: 0,
+            },
+        );
+
+        let rows = inner.rows as i64;
+        let cols = inner.cols as i64;
+        let total = (rows as i128) * (cols as i128);
+        let mut shape = Box::new([rows, cols]);
+        let mut strides = Box::new([cols, 1]);
+        let shape_ptr = shape.as_mut_ptr();
+        let strides_ptr = strides.as_mut_ptr();
+
+        let self_ref =
+            unsafe { PyObject::from_borrowed_ptr(py, self as *mut _ as *mut pyo3::ffi::PyObject) };
+        let mgr = Box::new(ManagerCtx {
+            shape: shape_ptr,
+            strides: strides_ptr,
+            _shape: shape,
+            _strides: strides,
+            _self_ref: self_ref,
+            _arr: inner,
+            _ctx: self._ctx_guard.clone(),
+        });
+        let mgr_ptr = Box::into_raw(mgr) as *mut c_void;
+
+        let dl = DLTensor {
+            data: if total == 0 {
+                std::ptr::null_mut()
+            } else {
+                unsafe {
+                    (*(mgr_ptr as *mut ManagerCtx))
+                        ._arr
+                        .buf
+                        .as_device_ptr()
+                        .as_raw() as *mut c_void
+                }
+            },
+            device: DLDevice {
+                device_type: 2,
+                device_id: self._device_id as i32,
+            },
+            ndim: 2,
+            dtype: DLDataType {
+                code: 2,
+                bits: 32,
+                lanes: 1,
+            },
+            shape: shape_ptr,
+            strides: strides_ptr,
+            byte_offset: 0,
+        };
+        let mt = Box::new(DLManagedTensor {
+            dl_tensor: dl,
+            manager_ctx: mgr_ptr,
+            deleter: Some(deleter),
+        });
+
+        let want_versioned = max_version.map(|(maj, _)| maj >= 1).unwrap_or(false);
+
+        unsafe {
+            if want_versioned {
+                let wrapped = Box::new(DLManagedTensorVersioned {
+                    manager: Box::into_raw(mt),
+                    version: 1,
+                });
+                let ptr = Box::into_raw(wrapped) as *mut c_void;
+                let name = CString::new("dltensor_versioned").unwrap();
+                let cap = pyffi::PyCapsule_New(ptr, name.as_ptr(), None);
+                if cap.is_null() {
+                    let _ = Box::from_raw(ptr as *mut DLManagedTensorVersioned);
+                    return Err(PyValueError::new_err("failed to create DLPack capsule"));
+                }
+                Ok(PyObject::from_owned_ptr(py, cap))
+            } else {
+                let ptr = Box::into_raw(mt) as *mut c_void;
+                let name = CString::new("dltensor").unwrap();
+                let cap = pyffi::PyCapsule_New(ptr, name.as_ptr(), None);
+                if cap.is_null() {
+                    let _ = Box::from_raw(ptr as *mut DLManagedTensor);
+                    return Err(PyValueError::new_err("failed to create DLPack capsule"));
+                }
+                Ok(PyObject::from_owned_ptr(py, cap))
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+impl CorrelHlDeviceArrayF32Py {
+    pub fn new_from_rust(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
+        Self {
+            inner,
+            _ctx_guard: ctx_guard,
+            _device_id: device_id,
+        }
+    }
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "correl_hl_cuda_batch_dev")]
+#[pyo3(signature = (high_f32, low_f32, period_range, device_id=0))]
+pub fn correl_hl_cuda_batch_dev_py(
+    py: Python<'_>,
+    high_f32: numpy::PyReadonlyArray1<'_, f32>,
+    low_f32: numpy::PyReadonlyArray1<'_, f32>,
+    period_range: (usize, usize, usize),
+    device_id: usize,
+) -> PyResult<CorrelHlDeviceArrayF32Py> {
+    use crate::cuda::correl_hl_wrapper::CudaCorrelHl;
+    use crate::cuda::cuda_available;
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let h = high_f32.as_slice()?;
+    let l = low_f32.as_slice()?;
+    let sweep = CorrelHlBatchRange {
+        period: period_range,
+    };
+    let (inner, ctx, dev_id) = py.allow_threads(|| {
+        let cuda =
+            CudaCorrelHl::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let (dev, _combos) = cuda
+            .correl_hl_batch_dev(h, l, &sweep)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok::<_, PyErr>((dev, cuda.context_arc(), cuda.device_id()))
+    })?;
+    Ok(CorrelHlDeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "correl_hl_cuda_many_series_one_param_dev")]
+#[pyo3(signature = (high_tm_f32, low_tm_f32, period, device_id=0))]
+pub fn correl_hl_cuda_many_series_one_param_dev_py(
+    py: Python<'_>,
+    high_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
+    low_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
+    period: usize,
+    device_id: usize,
+) -> PyResult<CorrelHlDeviceArrayF32Py> {
+    use crate::cuda::correl_hl_wrapper::CudaCorrelHl;
+    use crate::cuda::cuda_available;
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let shape = high_tm_f32.shape();
+    if shape.len() != 2 || low_tm_f32.shape() != shape {
+        return Err(PyValueError::new_err("expected matching 2D arrays"));
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    let h = high_tm_f32.as_slice()?;
+    let l = low_tm_f32.as_slice()?;
+    let (inner, ctx, dev_id) = py.allow_threads(|| {
+        let cuda =
+            CudaCorrelHl::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let dev = cuda
+            .correl_hl_many_series_one_param_time_major_dev(h, l, cols, rows, period)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok::<_, PyErr>((dev, cuda.context_arc(), cuda.device_id()))
+    })?;
+    Ok(CorrelHlDeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn correl_hl_output_into_js(
+    high: &[f64],
+    low: &[f64],
+    period: usize,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = correl_hl_js(high, low, period)?;
+    crate::write_wasm_f64_output("correl_hl_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn correl_hl_batch_output_into_js(
+    high: &[f64],
+    low: &[f64],
+    config: JsValue,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = correl_hl_batch_js(high, low, config)?;
+    crate::write_wasm_selected_object_f64_outputs("correl_hl_batch_output_into_js", &value, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_csv;
+    #[cfg(feature = "proptest")]
+    use proptest::prelude::*;
+
+    #[test]
+    fn test_correl_hl_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
+        let n = 256usize;
+        let mut ts = Vec::with_capacity(n);
+        let mut open = Vec::with_capacity(n);
+        let mut high = Vec::with_capacity(n);
+        let mut low = Vec::with_capacity(n);
+        let mut close = Vec::with_capacity(n);
+        let mut vol = Vec::with_capacity(n);
+
+        let mut cur = 100.0f64;
+        for i in 0..n {
+            let step = ((i as f64).sin() * 0.5) + 0.1;
+            let o = cur;
+            let c = cur + step;
+            let (lo, hi) = if c >= o {
+                (o - 0.3, c + 0.4)
+            } else {
+                (c - 0.3, o + 0.4)
+            };
+            ts.push(i as i64);
+            open.push(o);
+            close.push(c);
+            high.push(hi);
+            low.push(lo);
+            vol.push(1000.0 + (i % 10) as f64);
+            cur = c;
+        }
+
+        let candles = crate::utilities::data_loader::Candles::new(
+            ts,
+            open,
+            high.clone(),
+            low.clone(),
+            close,
+            vol,
+        );
+
+        let input = CorrelHlInput::from_candles(&candles, CorrelHlParams::default());
+
+        let baseline = correl_hl(&input)?;
+
+        let mut out = vec![0.0f64; n];
+        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+        {
+            correl_hl_into(&mut out, &input)?;
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+        {
+            correl_hl_into_slice(&mut out, &input, Kernel::Auto)?;
+        }
+
+        assert_eq!(baseline.values.len(), out.len());
+        for (a, b) in baseline.values.iter().zip(out.iter()) {
+            let equal = (a.is_nan() && b.is_nan()) || (*a == *b) || ((*a - *b).abs() <= 1e-12);
+            assert!(equal, "Mismatch: baseline={} into={}", a, b);
+        }
+
+        Ok(())
+    }
+
+    fn check_correl_hl_partial_params(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let params = CorrelHlParams { period: None };
+        let input = CorrelHlInput::from_candles(&candles, params);
+        let output = correl_hl_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_correl_hl_accuracy(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let params = CorrelHlParams { period: Some(5) };
+        let input = CorrelHlInput::from_candles(&candles, params);
+        let result = correl_hl_with_kernel(&input, kernel)?;
+        let expected = [
+            0.04589155420456278,
+            0.6491664099299647,
+            0.9691259236943873,
+            0.9915438003818791,
+            0.8460608423095615,
+        ];
+        let start_index = result.values.len() - 5;
+        for (i, &val) in result.values[start_index..].iter().enumerate() {
+            let exp = expected[i];
+            let diff = (val - exp).abs();
+            assert!(
+                diff < 1e-7,
+                "[{}] Value mismatch at index {}: expected {}, got {}",
+                test_name,
+                i,
+                exp,
+                val
+            );
+        }
+        Ok(())
+    }
+
+    fn check_correl_hl_zero_period(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let high = [1.0, 2.0, 3.0];
+        let low = [1.0, 2.0, 3.0];
+        let params = CorrelHlParams { period: Some(0) };
+        let input = CorrelHlInput::from_slices(&high, &low, params);
+        let result = correl_hl_with_kernel(&input, kernel);
+        assert!(
+            result.is_err(),
+            "[{}] correl_hl should fail with zero period",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_correl_hl_period_exceeds_length(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let high = [1.0, 2.0, 3.0];
+        let low = [1.0, 2.0, 3.0];
+        let params = CorrelHlParams { period: Some(10) };
+        let input = CorrelHlInput::from_slices(&high, &low, params);
+        let result = correl_hl_with_kernel(&input, kernel);
+        assert!(
+            result.is_err(),
+            "[{}] correl_hl should fail with period exceeding length",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_correl_hl_data_length_mismatch(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let high = [1.0, 2.0, 3.0];
+        let low = [1.0, 2.0];
+        let params = CorrelHlParams { period: Some(2) };
+        let input = CorrelHlInput::from_slices(&high, &low, params);
+        let result = correl_hl_with_kernel(&input, kernel);
+        assert!(
+            result.is_err(),
+            "[{}] correl_hl should fail on length mismatch",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_correl_hl_all_nan(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let high = [f64::NAN, f64::NAN, f64::NAN];
+        let low = [f64::NAN, f64::NAN, f64::NAN];
+        let params = CorrelHlParams { period: Some(2) };
+        let input = CorrelHlInput::from_slices(&high, &low, params);
+        let result = correl_hl_with_kernel(&input, kernel);
+        assert!(
+            result.is_err(),
+            "[{}] correl_hl should fail on all NaN",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_correl_hl_from_candles(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let params = CorrelHlParams { period: Some(9) };
+        let input = CorrelHlInput::from_candles(&candles, params);
+        let output = correl_hl_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_correl_hl_reinput(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let high = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let low = [0.5, 1.0, 1.5, 2.0, 2.5];
+        let params = CorrelHlParams { period: Some(2) };
+        let first_input = CorrelHlInput::from_slices(&high, &low, params.clone());
+        let first_result = correl_hl_with_kernel(&first_input, kernel)?;
+        let second_input = CorrelHlInput::from_slices(&first_result.values, &low, params);
+        let second_result = correl_hl_with_kernel(&second_input, kernel)?;
+        assert_eq!(second_result.values.len(), low.len());
+        Ok(())
+    }
+
+    fn check_correl_hl_very_small_dataset(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let single_high = [42.0];
+        let single_low = [21.0];
+        let params = CorrelHlParams { period: Some(1) };
+        let input = CorrelHlInput::from_slices(&single_high, &single_low, params);
+        let result = correl_hl_with_kernel(&input, kernel)?;
+        assert_eq!(result.values.len(), 1);
+
+        assert!(result.values[0].is_nan() || result.values[0].abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    fn check_correl_hl_empty_input(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let empty_high: [f64; 0] = [];
+        let empty_low: [f64; 0] = [];
+        let params = CorrelHlParams { period: Some(5) };
+        let input = CorrelHlInput::from_slices(&empty_high, &empty_low, params);
+        let result = correl_hl_with_kernel(&input, kernel);
+        assert!(
+            result.is_err(),
+            "[{}] correl_hl should fail on empty input",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_correl_hl_nan_handling(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let high = vec![1.0, 2.0, f64::NAN, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let low = vec![0.5, 1.0, 1.5, f64::NAN, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0];
+        let params = CorrelHlParams { period: Some(3) };
+        let input = CorrelHlInput::from_slices(&high, &low, params);
+        let result = correl_hl_with_kernel(&input, kernel)?;
+
+        assert_eq!(result.values.len(), high.len());
+
+        let mut valid_count = 0;
+        for i in 0..high.len() {
+            if !high[i].is_nan() && !low[i].is_nan() {
+                valid_count += 1;
+                if valid_count >= 3 {
+                    let has_valid = result.values[i..].iter().any(|&v| !v.is_nan());
+                    assert!(
+                        has_valid,
+                        "[{}] Should have valid correlations after enough data",
+                        test_name
+                    );
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_correl_hl_streaming(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let params = CorrelHlParams { period: Some(3) };
+        let mut stream = CorrelHlStream::try_new(params)?;
+
+        let high_data = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let low_data = [0.5, 1.0, 1.5, 2.0, 2.5];
+
+        assert!(stream.update(high_data[0], low_data[0]).is_none());
+        assert!(stream.update(high_data[1], low_data[1]).is_none());
+
+        let first_corr = stream.update(high_data[2], low_data[2]);
+        assert!(first_corr.is_some());
+
+        let second_corr = stream.update(high_data[3], low_data[3]);
+        assert!(second_corr.is_some());
+
+        let params_batch = CorrelHlParams { period: Some(3) };
+        let input_batch = CorrelHlInput::from_slices(&high_data[..4], &low_data[..4], params_batch);
+        let batch_result = correl_hl_with_kernel(&input_batch, kernel)?;
+
+        if let Some(batch_val) = batch_result.values.iter().rev().find(|&&v| !v.is_nan()) {
+            if let Some(stream_val) = second_corr {
+                assert!(
+                    (batch_val - stream_val).abs() < 1e-10,
+                    "[{}] Streaming vs batch mismatch: {} vs {}",
+                    test_name,
+                    stream_val,
+                    batch_val
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "proptest")]
+    #[allow(clippy::float_cmp)]
+    fn check_correl_hl_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use proptest::prelude::*;
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (2usize..=100).prop_flat_map(|period| {
+            (
+                prop::collection::vec((1.0f64..1000.0f64), period..400).prop_flat_map(
+                    move |close_prices| {
+                        let len = close_prices.len();
+                        (
+                            Just(close_prices.clone()),
+                            prop::collection::vec((0.001f64..0.05f64, 0.001f64..0.05f64), len),
+                        )
+                            .prop_map(move |(close, spreads)| {
+                                let mut high = Vec::with_capacity(len);
+                                let mut low = Vec::with_capacity(len);
+
+                                for (i, &close_price) in close.iter().enumerate() {
+                                    let (up_spread, down_spread) = spreads[i];
+
+                                    high.push(close_price * (1.0 + up_spread));
+                                    low.push(close_price * (1.0 - down_spread));
+                                }
+
+                                (high, low)
+                            })
+                    },
+                ),
+                Just(period),
+            )
+        });
+
+        proptest::test_runner::TestRunner::default()
+            .run(&strat, |((high, low), period)| {
+                let params = CorrelHlParams {
+                    period: Some(period),
+                };
+                let input = CorrelHlInput::from_slices(&high, &low, params);
+
+                let result = correl_hl_with_kernel(&input, kernel);
+                let reference = correl_hl_with_kernel(&input, Kernel::Scalar);
+
+                match (result, reference) {
+                    (Ok(output), Ok(ref_output)) => {
+                        let out = &output.values;
+                        let ref_out = &ref_output.values;
+
+                        prop_assert_eq!(out.len(), high.len());
+
+                        let warmup_len = period.saturating_sub(1).min(high.len());
+                        for i in 0..warmup_len {
+                            prop_assert!(
+                                out[i].is_nan(),
+                                "Expected NaN during warmup at index {}, got {}",
+                                i,
+                                out[i]
+                            );
+                        }
+
+                        for i in 0..out.len() {
+                            let y = out[i];
+                            let r = ref_out[i];
+
+                            if !y.is_finite() || !r.is_finite() {
+                                prop_assert_eq!(
+                                    y.to_bits(),
+                                    r.to_bits(),
+                                    "Special value mismatch at index {}: {} vs {}",
+                                    i,
+                                    y,
+                                    r
+                                );
+                                continue;
+                            }
+
+                            let ulp_diff = y.to_bits().abs_diff(r.to_bits());
+                            prop_assert!(
+                                (y - r).abs() <= 1e-9 || ulp_diff <= 4,
+                                "Kernel mismatch at index {}: {} vs {} (ULP={})",
+                                i,
+                                y,
+                                r,
+                                ulp_diff
+                            );
+                        }
+
+                        for (i, &val) in out.iter().enumerate() {
+                            if !val.is_nan() {
+                                let tolerance = 1e-3;
+                                prop_assert!(
+                                    val >= -1.0 - tolerance && val <= 1.0 + tolerance,
+                                    "Correlation at index {} out of range: {}",
+                                    i,
+                                    val
+                                );
+                            }
+                        }
+                    }
+                    (Err(_), Err(_)) => {}
+                    (Ok(_), Err(e)) => {
+                        prop_assert!(
+                            false,
+                            "Reference kernel failed but test kernel succeeded: {}",
+                            e
+                        );
+                    }
+                    (Err(e), Ok(_)) => {
+                        prop_assert!(
+                            false,
+                            "Test kernel failed but reference kernel succeeded: {}",
+                            e
+                        );
+                    }
+                }
+
+                Ok(())
+            })
+            .unwrap();
+
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_correl_hl_no_poison(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let input = CorrelHlInput::from_candles(&candles, CorrelHlParams::default());
+        let output = correl_hl_with_kernel(&input, kernel)?;
+
+        for (i, &val) in output.values.iter().enumerate() {
+            if val.is_nan() {
+                continue;
+            }
+
+            let bits = val.to_bits();
+
+            if bits == 0x11111111_11111111 {
+                panic!(
+                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {}",
+                    test_name, val, bits, i
+                );
+            }
+
+            if bits == 0x22222222_22222222 {
+                panic!(
+                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {}",
+                    test_name, val, bits, i
+                );
+            }
+
+            if bits == 0x33333333_33333333 {
+                panic!(
+                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {}",
+                    test_name, val, bits, i
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_correl_hl_no_poison(
+        _test_name: &str,
+        _kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    macro_rules! generate_all_correl_hl_tests {
+        ($($test_fn:ident),*) => {
+            paste::paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar);
+                    }
+                )*
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _avx2_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2);
+                    }
+                    #[test]
+                    fn [<$test_fn _avx512_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512);
+                    }
+                )*
+            }
+        }
+    }
+
+    #[test]
+    fn test_period_one_bug() {
+        let high = vec![100.0, 200.0, 300.0];
+        let low = vec![90.0, 190.0, 310.0];
+
+        let params = CorrelHlParams { period: Some(1) };
+        let input = CorrelHlInput::from_slices(&high, &low, params.clone());
+        let result = correl_hl(&input).unwrap();
+
+        println!("Period=1 correlation with different high/low:");
+        for (i, &val) in result.values.iter().enumerate() {
+            println!(
+                "  Index {}: high={}, low={}, corr={}",
+                i, high[i], low[i], val
+            );
+
+            assert!(
+                val.is_nan() || (val >= -1.0 && val <= 1.0),
+                "Period=1 correlation at index {} out of bounds: {}",
+                i,
+                val
+            );
+        }
+
+        let high2 = vec![100.0, 200.0, 300.0];
+        let low2 = vec![100.0, 200.0, 300.0];
+
+        let input2 = CorrelHlInput::from_slices(&high2, &low2, params.clone());
+        let result2 = correl_hl(&input2).unwrap();
+
+        println!("\nPeriod=1 correlation with identical high/low:");
+        for (i, &val) in result2.values.iter().enumerate() {
+            println!(
+                "  Index {}: high={}, low={}, corr={}",
+                i, high2[i], low2[i], val
+            );
+        }
+    }
+
+    generate_all_correl_hl_tests!(
+        check_correl_hl_partial_params,
+        check_correl_hl_accuracy,
+        check_correl_hl_zero_period,
+        check_correl_hl_period_exceeds_length,
+        check_correl_hl_data_length_mismatch,
+        check_correl_hl_all_nan,
+        check_correl_hl_from_candles,
+        check_correl_hl_reinput,
+        check_correl_hl_very_small_dataset,
+        check_correl_hl_empty_input,
+        check_correl_hl_nan_handling,
+        check_correl_hl_streaming,
+        check_correl_hl_no_poison
+    );
+
+    #[cfg(feature = "proptest")]
+    generate_all_correl_hl_tests!(check_correl_hl_property);
+
+    fn check_batch_default_row(
+        test: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let output = CorrelHlBatchBuilder::new()
+            .kernel(kernel)
+            .apply_candles(&c)?;
+
+        let def = CorrelHlParams::default();
+        let row = output.values_for(&def).expect("default row missing");
+
+        assert_eq!(row.len(), c.close.len());
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let output = CorrelHlBatchBuilder::new()
+            .kernel(kernel)
+            .period_range(5, 20, 5)
+            .apply_candles(&c)?;
+
+        for (idx, &val) in output.values.iter().enumerate() {
+            if val.is_nan() {
+                continue;
+            }
+
+            let bits = val.to_bits();
+            let row = idx / output.cols;
+            let col = idx % output.cols;
+
+            if bits == 0x11111111_11111111 {
+                panic!(
+					"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+					test, val, bits, row, col, idx
+				);
+            }
+
+            if bits == 0x22222222_22222222 {
+                panic!(
+					"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+					test, val, bits, row, col, idx
+				);
+            }
+
+            if bits == 0x33333333_33333333 {
+                panic!(
+					"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+					test, val, bits, row, col, idx
+				);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_batch_no_poison(
+        _test: &str,
+        _kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    macro_rules! gen_batch_tests {
+        ($fn_name:ident) => {
+            paste::paste! {
+                #[test] fn [<$fn_name _scalar>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx2>]()        {
+                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx512>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                }
+                #[test] fn [<$fn_name _auto_detect>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                }
+            }
+        };
+    }
+    gen_batch_tests!(check_batch_default_row);
+    gen_batch_tests!(check_batch_no_poison);
+}

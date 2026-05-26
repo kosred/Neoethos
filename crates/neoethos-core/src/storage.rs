@@ -427,7 +427,14 @@ impl RiskLedger {
         severity: &str,
         context: Option<JsonValue>,
     ) {
-        let event = RiskEvent::new(event_type, message, severity, context);
+        // F-099 migration site (2026-05-25): `RiskEvent::new` now takes
+        // the typed `RiskSeverity` enum. We parse the legacy `&str`
+        // severity via the lenient parser + default to `RiskSeverity::Info`
+        // when unrecognised (matches the previous behaviour where an
+        // unknown string would still be stored verbatim).
+        let parsed_severity = crate::domain::events::RiskSeverity::from_lenient(severity)
+            .unwrap_or(crate::domain::events::RiskSeverity::Info);
+        let event = RiskEvent::new(event_type, message, parsed_severity, context);
 
         if let Ok(mut lock) = self.events.lock() {
             if lock.len() >= self.max_events {

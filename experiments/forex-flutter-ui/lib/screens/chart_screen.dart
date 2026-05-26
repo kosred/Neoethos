@@ -531,10 +531,18 @@ class _ChartBody extends ConsumerWidget {
     // whereas the tick is sub-2 s old. Falls back to historical
     // when no tick is available (e.g. the streamer didn't spawn,
     // or this symbol isn't in the default-streamed-symbols list).
+    //
+    // **2026-05-26 fix (Κωνσταντίνος)**: cTrader spot events arrive
+    // separately for bid and ask. The cache can have bid=null when
+    // only an ask tick has arrived yet (or vice versa), so the prior
+    // `midPrice ?? bid` chain returned null and the chart silently
+    // fell back to the stale-by-minutes bar close — user reported
+    // "Chart not Live". Extend fallback through ask so any of the
+    // three populated values keeps the display fresh.
     final liveSnap = ref.watch(liveSpotsProvider).valueOrNull;
     final tick = liveSnap?.lookup(snapshot.symbol);
     final livePrice = (tick != null && !tick.isStale)
-        ? (tick.midPrice ?? tick.bid)
+        ? (tick.midPrice ?? tick.bid ?? tick.ask)
         : null;
     final displayedPrice = livePrice ?? snapshot.latestClose;
     // #182: when the backend returns an empty-data placeholder we get
@@ -654,6 +662,32 @@ class _AutoFetchPrompt extends ConsumerStatefulWidget {
 class _AutoFetchPromptState extends ConsumerState<_AutoFetchPrompt> {
   bool _busy = false;
   String? _error;
+  // 2026-05-26: guard so we only auto-trigger once per widget mount.
+  // Re-mounts (e.g. symbol/timeframe changes) get a fresh auto-fetch
+  // because the whole widget tree under `snapshot.candles.isEmpty` is
+  // rebuilt — that's the right behaviour.
+  bool _autoStarted = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // 2026-05-26: operator directive — "θα πρέπει να βλέπεις κεριά
+    // χωρίς να κάνεις κάτι". Auto-kick the broker fetch the first time
+    // this widget mounts so the chart isn't blank-waiting-for-click.
+    // The visible UI is unchanged (existing build() still shows the
+    // spinner while `_busy`, then either the chart re-renders or the
+    // manual retry button appears on error) — that retry path is the
+    // safety net for transient network blips so we don't strand the
+    // user with a permanently blank screen.
+    //
+    // Scheduled in a post-frame callback so we don't trigger setState
+    // during the initial build.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _autoStarted || _busy) return;
+      _autoStarted = true;
+      _fetch();
+    });
+  }
 
   Future<void> _fetch() async {
     setState(() {

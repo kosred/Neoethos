@@ -73,10 +73,11 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         } else {
             theme::TEXT_MUTED
         };
+        // `is_focused` and unfocused both render TEXT_PRIMARY — the focused
+        // state is signalled by `value_bg` below (ACCENT_SOFT vs PANEL_BG),
+        // not by the value foreground colour. Collapsed 2026-05-26.
         let value_color = if is_editing {
             theme::ACCENT
-        } else if is_focused {
-            theme::TEXT_PRIMARY
         } else {
             theme::TEXT_PRIMARY
         };

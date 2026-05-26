@@ -578,6 +578,22 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
             }
         }
     };
+    // **F-040 documentation (2026-05-25)** — this closure fills zero
+    // slots in `target` with the direction signal from a SECONDARY
+    // column (typically BoS / CHoCH / displacement). The audit flagged
+    // it as "conflating separate signals" because the source column's
+    // direction is treated as the target column's direction when the
+    // primary column was silent.
+    //
+    // The conflation is INTENTIONAL: SMC theory treats BoS / CHoCH /
+    // displacement as direction-confirming signals — when an Order
+    // Block hasn't been tagged in this bar but a Break-of-Structure
+    // is signalling the same direction, the OB inherits that
+    // direction for the gate-vote. The legacy behaviour is preserved
+    // here per operator directive 2026-05-25 ("ομοιομορφία είναι
+    // καλό" — uniformity of SMC voting rules across the indicators).
+    // A future research-driven sweep may split these into separate
+    // gate-votes; that's a Phase-C scope decision, not a bug.
     let apply_dir_fill_zeros = |target: &mut Vec<i8>, col_opt: Option<usize>| {
         if let Some(col) = col_opt
             && col < frame.data.ncols()

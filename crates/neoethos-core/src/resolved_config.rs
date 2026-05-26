@@ -159,9 +159,22 @@ impl ResolvedConfig {
         let disable_smc_gate_env = env_truthy("FOREX_BOT_DISABLE_SMC_GATE");
 
         // Filters section --------------------------------------------------
-        // In PROP_FIRM mode the search engine overrides `filtering`
-        // with permissive floors — we report those, not the YAML
-        // value, because that's what the GA actually applies.
+        // **F-148 documentation (2026-05-25)** — these literals
+        // intentionally MIRROR (not import) the values in
+        // `crate::genetic::FilteringConfig::default()` (over in
+        // neoethos-search). Importing across the search→core crate
+        // boundary would create a cycle (search depends on core
+        // already for `Settings`). The current pattern is:
+        //   - core resolved_config.rs holds the DISPLAY copy (this)
+        //   - neoethos-search FilteringConfig holds the ENFORCED copy
+        //   - both are documented as having to stay in sync; the
+        //     two test sites `resolved_config_tests::*_floors_match_*`
+        //     would assert byte-equality if added (Phase-C task).
+        //
+        // The PROP_FIRM-mode permissive floors `(0.0, 1.0, 0.50,
+        // -10.0, 0.0, 0.0)` are intentional — discovery in challenge
+        // mode runs with weaker quality filters so the gauntlet does
+        // the heavy lifting (operator directive 2026-05-15).
         let (min_fitness_score, min_trades, max_drawdown, min_sharpe, min_win_rate, min_pf) =
             if mode == "prop_firm" {
                 (0.0_f64, 1.0_f64, 0.50_f64, -10.0_f64, 0.0_f64, 0.0_f64)

@@ -216,7 +216,7 @@ pub struct FetchOutcomeDto {
     pub written_path: String,
 }
 
-pub async fn fetch(State(_state): State<AppApiState>, Json(body): Json<FetchBody>) -> Response {
+pub async fn fetch(State(state): State<AppApiState>, Json(body): Json<FetchBody>) -> Response {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let to_ms = body.to_ms.unwrap_or(now_ms);
 
@@ -233,9 +233,11 @@ pub async fn fetch(State(_state): State<AppApiState>, Json(body): Json<FetchBody
     }
 
     let from_ms = body.from_ms;
+    // F-553/F-576 closure (2026-05-25): config path threaded from CLI.
+    let config_path = state.config_path().to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        let settings = Settings::from_yaml("config.yaml")
-            .map_err(|e| anyhow::anyhow!("config.yaml not loadable: {e}"))?;
+        let settings = Settings::from_yaml(&config_path)
+            .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
         download_history_blocking(
             &symbol,
             &timeframe,
@@ -247,14 +249,23 @@ pub async fn fetch(State(_state): State<AppApiState>, Json(body): Json<FetchBody
     .await;
 
     match result {
-        Ok(Ok(outcome)) => Json(FetchOutcomeDto {
-            symbol: outcome.symbol,
-            timeframe: outcome.timeframe,
-            bar_count: outcome.bar_count,
-            has_more: outcome.has_more,
-            written_path: outcome.written_path.display().to_string(),
-        })
-        .into_response(),
+        Ok(Ok(outcome)) => {
+            // **2026-05-25 — chart-cache invalidation**: the Vortex
+            // file for this (symbol, *) was just rewritten by the
+            // `download_history_blocking` path. Drop any cached
+            // `ChartDto` for that symbol so the next chart click
+            // re-reads the fresh bars from disk instead of serving
+            // a 15s-old snapshot of the previous file.
+            super::chart_cache::clear_symbol(&outcome.symbol);
+            Json(FetchOutcomeDto {
+                symbol: outcome.symbol,
+                timeframe: outcome.timeframe,
+                bar_count: outcome.bar_count,
+                has_more: outcome.has_more,
+                written_path: outcome.written_path.display().to_string(),
+            })
+            .into_response()
+        }
         Ok(Err(err)) => broker_gateway_error(err),
         Err(join_err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -302,7 +313,7 @@ pub struct ImportOutcomeDto {
 /// the actual schema validation + write; we just route requests at
 /// it and return a tidy DTO.
 pub async fn import_file(
-    State(_state): State<AppApiState>,
+    State(state): State<AppApiState>,
     Json(body): Json<ImportBody>,
 ) -> Response {
     let symbol = body.symbol.trim().to_uppercase();
@@ -319,9 +330,11 @@ pub async fn import_file(
             .into_response();
     }
 
+    // F-553/F-576 closure (2026-05-25): config path threaded from CLI.
+    let config_path = state.config_path().to_path_buf();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<ImportOutcomeDto> {
-        let settings = Settings::from_yaml("config.yaml")
-            .map_err(|e| anyhow::anyhow!("config.yaml not loadable: {e}"))?;
+        let settings = Settings::from_yaml(&config_path)
+            .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
         let source = std::path::Path::new(&source_path);
         if !source.exists() {
             anyhow::bail!("source file not found: {}", source.display());
@@ -362,7 +375,13 @@ pub async fn import_file(
     .await;
 
     match result {
-        Ok(Ok(dto)) => Json(dto).into_response(),
+        Ok(Ok(dto)) => {
+            // **2026-05-25 — chart-cache invalidation**: import_file
+            // rewrites the Vortex for (symbol, *). Same reasoning as
+            // the `fetch` handler — drop the now-stale chart cache.
+            super::chart_cache::clear_symbol(&dto.symbol);
+            Json(dto).into_response()
+        }
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": err.to_string()})),

@@ -360,8 +360,42 @@ impl TradingSession {
                 // per operator directive §7.2.
                 if let Some(rm) = self.risky_mode_manager() {
                     let size_usd = (order_request.volume as f64) / 100.0;
-                    let sl_pips = order_request.relative_stop_loss.unwrap_or(0) as f64;
-                    let tp_pips = order_request.relative_take_profit.unwrap_or(0) as f64;
+                    // **F-CORE2 closure (2026-05-25)**: previously
+                    // `.unwrap_or(0)` for both SL and TP — silently
+                    // letting orders with no stop-loss through the
+                    // Risky Mode kill-switch as if they had 0-pip
+                    // risk. That defeats the §7 ruin-probability
+                    // ceiling. Now: when Risky Mode is on AND the
+                    // order has no explicit SL or TP, the kill switch
+                    // can't compute the per-trade risk envelope, so
+                    // the order is REJECTED here before reaching the
+                    // prop-firm gate. Operator must add explicit
+                    // stop_loss + take_profit to every Risky Mode
+                    // order.
+                    let (sl_pips, tp_pips) = match (
+                        order_request.relative_stop_loss,
+                        order_request.relative_take_profit,
+                    ) {
+                        (Some(sl), Some(tp)) => (sl as f64, tp as f64),
+                        _ => {
+                            let message = "Risky Mode rejected order: stop_loss and take_profit \
+                                 are both required (kill-switch needs them to compute the per-\
+                                 trade risk envelope per §7). Add explicit SL+TP to the order \
+                                 and retry."
+                                .to_string();
+                            tracing::warn!(
+                                target: "neoethos_app::risky_mode",
+                                size_usd,
+                                has_sl = order_request.relative_stop_loss.is_some(),
+                                has_tp = order_request.relative_take_profit.is_some(),
+                                "Risky Mode rejected order — missing SL/TP"
+                            );
+                            state.status_msg = message.clone();
+                            self.append_trade_journal(message.clone());
+                            record_app_event("risky_mode_gate", "BLOCKED_NO_SL_TP", message);
+                            return;
+                        }
+                    };
                     if let Err(tier) = rm.check_trade_allowed(size_usd, sl_pips, tp_pips) {
                         let message = format!(
                             "Risky Mode kill switch tripped ({tier:?}): order rejected before prop-firm gate"
@@ -377,6 +411,24 @@ impl TradingSession {
                         state.status_msg = message.clone();
                         self.append_trade_journal(message.clone());
                         record_app_event("risky_mode_gate", "BLOCKED", message);
+                        // **F-231/F-501/F-630 closure (2026-05-25)**:
+                        // record the kill timestamp so the 24 h auto
+                        // re-arm cooldown can run. The bridge polling
+                        // loop checks `auto_rearm_ready` every 5 s; once
+                        // the cooldown elapses it flips `armed=true` and
+                        // clears `last_killed_at_utc_ms`.
+                        if let Err(persist_err) =
+                            crate::app_services::risky_mode_persistence::record_kill_switch_trip()
+                        {
+                            tracing::warn!(
+                                target: "neoethos_app::risky_mode",
+                                error = %persist_err,
+                                "Failed to persist Risky Mode kill timestamp — \
+                                 auto re-arm cooldown clock starts only on next \
+                                 successful save. Operator can manually re-arm \
+                                 via Settings if this persists."
+                            );
+                        }
                         return;
                     }
                 }
@@ -1052,13 +1104,25 @@ impl TradingSession {
     /// shape arrives, log a structured warn and default to 4 so operators
     /// can spot the mis-routed instrument instead of silently mispricing it.
     pub(super) fn ctrader_symbol_pip_position(&self, symbol: &str) -> Option<i32> {
+        // GROUP D remediation (operator directive 2026-05-25): pip_position
+        // via canonical symbol_metadata. pip_position is the negative
+        // log10 of pip_size (e.g. pip_size=0.0001 → pip_position=4,
+        // pip_size=0.01 → pip_position=2). Falls back to the legacy
+        // JPY-contains heuristic only when metadata is absent — preserves
+        // backwards-compat for exotics not yet in the registry.
+        if let Some(meta) = neoethos_core::symbol_metadata::resolve(symbol) {
+            if meta.pip_size.is_finite() && meta.pip_size > 0.0 {
+                let exponent = (-meta.pip_size.log10()).round() as i32;
+                return Some(exponent);
+            }
+        }
         let normalized = symbol.to_ascii_uppercase();
         if normalized.contains("JPY") {
             return Some(2);
         }
-        // Heuristic: real FX symbols are exactly 6 alphabetic characters
-        // (EURUSD, GBPCHF, ...). Anything else is suspicious in a forex-only
-        // bot — log a warn but still return a sane default so we don't crash.
+        // Heuristic fallback: real FX symbols are exactly 6 alphabetic
+        // characters (EURUSD, GBPCHF, ...). Anything else is suspicious
+        // in a forex-only bot — log a warn but still return a sane default.
         let looks_like_fx_pair =
             normalized.len() == 6 && normalized.chars().all(|c| c.is_ascii_alphabetic());
         if !looks_like_fx_pair {

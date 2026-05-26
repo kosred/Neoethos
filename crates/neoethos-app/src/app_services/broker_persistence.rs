@@ -203,11 +203,12 @@ mod tests {
     use std::sync::Mutex;
     use std::{env, fs};
 
-    /// The path-override env var lives in `neoethos-core::broker_config`
-    /// now. The test name is repeated here so the tests can poke at it
-    /// directly via `env::set_var` without exposing it as a public
-    /// const just for the tests.
-    const ENV_OVERRIDE_VAR: &str = "NEOETHOS_BROKER_CREDENTIALS_PATH";
+    /// The path-override env var lives in
+    /// `neoethos_core::env_overrides::ENV_BROKER_CREDENTIALS_PATH`
+    /// now. The local alias keeps the in-file `env::set_var` /
+    /// `env::remove_var` test calls readable while still tracking the
+    /// canonical const — so a rename breaks the test file too.
+    const ENV_OVERRIDE_VAR: &str = neoethos_core::env_overrides::ENV_BROKER_CREDENTIALS_PATH;
 
     /// `env::set_var`/`env::var` are process-global. Serialize the env-mutating
     /// tests so they don't race.

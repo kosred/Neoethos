@@ -17,8 +17,17 @@ pub struct OrderExecutorConfig {
 
 impl Default for OrderExecutorConfig {
     fn default() -> Self {
+        // F-114 fix (2026-05-25): the previous default hardcoded
+        // `symbol = "EURUSD"` + `commission_per_lot = 7.0`. Both are
+        // synthetic-data violations per the operator's real-data
+        // directive 2026-05-24. Now we ship empty-string / NaN
+        // sentinels — production callers MUST construct via
+        // `OrderExecutorConfig::for_symbol(...)` or populate the
+        // cost fields from a real cTrader symbol-metadata source.
+        // Non-cost knobs (partial TP geometry, entry-patience tuning)
+        // retain their experimentally-derived defaults.
         Self {
-            symbol: "EURUSD".to_string(),
+            symbol: String::new(),
             partial_take_profit_enabled: true,
             partial_tp_min_total_lot: 0.03,
             partial_tp_r_levels: vec![1.0, 2.0, 3.0],
@@ -28,7 +37,28 @@ impl Default for OrderExecutorConfig {
             entry_patience_bars: 3,
             entry_patience_pullback_atr: 0.2,
             min_edge_cost_multiple: 3.0,
-            commission_per_lot: 7.0,
+            commission_per_lot: f64::NAN,
+        }
+    }
+}
+
+impl OrderExecutorConfig {
+    /// **F-114 fix (2026-05-25)** — real-symbol constructor.
+    ///
+    /// Builds an [`OrderExecutorConfig`] for a specific symbol with the
+    /// caller-supplied commission. Mirrors the
+    /// `BacktestSettings::for_symbol` / `GauntletConfig::for_symbol`
+    /// pattern (see F-003 / F-025 fixes). Used by production callers
+    /// that have a real cTrader symbol-metadata + commission table.
+    ///
+    /// `symbol` must be non-empty; `commission_per_lot` must be finite
+    /// and non-negative. NaN / empty inputs propagate so the downstream
+    /// guard catches operator-config bugs loudly.
+    pub fn for_symbol(symbol: &str, commission_per_lot: f64) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+            commission_per_lot,
+            ..Self::default()
         }
     }
 }

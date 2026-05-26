@@ -16,6 +16,28 @@ pub struct ConsistencyMetrics {
     pub grade: String,
 }
 
+/// Consistency-tracking trade event. **Distinct from
+/// [`crate::domain::events::TradeEvent`]** — see F-120 disambiguation
+/// note.
+///
+/// **F-120 fix (2026-05-25)**: the workspace has TWO `TradeEvent` types
+/// that mean different things. Rename in-place was rejected (would
+/// break ConsistencyTracker's persisted ledger), so this type is
+/// re-aliased + documented:
+///
+/// - [`ConsistencyTradeEvent`] (this type) — single-trade record used
+///   by [`ConsistencyTracker`] for grade computation. Carries the bare
+///   minimum (entry-time string, PnL, risk %, size, hold minutes,
+///   win-flag). Used INSIDE `consistency.rs` only.
+/// - [`crate::domain::events::TradeEvent`] — broker-shape OPEN/CLOSE
+///   event with bid/ask prices, commission, swap, magic. Used by the
+///   live trading event bus.
+///
+/// Both keep their original names for backward compat (downstream
+/// consumers import via `consistency::TradeEvent` or `events::TradeEvent`
+/// — the disambiguation is path-based, not name-based).
+pub type ConsistencyTradeEvent = TradeEvent;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeEvent {
     pub entry_time: String, // ISO format

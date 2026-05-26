@@ -204,8 +204,11 @@ fn load_and_compute(
     params: HashMap<String, f64>,
     limit: usize,
 ) -> anyhow::Result<(usize, Vec<IndicatorLine>)> {
-    let settings = Settings::from_yaml("config.yaml")
-        .map_err(|e| anyhow::anyhow!("config.yaml not loadable: {e}"))?;
+    // F-553/F-576 closure (2026-05-25): resolved via the process-wide
+    // install so a non-default `--config` flag still works.
+    let config_path = super::state::current_config_path();
+    let settings = Settings::from_yaml(&config_path)
+        .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
     let dataset = load_symbol_dataset(&settings.system.data_dir, &symbol)
         .map_err(|e| anyhow::anyhow!("dataset load failed for {symbol}: {e}"))?;
     let ohlcv = dataset.frames.get(&timeframe).ok_or_else(|| {

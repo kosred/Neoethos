@@ -256,13 +256,11 @@ pub enum MergeQuoteSide {
 
 impl MergeQuoteSide {
     pub fn from_env() -> Self {
-        match std::env::var("FOREX_BOT_CHART_MERGE_SIDE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
+        // F-CORE3 closure (2026-05-25): routed through the canonical
+        // `env_overrides::chart_merge_side_raw` getter so the env var
+        // is grep-able from one place. Parser tolerates whitespace +
+        // case; unknown values fall back to `Mid`.
+        match crate::app_services::env_overrides::chart_merge_side_raw().as_deref() {
             Some("bid") => Self::Bid,
             Some("ask") => Self::Ask,
             _ => Self::Mid,
@@ -433,22 +431,20 @@ pub fn load_live_chart_update(
 /// Maximum number of attempts (initial + retries) for `load_live_chart_update`.
 /// Tunable via `FOREX_BOT_CTRADER_STREAM_MAX_ATTEMPTS` (clamped to `[1, 5]`;
 /// default 3). Retry is safe here because each call is a stateless poll.
+///
+/// **F-CORE3 closure (2026-05-25)**: thin shim over the canonical
+/// `env_overrides::ctrader_stream_max_attempts` typed getter.
 fn streaming_max_attempts() -> u32 {
-    std::env::var("FOREX_BOT_CTRADER_STREAM_MAX_ATTEMPTS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(3)
-        .clamp(1, 5)
+    crate::app_services::env_overrides::ctrader_stream_max_attempts()
 }
 
 /// Base backoff in ms; tunable via `FOREX_BOT_CTRADER_STREAM_BACKOFF_BASE_MS`
 /// (clamped to `[10, 2000]`; default 200).
+///
+/// **F-CORE3 closure (2026-05-25)**: thin shim over the canonical
+/// `env_overrides::ctrader_stream_backoff_base_ms` typed getter.
 fn streaming_backoff_base_ms() -> u64 {
-    std::env::var("FOREX_BOT_CTRADER_STREAM_BACKOFF_BASE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(200)
-        .clamp(10, 2_000)
+    crate::app_services::env_overrides::ctrader_stream_backoff_base_ms()
 }
 
 fn streaming_backoff_sleep(attempt: u32) {
@@ -475,10 +471,21 @@ impl CTraderLiveStreamingTransport for ProductionCTraderLiveStreamingTransport {
             .context("cTrader account id must be numeric")?;
         let key =
             CTraderStreamingSessionKey::from_request(&self.endpoint_host, request, account_id);
+        // Graceful degradation on a poisoned lock: an earlier thread
+        // panicked while holding it. Recover the inner state and log
+        // — the operator's UI keeps moving on the next tick.
+        // Per the doctrine "log loud, never panic" we never abort on
+        // a poisoned lock; the streaming-session cache is rebuildable
+        // from scratch (the next call opens a fresh session) so the
+        // worst case is one missed update, not a process crash.
         let mut session = {
-            let mut cache = streaming_session_cache()
-                .lock()
-                .expect("cTrader streaming session cache lock");
+            let mut cache = streaming_session_cache().lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    target: "neoethos_app::ctrader_streaming",
+                    "streaming session cache mutex was poisoned; recovering inner state"
+                );
+                poisoned.into_inner()
+            });
             match cache.take() {
                 Some(session) if session.key == key => session,
                 Some(session) => {
@@ -501,9 +508,13 @@ impl CTraderLiveStreamingTransport for ProductionCTraderLiveStreamingTransport {
             request.digits,
         )?;
         let responses = session.responses.clone();
-        let mut cache = streaming_session_cache()
-            .lock()
-            .expect("cTrader streaming session cache lock");
+        let mut cache = streaming_session_cache().lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                target: "neoethos_app::ctrader_streaming",
+                "streaming session cache mutex was poisoned on writeback; recovering"
+            );
+            poisoned.into_inner()
+        });
         *cache = Some(session);
         Ok((responses, spot_event))
     }

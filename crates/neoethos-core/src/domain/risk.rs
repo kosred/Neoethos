@@ -234,7 +234,14 @@ impl RevengeTradeDetector {
             return false;
         }
 
-        let last_trade = self.recent_trades.last().unwrap();
+        // **2026-05-25 unwrap audit**: the `len() < 2` guard makes the
+        // `.last()` infallible. Pattern-match per the no-panic
+        // doctrine — a future refactor breaking the invariant now
+        // returns false (no revenge-trade flag) instead of panicking
+        // the gate.
+        let Some(last_trade) = self.recent_trades.last() else {
+            return false;
+        };
         let time_since_last_min =
             (current_time_sec.saturating_sub(last_trade.exit_time_sec)) as f64 / 60.0;
 
@@ -268,8 +275,16 @@ impl RevengeTradeDetector {
                 count_prev += 1;
             }
             if count_prev > 0 {
+                // **2026-05-25 unwrap audit**: `recent` is a slice
+                // taken from `recent_trades` after `len() >= 3` guard
+                // (line 261), so `recent.len() == 3` always. The
+                // pattern below is defensive: skip the doubling-size
+                // check if for any reason `last()` returns None.
+                let Some(last_recent) = recent.last() else {
+                    return false;
+                };
                 let mean_prev = sum_prev_sizes / (count_prev as f64);
-                let last_size = recent.last().unwrap().size;
+                let last_size = last_recent.size;
                 let prev_pnl = recent[recent.len() - 2].pnl;
                 if mean_prev > 0.0 && last_size > 1.5 * mean_prev && prev_pnl < 0.0 {
                     return true;

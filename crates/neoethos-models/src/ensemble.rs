@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, bail};
 use ndarray::Array2;
 use neoethos_core::storage::json::{
-    JsonBackupWriteConfig, write_json_with_backup as write_json_artifact_with_backup,
+    DirBackupWriteConfig, JsonBackupWriteConfig, write_dir_with_backup,
+    write_json_with_backup as write_json_artifact_with_backup,
 };
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::base::{
     ExpertModel, build_runtime_prediction_with_details, three_class_runtime_confidence,
@@ -226,68 +227,26 @@ fn validate_meta_metadata(
     Ok(())
 }
 
-fn staged_meta_artifact_dir(path: &Path) -> PathBuf {
-    path.with_extension("tmp_meta_artifact")
-}
-
-fn backup_meta_artifact_dir(path: &Path) -> PathBuf {
-    path.with_extension("bak_meta_artifact")
-}
-
-fn cleanup_meta_artifact_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("remove staged meta artifact {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn replace_meta_artifact_dir(staged_path: &Path, target_path: &Path) -> Result<()> {
-    let backup_path = backup_meta_artifact_dir(target_path);
-    cleanup_meta_artifact_dir(&backup_path)?;
-    if target_path.exists() {
-        std::fs::rename(target_path, &backup_path).with_context(|| {
-            format!(
-                "move previous meta artifact into backup {}",
-                backup_path.display()
-            )
-        })?;
-    }
-    if let Err(error) = std::fs::rename(staged_path, target_path) {
-        if backup_path.exists() {
-            if let Err(restore_err) = std::fs::rename(&backup_path, target_path) {
-                tracing::error!(
-                    target: "neoethos_models::artifact",
-                    backup = %backup_path.display(),
-                    target = %target_path.display(),
-                    error = %restore_err,
-                    "failed to restore backup after staged-rename failure;                      artifact directory may be in an inconsistent state"
-                );
-            }
-        }
-        bail!(
-            "rename staged meta artifact into {} failed: {}",
-            target_path.display(),
-            error
-        );
-    }
-    cleanup_meta_artifact_dir(&backup_path)?;
-    Ok(())
-}
-
+/// GROUP E remediation 2026-05-25: the hand-rolled
+/// `staged_meta_artifact_dir` / `backup_meta_artifact_dir` /
+/// `cleanup_meta_artifact_dir` / `replace_meta_artifact_dir` /
+/// `with_staged_meta_artifact_dir` quintet was replaced with a single
+/// call to the canonical `neoethos_core::storage::json::write_dir_with_backup`
+/// helper. Saves ~80 LOC of duplicate staged-tmp+backup logic per file
+/// (this file is one of 4 — ensemble/bayesian/linear/training-orchestrator).
 fn with_staged_meta_artifact_dir<F>(path: &Path, writer: F) -> Result<()>
 where
     F: FnOnce(&Path) -> Result<()>,
 {
-    let staged_path = staged_meta_artifact_dir(path);
-    cleanup_meta_artifact_dir(&staged_path)?;
-    std::fs::create_dir_all(&staged_path)
-        .with_context(|| format!("create staged meta artifact dir {}", staged_path.display()))?;
-    if let Err(error) = writer(&staged_path) {
-        let _ = cleanup_meta_artifact_dir(&staged_path);
-        return Err(error);
-    }
-    replace_meta_artifact_dir(&staged_path, path)
+    write_dir_with_backup(
+        path,
+        DirBackupWriteConfig {
+            artifact_label: "meta artifact",
+            temp_extension: "tmp_meta_artifact",
+            backup_extension: "bak_meta_artifact",
+        },
+        writer,
+    )
 }
 
 fn write_json_with_backup<T: Serialize>(path: &Path, value: &T) -> Result<()> {

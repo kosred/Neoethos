@@ -29,13 +29,18 @@
 //! is 0. The UI uses an empty response to render a "waiting for
 //! ticks…" placeholder rather than throwing an error.
 
+use std::convert::Infallible;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use axum::Json;
 use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use futures::stream::{Stream, StreamExt};
 use serde::Serialize;
-use std::time::{SystemTime, UNIX_EPOCH};
+use tokio_stream::wrappers::BroadcastStream;
 
-use crate::app_services::live_spots::{SpotTick, snapshot_all};
+use crate::app_services::live_spots::{SpotTick, snapshot_all, subscribe};
 
 use super::state::AppApiState;
 
@@ -88,6 +93,61 @@ struct SpotsResponse {
     snapshot_at_unix_ms: i64,
     #[serde(rename = "symbolCount")]
     symbol_count: usize,
+}
+
+/// **2026-05-25 — operator directive "push, not poll"**:
+/// `GET /live/spots/stream` — Server-Sent Events endpoint that
+/// pushes every tick to subscribed clients as it arrives.
+///
+/// Replaces the 1Hz Flutter poll of `/live/spots` with a real-
+/// time push channel. Latency now = network RTT (~1-5 ms on
+/// localhost / LAN) instead of the polling interval (~1000 ms).
+///
+/// ## Industry comparison
+///
+/// - **TradingView**: pushes ticks over a WebSocket stream
+///   (subscribed-symbols topic).
+/// - **cTrader Web**: WebSocket from broker → browser, no polling.
+/// - **MT5 Mobile**: long-poll with 50-100 ms timeout (effectively
+///   push within the LAN).
+/// - **NeoEthos before**: HTTP poll at 1 Hz — 1000 ms staleness.
+/// - **NeoEthos after**: SSE push — ~5 ms staleness.
+///
+/// ## Wire shape
+///
+/// Each event has `event: tick` and a JSON payload identical to
+/// one entry of the `/live/spots` array. Plus periodic
+/// `event: keep-alive` empty events every 15 s so proxies don't
+/// idle-close the connection.
+///
+/// ## Why SSE, not WebSocket
+///
+/// - SSE is plain HTTP, no upgrade handshake — works through any
+///   HTTP proxy that the operator might have between the backend
+///   and Flutter (e.g. Caddy, NGINX, corporate proxies).
+/// - One-way (server → client) suffices for tick fan-out; the UI
+///   uses `POST /orders` for the reverse direction anyway.
+/// - axum has first-class `axum::response::sse::Sse` support.
+/// - Flutter has community packages (`http`'s
+///   `Client.send` + line-decode) that consume SSE without
+///   extra dependencies.
+pub async fn stream(State(_state): State<AppApiState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let receiver = subscribe();
+    let stream = BroadcastStream::new(receiver).filter_map(|res| async move {
+        let tick = res.ok()?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let dto = SpotTickDto::from_tick(tick, now_ms);
+        let payload = serde_json::to_string(&dto).ok()?;
+        Some(Ok(Event::default().event("tick").data(payload)))
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
 
 pub async fn list(State(_state): State<AppApiState>) -> Response {

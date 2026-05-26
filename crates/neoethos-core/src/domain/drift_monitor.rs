@@ -128,11 +128,18 @@ impl ConceptDriftMonitor {
         if self.error_stream.len() >= self.window_size {
             self.drift_detected = self.check_drift();
             if self.drift_detected {
+                // F-138 fix (2026-05-25 — task #218 unwrap audit):
+                // the previous `.unwrap()` panicked if the system
+                // clock was before UNIX_EPOCH (only possible after
+                // an adversarial clock-set on Windows or a hardware
+                // RTC failure). We now fall back to `0` (Jan 1 1970)
+                // and continue — the drift event itself is the
+                // signal; an absurd timestamp is just diagnostic noise.
                 self.last_drift_at = Some(
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
                 );
             }
         }
@@ -247,8 +254,14 @@ impl ConceptDriftMonitor {
             return 0.0;
         }
 
-        let min_val = expected.first().unwrap();
-        let max_val = expected.last().unwrap();
+        // **2026-05-25 unwrap audit**: the emptiness guard above makes
+        // `first()` / `last()` infallible, but per the no-panic
+        // doctrine we use `let-else` instead of `.unwrap()`. The
+        // function returns 0.0 (= no drift) if a future refactor
+        // breaks the invariant — graceful degradation, not panic.
+        let (Some(min_val), Some(max_val)) = (expected.first(), expected.last()) else {
+            return 0.0;
+        };
 
         if (max_val - min_val).abs() < 1e-9 {
             return 0.0;

@@ -2069,3 +2069,328 @@ fn bot_decisions_to_overlays_returns_empty_when_no_candles() {
     });
     assert!(session.bot_decisions_to_overlays("EURUSD", &[]).is_empty());
 }
+
+// ── Dual-mode separation invariant (task #226 — 2026-05-25) ─────────────
+//
+// SAFETY-CRITICAL: the bot supports two trading modes that MUST be kept
+// strictly separate at the wiring level:
+//
+// - **Prop-firm passing mode** — typical `RiskConfig::risk_per_trade` is
+//   0.005-0.030 (0.5%-3%), targeting prop-firm rule compliance over 60
+//   trading days without rule violations.
+// - **Risky growth mode** — `RiskyModeConfig::stages[s].risk_per_trade_fraction`
+//   sits in [0.30, 0.50] per the operator-signed §7.1 contract,
+//   targeting $20-$100 → $50K-$100K compounding with high ruin probability.
+//
+// The invariant: a Risky-Mode signal (30%-50% per-trade) MUST NEVER leak
+// into a Prop-firm-only account (where 30% per-trade would breach the
+// daily drawdown cap on a single trade and fail the challenge). The
+// gating layer guarantees this by:
+//
+// 1. Holding `RiskyModeManager` as `Option` — `None` means "not armed".
+// 2. The Risky Mode gate at `orders.rs:361` is wrapped in
+//    `if let Some(rm) = self.risky_mode_manager()` — short-circuits to
+//    NO Risky Mode logic when the manager is absent.
+// 3. The Prop-firm gate at `orders.rs:444` reads `&state.risk` (the
+//    `RiskConfig`), which is a SEPARATE struct from `RiskyModeConfig`.
+//    The two never share storage.
+// 4. `disable_risky_mode()` sets the manager to None, so subsequent
+//    orders bypass the Risky Mode tier entirely.
+//
+// These tests pin the invariant so a future refactor that accidentally
+// merges the two configs (e.g. "let's unify all risk into one struct")
+// will fail loudly here.
+
+#[test]
+fn dual_mode_separation_fresh_session_is_prop_firm_only() {
+    // Baseline: a freshly-constructed TradingSession is in PROP-FIRM mode.
+    // No `enable_risky_mode` call has been made → every Risky Mode read
+    // returns the "not armed" sentinel.
+    let session = TradingSession::new();
+    assert!(
+        !session.risky_mode_active(),
+        "fresh session must NOT be in Risky Mode"
+    );
+    assert!(
+        session.risky_mode_manager().is_none(),
+        "fresh session must have NO RiskyModeManager"
+    );
+    assert!(
+        session.risky_mode_state().is_none(),
+        "fresh session must have NO Risky Mode state snapshot"
+    );
+}
+
+#[test]
+fn dual_mode_separation_disable_risky_mode_clears_all_state() {
+    // Lifecycle: enable → disable → all Risky Mode reads return None.
+    // No residue from the enabled period leaks back to subsequent
+    // reads. This is the architectural inverse of #28 (the operator-
+    // reported bug where the armed flag survived a checkbox toggle).
+    let mut session = TradingSession::new();
+    session
+        .enable_risky_mode(signed_risky_mode_config(), 100.0)
+        .expect("enable_risky_mode");
+    assert!(session.risky_mode_active(), "session should be armed");
+    assert!(session.risky_mode_manager().is_some());
+    assert!(session.risky_mode_state().is_some());
+
+    session.disable_risky_mode();
+
+    assert!(
+        !session.risky_mode_active(),
+        "disable_risky_mode must clear armed flag"
+    );
+    assert!(
+        session.risky_mode_manager().is_none(),
+        "disable_risky_mode must drop the manager"
+    );
+    assert!(
+        session.risky_mode_state().is_none(),
+        "disable_risky_mode must clear the state snapshot"
+    );
+}
+
+#[test]
+fn dual_mode_separation_risky_mode_does_not_mutate_prop_firm_risk_config() {
+    // The two configs live in independent storage. Enabling Risky Mode
+    // with a 30%-50% per-trade band MUST NOT touch `AppState::risk`
+    // (the prop-firm side). The prop-firm gate continues to enforce
+    // its own (much lower) per-trade ceiling.
+    let state = sample_state(DataSource::CTrader, "(dual-mode test)");
+    let mut session = TradingSession::new();
+
+    // Capture the prop-firm risk-per-trade BEFORE Risky Mode is armed.
+    let prop_firm_risk_before = state.risk.risk_per_trade;
+
+    // Arm Risky Mode with the signed contract (defaults: stages start
+    // at 0.30 risk-per-trade fraction — way above any prop-firm
+    // ceiling). This call must NOT propagate back into AppState.
+    session
+        .enable_risky_mode(signed_risky_mode_config(), 100.0)
+        .expect("enable_risky_mode");
+
+    // Prop-firm config has NOT changed. The two are independent.
+    assert_eq!(
+        state.risk.risk_per_trade, prop_firm_risk_before,
+        "Risky Mode arm must NOT mutate prop-firm RiskConfig.risk_per_trade"
+    );
+    // Defense-in-depth: the prop-firm side's typical ceiling is < 5%;
+    // the Risky Mode side's floor is 30%. They cannot be the same.
+    assert!(
+        state.risk.risk_per_trade < 0.05,
+        "prop-firm RiskConfig.risk_per_trade must remain a prop-firm-safe \
+         fraction even after Risky Mode is armed (got {})",
+        state.risk.risk_per_trade
+    );
+    let rm_min = neoethos_core::domain::risky_mode::RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION;
+    assert!(
+        rm_min >= 0.30,
+        "Risky Mode minimum per-trade fraction must be ≥ 30% (got {})",
+        rm_min
+    );
+    assert!(
+        state.risk.risk_per_trade < rm_min,
+        "prop-firm risk_per_trade {} must be strictly less than \
+         Risky Mode minimum {} — these are SEPARATE configs",
+        state.risk.risk_per_trade,
+        rm_min
+    );
+}
+
+#[test]
+fn dual_mode_separation_reenable_resets_bankroll_and_kill_switches() {
+    // Disable then re-enable: no carryover. The manager is freshly
+    // constructed each time; bankroll resets to `starting_bankroll`,
+    // stage cursor resets to 0, kill switches are clear.
+    let mut session = TradingSession::new();
+    let cfg = signed_risky_mode_config();
+    session
+        .enable_risky_mode(cfg.clone(), 100.0)
+        .expect("first enable");
+
+    // Trip the per-day kill switch by losing more than the daily cap.
+    {
+        let rm = session.risky_mode_manager_mut().expect("manager");
+        let stage = *rm.current_stage();
+        let cap_usd = stage.daily_loss_cap_fraction * rm.current_bankroll_usd();
+        rm.record_trade_outcome(-(cap_usd + 5.0));
+    }
+    assert!(
+        session
+            .risky_mode_manager()
+            .expect("manager")
+            .last_kill_switch_trip()
+            .is_some(),
+        "kill switch should have tripped after exceeding daily cap"
+    );
+
+    // Disable + re-enable.
+    session.disable_risky_mode();
+    session
+        .enable_risky_mode(cfg, 100.0)
+        .expect("second enable");
+
+    // The new manager has fresh state: bankroll back to start, no
+    // kill-switch trips, stage 0.
+    let rm = session.risky_mode_manager().expect("re-enabled manager");
+    let snapshot = session
+        .risky_mode_state()
+        .expect("re-enabled state snapshot");
+    assert_eq!(
+        snapshot.current_bankroll_usd, 100.0,
+        "bankroll should reset to the new starting_bankroll, not carry \
+         the previous session's drawdown"
+    );
+    assert_eq!(
+        snapshot.current_stage_idx, 0,
+        "stage cursor should reset to 0 after a fresh enable"
+    );
+    assert!(
+        rm.last_kill_switch_trip().is_none(),
+        "kill switches must be clear after disable + re-enable cycle"
+    );
+}
+
+#[test]
+fn dual_mode_separation_default_risky_mode_fraction_is_kelly_aligned() {
+    // §7.1 / task #230: the default `RiskyModeConfig` per-trade
+    // fraction is 0.30 (Kelly-aligned for p=0.55 win, RR=2.0 →
+    // f* = 0.325). The 0.50 upper bound exists for the first stage
+    // (small $20-$40 bankrolls) but is NOT the default for the
+    // static fallback used by code paths that don't iterate the
+    // stage table.
+    let default_frac = neoethos_core::domain::risky_mode::RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION;
+    assert!(
+        (default_frac - 0.30).abs() < 1e-9,
+        "default Risky Mode per-trade fraction must be exactly 0.30 \
+         (Kelly-aligned, lowered from 0.40 on 2026-05-25 per task #230); \
+         got {}",
+        default_frac
+    );
+    // The band [MIN, MAX] brackets Kelly — lower edge slightly sub-Kelly,
+    // upper edge over-Kelly. Anything outside [0.30, 0.50] would change
+    // the risk story documented in research §7.1.
+    let min_frac = neoethos_core::domain::risky_mode::RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION;
+    let max_frac = neoethos_core::domain::risky_mode::RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION;
+    assert!(
+        (min_frac - 0.30).abs() < 1e-9,
+        "Risky Mode minimum must stay at 0.30 (sub-Kelly floor); got {}",
+        min_frac
+    );
+    assert!(
+        (max_frac - 0.50).abs() < 1e-9,
+        "Risky Mode maximum must stay at 0.50 (over-Kelly cap); got {}",
+        max_frac
+    );
+}
+
+#[test]
+fn dual_mode_separation_inactive_session_has_no_kill_switch_gate() {
+    // When Risky Mode is NOT armed, `risky_mode_manager()` returns None
+    // — the `if let Some(rm) = ...` at orders.rs:361 short-circuits.
+    // The kill-switch / per-day / per-stage / per-month gates DO NOT
+    // run. Only the prop-firm gate runs. This means a Prop-firm-only
+    // session is gated solely by `RiskConfig::risk_per_trade` (1-3%)
+    // — there's no possibility of a Risky Mode 30-50% fraction
+    // sneaking in.
+    let session = TradingSession::new();
+    // The pattern that orders.rs:361 uses to decide whether to invoke
+    // the Risky Mode gate. None → no gate. Direct invariant check.
+    assert!(
+        session.risky_mode_manager().is_none(),
+        "fresh session must not have a manager → orders.rs:361 \
+         `if let Some(rm)` will short-circuit, bypassing the Risky \
+         Mode gate entirely"
+    );
+}
+
+#[test]
+fn dual_mode_separation_risky_mode_signal_cannot_replay_after_disable() {
+    // SCENARIO: operator runs Risky Mode for a while, then switches to
+    // Prop-firm mode. Any signals generated under Risky Mode (computed
+    // with a 30% per-trade size) MUST NOT slip into a subsequent
+    // Prop-firm-mode order routing. The defense: the manager goes away
+    // on disable, so the orders.rs `check_trade_allowed` call simply
+    // is never made — but the SAME order with a 30% size will be
+    // rejected by the prop-firm gate's own `risk_per_trade` ceiling.
+    //
+    // We simulate the no-leakage property by checking that after
+    // disable, the session's view of "is Risky Mode active" is
+    // false, and the manager-state APIs return None. The actual order
+    // dispatch path is covered by the existing
+    // `manual_buy_blocked_when_autonomous_only_contract_armed` test;
+    // the converse (no Risky Mode active → no Risky Mode rejection)
+    // is captured here.
+    let mut session = TradingSession::new();
+    session
+        .enable_risky_mode(signed_risky_mode_config(), 100.0)
+        .expect("enable_risky_mode");
+    assert!(session.risky_mode_active());
+
+    session.disable_risky_mode();
+
+    // After disable, the Risky-Mode kill-switch gate is gone.
+    // Any subsequent order goes through the prop-firm gate only.
+    assert!(!session.risky_mode_active());
+    assert!(session.risky_mode_manager().is_none());
+    // Defensive: even calling the state snapshot returns None — the
+    // manager is fully torn down, no "soft" residue.
+    assert!(session.risky_mode_state().is_none());
+}
+
+#[test]
+fn dual_mode_separation_prop_firm_only_default_is_safe() {
+    // A vanilla `RiskConfig::default()` lands in prop-firm-safe
+    // territory across EVERY known preset (FTMO, MyForexFunds,
+    // FundedNext, The5%ers, None). The safety bounds enforced by
+    // `validate_safety_bounds` scream above 5% per-trade / 20% daily /
+    // 30% total — those are the hard bounds we pin here. (The
+    // preset-specific actual numbers are tighter; this test asserts
+    // the WORST acceptable default across presets, not the FTMO
+    // specific 3%/4%/10% which can shift if the operator overrides
+    // `NEOETHOS_PROP_FIRM_PRESET`.)
+    let cfg = RiskConfig::default();
+    assert!(
+        cfg.risk_per_trade <= 0.05,
+        "default RiskConfig.risk_per_trade must remain prop-firm-safe \
+         (<= 5% per validate_safety_bounds scream-zone); got {}",
+        cfg.risk_per_trade
+    );
+    assert!(
+        cfg.daily_drawdown_limit > 0.0 && cfg.daily_drawdown_limit <= 0.20,
+        "default RiskConfig.daily_drawdown_limit must remain \
+         prop-firm-safe (in (0, 0.20] per validate_safety_bounds \
+         scream-zone); got {}",
+        cfg.daily_drawdown_limit
+    );
+    assert!(
+        cfg.total_drawdown_limit <= 0.30,
+        "default RiskConfig.total_drawdown_limit must remain \
+         prop-firm-safe (<= 30% per validate_safety_bounds \
+         scream-zone); got {}",
+        cfg.total_drawdown_limit
+    );
+    assert!(
+        cfg.total_drawdown_limit > cfg.daily_drawdown_limit,
+        "total_drawdown_limit ({}) must exceed daily_drawdown_limit \
+         ({}) per validate_safety_bounds (a daily cap >= the total \
+         cap can never be reached, which is an invalid prop-firm \
+         configuration)",
+        cfg.total_drawdown_limit,
+        cfg.daily_drawdown_limit
+    );
+    // Cross-check: the Risky Mode floor (30%) is at least 6× the
+    // prop-firm default per-trade (5% max). The two MODES cannot be
+    // confused by accident at the numeric level — even at the WORST
+    // acceptable prop-firm default, Risky Mode floor is 6× higher.
+    let rm_min = neoethos_core::domain::risky_mode::RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION;
+    assert!(
+        rm_min >= cfg.risk_per_trade * 6.0,
+        "Risky Mode minimum fraction {} must be at least 6× the \
+         prop-firm default {} so the two cannot be numerically \
+         confused",
+        rm_min,
+        cfg.risk_per_trade
+    );
+}

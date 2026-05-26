@@ -715,10 +715,10 @@ impl HardwareProbe {
         };
 
         for cmd in smi_candidates {
-            let Ok(output) = Command::new(cmd)
-                .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
-                .output()
-            else {
+            let mut command = Command::new(cmd);
+            command.args(["--query-gpu=compute_cap", "--format=csv,noheader"]);
+            // GROUP H remediation: 2s timeout per F-890.
+            let Some(output) = run_hw_probe_with_timeout(command) else {
                 continue;
             };
             if !output.status.success() {
@@ -738,7 +738,8 @@ impl HardwareProbe {
     }
 
     fn detect_rocm_accelerators(&self, id_offset: usize) -> Vec<AcceleratorDevice> {
-        let rocminfo = Command::new("rocminfo").output().ok();
+        // GROUP H remediation: 2s timeout (operator directive 2026-05-25).
+        let rocminfo = run_hw_probe_with_timeout(Command::new("rocminfo"));
         if let Some(output) = rocminfo
             && output.status.success()
         {
@@ -794,6 +795,41 @@ impl HardwareProbe {
                 source: "hardware_runtime_overrides.wgpu_device_names".to_string(),
             })
             .collect()
+    }
+}
+
+/// GROUP H remediation (operator directive 2026-05-25, F-890):
+/// run an external hardware-probe subprocess (`nvidia-smi`,
+/// `rocminfo`, `rocm-smi`) with a hard 2-second timeout. On a healthy
+/// host they answer in <100 ms; on a broken-NVML or zombie-rocm-smi
+/// install they can otherwise hang the entire backend's startup
+/// path. We spawn on a separate thread and accept that the
+/// subprocess may continue running in the background — the main
+/// process is unblocked which is what matters.
+fn run_hw_probe_with_timeout(mut cmd: Command) -> Option<std::process::Output> {
+    const HW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(cmd.output());
+    });
+    match rx.recv_timeout(HW_PROBE_TIMEOUT) {
+        Ok(Ok(output)) => Some(output),
+        Ok(Err(err)) => {
+            tracing::debug!(
+                target: "neoethos_core::system",
+                error = %err,
+                "hardware-probe subprocess failed to spawn"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "neoethos_core::system",
+                timeout_ms = HW_PROBE_TIMEOUT.as_millis() as u64,
+                "hardware-probe subprocess timed out; treating as not-available"
+            );
+            None
+        }
     }
 }
 

@@ -1,3 +1,12 @@
+// **2026-05-25 — gpu-vulkan build fix**: burn-wgpu + burn-cubecl pull
+// in `wgpu_hal::dynamic::DynShaderModule` and `naga::ir::ImageClass`
+// through deeply nested generics. The default 128 trait-resolution
+// recursion limit overflows when verifying `Sync` bounds on the
+// ensemble-inference adapters. 512 covers the deepest chains we have
+// without measurably slowing the type-checker. Standard fix per the
+// rustc error E0275 documentation.
+#![recursion_limit = "512"]
+
 // Base classes and utilities (derived from models/base.py)
 pub mod base;
 pub mod common;

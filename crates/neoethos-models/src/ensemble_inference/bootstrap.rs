@@ -18,25 +18,27 @@
 //!         catboost/
 //!         …
 //!         meta_stack/
+//!         hmm_regime/         (added 2026-05-25 — HMM Phase 2)
 //! ```
 //!
 //! [`build_ensemble_for_symbol`]:
 //!  1. Builds an [`super::ExpertRegistry`] with every default
-//!     loader pre-registered (32 canonical names — all wired
-//!     families from D1.2.1-D1.2.7).
+//!     loader pre-registered (33 canonical names — all wired
+//!     families from D1.2.1-D1.2.7 + the 34th model `hmm_regime`
+//!     added 2026-05-25).
 //!  2. Calls [`super::ExpertRegistry::load_with_partial`] against
 //!     the operator's `<models_root>/<symbol>/<tf>/` directory
 //!     with the full canonical name list. Missing/degraded
 //!     artifacts are reported in the outcome (per option β —
 //!     no fail-loud) so the operator can run the bot with
-//!     whatever subset of the 32 experts has been trained.
+//!     whatever subset of the 33 experts has been trained.
 //!  3. Constructs a [`super::SoftVotingEnsemble`] with the
 //!     default config (genetic + neuro_evo excluded from voting
 //!     per the operator's 2026-05-17 directive — they're upstream
 //!     strategy discoverers).
 //!
 //! Returns the ensemble plus the load outcome so the caller's
-//! chrome / system pane can render "Loaded X/32 experts —
+//! chrome / system pane can render "Loaded X/33 experts —
 //! Y missing, Z degraded".
 //!
 //! ## What it does NOT do
@@ -73,7 +75,7 @@ use super::{
 /// [`crate::runtime::capabilities::KNOWN_MODEL_NAMES`] minus the
 /// `swarm_forecaster` name which has a stateful-univariate API
 /// that doesn't fit the current ExpertModel trait (deferred to
-/// D1.2.8). 32 names total.
+/// D1.2.8). 33 names total (34 KNOWN_MODEL_NAMES minus swarm).
 pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     // Tree (7)
     "lightgbm",
@@ -95,7 +97,7 @@ pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     "transformer",
     "patchtst",
     "timesnet",
-    // Meta (7)
+    // Meta (8 — 7 originals + hmm_regime added 2026-05-25)
     "elasticnet",
     "logistic",
     "bayes_logit",
@@ -103,6 +105,7 @@ pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     "probability_calibrator",
     "conformal_gate",
     "meta_stack",
+    "hmm_regime",
     // Adaptive + Anomaly (3)
     "online_pa",
     "online_hoeffding",
@@ -135,7 +138,7 @@ pub fn build_default_registry() -> Result<ExpertRegistry> {
     debug_assert_eq!(
         registry.registered_names().len(),
         DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(),
-        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 32 canonical names"
+        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 33 canonical names"
     );
     Ok(registry)
 }
@@ -217,8 +220,8 @@ mod tests {
 
     #[test]
     fn default_bootstrap_names_match_known_model_names_minus_swarm() {
-        // 32 names = 33 KNOWN_MODEL_NAMES minus swarm_forecaster.
-        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 32);
+        // 33 names = 34 KNOWN_MODEL_NAMES minus swarm_forecaster.
+        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 33);
         let names: std::collections::HashSet<&str> =
             DEFAULT_BOOTSTRAP_EXPERT_NAMES.iter().copied().collect();
         assert!(
@@ -233,16 +236,17 @@ mod tests {
             "meta_stack",
             "dqn",
             "neat",
+            "hmm_regime",
         ] {
             assert!(names.contains(required), "missing '{required}'");
         }
     }
 
     #[test]
-    fn build_default_registry_installs_all_32_loaders() {
+    fn build_default_registry_installs_all_33_loaders() {
         let registry = build_default_registry().expect("build default registry");
         let registered = registry.registered_names();
-        assert_eq!(registered.len(), 32);
+        assert_eq!(registered.len(), 33);
         for required in DEFAULT_BOOTSTRAP_EXPERT_NAMES {
             assert!(
                 registry.has_loader(required),
@@ -259,7 +263,7 @@ mod tests {
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
         assert_eq!(outcome.loaded_count(), 0);
         assert_eq!(outcome.degraded_count(), 0);
-        assert_eq!(outcome.missing_count(), 32);
+        assert_eq!(outcome.missing_count(), 33);
         assert!(!outcome.has_any_loaded());
     }
 
@@ -285,8 +289,8 @@ mod tests {
         // Create the expected dir so the load can scan it.
         fs::create_dir_all(&expected).expect("mkdir");
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
-        // Still 32 missing because the dir is empty, but the
+        // Still 33 missing because the dir is empty, but the
         // function didn't error out → path resolution worked.
-        assert_eq!(outcome.missing_count(), 32);
+        assert_eq!(outcome.missing_count(), 33);
     }
 }

@@ -26,9 +26,9 @@ use neoethos_search::{
     compute_discovery_forward_test_artifacts, compute_discovery_prop_firm_artifacts,
     ensure_non_empty_portfolio, run_discovery_cycle_with_progress,
     save_canonical_backtest_artifacts, save_discovery_profile_json,
-    save_forward_test_validation_artifacts, save_portfolio_json, save_promotion_summary_json,
-    save_prop_firm_validation_artifacts, save_quality_report_json, save_trade_log_json,
-    save_walkforward_validation_artifacts,
+    save_forward_test_validation_artifacts, save_funnel_json, save_portfolio_json,
+    save_promotion_summary_json, save_prop_firm_validation_artifacts, save_quality_report_json,
+    save_trade_log_json, save_walkforward_validation_artifacts,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -985,6 +985,27 @@ pub fn start_discovery_job(
                     }
                 },
             )?;
+            // 2026-05-26 operator directive (dual-mode product): save the funnel
+            // BEFORE the empty-portfolio check returns an error. The funnel is
+            // the operator's main debugging artifact when the GA returns
+            // nothing — bailing out with `ensure_non_empty_portfolio` here
+            // without persisting the funnel would mean every empty run leaves
+            // no trace of WHICH stage rejected everything.
+            let funnel_out_path = PathBuf::from("cache").join("discovery").join(format!(
+                "{}_{}.json",
+                search_request.symbol, search_request.base_tf
+            ));
+            if let Some(parent) = funnel_out_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(err) = save_funnel_json(&funnel_out_path, &result) {
+                tracing::warn!(
+                    target: "neoethos_app::discovery",
+                    error = %err,
+                    "failed to save funnel JSON (non-fatal — discovery continues)"
+                );
+            }
+
             ensure_non_empty_portfolio(
                 &result,
                 &format!("{} {}", search_request.symbol, search_request.base_tf),
@@ -1313,10 +1334,18 @@ fn discovery_record(operation: &str, status: &str, message: String) -> Sectioned
 }
 
 fn system_time_string() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch");
-    format!("{}.{:09}Z", now.as_secs(), now.subsec_nanos())
+    // F-282 fix (2026-05-25): never panic on pre-1970 clock skew.
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(now) => format!("{}.{:09}Z", now.as_secs(), now.subsec_nanos()),
+        Err(err) => {
+            tracing::warn!(
+                target: "neoethos_app::discovery",
+                error = %err,
+                "system clock is before UNIX epoch; falling back to sentinel"
+            );
+            "pre-1970.000000000Z".to_string()
+        }
+    }
 }
 
 #[cfg(test)]

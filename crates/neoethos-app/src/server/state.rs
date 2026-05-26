@@ -14,12 +14,87 @@
 //! channel.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::app_services::jobs::{CancellationFlag, JobKind};
 use crate::server::codex::CodexFlowState;
 use crate::server::engines_control::EngineRunState;
+
+/// Default config-file path when no CLI override is provided. Routes that
+/// read `Settings::from_yaml(...)` consult `AppApiState::config_path()`
+/// (when state is in scope) or [`current_config_path`] (for free fns)
+/// rather than hardcoding this literal so the CLI `--config` flag can
+/// propagate cleanly.
+///
+/// **F-553/F-576 closure (2026-05-25)**: previously hardcoded as the
+/// literal `"config.yaml"` in 9 sites across the server module. Now
+/// centralized here so the operator's CLI override flows through the
+/// typed `AppApiState` boundary (route handlers) and the process-wide
+/// install (free functions like `resolve_data_root`) instead of being
+/// lost on `cargo run` from a non-canonical working directory.
+pub const DEFAULT_CONFIG_PATH: &str = "config.yaml";
+
+static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// **F-231-related closure (2026-05-25)** — process-wide handle to
+/// the bridge's `account_refresh` trigger channel. Set once at
+/// startup from `main.rs` after `AppApiState::new()` constructs
+/// the channel; readable from anywhere in the crate (notably the
+/// cTrader execution-event parser) without threading
+/// `AppApiState` through every call site.
+///
+/// Same pattern as `current_config_path()` — process-global,
+/// install-once, accessed via a free function so deep call sites
+/// don't depend on the axum router state.
+static ACCOUNT_REFRESH_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<()>> =
+    OnceLock::new();
+
+/// Install the global account-refresh trigger. Called from `main.rs`
+/// exactly once, right after `AppApiState::new()`. Subsequent calls
+/// are silent no-ops.
+pub fn install_account_refresh_trigger(
+    tx: tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    let _ = ACCOUNT_REFRESH_TX.set(tx);
+}
+
+/// Trigger an immediate account refresh from anywhere in the
+/// process. Used by the cTrader execution-event parser
+/// (`parse_execution_event`) so a fill / close / margin call from
+/// our own POST /orders flips the dashboard to the new state
+/// without waiting up to 5 s for the bridge's safety poll.
+///
+/// Silent no-op when the global isn't installed yet (= startup
+/// race window, harmless: the bridge's 5 s timer covers it).
+pub fn trigger_global_account_refresh() {
+    if let Some(tx) = ACCOUNT_REFRESH_TX.get() {
+        if tx.send(()).is_err() {
+            tracing::warn!(
+                target: "neoethos_app::server::state",
+                "global account_refresh_tx send failed — bridge receiver dropped?"
+            );
+        }
+    }
+}
+
+/// Process-wide install of the resolved config-file path. Called once
+/// from `main` after the CLI flag has been parsed; subsequent calls
+/// are no-ops (the first install wins).
+pub fn install_config_path(path: impl Into<PathBuf>) {
+    let _ = CONFIG_PATH.set(path.into());
+}
+
+/// Resolved config-file path. Free functions that don't carry
+/// `AppApiState` (e.g. `engines_control::resolve_data_root`) consult
+/// this to honour the operator's `--config` flag.
+pub fn current_config_path() -> PathBuf {
+    CONFIG_PATH
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+}
 
 /// A minimal, render-ready account snapshot. Same shape as the
 /// `AccountSnapshot` Dart class in `backend_client.dart`. Kept here
@@ -82,6 +157,43 @@ pub struct AppApiState {
     ///   3. The data is small (`Option<CodexFlowState>` is ≤ 200 B);
     ///      cloning the `Arc<Mutex<...>>` per request is free.
     pub codex: Arc<Mutex<Option<CodexFlowState>>>,
+    /// Path to the `config.yaml` (or operator-chosen alternative) that
+    /// routes consult via `Settings::from_yaml(state.config_path())`.
+    /// `Arc<PathBuf>` so cloning state-per-request is free and the
+    /// router stays Send + Sync without an extra lock.
+    config_path: Arc<PathBuf>,
+    /// **2026-05-25 — operator directive "uniform push everywhere"**:
+    /// broadcast channel fired on every `set_account` write. The
+    /// `/account/snapshot/stream` SSE endpoint subscribes here and
+    /// forwards account updates to Flutter as they arrive — same
+    /// pattern as `live_spots::SPOT_BROADCAST` for ticks. Capacity
+    /// 64 = generous buffer for slow consumers; the cache always
+    /// has the latest value so a dropped broadcast is never a
+    /// correctness issue.
+    account_broadcast: broadcast::Sender<AccountSnapshotPayload>,
+    /// **2026-05-25 — operator directive "uniform push everywhere"**:
+    /// account-refresh trigger. The bridge polling loop checks this
+    /// channel every tick; when a message arrives, it runs an
+    /// immediate `refresh_once` instead of waiting for the 5 s
+    /// timer. Senders:
+    ///   1. The future cTrader `OAExecutionEvent` handler in
+    ///      `ctrader_session` (fill / close / margin-call push from
+    ///      the broker → instant account refresh on the bridge).
+    ///   2. `POST /account/snapshot/refresh` — operator-triggered
+    ///      force-refresh button in the UI.
+    ///
+    /// Unbounded `mpsc::UnboundedSender` because the events are
+    /// rare and we never want to block the broker handler waiting
+    /// for the bridge to drain. Each enqueue is a single atomic.
+    account_refresh_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// Receiver paired with `account_refresh_tx`. Wrapped in `Mutex`
+    /// so the bridge can take exclusive ownership at startup
+    /// without us needing to thread it through the constructor.
+    /// One-shot ownership: the bridge takes it once via
+    /// `take_account_refresh_rx`; subsequent calls panic in debug
+    /// (deliberate — a second taker is a bug).
+    account_refresh_rx:
+        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<()>>>>,
 }
 
 #[derive(Default)]
@@ -123,11 +235,88 @@ impl AppApiState {
     /// Construct with empty state. Routes that hit unfilled fields
     /// return a deterministic placeholder so the Flutter UI never
     /// renders an empty white screen during a fresh boot.
+    ///
+    /// The `config_path` is sourced from [`current_config_path`] so
+    /// state built mid-process inherits the same install that
+    /// `main.rs` performed via [`install_config_path`]. Tests that
+    /// don't install ahead of time get the default `"config.yaml"`.
     pub fn new() -> Self {
+        let (account_broadcast, _) = broadcast::channel(64);
+        let (account_refresh_tx, account_refresh_rx) =
+            tokio::sync::mpsc::unbounded_channel();
         Self {
             inner: Arc::new(RwLock::new(AppApiInner::default())),
             codex: Arc::new(Mutex::new(None)),
+            config_path: Arc::new(current_config_path()),
+            account_broadcast,
+            account_refresh_tx,
+            account_refresh_rx: Arc::new(std::sync::Mutex::new(Some(account_refresh_rx))),
         }
+    }
+
+    /// Clone of the account-refresh sender, suitable for installing
+    /// as the process-wide handle via `install_account_refresh_trigger`.
+    /// Called by `main.rs` exactly once at startup.
+    pub fn account_refresh_tx_clone(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<()> {
+        self.account_refresh_tx.clone()
+    }
+
+    /// Trigger an immediate account refresh. Non-blocking; if the
+    /// bridge isn't draining the channel (shouldn't happen — it's
+    /// the bridge's job), the send still succeeds and accumulates.
+    /// Used by:
+    ///   - `POST /account/snapshot/refresh` (operator force-refresh)
+    ///   - cTrader `OAExecutionEvent` handler via the global trigger
+    ///     (`trigger_global_account_refresh`)
+    pub fn trigger_account_refresh(&self) {
+        // `send` only fails when the receiver is dropped — that
+        // would mean the bridge died, which is a separate problem.
+        // Best-effort, log on failure.
+        if self.account_refresh_tx.send(()).is_err() {
+            tracing::warn!(
+                target: "neoethos_app::server::state",
+                "account_refresh_tx send failed — bridge receiver dropped? \
+                 Account snapshot will still refresh on the 5s timer."
+            );
+        }
+    }
+
+    /// Bridge calls this exactly once at startup to take ownership of
+    /// the receiver side. Returns `None` on a second call so a future
+    /// regression doesn't silently spawn two consumers.
+    pub fn take_account_refresh_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+        self.account_refresh_rx
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+    }
+
+    /// Subscribe to account-snapshot broadcasts. Each call returns a
+    /// fresh receiver; the SSE endpoint
+    /// `/account/snapshot/stream` calls this to wrap the receiver
+    /// into a push stream for Flutter.
+    pub fn subscribe_account(&self) -> broadcast::Receiver<AccountSnapshotPayload> {
+        self.account_broadcast.subscribe()
+    }
+
+    /// Resolved config-file path. Routes that previously hardcoded
+    /// `Settings::from_yaml("config.yaml")` now read this so the
+    /// operator's `--config` flag flows through consistently.
+    ///
+    /// **F-553/F-576 closure (2026-05-25)**: the `with_config_path`
+    /// builder was dropped because `main.rs` now uses
+    /// [`install_config_path`] for the process-wide install, and
+    /// `AppApiState::new()` already sources its default from
+    /// [`current_config_path`]. Keeping an unused builder around
+    /// would be the "dead code with attribute" anti-pattern the
+    /// operator rejected on 2026-05-25 (see `chart.rs` Broker
+    /// variant + `score_from_metrics` shim).
+    pub fn config_path(&self) -> &Path {
+        self.config_path.as_path()
     }
 
     /// Bootstrap with a canned snapshot — used by the `#[cfg(test)]`
@@ -162,11 +351,20 @@ impl AppApiState {
         self.inner.blocking_read().account.clone()
     }
 
-    /// Overwrite the cached snapshot. Called from whatever background
-    /// task pulls live data off the cTrader stream.
-    #[allow(dead_code)] // wired up next session when the streaming worker lands
+    /// Overwrite the cached snapshot AND publish to the broadcast
+    /// channel so any subscribed SSE clients receive the new state
+    /// immediately. Called from the bridge polling loop on every
+    /// successful `refresh_once`.
+    ///
+    /// **2026-05-25**: the stale `#[allow(dead_code)]` (left from
+    /// pre-bridge-wiring days) was removed — the function is now
+    /// used both by the bridge AND by the SSE push fanout.
     pub async fn set_account(&self, snapshot: AccountSnapshotPayload) {
-        self.inner.write().await.account = Some(snapshot);
+        self.inner.write().await.account = Some(snapshot.clone());
+        // Best-effort push. `send` returns `Err` when there are no
+        // subscribers — fine; the cache write above still serves the
+        // polling GET path so nothing is lost.
+        let _ = self.account_broadcast.send(snapshot);
     }
 
     /// Wipe the cached snapshot — used by the bridge when refresh

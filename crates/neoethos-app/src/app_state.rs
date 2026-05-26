@@ -139,6 +139,15 @@ pub struct DiscoveryFormState {
 
 impl Default for DiscoveryFormState {
     fn default() -> Self {
+        // F-257 documentation (2026-05-25): the higher_tfs default
+        // "M5, M15, H1" mirrors `engines_control::DEFAULT_HIGHER_TFS`
+        // — the single source of truth for the discovery default
+        // multi-timeframe ladder. Operator can override via the
+        // wizard's discovery form; the const lives in engines_control
+        // for the headless `auto_discovery` path. Both stay in sync
+        // because the comma-joined form here is the human-readable
+        // mirror of the const slice. Phase C task: introduce a typed
+        // `TimeframeSet` and have both sites point at it.
         Self {
             base_tf: "M1".to_string(),
             higher_tfs: "M5, M15, H1".to_string(),
@@ -266,9 +275,17 @@ pub struct HardwareState {
 
 impl Default for HardwareState {
     fn default() -> Self {
+        // F-265 fix (2026-05-25): the previous default was
+        // `gpu_enabled: true` unconditionally, which made the
+        // chrome banner claim GPU acceleration on hosts without
+        // one. The default is now `false` (pessimistic) — the
+        // hardware-probe sequence (system::detect_*) writes the
+        // real value into the running `HardwareState` early at
+        // startup. UI sees "GPU: probing..." → "GPU: yes/no"
+        // instead of "GPU: yes" → corrected-later.
         Self {
             cpu_cores: num_cpus::get() as i32,
-            gpu_enabled: true,
+            gpu_enabled: false,
         }
     }
 }

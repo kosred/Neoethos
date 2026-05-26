@@ -1,0 +1,821 @@
+#![cfg(feature = "cuda")]
+
+use crate::cuda::moving_averages::DeviceArrayF32;
+use crate::indicators::kurtosis::{KurtosisBatchRange, KurtosisParams};
+use cust::context::Context;
+use cust::device::Device;
+use cust::error::CudaError;
+use cust::function::{BlockSize, GridSize};
+use cust::memory::{mem_get_info, DeviceBuffer, LockedBuffer};
+use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::prelude::*;
+use cust::stream::{Stream, StreamFlags};
+use std::env;
+use std::ffi::c_void;
+use std::sync::Arc;
+use thiserror::Error;
+
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Default)]
+struct Float2 {
+    x: f32,
+    y: f32,
+}
+unsafe impl cust::memory::DeviceCopy for Float2 {}
+
+#[inline(always)]
+fn two_sum_f32(a: f32, b: f32) -> (f32, f32) {
+    let s = a + b;
+    let bb = s - a;
+    let e = (a - (s - bb)) + (b - bb);
+    (s, e)
+}
+
+#[inline(always)]
+fn ds_add((ahi, alo): (f32, f32), (bhi, blo): (f32, f32)) -> (f32, f32) {
+    let (s, mut e) = two_sum_f32(ahi, bhi);
+    e += alo + blo;
+    let hi = s + e;
+    let lo = e - (hi - s);
+    (hi, lo)
+}
+
+#[derive(Debug, Error)]
+pub enum CudaKurtosisError {
+    #[error(transparent)]
+    Cuda(#[from] CudaError),
+    #[error("out of memory: required={required} free={free} headroom={headroom}")]
+    OutOfMemory {
+        required: usize,
+        free: usize,
+        headroom: usize,
+    },
+    #[error("missing kernel symbol: {name}")]
+    MissingKernelSymbol { name: &'static str },
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    #[error("invalid policy: {0}")]
+    InvalidPolicy(&'static str),
+    #[error("launch config too large: grid=({gx},{gy},{gz}) block=({bx},{by},{bz})")]
+    LaunchConfigTooLarge {
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
+    },
+    #[error("device mismatch: buf={buf} current={current}")]
+    DeviceMismatch { buf: u32, current: u32 },
+    #[error("not implemented")]
+    NotImplemented,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum BatchKernelPolicy {
+    #[default]
+    Auto,
+    Plain {
+        block_x: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum ManySeriesKernelPolicy {
+    #[default]
+    Auto,
+    OneD {
+        block_x: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CudaKurtosisPolicy {
+    pub batch: BatchKernelPolicy,
+    pub many_series: ManySeriesKernelPolicy,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BatchKernelSelected {
+    Plain { block_x: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ManySeriesKernelSelected {
+    OneD { block_x: u32 },
+}
+
+pub struct CudaKurtosis {
+    module: Module,
+    stream: Stream,
+    context: Arc<Context>,
+    device_id: u32,
+    policy: CudaKurtosisPolicy,
+    last_batch: Option<BatchKernelSelected>,
+    last_many: Option<ManySeriesKernelSelected>,
+    debug_batch_logged: bool,
+    debug_many_logged: bool,
+}
+
+impl CudaKurtosis {
+    pub fn new(device_id: usize) -> Result<Self, CudaKurtosisError> {
+        cust::init(CudaFlags::empty())?;
+        let device = Device::get_device(device_id as u32)?;
+        let context = Arc::new(Context::new(device)?);
+
+        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/kurtosis_kernel.ptx"));
+        let jit_opts = &[
+            ModuleJitOption::DetermineTargetFromContext,
+            ModuleJitOption::OptLevel(OptLevel::O2),
+        ];
+        let module = crate::load_cuda_embedded_module!("kurtosis_kernel")?;
+
+        let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
+
+        Ok(Self {
+            module,
+            stream,
+            context,
+            device_id: device_id as u32,
+            policy: CudaKurtosisPolicy::default(),
+            last_batch: None,
+            last_many: None,
+            debug_batch_logged: false,
+            debug_many_logged: false,
+        })
+    }
+
+    pub fn set_policy(&mut self, policy: CudaKurtosisPolicy) {
+        self.policy = policy;
+    }
+    pub fn policy(&self) -> &CudaKurtosisPolicy {
+        &self.policy
+    }
+    pub fn selected_batch_kernel(&self) -> Option<BatchKernelSelected> {
+        self.last_batch
+    }
+    pub fn selected_many_series_kernel(&self) -> Option<ManySeriesKernelSelected> {
+        self.last_many
+    }
+    pub fn context_arc(&self) -> Arc<Context> {
+        self.context.clone()
+    }
+    pub fn device_id(&self) -> u32 {
+        self.device_id
+    }
+
+    #[inline]
+    pub fn synchronize(&self) -> Result<(), CudaKurtosisError> {
+        self.stream.synchronize().map_err(Into::into)
+    }
+
+    #[inline]
+    fn mem_check_enabled() -> bool {
+        match env::var("CUDA_MEM_CHECK") {
+            Ok(v) => v != "0" && v.to_lowercase() != "false",
+            Err(_) => true,
+        }
+    }
+    #[inline]
+    fn device_mem_info() -> Option<(usize, usize)> {
+        mem_get_info().ok()
+    }
+    #[inline]
+    fn will_fit(required_bytes: usize, headroom_bytes: usize) -> bool {
+        if !Self::mem_check_enabled() {
+            return true;
+        }
+        if let Some((free, _)) = Self::device_mem_info() {
+            return required_bytes.saturating_add(headroom_bytes) <= free;
+        }
+        true
+    }
+
+    #[inline]
+    fn maybe_log_batch_debug(&self) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if self.debug_batch_logged {
+            return;
+        }
+        if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(sel) = self.last_batch {
+                if !ONCE.swap(true, Ordering::Relaxed) {
+                    eprintln!("[DEBUG] kurtosis batch selected kernel: {:?}", sel);
+                }
+                unsafe {
+                    (*(self as *const _ as *mut CudaKurtosis)).debug_batch_logged = true;
+                }
+            }
+        }
+    }
+    #[inline]
+    fn maybe_log_many_debug(&self) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if self.debug_many_logged {
+            return;
+        }
+        if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(sel) = self.last_many {
+                if !ONCE.swap(true, Ordering::Relaxed) {
+                    eprintln!("[DEBUG] kurtosis many-series selected kernel: {:?}", sel);
+                }
+                unsafe {
+                    (*(self as *const _ as *mut CudaKurtosis)).debug_many_logged = true;
+                }
+            }
+        }
+    }
+
+    fn expand_grid(r: &KurtosisBatchRange) -> Result<Vec<KurtosisParams>, CudaKurtosisError> {
+        fn axis_usize(
+            (start, end, step): (usize, usize, usize),
+        ) -> Result<Vec<usize>, CudaKurtosisError> {
+            if step == 0 || start == end {
+                return Ok(vec![start]);
+            }
+            if start < end {
+                return Ok((start..=end).step_by(step.max(1)).collect());
+            }
+            let mut v = Vec::new();
+            let mut x = start as isize;
+            let end_i = end as isize;
+            let st = (step as isize).max(1);
+            while x >= end_i {
+                v.push(x as usize);
+                x -= st;
+            }
+            if v.is_empty() {
+                return Err(CudaKurtosisError::InvalidInput(format!(
+                    "invalid period range: start={} end={} step={}",
+                    start, end, step
+                )));
+            }
+            Ok(v)
+        }
+        let periods = axis_usize(r.period)?;
+        let mut out = Vec::with_capacity(periods.len());
+        for p in periods {
+            out.push(KurtosisParams { period: Some(p) });
+        }
+        Ok(out)
+    }
+
+    fn prepare_batch_inputs(
+        data_f32: &[f32],
+        sweep: &KurtosisBatchRange,
+    ) -> Result<(Vec<KurtosisParams>, usize, usize), CudaKurtosisError> {
+        if data_f32.is_empty() {
+            return Err(CudaKurtosisError::InvalidInput("empty data".into()));
+        }
+        let len = data_f32.len();
+        let first_valid = data_f32
+            .iter()
+            .position(|v| !v.is_nan())
+            .ok_or_else(|| CudaKurtosisError::InvalidInput("all values are NaN".into()))?;
+        let combos = Self::prepare_device_batch_inputs(len, first_valid, sweep)?;
+        Ok((combos, first_valid, len))
+    }
+
+    fn prepare_device_batch_inputs(
+        len: usize,
+        first_valid: usize,
+        sweep: &KurtosisBatchRange,
+    ) -> Result<Vec<KurtosisParams>, CudaKurtosisError> {
+        if len == 0 {
+            return Err(CudaKurtosisError::InvalidInput("empty data".into()));
+        }
+        if first_valid >= len {
+            return Err(CudaKurtosisError::InvalidInput(
+                "first_valid must be within the input length".into(),
+            ));
+        }
+
+        let combos = Self::expand_grid(sweep)?;
+        if combos.is_empty() {
+            return Err(CudaKurtosisError::InvalidInput(
+                "no parameter combinations".into(),
+            ));
+        }
+        for c in &combos {
+            let p = c.period.unwrap_or(0);
+            if p == 0 {
+                return Err(CudaKurtosisError::InvalidInput("period must be > 0".into()));
+            }
+            if p > len {
+                return Err(CudaKurtosisError::InvalidInput(
+                    "period exceeds data length".into(),
+                ));
+            }
+            if len - first_valid < p {
+                return Err(CudaKurtosisError::InvalidInput(
+                    "not enough valid data after first_valid".into(),
+                ));
+            }
+        }
+        Ok(combos)
+    }
+
+    fn build_prefixes_ds(
+        &self,
+        data: &[f32],
+    ) -> Result<
+        (
+            LockedBuffer<Float2>,
+            LockedBuffer<Float2>,
+            LockedBuffer<Float2>,
+            LockedBuffer<Float2>,
+            LockedBuffer<i32>,
+        ),
+        CudaKurtosisError,
+    > {
+        let n = data.len();
+        let mut ps1 = unsafe { LockedBuffer::<Float2>::uninitialized(n + 1) }?;
+        let mut ps2 = unsafe { LockedBuffer::<Float2>::uninitialized(n + 1) }?;
+        let mut ps3 = unsafe { LockedBuffer::<Float2>::uninitialized(n + 1) }?;
+        let mut ps4 = unsafe { LockedBuffer::<Float2>::uninitialized(n + 1) }?;
+        let mut ps_nan = unsafe { LockedBuffer::<i32>::uninitialized(n + 1) }?;
+
+        ps1.as_mut_slice()[0] = Float2 { x: 0.0, y: 0.0 };
+        ps2.as_mut_slice()[0] = Float2 { x: 0.0, y: 0.0 };
+        ps3.as_mut_slice()[0] = Float2 { x: 0.0, y: 0.0 };
+        ps4.as_mut_slice()[0] = Float2 { x: 0.0, y: 0.0 };
+        ps_nan.as_mut_slice()[0] = 0;
+
+        let mut s1 = (0.0f32, 0.0f32);
+        let mut s2 = (0.0f32, 0.0f32);
+        let mut s3 = (0.0f32, 0.0f32);
+        let mut s4 = (0.0f32, 0.0f32);
+        let mut nan_count = 0i32;
+
+        let ps1_slice = ps1.as_mut_slice();
+        let ps2_slice = ps2.as_mut_slice();
+        let ps3_slice = ps3.as_mut_slice();
+        let ps4_slice = ps4.as_mut_slice();
+        let psn_slice = ps_nan.as_mut_slice();
+
+        for i in 0..n {
+            let v = data[i];
+            if v.is_nan() {
+                nan_count += 1;
+            } else {
+                let d = v;
+                let d2 = d.mul_add(d, 0.0);
+                s1 = ds_add(s1, (d, 0.0));
+                s2 = ds_add(s2, (d2, 0.0));
+                s3 = ds_add(s3, (d2 * d, 0.0));
+                s4 = ds_add(s4, (d2 * d2, 0.0));
+            }
+
+            ps1_slice[i + 1] = Float2 { x: s1.0, y: s1.1 };
+            ps2_slice[i + 1] = Float2 { x: s2.0, y: s2.1 };
+            ps3_slice[i + 1] = Float2 { x: s3.0, y: s3.1 };
+            ps4_slice[i + 1] = Float2 { x: s4.0, y: s4.1 };
+            psn_slice[i + 1] = nan_count;
+        }
+        Ok((ps1, ps2, ps3, ps4, ps_nan))
+    }
+
+    fn launch_batch(
+        &self,
+        d_ps1: &DeviceBuffer<Float2>,
+        d_ps2: &DeviceBuffer<Float2>,
+        d_ps3: &DeviceBuffer<Float2>,
+        d_ps4: &DeviceBuffer<Float2>,
+        d_ps_nan: &DeviceBuffer<i32>,
+        len: usize,
+        first_valid: usize,
+        d_periods: &DeviceBuffer<i32>,
+        combos: usize,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaKurtosisError> {
+        let func = self
+            .module
+            .get_function("kurtosis_batch_f32")
+            .map_err(|_| CudaKurtosisError::MissingKernelSymbol {
+                name: "kurtosis_batch_f32",
+            })?;
+
+        let block_x: u32 = match self.policy.batch {
+            BatchKernelPolicy::Auto => 512,
+            BatchKernelPolicy::Plain { block_x } => block_x.max(64),
+        };
+        let grid_x: u32 = ((len as u32) + block_x - 1) / block_x;
+        let grid_base: GridSize = (grid_x.max(1), 1, 1).into();
+        let block: BlockSize = (block_x, 1, 1).into();
+        unsafe {
+            (*(self as *const _ as *mut CudaKurtosis)).last_batch =
+                Some(BatchKernelSelected::Plain { block_x });
+        }
+
+        let mut launched = 0usize;
+        while launched < combos {
+            let chunk = (combos - launched).min(65_535);
+            let grid: GridSize = (grid_base.x, chunk as u32, 1).into();
+            unsafe {
+                let mut ps1 = d_ps1.as_device_ptr().as_raw();
+                let mut ps2 = d_ps2.as_device_ptr().as_raw();
+                let mut ps3 = d_ps3.as_device_ptr().as_raw();
+                let mut ps4 = d_ps4.as_device_ptr().as_raw();
+                let mut psn = d_ps_nan.as_device_ptr().as_raw();
+                let mut len_i = len as i32;
+                let mut first_valid_i = first_valid as i32;
+
+                let mut periods = d_periods
+                    .as_device_ptr()
+                    .as_raw()
+                    .saturating_add((launched as u64) * (std::mem::size_of::<i32>() as u64));
+                let mut combos_i = chunk as i32;
+                let mut outp = d_out.as_device_ptr().as_raw().saturating_add(
+                    ((launched * len) as u64) * (std::mem::size_of::<f32>() as u64),
+                );
+                let args: &mut [*mut c_void] = &mut [
+                    &mut ps1 as *mut _ as *mut c_void,
+                    &mut ps2 as *mut _ as *mut c_void,
+                    &mut ps3 as *mut _ as *mut c_void,
+                    &mut ps4 as *mut _ as *mut c_void,
+                    &mut psn as *mut _ as *mut c_void,
+                    &mut len_i as *mut _ as *mut c_void,
+                    &mut first_valid_i as *mut _ as *mut c_void,
+                    &mut periods as *mut _ as *mut c_void,
+                    &mut combos_i as *mut _ as *mut c_void,
+                    &mut outp as *mut _ as *mut c_void,
+                ];
+                self.stream.launch(&func, grid, block, 0, args)?;
+            }
+            launched += chunk;
+        }
+        Ok(())
+    }
+
+    fn launch_prefix_builder_device_raw(
+        &self,
+        d_data: &DeviceBuffer<f32>,
+        len: usize,
+        first_valid: usize,
+        d_ps1: &mut DeviceBuffer<Float2>,
+        d_ps2: &mut DeviceBuffer<Float2>,
+        d_ps3: &mut DeviceBuffer<Float2>,
+        d_ps4: &mut DeviceBuffer<Float2>,
+        d_ps_nan: &mut DeviceBuffer<i32>,
+    ) -> Result<(), CudaKurtosisError> {
+        let func = self
+            .module
+            .get_function("kurtosis_build_prefix_f32")
+            .map_err(|_| CudaKurtosisError::MissingKernelSymbol {
+                name: "kurtosis_build_prefix_f32",
+            })?;
+        let grid: GridSize = (1, 1, 1).into();
+        let block: BlockSize = (1, 1, 1).into();
+
+        unsafe {
+            let mut data_ptr = d_data.as_device_ptr().as_raw();
+            let mut len_i = len as i32;
+            let mut first_valid_i = first_valid as i32;
+            let mut ps1_ptr = d_ps1.as_device_ptr().as_raw();
+            let mut ps2_ptr = d_ps2.as_device_ptr().as_raw();
+            let mut ps3_ptr = d_ps3.as_device_ptr().as_raw();
+            let mut ps4_ptr = d_ps4.as_device_ptr().as_raw();
+            let mut psn_ptr = d_ps_nan.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut data_ptr as *mut _ as *mut c_void,
+                &mut len_i as *mut _ as *mut c_void,
+                &mut first_valid_i as *mut _ as *mut c_void,
+                &mut ps1_ptr as *mut _ as *mut c_void,
+                &mut ps2_ptr as *mut _ as *mut c_void,
+                &mut ps3_ptr as *mut _ as *mut c_void,
+                &mut ps4_ptr as *mut _ as *mut c_void,
+                &mut psn_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn kurtosis_batch_dev(
+        &self,
+        data_f32: &[f32],
+        sweep: &KurtosisBatchRange,
+    ) -> Result<(DeviceArrayF32, Vec<KurtosisParams>), CudaKurtosisError> {
+        let (_, first_valid, len) = Self::prepare_batch_inputs(data_f32, sweep)?;
+        let d_data = DeviceBuffer::from_slice(data_f32)?;
+        let out = self.kurtosis_batch_dev_from_device_prices(&d_data, len, first_valid, sweep)?;
+        self.stream.synchronize()?;
+        Ok(out)
+    }
+
+    pub fn kurtosis_batch_dev_from_device_prices(
+        &self,
+        d_data: &DeviceBuffer<f32>,
+        len: usize,
+        first_valid: usize,
+        sweep: &KurtosisBatchRange,
+    ) -> Result<(DeviceArrayF32, Vec<KurtosisParams>), CudaKurtosisError> {
+        if d_data.len() != len {
+            return Err(CudaKurtosisError::InvalidInput(format!(
+                "device input length mismatch (buffer={}, len={})",
+                d_data.len(),
+                len
+            )));
+        }
+
+        let combos = Self::prepare_device_batch_inputs(len, first_valid, sweep)?;
+        let periods: Vec<i32> = combos.iter().map(|c| c.period.unwrap() as i32).collect();
+        let prefix_elems = len
+            .checked_add(1)
+            .ok_or_else(|| CudaKurtosisError::InvalidInput("prefix length overflow".into()))?;
+        let bytes_prefix = prefix_elems
+            .checked_mul(4)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<Float2>()))
+            .ok_or_else(|| CudaKurtosisError::InvalidInput("prefix bytes overflow".into()))?;
+        let bytes_nan = prefix_elems
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| CudaKurtosisError::InvalidInput("nan bytes overflow".into()))?;
+        let bytes_periods = periods
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| CudaKurtosisError::InvalidInput("period bytes overflow".into()))?;
+        let out_elems = combos
+            .len()
+            .checked_mul(len)
+            .ok_or_else(|| CudaKurtosisError::InvalidInput("rows*cols overflow".into()))?;
+        let bytes_out = out_elems
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| CudaKurtosisError::InvalidInput("output bytes overflow".into()))?;
+        let required = bytes_prefix
+            .checked_add(bytes_nan)
+            .and_then(|v| v.checked_add(bytes_periods))
+            .and_then(|v| v.checked_add(bytes_out))
+            .ok_or_else(|| CudaKurtosisError::InvalidInput("VRAM bytes overflow".into()))?;
+        let headroom = 64 * 1024 * 1024;
+        if !Self::will_fit(required, headroom) {
+            if let Some((free, _)) = Self::device_mem_info() {
+                return Err(CudaKurtosisError::OutOfMemory {
+                    required,
+                    free,
+                    headroom,
+                });
+            } else {
+                return Err(CudaKurtosisError::InvalidInput(
+                    "insufficient device memory".into(),
+                ));
+            }
+        }
+
+        let mut d_ps1 = unsafe { DeviceBuffer::<Float2>::uninitialized(prefix_elems) }?;
+        let mut d_ps2 = unsafe { DeviceBuffer::<Float2>::uninitialized(prefix_elems) }?;
+        let mut d_ps3 = unsafe { DeviceBuffer::<Float2>::uninitialized(prefix_elems) }?;
+        let mut d_ps4 = unsafe { DeviceBuffer::<Float2>::uninitialized(prefix_elems) }?;
+        let mut d_psn = unsafe { DeviceBuffer::<i32>::uninitialized(prefix_elems) }?;
+        self.launch_prefix_builder_device_raw(
+            d_data,
+            len,
+            first_valid,
+            &mut d_ps1,
+            &mut d_ps2,
+            &mut d_ps3,
+            &mut d_ps4,
+            &mut d_psn,
+        )?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let mut d_out = unsafe { DeviceBuffer::<f32>::uninitialized(out_elems) }?;
+
+        self.launch_batch(
+            &d_ps1,
+            &d_ps2,
+            &d_ps3,
+            &d_ps4,
+            &d_psn,
+            len,
+            first_valid,
+            &d_periods,
+            combos.len(),
+            &mut d_out,
+        )?;
+        self.maybe_log_batch_debug();
+
+        Ok((
+            DeviceArrayF32 {
+                buf: d_out,
+                rows: combos.len(),
+                cols: len,
+            },
+            combos,
+        ))
+    }
+
+    pub fn kurtosis_many_series_one_param_time_major_dev(
+        &self,
+        data_tm_f32: &[f32],
+        cols: usize,
+        rows: usize,
+        period: usize,
+    ) -> Result<DeviceArrayF32, CudaKurtosisError> {
+        if cols == 0 || rows == 0 {
+            return Err(CudaKurtosisError::InvalidInput("empty matrix".into()));
+        }
+        let elems = cols
+            .checked_mul(rows)
+            .ok_or_else(|| CudaKurtosisError::InvalidInput("cols*rows overflow".into()))?;
+        if data_tm_f32.len() != elems {
+            return Err(CudaKurtosisError::InvalidInput(
+                "time-major slice length mismatch".into(),
+            ));
+        }
+        if period == 0 {
+            return Err(CudaKurtosisError::InvalidInput("period must be > 0".into()));
+        }
+
+        let mut first_valids = vec![-1i32; cols];
+        for s in 0..cols {
+            let mut fv = -1i32;
+            for t in 0..rows {
+                let v = data_tm_f32[t * cols + s];
+                if !v.is_nan() {
+                    fv = t as i32;
+                    break;
+                }
+            }
+            first_valids[s] = fv;
+        }
+
+        let bytes_in = elems
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| CudaKurtosisError::InvalidInput("bytes_in overflow".into()))?;
+        let bytes_out = bytes_in;
+        let bytes_fv = cols
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| CudaKurtosisError::InvalidInput("bytes_fv overflow".into()))?;
+        let required = bytes_in
+            .checked_add(bytes_out)
+            .and_then(|v| v.checked_add(bytes_fv))
+            .ok_or_else(|| CudaKurtosisError::InvalidInput("VRAM bytes overflow".into()))?;
+        let headroom = 64 * 1024 * 1024;
+        if !Self::will_fit(required, headroom) {
+            if let Some((free, _)) = Self::device_mem_info() {
+                return Err(CudaKurtosisError::OutOfMemory {
+                    required,
+                    free,
+                    headroom,
+                });
+            } else {
+                return Err(CudaKurtosisError::InvalidInput(
+                    "insufficient device memory".into(),
+                ));
+            }
+        }
+
+        let d_in = unsafe { DeviceBuffer::from_slice_async(data_tm_f32, &self.stream) }?;
+        let d_fv = unsafe { DeviceBuffer::from_slice_async(&first_valids, &self.stream) }?;
+        let mut d_out = unsafe { DeviceBuffer::<f32>::uninitialized_async(elems, &self.stream)? };
+
+        let func = self
+            .module
+            .get_function("kurtosis_many_series_one_param_f32")
+            .map_err(|_| CudaKurtosisError::MissingKernelSymbol {
+                name: "kurtosis_many_series_one_param_f32",
+            })?;
+        let block_x: u32 = match self.policy.many_series {
+            ManySeriesKernelPolicy::Auto => 128,
+            ManySeriesKernelPolicy::OneD { block_x } => block_x.max(32),
+        };
+        let grid: GridSize = (cols as u32, 1, 1).into();
+        let block: BlockSize = (block_x, 1, 1).into();
+        unsafe {
+            (*(self as *const _ as *mut CudaKurtosis)).last_many =
+                Some(ManySeriesKernelSelected::OneD { block_x });
+        }
+        unsafe {
+            (*(self as *const _ as *mut CudaKurtosis)).last_many =
+                Some(ManySeriesKernelSelected::OneD { block_x });
+        }
+
+        unsafe {
+            let mut in_ptr = d_in.as_device_ptr().as_raw();
+            let mut fv_ptr = d_fv.as_device_ptr().as_raw();
+            let mut period_i = period as i32;
+            let mut cols_i = cols as i32;
+            let mut rows_i = rows as i32;
+            let mut out_ptr = d_out.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut in_ptr as *mut _ as *mut c_void,
+                &mut fv_ptr as *mut _ as *mut c_void,
+                &mut period_i as *mut _ as *mut c_void,
+                &mut cols_i as *mut _ as *mut c_void,
+                &mut rows_i as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?;
+        }
+        self.stream.synchronize()?;
+        self.maybe_log_many_debug();
+
+        Ok(DeviceArrayF32 {
+            buf: d_out,
+            rows,
+            cols,
+        })
+    }
+}
+
+pub mod benches {
+    use super::*;
+    use crate::cuda::bench::helpers::gen_series;
+    use crate::cuda::bench::{CudaBenchScenario, CudaBenchState};
+    use crate::indicators::kurtosis::KurtosisBatchRange;
+
+    const ONE_SERIES_LEN: usize = 1_000_000;
+    const PARAM_SWEEP: usize = 250;
+
+    fn bytes_one_series_many_params() -> usize {
+        let ps = (ONE_SERIES_LEN + 1) * std::mem::size_of::<super::Float2>();
+        let prefixes = 4 * ps + (ONE_SERIES_LEN + 1) * std::mem::size_of::<i32>();
+        let periods = PARAM_SWEEP * std::mem::size_of::<i32>();
+        let out = ONE_SERIES_LEN * PARAM_SWEEP * std::mem::size_of::<f32>();
+        prefixes + periods + out + 64 * 1024 * 1024
+    }
+
+    struct KurtosisBatchState {
+        cuda: CudaKurtosis,
+        d_ps1: DeviceBuffer<Float2>,
+        d_ps2: DeviceBuffer<Float2>,
+        d_ps3: DeviceBuffer<Float2>,
+        d_ps4: DeviceBuffer<Float2>,
+        d_ps_nan: DeviceBuffer<i32>,
+        d_periods: DeviceBuffer<i32>,
+        first_valid: usize,
+        len: usize,
+        n_combos: usize,
+        d_out: DeviceBuffer<f32>,
+    }
+    impl CudaBenchState for KurtosisBatchState {
+        fn launch(&mut self) {
+            self.cuda
+                .launch_batch(
+                    &self.d_ps1,
+                    &self.d_ps2,
+                    &self.d_ps3,
+                    &self.d_ps4,
+                    &self.d_ps_nan,
+                    self.len,
+                    self.first_valid,
+                    &self.d_periods,
+                    self.n_combos,
+                    &mut self.d_out,
+                )
+                .expect("kurtosis batch");
+            self.cuda.synchronize().expect("kurtosis sync");
+        }
+    }
+
+    fn prep_one_series_many_params() -> Box<dyn CudaBenchState> {
+        let cuda = CudaKurtosis::new(0).expect("cuda kurtosis");
+        let price = gen_series(ONE_SERIES_LEN);
+        let sweep = KurtosisBatchRange {
+            period: (10, 10 + PARAM_SWEEP - 1, 1),
+        };
+        let (combos, first_valid, len) =
+            CudaKurtosis::prepare_batch_inputs(&price, &sweep).expect("kurtosis prep");
+        let (h_ps1, h_ps2, h_ps3, h_ps4, h_ps_nan) =
+            cuda.build_prefixes_ds(&price).expect("prefixes");
+        let periods: Vec<i32> = combos.iter().map(|c| c.period.unwrap() as i32).collect();
+
+        let d_ps1 = DeviceBuffer::from_slice(h_ps1.as_slice()).expect("d_ps1");
+        let d_ps2 = DeviceBuffer::from_slice(h_ps2.as_slice()).expect("d_ps2");
+        let d_ps3 = DeviceBuffer::from_slice(h_ps3.as_slice()).expect("d_ps3");
+        let d_ps4 = DeviceBuffer::from_slice(h_ps4.as_slice()).expect("d_ps4");
+        let d_ps_nan = DeviceBuffer::from_slice(h_ps_nan.as_slice()).expect("d_ps_nan");
+        let d_periods = DeviceBuffer::from_slice(&periods).expect("d_periods");
+        let elems = len * combos.len();
+        let d_out = unsafe { DeviceBuffer::<f32>::uninitialized(elems) }.expect("d_out");
+
+        Box::new(KurtosisBatchState {
+            cuda,
+            d_ps1,
+            d_ps2,
+            d_ps3,
+            d_ps4,
+            d_ps_nan,
+            d_periods,
+            first_valid,
+            len,
+            n_combos: combos.len(),
+            d_out,
+        })
+    }
+
+    pub fn bench_profiles() -> Vec<CudaBenchScenario> {
+        vec![CudaBenchScenario::new(
+            "kurtosis",
+            "one_series_many_params",
+            "kurtosis_cuda_batch_dev",
+            "1m_x_250",
+            prep_one_series_many_params,
+        )
+        .with_sample_size(10)
+        .with_mem_required(bytes_one_series_many_params())]
+    }
+}

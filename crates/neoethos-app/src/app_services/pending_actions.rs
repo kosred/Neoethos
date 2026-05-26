@@ -197,12 +197,26 @@ pub fn propose(kind: ActionKind, reason: String) -> Result<String> {
     {
         // Evict the oldest Pending entry. Confirmed / Executed
         // entries we keep around for audit + UI history.
+        //
+        // `q.iter().position(...)` guarantees the index is in-range, so
+        // `q.remove(idx)` returns `Some(_)` by construction. Even so, we
+        // pattern-match instead of `.expect()` per the no-panic doctrine —
+        // if a future refactor breaks the invariant, we silently skip
+        // the eviction and log, rather than crashing the whole server.
         if let Some(idx) = q.iter().position(|a| a.status == ActionStatus::Pending) {
-            let mut evicted = q.remove(idx).expect("position from iter");
-            evicted.status = ActionStatus::Expired;
-            evicted.result_note =
-                "Evicted by queue-cap pressure to make room for newer proposal".to_string();
-            journal_to_disk(&evicted);
+            if let Some(mut evicted) = q.remove(idx) {
+                evicted.status = ActionStatus::Expired;
+                evicted.result_note =
+                    "Evicted by queue-cap pressure to make room for newer proposal".to_string();
+                journal_to_disk(&evicted);
+            } else {
+                tracing::warn!(
+                    target: "neoethos_app::pending_actions",
+                    idx,
+                    "queue eviction race: position() said Some but remove() said None — \
+                     skipping eviction (queue likely mutated between calls)"
+                );
+            }
         }
     }
     let now = current_unix_ms();
@@ -344,11 +358,14 @@ fn sweep_expired(q: &mut VecDeque<PendingAction>) {
 
 /// Canonical on-disk audit path. Honours
 /// `NEOETHOS_PENDING_ACTIONS_PATH` for tests / CI.
+///
+/// **F-CORE3 closure (2026-05-25)**: routed through the canonical
+/// `env_overrides::pending_actions_path_override` typed getter.
 pub fn default_journal_path() -> PathBuf {
-    if let Ok(custom) = std::env::var("NEOETHOS_PENDING_ACTIONS_PATH") {
-        if !custom.trim().is_empty() {
-            return PathBuf::from(custom);
-        }
+    if let Some(custom) =
+        crate::app_services::env_overrides::pending_actions_path_override()
+    {
+        return PathBuf::from(custom);
     }
     let base = dirs::data_dir().unwrap_or_else(|| {
         std::env::current_dir()

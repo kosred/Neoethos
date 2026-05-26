@@ -6,7 +6,8 @@
 // trade-state vectors recorded from a backtest over the target
 // symbol/timeframe so the regret / propagation paths fire on
 // realistic outcomes.
-use super::*;
+// `use super::*;` removed 2026-05-26 — nothing actually consumed from it; the
+// explicit import below covers every symbol referenced in the test bodies.
 use super::{ExitAgent, ExitAgentArtifact, Experience, PendingRegret, exit_runtime_metadata};
 use crate::base::three_class_runtime_confidence;
 use crate::statistical::common::{METADATA_FILE_NAME, write_json};

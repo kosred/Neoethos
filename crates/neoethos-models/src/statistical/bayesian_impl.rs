@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use ndarray::{Array1, Array2, Axis};
+use neoethos_core::storage::json::{DirBackupWriteConfig, write_dir_with_backup};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::base::{
     ExpertModel, build_runtime_prediction_with_details, canonical_three_class_label_mapping,
@@ -68,72 +69,23 @@ fn split_train_val_indices(rows: usize) -> (Vec<usize>, Vec<usize>) {
     (train, val)
 }
 
-fn staged_bayesian_artifact_dir(path: &Path) -> PathBuf {
-    path.with_extension("tmp_bayesian_artifact")
-}
-
-fn backup_bayesian_artifact_dir(path: &Path) -> PathBuf {
-    path.with_extension("bak_bayesian_artifact")
-}
-
-fn cleanup_bayesian_artifact_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("remove bayesian artifact directory {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn replace_bayesian_artifact_dir(staged_path: &Path, target_path: &Path) -> Result<()> {
-    let backup_path = backup_bayesian_artifact_dir(target_path);
-    cleanup_bayesian_artifact_dir(&backup_path)?;
-    if target_path.exists() {
-        std::fs::rename(target_path, &backup_path).with_context(|| {
-            format!(
-                "move previous bayesian artifact into backup {}",
-                backup_path.display()
-            )
-        })?;
-    }
-    if let Err(error) = std::fs::rename(staged_path, target_path) {
-        if backup_path.exists() {
-            if let Err(restore_err) = std::fs::rename(&backup_path, target_path) {
-                tracing::error!(
-                    target: "neoethos_models::artifact",
-                    backup = %backup_path.display(),
-                    target = %target_path.display(),
-                    error = %restore_err,
-                    "failed to restore backup after staged-rename failure;                      artifact directory may be in an inconsistent state"
-                );
-            }
-        }
-        bail!(
-            "rename staged bayesian artifact into {} failed: {}",
-            target_path.display(),
-            error
-        );
-    }
-    cleanup_bayesian_artifact_dir(&backup_path)?;
-    Ok(())
-}
-
+/// GROUP E remediation 2026-05-25: 5 hand-rolled functions replaced
+/// with a single delegation to the canonical `write_dir_with_backup`
+/// helper in `neoethos-core::storage::json`. Saves ~60 LOC of duplicate
+/// staged-tmp+backup logic (this file is one of 4).
 fn with_staged_bayesian_artifact_dir<F>(path: &Path, writer: F) -> Result<()>
 where
     F: FnOnce(&Path) -> Result<()>,
 {
-    let staged_path = staged_bayesian_artifact_dir(path);
-    cleanup_bayesian_artifact_dir(&staged_path)?;
-    std::fs::create_dir_all(&staged_path).with_context(|| {
-        format!(
-            "create staged bayesian artifact directory {}",
-            staged_path.display()
-        )
-    })?;
-    if let Err(error) = writer(&staged_path) {
-        let _ = cleanup_bayesian_artifact_dir(&staged_path);
-        return Err(error);
-    }
-    replace_bayesian_artifact_dir(&staged_path, path)
+    write_dir_with_backup(
+        path,
+        DirBackupWriteConfig {
+            artifact_label: "bayesian artifact",
+            temp_extension: "tmp_bayesian_artifact",
+            backup_extension: "bak_bayesian_artifact",
+        },
+        writer,
+    )
 }
 
 fn runtime_metadata(
@@ -514,14 +466,15 @@ fn validate_bayesian_artifact(artifact: &BayesianOneVsRestArtifact) -> Result<()
             artifact.feature_columns.len()
         );
     }
-    if artifact.runtime_metadata.is_none() {
+    // **2026-05-25 unwrap audit**: collapse the is_none check + the
+    // `.expect("checked runtime metadata presence")` extraction into a
+    // single `let-else` so no panic-shaped expression remains. Same
+    // bail message preserved.
+    let Some(runtime_meta) = artifact.runtime_metadata.as_ref() else {
         bail!("bayesian artifact must persist runtime metadata");
-    }
+    };
     validate_runtime_metadata(
-        artifact
-            .runtime_metadata
-            .as_ref()
-            .expect("checked runtime metadata presence"),
+        runtime_meta,
         "bayes_logit",
         &artifact.feature_columns,
         artifact.dataset_rows,

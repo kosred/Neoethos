@@ -25,7 +25,14 @@ xgb = { version = "3.0.5", optional = true }
 catboost-rust = { version = "0.3.6", optional = true, features = ["gpu"] }
 sklears = { version = "0.1.1", optional = true, features = ["tree"] }
 candle-core = { version = "0.9.1", optional = true }
-cubecl = { version = "0.9.0", optional = true, default-features = false, features = ["std", "cuda"] }
+# cubecl 0.10 — pure defaults. Defaults already include cubecl-core,
+# cubecl-cuda?, cubecl-cpu?, cubecl-hip?, cubecl-wgpu? (all optional —
+# only activated when something else turns them on). NO explicit
+# runtime feature forced from here; the consumer (burn-wgpu via its
+# own defaults) decides which runtime to pull. This avoids the
+# wgpu/Naga SPIR-V path that crashes the AMD Vulkan Windows driver
+# (gfx-rs/wgpu issues #6329/#7198/#5733), confirmed 2026-05-26.
+cubecl = { version = "0.10.0", optional = true }
 
 # Pure Rust Evolutionary & Reinforcement Learning
 crfmnes = { version = "1.0.0", optional = true }
@@ -43,11 +50,34 @@ linfa-clustering = { version = "0.7.0", optional = true }
 variational-regression = { version = "0.1.0", optional = true }
 extended-isolation-forest = { version = "0.2.0", optional = true, features = ["serde"] }
 
-# Burn framework — use autodiff only (no train/dataset to avoid rusqlite conflict)
-# burn-nn is always included in burn-core, no extra dep needed
-burn = { version = "0.20", default-features = false, features = ["autodiff", "std"] }
-burn-ndarray = { version = "0.20", default-features = false, features = ["std"] }
-burn-wgpu = { version = "0.20.1", optional = true, default-features = false, features = ["std", "vulkan", "fusion"] }
+# Burn framework — Vulkan Tier-1 perf push (2026-05-25).
+#
+# burn 0.20→0.21 + cubecl 0.9→0.10, with FULL default features
+# preserved across all three crates so we don't accidentally drop
+# performance-critical defaults like `autotune` (the kernel
+# auto-selector that gives 1.5-3× matmul speedups), `fusion`
+# (element-wise + reduction op fusion, 70×+ on fusable subgraphs),
+# or the cubecl kernel variants that autotune picks between.
+#
+# `vulkan` is added on top of the defaults — it pulls cubecl-spirv
+# for direct Naga→SPIR-V compilation (~5-15% kernel-launch win) and
+# is the only path to AMD/Intel GPUs since cuda is NVIDIA-only.
+# `autodiff` on `burn` is needed because we use Autodiff<Wgpu> in
+# the training pipeline.
+# burn / burn-ndarray / burn-wgpu — PURE defaults.
+#
+# burn-wgpu defaults = [std, autotune, fusion, burn-cubecl/default,
+# cubecl/default]. Autotune + fusion (the perf features we want) are
+# IN the defaults. NO need to override anything. Adding `vulkan` or
+# `cubecl-spirv` would force the SPIR-V shader path which crashes the
+# AMD Vulkan Windows driver on Naga-generated shaders. Leaving the
+# defaults lets wgpu pick the safer WGSL path on AMD.
+#
+# `autodiff` on burn is the only explicit feature — we use Autodiff<Wgpu>
+# in the training pipeline.
+burn = { version = "0.21", features = ["autodiff"] }
+burn-ndarray = { version = "0.21" }
+burn-wgpu = { version = "0.21", optional = true }
 
 num_cpus = "1.17.0"
 rand = "0.9.2"

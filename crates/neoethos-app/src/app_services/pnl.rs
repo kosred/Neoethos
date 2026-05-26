@@ -113,24 +113,22 @@ pub const DEFAULT_PNL_CIRCUIT_BREAKER_FRACTION: f64 = 0.01;
 
 /// Effective drift threshold, clamped to `[1e-5, 0.05]` to keep the
 /// alarm from going silent on zero or pathological on >5 %.
+///
+/// **F-CORE3 closure (2026-05-25)**: thin shim over the canonical
+/// `env_overrides::pnl_audit_drift_fraction` typed getter.
 fn pnl_audit_drift_fraction() -> f64 {
-    std::env::var("FOREX_BOT_PNL_AUDIT_DRIFT_FRACTION")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(DEFAULT_PNL_AUDIT_DRIFT_FRACTION)
-        .clamp(1e-5, 0.05)
+    crate::app_services::env_overrides::pnl_audit_drift_fraction()
 }
 
 /// Effective circuit-breaker threshold, clamped to `[1e-4, 0.20]`. The
 /// upper bound caps the operator's "ignore drift" override at 20 % so
 /// the breaker cannot be fully disabled by a typo; the lower bound
 /// avoids tripping on float epsilon when broker and local agree.
+///
+/// **F-CORE3 closure (2026-05-25)**: thin shim over the canonical
+/// `env_overrides::pnl_circuit_breaker_fraction` typed getter.
 fn pnl_circuit_breaker_fraction() -> f64 {
-    std::env::var("FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(DEFAULT_PNL_CIRCUIT_BREAKER_FRACTION)
-        .clamp(1e-4, 0.20)
+    crate::app_services::env_overrides::pnl_circuit_breaker_fraction()
 }
 
 /// One line of the PnL audit log: pairs the broker's server-side
@@ -516,11 +514,18 @@ pub fn evaluate_pnl_drift_circuit_breaker(
             continue;
         };
         let notional = position_notional(position);
-        if !(notional > 0.0) {
+        // 2026-05-26: replaced `!(notional > 0.0)` with the explicit
+        // partial-order form. `!(a > b)` on floats is true for `b` finite-pos
+        // OR `a` NaN, but FALSE for `a == +Inf` — meaning the circuit breaker
+        // would silently continue past a corrupted +Inf notional and divide
+        // by infinity. Real-money safety: reject every non-finite-positive
+        // notional. Clippy `neg_cmp_op_on_partial_ord` flagged the original.
+        if !notional.is_finite() || notional <= 0.0 {
             tracing::debug!(
                 target: "neoethos_app::pnl_circuit_breaker",
                 position_id = position.position_id,
-                "skip circuit-breaker check: position notional is zero or non-finite"
+                notional,
+                "skip circuit-breaker check: position notional is not a positive finite"
             );
             continue;
         }

@@ -1,0 +1,2180 @@
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray1};
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::{PyAny, PyDict, PyList};
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use wasm_bindgen::prelude::*;
+
+use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
+};
+#[cfg(feature = "python")]
+use crate::utilities::kernel_validation::validate_kernel;
+use aligned_vec::{AVec, CACHELINE_ALIGN};
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use core::arch::x86_64::*;
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+use std::convert::AsRef;
+use std::error::Error;
+use std::mem::MaybeUninit;
+use thiserror::Error;
+
+impl<'a> AsRef<[f64]> for ErInput<'a> {
+    #[inline(always)]
+    fn as_ref(&self) -> &[f64] {
+        match &self.data {
+            ErData::Slice(slice) => slice,
+            ErData::Candles { candles, source } => er_source(candles, source),
+        }
+    }
+}
+
+#[inline(always)]
+fn er_source<'a>(candles: &'a Candles, source: &str) -> &'a [f64] {
+    match source {
+        "open" => &candles.open,
+        "high" => &candles.high,
+        "low" => &candles.low,
+        "close" => &candles.close,
+        "volume" => &candles.volume,
+        _ => source_type(candles, source),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ErData<'a> {
+    Candles {
+        candles: &'a Candles,
+        source: &'a str,
+    },
+    Slice(&'a [f64]),
+}
+
+#[derive(Debug, Clone)]
+pub struct ErOutput {
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "wasm"),
+    derive(Serialize, Deserialize)
+)]
+pub struct ErParams {
+    pub period: Option<usize>,
+}
+
+impl Default for ErParams {
+    fn default() -> Self {
+        Self { period: Some(5) }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ErInput<'a> {
+    pub data: ErData<'a>,
+    pub params: ErParams,
+}
+
+impl<'a> ErInput<'a> {
+    #[inline]
+    pub fn from_candles(c: &'a Candles, s: &'a str, p: ErParams) -> Self {
+        Self {
+            data: ErData::Candles {
+                candles: c,
+                source: s,
+            },
+            params: p,
+        }
+    }
+    #[inline]
+    pub fn from_slice(sl: &'a [f64], p: ErParams) -> Self {
+        Self {
+            data: ErData::Slice(sl),
+            params: p,
+        }
+    }
+    #[inline]
+    pub fn with_default_candles(c: &'a Candles) -> Self {
+        Self::from_candles(c, "close", ErParams::default())
+    }
+    #[inline]
+    pub fn get_period(&self) -> usize {
+        self.params.period.unwrap_or(5)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct ErBuilder {
+    period: Option<usize>,
+    kernel: Kernel,
+}
+
+impl Default for ErBuilder {
+    fn default() -> Self {
+        Self {
+            period: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl ErBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[inline(always)]
+    pub fn period(mut self, n: usize) -> Self {
+        self.period = Some(n);
+        self
+    }
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+    #[inline(always)]
+    pub fn apply(self, c: &Candles) -> Result<ErOutput, ErError> {
+        let p = ErParams {
+            period: self.period,
+        };
+        let i = ErInput::from_candles(c, "close", p);
+        er_with_kernel(&i, self.kernel)
+    }
+    #[inline(always)]
+    pub fn apply_slice(self, d: &[f64]) -> Result<ErOutput, ErError> {
+        let p = ErParams {
+            period: self.period,
+        };
+        let i = ErInput::from_slice(d, p);
+        er_with_kernel(&i, self.kernel)
+    }
+    #[inline(always)]
+    pub fn into_stream(self) -> Result<ErStream, ErError> {
+        let p = ErParams {
+            period: self.period,
+        };
+        ErStream::try_new(p)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ErError {
+    #[error("er: Input data slice is empty.")]
+    EmptyInputData,
+    #[error("er: All input data values are NaN.")]
+    AllValuesNaN,
+    #[error("er: Invalid period: period = {period}, data length = {data_len}")]
+    InvalidPeriod { period: usize, data_len: usize },
+    #[error("er: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+    #[error("er: Output length mismatch: expected {expected}, got {got}")]
+    OutputLengthMismatch { expected: usize, got: usize },
+    #[error("er: Invalid range: start={start}, end={end}, step={step}")]
+    InvalidRange {
+        start: String,
+        end: String,
+        step: String,
+    },
+    #[error("er: Invalid kernel for batch: {0:?}")]
+    InvalidKernelForBatch(crate::utilities::enums::Kernel),
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+impl From<ErError> for JsValue {
+    fn from(err: ErError) -> Self {
+        JsValue::from_str(&err.to_string())
+    }
+}
+
+#[inline]
+pub fn er(input: &ErInput) -> Result<ErOutput, ErError> {
+    er_with_kernel(input, Kernel::Auto)
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+#[inline]
+pub fn er_into(input: &ErInput, out: &mut [f64]) -> Result<(), ErError> {
+    er_into_slice(out, input, Kernel::Auto)
+}
+
+pub fn er_with_kernel(input: &ErInput, kernel: Kernel) -> Result<ErOutput, ErError> {
+    let data: &[f64] = input.as_ref();
+    let len = data.len();
+    if len == 0 {
+        return Err(ErError::EmptyInputData);
+    }
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(ErError::AllValuesNaN)?;
+    let period = input.get_period();
+    if period == 0 || period > len {
+        return Err(ErError::InvalidPeriod {
+            period,
+            data_len: len,
+        });
+    }
+    if (len - first) < period {
+        return Err(ErError::NotEnoughValidData {
+            needed: period,
+            valid: len - first,
+        });
+    }
+
+    let chosen = match kernel {
+        Kernel::Auto => Kernel::Scalar,
+        other => other,
+    };
+
+    let warm = first + period - 1;
+    let mut out = alloc_with_nan_prefix(len, warm);
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => er_scalar(data, period, first, &mut out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => er_avx2(data, period, first, &mut out),
+
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => er_scalar(data, period, first, &mut out),
+            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+            Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
+                er_scalar(data, period, first, &mut out)
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(ErOutput { values: out })
+}
+
+#[inline]
+pub fn er_into_slice(dst: &mut [f64], input: &ErInput, kern: Kernel) -> Result<(), ErError> {
+    let data: &[f64] = input.as_ref();
+    let len = data.len();
+    if len == 0 {
+        return Err(ErError::EmptyInputData);
+    }
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(ErError::AllValuesNaN)?;
+    let period = input.get_period();
+    if period == 0 || period > len {
+        return Err(ErError::InvalidPeriod {
+            period,
+            data_len: len,
+        });
+    }
+    if (len - first) < period {
+        return Err(ErError::NotEnoughValidData {
+            needed: period,
+            valid: len - first,
+        });
+    }
+    if dst.len() != len {
+        return Err(ErError::OutputLengthMismatch {
+            expected: len,
+            got: dst.len(),
+        });
+    }
+
+    let chosen = match kern {
+        Kernel::Auto => Kernel::Scalar,
+        other => other,
+    };
+
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => er_scalar(data, period, first, dst),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => er_avx2(data, period, first, dst),
+
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => er_scalar(data, period, first, dst),
+            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+            Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
+                er_scalar(data, period, first, dst)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let warm_end = first + period - 1;
+    for v in &mut dst[..warm_end] {
+        *v = f64::NAN;
+    }
+
+    Ok(())
+}
+
+#[inline]
+pub fn er_scalar(data: &[f64], period: usize, first: usize, out: &mut [f64]) {
+    if period == 5 {
+        er_scalar_period5(data, first, out);
+        return;
+    }
+
+    let n = data.len();
+    let warm = first + period - 1;
+    if warm >= n {
+        return;
+    }
+
+    let mut roll = 0.0f64;
+    let mut j = first;
+    while j < warm {
+        roll += (data[j + 1] - data[j]).abs();
+        j += 1;
+    }
+
+    let mut start = first;
+    let mut i = warm;
+    while i < n {
+        let delta = (data[i] - data[start]).abs();
+        out[i] = if roll > 0.0 {
+            (delta / roll).min(1.0)
+        } else {
+            0.0
+        };
+
+        if i + 1 == n {
+            break;
+        }
+        let add = (data[i + 1] - data[i]).abs();
+        let sub = (data[start + 1] - data[start]).abs();
+        roll = roll + add - sub;
+        start += 1;
+        i += 1;
+    }
+}
+
+#[inline(always)]
+fn er_scalar_period5(data: &[f64], first: usize, out: &mut [f64]) {
+    let n = data.len();
+    let warm = first + 4;
+    if warm >= n {
+        return;
+    }
+
+    unsafe {
+        let ptr = data.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+
+        let mut roll = (*ptr.add(first + 1) - *ptr.add(first)).abs()
+            + (*ptr.add(first + 2) - *ptr.add(first + 1)).abs()
+            + (*ptr.add(first + 3) - *ptr.add(first + 2)).abs()
+            + (*ptr.add(first + 4) - *ptr.add(first + 3)).abs();
+
+        let mut start = first;
+        let mut i = warm;
+        while i < n {
+            let delta = (*ptr.add(i) - *ptr.add(start)).abs();
+            *out_ptr.add(i) = if roll > 0.0 {
+                (delta / roll).min(1.0)
+            } else {
+                0.0
+            };
+
+            if i + 1 == n {
+                break;
+            }
+            let add = (*ptr.add(i + 1) - *ptr.add(i)).abs();
+            let sub = (*ptr.add(start + 1) - *ptr.add(start)).abs();
+            roll = roll + add - sub;
+            start += 1;
+            i += 1;
+        }
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub fn er_avx512(data: &[f64], period: usize, first: usize, out: &mut [f64]) {
+    unsafe {
+        if period <= 32 {
+            er_avx512_short(data, period, first, out);
+        } else {
+            er_avx512_long(data, period, first, out);
+        }
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx2")]
+pub unsafe fn er_avx2(data: &[f64], period: usize, first: usize, out: &mut [f64]) {
+    use core::arch::x86_64::*;
+    #[inline(always)]
+    unsafe fn hsum256(x: __m256d) -> f64 {
+        let hi = _mm256_extractf128_pd(x, 1);
+        let lo = _mm256_castpd256_pd128(x);
+        let s = _mm_add_pd(hi, lo);
+        let sh = _mm_unpackhi_pd(s, s);
+        _mm_cvtsd_f64(_mm_add_sd(s, sh))
+    }
+    #[inline(always)]
+    unsafe fn vabs(a: __m256d) -> __m256d {
+        let sign = _mm256_set1_pd(-0.0);
+        _mm256_andnot_pd(sign, a)
+    }
+
+    let n = data.len();
+    let warm = first + period - 1;
+    if warm >= n {
+        return;
+    }
+
+    let ptr = data.as_ptr();
+    let mut acc = unsafe { _mm256_setzero_pd() };
+    let mut j = first;
+    while j + 4 <= warm {
+        let a = unsafe { _mm256_loadu_pd(ptr.add(j)) };
+        let b = unsafe { _mm256_loadu_pd(ptr.add(j + 1)) };
+        acc = unsafe { _mm256_add_pd(acc, vabs(_mm256_sub_pd(b, a))) };
+        j += 4;
+    }
+    let mut roll = unsafe { hsum256(acc) };
+    while j < warm {
+        roll += (data[j + 1] - data[j]).abs();
+        j += 1;
+    }
+
+    let mut start = first;
+    let mut i = warm;
+    while i < n {
+        let delta = (data[i] - data[start]).abs();
+        out[i] = if roll > 0.0 {
+            (delta / roll).min(1.0)
+        } else {
+            0.0
+        };
+        if i + 1 == n {
+            break;
+        }
+        let add = (data[i + 1] - data[i]).abs();
+        let sub = (data[start + 1] - data[start]).abs();
+        roll = roll + add - sub;
+        start += 1;
+        i += 1;
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn er_avx512_short(data: &[f64], period: usize, first: usize, out: &mut [f64]) {
+    use core::arch::x86_64::*;
+    #[inline(always)]
+    unsafe fn hsum512(x: __m512d) -> f64 {
+        let v1 = _mm512_add_pd(x, _mm512_shuffle_f64x2(x, x, 0b11_10_01_00));
+        let v2 = _mm512_add_pd(v1, _mm512_shuffle_f64x2(v1, v1, 0b00_00_11_10));
+        let lo = _mm512_castpd512_pd128(v2);
+        let hi = _mm256_extractf64x2_pd(_mm512_castpd512_pd256(v2), 1);
+        let s = _mm_add_pd(lo, hi);
+        let sh = _mm_unpackhi_pd(s, s);
+        _mm_cvtsd_f64(_mm_add_sd(s, sh))
+    }
+    #[inline(always)]
+    unsafe fn vabs(a: __m512d) -> __m512d {
+        let sign = _mm512_set1_pd(-0.0);
+        _mm512_andnot_pd(sign, a)
+    }
+
+    let n = data.len();
+    let warm = first + period - 1;
+    if warm >= n {
+        return;
+    }
+
+    let ptr = data.as_ptr();
+    let mut acc = _mm512_setzero_pd();
+    let mut j = first;
+    while j + 8 <= warm {
+        let a = _mm512_loadu_pd(ptr.add(j));
+        let b = _mm512_loadu_pd(ptr.add(j + 1));
+        acc = _mm512_add_pd(acc, vabs(_mm512_sub_pd(b, a)));
+        j += 8;
+    }
+    let mut roll = hsum512(acc);
+    while j < warm {
+        roll += (data[j + 1] - data[j]).abs();
+        j += 1;
+    }
+
+    let mut start = first;
+    let mut i = warm;
+    while i < n {
+        let delta = (data[i] - data[start]).abs();
+        out[i] = if roll > 0.0 {
+            (delta / roll).min(1.0)
+        } else {
+            0.0
+        };
+        if i + 1 == n {
+            break;
+        }
+        let add = (data[i + 1] - data[i]).abs();
+        let sub = (data[start + 1] - data[start]).abs();
+        roll = roll + add - sub;
+        start += 1;
+        i += 1;
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn er_avx512_long(data: &[f64], period: usize, first: usize, out: &mut [f64]) {
+    er_avx512_short(data, period, first, out)
+}
+
+#[derive(Debug, Clone)]
+pub struct ErStream {
+    period: usize,
+    buffer: Vec<f64>,
+    head: usize,
+    filled: bool,
+    len: usize,
+    denom: f64,
+}
+
+impl ErStream {
+    pub fn try_new(params: ErParams) -> Result<Self, ErError> {
+        let period = params.period.unwrap_or(5);
+        if period == 0 {
+            return Err(ErError::InvalidPeriod {
+                period,
+                data_len: 0,
+            });
+        }
+        Ok(Self {
+            period,
+            buffer: vec![f64::NAN; period],
+            head: 0,
+            filled: false,
+            len: 0,
+            denom: 0.0,
+        })
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, value: f64) -> Option<f64> {
+        if self.period == 1 {
+            self.buffer[0] = value;
+            self.head = 0;
+            self.filled = true;
+            self.len = 1;
+            self.denom = 0.0;
+            return Some(0.0);
+        }
+
+        if !self.filled {
+            if self.len == 0 {
+                self.buffer[self.head] = value;
+                self.head = (self.head + 1) % self.period;
+                self.len = 1;
+                return None;
+            } else {
+                let prev_idx = if self.head == 0 {
+                    self.period - 1
+                } else {
+                    self.head - 1
+                };
+                self.denom += (value - self.buffer[prev_idx]).abs();
+
+                self.buffer[self.head] = value;
+                self.head = (self.head + 1) % self.period;
+                self.len += 1;
+
+                if self.len < self.period {
+                    return None;
+                }
+
+                self.filled = true;
+
+                let start = self.head;
+                let end = if start == 0 {
+                    self.period - 1
+                } else {
+                    start - 1
+                };
+                debug_assert!(self.len == self.period);
+
+                let delta = (self.buffer[end] - self.buffer[start]).abs();
+                if self.denom > 0.0 {
+                    return Some(if delta >= self.denom {
+                        1.0
+                    } else {
+                        delta / self.denom
+                    });
+                } else {
+                    return Some(0.0);
+                }
+            }
+        }
+
+        let start = self.head;
+        let second = if start + 1 == self.period {
+            0
+        } else {
+            start + 1
+        };
+        let end_prev = if start == 0 {
+            self.period - 1
+        } else {
+            start - 1
+        };
+
+        let sub = (self.buffer[second] - self.buffer[start]).abs();
+        let add = (value - self.buffer[end_prev]).abs();
+        let new_denom = self.denom + add - sub;
+
+        let delta = (value - self.buffer[second]).abs();
+
+        self.denom = new_denom;
+        self.buffer[start] = value;
+        self.head = second;
+
+        if self.denom > 0.0 {
+            Some(if delta >= self.denom {
+                1.0
+            } else {
+                delta / self.denom
+            })
+        } else {
+            Some(0.0)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ErBatchRange {
+    pub period: (usize, usize, usize),
+}
+
+impl Default for ErBatchRange {
+    fn default() -> Self {
+        Self {
+            period: (5, 254, 1),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ErBatchBuilder {
+    range: ErBatchRange,
+    kernel: Kernel,
+}
+
+impl ErBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+    #[inline]
+    pub fn period_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.period = (start, end, step);
+        self
+    }
+    #[inline]
+    pub fn period_static(mut self, p: usize) -> Self {
+        self.range.period = (p, p, 0);
+        self
+    }
+    pub fn apply_slice(self, data: &[f64]) -> Result<ErBatchOutput, ErError> {
+        er_batch_with_kernel(data, &self.range, self.kernel)
+    }
+    pub fn with_default_slice(data: &[f64], k: Kernel) -> Result<ErBatchOutput, ErError> {
+        ErBatchBuilder::new().kernel(k).apply_slice(data)
+    }
+    pub fn apply_candles(self, c: &Candles, src: &str) -> Result<ErBatchOutput, ErError> {
+        let slice = er_source(c, src);
+        self.apply_slice(slice)
+    }
+    pub fn with_default_candles(c: &Candles) -> Result<ErBatchOutput, ErError> {
+        ErBatchBuilder::new()
+            .kernel(Kernel::Auto)
+            .apply_candles(c, "close")
+    }
+}
+
+pub fn er_batch_with_kernel(
+    data: &[f64],
+    sweep: &ErBatchRange,
+    k: Kernel,
+) -> Result<ErBatchOutput, ErError> {
+    let kernel = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        other => return Err(ErError::InvalidKernelForBatch(other)),
+    };
+    let simd = match kernel {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => unreachable!(),
+    };
+    er_batch_par_slice(data, sweep, simd)
+}
+
+#[derive(Clone, Debug)]
+pub struct ErBatchOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<ErParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+impl ErBatchOutput {
+    pub fn row_for_params(&self, p: &ErParams) -> Option<usize> {
+        self.combos
+            .iter()
+            .position(|c| c.period.unwrap_or(5) == p.period.unwrap_or(5))
+    }
+    pub fn values_for(&self, p: &ErParams) -> Option<&[f64]> {
+        self.row_for_params(p).map(|row| {
+            let start = row * self.cols;
+            &self.values[start..start + self.cols]
+        })
+    }
+}
+
+#[inline(always)]
+fn expand_grid(r: &ErBatchRange) -> Vec<ErParams> {
+    fn axis_usize((start, end, step): (usize, usize, usize)) -> Vec<usize> {
+        if step == 0 || start == end {
+            return vec![start];
+        }
+        let st = step.max(1);
+        if start < end {
+            (start..=end).step_by(st).collect()
+        } else {
+            let mut v = Vec::new();
+            let mut x = start as isize;
+            let end_i = end as isize;
+            let st_i = st as isize;
+            while x >= end_i {
+                v.push(x as usize);
+                x -= st_i;
+            }
+            v
+        }
+    }
+    let periods = axis_usize(r.period);
+    let mut out = Vec::with_capacity(periods.len());
+    for &p in &periods {
+        out.push(ErParams { period: Some(p) });
+    }
+    out
+}
+
+#[inline(always)]
+fn validate_er_combos(combos: &[ErParams], len: usize) -> Result<usize, ErError> {
+    let mut max_p = 0usize;
+    for combo in combos {
+        let period = combo.period.unwrap();
+        if period == 0 || period > len {
+            return Err(ErError::InvalidPeriod {
+                period,
+                data_len: len,
+            });
+        }
+        max_p = max_p.max(period);
+    }
+    Ok(max_p)
+}
+
+#[inline(always)]
+pub fn er_batch_slice(
+    data: &[f64],
+    sweep: &ErBatchRange,
+    kern: Kernel,
+) -> Result<ErBatchOutput, ErError> {
+    er_batch_inner(data, sweep, kern, false)
+}
+
+#[inline(always)]
+pub fn er_batch_par_slice(
+    data: &[f64],
+    sweep: &ErBatchRange,
+    kern: Kernel,
+) -> Result<ErBatchOutput, ErError> {
+    er_batch_inner(data, sweep, kern, true)
+}
+
+#[inline(always)]
+fn er_batch_inner_into(
+    data: &[f64],
+    sweep: &ErBatchRange,
+    kern: Kernel,
+    parallel: bool,
+    out: &mut [f64],
+) -> Result<Vec<ErParams>, ErError> {
+    let combos = expand_grid(sweep);
+    if combos.is_empty() {
+        return Err(ErError::InvalidRange {
+            start: sweep.period.0.to_string(),
+            end: sweep.period.1.to_string(),
+            step: sweep.period.2.to_string(),
+        });
+    }
+
+    let cols = data.len();
+    if cols == 0 {
+        return Err(ErError::EmptyInputData);
+    }
+    let max_p = validate_er_combos(&combos, cols)?;
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(ErError::AllValuesNaN)?;
+    if cols - first < max_p {
+        return Err(ErError::NotEnoughValidData {
+            needed: max_p,
+            valid: cols - first,
+        });
+    }
+
+    let rows = combos.len();
+    let out_mu = unsafe {
+        std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut MaybeUninit<f64>, out.len())
+    };
+    let expected = rows
+        .checked_mul(cols)
+        .ok_or_else(|| ErError::InvalidRange {
+            start: "rows*cols".into(),
+            end: "overflow".into(),
+            step: "*".into(),
+        })?;
+    if out.len() != expected {
+        return Err(ErError::OutputLengthMismatch {
+            expected,
+            got: out.len(),
+        });
+    }
+    let warm: Vec<usize> = combos
+        .iter()
+        .map(|c| first + c.period.unwrap() - 1)
+        .collect();
+    init_matrix_prefixes(out_mu, cols, &warm);
+
+    let mut prefix = vec![0.0f64; cols];
+    if first < cols {
+        let mut j = first;
+        while j + 1 < cols {
+            let d = (data[j + 1] - data[j]).abs();
+            prefix[j + 1] = prefix[j] + d;
+            j += 1;
+        }
+    }
+
+    let do_row = |row: usize, out_row: &mut [f64]| unsafe {
+        let period = combos[row].period.unwrap();
+        match kern {
+            Kernel::Scalar => er_row_scalar_with_prefix(data, &prefix, first, period, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 => er_row_avx2(data, first, period, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 => er_row_avx512(data, first, period, out_row),
+            _ => unreachable!(),
+        }
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            out.par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(row, slice)| do_row(row, slice));
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (row, slice) in out.chunks_mut(cols).enumerate() {
+                do_row(row, slice);
+            }
+        }
+    } else {
+        for (row, slice) in out.chunks_mut(cols).enumerate() {
+            do_row(row, slice);
+        }
+    }
+
+    Ok(combos)
+}
+
+#[inline(always)]
+fn er_batch_inner(
+    data: &[f64],
+    sweep: &ErBatchRange,
+    kern: Kernel,
+    parallel: bool,
+) -> Result<ErBatchOutput, ErError> {
+    let combos = expand_grid(sweep);
+    if combos.is_empty() {
+        return Err(ErError::InvalidRange {
+            start: sweep.period.0.to_string(),
+            end: sweep.period.1.to_string(),
+            step: sweep.period.2.to_string(),
+        });
+    }
+
+    let cols = data.len();
+    if cols == 0 {
+        return Err(ErError::EmptyInputData);
+    }
+    let max_p = validate_er_combos(&combos, cols)?;
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(ErError::AllValuesNaN)?;
+    if cols - first < max_p {
+        return Err(ErError::NotEnoughValidData {
+            needed: max_p,
+            valid: cols - first,
+        });
+    }
+
+    let rows = combos.len();
+    let _total = rows
+        .checked_mul(cols)
+        .ok_or_else(|| ErError::InvalidRange {
+            start: "rows*cols".into(),
+            end: "overflow".into(),
+            step: "*".into(),
+        })?;
+    let mut buf_mu = make_uninit_matrix(rows, cols);
+
+    let warm: Vec<usize> = combos
+        .iter()
+        .map(|c| first + c.period.unwrap() - 1)
+        .collect();
+    init_matrix_prefixes(&mut buf_mu, cols, &warm);
+
+    let mut buf_guard = std::mem::ManuallyDrop::new(buf_mu);
+    let values: &mut [f64] = unsafe {
+        std::slice::from_raw_parts_mut(buf_guard.as_mut_ptr() as *mut f64, buf_guard.len())
+    };
+
+    let do_row = |row: usize, out_row: &mut [f64]| unsafe {
+        let period = combos[row].period.unwrap();
+        match kern {
+            Kernel::Scalar => er_row_scalar(data, first, period, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 => er_row_avx2(data, first, period, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 => er_row_avx512(data, first, period, out_row),
+            _ => unreachable!(),
+        }
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            values
+                .par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(row, slice)| do_row(row, slice));
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (row, slice) in values.chunks_mut(cols).enumerate() {
+                do_row(row, slice);
+            }
+        }
+    } else {
+        for (row, slice) in values.chunks_mut(cols).enumerate() {
+            do_row(row, slice);
+        }
+    }
+
+    let values = unsafe {
+        Vec::from_raw_parts(
+            buf_guard.as_mut_ptr() as *mut f64,
+            buf_guard.len(),
+            buf_guard.capacity(),
+        )
+    };
+
+    Ok(ErBatchOutput {
+        values,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+#[inline(always)]
+unsafe fn er_row_scalar(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
+    er_scalar(data, period, first, out)
+}
+
+#[inline(always)]
+fn er_row_scalar_with_prefix(
+    data: &[f64],
+    prefix: &[f64],
+    first: usize,
+    period: usize,
+    out: &mut [f64],
+) {
+    let n = data.len();
+    let warm = first + period - 1;
+    if warm >= n {
+        return;
+    }
+    let mut i = warm;
+    while i < n {
+        let start = i + 1 - period;
+        let delta = (data[i] - data[start]).abs();
+        let denom = prefix[i] - prefix[start];
+        out[i] = if denom > 0.0 {
+            (delta / denom).min(1.0)
+        } else {
+            0.0
+        };
+        i += 1;
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn er_row_avx2(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
+    er_avx2(data, period, first, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn er_row_avx512(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
+    if period <= 32 {
+        er_row_avx512_short(data, first, period, out);
+    } else {
+        er_row_avx512_long(data, first, period, out);
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn er_row_avx512_short(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
+    er_avx512_short(data, period, first, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn er_row_avx512_long(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
+    er_avx512_long(data, period, first, out)
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "er")]
+#[pyo3(signature = (data, period, kernel=None))]
+pub fn er_py<'py>(
+    py: Python<'py>,
+    data: numpy::PyReadonlyArray1<'py, f64>,
+    period: usize,
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
+    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+
+    let slice_in = data.as_slice()?;
+    let kern = validate_kernel(kernel, false)?;
+
+    let params = ErParams {
+        period: Some(period),
+    };
+    let input = ErInput::from_slice(slice_in, params);
+
+    let result_vec = py
+        .allow_threads(|| er_with_kernel(&input, kern))
+        .map(|result| result.values)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok(result_vec.into_pyarray(py))
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "ErStream")]
+pub struct ErStreamPy {
+    stream: ErStream,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl ErStreamPy {
+    #[new]
+    fn new(period: usize) -> PyResult<Self> {
+        let params = ErParams {
+            period: Some(period),
+        };
+        let stream = ErStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(ErStreamPy { stream })
+    }
+
+    fn update(&mut self, value: f64) -> Option<f64> {
+        self.stream.update(value)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "er_batch")]
+#[pyo3(signature = (data, period_range, kernel=None))]
+pub fn er_batch_py<'py>(
+    py: Python<'py>,
+    data: numpy::PyReadonlyArray1<'py, f64>,
+    period_range: (usize, usize, usize),
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+    use pyo3::types::PyDict;
+
+    let slice_in = data.as_slice()?;
+    let kern = validate_kernel(kernel, true)?;
+
+    let sweep = ErBatchRange {
+        period: period_range,
+    };
+    let combos = expand_grid(&sweep);
+    let rows = combos.len();
+    let cols = slice_in.len();
+
+    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
+    let slice_out = unsafe { out_arr.as_slice_mut()? };
+
+    let combos = py
+        .allow_threads(|| {
+            let simd = match kern {
+                Kernel::Auto => {
+                    let base = detect_best_kernel();
+                    match base {
+                        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                        Kernel::Avx512 => Kernel::Scalar,
+                        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                        Kernel::Avx2 => Kernel::Avx2,
+                        _ => Kernel::Scalar,
+                    }
+                }
+                other => match other {
+                    Kernel::ScalarBatch => Kernel::Scalar,
+                    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                    Kernel::Avx2Batch => Kernel::Avx2,
+                    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                    Kernel::Avx512Batch => Kernel::Avx512,
+                    _ => unreachable!(),
+                },
+            };
+            er_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
+    dict.set_item(
+        "periods",
+        combos
+            .iter()
+            .map(|p| p.period.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    dict.set_item("rows", rows)?;
+    dict.set_item("cols", cols)?;
+    Ok(dict)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn er_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
+    let params = ErParams {
+        period: Some(period),
+    };
+    let input = ErInput::from_slice(data, params);
+
+    let mut output = vec![0.0; data.len()];
+
+    er_into_slice(&mut output, &input, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    Ok(output)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn er_alloc(len: usize) -> *mut f64 {
+    let mut vec = Vec::<f64>::with_capacity(len);
+    let ptr = vec.as_mut_ptr();
+    std::mem::forget(vec);
+    ptr
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn er_free(ptr: *mut f64, len: usize) {
+    if !ptr.is_null() {
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, 0, len);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn er_into(
+    in_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    period: usize,
+) -> Result<(), JsValue> {
+    if in_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("null pointer passed to er_into"));
+    }
+
+    unsafe {
+        let data = std::slice::from_raw_parts(in_ptr, len);
+
+        if period == 0 || period > len {
+            return Err(JsValue::from_str("Invalid period"));
+        }
+
+        let params = ErParams {
+            period: Some(period),
+        };
+        let input = ErInput::from_slice(data, params);
+
+        if in_ptr == out_ptr {
+            let mut temp = vec![0.0; len];
+            er_into_slice(&mut temp, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            out.copy_from_slice(&temp);
+        } else {
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            er_into_slice(out, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct ErBatchConfig {
+    pub period_range: (usize, usize, usize),
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct ErBatchJsOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<ErParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = er_batch)]
+pub fn er_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
+    let config: ErBatchConfig = serde_wasm_bindgen::from_value(config)
+        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
+
+    let sweep = ErBatchRange {
+        period: config.period_range,
+    };
+
+    let output = er_batch_with_kernel(data, &sweep, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let js_output = ErBatchJsOutput {
+        values: output.values,
+        combos: output.combos,
+        rows: output.rows,
+        cols: output.cols,
+    };
+
+    serde_wasm_bindgen::to_value(&js_output).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn er_batch_into(
+    in_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+) -> Result<usize, JsValue> {
+    if in_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("null pointer passed to er_batch_into"));
+    }
+
+    unsafe {
+        let data = std::slice::from_raw_parts(in_ptr, len);
+        let sweep = ErBatchRange {
+            period: (period_start, period_end, period_step),
+        };
+        let combos = expand_grid(&sweep);
+        let rows = combos.len();
+        let cols = len;
+        if rows * cols > 0 {
+            let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
+
+            let batch_kernel = detect_best_batch_kernel();
+            let simd = match batch_kernel {
+                Kernel::Avx512Batch => Kernel::Avx512,
+                Kernel::Avx2Batch => Kernel::Avx2,
+                Kernel::ScalarBatch => Kernel::Scalar,
+                _ => unreachable!(),
+            };
+            er_batch_inner_into(data, &sweep, simd, false, out)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+        Ok(rows)
+    }
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::er_wrapper::{CudaEr, DeviceArrayF32Er};
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use numpy::PyReadonlyArray1;
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[cfg(all(feature = "python", feature = "cuda"))]
+use pyo3::prelude::*;
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "er_cuda_batch_dev")]
+#[pyo3(signature = (data_f32, period_range, device_id=0))]
+pub fn er_cuda_batch_dev_py(
+    py: Python<'_>,
+    data_f32: PyReadonlyArray1<'_, f32>,
+    period_range: (usize, usize, usize),
+    device_id: usize,
+) -> PyResult<DeviceArrayF32ErPy> {
+    use crate::cuda::cuda_available;
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let slice = data_f32.as_slice()?;
+    let sweep = ErBatchRange {
+        period: period_range,
+    };
+    let inner = py.allow_threads(|| {
+        let cuda = CudaEr::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        cuda.er_batch_dev(slice, &sweep)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+    Ok(DeviceArrayF32ErPy { inner })
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "er_cuda_many_series_one_param_dev")]
+#[pyo3(signature = (data_tm_f32, cols, rows, period, device_id=0))]
+pub fn er_cuda_many_series_one_param_dev_py(
+    py: Python<'_>,
+    data_tm_f32: PyReadonlyArray1<'_, f32>,
+    cols: usize,
+    rows: usize,
+    period: usize,
+    device_id: usize,
+) -> PyResult<DeviceArrayF32ErPy> {
+    use crate::cuda::cuda_available;
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let slice = data_tm_f32.as_slice()?;
+    let inner = py.allow_threads(|| {
+        let cuda = CudaEr::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        cuda.er_many_series_one_param_time_major_dev(slice, cols, rows, period)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+    Ok(DeviceArrayF32ErPy { inner })
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyclass(module = "vector_ta", unsendable)]
+pub struct DeviceArrayF32ErPy {
+    pub(crate) inner: DeviceArrayF32Er,
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pymethods]
+impl DeviceArrayF32ErPy {
+    #[getter]
+    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
+        d.set_item("typestr", "<f4")?;
+        d.set_item(
+            "strides",
+            (
+                self.inner.cols * std::mem::size_of::<f32>(),
+                std::mem::size_of::<f32>(),
+            ),
+        )?;
+        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
+        d.set_item("version", 3)?;
+        Ok(d)
+    }
+
+    fn __dlpack_device__(&self) -> (i32, i32) {
+        (2, self.inner.device_id as i32)
+    }
+
+    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
+    fn __dlpack__<'py>(
+        &mut self,
+        py: Python<'py>,
+        stream: Option<PyObject>,
+        max_version: Option<PyObject>,
+        dl_device: Option<PyObject>,
+        copy: Option<PyObject>,
+    ) -> PyResult<PyObject> {
+        use cust::memory::DeviceBuffer;
+        use pyo3::types::PyAny;
+        use pyo3::Bound;
+
+        let (dev_ty, alloc_dev) = self.__dlpack_device__();
+        if let Some(dev_obj) = dl_device.as_ref() {
+            if let Ok((want_ty, want_dev)) = dev_obj.extract::<(i32, i32)>(py) {
+                if want_ty != dev_ty || want_dev != alloc_dev {
+                    return Err(PyValueError::new_err(
+                        "__dlpack__ dl_device does not match ER buffer device",
+                    ));
+                }
+            } else {
+                return Err(PyValueError::new_err(
+                    "__dlpack__ dl_device must be a (device_type, device_id) tuple",
+                ));
+            }
+        }
+
+        let _ = stream;
+        let _ = copy;
+
+        let dummy =
+            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let rows = self.inner.rows;
+        let cols = self.inner.cols;
+        let ctx = self.inner.ctx.clone();
+        let device_id = self.inner.device_id;
+        let inner = std::mem::replace(
+            &mut self.inner,
+            DeviceArrayF32Er {
+                buf: dummy,
+                rows: 0,
+                cols: 0,
+                ctx,
+                device_id,
+            },
+        );
+
+        let max_version_bound: Option<Bound<'py, PyAny>> =
+            max_version.map(|obj| obj.into_bound(py));
+
+        export_f32_cuda_dlpack_2d(py, inner.buf, rows, cols, alloc_dev, max_version_bound)
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn er_output_into_js(
+    data: &[f64],
+    period: usize,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = er_js(data, period)?;
+    crate::write_wasm_f64_output("er_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn er_batch_unified_output_into_js(
+    data: &[f64],
+    config: JsValue,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = er_batch_unified_js(data, config)?;
+    crate::write_wasm_selected_object_f64_outputs("er_batch_unified_output_into_js", &value, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_csv;
+
+    fn check_er_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let default_params = ErParams { period: None };
+        let input = ErInput::from_candles(&candles, "close", default_params);
+        let output = er_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_er_into_matches_api() -> Result<(), Box<dyn Error>> {
+        let n = 256usize;
+        let mut data = Vec::with_capacity(n);
+        for i in 0..n {
+            if i < 3 {
+                data.push(f64::NAN);
+            } else {
+                let x = i as f64;
+                data.push((x * 0.01).sin() * (x * 0.02).cos() + 0.001 * x);
+            }
+        }
+
+        let input = ErInput::from_slice(&data, ErParams::default());
+
+        let base = er(&input)?.values;
+
+        let mut out = vec![0.0; n];
+
+        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+        {
+            er_into(&input, &mut out)?;
+        }
+
+        assert_eq!(base.len(), out.len());
+
+        fn eq_or_both_nan_eps(a: f64, b: f64) -> bool {
+            (a.is_nan() && b.is_nan()) || (a - b).abs() <= 1e-12
+        }
+
+        for i in 0..n {
+            assert!(
+                eq_or_both_nan_eps(base[i], out[i]),
+                "mismatch at {}: base={:?}, into={:?}",
+                i,
+                base[i],
+                out[i]
+            );
+        }
+        Ok(())
+    }
+
+    fn check_er_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let input = ErInput::with_default_candles(&candles);
+        match input.data {
+            ErData::Candles { source, .. } => assert_eq!(source, "close"),
+            _ => panic!("Expected ErData::Candles"),
+        }
+        let output = er_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_er_zero_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let input_data = [10.0, 20.0, 30.0];
+        let params = ErParams { period: Some(0) };
+        let input = ErInput::from_slice(&input_data, params);
+        let res = er_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] ER should fail with zero period",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_er_period_exceeds_length(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data_small = [10.0, 20.0, 30.0];
+        let params = ErParams { period: Some(10) };
+        let input = ErInput::from_slice(&data_small, params);
+        let res = er_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] ER should fail with period exceeding length",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_er_very_small_dataset(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let single_point = [42.0];
+        let params = ErParams { period: Some(5) };
+        let input = ErInput::from_slice(&single_point, params);
+        let res = er_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] ER should fail with insufficient data",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_er_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let first_params = ErParams { period: Some(5) };
+        let first_input = ErInput::from_candles(&candles, "close", first_params);
+        let first_result = er_with_kernel(&first_input, kernel)?;
+
+        let second_params = ErParams { period: Some(5) };
+        let second_input = ErInput::from_slice(&first_result.values, second_params);
+        let second_result = er_with_kernel(&second_input, kernel)?;
+
+        assert_eq!(second_result.values.len(), first_result.values.len());
+        Ok(())
+    }
+
+    fn check_er_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let input = ErInput::from_candles(&candles, "close", ErParams { period: Some(5) });
+        let res = er_with_kernel(&input, kernel)?;
+        assert_eq!(res.values.len(), candles.close.len());
+        if res.values.len() > 240 {
+            for (i, &val) in res.values[240..].iter().enumerate() {
+                assert!(
+                    !val.is_nan(),
+                    "[{}] Found unexpected NaN at out-index {}",
+                    test_name,
+                    240 + i
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn check_er_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let period = 5;
+
+        let input = ErInput::from_candles(
+            &candles,
+            "close",
+            ErParams {
+                period: Some(period),
+            },
+        );
+        let batch_output = er_with_kernel(&input, kernel)?.values;
+
+        let mut stream = ErStream::try_new(ErParams {
+            period: Some(period),
+        })?;
+
+        let mut stream_values = Vec::with_capacity(candles.close.len());
+        for &price in &candles.close {
+            match stream.update(price) {
+                Some(er_val) => stream_values.push(er_val),
+                None => stream_values.push(f64::NAN),
+            }
+        }
+
+        assert_eq!(batch_output.len(), stream_values.len());
+        for (i, (&b, &s)) in batch_output.iter().zip(stream_values.iter()).enumerate() {
+            if b.is_nan() && s.is_nan() {
+                continue;
+            }
+            let diff = (b - s).abs();
+            assert!(
+                diff < 1e-9,
+                "[{}] ER streaming f64 mismatch at idx {}: batch={}, stream={}, diff={}",
+                test_name,
+                i,
+                b,
+                s,
+                diff
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_er_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let test_params = vec![
+            ErParams::default(),
+            ErParams { period: Some(1) },
+            ErParams { period: Some(2) },
+            ErParams { period: Some(3) },
+            ErParams { period: Some(4) },
+            ErParams { period: Some(5) },
+            ErParams { period: Some(10) },
+            ErParams { period: Some(14) },
+            ErParams { period: Some(20) },
+            ErParams { period: Some(30) },
+            ErParams { period: Some(50) },
+            ErParams { period: Some(100) },
+            ErParams { period: Some(200) },
+            ErParams { period: Some(500) },
+            ErParams { period: Some(1000) },
+            ErParams { period: Some(2000) },
+        ];
+
+        for (param_idx, params) in test_params.iter().enumerate() {
+            let input = ErInput::from_candles(&candles, "close", params.clone());
+            let output = er_with_kernel(&input, kernel)?;
+
+            for (i, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+						 with params: period={} (param set {})",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(5),
+                        param_idx
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+						 with params: period={} (param set {})",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(5),
+                        param_idx
+                    );
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+						 with params: period={} (param set {})",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(5),
+                        param_idx
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_er_no_poison(_test_name: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    macro_rules! generate_all_er_tests {
+        ($($test_fn:ident),*) => {
+            paste::paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar);
+                    }
+                )*
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _avx2_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2);
+                    }
+                    #[test]
+                    fn [<$test_fn _avx512_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512);
+                    }
+                )*
+            }
+        }
+    }
+
+    generate_all_er_tests!(
+        check_er_partial_params,
+        check_er_default_candles,
+        check_er_zero_period,
+        check_er_period_exceeds_length,
+        check_er_very_small_dataset,
+        check_er_reinput,
+        check_er_nan_handling,
+        check_er_streaming,
+        check_er_no_poison
+    );
+
+    #[cfg(feature = "proptest")]
+    generate_all_er_tests!(check_er_property);
+
+    fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let output = ErBatchBuilder::new()
+            .kernel(kernel)
+            .apply_candles(&c, "close")?;
+
+        let def = ErParams::default();
+        let row = output.values_for(&def).expect("default row missing");
+        assert_eq!(row.len(), c.close.len());
+
+        Ok(())
+    }
+
+    macro_rules! gen_batch_tests {
+        ($fn_name:ident) => {
+            paste::paste! {
+                #[test] fn [<$fn_name _scalar>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx2>]()        {
+                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx512>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                }
+                #[test] fn [<$fn_name _auto_detect>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                }
+            }
+        };
+    }
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let test_configs = vec![
+            (1, 5, 1),
+            (2, 10, 2),
+            (5, 30, 5),
+            (10, 100, 10),
+            (50, 500, 50),
+            (100, 1000, 100),
+            (14, 14, 0),
+            (3, 15, 1),
+            (20, 200, 20),
+            (25, 50, 5),
+        ];
+
+        for (cfg_idx, &(period_start, period_end, period_step)) in test_configs.iter().enumerate() {
+            let output = ErBatchBuilder::new()
+                .kernel(kernel)
+                .period_range(period_start, period_end, period_step)
+                .apply_candles(&c, "close")?;
+
+            for (idx, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+                let row = idx / output.cols;
+                let col = idx % output.cols;
+                let combo = &output.combos[row];
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+						at row {} col {} (flat index {}) with params: period={}",
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(5)
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+						at row {} col {} (flat index {}) with params: period={}",
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(5)
+                    );
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+						at row {} col {} (flat index {}) with params: period={}",
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(5)
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_batch_no_poison(_test: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    gen_batch_tests!(check_batch_default_row);
+    gen_batch_tests!(check_batch_no_poison);
+
+    #[cfg(feature = "proptest")]
+    fn check_er_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use proptest::prelude::*;
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (2usize..=50)
+            .prop_flat_map(|period| {
+                let min_len = period * 2;
+                (
+                    (100.0f64..5000.0f64, 0.01f64..0.1f64),
+                    -0.02f64..0.02f64,
+                    Just(period),
+                    min_len..400,
+                )
+            })
+            .prop_flat_map(|((base_price, volatility), trend, period, len)| {
+                let price_changes = prop::collection::vec((-1.0f64..1.0f64), len);
+
+                (
+                    Just(base_price),
+                    Just(volatility),
+                    Just(trend),
+                    Just(period),
+                    price_changes,
+                )
+            })
+            .prop_map(|(base_price, volatility, trend, period, changes)| {
+                let mut data = Vec::with_capacity(changes.len());
+                let mut price = base_price;
+
+                for (i, &noise) in changes.iter().enumerate() {
+                    price *= 1.0 + trend;
+
+                    price *= 1.0 + (noise * volatility);
+
+                    price = price.max(1.0);
+                    data.push(price);
+                }
+
+                (data, period)
+            });
+
+        proptest::test_runner::TestRunner::default()
+            .run(&strat, |(data, period)| {
+                let params = ErParams {
+                    period: Some(period),
+                };
+                let input = ErInput::from_slice(&data, params);
+
+                let ErOutput { values: out } = er_with_kernel(&input, kernel).unwrap();
+                let ErOutput { values: ref_out } = er_with_kernel(&input, Kernel::Scalar).unwrap();
+
+                prop_assert_eq!(out.len(), data.len());
+
+                let warmup = period - 1;
+                for i in 0..warmup {
+                    prop_assert!(
+                        out[i].is_nan(),
+                        "Expected NaN during warmup at index {}, got {}",
+                        i,
+                        out[i]
+                    );
+                }
+
+                for i in warmup..data.len() {
+                    let val = out[i];
+                    if !val.is_nan() {
+                        prop_assert!(
+                            val >= -1e-10 && val <= 1.0 + 1e-10,
+                            "ER value {} at index {} outside valid range [0, 1]",
+                            val,
+                            i
+                        );
+                    }
+                }
+
+                for i in 0..data.len() {
+                    let y = out[i];
+                    let r = ref_out[i];
+
+                    if !y.is_finite() || !r.is_finite() {
+                        prop_assert_eq!(
+                            y.to_bits(),
+                            r.to_bits(),
+                            "NaN/Inf mismatch at index {}: {} vs {}",
+                            i,
+                            y,
+                            r
+                        );
+                    } else {
+                        let diff = (y - r).abs();
+                        let ulp_diff = y.to_bits().abs_diff(r.to_bits());
+                        prop_assert!(
+                            diff <= 1e-9 || ulp_diff <= 4,
+                            "Kernel mismatch at index {}: {} vs {} (diff={}, ULP={})",
+                            i,
+                            y,
+                            r,
+                            diff,
+                            ulp_diff
+                        );
+                    }
+                }
+
+                if data.len() >= period + 10 {
+                    for i in (warmup + 1)..data.len() {
+                        if i < period {
+                            continue;
+                        }
+                        let window_start = i + 1 - period;
+                        let window_end = i;
+
+                        let window = &data[window_start..=window_end];
+                        let is_monotonic_up = window.windows(2).all(|w| w[1] >= w[0] - 1e-10);
+                        let is_monotonic_down = window.windows(2).all(|w| w[1] <= w[0] + 1e-10);
+                        let is_constant = window.windows(2).all(|w| (w[1] - w[0]).abs() < 1e-10);
+
+                        if !is_constant && (is_monotonic_up || is_monotonic_down) {
+                            let er_val = out[i];
+                            let net_change = (window[window.len() - 1] - window[0]).abs();
+                            if !er_val.is_nan() && net_change > 1e-6 {
+                                prop_assert!(
+									er_val >= 0.90,
+									"Expected high ER (>0.90) for monotonic move at index {}, got {}",
+									i,
+									er_val
+								);
+                            }
+                        }
+                    }
+                }
+
+                for i in (warmup + 1)..data.len() {
+                    if i < period {
+                        continue;
+                    }
+                    let window_start = i + 1 - period;
+                    let window_end = i;
+                    let window = &data[window_start..=window_end];
+                    let is_constant = window.windows(2).all(|w| (w[1] - w[0]).abs() < 1e-10);
+
+                    if is_constant {
+                        let er_val = out[i];
+
+                        prop_assert!(
+                            er_val.is_nan() || er_val.abs() < 1e-10,
+                            "Constant prices should yield NaN or 0, got {} at index {}",
+                            er_val,
+                            i
+                        );
+                    }
+                }
+
+                for i in warmup..data.len() {
+                    let val = out[i];
+                    if !val.is_nan() {
+                        prop_assert!(
+                            val >= -1e-10,
+                            "ER should be non-negative, got {} at index {}",
+                            val,
+                            i
+                        );
+                    }
+                }
+
+                if period >= 4 && data.len() >= period * 3 {
+                    for i in (warmup + 1)..data.len() {
+                        if i < period {
+                            continue;
+                        }
+                        let window_start = i + 1 - period;
+                        let window_end = i;
+
+                        let net_change = (data[window_end] - data[window_start]).abs();
+                        let mut total_movement = 0.0;
+                        for j in window_start..window_end {
+                            total_movement += (data[j + 1] - data[j]).abs();
+                        }
+
+                        if total_movement > 0.0 && net_change / total_movement < 0.3 {
+                            let er_val = out[i];
+                            if !er_val.is_nan() {
+                                prop_assert!(
+                                    er_val <= 0.35,
+                                    "Expected low ER (<0.35) for choppy market at index {}, got {}",
+                                    i,
+                                    er_val
+                                );
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            })
+            .unwrap();
+
+        Ok(())
+    }
+}

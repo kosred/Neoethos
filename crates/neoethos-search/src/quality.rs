@@ -136,6 +136,13 @@ pub struct StrategyQualityAnalyzer {
     pub max_dd_acceptable: f64,
     pub min_monthly_return_pct: f64,
     pub edge_significance_pvalue: f64,
+    /// 2026-05-26 operator directive (dual-mode product): canonical threshold
+    /// for the "month has enough trades to count toward monthly stats" gate.
+    /// `Some(n)` overrides the env-driven `QualityRuntimeOverrides`. The
+    /// FilteringConfig path in `quality_analyzer_for_config` (discovery.rs)
+    /// sets this so the Settings-driven value wins over the env default.
+    /// `None` preserves the old env-driven behaviour for legacy callers.
+    pub min_trades_per_month: Option<usize>,
 }
 
 impl Default for StrategyQualityAnalyzer {
@@ -144,12 +151,22 @@ impl Default for StrategyQualityAnalyzer {
             min_sharpe: 1.2,
             min_sortino: 1.2,
             min_calmar: 1.0,
-            min_profit_factor: 1.5,
+            // 2026-05-26 operator directive (dual-mode product): canonical
+            // value across the workspace. Previously 1.5 here, 1.05 in
+            // strategy_gene.rs, 1.2 in gauntlet.rs (now deleted). 1.2 matches
+            // the FTMO industry baseline and avoids a divergent default per
+            // code path. If you change this, also change the matching default
+            // in `genetic::strategy_gene::FilteringConfig`.
+            min_profit_factor: 1.2,
             min_win_rate: 0.50,
             min_trades: 0,
             max_dd_acceptable: 0.15,
             min_monthly_return_pct: 0.04,
             edge_significance_pvalue: 0.01,
+            // None = fall back to env-driven QualityRuntimeOverrides for
+            // legacy callers; discovery's `quality_analyzer_for_config`
+            // overrides this with the FilteringConfig value.
+            min_trades_per_month: None,
         }
     }
 }
@@ -268,7 +285,13 @@ impl StrategyQualityAnalyzer {
         let kelly = calculate_kelly(win_rate, avg_win_pct, avg_loss_mag);
         let p_value = test_statistical_significance(&returns);
 
-        let monthly_metrics = analyze_monthly_consistency(trades, initial_balance);
+        // 2026-05-26 operator directive (dual-mode product): pass the
+        // analyzer's `min_trades_per_month` override so the FilteringConfig
+        // value wins over the env-driven default. None preserves legacy
+        // env-driven behaviour for direct callers using
+        // `StrategyQualityAnalyzer::default()`.
+        let monthly_metrics =
+            analyze_monthly_consistency(trades, initial_balance, self.min_trades_per_month);
         let monthly_win_rate = monthly_metrics.monthly_win_rate;
         let avg_monthly_return_pct = monthly_metrics.avg_return_pct;
 
@@ -385,7 +408,11 @@ struct MonthlyMetrics {
     avg_return_pct: f64,
 }
 
-fn analyze_monthly_consistency(trades: &[Trade], initial_balance: f64) -> MonthlyMetrics {
+fn analyze_monthly_consistency(
+    trades: &[Trade],
+    initial_balance: f64,
+    min_trades_per_month_override: Option<usize>,
+) -> MonthlyMetrics {
     if trades.is_empty() {
         return MonthlyMetrics {
             monthly_win_rate: 0.0,
@@ -397,9 +424,13 @@ fn analyze_monthly_consistency(trades: &[Trade], initial_balance: f64) -> Monthl
 
     // Bucket per-month PnL AND per-month trade count so we can drop months
     // with too few trades (a month with 1 lucky trade should not get the same
-    // weight in monthly_win_rate as a month with 50 trades). Threshold is
-    // resolved from `QualityRuntimeOverrides::min_trades_per_month`.
-    let min_trades_per_month = current_quality_runtime_overrides().min_trades_per_month;
+    // weight in monthly_win_rate as a month with 50 trades).
+    //
+    // 2026-05-26 operator directive (dual-mode product): the FilteringConfig
+    // value wins via `min_trades_per_month_override`; legacy direct callers
+    // (None) still get the env-driven `QualityRuntimeOverrides` default.
+    let min_trades_per_month = min_trades_per_month_override
+        .unwrap_or_else(|| current_quality_runtime_overrides().min_trades_per_month);
     let mut monthly: HashMap<i64, (f64, usize)> = HashMap::new();
     for trade in trades {
         if trade.entry_time <= 0 {
@@ -561,7 +592,18 @@ fn test_statistical_significance(returns: &[f64]) -> f64 {
         return 1.0;
     }
     let df = n - 1.0;
-    let dist = StudentsT::new(0.0, 1.0, df).unwrap();
+    // **2026-05-25 unwrap audit**: `StudentsT::new(loc, scale, freedom)`
+    // returns `Err` only for non-positive `scale` or `freedom`. Here
+    // `scale = 1.0` (literal) and `freedom = n - 1.0 >= 9.0` (because
+    // the guard at the top of this function returns early when
+    // `returns.len() < 10`). So this is logically infallible — but per
+    // the no-panic doctrine we still pattern-match instead of
+    // `.unwrap()`. A future regression in the guard above would now
+    // return p=1.0 (treat as not-significant) instead of panicking the
+    // entire validation pipeline.
+    let Ok(dist) = StudentsT::new(0.0, 1.0, df) else {
+        return 1.0;
+    };
     1.0 - dist.cdf(t_stat)
 }
 

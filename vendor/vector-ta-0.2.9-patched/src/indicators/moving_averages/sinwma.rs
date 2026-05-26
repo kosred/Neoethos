@@ -1,0 +1,2554 @@
+use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
+};
+use aligned_vec::{AVec, CACHELINE_ALIGN};
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use core::arch::x86_64::*;
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+use std::convert::AsRef;
+use std::error::Error;
+use std::f64::consts::PI;
+use std::mem::MaybeUninit;
+use std::sync::OnceLock;
+use thiserror::Error;
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::cuda_available;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::moving_averages::CudaSinwma;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
+#[cfg(feature = "python")]
+use crate::utilities::kernel_validation::validate_kernel;
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1};
+#[cfg(all(feature = "python", feature = "cuda"))]
+use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::{PyDict, PyList};
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use wasm_bindgen::prelude::*;
+
+impl<'a> AsRef<[f64]> for SinWmaInput<'a> {
+    #[inline(always)]
+    fn as_ref(&self) -> &[f64] {
+        match &self.data {
+            SinWmaData::Slice(slice) => slice,
+            SinWmaData::Candles { candles, source } => match *source {
+                "open" => &candles.open,
+                "high" => &candles.high,
+                "low" => &candles.low,
+                "close" => &candles.close,
+                "volume" => &candles.volume,
+                "hl2" => &candles.hl2,
+                "hlc3" => &candles.hlc3,
+                "ohlc4" => &candles.ohlc4,
+                "hlcc4" | "hlcc" => &candles.hlcc4,
+                _ => source_type(candles, source),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum SinWmaData<'a> {
+    Candles {
+        candles: &'a Candles,
+        source: &'a str,
+    },
+    Slice(&'a [f64]),
+}
+
+#[derive(Debug, Clone)]
+pub struct SinWmaOutput {
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SinWmaParams {
+    pub period: Option<usize>,
+}
+
+impl Default for SinWmaParams {
+    fn default() -> Self {
+        Self { period: Some(14) }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SinWmaInput<'a> {
+    pub data: SinWmaData<'a>,
+    pub params: SinWmaParams,
+}
+
+impl<'a> SinWmaInput<'a> {
+    #[inline]
+    pub fn from_candles(c: &'a Candles, s: &'a str, p: SinWmaParams) -> Self {
+        Self {
+            data: SinWmaData::Candles {
+                candles: c,
+                source: s,
+            },
+            params: p,
+        }
+    }
+    #[inline]
+    pub fn from_slice(sl: &'a [f64], p: SinWmaParams) -> Self {
+        Self {
+            data: SinWmaData::Slice(sl),
+            params: p,
+        }
+    }
+    #[inline]
+    pub fn with_default_candles(c: &'a Candles) -> Self {
+        Self::from_candles(c, "close", SinWmaParams::default())
+    }
+    #[inline]
+    pub fn get_period(&self) -> usize {
+        self.params.period.unwrap_or(14)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct SinWmaBuilder {
+    period: Option<usize>,
+    kernel: Kernel,
+}
+
+impl Default for SinWmaBuilder {
+    fn default() -> Self {
+        Self {
+            period: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl SinWmaBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[inline(always)]
+    pub fn period(mut self, n: usize) -> Self {
+        self.period = Some(n);
+        self
+    }
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline(always)]
+    pub fn apply(self, c: &Candles) -> Result<SinWmaOutput, SinWmaError> {
+        let p = SinWmaParams {
+            period: self.period,
+        };
+        let i = SinWmaInput::from_candles(c, "close", p);
+        sinwma_with_kernel(&i, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn apply_slice(self, d: &[f64]) -> Result<SinWmaOutput, SinWmaError> {
+        let p = SinWmaParams {
+            period: self.period,
+        };
+        let i = SinWmaInput::from_slice(d, p);
+        sinwma_with_kernel(&i, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn into_stream(self) -> Result<SinWmaStream, SinWmaError> {
+        let p = SinWmaParams {
+            period: self.period,
+        };
+        SinWmaStream::try_new(p)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum SinWmaError {
+    #[error("sinwma: No data provided (empty slice).")]
+    EmptyInputData,
+    #[error("sinwma: All values are NaN.")]
+    AllValuesNaN,
+    #[error("sinwma: Invalid period: period = {period}, data length = {data_len}")]
+    InvalidPeriod { period: usize, data_len: usize },
+    #[error("sinwma: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+    #[error("sinwma: Sum of sines is zero or too close to zero. sum_sines = {sum_sines}")]
+    ZeroSumSines { sum_sines: f64 },
+    #[error("sinwma: Output slice length mismatch: expected = {expected}, got = {got}")]
+    OutputLengthMismatch { expected: usize, got: usize },
+    #[error("sinwma: Invalid range: start={start}, end={end}, step={step}")]
+    InvalidRange {
+        start: usize,
+        end: usize,
+        step: usize,
+    },
+    #[error("sinwma: Invalid kernel for batch path: {0:?}")]
+    InvalidKernelForBatch(Kernel),
+}
+
+#[inline]
+pub fn sinwma(input: &SinWmaInput) -> Result<SinWmaOutput, SinWmaError> {
+    sinwma_with_kernel(input, Kernel::Auto)
+}
+
+pub fn sinwma_with_kernel(
+    input: &SinWmaInput,
+    kernel: Kernel,
+) -> Result<SinWmaOutput, SinWmaError> {
+    let (data, weights, period, first, chosen) = sinwma_prepare(input, kernel)?;
+
+    let mut out = alloc_with_nan_prefix(data.len(), first + period - 1);
+
+    sinwma_compute_into(data, weights.as_slice(), period, first, chosen, &mut out);
+
+    Ok(SinWmaOutput { values: out })
+}
+
+#[inline]
+pub fn sinwma_into_slice(
+    dst: &mut [f64],
+    input: &SinWmaInput,
+    kern: Kernel,
+) -> Result<(), SinWmaError> {
+    let (data, weights, period, first, chosen) = sinwma_prepare(input, kern)?;
+
+    if dst.len() != data.len() {
+        return Err(SinWmaError::OutputLengthMismatch {
+            expected: data.len(),
+            got: dst.len(),
+        });
+    }
+
+    sinwma_compute_into(data, weights.as_slice(), period, first, chosen, dst);
+
+    let warmup_end = first + period - 1;
+    for v in &mut dst[..warmup_end] {
+        *v = f64::NAN;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+#[inline]
+pub fn sinwma_into(input: &SinWmaInput, out: &mut [f64]) -> Result<(), SinWmaError> {
+    sinwma_into_slice(out, input, Kernel::Auto)
+}
+
+static SINWMA_DEFAULT_WEIGHTS_14: OnceLock<AVec<f64>> = OnceLock::new();
+
+#[derive(Clone)]
+enum SinWmaWeights {
+    Static(&'static [f64]),
+    Owned(AVec<f64>),
+}
+
+impl SinWmaWeights {
+    #[inline(always)]
+    fn as_slice(&self) -> &[f64] {
+        match self {
+            Self::Static(weights) => weights,
+            Self::Owned(weights) => weights,
+        }
+    }
+}
+
+#[inline]
+fn build_sinwma_weights(period: usize) -> Result<AVec<f64>, SinWmaError> {
+    let mut weights: AVec<f64> = AVec::with_capacity(CACHELINE_ALIGN, period);
+    weights.resize(period, 0.0);
+    let mut sum_sines = 0.0;
+    for k in 0..period {
+        let angle = (k as f64 + 1.0) * PI / (period as f64 + 1.0);
+        let val = angle.sin();
+        weights[k] = val;
+        sum_sines += val;
+    }
+
+    if sum_sines.abs() < f64::EPSILON {
+        return Err(SinWmaError::ZeroSumSines { sum_sines });
+    }
+    let inv_sum = 1.0 / sum_sines;
+    for w in &mut weights[..] {
+        *w *= inv_sum;
+    }
+
+    Ok(weights)
+}
+
+#[inline]
+fn sinwma_weights(period: usize) -> Result<SinWmaWeights, SinWmaError> {
+    if period == 14 {
+        let weights = SINWMA_DEFAULT_WEIGHTS_14
+            .get_or_init(|| build_sinwma_weights(14).expect("valid default SINWMA weights"));
+        Ok(SinWmaWeights::Static(weights.as_slice()))
+    } else {
+        Ok(SinWmaWeights::Owned(build_sinwma_weights(period)?))
+    }
+}
+
+#[inline(always)]
+fn sinwma_prepare<'a>(
+    input: &'a SinWmaInput,
+    kernel: Kernel,
+) -> Result<(&'a [f64], SinWmaWeights, usize, usize, Kernel), SinWmaError> {
+    let data: &[f64] = input.as_ref();
+    let len = data.len();
+
+    if len == 0 {
+        return Err(SinWmaError::EmptyInputData);
+    }
+
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(SinWmaError::AllValuesNaN)?;
+
+    let period = input.get_period();
+
+    if period == 0 || period > len {
+        return Err(SinWmaError::InvalidPeriod {
+            period,
+            data_len: len,
+        });
+    }
+    if (len - first) < period {
+        return Err(SinWmaError::NotEnoughValidData {
+            needed: period,
+            valid: len - first,
+        });
+    }
+
+    let weights = sinwma_weights(period)?;
+
+    let chosen = match kernel {
+        Kernel::Auto => detect_best_kernel(),
+        k => k,
+    };
+
+    Ok((data, weights, period, first, chosen))
+}
+
+#[inline(always)]
+fn sinwma_compute_into(
+    data: &[f64],
+    weights: &[f64],
+    period: usize,
+    first: usize,
+    kernel: Kernel,
+    out: &mut [f64],
+) {
+    unsafe {
+        if period == 14 {
+            match kernel {
+                Kernel::Scalar | Kernel::ScalarBatch => sinwma_scalar_14(data, weights, first, out),
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                Kernel::Avx2 | Kernel::Avx2Batch => sinwma_avx2_14(data, weights, first, out),
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                Kernel::Avx512 | Kernel::Avx512Batch => sinwma_avx512_14(data, weights, first, out),
+                #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+                Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
+                    sinwma_scalar_14(data, weights, first, out)
+                }
+                _ => unreachable!(),
+            }
+            return;
+        }
+
+        match kernel {
+            Kernel::Scalar | Kernel::ScalarBatch => {
+                sinwma_scalar(data, weights, period, first, out)
+            }
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => sinwma_avx2(data, weights, period, first, out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => {
+                sinwma_avx512(data, weights, period, first, out)
+            }
+            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+            Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
+                sinwma_scalar(data, weights, period, first, out)
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn hsum_pd_zmm(v: __m512d) -> f64 {
+    _mm512_reduce_add_pd(v)
+}
+
+#[inline(always)]
+fn sinwma_scalar_14(data: &[f64], weights: &[f64], first_val: usize, out: &mut [f64]) {
+    let w0 = weights[0];
+    let w1 = weights[1];
+    let w2 = weights[2];
+    let w3 = weights[3];
+    let w4 = weights[4];
+    let w5 = weights[5];
+    let w6 = weights[6];
+    let w7 = weights[7];
+    let w8 = weights[8];
+    let w9 = weights[9];
+    let w10 = weights[10];
+    let w11 = weights[11];
+    let w12 = weights[12];
+    let w13 = weights[13];
+
+    for i in (first_val + 13)..data.len() {
+        let start = i - 13;
+        unsafe {
+            let d = data.as_ptr().add(start);
+            let mut sum = ((*d.add(0) * w0 + *d.add(1) * w1) + *d.add(2) * w2) + *d.add(3) * w3;
+            sum += ((*d.add(4) * w4 + *d.add(5) * w5) + *d.add(6) * w6) + *d.add(7) * w7;
+            sum += ((*d.add(8) * w8 + *d.add(9) * w9) + *d.add(10) * w10) + *d.add(11) * w11;
+            sum += *d.add(12) * w12;
+            sum += *d.add(13) * w13;
+            *out.get_unchecked_mut(i) = sum;
+        }
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sinwma_avx2_14(data: &[f64], weights: &[f64], first_valid: usize, out: &mut [f64]) {
+    let w0 = _mm256_loadu_pd(weights.as_ptr());
+    let w4 = _mm256_loadu_pd(weights.as_ptr().add(4));
+    let w8 = _mm256_loadu_pd(weights.as_ptr().add(8));
+    let w12 = *weights.get_unchecked(12);
+    let w13 = *weights.get_unchecked(13);
+
+    for i in (first_valid + 13)..data.len() {
+        let start = i - 13;
+        let d0 = _mm256_loadu_pd(data.as_ptr().add(start));
+        let d4 = _mm256_loadu_pd(data.as_ptr().add(start + 4));
+        let d8 = _mm256_loadu_pd(data.as_ptr().add(start + 8));
+        let mut acc = _mm256_setzero_pd();
+        acc = _mm256_fmadd_pd(d0, w0, acc);
+        acc = _mm256_fmadd_pd(d4, w4, acc);
+        acc = _mm256_fmadd_pd(d8, w8, acc);
+
+        let sum128 = _mm_add_pd(_mm256_castpd256_pd128(acc), _mm256_extractf128_pd(acc, 1));
+        let mut sum = _mm_cvtsd_f64(_mm_hadd_pd(sum128, sum128));
+        sum = (*data.get_unchecked(start + 12)).mul_add(w12, sum);
+        sum = (*data.get_unchecked(start + 13)).mul_add(w13, sum);
+        *out.get_unchecked_mut(i) = sum;
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn sinwma_avx512_14(data: &[f64], weights: &[f64], first_valid: usize, out: &mut [f64]) {
+    let w0 = _mm512_loadu_pd(weights.as_ptr());
+    let wt = _mm512_maskz_loadu_pd(0b0011_1111, weights.as_ptr().add(8));
+
+    for i in (first_valid + 13)..data.len() {
+        let start = i - 13;
+        let d0 = _mm512_loadu_pd(data.as_ptr().add(start));
+        let dt = _mm512_maskz_loadu_pd(0b0011_1111, data.as_ptr().add(start + 8));
+        let mut acc = _mm512_setzero_pd();
+        acc = _mm512_fmadd_pd(d0, w0, acc);
+        acc = _mm512_fmadd_pd(dt, wt, acc);
+        *out.get_unchecked_mut(i) = hsum_pd_zmm(acc);
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub fn sinwma_avx512(
+    data: &[f64],
+    weights: &[f64],
+    period: usize,
+    first_valid: usize,
+    out: &mut [f64],
+) {
+    if period <= 32 {
+        unsafe { sinwma_avx512_short(data, weights, period, first_valid, out) }
+    } else {
+        unsafe { sinwma_avx512_long(data, weights, period, first_valid, out) }
+    }
+}
+
+#[inline]
+pub fn sinwma_scalar(
+    data: &[f64],
+    weights: &[f64],
+    period: usize,
+    first_val: usize,
+    out: &mut [f64],
+) {
+    assert_eq!(weights.len(), period, "weights.len() must equal `period`");
+    assert!(
+        out.len() >= data.len(),
+        "`out` must be at least as long as `data`"
+    );
+
+    let p4 = period & !3;
+
+    for i in (first_val + period - 1)..data.len() {
+        let start = i + 1 - period;
+        let window = &data[start..start + period];
+
+        let mut sum = 0.0;
+        for (d4, w4) in window[..p4]
+            .chunks_exact(4)
+            .zip(weights[..p4].chunks_exact(4))
+        {
+            sum += d4[0] * w4[0] + d4[1] * w4[1] + d4[2] * w4[2] + d4[3] * w4[3];
+        }
+
+        for (d, w) in window[p4..].iter().zip(&weights[p4..]) {
+            sum += d * w;
+        }
+
+        out[i] = sum;
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn sinwma_avx2(
+    data: &[f64],
+    weights: &[f64],
+    period: usize,
+    first_valid: usize,
+    out: &mut [f64],
+) {
+    debug_assert!(period >= 1);
+    debug_assert_eq!(data.len(), out.len());
+    debug_assert_eq!(weights.len(), period);
+
+    let p4 = period & !3usize;
+    for i in (first_valid + period - 1)..data.len() {
+        let start = i + 1 - period;
+        let mut acc = _mm256_setzero_pd();
+
+        let mut k = 0usize;
+        while k < p4 {
+            let w = _mm256_loadu_pd(weights.as_ptr().add(k));
+            let d = _mm256_loadu_pd(data.as_ptr().add(start + k));
+            acc = _mm256_fmadd_pd(d, w, acc);
+            k += 4;
+        }
+
+        let sum128 = _mm_add_pd(_mm256_castpd256_pd128(acc), _mm256_extractf128_pd(acc, 1));
+        let mut sum = _mm_cvtsd_f64(_mm_hadd_pd(sum128, sum128));
+
+        while k < period {
+            sum = (*data.get_unchecked(start + k)).mul_add(*weights.get_unchecked(k), sum);
+            k += 1;
+        }
+
+        *out.get_unchecked_mut(i) = sum;
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512f,fma")]
+pub unsafe fn sinwma_avx512_short(
+    data: &[f64],
+    weights: &[f64],
+    period: usize,
+    first_valid: usize,
+    out: &mut [f64],
+) {
+    debug_assert!(period >= 1);
+    debug_assert_eq!(data.len(), out.len());
+    debug_assert_eq!(weights.len(), period);
+
+    const STEP: usize = 8;
+    let chunks = period / STEP;
+    let tail_len = period % STEP;
+    let tail_mask: __mmask8 = (1u8 << tail_len).wrapping_sub(1);
+
+    if chunks == 0 {
+        let wv = _mm512_maskz_loadu_pd(tail_mask, weights.as_ptr());
+        for i in (first_valid + period - 1)..data.len() {
+            let start = i + 1 - period;
+            let dv = _mm512_maskz_loadu_pd(tail_mask, data.as_ptr().add(start));
+            let sum = hsum_pd_zmm(_mm512_mul_pd(dv, wv));
+            *out.get_unchecked_mut(i) = sum;
+        }
+        return;
+    }
+
+    for i in (first_valid + period - 1)..data.len() {
+        let start = i + 1 - period;
+        let mut acc = _mm512_setzero_pd();
+
+        for blk in 0..chunks {
+            let w = _mm512_loadu_pd(weights.as_ptr().add(blk * STEP));
+            let d = _mm512_loadu_pd(data.as_ptr().add(start + blk * STEP));
+            acc = _mm512_fmadd_pd(d, w, acc);
+        }
+
+        if tail_len != 0 {
+            let wt = _mm512_maskz_loadu_pd(tail_mask, weights.as_ptr().add(chunks * STEP));
+            let dt = _mm512_maskz_loadu_pd(tail_mask, data.as_ptr().add(start + chunks * STEP));
+            acc = _mm512_fmadd_pd(dt, wt, acc);
+        }
+
+        *out.get_unchecked_mut(i) = hsum_pd_zmm(acc);
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512f,fma,avx512dq")]
+pub unsafe fn sinwma_avx512_long(
+    data: &[f64],
+    weights: &[f64],
+    period: usize,
+    first_valid: usize,
+    out: &mut [f64],
+) {
+    const STEP: usize = 8;
+    let n_chunks = period / STEP;
+    let tail_len = period % STEP;
+    let unroll8 = n_chunks & !3;
+    let tail_mask: __mmask8 = (1u8 << tail_len).wrapping_sub(1);
+
+    debug_assert!(period >= 1);
+    debug_assert_eq!(data.len(), out.len());
+    debug_assert_eq!(weights.len(), period);
+
+    let mut wregs: Vec<__m512d> = Vec::with_capacity(n_chunks);
+    for blk in 0..n_chunks {
+        wregs.push(_mm512_loadu_pd(weights.as_ptr().add(blk * STEP)));
+    }
+    let w_tail = if tail_len != 0 {
+        Some(_mm512_maskz_loadu_pd(
+            tail_mask,
+            weights.as_ptr().add(n_chunks * STEP),
+        ))
+    } else {
+        None
+    };
+
+    let mut data_ptr = data.as_ptr().add(first_valid);
+    let stop_ptr = data.as_ptr().add(data.len());
+    let mut dst_ptr = out.as_mut_ptr().add(first_valid + period - 1);
+
+    if tail_len == 0 {
+        while data_ptr.add(period) <= stop_ptr {
+            let mut s0 = _mm512_setzero_pd();
+            let mut s1 = _mm512_setzero_pd();
+            let mut s2 = _mm512_setzero_pd();
+            let mut s3 = _mm512_setzero_pd();
+
+            for blk in (0..unroll8).step_by(4) {
+                let d0 = _mm512_loadu_pd(data_ptr.add((blk + 0) * STEP));
+                let d1 = _mm512_loadu_pd(data_ptr.add((blk + 1) * STEP));
+                let d2 = _mm512_loadu_pd(data_ptr.add((blk + 2) * STEP));
+                let d3 = _mm512_loadu_pd(data_ptr.add((blk + 3) * STEP));
+
+                s0 = _mm512_fmadd_pd(d0, *wregs.get_unchecked(blk + 0), s0);
+                s1 = _mm512_fmadd_pd(d1, *wregs.get_unchecked(blk + 1), s1);
+                s2 = _mm512_fmadd_pd(d2, *wregs.get_unchecked(blk + 2), s2);
+                s3 = _mm512_fmadd_pd(d3, *wregs.get_unchecked(blk + 3), s3);
+            }
+
+            for blk in unroll8..n_chunks {
+                let d = _mm512_loadu_pd(data_ptr.add(blk * STEP));
+                s0 = _mm512_fmadd_pd(d, *wregs.get_unchecked(blk), s0);
+            }
+
+            let sum01 = _mm512_add_pd(s0, s1);
+            let sum23 = _mm512_add_pd(s2, s3);
+            let tot = _mm512_add_pd(sum01, sum23);
+            *dst_ptr = hsum_pd_zmm(tot);
+
+            data_ptr = data_ptr.add(1);
+            dst_ptr = dst_ptr.add(1);
+        }
+    } else {
+        let wt = w_tail.unwrap();
+        while data_ptr.add(period) <= stop_ptr {
+            let mut s0 = _mm512_setzero_pd();
+            let mut s1 = _mm512_setzero_pd();
+            let mut s2 = _mm512_setzero_pd();
+            let mut s3 = _mm512_setzero_pd();
+
+            for blk in (0..unroll8).step_by(4) {
+                let d0 = _mm512_loadu_pd(data_ptr.add((blk + 0) * STEP));
+                let d1 = _mm512_loadu_pd(data_ptr.add((blk + 1) * STEP));
+                let d2 = _mm512_loadu_pd(data_ptr.add((blk + 2) * STEP));
+                let d3 = _mm512_loadu_pd(data_ptr.add((blk + 3) * STEP));
+
+                s0 = _mm512_fmadd_pd(d0, *wregs.get_unchecked(blk + 0), s0);
+                s1 = _mm512_fmadd_pd(d1, *wregs.get_unchecked(blk + 1), s1);
+                s2 = _mm512_fmadd_pd(d2, *wregs.get_unchecked(blk + 2), s2);
+                s3 = _mm512_fmadd_pd(d3, *wregs.get_unchecked(blk + 3), s3);
+            }
+
+            for blk in unroll8..n_chunks {
+                let d = _mm512_loadu_pd(data_ptr.add(blk * STEP));
+                s0 = _mm512_fmadd_pd(d, *wregs.get_unchecked(blk), s0);
+            }
+
+            let dt = _mm512_maskz_loadu_pd(tail_mask, data_ptr.add(n_chunks * STEP));
+            s0 = _mm512_fmadd_pd(dt, wt, s0);
+
+            let sum01 = _mm512_add_pd(s0, s1);
+            let sum23 = _mm512_add_pd(s2, s3);
+            let tot = _mm512_add_pd(sum01, sum23);
+            *dst_ptr = hsum_pd_zmm(tot);
+
+            data_ptr = data_ptr.add(1);
+            dst_ptr = dst_ptr.add(1);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SinWmaStream {
+    period: usize,
+
+    r_re: f64,
+    r_im: f64,
+    rp_re: f64,
+    rp_im: f64,
+
+    sinp: f64,
+    cosp: f64,
+
+    inv_sum: f64,
+
+    z_re: f64,
+    z_im: f64,
+
+    buffer: Vec<f64>,
+    head: usize,
+    filled: bool,
+
+    nan_count: usize,
+    z_valid: bool,
+}
+
+impl SinWmaStream {
+    pub fn try_new(params: SinWmaParams) -> Result<Self, SinWmaError> {
+        let period = params.period.unwrap_or(14);
+        if period == 0 {
+            return Err(SinWmaError::InvalidPeriod {
+                period,
+                data_len: 0,
+            });
+        }
+
+        let alpha = PI / (period as f64 + 1.0);
+
+        let (sina, cosa) = alpha.sin_cos();
+        let (sinp, cosp) = (alpha * period as f64).sin_cos();
+
+        let denom = (0.5 * alpha).sin();
+        if denom.abs() < f64::EPSILON {
+            return Err(SinWmaError::ZeroSumSines { sum_sines: 0.0 });
+        }
+        let sum_sines = (0.5 * alpha * period as f64).sin() / denom;
+        if sum_sines.abs() < f64::EPSILON {
+            return Err(SinWmaError::ZeroSumSines { sum_sines });
+        }
+        let inv_sum = 1.0 / sum_sines;
+
+        Ok(Self {
+            period,
+            r_re: cosa,
+            r_im: sina,
+            rp_re: cosp,
+            rp_im: sinp,
+            sinp,
+            cosp,
+            inv_sum,
+            z_re: 0.0,
+            z_im: 0.0,
+            buffer: vec![f64::NAN; period],
+            head: 0,
+            filled: false,
+            nan_count: period,
+            z_valid: false,
+        })
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, value: f64) -> Option<f64> {
+        if !self.filled {
+            let idx = self.head;
+            let old = self.buffer[idx];
+            if old.is_nan() {
+                self.nan_count = self.nan_count.saturating_sub(1);
+            }
+            if value.is_nan() {
+                self.nan_count += 1;
+            }
+            self.buffer[idx] = value;
+            self.head = (idx + 1) % self.period;
+
+            if self.head != 0 {
+                return None;
+            }
+
+            self.filled = true;
+
+            if self.nan_count != 0 {
+                self.z_valid = false;
+                return Some(f64::NAN);
+            }
+
+            self.rebuild_z();
+            return Some(self.output_from_z());
+        }
+
+        let idx_old = self.head;
+        let x_old = self.buffer[idx_old];
+
+        self.buffer[idx_old] = value;
+        self.head = (idx_old + 1) % self.period;
+
+        if x_old.is_nan() {
+            self.nan_count = self.nan_count.saturating_sub(1);
+        }
+        if value.is_nan() {
+            self.nan_count += 1;
+        }
+
+        if self.nan_count != 0 {
+            self.z_valid = false;
+            return Some(f64::NAN);
+        }
+
+        if !self.z_valid {
+            self.rebuild_z();
+            return Some(self.output_from_z());
+        }
+
+        let rZ_re = self.r_re.mul_add(self.z_re, -self.r_im * self.z_im);
+        let rZ_im = self.r_re.mul_add(self.z_im, self.r_im * self.z_re);
+
+        self.z_re = rZ_re + value - self.rp_re * x_old;
+        self.z_im = rZ_im - self.rp_im * x_old;
+
+        Some(self.output_from_z())
+    }
+
+    #[inline(always)]
+    fn output_from_z(&self) -> f64 {
+        let y_unscaled = self.sinp.mul_add(self.z_re, -self.cosp * self.z_im);
+        y_unscaled * self.inv_sum
+    }
+
+    #[inline(always)]
+    fn rebuild_z(&mut self) {
+        debug_assert!(
+            self.nan_count == 0,
+            "rebuild_z called on NaN-contaminated window"
+        );
+        let newest = (self.head + self.period - 1) % self.period;
+
+        let mut rj_re = 1.0f64;
+        let mut rj_im = 0.0f64;
+
+        let mut zr = 0.0f64;
+        let mut zi = 0.0f64;
+
+        for j in 0..self.period {
+            let idx = (newest + self.period - j) % self.period;
+            let x = self.buffer[idx];
+            zr = rj_re.mul_add(x, zr);
+            zi = rj_im.mul_add(x, zi);
+
+            let nr_re = rj_re.mul_add(self.r_re, -rj_im * self.r_im);
+            let nr_im = rj_re.mul_add(self.r_im, rj_im * self.r_re);
+            rj_re = nr_re;
+            rj_im = nr_im;
+        }
+
+        self.z_re = zr;
+        self.z_im = zi;
+        self.z_valid = true;
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SinWmaBatchRange {
+    pub period: (usize, usize, usize),
+}
+
+impl Default for SinWmaBatchRange {
+    fn default() -> Self {
+        Self {
+            period: (14, 263, 1),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SinWmaBatchBuilder {
+    range: SinWmaBatchRange,
+    kernel: Kernel,
+}
+
+impl SinWmaBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline]
+    pub fn period_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.period = (start, end, step);
+        self
+    }
+    #[inline]
+    pub fn period_static(mut self, p: usize) -> Self {
+        self.range.period = (p, p, 0);
+        self
+    }
+
+    pub fn apply_slice(self, data: &[f64]) -> Result<SinWmaBatchOutput, SinWmaError> {
+        sinwma_batch_with_kernel(data, &self.range, self.kernel)
+    }
+
+    pub fn with_default_slice(data: &[f64], k: Kernel) -> Result<SinWmaBatchOutput, SinWmaError> {
+        SinWmaBatchBuilder::new().kernel(k).apply_slice(data)
+    }
+
+    pub fn apply_candles(self, c: &Candles, src: &str) -> Result<SinWmaBatchOutput, SinWmaError> {
+        let slice = source_type(c, src);
+        self.apply_slice(slice)
+    }
+
+    pub fn with_default_candles(c: &Candles) -> Result<SinWmaBatchOutput, SinWmaError> {
+        SinWmaBatchBuilder::new()
+            .kernel(Kernel::Auto)
+            .apply_candles(c, "close")
+    }
+}
+
+pub fn sinwma_batch_with_kernel(
+    data: &[f64],
+    sweep: &SinWmaBatchRange,
+    k: Kernel,
+) -> Result<SinWmaBatchOutput, SinWmaError> {
+    let kernel = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        _ => return Err(SinWmaError::InvalidKernelForBatch(k)),
+    };
+
+    let simd = match kernel {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => unreachable!(),
+    };
+    sinwma_batch_par_slice(data, sweep, simd)
+}
+
+#[derive(Clone, Debug)]
+pub struct SinWmaBatchOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<SinWmaParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+impl SinWmaBatchOutput {
+    pub fn row_for_params(&self, p: &SinWmaParams) -> Option<usize> {
+        self.combos
+            .iter()
+            .position(|c| c.period.unwrap_or(14) == p.period.unwrap_or(14))
+    }
+
+    pub fn values_for(&self, p: &SinWmaParams) -> Option<&[f64]> {
+        self.row_for_params(p).map(|row| {
+            let start = row * self.cols;
+            &self.values[start..start + self.cols]
+        })
+    }
+}
+
+#[inline(always)]
+fn expand_grid(r: &SinWmaBatchRange) -> Result<Vec<SinWmaParams>, SinWmaError> {
+    fn axis_usize((start, end, step): (usize, usize, usize)) -> Result<Vec<usize>, SinWmaError> {
+        if step == 0 || start == end {
+            return Ok(vec![start]);
+        }
+        if start < end {
+            let v: Vec<usize> = (start..=end).step_by(step).collect();
+            if v.is_empty() {
+                return Err(SinWmaError::InvalidRange { start, end, step });
+            }
+            return Ok(v);
+        }
+
+        let mut v = Vec::new();
+        let mut cur = start;
+        while cur >= end {
+            v.push(cur);
+            if cur == end {
+                break;
+            }
+
+            let next = cur.saturating_sub(step);
+            if next == cur {
+                break;
+            }
+            cur = next;
+        }
+        if v.is_empty() {
+            return Err(SinWmaError::InvalidRange { start, end, step });
+        }
+        Ok(v)
+    }
+
+    let periods = axis_usize(r.period)?;
+
+    let mut out = Vec::with_capacity(periods.len());
+    for &p in &periods {
+        out.push(SinWmaParams { period: Some(p) });
+    }
+    Ok(out)
+}
+
+#[inline]
+fn round_up8(x: usize) -> usize {
+    (x + 7) & !7
+}
+
+#[inline(always)]
+pub unsafe fn sinwma_row_dispatch(
+    data: &[f64],
+    first: usize,
+    period: usize,
+    w_ptr: *const f64,
+    out: &mut [f64],
+    kern: Kernel,
+) {
+    match kern {
+        Kernel::Scalar | Kernel::ScalarBatch => sinwma_row_scalar(data, first, period, w_ptr, out),
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        Kernel::Avx2 | Kernel::Avx2Batch => sinwma_row_avx2(data, first, period, w_ptr, out),
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        Kernel::Avx512 | Kernel::Avx512Batch => sinwma_row_avx512(data, first, period, w_ptr, out),
+        #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+        Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
+            sinwma_row_scalar(data, first, period, w_ptr, out)
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[inline(always)]
+pub fn sinwma_batch_slice(
+    data: &[f64],
+    sweep: &SinWmaBatchRange,
+    kern: Kernel,
+) -> Result<SinWmaBatchOutput, SinWmaError> {
+    sinwma_batch_inner(data, sweep, kern, false)
+}
+
+#[inline(always)]
+pub fn sinwma_batch_par_slice(
+    data: &[f64],
+    sweep: &SinWmaBatchRange,
+    kern: Kernel,
+) -> Result<SinWmaBatchOutput, SinWmaError> {
+    sinwma_batch_inner(data, sweep, kern, true)
+}
+
+#[inline(always)]
+fn sinwma_batch_inner(
+    data: &[f64],
+    sweep: &SinWmaBatchRange,
+    kern: Kernel,
+    parallel: bool,
+) -> Result<SinWmaBatchOutput, SinWmaError> {
+    let combos = expand_grid(sweep)?;
+    if combos.is_empty() {
+        return Err(SinWmaError::InvalidRange {
+            start: sweep.period.0,
+            end: sweep.period.1,
+            step: sweep.period.2,
+        });
+    }
+
+    if data.is_empty() {
+        return Err(SinWmaError::EmptyInputData);
+    }
+
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(SinWmaError::AllValuesNaN)?;
+    let max_p = combos.iter().map(|c| c.period.unwrap()).max().unwrap();
+    if data.len() - first < max_p {
+        return Err(SinWmaError::NotEnoughValidData {
+            needed: max_p,
+            valid: data.len() - first,
+        });
+    }
+
+    let rows = combos.len();
+    let cols = data.len();
+
+    let _total = rows.checked_mul(cols).ok_or(SinWmaError::InvalidRange {
+        start: sweep.period.0,
+        end: sweep.period.1,
+        step: sweep.period.2,
+    })?;
+    let warm: Vec<usize> = combos
+        .iter()
+        .map(|c| first + c.period.unwrap() - 1)
+        .collect();
+
+    let mut raw = make_uninit_matrix(rows, cols);
+    init_matrix_prefixes(&mut raw, cols, &warm);
+
+    let stride = round_up8(max_p);
+    let cap = rows.checked_mul(stride).ok_or(SinWmaError::InvalidRange {
+        start: sweep.period.0,
+        end: sweep.period.1,
+        step: sweep.period.2,
+    })?;
+    let mut flat_w = AVec::<f64>::with_capacity(CACHELINE_ALIGN, cap);
+    flat_w.resize(cap, 0.0);
+
+    for (row, prm) in combos.iter().enumerate() {
+        let p = prm.period.unwrap();
+        let base = row * stride;
+        let mut sum = 0.0;
+        for k in 0..p {
+            let a = (k as f64 + 1.0) * PI / (p as f64 + 1.0);
+            let v = a.sin();
+            flat_w[base + k] = v;
+            sum += v;
+        }
+        let inv = 1.0 / sum;
+        for k in 0..p {
+            flat_w[base + k] *= inv;
+        }
+    }
+
+    let do_row = |row: usize, dst_mu: &mut [MaybeUninit<f64>]| unsafe {
+        let p = combos[row].period.unwrap();
+        let w_ptr = flat_w.as_ptr().add(row * stride);
+        let dst = core::slice::from_raw_parts_mut(dst_mu.as_mut_ptr() as *mut f64, dst_mu.len());
+        sinwma_row_dispatch(data, first, p, w_ptr, dst, kern);
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            raw.par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(r, sl)| do_row(r, sl));
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (r, sl) in raw.chunks_mut(cols).enumerate() {
+                do_row(r, sl);
+            }
+        }
+    } else {
+        for (r, sl) in raw.chunks_mut(cols).enumerate() {
+            do_row(r, sl);
+        }
+    }
+
+    let mut guard = core::mem::ManuallyDrop::new(raw);
+    let values = unsafe {
+        Vec::from_raw_parts(
+            guard.as_mut_ptr() as *mut f64,
+            guard.len(),
+            guard.capacity(),
+        )
+    };
+
+    Ok(SinWmaBatchOutput {
+        values,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+#[inline(always)]
+fn sinwma_batch_inner_into(
+    data: &[f64],
+    sweep: &SinWmaBatchRange,
+    kern: Kernel,
+    parallel: bool,
+    out: &mut [f64],
+) -> Result<Vec<SinWmaParams>, SinWmaError> {
+    let combos = expand_grid(sweep)?;
+    if combos.is_empty() {
+        return Err(SinWmaError::InvalidRange {
+            start: sweep.period.0,
+            end: sweep.period.1,
+            step: sweep.period.2,
+        });
+    }
+
+    if data.is_empty() {
+        return Err(SinWmaError::EmptyInputData);
+    }
+
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(SinWmaError::AllValuesNaN)?;
+    let max_p = combos.iter().map(|c| c.period.unwrap()).max().unwrap();
+    if data.len() - first < max_p {
+        return Err(SinWmaError::NotEnoughValidData {
+            needed: max_p,
+            valid: data.len() - first,
+        });
+    }
+
+    let rows = combos.len();
+    let cols = data.len();
+    let warm: Vec<usize> = combos
+        .iter()
+        .map(|c| first + c.period.unwrap() - 1)
+        .collect();
+
+    let expected = rows.checked_mul(cols).ok_or(SinWmaError::InvalidRange {
+        start: sweep.period.0,
+        end: sweep.period.1,
+        step: sweep.period.2,
+    })?;
+    if out.len() != expected {
+        return Err(SinWmaError::OutputLengthMismatch {
+            expected,
+            got: out.len(),
+        });
+    }
+
+    let out_mu = unsafe {
+        std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut MaybeUninit<f64>, out.len())
+    };
+    init_matrix_prefixes(out_mu, cols, &warm);
+
+    let stride = round_up8(max_p);
+    let cap = rows.checked_mul(stride).ok_or(SinWmaError::InvalidRange {
+        start: sweep.period.0,
+        end: sweep.period.1,
+        step: sweep.period.2,
+    })?;
+    let mut flat_w = AVec::<f64>::with_capacity(CACHELINE_ALIGN, cap);
+    flat_w.resize(cap, 0.0);
+
+    for (row, prm) in combos.iter().enumerate() {
+        let p = prm.period.unwrap();
+        let base = row * stride;
+        let mut sum = 0.0;
+        for k in 0..p {
+            let a = (k as f64 + 1.0) * PI / (p as f64 + 1.0);
+            let v = a.sin();
+            flat_w[base + k] = v;
+            sum += v;
+        }
+        let inv = 1.0 / sum;
+        for k in 0..p {
+            flat_w[base + k] *= inv;
+        }
+    }
+
+    let do_row = |row: usize, dst_mu: &mut [MaybeUninit<f64>]| unsafe {
+        let p = combos[row].period.unwrap();
+        let w_ptr = flat_w.as_ptr().add(row * stride);
+        let dst = core::slice::from_raw_parts_mut(dst_mu.as_mut_ptr() as *mut f64, dst_mu.len());
+        sinwma_row_dispatch(data, first, p, w_ptr, dst, kern);
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            out_mu
+                .par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(r, sl)| do_row(r, sl));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (r, sl) in out_mu.chunks_mut(cols).enumerate() {
+                do_row(r, sl);
+            }
+        }
+    } else {
+        for (r, sl) in out_mu.chunks_mut(cols).enumerate() {
+            do_row(r, sl);
+        }
+    }
+
+    Ok(combos)
+}
+
+#[inline(always)]
+pub unsafe fn sinwma_row_scalar(
+    data: &[f64],
+    first: usize,
+    period: usize,
+    w_ptr: *const f64,
+    out: &mut [f64],
+) {
+    let p4 = period & !3;
+    for i in (first + period - 1)..data.len() {
+        let start = i + 1 - period;
+        let mut sum = 0.0;
+        for k in (0..p4).step_by(4) {
+            let w = std::slice::from_raw_parts(w_ptr.add(k), 4);
+            let d = &data[start + k..start + k + 4];
+            sum += d[0] * w[0] + d[1] * w[1] + d[2] * w[2] + d[3] * w[3];
+        }
+        for k in p4..period {
+            sum += *data.get_unchecked(start + k) * *w_ptr.add(k);
+        }
+        out[i] = sum;
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn sinwma_row_avx2(
+    data: &[f64],
+    first: usize,
+    period: usize,
+    w_ptr: *const f64,
+    out: &mut [f64],
+) {
+    let p4 = period & !3usize;
+    for i in (first + period - 1)..data.len() {
+        let start = i + 1 - period;
+        let mut acc = _mm256_setzero_pd();
+
+        let mut k = 0usize;
+        while k < p4 {
+            let d = _mm256_loadu_pd(data.as_ptr().add(start + k));
+            let w = _mm256_loadu_pd(w_ptr.add(k));
+            acc = _mm256_fmadd_pd(d, w, acc);
+            k += 4;
+        }
+
+        let sum128 = _mm_add_pd(_mm256_castpd256_pd128(acc), _mm256_extractf128_pd(acc, 1));
+        let mut sum = _mm_cvtsd_f64(_mm_hadd_pd(sum128, sum128));
+
+        while k < period {
+            sum = (*data.get_unchecked(start + k)).mul_add(*w_ptr.add(k), sum);
+            k += 1;
+        }
+
+        *out.get_unchecked_mut(i) = sum;
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512f,fma,avx512dq")]
+pub unsafe fn sinwma_row_avx512(
+    data: &[f64],
+    first: usize,
+    period: usize,
+    w_ptr: *const f64,
+    out: &mut [f64],
+) {
+    if period <= 32 {
+        sinwma_row_avx512_short(data, first, period, w_ptr, out);
+    } else {
+        sinwma_row_avx512_long(data, first, period, w_ptr, out);
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512f,fma")]
+pub unsafe fn sinwma_row_avx512_short(
+    data: &[f64],
+    first: usize,
+    period: usize,
+    w_ptr: *const f64,
+    out: &mut [f64],
+) {
+    const STEP: usize = 8;
+    let chunks = period / STEP;
+    let tail = period % STEP;
+    let mask: __mmask8 = (1u8 << tail).wrapping_sub(1);
+
+    if chunks == 0 {
+        let wv = _mm512_maskz_loadu_pd(mask, w_ptr);
+        for i in (first + period - 1)..data.len() {
+            let start = i + 1 - period;
+            let dv = _mm512_maskz_loadu_pd(mask, data.as_ptr().add(start));
+            let sum = hsum_pd_zmm(_mm512_mul_pd(dv, wv));
+            *out.get_unchecked_mut(i) = sum;
+        }
+        return;
+    }
+
+    for i in (first + period - 1)..data.len() {
+        let start = i + 1 - period;
+        let mut acc = _mm512_setzero_pd();
+        for blk in 0..chunks {
+            let d = _mm512_loadu_pd(data.as_ptr().add(start + blk * STEP));
+            let w = _mm512_loadu_pd(w_ptr.add(blk * STEP));
+            acc = _mm512_fmadd_pd(d, w, acc);
+        }
+        if tail != 0 {
+            let dt = _mm512_maskz_loadu_pd(mask, data.as_ptr().add(start + chunks * STEP));
+            let wt = _mm512_maskz_loadu_pd(mask, w_ptr.add(chunks * STEP));
+            acc = _mm512_fmadd_pd(dt, wt, acc);
+        }
+        *out.get_unchecked_mut(i) = hsum_pd_zmm(acc);
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "avx512f,fma,avx512dq")]
+pub unsafe fn sinwma_row_avx512_long(
+    data: &[f64],
+    first: usize,
+    period: usize,
+    w_ptr: *const f64,
+    out: &mut [f64],
+) {
+    const STEP: usize = 8;
+    let n_chunks = period / STEP;
+    let tail_len = period % STEP;
+    let unroll4 = n_chunks & !3;
+    let mask: __mmask8 = (1u8 << tail_len).wrapping_sub(1);
+
+    let mut wregs: Vec<__m512d> = Vec::with_capacity(n_chunks);
+    for blk in 0..n_chunks {
+        wregs.push(_mm512_loadu_pd(w_ptr.add(blk * STEP)));
+    }
+    let wt = if tail_len != 0 {
+        Some(_mm512_maskz_loadu_pd(mask, w_ptr.add(n_chunks * STEP)))
+    } else {
+        None
+    };
+
+    for i in (first + period - 1)..data.len() {
+        let start = i + 1 - period;
+        let mut s0 = _mm512_setzero_pd();
+        let mut s1 = _mm512_setzero_pd();
+        let mut s2 = _mm512_setzero_pd();
+        let mut s3 = _mm512_setzero_pd();
+
+        for blk in (0..unroll4).step_by(4) {
+            let d0 = _mm512_loadu_pd(data.as_ptr().add(start + (blk + 0) * STEP));
+            let d1 = _mm512_loadu_pd(data.as_ptr().add(start + (blk + 1) * STEP));
+            let d2 = _mm512_loadu_pd(data.as_ptr().add(start + (blk + 2) * STEP));
+            let d3 = _mm512_loadu_pd(data.as_ptr().add(start + (blk + 3) * STEP));
+
+            s0 = _mm512_fmadd_pd(d0, *wregs.get_unchecked(blk + 0), s0);
+            s1 = _mm512_fmadd_pd(d1, *wregs.get_unchecked(blk + 1), s1);
+            s2 = _mm512_fmadd_pd(d2, *wregs.get_unchecked(blk + 2), s2);
+            s3 = _mm512_fmadd_pd(d3, *wregs.get_unchecked(blk + 3), s3);
+        }
+
+        for blk in unroll4..n_chunks {
+            let d = _mm512_loadu_pd(data.as_ptr().add(start + blk * STEP));
+            s0 = _mm512_fmadd_pd(d, *wregs.get_unchecked(blk), s0);
+        }
+
+        if let Some(wt) = wt {
+            let dt = _mm512_maskz_loadu_pd(mask, data.as_ptr().add(start + n_chunks * STEP));
+            s0 = _mm512_fmadd_pd(dt, wt, s0);
+        }
+
+        let sum01 = _mm512_add_pd(s0, s1);
+        let sum23 = _mm512_add_pd(s2, s3);
+        let tot = _mm512_add_pd(sum01, sum23);
+        *out.get_unchecked_mut(i) = hsum_pd_zmm(tot);
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn sinwma_output_into_js(
+    data: &[f64],
+    period: usize,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = sinwma_js(data, period)?;
+    crate::write_wasm_f64_output("sinwma_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn sinwma_batch_output_into_js(
+    data: &[f64],
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = sinwma_batch_js(data, period_start, period_end, period_step)?;
+    crate::write_wasm_f64_output("sinwma_batch_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn sinwma_batch_unified_output_into_js(
+    data: &[f64],
+    config: JsValue,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = sinwma_batch_unified_js(data, config)?;
+    crate::write_wasm_selected_object_f64_outputs(
+        "sinwma_batch_unified_output_into_js",
+        &value,
+        out,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_csv;
+    #[cfg(feature = "proptest")]
+    use proptest::prelude::*;
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+    #[test]
+    fn test_sinwma_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let input = SinWmaInput::with_default_candles(&candles);
+
+        let baseline = sinwma(&input)?.values;
+
+        let mut out = vec![0.0; candles.close.len()];
+        sinwma_into(&input, &mut out)?;
+
+        assert_eq!(baseline.len(), out.len());
+
+        fn eq_or_both_nan(a: f64, b: f64) -> bool {
+            (a.is_nan() && b.is_nan()) || (a == b)
+        }
+
+        for (i, (a, b)) in baseline.iter().zip(out.iter()).enumerate() {
+            assert!(
+                eq_or_both_nan(*a, *b),
+                "mismatch at index {}: baseline={}, into={}",
+                i,
+                a,
+                b
+            );
+        }
+
+        Ok(())
+    }
+
+    fn check_sinwma_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let default_params = SinWmaParams { period: None };
+        let input = SinWmaInput::from_candles(&candles, "close", default_params);
+        let output = sinwma_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_sinwma_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = SinWmaInput::from_candles(&candles, "close", SinWmaParams { period: Some(14) });
+        let result = sinwma_with_kernel(&input, kernel)?;
+        let expected_last_five = [
+            59376.72903536103,
+            59300.76862770367,
+            59229.27622157621,
+            59178.48781774477,
+            59154.66580703081,
+        ];
+        let start = result.values.len().saturating_sub(5);
+        for (i, &val) in result.values[start..].iter().enumerate() {
+            let diff = (val - expected_last_five[i]).abs();
+            assert!(
+                diff < 1e-6,
+                "[{}] SINWMA {:?} mismatch at idx {}: got {}, expected {}",
+                test_name,
+                kernel,
+                i,
+                val,
+                expected_last_five[i]
+            );
+        }
+        Ok(())
+    }
+
+    fn check_sinwma_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = SinWmaInput::with_default_candles(&candles);
+        match input.data {
+            SinWmaData::Candles { source, .. } => assert_eq!(source, "close"),
+            _ => panic!("Expected SinWmaData::Candles"),
+        }
+        let output = sinwma_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_sinwma_zero_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let input_data = [10.0, 20.0, 30.0];
+        let params = SinWmaParams { period: Some(0) };
+        let input = SinWmaInput::from_slice(&input_data, params);
+        let res = sinwma_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] SINWMA should fail with zero period",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_sinwma_period_exceeds_length(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data_small = [10.0, 20.0, 30.0];
+        let params = SinWmaParams { period: Some(10) };
+        let input = SinWmaInput::from_slice(&data_small, params);
+        let res = sinwma_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] SINWMA should fail with period exceeding length",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_sinwma_very_small_dataset(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let single_point = [42.0];
+        let params = SinWmaParams { period: Some(14) };
+        let input = SinWmaInput::from_slice(&single_point, params);
+        let res = sinwma_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] SINWMA should fail with insufficient data",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_sinwma_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let first_params = SinWmaParams { period: Some(14) };
+        let first_input = SinWmaInput::from_candles(&candles, "close", first_params);
+        let first_result = sinwma_with_kernel(&first_input, kernel)?;
+
+        let second_params = SinWmaParams { period: Some(5) };
+        let second_input = SinWmaInput::from_slice(&first_result.values, second_params);
+        let second_result = sinwma_with_kernel(&second_input, kernel)?;
+
+        assert_eq!(second_result.values.len(), first_result.values.len());
+        for &val in second_result.values.iter().skip(240) {
+            assert!(val.is_finite());
+        }
+        Ok(())
+    }
+
+    fn check_sinwma_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = SinWmaInput::from_candles(&candles, "close", SinWmaParams { period: Some(14) });
+        let res = sinwma_with_kernel(&input, kernel)?;
+        assert_eq!(res.values.len(), candles.close.len());
+        if res.values.len() > 240 {
+            for (i, &val) in res.values[240..].iter().enumerate() {
+                assert!(
+                    !val.is_nan(),
+                    "[{}] Found unexpected NaN at out-index {}",
+                    test_name,
+                    240 + i
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn check_sinwma_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let period = 14;
+
+        let input = SinWmaInput::from_candles(
+            &candles,
+            "close",
+            SinWmaParams {
+                period: Some(period),
+            },
+        );
+        let batch_output = sinwma_with_kernel(&input, kernel)?.values;
+
+        let mut stream = SinWmaStream::try_new(SinWmaParams {
+            period: Some(period),
+        })?;
+
+        let mut stream_values = Vec::with_capacity(candles.close.len());
+        for &price in &candles.close {
+            match stream.update(price) {
+                Some(val) => stream_values.push(val),
+                None => stream_values.push(f64::NAN),
+            }
+        }
+
+        assert_eq!(batch_output.len(), stream_values.len());
+        for (i, (&b, &s)) in batch_output.iter().zip(stream_values.iter()).enumerate() {
+            if b.is_nan() && s.is_nan() {
+                continue;
+            }
+            let diff = (b - s).abs();
+            assert!(
+                diff < 1e-9,
+                "[{}] SINWMA streaming f64 mismatch at idx {}: batch={}, stream={}, diff={}",
+                test_name,
+                i,
+                b,
+                s,
+                diff
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_sinwma_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let test_periods = vec![5, 10, 14, 20, 30, 50];
+
+        for period in test_periods {
+            let params = SinWmaParams {
+                period: Some(period),
+            };
+            let input = SinWmaInput::from_candles(&candles, "close", params);
+            let output = sinwma_with_kernel(&input, kernel)?;
+
+            for (i, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} (period={})",
+						test_name, val, bits, i, period
+					);
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} (period={})",
+						test_name, val, bits, i, period
+					);
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} (period={})",
+						test_name, val, bits, i, period
+					);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_sinwma_no_poison(_test_name: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    #[cfg(feature = "proptest")]
+    #[allow(clippy::float_cmp)]
+    fn check_sinwma_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use proptest::prelude::*;
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (1usize..=100).prop_flat_map(|period| {
+            (
+                prop::collection::vec(
+                    (-1e5f64..1e5f64).prop_filter("finite", |x| x.is_finite()),
+                    period..=500,
+                ),
+                Just(period),
+            )
+        });
+
+        proptest::test_runner::TestRunner::default()
+			.run(&strat, |(data, period)| {
+				let params = SinWmaParams { period: Some(period) };
+				let input = SinWmaInput::from_slice(&data, params);
+
+				let SinWmaOutput { values: out } = sinwma_with_kernel(&input, kernel).unwrap();
+				let SinWmaOutput { values: ref_out } = sinwma_with_kernel(&input, Kernel::Scalar).unwrap();
+
+
+				prop_assert_eq!(out.len(), data.len(), "Output length should match input length");
+
+
+				let warmup_end = period - 1;
+				for i in 0..warmup_end.min(data.len()) {
+					prop_assert!(
+						out[i].is_nan(),
+						"[{}] Expected NaN at index {} during warmup (period={})",
+						test_name,
+						i,
+						period
+					);
+				}
+
+
+				for i in warmup_end..data.len() {
+					let y = out[i];
+
+
+					if y.is_nan() {
+						continue;
+					}
+
+
+					let window_start = i + 1 - period;
+					let window = &data[window_start..=i];
+
+					let lo = window.iter().cloned().fold(f64::INFINITY, f64::min);
+					let hi = window.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+
+					let tolerance = 1e-9 + (hi - lo).abs() * 1e-12;
+					prop_assert!(
+						y >= lo - tolerance && y <= hi + tolerance,
+						"[{}] idx {}: value {} not in window bounds [{}, {}] (period={})",
+						test_name,
+						i,
+						y,
+						lo,
+						hi,
+						period
+					);
+				}
+
+
+				if data.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-12) && !data.is_empty() {
+					for i in warmup_end..data.len() {
+						if !out[i].is_nan() {
+							prop_assert!(
+								(out[i] - data[0]).abs() <= 1e-9,
+								"[{}] Constant input should produce constant output: expected {}, got {} at index {}",
+								test_name,
+								data[0],
+								out[i],
+								i
+							);
+						}
+					}
+				}
+
+
+				if period == 1 {
+
+
+					for i in 0..data.len() {
+						if !out[i].is_nan() && !data[i].is_nan() {
+							prop_assert!(
+								(out[i] - data[i]).abs() <= 1e-12,
+								"[{}] Period=1 should pass through input: expected {}, got {} at index {}",
+								test_name,
+								data[i],
+								out[i],
+								i
+							);
+						}
+					}
+				}
+
+
+				for i in 0..data.len() {
+					if out[i].is_nan() && ref_out[i].is_nan() {
+						continue;
+					}
+
+
+					let y_bits = out[i].to_bits();
+					let r_bits = ref_out[i].to_bits();
+
+					prop_assert_eq!(
+						y_bits,
+						r_bits,
+						"[{}] Kernel consistency failed at index {}: {:?} gives {}, Scalar gives {}",
+						test_name,
+						i,
+						kernel,
+						out[i],
+						ref_out[i]
+					);
+				}
+
+
+				for i in warmup_end..data.len() {
+					if out[i].is_nan() {
+						continue;
+					}
+
+					let window_start = i + 1 - period;
+					let window = &data[window_start..=i];
+
+					let all_positive = window.iter().all(|&x| x > 0.0);
+					let all_negative = window.iter().all(|&x| x < 0.0);
+
+					if all_positive {
+						prop_assert!(
+							out[i] > 0.0,
+							"[{}] All positive window should produce positive output, got {} at index {}",
+							test_name,
+							out[i],
+							i
+						);
+					}
+
+					if all_negative {
+						prop_assert!(
+							out[i] < 0.0,
+							"[{}] All negative window should produce negative output, got {} at index {}",
+							test_name,
+							out[i],
+							i
+						);
+					}
+				}
+
+
+				if data.len() >= period * 2 {
+					for i in (warmup_end + period)..data.len().min(warmup_end + period * 3) {
+						if out[i].is_nan() {
+							continue;
+						}
+
+						let window_start = i + 1 - period;
+						let window = &data[window_start..=i];
+
+
+						let window_min = window.iter().cloned().fold(f64::INFINITY, f64::min);
+						let window_max = window.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+						let range = window_max - window_min;
+
+						if range > 1.0 {
+
+							let middle_idx = period / 2;
+							let middle_value = window[middle_idx];
+							let first_value = window[0];
+							let last_value = window[period - 1];
+
+
+							let clearly_ascending = first_value < middle_value && middle_value < last_value
+								&& (last_value - first_value) > range * 0.8;
+							let clearly_descending = first_value > middle_value && middle_value > last_value
+								&& (first_value - last_value) > range * 0.8;
+
+							if clearly_ascending || clearly_descending {
+
+								let dist_to_middle = (out[i] - middle_value).abs();
+								let dist_to_first = (out[i] - first_value).abs();
+								let dist_to_last = (out[i] - last_value).abs();
+
+
+								prop_assert!(
+									dist_to_middle < dist_to_first.min(dist_to_last) * 1.2,
+									"[{}] idx {}: SINWMA output {} should be closer to middle {} than to extremes [{}, {}] (period={})",
+									test_name,
+									i,
+									out[i],
+									middle_value,
+									first_value,
+									last_value,
+									period
+								);
+							}
+						}
+					}
+				}
+
+				Ok(())
+			})?;
+
+        Ok(())
+    }
+
+    macro_rules! generate_all_sinwma_tests {
+        ($($test_fn:ident),*) => {
+            paste::paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar);
+                    }
+                )*
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _avx2_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2);
+                    }
+                    #[test]
+                    fn [<$test_fn _avx512_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512);
+                    }
+                )*
+            }
+        }
+    }
+
+    generate_all_sinwma_tests!(
+        check_sinwma_partial_params,
+        check_sinwma_accuracy,
+        check_sinwma_default_candles,
+        check_sinwma_zero_period,
+        check_sinwma_period_exceeds_length,
+        check_sinwma_very_small_dataset,
+        check_sinwma_reinput,
+        check_sinwma_nan_handling,
+        check_sinwma_streaming,
+        check_sinwma_no_poison
+    );
+
+    #[cfg(feature = "proptest")]
+    generate_all_sinwma_tests!(check_sinwma_property);
+
+    fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let output = SinWmaBatchBuilder::new()
+            .kernel(kernel)
+            .apply_candles(&c, "close")?;
+
+        let def = SinWmaParams::default();
+        let row = output.values_for(&def).expect("default row missing");
+
+        assert_eq!(row.len(), c.close.len());
+
+        let expected = [
+            59376.72903536103,
+            59300.76862770367,
+            59229.27622157621,
+            59178.48781774477,
+            59154.66580703081,
+        ];
+        let start = row.len() - 5;
+        for (i, &v) in row[start..].iter().enumerate() {
+            assert!(
+                (v - expected[i]).abs() < 1e-6,
+                "[{test}] default-row mismatch at idx {i}: {v} vs {expected:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let test_configs = vec![(5, 15, 5), (10, 30, 10), (20, 50, 15), (2, 10, 2)];
+
+        for (start, end, step) in test_configs {
+            let output = SinWmaBatchBuilder::new()
+                .kernel(kernel)
+                .period_range(start, end, step)
+                .apply_candles(&c, "close")?;
+
+            for (idx, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+                let row = idx / output.cols;
+                let col = idx % output.cols;
+                let period = output.combos[row].period.unwrap();
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {}, period={})",
+                        test, val, bits, row, col, idx, period
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {}, period={})",
+                        test, val, bits, row, col, idx, period
+                    );
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {}, period={})",
+                        test, val, bits, row, col, idx, period
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_batch_no_poison(_test: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    macro_rules! gen_batch_tests {
+        ($fn_name:ident) => {
+            paste::paste! {
+                #[test] fn [<$fn_name _scalar>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx2>]()        {
+                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx512>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                }
+                #[test] fn [<$fn_name _auto_detect>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                }
+            }
+        };
+    }
+    gen_batch_tests!(check_batch_default_row);
+    gen_batch_tests!(check_batch_no_poison);
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "sinwma")]
+#[pyo3(signature = (data, period, kernel=None))]
+
+pub fn sinwma_py<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray1<'py, f64>,
+    period: usize,
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+
+    let slice_in = data.as_slice()?;
+    let kern = validate_kernel(kernel, false)?;
+
+    let params = SinWmaParams {
+        period: Some(period),
+    };
+    let input = SinWmaInput::from_slice(slice_in, params);
+
+    let result_vec: Vec<f64> = py
+        .allow_threads(|| sinwma_with_kernel(&input, kern).map(|o| o.values))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok(result_vec.into_pyarray(py))
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "SinWmaStream")]
+
+pub struct SinWmaStreamPy {
+    stream: SinWmaStream,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl SinWmaStreamPy {
+    #[new]
+
+    fn new(period: usize) -> PyResult<Self> {
+        let params = SinWmaParams {
+            period: Some(period),
+        };
+        let stream =
+            SinWmaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(SinWmaStreamPy { stream })
+    }
+
+    fn update(&mut self, value: f64) -> Option<f64> {
+        self.stream.update(value)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "sinwma_batch")]
+#[pyo3(signature = (data, period_range, kernel=None))]
+
+pub fn sinwma_batch_py<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray1<'py, f64>,
+    period_range: (usize, usize, usize),
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+    use pyo3::types::PyDict;
+
+    let slice_in = data.as_slice()?;
+
+    let sweep = SinWmaBatchRange {
+        period: period_range,
+    };
+
+    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let rows = combos.len();
+    let cols = slice_in.len();
+
+    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
+    let slice_out = unsafe { out_arr.as_slice_mut()? };
+
+    let kern = validate_kernel(kernel, true)?;
+
+    let combos = py
+        .allow_threads(|| {
+            let kernel = match kern {
+                Kernel::Auto => detect_best_batch_kernel(),
+                k => k,
+            };
+            let simd = match kernel {
+                Kernel::Avx512Batch => Kernel::Avx512,
+                Kernel::Avx2Batch => Kernel::Avx2,
+                Kernel::ScalarBatch => Kernel::Scalar,
+                _ => unreachable!(),
+            };
+            sinwma_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
+    dict.set_item(
+        "periods",
+        combos
+            .iter()
+            .map(|p| p.period.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+
+    Ok(dict)
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "sinwma_cuda_batch_dev")]
+#[pyo3(signature = (data_f32, period_range, device_id=0))]
+pub fn sinwma_cuda_batch_dev_py(
+    py: Python<'_>,
+    data_f32: PyReadonlyArray1<'_, f32>,
+    period_range: (usize, usize, usize),
+    device_id: usize,
+) -> PyResult<DeviceArrayF32Py> {
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+
+    let slice_in = data_f32.as_slice()?;
+    let sweep = SinWmaBatchRange {
+        period: period_range,
+    };
+
+    let inner = py.allow_threads(|| {
+        let cuda = CudaSinwma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        cuda.sinwma_batch_dev(slice_in, &sweep)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+
+    Ok(make_device_array_py(device_id, inner)?)
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "sinwma_cuda_many_series_one_param_dev")]
+#[pyo3(signature = (data_tm_f32, period, device_id=0))]
+pub fn sinwma_cuda_many_series_one_param_dev_py(
+    py: Python<'_>,
+    data_tm_f32: PyReadonlyArray2<'_, f32>,
+    period: usize,
+    device_id: usize,
+) -> PyResult<DeviceArrayF32Py> {
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+
+    let flat_in = data_tm_f32.as_slice()?;
+    let rows = data_tm_f32.shape()[0];
+    let cols = data_tm_f32.shape()[1];
+    let params = SinWmaParams {
+        period: Some(period),
+    };
+
+    let inner = py.allow_threads(|| {
+        let cuda = CudaSinwma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        cuda.sinwma_many_series_one_param_time_major_dev(flat_in, cols, rows, &params)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+
+    Ok(make_device_array_py(device_id, inner)?)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn sinwma_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
+    let params = SinWmaParams {
+        period: Some(period),
+    };
+    let input = SinWmaInput::from_slice(data, params);
+
+    let mut output = vec![0.0; data.len()];
+
+    sinwma_into_slice(&mut output, &input, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    Ok(output)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn sinwma_alloc(len: usize) -> *mut f64 {
+    let mut vec = Vec::<f64>::with_capacity(len);
+    let ptr = vec.as_mut_ptr();
+    std::mem::forget(vec);
+    ptr
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn sinwma_free(ptr: *mut f64, len: usize) {
+    if !ptr.is_null() {
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, 0, len);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn sinwma_into(
+    in_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    period: usize,
+) -> Result<(), JsValue> {
+    if in_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("null pointer passed to sinwma_into"));
+    }
+
+    unsafe {
+        let data = std::slice::from_raw_parts(in_ptr, len);
+
+        if period == 0 || period > len {
+            return Err(JsValue::from_str("Invalid period"));
+        }
+
+        let params = SinWmaParams {
+            period: Some(period),
+        };
+        let input = SinWmaInput::from_slice(data, params);
+
+        if in_ptr == out_ptr {
+            let mut temp = vec![0.0; len];
+            sinwma_into_slice(&mut temp, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            out.copy_from_slice(&temp);
+        } else {
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            sinwma_into_slice(out, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct SinWmaBatchConfig {
+    pub period_range: (usize, usize, usize),
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct SinWmaBatchJsOutput {
+    pub values: Vec<f64>,
+    pub periods: Vec<usize>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = sinwma_batch)]
+pub fn sinwma_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
+    let config: SinWmaBatchConfig = serde_wasm_bindgen::from_value(config)
+        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
+
+    let sweep = SinWmaBatchRange {
+        period: config.period_range,
+    };
+
+    let output = sinwma_batch_with_kernel(data, &sweep, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let periods: Vec<usize> = output.combos.iter().map(|c| c.period.unwrap()).collect();
+
+    let js_output = SinWmaBatchJsOutput {
+        values: output.values,
+        periods,
+        rows: output.rows,
+        cols: output.cols,
+    };
+
+    serde_wasm_bindgen::to_value(&js_output)
+        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn sinwma_batch_js(
+    data: &[f64],
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+) -> Result<Vec<f64>, JsValue> {
+    let sweep = SinWmaBatchRange {
+        period: (period_start, period_end, period_step),
+    };
+
+    sinwma_batch_with_kernel(data, &sweep, Kernel::Auto)
+        .map(|output| output.values)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn sinwma_batch_metadata_js(
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+) -> Vec<u32> {
+    let sweep = SinWmaBatchRange {
+        period: (period_start, period_end, period_step),
+    };
+
+    let combos = expand_grid(&sweep).unwrap_or_else(|_| Vec::new());
+    combos.iter().map(|p| p.period.unwrap() as u32).collect()
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn sinwma_batch_rows_cols_js(
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+    data_len: usize,
+) -> Vec<u32> {
+    let sweep = SinWmaBatchRange {
+        period: (period_start, period_end, period_step),
+    };
+
+    let combos = expand_grid(&sweep).unwrap_or_else(|_| Vec::new());
+    vec![combos.len() as u32, data_len as u32]
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn sinwma_batch_into(
+    in_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+) -> Result<usize, JsValue> {
+    if in_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str(
+            "null pointer passed to sinwma_batch_into",
+        ));
+    }
+    unsafe {
+        let data = std::slice::from_raw_parts(in_ptr, len);
+        let sweep = SinWmaBatchRange {
+            period: (period_start, period_end, period_step),
+        };
+        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let rows = combos.len();
+        let cols = len;
+
+        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
+
+        let simd = match detect_best_batch_kernel() {
+            Kernel::Avx512Batch => Kernel::Avx512,
+            Kernel::Avx2Batch => Kernel::Avx2,
+            _ => Kernel::Scalar,
+        };
+        sinwma_batch_inner_into(data, &sweep, simd, false, out)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(rows)
+    }
+}

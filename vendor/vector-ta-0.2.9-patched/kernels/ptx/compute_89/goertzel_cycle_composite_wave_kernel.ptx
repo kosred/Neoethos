@@ -1,0 +1,12 @@
+.version 9.2
+.target sm_89
+.address_size 64
+
+
+.visible .entry goertzel_cycle_composite_wave_batch_f64()
+{
+
+
+	ret;
+
+}

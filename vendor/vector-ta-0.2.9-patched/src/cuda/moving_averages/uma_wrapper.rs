@@ -1,0 +1,1433 @@
+#![cfg(feature = "cuda")]
+
+use super::DeviceArrayF32;
+use crate::indicators::moving_averages::uma::{expand_grid_uma, UmaBatchRange, UmaParams};
+use cust::context::Context;
+use cust::device::Device;
+use cust::function::{BlockSize, GridSize};
+use cust::memory::{mem_get_info, DeviceBuffer};
+use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::prelude::*;
+use cust::stream::{Stream, StreamFlags};
+use std::env;
+use std::ffi::c_void;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum CudaUmaError {
+    #[error("CUDA error: {0}")]
+    Cuda(#[from] cust::error::CudaError),
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+    #[error("Invalid policy: {0}")]
+    InvalidPolicy(&'static str),
+    #[error("Out of memory on device: required={required}B, free={free}B, headroom={headroom}B")]
+    OutOfMemory {
+        required: usize,
+        free: usize,
+        headroom: usize,
+    },
+    #[error("Missing kernel symbol: {name}")]
+    MissingKernelSymbol { name: &'static str },
+    #[error("Launch config too large (grid=({gx},{gy},{gz}), block=({bx},{by},{bz}))")]
+    LaunchConfigTooLarge {
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
+    },
+    #[error("arithmetic overflow when computing {what}")]
+    ArithmeticOverflow { what: &'static str },
+    #[error("device mismatch for buffer (buf={buf}, current={current})")]
+    DeviceMismatch { buf: i32, current: i32 },
+    #[error("not implemented")]
+    NotImplemented,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BatchKernelPolicy {
+    Auto,
+    Plain { block_x: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ManySeriesKernelPolicy {
+    Auto,
+    OneD { block_x: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CudaUmaPolicy {
+    pub batch: BatchKernelPolicy,
+    pub many_series: ManySeriesKernelPolicy,
+}
+
+impl Default for CudaUmaPolicy {
+    fn default() -> Self {
+        Self {
+            batch: BatchKernelPolicy::Auto,
+            many_series: ManySeriesKernelPolicy::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BatchKernelSelected {
+    Plain { block_x: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ManySeriesKernelSelected {
+    OneD { block_x: u32 },
+}
+
+pub struct CudaUma {
+    module: Module,
+    stream: Stream,
+    context: Arc<Context>,
+    device_id: u32,
+    policy: CudaUmaPolicy,
+    last_batch: Option<BatchKernelSelected>,
+    last_many: Option<ManySeriesKernelSelected>,
+    debug_batch_logged: bool,
+    debug_many_logged: bool,
+}
+
+impl CudaUma {
+    pub fn new(device_id: usize) -> Result<Self, CudaUmaError> {
+        cust::init(CudaFlags::empty())?;
+
+        let device = Device::get_device(device_id as u32)?;
+        let context = Arc::new(Context::new(device)?);
+
+        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/uma_kernel.ptx"));
+
+        let jit_opts = &[
+            ModuleJitOption::DetermineTargetFromContext,
+            ModuleJitOption::OptLevel(OptLevel::O2),
+        ];
+        let module = crate::load_cuda_embedded_module!("uma_kernel")?;
+        let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
+
+        Ok(Self {
+            module,
+            stream,
+            context: context.clone(),
+            device_id: device_id as u32,
+            policy: CudaUmaPolicy::default(),
+            last_batch: None,
+            last_many: None,
+            debug_batch_logged: false,
+            debug_many_logged: false,
+        })
+    }
+
+    pub fn new_with_policy(device_id: usize, policy: CudaUmaPolicy) -> Result<Self, CudaUmaError> {
+        let mut s = Self::new(device_id)?;
+        s.policy = policy;
+        Ok(s)
+    }
+    pub fn set_policy(&mut self, policy: CudaUmaPolicy) {
+        self.policy = policy;
+    }
+    pub fn policy(&self) -> &CudaUmaPolicy {
+        &self.policy
+    }
+
+    #[inline]
+    pub fn context_arc(&self) -> Arc<Context> {
+        self.context.clone()
+    }
+
+    #[inline]
+    pub fn device_id(&self) -> u32 {
+        self.device_id
+    }
+
+    #[inline]
+    fn mem_check_enabled() -> bool {
+        match env::var("CUDA_MEM_CHECK") {
+            Ok(v) => v != "0" && v.to_lowercase() != "false",
+            Err(_) => true,
+        }
+    }
+
+    #[inline]
+    fn device_mem_info() -> Option<(usize, usize)> {
+        mem_get_info().ok()
+    }
+
+    #[inline]
+    fn will_fit_checked(required_bytes: usize, headroom_bytes: usize) -> Result<(), CudaUmaError> {
+        if !Self::mem_check_enabled() {
+            return Ok(());
+        }
+        let (free, _total) = match Self::device_mem_info() {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+        let need =
+            required_bytes
+                .checked_add(headroom_bytes)
+                .ok_or(CudaUmaError::ArithmeticOverflow {
+                    what: "required_bytes + headroom_bytes",
+                })?;
+        if need <= free {
+            Ok(())
+        } else {
+            Err(CudaUmaError::OutOfMemory {
+                required: required_bytes,
+                free,
+                headroom: headroom_bytes,
+            })
+        }
+    }
+
+    #[inline]
+    fn all_smooth_leq_one(smooth_lengths: &[i32]) -> bool {
+        smooth_lengths.iter().all(|&s| s <= 1)
+    }
+
+    #[inline]
+    fn maybe_log_batch_debug(&self) {
+        static GLOBAL_ONCE: AtomicBool = AtomicBool::new(false);
+        if self.debug_batch_logged {
+            return;
+        }
+        if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(sel) = self.last_batch {
+                let per_scenario =
+                    std::env::var("BENCH_DEBUG_SCOPE").ok().as_deref() == Some("scenario");
+                if per_scenario || !GLOBAL_ONCE.swap(true, Ordering::Relaxed) {
+                    eprintln!("[DEBUG] UMA batch selected kernel: {:?}", sel);
+                }
+                unsafe {
+                    (*(self as *const _ as *mut CudaUma)).debug_batch_logged = true;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn maybe_log_many_debug(&self) {
+        static GLOBAL_ONCE: AtomicBool = AtomicBool::new(false);
+        if self.debug_many_logged {
+            return;
+        }
+        if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(sel) = self.last_many {
+                let per_scenario =
+                    std::env::var("BENCH_DEBUG_SCOPE").ok().as_deref() == Some("scenario");
+                if per_scenario || !GLOBAL_ONCE.swap(true, Ordering::Relaxed) {
+                    eprintln!("[DEBUG] UMA many-series selected kernel: {:?}", sel);
+                }
+                unsafe {
+                    (*(self as *const _ as *mut CudaUma)).debug_many_logged = true;
+                }
+            }
+        }
+    }
+
+    pub fn uma_batch_dev(
+        &self,
+        prices: &[f32],
+        volumes: Option<&[f32]>,
+        sweep: &UmaBatchRange,
+    ) -> Result<DeviceArrayF32, CudaUmaError> {
+        let inputs = Self::prepare_batch_inputs(prices, volumes, sweep)?;
+        self.run_batch_kernel(prices, volumes, &inputs)
+    }
+
+    pub fn uma_batch_into_host_f32(
+        &self,
+        prices: &[f32],
+        volumes: Option<&[f32]>,
+        sweep: &UmaBatchRange,
+        out: &mut [f32],
+    ) -> Result<(usize, usize, Vec<UmaParams>), CudaUmaError> {
+        let inputs = Self::prepare_batch_inputs(prices, volumes, sweep)?;
+        let expected = inputs.series_len * inputs.combos.len();
+        if out.len() != expected {
+            return Err(CudaUmaError::InvalidInput(format!(
+                "out slice wrong length: got {}, expected {}",
+                out.len(),
+                expected
+            )));
+        }
+
+        let arr = self.run_batch_kernel(prices, volumes, &inputs)?;
+        arr.buf.copy_to(out)?;
+        let BatchInputs { combos, .. } = inputs;
+        Ok((arr.rows, arr.cols, combos))
+    }
+
+    pub fn uma_batch_device(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        d_volumes: Option<&DeviceBuffer<f32>>,
+        d_accelerators: &DeviceBuffer<f32>,
+        d_min_lengths: &DeviceBuffer<i32>,
+        d_max_lengths: &DeviceBuffer<i32>,
+        d_smooth_lengths: &DeviceBuffer<i32>,
+        series_len: usize,
+        n_combos: usize,
+        first_valid: usize,
+        has_volume: bool,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaUmaError> {
+        let mut d_raw: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized(series_len * n_combos) }
+                .map_err(CudaUmaError::Cuda)?;
+
+        self.launch_batch_kernel(
+            d_prices,
+            d_volumes,
+            d_accelerators,
+            d_min_lengths,
+            d_max_lengths,
+            d_smooth_lengths,
+            series_len,
+            n_combos,
+            first_valid,
+            has_volume,
+            &mut d_raw,
+            d_out,
+        )?;
+
+        self.stream.synchronize().map_err(CudaUmaError::from)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn uma_batch_device_with_raw(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        d_volumes: Option<&DeviceBuffer<f32>>,
+        d_accelerators: &DeviceBuffer<f32>,
+        d_min_lengths: &DeviceBuffer<i32>,
+        d_max_lengths: &DeviceBuffer<i32>,
+        d_smooth_lengths: &DeviceBuffer<i32>,
+        series_len: usize,
+        n_combos: usize,
+        first_valid: usize,
+        has_volume: bool,
+        d_raw: &mut DeviceBuffer<f32>,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaUmaError> {
+        self.launch_batch_kernel(
+            d_prices,
+            d_volumes,
+            d_accelerators,
+            d_min_lengths,
+            d_max_lengths,
+            d_smooth_lengths,
+            series_len,
+            n_combos,
+            first_valid,
+            has_volume,
+            d_raw,
+            d_out,
+        )
+    }
+
+    pub fn uma_many_series_one_param_device(
+        &self,
+        d_prices_tm: &DeviceBuffer<f32>,
+        d_volumes_tm: Option<&DeviceBuffer<f32>>,
+        accelerator: f32,
+        min_length: i32,
+        max_length: i32,
+        smooth_length: i32,
+        num_series: usize,
+        series_len: usize,
+        d_first_valids: &DeviceBuffer<i32>,
+        has_volume: bool,
+        d_raw_tm: &mut DeviceBuffer<f32>,
+        d_out_tm: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaUmaError> {
+        if accelerator < 1.0 {
+            return Err(CudaUmaError::InvalidInput(format!(
+                "accelerator must be >= 1.0 (got {})",
+                accelerator
+            )));
+        }
+        if min_length <= 0 || max_length <= 0 || smooth_length <= 0 {
+            return Err(CudaUmaError::InvalidInput(
+                "min_length, max_length, and smooth_length must be positive".into(),
+            ));
+        }
+        if min_length > max_length {
+            return Err(CudaUmaError::InvalidInput(format!(
+                "min_length {} greater than max_length {}",
+                min_length, max_length
+            )));
+        }
+        if num_series == 0 || series_len == 0 {
+            return Err(CudaUmaError::InvalidInput(
+                "num_series and series_len must be positive".into(),
+            ));
+        }
+        if num_series > i32::MAX as usize || series_len > i32::MAX as usize {
+            return Err(CudaUmaError::InvalidInput(
+                "arguments exceed kernel limits".into(),
+            ));
+        }
+
+        if smooth_length <= 1 {
+            let raw_ptr = d_out_tm.as_device_ptr().as_raw();
+            let out_ptr = raw_ptr;
+            self.launch_many_series_kernel_ptrs(
+                d_prices_tm,
+                d_volumes_tm,
+                accelerator,
+                min_length,
+                max_length,
+                smooth_length,
+                num_series,
+                series_len,
+                d_first_valids,
+                has_volume,
+                raw_ptr,
+                out_ptr,
+            )?;
+        } else {
+            self.launch_many_series_kernel(
+                d_prices_tm,
+                d_volumes_tm,
+                accelerator,
+                min_length,
+                max_length,
+                smooth_length,
+                num_series,
+                series_len,
+                d_first_valids,
+                has_volume,
+                d_raw_tm,
+                d_out_tm,
+            )?;
+        }
+
+        self.stream.synchronize().map_err(CudaUmaError::from)
+    }
+
+    pub fn uma_many_series_one_param_time_major_dev(
+        &self,
+        prices_tm_f32: &[f32],
+        volumes_tm_f32: Option<&[f32]>,
+        cols: usize,
+        rows: usize,
+        params: &UmaParams,
+    ) -> Result<DeviceArrayF32, CudaUmaError> {
+        let inputs =
+            Self::prepare_many_series_inputs(prices_tm_f32, volumes_tm_f32, cols, rows, params)?;
+        self.run_many_series_kernel(prices_tm_f32, volumes_tm_f32, &inputs)
+    }
+
+    pub fn uma_many_series_one_param_time_major_into_host_f32(
+        &self,
+        prices_tm_f32: &[f32],
+        volumes_tm_f32: Option<&[f32]>,
+        cols: usize,
+        rows: usize,
+        params: &UmaParams,
+        out_tm: &mut [f32],
+    ) -> Result<(), CudaUmaError> {
+        if out_tm.len() != cols * rows {
+            return Err(CudaUmaError::InvalidInput(format!(
+                "out slice wrong length: got {}, expected {}",
+                out_tm.len(),
+                cols * rows
+            )));
+        }
+        let inputs =
+            Self::prepare_many_series_inputs(prices_tm_f32, volumes_tm_f32, cols, rows, params)?;
+        let arr = self.run_many_series_kernel(prices_tm_f32, volumes_tm_f32, &inputs)?;
+        arr.buf.copy_to(out_tm)?;
+        Ok(())
+    }
+
+    fn run_batch_kernel(
+        &self,
+        prices: &[f32],
+        volumes: Option<&[f32]>,
+        inputs: &BatchInputs,
+    ) -> Result<DeviceArrayF32, CudaUmaError> {
+        let n_combos = inputs.combos.len();
+        let series_len = inputs.series_len;
+
+        let sz_f32 = std::mem::size_of::<f32>();
+        let price_bytes =
+            prices
+                .len()
+                .checked_mul(sz_f32)
+                .ok_or(CudaUmaError::ArithmeticOverflow {
+                    what: "len(prices) * sizeof(f32)",
+                })?;
+        let volume_bytes = if inputs.has_volume {
+            series_len
+                .checked_mul(sz_f32)
+                .ok_or(CudaUmaError::ArithmeticOverflow {
+                    what: "series_len * sizeof(f32)",
+                })?
+        } else {
+            0
+        };
+        let accel_bytes = n_combos
+            .checked_mul(sz_f32)
+            .ok_or(CudaUmaError::ArithmeticOverflow {
+                what: "n_combos * sizeof(f32)",
+            })?;
+        let len_bytes_each = n_combos.checked_mul(std::mem::size_of::<i32>()).ok_or(
+            CudaUmaError::ArithmeticOverflow {
+                what: "n_combos * sizeof(i32)",
+            },
+        )?;
+        let len_bytes = len_bytes_each
+            .checked_mul(3)
+            .ok_or(CudaUmaError::ArithmeticOverflow {
+                what: "(n_combos * sizeof(i32)) * 3",
+            })?;
+        let out_elems =
+            n_combos
+                .checked_mul(series_len)
+                .ok_or(CudaUmaError::ArithmeticOverflow {
+                    what: "n_combos * series_len",
+                })?;
+        let out_bytes = out_elems
+            .checked_mul(sz_f32)
+            .ok_or(CudaUmaError::ArithmeticOverflow {
+                what: "out_elems * sizeof(f32)",
+            })?;
+        let alias_raw_final = Self::all_smooth_leq_one(&inputs.smooth_lengths);
+        let raw_bytes = if alias_raw_final { 0 } else { out_bytes };
+        let required = price_bytes
+            .checked_add(volume_bytes)
+            .ok_or(CudaUmaError::ArithmeticOverflow {
+                what: "price+volume",
+            })?
+            .checked_add(accel_bytes)
+            .ok_or(CudaUmaError::ArithmeticOverflow { what: "prev+accel" })?
+            .checked_add(len_bytes)
+            .ok_or(CudaUmaError::ArithmeticOverflow { what: "prev+lens" })?
+            .checked_add(out_bytes)
+            .ok_or(CudaUmaError::ArithmeticOverflow { what: "prev+out" })?
+            .checked_add(raw_bytes)
+            .ok_or(CudaUmaError::ArithmeticOverflow { what: "prev+raw" })?;
+        let headroom = 64 * 1024 * 1024;
+        Self::will_fit_checked(required, headroom)?;
+
+        let d_prices = DeviceBuffer::from_slice(prices)?;
+        let d_volumes = if let Some(v) = volumes {
+            Some(DeviceBuffer::from_slice(v)?)
+        } else {
+            None
+        };
+        let d_accels = DeviceBuffer::from_slice(&inputs.accelerators)?;
+        let d_min = DeviceBuffer::from_slice(&inputs.min_lengths)?;
+        let d_max = DeviceBuffer::from_slice(&inputs.max_lengths)?;
+        let d_smooth = DeviceBuffer::from_slice(&inputs.smooth_lengths)?;
+
+        let mut d_out: DeviceBuffer<f32> = unsafe { DeviceBuffer::uninitialized(out_elems) }?;
+        if alias_raw_final {
+            let raw_ptr = d_out.as_device_ptr().as_raw();
+            let out_ptr = raw_ptr;
+            self.launch_batch_kernel_ptrs(
+                &d_prices,
+                d_volumes.as_ref(),
+                &d_accels,
+                &d_min,
+                &d_max,
+                &d_smooth,
+                series_len,
+                n_combos,
+                inputs.first_valid,
+                inputs.has_volume,
+                raw_ptr,
+                out_ptr,
+            )?;
+        } else {
+            let mut d_raw: DeviceBuffer<f32> = unsafe { DeviceBuffer::uninitialized(out_elems) }?;
+            self.launch_batch_kernel(
+                &d_prices,
+                d_volumes.as_ref(),
+                &d_accels,
+                &d_min,
+                &d_max,
+                &d_smooth,
+                series_len,
+                n_combos,
+                inputs.first_valid,
+                inputs.has_volume,
+                &mut d_raw,
+                &mut d_out,
+            )?;
+        }
+
+        self.stream.synchronize()?;
+
+        Ok(DeviceArrayF32 {
+            buf: d_out,
+            rows: n_combos,
+            cols: series_len,
+        })
+    }
+
+    fn run_many_series_kernel(
+        &self,
+        prices_tm_f32: &[f32],
+        volumes_tm_f32: Option<&[f32]>,
+        inputs: &ManySeriesInputs,
+    ) -> Result<DeviceArrayF32, CudaUmaError> {
+        let sz_f32 = std::mem::size_of::<f32>();
+        let prices_bytes =
+            prices_tm_f32
+                .len()
+                .checked_mul(sz_f32)
+                .ok_or(CudaUmaError::ArithmeticOverflow {
+                    what: "len(prices_tm) * sizeof(f32)",
+                })?;
+        let volume_bytes = if inputs.has_volume {
+            inputs
+                .num_series
+                .checked_mul(inputs.series_len)
+                .and_then(|x| x.checked_mul(sz_f32))
+                .ok_or(CudaUmaError::ArithmeticOverflow {
+                    what: "num_series * series_len * sizeof(f32)",
+                })?
+        } else {
+            0
+        };
+        let first_valid_bytes = inputs
+            .num_series
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or(CudaUmaError::ArithmeticOverflow {
+                what: "num_series * sizeof(i32)",
+            })?;
+        let out_bytes = inputs
+            .num_series
+            .checked_mul(inputs.series_len)
+            .and_then(|x| x.checked_mul(sz_f32))
+            .ok_or(CudaUmaError::ArithmeticOverflow {
+                what: "num_series * series_len * sizeof(f32) (out)",
+            })?;
+        let alias_raw_final = inputs.smooth_length <= 1;
+        let raw_bytes = if alias_raw_final { 0 } else { out_bytes };
+        let required = prices_bytes
+            .checked_add(volume_bytes)
+            .ok_or(CudaUmaError::ArithmeticOverflow {
+                what: "prices+volume",
+            })?
+            .checked_add(first_valid_bytes)
+            .ok_or(CudaUmaError::ArithmeticOverflow {
+                what: "prev+first_valid",
+            })?
+            .checked_add(out_bytes)
+            .ok_or(CudaUmaError::ArithmeticOverflow { what: "prev+out" })?
+            .checked_add(raw_bytes)
+            .ok_or(CudaUmaError::ArithmeticOverflow { what: "prev+raw" })?;
+        let headroom = 64 * 1024 * 1024;
+        Self::will_fit_checked(required, headroom)?;
+
+        let d_prices_tm = DeviceBuffer::from_slice(prices_tm_f32)?;
+        let d_volumes_tm = if inputs.has_volume {
+            let slice = volumes_tm_f32.ok_or_else(|| {
+                CudaUmaError::InvalidInput("volume matrix missing despite has_volume".into())
+            })?;
+            Some(DeviceBuffer::from_slice(slice)?)
+        } else {
+            None
+        };
+        let d_first_valids = DeviceBuffer::from_slice(&inputs.first_valids)?;
+        let out_elems = inputs.num_series.checked_mul(inputs.series_len).ok_or(
+            CudaUmaError::ArithmeticOverflow {
+                what: "num_series * series_len",
+            },
+        )?;
+        let mut d_out_tm: DeviceBuffer<f32> = unsafe { DeviceBuffer::uninitialized(out_elems) }?;
+        if alias_raw_final {
+            let raw_ptr = d_out_tm.as_device_ptr().as_raw();
+            let out_ptr = raw_ptr;
+            self.launch_many_series_kernel_ptrs(
+                &d_prices_tm,
+                d_volumes_tm.as_ref(),
+                inputs.accelerator,
+                inputs.min_length,
+                inputs.max_length,
+                inputs.smooth_length,
+                inputs.num_series,
+                inputs.series_len,
+                &d_first_valids,
+                inputs.has_volume,
+                raw_ptr,
+                out_ptr,
+            )?;
+        } else {
+            let mut d_raw_tm: DeviceBuffer<f32> =
+                unsafe { DeviceBuffer::uninitialized(out_elems) }?;
+            self.launch_many_series_kernel(
+                &d_prices_tm,
+                d_volumes_tm.as_ref(),
+                inputs.accelerator,
+                inputs.min_length,
+                inputs.max_length,
+                inputs.smooth_length,
+                inputs.num_series,
+                inputs.series_len,
+                &d_first_valids,
+                inputs.has_volume,
+                &mut d_raw_tm,
+                &mut d_out_tm,
+            )?;
+        }
+
+        self.stream.synchronize()?;
+
+        Ok(DeviceArrayF32 {
+            buf: d_out_tm,
+            rows: inputs.series_len,
+            cols: inputs.num_series,
+        })
+    }
+
+    fn launch_batch_kernel(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        d_volumes: Option<&DeviceBuffer<f32>>,
+        d_accelerators: &DeviceBuffer<f32>,
+        d_min_lengths: &DeviceBuffer<i32>,
+        d_max_lengths: &DeviceBuffer<i32>,
+        d_smooth_lengths: &DeviceBuffer<i32>,
+        series_len: usize,
+        n_combos: usize,
+        first_valid: usize,
+        has_volume: bool,
+        d_raw: &mut DeviceBuffer<f32>,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaUmaError> {
+        if series_len > i32::MAX as usize {
+            return Err(CudaUmaError::InvalidInput(
+                "series too long for kernel argument width".into(),
+            ));
+        }
+        if n_combos > i32::MAX as usize {
+            return Err(CudaUmaError::InvalidInput(
+                "too many parameter combinations".into(),
+            ));
+        }
+
+        let func = self.module.get_function("uma_batch_f32").map_err(|_| {
+            CudaUmaError::MissingKernelSymbol {
+                name: "uma_batch_f32",
+            }
+        })?;
+
+        let block_x = match self.policy.batch {
+            BatchKernelPolicy::Auto => 32u32,
+            BatchKernelPolicy::Plain { block_x } => block_x.max(1),
+        };
+        let grid: GridSize = (n_combos as u32, 1, 1).into();
+        let block: BlockSize = (block_x, 1, 1).into();
+
+        unsafe {
+            let mut prices_ptr = d_prices.as_device_ptr().as_raw();
+            let mut volumes_ptr = d_volumes
+                .map(|buf| buf.as_device_ptr().as_raw())
+                .unwrap_or(0);
+            let mut has_volume_i = if has_volume { 1i32 } else { 0i32 };
+            let mut accel_ptr = d_accelerators.as_device_ptr().as_raw();
+            let mut min_ptr = d_min_lengths.as_device_ptr().as_raw();
+            let mut max_ptr = d_max_lengths.as_device_ptr().as_raw();
+            let mut smooth_ptr = d_smooth_lengths.as_device_ptr().as_raw();
+            let mut series_len_i = series_len as i32;
+            let mut combos_i = n_combos as i32;
+            let mut first_valid_i = first_valid as i32;
+            let mut raw_ptr = d_raw.as_device_ptr().as_raw();
+            let mut out_ptr = d_out.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut prices_ptr as *mut _ as *mut c_void,
+                &mut volumes_ptr as *mut _ as *mut c_void,
+                &mut has_volume_i as *mut _ as *mut c_void,
+                &mut accel_ptr as *mut _ as *mut c_void,
+                &mut min_ptr as *mut _ as *mut c_void,
+                &mut max_ptr as *mut _ as *mut c_void,
+                &mut smooth_ptr as *mut _ as *mut c_void,
+                &mut series_len_i as *mut _ as *mut c_void,
+                &mut combos_i as *mut _ as *mut c_void,
+                &mut first_valid_i as *mut _ as *mut c_void,
+                &mut raw_ptr as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?
+        }
+        unsafe {
+            (*(self as *const _ as *mut CudaUma)).last_batch =
+                Some(BatchKernelSelected::Plain { block_x });
+        }
+        self.maybe_log_batch_debug();
+        Ok(())
+    }
+
+    fn launch_batch_kernel_ptrs(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        d_volumes: Option<&DeviceBuffer<f32>>,
+        d_accelerators: &DeviceBuffer<f32>,
+        d_min_lengths: &DeviceBuffer<i32>,
+        d_max_lengths: &DeviceBuffer<i32>,
+        d_smooth_lengths: &DeviceBuffer<i32>,
+        series_len: usize,
+        n_combos: usize,
+        first_valid: usize,
+        has_volume: bool,
+        raw_ptr_in: u64,
+        out_ptr_in: u64,
+    ) -> Result<(), CudaUmaError> {
+        if series_len > i32::MAX as usize {
+            return Err(CudaUmaError::InvalidInput(
+                "series too long for kernel argument width".into(),
+            ));
+        }
+        if n_combos > i32::MAX as usize {
+            return Err(CudaUmaError::InvalidInput(
+                "too many parameter combinations".into(),
+            ));
+        }
+
+        let func = self.module.get_function("uma_batch_f32").map_err(|_| {
+            CudaUmaError::MissingKernelSymbol {
+                name: "uma_batch_f32",
+            }
+        })?;
+
+        let block_x = match self.policy.batch {
+            BatchKernelPolicy::Auto => 32u32,
+            BatchKernelPolicy::Plain { block_x } => block_x.max(1),
+        };
+        let grid: GridSize = (n_combos as u32, 1, 1).into();
+        let block: BlockSize = (block_x, 1, 1).into();
+
+        unsafe {
+            let mut prices_ptr = d_prices.as_device_ptr().as_raw();
+            let mut volumes_ptr = d_volumes
+                .map(|buf| buf.as_device_ptr().as_raw())
+                .unwrap_or(0);
+            let mut has_volume_i = if has_volume { 1i32 } else { 0i32 };
+            let mut accel_ptr = d_accelerators.as_device_ptr().as_raw();
+            let mut min_ptr = d_min_lengths.as_device_ptr().as_raw();
+            let mut max_ptr = d_max_lengths.as_device_ptr().as_raw();
+            let mut smooth_ptr = d_smooth_lengths.as_device_ptr().as_raw();
+            let mut series_len_i = series_len as i32;
+            let mut combos_i = n_combos as i32;
+            let mut first_valid_i = first_valid as i32;
+            let mut raw_ptr = raw_ptr_in;
+            let mut out_ptr = out_ptr_in;
+            let args: &mut [*mut c_void] = &mut [
+                &mut prices_ptr as *mut _ as *mut c_void,
+                &mut volumes_ptr as *mut _ as *mut c_void,
+                &mut has_volume_i as *mut _ as *mut c_void,
+                &mut accel_ptr as *mut _ as *mut c_void,
+                &mut min_ptr as *mut _ as *mut c_void,
+                &mut max_ptr as *mut _ as *mut c_void,
+                &mut smooth_ptr as *mut _ as *mut c_void,
+                &mut series_len_i as *mut _ as *mut c_void,
+                &mut combos_i as *mut _ as *mut c_void,
+                &mut first_valid_i as *mut _ as *mut c_void,
+                &mut raw_ptr as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?
+        }
+        unsafe {
+            (*(self as *const _ as *mut CudaUma)).last_batch =
+                Some(BatchKernelSelected::Plain { block_x });
+        }
+        self.maybe_log_batch_debug();
+        Ok(())
+    }
+
+    fn launch_many_series_kernel(
+        &self,
+        d_prices_tm: &DeviceBuffer<f32>,
+        d_volumes_tm: Option<&DeviceBuffer<f32>>,
+        accelerator: f32,
+        min_length: i32,
+        max_length: i32,
+        smooth_length: i32,
+        num_series: usize,
+        series_len: usize,
+        d_first_valids: &DeviceBuffer<i32>,
+        has_volume: bool,
+        d_raw_tm: &mut DeviceBuffer<f32>,
+        d_out_tm: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaUmaError> {
+        if num_series > i32::MAX as usize || series_len > i32::MAX as usize {
+            return Err(CudaUmaError::InvalidInput(
+                "series dimensions exceed kernel limits".into(),
+            ));
+        }
+
+        let func = self
+            .module
+            .get_function("uma_many_series_one_param_f32")
+            .map_err(|_| CudaUmaError::MissingKernelSymbol {
+                name: "uma_many_series_one_param_f32",
+            })?;
+
+        let block_x = match self.policy.many_series {
+            ManySeriesKernelPolicy::Auto => 32u32,
+            ManySeriesKernelPolicy::OneD { block_x } => block_x.max(1),
+        };
+        let grid: GridSize = (num_series as u32, 1, 1).into();
+        let block: BlockSize = (block_x, 1, 1).into();
+
+        unsafe {
+            let mut prices_ptr = d_prices_tm.as_device_ptr().as_raw();
+            let mut volumes_ptr = d_volumes_tm
+                .map(|buf| buf.as_device_ptr().as_raw())
+                .unwrap_or(0);
+            let mut has_volume_i = if has_volume { 1i32 } else { 0i32 };
+            let mut accel = accelerator;
+            let mut min_i = min_length;
+            let mut max_i = max_length;
+            let mut smooth_i = smooth_length;
+            let mut num_series_i = num_series as i32;
+            let mut series_len_i = series_len as i32;
+            let mut first_valids_ptr = d_first_valids.as_device_ptr().as_raw();
+            let mut raw_ptr = d_raw_tm.as_device_ptr().as_raw();
+            let mut out_ptr = d_out_tm.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut prices_ptr as *mut _ as *mut c_void,
+                &mut volumes_ptr as *mut _ as *mut c_void,
+                &mut has_volume_i as *mut _ as *mut c_void,
+                &mut accel as *mut _ as *mut c_void,
+                &mut min_i as *mut _ as *mut c_void,
+                &mut max_i as *mut _ as *mut c_void,
+                &mut smooth_i as *mut _ as *mut c_void,
+                &mut num_series_i as *mut _ as *mut c_void,
+                &mut series_len_i as *mut _ as *mut c_void,
+                &mut first_valids_ptr as *mut _ as *mut c_void,
+                &mut raw_ptr as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?
+        }
+        unsafe {
+            (*(self as *const _ as *mut CudaUma)).last_many =
+                Some(ManySeriesKernelSelected::OneD { block_x });
+        }
+        self.maybe_log_many_debug();
+        Ok(())
+    }
+
+    fn launch_many_series_kernel_ptrs(
+        &self,
+        d_prices_tm: &DeviceBuffer<f32>,
+        d_volumes_tm: Option<&DeviceBuffer<f32>>,
+        accelerator: f32,
+        min_length: i32,
+        max_length: i32,
+        smooth_length: i32,
+        num_series: usize,
+        series_len: usize,
+        d_first_valids: &DeviceBuffer<i32>,
+        has_volume: bool,
+        raw_ptr_in: u64,
+        out_ptr_in: u64,
+    ) -> Result<(), CudaUmaError> {
+        if num_series > i32::MAX as usize || series_len > i32::MAX as usize {
+            return Err(CudaUmaError::InvalidInput(
+                "series dimensions exceed kernel limits".into(),
+            ));
+        }
+
+        let func = self
+            .module
+            .get_function("uma_many_series_one_param_f32")
+            .map_err(CudaUmaError::Cuda)?;
+
+        let block_x = match self.policy.many_series {
+            ManySeriesKernelPolicy::Auto => 32u32,
+            ManySeriesKernelPolicy::OneD { block_x } => block_x.max(1),
+        };
+        let grid: GridSize = (num_series as u32, 1, 1).into();
+        let block: BlockSize = (block_x, 1, 1).into();
+
+        unsafe {
+            let mut prices_ptr = d_prices_tm.as_device_ptr().as_raw();
+            let mut volumes_ptr = d_volumes_tm
+                .map(|buf| buf.as_device_ptr().as_raw())
+                .unwrap_or(0);
+            let mut has_volume_i = if has_volume { 1i32 } else { 0i32 };
+            let mut accel = accelerator;
+            let mut min_i = min_length;
+            let mut max_i = max_length;
+            let mut smooth_i = smooth_length;
+            let mut num_series_i = num_series as i32;
+            let mut series_len_i = series_len as i32;
+            let mut first_valids_ptr = d_first_valids.as_device_ptr().as_raw();
+            let mut raw_ptr = raw_ptr_in;
+            let mut out_ptr = out_ptr_in;
+            let args: &mut [*mut c_void] = &mut [
+                &mut prices_ptr as *mut _ as *mut c_void,
+                &mut volumes_ptr as *mut _ as *mut c_void,
+                &mut has_volume_i as *mut _ as *mut c_void,
+                &mut accel as *mut _ as *mut c_void,
+                &mut min_i as *mut _ as *mut c_void,
+                &mut max_i as *mut _ as *mut c_void,
+                &mut smooth_i as *mut _ as *mut c_void,
+                &mut num_series_i as *mut _ as *mut c_void,
+                &mut series_len_i as *mut _ as *mut c_void,
+                &mut first_valids_ptr as *mut _ as *mut c_void,
+                &mut raw_ptr as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream
+                .launch(&func, grid, block, 0, args)
+                .map_err(CudaUmaError::Cuda)?
+        }
+        unsafe {
+            (*(self as *const _ as *mut CudaUma)).last_many =
+                Some(ManySeriesKernelSelected::OneD { block_x });
+        }
+        self.maybe_log_many_debug();
+        Ok(())
+    }
+
+    fn prepare_batch_inputs(
+        prices: &[f32],
+        volumes: Option<&[f32]>,
+        sweep: &UmaBatchRange,
+    ) -> Result<BatchInputs, CudaUmaError> {
+        if prices.is_empty() {
+            return Err(CudaUmaError::InvalidInput("empty price series".into()));
+        }
+        if let Some(v) = volumes {
+            if v.len() != prices.len() {
+                return Err(CudaUmaError::InvalidInput(format!(
+                    "price/volume length mismatch: {} vs {}",
+                    prices.len(),
+                    v.len()
+                )));
+            }
+        }
+
+        let combos = expand_grid_uma(sweep);
+        if combos.is_empty() {
+            return Err(CudaUmaError::InvalidInput(
+                "no UMA parameter combinations".into(),
+            ));
+        }
+
+        let series_len = prices.len();
+        let first_valid = prices
+            .iter()
+            .position(|v| !v.is_nan())
+            .ok_or_else(|| CudaUmaError::InvalidInput("all price values are NaN".into()))?;
+
+        let mut accelerators = Vec::with_capacity(combos.len());
+        let mut min_lengths = Vec::with_capacity(combos.len());
+        let mut max_lengths = Vec::with_capacity(combos.len());
+        let mut smooth_lengths = Vec::with_capacity(combos.len());
+
+        for prm in &combos {
+            let accel = prm.accelerator.unwrap_or(1.0);
+            let min_len = prm.min_length.unwrap_or(5);
+            let max_len = prm.max_length.unwrap_or(50);
+            let smooth_len = prm.smooth_length.unwrap_or(4);
+
+            if accel < 1.0 {
+                return Err(CudaUmaError::InvalidInput(format!(
+                    "accelerator must be >= 1.0 (got {})",
+                    accel
+                )));
+            }
+            if min_len == 0 {
+                return Err(CudaUmaError::InvalidInput(
+                    "min_length must be positive".into(),
+                ));
+            }
+            if max_len == 0 {
+                return Err(CudaUmaError::InvalidInput(
+                    "max_length must be positive".into(),
+                ));
+            }
+            if min_len > max_len {
+                return Err(CudaUmaError::InvalidInput(format!(
+                    "min_length {} greater than max_length {}",
+                    min_len, max_len
+                )));
+            }
+            if smooth_len == 0 {
+                return Err(CudaUmaError::InvalidInput(
+                    "smooth_length must be positive".into(),
+                ));
+            }
+            if max_len > i32::MAX as usize
+                || min_len > i32::MAX as usize
+                || smooth_len > i32::MAX as usize
+            {
+                return Err(CudaUmaError::InvalidInput(
+                    "parameters exceed kernel limits".into(),
+                ));
+            }
+            let valid_available = series_len - first_valid;
+            if valid_available < max_len {
+                return Err(CudaUmaError::InvalidInput(format!(
+                    "not enough valid data: need >= {}, have {}",
+                    max_len, valid_available
+                )));
+            }
+
+            accelerators.push(accel as f32);
+            min_lengths.push(min_len as i32);
+            max_lengths.push(max_len as i32);
+            smooth_lengths.push(smooth_len as i32);
+        }
+
+        Ok(BatchInputs {
+            combos,
+            accelerators,
+            min_lengths,
+            max_lengths,
+            smooth_lengths,
+            first_valid,
+            series_len,
+            has_volume: volumes.map_or(false, |v| !v.is_empty()),
+        })
+    }
+
+    fn prepare_many_series_inputs(
+        prices_tm_f32: &[f32],
+        volumes_tm_f32: Option<&[f32]>,
+        cols: usize,
+        rows: usize,
+        params: &UmaParams,
+    ) -> Result<ManySeriesInputs, CudaUmaError> {
+        if cols == 0 || rows == 0 {
+            return Err(CudaUmaError::InvalidInput(
+                "num_series or series_len is zero".into(),
+            ));
+        }
+        if prices_tm_f32.len() != cols * rows {
+            return Err(CudaUmaError::InvalidInput(format!(
+                "price matrix length {} != cols*rows {}",
+                prices_tm_f32.len(),
+                cols * rows
+            )));
+        }
+        if let Some(v) = volumes_tm_f32 {
+            if v.len() != cols * rows {
+                return Err(CudaUmaError::InvalidInput(format!(
+                    "volume matrix length {} != cols*rows {}",
+                    v.len(),
+                    cols * rows
+                )));
+            }
+        }
+
+        let accelerator = params.accelerator.unwrap_or(1.0);
+        let min_length = params.min_length.unwrap_or(5);
+        let max_length = params.max_length.unwrap_or(50);
+        let smooth_length = params.smooth_length.unwrap_or(4);
+
+        if accelerator < 1.0 {
+            return Err(CudaUmaError::InvalidInput(format!(
+                "accelerator must be >= 1.0 (got {})",
+                accelerator
+            )));
+        }
+        if min_length == 0 {
+            return Err(CudaUmaError::InvalidInput(
+                "min_length must be positive".into(),
+            ));
+        }
+        if max_length == 0 {
+            return Err(CudaUmaError::InvalidInput(
+                "max_length must be positive".into(),
+            ));
+        }
+        if smooth_length == 0 {
+            return Err(CudaUmaError::InvalidInput(
+                "smooth_length must be positive".into(),
+            ));
+        }
+        if min_length > max_length {
+            return Err(CudaUmaError::InvalidInput(format!(
+                "min_length {} greater than max_length {}",
+                min_length, max_length
+            )));
+        }
+        if min_length > i32::MAX as usize
+            || max_length > i32::MAX as usize
+            || smooth_length > i32::MAX as usize
+        {
+            return Err(CudaUmaError::InvalidInput(
+                "parameters exceed kernel limits".into(),
+            ));
+        }
+
+        let mut first_valids = vec![0i32; cols];
+        for series in 0..cols {
+            let mut fv = None;
+            for t in 0..rows {
+                let val = prices_tm_f32[t * cols + series];
+                if !val.is_nan() {
+                    fv = Some(t);
+                    break;
+                }
+            }
+            let fv = fv.ok_or_else(|| {
+                CudaUmaError::InvalidInput(format!("series {} consists entirely of NaNs", series))
+            })?;
+            if rows - fv < max_length {
+                return Err(CudaUmaError::InvalidInput(format!(
+                    "series {} not enough valid data (needed >= {}, valid = {})",
+                    series,
+                    max_length,
+                    rows - fv
+                )));
+            }
+            first_valids[series] = fv as i32;
+        }
+
+        Ok(ManySeriesInputs {
+            first_valids,
+            accelerator: accelerator as f32,
+            min_length: min_length as i32,
+            max_length: max_length as i32,
+            smooth_length: smooth_length as i32,
+            num_series: cols,
+            series_len: rows,
+            has_volume: volumes_tm_f32.map_or(false, |v| !v.is_empty()),
+        })
+    }
+}
+
+pub mod benches {
+    use super::*;
+    use crate::cuda::bench::helpers::{gen_series, gen_time_major_prices};
+    use crate::cuda::bench::{CudaBenchScenario, CudaBenchState};
+
+    const ONE_SERIES_LEN: usize = 1_000_000;
+    const PARAM_SWEEP: usize = 250;
+    const MANY_SERIES_COLS: usize = 250;
+    const MANY_SERIES_LEN: usize = 1_000_000;
+
+    fn bytes_one_series_many_params() -> usize {
+        let in_bytes = ONE_SERIES_LEN * std::mem::size_of::<f32>();
+
+        let raw_bytes = ONE_SERIES_LEN * PARAM_SWEEP * std::mem::size_of::<f32>();
+        let out_bytes = ONE_SERIES_LEN * PARAM_SWEEP * std::mem::size_of::<f32>();
+
+        let param_bytes =
+            PARAM_SWEEP * (std::mem::size_of::<f32>() + 3 * std::mem::size_of::<i32>());
+        in_bytes + raw_bytes + out_bytes + param_bytes + 64 * 1024 * 1024
+    }
+    fn bytes_many_series_one_param() -> usize {
+        let elems = MANY_SERIES_COLS * MANY_SERIES_LEN;
+        let in_bytes = elems * std::mem::size_of::<f32>();
+        let out_bytes = 2 * elems * std::mem::size_of::<f32>();
+        in_bytes + out_bytes + MANY_SERIES_COLS * std::mem::size_of::<i32>() + 64 * 1024 * 1024
+    }
+
+    struct UmaBatchDeviceState {
+        cuda: CudaUma,
+        d_prices: DeviceBuffer<f32>,
+        d_accelerators: DeviceBuffer<f32>,
+        d_min_lengths: DeviceBuffer<i32>,
+        d_max_lengths: DeviceBuffer<i32>,
+        d_smooth_lengths: DeviceBuffer<i32>,
+        d_raw: DeviceBuffer<f32>,
+        d_out: DeviceBuffer<f32>,
+        series_len: usize,
+        n_combos: usize,
+        first_valid: usize,
+    }
+    impl CudaBenchState for UmaBatchDeviceState {
+        fn launch(&mut self) {
+            self.cuda
+                .uma_batch_device_with_raw(
+                    &self.d_prices,
+                    None,
+                    &self.d_accelerators,
+                    &self.d_min_lengths,
+                    &self.d_max_lengths,
+                    &self.d_smooth_lengths,
+                    self.series_len,
+                    self.n_combos,
+                    self.first_valid,
+                    false,
+                    &mut self.d_raw,
+                    &mut self.d_out,
+                )
+                .expect("launch uma batch");
+        }
+    }
+    fn prep_uma_one_series_many_params() -> Box<dyn CudaBenchState> {
+        let cuda = CudaUma::new(0).expect("cuda uma");
+        let price = gen_series(ONE_SERIES_LEN);
+
+        let series_len = ONE_SERIES_LEN;
+        let n_combos = PARAM_SWEEP;
+        let out_elems = series_len * n_combos;
+        let first_valid = price.iter().position(|x| !x.is_nan()).unwrap_or(0);
+
+        let accelerators = vec![1.0f32; n_combos];
+        let min_lengths = vec![5i32; n_combos];
+        let mut max_lengths = Vec::with_capacity(n_combos);
+        for i in 0..n_combos {
+            max_lengths.push(16i32 + i as i32);
+        }
+        let smooth_lengths = vec![4i32; n_combos];
+
+        let d_prices = DeviceBuffer::from_slice(&price).expect("upload prices");
+        let d_accelerators = DeviceBuffer::from_slice(&accelerators).expect("upload accelerators");
+        let d_min_lengths = DeviceBuffer::from_slice(&min_lengths).expect("upload min_lengths");
+        let d_max_lengths = DeviceBuffer::from_slice(&max_lengths).expect("upload max_lengths");
+        let d_smooth_lengths =
+            DeviceBuffer::from_slice(&smooth_lengths).expect("upload smooth_lengths");
+        let d_raw: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized(out_elems) }.expect("alloc raw");
+        let d_out: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized(out_elems) }.expect("alloc out");
+
+        Box::new(UmaBatchDeviceState {
+            cuda,
+            d_prices,
+            d_accelerators,
+            d_min_lengths,
+            d_max_lengths,
+            d_smooth_lengths,
+            d_raw,
+            d_out,
+            series_len,
+            n_combos,
+            first_valid,
+        })
+    }
+
+    struct UmaManyState {
+        cuda: CudaUma,
+        d_prices_tm: DeviceBuffer<f32>,
+        d_first_valids: DeviceBuffer<i32>,
+        cols: usize,
+        rows: usize,
+        accelerator: f32,
+        min_length: i32,
+        max_length: i32,
+        smooth_length: i32,
+        has_volume: bool,
+        d_raw_tm: DeviceBuffer<f32>,
+        d_out_tm: DeviceBuffer<f32>,
+    }
+    impl CudaBenchState for UmaManyState {
+        fn launch(&mut self) {
+            self.cuda
+                .launch_many_series_kernel(
+                    &self.d_prices_tm,
+                    None,
+                    self.accelerator,
+                    self.min_length,
+                    self.max_length,
+                    self.smooth_length,
+                    self.cols,
+                    self.rows,
+                    &self.d_first_valids,
+                    self.has_volume,
+                    &mut self.d_raw_tm,
+                    &mut self.d_out_tm,
+                )
+                .expect("launch uma many-series");
+            self.cuda
+                .stream
+                .synchronize()
+                .expect("uma many-series sync");
+        }
+    }
+    fn prep_uma_many_series_one_param() -> Box<dyn CudaBenchState> {
+        let cuda = CudaUma::new(0).expect("cuda uma");
+        let cols = MANY_SERIES_COLS;
+        let rows = MANY_SERIES_LEN;
+        let data_tm = gen_time_major_prices(cols, rows);
+        let params = UmaParams {
+            accelerator: Some(1.0),
+            min_length: Some(5),
+            max_length: Some(64),
+            smooth_length: Some(4),
+        };
+        let prepared = CudaUma::prepare_many_series_inputs(&data_tm, None, cols, rows, &params)
+            .expect("uma prepare many-series inputs");
+        let d_prices_tm = DeviceBuffer::from_slice(&data_tm).expect("d_prices_tm");
+        let d_first_valids =
+            DeviceBuffer::from_slice(&prepared.first_valids).expect("d_first_valids");
+        let elems = cols * rows;
+        let d_raw_tm: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized(elems) }.expect("d_raw_tm");
+        let d_out_tm: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized(elems) }.expect("d_out_tm");
+        cuda.stream.synchronize().expect("uma many prep sync");
+        Box::new(UmaManyState {
+            cuda,
+            d_prices_tm,
+            d_first_valids,
+            cols,
+            rows,
+            accelerator: prepared.accelerator,
+            min_length: prepared.min_length,
+            max_length: prepared.max_length,
+            smooth_length: prepared.smooth_length,
+            has_volume: prepared.has_volume,
+            d_raw_tm,
+            d_out_tm,
+        })
+    }
+
+    pub fn bench_profiles() -> Vec<CudaBenchScenario> {
+        vec![
+            CudaBenchScenario::new(
+                "uma",
+                "one_series_many_params",
+                "uma_cuda_batch_dev",
+                "1m_x_250",
+                prep_uma_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series_many_params()),
+            CudaBenchScenario::new(
+                "uma",
+                "many_series_one_param",
+                "uma_cuda_many_series_one_param",
+                "250x1m",
+                prep_uma_many_series_one_param,
+            )
+            .with_sample_size(5)
+            .with_mem_required(bytes_many_series_one_param()),
+        ]
+    }
+}
+
+struct BatchInputs {
+    combos: Vec<UmaParams>,
+    accelerators: Vec<f32>,
+    min_lengths: Vec<i32>,
+    max_lengths: Vec<i32>,
+    smooth_lengths: Vec<i32>,
+    first_valid: usize,
+    series_len: usize,
+    has_volume: bool,
+}
+
+struct ManySeriesInputs {
+    first_valids: Vec<i32>,
+    accelerator: f32,
+    min_length: i32,
+    max_length: i32,
+    smooth_length: i32,
+    num_series: usize,
+    series_len: usize,
+    has_volume: bool,
+}

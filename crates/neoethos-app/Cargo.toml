@@ -57,8 +57,8 @@ ctrader-protobuf-streaming = ["dep:webpki-roots"]
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
-tracing = "0.1.41"
-tracing-subscriber = "0.3.19"
+tracing = "0.1.42"  # aligned with workspace.dependencies (2026-05-26)
+tracing-subscriber = "0.3.22"  # aligned with workspace.dependencies (2026-05-26)
 anyhow = "1.0.100"
 chrono = "0.4"
 # chrono-tz 0.10 — IANA zoneinfo tables for "America/New_York" / "US/Eastern"
@@ -76,7 +76,7 @@ chrono-tz = "0.10"
 open = "5.3.2"
 # reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
 # In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
-reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "json", "rustls", "query", "form"] }
+reqwest = { version = "0.13.3", default-features = true, features = ["blocking", "json", "rustls", "query", "form"] }
 # `url` is the canonical parser shared with reqwest. Kept as a direct
 # dep so any future code that inspects URL components (SSRF guards,
 # allow-list checks for redirect handlers) uses the same parser
@@ -84,12 +84,19 @@ reqwest = { version = "0.13.3", default-features = false, features = ["blocking"
 # actual request issuance.
 url = "2.5"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = "1.0.149"  # aligned with workspace.dependencies (2026-05-26)
 toml = "0.8.20"
 dirs = "5.0.1"
 tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 tokio-tungstenite = { version = "0.26.1", features = ["rustls-tls-native-roots"] }
 futures = "0.3.31"
+# **2026-05-25 — SSE push channel**: `BroadcastStream` adapter so
+# the `/live/spots/stream` SSE endpoint can wrap a
+# `tokio::sync::broadcast::Receiver` and stream ticks to the
+# Flutter UI as they arrive. Already a transitive dep through
+# `tokio`-dependent crates; making it explicit here lets us name
+# the adapter type in the SSE handler.
+tokio-stream = { version = "0.1", features = ["sync"] }
 protobuf = "4.31.1-release"
 rand = { workspace = true }
 base64 = "0.22"
@@ -108,7 +115,7 @@ secrecy = "0.10"
 # the mixed reqwest/object_store feature graph can enable both ring and
 # aws-lc-rs and rustls 0.23 panics at runtime. webpki-roots stays gated
 # behind the native Protobuf-over-TCP transport.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = true, features = ["ring", "std", "tls12"] }
 webpki-roots = { version = "0.26", optional = true }
 
 # ── Flutter migration (Phase 1) ─────────────────────────────────────────────
@@ -133,7 +140,29 @@ polars = { version = "0.52.0", features = ["lazy", "dtype-full", "temporal", "ti
 neoethos-core = { path = "../neoethos-core" }
 neoethos-data = { path = "../neoethos-data" }
 neoethos-search = { path = "../neoethos-search" }
-neoethos-models = { path = "../neoethos-models", default-features = false, features = ["pure-rust-ml"] }
+# **2026-05-25 — task #236**: enable `tree-models` in the default
+# build so the 7 gradient-boosted tree experts
+# (lightgbm / xgboost x3 / catboost x2 / sklears_tree) get the real
+# native implementations instead of falling back to the
+# `gaussian_centroid_surrogate` (LDA-like classifier). The surrogate
+# is correct but ~30-50% weaker Sharpe than real gradient-boosted
+# trees, so the production binary was leaving 21 % of the
+# ensemble's predictive power on the table.
+#
+# Build prereqs picked up automatically on Windows + macOS + Linux:
+# - CMake (already on the dev box; the LightGBM/XGBoost cc-rs build
+#   scripts call it)
+# - MSVC toolchain on Windows (Rust's stable-msvc target ALREADY
+#   depends on this; if `cargo build` works at all, the C++ compiler
+#   is reachable through cc-rs's vcvars probing)
+# - libstdc++ on Linux, libc++ on macOS — both system-default
+#
+# `pure-rust-ml` + `tree-models` are BOTH listed by neoethos-models'
+# `default` feature, so simply removing `default-features = false`
+# would also work — but spelling them out makes the intent obvious
+# at the call site (and lets a future `gpu-cuda` add-on opt-in
+# without re-discovering this comment).
+neoethos-models = { path = "../neoethos-models", default-features = true, features = ["pure-rust-ml", "tree-models"] }
 # #204: ChatGPT subscription via the Codex CLI's PKCE OAuth flow.
 # Replaces the previous local-Gemma runtime. No native deps (pure
 # HTTP + crypto); the AI Helper proxies chat requests through the
@@ -171,23 +200,23 @@ tower = { version = "0.5", features = ["util"] }
 # mock/sample store out of the binary so a misconfigured platform fails
 # loudly instead of silently dropping tokens.
 [target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+keyring = { version = "3.6.3", default-features = true, features = ["windows-native"] }
 # Modern Win32 file dialog (uses the v6 common controls comctl32.dll
 # that ships with every Windows ≥ Vista — no extra runtime needed).
-rfd = { version = "0.17", default-features = false, features = ["common-controls-v6"] }
+rfd = { version = "0.17", default-features = true, features = ["common-controls-v6"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+keyring = { version = "3.6.3", default-features = true, features = ["apple-native"] }
 # macOS uses the AppKit NSOpenPanel — no extra features needed.
-rfd = { version = "0.17", default-features = false }
+rfd = { version = "0.17", default-features = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent"] }
+keyring = { version = "3.6.3", default-features = true, features = ["linux-native-sync-persistent"] }
 # Drop GTK3 — talks to xdg-desktop-portal over D-Bus instead. Works on
 # GNOME / KDE / WSL2g without `libgtk-3-dev` installed; falls back
 # cleanly when the portal isn't available (the picker just doesn't
 # open.
-rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+rfd = { version = "0.17", default-features = true, features = ["xdg-portal"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"

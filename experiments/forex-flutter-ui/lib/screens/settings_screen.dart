@@ -15,6 +15,7 @@ import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
+import 'advanced_settings_screen.dart';
 
 class SettingsScreen extends ConsumerStatefulWidget {
   const SettingsScreen({super.key});
@@ -153,9 +154,15 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             loading: () => const _Loading(),
             error: (err, _) => _Error(error: err.toString()),
           ),
-          // #193: surface the full config.yaml so operators can see
-          // (and locate on disk) the 200+ knobs the typed `/settings`
-          // DTO can't enumerate.
+          // **2026-05-25 — task #238 supersedes #193**: the live
+          // knob editor (`/settings/knob-catalog`) replaces the
+          // read-only YAML dump. Operators can now edit every
+          // catalogued knob, apply presets (Conservative/Balanced/
+          // Aggressive), and see per-knob help inline without
+          // touching config.yaml. The legacy read-only viewer is
+          // preserved below as a fallback for diagnostics.
+          const _AdvancedKnobEditorCard(),
+          const SizedBox(height: 16),
           const _AdvancedConfigCard(),
         ],
       ),
@@ -843,6 +850,57 @@ class _Loading extends StatelessWidget {
           style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
         ),
       );
+}
+
+/// **2026-05-25 — task #238**: live launcher for the
+/// AdvancedSettings screen. Renders a compact card with a "Open
+/// advanced editor" CTA. Clicking pushes the 2-pane knob editor
+/// where the operator can apply presets + tweak any of the ~42
+/// catalogued runtime knobs with inline help.
+class _AdvancedKnobEditorCard extends StatelessWidget {
+  const _AdvancedKnobEditorCard();
+
+  @override
+  Widget build(BuildContext context) {
+    return SectionCard(
+      title: 'Advanced runtime knobs',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Live editor for the ~42 catalogued knobs. Apply a preset '
+            '(Conservative / Balanced / Aggressive), or tweak any '
+            'individual knob with inline help.',
+            style: TextStyle(
+              fontSize: 12,
+              color: ForexAiTokens.textMuted,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              FilledButton.icon(
+                onPressed: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => Scaffold(
+                        appBar: AppBar(
+                          title: const Text('Advanced settings'),
+                        ),
+                        body: const AdvancedSettingsScreen(),
+                      ),
+                    ),
+                  );
+                },
+                icon: const Icon(Icons.tune, size: 16),
+                label: const Text('Open advanced editor'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 /// #193: surface the raw config.yaml contents (read-only) so an

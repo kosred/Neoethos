@@ -192,6 +192,15 @@ models:
   prop_search_opportunistic_min_trades_per_month: 10
   prop_search_opportunistic_min_trade_return_pct: 4.0
   prop_search_opportunistic_max_dd: 0.025
+  # 2026-05-26 operator directive (dual-mode product): the 5 knobs below were
+  # previously hardcoded in `crates/neoethos-search/src/discovery.rs`. Surfaced
+  # here so dual-mode operators can tune dedup aggressiveness + MC test rigour
+  # + sensitivity-test stress level from a single YAML.
+  prop_search_corr_threshold: 0.85          # |corr| ≥ this rejects strategy from portfolio (Pearson + Spearman both checked)
+  prop_search_mc_runs: 100                  # Monte-Carlo perturbation runs per candidate
+  prop_search_mc_min_profitable: 70         # min profitable MC runs to survive (out of mc_runs)
+  prop_search_sensitivity_spread_pips: 2.0  # stress-test spread (pips) — keep > production spread
+  prop_search_sensitivity_commission_per_lot: 7.0  # stress-test commission per lot (USD)
   train_batch_size: 32
   inference_batch_size: 32
   enable_transformer_expert: true

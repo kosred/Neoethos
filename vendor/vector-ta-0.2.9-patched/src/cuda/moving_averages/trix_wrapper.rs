@@ -1,0 +1,1130 @@
+#![cfg(feature = "cuda")]
+
+use super::DeviceArrayF32;
+use super::{BatchKernelPolicy, ManySeriesKernelPolicy};
+use crate::indicators::trix::{TrixBatchRange, TrixParams};
+use cust::context::Context;
+use cust::device::{Device, DeviceAttribute};
+use cust::function::{BlockSize, GridSize};
+use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
+use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::prelude::*;
+use cust::stream::{Stream, StreamFlags};
+use std::env;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[derive(thiserror::Error, Debug)]
+pub enum CudaTrixError {
+    #[error(transparent)]
+    Cuda(#[from] cust::error::CudaError),
+    #[error("out of memory: required={required} free={free} headroom={headroom}")]
+    OutOfMemory {
+        required: usize,
+        free: usize,
+        headroom: usize,
+    },
+    #[error("missing kernel symbol: {name}")]
+    MissingKernelSymbol { name: &'static str },
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    #[error("invalid policy: {0}")]
+    InvalidPolicy(&'static str),
+    #[error("launch config too large: grid=({gx},{gy},{gz}) block=({bx},{by},{bz})")]
+    LaunchConfigTooLarge {
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
+    },
+    #[error("device mismatch: buf={buf} current={current}")]
+    DeviceMismatch { buf: u32, current: u32 },
+    #[error("not implemented")]
+    NotImplemented,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CudaTrixPolicy {
+    pub batch: BatchKernelPolicy,
+    pub many_series: ManySeriesKernelPolicy,
+}
+impl Default for CudaTrixPolicy {
+    fn default() -> Self {
+        Self {
+            batch: BatchKernelPolicy::Auto,
+            many_series: ManySeriesKernelPolicy::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BatchKernelSelected {
+    Plain { block_x: u32 },
+
+    WarpScan { block_x: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ManySeriesKernelSelected {
+    OneD { block_x: u32 },
+}
+
+pub struct CudaTrix {
+    module: Module,
+    stream: Stream,
+    _context: Context,
+    device_id: u32,
+    policy: CudaTrixPolicy,
+    last_batch: Option<BatchKernelSelected>,
+    last_many: Option<ManySeriesKernelSelected>,
+    debug_batch_logged: bool,
+    debug_many_logged: bool,
+    max_grid_x: u32,
+}
+
+impl CudaTrix {
+    pub fn new(device_id: usize) -> Result<Self, CudaTrixError> {
+        cust::init(CudaFlags::empty())?;
+        let device = Device::get_device(device_id as u32)?;
+        let max_grid_x = device.get_attribute(DeviceAttribute::MaxGridDimX)? as u32;
+        let context = Context::new(device)?;
+
+        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/trix_kernel.ptx"));
+        let jit_opts = &[
+            ModuleJitOption::DetermineTargetFromContext,
+            ModuleJitOption::OptLevel(OptLevel::O2),
+        ];
+        let module = crate::load_cuda_embedded_module!("trix_kernel")?;
+
+        let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
+
+        Ok(Self {
+            module,
+            stream,
+            _context: context,
+            device_id: device_id as u32,
+            policy: CudaTrixPolicy::default(),
+            last_batch: None,
+            last_many: None,
+            debug_batch_logged: false,
+            debug_many_logged: false,
+            max_grid_x,
+        })
+    }
+
+    pub fn new_with_policy(
+        device_id: usize,
+        policy: CudaTrixPolicy,
+    ) -> Result<Self, CudaTrixError> {
+        let mut s = Self::new(device_id)?;
+        s.policy = policy;
+        Ok(s)
+    }
+    pub fn set_policy(&mut self, policy: CudaTrixPolicy) {
+        self.policy = policy;
+    }
+    pub fn policy(&self) -> &CudaTrixPolicy {
+        &self.policy
+    }
+    pub fn selected_batch_kernel(&self) -> Option<BatchKernelSelected> {
+        self.last_batch
+    }
+    pub fn selected_many_series_kernel(&self) -> Option<ManySeriesKernelSelected> {
+        self.last_many
+    }
+    pub fn synchronize(&self) -> Result<(), CudaTrixError> {
+        self.stream.synchronize().map_err(Into::into)
+    }
+
+    #[inline]
+    fn mem_check_enabled() -> bool {
+        match env::var("CUDA_MEM_CHECK") {
+            Ok(v) => v != "0" && v.to_lowercase() != "false",
+            Err(_) => true,
+        }
+    }
+    #[inline]
+    fn device_mem_info() -> Option<(usize, usize)> {
+        mem_get_info().ok()
+    }
+    #[inline]
+    fn will_fit(required_bytes: usize, headroom_bytes: usize) -> bool {
+        if !Self::mem_check_enabled() {
+            return true;
+        }
+        if let Some((free, _total)) = Self::device_mem_info() {
+            required_bytes.saturating_add(headroom_bytes) <= free
+        } else {
+            true
+        }
+    }
+
+    pub fn trix_batch_dev(
+        &self,
+        prices: &[f32],
+        sweep: &TrixBatchRange,
+    ) -> Result<DeviceArrayF32, CudaTrixError> {
+        let inputs = Self::prepare_batch_inputs(prices, sweep)?;
+        self.run_batch_kernel(&inputs)
+    }
+
+    pub fn trix_batch_dev_from_device_prices(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        series_len: usize,
+        first_valid: usize,
+        sweep: &TrixBatchRange,
+    ) -> Result<DeviceArrayF32, CudaTrixError> {
+        let (combos, periods) = Self::prepare_batch_params(series_len, first_valid, sweep)?;
+        self.run_batch_kernel_from_device_prices(
+            d_prices,
+            &periods,
+            combos.len(),
+            first_valid,
+            series_len,
+        )
+    }
+
+    pub fn trix_batch_into_host_f32(
+        &self,
+        prices: &[f32],
+        sweep: &TrixBatchRange,
+        out: &mut [f32],
+    ) -> Result<(usize, usize, Vec<TrixParams>), CudaTrixError> {
+        let inputs = Self::prepare_batch_inputs(prices, sweep)?;
+        let expected = inputs
+            .series_len
+            .checked_mul(inputs.combos.len())
+            .ok_or_else(|| CudaTrixError::InvalidInput("rows*cols overflow".into()))?;
+        if out.len() != expected {
+            return Err(CudaTrixError::InvalidInput(format!(
+                "out slice wrong length: got {}, expected {}",
+                out.len(),
+                expected
+            )));
+        }
+        let arr = self.run_batch_kernel(&inputs)?;
+        unsafe { arr.buf.async_copy_to(out, &self.stream) }?;
+        self.synchronize()?;
+        Ok((arr.rows, arr.cols, inputs.combos))
+    }
+
+    pub fn trix_batch_device(
+        &self,
+        d_logs: &DeviceBuffer<f32>,
+        d_periods: &DeviceBuffer<i32>,
+        series_len: usize,
+        n_combos: usize,
+        first_valid: usize,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaTrixError> {
+        if series_len == 0 || n_combos == 0 {
+            return Err(CudaTrixError::InvalidInput(
+                "series_len and n_combos must be positive".into(),
+            ));
+        }
+        if series_len > i32::MAX as usize || n_combos > i32::MAX as usize {
+            return Err(CudaTrixError::InvalidInput(
+                "arguments exceed kernel limits".into(),
+            ));
+        }
+        self.launch_batch_kernel(d_logs, d_periods, series_len, n_combos, first_valid, d_out)
+    }
+
+    pub fn trix_many_series_one_param_device(
+        &self,
+        d_prices_tm: &DeviceBuffer<f32>,
+        period: usize,
+        num_series: usize,
+        series_len: usize,
+        d_first_valids: &DeviceBuffer<i32>,
+        d_out_tm: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaTrixError> {
+        if period == 0 || num_series == 0 || series_len == 0 {
+            return Err(CudaTrixError::InvalidInput(
+                "period, num_series, and series_len must be positive".into(),
+            ));
+        }
+        if period > i32::MAX as usize
+            || num_series > i32::MAX as usize
+            || series_len > i32::MAX as usize
+        {
+            return Err(CudaTrixError::InvalidInput(
+                "arguments exceed kernel limits".into(),
+            ));
+        }
+        self.launch_many_series_kernel(
+            d_prices_tm,
+            period,
+            num_series,
+            series_len,
+            d_first_valids,
+            d_out_tm,
+        )
+    }
+
+    pub fn trix_many_series_one_param_time_major_dev(
+        &self,
+        prices_tm_f32: &[f32],
+        cols: usize,
+        rows: usize,
+        period: usize,
+    ) -> Result<DeviceArrayF32, CudaTrixError> {
+        let prepared = Self::prepare_many_series_inputs(prices_tm_f32, cols, rows, period)?;
+        self.run_many_series_kernel(prices_tm_f32, cols, rows, period, &prepared)
+    }
+
+    pub fn trix_many_series_one_param_time_major_into_host_f32(
+        &self,
+        prices_tm_f32: &[f32],
+        cols: usize,
+        rows: usize,
+        period: usize,
+        out_tm: &mut [f32],
+    ) -> Result<(), CudaTrixError> {
+        let expected = cols
+            .checked_mul(rows)
+            .ok_or_else(|| CudaTrixError::InvalidInput("rows*cols overflow".into()))?;
+        if out_tm.len() != expected {
+            return Err(CudaTrixError::InvalidInput(format!(
+                "out slice wrong length: got {}, expected {}",
+                out_tm.len(),
+                expected
+            )));
+        }
+        let prepared = Self::prepare_many_series_inputs(prices_tm_f32, cols, rows, period)?;
+        let arr = self.run_many_series_kernel(prices_tm_f32, cols, rows, period, &prepared)?;
+        unsafe { arr.buf.async_copy_to(out_tm, &self.stream) }?;
+        self.synchronize()?;
+        Ok(())
+    }
+
+    fn run_batch_kernel(&self, inputs: &BatchInputs) -> Result<DeviceArrayF32, CudaTrixError> {
+        let trace = std::env::var("TRIX_TRACE").ok().as_deref() == Some("1");
+
+        let logs_bytes = inputs
+            .series_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| CudaTrixError::InvalidInput("logs byte size overflow".into()))?;
+        let periods_bytes = inputs
+            .periods
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| CudaTrixError::InvalidInput("periods byte size overflow".into()))?;
+        let out_elems = inputs
+            .series_len
+            .checked_mul(inputs.combos.len())
+            .ok_or_else(|| CudaTrixError::InvalidInput("rows*cols overflow".into()))?;
+        let out_bytes = out_elems
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| CudaTrixError::InvalidInput("output byte size overflow".into()))?;
+        let bytes = logs_bytes
+            .checked_add(periods_bytes)
+            .and_then(|v| v.checked_add(out_bytes))
+            .ok_or_else(|| CudaTrixError::InvalidInput("VRAM requirement overflow".into()))?;
+        let headroom = 64 * 1024 * 1024;
+        if !Self::will_fit(bytes, headroom) {
+            if let Some((free, _total)) = Self::device_mem_info() {
+                return Err(CudaTrixError::OutOfMemory {
+                    required: bytes,
+                    free,
+                    headroom,
+                });
+            } else {
+                return Err(CudaTrixError::InvalidInput(
+                    "insufficient device memory for TRIX batch".into(),
+                ));
+            }
+        }
+
+        if trace {
+            eprintln!(
+                "[TRACE] trix.run_batch_kernel: series_len={} combos={} first_valid={} (device={})",
+                inputs.series_len,
+                inputs.combos.len(),
+                inputs.first_valid,
+                self.device_id
+            );
+        }
+        let d_logs = self.htod_copy_f32(&inputs.logs)?;
+        let d_periods = self.htod_copy_i32(&inputs.periods)?;
+        let out_len = out_elems;
+        let mut d_out: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized_async(out_len, &self.stream) }?;
+
+        if trace {
+            eprintln!("[TRACE] trix.run_batch_kernel: launching batch kernel");
+        }
+        self.launch_batch_kernel(
+            &d_logs,
+            &d_periods,
+            inputs.series_len,
+            inputs.combos.len(),
+            inputs.first_valid,
+            &mut d_out,
+        )?;
+
+        if trace {
+            eprintln!("[TRACE] trix.run_batch_kernel: stream.synchronize (begin)");
+        }
+        self.stream.synchronize()?;
+        if trace {
+            eprintln!("[TRACE] trix.run_batch_kernel: stream.synchronize (done)");
+        }
+
+        Ok(DeviceArrayF32 {
+            buf: d_out,
+            rows: inputs.combos.len(),
+            cols: inputs.series_len,
+        })
+    }
+
+    fn run_batch_kernel_from_device_prices(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        periods: &[i32],
+        combo_count: usize,
+        first_valid: usize,
+        series_len: usize,
+    ) -> Result<DeviceArrayF32, CudaTrixError> {
+        let logs_bytes = series_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| CudaTrixError::InvalidInput("logs byte size overflow".into()))?;
+        let periods_bytes = periods
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| CudaTrixError::InvalidInput("periods byte size overflow".into()))?;
+        let out_elems = series_len
+            .checked_mul(combo_count)
+            .ok_or_else(|| CudaTrixError::InvalidInput("rows*cols overflow".into()))?;
+        let out_bytes = out_elems
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| CudaTrixError::InvalidInput("output byte size overflow".into()))?;
+        let bytes = logs_bytes
+            .checked_add(periods_bytes)
+            .and_then(|v| v.checked_add(out_bytes))
+            .ok_or_else(|| CudaTrixError::InvalidInput("VRAM requirement overflow".into()))?;
+        let headroom = 64 * 1024 * 1024;
+        if !Self::will_fit(bytes, headroom) {
+            if let Some((free, _total)) = Self::device_mem_info() {
+                return Err(CudaTrixError::OutOfMemory {
+                    required: bytes,
+                    free,
+                    headroom,
+                });
+            } else {
+                return Err(CudaTrixError::InvalidInput(
+                    "insufficient device memory for TRIX batch".into(),
+                ));
+            }
+        }
+
+        let mut d_logs: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized_async(series_len, &self.stream) }?;
+        let d_periods = self.htod_copy_i32(periods)?;
+        let mut d_out: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized_async(out_elems, &self.stream) }?;
+
+        self.launch_log_builder_kernel(d_prices, series_len, first_valid, &mut d_logs)?;
+        self.launch_batch_kernel(
+            &d_logs,
+            &d_periods,
+            series_len,
+            combo_count,
+            first_valid,
+            &mut d_out,
+        )?;
+
+        Ok(DeviceArrayF32 {
+            buf: d_out,
+            rows: combo_count,
+            cols: series_len,
+        })
+    }
+
+    fn launch_log_builder_kernel(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        series_len: usize,
+        first_valid: usize,
+        d_logs: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaTrixError> {
+        let func = self
+            .module
+            .get_function("trix_build_logs_f32")
+            .map_err(|_| CudaTrixError::MissingKernelSymbol {
+                name: "trix_build_logs_f32",
+            })?;
+        let block_x: u32 = 256;
+        let grid_x: u32 = ((series_len as u32) + block_x - 1) / block_x;
+        let grid: GridSize = (grid_x.max(1), 1, 1).into();
+        let block: BlockSize = (block_x, 1, 1).into();
+
+        unsafe {
+            let mut prices_ptr = d_prices.as_device_ptr().as_raw();
+            let mut series_len_i = series_len as i32;
+            let mut first_valid_i = first_valid as i32;
+            let mut logs_ptr = d_logs.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut prices_ptr as *mut _ as *mut c_void,
+                &mut series_len_i as *mut _ as *mut c_void,
+                &mut first_valid_i as *mut _ as *mut c_void,
+                &mut logs_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?;
+        }
+        Ok(())
+    }
+
+    fn launch_batch_kernel(
+        &self,
+        d_logs: &DeviceBuffer<f32>,
+        d_periods: &DeviceBuffer<i32>,
+        series_len: usize,
+        n_combos: usize,
+        first_valid: usize,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaTrixError> {
+        let trace = std::env::var("TRIX_TRACE").ok().as_deref() == Some("1");
+
+        let warp_scan_enabled = std::env::var("TRIX_BATCH_WARP_SCAN").ok().as_deref() == Some("1");
+        let block_x: u32 = if warp_scan_enabled {
+            match self.policy.batch {
+                BatchKernelPolicy::Auto => std::env::var("TRIX_BLOCK_X")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(256),
+                BatchKernelPolicy::Plain { block_x } => block_x,
+                BatchKernelPolicy::Tiled { .. } => {
+                    return Err(CudaTrixError::InvalidPolicy(
+                        "TRIX does not support BatchKernelPolicy::Tiled",
+                    ));
+                }
+            }
+        } else {
+            1
+        };
+
+        if warp_scan_enabled && block_x >= 32 {
+            let block_x = (block_x / 32).max(1) * 32;
+            let warps_per_block = (block_x / 32).max(1) as usize;
+            let grid_x = ((n_combos + warps_per_block - 1) / warps_per_block) as u32;
+
+            if trace {
+                eprintln!(
+                    "[TRACE] trix.launch_batch_kernel: warp-scan path (block_x={}, warps_per_block={}, grid_x={}, combos={})",
+                    block_x,
+                    warps_per_block,
+                    grid_x,
+                    n_combos
+                );
+                eprintln!("[TRACE] trix.launch_batch_kernel: module.get_function(trix_batch_warp_scan_f32) (begin)");
+            }
+            let func = self
+                .module
+                .get_function("trix_batch_warp_scan_f32")
+                .map_err(|_| CudaTrixError::MissingKernelSymbol {
+                    name: "trix_batch_warp_scan_f32",
+                })?;
+            if trace {
+                eprintln!("[TRACE] trix.launch_batch_kernel: module.get_function(trix_batch_warp_scan_f32) (done)");
+            }
+            let grid: GridSize = (grid_x.max(1), 1, 1).into();
+            let block: BlockSize = (block_x, 1, 1).into();
+
+            unsafe {
+                (*(self as *const _ as *mut CudaTrix)).last_batch =
+                    Some(BatchKernelSelected::WarpScan { block_x });
+            }
+            self.maybe_log_batch_debug();
+
+            unsafe {
+                let mut logs_ptr = d_logs.as_device_ptr().as_raw();
+                let mut periods_ptr = d_periods.as_device_ptr().as_raw();
+                let mut series_len_i = series_len as i32;
+                let mut n_combos_i = n_combos as i32;
+                let mut first_valid_i = first_valid as i32;
+                let mut out_ptr = d_out.as_device_ptr().as_raw();
+                let args: &mut [*mut c_void] = &mut [
+                    &mut logs_ptr as *mut _ as *mut c_void,
+                    &mut periods_ptr as *mut _ as *mut c_void,
+                    &mut series_len_i as *mut _ as *mut c_void,
+                    &mut n_combos_i as *mut _ as *mut c_void,
+                    &mut first_valid_i as *mut _ as *mut c_void,
+                    &mut out_ptr as *mut _ as *mut c_void,
+                ];
+                if trace {
+                    eprintln!("[TRACE] trix.launch_batch_kernel: stream.launch(warp-scan) (begin)");
+                }
+                self.stream.launch(&func, grid, block, 0, args)?;
+                if trace {
+                    eprintln!("[TRACE] trix.launch_batch_kernel: stream.launch(warp-scan) (done)");
+                }
+            }
+            return Ok(());
+        }
+
+        if trace {
+            eprintln!("[TRACE] trix.launch_batch_kernel: plain path (block_x=1) (begin)");
+        }
+        let func = self.module.get_function("trix_batch_f32").map_err(|_| {
+            CudaTrixError::MissingKernelSymbol {
+                name: "trix_batch_f32",
+            }
+        })?;
+
+        let mut launched = 0usize;
+        while launched < n_combos {
+            let chunk = (n_combos - launched).min(self.max_grid_x as usize);
+            let grid: GridSize = (chunk as u32, 1, 1).into();
+            let block: BlockSize = (1, 1, 1).into();
+            unsafe {
+                (*(self as *const _ as *mut CudaTrix)).last_batch =
+                    Some(BatchKernelSelected::Plain { block_x: 1 });
+            }
+            self.maybe_log_batch_debug();
+
+            unsafe {
+                let mut logs_ptr = d_logs.as_device_ptr().as_raw() + 0u64;
+                let period_offset_bytes = launched
+                    .checked_mul(core::mem::size_of::<i32>())
+                    .ok_or_else(|| CudaTrixError::InvalidInput("periods offset overflow".into()))?;
+                let mut periods_ptr =
+                    d_periods.as_device_ptr().as_raw() + period_offset_bytes as u64;
+                let mut series_len_i = series_len as i32;
+                let mut n_combos_i = chunk as i32;
+                let mut first_valid_i = first_valid as i32;
+                let offset_elems = launched
+                    .checked_mul(series_len)
+                    .ok_or_else(|| CudaTrixError::InvalidInput("output offset overflow".into()))?;
+                let offset_bytes = offset_elems
+                    .checked_mul(core::mem::size_of::<f32>())
+                    .ok_or_else(|| {
+                        CudaTrixError::InvalidInput("output offset bytes overflow".into())
+                    })?;
+                let mut out_ptr = d_out.as_device_ptr().as_raw() + offset_bytes as u64;
+                let args: &mut [*mut c_void] = &mut [
+                    &mut logs_ptr as *mut _ as *mut c_void,
+                    &mut periods_ptr as *mut _ as *mut c_void,
+                    &mut series_len_i as *mut _ as *mut c_void,
+                    &mut n_combos_i as *mut _ as *mut c_void,
+                    &mut first_valid_i as *mut _ as *mut c_void,
+                    &mut out_ptr as *mut _ as *mut c_void,
+                ];
+                if trace {
+                    eprintln!("[TRACE] trix.launch_batch_kernel: stream.launch(plain) launched={} chunk={}", launched, chunk);
+                }
+                self.stream.launch(&func, grid, block, 0, args)?;
+            }
+            launched += chunk;
+        }
+        Ok(())
+    }
+
+    fn launch_many_series_kernel(
+        &self,
+        d_prices_tm: &DeviceBuffer<f32>,
+        period: usize,
+        num_series: usize,
+        series_len: usize,
+        d_first_valids: &DeviceBuffer<i32>,
+        d_out_tm: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaTrixError> {
+        let func = self
+            .module
+            .get_function("trix_many_series_one_param_f32")
+            .map_err(|_| CudaTrixError::MissingKernelSymbol {
+                name: "trix_many_series_one_param_f32",
+            })?;
+
+        let grid: GridSize = (num_series as u32, 1, 1).into();
+        let block: BlockSize = (1, 1, 1).into();
+        unsafe {
+            (*(self as *const _ as *mut CudaTrix)).last_many =
+                Some(ManySeriesKernelSelected::OneD { block_x: 1 });
+        }
+        self.maybe_log_many_debug();
+
+        unsafe {
+            let mut prices_ptr = d_prices_tm.as_device_ptr().as_raw();
+            let mut period_i = period as i32;
+            let mut num_series_i = num_series as i32;
+            let mut series_len_i = series_len as i32;
+            let mut fvs_ptr = d_first_valids.as_device_ptr().as_raw();
+            let mut out_ptr = d_out_tm.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut prices_ptr as *mut _ as *mut c_void,
+                &mut period_i as *mut _ as *mut c_void,
+                &mut num_series_i as *mut _ as *mut c_void,
+                &mut series_len_i as *mut _ as *mut c_void,
+                &mut fvs_ptr as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?;
+        }
+        Ok(())
+    }
+
+    fn run_many_series_kernel(
+        &self,
+        prices_tm_f32: &[f32],
+        cols: usize,
+        rows: usize,
+        period: usize,
+        inputs: &ManySeriesInputs,
+    ) -> Result<DeviceArrayF32, CudaTrixError> {
+        let elems = cols
+            .checked_mul(rows)
+            .ok_or_else(|| CudaTrixError::InvalidInput("rows*cols overflow".into()))?;
+        let prices_bytes = elems
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| CudaTrixError::InvalidInput("prices byte size overflow".into()))?;
+        let fvs_bytes = cols
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| CudaTrixError::InvalidInput("first_valids byte size overflow".into()))?;
+        let out_bytes = elems
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| CudaTrixError::InvalidInput("output byte size overflow".into()))?;
+        let required = prices_bytes
+            .checked_add(fvs_bytes)
+            .and_then(|v| v.checked_add(out_bytes))
+            .ok_or_else(|| CudaTrixError::InvalidInput("VRAM requirement overflow".into()))?;
+        let headroom = 64 * 1024 * 1024;
+        if !Self::will_fit(required, headroom) {
+            if let Some((free, _total)) = Self::device_mem_info() {
+                return Err(CudaTrixError::OutOfMemory {
+                    required,
+                    free,
+                    headroom,
+                });
+            } else {
+                return Err(CudaTrixError::InvalidInput(
+                    "insufficient device memory for TRIX many-series launch".into(),
+                ));
+            }
+        }
+        let d_prices_tm = unsafe { DeviceBuffer::from_slice_async(prices_tm_f32, &self.stream) }?;
+        let d_first_valids =
+            unsafe { DeviceBuffer::from_slice_async(&inputs.first_valids, &self.stream) }?;
+        let mut d_out_tm: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized_async(elems, &self.stream) }?;
+
+        self.launch_many_series_kernel(
+            &d_prices_tm,
+            period,
+            cols,
+            rows,
+            &d_first_valids,
+            &mut d_out_tm,
+        )?;
+
+        self.stream.synchronize()?;
+
+        Ok(DeviceArrayF32 {
+            buf: d_out_tm,
+            rows,
+            cols,
+        })
+    }
+
+    fn prepare_batch_inputs(
+        prices: &[f32],
+        sweep: &TrixBatchRange,
+    ) -> Result<BatchInputs, CudaTrixError> {
+        if prices.is_empty() {
+            return Err(CudaTrixError::InvalidInput("empty prices".into()));
+        }
+        let combos = expand_grid_trix(sweep)?;
+        if combos.is_empty() {
+            return Err(CudaTrixError::InvalidInput(
+                "no parameter combinations".into(),
+            ));
+        }
+
+        let first_valid = prices
+            .iter()
+            .position(|v| !v.is_nan())
+            .ok_or_else(|| CudaTrixError::InvalidInput("all values are NaN".into()))?;
+
+        let series_len = prices.len();
+        let mut periods = Vec::with_capacity(combos.len());
+        let mut max_period = 0usize;
+        for params in &combos {
+            let period = params.period.unwrap_or(0);
+            if period == 0 {
+                return Err(CudaTrixError::InvalidInput(
+                    "period must be positive".into(),
+                ));
+            }
+            if period > i32::MAX as usize {
+                return Err(CudaTrixError::InvalidInput(
+                    "period exceeds i32 kernel limit".into(),
+                ));
+            }
+            periods.push(period as i32);
+            max_period = max_period.max(period);
+        }
+
+        let needed = max_period
+            .checked_sub(1)
+            .and_then(|v| v.checked_mul(3))
+            .and_then(|v| v.checked_add(2))
+            .ok_or_else(|| {
+                CudaTrixError::InvalidInput(
+                    "period overflow when computing TRIX warmup length".into(),
+                )
+            })?;
+        if series_len - first_valid < needed {
+            return Err(CudaTrixError::InvalidInput(format!(
+                "not enough valid data (needed >= {}, valid = {})",
+                needed,
+                series_len - first_valid
+            )));
+        }
+
+        let mut logs = vec![0f32; series_len];
+        for i in 0..first_valid {
+            logs[i] = 0.0;
+        }
+        for i in first_valid..series_len {
+            logs[i] = (prices[i] as f64).ln() as f32;
+        }
+
+        Ok(BatchInputs {
+            combos,
+            periods,
+            first_valid,
+            series_len,
+            logs,
+        })
+    }
+
+    fn prepare_batch_params(
+        series_len: usize,
+        first_valid: usize,
+        sweep: &TrixBatchRange,
+    ) -> Result<(Vec<TrixParams>, Vec<i32>), CudaTrixError> {
+        if series_len == 0 {
+            return Err(CudaTrixError::InvalidInput("empty prices".into()));
+        }
+        if first_valid >= series_len {
+            return Err(CudaTrixError::InvalidInput(format!(
+                "first_valid {} out of range for len {}",
+                first_valid, series_len
+            )));
+        }
+        let combos = expand_grid_trix(sweep)?;
+        if combos.is_empty() {
+            return Err(CudaTrixError::InvalidInput(
+                "no parameter combinations".into(),
+            ));
+        }
+
+        let mut periods = Vec::with_capacity(combos.len());
+        let mut max_period = 0usize;
+        for params in &combos {
+            let period = params.period.unwrap_or(0);
+            if period == 0 {
+                return Err(CudaTrixError::InvalidInput(
+                    "period must be positive".into(),
+                ));
+            }
+            if period > i32::MAX as usize {
+                return Err(CudaTrixError::InvalidInput(
+                    "period exceeds i32 kernel limit".into(),
+                ));
+            }
+            periods.push(period as i32);
+            max_period = max_period.max(period);
+        }
+
+        let needed = max_period
+            .checked_sub(1)
+            .and_then(|v| v.checked_mul(3))
+            .and_then(|v| v.checked_add(2))
+            .ok_or_else(|| {
+                CudaTrixError::InvalidInput(
+                    "period overflow when computing TRIX warmup length".into(),
+                )
+            })?;
+        if series_len - first_valid < needed {
+            return Err(CudaTrixError::InvalidInput(format!(
+                "not enough valid data (needed >= {}, valid = {})",
+                needed,
+                series_len - first_valid
+            )));
+        }
+
+        Ok((combos, periods))
+    }
+
+    fn prepare_many_series_inputs(
+        prices_tm_f32: &[f32],
+        cols: usize,
+        rows: usize,
+        period: usize,
+    ) -> Result<ManySeriesInputs, CudaTrixError> {
+        if cols == 0 || rows == 0 {
+            return Err(CudaTrixError::InvalidInput(
+                "matrix dimensions must be positive".into(),
+            ));
+        }
+        let elems = cols
+            .checked_mul(rows)
+            .ok_or_else(|| CudaTrixError::InvalidInput("rows*cols overflow".into()))?;
+        if prices_tm_f32.len() != elems {
+            return Err(CudaTrixError::InvalidInput("matrix shape mismatch".into()));
+        }
+        if period == 0 {
+            return Err(CudaTrixError::InvalidInput(
+                "period must be positive".into(),
+            ));
+        }
+        if period > i32::MAX as usize {
+            return Err(CudaTrixError::InvalidInput(
+                "period exceeds i32 kernel limit".into(),
+            ));
+        }
+
+        let mut first_valids = vec![0i32; cols];
+        for series_idx in 0..cols {
+            let mut fv = None;
+            for row in 0..rows {
+                let idx = row * cols + series_idx;
+                let price = prices_tm_f32[idx];
+                if !price.is_nan() {
+                    fv = Some(row);
+                    break;
+                }
+            }
+            let first = fv.ok_or_else(|| {
+                CudaTrixError::InvalidInput(format!("series {} has all NaN values", series_idx))
+            })?;
+            let needed = period
+                .checked_sub(1)
+                .and_then(|v| v.checked_mul(3))
+                .and_then(|v| v.checked_add(2))
+                .ok_or_else(|| {
+                    CudaTrixError::InvalidInput(
+                        "period overflow when computing TRIX warmup length".into(),
+                    )
+                })?;
+            if rows - first < needed {
+                return Err(CudaTrixError::InvalidInput(format!(
+                    "series {} lacks data: needed >= {}, valid = {}",
+                    series_idx,
+                    needed,
+                    rows - first
+                )));
+            }
+            first_valids[series_idx] = first as i32;
+        }
+        Ok(ManySeriesInputs { first_valids })
+    }
+
+    #[inline]
+    fn htod_copy_f32(&self, src: &[f32]) -> Result<DeviceBuffer<f32>, CudaTrixError> {
+        match LockedBuffer::from_slice(src) {
+            Ok(h_pinned) => unsafe {
+                let mut dst = DeviceBuffer::uninitialized_async(src.len(), &self.stream)?;
+                dst.async_copy_from(&h_pinned, &self.stream)?;
+                Ok(dst)
+            },
+            Err(_) => DeviceBuffer::from_slice(src).map_err(Into::into),
+        }
+    }
+    #[inline]
+    fn htod_copy_i32(&self, src: &[i32]) -> Result<DeviceBuffer<i32>, CudaTrixError> {
+        match LockedBuffer::from_slice(src) {
+            Ok(h_pinned) => unsafe {
+                let mut dst = DeviceBuffer::uninitialized_async(src.len(), &self.stream)?;
+                dst.async_copy_from(&h_pinned, &self.stream)?;
+                Ok(dst)
+            },
+            Err(_) => DeviceBuffer::from_slice(src).map_err(Into::into),
+        }
+    }
+
+    #[inline]
+    fn maybe_log_batch_debug(&self) {
+        static GLOBAL_ONCE: AtomicBool = AtomicBool::new(false);
+        if self.debug_batch_logged {
+            return;
+        }
+        if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(sel) = self.last_batch {
+                let per_scenario =
+                    std::env::var("BENCH_DEBUG_SCOPE").ok().as_deref() == Some("scenario");
+                if per_scenario || !GLOBAL_ONCE.swap(true, Ordering::Relaxed) {
+                    eprintln!("[DEBUG] TRIX batch selected kernel: {:?}", sel);
+                }
+                unsafe {
+                    (*(self as *const _ as *mut CudaTrix)).debug_batch_logged = true;
+                }
+            }
+        }
+    }
+    #[inline]
+    fn maybe_log_many_debug(&self) {
+        static GLOBAL_ONCE: AtomicBool = AtomicBool::new(false);
+        if self.debug_many_logged {
+            return;
+        }
+        if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(sel) = self.last_many {
+                let per_scenario =
+                    std::env::var("BENCH_DEBUG_SCOPE").ok().as_deref() == Some("scenario");
+                if per_scenario || !GLOBAL_ONCE.swap(true, Ordering::Relaxed) {
+                    eprintln!("[DEBUG] TRIX many-series selected kernel: {:?}", sel);
+                }
+                unsafe {
+                    (*(self as *const _ as *mut CudaTrix)).debug_many_logged = true;
+                }
+            }
+        }
+    }
+}
+
+pub mod benches {
+    use super::*;
+    use crate::cuda::bench::helpers::gen_series;
+    use crate::cuda::bench::{CudaBenchScenario, CudaBenchState};
+    use crate::indicators::trix::TrixBatchRange;
+
+    const ONE_SERIES_LEN: usize = 1_000_000;
+    const PARAM_SWEEP: usize = 250;
+
+    fn bytes_one_series_many_params() -> usize {
+        let in_bytes = ONE_SERIES_LEN * std::mem::size_of::<f32>();
+        let out_bytes = ONE_SERIES_LEN * PARAM_SWEEP * std::mem::size_of::<f32>();
+        in_bytes + out_bytes + 64 * 1024 * 1024
+    }
+
+    struct TrixBatchDevState {
+        cuda: CudaTrix,
+        d_logs: DeviceBuffer<f32>,
+        d_periods: DeviceBuffer<i32>,
+        series_len: usize,
+        n_combos: usize,
+        first_valid: usize,
+        d_out: DeviceBuffer<f32>,
+    }
+    impl CudaBenchState for TrixBatchDevState {
+        fn launch(&mut self) {
+            self.cuda
+                .trix_batch_device(
+                    &self.d_logs,
+                    &self.d_periods,
+                    self.series_len,
+                    self.n_combos,
+                    self.first_valid,
+                    &mut self.d_out,
+                )
+                .expect("trix batch kernel");
+            self.cuda.stream.synchronize().expect("trix sync");
+        }
+    }
+
+    fn prep_one_series_many_params() -> Box<dyn CudaBenchState> {
+        let cuda = CudaTrix::new(0).expect("cuda trix");
+        let price = gen_series(ONE_SERIES_LEN);
+        let sweep = TrixBatchRange {
+            period: (10, 10 + PARAM_SWEEP - 1, 1),
+        };
+        let inputs = CudaTrix::prepare_batch_inputs(&price, &sweep).expect("trix prepare batch");
+        let n_combos = inputs.combos.len();
+
+        let d_logs = DeviceBuffer::from_slice(&inputs.logs).expect("d_logs");
+        let d_periods = DeviceBuffer::from_slice(&inputs.periods).expect("d_periods");
+        let d_out: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized(inputs.series_len * n_combos) }.expect("d_out");
+
+        cuda.stream.synchronize().expect("sync after prep");
+        Box::new(TrixBatchDevState {
+            cuda,
+            d_logs,
+            d_periods,
+            series_len: inputs.series_len,
+            n_combos,
+            first_valid: inputs.first_valid,
+            d_out,
+        })
+    }
+
+    pub fn bench_profiles() -> Vec<CudaBenchScenario> {
+        vec![CudaBenchScenario::new(
+            "trix",
+            "one_series_many_params",
+            "trix_cuda_batch_dev",
+            "1m_x_250",
+            prep_one_series_many_params,
+        )
+        .with_sample_size(10)
+        .with_mem_required(bytes_one_series_many_params())]
+    }
+}
+
+fn expand_grid_trix(range: &TrixBatchRange) -> Result<Vec<TrixParams>, CudaTrixError> {
+    let (start, end, step) = range.period;
+    if step == 0 || start == end {
+        return Ok(vec![TrixParams {
+            period: Some(start),
+        }]);
+    }
+    let mut vals = Vec::new();
+    if start < end {
+        let mut v = start;
+        loop {
+            vals.push(v);
+            if v >= end {
+                break;
+            }
+            let next = match v.checked_add(step) {
+                Some(n) => n,
+                None => break,
+            };
+            if next == v {
+                break;
+            }
+            v = next;
+        }
+    } else {
+        let mut v = start;
+        loop {
+            vals.push(v);
+            if v <= end {
+                break;
+            }
+            let next = v.saturating_sub(step);
+            if next == v {
+                break;
+            }
+            v = next;
+        }
+    }
+    if vals.is_empty() {
+        return Err(CudaTrixError::InvalidInput(format!(
+            "invalid range: start={} end={} step={}",
+            start, end, step
+        )));
+    }
+    let out = vals
+        .into_iter()
+        .map(|p| TrixParams { period: Some(p) })
+        .collect();
+    Ok(out)
+}
+
+struct BatchInputs {
+    combos: Vec<TrixParams>,
+    periods: Vec<i32>,
+    first_valid: usize,
+    series_len: usize,
+    logs: Vec<f32>,
+}
+
+struct ManySeriesInputs {
+    first_valids: Vec<i32>,
+}

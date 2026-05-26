@@ -3,7 +3,8 @@
 //!
 //! Phase D1.2.2. This module covers the three "classifier-head"
 //! deep experts that produce 3-class softmax probabilities over
-//! `[sell, neutral, buy]`: **MLP**, **KAN** (Kolmogorov-Arnold
+//! `[neutral, buy, sell]` (canonical order — see `base.rs` lines
+//! 128-135): **MLP**, **KAN** (Kolmogorov-Arnold
 //! Networks), and **TabNet**. The forecaster-head deep experts
 //! (NBEATS, TiDE, Transformer, PatchTST, TimesNet, NBeatsx_NF,
 //! TiDE_NF) emit continuous values and land in D1.2.3 with their

@@ -72,7 +72,9 @@ fn scan_intelligence() -> anyhow::Result<IntelligenceDto> {
     // The backend currently scans the hardcoded "models" path so the
     // Flutter screen surfaces the same artifacts every run.
     // If Settings ever grows a `models_dir` we'll switch over here.
-    let _settings = Settings::from_yaml("config.yaml").ok();
+    // F-553/F-576 closure (2026-05-25): resolved via the process-wide
+    // install so a non-default `--config` flag still works.
+    let _settings = Settings::from_yaml(super::state::current_config_path()).ok();
     let models_dir = std::path::PathBuf::from("models");
     let models_dir_str = models_dir.display().to_string();
     if !models_dir.exists() {

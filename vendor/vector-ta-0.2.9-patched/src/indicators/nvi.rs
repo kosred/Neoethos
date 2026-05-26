@@ -1,0 +1,1385 @@
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use wasm_bindgen::prelude::*;
+
+use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
+};
+#[cfg(feature = "python")]
+use crate::utilities::kernel_validation::validate_kernel;
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use core::arch::x86_64::*;
+use thiserror::Error;
+
+#[derive(Debug, Clone)]
+pub enum NviData<'a> {
+    Candles {
+        candles: &'a Candles,
+        close_source: &'a str,
+    },
+    Slices {
+        close: &'a [f64],
+        volume: &'a [f64],
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct NviOutput {
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NviParams;
+
+#[derive(Debug, Clone)]
+pub struct NviInput<'a> {
+    pub data: NviData<'a>,
+    pub params: NviParams,
+}
+
+impl<'a> NviInput<'a> {
+    #[inline]
+    pub fn from_candles(candles: &'a Candles, close_source: &'a str, params: NviParams) -> Self {
+        Self {
+            data: NviData::Candles {
+                candles,
+                close_source,
+            },
+            params,
+        }
+    }
+    #[inline]
+    pub fn from_slices(close: &'a [f64], volume: &'a [f64], params: NviParams) -> Self {
+        Self {
+            data: NviData::Slices { close, volume },
+            params,
+        }
+    }
+    #[inline]
+    pub fn with_default_candles(candles: &'a Candles) -> Self {
+        Self::from_candles(candles, "close", NviParams)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum NviError {
+    #[error("nvi: Empty data provided.")]
+    EmptyInputData,
+    #[error("nvi: Empty data provided.")]
+    EmptyData,
+    #[error("nvi: All values are NaN in both close and volume.")]
+    AllValuesNaN,
+    #[error("nvi: All close values are NaN.")]
+    AllCloseValuesNaN,
+    #[error("nvi: All volume values are NaN.")]
+    AllVolumeValuesNaN,
+    #[error("nvi: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+    #[error("nvi: Close and volume length mismatch: close={close_len}, volume={volume_len}")]
+    MismatchedLength { close_len: usize, volume_len: usize },
+    #[error(
+        "nvi: Destination length mismatch: dst={dst_len}, close={close_len}, volume={volume_len}"
+    )]
+    DestinationLengthMismatch {
+        dst_len: usize,
+        close_len: usize,
+        volume_len: usize,
+    },
+    #[error("nvi: output length mismatch: expected = {expected}, got = {got}")]
+    OutputLengthMismatch { expected: usize, got: usize },
+    #[error("nvi: invalid range: start={start}, end={end}, step={step}")]
+    InvalidRange {
+        start: usize,
+        end: usize,
+        step: usize,
+    },
+    #[error("nvi: invalid kernel for batch: {0:?}")]
+    InvalidKernelForBatch(Kernel),
+    #[error("nvi: invalid period: period = {period}, data length = {data_len}")]
+    InvalidPeriod { period: usize, data_len: usize },
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct NviBuilder {
+    kernel: Kernel,
+}
+impl NviBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self {
+            kernel: Kernel::Auto,
+        }
+    }
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+    #[inline(always)]
+    pub fn apply(self, c: &Candles) -> Result<NviOutput, NviError> {
+        let i = NviInput::with_default_candles(c);
+        nvi_with_kernel(&i, self.kernel)
+    }
+    #[inline(always)]
+    pub fn apply_slice(self, close: &[f64], volume: &[f64]) -> Result<NviOutput, NviError> {
+        let i = NviInput::from_slices(close, volume, NviParams);
+        nvi_with_kernel(&i, self.kernel)
+    }
+    #[inline(always)]
+    pub fn into_stream(self) -> Result<NviStream, NviError> {
+        NviStream::try_new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NviStream {
+    prev_close: f64,
+    prev_volume: f64,
+    nvi_val: f64,
+    started: bool,
+}
+
+impl NviStream {
+    #[inline]
+    pub fn try_new() -> Result<Self, NviError> {
+        Ok(Self {
+            prev_close: 0.0,
+            prev_volume: 0.0,
+            nvi_val: 1000.0,
+            started: false,
+        })
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, close: f64, volume: f64) -> Option<f64> {
+        if !self.started {
+            if close.is_nan() || volume.is_nan() {
+                return None;
+            }
+            self.prev_close = close;
+            self.prev_volume = volume;
+            self.started = true;
+            return Some(self.nvi_val);
+        }
+
+        let mut nvi = self.nvi_val;
+        if volume < self.prev_volume {
+            let pct = (close - self.prev_close) / self.prev_close;
+            nvi += nvi * pct;
+        }
+
+        self.nvi_val = nvi;
+        self.prev_close = close;
+        self.prev_volume = volume;
+
+        Some(nvi)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NviBatchOutput {
+    pub values: Vec<f64>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[inline]
+pub fn nvi(input: &NviInput) -> Result<NviOutput, NviError> {
+    nvi_with_kernel(input, Kernel::Auto)
+}
+pub fn nvi_with_kernel(input: &NviInput, kernel: Kernel) -> Result<NviOutput, NviError> {
+    let (close, volume): (&[f64], &[f64]) = match &input.data {
+        NviData::Candles {
+            candles,
+            close_source,
+        } => {
+            let close = source_type(candles, close_source);
+            (close, candles.volume.as_slice())
+        }
+        NviData::Slices { close, volume } => (*close, *volume),
+    };
+
+    if close.is_empty() || volume.is_empty() {
+        return Err(NviError::EmptyInputData);
+    }
+    if close.len() != volume.len() {
+        return Err(NviError::MismatchedLength {
+            close_len: close.len(),
+            volume_len: volume.len(),
+        });
+    }
+    let first = close
+        .iter()
+        .zip(volume)
+        .position(|(&c, &v)| !c.is_nan() && !v.is_nan())
+        .ok_or_else(|| {
+            if close.iter().all(|&c| c.is_nan()) {
+                NviError::AllCloseValuesNaN
+            } else {
+                NviError::AllVolumeValuesNaN
+            }
+        })?;
+    if close.len() - first < 2 {
+        return Err(NviError::NotEnoughValidData {
+            needed: 2,
+            valid: close.len() - first,
+        });
+    }
+    let mut out = alloc_with_nan_prefix(close.len(), first);
+    let _chosen = match kernel {
+        Kernel::Auto
+        | Kernel::Scalar
+        | Kernel::ScalarBatch
+        | Kernel::Avx2
+        | Kernel::Avx2Batch
+        | Kernel::Avx512
+        | Kernel::Avx512Batch => Kernel::Scalar,
+    };
+    nvi_scalar(close, volume, first, &mut out);
+    Ok(NviOutput { values: out })
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+#[inline]
+pub fn nvi_into(input: &NviInput, out: &mut [f64]) -> Result<(), NviError> {
+    let (close, volume): (&[f64], &[f64]) = match &input.data {
+        NviData::Candles {
+            candles,
+            close_source,
+        } => {
+            let close = source_type(candles, close_source);
+            (close, candles.volume.as_slice())
+        }
+        NviData::Slices { close, volume } => (*close, *volume),
+    };
+
+    nvi_into_slice(out, close, volume, Kernel::Auto)
+}
+
+#[inline]
+pub fn nvi_into_slice(
+    dst: &mut [f64],
+    close: &[f64],
+    volume: &[f64],
+    kern: Kernel,
+) -> Result<(), NviError> {
+    if close.is_empty() || volume.is_empty() {
+        return Err(NviError::EmptyInputData);
+    }
+    if close.len() != volume.len() {
+        return Err(NviError::MismatchedLength {
+            close_len: close.len(),
+            volume_len: volume.len(),
+        });
+    }
+    if dst.len() != close.len() {
+        return Err(NviError::OutputLengthMismatch {
+            expected: close.len(),
+            got: dst.len(),
+        });
+    }
+
+    let first = close
+        .iter()
+        .zip(volume)
+        .position(|(&c, &v)| !c.is_nan() && !v.is_nan())
+        .ok_or_else(|| {
+            if close.iter().all(|&c| c.is_nan()) {
+                NviError::AllCloseValuesNaN
+            } else {
+                NviError::AllVolumeValuesNaN
+            }
+        })?;
+
+    if close.len() - first < 2 {
+        return Err(NviError::NotEnoughValidData {
+            needed: 2,
+            valid: close.len() - first,
+        });
+    }
+
+    let _chosen = match kern {
+        Kernel::Auto
+        | Kernel::Scalar
+        | Kernel::ScalarBatch
+        | Kernel::Avx2
+        | Kernel::Avx2Batch
+        | Kernel::Avx512
+        | Kernel::Avx512Batch => Kernel::Scalar,
+    };
+    nvi_scalar(close, volume, first, dst);
+
+    for v in &mut dst[..first] {
+        *v = f64::NAN;
+    }
+
+    Ok(())
+}
+
+pub fn nvi_scalar(close: &[f64], volume: &[f64], first_valid: usize, out: &mut [f64]) {
+    debug_assert!(
+        close.len() == volume.len() && volume.len() == out.len(),
+        "Input slices must all have the same length."
+    );
+
+    let len = close.len();
+    if len == 0 || first_valid >= len {
+        return;
+    }
+
+    let mut nvi_val = 1000.0;
+
+    unsafe {
+        let close_ptr = close.as_ptr();
+        let vol_ptr = volume.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+
+        *out_ptr.add(first_valid) = nvi_val;
+
+        let mut i = first_valid + 1;
+        if i >= len {
+            return;
+        }
+
+        let mut prev_close = *close_ptr.add(i - 1);
+        let mut prev_volume = *vol_ptr.add(i - 1);
+
+        while i < len {
+            let c = *close_ptr.add(i);
+            let v = *vol_ptr.add(i);
+
+            if v < prev_volume {
+                let pct = (c - prev_close) / prev_close;
+                nvi_val += nvi_val * pct;
+            }
+
+            *out_ptr.add(i) = nvi_val;
+
+            prev_close = c;
+            prev_volume = v;
+            i += 1;
+        }
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn nvi_avx2(close: &[f64], volume: &[f64], first_valid: usize, out: &mut [f64]) {
+    let len = close.len();
+    if len == 0 || first_valid >= len {
+        return;
+    }
+
+    let close_ptr = close.as_ptr();
+    let vol_ptr = volume.as_ptr();
+    let out_ptr = out.as_mut_ptr();
+
+    let mut nvi_val = 1000.0;
+    *out_ptr.add(first_valid) = nvi_val;
+
+    let mut i = first_valid + 1;
+    if i >= len {
+        return;
+    }
+
+    while i + 3 < len {
+        let curr_c = _mm256_loadu_pd(close_ptr.add(i) as *const f64);
+        let prev_c = _mm256_loadu_pd(close_ptr.add(i - 1) as *const f64);
+
+        let curr_v = _mm256_loadu_pd(vol_ptr.add(i) as *const f64);
+        let prev_v = _mm256_loadu_pd(vol_ptr.add(i - 1) as *const f64);
+
+        let delta = _mm256_sub_pd(curr_c, prev_c);
+        let pct_raw = _mm256_div_pd(delta, prev_c);
+
+        let mask = _mm256_cmp_pd(curr_v, prev_v, _CMP_LT_OQ);
+        let pct_masked = _mm256_and_pd(pct_raw, mask);
+
+        let mut pcts: [f64; 4] = [0.0; 4];
+        _mm256_storeu_pd(pcts.as_mut_ptr(), pct_masked);
+
+        nvi_val += nvi_val * pcts[0];
+        *out_ptr.add(i) = nvi_val;
+
+        nvi_val += nvi_val * pcts[1];
+        *out_ptr.add(i + 1) = nvi_val;
+
+        nvi_val += nvi_val * pcts[2];
+        *out_ptr.add(i + 2) = nvi_val;
+
+        nvi_val += nvi_val * pcts[3];
+        *out_ptr.add(i + 3) = nvi_val;
+
+        i += 4;
+    }
+
+    while i < len {
+        let c = *close_ptr.add(i);
+        let v = *vol_ptr.add(i);
+
+        if v < *vol_ptr.add(i - 1) {
+            let pct = (c - *close_ptr.add(i - 1)) / *close_ptr.add(i - 1);
+            nvi_val += nvi_val * pct;
+        }
+        *out_ptr.add(i) = nvi_val;
+        i += 1;
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn nvi_avx512(close: &[f64], volume: &[f64], first_valid: usize, out: &mut [f64]) {
+    let len = close.len();
+    if len == 0 || first_valid >= len {
+        return;
+    }
+
+    let close_ptr = close.as_ptr();
+    let vol_ptr = volume.as_ptr();
+    let out_ptr = out.as_mut_ptr();
+
+    let mut nvi_val = 1000.0;
+    *out_ptr.add(first_valid) = nvi_val;
+
+    let mut i = first_valid + 1;
+    if i >= len {
+        return;
+    }
+
+    while i + 7 < len {
+        let curr_c = _mm512_loadu_pd(close_ptr.add(i) as *const f64);
+        let prev_c = _mm512_loadu_pd(close_ptr.add(i - 1) as *const f64);
+
+        let curr_v = _mm512_loadu_pd(vol_ptr.add(i) as *const f64);
+        let prev_v = _mm512_loadu_pd(vol_ptr.add(i - 1) as *const f64);
+
+        let delta = _mm512_sub_pd(curr_c, prev_c);
+        let pct_raw = _mm512_div_pd(delta, prev_c);
+
+        let m = _mm512_cmp_pd_mask(curr_v, prev_v, _CMP_LT_OQ);
+        let pct_masked = _mm512_maskz_mov_pd(m, pct_raw);
+
+        let mut pcts: [f64; 8] = [0.0; 8];
+        _mm512_storeu_pd(pcts.as_mut_ptr(), pct_masked);
+
+        nvi_val += nvi_val * pcts[0];
+        *out_ptr.add(i) = nvi_val;
+        nvi_val += nvi_val * pcts[1];
+        *out_ptr.add(i + 1) = nvi_val;
+        nvi_val += nvi_val * pcts[2];
+        *out_ptr.add(i + 2) = nvi_val;
+        nvi_val += nvi_val * pcts[3];
+        *out_ptr.add(i + 3) = nvi_val;
+        nvi_val += nvi_val * pcts[4];
+        *out_ptr.add(i + 4) = nvi_val;
+        nvi_val += nvi_val * pcts[5];
+        *out_ptr.add(i + 5) = nvi_val;
+        nvi_val += nvi_val * pcts[6];
+        *out_ptr.add(i + 6) = nvi_val;
+        nvi_val += nvi_val * pcts[7];
+        *out_ptr.add(i + 7) = nvi_val;
+
+        i += 8;
+    }
+
+    while i < len {
+        let c = *close_ptr.add(i);
+        let v = *vol_ptr.add(i);
+
+        if v < *vol_ptr.add(i - 1) {
+            let pct = (c - *close_ptr.add(i - 1)) / *close_ptr.add(i - 1);
+            nvi_val += nvi_val * pct;
+        }
+        *out_ptr.add(i) = nvi_val;
+        i += 1;
+    }
+}
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn nvi_avx512_short(close: &[f64], volume: &[f64], first: usize, out: &mut [f64]) {
+    nvi_avx512(close, volume, first, out)
+}
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn nvi_avx512_long(close: &[f64], volume: &[f64], first: usize, out: &mut [f64]) {
+    nvi_avx512(close, volume, first, out)
+}
+
+#[inline(always)]
+pub fn nvi_batch_with_kernel(
+    close: &[f64],
+    volume: &[f64],
+    k: Kernel,
+) -> Result<NviBatchOutput, NviError> {
+    if close.is_empty() || volume.is_empty() {
+        return Err(NviError::EmptyInputData);
+    }
+    if close.len() != volume.len() {
+        return Err(NviError::MismatchedLength {
+            close_len: close.len(),
+            volume_len: volume.len(),
+        });
+    }
+
+    let cols = close.len();
+    let first = close
+        .iter()
+        .zip(volume)
+        .position(|(&c, &v)| !c.is_nan() && !v.is_nan())
+        .ok_or_else(|| {
+            if close.iter().all(|&c| c.is_nan()) {
+                NviError::AllCloseValuesNaN
+            } else {
+                NviError::AllVolumeValuesNaN
+            }
+        })?;
+    if cols - first < 2 {
+        return Err(NviError::NotEnoughValidData {
+            needed: 2,
+            valid: cols - first,
+        });
+    }
+
+    let mut buf_mu = make_uninit_matrix(1, cols);
+    init_matrix_prefixes(&mut buf_mu, cols, &[first]);
+
+    let mut guard = core::mem::ManuallyDrop::new(buf_mu);
+    let out: &mut [f64] =
+        unsafe { core::slice::from_raw_parts_mut(guard.as_mut_ptr() as *mut f64, guard.len()) };
+
+    let chosen = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        other => return Err(NviError::InvalidKernelForBatch(other)),
+    };
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => nvi_row_scalar(close, volume, first, out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => nvi_row_scalar(close, volume, first, out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => nvi_row_scalar(close, volume, first, out),
+            _ => unreachable!(),
+        }
+    }
+
+    let values = unsafe {
+        Vec::from_raw_parts(
+            guard.as_mut_ptr() as *mut f64,
+            guard.len(),
+            guard.capacity(),
+        )
+    };
+    Ok(NviBatchOutput {
+        values,
+        rows: 1,
+        cols,
+    })
+}
+
+#[inline(always)]
+unsafe fn nvi_row_scalar(close: &[f64], volume: &[f64], first: usize, row_out_flat: &mut [f64]) {
+    let len = close.len();
+    let out = &mut row_out_flat[..len];
+    let mut nvi_val = 1000.0;
+    out[first] = nvi_val;
+
+    let mut prev_close = close[first];
+    let mut prev_volume = volume[first];
+
+    for i in (first + 1)..len {
+        if volume[i] < prev_volume {
+            let pct = (close[i] - prev_close) / prev_close;
+            nvi_val += nvi_val * pct;
+        }
+        out[i] = nvi_val;
+        prev_close = close[i];
+        prev_volume = volume[i];
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nvi_output_into_js(
+    close: &[f64],
+    volume: &[f64],
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = nvi_js(close, volume)?;
+    crate::write_wasm_f64_output("nvi_output_into_js", &values, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_csv;
+
+    fn check_nvi_partial_params(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = NviInput::with_default_candles(&candles);
+        let output = nvi_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+        Ok(())
+    }
+
+    fn check_nvi_accuracy(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let input = NviInput::with_default_candles(&candles);
+        let result = nvi_with_kernel(&input, kernel)?;
+        let expected_last_five = [
+            154243.6925373456,
+            153973.11239019397,
+            153973.11239019397,
+            154275.63921207888,
+            154275.63921207888,
+        ];
+        let start = result.values.len().saturating_sub(5);
+        for (i, &val) in result.values[start..].iter().enumerate() {
+            let diff = (val - expected_last_five[i]).abs();
+            assert!(
+                diff < 1e-5,
+                "[{}] NVI {:?} mismatch at idx {}: got {}, expected {}",
+                test_name,
+                kernel,
+                i,
+                val,
+                expected_last_five[i]
+            );
+        }
+        Ok(())
+    }
+
+    fn check_nvi_empty_data(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let close_data: [f64; 0] = [];
+        let volume_data: [f64; 0] = [];
+        let input = NviInput::from_slices(&close_data, &volume_data, NviParams);
+        let res = nvi_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] NVI should fail with empty data",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_nvi_not_enough_valid_data(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let close_data = [f64::NAN, 100.0];
+        let volume_data = [f64::NAN, 120.0];
+        let input = NviInput::from_slices(&close_data, &volume_data, NviParams);
+        let res = nvi_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] NVI should fail with not enough valid data",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_nvi_streaming(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+        let close = candles.select_candle_field("close")?;
+        let volume = candles.select_candle_field("volume")?;
+        let input = NviInput::from_slices(close, volume, NviParams);
+        let batch_output = nvi_with_kernel(&input, kernel)?.values;
+        let mut stream = NviStream::try_new()?;
+
+        let first_valid = close
+            .iter()
+            .zip(volume.iter())
+            .position(|(&c, &v)| !c.is_nan() && !v.is_nan())
+            .unwrap_or(0);
+
+        let mut stream_values = alloc_with_nan_prefix(close.len(), first_valid);
+
+        for (i, (&c, &v)) in close.iter().zip(volume.iter()).enumerate() {
+            if let Some(nvi_val) = stream.update(c, v) {
+                stream_values[i] = nvi_val;
+            }
+        }
+        assert_eq!(batch_output.len(), stream_values.len());
+        for (i, (&b, &s)) in batch_output.iter().zip(stream_values.iter()).enumerate() {
+            if b.is_nan() && s.is_nan() {
+                continue;
+            }
+            let diff = (b - s).abs();
+            assert!(
+                diff < 1e-9,
+                "[{}] NVI streaming mismatch at idx {}: batch={}, stream={}, diff={}",
+                test_name,
+                i,
+                b,
+                s,
+                diff
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_nvi_no_poison(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let test_scenarios = vec![
+            ("default_candles", NviInput::with_default_candles(&candles)),
+            (
+                "close_source",
+                NviInput::from_candles(&candles, "close", NviParams),
+            ),
+            (
+                "high_source",
+                NviInput::from_candles(&candles, "high", NviParams),
+            ),
+            (
+                "low_source",
+                NviInput::from_candles(&candles, "low", NviParams),
+            ),
+            (
+                "open_source",
+                NviInput::from_candles(&candles, "open", NviParams),
+            ),
+        ];
+
+        for (scenario_idx, (scenario_name, input)) in test_scenarios.iter().enumerate() {
+            let output = nvi_with_kernel(input, kernel)?;
+
+            for (i, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+						 with scenario: {} (scenario set {})",
+                        test_name, val, bits, i, scenario_name, scenario_idx
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+						 with scenario: {} (scenario set {})",
+                        test_name, val, bits, i, scenario_name, scenario_idx
+                    );
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+						 with scenario: {} (scenario set {})",
+                        test_name, val, bits, i, scenario_name, scenario_idx
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_nvi_no_poison(
+        _test_name: &str,
+        _kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn check_nvi_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use proptest::prelude::*;
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (50usize..=500)
+            .prop_flat_map(|len| {
+                (
+                    prop::collection::vec(
+                        prop::strategy::Union::new(vec![
+                            (0.001f64..0.1f64).boxed(),
+                            (10f64..10000f64).boxed(),
+                            (1e6f64..1e8f64).boxed(),
+                        ])
+                        .prop_filter("finite", |x| x.is_finite()),
+                        len,
+                    ),
+                    prop::collection::vec(
+                        prop::strategy::Union::new(vec![
+                            (100f64..1000f64).boxed(),
+                            (1000f64..1e6f64).boxed(),
+                            (1e6f64..1e9f64).boxed(),
+                        ])
+                        .prop_filter("finite", |x| x.is_finite()),
+                        len,
+                    ),
+                    0usize..=7,
+                )
+            })
+            .prop_map(|(mut prices, mut volumes, scenario)| {
+                match scenario {
+                    0 => {}
+                    1 => {
+                        let const_vol = volumes[0];
+                        volumes.iter_mut().for_each(|v| *v = const_vol);
+                    }
+                    2 => {
+                        volumes.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                    }
+                    3 => {
+                        volumes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    }
+                    4 => {
+                        for i in 0..volumes.len() {
+                            volumes[i] = if i % 2 == 0 { 1000.0 } else { 500.0 };
+                        }
+                    }
+                    5 => {
+                        let const_price = prices[0];
+                        prices.iter_mut().for_each(|p| *p = const_price);
+                    }
+                    6 => {
+                        let start = prices[0];
+                        let trend = 0.01f64;
+                        for i in 0..prices.len() {
+                            prices[i] = start * (1.0 + trend).powi(i as i32);
+                        }
+                    }
+                    7 => {
+                        let base = prices[0];
+                        for i in 0..prices.len() {
+                            prices[i] = base * (1.0 + 0.1 * ((i as f64 * 0.5).sin()));
+                        }
+
+                        for i in 0..volumes.len() {
+                            volumes[i] *= (1.0 - (i as f64 / volumes.len() as f64) * 0.5);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                (prices, volumes, scenario)
+            });
+
+        proptest::test_runner::TestRunner::default()
+            .run(&strat, |(close_data, volume_data, scenario)| {
+                let input = NviInput::from_slices(&close_data, &volume_data, NviParams);
+
+                let NviOutput { values: out } = nvi_with_kernel(&input, kernel)?;
+
+                let NviOutput { values: ref_out } = nvi_with_kernel(&input, Kernel::Scalar)?;
+
+                let first_valid = close_data
+                    .iter()
+                    .zip(volume_data.iter())
+                    .position(|(&c, &v)| !c.is_nan() && !v.is_nan())
+                    .unwrap_or(close_data.len());
+
+                if first_valid >= close_data.len() {
+                    return Ok(());
+                }
+
+                prop_assert!(
+                    (out[first_valid] - 1000.0).abs() < 1e-9,
+                    "NVI should start at 1000.0, got {} at index {} (scenario {})",
+                    out[first_valid],
+                    first_valid,
+                    scenario
+                );
+
+                let mut prev_nvi = 1000.0;
+                let mut prev_close = close_data[first_valid];
+                let mut prev_volume = volume_data[first_valid];
+
+                for i in (first_valid + 1)..close_data.len() {
+                    let curr_close = close_data[i];
+                    let curr_volume = volume_data[i];
+                    let curr_nvi = out[i];
+
+                    if curr_volume < prev_volume {
+                        let expected_pct = (curr_close - prev_close) / prev_close;
+                        let expected_nvi = prev_nvi + prev_nvi * expected_pct;
+
+                        prop_assert!(
+							(curr_nvi - expected_nvi).abs() < 1e-9 ||
+							(curr_nvi - expected_nvi).abs() / expected_nvi.abs() < 1e-9,
+							"NVI calculation error at index {} (scenario {}): expected {}, got {}, \
+							prev_nvi={}, pct_change={}, volume {} -> {}",
+							i, scenario, expected_nvi, curr_nvi, prev_nvi, expected_pct,
+							prev_volume, curr_volume
+						);
+                    } else {
+                        prop_assert!(
+							(curr_nvi - prev_nvi).abs() < 1e-9,
+							"NVI should not change when volume doesn't decrease at index {} (scenario {}): \
+							prev_nvi={}, curr_nvi={}, volume {} -> {}",
+							i, scenario, prev_nvi, curr_nvi, prev_volume, curr_volume
+						);
+                    }
+
+                    prev_nvi = curr_nvi;
+                    prev_close = curr_close;
+                    prev_volume = curr_volume;
+                }
+
+                for i in first_valid..close_data.len() {
+                    let y = out[i];
+                    let r = ref_out[i];
+
+                    if !y.is_finite() || !r.is_finite() {
+                        prop_assert!(
+                            y.to_bits() == r.to_bits(),
+                            "Kernel finite/NaN mismatch at index {} (scenario {}): {} vs {}",
+                            i,
+                            scenario,
+                            y,
+                            r
+                        );
+                    } else {
+                        let ulp_diff = y.to_bits().abs_diff(r.to_bits());
+                        prop_assert!(
+                            (y - r).abs() <= 1e-9 || ulp_diff <= 4,
+                            "Kernel mismatch at index {} (scenario {}): {} vs {} (ULP={})",
+                            i,
+                            scenario,
+                            y,
+                            r,
+                            ulp_diff
+                        );
+                    }
+                }
+
+                match scenario {
+                    1 => {
+                        for i in (first_valid + 1)..out.len() {
+                            prop_assert!(
+								(out[i] - 1000.0).abs() < 1e-9,
+								"NVI should stay at 1000.0 with constant volume, got {} at index {}",
+								out[i], i
+							);
+                        }
+                    }
+                    3 => {
+                        for i in (first_valid + 1)..out.len() {
+                            prop_assert!(
+								(out[i] - 1000.0).abs() < 1e-9,
+								"NVI should stay at 1000.0 with always increasing volume, got {} at index {}",
+								out[i], i
+							);
+                        }
+                    }
+                    5 => {
+                        if first_valid + 1 < out.len() {
+                            let mut expected_nvi = out[first_valid];
+                            for i in (first_valid + 1)..out.len() {
+                                prop_assert!(
+									(out[i] - expected_nvi).abs() < 1e-9,
+									"NVI should stay constant at {} with constant prices, got {} at index {}",
+									expected_nvi, out[i], i
+								);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                let mut stream = NviStream::try_new()?;
+                for i in 0..close_data.len() {
+                    if let Some(stream_val) = stream.update(close_data[i], volume_data[i]) {
+                        let batch_val = out[i];
+                        if !batch_val.is_nan() {
+                            prop_assert!(
+                                (stream_val - batch_val).abs() < 1e-9,
+                                "Streaming mismatch at index {} (scenario {}): stream={}, batch={}",
+                                i,
+                                scenario,
+                                stream_val,
+                                batch_val
+                            );
+                        }
+                    }
+                }
+
+                Ok(())
+            })
+            .unwrap();
+
+        Ok(())
+    }
+
+    macro_rules! generate_all_nvi_tests {
+        ($($test_fn:ident),*) => {
+            paste::paste! {
+                $( #[test] fn [<$test_fn _scalar_f64>]() { let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar); } )*
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $( #[test] fn [<$test_fn _avx2_f64>]() { let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2); } )*
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $( #[test] fn [<$test_fn _avx512_f64>]() { let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512); } )*
+            }
+        }
+    }
+
+    generate_all_nvi_tests!(
+        check_nvi_partial_params,
+        check_nvi_accuracy,
+        check_nvi_empty_data,
+        check_nvi_not_enough_valid_data,
+        check_nvi_streaming,
+        check_nvi_no_poison
+    );
+
+    #[cfg(test)]
+    generate_all_nvi_tests!(check_nvi_property);
+
+    #[test]
+    fn test_nvi_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
+        let len = 256usize;
+        let mut close = vec![f64::NAN; len];
+        let mut volume = vec![f64::NAN; len];
+
+        for i in 5..len {
+            let t = (i - 5) as f64;
+
+            close[i] = 100.0 + 0.05 * t + (0.01 * t).sin();
+
+            volume[i] = 2000.0 + ((i as i64 % 7) as f64 - 3.0) * 40.0;
+        }
+
+        let input = NviInput::from_slices(&close, &volume, NviParams);
+
+        let baseline = nvi(&input)?.values;
+
+        let mut out = vec![0.0; len];
+        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+        {
+            nvi_into(&input, &mut out)?;
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+        {
+            nvi_into_slice(&mut out, &close, &volume, Kernel::Auto)?;
+        }
+
+        assert_eq!(baseline.len(), out.len());
+        for (i, (&a, &b)) in baseline.iter().zip(out.iter()).enumerate() {
+            let equal = (a.is_nan() && b.is_nan()) || (a - b).abs() <= 1e-12;
+            assert!(
+                equal,
+                "nvi_into parity mismatch at index {}: {} vs {}",
+                i, a, b
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "NviStream")]
+pub struct NviStreamPy {
+    stream: NviStream,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl NviStreamPy {
+    #[new]
+    fn new() -> PyResult<Self> {
+        let stream = NviStream::try_new().map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(NviStreamPy { stream })
+    }
+
+    fn update(&mut self, close: f64, volume: f64) -> Option<f64> {
+        self.stream.update(close, volume)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "nvi")]
+#[pyo3(signature = (close, volume, kernel=None))]
+pub fn nvi_py<'py>(
+    py: Python<'py>,
+    close: PyReadonlyArray1<'py, f64>,
+    volume: PyReadonlyArray1<'py, f64>,
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let close_slice = close.as_slice()?;
+    let volume_slice = volume.as_slice()?;
+    let kern = validate_kernel(kernel, false)?;
+
+    let input = NviInput::from_slices(close_slice, volume_slice, NviParams);
+
+    let result_vec: Vec<f64> = py
+        .allow_threads(|| nvi_with_kernel(&input, kern).map(|o| o.values))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok(result_vec.into_pyarray(py))
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "nvi_batch")]
+#[pyo3(signature = (close, volume, kernel=None))]
+pub fn nvi_batch_py<'py>(
+    py: Python<'py>,
+    close: PyReadonlyArray1<'py, f64>,
+    volume: PyReadonlyArray1<'py, f64>,
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+    use pyo3::types::PyDict;
+
+    let close_slice = close.as_slice()?;
+    let volume_slice = volume.as_slice()?;
+    let kern = validate_kernel(kernel, true)?;
+
+    let rows = 1usize;
+    let cols = close_slice.len();
+    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
+    let out_slice = unsafe { out_arr.as_slice_mut()? };
+
+    py.allow_threads(|| -> Result<(), NviError> {
+        if close_slice.len() != volume_slice.len() {
+            return Err(NviError::MismatchedLength {
+                close_len: close_slice.len(),
+                volume_len: volume_slice.len(),
+            });
+        }
+        let first = close_slice
+            .iter()
+            .zip(volume_slice)
+            .position(|(&c, &v)| !c.is_nan() && !v.is_nan())
+            .ok_or_else(|| {
+                if close_slice.iter().all(|&c| c.is_nan()) {
+                    NviError::AllCloseValuesNaN
+                } else {
+                    NviError::AllVolumeValuesNaN
+                }
+            })?;
+        if cols - first < 2 {
+            return Err(NviError::NotEnoughValidData {
+                needed: 2,
+                valid: cols - first,
+            });
+        }
+
+        for v in &mut out_slice[..first] {
+            *v = f64::NAN;
+        }
+
+        unsafe { nvi_row_scalar(close_slice, volume_slice, first, out_slice) };
+        Ok(())
+    })
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let d = PyDict::new(py);
+    d.set_item("values", out_arr.reshape((rows, cols))?)?;
+    d.set_item("rows", rows)?;
+    d.set_item("cols", cols)?;
+    Ok(d)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nvi_js(close: &[f64], volume: &[f64]) -> Result<Vec<f64>, JsValue> {
+    let mut output = vec![0.0; close.len()];
+
+    nvi_into_slice(&mut output, close, volume, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    Ok(output)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nvi_into(
+    close_ptr: *const f64,
+    volume_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+) -> Result<(), JsValue> {
+    if close_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("Null pointer provided"));
+    }
+
+    unsafe {
+        let close = std::slice::from_raw_parts(close_ptr, len);
+        let volume = std::slice::from_raw_parts(volume_ptr, len);
+
+        if close_ptr == out_ptr as *const f64 || volume_ptr == out_ptr as *const f64 {
+            let mut temp = vec![0.0; len];
+            nvi_into_slice(&mut temp, close, volume, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            out.copy_from_slice(&temp);
+        } else {
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            nvi_into_slice(out, close, volume, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nvi_alloc(len: usize) -> *mut f64 {
+    let mut vec = Vec::<f64>::with_capacity(len);
+    let ptr = vec.as_mut_ptr();
+    std::mem::forget(vec);
+    ptr
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nvi_free(ptr: *mut f64, len: usize) {
+    if !ptr.is_null() {
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr, 0, len);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn nvi_batch_into(
+    close_ptr: *const f64,
+    volume_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+) -> Result<usize, JsValue> {
+    if close_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("Null pointer provided"));
+    }
+    unsafe {
+        let close = std::slice::from_raw_parts(close_ptr, len);
+        let volume = std::slice::from_raw_parts(volume_ptr, len);
+        let out = std::slice::from_raw_parts_mut(out_ptr, len);
+
+        if close.len() != volume.len() {
+            return Err(JsValue::from_str("Length mismatch"));
+        }
+        let first = close
+            .iter()
+            .zip(volume)
+            .position(|(&c, &v)| !c.is_nan() && !v.is_nan())
+            .ok_or_else(|| JsValue::from_str("All values NaN in one or both inputs"))?;
+        if len - first < 2 {
+            return Err(JsValue::from_str("Not enough valid data"));
+        }
+
+        for v in &mut out[..first] {
+            *v = f64::NAN;
+        }
+        nvi_row_scalar(close, volume, first, out);
+        Ok(1)
+    }
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::cuda_available;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::CudaNvi;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "nvi_cuda_batch_dev")]
+#[pyo3(signature = (close, volume, device_id=0))]
+pub fn nvi_cuda_batch_dev_py(
+    py: Python<'_>,
+    close: PyReadonlyArray1<'_, f32>,
+    volume: PyReadonlyArray1<'_, f32>,
+    device_id: usize,
+) -> PyResult<DeviceArrayF32Py> {
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let close_slice = close.as_slice()?;
+    let volume_slice = volume.as_slice()?;
+    if close_slice.len() != volume_slice.len() {
+        return Err(PyValueError::new_err("mismatched input lengths"));
+    }
+    let (inner, ctx, dev_id) = py.allow_threads(|| {
+        let cuda = CudaNvi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let ctx = cuda.context_arc();
+        let dev_id = cuda.device_id();
+        let arr = cuda
+            .nvi_batch_dev(close_slice, volume_slice)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok::<_, PyErr>((arr, ctx, dev_id))
+    })?;
+    Ok(DeviceArrayF32Py {
+        inner,
+        _ctx: Some(ctx),
+        device_id: Some(dev_id),
+    })
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "nvi_cuda_many_series_one_param_dev")]
+#[pyo3(signature = (close_tm, volume_tm, cols, rows, device_id=0))]
+pub fn nvi_cuda_many_series_one_param_dev_py(
+    py: Python<'_>,
+    close_tm: PyReadonlyArray1<'_, f32>,
+    volume_tm: PyReadonlyArray1<'_, f32>,
+    cols: usize,
+    rows: usize,
+    device_id: usize,
+) -> PyResult<DeviceArrayF32Py> {
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let close_slice = close_tm.as_slice()?;
+    let volume_slice = volume_tm.as_slice()?;
+    let (inner, ctx, dev_id) = py.allow_threads(|| {
+        let cuda = CudaNvi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let ctx = cuda.context_arc();
+        let dev_id = cuda.device_id();
+        let arr = cuda
+            .nvi_many_series_one_param_time_major_dev(close_slice, volume_slice, cols, rows)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok::<_, PyErr>((arr, ctx, dev_id))
+    })?;
+    Ok(DeviceArrayF32Py {
+        inner,
+        _ctx: Some(ctx),
+        device_id: Some(dev_id),
+    })
+}

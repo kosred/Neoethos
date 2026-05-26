@@ -1,16 +1,17 @@
-//! Inference-half foundation for the 33-model ensemble.
+//! Inference-half foundation for the 34-model ensemble.
 //!
 //! ## Why this module exists
 //!
-//! The training side of neoethos-models already trains all 33 expert
+//! The training side of neoethos-models already trains all 34 expert
 //! families ([`crate::runtime::capabilities::KNOWN_MODEL_NAMES`]) in
 //! parallel via [`crate::training_orchestrator::TrainingOrchestrator`]
-//! and saves each one's artifacts to disk. But until this module
-//! landed, the **inference side did not exist**: no runtime code
-//! loaded the trained experts back from disk, no orchestrator ran
-//! `predict_proba` on each, and no aggregator combined their outputs.
-//! The 33-model "ensemble" was 33 INDEPENDENT models with no
-//! consumer.
+//! and saves each one's artifacts to disk (34th added 2026-05-25:
+//! `hmm_regime`, a 3-state HMM regime classifier). But until this
+//! module landed, the **inference side did not exist**: no runtime
+//! code loaded the trained experts back from disk, no orchestrator
+//! ran `predict_proba` on each, and no aggregator combined their
+//! outputs. The 34-model "ensemble" was 34 INDEPENDENT models with
+//! no consumer.
 //!
 //! Phase D1.2 (this module) lays the **foundation traits** so the
 //! follow-up phases can build progressively:
@@ -49,9 +50,10 @@
 //!
 //! The [`EnsemblePredictor`] surfaces the load outcome through
 //! [`EnsemblePredictor::load_outcome`] so the operator chrome can
-//! render "Running ensemble: 24/33 experts active — 9 degraded
+//! render "Running ensemble: 25/33 experts active — 8 degraded
 //! (see system log)". This is the **tracked degradation** the
-//! operator explicitly asked for.
+//! operator explicitly asked for. (33 = `DEFAULT_BOOTSTRAP_EXPERT_NAMES.len()`
+//! — KNOWN_MODEL_NAMES.len() minus the deferred `swarm_forecaster`.)
 //!
 //! ## Heterogeneous expert outputs
 //!
@@ -117,9 +119,9 @@ pub use evolutionary_adapters::{
 };
 pub use meta_adapters::{
     BayesLogitAdapter, BayesLogitLoader, ConformalGateAdapter, ConformalGateLoader,
-    ElasticNetAdapter, ElasticNetLoader, LogisticAdapter, LogisticLoader, MetaBlenderAdapter,
-    MetaBlenderLoader, MetaStackAdapter, MetaStackLoader, ProbabilityCalibratorAdapter,
-    ProbabilityCalibratorLoader, register_meta_loaders,
+    ElasticNetAdapter, ElasticNetLoader, HmmRegimeAdapter, HmmRegimeLoader, LogisticAdapter,
+    LogisticLoader, MetaBlenderAdapter, MetaBlenderLoader, MetaStackAdapter, MetaStackLoader,
+    ProbabilityCalibratorAdapter, ProbabilityCalibratorLoader, register_meta_loaders,
 };
 pub use mixed_adapters::{
     IsolationForestAdapter, IsolationForestLoader, OnlineHoeffdingAdapter, OnlineHoeffdingLoader,
@@ -143,16 +145,21 @@ pub use tree_adapters::{
 /// to combine an expert's predictions with the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ExpertOutputKind {
-    /// 3-class probability vector `[p_sell, p_neutral, p_buy]`,
+    /// 3-class probability vector `[p_neutral, p_buy, p_sell]`,
     /// rows sum to 1.0. Produced by classification-head experts
     /// (LightGBM, XGBoost, MLP-classifier, transformer-classifier,
     /// etc.). This is the most directly aggregable output for a
-    /// trading decision.
+    /// trading decision. Canonical mapping (see `base.rs` lines
+    /// 128-135 + `runtime/artifacts.rs::default_three_class_label_mapping`):
+    /// col 0 = neutral (label 0), col 1 = buy (label 1),
+    /// col 2 = sell (label -1).
     Classification3,
-    /// 3-action Q-values for `[sell, hold, buy]` from an RL agent
+    /// 3-action Q-values for `[hold, buy, sell]` from an RL agent
     /// (dqn). Not a probability distribution — values are arbitrary
     /// reals; the action with the highest Q is the recommended
     /// action. Soft-voting treats argmax as a Classification3 vote.
+    /// Matches `dqn_impl.rs::TradingAction::as_index`: Hold=0,
+    /// Buy=1, Sell=2 (same axis order as Classification3).
     ActionValues3,
     /// Single continuous forecast value — e.g. predicted next-bar
     /// close-to-close return. Produced by time-series forecasters
@@ -283,11 +290,12 @@ impl ExpertPrediction {
 
 /// Uniform inference contract for every trained expert.
 ///
-/// All 33 expert families in
-/// [`crate::runtime::capabilities::KNOWN_MODEL_NAMES`] will
-/// implement this trait via a thin adapter (D1.2.x follow-up
-/// commits). The aggregating [`EnsemblePredictor`] holds a
-/// `Vec<Box<dyn ExpertModel>>` and treats each one uniformly.
+/// All 34 expert families in
+/// [`crate::runtime::capabilities::KNOWN_MODEL_NAMES`] implement
+/// this trait via a thin adapter (D1.2.x follow-up commits +
+/// HMM Phase 2 added the 34th 2026-05-25). The aggregating
+/// [`EnsemblePredictor`] holds a `Vec<Box<dyn ExpertModel>>` and
+/// treats each one uniformly.
 ///
 /// ## Conventions
 ///
@@ -643,12 +651,14 @@ impl Default for ExpertRegistry {
 ///   specialization, not artificial feature restrictions).
 ///
 /// Output is a `(n_rows, 3)` `ndarray::Array2<f32>` of
-/// `[p_sell, p_neutral, p_buy]` probabilities. Downstream callers
-/// (the auto-trade producer's `ModelPredictor` adapter — D1.3 also)
+/// `[p_neutral, p_buy, p_sell]` probabilities (canonical mapping —
+/// see `base.rs` lines 128-135). Downstream callers (the
+/// auto-trade producer's `ModelPredictor` adapter — D1.3 also)
 /// pick the argmax + confidence and map to `AutoTradeSide`.
 pub trait EnsemblePredictor: Send + Sync {
     /// Run inference on every row of `df`. Returns a `(n_rows, 3)`
-    /// matrix of `[p_sell, p_neutral, p_buy]`.
+    /// matrix of `[p_neutral, p_buy, p_sell]` (canonical order;
+    /// col 0 = neutral, col 1 = buy, col 2 = sell).
     fn predict(&self, df: &DataFrame) -> Result<ndarray::Array2<f32>>;
     /// Snapshot of which experts loaded / missed / degraded at
     /// construction time. Used by the chrome to render the

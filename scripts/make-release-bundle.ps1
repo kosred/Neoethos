@@ -78,7 +78,14 @@ if (-not (Test-Path $srcUiExe)) {
     throw "Could not find NeoEthos.exe / neoethos.exe / forex_flutter_ui.exe in $flutterDir - re-run flutter build windows --$Profile."
 }
 Copy-Item -Path $srcUiExe -Destination (Join-Path $dst 'NeoEthos.exe')
-Copy-Item -Path (Join-Path $flutterDir 'flutter_windows.dll') -Destination $dst
+# 2026-05-26 fix: previously only `flutter_windows.dll` was copied, but
+# `flutter build windows --release` also emits one DLL per Flutter plugin
+# (e.g. `url_launcher_windows_plugin.dll`). Loading the main exe with a
+# missing plugin DLL exits with 0xC0000135 STATUS_DLL_NOT_FOUND before
+# the BackendSupervisor ever runs — the UI window appears for ~50 ms and
+# disappears with no error popup. Bundle every *.dll the Flutter build
+# produced so plugins resolve at startup.
+Copy-Item -Path (Join-Path $flutterDir '*.dll') -Destination $dst
 Copy-Item -Path (Join-Path $flutterDir 'data') -Destination $dst -Recurse
 
 # 4. Copy Rust backend into a `bin/` subfolder so it stays out of the
@@ -89,6 +96,33 @@ $binDir = Join-Path $dst 'bin'
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 Write-Host "Copying neoethos-app.exe from $rustExe into bin/"
 Copy-Item -Path $rustExe -Destination $binDir
+
+# 4b. Tree-models runtime DLLs (task #236, 2026-05-25). The catboost-rust
+#     and xgboost-sys crates download pre-built native libraries during
+#     `cargo build --release`; the build-cargo-release.ps1 script has
+#     already copied them next to neoethos-app.exe. We bundle them into
+#     `bin/` so the dynamic loader finds them via the standard
+#     "same-dir-as-exe" search step when CatBoostExpert / XGBoostExpert
+#     initialise at runtime.
+#
+#     End-user contract: NO native runtime install required. CatBoost
+#     + XGBoost + LightGBM (static-linked) all ship inside this bundle.
+$dllSourceDir = Split-Path -Parent $rustExe
+foreach ($dll in @('catboostmodel.dll', 'xgboost.dll')) {
+    $src = Join-Path $dllSourceDir $dll
+    if (Test-Path $src) {
+        Copy-Item -Path $src -Destination $binDir -Force
+        $sizeMB = [math]::Round((Get-Item $src).Length / 1MB, 1)
+        Write-Host "  + $dll ($sizeMB MB) → bin/"
+    } else {
+        # catboost.dll absent = the build script didn't run or the
+        # cargo build didn't include `tree-models`. xgboost.dll absent
+        # is usually fine (static-linked variant). We warn but don't
+        # fail — the operator can still ship without these and the
+        # ensemble runs with the local-fallback tree experts.
+        Write-Warning "$dll not found next to $rustExe — make sure scripts\build-cargo-release.ps1 ran with the gpu-vulkan + tree-models features. Bundle will be missing this expert."
+    }
+}
 
 # 4a. Operator-confusion guard. The `bin/` folder ships a clear
 #     "do not run" marker AND has the Hidden + System attributes set

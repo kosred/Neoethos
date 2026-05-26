@@ -1,0 +1,377 @@
+//! Centralised env-var overrides for `neoethos-app`.
+//!
+//! Mirror of `neoethos_core::env_overrides` for the app crate's
+//! own knobs. Single grep-able file for every `FOREX_BOT_CTRADER_*`,
+//! `FOREX_BOT_PNL_*`, and `NEOETHOS_*` runtime override that the
+//! HTTP server / trading layer honours.
+//!
+//! ## Why this exists (F-CORE3 cluster consolidation, 2026-05-25)
+//!
+//! Before this module, the app crate spread `std::env::var(...)` reads
+//! across at least 10 files: `ctrader_execution.rs`, `ctrader_streaming.rs`,
+//! `ctrader_messages.rs`, `pnl.rs`, `server/mod.rs`, `live_journal.rs`,
+//! `pending_actions.rs`, `risky_mode_persistence.rs`, etc. Each had its
+//! own local clamping helper, which:
+//!
+//! - **Made auditing painful** — no single place to see what knobs exist.
+//! - **Duplicated parse logic** — same `parse + clamp + fallback` pattern repeated.
+//! - **Diverged on tolerances** — one site clamps `[1, 5]`, another `[1, 10]`
+//!   for the same conceptual knob.
+//!
+//! This module is the canonical registry. Each entry has:
+//!
+//! - A `pub const NAME: &str` for the env-var name (grep-able from one place).
+//! - A typed getter `fn() -> Option<T>` (or `fn() -> T` when a clamped
+//!   default is the right semantics) that parses + validates.
+//! - A doc-comment explaining what the var controls and what unset means.
+//!
+//! Call sites elsewhere in the crate import these getters / constants
+//! rather than calling `std::env::var(...)` directly.
+//!
+//! ## Migration plan
+//!
+//! Phase A (this commit) — registry created with the highest-impact knobs.
+//! Phase B — remaining call sites swap their inline reads for the
+//!   typed getters. Each migration is mechanical + behaviour-preserving.
+
+use std::env;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+// ---------------------------------------------------------------------------
+// Env-var names — canonical string constants
+// ---------------------------------------------------------------------------
+
+/// HTTP server bind address (`host:port`). When unset, falls back to
+/// `127.0.0.1:7423`. Read by `server::serve` at startup.
+pub const ENV_SERVER_BIND: &str = "NEOETHOS_SERVER_BIND";
+
+/// Maximum TCP read time (seconds) for `execute_via_session`. 0 disables
+/// the timeout. Clamped to `[0, 3600]`; default 30s.
+pub const ENV_CTRADER_READ_TIMEOUT_SECS: &str = "FOREX_BOT_CTRADER_READ_TIMEOUT_SECS";
+
+/// Maximum attempts (initial + retries) per cTrader execution call.
+/// Clamped to `[1, 5]`; default 3. Retry safety relies on the broker
+/// deduping by `clientOrderId`.
+pub const ENV_CTRADER_MAX_ATTEMPTS: &str = "FOREX_BOT_CTRADER_MAX_ATTEMPTS";
+
+/// Base backoff (ms) for cTrader retries; doubles per attempt with
+/// 0-99ms jitter, capped at 5s total. Clamped to `[10, 2000]`; default 200.
+pub const ENV_CTRADER_BACKOFF_BASE_MS: &str = "FOREX_BOT_CTRADER_BACKOFF_BASE_MS";
+
+/// Whether partial fills are accepted as final (`1`/`true`/`yes` → on).
+/// Default off — partial fills error out so the risk-per-trade math
+/// stays consistent.
+pub const ENV_CTRADER_ALLOW_PARTIAL_FILL: &str = "FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL";
+
+/// Maximum attempts for the streaming chart-update poll. Clamped
+/// `[1, 5]`; default 3. Stateless polls are safe to retry.
+pub const ENV_CTRADER_STREAM_MAX_ATTEMPTS: &str = "FOREX_BOT_CTRADER_STREAM_MAX_ATTEMPTS";
+
+/// Base backoff (ms) for the streaming layer. Clamped `[10, 2000]`;
+/// default 200.
+pub const ENV_CTRADER_STREAM_BACKOFF_BASE_MS: &str = "FOREX_BOT_CTRADER_STREAM_BACKOFF_BASE_MS";
+
+/// Quote side (`mid` / `bid` / `ask`) used for chart-merge when a
+/// single price is required (e.g. latest-close display). Default `mid`.
+pub const ENV_CHART_MERGE_SIDE: &str = "FOREX_BOT_CHART_MERGE_SIDE";
+
+/// PnL drift threshold (fraction of notional) above which an audit
+/// warning is logged. Clamped `[1e-5, 0.05]`; default 0.001 (10bp).
+pub const ENV_PNL_AUDIT_DRIFT_FRACTION: &str = "FOREX_BOT_PNL_AUDIT_DRIFT_FRACTION";
+
+/// PnL drift threshold (fraction of notional) that halts the auto-trader.
+/// Clamped `[1e-4, 0.20]` so the breaker cannot be silenced by a typo.
+/// Default 0.01 (1%).
+pub const ENV_PNL_CIRCUIT_BREAKER_FRACTION: &str = "FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION";
+
+/// Override path for the live trading journal. Test/CI use; production
+/// reads from the platform user-data-dir.
+pub const ENV_LIVE_JOURNAL_PATH: &str = "FOREX_BOT_LIVE_JOURNAL_PATH";
+
+/// Override path for the pending-actions store. Test/CI use.
+pub const ENV_PENDING_ACTIONS_PATH: &str = "NEOETHOS_PENDING_ACTIONS_PATH";
+
+/// Override path for the Risky Mode persistence file. Test/CI use.
+pub const ENV_RISKY_MODE_STATE_PATH: &str = "NEOETHOS_RISKY_MODE_STATE_PATH";
+
+/// **2026-05-25 — real-data fixture capture** (operator directive
+/// "ότι άλλο υπάρχει ανοιχτό μην αφήσουμε τίποτα"). When set to a
+/// directory path, the cTrader message-parsing layer writes every
+/// parsed `ProtoOA*` response payload to that directory as
+/// `<message_type>_<unix_ms>.bin`. The operator runs the app once
+/// with this env var set, performs the operations that the
+/// `TODO(real-data)` tests need a fixture for (place a market order,
+/// fetch positions, etc.), and the captured payloads appear on
+/// disk. The previously-`#[ignore]`'d tests then load them via
+/// `ctrader_test_fixtures::load_captured`.
+///
+/// Unset = capture is OFF (the default in production).
+pub const ENV_CAPTURE_FIXTURES_DIR: &str = "NEOETHOS_CAPTURE_FIXTURES_DIR";
+
+// ---------------------------------------------------------------------------
+// Defaults — exported as `pub const` so the catalog + tests don't drift
+// ---------------------------------------------------------------------------
+
+pub const DEFAULT_BIND_ADDR: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 7423);
+pub const DEFAULT_CTRADER_READ_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_CTRADER_MAX_ATTEMPTS: u32 = 3;
+pub const DEFAULT_CTRADER_BACKOFF_BASE_MS: u64 = 200;
+pub const DEFAULT_PNL_AUDIT_DRIFT_FRACTION: f64 = 0.001;
+pub const DEFAULT_PNL_CIRCUIT_BREAKER_FRACTION: f64 = 0.01;
+
+// ---------------------------------------------------------------------------
+// Typed getters
+// ---------------------------------------------------------------------------
+
+/// Resolve the HTTP server bind address. Env-var override or default.
+/// Logs a `tracing::warn!` when the env var is set but unparseable.
+pub fn server_bind_addr() -> SocketAddr {
+    if let Ok(raw) = env::var(ENV_SERVER_BIND) {
+        if let Ok(parsed) = raw.parse::<SocketAddr>() {
+            return parsed;
+        }
+        tracing::warn!(
+            target: "neoethos_app::env_overrides",
+            raw = %raw,
+            fallback = %DEFAULT_BIND_ADDR,
+            "{ENV_SERVER_BIND} set but unparseable; falling back to default"
+        );
+    }
+    DEFAULT_BIND_ADDR
+}
+
+/// cTrader read-timeout (seconds). 0 disables the timeout. Clamped to
+/// `[0, 3600]` so a typo can't wedge the trading loop indefinitely.
+pub fn ctrader_read_timeout_secs() -> u64 {
+    env::var(ENV_CTRADER_READ_TIMEOUT_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CTRADER_READ_TIMEOUT_SECS)
+        .min(3600)
+}
+
+/// Maximum cTrader execution attempts. Clamped `[1, 5]`.
+pub fn ctrader_max_attempts() -> u32 {
+    env::var(ENV_CTRADER_MAX_ATTEMPTS)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_CTRADER_MAX_ATTEMPTS)
+        .clamp(1, 5)
+}
+
+/// cTrader retry backoff base (ms). Clamped `[10, 2000]`.
+pub fn ctrader_backoff_base_ms() -> u64 {
+    env::var(ENV_CTRADER_BACKOFF_BASE_MS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CTRADER_BACKOFF_BASE_MS)
+        .clamp(10, 2_000)
+}
+
+/// Whether partial fills are accepted. `true` only for `1` / `true` / `yes`
+/// (case-sensitive on `yes` for backward compat). Default `false`.
+pub fn ctrader_allow_partial_fill() -> bool {
+    env::var(ENV_CTRADER_ALLOW_PARTIAL_FILL)
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Maximum streaming poll attempts. Clamped `[1, 5]`.
+pub fn ctrader_stream_max_attempts() -> u32 {
+    env::var(ENV_CTRADER_STREAM_MAX_ATTEMPTS)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_CTRADER_MAX_ATTEMPTS)
+        .clamp(1, 5)
+}
+
+/// Streaming retry backoff base (ms). Clamped `[10, 2000]`.
+pub fn ctrader_stream_backoff_base_ms() -> u64 {
+    env::var(ENV_CTRADER_STREAM_BACKOFF_BASE_MS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CTRADER_BACKOFF_BASE_MS)
+        .clamp(10, 2_000)
+}
+
+/// Chart-merge quote side. Parser tolerates whitespace + case. Unknown
+/// values fall back to the operator's choice via the caller's defaulting
+/// (this module just returns `None` for "no usable override").
+pub fn chart_merge_side_raw() -> Option<String> {
+    env::var(ENV_CHART_MERGE_SIDE)
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+}
+
+/// PnL audit drift threshold. Clamped `[1e-5, 0.05]`.
+pub fn pnl_audit_drift_fraction() -> f64 {
+    env::var(ENV_PNL_AUDIT_DRIFT_FRACTION)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_PNL_AUDIT_DRIFT_FRACTION)
+        .clamp(1e-5, 0.05)
+}
+
+/// PnL circuit-breaker threshold. Clamped `[1e-4, 0.20]`.
+pub fn pnl_circuit_breaker_fraction() -> f64 {
+    env::var(ENV_PNL_CIRCUIT_BREAKER_FRACTION)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_PNL_CIRCUIT_BREAKER_FRACTION)
+        .clamp(1e-4, 0.20)
+}
+
+/// Live-journal path override. `None` when unset → callers fall back to
+/// the platform user-data-dir default.
+pub fn live_journal_path_override() -> Option<String> {
+    env::var(ENV_LIVE_JOURNAL_PATH)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Pending-actions path override. `None` when unset.
+pub fn pending_actions_path_override() -> Option<String> {
+    env::var(ENV_PENDING_ACTIONS_PATH)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Risky-Mode persistence path override. `None` when unset.
+pub fn risky_mode_state_path_override() -> Option<String> {
+    env::var(ENV_RISKY_MODE_STATE_PATH)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Real-data fixture capture directory. `None` = capture disabled
+/// (production default). When `Some(dir)`, the cTrader parser layer
+/// writes each parsed response to
+/// `<dir>/<message_type>_<unix_ms>.bin` so the
+/// `ctrader_test_fixtures` loader can replay them in future tests.
+pub fn capture_fixtures_dir() -> Option<String> {
+    env::var(ENV_CAPTURE_FIXTURES_DIR)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Write a captured proto-payload to the configured fixture
+/// directory. No-op when `NEOETHOS_CAPTURE_FIXTURES_DIR` is unset
+/// (production default — zero overhead on the hot path).
+///
+/// **Usage** — call from any cTrader message-parser site after
+/// successfully decoding a `ProtoOA*` response:
+/// ```rust
+/// use crate::app_services::env_overrides::capture_fixture;
+/// capture_fixture("ProtoOADealListRes", raw_bytes);
+/// ```
+///
+/// Errors are logged at `warn` level but never propagated — capture
+/// is best-effort diagnostic, not a correctness contract. A failed
+/// fixture write must NEVER block trading.
+pub fn capture_fixture(message_type: &str, payload: &[u8]) {
+    let Some(dir) = capture_fixtures_dir() else {
+        return;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let safe_type: String = message_type
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let path = std::path::Path::new(&dir).join(format!("{safe_type}_{now_ms}.bin"));
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                target: "neoethos_app::env_overrides::capture_fixture",
+                path = %parent.display(),
+                error = %err,
+                "capture-fixtures dir not creatable; skipping this payload"
+            );
+            return;
+        }
+    }
+    if let Err(err) = std::fs::write(&path, payload) {
+        tracing::warn!(
+            target: "neoethos_app::env_overrides::capture_fixture",
+            path = %path.display(),
+            error = %err,
+            "capture-fixtures write failed; skipping"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin every env-var constant so renames break loudly here. The
+    /// operator's docs + Flutter Settings UI + the audit reference all
+    /// rely on these names — silently renaming any one of them is a
+    /// breaking change.
+    #[test]
+    fn env_var_names_are_stable() {
+        assert_eq!(ENV_SERVER_BIND, "NEOETHOS_SERVER_BIND");
+        assert_eq!(
+            ENV_CTRADER_READ_TIMEOUT_SECS,
+            "FOREX_BOT_CTRADER_READ_TIMEOUT_SECS"
+        );
+        assert_eq!(ENV_CTRADER_MAX_ATTEMPTS, "FOREX_BOT_CTRADER_MAX_ATTEMPTS");
+        assert_eq!(
+            ENV_CTRADER_BACKOFF_BASE_MS,
+            "FOREX_BOT_CTRADER_BACKOFF_BASE_MS"
+        );
+        assert_eq!(
+            ENV_CTRADER_ALLOW_PARTIAL_FILL,
+            "FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL"
+        );
+        assert_eq!(
+            ENV_CTRADER_STREAM_MAX_ATTEMPTS,
+            "FOREX_BOT_CTRADER_STREAM_MAX_ATTEMPTS"
+        );
+        assert_eq!(
+            ENV_CTRADER_STREAM_BACKOFF_BASE_MS,
+            "FOREX_BOT_CTRADER_STREAM_BACKOFF_BASE_MS"
+        );
+        assert_eq!(ENV_CHART_MERGE_SIDE, "FOREX_BOT_CHART_MERGE_SIDE");
+        assert_eq!(
+            ENV_PNL_AUDIT_DRIFT_FRACTION,
+            "FOREX_BOT_PNL_AUDIT_DRIFT_FRACTION"
+        );
+        assert_eq!(
+            ENV_PNL_CIRCUIT_BREAKER_FRACTION,
+            "FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION"
+        );
+        assert_eq!(ENV_LIVE_JOURNAL_PATH, "FOREX_BOT_LIVE_JOURNAL_PATH");
+        assert_eq!(ENV_PENDING_ACTIONS_PATH, "NEOETHOS_PENDING_ACTIONS_PATH");
+        assert_eq!(
+            ENV_RISKY_MODE_STATE_PATH,
+            "NEOETHOS_RISKY_MODE_STATE_PATH"
+        );
+        assert_eq!(
+            ENV_CAPTURE_FIXTURES_DIR,
+            "NEOETHOS_CAPTURE_FIXTURES_DIR"
+        );
+    }
+
+    #[test]
+    fn defaults_are_sensible() {
+        // Sanity-check the defaults against operator-documented values.
+        assert_eq!(DEFAULT_CTRADER_READ_TIMEOUT_SECS, 30);
+        assert_eq!(DEFAULT_CTRADER_MAX_ATTEMPTS, 3);
+        assert_eq!(DEFAULT_CTRADER_BACKOFF_BASE_MS, 200);
+        assert_eq!(DEFAULT_PNL_AUDIT_DRIFT_FRACTION, 0.001);
+        assert_eq!(DEFAULT_PNL_CIRCUIT_BREAKER_FRACTION, 0.01);
+        assert_eq!(
+            DEFAULT_BIND_ADDR.to_string(),
+            "127.0.0.1:7423"
+        );
+    }
+}

@@ -2431,71 +2431,26 @@ fn model_artifact_dir(
     models_dir.join(symbol).join(base_tf).join(model_name)
 }
 
-fn staged_training_artifact_dir(path: &Path) -> PathBuf {
-    path.with_extension("tmp_training_dispatch")
-}
-
-fn backup_training_artifact_dir(path: &Path) -> PathBuf {
-    path.with_extension("bak_training_dispatch")
-}
-
-fn cleanup_training_artifact_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("remove staged training artifact dir {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn replace_training_artifact_dir(staged_path: &Path, target_path: &Path) -> Result<()> {
-    let backup_path = backup_training_artifact_dir(target_path);
-    cleanup_training_artifact_dir(&backup_path)?;
-
-    if target_path.exists() {
-        std::fs::rename(target_path, &backup_path).with_context(|| {
-            format!(
-                "backup training artifact dir {} to {}",
-                target_path.display(),
-                backup_path.display()
-            )
-        })?;
-    }
-
-    if let Err(error) = std::fs::rename(staged_path, target_path) {
-        if backup_path.exists() {
-            let _ = std::fs::rename(&backup_path, target_path);
-        } else if staged_path.exists() {
-            let _ = std::fs::remove_dir_all(staged_path);
-        }
-        anyhow::bail!(
-            "promote staged training artifact dir {} to {} failed: {}",
-            staged_path.display(),
-            target_path.display(),
-            error
-        );
-    }
-
-    cleanup_training_artifact_dir(&backup_path)?;
-    Ok(())
-}
-
+/// GROUP E remediation 2026-05-25: 5 hand-rolled functions replaced
+/// with a single delegation to the canonical `write_dir_with_backup`
+/// helper in `neoethos-core::storage::json`. Saves ~60 LOC of duplicate
+/// staged-tmp+backup logic (this file is one of 4 — final one).
+/// Existing tests `with_staged_training_artifact_dir_promotes_complete_directory`
+/// and `with_staged_training_artifact_dir_cleans_up_failed_stage` exercise
+/// the same function name and continue to pin the consolidated semantics.
 fn with_staged_training_artifact_dir<F>(path: &Path, writer: F) -> Result<()>
 where
     F: FnOnce(&Path) -> Result<()>,
 {
-    let staged_path = staged_training_artifact_dir(path);
-    cleanup_training_artifact_dir(&staged_path)?;
-    std::fs::create_dir_all(&staged_path).with_context(|| {
-        format!(
-            "create staged training artifact dir {}",
-            staged_path.display()
-        )
-    })?;
-    if let Err(error) = writer(&staged_path) {
-        let _ = cleanup_training_artifact_dir(&staged_path);
-        return Err(error);
-    }
-    replace_training_artifact_dir(&staged_path, path)
+    neoethos_core::storage::json::write_dir_with_backup(
+        path,
+        neoethos_core::storage::json::DirBackupWriteConfig {
+            artifact_label: "training artifact",
+            temp_extension: "tmp_training_dispatch",
+            backup_extension: "bak_training_dispatch",
+        },
+        writer,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4110,7 +4065,17 @@ mod tests {
         .expect("staged training artifact directory should promote");
 
         assert!(target_dir.join(marker_name).is_file());
-        assert!(!staged_training_artifact_dir(&target_dir).exists());
+        // Pre-2026-05-26 this called a local `staged_training_artifact_dir`
+        // helper. After GROUP-E consolidation (#223) the helper was inlined
+        // into `write_dir_with_backup` (json.rs:230) which computes
+        // `target.with_extension(temp_extension)`. Re-derive the same path
+        // here so the post-condition still pins the implementation.
+        assert!(
+            !target_dir
+                .with_extension("tmp_training_dispatch")
+                .exists(),
+            "staged dir must be cleaned up after promote"
+        );
 
         if target_dir.exists() {
             std::fs::remove_dir_all(&target_dir).expect("cleanup promoted target dir");
@@ -4120,7 +4085,9 @@ mod tests {
     #[test]
     fn with_staged_training_artifact_dir_cleans_up_failed_stage() {
         let target_dir = unique_test_dir("staged_cleanup");
-        let staged_dir = staged_training_artifact_dir(&target_dir);
+        // See sibling test for why this is `with_extension(...)` rather than
+        // a helper call.
+        let staged_dir = target_dir.with_extension("tmp_training_dispatch");
 
         let err = with_staged_training_artifact_dir(&target_dir, |_staged_dir| {
             anyhow::bail!("synthetic staging failure")

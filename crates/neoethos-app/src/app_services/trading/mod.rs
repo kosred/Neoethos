@@ -275,10 +275,11 @@ pub enum BotDecisionSource {
 
 /// Lightweight summary of which experts loaded vs missed vs
 /// degraded — returned by [`TradingSession::start_auto_trade_with_ensemble`]
-/// so the chrome can render a "Running ensemble: X/32 experts
+/// so the chrome can render a "Running ensemble: X/33 experts
 /// active — Y missing, Z degraded" banner without holding a
 /// reference to the live ensemble (which moves into the
-/// predictor at start time).
+/// predictor at start time). The 33 is `DEFAULT_BOOTSTRAP_EXPERT_NAMES.len()`
+/// — 34 KNOWN_MODEL_NAMES minus the deferred `swarm_forecaster`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnsembleLoadSummary {
     /// Canonical names of experts that loaded healthy and are
@@ -1412,7 +1413,9 @@ impl TradingSession {
     ///    thread.
     ///
     /// Returns a load-summary so the chrome can render "Running
-    /// ensemble: X/32 experts active — Y missing, Z degraded".
+    /// ensemble: X/33 experts active — Y missing, Z degraded"
+    /// (33 = `DEFAULT_BOOTSTRAP_EXPERT_NAMES.len()`, which is
+    /// `KNOWN_MODEL_NAMES.len() - 1` for the deferred swarm).
     /// The full `ExpertLoadOutcome` (with the live Box<dyn
     /// ExpertModel> handles) is owned by the running predictor;
     /// callers that need richer introspection should query the

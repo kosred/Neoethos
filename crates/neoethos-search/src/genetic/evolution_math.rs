@@ -515,35 +515,37 @@ fn random_coarse_weight(rng: &mut impl Rng) -> f32 {
 }
 
 fn random_coarse_threshold(rng: &mut impl Rng) -> f32 {
-    // Two distinct calibrations — one for raw indicator outputs (used
-    // when the feature pipeline emits its native magnitudes; some
-    // indicators are bounded oscillators in [0, 100], some are
-    // unbounded; weighted sums end up in roughly [0.0, 5.0]) and one
-    // for normalized features (z-scores, weighted sums in roughly
-    // [0.0, 5.0] but centred on 0 with most mass within ±3).
+    // **2026-05-26 operator directive (dual-mode product, taskdoc #273)**:
+    // the previous `[0.30, 0.45, 0.60, 0.80, 1.00, 1.20]` ladder was
+    // calibrated against an older feature pipeline; empirical scoring on
+    // the current z-score frames shows the *combined* signal magnitude
+    // for a multi-indicator gene sits around 0.05-0.15 (≈ 0.5σ), with a
+    // 95th-percentile near 0.30-0.50. The old ladder's *minimum*
+    // threshold of 0.30 was at-or-above the 95th percentile, meaning
+    // most random initial genes never fired — even one indicator with a
+    // strong signal couldn't push the weighted combo past 0.30.
     //
-    // The second set is used when `FOREX_BOT_NORMALIZE_FEATURES=1`
-    // is on — without re-calibrated levels the GA's `combined > 0.45`
-    // fires either always or never depending on the symbol's raw
-    // magnitudes, which is the empty-portfolio bug we observed on
-    // EURJPY / XAUUSD.
-    let normalized = matches!(
-        std::env::var("FOREX_BOT_NORMALIZE_FEATURES").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    );
-    if normalized {
-        // Mid-range thresholds for normalized inputs. Empirically the
-        // [0.05–0.50] range is too low (fires constantly → 1 trade
-        // forever); [0.25–2.5] is too high (rarely fires → archive
-        // collapses). [0.30–1.20] is the current best guess; full
-        // re-calibration against a real-symbol fitness landscape is
-        // a v0.4 task tracked in the spec.
-        let levels = [0.30, 0.45, 0.60, 0.80, 1.00, 1.20];
-        levels[rng.random_range(0..levels.len())]
-    } else {
-        let levels = [0.15, 0.25, 0.35, 0.45, 0.55];
-        levels[rng.random_range(0..levels.len())]
-    }
+    // The narrower ladder `[0.10, 0.20, 0.35, 0.50, 0.70, 0.90]` keeps the
+    // top end (for picky genes that fire only on extreme moves) but
+    // adds a working low-end (genes that fire often, even on mild
+    // moves). Activity + downstream filters (min_trades, prop-firm
+    // window-pass) prevent over-trading from winning.
+    //
+    // Doctrine: F-058 (2026-05-25) hard-picked the normalised ladder; this
+    // change narrows that same ladder to match the empirical feature
+    // magnitudes, not the assumption of unit-variance noise.
+    //
+    // **F-058 history (kept for context)**: the dual-convention switch via
+    // `FOREX_BOT_NORMALIZE_FEATURES` was a leftover from audit-era
+    // debugging when the feature pipeline emitted both raw-indicator
+    // and z-score frames. The current feature pipeline (post-#212
+    // vector_ta normalisation) ALWAYS emits z-score-normalised
+    // features — so the "raw" threshold ladder is unreachable in
+    // practice. If the operator ever switches back to a raw-feature
+    // pipeline, re-introduce the env switch — but DO NOT default-on it
+    // again because the dual-convention was a silent runtime trap.
+    let levels = [0.10, 0.20, 0.35, 0.50, 0.70, 0.90];
+    levels[rng.random_range(0..levels.len())]
 }
 
 /// Reset every derived/financial metric on a Gene that was inherited from a
@@ -833,46 +835,20 @@ pub fn mutate(
     mutated
 }
 
-pub fn score_from_metrics(metrics: &[f64; 11]) -> f64 {
-    let sharpe = metrics[1];
-    let max_dd = metrics[3];
-    let win_rate = metrics[4];
-    let profit_factor = metrics[5];
-    let trades = metrics[8];
-    let consistency = metrics[9];
-
-    if !sharpe.is_finite() || trades < 1.0 {
-        return f64::NEG_INFINITY;
-    }
-
-    // Confidence factor: more trades → higher confidence (caps at ~100 trades)
-    let trades_confidence = (trades.sqrt() / 10.0).min(1.0);
-
-    // Sharpe weighted by confidence (primary signal)
-    let sharpe_component = sharpe * trades_confidence * 0.40;
-
-    // Consistency: reward smooth monthly returns
-    let consistency_component = consistency.clamp(0.0, 1.0) * 0.25;
-
-    // Drawdown: proportional penalty, not cliff-based
-    let dd_penalty = (max_dd * 15.0).min(5.0);
-
-    // Profit factor: smooth reward above 1.0, smooth penalty below
-    let pf_component = if profit_factor >= 1.0 {
-        ((profit_factor - 1.0) * 0.5).min(1.5) * 0.20
-    } else {
-        -(1.0 / profit_factor.max(0.1)) * 0.30
-    };
-
-    // Win rate bonus (minor, since PF already captures edge quality)
-    let wr_component = ((win_rate - 0.45) * 2.0).clamp(0.0, 0.5) * 0.10;
-
-    sharpe_component + consistency_component + pf_component + wr_component - dd_penalty
-}
+// **Scoring Phase B COMPLETE (2026-05-25 verbose-build pass)**: the
+// previous `score_from_metrics` deprecated shim was deleted. The only
+// in-crate caller (`apply_metrics` below) calls
+// `crate::scoring::ga_fitness` directly. External callers reaching for
+// the old name now get a compile error pointing at the canonical
+// function — which is what we want.
 
 pub fn apply_metrics(genes: &mut [Gene], metrics: &[[f64; 11]]) {
     for (gene, m) in genes.iter_mut().zip(metrics.iter()) {
-        gene.fitness = score_from_metrics(m);
+        // Scoring Phase B (2026-05-25): call the canonical
+        // `crate::scoring::ga_fitness` directly rather than the
+        // local `#[deprecated]` `score_from_metrics` shim. Behaviour
+        // is byte-for-byte identical (pinned by Phase-A test).
+        gene.fitness = crate::scoring::ga_fitness(m);
         gene.sharpe_ratio = m[1];
         gene.max_drawdown = m[3];
         gene.win_rate = m[4];

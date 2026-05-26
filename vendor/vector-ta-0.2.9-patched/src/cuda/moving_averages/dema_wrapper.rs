@@ -1,0 +1,953 @@
+#![cfg(feature = "cuda")]
+
+use super::alma_wrapper::DeviceArrayF32;
+use crate::indicators::moving_averages::dema::{DemaBatchRange, DemaParams};
+use cust::context::Context;
+use cust::device::Device;
+use cust::device::DeviceAttribute;
+use cust::function::{BlockSize, GridSize};
+use cust::memory::{mem_get_info, DeviceBuffer, DevicePointer};
+use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::prelude::*;
+use cust::stream::{Stream, StreamFlags};
+use cust::sys as cu;
+use std::ffi::c_void;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum CudaDemaError {
+    #[error("CUDA error: {0}")]
+    Cuda(#[from] cust::error::CudaError),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    #[error("invalid policy: {0}")]
+    InvalidPolicy(&'static str),
+    #[error("missing kernel symbol: {name}")]
+    MissingKernelSymbol { name: &'static str },
+    #[error("out of memory: required={required} free={free} headroom={headroom}")]
+    OutOfMemory {
+        required: usize,
+        free: usize,
+        headroom: usize,
+    },
+    #[error("launch config too large: grid=({gx},{gy},{gz}) block=({bx},{by},{bz})")]
+    LaunchConfigTooLarge {
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
+    },
+    #[error("device mismatch: buf on {buf}, current {current}")]
+    DeviceMismatch { buf: u32, current: u32 },
+    #[error("not implemented")]
+    NotImplemented,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BatchThreadsPerOutput {
+    One,
+    Two,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BatchKernelPolicy {
+    Auto,
+    Plain {
+        block_x: u32,
+    },
+
+    Tiled {
+        tile: u32,
+        per_thread: BatchThreadsPerOutput,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ManySeriesKernelPolicy {
+    Auto,
+    OneD { block_x: u32 },
+
+    Tiled2D { tx: u32, ty: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CudaDemaPolicy {
+    pub batch: BatchKernelPolicy,
+    pub many_series: ManySeriesKernelPolicy,
+}
+impl Default for CudaDemaPolicy {
+    fn default() -> Self {
+        Self {
+            batch: BatchKernelPolicy::Auto,
+            many_series: ManySeriesKernelPolicy::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BatchKernelSelected {
+    Plain { block_x: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ManySeriesKernelSelected {
+    OneD { block_x: u32 },
+}
+
+pub struct CudaDema {
+    module: Module,
+    stream: Stream,
+    ctx: Arc<Context>,
+    device_id: u32,
+    policy: CudaDemaPolicy,
+    last_batch: Option<BatchKernelSelected>,
+    last_many: Option<ManySeriesKernelSelected>,
+    debug_batch_logged: bool,
+    debug_many_logged: bool,
+}
+
+impl CudaDema {
+    pub fn new(device_id: usize) -> Result<Self, CudaDemaError> {
+        cust::init(CudaFlags::empty())?;
+        let device = Device::get_device(device_id as u32)?;
+        let context = Context::new(device)?;
+
+        let ptx = include_str!(concat!(env!("OUT_DIR"), "/dema_kernel.ptx"));
+        let jit_opts = &[
+            ModuleJitOption::DetermineTargetFromContext,
+            ModuleJitOption::OptLevel(OptLevel::O4),
+        ];
+        let module = match Module::from_ptx(ptx, jit_opts) {
+            Ok(m) => m,
+            Err(_) => Module::from_ptx(ptx, &[])?,
+        };
+        let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
+
+        Ok(Self {
+            module,
+            stream,
+            ctx: Arc::new(context),
+            device_id: device_id as u32,
+            policy: CudaDemaPolicy::default(),
+            last_batch: None,
+            last_many: None,
+            debug_batch_logged: false,
+            debug_many_logged: false,
+        })
+    }
+
+    #[inline]
+    pub fn synchronize(&self) -> Result<(), CudaDemaError> {
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
+    pub fn new_with_policy(
+        device_id: usize,
+        policy: CudaDemaPolicy,
+    ) -> Result<Self, CudaDemaError> {
+        let mut s = Self::new(device_id)?;
+        s.policy = policy;
+        Ok(s)
+    }
+    pub fn set_policy(&mut self, policy: CudaDemaPolicy) {
+        self.policy = policy;
+    }
+    pub fn policy(&self) -> &CudaDemaPolicy {
+        &self.policy
+    }
+    #[inline]
+    pub fn ctx(&self) -> Arc<Context> {
+        Arc::clone(&self.ctx)
+    }
+    #[inline]
+    pub fn device_id(&self) -> u32 {
+        self.device_id
+    }
+    pub fn selected_batch_kernel(&self) -> Option<BatchKernelSelected> {
+        self.last_batch
+    }
+    pub fn selected_many_series_kernel(&self) -> Option<ManySeriesKernelSelected> {
+        self.last_many
+    }
+
+    #[inline]
+    fn maybe_log_batch_debug(&self) {
+        static GLOBAL_ONCE: AtomicBool = AtomicBool::new(false);
+        if self.debug_batch_logged {
+            return;
+        }
+        if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(sel) = self.last_batch {
+                let per_scenario =
+                    std::env::var("BENCH_DEBUG_SCOPE").ok().as_deref() == Some("scenario");
+                if per_scenario || !GLOBAL_ONCE.swap(true, Ordering::Relaxed) {
+                    eprintln!("[DEBUG] DEMA batch selected kernel: {:?}", sel);
+                }
+                unsafe {
+                    (*(self as *const _ as *mut CudaDema)).debug_batch_logged = true;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn maybe_log_many_debug(&self) {
+        static GLOBAL_ONCE: AtomicBool = AtomicBool::new(false);
+        if self.debug_many_logged {
+            return;
+        }
+        if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(sel) = self.last_many {
+                let per_scenario =
+                    std::env::var("BENCH_DEBUG_SCOPE").ok().as_deref() == Some("scenario");
+                if per_scenario || !GLOBAL_ONCE.swap(true, Ordering::Relaxed) {
+                    eprintln!("[DEBUG] DEMA many-series selected kernel: {:?}", sel);
+                }
+                unsafe {
+                    (*(self as *const _ as *mut CudaDema)).debug_many_logged = true;
+                }
+            }
+        }
+    }
+
+    pub fn dema_batch_dev(
+        &self,
+        data_f32: &[f32],
+        sweep: &DemaBatchRange,
+    ) -> Result<DeviceArrayF32, CudaDemaError> {
+        let (combos, first_valid, series_len, _max_period) =
+            Self::prepare_batch_inputs(data_f32, sweep)?;
+        let periods: Vec<i32> = combos
+            .iter()
+            .map(|p| p.period.unwrap_or(0) as i32)
+            .collect();
+
+        let prices_bytes = series_len.checked_mul(std::mem::size_of::<f32>()).ok_or(
+            CudaDemaError::InvalidInput("size overflow computing prices_bytes".into()),
+        )?;
+        let periods_bytes = periods
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or(CudaDemaError::InvalidInput(
+                "size overflow computing periods_bytes".into(),
+            ))?;
+        let out_elems = series_len
+            .checked_mul(combos.len())
+            .ok_or(CudaDemaError::InvalidInput(
+                "size overflow computing output elements".into(),
+            ))?;
+        let out_bytes = out_elems.checked_mul(std::mem::size_of::<f32>()).ok_or(
+            CudaDemaError::InvalidInput("size overflow computing output bytes".into()),
+        )?;
+        let required = prices_bytes
+            .checked_add(periods_bytes)
+            .and_then(|v| v.checked_add(out_bytes))
+            .ok_or(CudaDemaError::InvalidInput(
+                "size overflow summing required bytes".into(),
+            ))?;
+
+        Self::will_fit_checked(required, 64 * 1024 * 1024)?;
+
+        let d_prices = DeviceBuffer::from_slice(data_f32)?;
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let out_len = out_elems;
+        let mut d_out: DeviceBuffer<f32> = unsafe { DeviceBuffer::uninitialized(out_len)? };
+
+        self.launch_batch_kernel(
+            d_prices.as_device_ptr(),
+            &d_periods,
+            series_len,
+            first_valid,
+            combos.len(),
+            &mut d_out,
+        )?;
+
+        Ok(DeviceArrayF32 {
+            buf: d_out,
+            rows: combos.len(),
+            cols: series_len,
+        })
+    }
+
+    pub fn dema_batch_device(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        d_periods: &DeviceBuffer<i32>,
+        series_len: i32,
+        first_valid: i32,
+        n_combos: i32,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaDemaError> {
+        if series_len <= 0 || n_combos <= 0 {
+            return Err(CudaDemaError::InvalidInput(
+                "series_len and n_combos must be positive".into(),
+            ));
+        }
+        self.launch_batch_kernel(
+            d_prices.as_device_ptr(),
+            d_periods,
+            series_len as usize,
+            first_valid.max(0) as usize,
+            n_combos as usize,
+            d_out,
+        )?;
+        self.synchronize()
+    }
+
+    pub fn dema_batch_from_device_prices(
+        &self,
+        d_prices: &DeviceBuffer<f32>,
+        series_len: usize,
+        first_valid: usize,
+        sweep: &DemaBatchRange,
+    ) -> Result<DeviceArrayF32, CudaDemaError> {
+        self.dema_batch_from_device_ptr(d_prices.as_device_ptr(), series_len, first_valid, sweep)
+    }
+
+    pub fn dema_batch_from_device_ptr(
+        &self,
+        d_prices: DevicePointer<f32>,
+        series_len: usize,
+        first_valid: usize,
+        sweep: &DemaBatchRange,
+    ) -> Result<DeviceArrayF32, CudaDemaError> {
+        if series_len == 0 {
+            return Err(CudaDemaError::InvalidInput("series_len is zero".into()));
+        }
+        let combos = expand_periods(sweep);
+        if combos.is_empty() {
+            return Err(CudaDemaError::InvalidInput(
+                "no period combinations provided".into(),
+            ));
+        }
+        let periods: Vec<i32> = combos
+            .iter()
+            .map(|p| p.period.unwrap_or(0) as i32)
+            .collect();
+        let max_period = combos
+            .iter()
+            .map(|p| p.period.unwrap_or(0))
+            .max()
+            .unwrap_or(0) as usize;
+        if max_period == 0 || series_len.saturating_sub(first_valid) < max_period {
+            return Err(CudaDemaError::InvalidInput(format!(
+                "not enough valid data (needed >= {}, valid = {})",
+                max_period,
+                series_len.saturating_sub(first_valid)
+            )));
+        }
+
+        let periods_bytes = periods
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or(CudaDemaError::InvalidInput(
+                "size overflow computing periods_bytes".into(),
+            ))?;
+        let out_elems = series_len
+            .checked_mul(combos.len())
+            .ok_or(CudaDemaError::InvalidInput(
+                "size overflow computing output elements".into(),
+            ))?;
+        let out_bytes = out_elems.checked_mul(std::mem::size_of::<f32>()).ok_or(
+            CudaDemaError::InvalidInput("size overflow computing output bytes".into()),
+        )?;
+        let required = periods_bytes
+            .checked_add(out_bytes)
+            .ok_or(CudaDemaError::InvalidInput(
+                "size overflow summing required bytes".into(),
+            ))?;
+        Self::will_fit_checked(required, 64 * 1024 * 1024)?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let mut d_out: DeviceBuffer<f32> = unsafe { DeviceBuffer::uninitialized(out_elems)? };
+
+        self.launch_batch_kernel(
+            d_prices,
+            &d_periods,
+            series_len,
+            first_valid,
+            combos.len(),
+            &mut d_out,
+        )?;
+
+        Ok(DeviceArrayF32 {
+            buf: d_out,
+            rows: combos.len(),
+            cols: series_len,
+        })
+    }
+
+    pub fn dema_batch_into_host_f32(
+        &self,
+        data_f32: &[f32],
+        sweep: &DemaBatchRange,
+        out_flat: &mut [f32],
+    ) -> Result<(), CudaDemaError> {
+        let (combos, _first_valid, series_len, _max_p) =
+            Self::prepare_batch_inputs(data_f32, sweep)?;
+        if out_flat.len() != combos.len() * series_len {
+            return Err(CudaDemaError::InvalidInput(
+                "output slice length mismatch".into(),
+            ));
+        }
+        let handle = self.dema_batch_dev(data_f32, sweep)?;
+        handle.buf.copy_to(out_flat)?;
+        Ok(())
+    }
+
+    fn prepare_batch_inputs(
+        data_f32: &[f32],
+        sweep: &DemaBatchRange,
+    ) -> Result<(Vec<DemaParams>, usize, usize, usize), CudaDemaError> {
+        if data_f32.is_empty() {
+            return Err(CudaDemaError::InvalidInput("input data is empty".into()));
+        }
+
+        let combos = expand_periods(sweep);
+        if combos.is_empty() {
+            return Err(CudaDemaError::InvalidInput(
+                "no period combinations provided".into(),
+            ));
+        }
+
+        let series_len = data_f32.len();
+        let first_valid = data_f32
+            .iter()
+            .position(|x| !x.is_nan())
+            .ok_or_else(|| CudaDemaError::InvalidInput("all values are NaN".into()))?;
+
+        let max_period = combos
+            .iter()
+            .map(|p| p.period.unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        if max_period == 0 {
+            return Err(CudaDemaError::InvalidInput(
+                "period must be positive".into(),
+            ));
+        }
+        let needed = 2 * (max_period - 1);
+        if series_len < needed {
+            return Err(CudaDemaError::InvalidInput(format!(
+                "not enough data: needed >= {}, have {}",
+                needed, series_len
+            )));
+        }
+        let valid = series_len - first_valid;
+        if valid < needed {
+            return Err(CudaDemaError::InvalidInput(format!(
+                "not enough valid data: needed >= {}, have {}",
+                needed, valid
+            )));
+        }
+
+        Ok((combos, first_valid, series_len, max_period))
+    }
+
+    fn launch_batch_kernel(
+        &self,
+        d_prices: DevicePointer<f32>,
+        d_periods: &DeviceBuffer<i32>,
+        series_len: usize,
+        first_valid: usize,
+        n_combos: usize,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaDemaError> {
+        if n_combos == 0 {
+            return Ok(());
+        }
+
+        let func = self.module.get_function("dema_batch_f32").map_err(|_| {
+            CudaDemaError::MissingKernelSymbol {
+                name: "dema_batch_f32",
+            }
+        })?;
+
+        let mut block_x: u32 = 1;
+        if let BatchKernelPolicy::Plain { block_x: bx } = self.policy.batch {
+            block_x = bx.max(1);
+        }
+        unsafe {
+            let this = self as *const _ as *mut CudaDema;
+            (*this).last_batch = Some(BatchKernelSelected::Plain { block_x });
+        }
+        self.maybe_log_batch_debug();
+
+        let grid_x: u32 = n_combos as u32;
+        let grid: GridSize = (grid_x, 1, 1).into();
+        let block: BlockSize = (block_x, 1, 1).into();
+
+        {
+            let dev = Device::get_device(self.device_id)?;
+            let max_grid_x = dev.get_attribute(DeviceAttribute::MaxGridDimX)? as u32;
+            let max_tpb = dev.get_attribute(DeviceAttribute::MaxThreadsPerBlock)? as u32;
+            if grid_x == 0 || grid_x > max_grid_x || block_x == 0 || block_x > max_tpb {
+                return Err(CudaDemaError::LaunchConfigTooLarge {
+                    gx: grid_x,
+                    gy: 1,
+                    gz: 1,
+                    bx: block_x,
+                    by: 1,
+                    bz: 1,
+                });
+            }
+        }
+
+        unsafe {
+            let mut prices_ptr = d_prices.as_raw();
+            let mut periods_ptr = d_periods.as_device_ptr().as_raw();
+            let mut series_len_i = series_len as i32;
+            let mut first_valid_i = first_valid as i32;
+            let mut n_combos_i = n_combos as i32;
+            let mut out_ptr = d_out.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut prices_ptr as *mut _ as *mut c_void,
+                &mut periods_ptr as *mut _ as *mut c_void,
+                &mut series_len_i as *mut _ as *mut c_void,
+                &mut first_valid_i as *mut _ as *mut c_void,
+                &mut n_combos_i as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn dema_many_series_one_param_time_major_dev(
+        &self,
+        data_tm_f32: &[f32],
+        num_series: usize,
+        series_len: usize,
+        params: &DemaParams,
+    ) -> Result<DeviceArrayF32, CudaDemaError> {
+        let (first_valids, period) =
+            Self::prepare_many_series_inputs(data_tm_f32, num_series, series_len, params)?;
+
+        let elems = num_series * series_len;
+        let required =
+            elems * 2 * std::mem::size_of::<f32>() + num_series * std::mem::size_of::<i32>();
+        Self::will_fit_checked(required, 64 * 1024 * 1024)?;
+
+        let d_prices_tm = DeviceBuffer::from_slice(data_tm_f32)?;
+        let d_first_valids = DeviceBuffer::from_slice(&first_valids)?;
+        let mut d_out_tm: DeviceBuffer<f32> = unsafe { DeviceBuffer::uninitialized(elems)? };
+
+        self.launch_many_series_kernel(
+            &d_prices_tm,
+            &d_first_valids,
+            period as i32,
+            num_series,
+            series_len,
+            &mut d_out_tm,
+        )?;
+
+        self.synchronize()?;
+
+        Ok(DeviceArrayF32 {
+            buf: d_out_tm,
+            rows: series_len,
+            cols: num_series,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dema_many_series_one_param_device(
+        &self,
+        d_prices_tm: &DeviceBuffer<f32>,
+        d_first_valids: &DeviceBuffer<i32>,
+        period: i32,
+        num_series: usize,
+        series_len: usize,
+        d_out_tm: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaDemaError> {
+        if num_series == 0 || series_len == 0 {
+            return Err(CudaDemaError::InvalidInput(
+                "num_series and series_len must be positive".into(),
+            ));
+        }
+        if period <= 0 {
+            return Err(CudaDemaError::InvalidInput(
+                "period must be positive".into(),
+            ));
+        }
+        if d_prices_tm.len() != num_series * series_len || d_out_tm.len() != num_series * series_len
+        {
+            return Err(CudaDemaError::InvalidInput(
+                "time-major buffer length mismatch".into(),
+            ));
+        }
+        if d_first_valids.len() != num_series {
+            return Err(CudaDemaError::InvalidInput(
+                "first_valids length mismatch".into(),
+            ));
+        }
+
+        self.launch_many_series_kernel(
+            d_prices_tm,
+            d_first_valids,
+            period,
+            num_series,
+            series_len,
+            d_out_tm,
+        )?;
+        self.synchronize()
+    }
+
+    pub fn dema_many_series_one_param_time_major_into_host_f32(
+        &self,
+        data_tm_f32: &[f32],
+        num_series: usize,
+        series_len: usize,
+        params: &DemaParams,
+        out_tm: &mut [f32],
+    ) -> Result<(), CudaDemaError> {
+        if out_tm.len() != num_series * series_len {
+            return Err(CudaDemaError::InvalidInput(
+                "output slice length mismatch".into(),
+            ));
+        }
+        let handle = self.dema_many_series_one_param_time_major_dev(
+            data_tm_f32,
+            num_series,
+            series_len,
+            params,
+        )?;
+        handle.buf.copy_to(out_tm).map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_many_series_kernel(
+        &self,
+        d_prices_tm: &DeviceBuffer<f32>,
+        d_first_valids: &DeviceBuffer<i32>,
+        period: i32,
+        num_series: usize,
+        series_len: usize,
+        d_out_tm: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaDemaError> {
+        let func = self
+            .module
+            .get_function("dema_many_series_one_param_time_major_f32")
+            .map_err(|_| CudaDemaError::MissingKernelSymbol {
+                name: "dema_many_series_one_param_time_major_f32",
+            })?;
+
+        let mut block_x_req: u32 = 128;
+        if let ManySeriesKernelPolicy::OneD { block_x: bx } = self.policy.many_series {
+            block_x_req = bx.max(32);
+        }
+        let warps_per_block = (block_x_req / 32).max(1);
+        let block_x = warps_per_block * 32;
+        let total_warps = ((num_series as u32) + 31) / 32;
+        let grid_x = (total_warps + warps_per_block - 1) / warps_per_block;
+
+        unsafe {
+            let this = self as *const _ as *mut CudaDema;
+            (*this).last_many = Some(ManySeriesKernelSelected::OneD { block_x });
+        }
+        self.maybe_log_many_debug();
+
+        let grid: GridSize = (grid_x, 1, 1).into();
+        let block: BlockSize = (block_x, 1, 1).into();
+        {
+            let dev = Device::get_device(self.device_id)?;
+            let max_grid_x = dev.get_attribute(DeviceAttribute::MaxGridDimX)? as u32;
+            let max_tpb = dev.get_attribute(DeviceAttribute::MaxThreadsPerBlock)? as u32;
+            if grid_x == 0 || grid_x > max_grid_x || block_x == 0 || block_x > max_tpb {
+                return Err(CudaDemaError::LaunchConfigTooLarge {
+                    gx: grid_x,
+                    gy: 1,
+                    gz: 1,
+                    bx: block_x,
+                    by: 1,
+                    bz: 1,
+                });
+            }
+        }
+
+        unsafe {
+            let mut prices_ptr = d_prices_tm.as_device_ptr().as_raw();
+            let mut first_ptr = d_first_valids.as_device_ptr().as_raw();
+            let mut period_i = period;
+            let mut num_series_i = num_series as i32;
+            let mut series_len_i = series_len as i32;
+            let mut out_ptr = d_out_tm.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut prices_ptr as *mut _ as *mut c_void,
+                &mut first_ptr as *mut _ as *mut c_void,
+                &mut period_i as *mut _ as *mut c_void,
+                &mut num_series_i as *mut _ as *mut c_void,
+                &mut series_len_i as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn mem_check_enabled() -> bool {
+        match std::env::var("CUDA_MEM_CHECK") {
+            Ok(v) => v != "0" && v.to_lowercase() != "false",
+            Err(_) => true,
+        }
+    }
+    #[inline]
+    fn will_fit_checked(required_bytes: usize, headroom_bytes: usize) -> Result<(), CudaDemaError> {
+        if !Self::mem_check_enabled() {
+            return Ok(());
+        }
+        let (free, _total) = mem_get_info()?;
+        let need = required_bytes.saturating_add(headroom_bytes);
+        if need <= free {
+            Ok(())
+        } else {
+            Err(CudaDemaError::OutOfMemory {
+                required: required_bytes,
+                free,
+                headroom: headroom_bytes,
+            })
+        }
+    }
+
+    fn prepare_many_series_inputs(
+        data_tm_f32: &[f32],
+        num_series: usize,
+        series_len: usize,
+        params: &DemaParams,
+    ) -> Result<(Vec<i32>, usize), CudaDemaError> {
+        if num_series == 0 || series_len == 0 {
+            return Err(CudaDemaError::InvalidInput(
+                "num_series and series_len must be positive".into(),
+            ));
+        }
+        if data_tm_f32.len() != num_series * series_len {
+            return Err(CudaDemaError::InvalidInput(
+                "time-major slice length mismatch".into(),
+            ));
+        }
+        let period = params.period.unwrap_or(0);
+        if period == 0 {
+            return Err(CudaDemaError::InvalidInput(
+                "period must be positive".into(),
+            ));
+        }
+
+        let mut first_valids = Vec::with_capacity(num_series);
+        let needed = 2usize.saturating_mul(period.saturating_sub(1));
+        for s in 0..num_series {
+            let mut found = None;
+            for t in 0..series_len {
+                let v = data_tm_f32[t * num_series + s];
+                if v.is_finite() {
+                    found = Some(t as i32);
+                    break;
+                }
+            }
+            let fv = found.ok_or_else(|| {
+                CudaDemaError::InvalidInput(format!("series {} contains only NaNs", s))
+            })?;
+            let remaining = series_len - fv as usize;
+
+            if remaining < needed {
+                return Err(CudaDemaError::InvalidInput(format!(
+                    "series {} does not have enough valid data: need >= {}, have {}",
+                    s, needed, remaining
+                )));
+            }
+            first_valids.push(fv);
+        }
+        Ok((first_valids, period))
+    }
+}
+
+fn expand_periods(range: &DemaBatchRange) -> Vec<DemaParams> {
+    let (start, end, step) = range.period;
+    if step == 0 || start == end {
+        return vec![DemaParams {
+            period: Some(start),
+        }];
+    }
+    let (lo, hi) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let mut vals = Vec::new();
+    let mut v = lo;
+    while v <= hi {
+        vals.push(v);
+        match v.checked_add(step.max(1)) {
+            Some(n) if n != v => v = n,
+            _ => break,
+        }
+    }
+    if start > end {
+        vals.reverse();
+    }
+    vals.into_iter()
+        .map(|p| DemaParams { period: Some(p) })
+        .collect()
+}
+
+pub mod benches {
+    use super::*;
+    use crate::cuda::bench::helpers::{gen_series, gen_time_major_prices};
+    use crate::cuda::bench::{CudaBenchScenario, CudaBenchState};
+    use crate::indicators::moving_averages::dema::DemaParams;
+
+    const ONE_SERIES_LEN: usize = 1_000_000;
+    const PARAM_SWEEP: usize = 250;
+    const MANY_SERIES_COLS: usize = 250;
+    const MANY_SERIES_LEN: usize = 1_000_000;
+
+    fn bytes_one_series_many_params() -> usize {
+        let in_bytes = ONE_SERIES_LEN * std::mem::size_of::<f32>();
+        let periods_bytes = PARAM_SWEEP * std::mem::size_of::<i32>();
+        let out_bytes = ONE_SERIES_LEN * PARAM_SWEEP * std::mem::size_of::<f32>();
+        in_bytes + periods_bytes + out_bytes + 64 * 1024 * 1024
+    }
+    fn bytes_many_series_one_param() -> usize {
+        let elems = MANY_SERIES_COLS * MANY_SERIES_LEN;
+        let in_bytes = elems * std::mem::size_of::<f32>();
+        let first_bytes = MANY_SERIES_COLS * std::mem::size_of::<i32>();
+        let out_bytes = elems * std::mem::size_of::<f32>();
+        in_bytes + first_bytes + out_bytes + 64 * 1024 * 1024
+    }
+
+    struct DemaBatchDevState {
+        cuda: CudaDema,
+        d_prices: DeviceBuffer<f32>,
+        d_periods: DeviceBuffer<i32>,
+        len: usize,
+        first_valid: usize,
+        rows: usize,
+        d_out: DeviceBuffer<f32>,
+    }
+    impl CudaBenchState for DemaBatchDevState {
+        fn launch(&mut self) {
+            self.cuda
+                .launch_batch_kernel(
+                    self.d_prices.as_device_ptr(),
+                    &self.d_periods,
+                    self.len,
+                    self.first_valid,
+                    self.rows,
+                    &mut self.d_out,
+                )
+                .expect("dema batch kernel");
+            self.cuda.stream.synchronize().expect("dema sync");
+        }
+    }
+
+    fn prep_one_series_many_params() -> Box<dyn CudaBenchState> {
+        let cuda = CudaDema::new(0).expect("cuda dema");
+        let price = gen_series(ONE_SERIES_LEN);
+        let first_valid = price.iter().position(|v| v.is_finite()).unwrap_or(0);
+        let periods_i32: Vec<i32> = (10..(10 + PARAM_SWEEP)).map(|p| p as i32).collect();
+
+        let d_prices = DeviceBuffer::from_slice(&price).expect("d_prices");
+        let d_periods = DeviceBuffer::from_slice(&periods_i32).expect("d_periods");
+        let d_out: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized(ONE_SERIES_LEN * PARAM_SWEEP) }.expect("d_out");
+        cuda.stream.synchronize().expect("sync after prep");
+
+        Box::new(DemaBatchDevState {
+            cuda,
+            d_prices,
+            d_periods,
+            len: ONE_SERIES_LEN,
+            first_valid,
+            rows: PARAM_SWEEP,
+            d_out,
+        })
+    }
+
+    struct DemaManyDevState {
+        cuda: CudaDema,
+        d_prices_tm: DeviceBuffer<f32>,
+        d_first_valids: DeviceBuffer<i32>,
+        cols: usize,
+        rows: usize,
+        period: i32,
+        d_out_tm: DeviceBuffer<f32>,
+    }
+    impl CudaBenchState for DemaManyDevState {
+        fn launch(&mut self) {
+            self.cuda
+                .dema_many_series_one_param_device(
+                    &self.d_prices_tm,
+                    &self.d_first_valids,
+                    self.period,
+                    self.cols,
+                    self.rows,
+                    &mut self.d_out_tm,
+                )
+                .expect("dema many-series kernel");
+        }
+    }
+
+    fn prep_many_series_one_param() -> Box<dyn CudaBenchState> {
+        let cuda = CudaDema::new(0).expect("cuda dema");
+        let cols = MANY_SERIES_COLS;
+        let rows = MANY_SERIES_LEN;
+        let data_tm = gen_time_major_prices(cols, rows);
+        let params = DemaParams { period: Some(64) };
+        let period = params.period.unwrap() as i32;
+        let mut first_valids: Vec<i32> = vec![rows as i32; cols];
+        for s in 0..cols {
+            for t in 0..rows {
+                let v = data_tm[t * cols + s];
+                if v.is_finite() {
+                    first_valids[s] = t as i32;
+                    break;
+                }
+            }
+        }
+        let d_prices_tm = DeviceBuffer::from_slice(&data_tm).expect("d_prices_tm");
+        let d_first_valids = DeviceBuffer::from_slice(&first_valids).expect("d_first_valids");
+        let d_out_tm: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized(cols * rows) }.expect("d_out_tm");
+        cuda.stream.synchronize().expect("sync after prep");
+
+        Box::new(DemaManyDevState {
+            cuda,
+            d_prices_tm,
+            d_first_valids,
+            cols,
+            rows,
+            period,
+            d_out_tm,
+        })
+    }
+
+    pub fn bench_profiles() -> Vec<CudaBenchScenario> {
+        vec![
+            CudaBenchScenario::new(
+                "dema",
+                "one_series_many_params",
+                "dema_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series_many_params()),
+            CudaBenchScenario::new(
+                "dema",
+                "many_series_one_param",
+                "dema_cuda_many_series_one_param",
+                "250x1m",
+                prep_many_series_one_param,
+            )
+            .with_sample_size(5)
+            .with_mem_required(bytes_many_series_one_param()),
+        ]
+    }
+}

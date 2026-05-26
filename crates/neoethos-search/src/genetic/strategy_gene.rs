@@ -81,7 +81,13 @@ impl Default for FilteringConfig {
             min_trades: 10.0,
             min_sharpe: 0.3,
             min_win_rate: 0.50,
-            min_profit_factor: 1.05,
+            // 2026-05-26 operator directive (dual-mode product): canonical
+            // value across the workspace. Previously 1.05 here, 1.5 in
+            // quality.rs, 1.2 in gauntlet.rs (now deleted). 1.2 matches the
+            // FTMO industry baseline and avoids a divergent default per code
+            // path. If you change this, also change the matching default in
+            // `quality.rs::QualityRuntimeOverrides` / similar.
+            min_profit_factor: 1.2,
             min_positive_months: 0,
             min_trades_per_month: 0.0,
             min_monthly_return_pct: 0.0,
@@ -130,7 +136,19 @@ fn symbol_kind(symbol: &str) -> &'static str {
     "other"
 }
 
-fn default_pip_size(symbol: &str) -> f64 {
+/// Symbol-aware canonical pip size. Empty / unparseable symbol returns
+/// NaN so downstream pip math collapses and the fitness guard rejects
+/// the strategy (GROUP C remediation).
+///
+/// Exposed as `pub(crate)` for use in `search_engine.rs::resolve_stop_target_arrays`
+/// (F-761 closure — replaces the hardcoded `0.0001` EURUSD-pip fallback
+/// with this symbol-aware lookup).
+pub(crate) fn default_pip_size(symbol: &str) -> f64 {
+    // GROUP C remediation: empty symbol → NaN sentinel so downstream
+    // pip math collapses and the fitness guard rejects the strategy.
+    if symbol.trim().is_empty() {
+        return f64::NAN;
+    }
     match symbol_kind(symbol) {
         "metal" => 0.01,
         "crypto" => 1.0,
@@ -143,6 +161,10 @@ fn default_pip_size(symbol: &str) -> f64 {
 }
 
 fn default_contract_size(symbol: &str) -> f64 {
+    // GROUP C remediation: empty symbol → NaN sentinel (see default_pip_size).
+    if symbol.trim().is_empty() {
+        return f64::NAN;
+    }
     match symbol_kind(symbol) {
         "metal" => match split_symbol_parts(symbol) {
             Some((base, _quote)) if base == "XAG" => 5_000.0,
@@ -226,10 +248,14 @@ fn estimate_pip_value_per_lot(
 }
 
 fn reject_cross_pair_fallback() -> bool {
-    matches!(
-        std::env::var("FOREX_BOT_REJECT_PIP_FALLBACK").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    )
+    // F-CORE3 closure (2026-05-25): previously read `std::env::var`
+    // inline on every fallback call. Now resolved through the typed
+    // `CostProfileRuntimeOverrides::reject_pip_fallback` boundary so
+    // the env is hit at most once per process (in
+    // `StrategyEvaluationRuntimeOverrides::from_env`).
+    super::runtime_overrides::current_strategy_evaluation_runtime_overrides()
+        .cost_profile
+        .reject_pip_fallback
 }
 
 pub fn infer_market_cost_profile(
@@ -245,42 +271,47 @@ pub fn infer_market_cost_profile(
     let runtime_overrides = current_strategy_evaluation_runtime_overrides();
     let cost = runtime_overrides.cost_profile;
 
+    // GROUP C remediation (operator directive 2026-05-25 "remove
+    // hardcoded values that kill performance"): the previous code
+    // silently fell back to "EURUSD" + "USD" when given empty
+    // inputs. That hid misconfiguration AND prevented the cost
+    // model from ever surfacing the bug. We now propagate the
+    // emptiness all the way down and let the downstream pip-math
+    // path collapse to NaN — the existing fitness guard rejects
+    // NaN PnL, so the strategy is rejected loudly rather than
+    // backtested against the wrong symbol. Runtime overrides (set
+    // explicitly by the operator) still resolve normally; only the
+    // last-resort EURUSD/USD literals are gone.
     let symbol = if symbol.trim().is_empty() {
-        // SYNTHETIC FALLBACK: passing an empty symbol resolves the
-        // typed runtime override, then "EURUSD" as a last-resort
-        // default. This crutch exists because several legacy
-        // `Default` impls (BacktestSettings, EvaluationConfig) have
-        // to produce a struct before any real symbol is bound. Each
-        // such call site is marked `TODO(real-data)` and should
-        // migrate to `for_symbol(...)` so the cost model is bound to
-        // the symbol the search is actually backtesting.
-        let resolved = cost.symbol.clone().unwrap_or_else(|| "EURUSD".to_string());
-        tracing::error!(
-            target: "neoethos_search::cost_model",
-            resolved_symbol = %resolved,
-            "infer_market_cost_profile called with empty symbol; \
-             using runtime-override or EURUSD default. This is a synthetic \
-             fallback — bind a real cTrader symbol before backtesting."
-        );
-        resolved
+        match cost.symbol.clone() {
+            Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+            _ => {
+                tracing::error!(
+                    target: "neoethos_search::cost_model",
+                    "infer_market_cost_profile called with empty symbol and no \
+                     runtime override; cost profile will be NaN-sentinel and \
+                     the strategy will be rejected by the fitness guard. \
+                     Bind a real cTrader symbol via for_symbol(...) before backtesting."
+                );
+                String::new()
+            }
+        }
     } else {
         symbol.trim().to_string()
     };
     let account_currency = if account_currency.trim().is_empty() {
-        // SYNTHETIC FALLBACK: same story as the symbol fallback
-        // above. cTrader-supplied account currency must replace this.
-        let resolved = cost
-            .account_currency
-            .clone()
-            .unwrap_or_else(|| "USD".to_string());
-        tracing::error!(
-            target: "neoethos_search::cost_model",
-            resolved_account_currency = %resolved,
-            "infer_market_cost_profile called with empty account_currency; \
-             using runtime-override or USD default. This is a synthetic \
-             fallback — bind a real account currency before backtesting."
-        );
-        resolved
+        match cost.account_currency.clone() {
+            Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+            _ => {
+                tracing::error!(
+                    target: "neoethos_search::cost_model",
+                    "infer_market_cost_profile called with empty account_currency \
+                     and no runtime override; cost profile will be NaN-sentinel \
+                     and the strategy will be rejected by the fitness guard."
+                );
+                String::new()
+            }
+        }
     } else {
         account_currency.trim().to_string()
     };
@@ -320,27 +351,65 @@ pub fn infer_market_cost_profile(
         )
     });
 
-    // TODO(real-data): the spread and commission constants below are
-    // synthesized per asset-class because cTrader's
-    // ProtoOASymbolCategory does not ship those on the symbol record.
-    // Once `neoethos_core::symbol_metadata::SymbolMetadata` is extended
-    // with broker-supplied `typical_spread_pips` and
-    // `commission_per_lot` fields (sourced from the cTrader account /
-    // commission plan), remove these magic defaults and bail when the
-    // metadata is missing.
+    // **F-029 fix (2026-05-25)** — resolved via F-126 (SymbolMetadata
+    // gained `typical_spread_pips` + `commission_per_lot`). The
+    // resolution order is now:
+    //   1. Explicit per-call override (`spread_pips_override` /
+    //      `commission_override`) — for unit tests + when the caller
+    //      already knows the value.
+    //   2. Process-wide runtime override (`cost.spread_pips` /
+    //      `cost.commission_per_trade`) — operator's `Settings`.
+    //   3. **SymbolMetadata** broker-authoritative value — the new
+    //      typed boundary populated by the cTrader connector.
+    //   4. Asset-class synthetic default — LAST RESORT, kept only so
+    //      that pre-F-126 `data/symbol_metadata.json` files (which
+    //      have neither field) keep working. Logs a `tracing::warn!`
+    //      so operators see the synthetic-fallback was taken.
+    //
+    // When `data/symbol_metadata.json` is populated from cTrader
+    // (`ProtoOASymbol::spread` + commission schedule), step (4) is
+    // never reached. Operator's real-data policy 2026-05-24 is
+    // honoured: synthetic only when broker silence + no operator
+    // override leaves no other choice.
     let spread_pips = spread_pips_override
         .filter(|value| value.is_finite() && *value >= 0.0)
         .or(cost.spread_pips)
-        .unwrap_or_else(|| match symbol_kind(&symbol) {
-            "metal" => 2.5,
-            "crypto" => 8.0,
-            "fx" => 1.5,
-            _ => 1.0,
+        .or_else(|| metadata.as_ref().and_then(|m| m.typical_spread_pips))
+        .unwrap_or_else(|| {
+            let fallback = match symbol_kind(&symbol) {
+                "metal" => 2.5,
+                "crypto" => 8.0,
+                "fx" => 1.5,
+                _ => 1.0,
+            };
+            tracing::warn!(
+                target: "neoethos_search::cost_model",
+                symbol = %symbol,
+                asset_class = symbol_kind(&symbol),
+                fallback_pips = fallback,
+                "Synthetic spread fallback used (F-029 LAST RESORT): \
+                 SymbolMetadata has no `typical_spread_pips` and no \
+                 operator override. Populate data/symbol_metadata.json \
+                 from cTrader ProtoOASymbol.spread to silence this."
+            );
+            fallback
         });
     let commission_per_trade = commission_override
         .filter(|value| value.is_finite() && *value >= 0.0)
         .or(cost.commission_per_trade)
-        .unwrap_or(7.0);
+        .or_else(|| metadata.as_ref().and_then(|m| m.commission_per_lot))
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                target: "neoethos_search::cost_model",
+                symbol = %symbol,
+                fallback_commission = 7.0,
+                "Synthetic commission fallback used (F-029 LAST RESORT): \
+                 SymbolMetadata has no `commission_per_lot` and no \
+                 operator override. Populate data/symbol_metadata.json \
+                 from cTrader commission schedule to silence this."
+            );
+            7.0
+        });
 
     MarketCostProfile {
         symbol,
@@ -541,27 +610,27 @@ pub struct EvaluationConfig {
 
 impl Default for EvaluationConfig {
     fn default() -> Self {
-        // TODO(real-data): the cost-profile fields below come from the
-        // empty-symbol synthetic fallback in `infer_market_cost_profile`
-        // (currently EURUSD on USD). Callers that actually run an
-        // evaluation MUST use `EvaluationConfig::for_symbol(...)` so
-        // the cost profile is bound to the real cTrader symbol. Once
-        // every backtest entry point uses `for_symbol`, drop this
-        // synthetic default and require an explicit constructor.
-        let profile = infer_market_cost_profile("", "", None, None, None);
+        // GROUP C remediation (operator directive 2026-05-25): the
+        // previous code synthesized EURUSD/USD cost-profile fields via
+        // `infer_market_cost_profile("", "", ...)`. We now emit empty
+        // strings + NaN sentinels so callers that use Default::default()
+        // WITHOUT then binding via `for_symbol(...)` are caught by the
+        // downstream NaN-fitness guard rather than silently backtested
+        // against EURUSD/USD math. Production callers MUST use
+        // `EvaluationConfig::for_symbol(...)`.
         let smc = current_strategy_evaluation_runtime_overrides().smc_weights;
 
         Self {
-            symbol: profile.symbol,
-            account_currency: profile.account_currency,
+            symbol: String::new(),
+            account_currency: String::new(),
             max_hold_bars: 0,
             trailing_enabled: false,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
-            pip_value: profile.pip_value,
-            spread_pips: profile.spread_pips,
-            commission_per_trade: profile.commission_per_trade,
-            pip_value_per_lot: profile.pip_value_per_lot,
+            pip_value: f64::NAN,
+            spread_pips: f64::NAN,
+            commission_per_trade: f64::NAN,
+            pip_value_per_lot: f64::NAN,
             smc_gate_threshold: smc.gate_threshold,
             smc_weight_ob: smc.w_ob,
             smc_weight_fvg: smc.w_fvg,

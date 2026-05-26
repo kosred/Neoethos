@@ -106,6 +106,16 @@ impl CodexClient {
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
+                // **2026-05-26 fix (Κωνσταντίνος, Option B)**: enable
+                // automatic cookie persistence across requests so any
+                // `cf_clearance` cookie that Cloudflare issues after a
+                // successful (browser-like) request is reused on the
+                // next call. Without this, every request was a "cold"
+                // visitor to Cloudflare's edge — challenge-eligible
+                // and 403-prone. With this + the spoofed UA below in
+                // `chat()`, the second-and-onward request normally
+                // sails through.
+                .cookie_store(true)
                 .build()
                 .expect("reqwest client build failed — only fails on TLS setup, which is fatal"),
             store,
@@ -155,6 +165,21 @@ impl CodexClient {
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .header("OpenAI-Beta", "codex-cli")
+            // **2026-05-26 fix (Κωνσταντίνος)**: Cloudflare at chatgpt.com
+            // returns 403 with anti-bot challenge HTML when the User-Agent
+            // looks like a non-browser HTTP client (e.g. reqwest's default).
+            // Spoofing a current Chrome desktop UA gets the request past
+            // the JS-challenge gate in most cases. If Cloudflare still
+            // 403s (e.g. rate-limited from this IP), the 403 handler
+            // below now surfaces a friendly message instead of dumping
+            // 16 KB of challenge HTML into the UI.
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+                 AppleWebKit/537.36 (KHTML, like Gecko) \
+                 Chrome/131.0.0.0 Safari/537.36",
+            )
+            .header("Accept-Language", "en-US,en;q=0.9")
             .json(&request)
             .send()
             .await?;
@@ -163,9 +188,28 @@ impl CodexClient {
         let text = response.text().await?;
 
         if !status.is_success() {
+            // **2026-05-26 fix**: detect Cloudflare anti-bot challenge
+            // (always returned as HTML containing `cf_chl` markers) and
+            // replace with a short operator-friendly message. Raw HTML
+            // in the error string was making the AI-Helper screen show
+            // a 16 KB unreadable blob; now it shows one actionable line.
+            let body_lower = text.to_lowercase();
+            let friendly = if status.as_u16() == 403
+                && (body_lower.contains("cf_chl")
+                    || body_lower.contains("cloudflare")
+                    || body_lower.contains("<html"))
+            {
+                "ChatGPT subscription endpoint is rate-limited by \
+                 Cloudflare. Wait ~6 minutes and try again, or use the \
+                 ChatGPT web app from this machine first to refresh the \
+                 anti-bot cookie."
+                    .to_string()
+            } else {
+                text
+            };
             return Err(CodexError::ApiCall {
                 status: status.as_u16(),
-                body: text,
+                body: friendly,
             });
         }
 

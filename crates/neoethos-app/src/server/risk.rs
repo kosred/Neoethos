@@ -23,7 +23,14 @@ use neoethos_core::domain::prop_firm::{PropFirmConstraints, PropFirmPreset};
 
 use super::state::AppApiState;
 
-const CONFIG_PATH: &str = "config.yaml";
+// F-553/F-576 closure (2026-05-25): the per-file `const CONFIG_PATH`
+// was removed in favour of the process-wide install on
+// `server::state::current_config_path()` so the operator's CLI
+// `--config` flag propagates. Local helper keeps the call-sites
+// readable without re-introducing the duplication.
+fn config_path() -> std::path::PathBuf {
+    super::state::current_config_path()
+}
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +53,13 @@ pub struct RiskDto {
     /// Whether the prop-firm gate is currently armed. Mirrors
     /// `RiskConfig.prop_firm_rules` — false when preset is `none`.
     pub prop_firm_rules_enabled: bool,
+    /// **F-231/F-501/F-630 (2026-05-25)** — Risky Mode kill-switch
+    /// cooldown status. `None` = no kill on record OR cooldown
+    /// already elapsed (Risky Mode armed or never killed). `Some(n)`
+    /// = the operator-approved 24 h auto re-arm has `n` seconds
+    /// remaining; UI renders "Risky Mode auto re-arming in 17h 23m"
+    /// as a status banner.
+    pub risky_mode_cooldown_remaining_secs: Option<u64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -68,7 +82,7 @@ pub struct PresetUpdateDto {
 pub async fn risk(State(_state): State<AppApiState>) -> Response {
     // config.yaml lives at the workspace root by default and remains
     // the single source of truth for backend risk settings.
-    let settings = match Settings::from_yaml(CONFIG_PATH) {
+    let settings = match Settings::from_yaml(config_path()) {
         Ok(s) => s,
         Err(err) => {
             tracing::warn!(
@@ -127,7 +141,7 @@ pub async fn update_preset(
         }
     };
 
-    let mut settings = match Settings::from_yaml(CONFIG_PATH) {
+    let mut settings = match Settings::from_yaml(config_path()) {
         Ok(s) => s,
         Err(err) => {
             tracing::warn!(
@@ -151,7 +165,7 @@ pub async fn update_preset(
     // disables the prop-firm gate; every other preset enables it.
     settings.risk.prop_firm_rules = preset != PropFirmPreset::None;
 
-    if let Err(err) = settings.save(CONFIG_PATH) {
+    if let Err(err) = settings.save(config_path()) {
         tracing::error!(
             target: "neoethos_app::server::risk",
             error = %err,
@@ -192,6 +206,17 @@ fn dto_from_settings(settings: &Settings) -> RiskDto {
             }
         })
         .collect();
+    // **F-231/F-501/F-630 (2026-05-25)**: surface Risky Mode kill-
+    // switch cooldown to the UI. We load the persisted state and ask
+    // it how many seconds remain on the 24h auto re-arm cooldown.
+    // Best-effort: any IO / parse error → `None` (no cooldown shown);
+    // the UI handles `None` as "no kill on record".
+    let risky_mode_cooldown_remaining_secs =
+        crate::app_services::risky_mode_persistence::load_risky_mode_state()
+            .ok()
+            .flatten()
+            .and_then(|state| state.cooldown_remaining_secs(neoethos_core::utils::now_unix_ms()));
+
     RiskDto {
         risk_per_trade: r.risk_per_trade,
         min_risk_per_trade: r.min_risk_per_trade,
@@ -204,5 +229,6 @@ fn dto_from_settings(settings: &Settings) -> RiskDto {
         preset_display_name: preset.display_name().to_string(),
         available_presets,
         prop_firm_rules_enabled: r.prop_firm_rules,
+        risky_mode_cooldown_remaining_secs,
     }
 }

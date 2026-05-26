@@ -217,6 +217,15 @@ pub fn build_execution_surface_snapshot_with_runtime(
     if !connection.terminal_info.trim().is_empty() {
         diagnostics.push(format!("Terminal: {}", connection.terminal_info));
     }
+    // F-468 documentation (2026-05-25): this string-equality check is
+    // intentionally kept (not switched to a `TradingAdapterKind` enum
+    // match) because `ConnectionSnapshot.adapter_name` is a `String`
+    // sourced from the upstream BrokerConfig — promoting it to an enum
+    // would require migrating the persisted broker-credentials JSON
+    // schema. The cluster of `adapter_name == "cTrader"` checks IS
+    // documented as a known-cluster pattern in `trading/mod.rs:151`.
+    // Phase C task: add a `TradingAdapterKind::from_str` parser used at
+    // the snapshot boundary so this stays string-comparable but typed.
     if connection.adapter_name == "cTrader" {
         diagnostics.push(format!(
             "Supported trade sides: {}",

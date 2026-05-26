@@ -17,6 +17,38 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   // plugins.
   ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
+  // **Task #266 fix (2026-05-26)**: defensive DLL-search-path setup.
+  //
+  // Symptom: csrss-hosted Win32 dialog "Code execution cannot continue
+  // because url_launcher_windows_plugin.dll was not found" pops up
+  // intermittently on a running NeoEthos. The DLL is PRESENT next to
+  // NeoEthos.exe — Windows' default loader normally finds it via the
+  // "application directory" search step. But on certain launch paths
+  // (Start Menu shortcut → ShellExecute with a non-canonical CWD,
+  // ProcessExplorer-style indirect spawn, NSIS uninstall handle still
+  // open) the application-directory step is skipped on the loader's
+  // delayed-resolution path for plugin DLLs.
+  //
+  // Belt-and-braces: explicitly pin the DLL search to the .exe's
+  // directory via `SetDllDirectoryW`. This is the legacy but
+  // rock-solid API supported by every Windows version we target.
+  // No-op when the default search path already includes us, defensive
+  // safety net when it doesn't.
+  {
+    wchar_t exe_path[MAX_PATH];
+    DWORD len = ::GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+    if (len > 0 && len < MAX_PATH) {
+      // Strip filename component → leave directory.
+      for (DWORD i = len; i-- > 0;) {
+        if (exe_path[i] == L'\\' || exe_path[i] == L'/') {
+          exe_path[i] = L'\0';
+          break;
+        }
+      }
+      ::SetDllDirectoryW(exe_path);
+    }
+  }
+
   flutter::DartProject project(L"data");
 
   std::vector<std::string> command_line_arguments =

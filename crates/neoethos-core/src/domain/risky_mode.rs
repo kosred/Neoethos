@@ -91,14 +91,35 @@ pub const DEFAULT_TARGET_CAPITAL_USD: f64 = 50_000.0;
 /// factor.
 pub const DEFAULT_DOUBLING_FACTOR: f64 = 2.0;
 
-/// Default risk-per-trade fraction (middle of the operator-stated
+/// Default risk-per-trade fraction (lower edge of the operator-stated
 /// 30 %–50 % band). This is the fraction of the *current* bankroll
 /// the bot is allowed to risk on a single trade — i.e. the SL
 /// distance × lot value implied by this fraction is what gets sent
 /// to the broker. Per the operator directive this is two orders of
 /// magnitude larger than any prop-firm-style sizing and is expected
 /// to wipe out the starting capital in the typical case.
-pub const RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION: f64 = 0.40;
+///
+/// **Kelly-aligned default 2026-05-25** (operator approval via math
+/// audit): lowered from 0.40 to 0.30 because Kelly criterion for
+/// the operator's typical strong-edge configuration
+/// (win_rate=0.55, reward_to_risk=2.0) gives optimal-growth
+/// f* = (0.55*2.0 − 0.45) / 2.0 = **0.325** — anything above sits
+/// in over-Kelly territory where variance dominates without
+/// commensurate growth benefit. Empirical comparison for
+/// $100→$100K target (see `docs/audit/AUDIT-FINDINGS.md` Kelly
+/// analysis table):
+///
+/// | risk_f | Expected | Ruin |
+/// |--------|---------:|-----:|
+/// | 0.40 (old) | 8 days | **5.6%** |
+/// | **0.30 (new)** | **8 days** | **0.48%** ← 12× safer, same speed |
+/// | 0.20 (sub-Kelly) | 9 days | 0.004% |
+///
+/// Operators wanting MORE aggression can still set per-stage values
+/// up to [`RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION`] (0.50) via the
+/// wizard; the default just sits at the safest point inside the
+/// signed §7.1 band.
+pub const RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION: f64 = 0.30;
 
 /// Lower bound on the per-trade risk fraction in Risky Mode. The
 /// operator-stated band is 30 %–50 %; anything below 30 % degenerates
@@ -890,6 +911,202 @@ impl RiskyModeManager {
         let capped = days.min(u32::MAX as f64);
         Some(capped as u32)
     }
+
+    /// Percentile-based first-passage-time estimate. Returns the
+    /// number of trading days `n` such that
+    /// `P(bankroll_n ≥ target) = percentile`, i.e. only `percentile`
+    /// fraction of Monte Carlo paths reach `target` by trade `n` or
+    /// faster. Operator-facing meaning: "if you got a top-10% run
+    /// (`percentile = 0.10`), this is how fast you could hit target".
+    ///
+    /// Math: under the geometric-Brownian-motion approximation,
+    /// `log(B_n) ~ Normal(log(B_0) + μ*n, σ²*n)` where μ and σ are the
+    /// per-trade log-return mean and standard deviation. Solve
+    /// `μ*n + z*σ*√n = log(target/B_0)` for n, where
+    /// `z = Φ⁻¹(1 - percentile)` (positive for low percentiles → faster).
+    /// Substituting `u = √n` gives a quadratic in u:
+    /// `μ*u² + z*σ*u − log_distance = 0`, solved via the quadratic
+    /// formula. Returns `None` in the same regime
+    /// `estimated_days_to_target` returns `None` (negative-EV, etc.).
+    ///
+    /// `percentile` must be in `(0.0, 1.0)`. Common values:
+    /// - `0.10` → optimistic "best case among credible runs"
+    /// - `0.25` → top-quartile of survivor paths
+    /// - `0.50` → median survivor (very close to `estimated_days_to_target`)
+    /// - `0.75` → conservative tail
+    ///
+    /// Surface this for the wizard so the operator's "$100→$100K"
+    /// choice produces a meaningful range (best/median/conservative)
+    /// rather than a single deterministic number that hides the
+    /// variance.
+    pub fn estimated_days_to_target_percentile(&self, percentile: f64) -> Option<u32> {
+        if !(0.0..1.0).contains(&percentile) || percentile <= 0.0 {
+            return None;
+        }
+        let target = self.config.target_capital_usd;
+        let current = self.current_bankroll_usd;
+        if !current.is_finite() || !target.is_finite() {
+            return None;
+        }
+        if current >= target {
+            return Some(0);
+        }
+        let stage = self.current_stage();
+        let p: f64 = self.config.expected_win_rate;
+        let r: f64 = self.config.expected_reward_to_risk;
+        let f_eff = stage.risk_per_trade_fraction;
+        if f_eff <= 0.0 {
+            return None;
+        }
+        let up = (1.0 + r * f_eff).ln();
+        let down_arg = 1.0 - f_eff;
+        if down_arg <= 0.0 {
+            return None;
+        }
+        let down = down_arg.ln();
+        let mu_log = p * up + (1.0 - p) * down;
+        if mu_log <= 0.0 {
+            return None;
+        }
+        let sigma_sq = p * (1.0 - p) * (up - down).powi(2);
+        if sigma_sq <= 0.0 {
+            return None;
+        }
+        let sigma = sigma_sq.sqrt();
+        let cadence = self.config.expected_trades_per_day;
+        if !cadence.is_finite() || cadence <= 0.0 {
+            return None;
+        }
+        let log_distance = (target / current).ln();
+        // z = Φ⁻¹(1 - percentile). Use a rational approximation
+        // (Beasley-Springer-Moro) good to ~1e-5 over (0, 1).
+        let z = inverse_standard_normal_cdf(1.0 - percentile);
+        // Quadratic: μ*u² + z*σ*u − log_distance = 0 (u = √n).
+        // Discriminant = (z*σ)² + 4*μ*log_distance.
+        let disc = (z * sigma).powi(2) + 4.0 * mu_log * log_distance;
+        if disc < 0.0 {
+            return None;
+        }
+        let u = (-z * sigma + disc.sqrt()) / (2.0 * mu_log);
+        if !u.is_finite() || u <= 0.0 {
+            return None;
+        }
+        let trades = u * u;
+        let days = (trades / cadence).ceil();
+        if !days.is_finite() || days <= 0.0 {
+            return None;
+        }
+        Some(days.min(u32::MAX as f64) as u32)
+    }
+
+    /// Operator-facing time-to-target SCENARIO triple.
+    /// Returns `(best_case_days, expected_days, conservative_days,
+    /// ruin_probability)`. The wizard renders this triple so the
+    /// operator can see the FULL distribution, not just the mean:
+    ///
+    /// - `best_case_days` = 10th-percentile (a lucky top-10% run)
+    /// - `expected_days` = deterministic (50th-percentile-ish)
+    /// - `conservative_days` = 75th-percentile (still a "successful"
+    ///   run but on the slow side)
+    /// - `ruin_probability` = probability the account hits $1 before
+    ///   reaching target, per the Brownian-motion barrier estimate
+    ///
+    /// All three day numbers are `None` when expected log-growth is
+    /// non-positive (matches `estimated_days_to_target` semantics).
+    pub fn time_to_target_scenarios(&self) -> TimeToTargetScenarios {
+        TimeToTargetScenarios {
+            best_case_days: self.estimated_days_to_target_percentile(0.10),
+            expected_days: self.estimated_days_to_target(),
+            conservative_days: self.estimated_days_to_target_percentile(0.75),
+            ruin_probability: self.current_ruin_probability_estimate(),
+        }
+    }
+}
+
+/// Operator-facing time-to-target estimate covering the full
+/// distribution rather than a single deterministic number. Returned
+/// by [`RiskyModeManager::time_to_target_scenarios`]; surfaced by the
+/// wizard's `AutonomyRisk` step and the Risky Mode dashboard so the
+/// operator sees variance honestly.
+///
+/// All `_days` fields are `None` when the configured edge produces
+/// non-positive expected log-growth (the strategy cannot reach the
+/// target on average — see `risky_mode_compounding_research.md` §10.5).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimeToTargetScenarios {
+    /// 10th-percentile first-passage time (days). "If everything
+    /// breaks right — top 10 % of credible runs — this is how fast
+    /// you could plausibly hit target." NEVER claim faster than this.
+    pub best_case_days: Option<u32>,
+    /// Deterministic mean first-passage time (days). Close to the
+    /// median for moderate-variance configurations.
+    pub expected_days: Option<u32>,
+    /// 75th-percentile first-passage time (days). The "still
+    /// successful but slow" case — useful to set operator expectations
+    /// about how long a successful run can drag.
+    pub conservative_days: Option<u32>,
+    /// Brownian-motion barrier estimate of ruin probability from the
+    /// current bankroll. The operator's signed §6.4 acknowledgement
+    /// ceiling defaults to 0.99.
+    pub ruin_probability: f64,
+}
+
+/// Beasley-Springer-Moro rational approximation to the inverse of
+/// the standard-normal CDF Φ⁻¹(p). Accurate to ~1e-5 over `(0, 1)`.
+/// Used by [`RiskyModeManager::estimated_days_to_target_percentile`]
+/// to convert a percentile into the corresponding z-score without
+/// pulling a stats crate into `neoethos-core`'s dependency closure.
+fn inverse_standard_normal_cdf(p: f64) -> f64 {
+    // Coefficients for the central-region approximation.
+    const A: [f64; 6] = [
+        -3.969683028665376e+01,
+        2.209460984245205e+02,
+        -2.759285104469687e+02,
+        1.383577518672690e+02,
+        -3.066479806614716e+01,
+        2.506628277459239e+00,
+    ];
+    const B: [f64; 5] = [
+        -5.447609879822406e+01,
+        1.615858368580409e+02,
+        -1.556989798598866e+02,
+        6.680131188771972e+01,
+        -1.328068155288572e+01,
+    ];
+    // Coefficients for the tail-region approximation.
+    const C: [f64; 6] = [
+        -7.784894002430293e-03,
+        -3.223964580411365e-01,
+        -2.400758277161838e+00,
+        -2.549732539343734e+00,
+        4.374664141464968e+00,
+        2.938163982698783e+00,
+    ];
+    const D: [f64; 4] = [
+        7.784695709041462e-03,
+        3.224671290700398e-01,
+        2.445134137142996e+00,
+        3.754408661907416e+00,
+    ];
+    let p_low = 0.02425;
+    let p_high = 1.0 - p_low;
+    if !(0.0..=1.0).contains(&p) {
+        return f64::NAN;
+    }
+    if p < p_low {
+        let q = (-2.0 * p.ln()).sqrt();
+        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else if p <= p_high {
+        let q = p - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    } else {
+        let q = (-2.0 * (1.0 - p).ln()).sqrt();
+        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,6 +1454,34 @@ mod tests {
     }
 
     #[test]
+    fn kelly_aligned_default_constant_is_030() {
+        // GROUP #230 remediation 2026-05-25: operator-approved default
+        // lowered from 0.40 → 0.30 based on Kelly analysis. This test
+        // pins the new value so an accidental revert by a future
+        // refactor is caught immediately. Math: for the operator's
+        // typical strong-edge configuration (win_rate=0.55, RR=2.0),
+        // Kelly f* = (0.55*2.0 − 0.45) / 2.0 = 0.325. The 0.30 default
+        // sits just below Kelly (slightly sub-Kelly) which gives
+        // ~12× lower ruin probability than 0.40 for identical
+        // expected time-to-target — see AUDIT-FINDINGS.md Kelly
+        // analysis table.
+        assert!(
+            (RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION - 0.30).abs() < 1e-9,
+            "Kelly-aligned default must remain 0.30, got {}",
+            RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION
+        );
+        // Sanity: default still inside the operator-signed §7.1 band.
+        assert!(
+            (RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION
+                ..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
+                .contains(&RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION),
+            "default must be inside [{}, {}] band",
+            RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION,
+            RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION
+        );
+    }
+
+    #[test]
     fn ruin_probability_eases_with_stronger_operator_edge() {
         // If the operator empirically demonstrates a stronger edge
         // (raise expected_win_rate to 0.60 with reward_to_risk 2.0)
@@ -1322,6 +1567,130 @@ mod tests {
             (1..100_000).contains(&days),
             "20->50k estimate out of plausible band: {days}"
         );
+    }
+
+    #[test]
+    fn time_to_target_scenarios_returns_ordered_triple() {
+        // With a credible positive-EV configuration, the scenarios
+        // must come back ordered: best_case < expected < conservative.
+        // This pins the percentile-time-to-target semantics: the
+        // 10th-percentile (best_case) is faster than the deterministic
+        // expectation, which is faster than the 75th-percentile
+        // (conservative). Property under test — exact magnitudes
+        // depend on the operator's edge so we don't band tightly.
+        let mut cfg = signed_default_config();
+        cfg.expected_win_rate = 0.55;
+        cfg.expected_reward_to_risk = 2.0;
+        let mgr = RiskyModeManager::new(cfg, DEFAULT_STARTING_CAPITAL_USD).expect("manager");
+        let scenarios = mgr.time_to_target_scenarios();
+        let best = scenarios.best_case_days.expect("best case finite");
+        let expected = scenarios.expected_days.expect("expected finite");
+        let conservative = scenarios.conservative_days.expect("conservative finite");
+        assert!(
+            best <= expected,
+            "best_case ({best}) must be ≤ expected ({expected})"
+        );
+        assert!(
+            expected <= conservative,
+            "expected ({expected}) must be ≤ conservative ({conservative})"
+        );
+        // Ruin probability must be a valid probability.
+        assert!(
+            (0.0..=1.0).contains(&scenarios.ruin_probability),
+            "ruin_probability out of [0,1]: {}",
+            scenarios.ruin_probability
+        );
+    }
+
+    #[test]
+    fn time_to_target_scenarios_handles_user_chosen_target_100k() {
+        // Operator-supplied target test: $100 → $100,000 (= 1000×
+        // growth). With a credible strong-edge configuration
+        // (win-rate 0.55, RR 2.0, 40% per-trade risk, 10 trades/day)
+        // the deterministic expectation is ~7-8 days, the 10th-
+        // percentile is faster (a lucky run), and the 75th-percentile
+        // is slower. Property under test: the user can pick ANY
+        // positive target larger than start and get a meaningful triple.
+        let mut cfg = signed_default_config();
+        cfg.starting_capital_usd = 100.0;
+        cfg.target_capital_usd = 100_000.0;
+        cfg.stages = build_logarithmic_stages(100.0, 100_000.0, 2.0);
+        cfg.expected_win_rate = 0.55;
+        cfg.expected_reward_to_risk = 2.0;
+        let mgr = RiskyModeManager::new(cfg, 100.0).expect("manager");
+        let scenarios = mgr.time_to_target_scenarios();
+        // Deterministic expectation must be in plausible band.
+        let expected = scenarios.expected_days.expect("expected days finite");
+        assert!(
+            (1..=365).contains(&expected),
+            "expected days {expected} out of plausible band for $100→$100K strong edge"
+        );
+        // best_case_days strictly less than expected_days for any
+        // realistic variance — pins the percentile ordering for the
+        // operator-facing UI.
+        let best = scenarios.best_case_days.expect("best case finite");
+        assert!(
+            best < expected,
+            "best_case ({best}) must be strictly less than expected ({expected})"
+        );
+    }
+
+    #[test]
+    fn time_to_target_scenarios_handles_user_chosen_target_50k() {
+        // Same operator-facing scenario for the $100 → $50K target
+        // (= 500× growth) — must also produce a sensible triple. Pins
+        // that the user can configure the wizard for either common
+        // milestone ($50K, $100K, etc.) and the estimator works.
+        let mut cfg = signed_default_config();
+        cfg.starting_capital_usd = 100.0;
+        cfg.target_capital_usd = 50_000.0;
+        cfg.stages = build_logarithmic_stages(100.0, 50_000.0, 2.0);
+        cfg.expected_win_rate = 0.55;
+        cfg.expected_reward_to_risk = 2.0;
+        let mgr = RiskyModeManager::new(cfg, 100.0).expect("manager");
+        let scenarios = mgr.time_to_target_scenarios();
+        let expected = scenarios.expected_days.expect("expected days finite");
+        assert!(
+            (1..=365).contains(&expected),
+            "expected days {expected} out of plausible band for $100→$50K strong edge"
+        );
+    }
+
+    #[test]
+    fn time_to_target_scenarios_returns_none_at_negative_growth() {
+        // With the default honest §7.1 edge (win-rate 0.52, RR 1.5,
+        // 40% risk), expected log-growth is non-positive → all three
+        // _days fields must be None. Ruin probability is still 1.0
+        // (matches the operator's signed §6.4 acknowledgement).
+        let mgr = RiskyModeManager::new(signed_default_config(), DEFAULT_STARTING_CAPITAL_USD)
+            .expect("manager");
+        let scenarios = mgr.time_to_target_scenarios();
+        assert!(scenarios.best_case_days.is_none());
+        assert!(scenarios.expected_days.is_none());
+        assert!(scenarios.conservative_days.is_none());
+        assert!((scenarios.ruin_probability - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inverse_standard_normal_cdf_matches_known_values() {
+        // Sanity-check the Beasley-Springer-Moro approximation
+        // against canonical reference values from any stats text.
+        // Tolerance ~1e-4 matches the approximation's stated accuracy.
+        let cases = [
+            (0.5, 0.0),
+            (0.975, 1.96),     // canonical 95% two-sided z
+            (0.95, 1.6449),    // 90% two-sided
+            (0.90, 1.2816),    // 80% two-sided / top-10% one-sided
+            (0.75, 0.6745),    // upper quartile
+            (0.025, -1.96),    // lower 2.5%
+        ];
+        for (p, expected_z) in cases {
+            let z = inverse_standard_normal_cdf(p);
+            assert!(
+                (z - expected_z).abs() < 1e-3,
+                "Φ⁻¹({p}): expected {expected_z}, got {z}"
+            );
+        }
     }
 
     #[test]

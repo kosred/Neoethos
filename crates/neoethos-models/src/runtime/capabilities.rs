@@ -107,6 +107,12 @@ pub const KNOWN_MODEL_NAMES: &[&str] = &[
     "online_hoeffding",
     "isolation_forest",
     "dqn",
+    // 34th model added 2026-05-25: 3-state Hidden Markov Model for
+    // soft-posterior regime detection (bullish_trend / bearish_trend /
+    // range). Output is Classification3 with the canonical
+    // [neutral, buy, sell] ordering. Synergizes with `infer_regime`
+    // (rule-based) as the SOFT side of the regime-vote ensemble.
+    "hmm_regime",
 ];
 
 pub fn normalize_runtime_device_policy(policy: &str) -> String {

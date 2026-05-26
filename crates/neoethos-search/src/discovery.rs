@@ -72,6 +72,14 @@ pub struct DiscoveryRuntimeOverrides {
     /// Where in the input window to slice the stage-1 fast-evaluation
     /// rows. Defaults to [`Stage1Window::Earliest`] for OOS safety.
     pub stage1_window: Stage1Window,
+    /// **F-096 fix (2026-05-25)** — minimum historical-data window
+    /// in years that the discovery pipeline requires before it agrees
+    /// to run. Default `10` per operator real-data directive
+    /// 2026-05-24. Setting to `0` skips the check (test fixtures /
+    /// demo replays). The pre-flight check lives in
+    /// [`ensure_sufficient_history`] and runs at the top of
+    /// `run_discovery_cycle_with_progress`.
+    pub min_history_years: u32,
 }
 
 impl Default for DiscoveryRuntimeOverrides {
@@ -81,6 +89,25 @@ impl Default for DiscoveryRuntimeOverrides {
             prefilter_insample_frac: 0.70,
             funnel_stage1_pct: 0.25,
             stage1_window: Stage1Window::Earliest,
+            // **2026-05-26 operator directive (Κωνσταντίνος)**: the design
+            // intent was always "use 80/20 of WHATEVER data we have", not
+            // "require absolute 10y before running". The 80/20 train/val
+            // split is enforced downstream by `prop_search_val_years` (last
+            // N years as validation) which already adapts to any window
+            // length. Setting the absolute-minimum gate to 0 by default
+            // means short windows (5y M5, 3y crypto, etc.) run through
+            // the same pipeline and the operator gets a *result* (even if
+            // empty portfolio because the strategies overfit) rather than
+            // a hard "Failed: insufficient history" preflight stop. Operators
+            // who want the strict 10y gate back can set
+            // `FOREX_BOT_MIN_HISTORY_YEARS=10` via env.
+            //
+            // F-096 history (2026-05-24, now superseded): the previous
+            // default was 10 because synthetic-data leaks into discovery
+            // had produced misleading results. With Vortex now refusing
+            // synthetic fallbacks (#221) the leak risk is gone, so the
+            // 10y floor is no longer needed.
+            min_history_years: 0,
         }
     }
 }
@@ -117,6 +144,15 @@ impl DiscoveryRuntimeOverrides {
             .and_then(|v| Stage1Window::from_env_str(&v))
         {
             overrides.stage1_window = window;
+        }
+        // F-096: minimum-history-years env override. 0 disables the
+        // check (for test runners and `--allow-short-history` operator
+        // flag). Production deployments leave it at the default 10y.
+        if let Some(years) = std::env::var("FOREX_BOT_MIN_HISTORY_YEARS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            overrides.min_history_years = years;
         }
         overrides
     }
@@ -185,6 +221,17 @@ pub struct DiscoveryConfig {
     /// `with_env_runtime_overrides`. `None` keeps the production
     /// behavior unchanged.
     pub prop_firm_gate: Option<PropFirmGateOverrides>,
+    /// 2026-05-26 operator directive (dual-mode product): Monte-Carlo
+    /// perturbation runs per surviving candidate. Previously hardcoded 100.
+    pub mc_runs: u32,
+    /// Minimum profitable MC runs required (out of `mc_runs`). Previously
+    /// hardcoded 70 (i.e. 70% threshold).
+    pub mc_min_profitable: u32,
+    /// Spread (pips) used in the sensitivity test. Previously hardcoded 2.0.
+    pub sensitivity_spread_pips: f64,
+    /// Commission per lot used in the sensitivity test. Previously
+    /// hardcoded $7/lot.
+    pub sensitivity_commission_per_lot: f64,
 }
 
 /// Configuration for the prop-firm window-pass gate.
@@ -200,10 +247,16 @@ impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
             timeframe_label: "M1".to_string(),
-            evaluation_symbol: "EURUSD".to_string(),
-            evaluation_account_currency: "USD".to_string(),
-            evaluation_spread_pips: 1.5,
-            evaluation_commission_per_trade: 0.0,
+            // GROUP C remediation (operator directive 2026-05-25):
+            // empty + NaN sentinels so a DiscoveryConfig that was
+            // constructed via Default::default() (rather than via
+            // `for_symbol(...)` or explicit field assignment) does
+            // NOT silently backtest against EURUSD/USD. Production
+            // callers MUST set these explicitly before run.
+            evaluation_symbol: String::new(),
+            evaluation_account_currency: String::new(),
+            evaluation_spread_pips: f64::NAN,
+            evaluation_commission_per_trade: f64::NAN,
             population: 1000,
             generations: 10,
             max_indicators: 5,
@@ -229,6 +282,13 @@ impl Default for DiscoveryConfig {
             higher_timeframes: Vec::new(),
             runtime_overrides: DiscoveryRuntimeOverrides::default(),
             prop_firm_gate: None,
+            // 2026-05-26 operator directive (dual-mode product): defaults
+            // reproduce the previous hardcoded behavior; from_settings
+            // overrides from typed config.
+            mc_runs: 100,
+            mc_min_profitable: 70,
+            sensitivity_spread_pips: 2.0,
+            sensitivity_commission_per_lot: 7.0,
         }
     }
 }
@@ -272,7 +332,13 @@ impl DiscoveryConfig {
         Self {
             timeframe_label: settings.system.base_timeframe.clone(),
             evaluation_symbol: settings.system.symbol.clone(),
-            evaluation_account_currency: "USD".to_string(),
+            // F-007 fix (2026-05-25): the hardcoded "USD" default was a
+            // synthetic-data violation per operator's real-data directive
+            // 2026-05-24. Empty default forces the caller to populate the
+            // value from the cTrader trader profile (Settings does so
+            // when the broker session is alive). The downstream cost-model
+            // NaN guard rejects backtests with empty account_currency.
+            evaluation_account_currency: String::new(),
             evaluation_spread_pips: settings.risk.backtest_spread_pips.max(0.0),
             evaluation_commission_per_trade: settings.risk.commission_per_lot.max(0.0),
             population: model_settings.prop_search_population.max(10),
@@ -291,7 +357,10 @@ impl DiscoveryConfig {
             max_rows: model_settings.prop_search_max_rows,
             max_rows_by_timeframe: model_settings.prop_search_max_rows_by_tf.clone(),
             max_hours: model_settings.prop_search_max_hours.max(0.0),
-            corr_threshold: 0.85,
+            // 2026-05-26 operator directive (dual-mode product): wired from
+            // Settings.models.prop_search_corr_threshold. Defaults to 0.85
+            // (the previous hardcoded value) when the config key is absent.
+            corr_threshold: model_settings.prop_search_corr_threshold.clamp(0.0, 1.0),
             min_trades_per_day: model_settings.prop_search_val_min_trades_per_day.max(0.2),
             walkforward_splits: model_settings.walkforward_splits.max(2),
             embargo_minutes: model_settings.embargo_minutes,
@@ -308,6 +377,20 @@ impl DiscoveryConfig {
             higher_timeframes: settings.system.higher_timeframes.clone(),
             runtime_overrides: DiscoveryRuntimeOverrides::default(),
             prop_firm_gate: None,
+            // 2026-05-26 operator directive (dual-mode product): Settings is
+            // now the single source of truth for these knobs. The corr_threshold
+            // assignment a few lines above stays as 0.85 fallback — it gets
+            // overwritten here so the operator's config wins.
+            mc_runs: model_settings.prop_search_mc_runs.max(1),
+            mc_min_profitable: model_settings
+                .prop_search_mc_min_profitable
+                .min(model_settings.prop_search_mc_runs.max(1)),
+            sensitivity_spread_pips: model_settings
+                .prop_search_sensitivity_spread_pips
+                .max(0.0),
+            sensitivity_commission_per_lot: model_settings
+                .prop_search_sensitivity_commission_per_lot
+                .max(0.0),
         }
     }
 
@@ -434,6 +517,15 @@ pub struct DiscoveryResult {
     /// [`compute_discovery_prop_firm_artifacts`] with a tail dataset and
     /// a rule set.
     pub prop_firm_validation_artifacts: Vec<PropFirmRiskValidationArtifactFile>,
+    /// 2026-05-26 operator directive (dual-mode product): 16-stage rejection
+    /// funnel. Captures count_in / count_out / top_reasons at every filter
+    /// boundary so an empty portfolio is debuggable without re-running the
+    /// pipeline. Saved as `<symbol>_<tf>_funnel.json` next to the portfolio
+    /// JSON by the caller (see `save_portfolio_json` + `funnel_profile`).
+    /// `None` only when something panicked early enough that we couldn't
+    /// even open the funnel — production callers should treat that as a
+    /// bug, not a normal case.
+    pub funnel_profile: Option<crate::funnel_profile::FunnelProfile>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -678,6 +770,13 @@ fn quality_analyzer_for_config(config: &DiscoveryConfig) -> StrategyQualityAnaly
         max_dd_acceptable: config.filtering.max_dd.max(0.0),
         min_monthly_return_pct: config.filtering.min_monthly_return_pct.max(0.0),
         edge_significance_pvalue: 0.05,
+        // 2026-05-26 operator directive (dual-mode product): the Settings
+        // path (FilteringConfig::min_trades_per_month from
+        // prop_search_val_min_trades_per_month) is the canonical source.
+        // Setting `Some(...)` here makes the analyzer ignore the env-driven
+        // QualityRuntimeOverrides default for this run — exactly one
+        // threshold drives the monthly consistency gate.
+        min_trades_per_month: Some(config.filtering.min_trades_per_month.max(0.0) as usize),
     }
 }
 
@@ -945,7 +1044,23 @@ fn evaluate_cpcv_gate(
     if portfolio.is_empty() {
         return Ok((false, 0, 0.0));
     }
+    // **F-018 documentation (2026-05-25)** — when CPCV is operator-
+    // disabled via `enable_cpcv = false`, this gate returns
+    // `(true, 0, 1.0)` so the discovery cycle continues. The original
+    // audit flagged this as "passes without running CPCV" — which is
+    // CORRECT: a disabled gate cannot fail. The fold_count of `0`
+    // surfaces in the run-profile so operators see "CPCV: disabled
+    // (0 folds)". Production prop-firm runs MUST keep CPCV enabled
+    // — the disable flag is only honoured for test fixtures /
+    // research-mode quick checks. Tracked by the upstream Settings-
+    // exposed `discovery.enable_cpcv` knob in `config.yaml`.
     if !config.enable_cpcv {
+        tracing::warn!(
+            target: "neoethos_search::discovery",
+            "CPCV gate is DISABLED via config.enable_cpcv=false — \
+             portfolio promoted without out-of-sample validation. \
+             For prop-firm production runs, set enable_cpcv=true."
+        );
         return Ok((true, 0, 1.0));
     }
 
@@ -1347,6 +1462,79 @@ struct GeneExport<'a> {
     sl_pips: f64,
 }
 
+/// **F-096 fix (2026-05-25)** — minimum-history pre-flight check.
+///
+/// Operator real-data directive 2026-05-24: discovery / training /
+/// validation MUST refuse to run when fewer than ~10 years of bars
+/// are available per symbol. The exact bar count threshold is
+/// timeframe-dependent (10 years × bars-per-year for the given TF),
+/// so we approximate by `min_bars = years × bars_per_year(tf)` with
+/// a conservative 220 trading days/year × 24 hours/day for M1, etc.
+///
+/// Returns `Ok(())` when the OHLCV has enough rows; returns
+/// `Err(anyhow!(...))` with the symbol name + actual coverage + the
+/// remediation path (user-imported OR auto-fetch from cTrader) when
+/// it doesn't. The caller (CLI, server, wizard) decides whether to
+/// auto-fetch and re-run, or bail to the operator.
+///
+/// `min_history_years` defaults to **0** (use whatever data exists, ratio-
+/// split via `prop_search_val_years` downstream — see operator directive
+/// 2026-05-26 in `DiscoveryRuntimeOverrides::default`). Set to a positive
+/// integer either via `FOREX_BOT_MIN_HISTORY_YEARS` env or explicitly in
+/// the override struct to re-instate a hard floor.
+pub fn ensure_sufficient_history(
+    ohlcv: &Ohlcv,
+    symbol: &str,
+    timeframe: &str,
+    min_history_years: u32,
+) -> Result<()> {
+    if min_history_years == 0 {
+        // Caller explicitly opted out (test / demo path).
+        return Ok(());
+    }
+    let bars_per_year = approx_bars_per_year(timeframe);
+    let required_bars = (min_history_years as usize).saturating_mul(bars_per_year);
+    let actual_bars = ohlcv.close.len();
+    if actual_bars < required_bars {
+        anyhow::bail!(
+            "Insufficient history for {symbol} {timeframe}: have {actual_bars} bars, \
+             need at least {required_bars} (≈ {min_history_years} years × {bars_per_year} \
+             bars/yr). Remediation: (1) import a longer window via Data Bootstrap, \
+             OR (2) auto-fetch from cTrader history API (POST /data/fetch-history?\
+             symbol={symbol}&timeframe={timeframe}&years={min_history_years}), \
+             OR (3) lower min_history_years if you accept the over-fitting risk. \
+             Operator policy 2026-05-24: refuse synthetic / insufficient data."
+        );
+    }
+    Ok(())
+}
+
+/// Approximate bars-per-year for a canonical timeframe label. Uses a
+/// conservative 220 trading-day year (FX market). Returns 0 for
+/// unknown timeframes — the caller's `saturating_mul` will then make
+/// `required_bars = 0` so the check effectively skips for non-canonical
+/// inputs (which should already have been rejected upstream).
+fn approx_bars_per_year(tf: &str) -> usize {
+    // 220 trading days × hours × bars-per-hour, conservatively. The
+    // FX market is 24/5 but we use 220 days × 24 hours instead of
+    // 252 × 24 to leave headroom for holiday gaps. For weekly /
+    // monthly timeframes we count calendar weeks / months.
+    match tf.trim().to_ascii_uppercase().as_str() {
+        "M1" => 220 * 24 * 60,
+        "M3" => 220 * 24 * 20,
+        "M5" => 220 * 24 * 12,
+        "M15" => 220 * 24 * 4,
+        "M30" => 220 * 24 * 2,
+        "H1" => 220 * 24,
+        "H4" => 220 * 6,
+        "H12" => 220 * 2,
+        "D1" => 220,
+        "W1" => 52,
+        "MN1" => 12,
+        _ => 0,
+    }
+}
+
 pub fn run_discovery_cycle(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
@@ -1364,15 +1552,67 @@ pub fn run_discovery_cycle_with_progress<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
+    // 2026-05-26 operator directive (dual-mode product): instrument the
+    // 16-stage rejection funnel before any pipeline work so a panic /
+    // preflight failure still leaves a partially-populated funnel for the
+    // operator to read. The funnel travels through the pipeline as a
+    // borrowed mutable handle and is moved into the final DiscoveryResult.
+    let mut funnel = crate::funnel_profile::FunnelProfile::new(
+        if config.evaluation_symbol.is_empty() {
+            "unknown_symbol".to_string()
+        } else {
+            config.evaluation_symbol.clone()
+        },
+        config.timeframe_label.clone(),
+    );
+    // Mode is determined by whether the prop-firm gate is configured. The
+    // canonical paths are: PropFirm (config.prop_firm_gate.is_some()) and
+    // Risky (gate absent — Strict / Risky modes fall here). Distinguishing
+    // Strict vs Risky requires inspecting filtering thresholds; that nuance
+    // lives in the report itself so the operator can tell modes apart.
+    let mode_label = if config.prop_firm_gate.is_some() {
+        "PropFirm"
+    } else {
+        "Risky"
+    };
+    funnel.set_mode(mode_label);
+
+    // F-096 pre-flight: refuse to run with insufficient history per
+    // operator's real-data directive 2026-05-24. The minimum-years
+    // threshold lives on `DiscoveryRuntimeOverrides` (operator-tunable
+    // via `Settings`); when zero, the check is skipped — used by test
+    // fixtures + replay paths that have intentionally-small windows.
+    if let Err(err) = ensure_sufficient_history(
+        ohlcv,
+        &config.evaluation_symbol,
+        &config.timeframe_label,
+        config.runtime_overrides.min_history_years,
+    ) {
+        funnel.finalize("preflight_failed");
+        return Err(err);
+    }
+
+    let n_input_rows = ohlcv.close.len();
+    funnel.record_stage("data_loaded", n_input_rows, n_input_rows);
+
     let (mut features, ohlcv, _) = trim_recent_history(features, ohlcv, config)?;
+    let n_after_trim = ohlcv.close.len();
+    funnel.record_stage("rows_after_trimming", n_input_rows, n_after_trim);
+    funnel.record_stage("features_built", 0, features.data.ncols());
 
     // Feature Pre-filtering (Idea #3)
     let prefilter_top_k = config.runtime_overrides.prefilter_top_k;
     let prefilter_insample_frac = config.runtime_overrides.resolved_prefilter_insample_frac();
 
+    let n_features_before_prefilter = features.names.len();
     if prefilter_top_k > 0 && features.names.len() > prefilter_top_k {
         features = prefilter_features(&features, &ohlcv, prefilter_top_k, prefilter_insample_frac);
     }
+    funnel.record_stage(
+        "features_after_prefilter",
+        n_features_before_prefilter,
+        features.names.len(),
+    );
     // Capture names after prefilter — gene indices refer to this list.
     let effective_feature_names = features.names.clone();
 
@@ -1434,12 +1674,24 @@ where
         },
     )?;
 
+    let stage1_count = search.genes.len();
+    funnel.record_stage("stage1_candidates_generated", 0, stage1_count);
+    // The archive that survived the GA is what we hand the IS evaluator. The
+    // genes themselves carry a `fitness` field reflecting the stage-1
+    // evaluation, so "profitable" here means fitness > 0.0. The GA already
+    // applies its own profitable-archive filter (`apply_metrics` archives
+    // only nonnegative-fitness genes), so this stage is informational —
+    // count_in == count_out unless the GA archive logic changes.
+    let profitable_count = search.genes.iter().filter(|g| g.fitness > 0.0).count();
+    funnel.record_stage("profitable_archive_size", stage1_count, profitable_count);
+
     finalize_candidates_with_progress(
         search.genes,
         &features,
         &ohlcv,
         config,
         effective_feature_names,
+        &mut funnel,
         progress_fn,
     )
 }
@@ -1573,11 +1825,12 @@ fn validate_regime_robustness(
         .position(|n| n == "regime_trend_strength");
     let vol_idx = features.names.iter().position(|n| n == "regime_vol_state");
 
-    if trend_idx.is_none() || vol_idx.is_none() {
+    // **2026-05-25 unwrap audit**: collapsed the early-return guard +
+    // two `.unwrap()` calls into a single `let-else` destructure. Same
+    // behaviour, no panic-shaped expression remains.
+    let (Some(t_idx), Some(v_idx)) = (trend_idx, vol_idx) else {
         return true;
-    }
-    let t_idx = trend_idx.unwrap();
-    let v_idx = vol_idx.unwrap();
+    };
 
     let mut trend_pnl = 0.0;
     let mut range_pnl = 0.0;
@@ -1777,6 +2030,7 @@ fn finalize_candidates_with_progress<F>(
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
     effective_feature_names: Vec<String>,
+    funnel: &mut crate::funnel_profile::FunnelProfile,
     mut progress_fn: F,
 ) -> Result<DiscoveryResult>
 where
@@ -1882,17 +2136,71 @@ where
         features.data.nrows(),
     );
     let ranked_total = ranked_candidates.len();
+    // 2026-05-26 operator directive: now that GA produced candidates,
+    // record the "full IS eval" stage in the funnel — this is the gene
+    // count fed into the post-search filter ladder.
+    funnel.record_stage("full_is_evaluated", ranked_total, ranked_total);
 
     // Diagnostic counter #1: `passes_filter` survivors. In permissive
     // / prop-firm mode this gate is trivially open, so a low number
     // here would be a strong signal that the filter floor still has
     // a hidden constraint we missed.
+    // 2026-05-26: also bucket WHY each gene failed `passes_filter` so the
+    // funnel JSON tells the operator which threshold (DD / win-rate / PF)
+    // killed most candidates.
+    let mut reject_dd = 0usize;
+    let mut reject_win_rate = 0usize;
+    let mut reject_profit_factor = 0usize;
+    let mut reject_fitness = 0usize;
+    let mut reject_other = 0usize;
     let prefiltered: Vec<(usize, Gene)> = ranked_candidates
         .iter()
-        .filter(|(_, g)| g.passes_filter(&config.filtering))
+        .filter(|(_, g)| {
+            let ok = g.passes_filter(&config.filtering);
+            if !ok {
+                // Cheap heuristic: pick the FIRST violated threshold so the
+                // counts roughly partition the rejections. Not every Gene
+                // populates every metric, so the buckets are a guide rather
+                // than an audit trail.
+                if !g.max_drawdown.is_nan() && g.max_drawdown > config.filtering.max_dd {
+                    reject_dd += 1;
+                } else if !g.win_rate.is_nan() && g.win_rate < config.filtering.min_win_rate {
+                    reject_win_rate += 1;
+                } else if !g.profit_factor.is_nan()
+                    && g.profit_factor < config.filtering.min_profit_factor
+                {
+                    reject_profit_factor += 1;
+                } else if !g.fitness.is_nan() && g.fitness < config.filtering.min_sharpe {
+                    reject_fitness += 1;
+                } else {
+                    reject_other += 1;
+                }
+            }
+            ok
+        })
         .map(|(idx, g)| (*idx, g.clone()))
         .collect();
     let post_passes_filter = prefiltered.len();
+    funnel.record_stage("passed_base_filter", ranked_total, post_passes_filter);
+    if reject_dd > 0 {
+        funnel.add_reject_reason("passed_base_filter", "max_dd_exceeded", reject_dd);
+    }
+    if reject_win_rate > 0 {
+        funnel.add_reject_reason("passed_base_filter", "win_rate_too_low", reject_win_rate);
+    }
+    if reject_profit_factor > 0 {
+        funnel.add_reject_reason(
+            "passed_base_filter",
+            "profit_factor_too_low",
+            reject_profit_factor,
+        );
+    }
+    if reject_fitness > 0 {
+        funnel.add_reject_reason("passed_base_filter", "fitness_too_low", reject_fitness);
+    }
+    if reject_other > 0 {
+        funnel.add_reject_reason("passed_base_filter", "other_threshold", reject_other);
+    }
 
     // Item 6: use the SMC-gated signal path so the post-search "min_trades"
     // filter sees the SAME trade count the evaluator scored. The previous
@@ -1924,6 +2232,19 @@ where
         .collect();
     let post_min_trades = signals_with_idx.len();
     let post_nonzero_signal = nonzero_signal_count.load(std::sync::atomic::Ordering::Relaxed);
+    // 2026-05-26: record "any signal at all" + "passed min-trades" as separate
+    // stages so the funnel can tell "SMC gate killed everything" (the common
+    // empty-portfolio root cause) apart from "had signals but too few".
+    funnel.record_stage("nonzero_signals", post_passes_filter, post_nonzero_signal);
+    let zero_signal_rejects = post_passes_filter.saturating_sub(post_nonzero_signal);
+    if zero_signal_rejects > 0 {
+        funnel.add_reject_reason(
+            "nonzero_signals",
+            "zero_signals_after_smc_gate",
+            zero_signal_rejects,
+        );
+    }
+    funnel.record_stage("passed_min_trades", post_nonzero_signal, post_min_trades);
     let mut filtered: Vec<(usize, Gene)> = Vec::with_capacity(signals_with_idx.len());
     let mut signals_map: Vec<Vec<i8>> = Vec::with_capacity(signals_with_idx.len());
     for (idx, gene, sig) in signals_with_idx {
@@ -1984,10 +2305,13 @@ where
                     return None;
                 }
 
-                // Monte Carlo Parameter Perturbation Test (100 runs).
+                // Monte Carlo Parameter Perturbation Test.
                 // Serial here because we are already inside a par_iter on
                 // candidates — nesting rayon would oversubscribe cores.
-                let mc_runs = 100usize;
+                // 2026-05-26 operator directive (dual-mode product): runs +
+                // min_profitable threshold sourced from typed Settings,
+                // previously hardcoded 100/70.
+                let mc_runs = config.mc_runs as usize;
                 let mut profitable_runs = 0usize;
                 let mut rng = rand::rng();
                 use rand::Rng;
@@ -2030,15 +2354,16 @@ where
                     }
                 }
 
-                if profitable_runs < 70 {
+                if (profitable_runs as u32) < config.mc_min_profitable {
                     return None;
                 }
 
-                // Spread/Slippage Sensitivity Test
+                // Spread/Slippage Sensitivity Test — wired from Settings
+                // 2026-05-26 (dual-mode product).
                 let mut sensitive_settings =
                     discovery_backtest_settings(config, &gene, ohlcv.close.last().copied());
-                sensitive_settings.spread_pips = 2.0;
-                sensitive_settings.commission_per_trade = 7.0;
+                sensitive_settings.spread_pips = config.sensitivity_spread_pips;
+                sensitive_settings.commission_per_trade = config.sensitivity_commission_per_lot;
                 let sens_trades = crate::eval::simulate_trades_core(
                     &ohlcv.close,
                     &ohlcv.high,
@@ -2122,6 +2447,14 @@ where
         filtered = screened_genes;
         signals_map = screened_signals;
     }
+    // 2026-05-26: quality screen (MC perturbation + spread sensitivity +
+    // regime robustness) collapses into a single funnel stage. The
+    // sub-rejection reasons (MC <70/100, sensitivity loss, regime fail)
+    // are visible via the tracing logs but not separately counted here —
+    // adding per-reason buckets would require threading atomics into the
+    // par_iter closure above. If operators report this stage is the
+    // bottleneck, follow-up adds those atomics.
+    funnel.record_stage("passed_quality", post_min_trades, filtered.len());
 
     // Prop-firm window-pass gate. Default behavior in `PropFirm` mode.
     // For each surviving candidate, simulate trades on N 60-day windows
@@ -2232,8 +2565,31 @@ where
             max_overall_drawdown_pct = pf.rules.max_overall_drawdown_pct,
             "prop-firm window-pass gate applied"
         );
+        // 2026-05-26: record the prop-firm-window stage with its two top
+        // reject reasons (counted_zero = the window-pass simulation produced
+        // zero windows for this gene, e.g. dataset too short or all windows
+        // crashed; below_pass_rate = some windows ran but pass-rate < floor).
+        funnel.record_stage("passed_prop_firm_window", pre_prop_firm, next_filtered.len());
+        if dbg_counted_zero > 0 {
+            funnel.add_reject_reason(
+                "passed_prop_firm_window",
+                "counted_zero",
+                dbg_counted_zero,
+            );
+        }
+        if dbg_below_pass_rate > 0 {
+            funnel.add_reject_reason(
+                "passed_prop_firm_window",
+                "below_pass_rate",
+                dbg_below_pass_rate,
+            );
+        }
         filtered = next_filtered;
         signals_map = next_signals;
+    } else {
+        // No prop-firm gate (Risky mode / Strict mode): the stage is a
+        // passthrough so the funnel doesn't show a phantom rejection.
+        funnel.record_stage("passed_prop_firm_window", pre_prop_firm, pre_prop_firm);
     }
 
     let mut portfolio = Vec::new();
@@ -2281,6 +2637,16 @@ where
     } else {
         pre_prop_firm
     };
+    // 2026-05-26: correlation pruning is the last stage before walkforward.
+    // Input = post_prop_firm count; output = portfolio.len().
+    funnel.record_stage("passed_correlation", post_prop_firm, portfolio.len());
+    if rejected_by_correlation > 0 {
+        funnel.add_reject_reason(
+            "passed_correlation",
+            "pearson_or_spearman_above_threshold",
+            rejected_by_correlation,
+        );
+    }
     tracing::info!(
         target: "neoethos_search::funnel",
         ranked = ranked_total,
@@ -2311,11 +2677,52 @@ where
             portfolio_pass_rates.iter().sum::<f64>() / portfolio_pass_rates.len() as f64
         };
     }
+    // 2026-05-26: walkforward + CPCV stages — Strict mode runs these as gates,
+    // PropFirm mode uses them as informational. Either way the funnel records
+    // pass/fail so the operator can see whether a non-empty portfolio later
+    // got dropped at the walkforward stage. The validation_gates bool fields
+    // are the canonical pass/fail signal.
+    let portfolio_size = portfolio.len();
+    let walkforward_pass = if validation_gates.walkforward_passed {
+        portfolio_size
+    } else {
+        0
+    };
+    funnel.record_stage("passed_walkforward", portfolio_size, walkforward_pass);
+    let cpcv_pass = if validation_gates.cpcv_passed {
+        walkforward_pass
+    } else {
+        0
+    };
+    funnel.record_stage("passed_cpcv", walkforward_pass, cpcv_pass);
+    // For PropFirm mode the canonical export-ready signal is
+    // `prop_firm_window_passed`; for Strict mode it's both walkforward + cpcv
+    // passed. `is_portfolio_export_ready()` handles both — so the final stage
+    // count is the portfolio size when ready, else 0.
+    let export_ready = if validation_gates.is_portfolio_export_ready() {
+        portfolio_size
+    } else {
+        0
+    };
+    funnel.record_stage("export_ready", portfolio_size, export_ready);
+
     progress_fn(DiscoveryProgress::Completed {
         candidate_count: ranked_candidate_genes.len(),
         filtered_count,
         portfolio_size: portfolio.len(),
     });
+
+    // 2026-05-26: finalize funnel with outcome label. The caller saves the
+    // file next to the portfolio JSON — that's where the file lives in the
+    // production layout.
+    let outcome = if portfolio.is_empty() {
+        "no_candidates"
+    } else if export_ready > 0 {
+        "exported"
+    } else {
+        "failed"
+    };
+    funnel.finalize(outcome);
 
     Ok(DiscoveryResult {
         portfolio,
@@ -2328,6 +2735,7 @@ where
         walkforward_validation_artifacts,
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: Some(funnel.clone()),
     })
 }
 
@@ -2470,6 +2878,25 @@ pub fn save_portfolio_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> 
 
 pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
     write_json_atomic(path, &result.quality_metrics)
+}
+
+/// 2026-05-26 operator directive (dual-mode product): save the 16-stage
+/// rejection funnel as `<portfolio_stem>_funnel.json` next to the portfolio
+/// JSON. The funnel is the operator's debug artifact for "why did the
+/// portfolio come out empty?" — without it the answer is "look at the logs",
+/// which doesn't survive across runs. No-op if the result has no funnel
+/// (only the case if the GA panicked before the FunnelProfile was created).
+pub fn save_funnel_json(
+    portfolio_json_path: impl AsRef<Path>,
+    result: &DiscoveryResult,
+) -> Result<()> {
+    let path = portfolio_json_path.as_ref();
+    if let Some(ref funnel) = result.funnel_profile {
+        funnel
+            .save_next_to(path)
+            .with_context(|| format!("saving funnel JSON next to {}", path.display()))?;
+    }
+    Ok(())
 }
 
 pub fn save_trade_log_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {

@@ -108,14 +108,11 @@ fn now_unix_ms() -> i64 {
 }
 
 fn journal_path() -> Option<PathBuf> {
-    if let Ok(value) = std::env::var("FOREX_BOT_LIVE_JOURNAL_PATH") {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        return Some(PathBuf::from(trimmed));
-    }
-    None
+    // F-CORE3 closure (2026-05-25): routed through the canonical
+    // `env_overrides::live_journal_path_override` typed getter so the
+    // env var is grep-able from one place.
+    crate::app_services::env_overrides::live_journal_path_override()
+        .map(PathBuf::from)
 }
 
 fn writer_lock() -> &'static Mutex<()> {

@@ -1,0 +1,865 @@
+#![cfg(feature = "cuda")]
+
+use crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32;
+use cust::context::Context;
+use cust::device::{Device, DeviceAttribute};
+use cust::function::{BlockSize, GridSize};
+use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer};
+use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::prelude::*;
+use cust::stream::{Stream, StreamFlags};
+use std::env;
+use std::ffi::c_void;
+use std::sync::Arc;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum CudaWadError {
+    #[error(transparent)]
+    Cuda(#[from] cust::error::CudaError),
+    #[error("wad: out of memory: required={required} free={free} headroom={headroom}")]
+    OutOfMemory {
+        required: usize,
+        free: usize,
+        headroom: usize,
+    },
+    #[error("wad: missing kernel symbol: {name}")]
+    MissingKernelSymbol { name: &'static str },
+    #[error("wad: invalid input: {0}")]
+    InvalidInput(String),
+    #[error("wad: invalid policy: {0}")]
+    InvalidPolicy(&'static str),
+    #[error("wad: launch config too large: grid=({gx},{gy},{gz}) block=({bx},{by},{bz})")]
+    LaunchConfigTooLarge {
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
+    },
+    #[error("wad: device mismatch: buf={buf} current={current}")]
+    DeviceMismatch { buf: u32, current: u32 },
+    #[error("wad: not implemented")]
+    NotImplemented,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BatchKernelPolicy {
+    Auto,
+    Plain { block_x: u32 },
+}
+impl Default for BatchKernelPolicy {
+    fn default() -> Self {
+        BatchKernelPolicy::Auto
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ManySeriesKernelPolicy {
+    Auto,
+    OneD { block_x: u32 },
+}
+impl Default for ManySeriesKernelPolicy {
+    fn default() -> Self {
+        ManySeriesKernelPolicy::Auto
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CudaWadPolicy {
+    pub batch: BatchKernelPolicy,
+    pub many_series: ManySeriesKernelPolicy,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BatchKernelSelected {
+    Plain { block_x: u32 },
+}
+#[derive(Clone, Copy, Debug)]
+pub enum ManySeriesKernelSelected {
+    OneD { block_x: u32 },
+}
+
+pub struct CudaWad {
+    module: Module,
+    stream: Stream,
+    context: Arc<Context>,
+    device_id: u32,
+    policy: CudaWadPolicy,
+    last_batch: Option<BatchKernelSelected>,
+    last_many: Option<ManySeriesKernelSelected>,
+    debug_batch_logged: bool,
+    debug_many_logged: bool,
+}
+
+const WAD_SCAN_BLOCK_X: u32 = 256;
+const WAD_SCAN_ITEMS_PER_THREAD: usize = 8;
+const WAD_SCAN_TILE: usize = WAD_SCAN_BLOCK_X as usize * WAD_SCAN_ITEMS_PER_THREAD;
+const WAD_SCAN_MAX_BLOCKS: usize = WAD_SCAN_TILE;
+
+impl CudaWad {
+    pub fn new(device_id: usize) -> Result<Self, CudaWadError> {
+        cust::init(CudaFlags::empty())?;
+        let device = Device::get_device(device_id as u32)?;
+        let context = Arc::new(Context::new(device)?);
+
+        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/wad_kernel.ptx"));
+        let jit_opts = &[
+            ModuleJitOption::DetermineTargetFromContext,
+            ModuleJitOption::OptLevel(OptLevel::O2),
+        ];
+        let module = crate::load_cuda_embedded_module!("wad_kernel")?;
+        let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
+
+        Ok(Self {
+            module,
+            stream,
+            context,
+            device_id: device_id as u32,
+            policy: CudaWadPolicy::default(),
+            last_batch: None,
+            last_many: None,
+            debug_batch_logged: false,
+            debug_many_logged: false,
+        })
+    }
+
+    #[inline]
+    pub fn context_arc(&self) -> Arc<Context> {
+        self.context.clone()
+    }
+    #[inline]
+    pub fn device_id(&self) -> u32 {
+        self.device_id
+    }
+
+    pub fn set_policy(&mut self, p: CudaWadPolicy) {
+        self.policy = p;
+    }
+    pub fn policy(&self) -> &CudaWadPolicy {
+        &self.policy
+    }
+    pub fn selected_batch_kernel(&self) -> Option<BatchKernelSelected> {
+        self.last_batch
+    }
+    pub fn selected_many_series_kernel(&self) -> Option<ManySeriesKernelSelected> {
+        self.last_many
+    }
+    pub fn synchronize(&self) -> Result<(), CudaWadError> {
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
+    #[inline]
+    fn maybe_log_batch_debug(&self) {
+        if self.debug_batch_logged {
+            return;
+        }
+        if env::var("BENCH_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(sel) = self.last_batch {
+                eprintln!("[DEBUG] WAD batch selected kernel: {:?}", sel);
+                unsafe {
+                    (*(self as *const _ as *mut CudaWad)).debug_batch_logged = true;
+                }
+            }
+        }
+    }
+    #[inline]
+    fn maybe_log_many_debug(&self) {
+        if self.debug_many_logged {
+            return;
+        }
+        if env::var("BENCH_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(sel) = self.last_many {
+                eprintln!("[DEBUG] WAD many-series selected kernel: {:?}", sel);
+                unsafe {
+                    (*(self as *const _ as *mut CudaWad)).debug_many_logged = true;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn mem_check_enabled() -> bool {
+        match env::var("CUDA_MEM_CHECK") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    }
+    #[inline]
+    fn device_mem_info() -> Option<(usize, usize)> {
+        mem_get_info().ok()
+    }
+    #[inline]
+    fn will_fit(required_bytes: usize, headroom_bytes: usize) -> Result<(), CudaWadError> {
+        if !Self::mem_check_enabled() {
+            return Ok(());
+        }
+        if let Some((free, _)) = Self::device_mem_info() {
+            if required_bytes.saturating_add(headroom_bytes) <= free {
+                Ok(())
+            } else {
+                Err(CudaWadError::OutOfMemory {
+                    required: required_bytes,
+                    free,
+                    headroom: headroom_bytes,
+                })
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    #[inline]
+    fn validate_launch(
+        &self,
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
+    ) -> Result<(), CudaWadError> {
+        let dev = Device::get_device(self.device_id)?;
+        let max_threads = dev
+            .get_attribute(DeviceAttribute::MaxThreadsPerBlock)
+            .unwrap_or(1024) as u32;
+        let max_bx = dev
+            .get_attribute(DeviceAttribute::MaxBlockDimX)
+            .unwrap_or(1024) as u32;
+        let max_by = dev
+            .get_attribute(DeviceAttribute::MaxBlockDimY)
+            .unwrap_or(1024) as u32;
+        let max_bz = dev
+            .get_attribute(DeviceAttribute::MaxBlockDimZ)
+            .unwrap_or(64) as u32;
+        let max_gx = dev
+            .get_attribute(DeviceAttribute::MaxGridDimX)
+            .unwrap_or(2_147_483_647) as u32;
+        let max_gy = dev
+            .get_attribute(DeviceAttribute::MaxGridDimY)
+            .unwrap_or(65_535) as u32;
+        let max_gz = dev
+            .get_attribute(DeviceAttribute::MaxGridDimZ)
+            .unwrap_or(65_535) as u32;
+
+        let threads = bx.saturating_mul(by).saturating_mul(bz);
+        if threads > max_threads
+            || bx > max_bx
+            || by > max_by
+            || bz > max_bz
+            || gx > max_gx
+            || gy > max_gy
+            || gz > max_gz
+        {
+            return Err(CudaWadError::LaunchConfigTooLarge {
+                gx,
+                gy,
+                gz,
+                bx,
+                by,
+                bz,
+            });
+        }
+        Ok(())
+    }
+
+    fn prepare_batch_inputs(
+        high: &[f32],
+        low: &[f32],
+        close: &[f32],
+    ) -> Result<usize, CudaWadError> {
+        if high.is_empty() || low.is_empty() || close.is_empty() {
+            return Err(CudaWadError::InvalidInput("empty input slices".into()));
+        }
+        let len = high.len();
+        if low.len() != len || close.len() != len {
+            return Err(CudaWadError::InvalidInput(
+                "input slice length mismatch".into(),
+            ));
+        }
+        if high.iter().all(|x| x.is_nan())
+            || low.iter().all(|x| x.is_nan())
+            || close.iter().all(|x| x.is_nan())
+        {
+            return Err(CudaWadError::InvalidInput("all values are NaN".into()));
+        }
+        Ok(len)
+    }
+
+    fn launch_batch_kernel(
+        &self,
+        d_high: &DeviceBuffer<f32>,
+        d_low: &DeviceBuffer<f32>,
+        d_close: &DeviceBuffer<f32>,
+        series_len: usize,
+        n_combos: usize,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaWadError> {
+        if n_combos == 1
+            && self.try_launch_series_scan_kernel(d_high, d_low, d_close, series_len, d_out)?
+        {
+            return Ok(());
+        }
+
+        let func = self.module.get_function("wad_batch_f32").map_err(|_| {
+            CudaWadError::MissingKernelSymbol {
+                name: "wad_batch_f32",
+            }
+        })?;
+
+        let block_x = self.default_block_x("WAD_BLOCK_X", 256);
+        let grid_x = self.choose_grid_1d(n_combos, block_x)?;
+        let grid: GridSize = (grid_x, 1, 1).into();
+        let block: BlockSize = (block_x, 1, 1).into();
+        self.validate_launch(grid_x, 1, 1, block_x, 1, 1)?;
+
+        unsafe {
+            let mut high_ptr = d_high.as_device_ptr().as_raw();
+            let mut low_ptr = d_low.as_device_ptr().as_raw();
+            let mut close_ptr = d_close.as_device_ptr().as_raw();
+            let mut len_i = series_len as i32;
+            let mut combos_i = n_combos as i32;
+            let mut out_ptr = d_out.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut high_ptr as *mut _ as *mut c_void,
+                &mut low_ptr as *mut _ as *mut c_void,
+                &mut close_ptr as *mut _ as *mut c_void,
+                &mut len_i as *mut _ as *mut c_void,
+                &mut combos_i as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?;
+        }
+
+        unsafe {
+            (*(self as *const _ as *mut CudaWad)).last_batch =
+                Some(BatchKernelSelected::Plain { block_x });
+        }
+        self.maybe_log_batch_debug();
+        Ok(())
+    }
+
+    fn try_launch_series_scan_kernel(
+        &self,
+        d_high: &DeviceBuffer<f32>,
+        d_low: &DeviceBuffer<f32>,
+        d_close: &DeviceBuffer<f32>,
+        series_len: usize,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<bool, CudaWadError> {
+        if series_len == 0 {
+            return Ok(false);
+        }
+
+        let num_blocks = series_len.saturating_add(WAD_SCAN_TILE - 1) / WAD_SCAN_TILE;
+        if num_blocks == 0 || num_blocks > WAD_SCAN_MAX_BLOCKS {
+            return Ok(false);
+        }
+
+        let scan_func = self
+            .module
+            .get_function("wad_series_scan_blocks_f32")
+            .map_err(|_| CudaWadError::MissingKernelSymbol {
+                name: "wad_series_scan_blocks_f32",
+            })?;
+        let sum_func = self
+            .module
+            .get_function("wad_scan_block_sums_f64")
+            .map_err(|_| CudaWadError::MissingKernelSymbol {
+                name: "wad_scan_block_sums_f64",
+            })?;
+        let add_func = self
+            .module
+            .get_function("wad_add_block_offsets_f32")
+            .map_err(|_| CudaWadError::MissingKernelSymbol {
+                name: "wad_add_block_offsets_f32",
+            })?;
+
+        let mut d_block_sums: DeviceBuffer<f64> =
+            unsafe { DeviceBuffer::uninitialized_async(num_blocks, &self.stream) }?;
+        let grid_x: u32 = num_blocks
+            .try_into()
+            .map_err(|_| CudaWadError::InvalidInput("scan block count exceeds u32".into()))?;
+        let series_len_i: i32 = series_len
+            .try_into()
+            .map_err(|_| CudaWadError::InvalidInput("series_len exceeds i32".into()))?;
+        let num_blocks_i: i32 = num_blocks
+            .try_into()
+            .map_err(|_| CudaWadError::InvalidInput("scan block count exceeds i32".into()))?;
+        let grid: GridSize = (grid_x, 1, 1).into();
+        let one_grid: GridSize = (1, 1, 1).into();
+        let block: BlockSize = (WAD_SCAN_BLOCK_X, 1, 1).into();
+        self.validate_launch(grid_x, 1, 1, WAD_SCAN_BLOCK_X, 1, 1)?;
+        self.validate_launch(1, 1, 1, WAD_SCAN_BLOCK_X, 1, 1)?;
+
+        unsafe {
+            let mut high_ptr = d_high.as_device_ptr().as_raw();
+            let mut low_ptr = d_low.as_device_ptr().as_raw();
+            let mut close_ptr = d_close.as_device_ptr().as_raw();
+            let mut len_arg = series_len_i;
+            let mut out_ptr = d_out.as_device_ptr().as_raw();
+            let mut sums_ptr = d_block_sums.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut high_ptr as *mut _ as *mut c_void,
+                &mut low_ptr as *mut _ as *mut c_void,
+                &mut close_ptr as *mut _ as *mut c_void,
+                &mut len_arg as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+                &mut sums_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&scan_func, grid, block, 0, args)?;
+
+            let mut sums_ptr = d_block_sums.as_device_ptr().as_raw();
+            let mut num_blocks_arg = num_blocks_i;
+            let args: &mut [*mut c_void] = &mut [
+                &mut sums_ptr as *mut _ as *mut c_void,
+                &mut num_blocks_arg as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&sum_func, one_grid, block, 0, args)?;
+
+            let mut out_ptr = d_out.as_device_ptr().as_raw();
+            let mut len_arg = series_len_i;
+            let mut sums_ptr = d_block_sums.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut out_ptr as *mut _ as *mut c_void,
+                &mut len_arg as *mut _ as *mut c_void,
+                &mut sums_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&add_func, grid, block, 0, args)?;
+        }
+
+        unsafe {
+            (*(self as *const _ as *mut CudaWad)).last_batch = Some(BatchKernelSelected::Plain {
+                block_x: WAD_SCAN_BLOCK_X,
+            });
+        }
+        self.maybe_log_batch_debug();
+        Ok(true)
+    }
+
+    fn run_batch(
+        &self,
+        high: &[f32],
+        low: &[f32],
+        close: &[f32],
+        n_combos: usize,
+    ) -> Result<DeviceArrayF32, CudaWadError> {
+        let series_len = Self::prepare_batch_inputs(high, low, close)?;
+
+        let required_cells_inputs = 3usize
+            .checked_mul(series_len)
+            .ok_or_else(|| CudaWadError::InvalidInput("size overflow".into()))?;
+        let required_cells_output = n_combos
+            .checked_mul(series_len)
+            .ok_or_else(|| CudaWadError::InvalidInput("size overflow".into()))?;
+        let required = (required_cells_inputs + required_cells_output) * std::mem::size_of::<f32>();
+        let headroom = 64 * 1024 * 1024;
+        Self::will_fit(required, headroom)?;
+
+        let d_high = unsafe { DeviceBuffer::from_slice_async(high, &self.stream) }?;
+        let d_low = unsafe { DeviceBuffer::from_slice_async(low, &self.stream) }?;
+        let d_close = unsafe { DeviceBuffer::from_slice_async(close, &self.stream) }?;
+
+        let mut d_out: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized_async(n_combos * series_len, &self.stream) }?;
+
+        if n_combos > 1 {
+            let mut d_row: DeviceBuffer<f32> =
+                unsafe { DeviceBuffer::uninitialized_async(series_len, &self.stream) }?;
+
+            self.launch_compute_single_row(&d_high, &d_low, &d_close, series_len, &mut d_row)?;
+            self.launch_broadcast_row(&d_row, series_len, n_combos, &mut d_out)?;
+        } else {
+            self.launch_batch_kernel(&d_high, &d_low, &d_close, series_len, n_combos, &mut d_out)?;
+        }
+
+        self.stream.synchronize()?;
+        Ok(DeviceArrayF32 {
+            buf: d_out,
+            rows: n_combos,
+            cols: series_len,
+        })
+    }
+
+    pub fn wad_batch_dev(
+        &self,
+        high: &[f32],
+        low: &[f32],
+        close: &[f32],
+    ) -> Result<DeviceArrayF32, CudaWadError> {
+        self.run_batch(high, low, close, 1)
+    }
+
+    pub fn wad_batch_dev_from_device_inputs(
+        &self,
+        d_high: &DeviceBuffer<f32>,
+        d_low: &DeviceBuffer<f32>,
+        d_close: &DeviceBuffer<f32>,
+        series_len: usize,
+    ) -> Result<DeviceArrayF32, CudaWadError> {
+        if series_len == 0
+            || d_high.len() != series_len
+            || d_low.len() != series_len
+            || d_close.len() != series_len
+        {
+            return Err(CudaWadError::InvalidInput(
+                "device OHLC buffers must match non-zero length".into(),
+            ));
+        }
+
+        let required_cells_inputs = 3usize
+            .checked_mul(series_len)
+            .ok_or_else(|| CudaWadError::InvalidInput("size overflow".into()))?;
+        let required_cells_output = series_len;
+        let required = (required_cells_inputs + required_cells_output) * std::mem::size_of::<f32>();
+        let headroom = 64 * 1024 * 1024;
+        Self::will_fit(required, headroom)?;
+
+        let mut d_out: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized_async(series_len, &self.stream) }?;
+
+        self.launch_batch_kernel(d_high, d_low, d_close, series_len, 1, &mut d_out)?;
+
+        Ok(DeviceArrayF32 {
+            buf: d_out,
+            rows: 1,
+            cols: series_len,
+        })
+    }
+
+    pub fn wad_batch_into_host_f32(
+        &self,
+        high: &[f32],
+        low: &[f32],
+        close: &[f32],
+        out: &mut [f32],
+    ) -> Result<(usize, usize), CudaWadError> {
+        let arr = self.wad_batch_dev(high, low, close)?;
+        let expected = arr
+            .cols
+            .checked_mul(arr.rows)
+            .ok_or_else(|| CudaWadError::InvalidInput("overflow in rows*cols".into()))?;
+        if out.len() != expected {
+            return Err(CudaWadError::InvalidInput(format!(
+                "out slice length {} != expected {}",
+                out.len(),
+                expected
+            )));
+        }
+        unsafe { arr.buf.async_copy_to(out, &self.stream) }?;
+        self.stream.synchronize()?;
+        Ok((arr.rows, arr.cols))
+    }
+
+    pub fn wad_series_dev(
+        &self,
+        high: &[f32],
+        low: &[f32],
+        close: &[f32],
+    ) -> Result<DeviceArrayF32, CudaWadError> {
+        self.wad_batch_dev(high, low, close)
+    }
+
+    pub fn wad_into_host_f32(
+        &self,
+        high: &[f32],
+        low: &[f32],
+        close: &[f32],
+        out: &mut [f32],
+    ) -> Result<usize, CudaWadError> {
+        let (_rows, cols) = self.wad_batch_into_host_f32(high, low, close, out)?;
+        Ok(cols)
+    }
+
+    fn prepare_many_series_inputs(
+        high_tm: &[f32],
+        low_tm: &[f32],
+        close_tm: &[f32],
+        cols: usize,
+        rows: usize,
+    ) -> Result<(), CudaWadError> {
+        if cols == 0 || rows == 0 {
+            return Err(CudaWadError::InvalidInput("cols/rows must be > 0".into()));
+        }
+        let cells = cols
+            .checked_mul(rows)
+            .ok_or_else(|| CudaWadError::InvalidInput("overflow in cols*rows".into()))?;
+        if high_tm.len() != cells || low_tm.len() != cells || close_tm.len() != cells {
+            return Err(CudaWadError::InvalidInput(
+                "input length != cols*rows".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn launch_many_series_kernel(
+        &self,
+        d_high_tm: &DeviceBuffer<f32>,
+        d_low_tm: &DeviceBuffer<f32>,
+        d_close_tm: &DeviceBuffer<f32>,
+        cols: usize,
+        rows: usize,
+        d_out_tm: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaWadError> {
+        let func = self
+            .module
+            .get_function("wad_many_series_one_param_f32")
+            .map_err(|_| CudaWadError::MissingKernelSymbol {
+                name: "wad_many_series_one_param_f32",
+            })?;
+
+        let block_x = self.default_block_x("WAD_MS_BLOCK_X", 256);
+        let grid_x = self.choose_grid_1d(cols, block_x)?;
+        let grid: GridSize = (grid_x.max(1), 1, 1).into();
+        let block: BlockSize = (block_x.max(1), 1, 1).into();
+        unsafe {
+            (*(self as *const _ as *mut CudaWad)).last_many =
+                Some(ManySeriesKernelSelected::OneD { block_x });
+        }
+        self.validate_launch(grid_x.max(1), 1, 1, block_x.max(1), 1, 1)?;
+
+        unsafe {
+            let mut high_ptr = d_high_tm.as_device_ptr().as_raw();
+            let mut low_ptr = d_low_tm.as_device_ptr().as_raw();
+            let mut close_ptr = d_close_tm.as_device_ptr().as_raw();
+            let mut cols_i = cols as i32;
+            let mut rows_i = rows as i32;
+            let mut out_ptr = d_out_tm.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut high_ptr as *mut _ as *mut c_void,
+                &mut low_ptr as *mut _ as *mut c_void,
+                &mut close_ptr as *mut _ as *mut c_void,
+                &mut cols_i as *mut _ as *mut c_void,
+                &mut rows_i as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?;
+        }
+        self.maybe_log_many_debug();
+        Ok(())
+    }
+
+    #[inline]
+    fn sm_count(&self) -> Result<u32, CudaWadError> {
+        let dev = Device::get_device(self.device_id)?;
+        let attr = dev.get_attribute(DeviceAttribute::MultiprocessorCount)? as u32;
+        Ok(attr)
+    }
+
+    #[inline]
+    fn default_block_x(&self, env_key: &str, fallback: u32) -> u32 {
+        env::var(env_key)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&bx| bx != 0)
+            .unwrap_or(fallback)
+    }
+
+    #[inline]
+    fn choose_grid_1d(&self, n: usize, block_x: u32) -> Result<u32, CudaWadError> {
+        let sm = self.sm_count()?;
+        let target_blocks = sm.saturating_mul(32);
+        let need = ((n as u64 + block_x as u64 - 1) / block_x as u64) as u32;
+        Ok(need.max(1).min(target_blocks.max(1)))
+    }
+
+    fn launch_compute_single_row(
+        &self,
+        d_high: &DeviceBuffer<f32>,
+        d_low: &DeviceBuffer<f32>,
+        d_close: &DeviceBuffer<f32>,
+        series_len: usize,
+        d_row_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaWadError> {
+        if self.try_launch_series_scan_kernel(d_high, d_low, d_close, series_len, d_row_out)? {
+            return Ok(());
+        }
+
+        let func = self
+            .module
+            .get_function("wad_compute_single_row_f32")
+            .map_err(|_| CudaWadError::MissingKernelSymbol {
+                name: "wad_compute_single_row_f32",
+            })?;
+
+        let grid: GridSize = (1, 1, 1).into();
+        let block: BlockSize = (1, 1, 1).into();
+
+        unsafe {
+            let mut high_ptr = d_high.as_device_ptr().as_raw();
+            let mut low_ptr = d_low.as_device_ptr().as_raw();
+            let mut close_ptr = d_close.as_device_ptr().as_raw();
+            let mut len_i = series_len as i32;
+            let mut out_ptr = d_row_out.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut high_ptr as *mut _ as *mut c_void,
+                &mut low_ptr as *mut _ as *mut c_void,
+                &mut close_ptr as *mut _ as *mut c_void,
+                &mut len_i as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?;
+        }
+        Ok(())
+    }
+
+    fn launch_broadcast_row(
+        &self,
+        d_row: &DeviceBuffer<f32>,
+        series_len: usize,
+        n_combos: usize,
+        d_out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), CudaWadError> {
+        let func = self.module.get_function("broadcast_row_f32").map_err(|_| {
+            CudaWadError::MissingKernelSymbol {
+                name: "broadcast_row_f32",
+            }
+        })?;
+
+        let total = series_len
+            .checked_mul(n_combos)
+            .ok_or_else(|| CudaWadError::InvalidInput("overflow in broadcast size".into()))?;
+
+        let block_x = self.default_block_x("WAD_BLOCK_X", 256);
+        let grid_x = self.choose_grid_1d(total, block_x)?;
+        let grid: GridSize = (grid_x, 1, 1).into();
+        let block: BlockSize = (block_x, 1, 1).into();
+        self.validate_launch(grid_x, 1, 1, block_x, 1, 1)?;
+
+        unsafe {
+            let mut row_ptr = d_row.as_device_ptr().as_raw();
+            let mut len_i = series_len as i32;
+            let mut combos_i = n_combos as i32;
+            let mut out_ptr = d_out.as_device_ptr().as_raw();
+            let args: &mut [*mut c_void] = &mut [
+                &mut row_ptr as *mut _ as *mut c_void,
+                &mut len_i as *mut _ as *mut c_void,
+                &mut combos_i as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+            ];
+            self.stream.launch(&func, grid, block, 0, args)?;
+        }
+        Ok(())
+    }
+
+    pub fn wad_many_series_one_param_time_major_dev(
+        &self,
+        high_tm: &[f32],
+        low_tm: &[f32],
+        close_tm: &[f32],
+        cols: usize,
+        rows: usize,
+    ) -> Result<DeviceArrayF32, CudaWadError> {
+        Self::prepare_many_series_inputs(high_tm, low_tm, close_tm, cols, rows)?;
+
+        let cells = cols
+            .checked_mul(rows)
+            .ok_or_else(|| CudaWadError::InvalidInput("overflow in cols*rows".into()))?;
+        let required = (3 * cells + cells) * std::mem::size_of::<f32>();
+        let headroom = 64 * 1024 * 1024;
+        Self::will_fit(required, headroom)?;
+
+        let d_high = unsafe { DeviceBuffer::from_slice_async(high_tm, &self.stream) }?;
+        let d_low = unsafe { DeviceBuffer::from_slice_async(low_tm, &self.stream) }?;
+        let d_close = unsafe { DeviceBuffer::from_slice_async(close_tm, &self.stream) }?;
+        let mut d_out: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized_async(cells, &self.stream) }?;
+
+        self.launch_many_series_kernel(&d_high, &d_low, &d_close, cols, rows, &mut d_out)?;
+        self.stream.synchronize()?;
+        Ok(DeviceArrayF32 {
+            buf: d_out,
+            rows,
+            cols,
+        })
+    }
+}
+
+pub mod benches {
+    use super::*;
+    use crate::cuda::bench::helpers::gen_series;
+    use crate::cuda::bench::{CudaBenchScenario, CudaBenchState};
+
+    const ONE_SERIES_LEN: usize = 1_000_000;
+    fn bytes_one_series() -> usize {
+        let in_bytes = 3 * ONE_SERIES_LEN * std::mem::size_of::<f32>();
+        let out_bytes = ONE_SERIES_LEN * std::mem::size_of::<f32>();
+        in_bytes + out_bytes + 32 * 1024 * 1024
+    }
+
+    fn synth_hlc_from_close(close: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let mut high = close.to_vec();
+        let mut low = close.to_vec();
+        for i in 0..close.len() {
+            let v = close[i];
+            if v.is_nan() {
+                continue;
+            }
+            let x = i as f32 * 0.0027;
+            let off = (0.0031 * x.cos()).abs() + 0.12;
+            high[i] = v + off;
+            low[i] = v - off;
+        }
+        (high, low)
+    }
+
+    struct WadState {
+        cuda: CudaWad,
+        d_high: DeviceBuffer<f32>,
+        d_low: DeviceBuffer<f32>,
+        d_close: DeviceBuffer<f32>,
+        len: usize,
+        d_out: DeviceBuffer<f32>,
+    }
+    impl CudaBenchState for WadState {
+        fn launch(&mut self) {
+            self.cuda
+                .launch_batch_kernel(
+                    &self.d_high,
+                    &self.d_low,
+                    &self.d_close,
+                    self.len,
+                    1,
+                    &mut self.d_out,
+                )
+                .expect("wad kernel");
+            self.cuda.stream.synchronize().expect("wad sync");
+        }
+    }
+    fn prep_one_series() -> Box<dyn CudaBenchState> {
+        let cuda = CudaWad::new(0).expect("cuda wad");
+        let close = gen_series(ONE_SERIES_LEN);
+        let (high, low) = synth_hlc_from_close(&close);
+        let d_high =
+            unsafe { DeviceBuffer::from_slice_async(&high, &cuda.stream) }.expect("d_high");
+        let d_low = unsafe { DeviceBuffer::from_slice_async(&low, &cuda.stream) }.expect("d_low");
+        let d_close =
+            unsafe { DeviceBuffer::from_slice_async(&close, &cuda.stream) }.expect("d_close");
+        let d_out: DeviceBuffer<f32> =
+            unsafe { DeviceBuffer::uninitialized_async(ONE_SERIES_LEN, &cuda.stream) }
+                .expect("d_out");
+        cuda.stream.synchronize().expect("sync after prep");
+        Box::new(WadState {
+            cuda,
+            d_high,
+            d_low,
+            d_close,
+            len: ONE_SERIES_LEN,
+            d_out,
+        })
+    }
+
+    pub fn bench_profiles() -> Vec<CudaBenchScenario> {
+        vec![CudaBenchScenario::new(
+            "wad",
+            "one_series",
+            "wad_cuda_series",
+            "1m",
+            prep_one_series,
+        )
+        .with_sample_size(10)
+        .with_mem_required(bytes_one_series())]
+    }
+}

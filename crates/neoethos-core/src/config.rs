@@ -76,8 +76,18 @@ impl Default for SystemConfig {
             .unwrap_or(1);
 
         Self {
-            symbol: "EURUSD".to_string(),
-            symbols: vec!["EURUSD".to_string()],
+            // F-129 fix (2026-05-25): the previous defaults hardcoded
+            // `symbol = "EURUSD"` + `symbols = vec!["EURUSD"]`. Both
+            // are synthetic-data violations per the operator's
+            // real-data directive 2026-05-24. Empty defaults force
+            // the loader / caller to populate from real `config.yaml`
+            // (which is the production path — `SystemConfig::default()`
+            // is only the seed for serde defaults). Any production code
+            // that runs against the all-empty default will hit the
+            // downstream guard that rejects empty-symbol orders
+            // (see `risk_gate::prop_firm_pre_trade_check` Batch B Pass 3).
+            symbol: String::new(),
+            symbols: Vec::new(),
             data_dir: PathBuf::from("data"),
             multi_resolution_enabled: true,
             multi_resolution_timeframes: CANONICAL_TIMEFRAMES
@@ -455,6 +465,30 @@ pub struct ModelsConfig {
     pub prop_search_opportunistic_min_trade_return_pct: f64,
     pub prop_search_opportunistic_max_dd: f64,
     pub prop_search_use_opportunistic: bool,
+    /// 2026-05-26 operator directive (dual-mode product): correlation
+    /// threshold for portfolio diversification (Pearson + Spearman both
+    /// checked). Strategies with |correlation| ≥ this value against any
+    /// portfolio member are rejected. Previously hardcoded 0.85 in
+    /// `discovery.rs` — surfaced here so the operator can tune dedup
+    /// aggressiveness from config / Settings UI without rebuilding.
+    pub prop_search_corr_threshold: f64,
+    /// Monte-Carlo perturbation runs per surviving candidate. The MC test
+    /// re-evaluates each gene with random ±15-25% noise on thresholds,
+    /// weights, and SL/TP and requires a configurable minimum to be
+    /// profitable. Previously hardcoded 100 in discovery.rs.
+    pub prop_search_mc_runs: u32,
+    /// Minimum number of profitable MC runs required for a candidate to
+    /// survive (out of `prop_search_mc_runs`). Previously hardcoded 70/100
+    /// in discovery.rs (i.e. 70% threshold).
+    pub prop_search_mc_min_profitable: u32,
+    /// Spread (in pips) used in the sensitivity test — re-runs the
+    /// candidate's backtest with a wider spread to verify the strategy
+    /// stays profitable under degraded execution. Previously hardcoded
+    /// 2.0 in discovery.rs.
+    pub prop_search_sensitivity_spread_pips: f64,
+    /// Commission per lot used in the sensitivity test. Previously
+    /// hardcoded $7/lot in discovery.rs.
+    pub prop_search_sensitivity_commission_per_lot: f64,
     pub train_batch_size: usize,
     pub inference_batch_size: usize,
     pub enable_transformer_expert: bool,
@@ -651,6 +685,15 @@ impl Default for ModelsConfig {
             prop_search_opportunistic_min_trade_return_pct: 4.0,
             prop_search_opportunistic_max_dd: 0.025,
             prop_search_use_opportunistic: true,
+            // 2026-05-26 operator directive (dual-mode product): the 5 knobs
+            // below were previously hardcoded in discovery.rs. Surfaced here
+            // so the dual-mode product can tune them without rebuilds. The
+            // defaults reproduce the previous hardcoded behavior.
+            prop_search_corr_threshold: 0.85,
+            prop_search_mc_runs: 100,
+            prop_search_mc_min_profitable: 70,
+            prop_search_sensitivity_spread_pips: 2.0,
+            prop_search_sensitivity_commission_per_lot: 7.0,
             train_batch_size: 32,
             inference_batch_size: 32,
             enable_transformer_expert: true,

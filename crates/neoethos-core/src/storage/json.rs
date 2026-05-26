@@ -167,6 +167,142 @@ pub fn write_json_with_backup<T: Serialize + ?Sized>(
     Ok(())
 }
 
+/// Configuration for [`write_dir_with_backup`]. Mirrors
+/// [`JsonBackupWriteConfig`] but for **directory-level** atomic
+/// replacement (e.g. multi-file model artifacts: `model.json` +
+/// `metadata.json` + `weights.bin` in the same dir).
+///
+/// `temp_extension` and `backup_extension` are appended to the
+/// target dir path via `Path::with_extension`. Example:
+/// target `/models/bayesian/eurusd_m1` with `temp_extension =
+/// "tmp_bayesian_artifact"` resolves to
+/// `/models/bayesian/eurusd_m1.tmp_bayesian_artifact`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirBackupWriteConfig {
+    /// Human-readable label used in error and tracing messages.
+    /// E.g. `"meta-model artifact"` or `"bayesian artifact"`.
+    pub artifact_label: &'static str,
+    /// Extension appended to the staged-temp directory. Convention:
+    /// `tmp_<family>_artifact` (e.g. `tmp_bayesian_artifact`).
+    pub temp_extension: &'static str,
+    /// Extension appended to the backup-of-previous directory.
+    /// Convention: `bak_<family>_artifact`.
+    pub backup_extension: &'static str,
+}
+
+/// Atomically replace a target DIRECTORY by running `writer` against
+/// a staged-temp dir and renaming it into place. Mirrors
+/// [`write_json_with_backup`] semantics but at directory granularity,
+/// for multi-file artifacts (model + metadata + weights, etc.).
+///
+/// GROUP E consolidation (operator directive 2026-05-25): replaces 4
+/// duplicate implementations across `neoethos-models` —
+/// `ensemble.rs`, `statistical/bayesian_impl.rs`,
+/// `statistical/linear_impl.rs`, `training_orchestrator.rs` — each
+/// of which hand-rolled ~80-100 LOC of identical staged-tmp +
+/// backup + atomic-rename + rollback logic.
+///
+/// Contract:
+/// 1. Compute `staged_path = target.with_extension(temp_extension)`
+///    and `backup_path = target.with_extension(backup_extension)`.
+/// 2. Delete any stale staged_path from a previous interrupted run.
+/// 3. Create staged_path (empty dir).
+/// 4. Run `writer(&staged_path)` — caller writes its files here.
+/// 5. If writer errored → clean up staged_path and propagate the error.
+/// 6. Delete any stale backup_path.
+/// 7. If target exists → rename it to backup_path.
+/// 8. Rename staged_path → target. If THIS fails, try to restore
+///    backup_path → target (log a structured error on restore failure
+///    so the operator sees the inconsistency).
+/// 9. Delete backup_path on success (or leave it if restore was needed).
+///
+/// Use this whenever a model expert needs to atomically replace its
+/// on-disk artifact directory in a way that survives a crash mid-write.
+pub fn write_dir_with_backup<F>(
+    path: impl AsRef<Path>,
+    config: DirBackupWriteConfig,
+    writer: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let path = path.as_ref();
+    let staged_path = path.with_extension(config.temp_extension);
+    let backup_path = path.with_extension(config.backup_extension);
+
+    // Step 1-2: clean up any stale staged dir from a prior interrupted run.
+    cleanup_dir_if_present(&staged_path, config.artifact_label, "staged")?;
+
+    // Step 3: create the staged dir.
+    fs::create_dir_all(&staged_path).with_context(|| {
+        format!(
+            "create staged {} dir {}",
+            config.artifact_label,
+            staged_path.display()
+        )
+    })?;
+
+    // Step 4-5: run the writer; clean up staged on error.
+    if let Err(error) = writer(&staged_path) {
+        let _ = cleanup_dir_if_present(&staged_path, config.artifact_label, "staged");
+        return Err(error);
+    }
+
+    // Step 6: clean up any stale backup from a prior interrupted run.
+    cleanup_dir_if_present(&backup_path, config.artifact_label, "backup")?;
+
+    // Step 7: if target exists, move it to backup.
+    if path.exists() {
+        fs::rename(path, &backup_path).with_context(|| {
+            format!(
+                "move previous {} into backup {}",
+                config.artifact_label,
+                backup_path.display()
+            )
+        })?;
+    }
+
+    // Step 8: rename staged → target. On failure, attempt backup restore.
+    if let Err(error) = fs::rename(&staged_path, path) {
+        if backup_path.exists() {
+            if let Err(restore_err) = fs::rename(&backup_path, path) {
+                tracing::error!(
+                    target: "neoethos_core::storage::dir",
+                    artifact = config.artifact_label,
+                    backup = %backup_path.display(),
+                    target = %path.display(),
+                    error = %restore_err,
+                    "failed to restore backup after staged-rename failure; \
+                     artifact directory may be in an inconsistent state"
+                );
+            }
+        }
+        anyhow::bail!(
+            "rename staged {} into {} failed: {}",
+            config.artifact_label,
+            path.display(),
+            error
+        );
+    }
+
+    // Step 9: clean up the backup on success.
+    cleanup_dir_if_present(&backup_path, config.artifact_label, "backup")?;
+    Ok(())
+}
+
+fn cleanup_dir_if_present(path: &Path, artifact_label: &str, role: &str) -> Result<()> {
+    if path.exists() {
+        fs::remove_dir_all(path).with_context(|| {
+            format!(
+                "remove {role} {} dir {}",
+                artifact_label,
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 pub fn read_json<T: DeserializeOwned>(path: impl AsRef<Path>, artifact_label: &str) -> Result<T> {
     let path = path.as_ref();
     let payload = fs::read(path)

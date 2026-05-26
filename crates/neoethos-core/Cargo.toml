@@ -18,17 +18,28 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
 tracing-appender = "0.2.4"
 # Platform-correct user-data dir for log storage. Same version as neoethos-app.
 dirs = "5.0.1"
-tokio = { version = "1.49.0", features = ["full"] }
+# F-102 fix (2026-05-25): `tokio` removed from neoethos-core dependencies.
+# Verified via `grep "use tokio|tokio::|#[tokio::"` — ZERO call sites in
+# the entire crate. The previous `features = ["full"]` pulled the
+# complete tokio runtime (~50 transitive crates) into a foundation
+# layer that does nothing async. Crates that DO need tokio (e.g.
+# neoethos-app, neoethos-cli) depend on it directly with minimal
+# features instead.
 sysinfo = "0.37.2"
 anyhow = "1.0.100"
 thiserror = "2.0.16"
-rusqlite = { version = "0.38.0", features = ["bundled", "chrono"] }
+# Pinned to 0.37 to share libsqlite3-sys 0.35 with burn-dataset (transitively
+# pulled via burn 0.21's default `burn-core/default` set). Cargo refuses to
+# link two different native `sqlite3` libs (libsqlite3-sys 0.35 vs 0.36 in
+# rusqlite 0.38). Our usage (Connection::open + params! + query — see
+# storage.rs) is stable across both, so 0.37 is a clean choice.
+rusqlite = { version = "0.37.0", features = ["bundled", "chrono"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.19.0", features = ["v4", "serde"] }
 ndarray = "0.17.2"
 # reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
 # In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
-reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "json", "blocking", "query", "form"] }
+reqwest = { version = "0.13.3", default-features = true, features = ["rustls", "json", "blocking", "query", "form"] }
 # API key wrapped in `secrecy::SecretString` (a `Box<str>` that cannot
 # reallocate, zeroized on drop). The zeroize upstream docs explicitly point
 # users to `secrecy` for string-shaped secrets because `Zeroizing<String>`
@@ -40,10 +51,18 @@ secrecy = "0.10"
 toml = "0.8.20"
 
 [target.'cfg(windows)'.dependencies]
+# F-101 follow-up (2026-05-25 — corrected after verbose build):
+# pruned from the previous 4-feature set down to the 3 actually
+# used after `utils/window_control.rs` was deleted:
+#   - `Win32_System_Console` — CLI console-mode detection
+#   - `Win32_UI_WindowsAndMessaging` — the startup MessageBox dialog
+#     in `logging.rs:140` (no-tty fallback)
+#   - `Win32_Foundation` — required by the WindowsAndMessaging types
+# `Win32_UI_Input_KeyboardAndMouse` was the only feature truly orphaned
+# by the F-101 deletion.
 windows = { version = "0.62.1", features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 

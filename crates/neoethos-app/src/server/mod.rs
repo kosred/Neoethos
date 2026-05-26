@@ -30,6 +30,12 @@ pub mod account;
 pub mod bridge;
 pub mod broker_control;
 pub mod chart;
+// **2026-05-25 — operator directive "live tick + chart switch
+// must be immediate"**: in-memory LRU cache for `ChartDto` so
+// repeat timeframe switches don't re-read the 30 MB Vortex file.
+// Mirrors the in-RAM series cache that TradingView / cTrader /
+// MT5 all use server-side or client-side.
+pub mod chart_cache;
 pub mod codex;
 pub mod data_control;
 pub mod diagnostics;
@@ -38,6 +44,7 @@ pub mod hardware;
 pub mod health;
 pub mod indicators;
 pub mod intelligence;
+pub mod knob_catalog;
 pub mod live_spots;
 pub mod orders;
 pub mod pending_actions;
@@ -49,7 +56,7 @@ pub mod system_status;
 use anyhow::Context;
 use axum::Router;
 use axum::routing::{get, post};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -67,6 +74,20 @@ pub fn router(state: AppApiState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/account/snapshot", get(account::snapshot))
+        // **2026-05-25 — operator directive "uniform push everywhere"**:
+        // SSE push channel mirror of `/live/spots/stream` for account
+        // updates. Bridge writes a fresh snapshot every 5 s (and in
+        // future on every `OAExecutionEvent` push); subscribers receive
+        // each update with ~5 ms latency vs. the previous 1000 ms poll
+        // of `/account/snapshot`.
+        .route("/account/snapshot/stream", get(account::stream))
+        // **2026-05-25 — uniform-push doctrine**: force-refresh
+        // trigger that bridges the 5 s safety poll. Operator clicks
+        // a "refresh" button → POST here → bridge skips the timer
+        // and runs `refresh_once` immediately → fresh snapshot
+        // broadcast within ~750 ms. Same channel the future
+        // `OAExecutionEvent` handler will use.
+        .route("/account/snapshot/refresh", post(account::refresh))
         .route("/hardware", get(hardware::hardware))
         .route("/risk", get(risk::risk))
         .route("/risk/preset", post(risk::update_preset))
@@ -77,6 +98,15 @@ pub fn router(state: AppApiState) -> Router {
         // #193: raw config.yaml for the Flutter Settings "Advanced"
         // panel that surfaces knobs the typed /settings DTO can't list.
         .route("/settings/raw", get(settings::settings_raw_yaml))
+        // **2026-05-25 — operator-approved**: the Flutter "Advanced
+        // Settings" screen consumes this catalog to render every
+        // runtime knob with help text + presets. Catalog is the
+        // machine-readable counterpart of `docs/CONFIG-KNOBS-REFERENCE.md`.
+        .route(
+            "/settings/knob-catalog",
+            get(knob_catalog::get_knob_catalog),
+        )
+        .route("/settings/presets", get(knob_catalog::get_presets))
         .route("/engines/status", get(system_status::engines))
         .route(
             "/engines/discovery/start",
@@ -125,6 +155,12 @@ pub fn router(state: AppApiState) -> Router {
         // long-running spot streamer populates; sub-2s freshness
         // for active majors.
         .route("/live/spots", get(live_spots::list))
+        // **2026-05-25 — operator directive "push, not poll"**:
+        // SSE endpoint that streams ticks to Flutter as they arrive
+        // (target latency ~5 ms vs. 1000 ms for the polling route
+        // above). The polling route is kept as a fallback for HTTP
+        // clients without SSE support + for the cold-start snapshot.
+        .route("/live/spots/stream", get(live_spots::stream))
         .route("/chart", get(chart::chart))
         .route("/indicators", get(indicators::indicators))
         .route("/diagnostics/report", post(diagnostics::report))
@@ -137,28 +173,16 @@ pub fn router(state: AppApiState) -> Router {
         .with_state(state)
 }
 
-/// Hard-coded fallback bind address. Constructed from primitives so the
-/// compiler can verify it at build time — no runtime `.parse()`, no
-/// `.unwrap()`/`.expect()` that could surprise us on a future refactor.
-/// The port is mirrored in `lib/api/backend_client.dart`; if either side
-/// changes, both must change in the same commit.
-const DEFAULT_BIND_ADDR: SocketAddr =
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 7423);
-
-/// Resolve the bind address: env-var override or [`DEFAULT_BIND_ADDR`].
+/// **F-527/F-CORE3 closure (2026-05-25)**: the hard-coded fallback bind
+/// address + the env-var resolution now live in the canonical
+/// `app_services::env_overrides` registry so the operator can grep one
+/// file to find every NeoEthos env knob. This shim keeps the
+/// `default_bind_addr()` callsite stable.
+///
+/// The port is mirrored in `lib/api/backend_client.dart`; if either
+/// side changes, both must change in the same commit.
 fn default_bind_addr() -> SocketAddr {
-    if let Ok(raw) = std::env::var("NEOETHOS_SERVER_BIND") {
-        if let Ok(parsed) = raw.parse::<SocketAddr>() {
-            return parsed;
-        }
-        tracing::warn!(
-            target: "neoethos_app::server",
-            raw = %raw,
-            fallback = %DEFAULT_BIND_ADDR,
-            "NEOETHOS_SERVER_BIND set but unparseable; falling back to default"
-        );
-    }
-    DEFAULT_BIND_ADDR
+    crate::app_services::env_overrides::server_bind_addr()
 }
 
 /// Bind the HTTP listener and serve until the process is killed. The

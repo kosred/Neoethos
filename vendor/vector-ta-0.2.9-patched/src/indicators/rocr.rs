@@ -1,0 +1,2258 @@
+use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
+};
+use aligned_vec::{AVec, CACHELINE_ALIGN};
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use core::arch::x86_64::*;
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+use std::convert::AsRef;
+use std::error::Error;
+use std::mem::ManuallyDrop;
+use thiserror::Error;
+
+const DEFAULT_PERIOD: usize = 10;
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::cuda::moving_averages::DeviceArrayF32;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+#[cfg(feature = "python")]
+use crate::utilities::kernel_validation::validate_kernel;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use cust::context::Context;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use cust::memory::DeviceBuffer;
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray1};
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::PyDict;
+#[cfg(all(feature = "python", feature = "cuda"))]
+use std::sync::Arc;
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+use wasm_bindgen::prelude::*;
+
+impl<'a> AsRef<[f64]> for RocrInput<'a> {
+    #[inline(always)]
+    fn as_ref(&self) -> &[f64] {
+        match &self.data {
+            RocrData::Slice(slice) => slice,
+            RocrData::Candles { candles, source } => source_type(candles, source),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RocrData<'a> {
+    Candles {
+        candles: &'a Candles,
+        source: &'a str,
+    },
+    Slice(&'a [f64]),
+}
+
+#[derive(Debug, Clone)]
+pub struct RocrOutput {
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "wasm"),
+    derive(Serialize, Deserialize)
+)]
+pub struct RocrParams {
+    pub period: Option<usize>,
+}
+
+impl Default for RocrParams {
+    fn default() -> Self {
+        Self {
+            period: Some(DEFAULT_PERIOD),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RocrInput<'a> {
+    pub data: RocrData<'a>,
+    pub params: RocrParams,
+}
+
+impl<'a> RocrInput<'a> {
+    #[inline]
+    pub fn from_candles(c: &'a Candles, s: &'a str, p: RocrParams) -> Self {
+        Self {
+            data: RocrData::Candles {
+                candles: c,
+                source: s,
+            },
+            params: p,
+        }
+    }
+    #[inline]
+    pub fn from_slice(sl: &'a [f64], p: RocrParams) -> Self {
+        Self {
+            data: RocrData::Slice(sl),
+            params: p,
+        }
+    }
+    #[inline]
+    pub fn with_default_candles(c: &'a Candles) -> Self {
+        Self::from_candles(c, "close", RocrParams::default())
+    }
+    #[inline]
+    pub fn get_period(&self) -> usize {
+        self.params.period.unwrap_or(DEFAULT_PERIOD)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct RocrBuilder {
+    period: Option<usize>,
+    kernel: Kernel,
+}
+
+impl Default for RocrBuilder {
+    fn default() -> Self {
+        Self {
+            period: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl RocrBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[inline(always)]
+    pub fn period(mut self, n: usize) -> Self {
+        self.period = Some(n);
+        self
+    }
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+    #[inline(always)]
+    pub fn apply(self, c: &Candles) -> Result<RocrOutput, RocrError> {
+        let p = RocrParams {
+            period: self.period,
+        };
+        let i = RocrInput::from_candles(c, "close", p);
+        rocr_with_kernel(&i, self.kernel)
+    }
+    #[inline(always)]
+    pub fn apply_slice(self, d: &[f64]) -> Result<RocrOutput, RocrError> {
+        let p = RocrParams {
+            period: self.period,
+        };
+        let i = RocrInput::from_slice(d, p);
+        rocr_with_kernel(&i, self.kernel)
+    }
+    #[inline(always)]
+    pub fn into_stream(self) -> Result<RocrStream, RocrError> {
+        let p = RocrParams {
+            period: self.period,
+        };
+        RocrStream::try_new(p)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum RocrError {
+    #[error("rocr: Empty data provided.")]
+    EmptyInputData,
+
+    #[error("rocr: All values are NaN.")]
+    AllValuesNaN,
+
+    #[error("rocr: Invalid period: period = {period}, data length = {data_len}")]
+    InvalidPeriod { period: usize, data_len: usize },
+
+    #[error("rocr: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+
+    #[error("rocr: Output length mismatch: expected {expected}, got {got}")]
+    OutputLengthMismatch { expected: usize, got: usize },
+
+    #[error("rocr: Invalid range: start={start}, end={end}, step={step}")]
+    InvalidRange {
+        start: usize,
+        end: usize,
+        step: usize,
+    },
+
+    #[error("rocr: Invalid kernel for batch: {0:?}")]
+    InvalidKernelForBatch(crate::utilities::enums::Kernel),
+}
+
+#[inline(always)]
+fn rocr_prepare<'a>(
+    input: &'a RocrInput,
+    kern: Kernel,
+) -> Result<(&'a [f64], usize, usize, Kernel), RocrError> {
+    let data: &[f64] = input.as_ref();
+    let len = data.len();
+    if len == 0 {
+        return Err(RocrError::EmptyInputData);
+    }
+
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(RocrError::AllValuesNaN)?;
+    let period = input.get_period();
+
+    if period == 0 || period > len {
+        return Err(RocrError::InvalidPeriod {
+            period,
+            data_len: len,
+        });
+    }
+    if len - first < period {
+        return Err(RocrError::NotEnoughValidData {
+            needed: period,
+            valid: len - first,
+        });
+    }
+
+    let chosen = match kern {
+        Kernel::Auto => {
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            {
+                match detect_best_kernel() {
+                    Kernel::Avx512 if len < 1_000_000 => Kernel::Avx512,
+                    Kernel::Avx512 | Kernel::Avx2 => Kernel::Avx2,
+                    _ => Kernel::Scalar,
+                }
+            }
+            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+            {
+                Kernel::Scalar
+            }
+        }
+        k => k,
+    };
+    Ok((data, period, first, chosen))
+}
+
+#[inline]
+pub fn rocr(input: &RocrInput) -> Result<RocrOutput, RocrError> {
+    rocr_with_kernel(input, Kernel::Auto)
+}
+
+pub fn rocr_with_kernel(input: &RocrInput, kernel: Kernel) -> Result<RocrOutput, RocrError> {
+    let (data, period, first, chosen) = rocr_prepare(input, kernel)?;
+    let mut out = alloc_with_nan_prefix(data.len(), first + period);
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => rocr_scalar(data, period, first, &mut out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => rocr_avx2(data, period, first, &mut out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => rocr_avx512(data, period, first, &mut out),
+            _ => unreachable!(),
+        }
+    }
+    Ok(RocrOutput { values: out })
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+pub fn rocr_into(input: &RocrInput, out: &mut [f64]) -> Result<(), RocrError> {
+    rocr_into_slice(out, input, Kernel::Auto)
+}
+
+pub fn rocr_into_slice(dst: &mut [f64], input: &RocrInput, kern: Kernel) -> Result<(), RocrError> {
+    let (data, period, first, chosen) = rocr_prepare(input, kern)?;
+    if dst.len() != data.len() {
+        return Err(RocrError::OutputLengthMismatch {
+            expected: data.len(),
+            got: dst.len(),
+        });
+    }
+
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => rocr_scalar(data, period, first, dst),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => rocr_avx2(data, period, first, dst),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => rocr_avx512(data, period, first, dst),
+            _ => unreachable!(),
+        }
+    }
+
+    let warm = first + period;
+    for v in &mut dst[..warm] {
+        *v = f64::NAN;
+    }
+    Ok(())
+}
+
+#[inline]
+pub fn rocr_scalar(data: &[f64], period: usize, first_val: usize, out: &mut [f64]) {
+    for i in (first_val + period)..data.len() {
+        let past = data[i - period];
+        out[i] = if past == 0.0 || past.is_nan() {
+            0.0
+        } else {
+            data[i] / past
+        };
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub fn rocr_avx512(data: &[f64], period: usize, first_valid: usize, out: &mut [f64]) {
+    unsafe { rocr_avx512_impl(data, period, first_valid, out) }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn rocr_avx512_impl(data: &[f64], period: usize, first_valid: usize, out: &mut [f64]) {
+    let start = first_valid + period;
+    let len = data.len();
+    if start >= len {
+        return;
+    }
+
+    let mut i = start;
+    let end = len;
+    let step = 8usize;
+    while i + step <= end {
+        let cur = _mm512_loadu_pd(data.as_ptr().add(i));
+        let pst = _mm512_loadu_pd(data.as_ptr().add(i - period));
+
+        let m0 = _mm512_cmp_pd_mask(pst, _mm512_set1_pd(0.0), _CMP_EQ_OQ);
+        let m1 = _mm512_cmp_pd_mask(pst, pst, _CMP_UNORD_Q);
+        let bad = m0 | m1;
+        let good = !bad;
+
+        let res = _mm512_maskz_div_pd(good, cur, pst);
+        _mm512_storeu_pd(out.as_mut_ptr().add(i), res);
+        i += step;
+    }
+    for j in i..end {
+        let p = *data.get_unchecked(j - period);
+        let c = *data.get_unchecked(j);
+        *out.get_unchecked_mut(j) = if p == 0.0 || p.is_nan() { 0.0 } else { c / p };
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub fn rocr_avx2(data: &[f64], period: usize, first_valid: usize, out: &mut [f64]) {
+    unsafe { rocr_avx2_impl(data, period, first_valid, out) }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn rocr_avx2_impl(data: &[f64], period: usize, first_valid: usize, out: &mut [f64]) {
+    let start = first_valid + period;
+    let len = data.len();
+    if start >= len {
+        return;
+    }
+
+    let mut i = start;
+    let mut p = i - period;
+    let end = len;
+    let zero = _mm256_set1_pd(0.0);
+
+    while i + 8 <= end {
+        let cur0 = _mm256_loadu_pd(data.as_ptr().add(i));
+        let pst0 = _mm256_loadu_pd(data.as_ptr().add(p));
+        let div0 = _mm256_div_pd(cur0, pst0);
+        let m0z = _mm256_cmp_pd(pst0, zero, _CMP_EQ_OQ);
+        let m0n = _mm256_cmp_pd(pst0, pst0, _CMP_UNORD_Q);
+        let m0 = _mm256_or_pd(m0z, m0n);
+        let res0 = _mm256_andnot_pd(m0, div0);
+        _mm256_storeu_pd(out.as_mut_ptr().add(i), res0);
+
+        let cur1 = _mm256_loadu_pd(data.as_ptr().add(i + 4));
+        let pst1 = _mm256_loadu_pd(data.as_ptr().add(p + 4));
+        let div1 = _mm256_div_pd(cur1, pst1);
+        let m1z = _mm256_cmp_pd(pst1, zero, _CMP_EQ_OQ);
+        let m1n = _mm256_cmp_pd(pst1, pst1, _CMP_UNORD_Q);
+        let m1 = _mm256_or_pd(m1z, m1n);
+        let res1 = _mm256_andnot_pd(m1, div1);
+        _mm256_storeu_pd(out.as_mut_ptr().add(i + 4), res1);
+
+        i += 8;
+        p += 8;
+    }
+
+    while i + 4 <= end {
+        let cur = _mm256_loadu_pd(data.as_ptr().add(i));
+        let pst = _mm256_loadu_pd(data.as_ptr().add(p));
+        let div = _mm256_div_pd(cur, pst);
+        let mz = _mm256_cmp_pd(pst, zero, _CMP_EQ_OQ);
+        let mn = _mm256_cmp_pd(pst, pst, _CMP_UNORD_Q);
+        let m = _mm256_or_pd(mz, mn);
+        let res = _mm256_andnot_pd(m, div);
+        _mm256_storeu_pd(out.as_mut_ptr().add(i), res);
+        i += 4;
+        p += 4;
+    }
+
+    while i < end {
+        let past = *data.get_unchecked(p);
+        let cur = *data.get_unchecked(i);
+        let b = past.to_bits();
+        let is_zero = (b & 0x7fff_ffff_ffff_ffff) == 0;
+        let is_nan = (b & 0x7ff0_0000_0000_0000) == 0x7ff0_0000_0000_0000
+            && (b & 0x000f_ffff_ffff_ffff) != 0;
+        *out.get_unchecked_mut(i) = if is_zero | is_nan { 0.0 } else { cur / past };
+        i += 1;
+        p += 1;
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn rocr_avx512_short(data: &[f64], period: usize, first_valid: usize, out: &mut [f64]) {
+    rocr_scalar(data, period, first_valid, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn rocr_avx512_long(data: &[f64], period: usize, first_valid: usize, out: &mut [f64]) {
+    rocr_scalar(data, period, first_valid, out)
+}
+
+pub struct RocrStream {
+    period: usize,
+    buffer: Vec<f64>,
+    head: usize,
+    filled: bool,
+}
+
+impl RocrStream {
+    pub fn try_new(params: RocrParams) -> Result<Self, RocrError> {
+        let period = params.period.unwrap_or(DEFAULT_PERIOD);
+        if period == 0 {
+            return Err(RocrError::InvalidPeriod {
+                period,
+                data_len: 0,
+            });
+        }
+        Ok(Self {
+            period,
+            buffer: vec![f64::NAN; period],
+            head: 0,
+            filled: false,
+        })
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, value: f64) -> Option<f64> {
+        const ABS_MASK: u64 = 0x7fff_ffff_ffff_ffff;
+        const EXP_MASK: u64 = 0x7ff0_0000_0000_0000;
+        const MAN_MASK: u64 = 0x000f_ffff_ffff_ffff;
+
+        let past = self.buffer[self.head];
+
+        let out = if self.filled {
+            let y = value / past;
+            let pb = past.to_bits();
+            let is_zero = (pb & ABS_MASK) == 0;
+            let is_nan = (pb & EXP_MASK) == EXP_MASK && (pb & MAN_MASK) != 0;
+            let good_mask: u64 = (!(is_zero | is_nan) as u64).wrapping_neg();
+            Some(f64::from_bits(y.to_bits() & good_mask))
+        } else {
+            None
+        };
+
+        self.buffer[self.head] = value;
+        let next = self.head + 1;
+        if next == self.period {
+            self.head = 0;
+            self.filled = true;
+        } else {
+            self.head = next;
+        }
+
+        out
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RocrBatchRange {
+    pub period: (usize, usize, usize),
+}
+
+impl Default for RocrBatchRange {
+    fn default() -> Self {
+        Self {
+            period: (9, 258, 1),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RocrBatchBuilder {
+    range: RocrBatchRange,
+    kernel: Kernel,
+}
+
+impl RocrBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline]
+    pub fn period_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.period = (start, end, step);
+        self
+    }
+    #[inline]
+    pub fn period_static(mut self, p: usize) -> Self {
+        self.range.period = (p, p, 0);
+        self
+    }
+
+    pub fn apply_slice(self, data: &[f64]) -> Result<RocrBatchOutput, RocrError> {
+        rocr_batch_with_kernel(data, &self.range, self.kernel)
+    }
+
+    pub fn with_default_slice(data: &[f64], k: Kernel) -> Result<RocrBatchOutput, RocrError> {
+        RocrBatchBuilder::new().kernel(k).apply_slice(data)
+    }
+
+    pub fn apply_candles(self, c: &Candles, src: &str) -> Result<RocrBatchOutput, RocrError> {
+        let slice = source_type(c, src);
+        self.apply_slice(slice)
+    }
+
+    pub fn with_default_candles(c: &Candles) -> Result<RocrBatchOutput, RocrError> {
+        RocrBatchBuilder::new()
+            .kernel(Kernel::Auto)
+            .apply_candles(c, "close")
+    }
+}
+
+pub fn rocr_batch_with_kernel(
+    data: &[f64],
+    sweep: &RocrBatchRange,
+    k: Kernel,
+) -> Result<RocrBatchOutput, RocrError> {
+    let kernel = match k {
+        Kernel::Auto => Kernel::ScalarBatch,
+        other if other.is_batch() => other,
+        _ => {
+            return Err(RocrError::InvalidKernelForBatch(k));
+        }
+    };
+    let simd = match kernel {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => unreachable!(),
+    };
+    rocr_batch_par_slice(data, sweep, simd)
+}
+
+#[derive(Clone, Debug)]
+pub struct RocrBatchOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<RocrParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+impl RocrBatchOutput {
+    pub fn row_for_params(&self, p: &RocrParams) -> Option<usize> {
+        self.combos
+            .iter()
+            .position(|c| c.period.unwrap_or(9) == p.period.unwrap_or(9))
+    }
+
+    pub fn values_for(&self, p: &RocrParams) -> Option<&[f64]> {
+        self.row_for_params(p).map(|row| {
+            let start = row * self.cols;
+            &self.values[start..start + self.cols]
+        })
+    }
+}
+
+#[inline(always)]
+fn expand_grid(r: &RocrBatchRange) -> Result<Vec<RocrParams>, RocrError> {
+    fn axis_usize((start, end, step): (usize, usize, usize)) -> Result<Vec<usize>, RocrError> {
+        if step == 0 || start == end {
+            return Ok(vec![start]);
+        }
+
+        if start < end {
+            let st = step.max(1);
+            let mut v = Vec::new();
+            let mut x = start;
+            while x <= end {
+                v.push(x);
+                x = match x.checked_add(st) {
+                    Some(next) => next,
+                    None => break,
+                };
+            }
+            if v.is_empty() {
+                return Err(RocrError::InvalidRange { start, end, step });
+            }
+            return Ok(v);
+        }
+
+        let st = step.max(1) as isize;
+        let mut v = Vec::new();
+        let mut x = start as isize;
+        let end_i = end as isize;
+        while x >= end_i {
+            v.push(x as usize);
+            x -= st;
+        }
+        if v.is_empty() {
+            return Err(RocrError::InvalidRange { start, end, step });
+        }
+        Ok(v)
+    }
+
+    let periods = axis_usize(r.period)?;
+    if periods.is_empty() {
+        return Err(RocrError::InvalidRange {
+            start: r.period.0,
+            end: r.period.1,
+            step: r.period.2,
+        });
+    }
+
+    let mut out = Vec::with_capacity(periods.len());
+    for &p in &periods {
+        out.push(RocrParams { period: Some(p) });
+    }
+    Ok(out)
+}
+
+#[inline(always)]
+fn rocr_batch_prepare(data: &[f64], combos: &[RocrParams]) -> Result<(usize, usize), RocrError> {
+    let cols = data.len();
+    if cols == 0 {
+        return Err(RocrError::EmptyInputData);
+    }
+
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(RocrError::AllValuesNaN)?;
+
+    let mut max_p = 0usize;
+    for c in combos {
+        let p = c.period.unwrap();
+        if p == 0 || p > cols {
+            return Err(RocrError::InvalidPeriod {
+                period: p,
+                data_len: cols,
+            });
+        }
+        if p > max_p {
+            max_p = p;
+        }
+    }
+
+    if cols - first < max_p {
+        return Err(RocrError::NotEnoughValidData {
+            needed: max_p,
+            valid: cols - first,
+        });
+    }
+
+    Ok((first, max_p))
+}
+
+#[inline(always)]
+pub fn rocr_batch_slice(
+    data: &[f64],
+    sweep: &RocrBatchRange,
+    kern: Kernel,
+) -> Result<RocrBatchOutput, RocrError> {
+    rocr_batch_inner(data, sweep, kern, false)
+}
+
+#[inline(always)]
+pub fn rocr_batch_par_slice(
+    data: &[f64],
+    sweep: &RocrBatchRange,
+    kern: Kernel,
+) -> Result<RocrBatchOutput, RocrError> {
+    rocr_batch_inner(data, sweep, kern, true)
+}
+
+#[inline(always)]
+fn rocr_batch_inner(
+    data: &[f64],
+    sweep: &RocrBatchRange,
+    kern: Kernel,
+    parallel: bool,
+) -> Result<RocrBatchOutput, RocrError> {
+    let combos = expand_grid(sweep)?;
+    let (first, _max_p) = rocr_batch_prepare(data, &combos)?;
+    let rows = combos.len();
+    let cols = data.len();
+
+    rows.checked_mul(cols).ok_or(RocrError::InvalidRange {
+        start: rows,
+        end: cols,
+        step: 0,
+    })?;
+
+    let mut values_uninit = make_uninit_matrix(rows, cols);
+
+    let warmup_periods: Vec<usize> = combos
+        .iter()
+        .map(|c| {
+            let p = c.period.unwrap();
+            first.checked_add(p).ok_or(RocrError::InvalidRange {
+                start: first,
+                end: p,
+                step: 0,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    init_matrix_prefixes(&mut values_uninit, cols, &warmup_periods);
+
+    let mut buf_guard = core::mem::ManuallyDrop::new(values_uninit);
+    let values: &mut [f64] = unsafe {
+        core::slice::from_raw_parts_mut(buf_guard.as_mut_ptr() as *mut f64, buf_guard.len())
+    };
+
+    let inv: Option<AVec<f64>> = match kern {
+        Kernel::Scalar => {
+            let mut buf: AVec<f64> = AVec::with_capacity(CACHELINE_ALIGN, cols);
+            unsafe { buf.set_len(cols) };
+
+            const ABS_MASK: u64 = 0x7fff_ffff_ffff_ffff;
+            const EXP_MASK: u64 = 0x7ff0_0000_0000_0000;
+            const MAN_MASK: u64 = 0x000f_ffff_ffff_ffff;
+            for j in first..cols {
+                let v = data[j];
+                let b = v.to_bits();
+                let is_zero = (b & ABS_MASK) == 0;
+                let is_nan = (b & EXP_MASK) == EXP_MASK && (b & MAN_MASK) != 0;
+                buf[j] = if is_zero | is_nan { 0.0 } else { 1.0 / v };
+            }
+            Some(buf)
+        }
+        _ => None,
+    };
+
+    let do_row = |row: usize, out_row: &mut [f64]| unsafe {
+        let period = combos[row].period.unwrap();
+
+        match kern {
+            Kernel::Scalar => match &inv {
+                Some(inv) => rocr_row_scalar_mul(data, inv.as_slice(), first, period, out_row),
+                None => rocr_row_scalar(data, first, period, out_row),
+            },
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 => rocr_row_avx2(data, first, period, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 => rocr_row_avx512(data, first, period, out_row),
+            _ => unreachable!(),
+        }
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            values
+                .par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(row, slice)| do_row(row, slice));
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (row, slice) in values.chunks_mut(cols).enumerate() {
+                do_row(row, slice);
+            }
+        }
+    } else {
+        for (row, slice) in values.chunks_mut(cols).enumerate() {
+            do_row(row, slice);
+        }
+    }
+
+    let values = unsafe {
+        Vec::from_raw_parts(
+            buf_guard.as_mut_ptr() as *mut f64,
+            buf_guard.len(),
+            buf_guard.capacity(),
+        )
+    };
+
+    Ok(RocrBatchOutput {
+        values,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+#[inline(always)]
+fn rocr_batch_inner_into(
+    data: &[f64],
+    combos: &[RocrParams],
+    first: usize,
+    kern: Kernel,
+    parallel: bool,
+    out: &mut [f64],
+) -> Result<(), RocrError> {
+    if combos.is_empty() {
+        return Err(RocrError::InvalidRange {
+            start: 0,
+            end: 0,
+            step: 0,
+        });
+    }
+    let cols = data.len();
+    if cols == 0 {
+        return Err(RocrError::EmptyInputData);
+    }
+    if first >= cols {
+        return Err(RocrError::AllValuesNaN);
+    }
+
+    let expected = combos
+        .len()
+        .checked_mul(cols)
+        .ok_or(RocrError::InvalidRange {
+            start: combos.len(),
+            end: cols,
+            step: 0,
+        })?;
+    if out.len() != expected {
+        return Err(RocrError::OutputLengthMismatch {
+            expected,
+            got: out.len(),
+        });
+    }
+
+    let do_row = |row: usize, out_row: &mut [f64]| unsafe {
+        let period = combos[row].period.unwrap();
+
+        match kern {
+            Kernel::Scalar => rocr_row_scalar(data, first, period, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 => rocr_row_avx2(data, first, period, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 => rocr_row_avx512(data, first, period, out_row),
+            _ => unreachable!(),
+        }
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            out.par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(row, slice)| do_row(row, slice));
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (row, slice) in out.chunks_mut(cols).enumerate() {
+                do_row(row, slice);
+            }
+        }
+    } else {
+        for (row, slice) in out.chunks_mut(cols).enumerate() {
+            do_row(row, slice);
+        }
+    }
+
+    Ok(())
+}
+
+#[inline(always)]
+unsafe fn rocr_row_scalar(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
+    let mut i = first + period;
+    let len = data.len();
+    if i >= len {
+        return;
+    }
+
+    const ABS_MASK: u64 = 0x7fff_ffff_ffff_ffff;
+    const EXP_MASK: u64 = 0x7ff0_0000_0000_0000;
+    const MAN_MASK: u64 = 0x000f_ffff_ffff_ffff;
+
+    #[inline(always)]
+    fn zero_if_bad(den_bits: u64, q: f64) -> f64 {
+        let is_zero = (den_bits & ABS_MASK) == 0;
+        let is_nan = (den_bits & EXP_MASK) == EXP_MASK && (den_bits & MAN_MASK) != 0;
+        let good_mask: u64 = (!(is_zero | is_nan) as u64).wrapping_neg();
+        f64::from_bits(q.to_bits() & good_mask)
+    }
+
+    while i + 4 <= len {
+        let base_p = i - period;
+        let p0 = data[base_p + 0];
+        let p1 = data[base_p + 1];
+        let p2 = data[base_p + 2];
+        let p3 = data[base_p + 3];
+
+        let c0 = data[i + 0];
+        let c1 = data[i + 1];
+        let c2 = data[i + 2];
+        let c3 = data[i + 3];
+
+        out[i + 0] = zero_if_bad(p0.to_bits(), c0 / p0);
+        out[i + 1] = zero_if_bad(p1.to_bits(), c1 / p1);
+        out[i + 2] = zero_if_bad(p2.to_bits(), c2 / p2);
+        out[i + 3] = zero_if_bad(p3.to_bits(), c3 / p3);
+
+        i += 4;
+    }
+    while i < len {
+        let p = data[i - period];
+        let c = data[i];
+        out[i] = zero_if_bad(p.to_bits(), c / p);
+        i += 1;
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn rocr_row_avx2(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
+    #[cfg(target_feature = "avx2")]
+    {
+        let start = first + period;
+        let len = data.len();
+        if start >= len {
+            return;
+        }
+        let mut i = start;
+        let mut p = i - period;
+        let end = len;
+        let zero = _mm256_set1_pd(0.0);
+
+        while i + 8 <= end {
+            let cur0 = _mm256_loadu_pd(data.as_ptr().add(i));
+            let pst0 = _mm256_loadu_pd(data.as_ptr().add(p));
+            let div0 = _mm256_div_pd(cur0, pst0);
+            let m0 = _mm256_or_pd(
+                _mm256_cmp_pd(pst0, zero, _CMP_EQ_OQ),
+                _mm256_cmp_pd(pst0, pst0, _CMP_UNORD_Q),
+            );
+            let res0 = _mm256_andnot_pd(m0, div0);
+            _mm256_storeu_pd(out.as_mut_ptr().add(i), res0);
+
+            let cur1 = _mm256_loadu_pd(data.as_ptr().add(i + 4));
+            let pst1 = _mm256_loadu_pd(data.as_ptr().add(p + 4));
+            let div1 = _mm256_div_pd(cur1, pst1);
+            let m1 = _mm256_or_pd(
+                _mm256_cmp_pd(pst1, zero, _CMP_EQ_OQ),
+                _mm256_cmp_pd(pst1, pst1, _CMP_UNORD_Q),
+            );
+            let res1 = _mm256_andnot_pd(m1, div1);
+            _mm256_storeu_pd(out.as_mut_ptr().add(i + 4), res1);
+
+            i += 8;
+            p += 8;
+        }
+
+        while i + 4 <= end {
+            let cur = _mm256_loadu_pd(data.as_ptr().add(i));
+            let pst = _mm256_loadu_pd(data.as_ptr().add(p));
+            let div = _mm256_div_pd(cur, pst);
+            let m = _mm256_or_pd(
+                _mm256_cmp_pd(pst, zero, _CMP_EQ_OQ),
+                _mm256_cmp_pd(pst, pst, _CMP_UNORD_Q),
+            );
+            let res = _mm256_andnot_pd(m, div);
+            _mm256_storeu_pd(out.as_mut_ptr().add(i), res);
+            i += 4;
+            p += 4;
+        }
+
+        while i < end {
+            let past = *data.get_unchecked(p);
+            let cur = *data.get_unchecked(i);
+            let b = past.to_bits();
+            let is_zero = (b & 0x7fff_ffff_ffff_ffff) == 0;
+            let is_nan = (b & 0x7ff0_0000_0000_0000) == 0x7ff0_0000_0000_0000
+                && (b & 0x000f_ffff_ffff_ffff) != 0;
+            *out.get_unchecked_mut(i) = if is_zero | is_nan { 0.0 } else { cur / past };
+            i += 1;
+            p += 1;
+        }
+        return;
+    }
+    rocr_row_scalar(data, first, period, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn rocr_row_avx512(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
+    #[cfg(target_feature = "avx512f")]
+    {
+        let start = first + period;
+        let len = data.len();
+        if start >= len {
+            return;
+        }
+        let mut i = start;
+        let end = len;
+        let step = 8usize;
+        while i + step <= end {
+            let cur = _mm512_loadu_pd(data.as_ptr().add(i));
+            let pst = _mm512_loadu_pd(data.as_ptr().add(i - period));
+            let m0 = _mm512_cmp_pd_mask(pst, _mm512_set1_pd(0.0), _CMP_EQ_OQ);
+            let m1 = _mm512_cmp_pd_mask(pst, pst, _CMP_UNORD_Q);
+            let good = !(m0 | m1);
+            let res = _mm512_maskz_div_pd(good, cur, pst);
+            _mm512_storeu_pd(out.as_mut_ptr().add(i), res);
+            i += step;
+        }
+        for j in i..end {
+            let p = *data.get_unchecked(j - period);
+            let c = *data.get_unchecked(j);
+            *out.get_unchecked_mut(j) = if p == 0.0 || p.is_nan() { 0.0 } else { c / p };
+        }
+        return;
+    }
+    rocr_row_scalar(data, first, period, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn rocr_row_avx512_short(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
+    rocr_row_avx512(data, first, period, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn rocr_row_avx512_long(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
+    rocr_row_avx512(data, first, period, out)
+}
+
+#[inline(always)]
+pub fn expand_grid_rocr(r: &RocrBatchRange) -> Vec<RocrParams> {
+    expand_grid(r).unwrap_or_else(|_| Vec::new())
+}
+
+#[inline(always)]
+unsafe fn rocr_row_scalar_mul(
+    data: &[f64],
+    inv: &[f64],
+    first: usize,
+    period: usize,
+    out: &mut [f64],
+) {
+    let mut i = first + period;
+    let len = data.len();
+    while i < len {
+        *out.get_unchecked_mut(i) = *data.get_unchecked(i) * *inv.get_unchecked(i - period);
+        i += 1;
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "rocr")]
+#[pyo3(signature = (data, period=DEFAULT_PERIOD, kernel=None))]
+pub fn rocr_py<'py>(
+    py: Python<'py>,
+    data: numpy::PyReadonlyArray1<'py, f64>,
+    period: usize,
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
+    use numpy::{IntoPyArray, PyArrayMethods};
+
+    let slice_in = data.as_slice()?;
+    let kern = validate_kernel(kernel, false)?;
+    let params = RocrParams {
+        period: Some(period),
+    };
+    let input = RocrInput::from_slice(slice_in, params);
+
+    let result_vec: Vec<f64> = py
+        .allow_threads(|| rocr_with_kernel(&input, kern).map(|o| o.values))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    Ok(result_vec.into_pyarray(py))
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "RocrStream")]
+pub struct RocrStreamPy {
+    stream: RocrStream,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl RocrStreamPy {
+    #[new]
+    fn new(period: usize) -> PyResult<Self> {
+        let params = RocrParams {
+            period: Some(period),
+        };
+        let stream =
+            RocrStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(RocrStreamPy { stream })
+    }
+
+    fn update(&mut self, value: f64) -> Option<f64> {
+        self.stream.update(value)
+    }
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyclass(module = "vector_ta", name = "RocrDeviceArrayF32", unsendable)]
+pub struct RocrDeviceArrayF32Py {
+    pub inner: DeviceArrayF32,
+    _ctx_guard: Arc<Context>,
+    device_id: i32,
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pymethods]
+impl RocrDeviceArrayF32Py {
+    #[getter]
+    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        let inner = &self.inner;
+        let itemsize = std::mem::size_of::<f32>();
+        d.set_item("shape", (inner.rows, inner.cols))?;
+        d.set_item("typestr", "<f4")?;
+        d.set_item("strides", (inner.cols * itemsize, itemsize))?;
+        let ptr_val = inner.buf.as_device_ptr().as_raw() as usize;
+        d.set_item("data", (ptr_val, false))?;
+
+        d.set_item("version", 3)?;
+        Ok(d)
+    }
+
+    fn __dlpack_device__(&self) -> (i32, i32) {
+        (2, self.device_id)
+    }
+
+    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, _copy=None))]
+    fn __dlpack__<'py>(
+        &mut self,
+        py: Python<'py>,
+        stream: Option<PyObject>,
+        max_version: Option<PyObject>,
+        dl_device: Option<PyObject>,
+        _copy: Option<PyObject>,
+    ) -> PyResult<PyObject> {
+        if let Some(dev) = dl_device {
+            if let Ok((dtype, did)) = dev.extract::<(i32, i32)>(py) {
+                if dtype != 2 || did != self.device_id {
+                    return Err(PyValueError::new_err("dl_device mismatch for ROCR buffer"));
+                }
+            }
+        }
+
+        if let Some(s) = stream {
+            if let Ok(v) = s.extract::<i64>(py) {
+                if v == 0 {
+                    return Err(PyValueError::new_err(
+                        "__dlpack__(stream=0) is invalid for CUDA",
+                    ));
+                }
+            }
+        }
+
+        let dummy =
+            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let inner = std::mem::replace(
+            &mut self.inner,
+            DeviceArrayF32 {
+                buf: dummy,
+                rows: 0,
+                cols: 0,
+            },
+        );
+
+        let rows = inner.rows;
+        let cols = inner.cols;
+        let buf = inner.buf;
+
+        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
+
+        export_f32_cuda_dlpack_2d(py, buf, rows, cols, self.device_id, max_version_bound)
+    }
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+impl RocrDeviceArrayF32Py {
+    fn new_from_cuda(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
+        Self {
+            inner,
+            _ctx_guard: ctx_guard,
+            device_id: device_id as i32,
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "rocr_batch")]
+#[pyo3(signature = (data, period_range, kernel=None))]
+pub fn rocr_batch_py<'py>(
+    py: Python<'py>,
+    data: numpy::PyReadonlyArray1<'py, f64>,
+    period_range: (usize, usize, usize),
+    kernel: Option<&str>,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+    use pyo3::types::PyDict;
+    use std::mem::MaybeUninit;
+
+    let slice_in = data.as_slice()?;
+    let sweep = RocrBatchRange {
+        period: period_range,
+    };
+
+    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let rows = combos.len();
+    let cols = slice_in.len();
+    let (first, _max_p) =
+        rocr_batch_prepare(slice_in, &combos).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let kern = validate_kernel(kernel, true)?;
+    let simd = match match kern {
+        Kernel::Auto => detect_best_batch_kernel(),
+        k => k,
+    } {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => unreachable!(),
+    };
+
+    let total = rows
+        .checked_mul(cols)
+        .ok_or_else(|| PyValueError::new_err("rocr_batch_py: rows*cols overflow"))?;
+    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
+    let slice_out = unsafe { out_arr.as_slice_mut()? };
+    let warms: Vec<usize> = combos
+        .iter()
+        .map(|c| {
+            let p = c.period.unwrap();
+            first
+                .checked_add(p)
+                .ok_or_else(|| PyValueError::new_err("rocr_batch_py: warmup overflow"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    unsafe {
+        let mu: &mut [MaybeUninit<f64>] = std::slice::from_raw_parts_mut(
+            slice_out.as_mut_ptr() as *mut MaybeUninit<f64>,
+            slice_out.len(),
+        );
+        init_matrix_prefixes(mu, cols, &warms);
+    }
+
+    py.allow_threads(|| rocr_batch_inner_into(slice_in, &combos, first, simd, true, slice_out))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
+    dict.set_item(
+        "periods",
+        combos
+            .iter()
+            .map(|p| p.period.unwrap() as u64)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+
+    Ok(dict)
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "rocr_cuda_batch_dev")]
+#[pyo3(signature = (data_f32, period_range, device_id=0))]
+pub fn rocr_cuda_batch_dev_py(
+    py: Python<'_>,
+    data_f32: numpy::PyReadonlyArray1<'_, f32>,
+    period_range: (usize, usize, usize),
+    device_id: usize,
+) -> PyResult<RocrDeviceArrayF32Py> {
+    use crate::cuda::cuda_available;
+    use crate::cuda::CudaRocr;
+
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+
+    let slice = data_f32.as_slice()?;
+    let sweep = RocrBatchRange {
+        period: period_range,
+    };
+    let result: PyResult<(DeviceArrayF32, Arc<Context>, u32)> = py.allow_threads(|| {
+        let cuda = CudaRocr::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let ctx = cuda.context_arc();
+        let dev_id = cuda.device_id();
+        let buf = cuda
+            .rocr_batch_dev(slice, &sweep)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok((buf, ctx, dev_id))
+    });
+    let (inner, ctx, dev_id) = result?;
+
+    Ok(RocrDeviceArrayF32Py::new_from_cuda(inner, ctx, dev_id))
+}
+
+#[cfg(all(feature = "python", feature = "cuda"))]
+#[pyfunction(name = "rocr_cuda_many_series_one_param_dev")]
+#[pyo3(signature = (data_tm_f32, cols, rows, period, device_id=0))]
+pub fn rocr_cuda_many_series_one_param_dev_py(
+    py: Python<'_>,
+    data_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
+    cols: usize,
+    rows: usize,
+    period: usize,
+    device_id: usize,
+) -> PyResult<RocrDeviceArrayF32Py> {
+    use crate::cuda::cuda_available;
+    use crate::cuda::CudaRocr;
+
+    if !cuda_available() {
+        return Err(PyValueError::new_err("CUDA not available"));
+    }
+    let slice = data_tm_f32.as_slice()?;
+    let result: PyResult<(DeviceArrayF32, Arc<Context>, u32)> = py.allow_threads(|| {
+        let cuda = CudaRocr::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let ctx = cuda.context_arc();
+        let dev_id = cuda.device_id();
+        let buf = cuda
+            .rocr_many_series_one_param_time_major_dev(slice, cols, rows, period)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok((buf, ctx, dev_id))
+    });
+    let (inner, ctx, dev_id) = result?;
+    Ok(RocrDeviceArrayF32Py::new_from_cuda(inner, ctx, dev_id))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn rocr_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
+    let params = RocrParams {
+        period: Some(period),
+    };
+    let input = RocrInput::from_slice(data, params);
+
+    let mut output = vec![0.0; data.len()];
+    rocr_into_slice(&mut output, &input, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    Ok(output)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn rocr_alloc(len: usize) -> *mut f64 {
+    let mut vec = Vec::<f64>::with_capacity(len);
+    let ptr = vec.as_mut_ptr();
+    std::mem::forget(vec);
+    ptr
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn rocr_free(ptr: *mut f64, len: usize) {
+    unsafe {
+        let _ = Vec::from_raw_parts(ptr, 0, len);
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn rocr_into(
+    in_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    period: usize,
+) -> Result<(), JsValue> {
+    if in_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("Null pointer provided"));
+    }
+
+    unsafe {
+        let data = std::slice::from_raw_parts(in_ptr, len);
+        let params = RocrParams {
+            period: Some(period),
+        };
+        let input = RocrInput::from_slice(data, params);
+
+        if in_ptr == out_ptr {
+            let mut temp = vec![0.0; len];
+            rocr_into_slice(&mut temp, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            out.copy_from_slice(&temp);
+        } else {
+            let out = std::slice::from_raw_parts_mut(out_ptr, len);
+            rocr_into_slice(out, &input, Kernel::Auto)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct RocrBatchConfig {
+    pub period_range: (usize, usize, usize),
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[derive(Serialize, Deserialize)]
+pub struct RocrBatchJsOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<RocrParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen(js_name = rocr_batch)]
+pub fn rocr_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
+    let config: RocrBatchConfig = serde_wasm_bindgen::from_value(config)
+        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
+
+    let sweep = RocrBatchRange {
+        period: config.period_range,
+    };
+
+    let output = rocr_batch_with_kernel(data, &sweep, Kernel::Auto)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let js_output = RocrBatchJsOutput {
+        values: output.values,
+        combos: output.combos,
+        rows: output.rows,
+        cols: output.cols,
+    };
+
+    serde_wasm_bindgen::to_value(&js_output)
+        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn rocr_batch_into(
+    in_ptr: *const f64,
+    out_ptr: *mut f64,
+    len: usize,
+    period_start: usize,
+    period_end: usize,
+    period_step: usize,
+) -> Result<usize, JsValue> {
+    if in_ptr.is_null() || out_ptr.is_null() {
+        return Err(JsValue::from_str("null pointer passed to rocr_batch_into"));
+    }
+
+    unsafe {
+        let sweep = RocrBatchRange {
+            period: (period_start, period_end, period_step),
+        };
+
+        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let period_count = combos.len();
+
+        if in_ptr == out_ptr {
+            let total_elements = period_count
+                .checked_mul(len)
+                .ok_or_else(|| JsValue::from_str("rocr_batch_into: rows*cols overflow"))?;
+            let mut temp = vec![0.0; total_elements];
+            let (first, _max_p) = {
+                let data = std::slice::from_raw_parts(in_ptr, len);
+                rocr_batch_prepare(data, &combos).map_err(|e| JsValue::from_str(&e.to_string()))?
+            };
+
+            use std::mem::MaybeUninit;
+            let warms: Vec<usize> = combos
+                .iter()
+                .map(|c| {
+                    let p = c.period.unwrap();
+                    first
+                        .checked_add(p)
+                        .ok_or_else(|| JsValue::from_str("rocr_batch_into: warmup overflow"))
+                })
+                .collect::<Result<_, _>>()?;
+
+            {
+                let mu: &mut [MaybeUninit<f64>] = std::slice::from_raw_parts_mut(
+                    temp.as_mut_ptr() as *mut MaybeUninit<f64>,
+                    total_elements,
+                );
+                init_matrix_prefixes(mu, len, &warms);
+            }
+
+            let simd = match detect_best_batch_kernel() {
+                Kernel::Avx512Batch => Kernel::Avx512,
+                Kernel::Avx2Batch => Kernel::Avx2,
+                _ => Kernel::Scalar,
+            };
+            {
+                let data = std::slice::from_raw_parts(in_ptr, len);
+                rocr_batch_inner_into(data, &combos, first, simd, false, &mut temp)
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            }
+
+            let out = std::slice::from_raw_parts_mut(out_ptr, total_elements);
+            out.copy_from_slice(&temp);
+            return Ok(period_count);
+        }
+
+        let data = std::slice::from_raw_parts(in_ptr, len);
+        let (first, _max_p) =
+            rocr_batch_prepare(data, &combos).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let total_elements = period_count
+            .checked_mul(len)
+            .ok_or_else(|| JsValue::from_str("rocr_batch_into: rows*cols overflow"))?;
+
+        use std::mem::MaybeUninit;
+        let warms: Vec<usize> = combos
+            .iter()
+            .map(|c| {
+                let p = c.period.unwrap();
+                first
+                    .checked_add(p)
+                    .ok_or_else(|| JsValue::from_str("rocr_batch_into: warmup overflow"))
+            })
+            .collect::<Result<_, _>>()?;
+        let mu: &mut [MaybeUninit<f64>] =
+            std::slice::from_raw_parts_mut(out_ptr as *mut MaybeUninit<f64>, total_elements);
+        init_matrix_prefixes(mu, len, &warms);
+        let out = std::slice::from_raw_parts_mut(out_ptr, total_elements);
+
+        let simd = match detect_best_batch_kernel() {
+            Kernel::Avx512Batch => Kernel::Avx512,
+            Kernel::Avx2Batch => Kernel::Avx2,
+            _ => Kernel::Scalar,
+        };
+        rocr_batch_inner_into(data, &combos, first, simd, false, out)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(period_count)
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn rocr_output_into_js(
+    data: &[f64],
+    period: usize,
+    out: &js_sys::Float64Array,
+) -> Result<usize, JsValue> {
+    let values = rocr_js(data, period)?;
+    crate::write_wasm_f64_output("rocr_output_into_js", &values, out)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[wasm_bindgen]
+pub fn rocr_batch_output_into_js(
+    data: &[f64],
+    config: JsValue,
+    out: &js_sys::Object,
+) -> Result<usize, JsValue> {
+    let value = rocr_batch_js(data, config)?;
+    crate::write_wasm_selected_object_f64_outputs("rocr_batch_output_into_js", &value, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_csv;
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+    #[test]
+    fn test_rocr_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let input = RocrInput::from_candles(&candles, "close", RocrParams::default());
+        let baseline = rocr(&input)?.values;
+
+        let mut out = vec![0.0; candles.close.len()];
+        rocr_into(&input, &mut out)?;
+
+        assert_eq!(baseline.len(), out.len());
+        fn eq_or_both_nan(a: f64, b: f64) -> bool {
+            (a.is_nan() && b.is_nan()) || (a == b) || (a - b).abs() <= 1e-12
+        }
+        for (i, (&a, &b)) in baseline.iter().zip(out.iter()).enumerate() {
+            assert!(
+                eq_or_both_nan(a, b),
+                "mismatch at index {}: api={} into={}",
+                i,
+                a,
+                b
+            );
+        }
+        Ok(())
+    }
+
+    fn check_rocr_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let default_params = RocrParams { period: None };
+        let input = RocrInput::from_candles(&candles, "close", default_params);
+        let output = rocr_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+
+        Ok(())
+    }
+
+    fn check_rocr_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let input = RocrInput::from_candles(&candles, "close", RocrParams { period: Some(10) });
+        let result = rocr_with_kernel(&input, kernel)?;
+        let expected_last_five = [
+            0.9977448290950706,
+            0.9944380965183492,
+            0.9967247986764135,
+            0.9950545846019277,
+            0.984954072979463,
+        ];
+        let start = result.values.len().saturating_sub(5);
+        for (i, &val) in result.values[start..].iter().enumerate() {
+            let diff = (val - expected_last_five[i]).abs();
+            assert!(
+                diff < 1e-8,
+                "[{}] ROCR {:?} mismatch at idx {}: got {}, expected {}",
+                test_name,
+                kernel,
+                i,
+                val,
+                expected_last_five[i]
+            );
+        }
+        Ok(())
+    }
+
+    fn check_rocr_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let input = RocrInput::with_default_candles(&candles);
+        match input.data {
+            RocrData::Candles { source, .. } => assert_eq!(source, "close"),
+            _ => panic!("Expected RocrData::Candles"),
+        }
+        let output = rocr_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+
+        Ok(())
+    }
+
+    fn check_rocr_zero_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let input_data = [10.0, 20.0, 30.0];
+        let params = RocrParams { period: Some(0) };
+        let input = RocrInput::from_slice(&input_data, params);
+        let res = rocr_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] ROCR should fail with zero period",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_rocr_period_exceeds_length(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data_small = [10.0, 20.0, 30.0];
+        let params = RocrParams { period: Some(10) };
+        let input = RocrInput::from_slice(&data_small, params);
+        let res = rocr_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] ROCR should fail with period exceeding length",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_rocr_very_small_dataset(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let single_point = [42.0];
+        let params = RocrParams { period: Some(9) };
+        let input = RocrInput::from_slice(&single_point, params);
+        let res = rocr_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] ROCR should fail with insufficient data",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_rocr_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let first_params = RocrParams { period: Some(14) };
+        let first_input = RocrInput::from_candles(&candles, "close", first_params);
+        let first_result = rocr_with_kernel(&first_input, kernel)?;
+
+        let second_params = RocrParams { period: Some(14) };
+        let second_input = RocrInput::from_slice(&first_result.values, second_params);
+        let second_result = rocr_with_kernel(&second_input, kernel)?;
+
+        assert_eq!(second_result.values.len(), first_result.values.len());
+        for i in 28..second_result.values.len() {
+            assert!(
+                !second_result.values[i].is_nan(),
+                "[{}] ROCR Slice Reinput {:?} unexpected NaN at idx {}",
+                test_name,
+                kernel,
+                i,
+            );
+        }
+        Ok(())
+    }
+
+    fn check_rocr_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let input = RocrInput::from_candles(&candles, "close", RocrParams { period: Some(9) });
+        let res = rocr_with_kernel(&input, kernel)?;
+        assert_eq!(res.values.len(), candles.close.len());
+        if res.values.len() > 240 {
+            for (i, &val) in res.values[240..].iter().enumerate() {
+                assert!(
+                    !val.is_nan(),
+                    "[{}] Found unexpected NaN at out-index {}",
+                    test_name,
+                    240 + i
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn check_rocr_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let period = 9;
+
+        let input = RocrInput::from_candles(
+            &candles,
+            "close",
+            RocrParams {
+                period: Some(period),
+            },
+        );
+        let batch_output = rocr_with_kernel(&input, kernel)?.values;
+
+        let mut stream = RocrStream::try_new(RocrParams {
+            period: Some(period),
+        })?;
+
+        let mut stream_values = Vec::with_capacity(candles.close.len());
+        for &price in &candles.close {
+            match stream.update(price) {
+                Some(rocr_val) => stream_values.push(rocr_val),
+                None => stream_values.push(f64::NAN),
+            }
+        }
+
+        assert_eq!(batch_output.len(), stream_values.len());
+        for (i, (&b, &s)) in batch_output.iter().zip(stream_values.iter()).enumerate() {
+            if b.is_nan() && s.is_nan() {
+                continue;
+            }
+            let diff = (b - s).abs();
+            assert!(
+                diff < 1e-9,
+                "[{}] ROCR streaming f64 mismatch at idx {}: batch={}, stream={}, diff={}",
+                test_name,
+                i,
+                b,
+                s,
+                diff
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_rocr_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let candles = read_candles_from_csv(file_path)?;
+
+        let test_params = vec![
+            RocrParams::default(),
+            RocrParams { period: Some(1) },
+            RocrParams { period: Some(5) },
+            RocrParams { period: Some(20) },
+            RocrParams { period: Some(50) },
+            RocrParams { period: Some(100) },
+            RocrParams { period: Some(2) },
+        ];
+
+        for (param_idx, params) in test_params.iter().enumerate() {
+            let input = RocrInput::from_candles(&candles, "close", params.clone());
+            let output = rocr_with_kernel(&input, kernel)?;
+
+            for (i, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+						 with params: period={} (param set {})",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(10),
+                        param_idx
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+						 with params: period={} (param set {})",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(10),
+                        param_idx
+                    );
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+						 with params: period={} (param set {})",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(10),
+                        param_idx
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_rocr_no_poison(_test_name: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    #[cfg(feature = "proptest")]
+    #[allow(clippy::float_cmp)]
+    fn check_rocr_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use proptest::prelude::*;
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (1usize..=64).prop_flat_map(|period| {
+            (
+                prop::collection::vec(
+                    prop::strategy::Union::new(vec![
+                        (0.1f64..10000f64).boxed(),
+                        prop::strategy::Just(0.0).boxed(),
+                        (1e-10f64..1e-5f64).boxed(),
+                        (1e5f64..1e8f64).boxed(),
+                    ])
+                    .prop_filter("finite values", |x| x.is_finite() && *x >= 0.0),
+                    period..400,
+                ),
+                Just(period),
+            )
+        });
+
+        proptest::test_runner::TestRunner::default()
+            .run(&strat, |(data, period)| {
+                let params = RocrParams {
+                    period: Some(period),
+                };
+                let input = RocrInput::from_slice(&data, params);
+
+                let RocrOutput { values: out } = rocr_with_kernel(&input, kernel).unwrap();
+                let RocrOutput { values: ref_out } =
+                    rocr_with_kernel(&input, Kernel::Scalar).unwrap();
+
+                for i in 0..period {
+                    prop_assert!(
+                        out[i].is_nan(),
+                        "Expected NaN during warmup at index {}, got {}",
+                        i,
+                        out[i]
+                    );
+                }
+
+                for i in period..data.len() {
+                    let current = data[i];
+                    let past = data[i - period];
+
+                    let expected = if past == 0.0 || past.is_nan() {
+                        0.0
+                    } else {
+                        current / past
+                    };
+
+                    let y = out[i];
+                    let r = ref_out[i];
+
+                    if !y.is_nan() {
+                        let tolerance = if expected.abs() > 1.0 {
+                            expected.abs() * 1e-9
+                        } else {
+                            1e-9
+                        };
+
+                        prop_assert!(
+							(y - expected).abs() <= tolerance,
+							"ROCR formula mismatch at idx {}: got {}, expected {} (current={}, past={})",
+							i, y, expected, current, past
+						);
+
+                        prop_assert!(
+                            y >= 0.0,
+                            "ROCR should be non-negative at idx {}: got {}",
+                            i,
+                            y
+                        );
+
+                        if current == 0.0 && past != 0.0 {
+                            prop_assert!(
+                                y == 0.0,
+                                "ROCR should be 0 when current=0 at idx {}: got {}",
+                                i,
+                                y
+                            );
+                        }
+
+                        if past == 0.0 {
+                            prop_assert!(
+                                y == 0.0,
+                                "ROCR should be 0 when past=0 at idx {}: got {}",
+                                i,
+                                y
+                            );
+                        }
+
+                        prop_assert!(
+                            y.is_finite(),
+                            "ROCR should be finite at idx {}: got {} (current={}, past={})",
+                            i,
+                            y,
+                            current,
+                            past
+                        );
+                    }
+
+                    if period == 1 && i > 0 && data[i - 1] != 0.0 {
+                        let expected_simple = data[i] / data[i - 1];
+                        if !y.is_nan() {
+                            let tolerance = if expected_simple.abs() > 1.0 {
+                                expected_simple.abs() * 1e-9
+                            } else {
+                                1e-9
+                            };
+                            prop_assert!(
+                                (y - expected_simple).abs() <= tolerance,
+                                "Period=1 mismatch at idx {}: got {}, expected {}",
+                                i,
+                                y,
+                                expected_simple
+                            );
+                        }
+                    }
+
+                    if i >= period && period > 1 {
+                        let window = &data[i - period + 1..=i];
+
+                        let first_val = window[0];
+                        let is_constant = first_val != 0.0
+                            && window.iter().all(|&v| {
+                                (v - first_val).abs() <= 1e-10 * first_val.abs().max(1.0)
+                            });
+
+                        if is_constant {
+                            prop_assert!(
+                                (y - 1.0).abs() <= 1e-9,
+                                "Constant data should yield ROCR=1.0 at idx {}: got {}",
+                                i,
+                                y
+                            );
+                        }
+                    }
+
+                    let y_bits = y.to_bits();
+                    let r_bits = r.to_bits();
+
+                    if !y.is_finite() || !r.is_finite() {
+                        prop_assert!(
+                            y.to_bits() == r.to_bits(),
+                            "finite/NaN mismatch idx {}: {} vs {}",
+                            i,
+                            y,
+                            r
+                        );
+                        continue;
+                    }
+
+                    let ulp_diff: u64 = y_bits.abs_diff(r_bits);
+
+                    let max_ulp = if y.abs() > 1e6 || y.abs() < 1e-6 {
+                        8
+                    } else {
+                        4
+                    };
+
+                    prop_assert!(
+                        (y - r).abs() <= 1e-9 || ulp_diff <= max_ulp,
+                        "Kernel mismatch idx {}: {} vs {} (ULP={})",
+                        i,
+                        y,
+                        r,
+                        ulp_diff
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        Ok(())
+    }
+
+    macro_rules! generate_all_rocr_tests {
+        ($($test_fn:ident),*) => {
+            paste::paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar);
+                    }
+                )*
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _avx2_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2);
+                    }
+                    #[test]
+                    fn [<$test_fn _avx512_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512);
+                    }
+                )*
+            }
+        }
+    }
+
+    generate_all_rocr_tests!(
+        check_rocr_partial_params,
+        check_rocr_accuracy,
+        check_rocr_default_candles,
+        check_rocr_zero_period,
+        check_rocr_period_exceeds_length,
+        check_rocr_very_small_dataset,
+        check_rocr_reinput,
+        check_rocr_nan_handling,
+        check_rocr_streaming,
+        check_rocr_no_poison
+    );
+
+    #[cfg(feature = "proptest")]
+    generate_all_rocr_tests!(check_rocr_property);
+
+    fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let output = RocrBatchBuilder::new()
+            .period_static(10)
+            .kernel(kernel)
+            .apply_candles(&c, "close")?;
+
+        let def = RocrParams::default();
+        let row = output.values_for(&def).expect("default row missing");
+
+        assert_eq!(row.len(), c.close.len());
+
+        let expected = [
+            0.9977448290950706,
+            0.9944380965183492,
+            0.9967247986764135,
+            0.9950545846019277,
+            0.984954072979463,
+        ];
+        let start = row.len() - 5;
+        for (i, &v) in row[start..].iter().enumerate() {
+            assert!(
+                (v - expected[i]).abs() < 1e-8,
+                "[{test}] default-row mismatch at idx {i}: {v} vs {expected:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+        let c = read_candles_from_csv(file)?;
+
+        let test_configs = vec![
+            (2, 10, 2),
+            (5, 25, 5),
+            (30, 60, 15),
+            (2, 5, 1),
+            (10, 50, 10),
+            (1, 3, 1),
+            (100, 200, 50),
+        ];
+
+        for (cfg_idx, &(p_start, p_end, p_step)) in test_configs.iter().enumerate() {
+            let output = RocrBatchBuilder::new()
+                .kernel(kernel)
+                .period_range(p_start, p_end, p_step)
+                .apply_candles(&c, "close")?;
+
+            for (idx, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+                let row = idx / output.cols;
+                let col = idx % output.cols;
+                let combo = &output.combos[row];
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+						 at row {} col {} (flat index {}) with params: period={}",
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(10)
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+						 at row {} col {} (flat index {}) with params: period={}",
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(10)
+                    );
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+						 at row {} col {} (flat index {}) with params: period={}",
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(10)
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_batch_no_poison(_test: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    macro_rules! gen_batch_tests {
+        ($fn_name:ident) => {
+            paste::paste! {
+                #[test] fn [<$fn_name _scalar>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx2>]()        {
+                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx512>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                }
+                #[test] fn [<$fn_name _auto_detect>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]),
+                                     Kernel::Auto);
+                }
+            }
+        };
+    }
+    gen_batch_tests!(check_batch_default_row);
+    gen_batch_tests!(check_batch_no_poison);
+}

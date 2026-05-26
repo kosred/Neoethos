@@ -13,9 +13,10 @@
 //! `with_n_classes(3)` at construction (see
 //! `deep_models.rs::default_*_config` for each — 7 call sites at
 //! lines 646, 654, 661, 667, 674, 689, 695, 703, 715, 723). They
-//! emit 3-class softmax probabilities over `[sell, neutral, buy]`
-//! exactly like the D1.2.2 classifiers, just via a time-series
-//! architecture rather than a feed-forward / KAN / TabNet one.
+//! emit 3-class softmax probabilities over `[neutral, buy, sell]`
+//! (canonical order — see `base.rs` lines 128-135) exactly like
+//! the D1.2.2 classifiers, just via a time-series architecture
+//! rather than a feed-forward / KAN / TabNet one.
 //!
 //! In other words: the architecture is "time-series", the OUTPUT
 //! HEAD is 3-class classification. The "forecast" framing only

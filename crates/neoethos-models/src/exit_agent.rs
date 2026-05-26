@@ -12,6 +12,7 @@ use burn::nn;
 use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
+use burn::tensor::backend::BackendTypes;
 use burn::record::{DefaultFileRecorder, FullPrecisionSettings, Recorder};
 
 use polars::prelude::{DataFrame, DataType, Series};
@@ -538,7 +539,7 @@ pub struct ExitAgent {
     training_report: Option<ExitAgentTrainingReport>,
     trained_checkpoint_ready: bool,
     train_step_count: usize,
-    device: <TrainBackend as Backend>::Device,
+    device: <TrainBackend as BackendTypes>::Device,
     requested_device_policy: String,
     effective_device_policy: String,
     execution_backend: String,
@@ -616,11 +617,18 @@ impl ExitAgent {
     pub fn with_device_policy(mut self, policy: impl Into<String>) -> Self {
         let requested = policy.into();
         let (device, selection) = resolve_train_device(&requested);
+        // **2026-05-25 — gpu-vulkan build fix**: under the wgpu backend
+        // `Device` is a non-Copy handle (vs. `NdArrayDevice` which is
+        // a zero-sized Copy type). The previous code moved `device`
+        // into `self.device` on the line above and then tried to
+        // `&device` it for `init()` — which only compiled when the
+        // device was Copy. Borrow from `self.device` so the same
+        // source works for both backends.
         self.device = device;
         self.model = ExitAgentNetConfig::new()
             .with_input_dim(self.input_dim)
             .with_hidden_dim(self.hidden_dim)
-            .init(&device);
+            .init(&self.device);
         self.target_model = self.model.clone();
         self.optim = AdamWConfig::new().with_weight_decay(1e-4).init();
         self.invalidate_trained_runtime_state();

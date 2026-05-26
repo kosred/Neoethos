@@ -64,6 +64,33 @@ pub struct SymbolMetadata {
     /// on price). Not authoritative — use a live quote when you have
     /// one. None for symbols with no obvious "typical" value.
     pub typical_price: Option<f64>,
+    /// **F-126 fix (2026-05-25)** — broker-authoritative typical spread
+    /// in pips for this symbol. Replaces the per-asset-class synthetic
+    /// defaults in `genetic::strategy_gene::infer_market_cost_profile`
+    /// (metal 2.5 / crypto 8 / fx 1.5 — F-029 root cause). When `Some`,
+    /// the backtest cost-model MUST use this value instead of the
+    /// asset-class heuristic. When `None`, the caller is responsible
+    /// for supplying an override or rejecting the backtest.
+    ///
+    /// Sourced from cTrader's `ProtoOASymbol::spread` field (in pips)
+    /// or an operator override in `data/symbol_metadata.json`. Use
+    /// `serde(default)` so existing on-disk tables without this field
+    /// load with `None`.
+    #[serde(default)]
+    pub typical_spread_pips: Option<f64>,
+    /// **F-126 fix (2026-05-25)** — broker-authoritative commission per
+    /// standard lot, denominated in `quote` currency. Replaces the
+    /// hardcoded `$7 per lot` synthetic default in
+    /// `infer_market_cost_profile`. When `Some`, the backtest cost-model
+    /// MUST use this value instead of the synthetic default. When
+    /// `None`, the caller is responsible for supplying an override or
+    /// rejecting the backtest.
+    ///
+    /// Sourced from cTrader's commission schedule (per-symbol via
+    /// `ProtoOASymbolCommissionType` + `commission` fields) or an
+    /// operator override in `data/symbol_metadata.json`.
+    #[serde(default)]
+    pub commission_per_lot: Option<f64>,
 }
 
 impl SymbolMetadata {
@@ -345,6 +372,10 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             max_lot: 100.0,
             lot_step: 0.01,
             typical_price: Some(2_400.0),
+            // F-126 fix: None forces caller to supply real broker spread
+            // / commission — no per-asset-class synthetic default.
+            typical_spread_pips: None,
+            commission_per_lot: None,
         },
         "XAGUSD" => SymbolMetadata {
             symbol: canon,
@@ -358,6 +389,8 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             max_lot: 100.0,
             lot_step: 0.01,
             typical_price: Some(28.0),
+            typical_spread_pips: None,
+            commission_per_lot: None,
         },
         // ── Crypto ──
         "BTCUSD" => SymbolMetadata {
@@ -372,6 +405,8 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             max_lot: 100.0,
             lot_step: 0.01,
             typical_price: Some(70_000.0),
+            typical_spread_pips: None,
+            commission_per_lot: None,
         },
         "ETHUSD" => SymbolMetadata {
             symbol: canon,
@@ -385,6 +420,8 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             max_lot: 100.0,
             lot_step: 0.01,
             typical_price: Some(3_500.0),
+            typical_spread_pips: None,
+            commission_per_lot: None,
         },
         _ => return None,
     };
@@ -413,6 +450,8 @@ fn fx(
         max_lot: 100.0,
         lot_step: 0.01,
         typical_price: typical,
+        typical_spread_pips: None,
+        commission_per_lot: None,
     }
 }
 
@@ -434,6 +473,8 @@ fn fx_jpy(symbol: String, base: &str, quote: &str, typical: Option<f64>) -> Symb
         max_lot: 100.0,
         lot_step: 0.01,
         typical_price: typical,
+        typical_spread_pips: None,
+        commission_per_lot: None,
     }
 }
 

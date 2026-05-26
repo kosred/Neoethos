@@ -102,8 +102,13 @@ pub fn ewma_f32(values: &[f32], alpha: f32) -> Vec<f32> {
     let a = alpha.clamp(0.0, 1.0);
     let mut out = Vec::with_capacity(values.len());
     out.push(values[0]);
+    // **2026-05-25 unwrap audit**: `out` is seeded with `values[0]`
+    // on the line above, so `out.last()` is always Some. Even so,
+    // pattern-match per the no-panic doctrine. A future regression
+    // that removes the seed would now propagate NaN through the EWMA
+    // stream instead of crashing the indicator pipeline.
     for v in &values[1..] {
-        let prev = *out.last().unwrap();
+        let prev = out.last().copied().unwrap_or(f32::NAN);
         out.push(a * v + (1.0 - a) * prev);
     }
     out

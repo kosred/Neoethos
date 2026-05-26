@@ -813,11 +813,14 @@ fn infer_snapshot(
     let window_volatility = volatility(&series.values[series.values.len() - last_window..]);
     let baseline_volatility = volatility(&series.values).max(1e-6);
 
+    // **2026-05-25 unwrap audit**: upstream guarantees non-empty
+    // (every slicing op above relies on `series.values.len() >= 1`),
+    // but per the no-panic doctrine we fall back to NaN if a future
+    // regression breaks that invariant. NaN propagates safely through
+    // the swarm pipeline; the operator sees a degraded snapshot
+    // instead of a process crash.
     SwarmForecastSnapshot {
-        last_value: *series
-            .values
-            .last()
-            .expect("training series snapshot requires at least one value"),
+        last_value: series.values.last().copied().unwrap_or(f32::NAN),
         rolling_mean,
         drift_slope: slope,
         volatility: window_volatility,
@@ -1044,9 +1047,15 @@ fn signed_direction(value: f32) -> f32 {
 
 fn ewma_forecast(values: &[f32], horizon: usize, alpha: f32) -> Vec<f32> {
     let alpha = alpha.clamp(0.05, 0.95);
-    let mut smoothed = *values
-        .last()
-        .expect("EWMA forecast requires at least one observation");
+    // **2026-05-25 unwrap audit**: an empty observation set used to
+    // panic the entire forecast worker. Now we return a NaN-filled
+    // horizon — the downstream ensemble already handles NaN slots
+    // (drops the contributor + degrades the consensus) so the rest
+    // of the pipeline keeps running.
+    let Some(&seed) = values.last() else {
+        return vec![f32::NAN; horizon];
+    };
+    let mut smoothed = seed;
     for value in values.iter().copied() {
         smoothed = alpha * value + (1.0 - alpha) * smoothed;
     }
@@ -2591,10 +2600,13 @@ fn build_local_snapshot_with_min(
         }
     }
 
+    // **2026-05-25 unwrap audit**: the `values.len() < min_observations`
+    // bail at the top of this function (min_observations >= 8) makes
+    // the `.last()` infallible. Even so, fall back to NaN per the
+    // no-panic doctrine — the downstream consumer treats NaN as a
+    // degraded contributor.
     Ok(SwarmForecastSnapshot {
-        last_value: *values
-            .last()
-            .expect("local swarm snapshot requires at least one value"),
+        last_value: values.last().copied().unwrap_or(f32::NAN),
         rolling_mean,
         drift_slope: slope,
         volatility: window_volatility,

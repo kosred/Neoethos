@@ -49,11 +49,30 @@ use std::{env, fs};
 
 /// Current schema version this build writes when saving Risky Mode
 /// state. Bumped on breaking changes to [`RiskyModeStateFile`].
-pub const RISKY_MODE_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+///
+/// **v2 (2026-05-25)** — added `last_killed_at_utc_ms` for the 24h
+/// auto re-arm cooldown (operator directive F-231/F-501/F-630). v1
+/// files load cleanly because the new field has `#[serde(default)]`
+/// → `None`, which means "no kill on record" → Risky Mode behaves
+/// exactly like v1 on legacy files.
+pub const RISKY_MODE_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
+
+/// Cooldown duration before Risky Mode auto re-arms after a
+/// kill-switch trip. Operator-chosen 24h via the architectural
+/// AskUserQuestion answer (2026-05-25).
+pub const RISKY_MODE_AUTO_REARM_COOLDOWN_MS: i64 = 24 * 60 * 60 * 1000;
 
 const APP_CONFIG_SUBDIR: &str = "neoethos";
 const STATE_FILENAME: &str = "risky_mode_state.json";
-const ENV_OVERRIDE_VAR: &str = "NEOETHOS_RISKY_MODE_STATE_PATH";
+
+// **F-CORE3 closure (2026-05-25)**: the canonical env-var name lives
+// in `app_services::env_overrides::ENV_RISKY_MODE_STATE_PATH`; the
+// test-only alias below keeps the in-file `#[cfg(test)]` set_var /
+// remove_var calls readable (and `cargo check` clean) without
+// duplicating the string literal.
+#[cfg(test)]
+const ENV_OVERRIDE_VAR: &str =
+    crate::app_services::env_overrides::ENV_RISKY_MODE_STATE_PATH;
 
 /// On-disk representation of the operator's Risky Mode arm decision.
 ///
@@ -101,6 +120,50 @@ pub struct RiskyModeStateFile {
     /// app instance detect a stale file.
     #[serde(default)]
     pub last_updated_utc_ms: i64,
+    /// **F-231/F-501/F-630 closure (2026-05-25 — schema v2)**: Unix-
+    /// millisecond timestamp of the last time the Risky Mode kill-
+    /// switch tripped. When non-`None` AND within the
+    /// [`RISKY_MODE_AUTO_REARM_COOLDOWN_MS`] window from `now`, the
+    /// `armed` flag is forced to `false` regardless of its persisted
+    /// value — the kill-switch sticks for 24 h. After the cooldown,
+    /// the background task in `server::bridge::run` calls
+    /// `auto_re_arm_if_ready` which sets `armed = true` (operator-
+    /// approved auto re-arm policy) and clears this field.
+    ///
+    /// `None` = no kill on record (initial state, or post-re-arm).
+    #[serde(default)]
+    pub last_killed_at_utc_ms: Option<i64>,
+}
+
+impl RiskyModeStateFile {
+    /// How many seconds remain on the kill-switch cooldown. `None` =
+    /// either no kill on record (`last_killed_at_utc_ms is None`) or
+    /// the 24 h has already elapsed. UI surfaces the remainder as
+    /// "Auto re-arm in 17h 23m" so the operator knows when Risky
+    /// Mode will come back online without an explicit action.
+    pub fn cooldown_remaining_secs(&self, now_utc_ms: i64) -> Option<u64> {
+        let killed_at = self.last_killed_at_utc_ms?;
+        let elapsed = now_utc_ms.saturating_sub(killed_at);
+        if elapsed >= RISKY_MODE_AUTO_REARM_COOLDOWN_MS {
+            None
+        } else {
+            Some(((RISKY_MODE_AUTO_REARM_COOLDOWN_MS - elapsed) / 1000) as u64)
+        }
+    }
+
+    /// Whether the kill-switch cooldown has elapsed since the last
+    /// kill. `true` when (a) a kill is on record AND (b) more than
+    /// 24 h have passed. The background task uses this gate before
+    /// flipping `armed = true` and clearing `last_killed_at_utc_ms`.
+    pub fn auto_rearm_ready(&self, now_utc_ms: i64) -> bool {
+        match self.last_killed_at_utc_ms {
+            Some(killed_at) => {
+                let elapsed = now_utc_ms.saturating_sub(killed_at);
+                elapsed >= RISKY_MODE_AUTO_REARM_COOLDOWN_MS
+            }
+            None => false,
+        }
+    }
 }
 
 impl Default for RiskyModeStateFile {
@@ -112,6 +175,7 @@ impl Default for RiskyModeStateFile {
             starting_capital_usd: None,
             autonomous_only_contract_accepted: false,
             last_updated_utc_ms: 0,
+            last_killed_at_utc_ms: None,
         }
     }
 }
@@ -137,10 +201,13 @@ pub fn state_file_path() -> Result<PathBuf> {
     // set it bypasses both existing-file lookup AND the fallback
     // chain so tests target an isolated temp path without silently
     // falling through to the operator's real config dir.
-    if let Ok(custom) = env::var(ENV_OVERRIDE_VAR) {
-        if !custom.trim().is_empty() {
-            return Ok(PathBuf::from(custom));
-        }
+    //
+    // **F-CORE3 closure (2026-05-25)**: routed through the canonical
+    // `env_overrides::risky_mode_state_path_override` typed getter.
+    if let Some(custom) =
+        crate::app_services::env_overrides::risky_mode_state_path_override()
+    {
+        return Ok(PathBuf::from(custom));
     }
 
     let candidates = candidate_paths()?;
@@ -185,9 +252,10 @@ fn candidate_paths() -> Result<Vec<PathBuf>> {
 /// Idempotent: a re-save with the same field values rewrites the
 /// file in place. Concurrent saves rely on the OS's atomic write —
 /// this is the same guarantee broker_persistence offers.
-// Used by the saved_state_roundtrip test in this file. Production write
-// path lives elsewhere — wired up when the Flutter risky-mode UI lands.
-#[allow(dead_code)]
+// **F-231/F-501/F-630 closure (2026-05-25)**: `save_risky_mode_state`
+// is now USED by `record_kill_switch_trip` and `auto_re_arm_if_ready`
+// below, so the `#[allow(dead_code)]` that masked it during the
+// pre-Flutter-wizard interim is gone. Production write path is live.
 pub fn save_risky_mode_state(state: &RiskyModeStateFile) -> Result<()> {
     let path = state_file_path().context("resolve risky mode state path")?;
 
@@ -214,6 +282,70 @@ pub fn save_risky_mode_state(state: &RiskyModeStateFile) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// **F-231/F-501/F-630 closure (2026-05-25)** — record a kill-switch
+/// trip on the persistent state file. Called from the trading order
+/// path when `RiskyModeManager::check_trade_allowed` returns `Err`.
+///
+/// Effect:
+/// - `armed = false` (kill-switch active)
+/// - `last_killed_at_utc_ms = Some(now)` (24 h cooldown clock starts)
+///
+/// The background task in `server::bridge::run` checks
+/// `auto_rearm_ready` every 5 s; once the 24 h cooldown elapses it
+/// calls `auto_re_arm_if_ready` (below) to flip `armed = true` and
+/// clear `last_killed_at_utc_ms` automatically.
+pub fn record_kill_switch_trip() -> Result<()> {
+    let mut state = load_risky_mode_state()
+        .context("load risky mode state before kill-switch trip")?
+        .unwrap_or_default();
+    state.armed = false;
+    state.last_killed_at_utc_ms = Some(current_unix_ms());
+    save_risky_mode_state(&state).context("persist kill-switch trip timestamp")?;
+    tracing::warn!(
+        target: "neoethos_app::risky_mode_persistence",
+        killed_at_utc_ms = state.last_killed_at_utc_ms,
+        cooldown_hours = RISKY_MODE_AUTO_REARM_COOLDOWN_MS / (60 * 60 * 1000),
+        "Risky Mode kill-switch tripped; 24h auto re-arm cooldown started"
+    );
+    Ok(())
+}
+
+/// **F-231/F-501/F-630 closure (2026-05-25)** — auto-rearm helper
+/// called periodically from the bridge polling loop. Returns
+/// `Ok(true)` when the cooldown has elapsed AND the state was
+/// flipped; `Ok(false)` when no action is needed (no kill on
+/// record, or cooldown still in progress).
+///
+/// Effect (when ready):
+/// - `armed = true` (Risky Mode comes back online)
+/// - `last_killed_at_utc_ms = None` (cooldown cleared)
+///
+/// Idempotent: calling repeatedly after re-arm returns `Ok(false)`.
+/// The bridge task can poll every 5 s without worrying about
+/// double-flips.
+pub fn auto_re_arm_if_ready() -> Result<bool> {
+    let Some(mut state) =
+        load_risky_mode_state().context("load risky mode state for auto re-arm check")?
+    else {
+        // No state file → no kill on record → nothing to re-arm.
+        return Ok(false);
+    };
+    let now = current_unix_ms();
+    if !state.auto_rearm_ready(now) {
+        return Ok(false);
+    }
+    state.armed = true;
+    state.last_killed_at_utc_ms = None;
+    save_risky_mode_state(&state).context("persist auto re-arm")?;
+    tracing::warn!(
+        target: "neoethos_app::risky_mode_persistence",
+        re_armed_at_utc_ms = now,
+        "Risky Mode auto re-armed after 24h cooldown — operator-approved policy. \
+         Operator can manually disarm via Settings if undesired."
+    );
+    Ok(true)
 }
 
 /// Load the Risky Mode arm state from disk.

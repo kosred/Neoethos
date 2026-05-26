@@ -1,5 +1,4 @@
 use super::strategy_gene::Gene;
-use std::collections::HashMap;
 
 pub type EvalMetrics = [f64; 11];
 
@@ -13,22 +12,17 @@ pub struct DiversityKey {
     pub dd_bin: u8,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct DiversityArchiveConfig {
-    pub max_total: usize,
-    pub per_bucket_cap: usize,
-    pub min_archive_score: f64,
-}
-
-// `DiversityArchiveConfig::from_env` was retired during Phase 19 of the
-// consolidated audit follow-on: the helper had no callers in this crate or
-// any of its dependents, so the only remaining behavior was reading the
-// `FOREX_BOT_PROP_DIVERSE_*` env vars on demand. Production diversity
-// archive caps are configured directly through the typed
-// `DiversityArchiveConfig` fields by the caller; if a future feature needs
-// env-driven defaults again, add them through a typed `*RuntimeOverrides`
-// boundary like `GeneticSearchRuntimeOverrides` rather than reintroducing
-// inline env reads.
+// `DiversityArchiveConfig` + `select_diverse_archive` + `archive_quality_score` —
+// DELETED 2026-05-26 (operator directive: dual-mode product). Three structs/fns
+// with zero callers outside their own tests. Diversity gating now happens at
+// two narrower seams:
+//   - `seen_signature_memory` (genetic::evolution_math) deduplicates the
+//     working population by gene signature.
+//   - `correlation` pruning at `discovery.rs::finalize_candidates_with_progress`
+//     enforces portfolio-level diversity on the FINAL strategies.
+// The `DiversityKey` + `diversity_key` + `smc_mask` helpers below are kept —
+// they remain useful for telemetry/funnel diagnostics even though no live
+// archive selection consumes them right now.
 
 use neoethos_core::utils::finite_or;
 
@@ -82,74 +76,6 @@ pub fn diversity_key(gene: &Gene, metrics: &EvalMetrics) -> DiversityKey {
     }
 }
 
-pub fn archive_quality_score(metrics: &EvalMetrics) -> f64 {
-    let net = finite_or(metrics[0], 0.0);
-    let sharpe = finite_or(metrics[1], 0.0);
-    let max_dd = finite_or(metrics[3], 1.0).max(0.0);
-    let win_rate = finite_or(metrics[4], 0.0).clamp(0.0, 1.0);
-    let profit_factor = finite_or(metrics[5], 0.0).max(0.0);
-    let expectancy = finite_or(metrics[6], 0.0);
-    let trades = finite_or(metrics[8], 0.0).max(0.0);
-    let consistency = finite_or(metrics[9], 0.0).clamp(0.0, 1.0);
-
-    let trade_confidence = (trades.sqrt() / 12.0).min(1.0);
-    let net_component = (net / 10_000.0).clamp(-5.0, 5.0) * 0.25;
-    let sharpe_component = sharpe.clamp(-3.0, 5.0) * 0.25 * trade_confidence;
-    let pf_component = ((profit_factor - 1.0) * 0.75).clamp(-2.0, 3.0) * 0.20;
-    let consistency_component = consistency * 0.20;
-    let win_component = ((win_rate - 0.45) * 2.0).clamp(0.0, 0.8) * 0.10;
-    let expectancy_component = (expectancy / 100.0).clamp(-2.0, 2.0) * 0.10;
-    let dd_penalty = (max_dd * 12.0).min(4.0);
-
-    net_component
-        + sharpe_component
-        + pf_component
-        + consistency_component
-        + win_component
-        + expectancy_component
-        - dd_penalty
-}
-
-pub fn select_diverse_archive(
-    mut archive: Vec<(Gene, EvalMetrics, usize)>,
-    config: DiversityArchiveConfig,
-) -> Vec<(Gene, EvalMetrics, usize)> {
-    archive.sort_by(|a, b| {
-        archive_quality_score(&b.1)
-            .partial_cmp(&archive_quality_score(&a.1))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.2.cmp(&b.2))
-    });
-
-    let mut bucket_counts: HashMap<DiversityKey, usize> = HashMap::new();
-    let mut selected = Vec::with_capacity(config.max_total.min(archive.len()));
-
-    for (gene, metrics, seq) in archive {
-        let score = archive_quality_score(&metrics);
-        if score < config.min_archive_score {
-            continue;
-        }
-        let key = diversity_key(&gene, &metrics);
-        let count = bucket_counts.entry(key).or_insert(0);
-        if *count >= config.per_bucket_cap {
-            continue;
-        }
-        *count += 1;
-        selected.push((gene, metrics, seq));
-        if selected.len() >= config.max_total {
-            break;
-        }
-    }
-
-    selected.sort_by(|a, b| {
-        b.1[0]
-            .partial_cmp(&a.1[0])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.2.cmp(&b.2))
-    });
-    selected
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,35 +111,14 @@ mod tests {
     }
 
     #[test]
-    fn diversity_selection_limits_bucket_dominance() {
-        let mut archive = Vec::new();
-        for i in 0..10 {
-            archive.push((
-                test_gene(&format!("same_{i}"), true, 40.0, 20.0),
-                test_metrics(10_000.0 - i as f64, 1.8, 0.04, 120.0),
-                i,
-            ));
-        }
-        archive.push((
-            test_gene("different", false, 25.0, 20.0),
-            test_metrics(5_000.0, 1.5, 0.03, 90.0),
-            99,
-        ));
-
-        let selected = select_diverse_archive(
-            archive,
-            DiversityArchiveConfig {
-                max_total: 20,
-                per_bucket_cap: 3,
-                min_archive_score: f64::NEG_INFINITY,
-            },
-        );
-
-        assert_eq!(selected.len(), 4);
-        assert!(
-            selected
-                .iter()
-                .any(|(gene, _, _)| gene.strategy_id == "different")
-        );
+    fn diversity_key_distinguishes_indicator_bins() {
+        // Sanity: two genes that differ in indicator count produce different keys.
+        let one = test_gene("one", true, 40.0, 20.0);
+        let mut two = test_gene("two", true, 40.0, 20.0);
+        two.indices.push(2);
+        two.weights.push(0.25);
+        let metrics_a = test_metrics(1_000.0, 1.5, 0.03, 50.0);
+        let metrics_b = test_metrics(1_000.0, 1.5, 0.03, 50.0);
+        assert_ne!(diversity_key(&one, &metrics_a), diversity_key(&two, &metrics_b));
     }
 }

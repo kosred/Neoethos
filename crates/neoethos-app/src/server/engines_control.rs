@@ -300,11 +300,16 @@ pub async fn training_stop(State(state): State<AppApiState>) -> Json<StopRespons
 // ─── shared helpers ───────────────────────────────────────────────────────
 
 /// Where the engines pull their input data from. Mirrors backend startup
-/// wiring: load `config.yaml` from CWD, then take `system.data_dir` from it.
+/// wiring: load the CLI-configured `config.yaml` (see
+/// `server::state::install_config_path`), then take `system.data_dir`
+/// from it.
 async fn resolve_data_root() -> Result<PathBuf> {
-    tokio::task::spawn_blocking(|| {
-        let settings = Settings::from_yaml("config.yaml")
-            .map_err(|e| anyhow::anyhow!("config.yaml not loadable: {e}"))?;
+    // F-553/F-576 closure (2026-05-25): resolved via the process-wide
+    // install so a non-default `--config` flag still works.
+    let config_path = super::state::current_config_path();
+    tokio::task::spawn_blocking(move || {
+        let settings = Settings::from_yaml(&config_path)
+            .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
         Ok(settings.system.data_dir)
     })
     .await
@@ -409,7 +414,7 @@ async fn preflight_discovery_data_root(
 ///
 ///     Discovery (GA-evolves a portfolio)
 ///        ↓ writes model_targets.json
-///     Training (33-model ensemble fits per model_targets.json)
+///     Training (34-model ensemble fits per model_targets.json)
 ///        ↓ writes models/*.{pkl,joblib,pt}
 ///     (Auto-Trader — lands in a follow-up)
 ///
