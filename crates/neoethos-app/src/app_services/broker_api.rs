@@ -419,12 +419,30 @@ pub fn submit_market_order_blocking(
     let creds = resolve_creds()?;
 
     // Resolve the symbol so we know its id + lot_size for volume
-    // conversion. cTrader expresses volume in centi-lots: 1 lot of
-    // EURUSD ≈ 100,000 units in the base currency, and the protocol
-    // wants that × 100 = 10,000,000. The resolved `lot_size` field is
-    // the unit count per 1 lot (typically 100,000 for FX), so we go
-    // `volume_units = volume_lots * lot_size * 100` to land in
-    // centi-units the way `parse_execution_event` will read them back.
+    // conversion.
+    //
+    // **2026-05-26 fix v2 (Κωνσταντίνος)**: cTrader's
+    // `ProtoOASymbol.lot_size` is documented as "Lot size in
+    // 1/100 of a unit" — i.e., it's ALREADY in cents (centi-units
+    // of base currency). For EURUSD the broker returns
+    // 10_000_000 = 100,000 EUR × 100 cents. The prior code further
+    // multiplied by `* 100.0` on top of that, which made every
+    // order 100× larger than the operator requested — a default
+    // 0.01-lot click opened a 1.0-lot position (100k EUR exposure
+    // instead of 1k), and on cTrader Demo the silent inflation went
+    // unnoticed until live close-position rejection surfaced the
+    // volume mismatch.
+    //
+    // Verified empirically against this Demo account (47367144,
+    // 2026-05-26): user typed 0.01 → backend computed
+    // 0.01 × 10_000_000 × 100 = 10_000_000 → broker stored a
+    // 1.0-lot position with `tradeData.volume = 10_000_000`. Removing
+    // the spurious `× 100` makes 0.01 × 10_000_000 = 100_000 wire,
+    // which is exactly 0.01 lot (1,000 EUR exposure × 100 cents).
+    //
+    // The `unwrap_or` fallback is now 10_000_000 (the cents-per-lot
+    // value for standard FX) so a missing catalog entry still
+    // produces sane volumes instead of 100× under-sizing.
     let resolved: CTraderResolvedSymbol = resolve_symbol(&CTraderSymbolLookupRequest {
         client_id: creds.client_id.clone(),
         client_secret: creds.client_secret.clone(),
@@ -433,8 +451,8 @@ pub fn submit_market_order_blocking(
         account_id: creds.account_id_str.clone(),
         symbol_name: symbol.to_string(),
     })?;
-    let lot_size = resolved.symbol.lot_size.unwrap_or(100_000);
-    let volume_units = (volume_lots * lot_size as f64 * 100.0).round() as i64;
+    let lot_size = resolved.symbol.lot_size.unwrap_or(10_000_000);
+    let volume_units = (volume_lots * lot_size as f64).round() as i64;
     if volume_units <= 0 {
         return Err(anyhow!(
             "computed volume ({volume_units}) is not positive — \

@@ -572,14 +572,35 @@ fn position_to_payload(
     resolved_name: Option<String>,
     pnl_by_position: &HashMap<i64, BrokerPositionPnL>,
 ) -> PositionPayload {
-    // cTrader feeds `volume` as already-converted lots (f64). The
-    // close-position endpoint wants broker volume units (centi-lots).
-    // Convert via the standard FX lot_size: 1 lot = 100,000 units;
-    // 1 lot in centi-units = 100,000 * 100 = 10_000_000. Non-FX
-    // instruments may have other lot_sizes — once we plumb the
-    // symbol catalog through here we'll look up the real lot_size
-    // per symbol. For the MVP, EURUSD-shaped FX is the common case.
-    let volume_units = (p.volume * 100_000.0 * 100.0).round() as i64;
+    // **2026-05-26 fix v2 (Κωνσταντίνος)**: corrected unit conversion
+    // for the Close-Position endpoint. Empirical chain from live trace
+    // against cTrader Demo account 47367144, position 262647379:
+    //
+    //   * cTrader proto wire field `tradeData.volume` is in CENTS of
+    //     base currency (1 lot EURUSD = 100,000 EUR × 100 = 10,000,000
+    //     wire units).
+    //   * `volume_to_units(wire) = wire / 100.0` in
+    //     `ctrader_account.rs:885`, so `p.volume` stored in the
+    //     snapshot is base-currency UNITS — not cents and not lots.
+    //     For a 1.0 standard lot EURUSD: p.volume = 100,000.
+    //   * The Close-Position endpoint (`ProtoOAClosePositionReq.volume`)
+    //     wants the same unit as `tradeData.volume`, i.e. CENTS.
+    //   * Therefore: `volume_units = p.volume * 100`.
+    //
+    // History:
+    //   v1 (this session, earlier): assumed `p.volume` was already in
+    //   cents — passed through → still 100× too small.
+    //   pre-v1 (the dev's original): assumed `p.volume` was in lots —
+    //   computed `lots * 100_000 * 100 = 10^7` → 10^7× too large.
+    //   v2 (here): `p.volume * 100` produces the correct wire volume.
+    //
+    // Verified against the broker's TRADING_BAD_VOLUME error trace:
+    //   "Order closeVolume 10000000000 is bigger than position
+    //    volume 100000" — broker displays in `wire / 100` units, so a
+    //   1.0-lot position shows 100,000 there too. To close it, the
+    //   close request must send wire volume = 10,000,000, which is
+    //   `snapshot.volume (100_000) * 100`.
+    let volume_units = (p.volume * 100.0).round() as i64;
 
     // #134 — broker-authoritative net unrealized PnL in the account
     // currency. The pnl module already handles money-digit scaling +

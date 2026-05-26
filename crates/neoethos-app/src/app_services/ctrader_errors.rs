@@ -98,12 +98,30 @@ pub fn translate_code(code: &str) -> TranslatedError {
         ),
 
         // ── Order placement & execution ────────────────────────────
-        "MARKET_CLOSED" | "TRADING_BAD_VOLUME" | "MARKET_NOT_OPEN" => (
+        "MARKET_CLOSED" | "MARKET_NOT_OPEN" => (
             "Markets are closed right now (weekend, holiday, or session gap). \
              Your order will be rejected until the session re-opens.",
             None,
             None,
             "info",
+        ),
+        // **2026-05-26 fix (Κωνσταντίνος)**: TRADING_BAD_VOLUME was
+        // mis-grouped under "markets closed" — completely wrong. The
+        // proto comment is literally "Invalid volume." Surface a real
+        // explanation so the operator can see when our volume-unit
+        // arithmetic mismatches the broker's expectation (the cause
+        // of every failed Close-Position until the bridge.rs ×10^7
+        // multiplier bug was fixed). Severity = error because this
+        // means the order WILL NOT execute as requested, not "wait
+        // a bit and retry".
+        "TRADING_BAD_VOLUME" => (
+            "Invalid order volume. The amount you submitted is either \
+             below the broker's minimum, above the maximum, or doesn't \
+             match the position you're closing. Check the size and try \
+             again, or report this if it persists on a normal-sized order.",
+            None,
+            None,
+            "error",
         ),
         "TRADING_DISABLED" => (
             "Trading is disabled on this account. Check with your broker if \

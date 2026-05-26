@@ -84,11 +84,29 @@ pub const CODEX_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 /// be rejected by the issuer.
 pub const CODEX_CALLBACK_PORT: u16 = 1455;
 
-/// API base for ChatGPT-subscription chat completions. The `/v1`
-/// suffix is conventional but the Codex backend exposes the OpenAI
-/// chat shape directly at `/conversation`. We use the
-/// `/backend-api/conversation` path to stay aligned with the Codex
-/// CLI, which is what subscription accounts authenticate against.
+/// API base for the ChatGPT-subscription privileged backend. The
+/// **actual** programmatic endpoint that the official Codex CLI uses
+/// is `/backend-api/codex/responses` — NOT `/conversation` (which is
+/// the chat-UI's own endpoint and rejects external-shaped bodies
+/// with 422 "Invalid conversation body").
+///
+/// The `/codex/responses` endpoint speaks the OpenAI Responses API
+/// format: `{model, input, stream, …}` rather than the Chat
+/// Completions `{messages: [...]}` shape. Response body is a plain
+/// JSON object containing `output: [{content: [{type: "output_text",
+/// text: "..."}]}]`. See [`crate::client`] for the request/response
+/// shaping we do internally to keep the call-site API (which still
+/// looks like Chat Completions) stable.
+///
+/// **2026-05-26 fix (Κωνσταντίνος)**: was previously
+/// `chatgpt.com/backend-api/conversation` per the dev's
+/// misunderstanding — that endpoint is the chat-UI's internal
+/// conversation flow and demands a very different schema
+/// (`{action: "next", messages: [{id, author, content: {parts}}],
+/// parent_message_id, …}` + SSE event-stream response). We switched
+/// to the documented Codex CLI path which uses a simpler synchronous
+/// shape that we can map cleanly to/from the existing
+/// `ChatCompletion{Request,Response}` types.
 pub const CODEX_API_BASE: &str = "https://chatgpt.com/backend-api";
 
 /// OAuth scopes we request. `openid` + `profile` give us the

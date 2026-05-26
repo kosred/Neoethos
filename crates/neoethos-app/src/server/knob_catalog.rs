@@ -62,7 +62,12 @@ pub struct KnobEntry {
     /// `None` when the knob has no env-var equivalent.
     pub env_var: Option<&'static str>,
 
-    /// What kind of widget the UI should render.
+    /// What kind of widget the UI should render. **2026-05-26**: this
+    /// field is `#[serde(flatten)]` so the `KnobKind` variant's tag
+    /// (`kind`) and constraint fields (`min`, `max`, `enumChoices`)
+    /// surface as top-level JSON keys instead of a nested object —
+    /// matching what Flutter's `KnobDescriptor.fromJson` expects.
+    #[serde(flatten)]
     pub kind: KnobKind,
 
     /// Default value (as a string — the front-end parses by `kind`).
@@ -87,19 +92,56 @@ pub struct KnobEntry {
     pub preset_aggressive: &'static str,
 }
 
+/// **2026-05-26 fix (Κωνσταντίνος)**: was previously serialized via the
+/// default externally-tagged + kebab-case representation, producing
+/// JSON like `{"int": {"min": 0, "max": 3600}}` for struct variants
+/// and `"bool"` for unit variants. The Flutter Advanced Settings
+/// screen (`advanced_settings_screen.dart:646-674`) parses with:
+///   ```dart
+///   kind: j['kind'] as String? ?? 'Text',
+///   minValue: (j['min'] as num?)?.toDouble(),
+///   enumChoices: (j['enumChoices'] as List?)?.cast<String>(),
+///   ```
+/// — i.e. expects a **flat** shape with `kind` as a String and
+/// `min`/`max`/`enumChoices` as siblings of `kind`. Under the old
+/// serde, `j['kind']` for any Int/Float/Enum knob was a `Map`, so the
+/// `as String?` cast fell through to `'Text'`, every numeric input
+/// rendered as a plain TextField with no clamping, every enum lost
+/// its dropdown, and the Save button silently dropped most edits.
+///
+/// Switching to `#[serde(tag = "kind")]` + `#[serde(flatten)]` on the
+/// containing `KnobEntry.kind` field gives us exactly the shape the
+/// UI wants: `{"id": "...", "kind": "Int", "min": 0, "max": 3600,
+/// ...}`. Unit variants serialize as `{"kind": "Bool"}` with no
+/// extras. The `variants` field renames to `enumChoices` to match
+/// the camelCase wire convention used by the rest of the DTOs.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(tag = "kind")]
 pub enum KnobKind {
     /// Integer with optional min/max clamp.
-    Int { min: Option<i64>, max: Option<i64> },
+    Int {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max: Option<i64>,
+    },
     /// Floating-point with optional min/max clamp.
-    Float { min: Option<f64>, max: Option<f64> },
+    Float {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max: Option<f64>,
+    },
     /// Boolean checkbox.
     Bool,
     /// Free-text string.
     Text,
-    /// One of a fixed enum set.
-    Enum { variants: &'static [&'static str] },
+    /// One of a fixed enum set. Flutter side reads this as
+    /// `enumChoices`, not `variants`.
+    Enum {
+        #[serde(rename = "enumChoices")]
+        variants: &'static [&'static str],
+    },
     /// Filesystem path.
     Path,
 }
