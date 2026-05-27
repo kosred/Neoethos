@@ -462,6 +462,7 @@ mod ctrader_integration_tests {
             step_volume: None,
             lot_size: None,
             pnl_conversion_fee_rate: None,
+            financials: None,
         };
 
         let result = parse_trendbars_response(&response.to_string(), &symbol).unwrap();
@@ -506,6 +507,7 @@ mod ctrader_integration_tests {
             step_volume: None,
             lot_size: None,
             pnl_conversion_fee_rate: None,
+            financials: None,
         };
 
         let result = parse_trendbars_response(&response.to_string(), &symbol).unwrap();

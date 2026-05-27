@@ -31,7 +31,298 @@ pub struct CTraderSymbolsListResult {
     pub archived_symbols: Vec<String>,
 }
 
+// ─── Cycle-3 Phase A — full ProtoOASymbol projection ────────────────────────
+//
+// Reference: proto/OpenApiModelMessages.proto:113-155 (ProtoOASymbol).
+// All proto field numbers, units, and semantics quoted verbatim from
+// the official cTrader Open API spec at
+// https://help.ctrader.com/open-api/model-messages/#protooasymbol.
+//
+// Until this commit the codebase parsed 5 of the 40 fields the broker
+// exposes, ignoring per-symbol commission, swap, SL/TP min-distance,
+// trading-mode gating, and conversion-fee — making every backtest cost
+// model systematically wrong and surfacing broker rejections at trade
+// time instead of at the pre-trade gate. This module now captures the
+// full ProtoOASymbol so downstream consumers (cost model in
+// crates/neoethos-search, pre-trade gate in trading/risk_gate, AI Dock
+// rationale in the new UI) can read the same numbers the broker uses
+// to settle real PnL.
+
+/// `ProtoOATradingMode` — the symbol's overall tradeability mode.
+///
+/// Proto file: `OpenApiModelMessages.proto:222-227`. cTrader's JSON
+/// proxy sends the enum as a string matching the proto constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TradingModeProto {
+    /// Default. Both opening and closing are allowed.
+    Enabled,
+    /// New market orders only; no pending orders.
+    DisabledWithoutPendingsExecution,
+    /// Pending orders allowed; market orders blocked.
+    DisabledWithPendingsExecution,
+    /// Only closing existing positions is allowed.
+    CloseOnlyMode,
+}
+
+/// `ProtoOACommissionType` — how to interpret the
+/// `precise_trading_commission_rate` value.
+///
+/// Proto file: `OpenApiModelMessages.proto:202-207`. The proto
+/// comment specifies units per variant:
+/// - `UsdPerMillionUsd`: USD per million USD of notional volume
+///   (typical FX, e.g. $50 per $1M).
+/// - `UsdPerLot`: USD per 1 lot (CFDs, commodities, indices).
+/// - `PercentageOfValue`: percentage of notional volume × 100,000
+///   (i.e. value 5 means 0.005%); used for equities.
+/// - `QuoteCcyPerLot`: quote-currency per 1 lot (CFDs in non-USD).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CommissionType {
+    UsdPerMillionUsd,
+    UsdPerLot,
+    PercentageOfValue,
+    QuoteCcyPerLot,
+}
+
+/// `ProtoOAMinCommissionType` — whether the broker's minimum
+/// commission is denominated in the deposit currency (`Currency`) or
+/// the symbol's quote currency (`QuoteCurrency`).
+///
+/// Proto file: `OpenApiModelMessages.proto:216-219`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MinCommissionType {
+    Currency,
+    QuoteCurrency,
+}
+
+/// `ProtoOASwapCalculationType` — units of the `swap_long`/`swap_short`
+/// double fields. Each variant changes how a daily-swap charge is
+/// computed:
+/// - `Pips`: the raw value is in pips (most common for FX).
+/// - `Percentage`: annual percentage (divide by 365 for daily).
+/// - `Points`: the raw value is in points (= 10^-digits).
+///
+/// Proto file: `OpenApiModelMessages.proto:230-234`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SwapCalculationType {
+    Pips,
+    Percentage,
+    Points,
+}
+
+/// `ProtoOASymbolDistanceType` — units for the min SL/TP/GSL distance
+/// fields.
+///
+/// Proto file: `OpenApiModelMessages.proto:210-213`. cTrader's JSON
+/// proxy uses the `SYMBOL_DISTANCE_IN_*` prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SymbolDistanceType {
+    SymbolDistanceInPoints,
+    SymbolDistanceInPercentage,
+}
+
+/// `ProtoOADayOfWeek` — used by `swap_rollover_3_days` to mark the
+/// triple-swap weekday, and by `rollover_commission_3_days` for the
+/// Shariah triple-rollover weekday.
+///
+/// Proto file: `OpenApiModelMessages.proto:184-193`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DayOfWeek {
+    None,
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+    Sunday,
+}
+
+/// One weekly-trading interval — start and end seconds counted from
+/// Sunday 00:00 in the symbol's `schedule_time_zone`. Mirrors
+/// `ProtoOAInterval` (`OpenApiModelMessages.proto:196-199`).
+///
+/// `end_second` is exclusive, `start_second` is inclusive. So a full
+/// trading day might be `(0, 86400)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TradingInterval {
+    pub start_second_from_sunday: u32,
+    pub end_second_from_sunday: u32,
+}
+
+/// One holiday window. Mirrors `ProtoOAHoliday`
+/// (`OpenApiModelMessages.proto:693-701`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HolidayWindow {
+    pub holiday_id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub schedule_time_zone: String,
+    /// Days since 1 Jan 1970. Multiply by 86_400_000 for Unix ms.
+    pub days_since_epoch: i64,
+    pub is_recurring: bool,
+    /// Optional intra-day offsets (e.g. closes at noon).
+    pub start_second_from_midnight: Option<i32>,
+    pub end_second_from_midnight: Option<i32>,
+}
+
+/// Full financial-fields projection of `ProtoOASymbol` — everything
+/// `CTraderSymbolInfo` doesn't already cover. Held as
+/// `Option<SymbolFinancials>` on the parent struct so legacy paths
+/// (light symbol list, cached symbol-by-name lookup) can keep working
+/// even when these fields haven't been fetched yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolFinancials {
+    // ── Commission (D.1 from batch-2 audit) ──────────────────────
+    /// How to interpret `precise_trading_commission_rate`.
+    pub commission_type: Option<CommissionType>,
+    /// Commission base amount. For non-percentage types this is the
+    /// raw rate × 10^8 (e.g. $50/million USD is stored as 50e8).
+    /// For `PercentageOfValue` the multiplier is × 10^5 instead
+    /// (per the proto comment on field 31).
+    pub precise_trading_commission_rate: Option<i64>,
+    /// Minimum commission per trade, ALWAYS × 10^8 (proto field 32).
+    pub precise_min_commission: Option<i64>,
+    /// Whether `precise_min_commission` is in the deposit currency
+    /// (`Currency`) or the symbol's quote currency (`QuoteCurrency`).
+    pub min_commission_type: Option<MinCommissionType>,
+    /// Asset code for the min commission (default "USD").
+    pub min_commission_asset: Option<String>,
+    /// Per-trade conversion fee when symbol quote ≠ deposit currency.
+    /// Stored as `1 = 0.01%`. A typical broker value is 50-100
+    /// (= 0.5-1% silent profit cut on every closed trade).
+    pub pnl_conversion_fee_rate: Option<i32>,
+
+    // ── Swap (D.2 from batch-2 audit) ────────────────────────────
+    /// SWAP charge for long positions, in units determined by
+    /// `swap_calculation_type` (PIPS / PERCENTAGE / POINTS).
+    pub swap_long: Option<f64>,
+    pub swap_short: Option<f64>,
+    pub swap_calculation_type: Option<SwapCalculationType>,
+    /// Hours between swap charges. 24 = once per day (the common
+    /// case); 12 = twice per day; 8 = thrice per day.
+    pub swap_period_hours: Option<i32>,
+    /// Minutes from 00:00 UTC when the first intraday swap is
+    /// charged. Defines the rollover moment within the day.
+    pub swap_time_minutes_from_utc_midnight: Option<i32>,
+    /// Triple-swap weekday. Most brokers: WEDNESDAY (the MT4
+    /// convention covers the weekend rollover); some FX brokers
+    /// use FRIDAY instead.
+    pub swap_rollover_3_days: Option<DayOfWeek>,
+    /// Initial period count to skip before the first swap charge.
+    pub skip_swap_periods: Option<i32>,
+    /// If TRUE, swap is charged for all 7 weekdays (rare; some
+    /// Islamic accounts may turn this on with the rollover field
+    /// instead).
+    pub charge_swap_at_weekends: Option<bool>,
+
+    // ── Rollover (Shariah / swap-free accounts) ──────────────────
+    /// Admin fee charged INSTEAD of swap on Shariah-compliant
+    /// accounts. Stored in the deposit currency, charged daily per
+    /// open lot.
+    pub rollover_commission: Option<i64>,
+    pub rollover_commission_3_days: Option<DayOfWeek>,
+    pub skip_rollover_days: Option<i32>,
+
+    // ── Distance constraints (D.3 from batch-2 audit) ────────────
+    /// Minimum allowed distance between Stop Loss and current price.
+    /// Units determined by `distance_set_in`. Sending an SL closer
+    /// than this gets the order rejected with TRADING_BAD_STOPS.
+    pub sl_distance_points: Option<u32>,
+    pub tp_distance_points: Option<u32>,
+    /// Same but for Guaranteed Stop Loss (limited-risk accounts
+    /// only).
+    pub gsl_distance_points: Option<u32>,
+    /// Guaranteed stop-loss fee. Units not documented in the proto
+    /// comment — assume same scaling as `precise_*` fields if you
+    /// need to read it.
+    pub gsl_charge: Option<i64>,
+    pub distance_set_in: Option<SymbolDistanceType>,
+    /// Per-symbol GSL availability flag (proto field 5 —
+    /// `guaranteedStopLoss`).
+    pub guaranteed_stop_loss_available: Option<bool>,
+
+    // ── Trading-mode gating (D.4 from batch-2 audit) ─────────────
+    /// Full proto enum — exposes more than the existing
+    /// `is_trading_enabled` bool (e.g., CLOSE_ONLY_MODE).
+    pub trading_mode: Option<TradingModeProto>,
+    pub enable_short_selling: Option<bool>,
+
+    // ── Schedule + holidays ──────────────────────────────────────
+    pub schedule_time_zone: Option<String>,
+    pub trading_intervals: Vec<TradingInterval>,
+    pub holidays: Vec<HolidayWindow>,
+
+    // ── Misc ─────────────────────────────────────────────────────
+    pub max_exposure: Option<u64>,
+    pub leverage_id: Option<i64>,
+    pub measurement_units: Option<String>,
+}
+
+impl SymbolFinancials {
+    /// Build the per-lot commission in the asset implied by
+    /// `commission_type`, for a given notional USD volume of the trade
+    /// (used by USD_PER_MILLION_USD) or lot count (for the other
+    /// variants). Returns None if commission_type or rate is missing.
+    ///
+    /// For non-percentage variants the proto stores the rate × 10^8;
+    /// for `PercentageOfValue` the multiplier is × 10^5. We undo the
+    /// scaling so the returned value is in plain decimal units
+    /// (USD per million USD, USD per lot, percentage, or quote-ccy
+    /// per lot — interpretation matches the variant).
+    ///
+    /// Caller is responsible for applying `precise_min_commission` and
+    /// the `pnl_conversion_fee_rate` separately — those are not
+    /// folded in here so the breakdown stays auditable.
+    pub fn commission_rate_decimal(&self) -> Option<f64> {
+        let rate = self.precise_trading_commission_rate?;
+        let kind = self.commission_type?;
+        let divisor: f64 = match kind {
+            CommissionType::PercentageOfValue => 1.0e5,
+            _ => 1.0e8,
+        };
+        Some(rate as f64 / divisor)
+    }
+
+    /// Daily swap charge in the units implied by
+    /// `swap_calculation_type`. The caller's cost model converts this
+    /// to a notional charge using the symbol's pip_size and lot
+    /// notional. Returns None if `swap_long` or the calc type is
+    /// missing.
+    pub fn daily_swap_long(&self) -> Option<f64> {
+        let raw = self.swap_long?;
+        let _kind = self.swap_calculation_type?;
+        // The raw double IS the daily charge in `kind` units —
+        // backtest scoring multiplies by hours-held / 24 and by
+        // contract notional / pip-size depending on kind.
+        Some(raw)
+    }
+    pub fn daily_swap_short(&self) -> Option<f64> {
+        let raw = self.swap_short?;
+        let _kind = self.swap_calculation_type?;
+        Some(raw)
+    }
+
+    /// True if the symbol allows opening NEW positions right now.
+    /// `CloseOnlyMode` and the two `Disabled*` variants return false.
+    pub fn can_open_new_position(&self) -> bool {
+        matches!(self.trading_mode, Some(TradingModeProto::Enabled))
+    }
+
+    /// True if SHORT (sell-to-open) is permitted on this symbol.
+    /// Defaults to true when the broker omitted the field — matches
+    /// cTrader's default behavior.
+    pub fn short_selling_allowed(&self) -> bool {
+        self.enable_short_selling.unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CTraderSymbolInfo {
     pub symbol_id: i64,
     pub symbol_name: String,
@@ -44,15 +335,17 @@ pub struct CTraderSymbolInfo {
     pub max_volume: Option<i64>,
     pub step_volume: Option<i64>,
     pub lot_size: Option<i64>,
+    /// **2026-05-27**: kept on the parent struct for backwards-compat
+    /// with paths that read it directly. New code should prefer
+    /// `financials.pnl_conversion_fee_rate` so the units and the
+    /// "missing when symbol wasn't fetched in full" case are obvious.
     pub pnl_conversion_fee_rate: Option<i32>,
-    // **2026-05-27 cycle-3 Phase A** — additional fields planned in
-    // `docs/audit/CYCLE-3-SPEC-2026-05-27.md` §3.A (commission, swap,
-    // SL/TP min distances, trading mode, short-sell flag). Adding
-    // them now would break ~4 construction sites and the wire-parser;
-    // the spec doc commits to the schema, and the next session
-    // implements the parser + plumbing in one focused pass with a
-    // green rebuild. Marker so search finds the spec.
-    // SEE: CYCLE-3-SPEC §3 Phase A.
+    /// Full ProtoOASymbol projection. `None` for light-symbol-list
+    /// entries (where the broker hasn't sent us the financial
+    /// fields); `Some(_)` after a successful
+    /// `ProtoOASymbolByIdReq` fetch. See `SymbolFinancials` for the
+    /// breakdown.
+    pub financials: Option<SymbolFinancials>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +358,7 @@ pub struct CTraderSymbolLookupRequest {
     pub symbol_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CTraderResolvedSymbol {
     pub account_id: i64,
     pub light_symbol: CTraderLightSymbolInfo,
@@ -188,8 +481,14 @@ struct SymbolByIdPayload {
     symbol: Vec<FullSymbolPayload>,
 }
 
+/// Wire-shape for one element of `ProtoOASymbolByIdRes.symbol`. Field
+/// names mirror the proto JSON encoding exactly (camelCase). Every
+/// optional that the proto marks `optional` is wrapped in `Option<>`
+/// so a broker that doesn't populate a field doesn't blow up
+/// deserialization.
 #[derive(Debug, Deserialize)]
 struct FullSymbolPayload {
+    // ── Identity / pricing / volume (already wired pre-Phase-A) ──
     #[serde(rename = "symbolId")]
     symbol_id: i64,
     digits: i32,
@@ -206,7 +505,106 @@ struct FullSymbolPayload {
     #[serde(rename = "pnlConversionFeeRate")]
     pnl_conversion_fee_rate: Option<i32>,
     #[serde(rename = "tradingMode")]
-    trading_mode: Option<Value>,
+    trading_mode: Option<TradingModeProto>,
+
+    // ── Phase A — commission (D.1) ───────────────────────────────
+    #[serde(rename = "commissionType")]
+    commission_type: Option<CommissionType>,
+    #[serde(rename = "preciseTradingCommissionRate")]
+    precise_trading_commission_rate: Option<i64>,
+    #[serde(rename = "preciseMinCommission")]
+    precise_min_commission: Option<i64>,
+    #[serde(rename = "minCommissionType")]
+    min_commission_type: Option<MinCommissionType>,
+    #[serde(rename = "minCommissionAsset")]
+    min_commission_asset: Option<String>,
+
+    // ── Phase A — swap (D.2) ─────────────────────────────────────
+    #[serde(rename = "swapLong")]
+    swap_long: Option<f64>,
+    #[serde(rename = "swapShort")]
+    swap_short: Option<f64>,
+    #[serde(rename = "swapCalculationType")]
+    swap_calculation_type: Option<SwapCalculationType>,
+    #[serde(rename = "swapPeriod")]
+    swap_period: Option<i32>,
+    #[serde(rename = "swapTime")]
+    swap_time: Option<i32>,
+    #[serde(rename = "swapRollover3Days")]
+    swap_rollover_3_days: Option<DayOfWeek>,
+    // Proto field name is `skipSWAPPeriods` (uppercase SWAP).
+    #[serde(rename = "skipSWAPPeriods")]
+    skip_swap_periods: Option<i32>,
+    #[serde(rename = "chargeSwapAtWeekends")]
+    charge_swap_at_weekends: Option<bool>,
+
+    // ── Phase A — rollover (Shariah accounts) ────────────────────
+    #[serde(rename = "rolloverCommission")]
+    rollover_commission: Option<i64>,
+    #[serde(rename = "rolloverCommission3Days")]
+    rollover_commission_3_days: Option<DayOfWeek>,
+    #[serde(rename = "skipRolloverDays")]
+    skip_rollover_days: Option<i32>,
+
+    // ── Phase A — distance constraints (D.3) ─────────────────────
+    #[serde(rename = "slDistance")]
+    sl_distance: Option<u32>,
+    #[serde(rename = "tpDistance")]
+    tp_distance: Option<u32>,
+    #[serde(rename = "gslDistance")]
+    gsl_distance: Option<u32>,
+    #[serde(rename = "gslCharge")]
+    gsl_charge: Option<i64>,
+    #[serde(rename = "distanceSetIn")]
+    distance_set_in: Option<SymbolDistanceType>,
+    #[serde(rename = "guaranteedStopLoss")]
+    guaranteed_stop_loss: Option<bool>,
+
+    // ── Phase A — trading-mode gating (D.4) ──────────────────────
+    #[serde(rename = "enableShortSelling")]
+    enable_short_selling: Option<bool>,
+
+    // ── Phase A — schedule + holidays ────────────────────────────
+    #[serde(rename = "scheduleTimeZone")]
+    schedule_time_zone: Option<String>,
+    #[serde(default)]
+    schedule: Vec<IntervalPayload>,
+    #[serde(default)]
+    holiday: Vec<HolidayPayload>,
+
+    // ── Phase A — misc ───────────────────────────────────────────
+    #[serde(rename = "maxExposure")]
+    max_exposure: Option<u64>,
+    #[serde(rename = "leverageId")]
+    leverage_id: Option<i64>,
+    #[serde(rename = "measurementUnits")]
+    measurement_units: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntervalPayload {
+    #[serde(rename = "startSecond")]
+    start_second: u32,
+    #[serde(rename = "endSecond")]
+    end_second: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct HolidayPayload {
+    #[serde(rename = "holidayId")]
+    holiday_id: i64,
+    name: String,
+    description: Option<String>,
+    #[serde(rename = "scheduleTimeZone")]
+    schedule_time_zone: String,
+    #[serde(rename = "holidayDate")]
+    holiday_date: i64,
+    #[serde(rename = "isRecurring")]
+    is_recurring: bool,
+    #[serde(rename = "startSecond")]
+    start_second: Option<i32>,
+    #[serde(rename = "endSecond")]
+    end_second: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,19 +708,78 @@ pub fn parse_symbol_by_id_response(response_json: &str) -> Result<Vec<CTraderSym
         .payload
         .symbol
         .into_iter()
-        .map(|symbol| CTraderSymbolInfo {
-            symbol_id: symbol.symbol_id,
-            symbol_name: String::new(),
-            display_name: String::new(),
-            digits: symbol.digits,
-            pip_position: symbol.pip_position,
-            is_archived: false,
-            is_trading_enabled: trading_mode_enabled(symbol.trading_mode.as_ref()),
-            min_volume: symbol.min_volume,
-            max_volume: symbol.max_volume,
-            step_volume: symbol.step_volume,
-            lot_size: symbol.lot_size,
-            pnl_conversion_fee_rate: symbol.pnl_conversion_fee_rate,
+        .map(|symbol| {
+            let financials = SymbolFinancials {
+                commission_type: symbol.commission_type,
+                precise_trading_commission_rate: symbol.precise_trading_commission_rate,
+                precise_min_commission: symbol.precise_min_commission,
+                min_commission_type: symbol.min_commission_type,
+                min_commission_asset: symbol.min_commission_asset,
+                pnl_conversion_fee_rate: symbol.pnl_conversion_fee_rate,
+                swap_long: symbol.swap_long,
+                swap_short: symbol.swap_short,
+                swap_calculation_type: symbol.swap_calculation_type,
+                swap_period_hours: symbol.swap_period,
+                swap_time_minutes_from_utc_midnight: symbol.swap_time,
+                swap_rollover_3_days: symbol.swap_rollover_3_days,
+                skip_swap_periods: symbol.skip_swap_periods,
+                charge_swap_at_weekends: symbol.charge_swap_at_weekends,
+                rollover_commission: symbol.rollover_commission,
+                rollover_commission_3_days: symbol.rollover_commission_3_days,
+                skip_rollover_days: symbol.skip_rollover_days,
+                sl_distance_points: symbol.sl_distance,
+                tp_distance_points: symbol.tp_distance,
+                gsl_distance_points: symbol.gsl_distance,
+                gsl_charge: symbol.gsl_charge,
+                distance_set_in: symbol.distance_set_in,
+                guaranteed_stop_loss_available: symbol.guaranteed_stop_loss,
+                trading_mode: symbol.trading_mode,
+                enable_short_selling: symbol.enable_short_selling,
+                schedule_time_zone: symbol.schedule_time_zone,
+                trading_intervals: symbol
+                    .schedule
+                    .into_iter()
+                    .map(|iv| TradingInterval {
+                        start_second_from_sunday: iv.start_second,
+                        end_second_from_sunday: iv.end_second,
+                    })
+                    .collect(),
+                holidays: symbol
+                    .holiday
+                    .into_iter()
+                    .map(|h| HolidayWindow {
+                        holiday_id: h.holiday_id,
+                        name: h.name,
+                        description: h.description,
+                        schedule_time_zone: h.schedule_time_zone,
+                        days_since_epoch: h.holiday_date,
+                        is_recurring: h.is_recurring,
+                        start_second_from_midnight: h.start_second,
+                        end_second_from_midnight: h.end_second,
+                    })
+                    .collect(),
+                max_exposure: symbol.max_exposure,
+                leverage_id: symbol.leverage_id,
+                measurement_units: symbol.measurement_units,
+            };
+            CTraderSymbolInfo {
+                symbol_id: symbol.symbol_id,
+                symbol_name: String::new(),
+                display_name: String::new(),
+                digits: symbol.digits,
+                pip_position: symbol.pip_position,
+                is_archived: false,
+                is_trading_enabled: matches!(
+                    symbol.trading_mode,
+                    Some(TradingModeProto::Enabled)
+                ),
+                min_volume: symbol.min_volume,
+                max_volume: symbol.max_volume,
+                step_volume: symbol.step_volume,
+                lot_size: symbol.lot_size,
+                pnl_conversion_fee_rate: symbol.pnl_conversion_fee_rate,
+                financials: Some(financials),
+            }
         })
         .collect())
 }
@@ -785,14 +1242,11 @@ fn trendbar_period_label(value: &Value) -> Result<String> {
     Ok(label.to_string())
 }
 
-fn trading_mode_enabled(value: Option<&Value>) -> bool {
-    match value {
-        Some(Value::String(mode)) => mode == "ENABLED",
-        Some(Value::Number(number)) => number.as_i64() == Some(0),
-        None => false,
-        _ => false,
-    }
-}
+// **2026-05-27 Phase A**: previously the wire-shape held
+// `trading_mode: Option<Value>` and this helper interrogated the JSON
+// untyped. Now `FullSymbolPayload.trading_mode` is `Option<TradingModeProto>`
+// (proper serde enum) and the parser uses `matches!(.., Some(Enabled))`
+// directly. Helper retired to remove an inconsistent fallback path.
 
 fn normalize_symbol_key(value: &str) -> String {
     value
@@ -922,6 +1376,7 @@ mod tests {
             step_volume: None,
             lot_size: None,
             pnl_conversion_fee_rate: None,
+            financials: None,
         };
         let response = serde_json::json!({
             "clientMsgId": "trendbars-1",
@@ -973,6 +1428,7 @@ mod tests {
             step_volume: None,
             lot_size: None,
             pnl_conversion_fee_rate: None,
+            financials: None,
         };
         let response = serde_json::json!({
             "clientMsgId": "ticks-1",
@@ -1019,6 +1475,7 @@ mod tests {
             step_volume: None,
             lot_size: None,
             pnl_conversion_fee_rate: None,
+            financials: None,
         };
         let response = serde_json::json!({
             "clientMsgId": "ticks-1",
