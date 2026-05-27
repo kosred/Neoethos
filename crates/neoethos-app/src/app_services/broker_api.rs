@@ -440,9 +440,16 @@ pub fn submit_market_order_blocking(
     // the spurious `× 100` makes 0.01 × 10_000_000 = 100_000 wire,
     // which is exactly 0.01 lot (1,000 EUR exposure × 100 cents).
     //
-    // The `unwrap_or` fallback is now 10_000_000 (the cents-per-lot
-    // value for standard FX) so a missing catalog entry still
-    // produces sane volumes instead of 100× under-sizing.
+    // **2026-05-27 — A.4 fix (Cycle-3 Phase A)**: route the
+    // conversion through `SymbolMetadata::lots_to_wire_volume` so
+    // (a) overflow + non-finite inputs are caught by the helper's
+    // explicit guards rather than the silent `as i64` saturation,
+    // and (b) we no longer silently fall back to 10_000_000 cents
+    // when the broker forgot `lotSize`. That fallback was correct
+    // for FX majors but **1000× wrong for XAU** (gold has
+    // `lotSize=100`) and similarly wrong for indices/CFDs. A
+    // missing-catalog entry is now a hard failure — operator sees
+    // the bug instead of placing a wildly mis-sized order.
     let resolved: CTraderResolvedSymbol = resolve_symbol(&CTraderSymbolLookupRequest {
         client_id: creds.client_id.clone(),
         client_secret: creds.client_secret.clone(),
@@ -451,14 +458,31 @@ pub fn submit_market_order_blocking(
         account_id: creds.account_id_str.clone(),
         symbol_name: symbol.to_string(),
     })?;
-    let lot_size = resolved.symbol.lot_size.unwrap_or(10_000_000);
-    let volume_units = (volume_lots * lot_size as f64).round() as i64;
-    if volume_units <= 0 {
-        return Err(anyhow!(
-            "computed volume ({volume_units}) is not positive — \
-             check lot_size ({lot_size}) and volume_lots ({volume_lots})"
-        ));
-    }
+    let lot_size = resolved.symbol.lot_size.ok_or_else(|| {
+        anyhow!(
+            "broker omitted lotSize for {symbol}; refusing to fall back \
+             to a synthetic 10,000,000-cents default (would be 1000× wrong \
+             for XAU/XAG/index symbols). Re-fetch /broker/symbols or check \
+             the cTrader symbol catalog endpoint."
+        )
+    })?;
+    let meta = neoethos_core::symbol_metadata::resolve(symbol).ok_or_else(|| {
+        anyhow!(
+            "no SymbolMetadata for {symbol} — wire-volume conversion needs \
+             pip_size/contract_size to bounds-check the result. Populate \
+             data/symbol_metadata.json (or its env override) from the \
+             ProtoOASymbol records before trading."
+        )
+    })?;
+    let volume_units = meta.lots_to_wire_volume(volume_lots, Some(lot_size)).ok_or_else(
+        || {
+            anyhow!(
+                "could not derive cTrader wire volume for {symbol}: \
+                 lots={volume_lots}, lot_size_cents={lot_size}. \
+                 Inputs must be finite, positive, and within i64 range."
+            )
+        },
+    )?;
     if let Some(min) = resolved.symbol.min_volume {
         if volume_units < min {
             return Err(anyhow!(
