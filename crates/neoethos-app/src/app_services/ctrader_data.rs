@@ -45,6 +45,14 @@ pub struct CTraderSymbolInfo {
     pub step_volume: Option<i64>,
     pub lot_size: Option<i64>,
     pub pnl_conversion_fee_rate: Option<i32>,
+    // **2026-05-27 cycle-3 Phase A** — additional fields planned in
+    // `docs/audit/CYCLE-3-SPEC-2026-05-27.md` §3.A (commission, swap,
+    // SL/TP min distances, trading mode, short-sell flag). Adding
+    // them now would break ~4 construction sites and the wire-parser;
+    // the spec doc commits to the schema, and the next session
+    // implements the parser + plumbing in one focused pass with a
+    // green rebuild. Marker so search finds the spec.
+    // SEE: CYCLE-3-SPEC §3 Phase A.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
