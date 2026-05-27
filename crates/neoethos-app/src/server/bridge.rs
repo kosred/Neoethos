@@ -469,6 +469,14 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
                      mid-refresh; dashboard will show pnl_usd=0.0 for all \
                      positions until the next bridge tick recovers it"
                 );
+                let currency =
+                    asset_id_to_currency(snapshot.trader.deposit_asset_id).to_string();
+                let positions = snapshot
+                    .reconcile
+                    .positions
+                    .iter()
+                    .map(|p| position_to_payload(p, None, &HashMap::new(), &currency))
+                    .collect();
                 return Ok(AccountSnapshotPayload {
                     balance,
                     equity,
@@ -478,14 +486,9 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
                     } else {
                         used_margin
                     },
-                    currency: asset_id_to_currency(snapshot.trader.deposit_asset_id).to_string(),
+                    currency,
                     fetched_at_unix_ms: chrono::Utc::now().timestamp_millis(),
-                    positions: snapshot
-                        .reconcile
-                        .positions
-                        .iter()
-                        .map(|p| position_to_payload(p, None, &HashMap::new()))
-                        .collect(),
+                    positions,
                 });
             }
         };
@@ -533,10 +536,21 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         HashMap::new()
     };
 
+    // Compute the deposit currency once so every position payload
+    // gets the same account_currency string (needed by
+    // `compute_pnl_pips` for the A.3 fix) and the snapshot's
+    // top-level `currency` field stays in sync.
+    let account_currency = asset_id_to_currency(snapshot.trader.deposit_asset_id).to_string();
+
     let mut positions = Vec::with_capacity(snapshot.reconcile.positions.len());
     for p in &snapshot.reconcile.positions {
         let resolved_name = state.resolve_symbol_name(p.symbol_id).await;
-        positions.push(position_to_payload(p, resolved_name, &pnl_by_position));
+        positions.push(position_to_payload(
+            p,
+            resolved_name,
+            &pnl_by_position,
+            &account_currency,
+        ));
     }
 
     Ok(AccountSnapshotPayload {
@@ -556,7 +570,7 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         // depositAssetId. EUR fallback for unknown ids, logged so
         // we can grow the table. Full ProtoOAAssetListReq still
         // a follow-up for the very-long-tail currencies.
-        currency: asset_id_to_currency(snapshot.trader.deposit_asset_id).to_string(),
+        currency: account_currency,
         // Wall-clock at the moment we finished assembling this
         // snapshot. The Flutter Dashboard converts to local time
         // for the "as of HH:MM:SS" freshness badge so the
@@ -571,6 +585,7 @@ fn position_to_payload(
     p: &CTraderPositionSnapshot,
     resolved_name: Option<String>,
     pnl_by_position: &HashMap<i64, BrokerPositionPnL>,
+    account_currency: &str,
 ) -> PositionPayload {
     // **2026-05-26 fix v2 (Κωνσταντίνος)**: corrected unit conversion
     // for the Close-Position endpoint. Empirical chain from live trace
@@ -613,18 +628,38 @@ fn position_to_payload(
         .unwrap_or(0.0);
 
     // Derive pnl_pips from the account-currency PnL via the symbol
-    // metadata table. Formula:
-    //   pip_value_quote = pip_size * contract_size (per lot)
-    //   pnl_pips = pnl_account_ccy / (pip_value_quote * volume_lots)
-    // For pairs where quote == account_currency this is exact. For
-    // base==account or cross pairs the FX conversion the broker
-    // already did is folded into pnl_usd, so the division still
-    // gives a sensible pip number — at worst off by the spot
-    // multiplier used at carry time, which is the right magnitude.
-    // When metadata is missing for the symbol (rare — exotic
-    // synthetics), report 0.0 pips rather than NaN; UI shows 0
-    // until the symbol table gets populated.
-    let mut pnl_pips = compute_pnl_pips(resolved_name.as_deref(), pnl_usd, p.volume);
+    // metadata table. **A.3 fix**: route through `SymbolMetadata::
+    // account_pnl_to_pips` which folds in the quote→account FX
+    // step explicitly. For quote == account_currency this is
+    // exact. For base == account we feed the live mid (below)
+    // so the helper can do the per-tick FX. For cross pairs
+    // (account is neither base nor quote) we don't have an FX
+    // rate yet — the helper returns NaN → 0.0 pips here, but the
+    // #142 live-tick override below recomputes pips directly from
+    // price_diff / pip_size, which is currency-free and works in
+    // every account configuration.
+    //
+    // We pull the live tick **once** here so the helper and the
+    // #142 override share the same observation; `get_tick` is a
+    // cheap mutex read but doing it twice would be a needless
+    // race window if a fresh tick arrived between the calls.
+    let tick = get_tick(p.symbol_id);
+    let live_mid = tick.as_ref().and_then(|t| t.mid_price());
+
+    let mut pnl_pips = compute_pnl_pips(
+        resolved_name.as_deref(),
+        pnl_usd,
+        p.volume,
+        account_currency,
+        // No FX registry wired yet — Phase B follow-up will
+        // populate this from a `BridgeBrokerFxCache` that
+        // subscribes to the symbols needed to bridge quote↔
+        // deposit currency. Until then, cross-currency accounts
+        // get 0.0 from this code path and rely on the
+        // currency-free live-tick override (#142, below).
+        None,
+        live_mid,
+    );
 
     // #142: if the live_spots streamer has a fresh tick for this
     // position's symbol AND we have an entry price, recompute
@@ -638,13 +673,13 @@ fn position_to_payload(
     // on the 5 s bridge tick. Good enough for the live-overlay
     // case; full live USD PnL is a follow-up.
     if let Some(entry_price) = p.price {
-        if let Some(tick) = get_tick(p.symbol_id) {
+        if let Some(tick) = tick.as_ref() {
             // Use the tick's freshness as the gate — > 5 s old and
             // we'd just be replacing one stale number with another.
             let now_ms = chrono::Utc::now().timestamp_millis();
             let freshness_ms = now_ms - tick.received_at_unix_ms;
             if freshness_ms <= 5_000 {
-                if let Some(mid) = tick.mid_price() {
+                if let Some(mid) = live_mid {
                     let price_diff = if p.trade_side.eq_ignore_ascii_case("Buy") {
                         mid - entry_price
                     } else {
@@ -701,17 +736,37 @@ fn position_to_payload(
 
 /// Derive PnL in pips from broker-side net unrealized PnL (already
 /// in account currency, broker did the FX conversion) and the
-/// position's lot volume. Returns 0.0 when:
+/// position's base-currency volume. Returns 0.0 when:
 ///   - `pnl_account_ccy` is 0.0 (nothing to convert),
-///   - `volume_lots` is 0.0 (defensive — shouldn't happen but a
-///     div-by-zero is unhelpful),
+///   - `volume_base_units` is 0.0 (defensive — shouldn't happen but
+///     a div-by-zero is unhelpful),
 ///   - the symbol isn't in the metadata table (use 0.0 as a
-///     visible "unknown" rather than NaN which breaks JSON).
-fn compute_pnl_pips(resolved_name: Option<&str>, pnl_account_ccy: f64, volume_lots: f64) -> f64 {
+///     visible "unknown" rather than NaN which breaks JSON),
+///   - the symbol's `contract_size` is missing (defensive),
+///   - the account currency is **cross** to both base and quote AND
+///     no `quote_to_account_rate` is supplied — we fail loud (0.0)
+///     rather than guess; the operator sees the broken column and
+///     the live-tick override (#142) still produces correct pips
+///     from price_diff/pip_size without any FX dependency.
+///
+/// **A.3 fix (2026-05-27)**: prior implementation divided by
+/// `pip_value_quote * volume_lots`, treating pip-value-in-quote as
+/// if it were pip-value-in-account. For a GBP account trading
+/// EURUSD that under-reported pips by the USD/GBP factor (~25 %).
+/// We now route through `SymbolMetadata::account_pnl_to_pips`,
+/// which folds in the FX step explicitly.
+fn compute_pnl_pips(
+    resolved_name: Option<&str>,
+    pnl_account_ccy: f64,
+    volume_base_units: f64,
+    account_currency: &str,
+    quote_to_account_rate: Option<f64>,
+    live_price: Option<f64>,
+) -> f64 {
     if !pnl_account_ccy.is_finite() || pnl_account_ccy == 0.0 {
         return 0.0;
     }
-    if !volume_lots.is_finite() || volume_lots <= 0.0 {
+    if !volume_base_units.is_finite() || volume_base_units <= 0.0 {
         return 0.0;
     }
     let Some(name) = resolved_name else {
@@ -720,17 +775,22 @@ fn compute_pnl_pips(resolved_name: Option<&str>, pnl_account_ccy: f64, volume_lo
     let Some(meta) = neoethos_core::symbol_metadata::resolve(name) else {
         return 0.0;
     };
-    // pip_value_quote is per-lot in the QUOTE currency. The broker
-    // returns PnL in the DEPOSIT (account) currency. For
-    // quote == account: exact. For other cases the conversion the
-    // broker did is implicit in pnl_account_ccy; dividing here
-    // gives a pip count that round-trips correctly when the price
-    // is close to typical_price (the bulk of trades).
-    let denom = meta.pip_value_quote * volume_lots;
-    if !denom.is_finite() || denom.abs() < 1e-12 {
+    if !meta.contract_size.is_finite() || meta.contract_size <= 0.0 {
         return 0.0;
     }
-    pnl_account_ccy / denom
+    // CTraderPositionSnapshot.volume is in base-currency UNITS
+    // (see the `volume_units` comment block above for the wire
+    // derivation). Convert to lots before handing off to the
+    // unit-conversion helper.
+    let lots = volume_base_units / meta.contract_size;
+    meta.account_pnl_to_pips(
+        pnl_account_ccy,
+        lots,
+        account_currency,
+        quote_to_account_rate,
+        live_price,
+    )
+    .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -742,7 +802,15 @@ mod tests {
             position_id: 42,
             symbol_id: 1,
             trade_side: "BUY".to_string(),
-            volume: 0.1,
+            // **E.1 fix (2026-05-27)**: `CTraderPositionSnapshot.volume`
+            // is in **base-currency UNITS** — not lots. For 0.1 lot
+            // EURUSD that's 10,000 EUR (= 0.1 × contract_size 100,000).
+            // Previously this fixture stored `0.1` which was lot-shaped
+            // and masked the A.3 bug because the broken legacy formula
+            // `pnl / (pip_value_quote × volume)` happened to produce the
+            // right number when `volume` was passed as lots. Now the
+            // fixture is wire-shape-accurate.
+            volume: 10_000.0,
             price: Some(1.0840),
             stop_loss: None,
             take_profit: None,
@@ -770,17 +838,20 @@ mod tests {
                 money_digits: 2,
             },
         );
-        let payload = position_to_payload(&p, Some("EURUSD".to_string()), &map);
+        // EURUSD on a USD account: account == quote, so
+        // pip_value_in_account = pip_value_quote = $10/lot. Position
+        // base-units = 10,000 → lots = 0.1 → $1/pip.
+        // PnL 11.3 USD → 11.3 pips.
+        let payload = position_to_payload(&p, Some("EURUSD".to_string()), &map, "USD");
         assert!((payload.pnl_usd - 11.3).abs() < 1e-9);
-        // For EURUSD: pip_value_quote = 0.0001 * 100_000 = 10.0/lot.
-        // At 0.1 lots → 1.0/pip. PnL 11.3 → 11.3 pips.
         assert!((payload.pnl_pips - 11.3).abs() < 0.01);
     }
 
     #[test]
     fn position_to_payload_zero_when_no_pnl_entry() {
         let p = sample_position();
-        let payload = position_to_payload(&p, Some("EURUSD".to_string()), &HashMap::new());
+        let payload =
+            position_to_payload(&p, Some("EURUSD".to_string()), &HashMap::new(), "USD");
         assert_eq!(payload.pnl_usd, 0.0);
         assert_eq!(payload.pnl_pips, 0.0);
     }
@@ -801,20 +872,90 @@ mod tests {
         // Resolved name is the placeholder — symbol_metadata::resolve
         // returns None → pnl_pips falls back to 0.0 (visible
         // "unknown", not NaN).
-        let payload = position_to_payload(&p, Some("sym#999".to_string()), &map);
+        let payload = position_to_payload(&p, Some("sym#999".to_string()), &map, "USD");
         assert_eq!(payload.pnl_usd, 5.0);
         assert_eq!(payload.pnl_pips, 0.0);
     }
 
+    /// **A.3 regression guard**: GBP account holding 0.1 lot EURUSD.
+    /// The broker tells us pnl_usd = £8 (it already did USD→GBP
+    /// server-side). Without an FX registry to convert pip values
+    /// from USD→GBP, `compute_pnl_pips` must return 0.0 (fail loud)
+    /// rather than the legacy ~25%-off approximation. The live-tick
+    /// override is the real source of pips for cross-currency
+    /// accounts until the FX cache lands in Phase B.
+    #[test]
+    fn compute_pnl_pips_cross_currency_returns_zero_without_fx_rate() {
+        let pips = compute_pnl_pips(
+            Some("EURUSD"),
+            8.0,         // £8 — broker-converted
+            10_000.0,    // base units = 0.1 lot
+            "GBP",       // account ccy is neither base (EUR) nor quote (USD)
+            None,        // no FX rate → helper returns None → 0.0 here
+            Some(1.0840),
+        );
+        assert_eq!(pips, 0.0, "must fail loud (0.0) when FX rate is unknown");
+    }
+
+    /// **A.3 happy path**: account == quote (USD account, EURUSD).
+    /// 0.1 lot, 20 USD PnL → exactly 20 pips.
+    #[test]
+    fn compute_pnl_pips_account_equals_quote_is_exact() {
+        let pips = compute_pnl_pips(
+            Some("EURUSD"),
+            20.0,
+            10_000.0,
+            "USD",
+            None,
+            None,
+        );
+        assert!(
+            (pips - 20.0).abs() < 1e-9,
+            "expected 20.0 pips, got {pips}"
+        );
+    }
+
+    /// **A.3 happy path**: account == base (EUR account, EURUSD).
+    /// 0.1 lot, broker tells us €9.23 PnL at a live mid of 1.0840:
+    /// pip_value_in_account = $10/1.0840 ≈ €9.225 per lot, so per
+    /// 0.1 lot that's ≈ €0.9225/pip → 9.23 / 0.9225 ≈ 10 pips.
+    #[test]
+    fn compute_pnl_pips_account_equals_base_uses_live_price() {
+        let pips = compute_pnl_pips(
+            Some("EURUSD"),
+            9.225,
+            10_000.0,
+            "EUR",
+            None,
+            Some(1.0840),
+        );
+        assert!(
+            (pips - 10.0).abs() < 0.05,
+            "expected ~10.0 pips, got {pips}"
+        );
+    }
+
     #[test]
     fn compute_pnl_pips_handles_zero_volume() {
-        assert_eq!(compute_pnl_pips(Some("EURUSD"), 10.0, 0.0), 0.0);
-        assert_eq!(compute_pnl_pips(Some("EURUSD"), 10.0, f64::NAN), 0.0);
+        assert_eq!(
+            compute_pnl_pips(Some("EURUSD"), 10.0, 0.0, "USD", None, None),
+            0.0
+        );
+        assert_eq!(
+            compute_pnl_pips(Some("EURUSD"), 10.0, f64::NAN, "USD", None, None),
+            0.0
+        );
     }
 
     #[test]
     fn compute_pnl_pips_handles_nonfinite_pnl() {
-        assert_eq!(compute_pnl_pips(Some("EURUSD"), f64::NAN, 0.1), 0.0);
-        assert_eq!(compute_pnl_pips(Some("EURUSD"), f64::INFINITY, 0.1), 0.0);
+        assert_eq!(
+            compute_pnl_pips(Some("EURUSD"), f64::NAN, 10_000.0, "USD", None, None),
+            0.0
+        );
+        assert_eq!(
+            compute_pnl_pips(Some("EURUSD"), f64::INFINITY, 10_000.0, "USD", None, None),
+            0.0
+        );
     }
 }
