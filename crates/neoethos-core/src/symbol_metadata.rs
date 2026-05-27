@@ -139,6 +139,191 @@ impl SymbolMetadata {
         }
         f64::NAN
     }
+
+    // ─── Unit conversion helpers (2026-05-27 cycle-3) ──────────────────
+    //
+    // The user-pointed-out fundamental: **PnL is in MONEY, trades are in
+    // LOT SIZES**. Every operation that translates between those two
+    // dimensions must consult per-symbol economic data (pip_size,
+    // contract_size, quote currency) and per-account economic data
+    // (deposit currency, live FX rate). The helpers below are the
+    // *only* sanctioned bridge between the two dimensions — call-sites
+    // that compute pips/lots/money math by hand are bugs waiting to
+    // surface.
+    //
+    // Worked example (referenced in tests below):
+    //   - Account: GBP deposit
+    //   - Symbol:  EURUSD (base=EUR, quote=USD, pip_size=0.0001,
+    //              contract_size=100_000)
+    //   - Live USD→GBP rate: ~0.79 (i.e. 1 USD = 0.79 GBP)
+    //   - pip_value_quote = 0.0001 × 100_000 = $10 / lot
+    //   - pip_value_in_account = $10 × 0.79 = £7.90 / lot
+    //   - Risk £100 with 20-pip SL → max_lots =
+    //       £100 / (20 pips × £7.90/lot) ≈ 0.633 lot
+    //   - Actual loss on the 20-pip stop = 0.633 × 20 × £7.90 = £100.01 ✓
+
+    /// Compute the lot size that risks AT MOST `max_loss_account_ccy`
+    /// over a `sl_pips` stop-loss distance. Returns `None` when the
+    /// inputs make the answer ill-defined: zero SL distance, missing
+    /// FX rate for a cross pair, etc.
+    ///
+    /// Inverse of `account_pnl_to_pips`. Used by the risk-gate when
+    /// converting a percent-of-equity risk budget into a concrete
+    /// order size.
+    pub fn risk_money_to_lots(
+        &self,
+        max_loss_account_ccy: f64,
+        sl_pips: f64,
+        account_currency: &str,
+        quote_to_account_rate: Option<f64>,
+        live_price: Option<f64>,
+    ) -> Option<f64> {
+        if !sl_pips.is_finite() || sl_pips <= 0.0 {
+            return None;
+        }
+        if !max_loss_account_ccy.is_finite() || max_loss_account_ccy <= 0.0 {
+            return None;
+        }
+        let pip_value_account = self.pip_value_in_account(
+            account_currency,
+            quote_to_account_rate,
+            live_price,
+        );
+        if !pip_value_account.is_finite() || pip_value_account <= 0.0 {
+            return None;
+        }
+        let lots = max_loss_account_ccy / (sl_pips * pip_value_account);
+        if !lots.is_finite() || lots <= 0.0 {
+            return None;
+        }
+        Some(lots)
+    }
+
+    /// Compute the pip-distance corresponding to a given PnL in account
+    /// currency. Used by `bridge.rs` to render the "PnL in pips" column.
+    ///
+    /// This is the **correct** formula:
+    ///   pips = pnl_account / (lots × pip_value_in_account)
+    /// where `pip_value_in_account` already includes the
+    /// quote-currency → deposit-currency FX conversion.
+    ///
+    /// **A.3 fix** (batch-1 audit): the previous implementation used
+    /// `pnl_account / (lots × pip_value_quote)` — wrong for any
+    /// non-quote-currency account because it skipped the FX step. On a
+    /// GBP account trading EURUSD that bug under-reported pips by the
+    /// USD/GBP factor (~25%).
+    pub fn account_pnl_to_pips(
+        &self,
+        pnl_account_ccy: f64,
+        lots: f64,
+        account_currency: &str,
+        quote_to_account_rate: Option<f64>,
+        live_price: Option<f64>,
+    ) -> Option<f64> {
+        if !lots.is_finite() || lots == 0.0 {
+            return None;
+        }
+        let pip_value_account = self.pip_value_in_account(
+            account_currency,
+            quote_to_account_rate,
+            live_price,
+        );
+        if !pip_value_account.is_finite() || pip_value_account <= 0.0 {
+            return None;
+        }
+        let pips = pnl_account_ccy / (lots * pip_value_account);
+        if !pips.is_finite() {
+            return None;
+        }
+        Some(pips)
+    }
+
+    /// Translate a user-facing lot count into the cTrader broker-wire
+    /// `volume` field that `ProtoOANewOrderReq` and
+    /// `ProtoOAClosePositionReq` accept.
+    ///
+    /// cTrader's wire `volume` is in centi-units of the base currency
+    /// (the `lotSize` proto field, in cents). For EURUSD `lotSize` is
+    /// `10_000_000` (= 100,000 EUR × 100 cents), so 0.01 lot →
+    /// 100,000 wire.
+    ///
+    /// The historical bug here was a redundant `× 100` outside the
+    /// `lotSize` factor (see commit 6cd24a78 batch B). This helper
+    /// removes that footgun by making the conversion a single call.
+    ///
+    /// `lot_size_cents` is the per-symbol `CTraderSymbolInfo.lot_size`
+    /// value. Pass `None` and the helper returns `None` so callers
+    /// don't silently underflow with a default.
+    pub fn lots_to_wire_volume(
+        &self,
+        lots: f64,
+        lot_size_cents: Option<i64>,
+    ) -> Option<i64> {
+        if !lots.is_finite() || lots <= 0.0 {
+            return None;
+        }
+        let lot_size = lot_size_cents.filter(|&v| v > 0)?;
+        let wire = (lots * lot_size as f64).round() as i64;
+        if wire <= 0 { return None; }
+        Some(wire)
+    }
+
+    /// Reverse direction — translate a broker-reported wire volume
+    /// back into lots for display in the Open Positions table.
+    ///
+    /// For EURUSD wire `10_000_000` → `1.0` lot.
+    pub fn wire_volume_to_lots(
+        &self,
+        wire_volume: i64,
+        lot_size_cents: Option<i64>,
+    ) -> Option<f64> {
+        if wire_volume <= 0 {
+            return None;
+        }
+        let lot_size = lot_size_cents.filter(|&v| v > 0)?;
+        let lots = wire_volume as f64 / lot_size as f64;
+        if !lots.is_finite() { return None; }
+        Some(lots)
+    }
+
+    /// Compute the gross PnL in **account currency** for an open
+    /// position. Currently unused (the broker is authoritative via
+    /// `ProtoOAPositionUnrealizedPnL.netUnrealizedPnL`), but exposed
+    /// so the backtest can reuse the same formula and the live
+    /// drift-detection circuit-breaker (currently dead per E.2 audit
+    /// finding) can be re-armed.
+    ///
+    /// `entry_price` and `exit_price` are in the symbol's quote
+    /// currency. For a BUY: PnL = (exit - entry) × contract × lots ×
+    /// quote_to_account. For a SELL: invert sign.
+    pub fn position_pnl_account(
+        &self,
+        entry_price: f64,
+        exit_price: f64,
+        lots: f64,
+        is_buy: bool,
+        account_currency: &str,
+        quote_to_account_rate: Option<f64>,
+        live_price_for_base_account: Option<f64>,
+    ) -> Option<f64> {
+        if !entry_price.is_finite() || !exit_price.is_finite() {
+            return None;
+        }
+        if !lots.is_finite() || lots <= 0.0 {
+            return None;
+        }
+        let price_delta_pips = (exit_price - entry_price) / self.pip_size;
+        let signed_pips = if is_buy { price_delta_pips } else { -price_delta_pips };
+        let pip_value_account = self.pip_value_in_account(
+            account_currency,
+            quote_to_account_rate,
+            live_price_for_base_account,
+        );
+        if !pip_value_account.is_finite() {
+            return None;
+        }
+        Some(signed_pips * lots * pip_value_account)
+    }
 }
 
 /// Disk-backed table. Loaded once per process; subsequent lookups are
@@ -548,5 +733,179 @@ mod tests {
         assert_eq!(canonical_symbol("eur/usd"), "EURUSD");
         assert_eq!(canonical_symbol("xau-usd"), "XAUUSD");
         assert_eq!(canonical_symbol("EUR_USD.cTr"), "EURUSDCTR");
+    }
+
+    // ─── Money ↔ Lots conversion (cycle-3 helpers, 2026-05-27) ────────
+
+    #[test]
+    fn risk_money_to_lots_eurusd_usd_account() {
+        // Account = USD (quote == account), so pip_value_account = $10/lot.
+        // Risk $100 with 20-pip SL → 100 / (20 × 10) = 0.5 lot.
+        let eurusd = baked_in_default("EURUSD").unwrap();
+        let lots = eurusd
+            .risk_money_to_lots(100.0, 20.0, "USD", None, None)
+            .expect("ok");
+        assert!((lots - 0.5).abs() < 1e-9, "expected 0.5, got {lots}");
+    }
+
+    #[test]
+    fn risk_money_to_lots_eurusd_gbp_account_uses_fx() {
+        // Account = GBP (cross), pip_value_quote = $10/lot, USD→GBP ≈ 0.79.
+        // pip_value_account = 10 × 0.79 = £7.90/lot.
+        // Risk £100 with 20-pip SL → 100 / (20 × 7.90) ≈ 0.6329 lot.
+        let eurusd = baked_in_default("EURUSD").unwrap();
+        let lots = eurusd
+            .risk_money_to_lots(100.0, 20.0, "GBP", Some(0.79), None)
+            .expect("ok");
+        assert!(
+            (lots - 0.6329).abs() < 1e-3,
+            "expected ≈0.633, got {lots}"
+        );
+        // And the realized loss at 20 pips × 0.6329 lots × £7.90/pip/lot
+        // should land within ~1p of the £100 budget — the round-trip
+        // sanity check.
+        let realized = 20.0 * lots * (10.0 * 0.79);
+        assert!((realized - 100.0).abs() < 0.1, "realized={realized}");
+    }
+
+    #[test]
+    fn risk_money_to_lots_refuses_when_fx_missing_for_cross() {
+        let eurusd = baked_in_default("EURUSD").unwrap();
+        // Cross pair with no quote_to_account rate → cannot size.
+        let lots = eurusd.risk_money_to_lots(100.0, 20.0, "GBP", None, None);
+        assert!(lots.is_none(), "expected None, got {:?}", lots);
+    }
+
+    #[test]
+    fn risk_money_to_lots_refuses_zero_sl() {
+        let eurusd = baked_in_default("EURUSD").unwrap();
+        assert!(eurusd
+            .risk_money_to_lots(100.0, 0.0, "USD", None, None)
+            .is_none());
+        assert!(eurusd
+            .risk_money_to_lots(100.0, -5.0, "USD", None, None)
+            .is_none());
+    }
+
+    #[test]
+    fn account_pnl_to_pips_is_inverse_of_risk_sizing() {
+        // Round-trip: size 0.5 lot, lose £100 over 20 pips on GBP account.
+        // Then ask the helper how many pips that £100 loss represents.
+        // Should be ~20 pips back out.
+        let eurusd = baked_in_default("EURUSD").unwrap();
+        let pips = eurusd
+            .account_pnl_to_pips(-100.0, 0.5, "USD", None, None)
+            .expect("ok");
+        // pip_value_account = $10/lot. PnL/(lots × pip_value) = -100 / (0.5 × 10) = -20.
+        assert!((pips - -20.0).abs() < 1e-9, "expected -20, got {pips}");
+    }
+
+    #[test]
+    fn account_pnl_to_pips_fixes_a3_under_cross_currency_account() {
+        // Documented A.3 bug from batch-1 audit: on a GBP account
+        // trading EURUSD, the OLD formula (`pnl / (lots × pip_value_quote)`)
+        // ignored the USD→GBP FX conversion → reported pips ~25% off
+        // (USD vs GBP rate). This test pins the CORRECT formula.
+        //
+        // Scenario: GBP account, EURUSD 0.5 lot, broker-reported PnL
+        // = +£79 (which corresponds to +20 pips: 20 × 0.5 × $10 × 0.79).
+        let eurusd = baked_in_default("EURUSD").unwrap();
+        let pips = eurusd
+            .account_pnl_to_pips(79.0, 0.5, "GBP", Some(0.79), None)
+            .expect("ok");
+        assert!((pips - 20.0).abs() < 1e-2, "expected ≈20, got {pips}");
+    }
+
+    #[test]
+    fn lots_to_wire_volume_eurusd() {
+        // EURUSD: lot_size_cents = 10_000_000.
+        // 0.01 lot → 100_000 wire.
+        // 1.0  lot → 10_000_000 wire.
+        let eurusd = baked_in_default("EURUSD").unwrap();
+        assert_eq!(
+            eurusd.lots_to_wire_volume(0.01, Some(10_000_000)),
+            Some(100_000)
+        );
+        assert_eq!(
+            eurusd.lots_to_wire_volume(1.0, Some(10_000_000)),
+            Some(10_000_000)
+        );
+    }
+
+    #[test]
+    fn lots_to_wire_volume_refuses_when_lot_size_unknown() {
+        let eurusd = baked_in_default("EURUSD").unwrap();
+        assert!(eurusd.lots_to_wire_volume(0.01, None).is_none());
+        assert!(eurusd.lots_to_wire_volume(0.01, Some(0)).is_none());
+        assert!(eurusd.lots_to_wire_volume(0.01, Some(-100)).is_none());
+    }
+
+    #[test]
+    fn wire_volume_to_lots_round_trips() {
+        let eurusd = baked_in_default("EURUSD").unwrap();
+        let lots = 0.01;
+        let wire = eurusd.lots_to_wire_volume(lots, Some(10_000_000)).unwrap();
+        let back = eurusd.wire_volume_to_lots(wire, Some(10_000_000)).unwrap();
+        assert!((back - lots).abs() < 1e-9, "round-trip lost: {back} ≠ {lots}");
+    }
+
+    #[test]
+    fn position_pnl_account_buy_positive_move_gbp_account() {
+        // Buy EURUSD at 1.0800, exits at 1.0820 → +20 pips.
+        // 0.1 lot × 20 pips × $10/pip × 0.79 (USD→GBP) = +£15.80.
+        let eurusd = baked_in_default("EURUSD").unwrap();
+        let pnl = eurusd
+            .position_pnl_account(
+                1.0800,
+                1.0820,
+                0.1,
+                /* is_buy */ true,
+                "GBP",
+                Some(0.79),
+                None,
+            )
+            .expect("ok");
+        assert!((pnl - 15.80).abs() < 0.01, "expected ≈£15.80, got £{pnl}");
+    }
+
+    #[test]
+    fn position_pnl_account_sell_negative_move_is_profit() {
+        // Sell EURUSD at 1.0820, exits at 1.0800 → +20 pips for a short.
+        let eurusd = baked_in_default("EURUSD").unwrap();
+        let pnl = eurusd
+            .position_pnl_account(
+                1.0820,
+                1.0800,
+                0.1,
+                /* is_buy */ false,
+                "USD",
+                None,
+                None,
+            )
+            .expect("ok");
+        // pip_value $10/lot, 0.1 lot, 20 pips → $20.
+        assert!((pnl - 20.0).abs() < 1e-6, "expected $20, got ${pnl}");
+    }
+
+    #[test]
+    fn position_pnl_account_usdjpy_uses_pip_size_0_01() {
+        // USDJPY pip_size = 0.01. Buy at 149.00, exits at 149.20 → +20 pips.
+        // pip_value_quote = 0.01 × 100_000 = 1000 JPY/lot.
+        // 0.1 lot × 20 × 1000 = 2000 JPY. On USD account
+        // with live price 149.0 (using base==account fallback), the
+        // pip_value_in_account = 1000 / 149 ≈ 6.71 USD/lot → 0.1 × 20 × 6.71 ≈ $13.42.
+        let usdjpy = baked_in_default("USDJPY").unwrap();
+        let pnl = usdjpy
+            .position_pnl_account(
+                149.00,
+                149.20,
+                0.1,
+                /* is_buy */ true,
+                "USD",
+                None,
+                Some(149.0),
+            )
+            .expect("ok");
+        assert!((pnl - 13.42).abs() < 0.05, "expected ≈$13.42, got ${pnl}");
     }
 }
