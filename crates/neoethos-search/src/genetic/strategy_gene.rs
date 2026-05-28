@@ -409,19 +409,46 @@ pub fn infer_market_cost_profile(
             );
             fallback
         });
+    // Phase D.2e (2026-05-28) — step 3.5 in the resolution chain:
+    // when the operator override and SymbolMetadata.commission_per_lot
+    // are both unset, derive commission from the broker-supplied
+    // `commission_type` + `commission_rate_decimal` (D.2d schema
+    // additions) via `commission_per_lot_account_ccy`. Returns the
+    // commission in **account currency** so it slots directly into
+    // MarketCostProfile.commission_per_trade (which the eval kernel
+    // subtracts from PnL in account ccy). Bails to None for:
+    //   - type 1/2 USD-denominated on non-USD accounts (need USD→
+    //     account rate; deferred to D.2f)
+    //   - cross-currency type 3/4 with missing quote_to_account_rate
+    // In those cases the synthetic $7/lot fallback is taken with a
+    // tracing::warn! — surfaces the gap rather than silently lying.
     let commission_per_trade = commission_override
         .filter(|value| value.is_finite() && *value >= 0.0)
         .or(cost.commission_per_trade)
         .or_else(|| metadata.as_ref().and_then(|m| m.commission_per_lot))
+        .or_else(|| {
+            metadata.as_ref().and_then(|m| {
+                m.commission_per_lot_account_ccy(
+                    &account_currency,
+                    price_hint.or(m.typical_price),
+                    cost.quote_to_account_rate,
+                )
+            })
+        })
         .unwrap_or_else(|| {
             tracing::warn!(
                 target: "neoethos_search::cost_model",
                 symbol = %symbol,
+                account_currency = %account_currency,
                 fallback_commission = 7.0,
                 "Synthetic commission fallback used (F-029 LAST RESORT): \
-                 SymbolMetadata has no `commission_per_lot` and no \
-                 operator override. Populate data/symbol_metadata.json \
-                 from cTrader commission schedule to silence this."
+                 SymbolMetadata has no `commission_per_lot`, no operator \
+                 override, AND the broker-derived `commission_per_lot_account_ccy` \
+                 returned None (typically: type 1/2 on non-USD account, or \
+                 cross-currency type 3/4 without quote_to_account_rate). \
+                 Populate `commission_type`+`commission_rate_decimal` via \
+                 --rebuild-symbol-metadata and supply quote_to_account_rate \
+                 to silence this."
             );
             7.0
         });

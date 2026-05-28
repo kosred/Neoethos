@@ -374,6 +374,73 @@ impl SymbolMetadata {
         }
     }
 
+    /// **Phase D.2e (2026-05-28)** — convenience wrapper that returns
+    /// the per-lot commission in **account currency** instead of the
+    /// type-mixed return of `commission_per_lot_quote_ccy` (which
+    /// returns USD for types 1+2 and quote-ccy for types 3+4).
+    ///
+    /// Inputs:
+    ///   - `account_currency`: the deposit currency of the trading account
+    ///   - `live_price`: a recent close (broker tick or last bar); only
+    ///     used by types 1 and 3 which need notional volume
+    ///   - `quote_to_account_rate`: spot FX rate from the symbol's
+    ///     quote currency to the account currency. For a USD account
+    ///     this doubles as quote→USD which is the rate type 1 needs;
+    ///     for type 3+4 it converts the quote-currency result.
+    ///
+    /// Returns `None` when:
+    ///   - the broker hasn't supplied commission_type / rate_decimal
+    ///   - type 1 needs a non-USD quote rate but `account_currency != "USD"`
+    ///   - type 1 or 2 are USD-denominated but `account_currency != "USD"`
+    ///     (we'd need a separate USD→account rate that current callers
+    ///     don't supply — future D.2f work)
+    ///   - type 3 or 4 cross-currency but `quote_to_account_rate` is None
+    ///
+    /// Falling back to None (rather than synthesising a default) is the
+    /// fail-loud path the operator's "no hardcoded numbers" rule demands.
+    pub fn commission_per_lot_account_ccy(
+        &self,
+        account_currency: &str,
+        live_price: Option<f64>,
+        quote_to_account_rate: Option<f64>,
+    ) -> Option<f64> {
+        let kind = self.commission_type?;
+        // For type 1 the inner helper needs a `quote → USD` rate when
+        // the quote is non-USD. When the account currency IS USD, the
+        // operator-supplied `quote_to_account_rate` is exactly that
+        // rate; for any other account currency we have no clean way
+        // to get quote→USD from the current inputs, so we bail.
+        let quote_to_usd_for_helper = if account_currency.eq_ignore_ascii_case("USD") {
+            quote_to_account_rate
+        } else {
+            None
+        };
+        let amount = self.commission_per_lot_quote_ccy(live_price, quote_to_usd_for_helper)?;
+        match kind {
+            1 | 2 => {
+                // Inner helper returned USD per lot. Convert USD →
+                // account. We can only do that directly when account
+                // == USD. For non-USD accounts the caller needs a
+                // USD→account rate (deferred to D.2f).
+                if account_currency.eq_ignore_ascii_case("USD") {
+                    Some(amount)
+                } else {
+                    None
+                }
+            }
+            3 | 4 => {
+                // Inner helper returned quote-currency per lot.
+                if self.quote.eq_ignore_ascii_case(account_currency) {
+                    Some(amount)
+                } else {
+                    let r = quote_to_account_rate.filter(|v| v.is_finite() && *v > 0.0)?;
+                    Some(amount * r)
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub fn account_pnl_to_pips(
         &self,
         pnl_account_ccy: f64,
@@ -1287,5 +1354,101 @@ mod tests {
         let back: SymbolMetadata = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.commission_type, Some(1));
         assert_eq!(back.commission_rate_decimal, Some(45.0));
+    }
+
+    // ─── Phase D.2e account-ccy commission helper (2026-05-28) ────────
+
+    #[test]
+    fn account_commission_helper_eurusd_usd_account() {
+        // EURUSD type 1, $45/M USD. At price 1.10 with USD account:
+        // returns $4.95 directly (no FX conversion needed).
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.commission_type = Some(1);
+        m.commission_rate_decimal = Some(45.0);
+        let c = m
+            .commission_per_lot_account_ccy("USD", Some(1.10), None)
+            .expect("commission");
+        assert!((c - 4.95).abs() < 1e-9, "expected $4.95, got ${c}");
+    }
+
+    #[test]
+    fn account_commission_helper_usdjpy_usd_account() {
+        // USDJPY type 1 hypothetical: notional in USD = contract×1.0
+        // (since base is USD). The helper passes quote_to_account
+        // (JPY→USD) as the inner quote_to_usd. With rate=45 USD/M:
+        // commission = 45 × 100_000 / 1_000_000 = $4.50 per lot.
+        let mut m = baked_in_default("USDJPY").unwrap();
+        m.commission_type = Some(1);
+        m.commission_rate_decimal = Some(45.0);
+        // price 150 JPY/USD, quote_to_account = JPY→USD ≈ 1/150.
+        let c = m
+            .commission_per_lot_account_ccy("USD", Some(150.0), Some(1.0 / 150.0))
+            .expect("commission");
+        assert!((c - 4.50).abs() < 1e-6, "expected $4.50, got ${c}");
+    }
+
+    #[test]
+    fn account_commission_helper_type3_quote_eq_account() {
+        // Type 3 PercentOfValue with EUR-quoted index on EUR account:
+        // returns the quote-currency amount directly (no FX).
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.quote = "EUR".to_string();
+        m.contract_size = 1.0;
+        m.commission_type = Some(3);
+        m.commission_rate_decimal = Some(0.02); // 0.02 %
+        // price 20_000, notional = 20_000 EUR, commission = 4.00 EUR.
+        let c = m
+            .commission_per_lot_account_ccy("EUR", Some(20_000.0), None)
+            .expect("commission");
+        assert!((c - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn account_commission_helper_type3_cross_currency() {
+        // GERMANY 40-style: type 3 on EUR-quoted index, USD account.
+        // commission = 4.0 EUR/lot × (EUR→USD ≈ 1.08) ≈ 4.32 USD.
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.quote = "EUR".to_string();
+        m.contract_size = 1.0;
+        m.commission_type = Some(3);
+        m.commission_rate_decimal = Some(0.02);
+        let c = m
+            .commission_per_lot_account_ccy("USD", Some(20_000.0), Some(1.08))
+            .expect("commission");
+        assert!((c - 4.32).abs() < 1e-6, "expected ~$4.32, got ${c}");
+    }
+
+    #[test]
+    fn account_commission_helper_type1_non_usd_account_bails() {
+        // EURUSD type 1 on EUR account: we'd need USD→EUR rate which
+        // current callers don't supply. Bail rather than guess.
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.commission_type = Some(1);
+        m.commission_rate_decimal = Some(45.0);
+        assert!(m
+            .commission_per_lot_account_ccy("EUR", Some(1.10), Some(1.20))
+            .is_none());
+    }
+
+    #[test]
+    fn account_commission_helper_type3_cross_no_rate_bails() {
+        // Type 3 cross-currency with missing FX rate must return None.
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.quote = "EUR".to_string();
+        m.contract_size = 1.0;
+        m.commission_type = Some(3);
+        m.commission_rate_decimal = Some(0.02);
+        assert!(m
+            .commission_per_lot_account_ccy("USD", Some(20_000.0), None)
+            .is_none());
+    }
+
+    #[test]
+    fn account_commission_helper_missing_type_bails() {
+        let m = baked_in_default("EURUSD").unwrap();
+        // No commission_type set → must bail.
+        assert!(m
+            .commission_per_lot_account_ccy("USD", Some(1.10), None)
+            .is_none());
     }
 }

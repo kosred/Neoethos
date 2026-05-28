@@ -472,6 +472,53 @@ impl BacktestSettings {
     }
 }
 
+/// **Phase C.2 (2026-05-28)** — apply broker-supplied carry costs to a
+/// closed-trade gross PnL.
+///
+/// `gross_pnl` is the price-derived PnL after commission + half-spread.
+/// `in_pos` is +1 for long, −1 for short. `entry_ts_ms` / `exit_ts_ms`
+/// are millisecond timestamps; pass 0 when timestamps are unavailable
+/// and the swap charge should be skipped (back-compat with pre-Phase-C
+/// callers that don't carry timestamps).
+///
+/// Math:
+///   overnight_days = max(exit_ts − entry_ts, 0) / 86_400_000  (fractional)
+///   swap_pips_per_day = swap_long if long else swap_short
+///     ↑ broker sign convention: positive = credit, negative = charge
+///   pnl_with_carry = gross_pnl + swap_pips_per_day × overnight_days
+///                      × pip_value_per_lot
+///   net_pnl = pnl_with_carry × (1 − pnl_conversion_fee_rate)
+///
+/// With both swap fields = 0.0 and conversion fee = 0.0 this is the
+/// identity, matching the pre-Phase-C kernel exactly.
+#[inline]
+fn apply_carry_and_fee(
+    gross_pnl: f64,
+    in_pos: i8,
+    entry_ts_ms: i64,
+    exit_ts_ms: i64,
+    settings: &BacktestSettings,
+) -> f64 {
+    let overnight_days = if exit_ts_ms > entry_ts_ms && entry_ts_ms > 0 {
+        (exit_ts_ms - entry_ts_ms) as f64 / 86_400_000.0
+    } else {
+        0.0
+    };
+    let swap_pips_per_day = if in_pos == 1 {
+        settings.swap_long_pips_per_day
+    } else {
+        settings.swap_short_pips_per_day
+    };
+    let swap_credit = swap_pips_per_day * overnight_days * settings.pip_value_per_lot;
+    let pnl_with_carry = gross_pnl + swap_credit;
+    let conv_fee = settings.pnl_conversion_fee_rate;
+    if conv_fee.is_finite() && conv_fee > 0.0 && conv_fee < 1.0 {
+        pnl_with_carry * (1.0 - conv_fee)
+    } else {
+        pnl_with_carry
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn fast_evaluate_strategy_core(
     close: &[f64],
@@ -576,6 +623,18 @@ pub fn fast_evaluate_strategy_core(
                     (entry_px - close[i]) / pip * settings.pip_value_per_lot
                 };
                 let pnl = pnl - settings.commission_per_trade - half_spread_cost;
+                // Phase C.2: apply broker swap + conversion fee.
+                let entry_ts_ms = if use_timestamps && entry_idx >= 0 {
+                    timestamps.get(entry_idx as usize).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                let exit_ts_ms = if use_timestamps {
+                    timestamps.get(i).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                let pnl = apply_carry_and_fee(pnl, in_pos, entry_ts_ms, exit_ts_ms, settings);
                 equity += pnl;
                 current_month_pnl += pnl;
                 trade_count += 1;
@@ -708,6 +767,18 @@ pub fn fast_evaluate_strategy_core(
             if exit {
                 // Half-spread on exit + commission (half-spread was already paid at entry via adjusted entry_px)
                 pnl -= settings.commission_per_trade + half_spread_cost;
+                // Phase C.2: apply broker swap + conversion fee.
+                let entry_ts_ms = if use_timestamps && entry_idx >= 0 {
+                    timestamps.get(entry_idx as usize).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                let exit_ts_ms = if use_timestamps {
+                    timestamps.get(i).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                let pnl = apply_carry_and_fee(pnl, in_pos, entry_ts_ms, exit_ts_ms, settings);
                 equity += pnl;
                 current_month_pnl += pnl;
                 trade_count += 1;
@@ -886,6 +957,8 @@ pub fn simulate_trades_core(
                     let pnl = pnl - settings.commission_per_trade - half_spread_cost;
                     let entry_time = timestamps.get(entry_idx).copied().unwrap_or_default();
                     let exit_time = ts;
+                    // Phase C.2: apply broker swap + conversion fee.
+                    let pnl = apply_carry_and_fee(pnl, in_pos, entry_time, exit_time, settings);
                     let duration_hours = if exit_time >= entry_time {
                         Some((exit_time - entry_time) as f64 / 3_600_000.0)
                     } else {
@@ -994,6 +1067,8 @@ pub fn simulate_trades_core(
                 pnl -= settings.commission_per_trade + half_spread_cost;
                 let entry_time = timestamps.get(entry_idx).copied().unwrap_or_default();
                 let exit_time = timestamps.get(i).copied().unwrap_or(entry_time);
+                // Phase C.2: apply broker swap + conversion fee.
+                let pnl = apply_carry_and_fee(pnl, in_pos, entry_time, exit_time, settings);
                 let duration_hours = if exit_time >= entry_time {
                     Some((exit_time - entry_time) as f64 / 3_600_000.0)
                 } else {
@@ -1355,5 +1430,106 @@ mod overrides_tests {
         // defaults or whatever was installed earlier.
         assert!(observed.initial_equity.is_finite() && observed.initial_equity > 0.0);
         assert!(observed.month_capacity > 0);
+    }
+
+    // ─── Phase C.2 carry-cost + conversion-fee helper ────────────────
+    //
+    // These tests pin the math used by every trade-close branch of the
+    // CPU evaluator. All four sites call `apply_carry_and_fee` so a
+    // regression here would corrupt every backtest's PnL.
+
+    fn settings_with_carry(
+        swap_long: f64,
+        swap_short: f64,
+        conv_fee: f64,
+        pip_value_per_lot: f64,
+    ) -> BacktestSettings {
+        let mut s = BacktestSettings::default();
+        s.swap_long_pips_per_day = swap_long;
+        s.swap_short_pips_per_day = swap_short;
+        s.pnl_conversion_fee_rate = conv_fee;
+        s.pip_value_per_lot = pip_value_per_lot;
+        s
+    }
+
+    #[test]
+    fn carry_fee_zero_zero_is_identity() {
+        let s = settings_with_carry(0.0, 0.0, 0.0, 10.0);
+        // Day-trade (entry == exit): no swap, no fee → gross.
+        assert!((apply_carry_and_fee(123.45, 1, 0, 0, &s) - 123.45).abs() < 1e-9);
+        // Long trade held 5 days, zero swap & fee → still gross.
+        let entry = 1_700_000_000_000_i64;
+        let exit = entry + 5 * 86_400_000;
+        assert!((apply_carry_and_fee(123.45, 1, entry, exit, &s) - 123.45).abs() < 1e-9);
+    }
+
+    #[test]
+    fn carry_fee_negative_swap_reduces_pnl_for_long() {
+        // EURUSD-style: swap_long = −2.445 pips/day, pip_value_per_lot = $10.
+        // Long held 5.0 days → carry = −2.445 × 5 × 10 = −$122.25.
+        // Gross $200 → net $77.75. No fee.
+        let s = settings_with_carry(-2.445, -0.105, 0.0, 10.0);
+        let entry = 1_700_000_000_000_i64;
+        let exit = entry + 5 * 86_400_000;
+        let net = apply_carry_and_fee(200.0, 1, entry, exit, &s);
+        assert!((net - 77.75).abs() < 1e-6, "expected ~77.75, got {net}");
+    }
+
+    #[test]
+    fn carry_fee_positive_swap_credits_short() {
+        // XTIUSD-style: swap_short = +0.4375 pips/day, pip_value_per_lot = $1.
+        // Short held 4.0 days → carry = +0.4375 × 4 × 1 = +$1.75 credit.
+        let s = settings_with_carry(-0.5, 0.4375, 0.0, 1.0);
+        let entry = 1_700_000_000_000_i64;
+        let exit = entry + 4 * 86_400_000;
+        let net = apply_carry_and_fee(10.0, -1, entry, exit, &s);
+        assert!((net - 11.75).abs() < 1e-6, "expected ~11.75, got {net}");
+    }
+
+    #[test]
+    fn carry_fee_fractional_days() {
+        // 12 hours = 0.5 days. swap = −1.0, pip_value = 10 → carry = −5.0.
+        let s = settings_with_carry(-1.0, -1.0, 0.0, 10.0);
+        let entry = 1_700_000_000_000_i64;
+        let exit = entry + 12 * 3_600_000;
+        let net = apply_carry_and_fee(50.0, 1, entry, exit, &s);
+        assert!((net - 45.0).abs() < 1e-6, "expected ~45.0, got {net}");
+    }
+
+    #[test]
+    fn carry_fee_conversion_scales_after_swap() {
+        // Conversion fee 0.5% applied AFTER swap.
+        // No swap, fee = 0.005. Gross $100 → net $99.50.
+        let s = settings_with_carry(0.0, 0.0, 0.005, 10.0);
+        let net = apply_carry_and_fee(100.0, 1, 0, 0, &s);
+        assert!((net - 99.5).abs() < 1e-6, "expected 99.5, got {net}");
+    }
+
+    #[test]
+    fn carry_fee_handles_missing_timestamps_as_day_trade() {
+        // entry_ts = 0 means "no timestamp data": skip swap entirely.
+        let s = settings_with_carry(-100.0, -100.0, 0.0, 10.0);
+        let net = apply_carry_and_fee(50.0, 1, 0, 1_700_000_000_000, &s);
+        assert!((net - 50.0).abs() < 1e-9, "expected 50.0 (no swap), got {net}");
+    }
+
+    #[test]
+    fn carry_fee_rejects_inverted_timestamps() {
+        // exit < entry: no negative time, no swap charge.
+        let s = settings_with_carry(-1.0, -1.0, 0.0, 10.0);
+        let entry = 1_700_000_000_000_i64;
+        let exit = entry - 86_400_000;
+        let net = apply_carry_and_fee(50.0, 1, entry, exit, &s);
+        assert!((net - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn carry_fee_rejects_out_of_range_conversion_fee() {
+        // fee = 1.0 would wipe out PnL — reject and skip.
+        let s = settings_with_carry(0.0, 0.0, 1.0, 10.0);
+        assert!((apply_carry_and_fee(100.0, 1, 0, 0, &s) - 100.0).abs() < 1e-9);
+        // Negative fee also rejected.
+        let s = settings_with_carry(0.0, 0.0, -0.1, 10.0);
+        assert!((apply_carry_and_fee(100.0, 1, 0, 0, &s) - 100.0).abs() < 1e-9);
     }
 }
