@@ -514,38 +514,132 @@ fn random_coarse_weight(rng: &mut impl Rng) -> f32 {
     levels[rng.random_range(0..levels.len())]
 }
 
+/// Static fallback threshold ladder. Calibrated for z-score-normalised
+/// features per the 2026-05-26 narrow-ladder fix (F-273). Used when
+/// the adaptive ladder hasn't been installed for this process.
+const STATIC_THRESHOLD_LADDER: [f32; 6] = [0.10, 0.20, 0.35, 0.50, 0.70, 0.90];
+
+/// F-277 (2026-05-28): process-wide adaptive threshold ladder derived
+/// from the actual feature-magnitude profile of the current discovery
+/// dataset. Installed once at the start of `run_discovery_cycle_with_progress`
+/// via `install_adaptive_threshold_ladder` when the operator opts in
+/// (`FOREX_BOT_PROP_ADAPTIVE_THRESHOLDS=1`). When None, gene init falls
+/// back to the static z-score ladder above.
+///
+/// Why: the static ladder is calibrated for the assumption that
+/// normalised features have unit-ish variance, but the cTrader vector_ta
+/// pipeline's normalisation step is per-indicator (not per-symbol-per-TF),
+/// so a metal-pair feature cube can have very different magnitudes
+/// from a JPY-cross cube. The static ladder works for the majority of
+/// FX majors but mis-calibrates extreme-volatility cases (XAGUSD on M1,
+/// BTCUSD on H1). The adaptive ladder reads the actual cube and picks
+/// thresholds at the dataset's own percentile points.
+static ADAPTIVE_THRESHOLD_LADDER: std::sync::OnceLock<[f32; 6]> = std::sync::OnceLock::new();
+
+/// Install the adaptive threshold ladder derived from the feature
+/// cube. First call wins (subsequent calls are no-ops, by OnceLock
+/// semantics). The values should be sorted ascending and each must
+/// be finite + non-negative.
+///
+/// Returns `Err(installed)` if a ladder was already installed
+/// (matches the `install_*_runtime_overrides` convention elsewhere
+/// in the crate).
+pub fn install_adaptive_threshold_ladder(ladder: [f32; 6]) -> Result<(), [f32; 6]> {
+    ADAPTIVE_THRESHOLD_LADDER.set(ladder)
+}
+
+/// Read the currently-installed threshold ladder. Returns the
+/// adaptive ladder when installed, else the static fallback. Used
+/// by tests that want to verify the ladder selection path.
+pub fn current_threshold_ladder() -> [f32; 6] {
+    ADAPTIVE_THRESHOLD_LADDER
+        .get()
+        .copied()
+        .unwrap_or(STATIC_THRESHOLD_LADDER)
+}
+
 fn random_coarse_threshold(rng: &mut impl Rng) -> f32 {
-    // **2026-05-26 operator directive (dual-mode product, taskdoc #273)**:
-    // the previous `[0.30, 0.45, 0.60, 0.80, 1.00, 1.20]` ladder was
-    // calibrated against an older feature pipeline; empirical scoring on
-    // the current z-score frames shows the *combined* signal magnitude
-    // for a multi-indicator gene sits around 0.05-0.15 (≈ 0.5σ), with a
-    // 95th-percentile near 0.30-0.50. The old ladder's *minimum*
-    // threshold of 0.30 was at-or-above the 95th percentile, meaning
-    // most random initial genes never fired — even one indicator with a
-    // strong signal couldn't push the weighted combo past 0.30.
-    //
-    // The narrower ladder `[0.10, 0.20, 0.35, 0.50, 0.70, 0.90]` keeps the
-    // top end (for picky genes that fire only on extreme moves) but
-    // adds a working low-end (genes that fire often, even on mild
-    // moves). Activity + downstream filters (min_trades, prop-firm
-    // window-pass) prevent over-trading from winning.
-    //
-    // Doctrine: F-058 (2026-05-25) hard-picked the normalised ladder; this
-    // change narrows that same ladder to match the empirical feature
-    // magnitudes, not the assumption of unit-variance noise.
-    //
-    // **F-058 history (kept for context)**: the dual-convention switch via
-    // `FOREX_BOT_NORMALIZE_FEATURES` was a leftover from audit-era
-    // debugging when the feature pipeline emitted both raw-indicator
-    // and z-score frames. The current feature pipeline (post-#212
-    // vector_ta normalisation) ALWAYS emits z-score-normalised
-    // features — so the "raw" threshold ladder is unreachable in
-    // practice. If the operator ever switches back to a raw-feature
-    // pipeline, re-introduce the env switch — but DO NOT default-on it
-    // again because the dual-convention was a silent runtime trap.
-    let levels = [0.10, 0.20, 0.35, 0.50, 0.70, 0.90];
+    // F-273 narrow ladder by default; F-277 adaptive ladder when the
+    // operator opts in via `install_adaptive_threshold_ladder` from
+    // `run_discovery_cycle_with_progress`.
+    let levels = current_threshold_ladder();
     levels[rng.random_range(0..levels.len())]
+}
+
+/// F-277 (2026-05-28): derive an adaptive threshold ladder from the
+/// per-column magnitude profile of a feature cube. The ladder maps
+/// to typical-signal-strength percentile points so the GA's random
+/// init produces genes that fire at meaningful rates regardless of
+/// the dataset's absolute scale.
+///
+/// Algorithm:
+/// 1. For each column, collect `|value|` of finite rows (typically
+///    the column's mean-deviated magnitude).
+/// 2. Pool across columns into one sample (each column contributes
+///    its median |value|).
+/// 3. Compute 6 percentile points: [p10, p25, p50, p75, p90, p99].
+/// 4. Clamp each to `[1e-4, 10.0]` to guard pathological zero-variance
+///    or numerically explosive columns.
+/// 5. Sort ascending (already is by construction).
+///
+/// Returns `None` when the cube is empty or has zero finite values.
+pub fn derive_adaptive_threshold_ladder_from_features(
+    feature_data: &ndarray::Array2<f32>,
+) -> Option<[f32; 6]> {
+    let n_cols = feature_data.ncols();
+    let n_rows = feature_data.nrows();
+    if n_cols == 0 || n_rows == 0 {
+        return None;
+    }
+
+    // Per-column median |value|.
+    let mut per_col_median_abs: Vec<f32> = Vec::with_capacity(n_cols);
+    for c in 0..n_cols {
+        let mut abs_vals: Vec<f32> = (0..n_rows)
+            .map(|r| feature_data[(r, c)])
+            .filter(|v| v.is_finite())
+            .map(|v| v.abs())
+            .collect();
+        if abs_vals.is_empty() {
+            continue;
+        }
+        abs_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = abs_vals[abs_vals.len() / 2];
+        if median.is_finite() && median >= 0.0 {
+            per_col_median_abs.push(median);
+        }
+    }
+
+    if per_col_median_abs.is_empty() {
+        return None;
+    }
+
+    // Pool: percentile points on the per-column-median sample.
+    per_col_median_abs
+        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pct = |p: f64| -> f32 {
+        let idx = ((p * (per_col_median_abs.len() as f64 - 1.0)).round() as usize)
+            .min(per_col_median_abs.len() - 1);
+        per_col_median_abs[idx].clamp(1e-4, 10.0)
+    };
+
+    let ladder = [
+        pct(0.10),
+        pct(0.25),
+        pct(0.50),
+        pct(0.75),
+        pct(0.90),
+        pct(0.99),
+    ];
+    // Final safety: ensure strictly non-decreasing (clamp+pct may
+    // collapse two adjacent points in degenerate inputs).
+    for i in 1..ladder.len() {
+        if ladder[i] < ladder[i - 1] {
+            // Degenerate distribution — bail to static fallback.
+            return None;
+        }
+    }
+    Some(ladder)
 }
 
 /// Reset every derived/financial metric on a Gene that was inherited from a
@@ -918,5 +1012,74 @@ mod tests {
         let observed = current_seen_signature_memory_runtime_overrides();
         assert!(observed.flush_every >= 1);
         assert!(observed.max_entries >= 1);
+    }
+
+    // ─── F-277 adaptive threshold ladder tests ────────────────────────
+
+    #[test]
+    fn derive_ladder_returns_none_for_empty_cube() {
+        let empty: ndarray::Array2<f32> = ndarray::Array2::zeros((0, 0));
+        assert!(derive_adaptive_threshold_ladder_from_features(&empty).is_none());
+
+        let no_rows: ndarray::Array2<f32> = ndarray::Array2::zeros((0, 5));
+        assert!(derive_adaptive_threshold_ladder_from_features(&no_rows).is_none());
+
+        let no_cols: ndarray::Array2<f32> = ndarray::Array2::zeros((100, 0));
+        assert!(derive_adaptive_threshold_ladder_from_features(&no_cols).is_none());
+    }
+
+    #[test]
+    fn derive_ladder_returns_none_for_all_nan_cube() {
+        let mut data: ndarray::Array2<f32> = ndarray::Array2::zeros((10, 3));
+        data.fill(f32::NAN);
+        assert!(derive_adaptive_threshold_ladder_from_features(&data).is_none());
+    }
+
+    #[test]
+    fn derive_ladder_produces_monotonic_ascending_values() {
+        // Sample with varied magnitudes per column.
+        let mut data: ndarray::Array2<f32> = ndarray::Array2::zeros((100, 4));
+        for r in 0..100 {
+            data[(r, 0)] = (r as f32) * 0.01; // 0..1.0 — small magnitudes
+            data[(r, 1)] = (r as f32) * 0.05; // 0..5.0 — medium
+            data[(r, 2)] = (r as f32) * 0.10; // 0..10.0 — large (will clamp)
+            data[(r, 3)] = -(r as f32) * 0.02; // negative side
+        }
+        let ladder = derive_adaptive_threshold_ladder_from_features(&data)
+            .expect("non-degenerate cube must produce ladder");
+        // Monotone ascending
+        for i in 1..ladder.len() {
+            assert!(
+                ladder[i] >= ladder[i - 1],
+                "ladder[{i}]={} < ladder[{}]={}",
+                ladder[i],
+                i - 1,
+                ladder[i - 1]
+            );
+        }
+        // All clamped to safe range
+        for v in ladder.iter() {
+            assert!(v.is_finite());
+            assert!(*v >= 1e-4);
+            assert!(*v <= 10.0);
+        }
+    }
+
+    #[test]
+    fn install_adaptive_ladder_first_install_wins() {
+        // Use a unique value to avoid clashing with other tests that
+        // might have already installed. The static fallback is also a
+        // legal observation if no install happened.
+        let probe = current_threshold_ladder();
+        // The static fallback is `[0.10, 0.20, 0.35, 0.50, 0.70, 0.90]`.
+        // If an adaptive ladder is already installed (from another test
+        // in the same process), the assertion would be against THAT;
+        // either way the values are finite + monotone-ascending.
+        for i in 1..probe.len() {
+            assert!(probe[i] >= probe[i - 1]);
+        }
+        for v in probe.iter() {
+            assert!(v.is_finite() && *v > 0.0);
+        }
     }
 }

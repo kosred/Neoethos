@@ -1721,6 +1721,56 @@ where
     };
     funnel.set_mode(mode_label);
 
+    // F-277 (2026-05-28): adaptive threshold ladder. The hardcoded
+    // ladder in `evolution_math::random_coarse_threshold` is calibrated
+    // for z-score-normalised features with unit-ish variance, but real
+    // datasets vary widely in magnitude (XAGUSD M1 vs EURUSD D1 differ
+    // by ~10×). When the operator opts in via
+    // `FOREX_BOT_PROP_ADAPTIVE_THRESHOLDS=1`, derive a per-dataset
+    // ladder from the actual feature cube — gene init then picks
+    // thresholds at percentile points of the dataset's own signal
+    // magnitude distribution.
+    //
+    // The OnceLock semantics mean only the FIRST discovery run in a
+    // process installs the ladder; subsequent runs on different
+    // symbols would inherit the first symbol's ladder. The operator
+    // should disable the feature for production multi-symbol sweeps
+    // until F-277b adds per-symbol installation (deferred).
+    if std::env::var("FOREX_BOT_PROP_ADAPTIVE_THRESHOLDS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        if let Some(ladder) =
+            crate::genetic::derive_adaptive_threshold_ladder_from_features(&features.data)
+        {
+            match crate::genetic::install_adaptive_threshold_ladder(ladder) {
+                Ok(_) => tracing::info!(
+                    target: "neoethos_search::discovery",
+                    p10 = ladder[0],
+                    p25 = ladder[1],
+                    p50 = ladder[2],
+                    p75 = ladder[3],
+                    p90 = ladder[4],
+                    p99 = ladder[5],
+                    "F-277: installed adaptive threshold ladder from feature cube"
+                ),
+                Err(existing) => tracing::warn!(
+                    target: "neoethos_search::discovery",
+                    new = ?ladder,
+                    existing = ?existing,
+                    "F-277: adaptive ladder already installed (first-run wins). \
+                     Restart the process for a different symbol's ladder."
+                ),
+            }
+        } else {
+            tracing::warn!(
+                target: "neoethos_search::discovery",
+                "F-277: adaptive ladder derivation returned None (degenerate \
+                 feature cube: empty or zero-variance). Falling back to static ladder."
+            );
+        }
+    }
+
     // F-096 pre-flight: refuse to run with insufficient history per
     // operator's real-data directive 2026-05-24. The minimum-years
     // threshold lives on `DiscoveryRuntimeOverrides` (operator-tunable

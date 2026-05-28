@@ -21,8 +21,9 @@ pub use diversity::{DiversityKey, EvalMetrics, diversity_key, smc_mask};
 pub use evolution_math::{
     EvolutionSearchPolicy, ParentSelectionPolicy, SeenSignatureMemory,
     SeenSignatureMemoryRuntimeOverrides, SurvivorSelectionPolicy, apply_metrics, crossover,
-    current_seen_signature_memory_runtime_overrides, gene_signature_hash, generate_random_genes,
-    install_seen_signature_memory_runtime_overrides,
+    current_seen_signature_memory_runtime_overrides, current_threshold_ladder,
+    derive_adaptive_threshold_ladder_from_features, gene_signature_hash, generate_random_genes,
+    install_adaptive_threshold_ladder, install_seen_signature_memory_runtime_overrides,
     install_seen_signature_memory_runtime_overrides_from_env, mutate, new_random_gene,
     reset_gene_metrics, select_parent_index, select_survivor_indices,
     unique_candidate_or_retry,
