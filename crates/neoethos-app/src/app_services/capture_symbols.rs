@@ -34,14 +34,38 @@ use serde_json::{Map, Value, json, to_value};
 
 use crate::app_services::broker_persistence::load_broker_settings;
 use crate::app_services::ctrader_data::{
-    parse_symbol_by_id_response, parse_symbols_list_response, CTraderSymbolInfo,
+    parse_asset_class_list_response, parse_symbol_by_id_response,
+    parse_symbol_category_list_response, parse_symbols_list_response, CTraderSymbolInfo,
 };
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
-    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, build_account_auth_request,
-    build_application_auth_request, build_symbol_by_id_request, build_symbols_list_request,
+    build_account_auth_request, build_application_auth_request, build_asset_class_list_request,
+    build_symbol_by_id_request, build_symbol_category_list_request, build_symbols_list_request,
+    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
 };
 use crate::app_services::secure_store::production_ctrader_token_store;
+
+/// Asset classes the forex-ai catalog keeps. Match is
+/// case-insensitive substring. Anything else (Stocks, ETFs,
+/// Cryptocurrencies, ...) is dropped at bootstrap time.
+///
+/// User directive (2026-05-28): "FX majors/minors/exotics + Metals
+/// + Indices + Commodities (oil/gas) — ΑΥΤΑ ΚΑΙ ΜΟΝΟ ΑΥΤΑ".
+pub const FOREX_AI_ASSET_CLASS_KEYWORDS: &[&str] =
+    &["forex", "fx", "metal", "indice", "index", "commodit", "energ", "oil", "gas"];
+
+/// True iff the broker's asset class name matches one of the
+/// forex-ai keep keywords. Case-insensitive substring match — broker
+/// naming varies ("Forex" vs "FX" vs "Currencies", "Metals" vs
+/// "Spot Metals", "Indices" vs "Stock Indices", "Commodities" vs
+/// "Energies"), so a keyword list with permissive matching is the
+/// most-portable filter.
+pub fn is_forex_ai_asset_class(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    FOREX_AI_ASSET_CLASS_KEYWORDS
+        .iter()
+        .any(|kw| lower.contains(kw))
+}
 
 /// Resolve creds, hit cTrader, write one fixture per symbol.
 ///
@@ -547,13 +571,125 @@ pub fn run_bootstrap(env_label: &str, output_root: &Path) -> Result<()> {
         ));
     }
     let symbols_list = parse_symbols_list_response(&auth_responses[2])?;
-    let total = symbols_list.symbols.len();
-    eprintln!("[bootstrap] symbols catalog: {} entries", total);
-    if total == 0 {
+    let total_raw = symbols_list.symbols.len();
+    eprintln!("[bootstrap] symbols catalog: {} entries (unfiltered)", total_raw);
+    if total_raw == 0 {
         return Err(anyhow!(
             "broker returned an empty symbol catalog — refusing to write a useless bootstrap"
         ));
     }
+
+    // ── Step 1b: asset-class + symbol-category filter ────────────
+    //
+    // Forex-ai trades FX / Metals / Indices / Commodities only — the
+    // 700+ equity symbols this broker carries are useless cost-model
+    // ballast. We fetch the broker's own classification tables and
+    // keep only the LightSymbols whose category belongs to a class
+    // matching `FOREX_AI_ASSET_CLASS_KEYWORDS`. No name-pattern hacks.
+    let class_responses = transport.send_sequence(&[
+        build_application_auth_request(
+            &ctrader.client_id,
+            &ctrader.client_secret,
+            "bootstrap-class-auth",
+        ),
+        build_account_auth_request(
+            account_id,
+            &token_bundle.access_token,
+            "bootstrap-class-acct",
+        ),
+        build_asset_class_list_request(account_id, "bootstrap-asset-classes"),
+    ])?;
+    if class_responses.len() < 3 {
+        return Err(anyhow!(
+            "asset-class list: expected 3 responses, got {}",
+            class_responses.len()
+        ));
+    }
+    let asset_classes = parse_asset_class_list_response(&class_responses[2])?;
+    let kept_class_ids: std::collections::HashSet<i64> = asset_classes
+        .iter()
+        .filter(|c| is_forex_ai_asset_class(&c.name))
+        .map(|c| c.id)
+        .collect();
+    eprintln!(
+        "[bootstrap] asset classes total={} kept={} ({:?})",
+        asset_classes.len(),
+        kept_class_ids.len(),
+        asset_classes
+            .iter()
+            .filter(|c| kept_class_ids.contains(&c.id))
+            .map(|c| &c.name)
+            .collect::<Vec<_>>()
+    );
+    if kept_class_ids.is_empty() {
+        return Err(anyhow!(
+            "no asset classes matched the forex-ai keep-list — broker named them: {:?}",
+            asset_classes.iter().map(|c| &c.name).collect::<Vec<_>>()
+        ));
+    }
+
+    let cat_responses = transport.send_sequence(&[
+        build_application_auth_request(
+            &ctrader.client_id,
+            &ctrader.client_secret,
+            "bootstrap-cat-auth",
+        ),
+        build_account_auth_request(account_id, &token_bundle.access_token, "bootstrap-cat-acct"),
+        build_symbol_category_list_request(account_id, "bootstrap-symbol-categories"),
+    ])?;
+    if cat_responses.len() < 3 {
+        return Err(anyhow!(
+            "symbol-category list: expected 3 responses, got {}",
+            cat_responses.len()
+        ));
+    }
+    let categories = parse_symbol_category_list_response(&cat_responses[2])?;
+    let kept_category_ids: std::collections::HashSet<i64> = categories
+        .iter()
+        .filter(|c| kept_class_ids.contains(&c.asset_class_id))
+        .map(|c| c.id)
+        .collect();
+    eprintln!(
+        "[bootstrap] symbol categories total={} kept={}",
+        categories.len(),
+        kept_category_ids.len()
+    );
+
+    // Filter the LightSymbols list now.
+    let filtered_symbols: Vec<_> = symbols_list
+        .symbols
+        .into_iter()
+        .filter(|ls| {
+            // None category_id → broker classification unknown,
+            // safest to DROP rather than potentially keep an
+            // equity. Phase D.2 can later widen this if any
+            // legit forex symbol is found to lack a category.
+            ls.symbol_category_id
+                .map(|id| kept_category_ids.contains(&id))
+                .unwrap_or(false)
+        })
+        .collect();
+    let total = filtered_symbols.len();
+    eprintln!(
+        "[bootstrap] filtered: {} kept of {} (forex/metals/indices/commodities only)",
+        total, total_raw
+    );
+    if total == 0 {
+        return Err(anyhow!(
+            "after filtering by forex-ai asset classes, 0 symbols remain — \
+             check the broker's asset class names: {:?}",
+            asset_classes.iter().map(|c| &c.name).collect::<Vec<_>>()
+        ));
+    }
+
+    // Rebind the loop's source to the filtered list. We keep the
+    // original variable name `symbols_list.symbols` semantics so
+    // the downstream `chunk` loop below doesn't need re-plumbing.
+    let symbols_list = crate::app_services::ctrader_data::CTraderSymbolsListResult {
+        account_id: symbols_list.account_id,
+        symbols: filtered_symbols,
+        archived_symbols: symbols_list.archived_symbols,
+    };
 
     // ── Step 2: chunked symbol_by_id round-trips ─────────────────
     // We batch IDs to amortise the per-WSS-connection auth overhead.

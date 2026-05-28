@@ -22,6 +22,39 @@ pub struct CTraderLightSymbolInfo {
     pub symbol_name: String,
     pub enabled: bool,
     pub description: Option<String>,
+    /// **Phase D.1b (2026-05-28)** — broker's classification of the
+    /// symbol into a category (e.g. "FX Majors", "Spot Metals",
+    /// "US Indices"). Joins to `ProtoOASymbolCategory.id` which in
+    /// turn references `ProtoOAAssetClass.id`. We use this chain to
+    /// filter the bootstrap catalog to forex-relevant classes only,
+    /// dropping the 700+ equity symbols a forex-ai will never
+    /// trade. `None` when the broker omits the field (some exotic
+    /// instruments).
+    pub symbol_category_id: Option<i64>,
+}
+
+/// **Phase D.1b (2026-05-28)** — top-level asset class metadata.
+/// Mirrors `ProtoOAAssetClass`. Names are broker-defined strings
+/// like "Forex", "Metals", "Indices", "Commodities", "Stocks",
+/// "Cryptocurrencies", "ETFs". The Phase D bootstrap filters by
+/// these names case-insensitively.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderAssetClassInfo {
+    pub id: i64,
+    pub name: String,
+    pub sorting_number: Option<f64>,
+}
+
+/// **Phase D.1b (2026-05-28)** — symbol category metadata. Mirrors
+/// `ProtoOASymbolCategory`. Each category points to a parent
+/// `asset_class_id` so the bootstrap can keep symbols whose
+/// category belongs to a desired asset class.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderSymbolCategoryInfo {
+    pub id: i64,
+    pub asset_class_id: i64,
+    pub name: String,
+    pub sorting_number: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -498,6 +531,68 @@ struct LightSymbolPayload {
     symbol_name: Option<String>,
     enabled: Option<bool>,
     description: Option<String>,
+    // **Phase D.1b (2026-05-28)** — broker's category classifier;
+    // joins to ProtoOASymbolCategory.id. Proto field 6 on
+    // ProtoOALightSymbol; previously unused by our parser.
+    #[serde(rename = "symbolCategoryId")]
+    symbol_category_id: Option<i64>,
+}
+
+// ─── Phase D.1b — asset class + symbol category wire shapes ─────────
+//
+// The catalog filter chain is:
+//   ProtoOAAssetClassListRes  → [ {id, name, sortingNumber}, ... ]
+//   ProtoOASymbolCategoryListRes → [ {id, assetClassId, name, sortingNumber}, ... ]
+//   ProtoOASymbolsListRes         → [ {symbolId, symbolName, symbolCategoryId, ...}, ... ]
+//
+// At bootstrap time we resolve the user's asset-class allow-list
+// ("Forex", "Metals", "Indices", "Commodities") against the broker's
+// own naming, then keep only LightSymbols whose category's parent
+// class is in the allow-list. No name-pattern heuristics — the
+// broker is the source of truth for classification too.
+
+#[derive(Debug, Deserialize)]
+struct AssetClassListEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: AssetClassListPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssetClassListPayload {
+    #[serde(default, rename = "assetClass")]
+    asset_class: Vec<AssetClassEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssetClassEntry {
+    id: i64,
+    name: Option<String>,
+    #[serde(rename = "sortingNumber")]
+    sorting_number: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SymbolCategoryListEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: SymbolCategoryListPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct SymbolCategoryListPayload {
+    #[serde(default, rename = "symbolCategory")]
+    symbol_category: Vec<SymbolCategoryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SymbolCategoryEntry {
+    id: i64,
+    #[serde(rename = "assetClassId")]
+    asset_class_id: i64,
+    name: Option<String>,
+    #[serde(rename = "sortingNumber")]
+    sorting_number: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -720,6 +815,7 @@ pub fn parse_symbols_list_response(response_json: &str) -> Result<CTraderSymbols
                 symbol_name: symbol.symbol_name.unwrap_or_default(),
                 enabled: symbol.enabled.unwrap_or(false),
                 description: symbol.description,
+                symbol_category_id: symbol.symbol_category_id,
             })
             .collect(),
         archived_symbols: envelope
@@ -729,6 +825,67 @@ pub fn parse_symbols_list_response(response_json: &str) -> Result<CTraderSymbols
             .map(|symbol| symbol.name)
             .collect(),
     })
+}
+
+/// **Phase D.1b (2026-05-28)** — parse `ProtoOAAssetClassListRes`.
+/// Returns the broker's top-level asset class table (Forex, Metals,
+/// Indices, Commodities, Stocks, Cryptocurrencies, ETFs, ...).
+/// Used by the catalog bootstrap to map a user-supplied allow-list
+/// of class names to broker-defined IDs.
+pub fn parse_asset_class_list_response(
+    response_json: &str,
+) -> Result<Vec<CTraderAssetClassInfo>> {
+    let envelope: AssetClassListEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader asset class list response")?;
+    if envelope.payload_type
+        != crate::app_services::ctrader_messages::CTRADER_OA_ASSET_CLASS_LIST_RESPONSE_PAYLOAD_TYPE
+    {
+        return Err(anyhow!(
+            "unexpected cTrader asset class list payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    Ok(envelope
+        .payload
+        .asset_class
+        .into_iter()
+        .map(|e| CTraderAssetClassInfo {
+            id: e.id,
+            name: e.name.unwrap_or_default(),
+            sorting_number: e.sorting_number,
+        })
+        .collect())
+}
+
+/// **Phase D.1b (2026-05-28)** — parse `ProtoOASymbolCategoryListRes`.
+/// Returns the broker's symbol category table. Each row joins
+/// `LightSymbol.symbol_category_id` to a parent `asset_class_id`,
+/// completing the filter chain
+/// `symbol → category → asset_class → allow-list`.
+pub fn parse_symbol_category_list_response(
+    response_json: &str,
+) -> Result<Vec<CTraderSymbolCategoryInfo>> {
+    let envelope: SymbolCategoryListEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader symbol category list response")?;
+    if envelope.payload_type
+        != crate::app_services::ctrader_messages::CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE
+    {
+        return Err(anyhow!(
+            "unexpected cTrader symbol category list payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    Ok(envelope
+        .payload
+        .symbol_category
+        .into_iter()
+        .map(|e| CTraderSymbolCategoryInfo {
+            id: e.id,
+            asset_class_id: e.asset_class_id,
+            name: e.name.unwrap_or_default(),
+            sorting_number: e.sorting_number,
+        })
+        .collect())
 }
 
 pub fn parse_symbol_by_id_response(response_json: &str) -> Result<Vec<CTraderSymbolInfo>> {

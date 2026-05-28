@@ -67,6 +67,16 @@ pub const CTRADER_OA_SYMBOLS_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2114;
 pub const CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2115;
 pub const CTRADER_OA_SYMBOL_BY_ID_REQUEST_PAYLOAD_TYPE: u32 = 2116;
 pub const CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE: u32 = 2117;
+// **Phase D.1 follow-up (2026-05-28)**: asset class + symbol category
+// payloads. The broker uses these to group symbols into "Forex",
+// "Metals", "Indices", "Commodities", "Stocks", "Cryptocurrencies",
+// etc. We filter the catalog by these classes so the forex-bot's
+// cost model doesn't waste cycles on the 700+ equity symbols that
+// will never be traded.
+pub const CTRADER_OA_ASSET_CLASS_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2153;
+pub const CTRADER_OA_ASSET_CLASS_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2154;
+pub const CTRADER_OA_SYMBOL_CATEGORY_REQUEST_PAYLOAD_TYPE: u32 = 2160;
+pub const CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE: u32 = 2161;
 pub const CTRADER_OA_GET_TRENDBARS_REQUEST_PAYLOAD_TYPE: u32 = 2137;
 pub const CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE: u32 = 2138;
 pub const CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE: u32 = 2142;
@@ -89,13 +99,12 @@ pub const CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE: u32 = 2164;
 /// `crates/neoethos-app/src/app_services/pnl.rs`.
 pub const CTRADER_OA_GET_POSITION_UNREALIZED_PNL_REQUEST_PAYLOAD_TYPE: u32 = 2187;
 pub const CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE: u32 = 2188;
-/// `ProtoOASymbolCategoryListReq` / `…Res` (group G of the 2026-05-14
-/// upstream proto refresh — see
-/// `docs/audits/research/spotware_proto_new_messages.md`). The numeric
-/// values are fixed in
-/// `proto/OpenApiModelMessages.proto::ProtoOAPayloadType`.
-pub const CTRADER_OA_SYMBOL_CATEGORY_REQUEST_PAYLOAD_TYPE: u32 = 2160;
-pub const CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE: u32 = 2161;
+// **Phase D.1b (2026-05-28)** — note: `CTRADER_OA_SYMBOL_CATEGORY_*`
+// (2160/2161) are declared above with the other 2154/2160 family,
+// alongside `CTRADER_OA_ASSET_CLASS_LIST_*` (2153/2154). The earlier
+// pre-Phase-D constant set lived here; consolidated upward so the
+// group-G chunk is grep-able as one block.
+
 /// `ProtoOADealListByPositionIdReq` / `…Res` — group D, narrow-window
 /// trade-history lookup tied to a single `positionId`.
 pub const CTRADER_OA_DEAL_LIST_BY_POSITION_ID_REQUEST_PAYLOAD_TYPE: u32 = 2179;
@@ -747,6 +756,43 @@ pub fn build_symbol_by_id_request(
     }
 }
 
+/// **Phase D.1 (2026-05-28)** — request the broker's asset class
+/// list. Returns top-level groupings like "Forex", "Metals",
+/// "Indices", "Commodities", "Stocks", "Cryptocurrencies", "ETFs".
+/// Used by `--bootstrap-broker-catalog` to filter the catalog to
+/// only the asset classes relevant to forex-ai.
+pub fn build_asset_class_list_request(
+    ctid_trader_account_id: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_ASSET_CLASS_LIST_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+        }),
+    }
+}
+
+/// **Phase D.1 (2026-05-28)** — request the broker's symbol category
+/// list. Each category links a `symbolCategoryId` (carried on
+/// `ProtoOALightSymbol`) to a parent `assetClassId` and a human
+/// name like "FX Majors" / "Spot Metals" / "US Indices". The chain
+/// asset_class → symbol_category → light_symbol lets us classify
+/// every catalog entry without name-pattern hacks.
+pub fn build_symbol_category_list_request(
+    ctid_trader_account_id: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_SYMBOL_CATEGORY_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+        }),
+    }
+}
+
 pub fn build_get_trendbars_request(
     ctid_trader_account_id: i64,
     symbol_id: i64,
@@ -911,20 +957,11 @@ pub fn build_order_details_request(
     }
 }
 
-/// Build the JSON envelope for `ProtoOASymbolCategoryListReq`
-/// (payload type 2160). Only required field is `ctidTraderAccountId`.
-pub fn build_symbol_category_list_request(
-    ctid_trader_account_id: i64,
-    client_msg_id: impl Into<String>,
-) -> CTraderOpenApiJsonMessage {
-    CTraderOpenApiJsonMessage {
-        client_msg_id: client_msg_id.into(),
-        payload_type: CTRADER_OA_SYMBOL_CATEGORY_REQUEST_PAYLOAD_TYPE,
-        payload: serde_json::json!({
-            "ctidTraderAccountId": ctid_trader_account_id,
-        }),
-    }
-}
+// **Phase D.1b (2026-05-28)** — note: `build_symbol_category_list_request`
+// is now declared earlier in this file alongside its sibling
+// `build_asset_class_list_request` so the two related RPCs are
+// physically co-located. The pre-Phase-D definition that lived here
+// has been merged upward.
 
 pub fn parse_open_api_envelope(response_json: &str) -> Result<CTraderOpenApiJsonMessage> {
     serde_json::from_str(response_json).with_context(|| {
@@ -990,6 +1027,13 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         }
         CTRADER_OA_SYMBOL_CATEGORY_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE)
+        }
+        // Phase D.1b (2026-05-28) — `ProtoOAAssetClassListReq/Res`,
+        // used by the bootstrap to fetch the broker's top-level
+        // asset class table so we can keep only Forex/Metals/
+        // Indices/Commodities and drop the equity catalog.
+        CTRADER_OA_ASSET_CLASS_LIST_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_ASSET_CLASS_LIST_RESPONSE_PAYLOAD_TYPE)
         }
         CTRADER_OA_DEAL_LIST_BY_POSITION_ID_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_DEAL_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE)
