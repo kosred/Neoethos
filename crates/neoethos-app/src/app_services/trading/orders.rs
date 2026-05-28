@@ -493,6 +493,19 @@ impl TradingSession {
                 // to bypass the risk-per-trade ceiling.
                 let market_price_for_entry =
                     self.ctrader_live_mid_price_for_symbol(order_request.symbol_id);
+                // **Phase B follow-up (2026-05-27)**: the gate now
+                // accepts an optional `&SymbolFinancials` for broker-
+                // side trading-mode / short-selling / SL-TP distance
+                // gating. Currently `None` here so the new gates are
+                // dormant on the production path — wiring requires
+                // `build_ctrader_order_request` to return the
+                // resolved `CTraderSymbolInfo` alongside the order
+                // request (a focused, mechanical follow-up). Until
+                // then, the broker still enforces these constraints
+                // server-side with `TRADING_DISABLED` /
+                // `TRADING_BAD_STOPS` — operator just sees the
+                // raw error code instead of the pre-emptive
+                // friendly message.
                 if let Err(err) = prop_firm_pre_trade_check(
                     &state.risk,
                     &order_request,
@@ -502,6 +515,7 @@ impl TradingSession {
                     pip_position,
                     &state.selected_pair,
                     market_price_for_entry,
+                    None,
                 ) {
                     let message = format!("Prop-firm risk gate blocked: {err}");
                     state.status_msg = message.clone();

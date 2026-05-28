@@ -1292,7 +1292,7 @@ fn prop_firm_gate_blocks_order_without_stop_loss() {
     order.stop_loss = None;
     let risk = RiskConfig::default();
     let err =
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None)
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None, None)
             .unwrap_err();
     assert!(err.to_string().contains("missing stop_loss"));
 }
@@ -1302,7 +1302,7 @@ fn prop_firm_gate_blocks_when_daily_drawdown_breached() {
     let _guard = install_prop_firm_test_env();
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
-    let err = prop_firm_pre_trade_check(&risk, &order, 9500.0, 10000.0, 10000.0, 4, "EURUSD", None)
+    let err = prop_firm_pre_trade_check(&risk, &order, 9500.0, 10000.0, 10000.0, 4, "EURUSD", None, None)
         .unwrap_err();
     assert!(err.to_string().contains("Daily drawdown limit reached"));
     assert!(err.to_string().contains("current 5.00% >= max 4.00%"));
@@ -1329,14 +1329,14 @@ fn prop_firm_gate_respects_jpy_pip_precision() {
     };
     // Should pass under 2-digit precision (50 pips).
     assert!(
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 2, "USDJPY", None)
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 2, "USDJPY", None, None)
             .is_ok()
     );
     // 4-digit precision would amplify pip_distance by 100×; with the same
     // lot size and pip value that's $50,000 of risk on a $10,000 account,
     // still > 100% so it must reject.
     assert!(
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "USDJPY", None)
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "USDJPY", None, None)
             .is_err()
     );
 }
@@ -1347,7 +1347,7 @@ fn prop_firm_gate_blocks_when_total_drawdown_breached() {
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
     // Set day_start_equity equal to account_equity so daily DD is 0%, forcing it to hit total DD rule
-    let err = prop_firm_pre_trade_check(&risk, &order, 8900.0, 10000.0, 8900.0, 4, "EURUSD", None)
+    let err = prop_firm_pre_trade_check(&risk, &order, 8900.0, 10000.0, 8900.0, 4, "EURUSD", None, None)
         .unwrap_err();
     assert!(err.to_string().contains("Total drawdown limit reached"));
     assert!(err.to_string().contains("current 11.00% >= max 7.00%"));
@@ -1363,7 +1363,7 @@ fn prop_firm_gate_passes_valid_order_within_limits() {
     order.limit_price = Some(1.10000);
     let risk = RiskConfig::default();
     assert!(
-        prop_firm_pre_trade_check(&risk, &order, 10100.0, 10000.0, 10000.0, 4, "EURUSD", None)
+        prop_firm_pre_trade_check(&risk, &order, 10100.0, 10000.0, 10000.0, 4, "EURUSD", None, None)
             .is_ok()
     );
 }
@@ -1382,7 +1382,7 @@ fn prop_firm_gate_rejects_market_with_sl_but_no_entry_estimate() {
     // Pass None for the market-price fallback — simulates the cold-start
     // case where no live spot quote is available for the symbol yet.
     let err =
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None)
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None, None)
             .unwrap_err();
     assert!(
         err.to_string().contains("no entry-price estimate")
@@ -1415,6 +1415,7 @@ fn prop_firm_gate_accepts_market_with_sl_when_mid_price_supplied() {
             4,
             "EURUSD",
             Some(1.10000),
+            None,
         )
         .is_ok(),
         "Market order with SL and live mid-price must pass the sized risk gate"
@@ -1431,7 +1432,7 @@ fn prop_firm_gate_respects_disabled_stop_loss_requirement() {
         ..RiskConfig::default()
     };
     assert!(
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None)
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None, None)
             .is_ok()
     );
 }
@@ -1444,7 +1445,7 @@ fn prop_firm_gate_rejects_unknown_symbol_without_synthetic_fallback() {
     // Empty symbol must be rejected — the old code silently used
     // `infer_market_cost_profile("", "", …)` and the EURUSD default,
     // producing a synthetic pip value. That is not allowed any more.
-    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "", None)
+    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "", None, None)
         .unwrap_err();
     assert!(
         err.to_string().contains("symbol name was not supplied")
@@ -1472,12 +1473,184 @@ fn prop_firm_gate_rejects_when_account_currency_unset() {
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
     let err =
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None)
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None, None)
             .unwrap_err();
     assert!(
         err.to_string().contains("FOREX_BOT_PROP_ACCOUNT_CURRENCY")
             || err.to_string().contains("symbol metadata"),
         "unexpected error: {err}"
+    );
+}
+
+// ── Phase B gating (2026-05-27 cycle-3): broker-side trading-mode,
+// short-selling, and SL/TP minimum-distance checks driven by the
+// `SymbolFinancials` projection from `ProtoOASymbol`. The risk
+// gate accepts `None` for `financials` (legacy / test-bypass path);
+// these tests build a minimal sample financials struct and verify
+// each of the three new branches.
+
+/// Empty-but-trading-enabled financials, with no distance constraints.
+/// Tests mutate one field at a time using struct-update syntax.
+fn sample_symbol_financials() -> SymbolFinancials {
+    SymbolFinancials {
+        commission_type: None,
+        precise_trading_commission_rate: None,
+        precise_min_commission: None,
+        min_commission_type: None,
+        min_commission_asset: None,
+        pnl_conversion_fee_rate: None,
+        swap_long: None,
+        swap_short: None,
+        swap_calculation_type: None,
+        swap_period_hours: None,
+        swap_time_minutes_from_utc_midnight: None,
+        swap_rollover_3_days: None,
+        skip_swap_periods: None,
+        charge_swap_at_weekends: None,
+        rollover_commission: None,
+        rollover_commission_3_days: None,
+        skip_rollover_days: None,
+        sl_distance_points: None,
+        tp_distance_points: None,
+        gsl_distance_points: None,
+        gsl_charge: None,
+        distance_set_in: None,
+        guaranteed_stop_loss_available: None,
+        trading_mode: Some(TradingModeProto::Enabled),
+        enable_short_selling: None,
+        schedule_time_zone: None,
+        trading_intervals: Vec::new(),
+        holidays: Vec::new(),
+        max_exposure: None,
+        leverage_id: None,
+        measurement_units: None,
+    }
+}
+
+#[test]
+fn prop_firm_gate_rejects_close_only_mode() {
+    let _guard = install_prop_firm_test_env();
+    let mut order = sample_prop_firm_order();
+    order.volume = 1;
+    order.limit_price = Some(1.10000);
+    let risk = RiskConfig::default();
+    let mut fin = sample_symbol_financials();
+    fin.trading_mode = Some(TradingModeProto::CloseOnlyMode);
+    let err = prop_firm_pre_trade_check(
+        &risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None, Some(&fin),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("not currently accepting new positions")
+            || err.to_string().contains("trading_mode"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn prop_firm_gate_rejects_sell_when_short_selling_disabled() {
+    let _guard = install_prop_firm_test_env();
+    let mut order = sample_prop_firm_order();
+    order.volume = 1;
+    order.trade_side = CTraderTradeSide::Sell;
+    order.limit_price = Some(1.10000);
+    let risk = RiskConfig::default();
+    let mut fin = sample_symbol_financials();
+    fin.enable_short_selling = Some(false);
+    let err = prop_firm_pre_trade_check(
+        &risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None, Some(&fin),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("Short-selling is disabled"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn prop_firm_gate_accepts_sell_when_short_selling_enabled() {
+    let _guard = install_prop_firm_test_env();
+    let mut order = sample_prop_firm_order();
+    order.volume = 1;
+    order.trade_side = CTraderTradeSide::Sell;
+    order.limit_price = Some(1.10000);
+    order.stop_loss = Some(1.15000); // SELL with SL above entry
+    let risk = RiskConfig::default();
+    let mut fin = sample_symbol_financials();
+    fin.enable_short_selling = Some(true);
+    assert!(
+        prop_firm_pre_trade_check(
+            &risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None, Some(&fin),
+        )
+        .is_ok(),
+        "SELL order must pass when short-selling is explicitly enabled"
+    );
+}
+
+#[test]
+fn prop_firm_gate_rejects_stop_loss_inside_min_distance() {
+    let _guard = install_prop_firm_test_env();
+    let mut order = sample_prop_firm_order();
+    order.volume = 1;
+    order.limit_price = Some(1.10000);
+    // SL at 1.09995 is 5 points (0.00005) from entry on a 5-digit
+    // FX symbol. The broker requires at least 10 points → reject.
+    order.stop_loss = Some(1.09995);
+    let risk = RiskConfig::default();
+    let mut fin = sample_symbol_financials();
+    fin.distance_set_in = Some(SymbolDistanceType::SymbolDistanceInPoints);
+    fin.sl_distance_points = Some(10);
+    let err = prop_firm_pre_trade_check(
+        &risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None, Some(&fin),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("stop-loss")
+            && err.to_string().contains("too close to entry"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn prop_firm_gate_accepts_stop_loss_at_or_beyond_min_distance() {
+    let _guard = install_prop_firm_test_env();
+    let mut order = sample_prop_firm_order();
+    order.volume = 1;
+    order.limit_price = Some(1.10000);
+    // SL at 1.09980 is 20 points from entry; broker min is 10. Should pass.
+    order.stop_loss = Some(1.09980);
+    let risk = RiskConfig::default();
+    let mut fin = sample_symbol_financials();
+    fin.distance_set_in = Some(SymbolDistanceType::SymbolDistanceInPoints);
+    fin.sl_distance_points = Some(10);
+    assert!(
+        prop_firm_pre_trade_check(
+            &risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None, Some(&fin),
+        )
+        .is_ok(),
+        "Stop-loss at 2× the broker minimum distance must pass the gate"
+    );
+}
+
+#[test]
+fn prop_firm_gate_skips_phase_b_checks_when_financials_none() {
+    // Verifies the dormant-on-None contract. If `financials` is None
+    // the new Phase B gates must NOT trigger — the order still goes
+    // through the risk-per-trade math and either passes or fails
+    // based on size alone. This is what the production caller
+    // (orders.rs::execute_ctrader_order) does today until the
+    // financials threading follow-up lands.
+    let _guard = install_prop_firm_test_env();
+    let mut order = sample_prop_firm_order();
+    order.volume = 1;
+    order.limit_price = Some(1.10000);
+    let risk = RiskConfig::default();
+    assert!(
+        prop_firm_pre_trade_check(
+            &risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None, None,
+        )
+        .is_ok(),
+        "Phase B checks must be dormant when financials = None"
     );
 }
 

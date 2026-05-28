@@ -22,8 +22,10 @@
 //!   symbol metadata cannot make `10.0_f64.powi(pip_position)` go to
 //!   `inf`/`0.0` and silently flip the gate.
 
-use crate::app_services::ctrader_data::CTraderSymbolInfo;
-use crate::app_services::ctrader_messages::CTraderNewOrderRequest;
+use crate::app_services::ctrader_data::{
+    CTraderSymbolInfo, SymbolDistanceType, SymbolFinancials,
+};
+use crate::app_services::ctrader_messages::{CTraderNewOrderRequest, CTraderTradeSide};
 use crate::app_state::OrderTicketState;
 
 /// Convert "units" (cTrader's strategy-side unit count) to the on-wire
@@ -126,6 +128,16 @@ pub(super) fn prop_firm_pre_trade_check(
     // risk-per-trade gate is N/A); for Market orders WITH stop-loss the
     // gate hard-fails (see the new branch below) — Note.
     market_price_for_entry: Option<f64>,
+    // **Phase B (2026-05-27)**: the broker's per-symbol financial &
+    // schedule projection from `ProtoOASymbol`. Supplies the
+    // trading-mode flag, short-selling permission, and the
+    // SL/TP minimum-distance constraints that cTrader would otherwise
+    // reject server-side with `TRADING_BAD_STOPS` /
+    // `TRADING_DISABLED`. `None` is accepted for the test fixtures and
+    // legacy paths where the broker catalog hasn't been threaded
+    // through yet — those paths simply skip the new gates, preserving
+    // pre-Phase-B behaviour.
+    financials: Option<&SymbolFinancials>,
 ) -> anyhow::Result<()> {
     // SECURITY (audit-fix F7): `10.0_f64.powi(pip_position)` returns `inf`
     // when `pip_position >= 308` and `0.0` when `pip_position <= -308`,
@@ -145,6 +157,115 @@ pub(super) fn prop_firm_pre_trade_check(
         return Err(anyhow::anyhow!(
             "Mandatory stop-loss rule violated: order missing stop_loss"
         ));
+    }
+
+    // ── Phase B broker-side gating (2026-05-27 cycle-3) ──────────────
+    //
+    // When the broker's per-symbol financial projection is supplied
+    // (production path — `orders.rs` resolves it from the
+    // `CTraderSymbolInfo`), enforce the three constraints cTrader
+    // would otherwise reject at the server with `TRADING_DISABLED`
+    // or `TRADING_BAD_STOPS`. Each check fail-loud at the gate so
+    // the operator sees the directive instead of the broker's
+    // opaque error code returned via WSS.
+    //
+    // Legacy / test paths that pass `None` skip these — preserves
+    // pre-Phase-B behaviour exactly.
+    if let Some(fin) = financials {
+        // (1) Trading-mode gating — the symbol must allow opening
+        //     new positions. `CLOSE_ONLY_MODE`, `DISABLED_*` etc.
+        //     are rejected here so the operator sees why instead
+        //     of waiting for the broker to bounce the order.
+        if !fin.can_open_new_position() {
+            return Err(anyhow::anyhow!(
+                "Symbol {symbol_name} is not currently accepting new \
+                 positions (cTrader trading_mode = {:?}). Operator must \
+                 wait for the symbol to re-enable or pick a different \
+                 instrument.",
+                fin.trading_mode
+            ));
+        }
+
+        // (2) Short-selling gating — if the order is a SELL and the
+        //     broker has short-selling disabled for this symbol,
+        //     reject. The default when the broker omits the field
+        //     is `true` (most pairs allow shorts), per
+        //     `SymbolFinancials::short_selling_allowed`.
+        if order.trade_side == CTraderTradeSide::Sell && !fin.short_selling_allowed() {
+            return Err(anyhow::anyhow!(
+                "Short-selling is disabled by the broker for {symbol_name}. \
+                 Long-only trading is permitted; switch the order side to \
+                 BUY or pick a different instrument."
+            ));
+        }
+
+        // (3) SL / TP minimum-distance gating — cTrader rejects
+        //     stops or take-profits closer to the entry than the
+        //     `MinDistance` thresholds carried on `ProtoOASymbol`.
+        //     We pre-emptively reject so the operator sees the
+        //     concrete distance instead of `TRADING_BAD_STOPS`.
+        //
+        //     Units are determined by `distance_set_in`:
+        //       - SymbolDistanceInPoints     → distance × 10^-(pip_position+1)
+        //         (i.e. distance is in `points`, where 1 point =
+        //         the smallest price increment for the symbol).
+        //       - SymbolDistanceInPercentage → distance% of entry.
+        //
+        //     `distance_set_in == None` is treated as "broker did not
+        //     specify units" → skip the check rather than guess.
+        let entry_for_distance = order
+            .limit_price
+            .or(order.stop_price)
+            .or(market_price_for_entry);
+        if let (Some(entry), Some(dist_kind)) = (entry_for_distance, fin.distance_set_in) {
+            // 1 point = 10^-(pip_position+1) of price. For 5-digit FX
+            // (pip_position=4): point = 1e-5. For 3-digit JPY
+            // (pip_position=2): point = 1e-3.
+            let point_size = 10f64.powi(-(pip_position + 1));
+            let check_distance = |label: &str, target: f64, min_points: Option<u32>| -> anyhow::Result<()> {
+                let Some(min_points) = min_points else {
+                    return Ok(()); // broker didn't supply a minimum
+                };
+                if min_points == 0 {
+                    return Ok(());
+                }
+                let actual_price_distance = (entry - target).abs();
+                let min_price_distance = match dist_kind {
+                    SymbolDistanceType::SymbolDistanceInPoints => {
+                        min_points as f64 * point_size
+                    }
+                    SymbolDistanceType::SymbolDistanceInPercentage => {
+                        // Proto stores the value × 100 for the
+                        // percentage variant (per cTrader docs);
+                        // undo by /100 then ×entry. Defensive abs
+                        // on `entry` to avoid the rare negative
+                        // synthetic instrument.
+                        (min_points as f64 / 100.0) * entry.abs() / 100.0
+                    }
+                };
+                if actual_price_distance < min_price_distance {
+                    return Err(anyhow::anyhow!(
+                        "{label} for {symbol_name} is too close to entry: \
+                         distance {:.5} < broker minimum {:.5} \
+                         (entry={:.5}, target={:.5}, {} points). \
+                         Widen the {label} and retry.",
+                        actual_price_distance,
+                        min_price_distance,
+                        entry,
+                        target,
+                        min_points,
+                    ));
+                }
+                Ok(())
+            };
+
+            if let Some(sl) = order.stop_loss {
+                check_distance("stop-loss", sl, fin.sl_distance_points)?;
+            }
+            if let Some(tp) = order.take_profit {
+                check_distance("take-profit", tp, fin.tp_distance_points)?;
+            }
+        }
     }
 
     if day_start_equity > 0.0 {

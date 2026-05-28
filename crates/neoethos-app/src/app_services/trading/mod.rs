@@ -16,8 +16,8 @@ pub(super) use crate::app_services::ctrader_auth::{
     CTraderAuthSession, CTraderAuthSnapshot, CTraderTokenBundle,
 };
 pub(super) use crate::app_services::ctrader_data::{
-    CTraderChartHistoryRequest, CTraderSymbolLookupRequest, HistoricalBar, load_chart_history,
-    resolve_symbol,
+    CTraderChartHistoryRequest, CTraderSymbolLookupRequest, HistoricalBar, SymbolDistanceType,
+    SymbolFinancials, TradingModeProto, load_chart_history, resolve_symbol,
 };
 pub(super) use crate::app_services::ctrader_execution::{
     CTraderExecutionBackend, CTraderExecutionOutcome, CTraderExecutionRequest,
