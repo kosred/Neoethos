@@ -1336,3 +1336,106 @@ fn from_settings_propagates_account_currency() {
     assert!(cfg.evaluation_spread_pips.is_finite());
     assert!(cfg.evaluation_commission_per_trade.is_finite());
 }
+
+// ─── F-305 PropFirm gate scaling tests (2026-05-28) ───────────────
+
+#[test]
+fn min_trades_per_month_scale_intra_day_unchanged() {
+    // Intra-day TFs keep operator's value at 1.0× — plenty of bars,
+    // 15 trades/month is fine.
+    assert_eq!(min_trades_per_month_scale_for_tf("M1"), 1.0);
+    assert_eq!(min_trades_per_month_scale_for_tf("M5"), 1.0);
+    assert_eq!(min_trades_per_month_scale_for_tf("M15"), 1.0);
+}
+
+#[test]
+fn min_trades_per_month_scale_drops_for_higher_tfs() {
+    // The whole point: higher TFs have fewer bars, so a tight floor
+    // mechanically rejects sane swing strategies.
+    let m30 = min_trades_per_month_scale_for_tf("M30");
+    let h1 = min_trades_per_month_scale_for_tf("H1");
+    let h4 = min_trades_per_month_scale_for_tf("H4");
+    let d1 = min_trades_per_month_scale_for_tf("D1");
+    let w1 = min_trades_per_month_scale_for_tf("W1");
+    let mn1 = min_trades_per_month_scale_for_tf("MN1");
+    // Monotone-decreasing in bar density
+    assert!(m30 < 1.0, "M30 should be < 1.0");
+    assert!(h1 < m30, "H1 < M30");
+    assert!(h4 < h1, "H4 < H1");
+    assert!(d1 < h4, "D1 < H4");
+    assert!(w1 < d1, "W1 < D1");
+    assert!(mn1 < w1, "MN1 < W1");
+    // Sanity: for operator's default 15 trades/month, D1 must produce
+    // a sane floor (e.g. ≤ 3 trades/month so realistic swing
+    // strategies aren't auto-rejected).
+    assert!(15.0 * d1 <= 3.0, "D1 floor at base=15 must be ≤ 3, got {}", 15.0 * d1);
+}
+
+#[test]
+fn min_trades_per_month_scale_case_insensitive() {
+    assert_eq!(
+        min_trades_per_month_scale_for_tf("d1"),
+        min_trades_per_month_scale_for_tf("D1")
+    );
+    assert_eq!(
+        min_trades_per_month_scale_for_tf("h4"),
+        min_trades_per_month_scale_for_tf("H4")
+    );
+}
+
+#[test]
+fn min_trades_per_month_scale_unknown_tf_is_conservative() {
+    // Unknown TFs default to 1.0 — don't silently relax thresholds
+    // for inputs we don't understand.
+    assert_eq!(min_trades_per_month_scale_for_tf(""), 1.0);
+    assert_eq!(min_trades_per_month_scale_for_tf("H2"), 1.0); // non-canonical
+    assert_eq!(min_trades_per_month_scale_for_tf("XYZ"), 1.0);
+}
+
+#[test]
+fn propfirm_mode_scales_min_trades_per_month_for_d1() {
+    // End-to-end: PropFirm mode + D1 should produce a clearly-lower
+    // min_trades_per_month than the operator's raw config value.
+    //
+    // Note: env-var test lock not needed here — we read the mode
+    // via `resolve_discovery_mode()` which is process-global, but
+    // the default with no env is PropFirm anyway. Tests that mutate
+    // FOREX_BOT_DISCOVERY_MODE must use ENV_VAR_TEST_LOCK; we don't.
+    let mut cfg = DiscoveryConfig::default();
+    cfg.evaluation_symbol = "EURUSD".to_string();
+    cfg.evaluation_account_currency = "USD".to_string();
+    cfg.evaluation_spread_pips = 1.0;
+    cfg.evaluation_commission_per_trade = 7.0;
+    cfg.timeframe_label = "D1".to_string();
+    cfg.filtering.min_trades_per_month = 15.0;
+    cfg.filtering.opportunistic_min_trades_per_month = 10.0;
+
+    let cfg = cfg.with_env_runtime_overrides();
+    // PropFirm mode is the default; D1 scale = 0.13 → 15 × 0.13 = 1.95
+    // (clamped to ≥ 0.5).
+    assert!(
+        cfg.filtering.min_trades_per_month < 5.0,
+        "expected D1 PropFirm min_trades_per_month < 5.0, got {}",
+        cfg.filtering.min_trades_per_month
+    );
+    assert!(
+        cfg.filtering.min_trades_per_month >= 0.5,
+        "expected floor of 0.5, got {}",
+        cfg.filtering.min_trades_per_month
+    );
+}
+
+#[test]
+fn propfirm_mode_leaves_m1_min_trades_per_month_unchanged() {
+    // On M1, scale = 1.0 → operator's value passes through unchanged.
+    let mut cfg = DiscoveryConfig::default();
+    cfg.evaluation_symbol = "EURUSD".to_string();
+    cfg.evaluation_account_currency = "USD".to_string();
+    cfg.evaluation_spread_pips = 1.0;
+    cfg.evaluation_commission_per_trade = 7.0;
+    cfg.timeframe_label = "M1".to_string();
+    cfg.filtering.min_trades_per_month = 15.0;
+
+    let cfg = cfg.with_env_runtime_overrides();
+    assert_eq!(cfg.filtering.min_trades_per_month, 15.0);
+}

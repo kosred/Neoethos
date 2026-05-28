@@ -439,6 +439,45 @@ impl DiscoveryConfig {
             if std::env::var("FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY").is_err() {
                 self.min_trades_per_day = 0.001;
             }
+
+            // F-305 fix (2026-05-28): scale `min_trades_per_month` by TF
+            // bar density. The operator's `config.yaml` sets the value
+            // for M1/M5/M15 (typically 15 trades/month). On D1 with ~21
+            // bars/month, 15 trades requires trading 70%+ of bars —
+            // mathematically forced over-trading. Empty portfolios on
+            // D1/H4 weren't a strategy problem; they were a config
+            // problem masking a strategy.
+            //
+            // Scale factors picked to keep daily trade frequency
+            // approximately stable across TFs:
+            //   M1/M3/M5/M15: 1.0× operator value  (intra-day strategies)
+            //   M30:          0.67× (15 → 10/month)
+            //   H1:           0.40× (15 → 6/month)
+            //   H4:           0.20× (15 → 3/month)
+            //   D1:           0.13× (15 → 2/month — ~1 trade/two weeks)
+            //   W1/MN1:       0.03× (essentially "any trade qualifies")
+            //
+            // Risky/Strict modes keep the operator's exact value — those
+            // are scenario-specific runs where the operator explicitly
+            // wants to over- or under-shoot.
+            let scale = min_trades_per_month_scale_for_tf(&self.timeframe_label);
+            if self.filtering.min_trades_per_month > 0.0 && scale < 1.0 {
+                let base = self.filtering.min_trades_per_month;
+                self.filtering.min_trades_per_month = (base * scale).max(0.5);
+                tracing::info!(
+                    target: "neoethos_search::discovery",
+                    tf = %self.timeframe_label,
+                    base = base,
+                    scale = scale,
+                    scaled = self.filtering.min_trades_per_month,
+                    "F-305: scaled min_trades_per_month for PropFirm mode on higher TF"
+                );
+            }
+            if self.filtering.opportunistic_min_trades_per_month > 0.0 && scale < 1.0 {
+                self.filtering.opportunistic_min_trades_per_month =
+                    (self.filtering.opportunistic_min_trades_per_month * scale).max(0.5);
+            }
+
             self.prop_firm_gate = Some(self.derive_prop_firm_gate());
         }
         self
@@ -812,6 +851,51 @@ fn discovery_backtest_settings(
         pip_value_per_lot: evaluation.pip_value_per_lot,
         kill_zones_enabled: true,
         ..crate::eval::BacktestSettings::default()
+    }
+}
+
+/// F-305 (2026-05-28): scale `min_trades_per_month` proportionally to
+/// timeframe bar density so the operator's `config.yaml` value
+/// (typically 15 trades/month, tuned for M1/M5/M15 intra-day flow)
+/// doesn't mechanically reject every D1/H4 candidate that trades at
+/// a sensible-for-the-TF cadence.
+///
+/// Bar count per calendar month roughly:
+///   M1:    ~30_240   (24 × 60 × 21 trading days)
+///   M5:    ~6_048
+///   M15:   ~2_016
+///   M30:   ~1_008
+///   H1:    ~504
+///   H4:    ~126
+///   D1:    ~21
+///   W1:    ~4.3
+///   MN1:   ~1
+///
+/// For the operator's default 15 trades/month on M1/M5/M15, that's
+/// ~0.05% of bars — completely reasonable. On D1 with only 21 bars,
+/// 15 trades means trading 70%+ of bars (mechanically impossible for
+/// any signal with non-trivial selectivity). The scale below targets
+/// roughly "~5-10% of bars must trade" on the longer TFs.
+fn min_trades_per_month_scale_for_tf(tf: &str) -> f64 {
+    match tf.to_ascii_uppercase().as_str() {
+        // Intra-day TFs keep operator's value as-is — they have
+        // thousands of bars per month, 15-50 trades is a small
+        // fraction of total bar count.
+        "M1" | "M3" | "M5" | "M15" => 1.0,
+        // Half-hour: still plenty of bars (~1000/month), small relax
+        "M30" => 0.67,
+        // Hourly: ~500 bars/month, 6 trades = ~1.2% of bars
+        "H1" => 0.40,
+        // 4h: ~126 bars/month, 3 trades = ~2.4% of bars
+        "H4" => 0.20,
+        // Daily: ~21 bars/month, 2 trades = ~10% of bars (one swing
+        // trade every ~2 weeks is realistic for prop-firm passing)
+        "D1" => 0.13,
+        // Weekly/monthly: very long-horizon, ANY signal qualifies
+        "W1" => 0.04,
+        "MN1" => 0.02,
+        // Unknown TF: be conservative, keep operator's value
+        _ => 1.0,
     }
 }
 
