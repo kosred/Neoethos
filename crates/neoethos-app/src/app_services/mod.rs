@@ -47,6 +47,12 @@ pub mod discovery;
 // starts dispatching DxTrade through the runtime adapter trait, the
 // allow below comes off.
 pub mod broker_api;
+// Phase C (2026-05-28) — one-shot tool that captures real
+// `ProtoOASymbolByIdRes` payloads from the configured cTrader
+// account and writes them as fixtures under tests/fixtures/. Used
+// to verify Phase A.1 schema assumptions against actual broker
+// bytes (see `--capture-symbols` CLI flag in main.rs).
+pub mod capture_symbols;
 pub mod dxtrade;
 pub mod embedded_credentials;
 pub mod jobs;

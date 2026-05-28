@@ -119,6 +119,27 @@ struct Args {
     #[arg(long, default_value_t = false)]
     launched_by_flutter: bool,
 
+    /// **Phase C (2026-05-28)** — capture the real `ProtoOASymbolByIdRes`
+    /// payload for each comma-separated symbol from the configured
+    /// cTrader account, then exit. Each capture dumps a `.raw.json`
+    /// (verbatim broker bytes) and a `.decoded.json` (the parser's
+    /// projection) under `--capture-output` (default
+    /// `crates/neoethos-app/tests/fixtures`).
+    ///
+    /// Used to verify Phase A.1 `SymbolFinancials` schema assumptions
+    /// against real bytes instead of proto comments. Mutually
+    /// exclusive with all other modes; exits 0 on success.
+    ///
+    /// Example:
+    ///   neoethos-app --capture-symbols EURUSD,USDJPY,XAUUSD,BTCUSD
+    #[arg(long)]
+    capture_symbols: Option<String>,
+
+    /// Output directory for `--capture-symbols`. Created if missing.
+    /// Default: `crates/neoethos-app/tests/fixtures` (relative to
+    /// the current working directory, so run from the repo root).
+    #[arg(long)]
+    capture_output: Option<String>,
 }
 
 #[tokio::main]
@@ -219,6 +240,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "OAuth flow complete; token bundle saved to keyring"
         );
         info!("Token bundle saved. You can now run: neoethos-app --server");
+        return Ok(());
+    }
+
+    if let Some(raw) = args.capture_symbols.as_deref() {
+        // Phase C (2026-05-28) — one-shot fixture capture. Runs the
+        // 3-step `ProtoOAApplicationAuthReq → ProtoOAAccountAuthReq →
+        // ProtoOASymbolByIdReq` sequence per requested symbol, writes
+        // the raw broker envelope to disk, and exits. Driven by the
+        // audit finding that we have ZERO recorded broker payloads
+        // — Phase A.1 schema assumptions need real bytes to verify.
+        let symbols = app_services::capture_symbols::parse_symbol_list(raw);
+        if symbols.is_empty() {
+            return Err(anyhow::anyhow!(
+                "--capture-symbols requires a comma-separated list of symbol names, got: {raw:?}"
+            )
+            .into());
+        }
+        let output_dir = args
+            .capture_output
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(app_services::capture_symbols::default_output_dir);
+        info!(
+            target: "neoethos_app::capture_symbols",
+            symbols = ?symbols,
+            output_dir = %output_dir.display(),
+            "starting cTrader fixture capture"
+        );
+        let symbols_clone = symbols.clone();
+        let output_clone = output_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            app_services::capture_symbols::run_capture(&symbols_clone, &output_clone)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("capture blocking task panicked: {e}"))??;
+        info!("Capture complete. Fixtures under {}", output_dir.display());
         return Ok(());
     }
 

@@ -52,7 +52,7 @@ pub struct CTraderSymbolsListResult {
 ///
 /// Proto file: `OpenApiModelMessages.proto:222-227`. cTrader's JSON
 /// proxy sends the enum as a string matching the proto constant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TradingModeProto {
     /// Default. Both opening and closing are allowed.
@@ -76,7 +76,7 @@ pub enum TradingModeProto {
 /// - `PercentageOfValue`: percentage of notional volume × 100,000
 ///   (i.e. value 5 means 0.005%); used for equities.
 /// - `QuoteCcyPerLot`: quote-currency per 1 lot (CFDs in non-USD).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommissionType {
     UsdPerMillionUsd,
@@ -90,7 +90,7 @@ pub enum CommissionType {
 /// the symbol's quote currency (`QuoteCurrency`).
 ///
 /// Proto file: `OpenApiModelMessages.proto:216-219`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MinCommissionType {
     Currency,
@@ -105,7 +105,7 @@ pub enum MinCommissionType {
 /// - `Points`: the raw value is in points (= 10^-digits).
 ///
 /// Proto file: `OpenApiModelMessages.proto:230-234`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SwapCalculationType {
     Pips,
@@ -118,7 +118,7 @@ pub enum SwapCalculationType {
 ///
 /// Proto file: `OpenApiModelMessages.proto:210-213`. cTrader's JSON
 /// proxy uses the `SYMBOL_DISTANCE_IN_*` prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SymbolDistanceType {
     SymbolDistanceInPoints,
@@ -130,7 +130,7 @@ pub enum SymbolDistanceType {
 /// Shariah triple-rollover weekday.
 ///
 /// Proto file: `OpenApiModelMessages.proto:184-193`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DayOfWeek {
     None,
