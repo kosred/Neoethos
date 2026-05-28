@@ -345,7 +345,7 @@ impl TradingSession {
             return;
         }
         match self.build_ctrader_order_request(state, side) {
-            Ok(order_request) => {
+            Ok((order_request, financials)) => {
                 // Risky Mode gate (research §4–§5 + operator directive
                 // §7.1). When Risky Mode is armed it sits IMMEDIATELY
                 // above the prop-firm gate — both run, Risky Mode is
@@ -493,19 +493,20 @@ impl TradingSession {
                 // to bypass the risk-per-trade ceiling.
                 let market_price_for_entry =
                     self.ctrader_live_mid_price_for_symbol(order_request.symbol_id);
-                // **Phase B follow-up (2026-05-27)**: the gate now
-                // accepts an optional `&SymbolFinancials` for broker-
-                // side trading-mode / short-selling / SL-TP distance
-                // gating. Currently `None` here so the new gates are
-                // dormant on the production path — wiring requires
-                // `build_ctrader_order_request` to return the
-                // resolved `CTraderSymbolInfo` alongside the order
-                // request (a focused, mechanical follow-up). Until
-                // then, the broker still enforces these constraints
-                // server-side with `TRADING_DISABLED` /
-                // `TRADING_BAD_STOPS` — operator just sees the
-                // raw error code instead of the pre-emptive
-                // friendly message.
+                // F-302 (2026-05-28): the gate now receives the
+                // broker's per-symbol `SymbolFinancials` projection
+                // (cloned out of `build_ctrader_order_request`'s
+                // resolved `CTraderResolvedSymbol.symbol.financials`).
+                // The Phase B broker-side gates — `trading_mode`,
+                // `short_selling_mode`, minimum SL/TP distance — now
+                // fire pre-emptively instead of the order being
+                // rejected server-side with `TRADING_DISABLED` /
+                // `TRADING_BAD_STOPS`. Operators get an actionable
+                // pre-flight failure message instead of a raw broker
+                // error code. `None` flows through when the broker
+                // catalog hasn't fetched the financials yet (rare —
+                // happens only on a cold-start race before the
+                // catalog refresh completes).
                 if let Err(err) = prop_firm_pre_trade_check(
                     &state.risk,
                     &order_request,
@@ -515,7 +516,7 @@ impl TradingSession {
                     pip_position,
                     &state.selected_pair,
                     market_price_for_entry,
-                    None,
+                    financials.as_ref(),
                 ) {
                     let message = format!("Prop-firm risk gate blocked: {err}");
                     state.status_msg = message.clone();
@@ -780,12 +781,31 @@ impl TradingSession {
         Some(atr_points as i64)
     }
 
+    /// F-302 (2026-05-28): now returns a tuple of
+    /// `(CTraderNewOrderRequest, Option<SymbolFinancials>)`. The
+    /// financials half is the broker's per-symbol projection from
+    /// `ProtoOASymbol`, threaded through to the production call site
+    /// of `prop_firm_pre_trade_check` so the Phase B gates (broker
+    /// trading mode, short-selling, SL/TP min-distance) actually
+    /// fire on live trades. Previously the call site passed `None`
+    /// and the broker rejected violating orders server-side with raw
+    /// `TRADING_DISABLED` / `TRADING_BAD_STOPS` codes — operators
+    /// saw cryptic errors instead of pre-emptive friendly messages.
+    ///
+    /// `None` on the financials side preserves the legacy "broker
+    /// catalog hasn't been threaded through" path for test fixtures
+    /// and any caller that hasn't migrated; the gate skips its
+    /// financials-only checks in that case.
     pub(super) fn build_ctrader_order_request(
         &mut self,
         state: &AppState,
         side: CTraderTradeSide,
-    ) -> anyhow::Result<CTraderNewOrderRequest> {
+    ) -> anyhow::Result<(
+        CTraderNewOrderRequest,
+        Option<crate::app_services::ctrader_data::SymbolFinancials>,
+    )> {
         let resolved = self.resolve_selected_ctrader_symbol(&state.selected_pair)?;
+        let financials = resolved.symbol.financials.clone();
         let protocol_volume = validate_and_convert_lot_size_to_ctrader_volume(
             &state.order_ticket,
             state.risk.max_lot_size,
@@ -851,39 +871,42 @@ impl TradingSession {
             _ => (None, None),
         };
 
-        Ok(CTraderNewOrderRequest {
-            account_id: resolved.account_id,
-            symbol_id: resolved.light_symbol.symbol_id,
-            order_type,
-            trade_side: side,
-            volume: protocol_volume,
-            limit_price,
-            stop_price,
-            time_in_force: Some(CTraderTimeInForce::ImmediateOrCancel),
-            expiration_timestamp_ms: None,
-            stop_loss: None, // We use relative points below
-            take_profit: None,
-            comment: non_empty_option(&state.order_ticket.comment),
-            base_slippage_price: None,
-            slippage_in_points: Some(state.order_ticket.slippage_in_points),
-            label: non_empty_option(&state.order_ticket.label),
-            position_id: None,
-            client_order_id: Some(format!(
-                "{}-{}-{}-{:x}",
-                side.label().to_ascii_lowercase(),
-                state.selected_pair.to_ascii_lowercase(),
-                // DOCUMENTED-DEFAULT: timestamp is decorative; `next_client_order_seq`
-                // is the actual uniqueness guarantee. A clock-before-epoch failure
-                // would just yield "0-<seq>" which is still unique.
-                current_unix_seconds().unwrap_or_default(),
-                next_client_order_seq()
-            )),
-            relative_stop_loss,
-            relative_take_profit,
-            guaranteed_stop_loss: None,
-            trailing_stop_loss: state.order_ticket.trailing_stop.then_some(true),
-            stop_trigger_method: None,
-        })
+        Ok((
+            CTraderNewOrderRequest {
+                account_id: resolved.account_id,
+                symbol_id: resolved.light_symbol.symbol_id,
+                order_type,
+                trade_side: side,
+                volume: protocol_volume,
+                limit_price,
+                stop_price,
+                time_in_force: Some(CTraderTimeInForce::ImmediateOrCancel),
+                expiration_timestamp_ms: None,
+                stop_loss: None, // We use relative points below
+                take_profit: None,
+                comment: non_empty_option(&state.order_ticket.comment),
+                base_slippage_price: None,
+                slippage_in_points: Some(state.order_ticket.slippage_in_points),
+                label: non_empty_option(&state.order_ticket.label),
+                position_id: None,
+                client_order_id: Some(format!(
+                    "{}-{}-{}-{:x}",
+                    side.label().to_ascii_lowercase(),
+                    state.selected_pair.to_ascii_lowercase(),
+                    // DOCUMENTED-DEFAULT: timestamp is decorative; `next_client_order_seq`
+                    // is the actual uniqueness guarantee. A clock-before-epoch failure
+                    // would just yield "0-<seq>" which is still unique.
+                    current_unix_seconds().unwrap_or_default(),
+                    next_client_order_seq()
+                )),
+                relative_stop_loss,
+                relative_take_profit,
+                guaranteed_stop_loss: None,
+                trailing_stop_loss: state.order_ticket.trailing_stop.then_some(true),
+                stop_trigger_method: None,
+            },
+            financials,
+        ))
     }
 
     pub(super) fn resolve_selected_ctrader_symbol(
