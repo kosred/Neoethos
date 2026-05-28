@@ -148,6 +148,58 @@ fn discover_timeframes_cache_put(root: &Path, symbol: &str, value: Vec<String>) 
     }
 }
 
+/// Integrity status of a single `(symbol, timeframe)` Vortex folder.
+///
+/// F-307 (2026-05-28): the loader used to accept any folder named
+/// `timeframe=XX` that matched a canonical timeframe label, without
+/// checking whether the data inside was actually usable. A half-finished
+/// bootstrap leaves `data.vortex.partial` next to a stale `data.vortex`
+/// from an earlier run, and the loader would happily feed that 12-month-
+/// out-of-date blob into a 24-month sweep — producing NaN-laden features
+/// and zero-trade GA candidates with no diagnostic.
+///
+/// State machine (all four states observed in production data dirs):
+///   - `data.vortex` + `.complete` + no `.partial`  → `Complete`
+///   - `data.vortex` + `.complete` + `.partial`     → `Complete` (new
+///     bootstrap in progress; old data still usable) + WARN
+///   - `data.vortex` + no `.complete` + `.partial`  → `StalePartial`  🚫
+///   - `data.vortex` + no `.complete` + no `.partial` → `LegacyNoMarker`
+///     (pre-marker era data; ACCEPT with one-time WARN so the operator
+///     knows to re-bootstrap if they want full integrity)
+///   - no `data.vortex`                            → `Missing` 🚫
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VortexIntegrity {
+    /// Data is usable — `.complete` marker present.
+    Complete,
+    /// Data dir exists but `.partial` marker is there without `.complete`.
+    /// A previous bootstrap aborted mid-write; the blob is stale and the
+    /// loader MUST reject to avoid feeding half-data to backtests.
+    StalePartial,
+    /// `data.vortex` exists but neither `.complete` nor `.partial` is
+    /// present. Pre-F-307 data files predate the marker convention.
+    /// Accept-with-warn so existing operator data dirs keep working.
+    LegacyNoMarker,
+    /// No `data.vortex` in the folder — folder exists but is empty.
+    Missing,
+}
+
+/// Inspect a `(symbol, timeframe)` directory and classify its load
+/// readiness. See [`VortexIntegrity`] for the state machine.
+pub fn vortex_integrity(dir: impl AsRef<Path>) -> VortexIntegrity {
+    let dir = dir.as_ref();
+    let vortex = dir.join("data.vortex");
+    if !vortex.exists() {
+        return VortexIntegrity::Missing;
+    }
+    let complete = dir.join("data.vortex.complete").exists();
+    let partial = dir.join("data.vortex.partial").exists();
+    match (complete, partial) {
+        (true, _) => VortexIntegrity::Complete,
+        (false, true) => VortexIntegrity::StalePartial,
+        (false, false) => VortexIntegrity::LegacyNoMarker,
+    }
+}
+
 pub fn discover_timeframes(root: impl AsRef<Path>, symbol: &str) -> Result<Vec<String>> {
     let root_path = root.as_ref();
     // Task #79 — 60 Hz filesystem read elimination. The chart panel's
@@ -182,7 +234,52 @@ pub fn discover_timeframes(root: impl AsRef<Path>, symbol: &str) -> Result<Vec<S
                 .iter()
                 .any(|canonical| canonical.eq_ignore_ascii_case(&tf))
             {
-                tfs.insert(tf);
+                // F-307 (2026-05-28): integrity gate. The folder being
+                // named correctly doesn't mean the data inside is
+                // usable. `.partial` without `.complete` means a
+                // half-finished bootstrap left a stale blob; the
+                // discovery pipeline would feed that into the GA and
+                // produce zero-trade candidates with no diagnostic
+                // (root cause for the 4/4-candidate AUDUSD M15 funnel).
+                match vortex_integrity(entry.path()) {
+                    VortexIntegrity::Complete => {
+                        tfs.insert(tf);
+                    }
+                    VortexIntegrity::LegacyNoMarker => {
+                        // Accept (legacy data predates marker convention)
+                        // but warn once so operators know to re-bootstrap
+                        // for full integrity guarantees.
+                        if !warned_once_for(symbol, &format!("{tf}/legacy")) {
+                            tracing::warn!(
+                                target: "neoethos_data::discover_timeframes",
+                                symbol = symbol,
+                                timeframe = %tf,
+                                "legacy vortex file without .complete marker — accepted for backward-compat, re-bootstrap recommended"
+                            );
+                        }
+                        tfs.insert(tf);
+                    }
+                    VortexIntegrity::StalePartial => {
+                        // Reject loudly — the partial marker proves the
+                        // existing data.vortex is from a previous
+                        // never-completed bootstrap. Including this
+                        // timeframe in the discovery pipeline would feed
+                        // stale/half-data into the cost model.
+                        if !warned_once_for(symbol, &format!("{tf}/stale")) {
+                            tracing::warn!(
+                                target: "neoethos_data::discover_timeframes",
+                                symbol = symbol,
+                                timeframe = %tf,
+                                "REJECTED: data.vortex.partial present without .complete marker (half-finished bootstrap). Re-run --bootstrap-data for this timeframe."
+                            );
+                        }
+                    }
+                    VortexIntegrity::Missing => {
+                        // Folder exists but no data.vortex inside — silent
+                        // skip; the bootstrap may be in its very first
+                        // chunk and the file just isn't there yet.
+                    }
+                }
             } else if !warned_once_for(symbol, &tf) {
                 // First time we see this (symbol, tf) since process start.
                 // Subsequent calls with the same pair stay silent so the
@@ -210,6 +307,33 @@ pub fn load_symbol_timeframe(
     let path = symbol_timeframe_vortex_path(root, symbol, timeframe);
     if !path.exists() {
         bail!("vortex dataset not found: {}", path.display());
+    }
+    // F-307 (2026-05-28): belt-and-braces integrity gate. Most callers
+    // arrive here via `discover_timeframes` which already filters out
+    // `StalePartial` folders, but direct callers (`load_symbol_dataset_with_timeframes`,
+    // tail-readers, bridge endpoints) bypass that filter. Guard here too
+    // so a half-finished bootstrap can't poison ANY load path.
+    if let Some(parent) = path.parent() {
+        match vortex_integrity(parent) {
+            VortexIntegrity::Complete | VortexIntegrity::LegacyNoMarker => {
+                // ok — proceed to load
+            }
+            VortexIntegrity::StalePartial => {
+                bail!(
+                    "vortex dataset {} {} REJECTED: data.vortex.partial present without \
+                     .complete marker (half-finished bootstrap left stale data). \
+                     Re-run data bootstrap for this timeframe.",
+                    symbol,
+                    timeframe
+                );
+            }
+            VortexIntegrity::Missing => {
+                // Shouldn't happen — path.exists() already checked — but
+                // guard against TOCTOU race where the file vanishes
+                // between the .exists() call above and here.
+                bail!("vortex dataset {} {} disappeared during load", symbol, timeframe);
+            }
+        }
     }
     load_vortex(path)
 }
@@ -814,6 +938,132 @@ mod tests {
         assert!(
             err.to_string().contains("M5") || err.to_string().contains("vortex"),
             "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    // ─── F-307 vortex integrity gate (2026-05-28) ─────────────────────
+
+    fn make_tf_dir(root: &Path, symbol: &str, tf: &str) -> Result<PathBuf> {
+        let dir = root.join(format!("symbol={symbol}")).join(format!("timeframe={tf}"));
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn vortex_integrity_missing_when_no_data_vortex() -> Result<()> {
+        let root = unique_temp_root("integ_missing");
+        let dir = make_tf_dir(&root, "TEST", "M1")?;
+        assert_eq!(vortex_integrity(&dir), VortexIntegrity::Missing);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn vortex_integrity_complete_when_marker_present() -> Result<()> {
+        let root = unique_temp_root("integ_complete");
+        let dir = make_tf_dir(&root, "TEST", "M1")?;
+        write_valid_ohlcv_vortex(&dir.join("data.vortex"))?;
+        fs::write(dir.join("data.vortex.complete"), b"")?;
+        assert_eq!(vortex_integrity(&dir), VortexIntegrity::Complete);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn vortex_integrity_complete_dominates_partial() -> Result<()> {
+        // New bootstrap in progress next to old-but-complete data —
+        // operator should still see Complete (existing data is usable).
+        let root = unique_temp_root("integ_complete_with_partial");
+        let dir = make_tf_dir(&root, "TEST", "M1")?;
+        write_valid_ohlcv_vortex(&dir.join("data.vortex"))?;
+        fs::write(dir.join("data.vortex.complete"), b"")?;
+        fs::write(dir.join("data.vortex.partial"), b"")?;
+        assert_eq!(vortex_integrity(&dir), VortexIntegrity::Complete);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn vortex_integrity_stale_partial_without_complete() -> Result<()> {
+        // The AUDUSD M15 production failure mode — partial marker exists
+        // but no complete marker. Loader MUST reject.
+        let root = unique_temp_root("integ_stale_partial");
+        let dir = make_tf_dir(&root, "TEST", "M1")?;
+        write_valid_ohlcv_vortex(&dir.join("data.vortex"))?;
+        fs::write(dir.join("data.vortex.partial"), b"")?;
+        assert_eq!(vortex_integrity(&dir), VortexIntegrity::StalePartial);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn vortex_integrity_legacy_no_marker() -> Result<()> {
+        // Pre-marker era data: vortex file but no markers. Accept-with-warn.
+        let root = unique_temp_root("integ_legacy");
+        let dir = make_tf_dir(&root, "TEST", "M1")?;
+        write_valid_ohlcv_vortex(&dir.join("data.vortex"))?;
+        assert_eq!(vortex_integrity(&dir), VortexIntegrity::LegacyNoMarker);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn discover_timeframes_rejects_stale_partial_tf() -> Result<()> {
+        // Mixed dataset: M1 complete, M5 stale-partial, M15 legacy.
+        // Expect M1 + M15 to surface; M5 rejected.
+        let root = unique_temp_root("discover_stale");
+        let symbol = "AUDUSD";
+
+        let m1_dir = make_tf_dir(&root, symbol, "M1")?;
+        write_valid_ohlcv_vortex(&m1_dir.join("data.vortex"))?;
+        fs::write(m1_dir.join("data.vortex.complete"), b"")?;
+
+        let m5_dir = make_tf_dir(&root, symbol, "M5")?;
+        write_valid_ohlcv_vortex(&m5_dir.join("data.vortex"))?;
+        fs::write(m5_dir.join("data.vortex.partial"), b"")?;
+        // No .complete — STALE
+
+        let m15_dir = make_tf_dir(&root, symbol, "M15")?;
+        write_valid_ohlcv_vortex(&m15_dir.join("data.vortex"))?;
+        // No markers — LEGACY
+
+        let tfs = discover_timeframes(&root, symbol)?;
+        assert!(tfs.contains(&"M1".to_string()), "M1 missing: {:?}", tfs);
+        assert!(
+            !tfs.contains(&"M5".to_string()),
+            "M5 (stale partial) should be rejected: {:?}",
+            tfs
+        );
+        assert!(
+            tfs.contains(&"M15".to_string()),
+            "M15 (legacy no marker) should be accepted: {:?}",
+            tfs
+        );
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_symbol_timeframe_rejects_stale_partial() -> Result<()> {
+        // Belt-and-braces guard: even when discover_timeframes is
+        // bypassed, the loader must reject stale-partial data.
+        let root = unique_temp_root("load_stale");
+        let symbol = "AUDUSD";
+        let dir = make_tf_dir(&root, symbol, "M15")?;
+        write_valid_ohlcv_vortex(&dir.join("data.vortex"))?;
+        fs::write(dir.join("data.vortex.partial"), b"")?;
+        // No .complete
+
+        let err = load_symbol_timeframe(&root, symbol, "M15")
+            .expect_err("load must reject stale-partial vortex");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("partial") || msg.contains("REJECTED"),
+            "unexpected error: {msg}"
         );
 
         fs::remove_dir_all(&root)?;
