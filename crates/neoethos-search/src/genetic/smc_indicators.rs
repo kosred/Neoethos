@@ -24,7 +24,22 @@ impl Default for SmcSearchConfig {
     fn default() -> Self {
         let default_p = 0.50;
         Self {
-            force_ratio: 0.65,
+            // F-276 (2026-05-28): lowered from 0.65 → 0.30. The original
+            // 0.65 forced 65% of every generation to carry at least one
+            // SMC flag — disproportionately restrictive when the GA is
+            // already evolving threshold + indicator weights. On
+            // empty-portfolio diagnostic runs the SMC-forced subset
+            // produced 4-candidate funnels (one of the AUDUSD M15
+            // smoking-guns from the earlier audit). 0.30 keeps SMC
+            // injection as a meaningful seed (~30% of every generation
+            // is SMC-aware) without crowding out the non-SMC genome
+            // pool that often discovers profitable counter-momentum
+            // strategies on D1/H4.
+            //
+            // Operator can still pin the old value via:
+            //   FOREX_BOT_PROP_SMC_FORCE_RATIO=0.65
+            // — env override at `read_smc_search_config_from_env` below.
+            force_ratio: 0.30,
             min_flags: 1,
             p_ob: default_p,
             p_fvg: default_p,
@@ -72,7 +87,7 @@ fn smc_env_bool(name: &str, default: bool) -> bool {
 fn read_smc_search_config_from_env() -> SmcSearchConfig {
     let default_p = smc_env_f64("FOREX_BOT_PROP_SMC_ENABLE_P", 0.50).clamp(0.0, 1.0);
     let mut cfg = SmcSearchConfig {
-        force_ratio: smc_env_f64("FOREX_BOT_PROP_SMC_FORCE_RATIO", 0.65).clamp(0.0, 1.0),
+        force_ratio: smc_env_f64("FOREX_BOT_PROP_SMC_FORCE_RATIO", 0.30).clamp(0.0, 1.0),
         min_flags: smc_env_usize("FOREX_BOT_PROP_SMC_MIN_FLAGS", 1),
         p_ob: smc_env_f64("FOREX_BOT_PROP_SMC_P_OB", default_p).clamp(0.0, 1.0),
         p_fvg: smc_env_f64("FOREX_BOT_PROP_SMC_P_FVG", default_p).clamp(0.0, 1.0),
@@ -117,8 +132,13 @@ mod overrides_tests {
 
     #[test]
     fn smc_search_config_default_matches_documented_defaults() {
+        // F-276 (2026-05-28): updated for the new 0.30 force_ratio
+        // (previously 0.65). See `SmcSearchConfig::default` for the
+        // rationale — 0.65 was crowding out non-SMC genome paths on
+        // D1/H4 discovery and contributing to the 4-candidate
+        // funnel failure mode.
         let defaults = SmcSearchConfig::default();
-        assert!((defaults.force_ratio - 0.65).abs() < 1e-9);
+        assert!((defaults.force_ratio - 0.30).abs() < 1e-9);
         assert_eq!(defaults.min_flags, 1);
         assert!((defaults.p_mtf - 0.85).abs() < 1e-9);
         assert!((defaults.p_ob - 0.50).abs() < 1e-9);
