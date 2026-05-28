@@ -103,11 +103,18 @@ pub struct SymbolMetadata {
     /// trader does.
     ///
     /// Daily SWAP charge for a long position, in **pips per day**.
-    /// Positive value = COST (debit per overnight roll). Negative =
-    /// credit. Only used when the broker's
-    /// `swap_calculation_type` is `PIPS` — the other proto variants
-    /// (`PERCENTAGE`, `POINTS`) require a different conversion path
-    /// and currently fall back to `None` (Phase C follow-up).
+    /// Positive value = CREDIT (broker pays you for holding overnight).
+    /// Negative = cost (broker debits you). Note: real broker data
+    /// (Phase D.1 capture, IcMarkets demo 47367144) shows MIXED
+    /// signs even within FX — e.g. AUDCAD long pays +0.15 pips/day,
+    /// XTIUSD short pays +0.4375 pips/day. The previous "synthetic
+    /// 0 swap" fallback hid these carry opportunities.
+    ///
+    /// Only used when the broker's `swap_calculation_type` is
+    /// `PIPS` — the other proto variants (`PERCENTAGE`, `POINTS`)
+    /// require a different conversion path and currently fall back
+    /// to `None` (Phase C follow-up). The 92/92 forex-bot filtered
+    /// catalog uses PIPS.
     #[serde(default)]
     pub daily_swap_long_pips: Option<f64>,
     /// Daily SWAP charge for a short position. Same semantics as
@@ -124,6 +131,43 @@ pub struct SymbolMetadata {
     /// (no conversion needed).
     #[serde(default)]
     pub pnl_conversion_fee_rate: Option<f64>,
+
+    /// **Phase D.2d (2026-05-28)** — broker's commission TYPE for
+    /// this symbol. `ProtoOACommissionType` discriminants (the
+    /// Spotware-defined integer values, NOT the previous string
+    /// encoding the audit caught):
+    ///   1 = UsdPerMillionUsd     (FX, metals, energies: 79 / 92)
+    ///   2 = UsdPerLot            (equities — filtered out)
+    ///   3 = PercentageOfValue    (indices: 13 / 92, rate × 10^5)
+    ///   4 = QuoteCcyPerLot       (zero in our broker)
+    ///
+    /// Stored as `Option<u8>` so legacy JSON without this field still
+    /// loads. Combined with `commission_rate_decimal` below, the
+    /// cost model can compute commission_per_lot at trade time given
+    /// the live spot price (no hardcoded $7 fallback).
+    #[serde(default)]
+    pub commission_type: Option<u8>,
+
+    /// **Phase D.2d (2026-05-28)** — broker's commission rate in the
+    /// dimension implied by `commission_type`. The cTrader proto
+    /// stores this as `precise_trading_commission_rate: i64` scaled
+    /// by 10^8 (for non-percentage types) or 10^5 (for percentage).
+    /// The bootstrap converter already undoes that scaling so this
+    /// field carries the rate in operator-friendly units:
+    ///   commission_type=1 → USD per million USD of notional
+    ///                       (e.g. 45.0 = "$45 per $1M")
+    ///   commission_type=2 → USD per lot
+    ///   commission_type=3 → percentage points / 100 of notional
+    ///                       (e.g. 0.02 = 0.02 % per trade)
+    ///   commission_type=4 → quote-currency per lot
+    ///
+    /// Combined with `commission_type`, the cost model does the
+    /// proper per-trade math instead of falling back to $7/lot.
+    /// `commission_per_lot` (above) remains for callers that want
+    /// a pre-computed $/lot number; new code should prefer the
+    /// rate+type pair so commission scales correctly with price.
+    #[serde(default)]
+    pub commission_rate_decimal: Option<f64>,
 }
 
 impl SymbolMetadata {
@@ -245,6 +289,91 @@ impl SymbolMetadata {
     /// non-quote-currency account because it skipped the FX step. On a
     /// GBP account trading EURUSD that bug under-reported pips by the
     /// USD/GBP factor (~25%).
+    /// **Phase D.2d (2026-05-28)** — compute commission per lot, in
+    /// account currency, using the broker's commission_type +
+    /// commission_rate_decimal. The legacy `commission_per_lot`
+    /// field stays as a precomputed fallback; this method does the
+    /// proper math when the rate + type are available.
+    ///
+    /// Inputs:
+    ///   * `live_price`: current spot for the symbol (e.g. EURUSD =
+    ///     1.0840). Required for type=1 (UsdPerMillion) and type=3
+    ///     (PercentOfValue) since both depend on notional.
+    ///   * `quote_to_account_rate`: FX rate from quote currency to
+    ///     account currency. `None` is fine when quote==account.
+    ///
+    /// Returns `None` when:
+    ///   * commission_type or commission_rate_decimal is missing,
+    ///   * live_price is needed but missing/non-positive,
+    ///   * commission_type is unknown (anything outside 1..=4).
+    ///
+    /// Per-type math (verified against IcMarkets demo, 2026-05-28):
+    ///   type=1 (UsdPerMillion):
+    ///     notional_usd  = contract_size × live_price       (for X/USD)
+    ///                  OR contract_size × live_price × quote_to_USD
+    ///                     (for X/Y where Y≠USD)
+    ///     commission   = rate × notional_usd / 1_000_000
+    ///   type=2 (UsdPerLot):
+    ///     commission   = rate                             (literal $/lot)
+    ///   type=3 (PercentageOfValue):
+    ///     notional_quote = contract_size × live_price
+    ///     commission     = (rate / 100) × notional_quote
+    ///     (rate field carries % directly after × 10^5 unscaling)
+    ///   type=4 (QuoteCcyPerLot):
+    ///     commission   = rate                             (in quote ccy)
+    ///
+    /// Then converted to account currency via `quote_to_account_rate`
+    /// when types 3/4 return a quote-ccy figure on a non-quote
+    /// account. Types 1/2 already return USD; conversion handled by
+    /// the caller (cost_model) where it has access to the account
+    /// currency string.
+    pub fn commission_per_lot_quote_ccy(
+        &self,
+        live_price: Option<f64>,
+        quote_to_usd_rate: Option<f64>,
+    ) -> Option<f64> {
+        let kind = self.commission_type?;
+        let rate = self
+            .commission_rate_decimal
+            .filter(|v| v.is_finite() && *v >= 0.0)?;
+        match kind {
+            1 => {
+                // UsdPerMillionUsd. Need notional in USD.
+                let price = live_price.filter(|v| v.is_finite() && *v > 0.0)?;
+                // notional in quote currency
+                let notional_quote = self.contract_size * price;
+                // convert quote → USD if quote != USD
+                let notional_usd = if self.quote.eq_ignore_ascii_case("USD") {
+                    notional_quote
+                } else {
+                    let r = quote_to_usd_rate.filter(|v| v.is_finite() && *v > 0.0)?;
+                    notional_quote * r
+                };
+                Some(rate * notional_usd / 1_000_000.0)
+            }
+            2 => {
+                // UsdPerLot. Literal rate (no price needed).
+                Some(rate)
+            }
+            3 => {
+                // PercentageOfValue. The decimal rate after
+                // un-scaling is a fraction-of-100 (the proto
+                // pre-scaled by 10^5 to encode percent-points).
+                // E.g. raw 2000 → decimal 0.02 → "0.02 %" of
+                // notional. Convert via /100.
+                let price = live_price.filter(|v| v.is_finite() && *v > 0.0)?;
+                let notional_quote = self.contract_size * price;
+                Some(notional_quote * rate / 100.0)
+            }
+            4 => {
+                // QuoteCcyPerLot. Literal rate in quote-currency
+                // units per lot. Caller converts to account.
+                Some(rate)
+            }
+            _ => None,
+        }
+    }
+
     pub fn account_pnl_to_pips(
         &self,
         pnl_account_ccy: f64,
@@ -598,6 +727,9 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             daily_swap_long_pips: None,
             daily_swap_short_pips: None,
             pnl_conversion_fee_rate: None,
+            // Phase D.2d — broker-supplied (ProtoOACommissionType + rate).
+            commission_type: None,
+            commission_rate_decimal: None,
         },
         "XAGUSD" => SymbolMetadata {
             symbol: canon,
@@ -616,6 +748,8 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             daily_swap_long_pips: None,
             daily_swap_short_pips: None,
             pnl_conversion_fee_rate: None,
+            commission_type: None,
+            commission_rate_decimal: None,
         },
         // ── Crypto ──
         "BTCUSD" => SymbolMetadata {
@@ -635,6 +769,8 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             daily_swap_long_pips: None,
             daily_swap_short_pips: None,
             pnl_conversion_fee_rate: None,
+            commission_type: None,
+            commission_rate_decimal: None,
         },
         "ETHUSD" => SymbolMetadata {
             symbol: canon,
@@ -653,6 +789,8 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             daily_swap_long_pips: None,
             daily_swap_short_pips: None,
             pnl_conversion_fee_rate: None,
+            commission_type: None,
+            commission_rate_decimal: None,
         },
         _ => return None,
     };
@@ -686,6 +824,8 @@ fn fx(
         daily_swap_long_pips: None,
         daily_swap_short_pips: None,
         pnl_conversion_fee_rate: None,
+        commission_type: None,
+        commission_rate_decimal: None,
     }
 }
 
@@ -712,6 +852,8 @@ fn fx_jpy(symbol: String, base: &str, quote: &str, typical: Option<f64>) -> Symb
         daily_swap_long_pips: None,
         daily_swap_short_pips: None,
         pnl_conversion_fee_rate: None,
+        commission_type: None,
+        commission_rate_decimal: None,
     }
 }
 
@@ -1022,5 +1164,128 @@ mod tests {
             )
             .expect("ok");
         assert!((pnl - 13.42).abs() < 0.05, "expected ≈$13.42, got ${pnl}");
+    }
+
+    // ─── Phase D.2d commission helper (2026-05-28) ────────────────────
+    //
+    // `commission_per_lot_quote_ccy` should return the commission in
+    // the symbol's quote currency for one standard lot, given the
+    // broker-supplied `commission_type` (proto enum discriminant 1..=4)
+    // and `commission_rate_decimal`. These tests pin the math for each
+    // of the four cTrader commission types against the actual values
+    // captured from the IcMarkets Demo broker on 2026-05-28.
+
+    fn eurusd_with_ctype(disc: u8, rate: f64) -> SymbolMetadata {
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.commission_type = Some(disc);
+        m.commission_rate_decimal = Some(rate);
+        m
+    }
+
+    #[test]
+    fn commission_helper_usd_per_million_eurusd_real_value() {
+        // EURUSD on the captured IcMarkets Demo: $45 per $1M USD
+        // (commission_type=1 UsdPerMillionUsd, rate_decimal=45.0).
+        // Notional at price 1.10: 100_000 × 1.10 = $110_000 USD.
+        // Commission per lot = 45 × 110_000 / 1_000_000 = $4.95.
+        let m = eurusd_with_ctype(1, 45.0);
+        let c = m
+            .commission_per_lot_quote_ccy(Some(1.10), None)
+            .expect("commission");
+        assert!((c - 4.95).abs() < 1e-9, "expected $4.95, got ${c}");
+    }
+
+    #[test]
+    fn commission_helper_usd_per_million_needs_price() {
+        // UsdPerMillionUsd cannot resolve without live_price.
+        let m = eurusd_with_ctype(1, 45.0);
+        assert!(m.commission_per_lot_quote_ccy(None, None).is_none());
+    }
+
+    #[test]
+    fn commission_helper_usd_per_lot_is_literal_rate() {
+        // commission_type=2 UsdPerLot, rate_decimal=7.0 → flat $7/lot.
+        let m = eurusd_with_ctype(2, 7.0);
+        let c = m.commission_per_lot_quote_ccy(None, None).expect("commission");
+        assert!((c - 7.0).abs() < 1e-9, "expected $7, got ${c}");
+    }
+
+    #[test]
+    fn commission_helper_percent_of_value_germany40() {
+        // commission_type=3 PercentageOfValue. Per cTrader proto the
+        // raw int64 is multiplied by 1e5 to encode percent-points, and
+        // `commission_rate_decimal()` un-scales to a "percent" number.
+        // Example: raw 2000 → decimal 0.02 → "0.02 % of notional".
+        // For GERMANY 40 contract_size 1.0 at price 20_000 → notional
+        // 20_000, commission = 20_000 × 0.02 / 100 = $4.00 per lot.
+        let mut m = eurusd_with_ctype(3, 0.02);
+        m.contract_size = 1.0; // mimic a single-unit index contract
+        let c = m
+            .commission_per_lot_quote_ccy(Some(20_000.0), None)
+            .expect("commission");
+        assert!((c - 4.0).abs() < 1e-9, "expected $4, got ${c}");
+    }
+
+    #[test]
+    fn commission_helper_quote_ccy_per_lot_is_literal_rate() {
+        // commission_type=4 QuoteCcyPerLot → returned as-is in quote ccy.
+        let m = eurusd_with_ctype(4, 12.5);
+        let c = m.commission_per_lot_quote_ccy(None, None).expect("commission");
+        assert!((c - 12.5).abs() < 1e-9, "expected 12.5, got {c}");
+    }
+
+    #[test]
+    fn commission_helper_returns_none_when_type_missing() {
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.commission_type = None;
+        m.commission_rate_decimal = Some(45.0);
+        assert!(m.commission_per_lot_quote_ccy(Some(1.10), None).is_none());
+    }
+
+    #[test]
+    fn commission_helper_returns_none_when_rate_missing() {
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.commission_type = Some(1);
+        m.commission_rate_decimal = None;
+        assert!(m.commission_per_lot_quote_ccy(Some(1.10), None).is_none());
+    }
+
+    #[test]
+    fn commission_helper_rejects_negative_rate() {
+        let m = eurusd_with_ctype(2, -1.0);
+        assert!(m.commission_per_lot_quote_ccy(None, None).is_none());
+    }
+
+    #[test]
+    fn d2d_fields_default_when_missing_in_legacy_json() {
+        // Pre-Phase-D.2d JSON — must still deserialize, with the new
+        // fields landing as `None`.
+        let legacy_json = r#"{
+            "symbol": "EURUSD",
+            "base": "EUR",
+            "quote": "USD",
+            "pip_size": 0.0001,
+            "contract_size": 100000.0,
+            "pip_value_quote": 10.0,
+            "digits": 5,
+            "min_lot": 0.01,
+            "max_lot": 100.0,
+            "lot_step": 0.01
+        }"#;
+        let m: SymbolMetadata =
+            serde_json::from_str(legacy_json).expect("legacy deserialize");
+        assert_eq!(m.commission_type, None);
+        assert_eq!(m.commission_rate_decimal, None);
+    }
+
+    #[test]
+    fn d2d_fields_serde_round_trip() {
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.commission_type = Some(1);
+        m.commission_rate_decimal = Some(45.0);
+        let json = serde_json::to_string(&m).expect("serialize");
+        let back: SymbolMetadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.commission_type, Some(1));
+        assert_eq!(back.commission_rate_decimal, Some(45.0));
     }
 }

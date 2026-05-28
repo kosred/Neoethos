@@ -163,6 +163,22 @@ struct Args {
     /// current working directory).
     #[arg(long)]
     bootstrap_output: Option<String>,
+
+    /// **Phase D.2d (2026-05-28)** — re-run ONLY the catalog →
+    /// `SymbolMetadataTable` conversion step against the on-disk
+    /// `raw_batches/` cache previously written by
+    /// `--bootstrap-broker-catalog`, without touching the broker.
+    ///
+    /// Use this after a schema change to `SymbolMetadata` (e.g. new
+    /// fields added) to regenerate `data/symbol_metadata.json` with
+    /// the new shape, while preserving the operator's broker capture
+    /// (so we don't burn quota re-fetching 830 symbols).
+    ///
+    /// Reads `<bootstrap-output>/<env>/raw_batches/*.json`
+    /// + `light_symbols.json` + `asset_list.json`. Writes
+    /// `data/symbol_metadata.json`. No network I/O. ~1 s.
+    #[arg(long, default_value_t = false)]
+    rebuild_symbol_metadata: bool,
 }
 
 #[tokio::main]
@@ -263,6 +279,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "OAuth flow complete; token bundle saved to keyring"
         );
         info!("Token bundle saved. You can now run: neoethos-app --server");
+        return Ok(());
+    }
+
+    if args.rebuild_symbol_metadata {
+        // Phase D.2d (2026-05-28) — regenerate data/symbol_metadata.json
+        // from the cached raw_batches WITHOUT a broker round-trip.
+        // Picks the env_dir based on broker settings (demo vs live).
+        let output_root = args
+            .bootstrap_output
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(app_services::capture_symbols::default_bootstrap_root);
+        let env_label = app_services::capture_symbols::env_label_from_settings();
+        let env_dir = output_root.join(env_label);
+        info!(
+            target: "neoethos_app::rebuild_symbol_metadata",
+            env_dir = %env_dir.display(),
+            "rebuilding SymbolMetadataTable from cached raw_batches"
+        );
+        let env_dir_clone = env_dir.clone();
+        let table = tokio::task::spawn_blocking(move || {
+            app_services::capture_symbols::build_symbol_metadata_table_from_catalog(
+                &env_dir_clone,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("rebuild blocking task panicked: {e}"))??;
+        let metadata_path = std::path::PathBuf::from("data").join("symbol_metadata.json");
+        table.save_to_disk(&metadata_path).map_err(|e| {
+            anyhow::anyhow!("write {}: {e}", metadata_path.display())
+        })?;
+        info!(
+            target: "neoethos_app::rebuild_symbol_metadata",
+            entries = table.entries.len(),
+            path = %metadata_path.display(),
+            "rebuild complete"
+        );
+        eprintln!(
+            "[rebuild] wrote {} entries → {}",
+            table.entries.len(),
+            metadata_path.display()
+        );
         return Ok(());
     }
 

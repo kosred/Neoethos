@@ -1151,6 +1151,20 @@ pub fn build_symbol_metadata_table_from_catalog(
                 .map(|raw| raw as f64 / 10_000.0)
                 .filter(|v| v.is_finite() && *v >= 0.0 && *v < 1.0);
 
+            // Phase D.2d — broker-supplied commission rate. Keep the raw
+            // proto enum discriminant (1..=4) plus the human-decimal rate
+            // (e.g. 45.0 = $45 per $1M for EURUSD UsdPerMillion) so the
+            // cost model can apply the correct math per type without
+            // re-deriving from the raw int64.
+            let commission_type_disc = sym
+                .financials
+                .as_ref()
+                .and_then(|f| f.commission_type.map(|c| c as u8));
+            let commission_rate_decimal = sym
+                .financials
+                .as_ref()
+                .and_then(|f| f.commission_rate_decimal());
+
             let meta = SymbolMetadata {
                 symbol: name.clone(),
                 base: base_name,
@@ -1168,6 +1182,8 @@ pub fn build_symbol_metadata_table_from_catalog(
                 daily_swap_long_pips: daily_swap_long,
                 daily_swap_short_pips: daily_swap_short,
                 pnl_conversion_fee_rate: pnl_conv_fee,
+                commission_type: commission_type_disc,
+                commission_rate_decimal,
             };
             table.upsert(meta);
             kept += 1;
