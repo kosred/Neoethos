@@ -263,6 +263,16 @@ fn backtest_population_kernel(
     spread_pips: f32,
     commission_per_trade: f32,
     pip_value_per_lot: f32,
+    // Phase C.3 (2026-05-28) — broker-supplied carry costs mirrored
+    // from the CPU `apply_carry_and_fee` helper. Sign convention
+    // matches the broker: positive = credit, negative = charge per
+    // overnight day. `pnl_conversion_fee_rate` is a fraction (0.005
+    // = 0.5%); skipped if non-finite / out-of-range so a missing-
+    // broker-data run still produces a backtest, matching the CPU
+    // kernel's fail-safe default behaviour.
+    swap_long_pips_per_day: f32,
+    swap_short_pips_per_day: f32,
+    pnl_conversion_fee_rate: f32,
 ) {
     // cubecl 0.9: index arithmetic is usize; coerce u32 params at the top.
     // Every scalar accumulator that gets reassigned must use RuntimeCell —
@@ -317,8 +327,24 @@ fn backtest_population_kernel(
         let entry_px = RuntimeCell::<f32>::new(0.0);
         let entry_idx = RuntimeCell::<i32>::new(-1);
         let trail_px = RuntimeCell::<f32>::new(0.0);
+        // Phase C.3: accumulated days in position. Resets to 0 at entry,
+        // each in-position bar adds `timestamp_deltas_ms[i] / 86_400_000`.
+        // f32 precision loss on the cast is bounded by ~5 ms per bar
+        // (cast of values up to 86.4M ms into 24-bit mantissa); over
+        // a year of D1 bars this accumulates to <$0.001 of swap error
+        // at typical EURUSD pip values — negligible vs the $122/year
+        // swap charge being modelled.
+        let position_days = RuntimeCell::<f32>::new(0.0);
 
         for i in 1..n_samples {
+            // Phase C.3: accumulate carry duration while in position.
+            // Runs BEFORE any exit logic so the close branches use the
+            // total time held, INCLUDING the delta into the current bar.
+            if in_pos.read() != 0 && use_timestamps != 0 && timestamp_deltas_ms[i] > 0 {
+                let delta_days = timestamp_deltas_ms[i] as f32 / 86_400_000.0;
+                position_days.store(position_days.read() + delta_days);
+            }
+
             let m_val = month_idx[i];
             let last_month_v = last_month.read();
             if m_val != last_month_v {
@@ -366,6 +392,18 @@ fn backtest_population_kernel(
                         - commission_per_trade
                         - (spread_pips * 0.5 * pip_value_per_lot),
                 );
+                // Phase C.3: broker swap (signed: + = credit, − = charge).
+                let swap_per_day_gap = if in_pos_v == 1 {
+                    swap_long_pips_per_day
+                } else {
+                    swap_short_pips_per_day
+                };
+                let swap_credit_gap = swap_per_day_gap * position_days.read() * pip_value_per_lot;
+                pnl_cell.store(pnl_cell.read() + swap_credit_gap);
+                // PnL conversion fee applied last; skip if out-of-range.
+                if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
+                    pnl_cell.store(pnl_cell.read() * (1.0 - pnl_conversion_fee_rate));
+                }
                 let pnl = pnl_cell.read();
                 equity.store(equity.read() + pnl);
                 current_month_pnl.store(current_month_pnl.read() + pnl);
@@ -500,6 +538,17 @@ fn backtest_population_kernel(
                             - commission_per_trade
                             - (spread_pips * 0.5 * pip_value_per_lot),
                     );
+                    // Phase C.3: broker swap (signed: + = credit, − = charge).
+                    let swap_per_day = if in_pos_v2 == 1 {
+                        swap_long_pips_per_day
+                    } else {
+                        swap_short_pips_per_day
+                    };
+                    let swap_credit = swap_per_day * position_days.read() * pip_value_per_lot;
+                    pnl_cell.store(pnl_cell.read() + swap_credit);
+                    if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
+                        pnl_cell.store(pnl_cell.read() * (1.0 - pnl_conversion_fee_rate));
+                    }
                     let pnl = pnl_cell.read();
                     equity.store(equity.read() + pnl);
                     current_month_pnl.store(current_month_pnl.read() + pnl);
@@ -538,6 +587,8 @@ fn backtest_population_kernel(
                         entry_px.store(close_pips[i] + (s as f32) * spread_pips * 0.5);
                         entry_idx.store(i as i32);
                         trail_px.store(0.0);
+                        // Phase C.3: reset carry accumulator at new entry.
+                        position_days.store(0.0);
                         day_trade_count.store(day_trade_count.read() + 1);
                     }
                 }
@@ -1173,6 +1224,10 @@ fn launch_backtest_kernel<R: Runtime>(
         ScalarArg::new(settings.spread_pips as f32),
         ScalarArg::new(settings.commission_per_trade as f32),
         ScalarArg::new(settings.pip_value_per_lot as f32),
+        // Phase C.3 (2026-05-28) — broker-supplied carry costs.
+        ScalarArg::new(settings.swap_long_pips_per_day as f32),
+        ScalarArg::new(settings.swap_short_pips_per_day as f32),
+        ScalarArg::new(settings.pnl_conversion_fee_rate as f32),
     )
     .context("launch cuda evaluator backtest kernel")?;
 
