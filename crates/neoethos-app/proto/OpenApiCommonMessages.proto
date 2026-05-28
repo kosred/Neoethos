@@ -19,7 +19,7 @@ message ProtoMessage {
 /** Error response that is sent from Open API proxy when error occurs. */
 message ProtoErrorRes {
     optional ProtoPayloadType payloadType = 1 [default = ERROR_RES];
-
+    
     required string errorCode = 2; // Contains name of ProtoErrorCode or other custom ErrorCodes (e.g. ProtoCHErrorCode).
     optional string description = 3; // Error description.
     optional uint64 maintenanceEndTimestamp = 4; // The Unix time in milliseconds of the end of the maintenance.
