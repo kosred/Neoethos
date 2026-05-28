@@ -1278,8 +1278,20 @@ mod tests {
 
     #[test]
     fn test_default_settings() {
+        // F-303 (2026-05-28): updated post-F-129 — the previous
+        // assertion `settings.system.symbol == "EURUSD"` was a stale
+        // hardcoded-default check from before the synthetic-data
+        // cleanup. `SystemConfig::default()` now returns empty for
+        // both `symbol` and `account_currency` (F-304), forcing the
+        // operator's `config.yaml` to populate them. The pre-flight
+        // bail in `run_discovery_cycle` catches the omission with an
+        // actionable error.
         let settings = Settings::default();
-        assert_eq!(settings.system.symbol, "EURUSD");
+        assert_eq!(settings.system.symbol, "", "default symbol must be empty per F-129");
+        assert_eq!(
+            settings.system.account_currency, "",
+            "default account_currency must be empty per F-304"
+        );
         assert_eq!(settings.risk.initial_balance, 10_000.0);
         assert!(!settings.models.ml_models.is_empty());
     }

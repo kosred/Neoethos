@@ -288,14 +288,23 @@ mod tests {
 
     #[test]
     fn expectancy_component_zero_for_invalid_input() {
+        // F-303 (2026-05-28): the author's previous draft asserted 1.0
+        // for INFINITY but their own comment block correctly traced
+        // through the actual logic: `finite_or(INFINITY, 0.0)` returns
+        // 0.0 (INFINITY is non-finite → fallback), then 0.0 / 50.0 = 0
+        // → clamp returns 0.0. The author never came back to update the
+        // assertion. Fixed to match the actual (and correct) behaviour.
         assert_eq!(expectancy_component(f64::NAN), 0.0);
-        assert_eq!(expectancy_component(f64::INFINITY), 1.0);
-        // INFINITY → finite_or fallback 0.0 / 50.0 = 0.0 — BUT
-        // finite_or returns the value if it IS finite, and INFINITY
-        // is NOT finite so we fall through to 0.0 / 50.0 = 0.0 then
-        // clamp returns 0.0. Wait: re-read finite_or — if non-finite,
-        // returns the fallback (0.0). So INFINITY → 0.0 / 50.0 = 0.0
-        // → clamp returns 0.0. Update assertion:
+        assert_eq!(
+            expectancy_component(f64::INFINITY),
+            0.0,
+            "INFINITY → finite_or fallback (0.0) → 0/50 → 0"
+        );
+        assert_eq!(
+            expectancy_component(f64::NEG_INFINITY),
+            0.0,
+            "−INFINITY → finite_or fallback (0.0) → 0/50 → 0"
+        );
     }
 
     #[test]
