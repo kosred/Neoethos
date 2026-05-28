@@ -119,8 +119,60 @@ pub fn ensure_timeframes_with_resample(
         .ok_or_else(|| anyhow::anyhow!("base timeframe {} not found", base_tf))?;
     let base_minutes = parse_timeframe_to_minutes(base_tf)?;
 
+    // F-309 (2026-05-28): opt-in auto-rebuild of stale higher TFs.
+    // When enabled, a present-but-stale higher-TF (last bar > K × period
+    // before base's last bar) is REBUILT from the base via resample
+    // instead of being passed through to the aligner. Without this, the
+    // F-308 max-age guard would just NaN-out the stale tail; with it,
+    // the operator gets a fresh tail derived from the base.
+    //
+    // Gated behind FOREX_BOT_REBUILD_STALE_HIGHER_TFS=1 because
+    // unsolicited auto-rebuild could surprise operators who keep
+    // intentionally-stale higher-TF data (e.g. a fixed regime window).
+    let rebuild_stale = std::env::var("FOREX_BOT_REBUILD_STALE_HIGHER_TFS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let base_last_ts = base_ohlcv
+        .timestamp
+        .as_ref()
+        .and_then(|ts| ts.last())
+        .copied()
+        .unwrap_or(0);
+
     for tf in target_tfs {
-        if !new_frames.contains_key(*tf) && parse_timeframe_to_minutes(tf)? > base_minutes {
+        let tf_minutes = parse_timeframe_to_minutes(tf)?;
+        if tf_minutes <= base_minutes {
+            continue;
+        }
+        if let Some(existing) = new_frames.get(*tf) {
+            // Existing higher-TF: check freshness if requested.
+            if rebuild_stale && base_last_ts > 0 {
+                let h_last = existing
+                    .timestamp
+                    .as_ref()
+                    .and_then(|ts| ts.last())
+                    .copied()
+                    .unwrap_or(0);
+                // 2× period lag = stale (matches F-308 max_age policy)
+                let max_lag_ms = (tf_minutes as i64).saturating_mul(60 * 1000).saturating_mul(2);
+                if h_last > 0 && base_last_ts.saturating_sub(h_last) > max_lag_ms {
+                    tracing::warn!(
+                        target: "neoethos_data::ensure_timeframes_with_resample",
+                        symbol = %ds.symbol,
+                        tf = tf,
+                        base_last_ms = base_last_ts,
+                        h_last_ms = h_last,
+                        lag_ms = base_last_ts - h_last,
+                        max_lag_ms,
+                        "F-309: rebuilding stale higher-TF from base via resample"
+                    );
+                    let resampled = resample_ohlcv(base_ohlcv, tf)?;
+                    new_frames.insert(tf.to_string(), resampled);
+                }
+            }
+            // else: existing is fresh enough (or rebuild not opted in) — keep
+        } else {
+            // Missing TF — original behaviour: resample from base.
             let resampled = resample_ohlcv(base_ohlcv, tf)?;
             new_frames.insert(tf.to_string(), resampled);
         }

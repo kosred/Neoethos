@@ -486,23 +486,53 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         }
         .with_env_runtime_overrides();
         let result = neoethos_search::run_discovery_cycle(&features, base_ohlcv, &config)?;
-        neoethos_search::ensure_non_empty_portfolio(&result, &format!("{} {}", symbol, base))?;
         if let Some(parent) = std::path::Path::new(&out).parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)?;
         }
-        neoethos_search::save_portfolio_json(&out, &result)?;
-        let profile_path = format!("{out}.profile.json");
-        neoethos_search::save_discovery_profile_json(&profile_path, &config, &result)?;
+        // F-306 fix (2026-05-28): save funnel + quality + trade log
+        // BEFORE the empty-portfolio guard. The previous order made
+        // every empty run leave ZERO artifacts on disk, blocking
+        // post-mortem diagnosis. Mirrors the app server pattern at
+        // `crates/neoethos-app/src/app_services/discovery.rs:988-1007`.
+        let funnel_path = format!("{out}.funnel.json");
+        if let Err(err) = neoethos_search::save_funnel_json(&funnel_path, &result) {
+            tracing::warn!(
+                target: "neoethos_cli::discover",
+                error = %err,
+                path = %funnel_path,
+                "save_funnel_json failed (non-fatal — continuing to other artifacts)"
+            );
+        }
         if !result.quality_metrics.is_empty() {
             let quality_path = format!("{out}.quality.json");
-            neoethos_search::save_quality_report_json(&quality_path, &result)?;
+            if let Err(err) = neoethos_search::save_quality_report_json(&quality_path, &result) {
+                tracing::warn!(
+                    target: "neoethos_cli::discover",
+                    error = %err,
+                    path = %quality_path,
+                    "save_quality_report_json failed (non-fatal)"
+                );
+            }
         }
         if !result.logged_trades.is_empty() {
             let trade_log_path = format!("{out}.trades.json");
-            neoethos_search::save_trade_log_json(&trade_log_path, &result)?;
+            if let Err(err) = neoethos_search::save_trade_log_json(&trade_log_path, &result) {
+                tracing::warn!(
+                    target: "neoethos_cli::discover",
+                    error = %err,
+                    path = %trade_log_path,
+                    "save_trade_log_json failed (non-fatal)"
+                );
+            }
         }
+        // Now the empty-portfolio guard. Diagnostics are already on
+        // disk, so the operator can post-mortem even when this fires.
+        neoethos_search::ensure_non_empty_portfolio(&result, &format!("{} {}", symbol, base))?;
+        neoethos_search::save_portfolio_json(&out, &result)?;
+        let profile_path = format!("{out}.profile.json");
+        neoethos_search::save_discovery_profile_json(&profile_path, &config, &result)?;
         if !result.canonical_backtest_artifacts.is_empty() {
             let backtest_dir = format!("{out}.canonical_backtests");
             neoethos_search::save_canonical_backtest_artifacts(&backtest_dir, &result)?;

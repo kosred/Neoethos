@@ -2224,6 +2224,69 @@ where
             mean_abs_finite = mean_abs,
             "feature frame summary"
         );
+
+        // F-310 (2026-05-28): per-column variance check on the trailing
+        // window. The NaN+zero counters above can't see "frozen
+        // constant" columns — F-308 was about higher-TF forward-fill
+        // staling, and the resulting column values are FINITE NON-ZERO
+        // but all identical. Indicators on a constant input emit a
+        // constant; GA on a constant signal produces zero-trade
+        // candidates. This sub-diagnostic walks each column over the
+        // last `min(rows, 1000)` rows and counts columns whose
+        // (max−min) is essentially zero. A high count is the
+        // unambiguous signal that the alignment / data pipeline broke.
+        let trailing = features.data.nrows().min(1000);
+        if trailing > 1 {
+            let n_cols = features.data.ncols();
+            let mut zero_var_cols = 0usize;
+            let mut named_examples: Vec<String> = Vec::new();
+            let start_row = features.data.nrows() - trailing;
+            for c in 0..n_cols {
+                let mut col_min = f32::INFINITY;
+                let mut col_max = f32::NEG_INFINITY;
+                let mut finite_seen = 0usize;
+                for r in start_row..features.data.nrows() {
+                    let v = features.data[(r, c)];
+                    if v.is_finite() {
+                        finite_seen += 1;
+                        if v < col_min {
+                            col_min = v;
+                        }
+                        if v > col_max {
+                            col_max = v;
+                        }
+                    }
+                }
+                // Zero-variance only if we saw enough finite values AND
+                // the span is below epsilon. Skip mostly-NaN columns —
+                // those are already counted in `nan_frac`.
+                if finite_seen >= (trailing * 7 / 10)
+                    && col_min.is_finite()
+                    && col_max.is_finite()
+                    && (col_max - col_min).abs() < 1e-9
+                {
+                    zero_var_cols += 1;
+                    if named_examples.len() < 5
+                        && c < features.names.len()
+                    {
+                        named_examples.push(features.names[c].clone());
+                    }
+                }
+            }
+            if zero_var_cols > 0 {
+                tracing::warn!(
+                    target: "neoethos_search::funnel",
+                    zero_var_cols,
+                    total_cols = n_cols,
+                    trailing_rows = trailing,
+                    examples = ?named_examples,
+                    "F-310: zero-variance feature columns detected over trailing window. \
+                     Most-likely cause: stale higher-TF data being forward-filled into \
+                     base bars (F-308 / F-309 scope). Operator action: re-bootstrap \
+                     the affected higher timeframe."
+                );
+            }
+        }
     }
     // Sort by an income-focused ranking score to find reliably profitable ones
     let mut ranked_candidates: Vec<(usize, Gene)> = candidates.into_iter().enumerate().collect();
