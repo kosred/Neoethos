@@ -332,13 +332,18 @@ impl DiscoveryConfig {
         Self {
             timeframe_label: settings.system.base_timeframe.clone(),
             evaluation_symbol: settings.system.symbol.clone(),
-            // F-007 fix (2026-05-25): the hardcoded "USD" default was a
-            // synthetic-data violation per operator's real-data directive
-            // 2026-05-24. Empty default forces the caller to populate the
-            // value from the cTrader trader profile (Settings does so
-            // when the broker session is alive). The downstream cost-model
-            // NaN guard rejects backtests with empty account_currency.
-            evaluation_account_currency: String::new(),
+            // F-304 fix (2026-05-28): SystemConfig.account_currency is
+            // the typed channel for operator/broker-supplied account
+            // currency, populated from one of:
+            //  - `config.yaml` `system.account_currency`
+            //  - cTrader trader profile (bridge writes back at startup)
+            //  - `FOREX_BOT_PROP_ACCOUNT_CURRENCY` env override
+            // Empty propagates downstream so the cost-model NaN guard
+            // can reject runs that haven't bound a real currency. The
+            // previous F-007 fix used `String::new()` here unconditionally,
+            // making *every* `from_settings` call fall into the NaN trap
+            // even when the operator had set the value — root cause #304.
+            evaluation_account_currency: settings.system.account_currency.clone(),
             evaluation_spread_pips: settings.risk.backtest_spread_pips.max(0.0),
             evaluation_commission_per_trade: settings.risk.commission_per_lot.max(0.0),
             population: model_settings.prop_search_population.max(10),
@@ -1552,6 +1557,61 @@ pub fn run_discovery_cycle_with_progress<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
+    // F-304 fix (2026-05-28): pre-flight bail. The cost-model NaN
+    // guard at `strategy_gene::infer_market_cost_profile` returns
+    // empty-string + NaN-sentinel values when `evaluation_symbol` or
+    // `evaluation_account_currency` are blank. Those NaN values then
+    // propagate through `pip = settings.pip_value` (only near-zero is
+    // checked, not NaN) → spread_pips * pip = NaN entry_px, no trades
+    // open, sanitizer scrubs metrics to 0.0, GA sees a zero-trade
+    // candidate. Operator gets "no trades found" with no explanation.
+    //
+    // Bail loud here BEFORE the FunnelProfile/GA spin up so the error
+    // message points at the right config field instead of a downstream
+    // silent-failure metric.
+    if config.evaluation_symbol.trim().is_empty() {
+        anyhow::bail!(
+            "run_discovery_cycle: DiscoveryConfig.evaluation_symbol is empty. \
+             Set it explicitly before calling — the cost-model NaN guard \
+             would otherwise produce zero-trade candidates with no clear \
+             failure signal. Bind the symbol via DiscoveryConfig::from_settings() \
+             then `config.evaluation_symbol = symbol.to_string()` if it differs \
+             from settings.system.symbol."
+        );
+    }
+    if config.evaluation_account_currency.trim().is_empty() {
+        anyhow::bail!(
+            "run_discovery_cycle: DiscoveryConfig.evaluation_account_currency \
+             is empty. Set `system.account_currency` in config.yaml (or via \
+             the cTrader trader-profile bridge when the broker session is \
+             alive), or pass the env var FOREX_BOT_PROP_ACCOUNT_CURRENCY. \
+             Empty currency causes the cost model to return NaN spread/pip \
+             values that the sanitizer scrubs to 0.0 — every GA candidate \
+             ends up with 0 trades and the operator sees no diagnostic."
+        );
+    }
+    if !config.evaluation_spread_pips.is_finite() {
+        anyhow::bail!(
+            "run_discovery_cycle: DiscoveryConfig.evaluation_spread_pips is \
+             non-finite ({}). Set settings.risk.backtest_spread_pips in \
+             config.yaml (typical: 0.5–2.0 for FX, 2.5–8.0 for indices/\
+             commodities; live spread varies — pick a backtest-conservative \
+             value).",
+            config.evaluation_spread_pips
+        );
+    }
+    if !config.evaluation_commission_per_trade.is_finite() {
+        anyhow::bail!(
+            "run_discovery_cycle: DiscoveryConfig.evaluation_commission_per_trade \
+             is non-finite ({}). Set settings.risk.commission_per_lot in \
+             config.yaml. (D.2e wire-up now derives this from the broker's \
+             commission_type+rate when SymbolMetadata is populated — but \
+             the default-NaN sentinel still needs a real number for fully \
+             standalone runs without a broker session.)",
+            config.evaluation_commission_per_trade
+        );
+    }
+
     // 2026-05-26 operator directive (dual-mode product): instrument the
     // 16-stage rejection funnel before any pipeline work so a panic /
     // preflight failure still leaves a partially-populated funnel for the

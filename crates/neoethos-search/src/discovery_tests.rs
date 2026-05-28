@@ -1222,3 +1222,117 @@ fn discovery_run_profile_exposes_validation_evidence_hashes_and_missing_kinds() 
     );
     assert_eq!(profile.prop_firm_validation_artifacts_observed, 1);
 }
+
+// ─── F-304: pre-flight bail tests (2026-05-28) ────────────────────
+//
+// `run_discovery_cycle_with_progress` must fail loud BEFORE spinning
+// up the GA when `evaluation_symbol` or `evaluation_account_currency`
+// is empty. The previous behaviour was to silently propagate the
+// empty strings into the cost-model NaN-sentinel guard which made
+// every GA candidate produce zero-trade metrics that the sanitizer
+// scrubbed to 0.0 — operator's "no trades found" with no clue why.
+
+fn valid_discovery_config() -> DiscoveryConfig {
+    DiscoveryConfig {
+        timeframe_label: "M1".to_string(),
+        evaluation_symbol: "EURUSD".to_string(),
+        evaluation_account_currency: "USD".to_string(),
+        evaluation_spread_pips: 1.0,
+        evaluation_commission_per_trade: 7.0,
+        population: 10,
+        generations: 1,
+        candidate_count: 10,
+        portfolio_size: 5,
+        ..DiscoveryConfig::default()
+    }
+}
+
+#[test]
+fn run_discovery_cycle_bails_on_empty_evaluation_symbol() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let mut cfg = valid_discovery_config();
+    cfg.evaluation_symbol = String::new();
+    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
+        .expect_err("empty symbol must bail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("evaluation_symbol is empty"),
+        "expected symbol-empty diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn run_discovery_cycle_bails_on_empty_account_currency() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let mut cfg = valid_discovery_config();
+    cfg.evaluation_account_currency = String::new();
+    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
+        .expect_err("empty account_currency must bail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("evaluation_account_currency"),
+        "expected account-ccy-empty diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn run_discovery_cycle_bails_on_nan_spread() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let mut cfg = valid_discovery_config();
+    cfg.evaluation_spread_pips = f64::NAN;
+    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
+        .expect_err("NaN spread must bail");
+    assert!(
+        err.to_string().contains("evaluation_spread_pips"),
+        "expected spread diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn run_discovery_cycle_bails_on_nan_commission() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let mut cfg = valid_discovery_config();
+    cfg.evaluation_commission_per_trade = f64::NAN;
+    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
+        .expect_err("NaN commission must bail");
+    assert!(
+        err.to_string().contains("evaluation_commission_per_trade"),
+        "expected commission diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn run_discovery_cycle_bails_on_whitespace_only_currency() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let mut cfg = valid_discovery_config();
+    cfg.evaluation_account_currency = "   ".to_string();
+    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
+        .expect_err("whitespace-only currency must bail");
+    assert!(
+        err.to_string().contains("evaluation_account_currency"),
+        "expected ccy-empty diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn from_settings_propagates_account_currency() {
+    // F-304: regression guard — verify that
+    // `DiscoveryConfig::from_settings` now pulls `account_currency` from
+    // SystemConfig instead of hardcoding `String::new()`. Without this
+    // fix, every settings-derived config tripped the pre-flight bail.
+    let mut settings = neoethos_core::Settings::default();
+    settings.system.symbol = "GBPJPY".to_string();
+    settings.system.account_currency = "GBP".to_string();
+    settings.risk.backtest_spread_pips = 1.5;
+    settings.risk.commission_per_lot = 7.0;
+    let cfg = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(cfg.evaluation_symbol, "GBPJPY");
+    assert_eq!(cfg.evaluation_account_currency, "GBP");
+    assert!(cfg.evaluation_spread_pips.is_finite());
+    assert!(cfg.evaluation_commission_per_trade.is_finite());
+}

@@ -1,6 +1,13 @@
 system:
   symbol: EURUSD
   symbols: [EURUSD]
+  # F-304 (2026-05-28): account currency for the backtest cost model.
+  # Cost model uses this for commission/swap/pnl_conversion_fee FX
+  # conversions and the risk gate uses it for position-sizing pip-value
+  # math. Auto-populated from cTrader trader profile when the broker
+  # session is alive — manual setting here is the operator override.
+  # Leave empty to force fail-loud guard if no broker session is wired.
+  account_currency: USD
   data_dir: data
   base_timeframe: M1  # 1-minute base for multi-timeframe analysis
   multi_resolution_enabled: true

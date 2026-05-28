@@ -394,6 +394,25 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
         let higher = parse_flag(args, "--higher")
             .unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref()));
+        // F-304 fix (2026-05-28): bind the account currency for the
+        // cost model. Resolution order:
+        //   1. `--account-currency` CLI flag (operator-explicit)
+        //   2. `Settings.system.account_currency` (from config.yaml or
+        //      cTrader trader profile written back by the bridge)
+        //   3. `FOREX_BOT_PROP_ACCOUNT_CURRENCY` env override (legacy)
+        // Empty propagates downstream — the cost-model NaN guard will
+        // reject the run with a clear error message rather than
+        // silently producing NaN spread/pip values that the sanitizer
+        // scrubs to 0.0 (= GA sees zero-trade candidates).
+        let account_currency = parse_flag(args, "--account-currency")
+            .or_else(|| {
+                settings
+                    .as_ref()
+                    .map(|s| s.system.account_currency.clone())
+                    .filter(|c| !c.trim().is_empty())
+            })
+            .or_else(|| std::env::var("FOREX_BOT_PROP_ACCOUNT_CURRENCY").ok())
+            .unwrap_or_default();
         let population: usize = parse_flag(args, "--population")
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.population);
@@ -448,6 +467,13 @@ fn cmd_discover(args: &[String]) -> Result<()> {
 
         let config = neoethos_search::DiscoveryConfig {
             timeframe_label: base.clone(),
+            // F-304 fix (2026-05-28): bind the CLI-resolved symbol +
+            // account currency BEFORE `..defaults.clone()` so the
+            // cost-model receives the operator's chosen values, not
+            // the (potentially stale or empty) settings copy. Empty
+            // values still propagate and trip the run-loud guard.
+            evaluation_symbol: symbol.clone(),
+            evaluation_account_currency: account_currency.clone(),
             population,
             generations,
             max_indicators,

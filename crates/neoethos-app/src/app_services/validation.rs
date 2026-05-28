@@ -281,17 +281,20 @@ async fn run_one_tf(
     // Honor the operator's config.yaml — defaults in code are smaller
     // than what we need for a meaningful validation signal.
     let mut config = DiscoveryConfig::from_settings(settings);
-    // #214: bind the *actual* sweep symbol into the discovery config so
-    // the cost-model lookup sees a real cTrader symbol instead of the
-    // empty-string fallback (which floods logs with synthetic-EURUSD
-    // warnings and makes MaxDD numbers untrustworthy). The settings
+    // #214 + F-304: bind the *actual* sweep symbol into the discovery
+    // config so the cost-model lookup sees a real cTrader symbol
+    // instead of the empty-string fallback. The settings
     // `system.symbol` may differ from the sweep symbol — `discover_symbols`
     // chose the latter from on-disk Parquet, and that's the symbol whose
-    // data the GA actually backtests. Account currency defaults to USD
-    // because `SystemConfig` does not yet carry an account-currency field
-    // (#214 follow-up tracked separately).
+    // data the GA actually backtests.
+    //
+    // F-304 (2026-05-28): `SystemConfig.account_currency` now exists
+    // as a typed channel. `from_settings` above already populates
+    // `evaluation_account_currency`; we no longer need the hardcoded
+    // "USD" patch (which would override operator's GBP/EUR account
+    // setting). If the operator hasn't configured a currency, the
+    // value stays empty and the cost-model NaN guard fires loud.
     config.evaluation_symbol = symbol.to_string();
-    config.evaluation_account_currency = "USD".to_string();
     // #215: floor the GA generation count so short-data TFs (D1/H4) can't
     // smoke-test through the sweep with a 0.2s run that produces a tiny
     // archive. The floor is applied per-TF — `min_generations = 0` skips

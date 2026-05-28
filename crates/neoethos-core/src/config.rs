@@ -13,6 +13,27 @@ use std::path::PathBuf;
 pub struct SystemConfig {
     pub symbol: String,
     pub symbols: Vec<String>,
+    /// Operator's account currency for cost-model FX conversions
+    /// (commission, swap, pnl_conversion_fee → account ccy) and the
+    /// risk-gate sizing math.
+    ///
+    /// Population paths:
+    ///  1. Manual via `config.yaml` `system.account_currency: "USD"`.
+    ///  2. Auto from the cTrader trader profile when the broker session
+    ///     is alive — the `/account/snapshot` bridge resolves
+    ///     `ProtoOATrader.depositAssetId` → currency name via the
+    ///     asset table and writes it back here (Phase D follow-up).
+    ///  3. Env-var fallback `FOREX_BOT_PROP_ACCOUNT_CURRENCY` honoured
+    ///     by `prop_firm_account_currency()` for the live risk gate.
+    ///
+    /// **Empty string (`""`) is the deliberate fail-loud default**
+    /// matching the `symbol` field's policy — `DiscoveryConfig::
+    /// from_settings()` propagates it to `evaluation_account_currency`
+    /// and the cost-model NaN-sentinel guard then rejects backtests
+    /// rather than silently lying about commission/swap values.
+    /// Operators must populate before running discovery.
+    #[serde(default)]
+    pub account_currency: String,
     pub data_dir: PathBuf,
     pub multi_resolution_enabled: bool,
     pub multi_resolution_timeframes: Vec<String>,
@@ -88,6 +109,13 @@ impl Default for SystemConfig {
             // (see `risk_gate::prop_firm_pre_trade_check` Batch B Pass 3).
             symbol: String::new(),
             symbols: Vec::new(),
+            // F-304 fix (2026-05-28): empty default forces operator/
+            // broker-session population, matching `symbol`. The
+            // cost-model NaN-sentinel guard rejects empty values
+            // downstream, so a bare-install run fails LOUD instead of
+            // silently producing zero-trade GA results from a NaN pip
+            // value.
+            account_currency: String::new(),
             data_dir: PathBuf::from("data"),
             multi_resolution_enabled: true,
             multi_resolution_timeframes: CANONICAL_TIMEFRAMES

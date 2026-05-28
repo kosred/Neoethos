@@ -153,7 +153,38 @@ pub async fn discovery_start(
     // #194: stitch operator overrides into the default DiscoveryConfig.
     // Anything the body omits stays at the engine default (which itself
     // pulls from config.yaml).
-    let mut config = neoethos_search::DiscoveryConfig::default();
+    //
+    // F-304 fix (2026-05-28): seed the config via `from_settings` rather
+    // than `default()` so `evaluation_symbol` + `evaluation_account_currency`
+    // arrive populated from `Settings.system.*`, then explicitly override
+    // the symbol with the request-body value. Without this seed, every
+    // /engines/discovery/start request ran with empty symbol + empty
+    // account_currency + NaN spread/commission, tripping the cost-model
+    // NaN guard and producing zero-trade GA candidates that the
+    // sanitizer scrubbed to 0.0 — invisible failure mode.
+    let mut config = match Settings::from_yaml(state.config_path()) {
+        Ok(settings) => neoethos_search::DiscoveryConfig::from_settings(&settings),
+        Err(err) => {
+            tracing::warn!(
+                target: "neoethos_app::engines_control",
+                error = %err,
+                config_path = %state.config_path().display(),
+                "failed to load Settings; falling back to DiscoveryConfig::default() \
+                 (evaluation_symbol/account_currency will be empty — discovery will \
+                 fail at the cost-model NaN guard until config.yaml is fixed)"
+            );
+            neoethos_search::DiscoveryConfig::default()
+        }
+    };
+    // Body-supplied symbol always wins (operator picked it on the UI).
+    config.evaluation_symbol = symbol.clone();
+    // Account currency: prefer Settings (already loaded into config by
+    // from_settings), fall back to env-var, empty propagates to guard.
+    if config.evaluation_account_currency.trim().is_empty() {
+        if let Ok(env_ccy) = std::env::var("FOREX_BOT_PROP_ACCOUNT_CURRENCY") {
+            config.evaluation_account_currency = env_ccy;
+        }
+    }
     if let Some(p) = body.population.filter(|&p| p > 0) {
         config.population = p;
     }
