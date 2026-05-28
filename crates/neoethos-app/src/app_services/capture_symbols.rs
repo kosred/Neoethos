@@ -438,3 +438,262 @@ pub fn parse_symbol_list(raw: &str) -> Vec<String> {
 pub fn default_output_dir() -> PathBuf {
     PathBuf::from("crates/neoethos-app/tests/fixtures")
 }
+
+/// Default output directory for the full broker catalog bootstrap
+/// (`--bootstrap-broker-catalog`).
+///
+/// One sub-folder per environment so demo and live catalogs don't
+/// collide. The live trader catalog is what production reads at
+/// app-startup — the demo catalog is for testing the GA against
+/// the broker's actual cost model without touching live.
+pub fn default_bootstrap_root() -> PathBuf {
+    PathBuf::from("data/broker_symbols")
+}
+
+/// **Phase D.1 (2026-05-28)** — full broker catalog bootstrap.
+///
+/// Fetches ALL symbols from the configured cTrader account
+/// (typically 800-900 entries on a typical retail demo) plus their
+/// full `ProtoOASymbolByIdRes` payloads, batched 50 IDs per
+/// request. Writes:
+///
+///   - `<output_root>/<env>/raw_batches/batch_NNN.json` — verbatim
+///     broker envelopes (audit trail; one file per batch).
+///   - `<output_root>/<env>/symbol_index.json` — light index
+///     `[{symbol_id, symbol_name, batch_file}, ...]` so callers
+///     can locate the batch carrying a given symbol without
+///     reading every file.
+///   - `<output_root>/<env>/bootstrap_meta.json` — refresh
+///     timestamp, env, account_id, schema version. The bridge's
+///     24 h refresh consults this to decide whether to re-bootstrap.
+///
+/// Phase D.2 will add a converter that walks these files and
+/// populates the canonical `SymbolMetadataTable` consumed by the
+/// backtest cost model, replacing the synthetic fallbacks for
+/// commission / spread / swap.
+///
+/// Runtime: ~30-90 s for 830 symbols (17 batches × ~3-5 s per WSS
+/// round-trip). Network-bound; not parallelised because cTrader's
+/// 50 req/sec rate limit is shared across the entire account and
+/// we want headroom for the live trader.
+///
+/// **Idempotent.** Re-running overwrites every output file. Safe
+/// to call from the 24 h bridge refresh once Phase D.3 lands.
+pub fn run_bootstrap(env_label: &str, output_root: &Path) -> Result<()> {
+    use crate::app_services::ctrader_messages::{
+        CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, parse_open_api_envelope,
+    };
+    const SYMBOLS_PER_BATCH: usize = 50;
+
+    let env_dir = output_root.join(env_label);
+    let raw_dir = env_dir.join("raw_batches");
+    std::fs::create_dir_all(&raw_dir)
+        .map_err(|e| anyhow!("could not create {}: {e}", raw_dir.display()))?;
+
+    // ── Load credentials (same as run_capture) ───────────────────
+    let settings = load_broker_settings();
+    let ctrader = &settings.ctrader;
+    if ctrader.client_id.trim().is_empty() || ctrader.client_secret.trim().is_empty() {
+        return Err(anyhow!(
+            "broker_credentials.toml is missing cTrader client_id / client_secret"
+        ));
+    }
+    let account_target = ctrader
+        .accounts
+        .first()
+        .ok_or_else(|| anyhow!("broker_credentials.toml has no cTrader account picked"))?;
+    let account_id: i64 = account_target
+        .account_id
+        .parse()
+        .map_err(|e| anyhow!("account_id must be numeric: {e}"))?;
+    let token_bundle = production_ctrader_token_store()
+        .load_token_bundle_with_legacy_fallback()
+        .map_err(|e| anyhow!("token bundle load failed: {e}"))?
+        .ok_or_else(|| {
+            anyhow!("no saved cTrader OAuth token bundle — run --reauth first")
+        })?;
+
+    let environment = match ctrader.environment {
+        crate::app_services::broker_config::CTraderBrokerEnvironment::Demo => {
+            CTraderEnvironment::Demo
+        }
+        crate::app_services::broker_config::CTraderBrokerEnvironment::Live => {
+            CTraderEnvironment::Live
+        }
+    };
+    let transport = ProductionCTraderOpenApiTransport::new(environment.endpoint_host());
+    eprintln!(
+        "[bootstrap] environment = {:?}, account_id = {}, output = {}",
+        environment,
+        account_id,
+        env_dir.display()
+    );
+
+    // ── Step 1: symbols list (one round-trip) ────────────────────
+    let auth_responses = transport.send_sequence(&[
+        build_application_auth_request(
+            &ctrader.client_id,
+            &ctrader.client_secret,
+            "bootstrap-app-auth",
+        ),
+        build_account_auth_request(account_id, &token_bundle.access_token, "bootstrap-acct-auth"),
+        build_symbols_list_request(account_id, false, "bootstrap-symbols-list"),
+    ])?;
+    if auth_responses.len() < 3 {
+        return Err(anyhow!(
+            "bootstrap: expected 3 cTrader auth/list responses, got {}",
+            auth_responses.len()
+        ));
+    }
+    let symbols_list = parse_symbols_list_response(&auth_responses[2])?;
+    let total = symbols_list.symbols.len();
+    eprintln!("[bootstrap] symbols catalog: {} entries", total);
+    if total == 0 {
+        return Err(anyhow!(
+            "broker returned an empty symbol catalog — refusing to write a useless bootstrap"
+        ));
+    }
+
+    // ── Step 2: chunked symbol_by_id round-trips ─────────────────
+    // We batch IDs to amortise the per-WSS-connection auth overhead.
+    // cTrader accepts up to ~100 IDs per request in practice, but we
+    // stay conservative at 50 to leave headroom for unusually large
+    // responses (e.g. symbols with long holiday lists).
+    let mut index_entries: Vec<Value> = Vec::with_capacity(total);
+    let mut batch_idx: usize = 0;
+    for chunk in symbols_list.symbols.chunks(SYMBOLS_PER_BATCH) {
+        let symbol_ids: Vec<i64> = chunk.iter().map(|s| s.symbol_id).collect();
+        let batch_label = format!("batch-{batch_idx:03}");
+        eprintln!(
+            "[bootstrap] {} : requesting {} symbols (ids: {:?}...{:?})",
+            batch_label,
+            symbol_ids.len(),
+            symbol_ids.first(),
+            symbol_ids.last()
+        );
+
+        // Each batch opens a fresh WSS connection (same constraint as
+        // resolve_symbol_with_transport) so we re-auth at the head.
+        let responses = transport.send_sequence(&[
+            build_application_auth_request(
+                &ctrader.client_id,
+                &ctrader.client_secret,
+                format!("{batch_label}-app-auth"),
+            ),
+            build_account_auth_request(
+                account_id,
+                &token_bundle.access_token,
+                format!("{batch_label}-acct-auth"),
+            ),
+            build_symbol_by_id_request(account_id, &symbol_ids, batch_label.clone()),
+        ])?;
+        if responses.len() < 3 {
+            // Walk the partial set to surface the broker's actual error
+            // code (CH_ACCESS_TOKEN_INVALID etc.) instead of an opaque
+            // count mismatch.
+            for r in &responses {
+                if let Ok(env) = parse_open_api_envelope(r) {
+                    if env.payload_type
+                        != CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE
+                        && env.payload_type != CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE
+                    {
+                        return Err(anyhow!(
+                            "{batch_label}: cTrader returned non-success payload \
+                             type {} — likely auth or quota error. Raw: {}",
+                            env.payload_type,
+                            r
+                        ));
+                    }
+                }
+            }
+            return Err(anyhow!(
+                "{batch_label}: expected 3 cTrader responses, got {}",
+                responses.len()
+            ));
+        }
+
+        // Persist the verbatim envelope for audit + future re-parsing.
+        let raw_payload = &responses[2];
+        let raw_pretty = match serde_json::from_str::<Value>(raw_payload) {
+            Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw_payload.clone()),
+            Err(_) => raw_payload.clone(),
+        };
+        let raw_path = raw_dir.join(format!("batch_{batch_idx:03}.json"));
+        std::fs::write(&raw_path, &raw_pretty)
+            .map_err(|e| anyhow!("write {}: {e}", raw_path.display()))?;
+
+        // Verify the parser accepts this envelope before we commit it to
+        // the index (catches enum-encoding drift early — same regression
+        // guard that motivated commit e60972ad).
+        let parsed = parse_symbol_by_id_response(raw_payload)
+            .map_err(|e| anyhow!("{batch_label}: parser rejected broker payload: {e}"))?;
+        for s in &parsed {
+            // Map symbol_id → name via the light-symbols list (the
+            // detail response doesn't echo the name).
+            let name = chunk
+                .iter()
+                .find(|ls| ls.symbol_id == s.symbol_id)
+                .map(|ls| ls.symbol_name.clone())
+                .unwrap_or_else(|| format!("sym#{}", s.symbol_id));
+            index_entries.push(json!({
+                "symbol_id": s.symbol_id,
+                "symbol_name": name,
+                "batch_file": format!("raw_batches/batch_{batch_idx:03}.json"),
+            }));
+        }
+        eprintln!(
+            "[bootstrap] {} : parsed {} symbols, wrote {}",
+            batch_label,
+            parsed.len(),
+            raw_path.display()
+        );
+        batch_idx += 1;
+    }
+
+    // ── Step 3: top-level index + metadata ───────────────────────
+    let index_path = env_dir.join("symbol_index.json");
+    let index_json = serde_json::to_string_pretty(&json!({
+        "symbols": index_entries,
+    }))
+    .map_err(|e| anyhow!("serialize symbol_index: {e}"))?;
+    std::fs::write(&index_path, &index_json)
+        .map_err(|e| anyhow!("write {}: {e}", index_path.display()))?;
+
+    let meta_path = env_dir.join("bootstrap_meta.json");
+    let meta = json!({
+        "schema_version": 1u32,
+        "captured_at_unix_ms": chrono::Utc::now().timestamp_millis(),
+        "environment": format!("{:?}", environment),
+        "account_id": account_id,
+        "symbol_count": index_entries.len(),
+        "batch_count": batch_idx,
+        "symbols_per_batch": SYMBOLS_PER_BATCH,
+        "proto_source": "https://github.com/spotware/openapi-proto-messages",
+    });
+    std::fs::write(
+        &meta_path,
+        serde_json::to_string_pretty(&meta)
+            .map_err(|e| anyhow!("serialize bootstrap_meta: {e}"))?,
+    )
+    .map_err(|e| anyhow!("write {}: {e}", meta_path.display()))?;
+
+    eprintln!(
+        "[bootstrap] done: {} symbols across {} batches → {}",
+        index_entries.len(),
+        batch_idx,
+        env_dir.display()
+    );
+    Ok(())
+}
+
+/// Derive the on-disk environment label (`"demo"` / `"live"`) from
+/// the configured broker environment. Used by both
+/// `--bootstrap-broker-catalog` and the future bridge auto-refresh.
+pub fn env_label_from_settings() -> &'static str {
+    use crate::app_services::broker_config::CTraderBrokerEnvironment;
+    match load_broker_settings().ctrader.environment {
+        CTraderBrokerEnvironment::Demo => "demo",
+        CTraderBrokerEnvironment::Live => "live",
+    }
+}

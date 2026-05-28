@@ -108,3 +108,11 @@ crates/forex-flutter-ui/macos/
 # extraction (see docs/qa/*-split-draft.md for context).
 **/_section_*.body
 dist/
+
+# Phase D.1 (2026-05-28) — broker-specific catalog dumps from
+# `--bootstrap-broker-catalog`. Account-specific (different brokers
+# have different symbols + commission schedules), so each operator
+# runs the bootstrap on their own machine. The 6 reference test
+# fixtures under crates/neoethos-app/tests/fixtures/ stay committed
+# as parser regression guards — those are the universal ones.
+/data/broker_symbols/

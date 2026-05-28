@@ -140,6 +140,29 @@ struct Args {
     /// the current working directory, so run from the repo root).
     #[arg(long)]
     capture_output: Option<String>,
+
+    /// **Phase D.1 (2026-05-28)** — fetch the entire broker symbol
+    /// catalog (typically 800-900 entries) plus full
+    /// `ProtoOASymbolByIdRes` payloads, batched 50 symbols per
+    /// request. Writes verbatim broker envelopes + a symbol index
+    /// + bootstrap metadata under
+    /// `data/broker_symbols/<env>/` (overridable via
+    /// `--bootstrap-output`). One-shot, ~30-90 s for 830 symbols.
+    ///
+    /// Why: the GA cost model has been operating on synthetic
+    /// $7/lot commission + 1.5-pip spread fallbacks because no code
+    /// path ever populated `SymbolMetadata.commission_per_lot` from
+    /// the broker. This bootstrap is the foundation for Phase D.2
+    /// (delete the synthetic fallbacks; metadata reads from this
+    /// catalog).
+    #[arg(long, default_value_t = false)]
+    bootstrap_broker_catalog: bool,
+
+    /// Output directory for `--bootstrap-broker-catalog`. Created
+    /// if missing. Default: `data/broker_symbols` (relative to the
+    /// current working directory).
+    #[arg(long)]
+    bootstrap_output: Option<String>,
 }
 
 #[tokio::main]
@@ -240,6 +263,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "OAuth flow complete; token bundle saved to keyring"
         );
         info!("Token bundle saved. You can now run: neoethos-app --server");
+        return Ok(());
+    }
+
+    if args.bootstrap_broker_catalog {
+        // Phase D.1 (2026-05-28) — pull the full broker catalog into
+        // disk so Phase D.2 can replace `baked_in_default()` +
+        // synthetic cost fallbacks with broker-supplied real data.
+        let output_root = args
+            .bootstrap_output
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(app_services::capture_symbols::default_bootstrap_root);
+        let env_label = app_services::capture_symbols::env_label_from_settings();
+        info!(
+            target: "neoethos_app::bootstrap_broker_catalog",
+            env_label,
+            output_root = %output_root.display(),
+            "starting full broker catalog bootstrap"
+        );
+        let output_root_clone = output_root.clone();
+        tokio::task::spawn_blocking(move || {
+            app_services::capture_symbols::run_bootstrap(env_label, &output_root_clone)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("bootstrap blocking task panicked: {e}"))??;
+        info!(
+            "Bootstrap complete. Catalog under {}/{}",
+            output_root.display(),
+            env_label
+        );
         return Ok(());
     }
 
