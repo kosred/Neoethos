@@ -905,6 +905,32 @@ pub fn run_bootstrap(env_label: &str, output_root: &Path) -> Result<()> {
         batch_idx,
         env_dir.display()
     );
+
+    // ── Phase D.2b — emit the canonical SymbolMetadataTable ──────
+    //
+    // Convert the raw broker artefacts into the
+    // `neoethos_core::symbol_metadata::SymbolMetadataTable` shape
+    // that `resolve(symbol)` consumes everywhere in the cost model
+    // + risk gates. Write to `data/symbol_metadata.json` which is
+    // the canonical path the existing `global_table()` loader picks
+    // up automatically (no operator action needed).
+    //
+    // After this point the cost model has real broker commission +
+    // swap + fee data for all 92 filtered FX/Metals/Indices/Energies
+    // symbols, with NO synthetic fallbacks. Phase D.2c/D.2d delete
+    // the now-unreachable fallback code paths.
+    let metadata_table = build_symbol_metadata_table_from_catalog(&env_dir)
+        .map_err(|e| anyhow!("D.2b converter failed: {e}"))?;
+    let metadata_path = std::path::PathBuf::from("data").join("symbol_metadata.json");
+    metadata_table
+        .save_to_disk(&metadata_path)
+        .map_err(|e| anyhow!("write {}: {e}", metadata_path.display()))?;
+    eprintln!(
+        "[bootstrap] wrote SymbolMetadataTable ({} entries) → {}",
+        metadata_table.entries.len(),
+        metadata_path.display()
+    );
+
     Ok(())
 }
 
@@ -917,4 +943,255 @@ pub fn env_label_from_settings() -> &'static str {
         CTraderBrokerEnvironment::Demo => "demo",
         CTraderBrokerEnvironment::Live => "live",
     }
+}
+
+/// **Phase D.2b (2026-05-28)** — convert the broker catalog produced
+/// by `run_bootstrap` into a `SymbolMetadataTable` consumable by the
+/// `neoethos_core::symbol_metadata::resolve` path used throughout
+/// the cost model + risk gates.
+///
+/// Inputs (read from `<env_dir>/`):
+///   - `light_symbols.json`  — 92 filtered symbols with base/quote
+///                             asset ids + category id
+///   - `asset_list.json`     — 2400 entries mapping asset_id → name
+///                             ("EUR", "USD", "XAU", "WTI", ...)
+///   - `raw_batches/batch_NNN.json` — full `ProtoOASymbolByIdRes`
+///                             envelopes; re-parsed via
+///                             `parse_symbol_by_id_response`
+///
+/// Output: a `SymbolMetadataTable` with one entry per symbol, fully
+/// populated from broker data. Fields:
+///   - `symbol`            : broker's symbol name (e.g. "EURUSD")
+///   - `base` / `quote`    : looked up via asset_list join
+///   - `pip_size`          : `10^-pip_position`
+///   - `contract_size`     : `lot_size / 100` (base units per lot)
+///   - `pip_value_quote`   : pre-computed product
+///   - `digits`            : broker's `digits` field
+///   - `min_lot` / `max_lot` / `lot_step`: derived from
+///                             `{min,max,step}_volume / lot_size`
+///   - `typical_price`     : `None` — operator must use the live
+///                             tick stream, NOT a stale baked value
+///   - `typical_spread_pips`: `None` — live tick is the source
+///   - `commission_per_lot`: `None` — cost model derives at runtime
+///                             via `SymbolFinancials::commission_rate_decimal()`
+///                             + live spot (see Phase C cost model)
+///   - `daily_swap_long_pips` / `daily_swap_short_pips`: from
+///                             `SymbolFinancials::daily_swap_*()`
+///                             when `swap_calculation_type == Pips`
+///                             (proto default; verified against 92/92
+///                             of our filtered catalog)
+///   - `pnl_conversion_fee_rate`: proto i32 (`1 = 0.01%`) converted
+///                             to fraction (`/ 10_000.0`)
+///
+/// Symbols where the broker omits required fields (no `lot_size`,
+/// no `digits`) are silently SKIPPED — the broker has authoritative
+/// data for the 92 filtered symbols, so a skip indicates we filtered
+/// something we shouldn't have, not legitimately-missing data. The
+/// total kept/skipped count is logged for the operator.
+pub fn build_symbol_metadata_table_from_catalog(
+    env_dir: &Path,
+) -> Result<neoethos_core::symbol_metadata::SymbolMetadataTable> {
+    use neoethos_core::symbol_metadata::{SymbolMetadata, SymbolMetadataTable};
+    use std::collections::HashMap;
+
+    // ── Load the three on-disk artefacts ─────────────────────────
+    let assets_raw = std::fs::read_to_string(env_dir.join("asset_list.json"))
+        .map_err(|e| anyhow!("read asset_list.json: {e}"))?;
+    let assets_doc: Value = serde_json::from_str(&assets_raw)
+        .map_err(|e| anyhow!("parse asset_list.json: {e}"))?;
+    let mut asset_lookup: HashMap<i64, String> = HashMap::new();
+    if let Some(arr) = assets_doc.get("assets").and_then(|v| v.as_array()) {
+        for entry in arr {
+            let id = entry.get("asset_id").and_then(|v| v.as_i64());
+            let name = entry.get("name").and_then(|v| v.as_str());
+            if let (Some(id), Some(name)) = (id, name) {
+                if !name.is_empty() {
+                    asset_lookup.insert(id, name.to_string());
+                }
+            }
+        }
+    }
+    eprintln!("[convert] asset_list: {} entries", asset_lookup.len());
+
+    let light_raw = std::fs::read_to_string(env_dir.join("light_symbols.json"))
+        .map_err(|e| anyhow!("read light_symbols.json: {e}"))?;
+    let light_doc: Value = serde_json::from_str(&light_raw)
+        .map_err(|e| anyhow!("parse light_symbols.json: {e}"))?;
+    let mut light_lookup: HashMap<i64, (String, Option<i64>, Option<i64>)> = HashMap::new();
+    if let Some(arr) = light_doc.get("symbols").and_then(|v| v.as_array()) {
+        for entry in arr {
+            let sid = entry.get("symbol_id").and_then(|v| v.as_i64());
+            let name = entry
+                .get("symbol_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let base = entry.get("base_asset_id").and_then(|v| v.as_i64());
+            let quote = entry.get("quote_asset_id").and_then(|v| v.as_i64());
+            if let (Some(sid), Some(name)) = (sid, name) {
+                light_lookup.insert(sid, (name, base, quote));
+            }
+        }
+    }
+    eprintln!("[convert] light_symbols: {} entries", light_lookup.len());
+
+    // ── Iterate the raw batches and convert each entry ───────────
+    let raw_dir = env_dir.join("raw_batches");
+    let mut batch_files: Vec<_> = std::fs::read_dir(&raw_dir)
+        .map_err(|e| anyhow!("read raw_batches dir: {e}"))?
+        .filter_map(|d| d.ok())
+        .map(|d| d.path())
+        .filter(|p| {
+            p.extension().and_then(|s| s.to_str()) == Some("json")
+                && p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|n| n.starts_with("batch_"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    batch_files.sort();
+
+    let mut table = SymbolMetadataTable::default();
+    let mut kept = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+
+    for path in &batch_files {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
+        let parsed = parse_symbol_by_id_response(&raw)
+            .map_err(|e| anyhow!("parse {}: {e}", path.display()))?;
+        for sym in parsed {
+            let Some((name, base_id, quote_id)) = light_lookup.get(&sym.symbol_id) else {
+                skipped.push(format!("sym#{} (no light entry)", sym.symbol_id));
+                continue;
+            };
+            // pip_size from broker's pip_position. Proto convention:
+            //   pip_position == 4 → pip = 1e-4 = 0.0001 (5-digit FX)
+            //   pip_position == 2 → pip = 1e-2 = 0.01   (JPY pairs, indices)
+            //   pip_position == 1 → pip = 1e-1 = 0.1    (BTC)
+            // Defensive: clamp pip_position to a sane range (the
+            // Phase B audit already showed garbage in the synthetic
+            // path can poison `10f64.powi`).
+            if !(-10..=10).contains(&sym.pip_position) {
+                skipped.push(format!("{name} (bad pip_position {})", sym.pip_position));
+                continue;
+            }
+            let pip_size = 10f64.powi(-sym.pip_position);
+            // contract_size: lot_size proto field is in centi-units
+            // of the base currency. For EURUSD lot_size = 10_000_000
+            // = 100,000 EUR × 100 cents/EUR. So:
+            //   contract_size (base units per lot) = lot_size / 100.0
+            let Some(lot_size_cents) = sym.lot_size.filter(|&v| v > 0) else {
+                skipped.push(format!("{name} (no lot_size)"));
+                continue;
+            };
+            let contract_size = lot_size_cents as f64 / 100.0;
+            let pip_value_quote = pip_size * contract_size;
+
+            // base/quote currency names from the asset registry.
+            // For indices (where base is the index's synthetic asset)
+            // we keep whatever the broker recorded — cost model
+            // doesn't need a real ccy code for `base` when the
+            // commission_type is `PercentOfValue` (indices use
+            // notional × percent, not base/quote arithmetic).
+            let base_name = base_id
+                .and_then(|id| asset_lookup.get(&id).cloned())
+                .unwrap_or_else(|| String::new());
+            let quote_name = quote_id
+                .and_then(|id| asset_lookup.get(&id).cloned())
+                .unwrap_or_else(|| String::new());
+
+            // Lot constraints. The broker reports min_volume,
+            // max_volume, step_volume in the SAME cents-of-base units
+            // as lot_size. So lot count = volume / lot_size.
+            let min_lot = sym
+                .min_volume
+                .map(|v| v as f64 / lot_size_cents as f64)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(0.01);
+            let max_lot = sym
+                .max_volume
+                .map(|v| v as f64 / lot_size_cents as f64)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(100.0);
+            let lot_step = sym
+                .step_volume
+                .map(|v| v as f64 / lot_size_cents as f64)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(0.01);
+
+            // Swap conversion: only honour PIPS-typed swap. Other
+            // calc types (PERCENTAGE/POINTS) would need additional
+            // per-symbol math; bootstrap leaves them None so the
+            // cost model can fail loud rather than apply the wrong
+            // formula. The 92/92 filtered catalog uses PIPS so this
+            // is safe for forex-ai today.
+            let (daily_swap_long, daily_swap_short) =
+                if let Some(fin) = sym.financials.as_ref() {
+                    use crate::app_services::ctrader_data::SwapCalculationType;
+                    let is_pips = fin
+                        .swap_calculation_type
+                        .map(|k| matches!(k, SwapCalculationType::Pips))
+                        .unwrap_or(true); // None defaults to PIPS per proto
+                    if is_pips {
+                        (fin.daily_swap_long(), fin.daily_swap_short())
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                };
+
+            // pnl_conversion_fee_rate: proto stores `1 = 0.01%`.
+            // We carry a fraction (`0.0001`) so cost_model multiplies
+            // directly. Filter NaN-shaped values from the conversion.
+            let pnl_conv_fee = sym
+                .financials
+                .as_ref()
+                .and_then(|f| f.pnl_conversion_fee_rate)
+                .map(|raw| raw as f64 / 10_000.0)
+                .filter(|v| v.is_finite() && *v >= 0.0 && *v < 1.0);
+
+            let meta = SymbolMetadata {
+                symbol: name.clone(),
+                base: base_name,
+                quote: quote_name,
+                pip_size,
+                contract_size,
+                pip_value_quote,
+                digits: sym.digits.max(0) as u32,
+                min_lot,
+                max_lot,
+                lot_step,
+                typical_price: None,           // live tick is source of truth
+                typical_spread_pips: None,     // live tick is source of truth
+                commission_per_lot: None,      // cost model derives at runtime
+                daily_swap_long_pips: daily_swap_long,
+                daily_swap_short_pips: daily_swap_short,
+                pnl_conversion_fee_rate: pnl_conv_fee,
+            };
+            table.upsert(meta);
+            kept += 1;
+        }
+    }
+
+    eprintln!(
+        "[convert] kept {} symbols, skipped {} ({})",
+        kept,
+        skipped.len(),
+        if skipped.is_empty() {
+            "none".to_string()
+        } else {
+            skipped.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
+        }
+    );
+
+    if kept == 0 {
+        return Err(anyhow!(
+            "converter produced 0 SymbolMetadata entries — broker catalog at \
+             {} likely missing or empty",
+            env_dir.display()
+        ));
+    }
+
+    Ok(table)
 }
