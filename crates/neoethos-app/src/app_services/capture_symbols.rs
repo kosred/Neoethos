@@ -34,14 +34,14 @@ use serde_json::{Map, Value, json, to_value};
 
 use crate::app_services::broker_persistence::load_broker_settings;
 use crate::app_services::ctrader_data::{
-    parse_asset_class_list_response, parse_symbol_by_id_response,
+    parse_asset_class_list_response, parse_asset_list_response, parse_symbol_by_id_response,
     parse_symbol_category_list_response, parse_symbols_list_response, CTraderSymbolInfo,
 };
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
     build_account_auth_request, build_application_auth_request, build_asset_class_list_request,
-    build_symbol_by_id_request, build_symbol_category_list_request, build_symbols_list_request,
-    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
+    build_asset_list_request, build_symbol_by_id_request, build_symbol_category_list_request,
+    build_symbols_list_request, CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
 };
 use crate::app_services::secure_store::production_ctrader_token_store;
 
@@ -690,6 +690,91 @@ pub fn run_bootstrap(env_label: &str, output_root: &Path) -> Result<()> {
         symbols: filtered_symbols,
         archived_symbols: symbols_list.archived_symbols,
     };
+
+    // ── Step 1c: persist the FILTERED light-symbols list ─────────
+    //
+    // Saved alongside the raw_batches/ folder so the Phase D.2
+    // loader knows which base/quote asset ids each symbol points to
+    // (the symbol_by_id response doesn't echo these — they live only
+    // on the LightSymbol).
+    let light_symbols_json: Vec<Value> = symbols_list
+        .symbols
+        .iter()
+        .map(|s| {
+            json!({
+                "symbol_id": s.symbol_id,
+                "symbol_name": s.symbol_name,
+                "enabled": s.enabled,
+                "description": s.description,
+                "symbol_category_id": s.symbol_category_id,
+                "base_asset_id": s.base_asset_id,
+                "quote_asset_id": s.quote_asset_id,
+            })
+        })
+        .collect();
+    let light_path = env_dir.join("light_symbols.json");
+    std::fs::write(
+        &light_path,
+        serde_json::to_string_pretty(&json!({ "symbols": light_symbols_json }))
+            .map_err(|e| anyhow!("serialize light_symbols: {e}"))?,
+    )
+    .map_err(|e| anyhow!("write {}: {e}", light_path.display()))?;
+    eprintln!(
+        "[bootstrap] wrote {} filtered light symbols → {}",
+        symbols_list.symbols.len(),
+        light_path.display()
+    );
+
+    // ── Step 1d: fetch and persist the asset list ────────────────
+    //
+    // ProtoOAAssetListReq (2112). Joins LightSymbol.{base,quote}AssetId
+    // to a 3-letter currency code (EUR/USD/XAU/...). The D.2 loader
+    // needs this to populate `SymbolMetadata.base` and `.quote` from
+    // broker-canonical strings — NO hand-rolled asset_id_to_currency
+    // table.
+    let asset_responses = transport.send_sequence(&[
+        build_application_auth_request(
+            &ctrader.client_id,
+            &ctrader.client_secret,
+            "bootstrap-asset-auth",
+        ),
+        build_account_auth_request(
+            account_id,
+            &token_bundle.access_token,
+            "bootstrap-asset-acct",
+        ),
+        build_asset_list_request(account_id, "bootstrap-asset-list"),
+    ])?;
+    if asset_responses.len() < 3 {
+        return Err(anyhow!(
+            "asset list: expected 3 responses, got {}",
+            asset_responses.len()
+        ));
+    }
+    let assets = parse_asset_list_response(&asset_responses[2])?;
+    let assets_json: Vec<Value> = assets
+        .iter()
+        .map(|a| {
+            json!({
+                "asset_id": a.asset_id,
+                "name": a.name,
+                "display_name": a.display_name,
+                "digits": a.digits,
+            })
+        })
+        .collect();
+    let asset_path = env_dir.join("asset_list.json");
+    std::fs::write(
+        &asset_path,
+        serde_json::to_string_pretty(&json!({ "assets": assets_json }))
+            .map_err(|e| anyhow!("serialize asset_list: {e}"))?,
+    )
+    .map_err(|e| anyhow!("write {}: {e}", asset_path.display()))?;
+    eprintln!(
+        "[bootstrap] wrote {} broker assets → {}",
+        assets.len(),
+        asset_path.display()
+    );
 
     // ── Step 2: chunked symbol_by_id round-trips ─────────────────
     // We batch IDs to amortise the per-WSS-connection auth overhead.

@@ -77,6 +77,13 @@ pub const CTRADER_OA_ASSET_CLASS_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2153;
 pub const CTRADER_OA_ASSET_CLASS_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2154;
 pub const CTRADER_OA_SYMBOL_CATEGORY_REQUEST_PAYLOAD_TYPE: u32 = 2160;
 pub const CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE: u32 = 2161;
+// **Phase D.2a (2026-05-28)**: `ProtoOAAssetListReq/Res` — the
+// broker's asset registry. Joins `ProtoOALightSymbol.{base,quote}AssetId`
+// to a 3-letter currency code (or metal/commodity unit) so the
+// downstream `SymbolMetadata` can populate `base`/`quote` strings
+// without name-pattern guesses against symbolName.
+pub const CTRADER_OA_ASSET_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2112;
+pub const CTRADER_OA_ASSET_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2113;
 pub const CTRADER_OA_GET_TRENDBARS_REQUEST_PAYLOAD_TYPE: u32 = 2137;
 pub const CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE: u32 = 2138;
 pub const CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE: u32 = 2142;
@@ -756,6 +763,25 @@ pub fn build_symbol_by_id_request(
     }
 }
 
+/// **Phase D.2a (2026-05-28)** — request the broker's asset list
+/// (NOT asset CLASS list — this is the per-currency table).
+/// Returns `[{assetId, name="EUR"|"USD"|"XAU"|..., displayName,
+/// digits}, ...]`. Used to map a LightSymbol's
+/// `baseAssetId`/`quoteAssetId` integers to the 3-letter currency
+/// strings that `SymbolMetadata` uses.
+pub fn build_asset_list_request(
+    ctid_trader_account_id: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_ASSET_LIST_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+        }),
+    }
+}
+
 /// **Phase D.1 (2026-05-28)** — request the broker's asset class
 /// list. Returns top-level groupings like "Forex", "Metals",
 /// "Indices", "Commodities", "Stocks", "Cryptocurrencies", "ETFs".
@@ -1034,6 +1060,12 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         // Indices/Commodities and drop the equity catalog.
         CTRADER_OA_ASSET_CLASS_LIST_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_ASSET_CLASS_LIST_RESPONSE_PAYLOAD_TYPE)
+        }
+        // Phase D.2a (2026-05-28) — `ProtoOAAssetListReq/Res`, the
+        // per-currency asset registry. Joins LightSymbol.{base,quote}AssetId
+        // to 3-letter codes (EUR, USD, XAU, ...).
+        CTRADER_OA_ASSET_LIST_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_ASSET_LIST_RESPONSE_PAYLOAD_TYPE)
         }
         CTRADER_OA_DEAL_LIST_BY_POSITION_ID_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_DEAL_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE)

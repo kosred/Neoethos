@@ -31,6 +31,31 @@ pub struct CTraderLightSymbolInfo {
     /// trade. `None` when the broker omits the field (some exotic
     /// instruments).
     pub symbol_category_id: Option<i64>,
+    /// **Phase D.2a (2026-05-28)** — base asset id (e.g. 4 = EUR).
+    /// Joins to `ProtoOAAsset.assetId` from the asset list. Used by
+    /// `SymbolMetadataTable::load_from_broker_catalog` to populate
+    /// `SymbolMetadata.base` without name-pattern hacks on
+    /// symbolName. `None` for symbols where broker omits the field
+    /// (rare).
+    pub base_asset_id: Option<i64>,
+    /// **Phase D.2a (2026-05-28)** — quote asset id (e.g. 8 = USD).
+    /// Joins to `ProtoOAAsset.assetId`. Used by the loader to
+    /// populate `SymbolMetadata.quote`.
+    pub quote_asset_id: Option<i64>,
+}
+
+/// **Phase D.2a (2026-05-28)** — broker's per-asset record. Mirrors
+/// `ProtoOAAsset`. `name` is the canonical 3-letter currency code
+/// for FX (`"EUR"`, `"USD"`), metal code (`"XAU"`), or commodity
+/// unit (`"Oz"` doesn't exist as an asset; gold quotes use USD
+/// quote_asset_id). `digits` is the precision of the asset itself
+/// (independent of any symbol that uses it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderAssetInfo {
+    pub asset_id: i64,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub digits: Option<i32>,
 }
 
 /// **Phase D.1b (2026-05-28)** — top-level asset class metadata.
@@ -536,6 +561,38 @@ struct LightSymbolPayload {
     // ProtoOALightSymbol; previously unused by our parser.
     #[serde(rename = "symbolCategoryId")]
     symbol_category_id: Option<i64>,
+    // **Phase D.2a (2026-05-28)** — proto fields 4 & 5; joins to
+    // ProtoOAAsset.assetId so the catalog loader can populate
+    // `SymbolMetadata.base`/`quote` strings from the broker's
+    // own asset table.
+    #[serde(rename = "baseAssetId")]
+    base_asset_id: Option<i64>,
+    #[serde(rename = "quoteAssetId")]
+    quote_asset_id: Option<i64>,
+}
+
+// ─── Phase D.2a — asset list wire shapes ────────────────────────────
+#[derive(Debug, Deserialize)]
+struct AssetListEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: AssetListPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssetListPayload {
+    #[serde(default)]
+    asset: Vec<AssetEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssetEntry {
+    #[serde(rename = "assetId")]
+    asset_id: i64,
+    name: Option<String>,
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+    digits: Option<i32>,
 }
 
 // ─── Phase D.1b — asset class + symbol category wire shapes ─────────
@@ -816,6 +873,8 @@ pub fn parse_symbols_list_response(response_json: &str) -> Result<CTraderSymbols
                 enabled: symbol.enabled.unwrap_or(false),
                 description: symbol.description,
                 symbol_category_id: symbol.symbol_category_id,
+                base_asset_id: symbol.base_asset_id,
+                quote_asset_id: symbol.quote_asset_id,
             })
             .collect(),
         archived_symbols: envelope
@@ -853,6 +912,33 @@ pub fn parse_asset_class_list_response(
             id: e.id,
             name: e.name.unwrap_or_default(),
             sorting_number: e.sorting_number,
+        })
+        .collect())
+}
+
+/// **Phase D.2a (2026-05-28)** — parse `ProtoOAAssetListRes`.
+/// Returns the broker's per-asset registry, used to map
+/// `LightSymbol.{base,quote}AssetId` to a 3-letter currency code.
+pub fn parse_asset_list_response(response_json: &str) -> Result<Vec<CTraderAssetInfo>> {
+    let envelope: AssetListEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader asset list response")?;
+    if envelope.payload_type
+        != crate::app_services::ctrader_messages::CTRADER_OA_ASSET_LIST_RESPONSE_PAYLOAD_TYPE
+    {
+        return Err(anyhow!(
+            "unexpected cTrader asset list payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    Ok(envelope
+        .payload
+        .asset
+        .into_iter()
+        .map(|e| CTraderAssetInfo {
+            asset_id: e.asset_id,
+            name: e.name.unwrap_or_default(),
+            display_name: e.display_name,
+            digits: e.digits,
         })
         .collect())
 }
