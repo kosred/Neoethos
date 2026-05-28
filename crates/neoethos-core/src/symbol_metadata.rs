@@ -404,28 +404,78 @@ impl SymbolMetadata {
         live_price: Option<f64>,
         quote_to_account_rate: Option<f64>,
     ) -> Option<f64> {
+        // F-300 (2026-05-28): thin back-compat wrapper. The original
+        // D.2e helper bailed for type 1/2 on non-USD accounts because
+        // it had no USD→account rate. `commission_per_lot_account_ccy_v2`
+        // takes that rate explicitly; this old entrypoint passes None
+        // so existing call sites get identical behaviour. New callers
+        // (strategy_gene.rs cost model) should use _v2 directly.
+        self.commission_per_lot_account_ccy_v2(
+            account_currency,
+            live_price,
+            quote_to_account_rate,
+            None,
+        )
+    }
+
+    /// **Phase D.2f (2026-05-28)** — extended account-ccy commission
+    /// helper that accepts a separate `usd_to_account_rate` so type 1
+    /// (UsdPerMillionUsd) and type 2 (UsdPerLot) commissions can be
+    /// converted to a non-USD account currency. D.2e left a gap where
+    /// EUR / GBP / JPY account operators always fell into the
+    /// $7/lot synthetic warn for FX majors — there are NO USD-quoted
+    /// FX majors on EUR/GBP/JPY accounts where the existing helper
+    /// could complete the math.
+    ///
+    /// Signature additions vs `commission_per_lot_account_ccy`:
+    /// - `usd_to_account_rate`: spot FX rate from USD → account
+    ///   currency. When `account_currency == "USD"`, ignored (the
+    ///   identity is implicit). When `account_currency != "USD"` AND
+    ///   the symbol is type 1/2 (USD-denominated commission), this
+    ///   rate completes the conversion.
+    ///
+    /// Type 1 also benefits from this for non-USD-quoted symbols on
+    /// non-USD accounts: the inner `commission_per_lot_quote_ccy` can
+    /// now use a synthesised quote→USD rate when both halves are
+    /// available (quote→account via `quote_to_account_rate` and USD→
+    /// account via the new param), via the identity quote→USD =
+    /// (quote→account) / (USD→account).
+    pub fn commission_per_lot_account_ccy_v2(
+        &self,
+        account_currency: &str,
+        live_price: Option<f64>,
+        quote_to_account_rate: Option<f64>,
+        usd_to_account_rate: Option<f64>,
+    ) -> Option<f64> {
         let kind = self.commission_type?;
-        // For type 1 the inner helper needs a `quote → USD` rate when
-        // the quote is non-USD. When the account currency IS USD, the
-        // operator-supplied `quote_to_account_rate` is exactly that
-        // rate; for any other account currency we have no clean way
-        // to get quote→USD from the current inputs, so we bail.
-        let quote_to_usd_for_helper = if account_currency.eq_ignore_ascii_case("USD") {
+        // Derive quote→USD for the inner helper. Cases:
+        //   - quote IS USD: rate=1.0 implicit, inner helper handles
+        //   - account IS USD: quote_to_account == quote_to_USD by identity
+        //   - both non-USD: quote→USD = quote_to_account / USD_to_account
+        let quote_to_usd_for_helper = if self.quote.eq_ignore_ascii_case("USD") {
+            None // inner helper short-circuits when quote==USD
+        } else if account_currency.eq_ignore_ascii_case("USD") {
             quote_to_account_rate
         } else {
-            None
+            // Derive via the two-leg identity.
+            match (quote_to_account_rate, usd_to_account_rate) {
+                (Some(q2a), Some(u2a)) if q2a.is_finite() && u2a.is_finite() && u2a > 0.0 => {
+                    Some(q2a / u2a)
+                }
+                _ => None,
+            }
         };
         let amount = self.commission_per_lot_quote_ccy(live_price, quote_to_usd_for_helper)?;
         match kind {
             1 | 2 => {
                 // Inner helper returned USD per lot. Convert USD →
-                // account. We can only do that directly when account
-                // == USD. For non-USD accounts the caller needs a
-                // USD→account rate (deferred to D.2f).
+                // account.
                 if account_currency.eq_ignore_ascii_case("USD") {
                     Some(amount)
                 } else {
-                    None
+                    let r =
+                        usd_to_account_rate.filter(|v| v.is_finite() && *v > 0.0)?;
+                    Some(amount * r)
                 }
             }
             3 | 4 => {
@@ -1450,5 +1500,88 @@ mod tests {
         assert!(m
             .commission_per_lot_account_ccy("USD", Some(1.10), None)
             .is_none());
+    }
+
+    // ─── F-300 D.2f: USD↔account-ccy extension ───────────────────────
+
+    #[test]
+    fn account_commission_v2_eurusd_eur_account_with_usd_rate() {
+        // EURUSD type 1 ($45/M USD) on an EUR account.
+        // Notional in USD at price 1.10 = 100_000 × 1.10 = $110_000.
+        // Commission in USD per lot = 45 × 110_000 / 1_000_000 = $4.95.
+        // USD→EUR ≈ 0.91 → commission in EUR ≈ €4.50.
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.commission_type = Some(1);
+        m.commission_rate_decimal = Some(45.0);
+        let c = m
+            .commission_per_lot_account_ccy_v2(
+                "EUR",
+                Some(1.10),
+                None,        // quote (USD) → EUR not needed; quote IS USD
+                Some(0.91),  // USD → EUR
+            )
+            .expect("commission");
+        assert!((c - 4.5045).abs() < 1e-3, "expected ≈€4.50, got {c}");
+    }
+
+    #[test]
+    fn account_commission_v2_usdjpy_eur_account_with_two_legs() {
+        // Type 1, $45/M USD on USDJPY (quote=JPY), EUR account.
+        // notional USD = 100_000 × 1.0 (USDJPY base IS USD, formula
+        // contract_size × price × quote_to_usd = 100k × 150 × 1/150 = 100k)
+        // commission USD = 45 × 100_000 / 1_000_000 = $4.50/lot
+        // EUR → JPY ≈ 160, USD → EUR ≈ 0.91 → JPY → USD = 0.91/160 ≈ 0.00569
+        // (we provide q2a = JPY→EUR ≈ 0.00625, u2a = USD→EUR ≈ 0.91)
+        // q2u derived = q2a / u2a = 0.00625 / 0.91 ≈ 0.00687
+        // notional_usd = 100k × 150 × 0.00687 = $103k (small rounding)
+        // commission USD = 45 × 103_000 / 1M ≈ $4.64
+        // → EUR ≈ 4.64 × 0.91 ≈ €4.22
+        // This test pins the two-leg derivation path.
+        let mut m = baked_in_default("USDJPY").unwrap();
+        m.commission_type = Some(1);
+        m.commission_rate_decimal = Some(45.0);
+        let c = m
+            .commission_per_lot_account_ccy_v2(
+                "EUR",
+                Some(150.0),
+                Some(0.00625), // JPY → EUR
+                Some(0.91),    // USD → EUR
+            )
+            .expect("commission");
+        assert!(c > 3.0 && c < 6.0, "expected €3–€6, got {c}");
+    }
+
+    #[test]
+    fn account_commission_v2_falls_back_to_none_without_usd_rate() {
+        // Type 1 on non-USD account WITHOUT usd_to_account_rate must
+        // still bail — F-300 is opt-in only when the operator supplies
+        // the extra rate; not supplying it means no synthesised data.
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.commission_type = Some(1);
+        m.commission_rate_decimal = Some(45.0);
+        let c = m.commission_per_lot_account_ccy_v2(
+            "EUR",
+            Some(1.10),
+            None,
+            None,
+        );
+        assert!(c.is_none(), "must bail without USD→account rate");
+    }
+
+    #[test]
+    fn account_commission_v2_back_compat_with_v1_for_usd_account() {
+        // The old helper (no usd_to_account_rate) and the new one
+        // (None for usd_to_account_rate) must produce IDENTICAL
+        // results for the standard USD-account, USD-quoted case.
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.commission_type = Some(1);
+        m.commission_rate_decimal = Some(45.0);
+        let v1 = m
+            .commission_per_lot_account_ccy("USD", Some(1.10), None)
+            .expect("v1");
+        let v2 = m
+            .commission_per_lot_account_ccy_v2("USD", Some(1.10), None, None)
+            .expect("v2");
+        assert!((v1 - v2).abs() < 1e-9, "v1={v1} v2={v2}");
     }
 }

@@ -386,28 +386,51 @@ pub fn infer_market_cost_profile(
     // never reached. Operator's real-data policy 2026-05-24 is
     // honoured: synthetic only when broker silence + no operator
     // override leaves no other choice.
+    // F-301 (2026-05-28): kill the synthetic-spread fallback. The
+    // previous code returned a per-asset-class default (1.5 / 2.5 /
+    // 8.0 / 1.0 pips) with a tracing::warn — which meant every novel
+    // symbol with no broker data silently got fake numbers, and the
+    // GA produced backtests using spread that didn't match the live
+    // market. The operator's directive 2026-05-24: "ολα τα νουμερα
+    // απο τον σερβερ", and that includes spread.
+    //
+    // Resolution chain unchanged at the top; on miss:
+    //   - tracing::error! with the symbol context (operators see the
+    //     exact (symbol, asset_class) tuple that needs broker data)
+    //   - NaN-sentinel return value. Downstream:
+    //     - `BacktestSettings.spread_pips` becomes NaN
+    //     - eval kernel's `half_spread_cost = NaN * NaN` = NaN
+    //     - entry_px = close + NaN = NaN
+    //     - no trades open; sanitize() scrubs metrics to 0
+    //     - GA candidate has trade_count=0
+    //     - run_discovery_cycle's F-304 preflight catches non-finite
+    //       evaluation_spread_pips at config-level if it propagated
+    //       through DiscoveryConfig
+    //   - operator's `--bootstrap-data` or `data/symbol_metadata.json`
+    //     edit resolves the issue
+    //
+    // Live-trading path is unaffected: live spread comes from the
+    // cTrader spot tick, not from this offline-backtest helper.
     let spread_pips = spread_pips_override
         .filter(|value| value.is_finite() && *value >= 0.0)
         .or(cost.spread_pips)
         .or_else(|| metadata.as_ref().and_then(|m| m.typical_spread_pips))
         .unwrap_or_else(|| {
-            let fallback = match symbol_kind(&symbol) {
-                "metal" => 2.5,
-                "crypto" => 8.0,
-                "fx" => 1.5,
-                _ => 1.0,
-            };
-            tracing::warn!(
+            tracing::error!(
                 target: "neoethos_search::cost_model",
                 symbol = %symbol,
                 asset_class = symbol_kind(&symbol),
-                fallback_pips = fallback,
-                "Synthetic spread fallback used (F-029 LAST RESORT): \
-                 SymbolMetadata has no `typical_spread_pips` and no \
-                 operator override. Populate data/symbol_metadata.json \
-                 from cTrader ProtoOASymbol.spread to silence this."
+                "F-301 fail-loud: no broker spread for this symbol. \
+                 SymbolMetadata has no `typical_spread_pips`, no \
+                 operator override, and no cost.spread_pips. Synthetic \
+                 fallback REMOVED — returning NaN so the eval kernel \
+                 zero-trades this candidate instead of silently using \
+                 1.5 pips. Action: populate data/symbol_metadata.json \
+                 from cTrader ProtoOASymbol.spread (run \
+                 --rebuild-symbol-metadata) OR set \
+                 settings.risk.backtest_spread_pips in config.yaml."
             );
-            fallback
+            f64::NAN
         });
     // Phase D.2e (2026-05-28) — step 3.5 in the resolution chain:
     // when the operator override and SymbolMetadata.commission_per_lot
