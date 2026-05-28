@@ -800,7 +800,46 @@ pub fn prepare_multitimeframe_features_with_options(
                 .timestamp
                 .as_ref()
                 .context("higher tf has no timestamps")?;
-            let aligned = align_features_by_ns(base_ns, h_ns, &h_feats.data, true);
+            // F-308 fix (2026-05-28): cap forward-fill at 2× the
+            // higher-TF period. Stale higher-TF data (last bar weeks
+            // before base last bar) would otherwise propagate as a
+            // frozen-constant column for the entire held-out window
+            // — indicators on constants produce constants → GA sees
+            // zero or look-alike signals → `ranked=N, post_passes_filter=0`
+            // funnel with no diagnostic. Beyond `max_age`, rows
+            // become NaN and the downstream feature-cube summary's
+            // NaN counter flags them.
+            //
+            // 2× period is the lenient bound (one missed bar is
+            // normal; two missed bars means the higher-TF source
+            // has stalled). Failure to parse the TF label leaves
+            // max_age None (legacy unbounded behaviour) — safer
+            // default for hand-rolled non-canonical TF strings.
+            let max_age_ns = parse_timeframe_to_minutes(h_tf)
+                .ok()
+                .filter(|m| *m > 0)
+                .map(|m| (m as i64).saturating_mul(60).saturating_mul(1_000_000_000).saturating_mul(2));
+            // Surface stale-higher-TF condition before the align call
+            // so operators see a clear log line even when the data
+            // looks fine downstream.
+            let base_last = base_ns.last().copied().unwrap_or(0);
+            let h_last = h_ns.last().copied().unwrap_or(0);
+            if base_last > 0 && h_last > 0 && base_last > h_last {
+                if let Some(max_age) = max_age_ns {
+                    let lag_ns = base_last - h_last;
+                    if lag_ns > max_age {
+                        tracing::warn!(
+                            target: "neoethos_data::prepare_multitimeframe_features",
+                            base_tf = base_tf,
+                            higher_tf = h_tf,
+                            lag_seconds = lag_ns / 1_000_000_000,
+                            max_age_seconds = max_age / 1_000_000_000,
+                            "higher-TF last bar is older than 2× period — feature columns past max_age will be NaN. Re-run --bootstrap-data for this (symbol, timeframe) to refresh."
+                        );
+                    }
+                }
+            }
+            let aligned = align_features_by_ns(base_ns, h_ns, &h_feats.data, true, max_age_ns);
             all_names.extend(h_feats.names.iter().map(|n| format!("{}_{}", h_tf, n)));
             all_data_parts.push(aligned);
         }

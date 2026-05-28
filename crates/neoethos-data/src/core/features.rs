@@ -70,11 +70,41 @@ impl FeatureFrame {
     }
 }
 
+/// Align a higher-timeframe feature matrix onto the base-timeframe
+/// timestamp grid via as-of join (binary-search style forward scan).
+///
+/// `ffill` controls behaviour when a base timestamp falls strictly
+/// between two higher-TF bars: with `ffill = true` the most-recent
+/// prior higher-TF row is forwarded; with `ffill = false` only exact
+/// timestamp matches survive.
+///
+/// **F-308 (2026-05-28) — max_age_ns parameter**: when `ffill = true`,
+/// previous behaviour silently propagated the LAST higher-TF row to
+/// every subsequent base row forever, even when the higher-TF source
+/// had ended weeks or months before the base. A stale D1 (last bar 2
+/// months ago) on a fresh M1 grid → every M1 bar from those 2 months
+/// got the SAME stale close/high/low/RSI/etc., feeding a frozen-
+/// constant column into the indicator stack. GA candidates would then
+/// see indicator outputs that don't change over the held-out window,
+/// produce zero or look-alike signals, and the discovery funnel would
+/// report `ranked=N, post_passes_filter=0` with no diagnostic.
+///
+/// `max_age_ns` (Some) caps the forward-fill: if the chosen previous
+/// higher-TF timestamp is more than `max_age_ns` older than the
+/// current base timestamp, the row is left NaN. NaN propagates
+/// through the downstream NaN counter (`discovery.rs::feature_cube_summary`)
+/// so the operator sees explicit "stale higher-TF" warnings instead
+/// of silent zero-trade GA output.
+///
+/// `max_age_ns = None` preserves the legacy unbounded behaviour for
+/// callers that explicitly want it (e.g. UI chart preview where
+/// indicators on yesterday's last-known close are fine).
 pub fn align_features_by_ns(
     base_ns: &[i64],
     feature_ns: &[i64],
     feature_data: &Array2<f32>,
     ffill: bool,
+    max_age_ns: Option<i64>,
 ) -> Array2<f32> {
     let n_base = base_ns.len();
     let n_feat = feature_ns.len();
@@ -94,8 +124,15 @@ pub fn align_features_by_ns(
 
         let best_idx = if feat_idx > 0 {
             let prev = feat_idx - 1;
-            if feature_ns[prev] == ts || ffill {
+            if feature_ns[prev] == ts {
                 Some(prev)
+            } else if ffill {
+                // F-308 max-age guard: drop the forward-fill when the
+                // most-recent higher-TF bar is older than the cap.
+                match max_age_ns {
+                    Some(max_age) if ts - feature_ns[prev] > max_age => None,
+                    _ => Some(prev),
+                }
             } else {
                 None
             }
@@ -110,4 +147,122 @@ pub fn align_features_by_ns(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod align_tests {
+    use super::*;
+    use ndarray::array;
+
+    fn ns_grid(start_min: i64, step_min: i64, n: usize) -> Vec<i64> {
+        (0..n as i64)
+            .map(|i| (start_min + i * step_min) * 60 * 1_000_000_000)
+            .collect()
+    }
+
+    #[test]
+    fn align_unbounded_forward_fills_to_end() {
+        // Legacy behaviour preserved when max_age = None.
+        let base_ns = ns_grid(0, 1, 10);   // M1 × 10 bars
+        let feat_ns = ns_grid(0, 5, 2);    // M5 × 2 bars: t=0, t=5
+        let feat_data = array![[1.0_f32], [2.0_f32]];
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, None);
+        // Without max_age, every base bar past t=5 keeps value 2.0.
+        assert_eq!(aligned[(0, 0)], 1.0); // t=0
+        assert_eq!(aligned[(4, 0)], 1.0); // t=4 (before first M5 close at 5)
+        assert_eq!(aligned[(5, 0)], 2.0); // t=5
+        assert_eq!(aligned[(9, 0)], 2.0); // t=9 — frozen, what F-308 calls the bug
+    }
+
+    #[test]
+    fn align_max_age_caps_stale_forward_fill() {
+        // F-308 fix: max_age = 3 minutes (in ns) drops values past 3 min lag.
+        let base_ns = ns_grid(0, 1, 10);
+        let feat_ns = ns_grid(0, 5, 2);
+        let feat_data = array![[1.0_f32], [2.0_f32]];
+        let max_age_ns = Some(3_i64 * 60 * 1_000_000_000);
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, max_age_ns);
+        // t=0 → exact, 1.0
+        assert_eq!(aligned[(0, 0)], 1.0);
+        // t=1,2,3 → within 3min of t=0, still ffill to 1.0
+        assert_eq!(aligned[(3, 0)], 1.0);
+        // t=4 → 4 min after t=0, EXCEEDS max_age → NaN
+        assert!(aligned[(4, 0)].is_nan(), "expected NaN at t=4, got {}", aligned[(4, 0)]);
+        // t=5 → exact match on second feat row, value 2.0
+        assert_eq!(aligned[(5, 0)], 2.0);
+        // t=6,7,8 → within 3min of t=5, ffill 2.0
+        assert_eq!(aligned[(8, 0)], 2.0);
+        // t=9 → 4 min after t=5, exceeds → NaN. This is what kills the
+        // frozen-constant downstream propagation in the F-308 scenario.
+        assert!(aligned[(9, 0)].is_nan(), "expected NaN at t=9, got {}", aligned[(9, 0)]);
+    }
+
+    #[test]
+    fn align_max_age_zero_preserves_exact_matches() {
+        // Edge case: max_age = 0 forbids any forward-fill, only exact ts hits.
+        let base_ns = ns_grid(0, 1, 5);
+        let feat_ns = ns_grid(0, 5, 1); // single feat row at t=0
+        let feat_data = array![[42.0_f32]];
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, Some(0));
+        assert_eq!(aligned[(0, 0)], 42.0); // exact match
+        for i in 1..5 {
+            assert!(aligned[(i, 0)].is_nan(), "expected NaN at i={i}");
+        }
+    }
+
+    #[test]
+    fn align_max_age_with_ffill_false_is_consistent() {
+        // When ffill is false, max_age has no effect — only exact matches.
+        let base_ns = ns_grid(0, 1, 5);
+        let feat_ns = ns_grid(0, 5, 1);
+        let feat_data = array![[7.0_f32]];
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, false, Some(i64::MAX));
+        assert_eq!(aligned[(0, 0)], 7.0);
+        for i in 1..5 {
+            assert!(aligned[(i, 0)].is_nan());
+        }
+    }
+
+    #[test]
+    fn align_empty_feature_ns_returns_all_nan() {
+        let base_ns = ns_grid(0, 1, 5);
+        let feat_ns: Vec<i64> = Vec::new();
+        let feat_data: Array2<f32> = Array2::zeros((0, 2));
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, Some(60_000_000_000));
+        assert_eq!(aligned.shape(), &[5, 2]);
+        for i in 0..5 {
+            for j in 0..2 {
+                assert!(aligned[(i, j)].is_nan());
+            }
+        }
+    }
+
+    #[test]
+    fn align_higher_tf_ends_before_base_last_creates_nan_tail() {
+        // The F-308 production scenario: base = M1 × 100 fresh bars,
+        // higher TF = D1 with only 1 bar at t=0. Without max_age the
+        // entire 100-bar base would have constant D1 values. With
+        // max_age = 2 × D1_period = 2 days, all but the first ~2*1440 min
+        // of base bars become NaN.
+        let base_ns = ns_grid(0, 1, 100); // M1 × 100 = 100 min span
+        let feat_ns = ns_grid(0, 1440, 1); // single D1 bar at t=0
+        let feat_data = array![[99.0_f32]];
+        // max_age = 2 × D1_period = 2 × 1440 × 60 × 1e9 ns
+        let max_age_ns = Some(2_i64 * 1440 * 60 * 1_000_000_000);
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, max_age_ns);
+        // All 100 base bars are within 2 days of t=0, so ALL get 99.0.
+        for i in 0..100 {
+            assert_eq!(aligned[(i, 0)], 99.0);
+        }
+        // Now tighten max_age to 50 minutes — only first 51 base bars
+        // (t=0..50) survive; rest become NaN.
+        let max_age_ns = Some(50_i64 * 60 * 1_000_000_000);
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, max_age_ns);
+        for i in 0..=50 {
+            assert_eq!(aligned[(i, 0)], 99.0, "i={i}");
+        }
+        for i in 51..100 {
+            assert!(aligned[(i, 0)].is_nan(), "expected NaN at i={i}, got {}", aligned[(i, 0)]);
+        }
+    }
 }
