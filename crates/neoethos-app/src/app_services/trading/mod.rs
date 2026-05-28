@@ -16,8 +16,19 @@ pub(super) use crate::app_services::ctrader_auth::{
     CTraderAuthSession, CTraderAuthSnapshot, CTraderTokenBundle,
 };
 pub(super) use crate::app_services::ctrader_data::{
-    CTraderChartHistoryRequest, CTraderSymbolLookupRequest, HistoricalBar, SymbolDistanceType,
-    SymbolFinancials, TradingModeProto, load_chart_history, resolve_symbol,
+    CTraderChartHistoryRequest, CTraderSymbolLookupRequest, HistoricalBar, load_chart_history,
+    resolve_symbol,
+};
+// Phase B (2026-05-27) — gating types used only by the `prop_firm_gate`
+// regression tests below. Kept on a `#[cfg(test)]` re-export so the
+// production build doesn't carry an unused-import warning, but the
+// test module can still pick them up via `super::*`. Production callers
+// pull these directly from `crate::app_services::ctrader_data` when
+// the build-ctrader-order-request follow-up wires `Some(&financials)`
+// through the gate.
+#[cfg(test)]
+pub(super) use crate::app_services::ctrader_data::{
+    SymbolDistanceType, SymbolFinancials, TradingModeProto,
 };
 pub(super) use crate::app_services::ctrader_execution::{
     CTraderExecutionBackend, CTraderExecutionOutcome, CTraderExecutionRequest,

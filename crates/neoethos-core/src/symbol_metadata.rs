@@ -91,6 +91,39 @@ pub struct SymbolMetadata {
     /// operator override in `data/symbol_metadata.json`.
     #[serde(default)]
     pub commission_per_lot: Option<f64>,
+
+    /// **Phase C (2026-05-28) — broker swap & conversion-fee fields.**
+    ///
+    /// The cTrader broker hands us these values for every symbol it
+    /// streams via `ProtoOASymbol`. Backtest cost models that ignore
+    /// them ship strategies whose live PnL silently lags by the swap
+    /// + fee delta. The audit-finding F-CY3-2 + F-CY3-3 chain
+    /// motivated lifting these onto the canonical metadata table so
+    /// the GA fitness function has the same cost view the live
+    /// trader does.
+    ///
+    /// Daily SWAP charge for a long position, in **pips per day**.
+    /// Positive value = COST (debit per overnight roll). Negative =
+    /// credit. Only used when the broker's
+    /// `swap_calculation_type` is `PIPS` — the other proto variants
+    /// (`PERCENTAGE`, `POINTS`) require a different conversion path
+    /// and currently fall back to `None` (Phase C follow-up).
+    #[serde(default)]
+    pub daily_swap_long_pips: Option<f64>,
+    /// Daily SWAP charge for a short position. Same semantics as
+    /// `daily_swap_long_pips`.
+    #[serde(default)]
+    pub daily_swap_short_pips: Option<f64>,
+    /// Per-trade conversion fee when symbol-quote ≠ deposit-currency.
+    /// Stored as a **fraction**, e.g. `0.0005` = 0.05 %. cTrader's
+    /// proto value is `i32` with the convention `1 = 0.01 %`, so the
+    /// conversion is `fraction = proto_value / 10_000.0`. Applied
+    /// once at trade exit: `pnl_net = pnl_gross × (1 − fee_rate)`.
+    /// Typical broker values: 0.005 – 0.01 (0.5 – 1 %) for cross-
+    /// currency accounts; `None` for same-quote-and-deposit accounts
+    /// (no conversion needed).
+    #[serde(default)]
+    pub pnl_conversion_fee_rate: Option<f64>,
 }
 
 impl SymbolMetadata {
@@ -561,6 +594,10 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             // / commission — no per-asset-class synthetic default.
             typical_spread_pips: None,
             commission_per_lot: None,
+            // Phase C — broker-supplied; None forces caller to fetch.
+            daily_swap_long_pips: None,
+            daily_swap_short_pips: None,
+            pnl_conversion_fee_rate: None,
         },
         "XAGUSD" => SymbolMetadata {
             symbol: canon,
@@ -576,6 +613,9 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             typical_price: Some(28.0),
             typical_spread_pips: None,
             commission_per_lot: None,
+            daily_swap_long_pips: None,
+            daily_swap_short_pips: None,
+            pnl_conversion_fee_rate: None,
         },
         // ── Crypto ──
         "BTCUSD" => SymbolMetadata {
@@ -592,6 +632,9 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             typical_price: Some(70_000.0),
             typical_spread_pips: None,
             commission_per_lot: None,
+            daily_swap_long_pips: None,
+            daily_swap_short_pips: None,
+            pnl_conversion_fee_rate: None,
         },
         "ETHUSD" => SymbolMetadata {
             symbol: canon,
@@ -607,6 +650,9 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             typical_price: Some(3_500.0),
             typical_spread_pips: None,
             commission_per_lot: None,
+            daily_swap_long_pips: None,
+            daily_swap_short_pips: None,
+            pnl_conversion_fee_rate: None,
         },
         _ => return None,
     };
@@ -637,6 +683,9 @@ fn fx(
         typical_price: typical,
         typical_spread_pips: None,
         commission_per_lot: None,
+        daily_swap_long_pips: None,
+        daily_swap_short_pips: None,
+        pnl_conversion_fee_rate: None,
     }
 }
 
@@ -660,6 +709,9 @@ fn fx_jpy(symbol: String, base: &str, quote: &str, typical: Option<f64>) -> Symb
         typical_price: typical,
         typical_spread_pips: None,
         commission_per_lot: None,
+        daily_swap_long_pips: None,
+        daily_swap_short_pips: None,
+        pnl_conversion_fee_rate: None,
     }
 }
 
@@ -733,6 +785,69 @@ mod tests {
         assert_eq!(canonical_symbol("eur/usd"), "EURUSD");
         assert_eq!(canonical_symbol("xau-usd"), "XAUUSD");
         assert_eq!(canonical_symbol("EUR_USD.cTr"), "EURUSDCTR");
+    }
+
+    // ─── Phase C broker-cost fields (2026-05-28) ──────────────────────
+    //
+    // Schema additions for `daily_swap_long_pips`, `daily_swap_short_pips`,
+    // and `pnl_conversion_fee_rate`. These are populated by the cTrader
+    // bootstrap path from `SymbolFinancials` and consumed by the
+    // backtest cost model. Tests verify:
+    //   1. Baked-in defaults set them to `None` (so caller-supplied
+    //      broker data is the ONLY source of truth — no synthetic
+    //      "1.5 pips/day swap" silent default).
+    //   2. Serde round-trip preserves them.
+    //   3. Loading a `SymbolMetadata` JSON written before Phase C
+    //      (i.e. without these fields) still works — they default to
+    //      `None` thanks to `#[serde(default)]`.
+
+    #[test]
+    fn phase_c_fields_default_to_none_in_baked_defaults() {
+        for sym in ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "XAGUSD"] {
+            let m = baked_in_default(sym).unwrap_or_else(|| panic!("missing baked: {sym}"));
+            assert_eq!(m.daily_swap_long_pips, None, "{sym}: swap_long default");
+            assert_eq!(m.daily_swap_short_pips, None, "{sym}: swap_short default");
+            assert_eq!(m.pnl_conversion_fee_rate, None, "{sym}: fee_rate default");
+        }
+    }
+
+    #[test]
+    fn phase_c_fields_serde_round_trip() {
+        let mut m = baked_in_default("EURUSD").unwrap();
+        m.daily_swap_long_pips = Some(-0.7);
+        m.daily_swap_short_pips = Some(0.3);
+        m.pnl_conversion_fee_rate = Some(0.005);
+        let json = serde_json::to_string(&m).expect("serialize");
+        let back: SymbolMetadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.daily_swap_long_pips, Some(-0.7));
+        assert_eq!(back.daily_swap_short_pips, Some(0.3));
+        assert_eq!(back.pnl_conversion_fee_rate, Some(0.005));
+    }
+
+    #[test]
+    fn phase_c_fields_default_when_missing_in_legacy_json() {
+        // Pre-Phase-C SymbolMetadata JSON — no swap/fee fields. Must
+        // still deserialize, with the new fields landing as `None`.
+        let legacy_json = r#"{
+            "symbol": "EURUSD",
+            "base": "EUR",
+            "quote": "USD",
+            "pip_size": 0.0001,
+            "contract_size": 100000.0,
+            "pip_value_quote": 10.0,
+            "digits": 5,
+            "min_lot": 0.01,
+            "max_lot": 100.0,
+            "lot_step": 0.01,
+            "typical_price": 1.08
+        }"#;
+        let m: SymbolMetadata = serde_json::from_str(legacy_json).expect("legacy deserialize");
+        assert_eq!(m.daily_swap_long_pips, None);
+        assert_eq!(m.daily_swap_short_pips, None);
+        assert_eq!(m.pnl_conversion_fee_rate, None);
+        // Sanity: existing fields landed correctly.
+        assert_eq!(m.symbol, "EURUSD");
+        assert_eq!(m.pip_size, 0.0001);
     }
 
     // ─── Money ↔ Lots conversion (cycle-3 helpers, 2026-05-27) ────────

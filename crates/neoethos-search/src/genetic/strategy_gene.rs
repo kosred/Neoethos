@@ -71,6 +71,21 @@ pub struct MarketCostProfile {
     pub pip_value_per_lot: f64,
     pub spread_pips: f64,
     pub commission_per_trade: f64,
+    /// **Phase C (2026-05-28)** — broker-supplied daily SWAP charges
+    /// and cross-currency conversion fee. `0.0` means "no charge
+    /// known"; non-zero comes from the broker's `ProtoOASymbol`
+    /// projection (`SymbolFinancials::daily_swap_long/short`,
+    /// `pnl_conversion_fee_rate`). The CPU + GPU eval kernels
+    /// subtract `swap_pips × overnight_days × pip_value_per_lot` at
+    /// each trade exit and apply `(1 − pnl_conversion_fee_rate)`
+    /// once. Defaulting to 0 is **deliberate fail-safe** so a
+    /// missing-broker-data run still produces a backtest; the GA
+    /// fitness function additionally penalises strategies that lean
+    /// heavily on overnight positions when these costs are unknown
+    /// (TODO follow-up — currently a no-op).
+    pub swap_long_pips_per_day: f64,
+    pub swap_short_pips_per_day: f64,
+    pub pnl_conversion_fee_rate: f64,
 }
 
 impl Default for FilteringConfig {
@@ -411,6 +426,30 @@ pub fn infer_market_cost_profile(
             7.0
         });
 
+    // **Phase C (2026-05-28)**: pull the broker-supplied swap +
+    // conversion fee values from SymbolMetadata. Default to 0.0 when
+    // unknown — the eval kernel treats 0.0 as "no charge", matching
+    // the pre-Phase-C silent behaviour. The audit (F-CY3-2/3) calls
+    // this out as a HIGH-severity gap when the broker data exists
+    // but the cost model ignores it; populating these fields from
+    // `data/symbol_metadata.json` (which the bridge refreshes from
+    // cTrader) lifts the gap.
+    let swap_long_pips_per_day = metadata
+        .as_ref()
+        .and_then(|m| m.daily_swap_long_pips)
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0);
+    let swap_short_pips_per_day = metadata
+        .as_ref()
+        .and_then(|m| m.daily_swap_short_pips)
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0);
+    let pnl_conversion_fee_rate = metadata
+        .as_ref()
+        .and_then(|m| m.pnl_conversion_fee_rate)
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v < 1.0)
+        .unwrap_or(0.0);
+
     MarketCostProfile {
         symbol,
         account_currency,
@@ -418,6 +457,9 @@ pub fn infer_market_cost_profile(
         pip_value_per_lot,
         spread_pips,
         commission_per_trade,
+        swap_long_pips_per_day,
+        swap_short_pips_per_day,
+        pnl_conversion_fee_rate,
     }
 }
 
@@ -715,4 +757,36 @@ mod tests {
         assert_eq!(gene.tp_pips, 40.0);
         assert_eq!(gene.sl_pips, 20.0);
     }
+
+    // ─── Phase C broker-cost plumbing (2026-05-28) ────────────────────
+    //
+    // `infer_market_cost_profile` must surface the broker-supplied
+    // swap & PnL-conversion-fee values from `SymbolMetadata` into
+    // the `MarketCostProfile`. The eval kernel reads them from
+    // BacktestSettings (populated in turn from MarketCostProfile).
+    // These tests guard the data-layer plumbing; the eval-kernel
+    // application is exercised in eval.rs (Phase C.2).
+
+    #[test]
+    fn infer_market_cost_profile_zeroes_swap_and_fee_when_metadata_absent() {
+        // EURUSD baked-in default ships with `daily_swap_*: None` and
+        // `pnl_conversion_fee_rate: None`. The cost-model fall-back
+        // for those is `0.0` (fail-safe — no charge known means no
+        // charge applied). The synthetic-fallback warn is logged for
+        // commission + spread only, not for swap/fee.
+        let profile = infer_market_cost_profile("EURUSD", "USD", None, None, None);
+        assert_eq!(profile.swap_long_pips_per_day, 0.0);
+        assert_eq!(profile.swap_short_pips_per_day, 0.0);
+        assert_eq!(profile.pnl_conversion_fee_rate, 0.0);
+    }
+
+    // Note: a follow-up test will verify that broker-supplied swap +
+    // fee values flow end-to-end from `SymbolFinancials` →
+    // `SymbolMetadata` → `MarketCostProfile`. That requires a
+    // `SymbolMetadataTable::override_for_test` helper (not yet
+    // wired) so the test can install custom metadata without
+    // racing the singleton. Currently the Phase C schema tests in
+    // `symbol_metadata.rs::tests::phase_c_fields_*` cover the
+    // schema/serde boundary; this file covers the cost-model
+    // boundary (the third leg — eval kernel — lands in Phase C.2).
 }

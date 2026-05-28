@@ -1377,6 +1377,13 @@ mod tests {
             pip_value_per_lot: 10_000.0,
             kill_zones_enabled: false,
             session_spread_profile: None,
+            // Phase C — flat-test fixture: no swap, no conversion fee.
+            // These are deliberately zeroed so the existing test
+            // assertions (which assume only commission + spread costs)
+            // continue to hold.
+            swap_long_pips_per_day: 0.0,
+            swap_short_pips_per_day: 0.0,
+            pnl_conversion_fee_rate: 0.0,
         }
     }
 

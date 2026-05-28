@@ -134,6 +134,31 @@ pub struct BacktestSettings {
     /// the bar's UTC timestamp. Requires bar timestamps to be present;
     /// falls back to `spread_pips` when timestamps are empty or zero.
     pub session_spread_profile: Option<SessionSpreadProfile>,
+
+    /// **Phase C (2026-05-28)** — broker-supplied overnight SWAP and
+    /// cross-currency conversion fee. Flow:
+    ///   - `SymbolMetadata.daily_swap_{long,short}_pips` (cTrader
+    ///     `ProtoOASymbol::swap_long/short` when calc-type is `PIPS`)
+    ///   - copied into `MarketCostProfile` by
+    ///     `genetic::strategy_gene::infer_market_cost_profile`
+    ///   - copied here by the BacktestSettings constructor.
+    ///
+    /// Semantics: at each trade exit, the eval kernel subtracts
+    ///   `swap_{long|short}_pips × overnight_days × pip_value_per_lot`
+    /// from the trade PnL. `overnight_days` = count of UTC midnight
+    /// crossings between entry and exit timestamps; 0 means the
+    /// trade was day-traded (no swap charge).
+    ///
+    /// Defaults to `0.0` (no charge) when the broker hasn't supplied
+    /// the value. This matches the pre-Phase-C silent behaviour but
+    /// emits a warn in `infer_market_cost_profile` to surface the
+    /// missing-broker-data path.
+    pub swap_long_pips_per_day: f64,
+    pub swap_short_pips_per_day: f64,
+    /// **Phase C (2026-05-28)** — `pnl_net = pnl_gross × (1 −
+    /// pnl_conversion_fee_rate)` applied once per closed trade.
+    /// Fraction (0.005 = 0.5 %), default 0.0.
+    pub pnl_conversion_fee_rate: f64,
 }
 
 impl BacktestSettings {
@@ -264,6 +289,20 @@ impl Default for BacktestSettings {
             pip_value_per_lot: f64::NAN,
             kill_zones_enabled: false,
             session_spread_profile: None,
+            // **Phase C (2026-05-28)**: swap + conversion-fee default
+            // to 0.0 (no charge). NaN-sentinel pattern from the cost
+            // fields above is NOT applied here because (a) it would
+            // collapse every backtest that doesn't have broker swap
+            // data into NaN fitness — a regression for symbols with
+            // no overnight exposure — and (b) the swap term is a
+            // CHARGE: 0.0 produces a conservative (rosy) PnL, which
+            // the existing F-029 LAST-RESORT warn in
+            // `infer_market_cost_profile` already flags. When broker
+            // data exists, `for_symbol(...)` overrides these to the
+            // real values.
+            swap_long_pips_per_day: 0.0,
+            swap_short_pips_per_day: 0.0,
+            pnl_conversion_fee_rate: 0.0,
         }
     }
 }
@@ -310,6 +349,15 @@ impl BacktestSettings {
             pip_value_per_lot: profile.pip_value_per_lot,
             spread_pips: profile.spread_pips,
             commission_per_trade: profile.commission_per_trade,
+            // **Phase C (2026-05-28)** — propagate broker-supplied
+            // swap & conversion fee. `infer_market_cost_profile`
+            // returns 0.0 when the broker hasn't provided these on
+            // `SymbolMetadata`, so the production behaviour is
+            // "no charge if no broker data" (conservative-rosy);
+            // populated values yield the real broker-aligned cost.
+            swap_long_pips_per_day: profile.swap_long_pips_per_day,
+            swap_short_pips_per_day: profile.swap_short_pips_per_day,
+            pnl_conversion_fee_rate: profile.pnl_conversion_fee_rate,
             ..Self::default()
         }
     }
