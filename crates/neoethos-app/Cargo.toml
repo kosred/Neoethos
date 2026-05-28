@@ -85,6 +85,14 @@ reqwest = { version = "0.13.3", default-features = true, features = ["blocking",
 url = "2.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"  # aligned with workspace.dependencies (2026-05-26)
+# **2026-05-28 (Phase A audit)**: cTrader's JSON proxy encodes
+# protobuf enums as INTEGER discriminants (`"tradingMode": 0`), not
+# SCREAMING_SNAKE_CASE strings. We discovered this by capturing real
+# `ProtoOASymbolByIdRes` payloads via the `--capture-symbols` CLI
+# flag and finding that the existing string-tagged enums failed to
+# deserialize EVERY response. serde_repr round-trips u8/u16/u32
+# discriminants directly, matching the wire format.
+serde_repr = "0.1"
 toml = "0.8.20"
 dirs = "5.0.1"
 tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }

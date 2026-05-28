@@ -50,19 +50,28 @@ pub struct CTraderSymbolsListResult {
 
 /// `ProtoOATradingMode` — the symbol's overall tradeability mode.
 ///
-/// Proto file: `OpenApiModelMessages.proto:222-227`. cTrader's JSON
-/// proxy sends the enum as a string matching the proto constant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+/// Proto file: `OpenApiModelMessages.proto:222-227`. **2026-05-28
+/// real-data correction**: the cTrader JSON proxy sends the enum as
+/// the **protobuf integer discriminant** (e.g. `"tradingMode": 0`),
+/// NOT a SCREAMING_SNAKE_CASE string. We discovered this by capturing
+/// real `ProtoOASymbolByIdRes` payloads via `--capture-symbols` and
+/// finding the string-tagged enum failed to deserialize every
+/// response. The explicit discriminants below match the proto's
+/// `enum ProtoOATradingMode` declared values exactly.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq,
+    serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
+)]
+#[repr(u8)]
 pub enum TradingModeProto {
     /// Default. Both opening and closing are allowed.
-    Enabled,
+    Enabled = 0,
     /// New market orders only; no pending orders.
-    DisabledWithoutPendingsExecution,
+    DisabledWithoutPendingsExecution = 1,
     /// Pending orders allowed; market orders blocked.
-    DisabledWithPendingsExecution,
+    DisabledWithPendingsExecution = 2,
     /// Only closing existing positions is allowed.
-    CloseOnlyMode,
+    CloseOnlyMode = 3,
 }
 
 /// `ProtoOACommissionType` — how to interpret the
@@ -76,13 +85,16 @@ pub enum TradingModeProto {
 /// - `PercentageOfValue`: percentage of notional volume × 100,000
 ///   (i.e. value 5 means 0.005%); used for equities.
 /// - `QuoteCcyPerLot`: quote-currency per 1 lot (CFDs in non-USD).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq,
+    serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
+)]
+#[repr(u8)]
 pub enum CommissionType {
-    UsdPerMillionUsd,
-    UsdPerLot,
-    PercentageOfValue,
-    QuoteCcyPerLot,
+    UsdPerMillionUsd = 1,
+    UsdPerLot = 2,
+    PercentageOfValue = 3,
+    QuoteCcyPerLot = 4,
 }
 
 /// `ProtoOAMinCommissionType` — whether the broker's minimum
@@ -90,11 +102,14 @@ pub enum CommissionType {
 /// the symbol's quote currency (`QuoteCurrency`).
 ///
 /// Proto file: `OpenApiModelMessages.proto:216-219`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq,
+    serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
+)]
+#[repr(u8)]
 pub enum MinCommissionType {
-    Currency,
-    QuoteCurrency,
+    Currency = 1,
+    QuoteCurrency = 2,
 }
 
 /// `ProtoOASwapCalculationType` — units of the `swap_long`/`swap_short`
@@ -105,12 +120,15 @@ pub enum MinCommissionType {
 /// - `Points`: the raw value is in points (= 10^-digits).
 ///
 /// Proto file: `OpenApiModelMessages.proto:230-234`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq,
+    serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
+)]
+#[repr(u8)]
 pub enum SwapCalculationType {
-    Pips,
-    Percentage,
-    Points,
+    Pips = 0,
+    Percentage = 1,
+    Points = 2,
 }
 
 /// `ProtoOASymbolDistanceType` — units for the min SL/TP/GSL distance
@@ -118,11 +136,14 @@ pub enum SwapCalculationType {
 ///
 /// Proto file: `OpenApiModelMessages.proto:210-213`. cTrader's JSON
 /// proxy uses the `SYMBOL_DISTANCE_IN_*` prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq,
+    serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
+)]
+#[repr(u8)]
 pub enum SymbolDistanceType {
-    SymbolDistanceInPoints,
-    SymbolDistanceInPercentage,
+    SymbolDistanceInPoints = 1,
+    SymbolDistanceInPercentage = 2,
 }
 
 /// `ProtoOADayOfWeek` — used by `swap_rollover_3_days` to mark the
@@ -130,17 +151,20 @@ pub enum SymbolDistanceType {
 /// Shariah triple-rollover weekday.
 ///
 /// Proto file: `OpenApiModelMessages.proto:184-193`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq,
+    serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
+)]
+#[repr(u8)]
 pub enum DayOfWeek {
-    None,
-    Monday,
-    Tuesday,
-    Wednesday,
-    Thursday,
-    Friday,
-    Saturday,
-    Sunday,
+    None = 0,
+    Monday = 1,
+    Tuesday = 2,
+    Wednesday = 3,
+    Thursday = 4,
+    Friday = 5,
+    Saturday = 6,
+    Sunday = 7,
 }
 
 /// One weekly-trading interval — start and end seconds counted from
@@ -292,19 +316,32 @@ impl SymbolFinancials {
     /// Daily swap charge in the units implied by
     /// `swap_calculation_type`. The caller's cost model converts this
     /// to a notional charge using the symbol's pip_size and lot
-    /// notional. Returns None if `swap_long` or the calc type is
-    /// missing.
+    /// notional. Returns None if `swap_long` is missing.
+    ///
+    /// **2026-05-28 real-data correction**: for BTC/USD on the
+    /// captured Demo account the broker sends `swap_long: 0.0,
+    /// swap_short: 0.0` but **OMITS** `swap_calculation_type`. The
+    /// previous implementation `let _kind = self.swap_calculation_type?`
+    /// silently returned `None` in that case, so the backtest saw
+    /// "unknown swap" instead of "zero swap" — same fail-loud
+    /// regression we just fixed for the enum deserializer. Now we
+    /// treat a missing calc_type as PIPS (the proto default per
+    /// `ProtoOASwapCalculationType` declaration), matching the cTrader
+    /// proxy's omitted-means-default convention. The fixture
+    /// `ctrader_symbol_BTCUSD.raw.json` exercises this path.
     pub fn daily_swap_long(&self) -> Option<f64> {
         let raw = self.swap_long?;
-        let _kind = self.swap_calculation_type?;
-        // The raw double IS the daily charge in `kind` units —
-        // backtest scoring multiplies by hours-held / 24 and by
-        // contract notional / pip-size depending on kind.
+        // Default to PIPS per proto when broker omits the field.
+        let _kind = self
+            .swap_calculation_type
+            .unwrap_or(SwapCalculationType::Pips);
         Some(raw)
     }
     pub fn daily_swap_short(&self) -> Option<f64> {
         let raw = self.swap_short?;
-        let _kind = self.swap_calculation_type?;
+        let _kind = self
+            .swap_calculation_type
+            .unwrap_or(SwapCalculationType::Pips);
         Some(raw)
     }
 
@@ -1337,6 +1374,15 @@ mod tests {
 
     #[test]
     fn symbol_by_id_response_parses_full_symbol_metadata() {
+        // **2026-05-28 real-data correction**: previously this test
+        // used a synthetic payload with `"tradingMode": "ENABLED"`
+        // (string), asserted only 4 of the 30+ fields, and "passed"
+        // — masking the production bug where the cTrader proxy
+        // actually sends `"tradingMode": 0` (integer). Confirmed by
+        // capturing real `ProtoOASymbolByIdRes` payloads via the new
+        // `--capture-symbols` CLI. Test now uses the integer enum
+        // encoding the broker really emits, asserting both the basic
+        // identity fields and the `SymbolFinancials` projection.
         let response = serde_json::json!({
             "clientMsgId": "symbol-by-id-1",
             "payloadType": 2117,
@@ -1346,7 +1392,17 @@ mod tests {
                         "symbolId": 1,
                         "digits": 5,
                         "pipPosition": 4,
-                        "tradingMode": "ENABLED"
+                        "tradingMode": 0,
+                        "commissionType": 1,
+                        "preciseTradingCommissionRate": 4500000000_i64,
+                        "swapCalculationType": 0,
+                        "swapLong": -2.445,
+                        "swapShort": -0.105,
+                        "swapRollover3Days": 3,
+                        "distanceSetIn": 1,
+                        "enableShortSelling": true,
+                        "minCommissionType": 2,
+                        "pnlConversionFeeRate": 0
                     }
                 ]
             }
@@ -1359,6 +1415,131 @@ mod tests {
         assert_eq!(symbols[0].digits, 5);
         assert_eq!(symbols[0].pip_position, 4);
         assert!(symbols[0].is_trading_enabled);
+        let financials = symbols[0]
+            .financials
+            .as_ref()
+            .expect("financials projection must be present");
+        assert_eq!(financials.trading_mode, Some(TradingModeProto::Enabled));
+        assert_eq!(financials.commission_type, Some(CommissionType::UsdPerMillionUsd));
+        assert_eq!(financials.precise_trading_commission_rate, Some(4_500_000_000));
+        assert_eq!(financials.commission_rate_decimal(), Some(45.0));
+        assert_eq!(
+            financials.swap_calculation_type,
+            Some(SwapCalculationType::Pips)
+        );
+        assert_eq!(financials.swap_long, Some(-2.445));
+        assert_eq!(financials.swap_short, Some(-0.105));
+        assert_eq!(financials.daily_swap_long(), Some(-2.445));
+        assert_eq!(financials.daily_swap_short(), Some(-0.105));
+        assert_eq!(financials.swap_rollover_3_days, Some(DayOfWeek::Wednesday));
+        assert_eq!(
+            financials.distance_set_in,
+            Some(SymbolDistanceType::SymbolDistanceInPoints)
+        );
+        assert_eq!(
+            financials.min_commission_type,
+            Some(MinCommissionType::QuoteCurrency)
+        );
+        assert_eq!(financials.pnl_conversion_fee_rate, Some(0));
+        assert!(financials.short_selling_allowed());
+        assert!(financials.can_open_new_position());
+    }
+
+    #[test]
+    fn symbol_by_id_response_parses_real_eurusd_broker_capture() {
+        // Loads the verbatim payload captured from cTrader Demo
+        // (account 47367144, 2026-05-28) via `--capture-symbols
+        // EURUSD`. This is the parser's regression guard against the
+        // ground-truth wire format the broker actually emits.
+        // Updating the parser without re-running the capture is
+        // forbidden — the fixture is the source of truth.
+        let raw = include_str!("../../tests/fixtures/ctrader_symbol_EURUSD.raw.json");
+        let symbols =
+            parse_symbol_by_id_response(raw).expect("real cTrader EURUSD payload must parse");
+        assert_eq!(symbols.len(), 1);
+        let s = &symbols[0];
+        assert_eq!(s.symbol_id, 1);
+        assert_eq!(s.digits, 5);
+        assert_eq!(s.pip_position, 4);
+        assert!(s.is_trading_enabled);
+        assert_eq!(s.lot_size, Some(10_000_000));
+        let f = s.financials.as_ref().expect("financials must be populated");
+        // Commission: $45/M USD (proto rate × 10^8 = 4_500_000_000).
+        assert_eq!(f.commission_type, Some(CommissionType::UsdPerMillionUsd));
+        assert_eq!(f.precise_trading_commission_rate, Some(4_500_000_000));
+        assert_eq!(f.commission_rate_decimal(), Some(45.0));
+        // Swap: PIPS-typed, both sides charge (negative = cost).
+        assert_eq!(f.swap_calculation_type, Some(SwapCalculationType::Pips));
+        assert!((f.swap_long.unwrap() - (-2.445)).abs() < 1e-9);
+        assert!((f.swap_short.unwrap() - (-0.105)).abs() < 1e-9);
+        assert_eq!(f.swap_period_hours, Some(24));
+        assert_eq!(f.swap_time_minutes_from_utc_midnight, Some(1259));
+        assert_eq!(f.swap_rollover_3_days, Some(DayOfWeek::Wednesday));
+        // No fee for USD-quoted symbol on this USD-deposit account.
+        assert_eq!(f.pnl_conversion_fee_rate, Some(0));
+        // Trading mode + short selling.
+        assert_eq!(f.trading_mode, Some(TradingModeProto::Enabled));
+        assert_eq!(f.enable_short_selling, Some(true));
+        // No minimum SL/TP distance — broker reports 0 for FX majors.
+        assert_eq!(f.sl_distance_points, Some(0));
+        assert_eq!(f.tp_distance_points, Some(0));
+        assert_eq!(
+            f.distance_set_in,
+            Some(SymbolDistanceType::SymbolDistanceInPoints)
+        );
+        // 5 trading intervals (Mon-Fri), no holidays in this payload.
+        assert_eq!(f.trading_intervals.len(), 5);
+        assert!(f.holidays.is_empty());
+    }
+
+    #[test]
+    fn symbol_by_id_response_parses_real_btcusd_with_missing_swap_calc_type() {
+        // BTCUSD on this demo account ships with
+        //   swap_long: 0.0
+        //   swap_short: 0.0
+        //   swap_calculation_type: <field omitted>
+        // The fix in `daily_swap_long/short()` treats a missing
+        // calc-type as PIPS (proto default) so the helper returns
+        // Some(0.0) instead of None — which would have silently
+        // zeroed swap in the backtest cost model.
+        let raw = include_str!("../../tests/fixtures/ctrader_symbol_BTCUSD.raw.json");
+        let symbols = parse_symbol_by_id_response(raw).expect("BTCUSD payload must parse");
+        let s = &symbols[0];
+        let f = s.financials.as_ref().expect("financials must be populated");
+        assert_eq!(f.swap_calculation_type, None);
+        assert_eq!(f.swap_long, Some(0.0));
+        assert_eq!(f.swap_short, Some(0.0));
+        // The fix: daily_swap_* returns Some(0.0), not None.
+        assert_eq!(f.daily_swap_long(), Some(0.0));
+        assert_eq!(f.daily_swap_short(), Some(0.0));
+        // BTCUSD has zero commission on this demo broker.
+        assert_eq!(f.precise_trading_commission_rate, Some(0));
+        assert_eq!(f.commission_rate_decimal(), Some(0.0));
+    }
+
+    #[test]
+    fn symbol_by_id_response_parses_real_xauusd_distinct_lot_and_commission() {
+        // XAUUSD differs from FX in:
+        //   - lot_size = 10_000 (vs FX 10_000_000) — exactly what
+        //     A.4 (broker_api lots→wire) needed to NOT silently fall
+        //     back to the 10M default.
+        //   - commission = $25/M USD (vs FX $45/M USD).
+        //   - measurement_units = "Oz" (ounces).
+        //   - schedule_time_zone = "UTC" (vs FX "America/New_York").
+        let raw = include_str!("../../tests/fixtures/ctrader_symbol_XAUUSD.raw.json");
+        let symbols = parse_symbol_by_id_response(raw).expect("XAUUSD payload must parse");
+        let s = &symbols[0];
+        assert_eq!(s.lot_size, Some(10_000));
+        assert_eq!(s.digits, 2);
+        let f = s.financials.as_ref().expect("financials must be populated");
+        assert_eq!(f.precise_trading_commission_rate, Some(2_500_000_000));
+        assert_eq!(f.commission_rate_decimal(), Some(25.0));
+        assert_eq!(f.measurement_units.as_deref(), Some("Oz"));
+        assert_eq!(f.schedule_time_zone.as_deref(), Some("UTC"));
+        // Swap is PIPS-typed, both sides charge (gold isn't free to hold).
+        assert_eq!(f.swap_calculation_type, Some(SwapCalculationType::Pips));
+        assert!(f.swap_long.unwrap() < 0.0); // charge, not credit
+        assert!(f.swap_short.unwrap() < 0.0);
     }
 
     #[test]
