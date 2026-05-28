@@ -86,6 +86,27 @@ pub fn install_config_path(path: impl Into<PathBuf>) {
     let _ = CONFIG_PATH.set(path.into());
 }
 
+/// F-270 (2026-05-28): process-global record of whether THIS backend
+/// was spawned by a Flutter supervisor (via `--launched-by-flutter`).
+/// Exposed via `/healthz` so a second Flutter shell starting up while
+/// a stale backend (api-test orphan, manually-started server) holds
+/// port 7423 can tell "this is a sibling UI's backend, refuse second
+/// launch" apart from "this is a stale backend, attach to it instead
+/// of exiting the new shell".
+static LAUNCHED_BY_FLUTTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Record at startup whether `--launched-by-flutter` was set. Called
+/// once from `main`; subsequent calls are no-ops (first install wins).
+pub fn install_launched_by_flutter(flag: bool) {
+    let _ = LAUNCHED_BY_FLUTTER.set(flag);
+}
+
+/// Read the launched-by-Flutter flag for `/healthz`. Defaults to false
+/// when no install has happened (= test/library callers).
+pub fn launched_by_flutter() -> bool {
+    LAUNCHED_BY_FLUTTER.get().copied().unwrap_or(false)
+}
+
 /// Resolved config-file path. Free functions that don't carry
 /// `AppApiState` (e.g. `engines_control::resolve_data_root`) consult
 /// this to honour the operator's `--config` flag.

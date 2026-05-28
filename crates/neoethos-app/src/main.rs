@@ -406,6 +406,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // AppApiState construction so state.config_path() reads the
     // resolved value.
     server::state::install_config_path(args.config.clone());
+    // F-270 (2026-05-28): record whether THIS backend was spawned by
+    // a Flutter supervisor. The /healthz response exposes this so a
+    // second Flutter shell launching against a stale backend (api-test
+    // orphan, manually-started server) can tell "the existing port
+    // holder is a sibling UI's backend → refuse second launch" apart
+    // from "the port is held by a zombie → attach instead of exiting".
+    server::state::install_launched_by_flutter(args.launched_by_flutter);
     let state = server::state::AppApiState::new();
     // F-231-related closure (2026-05-25): install the process-wide
     // account-refresh trigger so the deep cTrader execution-event

@@ -10,6 +10,7 @@
 
 import 'dart:ui' as ui;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
@@ -18,6 +19,7 @@ import 'package:dio/dio.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../charts/chart_viewport.dart';
 import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../state/system_providers.dart';
@@ -162,29 +164,35 @@ class ChartScreen extends ConsumerWidget {
     final activeSymbol = ref.watch(_slotA.symbol);
     final activeTimeframe = ref.watch(_slotA.timeframe);
 
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      floatingActionButton: FloatingActionButton.extended(
-        // #198: TradingView Copilot is a corner button on the chart
-        // page that pops a context-aware chat. We do the same.
-        onPressed: () => _openContextualAi(
-          context,
-          ref,
-          activeSymbol,
-          activeTimeframe,
-        ),
-        icon: const Icon(Icons.psychology_alt_outlined),
-        label: const Text('Ask AI'),
-      ),
-      body: SingleChildScrollView(
+    return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          ViewHeader(
-            title: multi ? 'Charts (A + B)' : 'Chart',
-            subtitle: multi
-                ? 'Compare two symbols · max 2 panels (deliberate UX constraint)'
-                : 'Local OHLC · symbol / timeframe / 200 candles',
+          Row(
+            children: [
+              Expanded(
+                child: ViewHeader(
+                  title: multi ? 'Charts (A + B)' : 'Chart',
+                  subtitle: multi
+                      ? 'Compare two symbols · max 2 panels (deliberate UX constraint)'
+                      : 'Local OHLC · symbol / timeframe / 200 candles',
+                ),
+              ),
+              const SizedBox(width: 12),
+              FloatingActionButton.extended(
+                // #198: TradingView Copilot is a corner button on the chart
+                // page that pops a context-aware chat. We keep it inside
+                // the shell content so ChartScreen is not a nested Scaffold.
+                onPressed: () => _openContextualAi(
+                  context,
+                  ref,
+                  activeSymbol,
+                  activeTimeframe,
+                ),
+                icon: const Icon(Icons.psychology_alt_outlined),
+                label: const Text('Ask AI'),
+              ),
+            ],
           ),
           // Compare-mode toggle. Tapping it flips panel B on/off.
           // Limit: TWO panels only. There is no UI affordance to add
@@ -197,9 +205,8 @@ class ChartScreen extends ConsumerWidget {
               children: [
                 Switch(
                   value: multi,
-                  onChanged: (v) => ref
-                      .read(multiChartEnabledProvider.notifier)
-                      .state = v,
+                  onChanged: (v) =>
+                      ref.read(multiChartEnabledProvider.notifier).state = v,
                 ),
                 const SizedBox(width: 8),
                 Expanded(
@@ -251,7 +258,6 @@ class ChartScreen extends ConsumerWidget {
             _ChartPanel(slot: _slotA),
         ],
       ),
-      ),
     );
   }
 }
@@ -271,8 +277,7 @@ class _ContextualAiSheet extends ConsumerStatefulWidget {
   });
 
   @override
-  ConsumerState<_ContextualAiSheet> createState() =>
-      _ContextualAiSheetState();
+  ConsumerState<_ContextualAiSheet> createState() => _ContextualAiSheetState();
 }
 
 class _ContextualAiSheetState extends ConsumerState<_ContextualAiSheet> {
@@ -307,7 +312,8 @@ class _ContextualAiSheetState extends ConsumerState<_ContextualAiSheet> {
       setState(() => _msgs.add((user: false, text: r.response.trim())));
     } on DioException catch (e) {
       if (!mounted) return;
-      setState(() => _msgs.add((user: false, text: 'Error: ${describeError(e)}')));
+      setState(
+          () => _msgs.add((user: false, text: 'Error: ${describeError(e)}')));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -443,8 +449,7 @@ class _ChartPanel extends ConsumerWidget {
           child: SymbolPicker(
             value: symbol,
             label: 'Symbol',
-            onChanged: (s) =>
-                ref.read(slot.symbol.notifier).state = s,
+            onChanged: (s) => ref.read(slot.symbol.notifier).state = s,
           ),
         ),
         SectionCard(
@@ -484,11 +489,23 @@ class _ChartPanel extends ConsumerWidget {
               for (final ind in _indicatorChips)
                 Consumer(
                   builder: (ctx, indRef, _) {
-                    final active = indRef
-                        .watch(slot.activeIndicators)
-                        .contains(ind);
-                    return _Chip(
-                      label: _indicatorLabel(ind),
+                    final active =
+                        indRef.watch(slot.activeIndicators).contains(ind);
+                    // F-268 (2026-05-28): oscillator-pending hint.
+                    // Indicators NOT in `_priceBandOverlays` don't
+                    // render any line on the price canvas yet — the
+                    // user reported "chip activates but no overlay
+                    // drawn" as a bug. The Wrap below already shows
+                    // a small text note, but the chips themselves
+                    // looked identical to working overlays. Mark
+                    // oscillators with a leading "• " bullet so the
+                    // distinction is visible at the click site, and
+                    // wrap in a Tooltip explaining the pending state.
+                    final isOscillator = !_priceBandOverlays.contains(ind);
+                    final chip = _Chip(
+                      label: isOscillator
+                          ? '• ${_indicatorLabel(ind)}'
+                          : _indicatorLabel(ind),
                       selected: active,
                       onTap: () {
                         final notifier =
@@ -502,6 +519,17 @@ class _ChartPanel extends ConsumerWidget {
                         notifier.state = next;
                       },
                     );
+                    return isOscillator
+                        ? Tooltip(
+                            message:
+                                '${_indicatorLabel(ind)} is an oscillator '
+                                '— renders in a sub-panel (not the price '
+                                'canvas). Sub-panel rendering is parked; '
+                                'toggling on/off still affects the '
+                                'oscillator-status text below the chart.',
+                            child: chip,
+                          )
+                        : chip;
                   },
                 ),
             ],
@@ -551,8 +579,8 @@ class _ChartBody extends ConsumerWidget {
     // operators reasonably ask "is EURUSD really priced at 0.00000?".
     // Treat the no-data case explicitly and show an em-dash so it's
     // unambiguous that no candles are loaded for this pair yet.
-    final hasData = snapshot.candleCount > 0
-        && (displayedPrice > 0.0 || livePrice != null);
+    final hasData =
+        snapshot.candleCount > 0 && (displayedPrice > 0.0 || livePrice != null);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -595,9 +623,7 @@ class _ChartBody extends ConsumerWidget {
                       fontSize: 14,
                       fontWeight: FontWeight.w700,
                       color: hasData
-                          ? (changePos
-                              ? ForexAiTokens.buy
-                              : ForexAiTokens.sell)
+                          ? (changePos ? ForexAiTokens.buy : ForexAiTokens.sell)
                           : ForexAiTokens.textMuted,
                     ),
                   ),
@@ -622,6 +648,10 @@ class _ChartBody extends ConsumerWidget {
                   color: ForexAiTokens.textMuted,
                 ),
               ),
+              if (!snapshot.isBrokerSource) ...[
+                const SizedBox(height: 8),
+                _ChartSourceBanner(snapshot: snapshot),
+              ],
               const SizedBox(height: 12),
               if (snapshot.candles.isEmpty)
                 _AutoFetchPrompt(
@@ -635,6 +665,36 @@ class _ChartBody extends ConsumerWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _ChartSourceBanner extends StatelessWidget {
+  final ChartSnapshot snapshot;
+  const _ChartSourceBanner({required this.snapshot});
+
+  @override
+  Widget build(BuildContext context) {
+    final text = snapshot.isDiskCache
+        ? 'Cached chart data · broker live candles pending'
+        : 'Chart data source: ${snapshot.source}';
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: ForexAiTokens.warning.withValues(alpha: 0.08),
+        border:
+            Border.all(color: ForexAiTokens.warning.withValues(alpha: 0.35)),
+        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          fontSize: 11,
+          fontWeight: FontWeight.w600,
+          color: ForexAiTokens.warning,
+        ),
+      ),
     );
   }
 }
@@ -764,7 +824,7 @@ class _AutoFetchPromptState extends ConsumerState<_AutoFetchPrompt> {
 /// candlestick painter. Oscillators (RSI/MACD/Stoch/ADX/ATR) still
 /// toggle in the chip row but don't draw here — they need their own
 /// sub-panel with an independent Y-axis (next iteration).
-class _ChartCanvasWithOverlays extends ConsumerWidget {
+class _ChartCanvasWithOverlays extends ConsumerStatefulWidget {
   final ChartSnapshot snapshot;
   final _ChartSlot slot;
   const _ChartCanvasWithOverlays({
@@ -773,17 +833,74 @@ class _ChartCanvasWithOverlays extends ConsumerWidget {
   });
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final active = ref.watch(slot.activeIndicators);
+  ConsumerState<_ChartCanvasWithOverlays> createState() =>
+      _ChartCanvasWithOverlaysState();
+}
+
+class _ChartCanvasWithOverlaysState
+    extends ConsumerState<_ChartCanvasWithOverlays> {
+  late ChartViewport _viewport;
+
+  @override
+  void initState() {
+    super.initState();
+    _viewport = ChartViewport.live(totalCount: widget.snapshot.candles.length);
+  }
+
+  @override
+  void didUpdateWidget(covariant _ChartCanvasWithOverlays oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final switchedMarket =
+        oldWidget.snapshot.symbol != widget.snapshot.symbol ||
+            oldWidget.snapshot.timeframe != widget.snapshot.timeframe;
+    if (switchedMarket) {
+      _viewport =
+          ChartViewport.live(totalCount: widget.snapshot.candles.length);
+    } else {
+      _viewport = _viewport.withTotalCount(widget.snapshot.candles.length);
+    }
+  }
+
+  void _pan(int deltaBars) {
+    if (deltaBars == 0) return;
+    final next = _viewport.pan(deltaBars);
+    if (next.firstIndex == _viewport.firstIndex &&
+        next.visibleCount == _viewport.visibleCount) {
+      return;
+    }
+    setState(() => _viewport = next);
+  }
+
+  void _zoom(double factor) {
+    final next = _viewport.zoom(factor);
+    if (next.firstIndex == _viewport.firstIndex &&
+        next.visibleCount == _viewport.visibleCount) {
+      return;
+    }
+    setState(() => _viewport = next);
+  }
+
+  void _goLive() {
+    final next = _viewport.goLive();
+    if (next.firstIndex == _viewport.firstIndex) {
+      return;
+    }
+    setState(() => _viewport = next);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final active = ref.watch(widget.slot.activeIndicators);
     final overlayLines = <_PaintedLine>[];
     var colorIdx = 0;
     for (final ind in active) {
       if (!_priceBandOverlays.contains(ind)) continue;
-      final snap = ref.watch(slot.indicator(ind));
+      final snap = ref.watch(widget.slot.indicator(ind));
       snap.whenData((s) {
         for (final line in s.lines) {
           overlayLines.add(_PaintedLine(
-            label: '${_indicatorLabel(ind)}${s.lines.length > 1 ? " · ${line.name.split("_").last}" : ""}',
+            label:
+                '${_indicatorLabel(ind)}${s.lines.length > 1 ? " · ${line.name.split("_").last}" : ""}',
             values: line.values,
             color: _overlayPalette[colorIdx % _overlayPalette.length],
           ));
@@ -794,14 +911,63 @@ class _ChartCanvasWithOverlays extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              _ChartToolButton(
+                tooltip: 'Older candles',
+                icon: Icons.keyboard_arrow_left,
+                onPressed: _viewport.firstIndex <= 0 ? null : () => _pan(-20),
+              ),
+              _ChartToolButton(
+                tooltip: 'Newer candles',
+                icon: Icons.keyboard_arrow_right,
+                onPressed: _viewport.isAtLiveEnd ? null : () => _pan(20),
+              ),
+              _ChartToolButton(
+                tooltip: 'Zoom in',
+                icon: Icons.zoom_in,
+                onPressed: () => _zoom(1.25),
+              ),
+              _ChartToolButton(
+                tooltip: 'Zoom out',
+                icon: Icons.zoom_out,
+                onPressed: () => _zoom(0.8),
+              ),
+              _ChartToolButton(
+                tooltip: 'Go live',
+                icon: Icons.my_location,
+                onPressed: _viewport.isAtLiveEnd ? null : _goLive,
+              ),
+              _ViewportBadge(viewport: _viewport),
+            ],
+          ),
+        ),
         SizedBox(
           height: 320,
-          child: CustomPaint(
-            painter: _CandlestickPainter(
-              snapshot: snapshot,
-              overlays: overlayLines,
+          child: Listener(
+            onPointerSignal: (event) {
+              if (event is PointerScrollEvent) {
+                _zoom(event.scrollDelta.dy < 0 ? 1.15 : 0.85);
+              }
+            },
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onHorizontalDragUpdate: (details) =>
+                  _pan((-details.delta.dx / 8).round()),
+              child: CustomPaint(
+                painter: _CandlestickPainter(
+                  snapshot: widget.snapshot,
+                  overlays: overlayLines,
+                  viewport: _viewport,
+                ),
+                size: Size.infinite,
+              ),
             ),
-            size: Size.infinite,
           ),
         ),
         if (overlayLines.isNotEmpty) ...[
@@ -828,20 +994,104 @@ class _ChartCanvasWithOverlays extends ConsumerWidget {
             ],
           ),
         ],
-        // Oscillators that the user toggled on but we can't render
-        // on the price canvas yet — surface a hint so they know it
-        // worked but is parked.
+        // F-268 (2026-05-28): oscillators that the user toggled on
+        // but we can't render on the price canvas yet — surface an
+        // ATTENTIVE hint with the warning icon so the user knows the
+        // click registered but the line isn't drawn. Previous
+        // fontSize=10 + faint color was easy to miss → operator
+        // reported "chip activates but overlay not drawn" as a bug.
         if (active.any((i) => !_priceBandOverlays.contains(i))) ...[
-          const SizedBox(height: 4),
-          Text(
-            'Oscillators (${active.where((i) => !_priceBandOverlays.contains(i)).map(_indicatorLabel).join(", ")}) — sub-panel coming soon.',
-            style: const TextStyle(
-              fontSize: 10,
-              color: ForexAiTokens.textFaint,
-            ),
+          const SizedBox(height: 6),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Icon(
+                Icons.info_outline,
+                size: 14,
+                color: ForexAiTokens.warning,
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Text(
+                  '${active.where((i) => !_priceBandOverlays.contains(i)).map(_indicatorLabel).join(", ")}'
+                  ' — oscillator(s) active but sub-panel rendering not yet '
+                  'implemented. The chip click registered; no line is drawn '
+                  'on the price canvas (oscillators have a different Y-axis).',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: ForexAiTokens.warning,
+                  ),
+                ),
+              ),
+            ],
           ),
         ],
       ],
+    );
+  }
+}
+
+class _ChartToolButton extends StatelessWidget {
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback? onPressed;
+  const _ChartToolButton({
+    required this.tooltip,
+    required this.icon,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+        width: 30,
+        height: 30,
+        child: IconButton(
+          tooltip: tooltip,
+          onPressed: onPressed,
+          icon: Icon(icon),
+          iconSize: 18,
+          padding: EdgeInsets.zero,
+          splashRadius: 18,
+          color: ForexAiTokens.textPrimary,
+          disabledColor: ForexAiTokens.textFaint,
+        ),
+      );
+}
+
+class _ViewportBadge extends StatelessWidget {
+  final ChartViewport viewport;
+  const _ViewportBadge({required this.viewport});
+
+  @override
+  Widget build(BuildContext context) {
+    final first = viewport.totalCount == 0 ? 0 : viewport.firstIndex + 1;
+    final label = '$first-${viewport.visibleEndExclusive} / '
+        '${viewport.totalCount}${viewport.isAtLiveEnd ? " · Live" : ""}';
+    return Container(
+      height: 30,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: viewport.isAtLiveEnd
+            ? ForexAiTokens.buy.withValues(alpha: 0.10)
+            : ForexAiTokens.surfaceBg,
+        border: Border.all(
+          color: viewport.isAtLiveEnd
+              ? ForexAiTokens.buy.withValues(alpha: 0.45)
+              : ForexAiTokens.border,
+        ),
+        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w700,
+          color: viewport.isAtLiveEnd
+              ? ForexAiTokens.buy
+              : ForexAiTokens.textMuted,
+        ),
+      ),
     );
   }
 }
@@ -861,12 +1111,22 @@ class _PaintedLine {
 class _CandlestickPainter extends CustomPainter {
   final ChartSnapshot snapshot;
   final List<_PaintedLine> overlays;
-  _CandlestickPainter({required this.snapshot, this.overlays = const []});
+  final ChartViewport viewport;
+  _CandlestickPainter({
+    required this.snapshot,
+    required this.viewport,
+    this.overlays = const [],
+  });
 
   @override
   void paint(Canvas canvas, Size size) {
-    final candles = snapshot.candles;
-    if (candles.isEmpty) return;
+    final allCandles = snapshot.candles;
+    if (allCandles.isEmpty) return;
+    final start = viewport.firstIndex.clamp(0, allCandles.length - 1).toInt();
+    final end = viewport.visibleEndExclusive
+        .clamp(start + 1, allCandles.length)
+        .toInt();
+    final candles = allCandles.sublist(start, end);
 
     // Padding so wicks/tops don't clip the edges.
     const padTop = 8.0;
@@ -879,10 +1139,17 @@ class _CandlestickPainter extends CustomPainter {
 
     // Span a touch wider than min/max so the most extreme wicks don't
     // touch the frame.
-    final span = (snapshot.priceMax - snapshot.priceMin).abs();
+    var priceMin = double.infinity;
+    var priceMax = double.negativeInfinity;
+    for (final candle in candles) {
+      if (candle.low < priceMin) priceMin = candle.low;
+      if (candle.high > priceMax) priceMax = candle.high;
+    }
+    if (!priceMin.isFinite || !priceMax.isFinite) return;
+    final span = (priceMax - priceMin).abs();
     final pad = span == 0 ? 1e-5 : span * 0.04;
-    final ymin = snapshot.priceMin - pad;
-    final ymax = snapshot.priceMax + pad;
+    final ymin = priceMin - pad;
+    final ymax = priceMax + pad;
     final yspan = ymax - ymin;
 
     final gridPaint = Paint()
@@ -920,8 +1187,7 @@ class _CandlestickPainter extends CustomPainter {
       ..strokeWidth = 1.0
       ..style = PaintingStyle.stroke;
 
-    double yOf(double price) =>
-        padTop + (1 - (price - ymin) / yspan) * plotH;
+    double yOf(double price) => padTop + (1 - (price - ymin) / yspan) * plotH;
 
     for (var i = 0; i < candles.length; i++) {
       final c = candles[i];
@@ -951,18 +1217,26 @@ class _CandlestickPainter extends CustomPainter {
     // NaN warm-up bars (most indicators emit NaN until they have
     // enough history) so the line begins where the indicator
     // actually has a value. Indicator series are right-aligned with
-    // the candle slice: index 0 of the overlay maps to index 0 of
-    // the visible candles (server already trimmed to limit).
+    // the candle slice. Indicator series are treated as right-aligned
+    // with the chart candles so shorter warm-up series still line up
+    // with the latest visible bars.
     for (final overlay in overlays) {
       final overlayPaint = Paint()
         ..color = overlay.color
         ..strokeWidth = 1.5
         ..style = PaintingStyle.stroke;
       Offset? prev;
-      final maxLen =
-          overlay.values.length < candles.length ? overlay.values.length : candles.length;
-      for (var i = 0; i < maxLen; i++) {
-        final v = overlay.values[i];
+      final valueOffset = overlay.values.length >= allCandles.length
+          ? 0
+          : allCandles.length - overlay.values.length;
+      for (var i = 0; i < candles.length; i++) {
+        final sourceIndex = start + i;
+        final valueIndex = sourceIndex - valueOffset;
+        if (valueIndex < 0 || valueIndex >= overlay.values.length) {
+          prev = null;
+          continue;
+        }
+        final v = overlay.values[valueIndex];
         if (v.isNaN || v.isInfinite) {
           prev = null;
           continue;
@@ -980,9 +1254,10 @@ class _CandlestickPainter extends CustomPainter {
     final tsFmt = DateFormat('MM-dd HH:mm');
     String tsLabel(int idx) {
       final ts = candles[idx].tsMs;
-      if (ts == null) return '#$idx';
+      if (ts == null) return '#${start + idx}';
       return tsFmt.format(DateTime.fromMillisecondsSinceEpoch(ts));
     }
+
     _drawText(
       canvas,
       tsLabel(0),
@@ -1017,15 +1292,20 @@ class _CandlestickPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _CandlestickPainter old) =>
       old.snapshot != snapshot ||
+      old.viewport.firstIndex != viewport.firstIndex ||
+      old.viewport.visibleCount != viewport.visibleCount ||
+      old.viewport.totalCount != viewport.totalCount ||
       old.overlays.length != overlays.length ||
       // Compare colors/lengths as a cheap proxy — full value-by-value
       // comparison would dominate paint time for long histories.
       !_overlaysShallowEqual(old.overlays, overlays);
 
-  static bool _overlaysShallowEqual(List<_PaintedLine> a, List<_PaintedLine> b) {
+  static bool _overlaysShallowEqual(
+      List<_PaintedLine> a, List<_PaintedLine> b) {
     if (a.length != b.length) return false;
     for (var i = 0; i < a.length; i++) {
-      if (a[i].color != b[i].color || a[i].values.length != b[i].values.length) {
+      if (a[i].color != b[i].color ||
+          a[i].values.length != b[i].values.length) {
         return false;
       }
     }
@@ -1058,9 +1338,7 @@ class _Chip extends StatelessWidget {
               ? ForexAiTokens.accent.withValues(alpha: 0.18)
               : ForexAiTokens.surfaceBg,
           border: Border.all(
-            color: selected
-                ? ForexAiTokens.accent
-                : ForexAiTokens.border,
+            color: selected ? ForexAiTokens.accent : ForexAiTokens.border,
           ),
           borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
         ),
@@ -1069,9 +1347,7 @@ class _Chip extends StatelessWidget {
           style: TextStyle(
             fontSize: 11,
             fontWeight: FontWeight.w700,
-            color: selected
-                ? ForexAiTokens.accent
-                : ForexAiTokens.textPrimary,
+            color: selected ? ForexAiTokens.accent : ForexAiTokens.textPrimary,
           ),
         ),
       ),

@@ -32,6 +32,19 @@ import 'dart:io';
 
 import 'package:dio/dio.dart';
 
+/// F-270 (2026-05-28): rich `/healthz` probe result. The boolean
+/// `probeHealth()` API used elsewhere collapses this to just `alive`;
+/// the supervisor's start-of-run logic uses `launchedByFlutter` to
+/// avoid the second-shell-exits-on-stale-backend false-positive.
+class _HealthProbeResult {
+  final bool alive;
+  final bool launchedByFlutter;
+  const _HealthProbeResult({
+    required this.alive,
+    required this.launchedByFlutter,
+  });
+}
+
 class BackendSupervisor {
   BackendSupervisor._();
   static final BackendSupervisor instance = BackendSupervisor._();
@@ -66,6 +79,19 @@ class BackendSupervisor {
   Future<bool> probeHealth({
     Duration timeout = const Duration(seconds: 2),
   }) async {
+    final result = await probeHealthDetail(timeout: timeout);
+    return result.alive;
+  }
+
+  /// F-270 (2026-05-28): rich /healthz probe that returns the
+  /// backend's `launched_by_flutter` flag alongside liveness. The
+  /// supervisor uses this to distinguish:
+  ///   - sibling Flutter UI's backend → refuse second launch
+  ///   - stale backend (api-test, manual run, zombie) → attach
+  /// where the previous probeHealth() boolean conflated both.
+  Future<_HealthProbeResult> probeHealthDetail({
+    Duration timeout = const Duration(seconds: 2),
+  }) async {
     final dio = Dio(BaseOptions(
       baseUrl: _baseUrl,
       connectTimeout: timeout,
@@ -74,9 +100,20 @@ class BackendSupervisor {
     ));
     try {
       final r = await dio.get<dynamic>('/healthz');
-      return r.statusCode == 200;
+      if (r.statusCode != 200) {
+        return const _HealthProbeResult(alive: false, launchedByFlutter: false);
+      }
+      // Old backends (pre-F-270) won't have `launched_by_flutter` in
+      // the response. Treat missing field as `false` — the supervisor
+      // then attaches (the safer default for ambiguous probes).
+      final body = r.data;
+      bool launched = false;
+      if (body is Map && body.containsKey('launched_by_flutter')) {
+        launched = body['launched_by_flutter'] == true;
+      }
+      return _HealthProbeResult(alive: true, launchedByFlutter: launched);
     } catch (_) {
-      return false;
+      return const _HealthProbeResult(alive: false, launchedByFlutter: false);
     } finally {
       dio.close(force: true);
     }
@@ -146,22 +183,32 @@ class BackendSupervisor {
     _log('ensureRunning() start. Flutter exe: ${Platform.resolvedExecutable}');
     _log('CWD: ${Directory.current.path}');
 
-    if (await _probeHealth()) {
-      // #176: an already-running backend almost certainly means an
-      // already-running Flutter shell owns the UI. Verified live
-      // today — the user ended up with TWO NeoEthos windows + a
-      // stale dev-bundle backend confusing every click. Refusing
-      // the second launch is the cleanest UX: the existing window
-      // stays in focus and the new shell never opens a competing
-      // viewport.
+    final initialProbe = await probeHealthDetail(
+      timeout: const Duration(milliseconds: 500),
+    );
+    if (initialProbe.alive) {
+      // F-270 (2026-05-28): differentiate sibling-UI vs stale-backend.
+      // The previous #176 logic refused EVERY second launch, but in
+      // practice an api-test orphan, a manually-started --server, or
+      // a zombie process from a hard-killed Flutter shell would hold
+      // port 7423 with NO active UI — and the new Flutter shell would
+      // exit before opening a window. Operator saw the splash, then
+      // nothing.
       //
-      // We could add a "bring existing to foreground" IPC here
-      // (Win32 SetForegroundWindow on the existing Flutter HWND)
-      // but that's polish — exiting clean already solves the
-      // confusion. Logs say why.
-      _log('Backend already responding on $_baseUrl — '
-          'another NeoEthos instance is running. This shell will exit.');
-      return false;
+      // The backend now tags its /healthz response with
+      // `launched_by_flutter`. We refuse the second launch ONLY when
+      // that flag is true (= a sibling Flutter supervisor spawned
+      // this backend, so a sibling UI is alive). When false, we
+      // attach to the existing backend and proceed — the UI opens.
+      if (initialProbe.launchedByFlutter) {
+        _log('Backend on $_baseUrl was spawned by another Flutter '
+            'supervisor — sibling UI is running. This shell will exit.');
+        return false;
+      }
+      _log('Backend on $_baseUrl is alive but NOT spawned by Flutter '
+          '(api-test orphan, manual --server, or zombie). '
+          'Attaching to it instead of exiting.');
+      return true;
     }
 
     final binary = _locateBackendBinary();
