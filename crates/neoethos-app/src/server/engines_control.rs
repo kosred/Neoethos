@@ -201,6 +201,23 @@ pub async fn discovery_start(
         config.portfolio_size = s;
     }
 
+    // F-314 fix (2026-05-29): wire env runtime overrides into the
+    // UI-driven Discovery path. Until today, only `neoethos-cli`
+    // (`main.rs:487`) called this helper; the UI route silently ran
+    // in accidental "Strict" mode with `prop_firm_gate=None`, no
+    // F-305 timeframe-aware `min_trades_per_month` scaling, and no
+    // F-277 adaptive threshold ladder — hitting the legacy walk-
+    // forward consistency gate that rejects almost every candidate.
+    // The visible symptom: every UI Discovery run produced an empty
+    // portfolio while CLI runs found strategies for the developer.
+    //
+    // Apply this AFTER the body-supplied GA knob overrides above so
+    // the operator's UI-tuned population/generations/etc. survive,
+    // and AFTER the `evaluation_symbol`/`evaluation_account_currency`
+    // overrides so the env-driven mode resolution + ladder install
+    // see the final config — not the from-yaml-defaults version.
+    config = config.with_env_runtime_overrides();
+
     let request = DiscoveryRequest {
         data_root,
         symbol: symbol.clone(),
