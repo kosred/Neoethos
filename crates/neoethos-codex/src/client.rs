@@ -19,12 +19,36 @@
 //! identifier (`gpt-5-codex` etc.); we encode the difference in
 //! `model` defaults but otherwise pass the request through.
 
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 
 use crate::auth_store::{AuthStore, StoredAuth};
 use crate::error::CodexError;
 use crate::oauth::refresh_token;
 use crate::CODEX_API_BASE;
+
+/// Process-stable installation ID sent on every `/codex/responses` request
+/// via the `x-codex-installation-id` header. The official Codex CLI
+/// generates one on first launch and persists it under `~/.codex/`; we
+/// just create one per backend process so the header is well-formed and
+/// stable across the session. We do NOT try to mimic the persistence
+/// scheme because (a) collisions with a real `~/.codex/install.json`
+/// would corrupt that file for users who also run the official CLI and
+/// (b) the server doesn't appear to enforce continuity across processes —
+/// the header is used for telemetry / per-install rate-limiting, not
+/// auth (auth is the Bearer token).
+///
+/// Format mirrors the CLI: 32 lowercase hex chars (= 16 random bytes).
+fn process_installation_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        use rand::RngCore;
+        let mut bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut bytes);
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
 
 /// One conversational turn. Matches the OpenAI shape exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,12 +227,37 @@ impl CodexClient {
             .bearer_auth(auth.access_token.expose())
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
-            // Header that the Codex CLI sets to identify itself. Keeping
-            // it here helps the backend route the request to the
-            // privileged code path even though we're not the official
-            // binary. (Empirically: without this, /codex/responses can
-            // 403 even with a valid bearer.)
+            // **2026-05-29 (F-291 Cycle 3 research)**: the official Codex
+            // CLI source (github.com/openai/codex/codex-rs/core/src/
+            // client.rs) sets three identity headers the backend
+            // appears to require for the `/codex/responses` privileged
+            // path. Without them the server returns
+            // `"The 'X' model is not supported when using Codex with a
+            // ChatGPT account."` for every model name, including the
+            // ones the user's plan *does* entitle. Adding them at the
+            // very least makes us look like a real CLI install:
+            //
+            //   - `OAI-Product-Sku: codex`  →  routes the request to
+            //     the privileged Codex path (vs. plain ChatGPT chat).
+            //   - `x-codex-installation-id: <32-hex>` →  per-install
+            //     telemetry / rate-limiting key. We generate a random
+            //     stable-per-process ID since we have no `~/.codex/
+            //     install.json` to read.
+            //   - `OpenAI-Beta: responses=v1` →  enables the synchronous
+            //     Responses-API path (the WS path uses a different
+            //     beta value `responses_websockets=2026-02-06`).
+            //
+            // KNOWN LIMITATION: even with all three set, the server may
+            // still 400 on every model name if the operator's ChatGPT
+            // plan doesn't include Codex entitlement (Plus has limited
+            // Codex; Pro/Team/Enterprise have more). In that case the
+            // friendly-error fallback below is the best UX we can give —
+            // the next remediation step would be to switch to
+            // `api.openai.com/v1/chat/completions` with a user-provided
+            // API key, which breaks the "no API key needed" promise.
             .header("OpenAI-Beta", "responses=v1")
+            .header("OAI-Product-Sku", "codex")
+            .header("x-codex-installation-id", process_installation_id())
             // **2026-05-26 fix (Κωνσταντίνος)**: Cloudflare at chatgpt.com
             // returns 403 with anti-bot challenge HTML when the User-Agent
             // looks like a non-browser HTTP client (e.g. reqwest's default).
@@ -237,6 +286,14 @@ impl CodexClient {
             // replace with a short operator-friendly message. Raw HTML
             // in the error string was making the AI-Helper screen show
             // a 16 KB unreadable blob; now it shows one actionable line.
+            //
+            // **2026-05-29 (F-291)**: also intercept the per-account
+            // model-not-supported 400 ("The 'X' model is not supported
+            // when using Codex with a ChatGPT account.") and replace
+            // with an actionable line that names the user-facing
+            // remediation (plan upgrade / model picker / API key
+            // fallback). Without this, the AI Helper just shows the
+            // raw 400 body which doesn't tell the operator what to do.
             let body_lower = text.to_lowercase();
             let friendly = if status.as_u16() == 403
                 && (body_lower.contains("cf_chl")
@@ -248,6 +305,20 @@ impl CodexClient {
                  ChatGPT web app from this machine first to refresh the \
                  anti-bot cookie."
                     .to_string()
+            } else if status.as_u16() == 400
+                && body_lower.contains("not supported when using codex")
+            {
+                format!(
+                    "Your ChatGPT plan does not entitle '{model}' via the \
+                     Codex API. Codex access is currently limited to \
+                     ChatGPT Pro / Team / Enterprise plans (Plus has \
+                     restricted access). Either upgrade the plan, sign \
+                     in with a different account that has Codex \
+                     entitlement, or set an OpenAI API key in Settings \
+                     to fall back to the public chat-completions \
+                     endpoint.",
+                    model = request.model,
+                )
             } else {
                 text
             };
@@ -431,11 +502,33 @@ mod tests {
     fn serializes_without_optional_nulls() {
         let req = ChatCompletionRequest::simple("hi");
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"model\":\"gpt-5-codex\""));
+        // **2026-05-29 fix (F-291)**: was previously asserting
+        // `"model":"gpt-5-codex"` — wrong since the 2026-05-26 switch
+        // to `gpt-5` per the per-account-rejection investigation
+        // (`gpt-5-codex` is rejected with the per-account error,
+        // `gpt-5` is the documented ChatGPT subscription model id).
+        // The test would have silently broken on the next CI run; pin
+        // it to the actual default now so the contract is enforced.
+        assert!(json.contains("\"model\":\"gpt-5\""));
         assert!(json.contains("\"messages\""));
         // Skipped if None — these should NOT appear in the body.
         assert!(!json.contains("max_tokens"));
         assert!(!json.contains("temperature"));
+    }
+
+    #[test]
+    fn process_installation_id_is_stable_and_hex() {
+        // The header must round-trip the CLI's 32-hex shape; if it isn't,
+        // the server may reject the request as malformed before even
+        // reaching the model-entitlement check.
+        let a = process_installation_id();
+        let b = process_installation_id();
+        assert_eq!(a, b, "installation id must be process-stable");
+        assert_eq!(a.len(), 32, "installation id must be 32 hex chars");
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "installation id must be lowercase hex only: {a}"
+        );
     }
 
     #[test]
