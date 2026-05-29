@@ -391,10 +391,31 @@ class BackendSupervisor {
     return binary.parent;
   }
 
-  /// First-launch seed: copy the bundle's `config.yaml` into
+  /// First-launch seed AND per-launch upgrade.
+  ///
+  /// Phase A (first launch): copy the bundle's `config.yaml` into
   /// the user-data dir if it isn't there, and pre-create the
   /// `data/`, `models/`, `logs/` subdirs the backend expects to
-  /// be writable. Subsequent launches are a no-op.
+  /// be writable.
+  ///
+  /// Phase B (every subsequent launch): additive-merge any
+  /// **new scalar fields** from the bundle template into the
+  /// user's config. This is the "schema upgrade" path that closes
+  /// task #310 — without it, a bundle that ships a new field
+  /// (e.g. F-304's `system.account_currency`) NEVER reaches the
+  /// running backend because the original seed-once logic kept
+  /// the stale user copy forever, and the backend bailed at
+  /// `discovery.rs:1666` with `evaluation_account_currency is
+  /// empty` even though the bundle had the field. We preserve
+  /// every value the user has customised; the merge only ADDS
+  /// keys the user doesn't already have.
+  ///
+  /// Limited to **scalar fields under top-level sections**
+  /// (lines matching `^  name: value`). Nested objects, lists
+  /// re-ordered between bundle / user, and structurally-changed
+  /// keys are out of scope — those require a manual migration.
+  /// In practice every field added since v0.4.20 has been a
+  /// scalar, so the heuristic covers the realistic upgrade path.
   void _seedUserDataDir(Directory userDataDir, Directory bundleDir) {
     if (!userDataDir.existsSync()) {
       userDataDir.createSync(recursive: true);
@@ -409,10 +430,208 @@ class BackendSupervisor {
         '${userDataDir.path}${Platform.pathSeparator}config.yaml');
     final bundleConfig = File(
         '${bundleDir.path}${Platform.pathSeparator}config.yaml');
+    // Phase A: first-launch seed.
     if (!userConfig.existsSync() && bundleConfig.existsSync()) {
       userConfig.writeAsStringSync(bundleConfig.readAsStringSync());
       _log('Seeded ${userConfig.path} from bundle template.');
+      return;
     }
+    // Phase B: per-launch schema upgrade.
+    if (!userConfig.existsSync() || !bundleConfig.existsSync()) return;
+    try {
+      final userYaml = userConfig.readAsStringSync();
+      final bundleYaml = bundleConfig.readAsStringSync();
+      final upgraded = _mergeMissingScalarFields(
+        userYaml: userYaml,
+        bundleYaml: bundleYaml,
+      );
+      // Always log the merger decision so we can tell the difference
+      // between "nothing to add" and "merger never ran" in supervisor.log.
+      // Costs one line per launch — cheap compared to the upgrade flush.
+      _log('Schema-upgrade check: user=${userYaml.length}b bundle='
+          '${bundleYaml.length}b → ${upgraded == null
+              ? "no missing fields"
+              : "${upgraded.added.length} missing"}');
+      if (upgraded != null) {
+        // Write a one-time backup before mutating — paranoia about
+        // a parser bug clobbering user customisations. Timestamped
+        // so multiple upgrade runs don't overwrite each other.
+        final stamp = DateTime.now().toIso8601String().replaceAll(':', '-');
+        final backup = File('${userConfig.path}.bak.$stamp');
+        backup.writeAsStringSync(userConfig.readAsStringSync());
+        userConfig.writeAsStringSync(upgraded.yaml);
+        _log('Schema-upgraded ${userConfig.path} '
+            '(added ${upgraded.added.length} field${upgraded.added.length == 1 ? '' : 's'}: '
+            '${upgraded.added.join(', ')}). '
+            'Backup at ${backup.path}.');
+      }
+    } catch (e, st) {
+      // Merger blew up — log but don't block startup. The user's
+      // existing config is intact and the backend still loads it;
+      // a future fix to the merger can re-run safely.
+      _log('Schema-upgrade merge failed (continuing with existing '
+          'user config): $e\n$st');
+    }
+  }
+
+  /// Additive merge: walks the bundle YAML, finds scalar fields under
+  /// top-level sections that the user YAML doesn't already declare,
+  /// appends them at the end of the matching section in the user file.
+  /// Returns null if no fields are missing (no write needed).
+  ///
+  /// Public to make the unit tests in `test/backend_supervisor_test.dart`
+  /// straightforward — pure-function semantics, no I/O.
+  static _MergeResult? _mergeMissingScalarFields({
+    required String userYaml,
+    required String bundleYaml,
+  }) {
+    final userSections = _scalarFieldsBySection(userYaml);
+    final bundleSections = _scalarFieldsBySection(bundleYaml);
+
+    // Collect (section, key, value-block) triples for fields the
+    // user is missing. A value-block is the bundle's full line(s)
+    // for that key including any preceding contiguous comment lines —
+    // that way doc comments travel with the field.
+    final missing = <String, List<_MissingField>>{};
+    bundleSections.forEach((section, bundleKeys) {
+      final userKeys = userSections[section] ?? const <String, _Field>{};
+      bundleKeys.forEach((key, bundleField) {
+        if (!userKeys.containsKey(key)) {
+          missing.putIfAbsent(section, () => []).add(
+                _MissingField(
+                  key: key,
+                  block: bundleField.lines.join('\n'),
+                ),
+              );
+        }
+      });
+    });
+
+    if (missing.isEmpty) return null;
+
+    // Walk the user YAML, find the end of each section in `missing`,
+    // and splice in the new fields. End of section = the line BEFORE
+    // the next top-level line (or EOF).
+    final lines = userYaml.split('\n');
+    final patched = StringBuffer();
+    String? currentSection;
+    var i = 0;
+    final addedKeys = <String>[];
+    while (i < lines.length) {
+      final line = lines[i];
+      final nextTopLevel = _topLevelKey(line);
+      if (nextTopLevel != null && nextTopLevel != currentSection) {
+        // Before transitioning, flush missing fields for the section
+        // we're leaving (if any).
+        if (currentSection != null && missing.containsKey(currentSection)) {
+          for (final f in missing[currentSection]!) {
+            patched.write(f.block);
+            patched.write('\n');
+            addedKeys.add('$currentSection.${f.key}');
+          }
+          missing.remove(currentSection);
+        }
+        currentSection = nextTopLevel;
+      }
+      patched.write(line);
+      patched.write('\n');
+      i++;
+    }
+    // EOF flush for the last section.
+    if (currentSection != null && missing.containsKey(currentSection)) {
+      for (final f in missing[currentSection]!) {
+        patched.write(f.block);
+        patched.write('\n');
+        addedKeys.add('$currentSection.${f.key}');
+      }
+      missing.remove(currentSection);
+    }
+    // Top-level sections that exist in bundle but NOT in user are
+    // appended verbatim at EOF. (Unusual — usually means a brand-new
+    // subsystem was added in this release.)
+    if (missing.isNotEmpty) {
+      missing.forEach((section, fields) {
+        patched.write('\n$section:\n');
+        for (final f in fields) {
+          patched.write(f.block);
+          patched.write('\n');
+          addedKeys.add('$section.${f.key}');
+        }
+      });
+    }
+
+    // Drop the trailing newline we added at the very end if the
+    // original file didn't end with one.
+    var result = patched.toString();
+    if (!userYaml.endsWith('\n') && result.endsWith('\n')) {
+      result = result.substring(0, result.length - 1);
+    }
+    return _MergeResult(yaml: result, added: addedKeys);
+  }
+
+  /// Parse `yaml` into a map of `section name -> {scalar key -> field}`.
+  /// "Scalar" = a `name: value` line where `value` is non-empty and is
+  /// NOT the start of a nested block (i.e. doesn't end with `:` alone,
+  /// doesn't begin with a list/object literal continuation). Nested
+  /// objects, lists, and multi-line strings are intentionally skipped
+  /// — see the heuristic notes on `_mergeMissingScalarFields`.
+  static Map<String, Map<String, _Field>> _scalarFieldsBySection(
+    String yaml,
+  ) {
+    final out = <String, Map<String, _Field>>{};
+    final lines = yaml.split('\n');
+    String? section;
+    var pendingComments = <String>[];
+    for (var i = 0; i < lines.length; i++) {
+      // Strip trailing \r so a CRLF file split by \n doesn't carry the
+      // \r into the line content (where it breaks `$` in our regex).
+      final raw = lines[i];
+      final line = raw.endsWith('\r') ? raw.substring(0, raw.length - 1) : raw;
+      final topLevel = _topLevelKey(line);
+      if (topLevel != null) {
+        section = topLevel;
+        out.putIfAbsent(section, () => <String, _Field>{});
+        pendingComments = <String>[];
+        continue;
+      }
+      if (section == null) {
+        pendingComments = <String>[];
+        continue;
+      }
+      // Comment line: queue it; might prefix a scalar.
+      if (line.trimLeft().startsWith('#')) {
+        pendingComments.add(line);
+        continue;
+      }
+      // Blank line breaks a comment block.
+      if (line.trim().isEmpty) {
+        pendingComments = <String>[];
+        continue;
+      }
+      // Match `  name: value` — 2+ space indent (sub-key of section),
+      // a key, colon, and a non-empty trailing value (anything after
+      // `: ` that isn't just whitespace).
+      final m = RegExp(r'^(\s+)([A-Za-z_][\w]*):\s+(\S.*)$').firstMatch(line);
+      if (m == null) {
+        // Sub-key with no inline value (start of nested object/list)
+        // or a deeper-indent continuation — skip and reset comments.
+        pendingComments = <String>[];
+        continue;
+      }
+      final key = m.group(2)!;
+      final fullBlock = <String>[...pendingComments, line];
+      out[section]![key] = _Field(lines: fullBlock);
+      pendingComments = <String>[];
+    }
+    return out;
+  }
+
+  /// Returns the section name if [line] is a top-level YAML key
+  /// (no leading whitespace, ends with `:` and either nothing else
+  /// or a `# comment`). Null otherwise.
+  static String? _topLevelKey(String line) {
+    final m = RegExp(r'^([A-Za-z_][\w]*):\s*(?:#.*)?$').firstMatch(line);
+    return m?.group(1);
   }
 
   // ─── Diagnostic file logging ─────────────────────────────────────────
@@ -456,4 +675,27 @@ class BackendSupervisor {
     // Also write to stderr; harmless when the parent is GUI subsystem.
     stderr.write(line);
   }
+}
+
+/// A scalar field captured by `_scalarFieldsBySection` — the
+/// rendered lines (key + any preceding contiguous comment block)
+/// that get re-emitted verbatim when merging into the user file.
+class _Field {
+  final List<String> lines;
+  const _Field({required this.lines});
+}
+
+/// One missing-from-user field the merger plans to splice in.
+class _MissingField {
+  final String key;
+  final String block;
+  const _MissingField({required this.key, required this.block});
+}
+
+/// Result of `_mergeMissingScalarFields` — the patched YAML plus the
+/// list of `section.key` identifiers actually added, for logging.
+class _MergeResult {
+  final String yaml;
+  final List<String> added;
+  const _MergeResult({required this.yaml, required this.added});
 }
