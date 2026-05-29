@@ -496,7 +496,12 @@ class BackendSupervisor {
     bundleSections.forEach((section, bundleKeys) {
       final userKeys = userSections[section] ?? const <String, _Field>{};
       bundleKeys.forEach((key, bundleField) {
-        if (!userKeys.containsKey(key)) {
+        // Only fill missing INLINE-scalar fields. Block-format keys
+        // (a `name:` header with nested content on following lines)
+        // cannot be safely spliced because the parser doesn't capture
+        // their indented body — emitting just the header would corrupt
+        // YAML. New block-format subsystems require a manual migration.
+        if (!userKeys.containsKey(key) && bundleField.hasInlineValue) {
           missing.putIfAbsent(section, () => []).add(
                 _MissingField(
                   key: key,
@@ -582,6 +587,19 @@ class BackendSupervisor {
     final lines = yaml.split('\n');
     String? section;
     var pendingComments = <String>[];
+    // Heuristic: `^(\s+)(name):` matches ANY indented sub-key including
+    // block-format keys with no inline value (e.g. `  symbols:` on its
+    // own line followed by `  - EURUSD` list items). We track the
+    // existence of the key under the section regardless of format —
+    // the merger only cares "does the user have this key", not the
+    // exact shape of its value. The inline-vs-block distinction is
+    // recorded separately via [_Field.hasInlineValue] so the splice
+    // logic re-emits the bundle's verbatim block (comments + value)
+    // when ADDING a missing key, but never duplicates a block-format
+    // user key with an inline-format bundle key (root cause of the
+    // first F-310 attempt's "duplicate `symbols:` lines crashed YAML
+    // parse" regression).
+    final keyRe = RegExp(r'^(\s+)([A-Za-z_][\w]*):(\s+\S.*)?$');
     for (var i = 0; i < lines.length; i++) {
       // Strip trailing \r so a CRLF file split by \n doesn't carry the
       // \r into the line content (where it breaks `$` in our regex).
@@ -608,19 +626,26 @@ class BackendSupervisor {
         pendingComments = <String>[];
         continue;
       }
-      // Match `  name: value` — 2+ space indent (sub-key of section),
-      // a key, colon, and a non-empty trailing value (anything after
-      // `: ` that isn't just whitespace).
-      final m = RegExp(r'^(\s+)([A-Za-z_][\w]*):\s+(\S.*)$').firstMatch(line);
+      final m = keyRe.firstMatch(line);
       if (m == null) {
-        // Sub-key with no inline value (start of nested object/list)
-        // or a deeper-indent continuation — skip and reset comments.
+        // Deeper-indent continuation (e.g. `  - M1` list item under a
+        // block-format key) or unrecognised structure — skip and
+        // reset comments.
         pendingComments = <String>[];
         continue;
       }
       final key = m.group(2)!;
+      final hasInlineValue = m.group(3) != null;
       final fullBlock = <String>[...pendingComments, line];
-      out[section]![key] = _Field(lines: fullBlock);
+      // Only RECORD the inline-form block as the field's value — if the
+      // user has a block-form version, we still want to know the key
+      // exists so the merger doesn't add a duplicate. The lines payload
+      // is only used when EMITTING a missing key (which comes from the
+      // bundle side); for "present" detection we just need the key map.
+      out[section]![key] = _Field(
+        lines: hasInlineValue ? fullBlock : <String>[line],
+        hasInlineValue: hasInlineValue,
+      );
       pendingComments = <String>[];
     }
     return out;
@@ -680,9 +705,17 @@ class BackendSupervisor {
 /// A scalar field captured by `_scalarFieldsBySection` — the
 /// rendered lines (key + any preceding contiguous comment block)
 /// that get re-emitted verbatim when merging into the user file.
+///
+/// [hasInlineValue] distinguishes `name: value` (inline scalar) from
+/// `name:` (block-format header for a nested object/list). Both shapes
+/// register the key under the section so the merger doesn't ADD a
+/// duplicate, but only the inline shape's `lines` are emittable — the
+/// merger uses bundle-side `lines` when filling a missing key, never
+/// the user's.
 class _Field {
   final List<String> lines;
-  const _Field({required this.lines});
+  final bool hasInlineValue;
+  const _Field({required this.lines, required this.hasInlineValue});
 }
 
 /// One missing-from-user field the merger plans to splice in.
