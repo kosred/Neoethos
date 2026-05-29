@@ -622,6 +622,37 @@ class BackendClient {
     return response.data ?? const <String, dynamic>{};
   }
 
+  /// POST `/settings/raw` (F-312, 2026-05-29) — write the entire
+  /// `config.yaml` verbatim. Closes the silent-drop hole where the
+  /// typed `POST /settings` DTO only allowed 5 of the 200+ fields
+  /// through. The backend validates the YAML against the `Settings`
+  /// struct before writing, so a typo'd field surfaces here as a 400
+  /// instead of waiting until the next discovery start.
+  ///
+  /// Returns the backend's structured success payload:
+  ///   `{ok: true, path: "<abs>", backupPath: "<abs>", bytesWritten: N}`.
+  /// On 400 (YAML/schema error), the response body carries
+  /// `{error: "...", code: "yaml_parse_failed" | "yaml_schema_failed",
+  ///  hint: "..."}` — surface verbatim to the operator so they can
+  /// fix the typo without a guessing game.
+  Future<Map<String, dynamic>> saveRawConfigYaml(String yaml) async {
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/settings/raw',
+      data: {'yaml': yaml},
+      // Bigger config files (~12 KB today, but room to grow) can take a
+      // moment to schema-validate. Give the backend headroom over the
+      // default 10 s receive timeout — 30 s covers worst-case fully-
+      // populated configs without making a snappy save feel slow.
+      options: Options(
+        receiveTimeout: const Duration(seconds: 30),
+        // Surface 4xx (validation errors) as Response, not exception,
+        // so the UI can render the structured error body inline.
+        validateStatus: (code) => code != null && code < 500,
+      ),
+    );
+    return response.data ?? const <String, dynamic>{};
+  }
+
   /// POST `/data/import` (#192) — convert a local CSV/Parquet/Arrow/
   /// JSON/JSONL/TSV file into the canonical Vortex layout under
   /// `data/symbol=<sym>/timeframe=<tf>/`. The source format is auto-

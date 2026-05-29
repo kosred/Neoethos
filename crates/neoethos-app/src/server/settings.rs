@@ -112,6 +112,171 @@ pub async fn settings_raw_yaml(State(_state): State<AppApiState>) -> Response {
     }
 }
 
+/// Payload for `POST /settings/raw` — F-312, 2026-05-29.
+#[derive(Debug, serde::Deserialize)]
+pub struct RawYamlUpdate {
+    /// Verbatim new contents of `config.yaml`. Must parse as a YAML
+    /// mapping (the top-level structure expected by `Settings`).
+    pub yaml: String,
+}
+
+/// `POST /settings/raw` — write the entire `config.yaml` verbatim.
+///
+/// Closes the F-312 silent-drop hole: the typed `POST /settings`
+/// (`SettingsUpdateDto`) only knows about 5 fields out of 200+.
+/// Operators editing GA / risk / model knobs via the Advanced Settings
+/// raw-YAML editor previously saw "Saved." but their edits were
+/// silently filtered out by the DTO's strict deserialization.
+///
+/// This endpoint:
+///   1. Parses the submitted body as `serde_yaml_ng::Value` to confirm it
+///      is well-formed and a top-level mapping (the shape `Settings`
+///      expects). Reject 400 on parse failure with the parser's own
+///      error message — much friendlier than letting `Settings` blow
+///      up on the next discovery start.
+///   2. Re-parses as `Settings` to enforce the typed schema (catches
+///      missing required fields, type mismatches). Reject 400 on
+///      schema failure with the typed-deserialize error.
+///   3. Writes a timestamped backup of the current file alongside it
+///      (`config.yaml.bak.<unix-ms>`). Pull-to-restore is then a
+///      manual `Copy-Item` away — cheap insurance against a Save
+///      button click that the operator regrets.
+///   4. Writes the new YAML to the canonical config path atomically
+///      (via `write_to_temp + rename`).
+///
+/// Returns `{ok: true, path: "...", backupPath: "..."}` on success.
+pub async fn update_settings_raw_yaml(
+    State(_state): State<AppApiState>,
+    Json(payload): Json<RawYamlUpdate>,
+) -> Response {
+    // (1) YAML well-formedness check.
+    let parsed_value: serde_yaml_ng::Value = match serde_yaml_ng::from_str(&payload.yaml) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("YAML parse error: {err}"),
+                    "code": "yaml_parse_failed",
+                })),
+            )
+                .into_response();
+        }
+    };
+    if !matches!(parsed_value, serde_yaml_ng::Value::Mapping(_)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "config.yaml must be a top-level YAML mapping \
+                          (sections like `system:`, `risk:`, `models:` etc.)",
+                "code": "yaml_not_a_mapping",
+            })),
+        )
+            .into_response();
+    }
+
+    // (2) Typed schema check. This catches fat-finger field renames
+    // before they reach the GA engine. Use the same deserializer that
+    // `Settings::from_yaml` uses internally.
+    if let Err(err) = serde_yaml_ng::from_str::<neoethos_core::Settings>(&payload.yaml) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Schema error — your YAML parses but \
+                                  doesn't match the Settings struct: {err}"),
+                "code": "yaml_schema_failed",
+                "hint": "Common causes: typo in a field name, wrong type \
+                         (e.g. string where the schema expects a number), \
+                         missing required section.",
+            })),
+        )
+            .into_response();
+    }
+
+    // (3) Backup the existing file. We accept a missing source (e.g.
+    // first save before any seed wrote) but log it so the operator
+    // sees something happened.
+    let path = config_path();
+    let backup_path = match write_backup(&path) {
+        Ok(Some(p)) => Some(p),
+        Ok(None) => None,
+        Err(err) => {
+            // Don't block the write on backup failure — log + continue.
+            tracing::warn!(
+                target: "neoethos_app::server::settings",
+                error = %err,
+                "failed to write config.yaml backup before raw save \
+                 (continuing with the write)"
+            );
+            None
+        }
+    };
+
+    // (4) Atomic write via temp file + rename so a crash mid-write
+    // can't truncate the live config.
+    if let Err(err) = write_atomic(&path, &payload.yaml) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("failed to persist config.yaml: {err}"),
+                "code": "config_save_failed",
+            })),
+        )
+            .into_response();
+    }
+
+    tracing::info!(
+        target: "neoethos_app::server::settings",
+        path = %path.display(),
+        bytes = payload.yaml.len(),
+        "config.yaml updated via POST /settings/raw"
+    );
+
+    Json(serde_json::json!({
+        "ok": true,
+        "path": path.display().to_string(),
+        "backupPath": backup_path.map(|p| p.display().to_string()),
+        "bytesWritten": payload.yaml.len(),
+    }))
+    .into_response()
+}
+
+/// Write `<path>.bak.<unix-ms>` from the current contents of `path`.
+/// Returns `Ok(None)` if the source file doesn't exist yet (first
+/// write — nothing to back up). Returns `Ok(Some(backup_path))` on
+/// success, `Err(...)` on actual I/O failure.
+fn write_backup(path: &std::path::Path) -> std::io::Result<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let backup = path.with_extension(format!(
+        "yaml.bak.{}",
+        stamp
+    ));
+    std::fs::copy(path, &backup)?;
+    Ok(Some(backup))
+}
+
+/// Write `contents` to `path` atomically via temp-file + rename.
+fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, contents)?;
+    // On Windows, `rename` over an existing file fails — explicitly
+    // remove the target first. The temp file stays as the
+    // crash-recovery artefact if rename then fails.
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// POST /settings — merge-update + persist to config.yaml.
 ///
 /// Validation rules:

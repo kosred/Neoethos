@@ -85,6 +85,12 @@ reqwest = { version = "0.13.3", default-features = true, features = ["blocking",
 url = "2.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"  # aligned with workspace.dependencies (2026-05-26)
+# F-312 (2026-05-29): POST /settings/raw needs to validate that the
+# operator's edited YAML parses as the typed `Settings` struct before
+# writing. Same `serde_yaml_ng` fork the core crate already uses —
+# `serde_yaml` itself is unmaintained per its README, the `_ng` fork
+# is the maintained drop-in.
+serde_yaml_ng = "0.10.0"
 # **2026-05-28 (Phase A audit)**: cTrader's JSON proxy encodes
 # protobuf enums as INTEGER discriminants (`"tradingMode": 0`), not
 # SCREAMING_SNAKE_CASE strings. We discovered this by capturing real

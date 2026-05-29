@@ -903,11 +903,19 @@ class _AdvancedKnobEditorCard extends StatelessWidget {
   }
 }
 
-/// #193: surface the raw config.yaml contents (read-only) so an
-/// operator can inspect the 200+ knobs the typed `/settings` DTO
-/// can't enumerate. The on-disk path is shown so the user knows
-/// which file to edit if they want to change something the UI
-/// doesn't yet expose as a typed control.
+/// #193: surface the raw config.yaml contents so an operator can
+/// inspect the 200+ knobs the typed `/settings` DTO can't enumerate.
+/// The on-disk path is shown so the user knows which file to edit if
+/// they want to change something the UI doesn't yet expose as a typed
+/// control.
+///
+/// F-312 (2026-05-29): previously read-only. Now editable + Save —
+/// closes the silent-drop hole where the typed knob save path
+/// dropped any edits outside its 5-field allowlist. The Save button
+/// pushes the entire YAML body to `POST /settings/raw`, which
+/// schema-validates against the `Settings` struct before writing,
+/// so a typo'd field surfaces as a 400 with an actionable error
+/// message instead of waiting until the next discovery start.
 class _AdvancedConfigCard extends ConsumerStatefulWidget {
   const _AdvancedConfigCard();
 
@@ -917,23 +925,46 @@ class _AdvancedConfigCard extends ConsumerStatefulWidget {
 }
 
 class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
-  String? _yaml;
+  /// Last value the backend confirmed on disk. Compared against
+  /// [_controller.text] to detect dirty edits.
+  String? _yamlOnDisk;
   String? _path;
   String? _error;
+  /// Structured remediation hint from the backend's 400 body — e.g.
+  /// "Common causes: typo in a field name, wrong type, missing
+  /// required section." Surfaced inline next to the error so the
+  /// operator doesn't have to dig through logs.
+  String? _errorHint;
   bool _open = false;
   bool _loading = false;
+  bool _saving = false;
+
+  /// The text-field controller backs the editable view. Initialised
+  /// lazily on first load + kept across rebuilds so the user's edits
+  /// survive a re-render (e.g. theme switch) without being clobbered.
+  final TextEditingController _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  bool get _dirty => _yamlOnDisk != null && _controller.text != _yamlOnDisk;
 
   Future<void> _load() async {
     setState(() {
       _loading = true;
       _error = null;
+      _errorHint = null;
     });
     try {
       final r = await ref.read(backendClientProvider).fetchRawConfigYaml();
       if (!mounted) return;
       setState(() {
-        _yaml = (r['yaml'] as String?) ?? '';
+        _yamlOnDisk = (r['yaml'] as String?) ?? '';
         _path = (r['path'] as String?) ?? '';
+        _controller.text = _yamlOnDisk!;
       });
     } catch (err) {
       if (mounted) setState(() => _error = err.toString());
@@ -942,19 +973,98 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
     }
   }
 
+  Future<void> _save() async {
+    if (_yamlOnDisk == null || !_dirty) return;
+    setState(() {
+      _saving = true;
+      _error = null;
+      _errorHint = null;
+    });
+    try {
+      final r = await ref
+          .read(backendClientProvider)
+          .saveRawConfigYaml(_controller.text);
+      if (!mounted) return;
+      // Backend returns `{ok: true, ...}` on success or
+      // `{error: "...", code: "...", hint: "..."}` on validation
+      // failure (4xx still flows through `validateStatus < 500`).
+      if (r['ok'] == true) {
+        setState(() {
+          _yamlOnDisk = _controller.text;
+          _error = null;
+          _errorHint = null;
+        });
+        if (mounted) {
+          final bytes = (r['bytesWritten'] as num?)?.toInt() ?? 0;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                'config.yaml saved ($bytes bytes). '
+                '${r['backupPath'] != null ? "Backup at ${r['backupPath']}" : ""}',
+              ),
+              duration: const Duration(seconds: 4),
+            ),
+          );
+        }
+      } else {
+        setState(() {
+          _error = (r['error'] as String?) ?? 'unknown error';
+          _errorHint = r['hint'] as String?;
+        });
+      }
+    } catch (err) {
+      if (mounted) setState(() => _error = err.toString());
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  void _revert() {
+    if (_yamlOnDisk == null) return;
+    setState(() {
+      _controller.text = _yamlOnDisk!;
+      _error = null;
+      _errorHint = null;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: ExpansionTile(
-        title: const Text(
-          'Advanced: full config.yaml (read-only)',
-          style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+        title: Row(
+          children: [
+            const Text(
+              'Advanced: full config.yaml',
+              style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+            ),
+            if (_dirty) ...[
+              const SizedBox(width: 8),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE65100),
+                  borderRadius: BorderRadius.circular(3),
+                ),
+                child: const Text(
+                  'UNSAVED',
+                  style: TextStyle(
+                    fontSize: 9,
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ],
         ),
         subtitle: Text(
           _path == null
-              ? 'Expand to view every config knob. The on-disk path is shown so '
-                  'you can edit fields the UI doesn\'t yet expose.'
+              ? 'Expand to edit every config knob. Save validates against '
+                  'the typed Settings schema before writing — a typo here '
+                  'surfaces as an error, not a silent failure later.'
               : 'Source: $_path',
           style: const TextStyle(
             fontSize: 11,
@@ -964,7 +1074,7 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
         initiallyExpanded: _open,
         onExpansionChanged: (v) {
           setState(() => _open = v);
-          if (v && _yaml == null && !_loading) _load();
+          if (v && _yamlOnDisk == null && !_loading) _load();
         },
         children: [
           Padding(
@@ -972,10 +1082,11 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                // ── Action bar: Reload + Save + Revert ─────────────
                 Row(
                   children: [
                     OutlinedButton.icon(
-                      onPressed: _loading ? null : _load,
+                      onPressed: (_loading || _saving) ? null : _load,
                       icon: _loading
                           ? const SizedBox(
                               width: 14,
@@ -984,35 +1095,106 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
                                   strokeWidth: 2),
                             )
                           : const Icon(Icons.refresh, size: 16),
-                      label: const Text('Reload'),
+                      label: const Text('Reload from disk'),
                     ),
+                    const SizedBox(width: 8),
+                    FilledButton.icon(
+                      onPressed:
+                          (_saving || !_dirty || _yamlOnDisk == null)
+                              ? null
+                              : _save,
+                      icon: _saving
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Icon(Icons.save, size: 16),
+                      label: const Text('Save changes'),
+                    ),
+                    const SizedBox(width: 8),
+                    if (_dirty)
+                      OutlinedButton.icon(
+                        onPressed: _saving ? null : _revert,
+                        icon: const Icon(Icons.undo, size: 16),
+                        label: const Text('Revert'),
+                      ),
                   ],
                 ),
                 const SizedBox(height: 8),
-                if (_error != null)
-                  Text(
-                    _error!,
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: ForexAiTokens.sell,
-                    ),
-                  )
-                else if (_yaml != null)
+                // ── Inline error block (validation failures land here) ──
+                if (_error != null) ...[
                   Container(
                     width: double.infinity,
                     padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
-                      color: ForexAiTokens.surfaceBg,
-                      border: Border.all(color: ForexAiTokens.border),
+                      color: const Color(0x33B71C1C),
+                      border: Border.all(color: const Color(0xFFB71C1C)),
                       borderRadius: BorderRadius.circular(4),
                     ),
-                    child: SelectableText(
-                      _yaml!,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          _error!,
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: ForexAiTokens.sell,
+                          ),
+                        ),
+                        if (_errorHint != null) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            _errorHint!,
+                            style: const TextStyle(
+                              fontSize: 10,
+                              fontStyle: FontStyle.italic,
+                              color: ForexAiTokens.textMuted,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                ],
+                // ── The YAML editor itself ─────────────────────────
+                if (_yamlOnDisk != null)
+                  Container(
+                    width: double.infinity,
+                    decoration: BoxDecoration(
+                      color: ForexAiTokens.surfaceBg,
+                      border: Border.all(
+                        color: _dirty
+                            ? const Color(0xFFE65100)
+                            : ForexAiTokens.border,
+                      ),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: TextField(
+                      controller: _controller,
+                      minLines: 18,
+                      maxLines: 40,
                       style: const TextStyle(
                         fontFamily: 'monospace',
                         fontSize: 11,
                         color: ForexAiTokens.textPrimary,
                       ),
+                      decoration: const InputDecoration(
+                        border: InputBorder.none,
+                        contentPadding: EdgeInsets.all(10),
+                        isCollapsed: true,
+                      ),
+                      onChanged: (_) {
+                        // Force a rebuild so the UNSAVED badge + Save/
+                        // Revert button enablement reflect the dirty
+                        // state on every keystroke. TextField itself
+                        // doesn't trigger setState for content changes.
+                        setState(() {});
+                      },
                     ),
                   )
                 else if (_loading)

@@ -97,7 +97,15 @@ pub fn router(state: AppApiState) -> Router {
         )
         // #193: raw config.yaml for the Flutter Settings "Advanced"
         // panel that surfaces knobs the typed /settings DTO can't list.
-        .route("/settings/raw", get(settings::settings_raw_yaml))
+        //
+        // F-312 (2026-05-29): POST handler on the same route writes the
+        // whole YAML verbatim, closing the silent-drop hole where the
+        // typed `POST /settings` DTO dropped edits to any of the 200+
+        // fields outside its 5-field allowlist.
+        .route(
+            "/settings/raw",
+            get(settings::settings_raw_yaml).post(settings::update_settings_raw_yaml),
+        )
         // **2026-05-25 — operator-approved**: the Flutter "Advanced
         // Settings" screen consumes this catalog to render every
         // runtime knob with help text + presets. Catalog is the
