@@ -25,6 +25,7 @@ class Position {
   final String symbol;
   final String side;
   final double volume;
+
   /// Position open time as Unix milliseconds (UTC). Convert with
   /// `DateTime.fromMillisecondsSinceEpoch(openTimestampMs!)` for
   /// the local-time "since HH:MM" badge in the position row.
@@ -61,6 +62,7 @@ class AccountSnapshot {
   final double freeMargin;
   final double usedMargin;
   final String currency;
+
   /// Unix-ms (UTC) when the snapshot was assembled server-side.
   /// Use `DateTime.fromMillisecondsSinceEpoch(fetchedAtUnixMs!)`
   /// for the local-time freshness badge on the Dashboard. Null
@@ -262,8 +264,7 @@ class BackendClient {
   /// mapping of knob id → value that the operator can apply with
   /// one click.
   Future<KnobPresetCatalog> fetchKnobPresets() async {
-    final response =
-        await _dio.get<Map<String, dynamic>>('/settings/presets');
+    final response = await _dio.get<Map<String, dynamic>>('/settings/presets');
     if (response.statusCode != 200 || response.data == null) {
       throw DioException(
         requestOptions: response.requestOptions,
@@ -350,9 +351,19 @@ class BackendClient {
   /// engine uses defaults from `config.yaml`. Passing any non-null
   /// value here lets the operator tune that knob from the Advanced
   /// expander without editing YAML.
+  ///
+  /// #264 (2026-05-29): [higherTfs] threads the multi-TF UI chip
+  /// selection through to the backend's `StartJobBody.higher_tfs`
+  /// (`engines_control.rs:48`). When `null` or empty, the server
+  /// uses `DEFAULT_HIGHER_TFS = ["M5", "M15", "H1"]`. Passing
+  /// e.g. `["M15", "H1", "H4"]` overrides only the higher-TF context
+  /// for this run; everything else (symbol/base_tf/GA knobs) is
+  /// unaffected. The list is sent as a JSON array of canonical
+  /// timeframe labels; the server uppercases + trims defensively.
   Future<Map<String, dynamic>> startDiscovery({
     String? symbol,
     String? baseTf,
+    List<String>? higherTfs,
     int? population,
     int? generations,
     int? maxIndicators,
@@ -362,6 +373,19 @@ class BackendClient {
     final body = <String, dynamic>{};
     if (symbol != null && symbol.trim().isNotEmpty) body['symbol'] = symbol;
     if (baseTf != null && baseTf.trim().isNotEmpty) body['base_tf'] = baseTf;
+    if (higherTfs != null && higherTfs.isNotEmpty) {
+      // De-dup + trim before sending so the server doesn't have to.
+      // Skip the body field entirely when the cleaned set is empty so
+      // the backend falls back to DEFAULT_HIGHER_TFS instead of
+      // receiving an empty array (which it would also fall back on,
+      // but the cleaner wire is easier to reason about in logs).
+      final cleaned = higherTfs
+          .map((tf) => tf.trim())
+          .where((tf) => tf.isNotEmpty)
+          .toSet()
+          .toList(growable: false);
+      if (cleaned.isNotEmpty) body['higher_tfs'] = cleaned;
+    }
     if (population != null) body['population'] = population;
     if (generations != null) body['generations'] = generations;
     if (maxIndicators != null) body['max_indicators'] = maxIndicators;
@@ -550,9 +574,7 @@ class BackendClient {
       '/broker/timeframes',
     );
     final raw = response.data?['timeframes'] as List?;
-    return (raw ?? const [])
-        .map((e) => e as String)
-        .toList(growable: false);
+    return (raw ?? const []).map((e) => e as String).toList(growable: false);
   }
 
   /// `/broker/symbols` — full broker symbol catalog (not hardcoded).
@@ -894,12 +916,14 @@ class RiskSnapshot {
   final double totalDrawdownLimit;
   final double maxLotSize;
   final bool requireStopLoss;
+
   /// Active prop-firm preset (snake_case id, e.g. `ftmo`, `none`).
   /// Empty string when the backend pre-dates the preset registry —
   /// the UI treats that as "ftmo" for back-compat display.
   final String preset;
   final String presetDisplayName;
   final List<PropFirmPresetSummary> availablePresets;
+
   /// Whether the prop-firm gate is armed (false when preset == none).
   final bool propFirmRulesEnabled;
 
@@ -982,6 +1006,7 @@ class SettingsSnapshot {
   final bool newsCalendarEnabled;
   final String newsCalendarSource;
   final String openaiModel;
+
   /// Snake_case news-trading mode id from
   /// `crate::config::NewsTradingMode`. Empty when the backend
   /// predates the field — the UI treats that as `block_on_news`
@@ -1123,15 +1148,14 @@ class BrokerSymbolsSnapshot {
   /// likely indices, equities, or other CFDs on a retail broker catalog.
   /// Defined by exclusion so we don't have to enumerate every ticker.
   List<BrokerSymbol> get equitiesAndIndicesEnabled {
-        final forexNames =
-            forexLikeEnabled.map((x) => x.symbolName).toSet();
-        final metalNames = metalsEnabled.map((x) => x.symbolName).toSet();
-        return symbols.where((s) {
-          if (!s.enabled) return false;
-          if (forexNames.contains(s.symbolName)) return false;
-          if (metalNames.contains(s.symbolName)) return false;
-          return true;
-        }).toList(growable: false);
+    final forexNames = forexLikeEnabled.map((x) => x.symbolName).toSet();
+    final metalNames = metalsEnabled.map((x) => x.symbolName).toSet();
+    return symbols.where((s) {
+      if (!s.enabled) return false;
+      if (forexNames.contains(s.symbolName)) return false;
+      if (metalNames.contains(s.symbolName)) return false;
+      return true;
+    }).toList(growable: false);
   }
 }
 
@@ -1293,6 +1317,7 @@ class ChartSnapshot {
   final double latestClose;
   final double priceChangePct;
   final String headline;
+  final String source;
   const ChartSnapshot({
     required this.symbol,
     required this.timeframe,
@@ -1304,6 +1329,7 @@ class ChartSnapshot {
     required this.latestClose,
     required this.priceChangePct,
     required this.headline,
+    required this.source,
   });
   factory ChartSnapshot.fromJson(Map<String, dynamic> j) => ChartSnapshot(
         symbol: j['symbol'] as String,
@@ -1320,7 +1346,11 @@ class ChartSnapshot {
         latestClose: (j['latestClose'] as num).toDouble(),
         priceChangePct: (j['priceChangePct'] as num).toDouble(),
         headline: (j['headline'] as String?) ?? '',
+        source: (j['source'] as String?) ?? 'unknown',
       );
+
+  bool get isDiskCache => source == 'disk-cache';
+  bool get isBrokerSource => source == 'broker';
 }
 
 /// One series produced by `/indicators`. Multi-output indicators
@@ -1414,8 +1444,7 @@ class IntelligenceSnapshot {
             .toList(growable: false),
         lastTouchedUnixMs: j['lastTouchedUnixMs'] as int?,
         discoveryTargets: ((j['discoveryTargets'] as List?) ?? const [])
-            .map((e) =>
-                DiscoveryTarget.fromJson(e as Map<String, dynamic>))
+            .map((e) => DiscoveryTarget.fromJson(e as Map<String, dynamic>))
             .toList(growable: false),
         walkforwardSplits: j['walkforwardSplits'] as int?,
         walkforwardAvgAccuracy:
@@ -1453,8 +1482,12 @@ class DiagnosticReport {
       );
 
   String get sizeLabel {
-    if (totalBytes < 1024) return '$totalBytes B';
-    if (totalBytes < 1024 * 1024) return '${(totalBytes / 1024).toStringAsFixed(1)} KB';
+    if (totalBytes < 1024) {
+      return '$totalBytes B';
+    }
+    if (totalBytes < 1024 * 1024) {
+      return '${(totalBytes / 1024).toStringAsFixed(1)} KB';
+    }
     return '${(totalBytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 }
@@ -1472,7 +1505,8 @@ class DataBootstrapSnapshot {
     required this.fileCount,
     required this.lastTouchedUnixMs,
   });
-  factory DataBootstrapSnapshot.fromJson(Map<String, dynamic> j) => DataBootstrapSnapshot(
+  factory DataBootstrapSnapshot.fromJson(Map<String, dynamic> j) =>
+      DataBootstrapSnapshot(
         dataDir: j['dataDir'] as String,
         dataDirExists: j['dataDirExists'] as bool,
         symbols: ((j['symbols'] as List?) ?? const [])
@@ -1495,6 +1529,7 @@ class LiveSpotTick {
   final double? midPrice;
   final int receivedAtUnixMs;
   final int? brokerTimestampMs;
+
   /// Seconds since this tick was received server-side. The UI
   /// uses this for a "stale tick" warning when freshness > 5 s.
   final double freshnessSeconds;
@@ -1533,7 +1568,8 @@ class LiveSpotsSnapshot {
     required this.symbolCount,
   });
 
-  factory LiveSpotsSnapshot.fromJson(Map<String, dynamic> j) => LiveSpotsSnapshot(
+  factory LiveSpotsSnapshot.fromJson(Map<String, dynamic> j) =>
+      LiveSpotsSnapshot(
         spots: ((j['spots'] as List?) ?? const [])
             .map((e) => LiveSpotTick.fromJson(e as Map<String, dynamic>))
             .toList(growable: false),
@@ -1551,6 +1587,25 @@ class LiveSpotsSnapshot {
         symbolCount: 0,
       );
 
+  LiveSpotsSnapshot mergeTick(LiveSpotTick tick) {
+    var replaced = false;
+    final merged = <LiveSpotTick>[];
+    for (final existing in spots) {
+      if (_sameSpotIdentity(existing, tick)) {
+        merged.add(_mergeSpotTick(existing, tick));
+        replaced = true;
+      } else {
+        merged.add(existing);
+      }
+    }
+    if (!replaced) merged.add(tick);
+    return LiveSpotsSnapshot(
+      spots: merged,
+      snapshotAtUnixMs: tick.receivedAtUnixMs,
+      symbolCount: merged.length,
+    );
+  }
+
   /// O(n) lookup by symbol name. The snapshot is small (≤ 8 majors
   /// in v1) so the linear scan is cheap; promoting to a map only
   /// pays off if the subscription set grows beyond ~50.
@@ -1560,6 +1615,30 @@ class LiveSpotsSnapshot {
     }
     return null;
   }
+}
+
+bool _sameSpotIdentity(LiveSpotTick a, LiveSpotTick b) {
+  if (a.symbolId != 0 && b.symbolId != 0) return a.symbolId == b.symbolId;
+  return a.symbolName.toUpperCase() == b.symbolName.toUpperCase();
+}
+
+LiveSpotTick _mergeSpotTick(LiveSpotTick existing, LiveSpotTick update) {
+  final bid = update.bid ?? existing.bid;
+  final ask = update.ask ?? existing.ask;
+  final mid = (bid != null && ask != null)
+      ? (bid + ask) / 2.0
+      : update.midPrice ?? existing.midPrice;
+  return LiveSpotTick(
+    symbolId: update.symbolId != 0 ? update.symbolId : existing.symbolId,
+    symbolName:
+        update.symbolName.isNotEmpty ? update.symbolName : existing.symbolName,
+    bid: bid,
+    ask: ask,
+    midPrice: mid,
+    receivedAtUnixMs: update.receivedAtUnixMs,
+    brokerTimestampMs: update.brokerTimestampMs ?? existing.brokerTimestampMs,
+    freshnessSeconds: update.freshnessSeconds,
+  );
 }
 
 /// Mirror of `crate::app_services::pending_actions::PendingAction`.
@@ -1581,6 +1660,7 @@ class PendingAction {
   final String reason;
   final int proposedAtUnixMs;
   final int expiresAtUnixMs;
+
   /// Snake-case state: `pending`, `confirmed`, `rejected`, `expired`,
   /// `executed`, `failed`. The widget switches on these directly.
   final String status;
@@ -1637,12 +1717,9 @@ class PendingAction {
   /// the user clicks Confirm — the banner re-renders instantly.
   String get summary {
     if (kindTag == 'close_position') {
-      final vol = (volumeUnits ?? 0) == 0
-          ? 'entire'
-          : '${volumeUnits!} units';
-      final sym = (symbolHint == null || symbolHint!.isEmpty)
-          ? '?'
-          : symbolHint!;
+      final vol = (volumeUnits ?? 0) == 0 ? 'entire' : '${volumeUnits!} units';
+      final sym =
+          (symbolHint == null || symbolHint!.isEmpty) ? '?' : symbolHint!;
       return 'Close $vol of position #${positionId ?? 0} ($sym)';
     }
     return kindTag.isEmpty ? 'Unknown action' : 'Action: $kindTag';
@@ -1675,8 +1752,10 @@ class KnobEntry {
   final dynamic presetConservative;
   final dynamic presetBalanced;
   final dynamic presetAggressive;
+
   /// Enum: list of valid choices. `null` for non-Enum kinds.
   final List<String>? enumChoices;
+
   /// Numeric ranges (Int/Float). `null` for non-numeric kinds.
   final double? minValue;
   final double? maxValue;
