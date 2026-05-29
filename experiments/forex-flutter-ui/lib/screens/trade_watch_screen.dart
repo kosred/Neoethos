@@ -154,10 +154,10 @@ class _PositionRow extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final p = position;
-    final sideColor = p.side.toUpperCase() == 'LONG' ||
-            p.side.toUpperCase() == 'BUY'
-        ? ForexAiTokens.buy
-        : ForexAiTokens.sell;
+    final sideColor =
+        p.side.toUpperCase() == 'LONG' || p.side.toUpperCase() == 'BUY'
+            ? ForexAiTokens.buy
+            : ForexAiTokens.sell;
     // #142: detect whether this position's PnL pips number is being
     // driven by the live-spot stream (sub-2 s) or the broker's 5 s
     // poll. The bridge silently overrides pnl_pips on the wire; the
@@ -210,40 +210,45 @@ class _PositionRow extends ConsumerWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.end,
-                  children: [
-                    if (hasFreshTick) ...[
-                      const Tooltip(
-                        message: 'Live tick (sub-2 s)',
-                        child: Icon(
-                          Icons.bolt,
-                          size: 12,
-                          color: ForexAiTokens.buy,
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (hasFreshTick) ...[
+                          const Tooltip(
+                            message: 'Live tick (sub-2 s)',
+                            child: Icon(
+                              Icons.bolt,
+                              size: 12,
+                              color: ForexAiTokens.buy,
+                            ),
+                          ),
+                          const SizedBox(width: 2),
+                        ],
+                        Text(
+                          '${p.pnlPips >= 0 ? '+' : ''}${p.pnlPips.toStringAsFixed(1)} p',
+                          style: TextStyle(
+                            fontWeight: FontWeight.w700,
+                            fontSize: 12,
+                            color: p.pnlPips >= 0
+                                ? ForexAiTokens.buy
+                                : ForexAiTokens.sell,
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 2),
-                    ],
-                    Text(
-                      '${p.pnlPips >= 0 ? '+' : ''}${p.pnlPips.toStringAsFixed(1)} p',
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 12,
-                        color: p.pnlPips >= 0
-                            ? ForexAiTokens.buy
-                            : ForexAiTokens.sell,
-                      ),
+                      ],
                     ),
-                  ],
+                  ),
                 ),
                 Text(
                   money.format(p.pnlUsd),
                   style: TextStyle(
                     fontWeight: FontWeight.w700,
                     fontSize: 11,
-                    color: p.pnlUsd >= 0
-                        ? ForexAiTokens.buy
-                        : ForexAiTokens.sell,
+                    color:
+                        p.pnlUsd >= 0 ? ForexAiTokens.buy : ForexAiTokens.sell,
                   ),
                 ),
               ],
@@ -262,8 +267,7 @@ class _PositionRow extends ConsumerWidget {
             label: const Text('Close'),
             style: OutlinedButton.styleFrom(
               foregroundColor: ForexAiTokens.sell,
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
               minimumSize: const Size(0, 28),
               textStyle: const TextStyle(fontSize: 11),
             ),

@@ -14,7 +14,7 @@ void main() {
     await useDesktopSurface(tester);
     await tester.pumpWidget(shellHarness());
     // TopBar brand
-    expect(find.text('neoethos'), findsOneWidget);
+    expect(find.text('NeoEthos'), findsOneWidget);
     // Sidebar section headers (letter-spaced uppercase)
     expect(find.textContaining('T R A D I N G'), findsOneWidget);
     expect(find.textContaining('A I   E N G I N E'), findsOneWidget);

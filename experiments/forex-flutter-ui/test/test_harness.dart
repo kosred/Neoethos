@@ -4,7 +4,10 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:forex_flutter_ui/api/backend_client.dart';
 import 'package:forex_flutter_ui/main.dart';
+import 'package:forex_flutter_ui/startup/backend_watchdog.dart';
 import 'package:forex_flutter_ui/state/account_provider.dart';
+import 'package:forex_flutter_ui/state/live_spots_provider.dart';
+import 'package:forex_flutter_ui/state/pending_actions_provider.dart';
 import 'package:forex_flutter_ui/state/system_providers.dart';
 import 'package:forex_flutter_ui/theme/theme.dart';
 import 'package:forex_flutter_ui/widgets/app_shell.dart';
@@ -31,6 +34,49 @@ class TestAccountSnapshotNotifier extends AccountSnapshotNotifier {
           ),
         ],
       );
+}
+
+class TestLiveSpotsNotifier extends LiveSpotsNotifier {
+  @override
+  Future<LiveSpotsSnapshot> build() async => const LiveSpotsSnapshot(
+        spots: [
+          LiveSpotTick(
+            symbolId: 1,
+            symbolName: 'EURUSD',
+            bid: 1.0814,
+            ask: 1.0816,
+            midPrice: 1.0815,
+            receivedAtUnixMs: 1716422460000,
+            brokerTimestampMs: 1716422460000,
+            freshnessSeconds: 0,
+          ),
+        ],
+        snapshotAtUnixMs: 1716422460000,
+        symbolCount: 1,
+      );
+}
+
+class TestPendingActionsNotifier extends PendingActionsNotifier {
+  @override
+  Future<List<PendingAction>> build() async => const [];
+
+  @override
+  Future<void> refreshNow() async {
+    state = const AsyncData([]);
+  }
+}
+
+class TestBackendWatchdog extends BackendWatchdog {
+  @override
+  BackendHealthState build() => BackendHealthState(
+        status: BackendHealthStatus.online,
+        lastSeenAt: DateTime.fromMillisecondsSinceEpoch(1716422460000),
+        respawnAttempts: 0,
+        consecutiveFailures: 0,
+      );
+
+  @override
+  Future<void> manualRestart() async {}
 }
 
 const _engineSnapshot = EnginesSnapshot(
@@ -98,10 +144,14 @@ const _chart = ChartSnapshot(
   latestClose: 1.0815,
   priceChangePct: 0.13,
   headline: 'EURUSD M1 test feed',
+  source: 'disk-cache',
 );
 
 List<Override> testProviderOverrides() => [
       accountSnapshotProvider.overrideWith(TestAccountSnapshotNotifier.new),
+      liveSpotsProvider.overrideWith(TestLiveSpotsNotifier.new),
+      pendingActionsProvider.overrideWith(TestPendingActionsNotifier.new),
+      backendHealthProvider.overrideWith(TestBackendWatchdog.new),
       hardwareProvider.overrideWith(
         (ref) async => const HardwareSnapshot(
           cpuModel: 'Test CPU',

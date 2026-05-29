@@ -129,9 +129,7 @@ class _SymbolPickerState extends ConsumerState<SymbolPicker> {
             if (query.isEmpty) {
               return names.take(15);
             }
-            return names
-                .where((n) => n.toUpperCase().contains(query))
-                .take(20);
+            return names.where((n) => n.toUpperCase().contains(query)).take(20);
           },
           onSelected: (sel) => widget.onChanged(sel.toUpperCase()),
           fieldViewBuilder: (
@@ -240,32 +238,36 @@ class _SymbolPickerState extends ConsumerState<SymbolPicker> {
         // catalog. The picker remembers the choice for the lifetime of
         // the widget instance (state is local on purpose — different
         // screens may want different defaults).
-        Row(
+        Wrap(
+          spacing: 6,
+          runSpacing: 4,
           children: [
             for (final entry in [
-              (_SymbolCategory.forex, 'Forex (${snap.forexLikeEnabled.length})'),
+              (
+                _SymbolCategory.forex,
+                'Forex (${snap.forexLikeEnabled.length})'
+              ),
               (_SymbolCategory.metals, 'Metals (${snap.metalsEnabled.length})'),
               (
                 _SymbolCategory.equities,
                 'Equities/Indices (${snap.equitiesAndIndicesEnabled.length})'
               ),
-              (_SymbolCategory.all, 'All (${snap.symbols.where((s) => s.enabled).length})'),
+              (
+                _SymbolCategory.all,
+                'All (${snap.symbols.where((s) => s.enabled).length})'
+              ),
             ])
-              Padding(
-                padding: const EdgeInsets.only(right: 6),
-                child: FilterChip(
-                  label: Text(
-                    entry.$2,
-                    style: const TextStyle(fontSize: 11),
-                  ),
-                  selected: _category == entry.$1,
-                  visualDensity: VisualDensity.compact,
-                  materialTapTargetSize:
-                      MaterialTapTargetSize.shrinkWrap,
-                  onSelected: widget.enabled
-                      ? (_) => setState(() => _category = entry.$1)
-                      : null,
+              FilterChip(
+                label: Text(
+                  entry.$2,
+                  style: const TextStyle(fontSize: 11),
                 ),
+                selected: _category == entry.$1,
+                visualDensity: VisualDensity.compact,
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                onSelected: widget.enabled
+                    ? (_) => setState(() => _category = entry.$1)
+                    : null,
               ),
           ],
         ),
@@ -326,7 +328,8 @@ class TimeframePicker extends ConsumerWidget {
         final current = list.contains(value) ? value : list.first;
         if (current != value) {
           // One-shot post-frame nudge — parent should update next frame.
-          WidgetsBinding.instance.addPostFrameCallback((_) => onChanged(current));
+          WidgetsBinding.instance
+              .addPostFrameCallback((_) => onChanged(current));
         }
         return InputDecorator(
           decoration: InputDecoration(
@@ -343,7 +346,11 @@ class TimeframePicker extends ConsumerWidget {
                 for (final tf in list)
                   DropdownMenuItem(value: tf, child: Text(tf)),
               ],
-              onChanged: enabled ? (v) { if (v != null) onChanged(v); } : null,
+              onChanged: enabled
+                  ? (v) {
+                      if (v != null) onChanged(v);
+                    }
+                  : null,
             ),
           ),
         );

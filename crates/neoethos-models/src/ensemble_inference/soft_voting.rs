@@ -82,34 +82,21 @@ pub struct SoftVotingEnsembleConfig {
     /// passes through verbatim.
     pub abstain_below_confidence: Option<f32>,
     /// Expert canonical names that must NOT participate in voting
-    /// even when present in the load outcome. Use this for
-    /// **upstream / non-voter** experts — most importantly the
-    /// strategy-discovery family (`genetic`, `neuro_evo`):
-    /// their primary role is to DISCOVER trading strategies during
-    /// training, not to vote on direction at inference time. The
-    /// discovered strategies feed into the feature pipeline that
-    /// the actual voters (tree models, deep classifiers, meta
-    /// layer) consume; aggregating the discoverers' own
-    /// `predict_proba` here would double-count their contribution.
+    /// even when present in the load outcome.
     ///
-    /// The default value [`default_strategy_discoverer_names`]
-    /// excludes `genetic` and `neuro_evo`. Operators wanting them
-    /// in the voting layer (e.g. to evaluate raw rule outputs as
-    /// a sanity check) can clear this field.
+    /// **History (F-319, 2026-05-29)**: this field used to hold a
+    /// default exclusion set of `{"genetic", "neuro_evo"}` because
+    /// those adapters were architecturally misplaced — they wrapped
+    /// strategy-discovery algorithms (GA / CR-FM-NES neuroevolution)
+    /// from `neoethos-search` as if they were inference experts. The
+    /// 2026-05-17 operator correction added the exclusion to prevent
+    /// double-counting. F-319 removed the adapters entirely (the
+    /// discoverers run in the search crate; only trained models vote
+    /// here), so the default exclusion set is now empty — there are
+    /// no built-in non-voters left to skip. Operators can still
+    /// populate this field manually to drop a specific expert from
+    /// voting (e.g., A/B testing whether a deep model contributes).
     pub excluded_names: std::collections::HashSet<String>,
-}
-
-/// Canonical names of the strategy-discovery experts that
-/// [`SoftVotingEnsembleConfig::default`] excludes from voting.
-/// The user's 2026-05-17 correction: Genetic + NeuroEvo are
-/// UPSTREAM strategy discoverers — their job is to find trading
-/// strategies that then feed into the training of the actual
-/// voters, NOT to vote on trade direction themselves.
-pub fn default_strategy_discoverer_names() -> std::collections::HashSet<String> {
-    let mut s = std::collections::HashSet::new();
-    s.insert("genetic".to_string());
-    s.insert("neuro_evo".to_string());
-    s
 }
 
 impl Default for SoftVotingEnsembleConfig {
@@ -117,7 +104,7 @@ impl Default for SoftVotingEnsembleConfig {
         Self {
             expert_weights: std::collections::HashMap::new(),
             abstain_below_confidence: None,
-            excluded_names: default_strategy_discoverer_names(),
+            excluded_names: std::collections::HashSet::new(),
         }
     }
 }

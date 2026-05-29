@@ -116,7 +116,7 @@ pub fn update_tick(
     broker_timestamp_ms: Option<i64>,
 ) {
     let now_ms = now_unix_ms();
-    let tick = SpotTick {
+    let mut tick = SpotTick {
         symbol_id,
         symbol_name: symbol_name.into(),
         bid,
@@ -125,6 +125,20 @@ pub fn update_tick(
         broker_timestamp_ms,
     };
     if let Ok(mut g) = cache().write() {
+        if let Some(prev) = g.get(&symbol_id) {
+            if tick.symbol_name.is_empty() {
+                tick.symbol_name = prev.symbol_name.clone();
+            }
+            if tick.bid.is_none() {
+                tick.bid = prev.bid;
+            }
+            if tick.ask.is_none() {
+                tick.ask = prev.ask;
+            }
+            if tick.broker_timestamp_ms.is_none() {
+                tick.broker_timestamp_ms = prev.broker_timestamp_ms;
+            }
+        }
         g.insert(symbol_id, tick.clone());
     }
     // **2026-05-25 — push-fanout to subscribers**. `send` returns
@@ -201,6 +215,25 @@ mod tests {
         let tick = get_tick(1).expect("present");
         assert_eq!(tick.bid, Some(1.0860));
         assert_eq!(tick.ask, Some(1.0862));
+        clear();
+    }
+
+    #[test]
+    fn update_preserves_previous_quote_side_when_event_is_partial() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        update_tick(1, "EURUSD", Some(1.0850), Some(1.0852), Some(1_700_000_000));
+        update_tick(1, "EURUSD", Some(1.0860), None, Some(1_700_000_100));
+        let bid_update = get_tick(1).expect("bid update present");
+        assert_eq!(bid_update.bid, Some(1.0860));
+        assert_eq!(bid_update.ask, Some(1.0852));
+        assert_eq!(bid_update.broker_timestamp_ms, Some(1_700_000_100));
+
+        update_tick(1, "EURUSD", None, Some(1.0864), Some(1_700_000_200));
+        let ask_update = get_tick(1).expect("ask update present");
+        assert_eq!(ask_update.bid, Some(1.0860));
+        assert_eq!(ask_update.ask, Some(1.0864));
+        assert_eq!(ask_update.broker_timestamp_ms, Some(1_700_000_200));
         clear();
     }
 

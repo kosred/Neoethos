@@ -93,7 +93,17 @@ use crate::runtime::capabilities::ModelFamily;
 pub mod bootstrap;
 pub mod deep_classification_adapters;
 pub mod deep_timeseries_adapters;
-pub mod evolutionary_adapters;
+// F-319 (2026-05-29, operator directive): the `evolutionary_adapters`
+// module was removed entirely. `genetic` / `neuro_evo` / `neat` were
+// architecturally misplaced — they are STRATEGY DISCOVERERS in
+// `neoethos-search`, not inference experts. Wrapping them as
+// `ExpertModel` voters and then permanently excluding them via
+// `SoftVotingEnsembleConfig::excluded_names` was the 2026-05-17
+// workaround for the original misclassification. Today we finish
+// the cleanup — the loaders, adapters, and exclusion bookkeeping
+// are all gone. The Discovery → Training → Inference pipeline is
+// now layered cleanly: GA/NeuroEvo run in the search crate;
+// trained models (trees, deep nets, statistical, RL) vote here.
 pub mod meta_adapters;
 pub mod mixed_adapters;
 pub mod rl_exit_adapters;
@@ -113,10 +123,9 @@ pub use deep_timeseries_adapters::{
     PatchTstLoader, TiDEAdapter, TiDELoader, TiDENfAdapter, TiDENfLoader, TimesNetAdapter,
     TimesNetLoader, TransformerAdapter, TransformerLoader, register_deep_timeseries_loaders,
 };
-pub use evolutionary_adapters::{
-    GeneticAdapter, GeneticLoader, NeatAdapter, NeatLoader, NeuroEvoAdapter, NeuroEvoLoader,
-    register_evolutionary_loaders,
-};
+// F-319: `evolutionary_adapters` re-export removed — those adapters
+// were the misclassified-as-experts wrappers around GA/NeuroEvo/NEAT
+// search algorithms. See the comment block above the module list.
 pub use meta_adapters::{
     BayesLogitAdapter, BayesLogitLoader, ConformalGateAdapter, ConformalGateLoader,
     ElasticNetAdapter, ElasticNetLoader, HmmRegimeAdapter, HmmRegimeLoader, LogisticAdapter,

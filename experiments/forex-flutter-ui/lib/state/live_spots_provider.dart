@@ -27,7 +27,7 @@ import '../api/sse_client.dart';
 import 'account_provider.dart';
 
 class LiveSpotsNotifier extends AsyncNotifier<LiveSpotsSnapshot> {
-  SseSubscription<LiveSpotsSnapshot>? _sub;
+  SseSubscription<LiveSpotTick>? _sub;
   bool _disposed = false;
 
   @override
@@ -57,15 +57,16 @@ class LiveSpotsNotifier extends AsyncNotifier<LiveSpotsSnapshot> {
       initial = null;
     }
 
-    _sub = SseSubscription<LiveSpotsSnapshot>(
+    _sub = SseSubscription<LiveSpotTick>(
       config: SseConfig(
         url: '$baseUrl/live/spots/stream',
         tag: 'live-spots',
       ),
-      parse: (json) => LiveSpotsSnapshot.fromJson(json),
-      onEvent: (snapshot) {
+      parse: (json) => LiveSpotTick.fromJson(json),
+      onEvent: (tick) {
         if (_disposed) return;
-        state = AsyncData(snapshot);
+        final current = state.valueOrNull ?? LiveSpotsSnapshot.empty();
+        state = AsyncData(current.mergeTick(tick));
       },
       onError: (e, st) {
         if (_disposed) return;
@@ -77,8 +78,10 @@ class LiveSpotsNotifier extends AsyncNotifier<LiveSpotsSnapshot> {
     if (initial != null) return initial;
 
     final completer = Completer<LiveSpotsSnapshot>();
-    final subscription = _sub!.events.listen((snapshot) {
-      if (!completer.isCompleted) completer.complete(snapshot);
+    final subscription = _sub!.events.listen((tick) {
+      if (!completer.isCompleted) {
+        completer.complete(LiveSpotsSnapshot.empty().mergeTick(tick));
+      }
     });
     final result = await completer.future.timeout(
       const Duration(seconds: 10),

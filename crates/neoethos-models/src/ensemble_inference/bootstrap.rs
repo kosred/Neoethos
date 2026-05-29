@@ -23,8 +23,9 @@
 //!
 //! [`build_ensemble_for_symbol`]:
 //!  1. Builds an [`super::ExpertRegistry`] with every default
-//!     loader pre-registered (33 canonical names — all wired
-//!     families from D1.2.1-D1.2.7 + the 34th model `hmm_regime`
+//!     loader pre-registered (30 canonical names — all wired
+//!     families from D1.2.1-D1.2.7 + the 34th model `hmm_regime`,
+//!     minus the 3 strategy-discoverer adapters removed in F-319
 //!     added 2026-05-25).
 //!  2. Calls [`super::ExpertRegistry::load_with_partial`] against
 //!     the operator's `<models_root>/<symbol>/<tf>/` directory
@@ -64,18 +65,27 @@ use super::{
     ExpertLoadOutcome, ExpertRegistry, SoftVotingEnsemble, SoftVotingEnsembleConfig,
     deep_classification_adapters::register_deep_classification_loaders,
     deep_timeseries_adapters::register_deep_timeseries_loaders,
-    evolutionary_adapters::register_evolutionary_loaders, meta_adapters::register_meta_loaders,
-    mixed_adapters::register_mixed_loaders, rl_exit_adapters::register_rl_exit_loaders,
-    tree_adapters::register_tree_loaders,
+    meta_adapters::register_meta_loaders, mixed_adapters::register_mixed_loaders,
+    rl_exit_adapters::register_rl_exit_loaders, tree_adapters::register_tree_loaders,
 };
+// F-319: `register_evolutionary_loaders` import removed —
+// genetic/neuro_evo/neat are strategy discoverers in `neoethos-search`,
+// not inference experts. The wrappers + bootstrap entries are gone.
 
 /// Canonical list of expert names the bootstrap tries to load.
 ///
 /// Sourced from `KNOWN_MODEL_NAMES` per
-/// [`crate::runtime::capabilities::KNOWN_MODEL_NAMES`] minus the
-/// `swarm_forecaster` name which has a stateful-univariate API
-/// that doesn't fit the current ExpertModel trait (deferred to
-/// D1.2.8). 33 names total (34 KNOWN_MODEL_NAMES minus swarm).
+/// [`crate::runtime::capabilities::KNOWN_MODEL_NAMES`] minus:
+///   - `swarm_forecaster` — stateful-univariate API that doesn't fit
+///     the current ExpertModel trait (deferred to D1.2.8).
+///   - `genetic`, `neuro_evo`, `neat` — strategy discoverers in
+///     `neoethos-search`, NOT inference voters (F-319, 2026-05-29
+///     operator directive). KNOWN_MODEL_NAMES still lists them as
+///     legitimate algorithms because they run inside the search
+///     crate, but they have no role in the soft-voting ensemble.
+///
+/// **30 names total** (34 KNOWN_MODEL_NAMES − swarm − 3 evolutionary
+/// search algorithms).
 pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     // Tree (7)
     "lightgbm",
@@ -110,13 +120,6 @@ pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     "online_pa",
     "online_hoeffding",
     "isolation_forest",
-    // Evolutionary (3) — excluded from voting by SoftVoting's
-    // default config (they're upstream strategy discoverers per
-    // the 2026-05-17 directive) but still loaded so the chrome
-    // can list them and the operator can override exclusion.
-    "genetic",
-    "neuro_evo",
-    "neat",
     // RL + Exit (2)
     "dqn",
     "exit_agent",
@@ -133,12 +136,11 @@ pub fn build_default_registry() -> Result<ExpertRegistry> {
     register_deep_timeseries_loaders(&mut registry).context("register deep time-series loaders")?;
     register_meta_loaders(&mut registry).context("register meta loaders")?;
     register_mixed_loaders(&mut registry).context("register mixed loaders")?;
-    register_evolutionary_loaders(&mut registry).context("register evolutionary loaders")?;
     register_rl_exit_loaders(&mut registry).context("register rl+exit loaders")?;
     debug_assert_eq!(
         registry.registered_names().len(),
         DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(),
-        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 33 canonical names"
+        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 30 canonical names"
     );
     Ok(registry)
 }
@@ -221,13 +223,21 @@ mod tests {
     #[test]
     fn default_bootstrap_names_match_known_model_names_minus_swarm() {
         // 33 names = 34 KNOWN_MODEL_NAMES minus swarm_forecaster.
-        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 33);
+        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 30);
         let names: std::collections::HashSet<&str> =
             DEFAULT_BOOTSTRAP_EXPERT_NAMES.iter().copied().collect();
         assert!(
             !names.contains("swarm_forecaster"),
             "swarm_forecaster is intentionally absent (D1.2.7 deferral)"
         );
+        // F-319 (2026-05-29): genetic/neuro_evo/neat are strategy
+        // discoverers in `neoethos-search`, NOT inference experts.
+        for absent in ["genetic", "neuro_evo", "neat"] {
+            assert!(
+                !names.contains(absent),
+                "{absent} is a strategy discoverer, not an inference voter (F-319)"
+            );
+        }
         // Sample required canonical names.
         for required in [
             "lightgbm",
@@ -235,7 +245,6 @@ mod tests {
             "transformer",
             "meta_stack",
             "dqn",
-            "neat",
             "hmm_regime",
         ] {
             assert!(names.contains(required), "missing '{required}'");
@@ -243,10 +252,10 @@ mod tests {
     }
 
     #[test]
-    fn build_default_registry_installs_all_33_loaders() {
+    fn build_default_registry_installs_all_30_loaders() {
         let registry = build_default_registry().expect("build default registry");
         let registered = registry.registered_names();
-        assert_eq!(registered.len(), 33);
+        assert_eq!(registered.len(), 30);
         for required in DEFAULT_BOOTSTRAP_EXPERT_NAMES {
             assert!(
                 registry.has_loader(required),
@@ -263,7 +272,7 @@ mod tests {
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
         assert_eq!(outcome.loaded_count(), 0);
         assert_eq!(outcome.degraded_count(), 0);
-        assert_eq!(outcome.missing_count(), 33);
+        assert_eq!(outcome.missing_count(), 30);
         assert!(!outcome.has_any_loaded());
     }
 
@@ -289,8 +298,8 @@ mod tests {
         // Create the expected dir so the load can scan it.
         fs::create_dir_all(&expected).expect("mkdir");
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
-        // Still 33 missing because the dir is empty, but the
+        // Still 30 missing because the dir is empty, but the
         // function didn't error out → path resolution worked.
-        assert_eq!(outcome.missing_count(), 33);
+        assert_eq!(outcome.missing_count(), 30);
     }
 }
