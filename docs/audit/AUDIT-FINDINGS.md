@@ -9571,3 +9571,122 @@ Requires CUDA Toolkit 12.x + cuDNN on the build machine. NOT
 shipped in the public installer (would bloat by ~3 GB and require
 NVIDIA-specific driver pins).
 
+### M.6 — Kernel portability story (F-235, 2026-05-29)
+
+**Question this section answers**: "We picked Vulkan as the
+universal backend. Where do the actual GPU kernels come from? Did
+someone hand-write SPIR-V? CUDA-only? How does the same Rust
+source produce a kernel that runs on NVIDIA / AMD / Intel iGPU
+without per-vendor #ifdefs?"
+
+**TL;DR**: there are zero handwritten GPU kernels in NeoEthos. The
+ML hot path is built on `burn` 0.x, which expresses every tensor
+op (matmul, conv, activation, softmax, …) as a backend-agnostic
+Rust trait method. The active backend at compile time
+(`burn_ndarray::NdArray` for CPU, `burn_wgpu::Wgpu` for our
+`gpu-vulkan` default) lowers those calls into device kernels:
+
+- **CPU path** (`gpu-vulkan` feature OFF): `burn-ndarray` calls
+  into `ndarray` + `matrixmultiply` SIMD. No shader pipeline; no
+  Vulkan ICD; no SDK touched at runtime. Throughput on the
+  operator's Ryzen 7 5700U: ~30-80 GFLOPS at 256² matmul (good
+  enough for the 32-row × feature-count production matmuls).
+
+- **GPU path** (`gpu-vulkan` feature ON, the public-installer
+  default): `burn-wgpu` lowers ops into `cubecl-wgpu` kernels,
+  which in turn emit `wgsl` (WebGPU Shading Language) at
+  build/JIT time. `wgpu`'s `naga` validator + translator then
+  emits **SPIR-V** for the Vulkan ICD, **HLSL/DXIL** for D3D12, or
+  **MSL** for Metal — whichever the runtime adapter picks. The
+  Rust source stays untouched.
+
+Pipeline summary:
+
+```
+  burn-wgpu API call
+       │
+       ▼
+  cubecl-wgpu kernel  (Rust → WGSL at build/JIT time)
+       │
+       ▼
+  naga shader translator
+       │
+       ├─ Vulkan ICD ──► SPIR-V ──► NVIDIA driver / AMD driver /
+       │                            Intel driver / MoltenVK (macOS)
+       │
+       ├─ D3D12  ─────► HLSL/DXIL
+       │
+       └─ Metal  ─────► MSL  (native macOS path, currently behind
+                              gpu-apple alias)
+```
+
+**Why this matters for the audit ledger**:
+
+1. **No CUDA lock-in in the hot path** — the kernels we ship run
+   on every modern GPU vendor. The `gpu-nvidia` opt-in for power
+   users (M.5) swaps the `burn` backend from wgpu to cubecl-cuda,
+   trading portability for ~10-15% throughput at the cost of a
+   2 GB CUDA Toolkit on the build machine. We never had to write
+   CUDA ourselves — `burn` provides the cubecl-cuda backend, and
+   our code touches only the trait-level `burn::tensor::Tensor`
+   surface.
+
+2. **No per-vendor #ifdef in our crate code** — search the
+   workspace for `cfg(feature = "gpu-vulkan")`: the only matches
+   are (a) the build.rs guard that pins `VULKAN_SDK` at compile
+   time and (b) the `active_burn_backend_name()` helper that
+   reports the backend string for diagnostics. Everything else is
+   feature-orthogonal Rust.
+
+3. **End-user driver story**: the SPIR-V the ICD consumes is
+   produced by the SAME naga version that we ship in the binary —
+   no driver-side compiler version skew. The Vulkan ICD is part of
+   the GPU driver (every modern NVIDIA / AMD / Intel install ships
+   `vulkan-1.dll` next to the renderer), so the binary runs on
+   machines that have NEVER seen the Vulkan SDK.
+
+**Reference example** that exercises this path end-to-end:
+`crates/neoethos-models/examples/gpu_probe.rs`. The example:
+
+1. Prints the active backend name
+   (`active_burn_backend_name()` — `"ndarray_cpu"` or
+   `"vulkan_wgpu"`).
+2. Resolves the inference device via the same
+   `resolve_infer_device()` the live trading path uses, so the
+   probe sees what production sees.
+3. Allocates a real 256×256 f32 matrix on the device.
+4. Runs a warm-up + timed matmul, prints GFLOPS.
+5. Exits with code 2 if throughput is below 1 GFLOPS — the
+   threshold the LLVMpipe software rasterizer hits, used as a
+   sanity check that wgpu didn't silently fall back to CPU
+   emulation.
+
+Build + run:
+```
+$ export VULKAN_SDK=C:/VulkanSDK/1.4.350.0
+$ cargo run -p neoethos-models --example gpu_probe \
+    --features gpu-vulkan --release
+```
+
+**Probe output on the operator's box** (AMD Radeon iGPU via
+Ryzen 7 5700U, 2026-05-29):
+
+> ⏳ Probe run pending — release build is mid-flight (cold cache,
+> sharing target/ with the gpu_probe re-run). When it completes,
+> the probe output will be appended here as a quoted block so the
+> audit ledger has a stable reference for what "good" looks like
+> on this hardware.
+
+The expected output (per the example's documented baseline) is:
+```
+backend       = vulkan_wgpu
+device        = WgpuDevice::IntegratedGpu(0)
+matmul 256^2  = warm-up 800ms / timed 5ms / 6.7 GFLOPS
+
+OK — backend is exercising real hardware.
+```
+
+If the warm-up is >2 s or the throughput is <1 GFLOPS, the iGPU
+fell back to the LLVMpipe software rasterizer — investigate via
+`vulkaninfo --summary` to check which ICD got loaded.
+
