@@ -897,6 +897,70 @@ class BackendClient {
     }
     return DataBootstrapSnapshot.fromJson(response.data!);
   }
+
+  /// `GET /strategy_lab/promotion?symbol=&base_tf=` (F-330) — the
+  /// Promotion Gate verdict for a symbol/timeframe portfolio. Returns
+  /// the aggregate backtest metrics, the per-criterion pass/fail
+  /// breakdown, and the gate config thresholds so the UI can render
+  /// "actual vs threshold" without hard-coding numbers. `aggregate`
+  /// is null when there's no portfolio yet; `decision.criteria` is
+  /// empty in that case with an actionable `summary`.
+  Future<PromotionStatus> fetchPromotionStatus({
+    required String symbol,
+    required String baseTf,
+  }) async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '/strategy_lab/promotion',
+      queryParameters: {'symbol': symbol, 'base_tf': baseTf},
+    );
+    if (response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/strategy_lab/promotion returned 200 with empty body',
+      );
+    }
+    return PromotionStatus.fromJson(response.data!);
+  }
+
+  /// `POST /strategy_lab/promote` (F-330) — copy the staged model
+  /// bundle to `live_models/<symbol>/<tf>/` if (and only if) the
+  /// promotion gate passes.
+  ///
+  /// A blocked promotion comes back as **412 Precondition Failed**,
+  /// which is a *valid* business response (the gate did its job), not
+  /// a transport error. We widen `validateStatus` so the 412 body
+  /// flows back as a parsed [PromoteResult] with `promoted:false` +
+  /// the actionable `message`, instead of throwing. Real transport /
+  /// 5xx failures still raise `DioException` for the caller's
+  /// retry/error UI.
+  Future<PromoteResult> promoteToLive({
+    required String symbol,
+    required String baseTf,
+  }) async {
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/strategy_lab/promote',
+      data: {'symbol': symbol, 'baseTf': baseTf},
+      // Copying the bundle is a filesystem round-trip (dozens of
+      // files); give it headroom over the default 10 s.
+      options: Options(
+        receiveTimeout: const Duration(seconds: 30),
+        // 412 = gate blocked (expected). Let everything below 500
+        // through as a Response so we can parse `promoted:false`; only
+        // 5xx + transport errors throw.
+        validateStatus: (code) => code != null && code < 500,
+      ),
+    );
+    if (response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: 'POST /strategy_lab/promote returned empty body '
+            '(${response.statusCode})',
+      );
+    }
+    return PromoteResult.fromJson(response.data!);
+  }
 }
 
 class HardwareSnapshot {
@@ -1887,4 +1951,182 @@ class KnobPresetCatalog {
     }
     return KnobPresetCatalog(presets: map);
   }
+}
+
+// ============================================================================
+// F-330 — Promotion Gate DTOs.
+//
+// Mirror of the camelCase wire shape from `GET /strategy_lab/promotion`
+// (see crates/neoethos-app/src/server/strategy_lab.rs). `aggregate` is
+// null for an empty/absent portfolio; `decision.criteria` is empty in
+// that case and `decision.promoted` is false with an actionable summary.
+
+/// Aggregate backtest metrics across the whole portfolio. Null when
+/// there is no portfolio on disk yet (nothing discovered/trained).
+class PromotionAggregate {
+  final double sharpe;
+  final double winRate;
+  final double profitFactor;
+  final double maxDrawdownPct;
+  final int trades;
+  const PromotionAggregate({
+    required this.sharpe,
+    required this.winRate,
+    required this.profitFactor,
+    required this.maxDrawdownPct,
+    required this.trades,
+  });
+
+  factory PromotionAggregate.fromJson(Map<String, dynamic> j) =>
+      PromotionAggregate(
+        sharpe: (j['sharpe'] as num?)?.toDouble() ?? 0.0,
+        winRate: (j['winRate'] as num?)?.toDouble() ?? 0.0,
+        profitFactor: (j['profitFactor'] as num?)?.toDouble() ?? 0.0,
+        maxDrawdownPct: (j['maxDrawdownPct'] as num?)?.toDouble() ?? 0.0,
+        trades: (j['trades'] as num?)?.toInt() ?? 0,
+      );
+}
+
+/// One gate criterion (e.g. "Sharpe ratio") with its measured value,
+/// the configured threshold, and the comparison operator (">=" etc.)
+/// so the UI can render "1.40 >= 1.00 ✓" without hard-coding logic.
+class PromotionCriterion {
+  final String name;
+  final bool passed;
+  final double actual;
+  final double threshold;
+  final String comparison;
+  const PromotionCriterion({
+    required this.name,
+    required this.passed,
+    required this.actual,
+    required this.threshold,
+    required this.comparison,
+  });
+
+  factory PromotionCriterion.fromJson(Map<String, dynamic> j) =>
+      PromotionCriterion(
+        name: (j['name'] as String?) ?? '',
+        passed: (j['passed'] as bool?) ?? false,
+        actual: (j['actual'] as num?)?.toDouble() ?? 0.0,
+        threshold: (j['threshold'] as num?)?.toDouble() ?? 0.0,
+        comparison: (j['comparison'] as String?) ?? '>=',
+      );
+}
+
+/// The gate verdict: overall `promoted` flag, the per-criterion
+/// breakdown, and a human-readable `summary` line.
+class PromotionDecision {
+  final bool promoted;
+  final List<PromotionCriterion> criteria;
+  final String summary;
+  const PromotionDecision({
+    required this.promoted,
+    required this.criteria,
+    required this.summary,
+  });
+
+  factory PromotionDecision.fromJson(Map<String, dynamic> j) =>
+      PromotionDecision(
+        promoted: (j['promoted'] as bool?) ?? false,
+        criteria: ((j['criteria'] as List?) ?? const [])
+            .map((e) => PromotionCriterion.fromJson(e as Map<String, dynamic>))
+            .toList(growable: false),
+        summary: (j['summary'] as String?) ?? '',
+      );
+}
+
+/// The configured gate thresholds (from config.yaml). Surfaced so the
+/// UI can show "gate enabled?" + the limits even before a portfolio
+/// exists.
+class PromotionConfig {
+  final bool enabled;
+  final double minSharpe;
+  final double minWinRate;
+  final double minProfitFactor;
+  final double maxDrawdownPct;
+  final int minTrades;
+  const PromotionConfig({
+    required this.enabled,
+    required this.minSharpe,
+    required this.minWinRate,
+    required this.minProfitFactor,
+    required this.maxDrawdownPct,
+    required this.minTrades,
+  });
+
+  factory PromotionConfig.fromJson(Map<String, dynamic> j) => PromotionConfig(
+        enabled: (j['enabled'] as bool?) ?? false,
+        minSharpe: (j['minSharpe'] as num?)?.toDouble() ?? 0.0,
+        minWinRate: (j['minWinRate'] as num?)?.toDouble() ?? 0.0,
+        minProfitFactor: (j['minProfitFactor'] as num?)?.toDouble() ?? 0.0,
+        maxDrawdownPct: (j['maxDrawdownPct'] as num?)?.toDouble() ?? 0.0,
+        minTrades: (j['minTrades'] as num?)?.toInt() ?? 0,
+      );
+}
+
+/// Top-level `GET /strategy_lab/promotion` response.
+class PromotionStatus {
+  final String symbol;
+  final String baseTf;
+  final int portfolioSize;
+
+  /// Null when there is no portfolio yet (empty staging dir).
+  final PromotionAggregate? aggregate;
+  final PromotionDecision decision;
+  final PromotionConfig config;
+  const PromotionStatus({
+    required this.symbol,
+    required this.baseTf,
+    required this.portfolioSize,
+    required this.aggregate,
+    required this.decision,
+    required this.config,
+  });
+
+  factory PromotionStatus.fromJson(Map<String, dynamic> j) => PromotionStatus(
+        symbol: (j['symbol'] as String?) ?? '',
+        baseTf: (j['baseTf'] as String?) ?? '',
+        portfolioSize: (j['portfolioSize'] as num?)?.toInt() ?? 0,
+        aggregate: j['aggregate'] == null
+            ? null
+            : PromotionAggregate.fromJson(
+                j['aggregate'] as Map<String, dynamic>),
+        decision: PromotionDecision.fromJson(
+          (j['decision'] as Map<String, dynamic>?) ?? const {},
+        ),
+        config: PromotionConfig.fromJson(
+          (j['config'] as Map<String, dynamic>?) ?? const {},
+        ),
+      );
+}
+
+/// `POST /strategy_lab/promote` response. `promoted` is false on a 412
+/// gate-block (a valid response, not an error) — the `message` carries
+/// the actionable reason. On a 200, `filesCopied` + `liveModelsPath`
+/// describe what landed where.
+class PromoteResult {
+  final bool promoted;
+  final String symbol;
+  final String baseTf;
+  final String liveModelsPath;
+  final int filesCopied;
+  final String message;
+  const PromoteResult({
+    required this.promoted,
+    required this.symbol,
+    required this.baseTf,
+    required this.liveModelsPath,
+    required this.filesCopied,
+    required this.message,
+  });
+
+  factory PromoteResult.fromJson(Map<String, dynamic> j) => PromoteResult(
+        promoted: (j['promoted'] as bool?) ?? false,
+        symbol: (j['symbol'] as String?) ?? '',
+        baseTf: (j['baseTf'] as String?) ?? '',
+        liveModelsPath: (j['liveModelsPath'] as String?) ?? '',
+        filesCopied: (j['filesCopied'] as num?)?.toInt() ?? 0,
+        message: (j['message'] as String?) ?? '',
+      );
 }

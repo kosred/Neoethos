@@ -21,10 +21,12 @@
 // inlines under the pipeline; until then we keep the existing rich
 // screens accessible as tabs so nothing regresses.
 
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
+import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import 'discovery_screen.dart';
@@ -77,7 +79,7 @@ class _StrategyLabScreenState extends ConsumerState<StrategyLabScreen>
               DiscoveryScreen(),
               TrainingScreen(),
               _ValidationStub(),
-              _PromotionGateStub(),
+              _PromotionGateView(),
             ],
           ),
         ),
@@ -394,53 +396,488 @@ class _ValidationStub extends ConsumerWidget {
   }
 }
 
-class _PromotionGateStub extends ConsumerWidget {
-  const _PromotionGateStub();
+// ---------------------------------------------------------------------------
+// F-330 — Promotion Gate (real, wired to /strategy_lab/promotion +
+// /strategy_lab/promote). Replaces the old _PromotionGateStub.
+// ---------------------------------------------------------------------------
+
+class _PromotionGateView extends ConsumerStatefulWidget {
+  const _PromotionGateView();
+
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final intel = ref.watch(intelligenceProvider).valueOrNull;
-    final splits = intel?.walkforwardSplits ?? 0;
-    final acc = intel?.walkforwardAvgAccuracy;
-    final ready = splits > 0 && acc != null && acc >= 0.55;
-    return _PlaceholderCard(
-      ticket: 'F-330',
-      title: 'Promotion Gate',
-      body: ready
-          ? 'Validation passed (≥ 55 % WFA accuracy). Promotion will '
-              'enforce Sharpe ≥ 1.0, Calmar ≥ 0.7, win-rate ≥ 50 %, '
-              'max drawdown ≤ 25 % once F-330 wires the gate to '
-              '`/strategy_lab/promote`. Until then, copy the model '
-              'bundle from `models/staging/` to `models/live/` by hand '
-              'after manually reviewing the validation report.'
-          : 'Promotion Gate is disabled until Validation completes. '
-              'Currently: $splits WFA splits, '
-              '${acc == null ? "no accuracy yet" : "${(acc * 100).toStringAsFixed(1)}% accuracy"}. '
-              'The gate enforces Sharpe ≥ 1.0, Calmar ≥ 0.7, win-rate ≥ 50 %, '
-              'max drawdown ≤ 25 % before copying to `models/live/`.',
-      action: ready
-          ? FilledButton.icon(
-              onPressed: null, // F-330 wires this to /strategy_lab/promote
-              icon: const Icon(Icons.upload, size: 16),
-              label: const Text('Promote to Live (F-330)'),
-              style: FilledButton.styleFrom(
-                backgroundColor: ForexAiTokens.buy,
-              ),
-            )
-          : null,
+  ConsumerState<_PromotionGateView> createState() => _PromotionGateViewState();
+}
+
+class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
+  // No symbol/timeframe selection state exists on the Strategy Lab
+  // screen yet (Discovery uses a per-card queue, Training its own
+  // fields). F-330 backend defaults the gate to the primary pair, so
+  // we mirror that here until a shared selection provider lands.
+  static const _symbol = 'EURUSD';
+  static const _baseTf = 'M5';
+
+  PromotionStatus? _status;
+  String? _error;
+  bool _loading = true;
+  bool _promoting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final client = ref.read(backendClientProvider);
+      final status = await client.fetchPromotionStatus(
+        symbol: _symbol,
+        baseTf: _baseTf,
+      );
+      if (!mounted) return;
+      setState(() {
+        _status = status;
+        _loading = false;
+      });
+    } on DioException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = _formatPromotionError(e);
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _promote() async {
+    setState(() => _promoting = true);
+    try {
+      final client = ref.read(backendClientProvider);
+      final result = await client.promoteToLive(
+        symbol: _symbol,
+        baseTf: _baseTf,
+      );
+      if (!mounted) return;
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(result.message),
+          backgroundColor:
+              result.promoted ? ForexAiTokens.buy : ForexAiTokens.warning,
+        ),
+      );
+    } on DioException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Promotion failed: ${_formatPromotionError(e)}'),
+            backgroundColor: ForexAiTokens.sell,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Promotion failed: $e'),
+            backgroundColor: ForexAiTokens.sell,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _promoting = false);
+      // Re-fetch so the gate verdict + portfolio reflect the new
+      // live_models state regardless of outcome.
+      await _load();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 640),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(vertical: ForexAiTokens.spMd),
+          child: Container(
+            padding: const EdgeInsets.all(ForexAiTokens.spLg),
+            decoration: BoxDecoration(
+              color: ForexAiTokens.panelBg,
+              border: Border.all(color: ForexAiTokens.border),
+              borderRadius: BorderRadius.circular(ForexAiTokens.rMd),
+            ),
+            child: _body(),
+          ),
+        ),
+      ),
     );
   }
+
+  Widget _body() {
+    if (_loading) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 40),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2.4),
+              ),
+              SizedBox(height: ForexAiTokens.spMd),
+              Text(
+                'Checking promotion gate…',
+                style: TextStyle(
+                  color: ForexAiTokens.textMuted,
+                  fontSize: ForexAiTokens.fsBody,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (_error != null) {
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.error_outline, color: ForexAiTokens.sell, size: 18),
+              SizedBox(width: ForexAiTokens.spSm),
+              Text(
+                'Could not load promotion gate',
+                style: TextStyle(
+                  fontSize: ForexAiTokens.fsSubtitle,
+                  fontWeight: FontWeight.w700,
+                  color: ForexAiTokens.textPrimary,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: ForexAiTokens.spSm),
+          Text(
+            _error!,
+            style: const TextStyle(
+              fontSize: ForexAiTokens.fsBody,
+              color: ForexAiTokens.textMuted,
+              height: 1.4,
+            ),
+          ),
+          const SizedBox(height: ForexAiTokens.spMd),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton.icon(
+              onPressed: _load,
+              icon: const Icon(Icons.refresh, size: 16),
+              label: const Text('Retry'),
+            ),
+          ),
+        ],
+      );
+    }
+
+    return _content(_status!);
+  }
+
+  Widget _content(PromotionStatus s) {
+    final promoted = s.decision.promoted;
+    final badgeColor = promoted ? ForexAiTokens.buy : ForexAiTokens.warning;
+    final badgeLabel = promoted ? 'ELIGIBLE' : 'BLOCKED';
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // Header: title + symbol/tf + status badge + refresh.
+        Row(
+          children: [
+            const Text(
+              'Promotion Gate',
+              style: TextStyle(
+                fontSize: ForexAiTokens.fsSubtitle,
+                fontWeight: FontWeight.w700,
+                color: ForexAiTokens.textPrimary,
+              ),
+            ),
+            const SizedBox(width: ForexAiTokens.spSm),
+            Text(
+              '${s.symbol} · ${s.baseTf}',
+              style: const TextStyle(
+                fontSize: ForexAiTokens.fsCaption,
+                color: ForexAiTokens.textMuted,
+              ),
+            ),
+            const Spacer(),
+            _statusBadge(badgeLabel, badgeColor),
+            const SizedBox(width: ForexAiTokens.spSm),
+            IconButton(
+              tooltip: 'Refresh',
+              onPressed: _loading ? null : _load,
+              icon: const Icon(Icons.refresh, size: 18),
+              color: ForexAiTokens.textMuted,
+              constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+              padding: EdgeInsets.zero,
+            ),
+          ],
+        ),
+        const SizedBox(height: ForexAiTokens.spMd),
+
+        // Decision summary.
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(ForexAiTokens.spMd),
+          decoration: BoxDecoration(
+            color: badgeColor.withValues(alpha: 0.10),
+            border: Border.all(color: badgeColor.withValues(alpha: 0.45)),
+            borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+          ),
+          child: Text(
+            s.decision.summary.isEmpty
+                ? (promoted
+                    ? 'Portfolio is eligible for promotion.'
+                    : 'Portfolio is not eligible for promotion yet.')
+                : s.decision.summary,
+            style: TextStyle(
+              fontSize: ForexAiTokens.fsBody,
+              color: badgeColor,
+              height: 1.4,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+        const SizedBox(height: ForexAiTokens.spLg),
+
+        // Portfolio + aggregate metrics.
+        const _SectionLabel('PORTFOLIO'),
+        const SizedBox(height: ForexAiTokens.spSm),
+        _metricsGrid(s),
+        const SizedBox(height: ForexAiTokens.spLg),
+
+        // Criteria breakdown.
+        if (s.decision.criteria.isNotEmpty) ...[
+          const _SectionLabel('GATE CRITERIA'),
+          const SizedBox(height: ForexAiTokens.spSm),
+          for (final c in s.decision.criteria) _criterionRow(c),
+          const SizedBox(height: ForexAiTokens.spLg),
+        ] else ...[
+          const Padding(
+            padding: EdgeInsets.only(bottom: ForexAiTokens.spLg),
+            child: Text(
+              'No criteria evaluated yet — run Discovery + Training to '
+              'build a portfolio for this symbol/timeframe.',
+              style: TextStyle(
+                fontSize: ForexAiTokens.fsBody,
+                color: ForexAiTokens.textMuted,
+                height: 1.4,
+              ),
+            ),
+          ),
+        ],
+
+        // Promote action.
+        Align(
+          alignment: Alignment.centerRight,
+          child: FilledButton.icon(
+            onPressed: (promoted && !_promoting) ? _promote : null,
+            icon: _promoting
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: ForexAiTokens.textPrimary,
+                    ),
+                  )
+                : const Icon(Icons.upload, size: 16),
+            label: Text(_promoting ? 'Promoting…' : 'Promote to Live'),
+            style: FilledButton.styleFrom(
+              backgroundColor: ForexAiTokens.buy,
+              disabledBackgroundColor:
+                  ForexAiTokens.border.withValues(alpha: 0.5),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _statusBadge(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.16),
+        border: Border.all(color: color.withValues(alpha: 0.6)),
+        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: ForexAiTokens.fsCaption,
+          fontWeight: FontWeight.w800,
+          letterSpacing: 0.5,
+          color: color,
+        ),
+      ),
+    );
+  }
+
+  Widget _metricsGrid(PromotionStatus s) {
+    final agg = s.aggregate;
+    final tiles = <Widget>[
+      _metricTile('Portfolio size', '${s.portfolioSize}'),
+      if (agg != null) ...[
+        _metricTile('Sharpe', agg.sharpe.toStringAsFixed(2)),
+        _metricTile('Win rate', '${(agg.winRate * 100).toStringAsFixed(1)}%'),
+        _metricTile('Profit factor', agg.profitFactor.toStringAsFixed(2)),
+        _metricTile(
+          'Max drawdown',
+          '${agg.maxDrawdownPct.toStringAsFixed(1)}%',
+        ),
+        _metricTile('Trades', '${agg.trades}'),
+      ],
+    ];
+    if (agg == null) {
+      tiles.add(_metricTile('Metrics', 'No portfolio yet'));
+    }
+    return Wrap(
+      spacing: ForexAiTokens.spSm,
+      runSpacing: ForexAiTokens.spSm,
+      children: tiles,
+    );
+  }
+
+  Widget _metricTile(String label, String value) {
+    return Container(
+      width: 120,
+      padding: const EdgeInsets.symmetric(
+        horizontal: ForexAiTokens.spMd,
+        vertical: ForexAiTokens.spSm,
+      ),
+      decoration: BoxDecoration(
+        color: ForexAiTokens.appBg,
+        border: Border.all(color: ForexAiTokens.border),
+        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label.toUpperCase(),
+            style: const TextStyle(
+              fontSize: ForexAiTokens.fsCaption - 1,
+              letterSpacing: 0.6,
+              fontWeight: FontWeight.w700,
+              color: ForexAiTokens.textFaint,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            value,
+            style: const TextStyle(
+              fontSize: ForexAiTokens.fsBody,
+              fontWeight: FontWeight.w700,
+              color: ForexAiTokens.textPrimary,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _criterionRow(PromotionCriterion c) {
+    final color = c.passed ? ForexAiTokens.buy : ForexAiTokens.sell;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        children: [
+          Icon(
+            c.passed ? Icons.check_circle : Icons.cancel,
+            size: 16,
+            color: color,
+          ),
+          const SizedBox(width: ForexAiTokens.spSm),
+          Expanded(
+            child: Text(
+              c.name,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: ForexAiTokens.fsBody,
+                color: ForexAiTokens.textPrimary,
+              ),
+            ),
+          ),
+          Text(
+            '${_fmtNum(c.actual)} ${c.comparison} ${_fmtNum(c.threshold)}',
+            style: TextStyle(
+              fontSize: ForexAiTokens.fsBody,
+              fontWeight: FontWeight.w700,
+              fontFeatures: const [FontFeature.tabularFigures()],
+              color: color,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Trim trailing zeros so "1.40" → "1.4" but "0.52" stays "0.52".
+  static String _fmtNum(double v) {
+    if (v == v.roundToDouble()) return v.toStringAsFixed(0);
+    final s = v.toStringAsFixed(2);
+    return s.endsWith('0') ? s.substring(0, s.length - 1) : s;
+  }
+
+  static String _formatPromotionError(DioException e) {
+    final body = e.response?.data;
+    if (body is Map && body['message'] is String) {
+      return body['message'] as String;
+    }
+    if (body is Map && body['error'] is String) {
+      return body['error'] as String;
+    }
+    return e.message ?? e.toString();
+  }
+}
+
+/// Small all-caps section header used inside the Promotion Gate card.
+class _SectionLabel extends StatelessWidget {
+  final String text;
+  const _SectionLabel(this.text);
+  @override
+  Widget build(BuildContext context) => Text(
+        text,
+        style: const TextStyle(
+          fontSize: ForexAiTokens.fsCaption,
+          letterSpacing: 1.0,
+          fontWeight: FontWeight.w700,
+          color: ForexAiTokens.textMuted,
+        ),
+      );
 }
 
 class _PlaceholderCard extends StatelessWidget {
   final String ticket;
   final String title;
   final String body;
-  final Widget? action;
   const _PlaceholderCard({
     required this.ticket,
     required this.title,
     required this.body,
-    this.action,
   });
 
   @override
@@ -503,13 +940,6 @@ class _PlaceholderCard extends StatelessWidget {
                   height: 1.5,
                 ),
               ),
-              if (action != null) ...[
-                const SizedBox(height: ForexAiTokens.spLg),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: action!,
-                ),
-              ],
             ],
           ),
         ),
