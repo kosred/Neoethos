@@ -148,6 +148,13 @@ pub fn router(state: AppApiState) -> Router {
         .route("/broker/symbols", get(data_control::symbols))
         .route("/broker/timeframes", get(data_control::timeframes))
         .route("/broker/accounts", get(data_control::accounts))
+        // F-333: set the *active* cTrader account by promoting it to the
+        // front of broker_credentials.toml's accounts list (resolve_creds
+        // reads accounts.first()). MVP — takes effect on next start.
+        .route(
+            "/broker/account/select",
+            post(broker_control::account_select),
+        )
         .route("/data/bootstrap", get(system_status::data_bootstrap))
         .route("/data/fetch", post(data_control::fetch))
         // #192: import user-provided CSV/Parquet/Arrow/JSON/JSONL/TSV

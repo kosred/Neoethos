@@ -19,6 +19,7 @@ use crate::app_services::broker_config::{
     BROKER_CREDENTIALS_SCHEMA_VERSION, BrokerAccountTarget, CTRADER_OAUTH_REDIRECT_URI,
     CTraderBrokerEnvironment, CTraderBrokerSettings,
 };
+use crate::app_services::broker_api::fetch_broker_accounts_blocking;
 use crate::app_services::broker_persistence::{load_broker_settings, save_broker_settings};
 use crate::app_services::reauth::run_reauth_flow_blocking;
 
@@ -177,6 +178,161 @@ pub async fn credentials_post(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": format!("save task panicked: {join_err}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+// ─── POST /broker/account/select ──────────────────────────────────────────
+
+/// Wire DTO for `POST /broker/account/select`. The operator picks an
+/// account from the Settings dropdown (sourced from `/broker/accounts`)
+/// and we make it the *active* one by promoting it to the front of the
+/// on-disk `[[ctrader.accounts]]` list — `resolve_creds()` always takes
+/// `accounts.first()`, so first == active.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSelectDto {
+    /// Numeric cTID as a string — cTrader ids can exceed i32 range so
+    /// the wire shape is text, mirroring `BrokerAccountDto::account_id`.
+    pub account_id: String,
+}
+
+/// Outcome of the blocking select task — distinguishes the three
+/// terminal states so the async wrapper can map each to the right
+/// HTTP status without stringly-typed sniffing.
+enum SelectOutcome {
+    /// Account was already on disk and is now first (or already was).
+    Promoted,
+    /// Account wasn't on disk but is a valid OAuth-granted cTID, so we
+    /// added it as the active (first) entry.
+    AddedFromGrant,
+    /// `account_id` matched neither the on-disk list nor the live OAuth
+    /// grant — a genuinely-unknown id. Maps to 404.
+    NotFound,
+}
+
+/// `POST /broker/account/select` — set the *active* cTrader account.
+///
+/// MVP behaviour (no runtime hot-swap yet): load broker_credentials.toml
+/// and make the requested account **first** in the `[[ctrader.accounts]]`
+/// list. `resolve_creds()` always reads `accounts.first()`, so first ==
+/// active; the next NeoEthos start picks up the freshly-promoted account.
+/// We return `requiresRestart: true` so the UI prompts accordingly.
+///
+/// Two cases, both non-destructive (existing accounts are preserved, never
+/// cleared the way `credentials_post` does — clearing would force a
+/// re-OAuth to recover the rest of the granted set):
+///
+///   1. The id is already in the on-disk list → **reorder** it to the
+///      front.
+///   2. The id is NOT on disk yet → it's almost always a different
+///      account from the same OAuth grant (the Settings dropdown is fed
+///      by `/broker/accounts`, which lists the *full* grant, while
+///      `credentials_post` only ever persists one account). We validate
+///      it against the live grant and, if present there, **prepend** it
+///      as a fresh enabled target. This is the case that actually makes
+///      multi-account selection work — without it, picking any account
+///      other than the single persisted one would be a no-op.
+///
+/// Errors:
+///   - 400 if `accountId` is blank.
+///   - 404 if the id is in neither the on-disk list nor the live OAuth
+///     grant (stale UI / typo / revoked access).
+pub async fn account_select(
+    State(_state): State<AppApiState>,
+    Json(body): Json<AccountSelectDto>,
+) -> Response {
+    let account_id = body.account_id.trim().to_string();
+    if account_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "accountId must be non-empty"})),
+        )
+            .into_response();
+    }
+
+    let select_id = account_id.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<SelectOutcome> {
+        let mut current = load_broker_settings();
+        let accounts = &mut current.ctrader.accounts;
+
+        if let Some(pos) = accounts.iter().position(|a| a.account_id == select_id) {
+            // Case 1 — already persisted. Promote to front. If it's
+            // already first this is a no-op; skip the write so we don't
+            // bump the file mtime (and trip the credentials-drift
+            // healer) for nothing.
+            if pos != 0 {
+                let picked = accounts.remove(pos);
+                accounts.insert(0, picked);
+                current.schema_version = BROKER_CREDENTIALS_SCHEMA_VERSION;
+                save_broker_settings(&current)?;
+            }
+            return Ok(SelectOutcome::Promoted);
+        }
+
+        // Case 2 — not on disk. Confirm it's a real account from the
+        // live OAuth grant before we add it, so a typo'd / revoked id
+        // becomes a clean 404 instead of silently pinning a bad cTID
+        // (which is exactly the CH_ACCESS_TOKEN_INVALID footgun this
+        // whole picker exists to eliminate).
+        let grant = fetch_broker_accounts_blocking()?;
+        let Some(granted) = grant.accounts.iter().find(|a| a.account_id == select_id) else {
+            return Ok(SelectOutcome::NotFound);
+        };
+
+        // Prepend as the active target, preserving the granted label +
+        // execution flag so the on-disk row matches what the user saw
+        // in the dropdown.
+        accounts.insert(
+            0,
+            BrokerAccountTarget {
+                account_id: granted.account_id.clone(),
+                label: if granted.account_name.is_empty() {
+                    granted.account_id.clone()
+                } else {
+                    granted.account_name.clone()
+                },
+                enabled_for_execution: granted.enabled_for_execution,
+            },
+        );
+        current.schema_version = BROKER_CREDENTIALS_SCHEMA_VERSION;
+        save_broker_settings(&current)?;
+        Ok(SelectOutcome::AddedFromGrant)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(SelectOutcome::Promoted)) | Ok(Ok(SelectOutcome::AddedFromGrant)) => {
+            Json(serde_json::json!({
+                "ok": true,
+                "selectedAccountId": account_id,
+                "requiresRestart": true,
+            }))
+            .into_response()
+        }
+        Ok(Ok(SelectOutcome::NotFound)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!(
+                    "account '{account_id}' is not in broker_credentials.toml \
+                     nor in the current cTrader OAuth grant; re-authenticate \
+                     (Broker Setup → Re-authenticate) and pick it from the \
+                     refreshed list"
+                ),
+            })),
+        )
+            .into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("account-select task panicked: {join_err}"),
             })),
         )
             .into_response(),

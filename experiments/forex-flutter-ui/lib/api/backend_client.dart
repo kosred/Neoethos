@@ -614,6 +614,34 @@ class BackendClient {
     return BrokerAccountsSnapshot.fromJson(response.data!);
   }
 
+  /// POST `/broker/account/select` (F-333) — set the *active* cTrader
+  /// account. The backend reorders `broker_credentials.toml` so the
+  /// picked cTID becomes first in the accounts list (the runtime always
+  /// trades `accounts.first()`), adding it from the live OAuth grant if
+  /// it wasn't persisted yet.
+  ///
+  /// Returns the backend payload:
+  ///   `{ok: true, selectedAccountId: "...", requiresRestart: true}`.
+  /// Runtime hot-swap isn't in scope yet, so `requiresRestart` is the
+  /// honest signal that the operator must restart NeoEthos to apply.
+  ///
+  /// Throws `DioException` on 4xx/5xx — notably 404 when the id is in
+  /// neither the on-disk list nor the current OAuth grant (stale UI /
+  /// revoked access).
+  Future<Map<String, dynamic>> selectBrokerAccount({
+    required String accountId,
+  }) async {
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/broker/account/select',
+      data: {'accountId': accountId},
+      // Selecting an account that isn't persisted yet triggers a live
+      // /broker/accounts grant lookup server-side (WSS round-trip), so
+      // give it headroom over the default 10 s receive timeout.
+      options: Options(receiveTimeout: const Duration(seconds: 25)),
+    );
+    return response.data ?? const <String, dynamic>{};
+  }
+
   /// GET `/settings/raw` (#193) — full `config.yaml` contents as a
   /// single string, plus the absolute on-disk path. Lets the Settings
   /// screen surface the 200+ knobs the typed `/settings` DTO can't.

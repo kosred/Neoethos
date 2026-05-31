@@ -325,6 +325,48 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
     }
   }
 
+  /// F-333: the operator picked a different cTID in the dropdown. Make it
+  /// the *active* account server-side — the backend reorders
+  /// broker_credentials.toml so `accounts.first()` (what the runtime
+  /// trades) becomes this id. Runtime hot-swap isn't in scope yet, so we
+  /// prompt for a restart, which is the honest MVP.
+  ///
+  /// Kept separate from `_save`: selection is a one-click action that
+  /// shouldn't require re-submitting the whole credentials form, and it
+  /// must NOT fire on the picker's automatic stale-id correction (that
+  /// path calls `onPicked` only).
+  Future<void> _selectAccount(String accountId) async {
+    final id = accountId.trim();
+    if (id.isEmpty) return;
+    try {
+      final r = await ref
+          .read(backendClientProvider)
+          .selectBrokerAccount(accountId: id);
+      if (!mounted) return;
+      final ok = r['ok'] == true;
+      final selected = (r['selectedAccountId'] as String?) ?? id;
+      // Force broker-status + account snapshot to re-read on next tick so
+      // the status bar reflects the pending change (the actual swap lands
+      // after restart, but invalidating avoids showing stale-cached data).
+      ref.invalidate(brokerStatusProvider);
+      ref.invalidate(accountSnapshotProvider);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: ok ? ForexAiTokens.buy : ForexAiTokens.warning,
+          content: Text(
+            ok
+                ? 'Active account → $selected. Restart NeoEthos to apply.'
+                : 'Account select returned an unexpected response.',
+          ),
+          duration: const Duration(seconds: 6),
+        ),
+      );
+    } on DioException catch (e) {
+      if (!mounted) return;
+      showTranslatedErrorSnackbar(context, e, prefix: 'Account select failed');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final asyncSettings = ref.watch(settingsProvider);
@@ -426,6 +468,7 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
                 onPicked: (id) => setState(() {
                   _accountIdCtrl.text = id;
                 }),
+                onUserPicked: _selectAccount,
                 fallback: TextField(
                   controller: _accountIdCtrl,
                   enabled: !_busy,
@@ -808,12 +851,23 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
 class _AccountPicker extends ConsumerWidget {
   final String currentAccountId;
   final bool enabled;
+
+  /// Fired for AUTOMATIC corrections only — e.g. the saved cTID isn't in
+  /// the granted set, so we snap the local field to the first available.
+  /// This must stay side-effect-free (local state only); it runs in a
+  /// post-frame callback on every build and must NOT hit the backend.
   final ValueChanged<String> onPicked;
+
+  /// Fired only when the OPERATOR actively chooses a row from the
+  /// dropdown. F-333: this is the one that promotes the account to
+  /// active server-side (reorders broker_credentials.toml).
+  final ValueChanged<String> onUserPicked;
   final Widget fallback;
   const _AccountPicker({
     required this.currentAccountId,
     required this.enabled,
     required this.onPicked,
+    required this.onUserPicked,
     required this.fallback,
   });
 
@@ -904,7 +958,12 @@ class _AccountPicker extends ConsumerWidget {
               ],
               onChanged: enabled
                   ? (v) {
-                      if (v != null) onPicked(v);
+                      if (v != null && v != selected) {
+                        // Update the local field immediately, then
+                        // promote the account server-side (F-333).
+                        onPicked(v);
+                        onUserPicked(v);
+                      }
                     }
                   : null,
             ),
