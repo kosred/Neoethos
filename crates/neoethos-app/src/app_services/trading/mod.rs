@@ -1449,11 +1449,30 @@ impl TradingSession {
         }
         // Build ensemble from saved artifacts. SoftVotingEnsemble::new
         // already rejects the no-voters case for us.
-        let ensemble = neoethos_models::build_ensemble_for_symbol(models_dir, symbol, timeframe)
+        //
+        // **F-330**: prefer promoted artifacts in `live_models/<sym>/<tf>`
+        // when they exist — that's how the Promotion Gate's "Promote to
+        // Live" takes effect (the `/strategy_lab/promote` endpoint copies
+        // gated models there). Fall back to the trained `models_dir` the
+        // caller passed when nothing has been promoted yet. The dir name
+        // is kept in sync with `server::strategy_lab::LIVE_MODELS_DIR`.
+        let live_dir = std::path::Path::new("live_models");
+        let effective_dir: &std::path::Path =
+            if live_dir.join(symbol).join(timeframe).is_dir() {
+                tracing::info!(
+                    target: "neoethos_app::trading::auto_trade",
+                    symbol, timeframe,
+                    "using promoted live_models/ artifacts (F-330)"
+                );
+                live_dir
+            } else {
+                models_dir
+            };
+        let ensemble = neoethos_models::build_ensemble_for_symbol(effective_dir, symbol, timeframe)
             .with_context(|| {
                 format!(
                     "build_ensemble_for_symbol({}, {}, {}) failed",
-                    models_dir.display(),
+                    effective_dir.display(),
                     symbol,
                     timeframe
                 )

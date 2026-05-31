@@ -51,6 +51,7 @@ pub mod pending_actions;
 pub mod risk;
 pub mod settings;
 pub mod state;
+pub mod strategy_lab;
 pub mod system_status;
 
 use anyhow::Context;
@@ -132,6 +133,12 @@ pub fn router(state: AppApiState) -> Router {
             "/engines/training/stop",
             post(engines_control::training_stop),
         )
+        // F-330 Strategy Lab — Promotion Gate status + promote-to-live.
+        .route(
+            "/strategy_lab/promotion",
+            get(strategy_lab::promotion_status),
+        )
+        .route("/strategy_lab/promote", post(strategy_lab::promote))
         .route("/broker/status", get(system_status::broker_status))
         .route("/broker/reauth", post(broker_control::reauth))
         .route(
