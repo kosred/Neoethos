@@ -1940,11 +1940,30 @@ class KnobPresetCatalog {
 
   factory KnobPresetCatalog.fromJson(Map<String, dynamic> j) {
     final map = <String, String>{};
-    final raw = j['presets'] as Map<String, dynamic>?;
-    if (raw != null) {
-      raw.forEach((k, v) => map[k] = v as String);
+    final raw = j['presets'];
+    if (raw is List) {
+      // **Bug-fix (2026-05-31)**: the backend's actual shape is a LIST
+      // of objects — `{"presets":[{"id":"conservative","label":
+      // "Conservative","description":"..."}]}` — NOT a Map. The old
+      // `as Map<String,dynamic>?` cast threw "List<dynamic> is not a
+      // subtype of Map<String,dynamic>?" which crashed the entire
+      // Advanced Settings tab. Map each entry's id → label.
+      for (final e in raw) {
+        if (e is Map<String, dynamic>) {
+          final id = e['id'] as String?;
+          final label = e['label'] as String?;
+          if (id != null && id.isNotEmpty) {
+            map[id] = (label != null && label.isNotEmpty) ? label : id;
+          }
+        }
+      }
+    } else if (raw is Map<String, dynamic>) {
+      // Legacy flat shape: {id: label}.
+      raw.forEach((k, v) {
+        if (v is String) map[k] = v;
+      });
     } else {
-      // Backend may have flat shape; tolerate either.
+      // Last-resort: top-level flat {id: label}.
       j.forEach((k, v) {
         if (v is String) map[k] = v;
       });

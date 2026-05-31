@@ -218,7 +218,15 @@ impl CodexClient {
             // we send the whole prompt every time and the server doesn't
             // persist a thread for us to reference later.
             store: false,
-            max_output_tokens: request.max_tokens,
+            // **F-291 Cycle 5 (2026-05-31)**: `max_output_tokens` is
+            // NOT accepted by the ChatGPT-subscription Codex
+            // `/responses` endpoint — it returns HTTP 400
+            // "Unsupported parameter: max_output_tokens" the moment the
+            // UI passes a non-null `openai_max_tokens`. (The earlier
+            // smoke test missed it because it sent a prompt with no
+            // token cap.) The endpoint caps output server-side, so we
+            // simply don't send the field. `request.max_tokens` is
+            // still accepted on the public-API path elsewhere.
         };
 
         let url = format!("{CODEX_API_BASE}/codex/responses");
@@ -385,9 +393,9 @@ struct ResponsesApiRequest {
     /// Whether ChatGPT should persist this turn in server-side memory.
     /// Codex CLI sends `false` for stateless use.
     store: bool,
-    /// Cap on output tokens. None → use server default.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
+    // **F-291 Cycle 5**: no `max_output_tokens` — the ChatGPT-account
+    // `/responses` endpoint rejects it with HTTP 400 "Unsupported
+    // parameter: max_output_tokens". Output is capped server-side.
 }
 
 /// One message in the Responses-API `input` list.
@@ -626,7 +634,6 @@ mod tests {
             instructions,
             stream: true,
             store: false,
-            max_output_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"input\":["), "input must serialize as a list");
@@ -636,6 +643,13 @@ mod tests {
         assert!(
             !json.contains("\"instructions\":\"\""),
             "instructions must be non-empty"
+        );
+        // **F-291 Cycle 5 regression guard**: the endpoint 400s on
+        // `max_output_tokens` ("Unsupported parameter"). It must never
+        // appear on the wire.
+        assert!(
+            !json.contains("max_output_tokens"),
+            "max_output_tokens is rejected by the /responses endpoint"
         );
     }
 
