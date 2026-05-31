@@ -61,12 +61,43 @@ void main() {
     expect(find.text('Forex only'), findsOneWidget);
   });
 
-  testWidgets('SettingsScreen renders without crashing', (tester) async {
+  testWidgets('SettingsScreen renders the consolidated tab strip',
+      (tester) async {
+    // **F-327 invariant**: SettingsScreen is now a TabBar wrapper with
+    // 6 sub-tabs (Account, App, Risk, Advanced, Hardware, Data) + a
+    // Help link in the top-right. Pinning the labels here so the tab
+    // strip doesn't silently lose entries.
     await useDesktopSurface(tester);
     await tester.pumpWidget(_wrap(const SettingsScreen()));
     await tester.pumpAndSettle(const Duration(seconds: 1));
     expect(find.byType(SettingsScreen), findsOneWidget);
-    // #193 invariant: the advanced config card mounts.
+    for (final label in const [
+      'Account',
+      'App',
+      'Risk',
+      'Advanced',
+      'Hardware',
+      'Data',
+    ]) {
+      expect(
+        find.textContaining(label),
+        findsWidgets,
+        reason: 'Settings tab strip should list "$label"',
+      );
+    }
+    // The Help (F1) jump-out link sits in the top-right corner.
+    expect(find.textContaining('Help (F1)'), findsOneWidget);
+  });
+
+  testWidgets('AppSettingsScreen keeps the raw YAML editor (#193)',
+      (tester) async {
+    // **F-327 invariant**: the original SettingsScreen content lives
+    // on as AppSettingsScreen and renders inside the consolidated
+    // "App" tab. The #193 raw-YAML editor must still mount here.
+    await useDesktopSurface(tester);
+    await tester.pumpWidget(_wrap(const AppSettingsScreen()));
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+    expect(find.byType(AppSettingsScreen), findsOneWidget);
     expect(
       find.textContaining('Advanced: full config.yaml'),
       findsOneWidget,

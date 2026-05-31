@@ -1,9 +1,27 @@
-// Settings — credentials form + read-only config view.
+// Settings — consolidated single-tab home for ALL backend + frontend
+// configuration the user can touch.
+//
+// **F-327 (2026-05-29 rebuild)**: per the Codex mockup, the 4 sidebar
+// entries that used to live under the "System" group (Broker Setup,
+// Risk, Hardware, Data Bootstrap) plus the standalone Advanced
+// Settings knob editor (#238) all collapse into a single Settings tab
+// with an internal sub-tab bar:
+//
+//   🔐 Account       — cTrader OAuth + saved credentials
+//   ⚙  App           — data dir, news, LLM, news-trading mode + raw YAML
+//   ⚠  Risk          — prop-firm preset + drawdown caps
+//   🛠 Advanced      — full 42+ knob editor (inline now, not a modal)
+//   🖥 Hardware      — CPU/GPU probe (read-only)
+//   📂 Data          — historical bootstrap + CSV import
+//
+// The old `SettingsScreen` (credentials form + 5 app settings + raw
+// YAML editor) lives on as `AppSettingsScreen` and is rendered inside
+// the "App" tab — its state/providers/tests are unchanged.
 //
 // The credentials form posts to /broker/credentials which writes
 // broker_credentials.toml under %APPDATA%/neoethos/. After save, the
-// operator goes to Broker Setup → Re-authenticate to do the actual
-// OAuth flow against the freshly-saved client_id/secret.
+// operator goes to Settings → Account → Re-authenticate to do the
+// actual OAuth flow against the freshly-saved client_id/secret.
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
@@ -16,15 +34,185 @@ import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
 import 'advanced_settings_screen.dart';
+import 'broker_setup_screen.dart';
+import 'data_bootstrap_screen.dart';
+import 'hardware_screen.dart';
+import 'help_screen.dart';
+import 'risk_screen.dart';
 
-class SettingsScreen extends ConsumerStatefulWidget {
+/// The consolidated Settings tab.
+///
+/// **F-327 (2026-05-29)**: was a single rich screen exposed via the
+/// sidebar's `Settings` entry. Now an outer TabBar wrapper whose body
+/// hosts the 6 sub-tabs of the Codex mockup's consolidated Settings
+/// group. The pre-F-327 content lives at the "App" sub-tab as
+/// `AppSettingsScreen`.
+class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
 
   @override
-  ConsumerState<SettingsScreen> createState() => _SettingsScreenState();
+  State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
-class _SettingsScreenState extends ConsumerState<SettingsScreen> {
+class _SettingsScreenState extends State<SettingsScreen>
+    with SingleTickerProviderStateMixin {
+  late final TabController _controller;
+
+  // Section list — kept in this exact order so the "primary path" tab
+  // (Account / App) is on the left and the rarely-touched ones
+  // (Hardware / Data) are on the right. The Help link sits in the
+  // top-right corner of the tab strip instead of being a tab body.
+  static const _tabs = [
+    ('Account', '🔐',
+        'cTrader OAuth + saved client_id/secret'),
+    ('App', '⚙',
+        'Data dir, news source, LLM model, news-trading mode, raw YAML'),
+    ('Risk', '⚠',
+        'Prop-firm preset + drawdown caps + per-trade risk'),
+    ('Advanced', '🛠',
+        '42+ search-pipeline knobs — population, GA params, thresholds'),
+    ('Hardware', '🖥',
+        'CPU / GPU detection (read-only)'),
+    ('Data', '📂',
+        'Historical bootstrap + CSV/Parquet import'),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TabController(length: _tabs.length, vsync: this);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _SettingsTabStrip(controller: _controller, tabs: _tabs),
+        const SizedBox(height: ForexAiTokens.spSm),
+        Expanded(
+          child: TabBarView(
+            controller: _controller,
+            physics: const NeverScrollableScrollPhysics(),
+            children: const [
+              // Account = OAuth + saved credentials. BrokerSetupScreen
+              // wraps the full flow.
+              SingleChildScrollView(child: BrokerSetupScreen()),
+              // App = original SettingsScreen body. Stays scrollable so
+              // the long form (credentials → settings → account picker
+              // → raw YAML) still fits on smaller windows.
+              SingleChildScrollView(child: AppSettingsScreen()),
+              // Risk = prop-firm preset + drawdown caps.
+              SingleChildScrollView(child: RiskScreen()),
+              // Advanced = the 2-pane knob editor (#238). It manages
+              // its own scroll surfaces so don't wrap in another
+              // SingleChildScrollView (that'd nest vertical scrolls).
+              AdvancedSettingsScreen(),
+              // Hardware = read-only probe.
+              SingleChildScrollView(child: HardwareScreen()),
+              // Data = historical bootstrap + CSV/Parquet import.
+              SingleChildScrollView(child: DataBootstrapScreen()),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _SettingsTabStrip extends StatelessWidget {
+  final TabController controller;
+  final List<(String, String, String)> tabs; // (label, icon, tooltip)
+  const _SettingsTabStrip({required this.controller, required this.tabs});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: ForexAiTokens.panelBg,
+        border: Border.all(color: ForexAiTokens.border),
+        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+      ),
+      padding: const EdgeInsets.only(right: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: TabBar(
+              controller: controller,
+              isScrollable: true,
+              labelColor: ForexAiTokens.accent,
+              unselectedLabelColor: ForexAiTokens.textMuted,
+              indicatorColor: ForexAiTokens.accent,
+              labelStyle: const TextStyle(
+                fontSize: ForexAiTokens.fsBody,
+                fontWeight: FontWeight.w700,
+              ),
+              unselectedLabelStyle: const TextStyle(
+                fontSize: ForexAiTokens.fsBody,
+                fontWeight: FontWeight.w500,
+              ),
+              tabs: [
+                for (final (label, icon, tooltip) in tabs)
+                  Tooltip(
+                    message: tooltip,
+                    waitDuration: const Duration(milliseconds: 600),
+                    child: Tab(text: '$icon  $label'),
+                  ),
+              ],
+            ),
+          ),
+          // Help link sits in the top-right so the user can always
+          // jump to the F1 docs from inside Settings, without it
+          // being a separate sub-tab (Help is its own full-screen
+          // experience).
+          TextButton.icon(
+            onPressed: () => showHelpDialog(context),
+            icon: const Icon(Icons.help_outline,
+                size: 16, color: ForexAiTokens.textMuted),
+            label: const Text(
+              'Help (F1)',
+              style: TextStyle(
+                fontSize: ForexAiTokens.fsCaption,
+                fontWeight: FontWeight.w600,
+                color: ForexAiTokens.textMuted,
+              ),
+            ),
+            style: TextButton.styleFrom(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// "App Settings" tab body — broker credentials + the 5 app-wide
+/// settings (data dir, news source, OpenAI model, news-trading mode,
+/// account picker) + the F-312 raw YAML editor.
+///
+/// **F-327 (2026-05-29 rebuild)**: was the public `SettingsScreen`
+/// exposed directly to the sidebar. Now lives as one tab inside the
+/// consolidated `SettingsScreen` (`settings_consolidated_screen.dart`).
+/// The class was renamed but the body is unchanged — all existing
+/// fields, providers, and tests still apply to it.
+class AppSettingsScreen extends ConsumerStatefulWidget {
+  const AppSettingsScreen({super.key});
+
+  @override
+  ConsumerState<AppSettingsScreen> createState() => _AppSettingsScreenState();
+}
+
+class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
   final _clientIdCtrl = TextEditingController();
   final _clientSecretCtrl = TextEditingController();
   final _accountIdCtrl = TextEditingController();

@@ -25,6 +25,7 @@ import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
 import '../api/currency_format.dart';
+import '../screens/help_screen.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -142,6 +143,15 @@ class TopBar extends ConsumerWidget {
                 .refreshNow(),
             tooltip: 'Refresh account snapshot now',
             icon: const Icon(Icons.refresh, color: ForexAiTokens.textMuted),
+          ),
+          // Help — F1 keyboard shortcut also opens this. Greek + English
+          // docs across 6 sections (Welcome, Trading, AI Engine, Risk,
+          // Shortcuts, FAQ). Lifted from the Codex mockup in F-329.
+          IconButton(
+            onPressed: () => showHelpDialog(context),
+            tooltip: 'Help (F1) — Welcome guide, trading, AI, risk, FAQs',
+            icon: const Icon(Icons.help_outline,
+                color: ForexAiTokens.textMuted),
           ),
           // Report Issue — single, always-visible entry point. End
           // users can't rebuild the app, so this is the canonical way

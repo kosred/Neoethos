@@ -1,5 +1,11 @@
 // Smoke tests that prove the shell renders without errors and
 // that nav-tab clicks swap the dock view.
+//
+// **F-321 (2026-05-29 rebuild)**: was a 15-tab grouped nav with three
+// section dividers (T R A D I N G / A I   E N G I N E / S Y S T E M).
+// The Codex mockup collapsed that into 6 flat tabs and the old
+// `NavGroup` enum was deleted, so these tests had to be reworked.
+// `kNavTabs.length` is now `6` and no section dividers render any more.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -10,20 +16,17 @@ import 'package:forex_flutter_ui/theme/theme.dart';
 import 'test_harness.dart';
 
 void main() {
-  testWidgets('shell renders all four grid areas', (tester) async {
+  testWidgets('shell renders TopBar + Sidebar brand + Dashboard default',
+      (tester) async {
     await useDesktopSurface(tester);
     await tester.pumpWidget(shellHarness());
-    // TopBar brand
-    expect(find.text('NeoEthos'), findsOneWidget);
-    // Sidebar section headers (letter-spaced uppercase)
-    expect(find.textContaining('T R A D I N G'), findsOneWidget);
-    expect(find.textContaining('A I   E N G I N E'), findsOneWidget);
-    expect(find.textContaining('S Y S T E M'), findsOneWidget);
-    // Default screen is Dashboard
-    expect(find.text('Operator Overview'), findsOneWidget);
+    // TopBar brand AND sidebar brand both render "NeoEthos".
+    expect(find.text('NeoEthos'), findsWidgets);
+    // Default screen header is the Dashboard tab title.
+    expect(find.text('Dashboard'), findsWidgets);
   });
 
-  testWidgets('sidebar lists all 15 panels', (tester) async {
+  testWidgets('sidebar lists all 6 top-level tabs', (tester) async {
     await useDesktopSurface(tester);
     await tester.pumpWidget(shellHarness());
     for (final tab in kNavTabs) {
@@ -38,18 +41,15 @@ void main() {
   testWidgets('clicking a sidebar item swaps the dock view', (tester) async {
     await useDesktopSurface(tester);
     await tester.pumpWidget(shellHarness());
-    // Click "Broker Setup" in the sidebar.
-    await tester.tap(find.text('Broker Setup').first);
+    // Click "Settings" in the sidebar (lives at the bottom of the rail).
+    await tester.tap(find.text('Settings').first);
     await tester.pumpAndSettle();
-    // The dock should show the BrokerSetupScreen placeholder.
-    expect(find.text('Broker Setup'), findsWidgets);
-    expect(
-      find.textContaining('cTrader / DXtrade'),
-      findsOneWidget,
-    );
+    // The dock now shows the Settings header twice (sidebar + dock
+    // breadcrumb), and the Settings screen content underneath.
+    expect(find.text('Settings'), findsWidgets);
   });
 
-  testWidgets('all 15 screens load without throwing', (tester) async {
+  testWidgets('all 6 screens load without throwing', (tester) async {
     await useDesktopSurface(tester);
     await tester.pumpWidget(shellHarness());
     for (final tab in kNavTabs) {
@@ -59,14 +59,37 @@ void main() {
     // No exception escapes pumpAndSettle.
   });
 
-  test('nav tab catalog has 15 entries grouped 6/4/5', () {
-    final trading = kNavTabs.where((t) => t.group == NavGroup.trading).length;
-    final ai = kNavTabs.where((t) => t.group == NavGroup.aiEngine).length;
-    final system = kNavTabs.where((t) => t.group == NavGroup.system).length;
-    expect(trading, 6);
-    expect(ai, 4);
-    expect(system, 5);
-    expect(kNavTabs.length, 15);
+  test('nav tab catalog has exactly 6 flat entries', () {
+    expect(kNavTabs.length, 6);
+    // Pin the canonical IDs so persistence (#24) doesn't silently
+    // drift if someone renames a tab without thinking about it.
+    expect(
+      kNavTabs.map((t) => t.id).toList(),
+      ['Dashboard', 'MarketWatch', 'StrategyLab', 'Positions', 'AiDesk',
+        'Settings'],
+    );
+  });
+
+  test('migrateLegacyNavId moves pre-F-321 IDs to the right home', () {
+    // Trading group → MarketWatch / Positions
+    expect(migrateLegacyNavId('Chart'), 'MarketWatch');
+    expect(migrateLegacyNavId('Markets'), 'MarketWatch');
+    expect(migrateLegacyNavId('Execution'), 'MarketWatch');
+    expect(migrateLegacyNavId('News'), 'MarketWatch');
+    expect(migrateLegacyNavId('TradeWatch'), 'Positions');
+    // AI Engine group → StrategyLab / AiDesk
+    expect(migrateLegacyNavId('Discovery'), 'StrategyLab');
+    expect(migrateLegacyNavId('Training'), 'StrategyLab');
+    expect(migrateLegacyNavId('Intelligence'), 'AiDesk');
+    expect(migrateLegacyNavId('AiHelper'), 'AiDesk');
+    // System group → Settings (4 sub-tabs eventually)
+    expect(migrateLegacyNavId('BrokerSetup'), 'Settings');
+    expect(migrateLegacyNavId('DataBootstrap'), 'Settings');
+    expect(migrateLegacyNavId('Hardware'), 'Settings');
+    expect(migrateLegacyNavId('Risk'), 'Settings');
+    // Valid current IDs pass through unchanged
+    expect(migrateLegacyNavId('Dashboard'), 'Dashboard');
+    expect(migrateLegacyNavId('StrategyLab'), 'StrategyLab');
   });
 
   test('design tokens pin TradingView dark scheme', () {

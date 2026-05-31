@@ -1,5 +1,12 @@
-// Sidebar — left rail with the 14-panel nav grouped by Trading /
-// AI Engine / System (mirrors the mockup's .sidebar block).
+// Sidebar — left rail with the 6 canonical top-level tabs
+// (Dashboard, Market Watch, Strategy Lab, Positions, AI Desk, Settings).
+//
+// **F-321 (2026-05-29 rebuild)**: was a 14-panel grouped nav
+// (Trading / AI Engine / System sections with letter-spaced section
+// dividers). Codex mockup replaced that with a 6-tab flat list — fewer
+// destinations, each one a richer consolidated screen. The old
+// section-divider styling is gone; only the active-state left border
+// + accent-muted background carries over.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -13,7 +20,6 @@ class Sidebar extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final active = ref.watch(activeTabProvider);
-    final groups = [NavGroup.trading, NavGroup.aiEngine, NavGroup.system];
     return Container(
       width: ForexAiTokens.sidebarWidth,
       decoration: const BoxDecoration(
@@ -24,47 +30,85 @@ class Sidebar extends ConsumerWidget {
         vertical: ForexAiTokens.spMd,
         horizontal: ForexAiTokens.spSm,
       ),
-      child: ListView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          for (var i = 0; i < groups.length; i++) ...[
-            if (i > 0) const SizedBox(height: ForexAiTokens.spLg),
-            _SectionLabel(label: navGroupLabel(groups[i])),
-            ...kNavTabs
-                .where((t) => t.group == groups[i])
-                .map((t) => _NavItem(
-                      tab: t,
-                      active: active == t.id,
-                      onTap: () => ref
-                          .read(activeTabProvider.notifier)
-                          .state = t.id,
-                    )),
-          ],
+          // Brand block at the top — mirrors the Codex mockup which
+          // anchors a small wordmark above the nav rather than relying
+          // on the TopBar alone.
+          const _BrandBlock(),
+          const SizedBox(height: ForexAiTokens.spMd),
+          Expanded(
+            child: ListView(
+              padding: EdgeInsets.zero,
+              children: [
+                for (final tab in kNavTabs)
+                  _NavItem(
+                    tab: tab,
+                    active: active == tab.id,
+                    onTap: () => ref
+                        .read(activeTabProvider.notifier)
+                        .state = tab.id,
+                  ),
+              ],
+            ),
+          ),
         ],
       ),
     );
   }
 }
 
-class _SectionLabel extends StatelessWidget {
-  final String label;
-  const _SectionLabel({required this.label});
+class _BrandBlock extends StatelessWidget {
+  const _BrandBlock();
   @override
   Widget build(BuildContext context) {
-    // Letter-spaced uppercase divider, matches the mockup.
-    return Container(
-      padding: const EdgeInsets.all(ForexAiTokens.spXs),
-      margin: const EdgeInsets.only(bottom: ForexAiTokens.spXs),
-      decoration: const BoxDecoration(
-        border: Border(bottom: BorderSide(color: ForexAiTokens.border)),
+    return Padding(
+      padding: const EdgeInsets.only(
+        left: 4,
+        right: 4,
+        top: 2,
+        bottom: 2,
       ),
-      child: Text(
-        label.split('').join(' '),
-        style: const TextStyle(
-          fontSize: ForexAiTokens.fsCaption - 1,
-          letterSpacing: 1.4,
-          color: ForexAiTokens.textFaint,
-          fontWeight: FontWeight.w700,
-        ),
+      child: Row(
+        children: [
+          // Tiny mark — keeps the rail visually anchored without
+          // duplicating the topbar brand. Plain glyph, no asset
+          // dependency so the bundle stays small.
+          Container(
+            width: 22,
+            height: 22,
+            decoration: BoxDecoration(
+              color: ForexAiTokens.accent.withValues(alpha: 0.18),
+              border: Border.all(
+                color: ForexAiTokens.accent.withValues(alpha: 0.55),
+              ),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            alignment: Alignment.center,
+            child: const Text(
+              '✦',
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: ForexAiTokens.accent,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          const Expanded(
+            child: Text(
+              'NeoEthos',
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: ForexAiTokens.fsBody + 1,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.3,
+                color: ForexAiTokens.textPrimary,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -86,56 +130,58 @@ class _NavItem extends StatelessWidget {
       cursor: SystemMouseCursors.click,
       child: GestureDetector(
         onTap: onTap,
-        child: Container(
-          height: 28,
-          padding: const EdgeInsets.only(left: 12),
-          decoration: BoxDecoration(
-            color: active
-                ? ForexAiTokens.accentMuted
-                : Colors.transparent,
-            borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
-            border: active
-                ? const Border(
-                    left: BorderSide(
-                      color: ForexAiTokens.accent,
-                      width: 3,
+        child: Tooltip(
+          message: tab.description,
+          waitDuration: const Duration(milliseconds: 600),
+          child: Container(
+            height: 34,
+            margin: const EdgeInsets.symmetric(vertical: 1),
+            padding: const EdgeInsets.only(left: 10, right: 8),
+            decoration: BoxDecoration(
+              color: active
+                  ? ForexAiTokens.accentMuted
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+              border: active
+                  ? const Border(
+                      left: BorderSide(
+                        color: ForexAiTokens.accent,
+                        width: 3,
+                      ),
+                    )
+                  : null,
+            ),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 22,
+                  child: Text(
+                    tab.icon,
+                    style: TextStyle(
+                      fontSize: 15,
+                      color: active
+                          ? ForexAiTokens.accent
+                          : ForexAiTokens.textFaint,
                     ),
-                  )
-                : null,
-          ),
-          child: Row(
-            children: [
-              SizedBox(
-                width: 20,
-                child: Text(
-                  tab.icon,
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: active
-                        ? ForexAiTokens.accent
-                        : ForexAiTokens.textFaint,
-                  ),
-                  textAlign: TextAlign.center,
-                ),
-              ),
-              const SizedBox(width: 8),
-              // Wrap the title in Expanded so it occupies the
-              // remaining width and ellipsises when the sidebar is
-              // narrow (kept the icon at fixed 20px so the label
-              // alignment stays consistent across all 14 tabs).
-              Expanded(
-                child: Text(
-                  tab.title,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: ForexAiTokens.fsBody,
-                    color: active
-                        ? ForexAiTokens.textPrimary
-                        : ForexAiTokens.textMuted,
+                    textAlign: TextAlign.center,
                   ),
                 ),
-              ),
-            ],
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    tab.title,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: ForexAiTokens.fsBody,
+                      fontWeight: active ? FontWeight.w600 : FontWeight.w500,
+                      color: active
+                          ? ForexAiTokens.textPrimary
+                          : ForexAiTokens.textMuted,
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),

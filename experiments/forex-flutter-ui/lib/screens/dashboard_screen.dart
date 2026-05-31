@@ -25,7 +25,9 @@ class DashboardScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final snapshot = ref.watch(accountSnapshotProvider);
-    return Column(
+    final brokerAsync = ref.watch(brokerStatusProvider);
+    return SingleChildScrollView(
+      child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         // **2026-05-25 — task #241**: header row with the refresh
@@ -62,6 +64,13 @@ class DashboardScreen extends ConsumerWidget {
             ),
           ],
         ),
+        // F-328 (2026-05-29): account-context strip directly under the
+        // header, so the operator always sees which account they're
+        // looking at before reading any number underneath.
+        _AccountContextStrip(
+          accountAsync: snapshot,
+          brokerAsync: brokerAsync,
+        ),
         if (snapshot.hasError) _ErrorBanner(error: snapshot.error!),
         _StatRow(snapshot: snapshot),
         // Growth Mode card — surfaces the "from €100 to thousands"
@@ -78,6 +87,7 @@ class DashboardScreen extends ConsumerWidget {
           child: _EngineHealthRow(),
         ),
       ],
+      ),
     );
   }
 }
@@ -111,6 +121,22 @@ class _StatRow extends StatelessWidget {
     final freeMargin = data == null
         ? (isFirstLoad ? '…' : '—')
         : fmt(data.freeMargin);
+    final usedMargin = data == null
+        ? (isFirstLoad ? '…' : '—')
+        : fmt(data.usedMargin);
+    // F-328: margin level (equity / used margin × 100 %) — the standard
+    // forex broker health metric. Above 200 % = comfortable, 50-100 % =
+    // margin-call zone, below 50 % = stop-out zone for most brokers.
+    final marginLevel = data == null || data.usedMargin == 0
+        ? (isFirstLoad ? '…' : '—')
+        : '${(data.equity / data.usedMargin * 100).toStringAsFixed(0)}%';
+    final marginLevelColor = data == null || data.usedMargin == 0
+        ? null
+        : data.equity / data.usedMargin >= 2.0
+            ? ForexAiTokens.buy
+            : data.equity / data.usedMargin >= 1.0
+                ? ForexAiTokens.warning
+                : ForexAiTokens.sell;
     final openCount = data == null
         ? (isFirstLoad ? '…' : '—')
         : '${data.positions.length}';
@@ -141,7 +167,12 @@ class _StatRow extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         GridView.count(
-          crossAxisCount: 4,
+          // F-328: 6 cards (Balance · Equity · Free Margin · Used Margin
+          // · Margin Level · Open Positions). The first row is the cash
+          // ladder; the second adds the broker-health margin level + the
+          // open-positions counter so the operator gets the full account
+          // picture before scrolling further.
+          crossAxisCount: 3,
           crossAxisSpacing: 8,
           mainAxisSpacing: 8,
           childAspectRatio: 3.2,
@@ -151,6 +182,12 @@ class _StatRow extends StatelessWidget {
             StatCard(label: 'Balance', value: balance),
             StatCard(label: 'Equity', value: equity, valueColor: equityColor),
             StatCard(label: 'Free Margin', value: freeMargin),
+            StatCard(label: 'Used Margin', value: usedMargin),
+            StatCard(
+              label: 'Margin Level',
+              value: marginLevel,
+              valueColor: marginLevelColor,
+            ),
             StatCard(label: 'Open Positions', value: openCount),
           ],
         ),
@@ -234,6 +271,120 @@ class _PositionsTable extends StatelessWidget {
               color: p.pnlUsd >= 0 ? ForexAiTokens.buy : ForexAiTokens.sell,
             ),
           ]),
+      ],
+    );
+  }
+}
+
+/// Compact account-context strip that sits under the page header.
+/// Shows the account ID, environment (Demo / Live), broker adapter,
+/// account currency, and a freshness "as of" timestamp. Every value
+/// is broker-sourced; we never invent labels.
+class _AccountContextStrip extends StatelessWidget {
+  final AsyncValue<AccountSnapshot> accountAsync;
+  final AsyncValue<BrokerStatus> brokerAsync;
+  const _AccountContextStrip({
+    required this.accountAsync,
+    required this.brokerAsync,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final acc = accountAsync.valueOrNull;
+    final broker = brokerAsync.valueOrNull;
+    final asOf = acc?.fetchedAtUnixMs == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(acc!.fetchedAtUnixMs!)
+            .toLocal();
+    final asOfLabel = asOf == null
+        ? 'no snapshot yet'
+        : 'snapshot ${DateFormat('HH:mm:ss').format(asOf)} local';
+    final environment = broker?.environment ?? '—';
+    final envColor = environment.toLowerCase() == 'live'
+        ? ForexAiTokens.sell
+        : environment.toLowerCase() == 'demo'
+            ? ForexAiTokens.accent
+            : ForexAiTokens.textFaint;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: ForexAiTokens.panelBg,
+        border: Border.all(color: ForexAiTokens.border),
+        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+      ),
+      child: Row(
+        children: [
+          _ContextChip(
+            label: 'ACCOUNT',
+            value: broker?.accountId ?? '—',
+          ),
+          const SizedBox(width: 12),
+          _ContextChip(
+            label: 'BROKER',
+            value: broker?.adapter ?? '—',
+          ),
+          const SizedBox(width: 12),
+          _ContextChip(
+            label: 'ENVIRONMENT',
+            value: environment.toUpperCase(),
+            color: envColor,
+          ),
+          const SizedBox(width: 12),
+          _ContextChip(
+            label: 'CURRENCY',
+            value: acc?.currency ?? '—',
+          ),
+          const Spacer(),
+          Text(
+            asOfLabel,
+            style: const TextStyle(
+              fontSize: 11,
+              color: ForexAiTokens.textFaint,
+              fontFeatures: [FontFeature.tabularFigures()],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ContextChip extends StatelessWidget {
+  final String label;
+  final String value;
+  final Color? color;
+  const _ContextChip({
+    required this.label,
+    required this.value,
+    this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.baseline,
+      textBaseline: TextBaseline.alphabetic,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            fontSize: 10,
+            letterSpacing: 0.8,
+            fontWeight: FontWeight.w800,
+            color: ForexAiTokens.textFaint,
+          ),
+        ),
+        const SizedBox(width: 4),
+        Text(
+          value,
+          style: TextStyle(
+            fontSize: ForexAiTokens.fsBody,
+            fontWeight: FontWeight.w800,
+            color: color ?? ForexAiTokens.textPrimary,
+            fontFeatures: const [FontFeature.tabularFigures()],
+          ),
+        ),
       ],
     );
   }
