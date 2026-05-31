@@ -1012,6 +1012,64 @@ impl Default for Settings {
     }
 }
 
+/// Canonical user-data path for the operator's editable `config.yaml`.
+///
+/// **F-311 (2026-05-29) — single source of truth**. Historically four
+/// separate call sites (`neoethos-core::Settings::load`, the
+/// `neoethos-app` server routes, `neoethos-cli` argument parsing, the
+/// `neoethos-models::registry`) each rolled their own resolution: some
+/// honoured `$CONFIG_FILE`, some used a relative literal, some
+/// hard-coded the install dir. That shadow made F-310 (supervisor
+/// seeding the wrong file) extremely hard to diagnose because two
+/// readers saw two different states for the same logical config.
+///
+/// Going forward every read should resolve via this helper:
+///
+/// * **Windows**: `%LOCALAPPDATA%\neoethos\config.yaml`
+///   (`C:\Users\<u>\AppData\Local\neoethos\config.yaml`).
+/// * **Linux**: `$XDG_DATA_HOME/neoethos/config.yaml` or
+///   `~/.local/share/neoethos/config.yaml`.
+/// * **macOS**: `~/Library/Application Support/neoethos/config.yaml`.
+///
+/// On startup the F-310 supervisor seeds this path from the bundle's
+/// read-only config when the user file is missing; subsequent edits
+/// (Settings → App tab, F-312 raw YAML editor, `/settings` POST) write
+/// back to the same path. Tests that need a synthetic path can still
+/// supply one via the `CONFIG_FILE` env var — `Settings::load` checks
+/// that first.
+pub fn user_config_path() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local).join("neoethos").join("config.yaml");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("neoethos")
+                .join("config.yaml");
+        }
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+            return PathBuf::from(xdg).join("neoethos").join("config.yaml");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("neoethos")
+                .join("config.yaml");
+        }
+    }
+    PathBuf::from("config.yaml")
+}
+
 impl Settings {
     /// Load settings from YAML config file
     pub fn from_yaml(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
@@ -1021,10 +1079,34 @@ impl Settings {
         Ok(settings)
     }
 
-    /// Load settings from environment variable CONFIG_FILE or default config.yaml
+    /// Load settings from the canonical user-data config path.
+    ///
+    /// **F-311 (2026-05-29)**: this used to fall back to the literal
+    /// string `"config.yaml"` (so it resolved against the process cwd).
+    /// That broke whenever the operator ran the installed app from
+    /// `Start Menu` — cwd is `C:\Windows\System32` and the bundle's
+    /// read-only `config.yaml` lived elsewhere. The 4-location shadow
+    /// (CLI / server / models / TUI each rolling their own path) made
+    /// debugging F-310 painful. The unified resolution order is now:
+    ///   1. `$CONFIG_FILE` env var (CI / test overrides)
+    ///   2. `user_config_path()` — `%LOCALAPPDATA%\neoethos\config.yaml`
+    ///      on Windows, `$XDG_DATA_HOME/neoethos/config.yaml` on Linux,
+    ///      `~/Library/Application Support/neoethos/config.yaml` on
+    ///      macOS — the same place the F-310 supervisor seeds.
+    ///   3. Last-resort fallback to literal `"config.yaml"` (relative)
+    ///      so cargo-test invocations in the workspace root still work.
     pub fn load() -> anyhow::Result<Self> {
-        let config_file =
-            std::env::var("CONFIG_FILE").unwrap_or_else(|_| "config.yaml".to_string());
+        let config_file = std::env::var("CONFIG_FILE")
+            .map(PathBuf::from)
+            .ok()
+            .unwrap_or_else(|| {
+                let user = user_config_path();
+                if user.exists() {
+                    user
+                } else {
+                    PathBuf::from("config.yaml")
+                }
+            });
         Self::from_yaml(&config_file)
     }
 

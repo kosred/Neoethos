@@ -871,6 +871,43 @@ pub fn fast_evaluate_strategy_core(
 
     // Final NaN/inf scrub. A single non-finite slot would poison sorting in
     // the GA (any comparison with NaN returns Equal via partial_cmp fallback).
+    //
+    // **F-316 (2026-05-29)**: emit a `tracing::warn` whenever a metric
+    // arrives non-finite — historically the closure silently mapped NaN
+    // to 0, which made "broker has no financials for this symbol"
+    // (NaN cost model output → NaN PnL → 0 sanitised) look identical to
+    // "real strategy with zero PnL". The warn fires with the candidate's
+    // trade count + the per-metric NaN mask so the operator can see in
+    // the discovery log when an entire symbol's cost data is missing
+    // (typically: broker catalog incomplete, fix via Data Bootstrap or
+    // re-auth). The sanitised return value is unchanged — sortability
+    // matters more than failing the candidate, and the upstream
+    // `infer_market_cost_profile` will already have logged the root
+    // cause separately.
+    let inputs = [
+        ("net_profit", net_profit),
+        ("sharpe", sharpe),
+        ("peak_equity", peak_equity),
+        ("max_dd", max_dd),
+        ("win_rate", win_rate),
+        ("pf", pf),
+        ("expectancy", expectancy),
+        ("consistency", consistency),
+        ("max_daily_dd", max_daily_dd),
+    ];
+    let nan_names: Vec<&str> = inputs
+        .iter()
+        .filter(|(_, v)| !v.is_finite())
+        .map(|(name, _)| *name)
+        .collect();
+    if !nan_names.is_empty() {
+        tracing::warn!(
+            target: "neoethos_search::eval",
+            trade_count,
+            non_finite_metrics = ?nan_names,
+            "candidate emitted non-finite cost-model metrics — likely broker financials missing for the symbol; check `infer_market_cost_profile` log lines above"
+        );
+    }
     let sanitize = |v: f64| if v.is_finite() { v } else { 0.0 };
     [
         sanitize(net_profit),

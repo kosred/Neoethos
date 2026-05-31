@@ -688,7 +688,21 @@ where
             n_indicators,
             &mut rng,
         );
-        if !seeds.is_empty() {
+        if seeds.is_empty() {
+            // **F-317 (2026-05-29)**: templates wanted to seed but
+            // resolved to zero genes — usually means the feature names
+            // exposed by the upstream pipeline don't match what the
+            // templates expect (e.g. single-TF run with no D1/H4
+            // prefixes, or a custom feature set). Log loudly so the
+            // operator knows their cold-start is actually pure random.
+            tracing::warn!(
+                target: "neoethos_search::search_engine",
+                seed_count,
+                feature_count = features.names.len(),
+                n_indicators,
+                "GA Fix C seed templates returned 0 genes — check that the upstream feature pipeline exposes the expected multi-TF prefixes (e.g. D1_, H4_, H1_, M15_, M5_); falling back to pure-random cold start"
+            );
+        } else {
             tracing::info!(
                 target: "neoethos_search::search_engine",
                 seeded = seeds.len(),
@@ -710,6 +724,18 @@ where
         ));
         out
     } else {
+        // **F-317 (2026-05-29)**: `seed_count == 0` means
+        // `population / 10` rounded down to zero, i.e. `population < 10`.
+        // The historical code silently fell through to pure random with
+        // no diagnostic. That breaks the GA Fix C invariant ("10 % of
+        // the cold start should be hand-crafted templates"), so emit
+        // a warn so the operator sees that their tiny-population run
+        // gets no template seeding.
+        tracing::warn!(
+            target: "neoethos_search::search_engine",
+            population,
+            "GA Fix C seed templates skipped because population ({population}) < 10 — set --population to >= 10 for hand-crafted seeding, otherwise the cold start is pure random"
+        );
         generate_random_genes(
             population,
             n_indicators,

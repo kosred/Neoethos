@@ -317,9 +317,21 @@ news:
   news_backfill_days: 0  # 0 = full data span
   enable_llm_helper: true
   llm_helper_enabled: true
-  # Defaults to the model FAMILY rather than a dated snapshot — OpenAI
-  # deprecates dated snapshots ~3 months after release and pinning to one
-  # makes every fresh install break until manually edited (V0.4 audit
-  # Task #59). Pin to a specific date here if you need reproducibility.
-  openai_model: "gpt-5-nano"
+  # **F-291 (2026-05-29 Cycle 4 — verified empirically against the live
+  # endpoint with the operator's actual ChatGPT subscription token)**:
+  # The ChatGPT-subscription Codex backend at
+  # `https://chatgpt.com/backend-api/codex/responses` accepts EXACTLY
+  # ONE model name: **`gpt-5.5`**. Every other name — `gpt-5`,
+  # `gpt-5-codex`, `gpt-5-mini`, `gpt-5-thinking`, `gpt-5-nano`,
+  # `gpt-4o`, `o1`, `o3`, `o4-mini`, `codex-1`, `codex-mini` — returns
+  # HTTP 400 with detail "The 'X' model is not supported when using
+  # Codex with a ChatGPT account." `gpt-5.5` is the correct name AND
+  # the call must also (a) include a non-empty `instructions` string,
+  # (b) send `input` as a list of role+content message objects (not a
+  # plain prompt string), and (c) set `stream: true` (the Responses
+  # API streams via SSE; a non-streaming request returns "Stream must
+  # be set to true"). See `crates/neoethos-codex/src/client.rs` for
+  # the chat-side handler that builds this shape. Pin to a specific
+  # date here if you need reproducibility against a snapshot.
+  openai_model: "gpt-5.5"
   openai_max_tokens: 1000

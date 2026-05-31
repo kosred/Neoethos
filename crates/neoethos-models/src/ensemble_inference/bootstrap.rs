@@ -84,8 +84,18 @@ use super::{
 ///     legitimate algorithms because they run inside the search
 ///     crate, but they have no role in the soft-voting ensemble.
 ///
-/// **30 names total** (34 KNOWN_MODEL_NAMES − swarm − 3 evolutionary
-/// search algorithms).
+/// **29 names total** (34 KNOWN_MODEL_NAMES − swarm − 3 evolutionary
+/// search algorithms − exit_agent).
+///
+/// `exit_agent` was removed in F-318 (2026-05-29): the model trains
+/// successfully and emits `ExitDecision3` probabilities, but
+/// `SoftVotingEnsemble` actively filters those outputs (Classification3
+/// only votes) and no auto-trade exit-side pipeline consumes them in
+/// production. Keeping it in the bootstrap list reserved memory + disk
+/// for an artifact that no production code path reads. The source
+/// (`exit_agent.rs`, `ExitAgentAdapter`, `ExitAgentLoader`) stays for
+/// future revival once an exit-side decision loop ships, but the
+/// registry no longer wires it in until then.
 pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     // Tree (7)
     "lightgbm",
@@ -120,9 +130,8 @@ pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     "online_pa",
     "online_hoeffding",
     "isolation_forest",
-    // RL + Exit (2)
+    // RL (1) — exit_agent removed in F-318 (consumers never wired)
     "dqn",
-    "exit_agent",
 ];
 
 /// Build a fully populated [`ExpertRegistry`] with every default
@@ -140,7 +149,7 @@ pub fn build_default_registry() -> Result<ExpertRegistry> {
     debug_assert_eq!(
         registry.registered_names().len(),
         DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(),
-        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 30 canonical names"
+        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 29 canonical names"
     );
     Ok(registry)
 }
@@ -223,7 +232,7 @@ mod tests {
     #[test]
     fn default_bootstrap_names_match_known_model_names_minus_swarm() {
         // 33 names = 34 KNOWN_MODEL_NAMES minus swarm_forecaster.
-        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 30);
+        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 29);
         let names: std::collections::HashSet<&str> =
             DEFAULT_BOOTSTRAP_EXPERT_NAMES.iter().copied().collect();
         assert!(
@@ -238,6 +247,15 @@ mod tests {
                 "{absent} is a strategy discoverer, not an inference voter (F-319)"
             );
         }
+        // F-318 (2026-05-29): exit_agent's ExitDecision3 outputs are
+        // filtered out by SoftVotingEnsemble (Classification3 only) and
+        // no production exit-side pipeline consumes them. Removed from
+        // the bootstrap to stop reserving memory + disk for an artifact
+        // no live code path reads.
+        assert!(
+            !names.contains("exit_agent"),
+            "exit_agent removed in F-318 — consumers never wired"
+        );
         // Sample required canonical names.
         for required in [
             "lightgbm",
@@ -252,10 +270,10 @@ mod tests {
     }
 
     #[test]
-    fn build_default_registry_installs_all_30_loaders() {
+    fn build_default_registry_installs_all_29_loaders() {
         let registry = build_default_registry().expect("build default registry");
         let registered = registry.registered_names();
-        assert_eq!(registered.len(), 30);
+        assert_eq!(registered.len(), 29);
         for required in DEFAULT_BOOTSTRAP_EXPERT_NAMES {
             assert!(
                 registry.has_loader(required),
@@ -272,7 +290,7 @@ mod tests {
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
         assert_eq!(outcome.loaded_count(), 0);
         assert_eq!(outcome.degraded_count(), 0);
-        assert_eq!(outcome.missing_count(), 30);
+        assert_eq!(outcome.missing_count(), 29);
         assert!(!outcome.has_any_loaded());
     }
 
@@ -300,6 +318,6 @@ mod tests {
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
         // Still 30 missing because the dir is empty, but the
         // function didn't error out → path resolution worked.
-        assert_eq!(outcome.missing_count(), 30);
+        assert_eq!(outcome.missing_count(), 29);
     }
 }

@@ -1392,6 +1392,40 @@ pub fn compute_discovery_forward_test_artifacts(
     let (months, days) = month_day_indices(&tail_features.timestamps);
     let timestamps = &tail_features.timestamps[..n];
 
+    // **F-315 (2026-05-29) — partial diagnostic, full fix deferred to F-315b**.
+    //
+    // The stage-1 GA in `search_engine.rs:818` anneals the SMC gate
+    // from `gate_start` (default 0.75) down to `gate_end` (default
+    // 0.35) across generations. The forward-test pass below
+    // re-evaluates each survivor with the STATIC
+    // `runtime.smc_weights.gate_threshold` from
+    // `current_strategy_evaluation_runtime_overrides()` (default 0.75
+    // per `runtime_overrides.rs:417`). Candidates that survived the
+    // last generation under e.g. 0.35 may fail forward-test with 0.75
+    // — the asymmetry the F-315 ticket flagged. The proper fix is to
+    // forward the stage-1 final gate value through `SearchResult` and
+    // override the forward-test runtime gate to match; that touches
+    // 7 SearchResult construction sites in search_engine.rs plus the
+    // discovery + forward-test plumbing. **F-315b** tracks the
+    // architectural follow-up. For this ticket, we emit a warn at
+    // the top of `current_strategy_evaluation_runtime_overrides()`
+    // when the operator's static gate exceeds 0.5 (i.e. clearly above
+    // the GA's typical `gate_end` of 0.35) so the asymmetry surfaces
+    // in the discovery log instead of staying invisible.
+    {
+        use crate::genetic::runtime_overrides::current_strategy_evaluation_runtime_overrides;
+        let static_gate = current_strategy_evaluation_runtime_overrides()
+            .smc_weights
+            .gate_threshold;
+        if static_gate > 0.5 {
+            tracing::warn!(
+                target: "neoethos_search::discovery",
+                forward_test_smc_gate = static_gate,
+                "F-315 mismatch: forward-test SMC gate ({static_gate:.2}) is well above the GA stage-1 typical end (0.35). Survivors of the final generation may fail forward-test for a threshold they never passed in stage-1. Lower the runtime override (`smc_weights.gate_threshold`) toward 0.35 to align, or wait for F-315b to plumb the GA's final gate through SearchResult."
+            );
+        }
+    }
+
     let mut artifacts = Vec::with_capacity(portfolio.len());
     for gene in portfolio {
         let settings = discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());

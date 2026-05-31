@@ -260,10 +260,16 @@ impl ExpertLoader for ExitAgentLoader {
 // Convenience: register-all-rl-exit-loaders
 // ---------------------------------------------------------------------------
 
-/// Register the dqn + exit_agent loaders (2 canonical names).
+/// Register the dqn loader (1 canonical name).
+///
+/// **F-318 (2026-05-29)**: was a 2-name function (dqn + exit_agent),
+/// but ExitAgent's `ExitDecision3` outputs are filtered out by
+/// `SoftVotingEnsemble` (Classification3 only) and no production
+/// exit-side pipeline reads them. `ExitAgentLoader` is kept in the
+/// module for future revival when an exit-side decision loop ships;
+/// the bootstrap simply doesn't wire it in until then.
 pub fn register_rl_exit_loaders(registry: &mut super::ExpertRegistry) -> Result<()> {
     registry.register(Box::new(DqnLoader))?;
-    registry.register(Box::new(ExitAgentLoader))?;
     Ok(())
 }
 
@@ -319,7 +325,12 @@ mod tests {
     }
 
     #[test]
-    fn full_33_loaders_coexist() {
+    fn full_29_loaders_coexist() {
+        // **F-319 (2026-05-29)**: genetic/neuro_evo/neat removed — they
+        // are strategy discoverers in `neoethos-search`, not voters.
+        // **F-318 (2026-05-29)**: exit_agent removed — `ExitDecision3`
+        // outputs are filtered out by SoftVotingEnsemble and no
+        // production exit-side pipeline consumes them.
         let mut reg = ExpertRegistry::new();
         super::super::tree_adapters::register_tree_loaders(&mut reg).expect("trees");
         super::super::deep_classification_adapters::register_deep_classification_loaders(&mut reg)
@@ -328,12 +339,12 @@ mod tests {
             .expect("deep-ts");
         super::super::meta_adapters::register_meta_loaders(&mut reg).expect("meta");
         super::super::mixed_adapters::register_mixed_loaders(&mut reg).expect("mixed");
-        super::super::evolutionary_adapters::register_evolutionary_loaders(&mut reg).expect("evo");
-        register_rl_exit_loaders(&mut reg).expect("rl-exit");
+        register_rl_exit_loaders(&mut reg).expect("rl");
         // 7 tree + 3 deep-cls + 7 deep-ts + 8 meta (incl. hmm_regime) +
-        // 3 mixed + 3 evo + 2 rl/exit = 33
-        // (34th = swarm_forecaster, deferred to D1.2.8)
-        assert_eq!(reg.registered_names().len(), 33);
+        // 3 mixed + 1 rl (dqn) = 29
+        // (34th = swarm_forecaster, deferred to D1.2.8;
+        //  3 evolutionary removed in F-319; exit_agent removed in F-318)
+        assert_eq!(reg.registered_names().len(), 29);
         for required in [
             "lightgbm",
             "xgboost",
@@ -363,15 +374,17 @@ mod tests {
             "online_pa",
             "online_hoeffding",
             "isolation_forest",
-            "genetic",
-            "neuro_evo",
-            "neat",
             "dqn",
-            "exit_agent",
         ] {
             assert!(
                 reg.has_loader(required),
                 "registry missing loader for '{required}'"
+            );
+        }
+        for absent in ["genetic", "neuro_evo", "neat", "exit_agent"] {
+            assert!(
+                !reg.has_loader(absent),
+                "registry should not have loader for '{absent}' (F-318/F-319)"
             );
         }
         assert!(
