@@ -141,6 +141,107 @@ impl StoredAuth {
     }
 }
 
+/// On-disk shape that tolerates BOTH auth.json layouts (F-291).
+///
+/// 1. **Modern Codex CLI** (what `codex login` writes today):
+///    ```json
+///    {
+///      "auth_mode": "chatgpt",
+///      "last_refresh": "2026-05-27T17:43:33Z",
+///      "OPENAI_API_KEY": null,
+///      "tokens": {
+///        "access_token": "...",
+///        "account_id": "...",
+///        "id_token": "...",
+///        "refresh_token": "..."
+///      }
+///    }
+///    ```
+/// 2. **Legacy flat** (what [`StoredAuth::from_bundle`] + [`AuthStore::save`]
+///    wrote before F-291): `access_token` / `refresh_token` / `id_token`
+///    / `expires_at` / `token_type` / `email` all at the top level.
+///
+/// `load()` parses into this, then [`OnDiskAuth::into_stored`] normalises
+/// to the canonical [`StoredAuth`]. Every field is optional so a file
+/// from either era deserialises; the conversion fails loudly only when
+/// NEITHER an `access_token` could be found.
+#[derive(Debug, Deserialize)]
+struct OnDiskAuth {
+    /// Modern CLI: the nested token bundle. Preferred when present.
+    #[serde(default)]
+    tokens: Option<OnDiskTokens>,
+    /// Legacy flat: top-level access token.
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    token_type: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+/// The modern CLI's nested `tokens` object.
+#[derive(Debug, Deserialize)]
+struct OnDiskTokens {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    /// The CLI persists this; we don't use it yet but accept it so an
+    /// unknown-field-strict future serde config wouldn't choke.
+    #[serde(default)]
+    #[allow(dead_code)]
+    account_id: Option<String>,
+}
+
+impl OnDiskAuth {
+    /// Normalise either schema into a [`StoredAuth`]. Prefers the
+    /// modern nested `tokens` object; falls back to the legacy flat
+    /// fields. Fails with [`CodexError::AuthStoreParse`] when no
+    /// access token is present in either location.
+    fn into_stored(self) -> Result<StoredAuth, CodexError> {
+        let (access_token, refresh_token, id_token) =
+            if let Some(t) = self.tokens {
+                (t.access_token, t.refresh_token, t.id_token)
+            } else if let Some(at) = self.access_token {
+                (at, self.refresh_token, self.id_token)
+            } else {
+                return Err(CodexError::AuthStoreParse(
+                    "auth.json has neither a `tokens.access_token` (modern \
+                     Codex CLI) nor a top-level `access_token` (legacy) — \
+                     re-run `codex login` or reconnect from Settings → \
+                     Account."
+                        .to_string(),
+                ));
+            };
+        // Decode the email claim from the id_token when the legacy
+        // `email` field wasn't already stored.
+        let decoded_email = id_token.as_deref().and_then(parse_email_claim);
+        Ok(StoredAuth {
+            provider: self.provider.unwrap_or_else(|| "openai".to_string()),
+            access_token: SecretString(access_token),
+            refresh_token: refresh_token.map(SecretString),
+            id_token: id_token.map(SecretString),
+            // The modern CLI doesn't write an `expires_at`; leaving it
+            // None makes `is_expired()` return false so we attempt the
+            // call and let a server 401 drive the refresh path. The
+            // legacy schema's `expires_at` is preserved when present.
+            expires_at: self.expires_at,
+            token_type: self.token_type.unwrap_or_else(|| "Bearer".to_string()),
+            email: self.email.or(decoded_email),
+            extras: serde_json::Value::Null,
+        })
+    }
+}
+
 /// Default location: `$HOME/.codex/auth.json`.
 ///
 /// `directories::UserDirs` is cross-platform and matches what the
@@ -183,12 +284,25 @@ impl AuthStore {
     /// doesn't exist (a fresh install) — the caller decides what
     /// "no auth yet" should look like. Returns `Err` for I/O
     /// failures and corrupt JSON.
+    ///
+    /// **F-291 (2026-05-29)**: parses through [`OnDiskAuth`] which
+    /// tolerates BOTH the modern Codex CLI schema (token fields nested
+    /// under a `tokens` object, plus a top-level `last_refresh`) AND
+    /// the legacy flat schema this crate wrote before today. The old
+    /// code deserialised straight into [`StoredAuth`], whose
+    /// `access_token` lives at the top level — so it silently failed to
+    /// read ANY `auth.json` written by a current `codex login`
+    /// (everything is under `tokens` there). That surfaced as a
+    /// perpetual "Not authenticated" no matter how many times the
+    /// operator logged in, and is the real reason the AI Helper
+    /// appeared to "reject every model" — most calls never got a valid
+    /// bearer to send in the first place.
     pub fn load(&self) -> Result<Option<StoredAuth>, CodexError> {
         match std::fs::read_to_string(&self.path) {
             Ok(text) => {
-                let parsed: StoredAuth = serde_json::from_str(&text)
+                let on_disk: OnDiskAuth = serde_json::from_str(&text)
                     .map_err(|e| CodexError::AuthStoreParse(e.to_string()))?;
-                Ok(Some(parsed))
+                Ok(Some(on_disk.into_stored()?))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(CodexError::AuthStoreWrite {
@@ -358,6 +472,72 @@ mod tests {
     fn parse_email_claim_tolerates_malformed_input() {
         assert_eq!(parse_email_claim("not.a.jwt"), None);
         assert_eq!(parse_email_claim(""), None);
+    }
+
+    #[test]
+    fn loads_modern_nested_codex_cli_schema() {
+        // **F-291 regression**: a current `codex login` writes the token
+        // fields NESTED under a `tokens` object, with a top-level
+        // `last_refresh`. The old loader deserialised straight into
+        // StoredAuth (top-level `access_token`) and failed with
+        // "missing field `access_token`" — which surfaced as a permanent
+        // "Not authenticated" in the AI Helper. This must now parse.
+        let dir = std::env::temp_dir()
+            .join(format!("neoethos-codex-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "auth_mode": "chatgpt",
+              "last_refresh": "2026-05-27T17:43:33.025749300Z",
+              "OPENAI_API_KEY": null,
+              "tokens": {
+                "access_token": "NESTED_AT",
+                "account_id": "acct-123",
+                "id_token": "header.payload.sig",
+                "refresh_token": "NESTED_RT"
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let store = AuthStore::new(path);
+        let loaded = store.load().unwrap().expect("nested schema must parse");
+        assert_eq!(loaded.access_token.expose(), "NESTED_AT");
+        assert_eq!(
+            loaded.refresh_token.as_ref().map(|s| s.expose()),
+            Some("NESTED_RT")
+        );
+        // The modern CLI doesn't write an `expires_at` → None →
+        // is_expired() stays false so we attempt the call.
+        assert!(!loaded.is_expired());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rejects_auth_json_with_no_access_token() {
+        // Neither a nested `tokens.access_token` nor a top-level one →
+        // fail loud with a message that tells the operator to re-login,
+        // rather than silently behaving as "not authenticated".
+        let dir = std::env::temp_dir()
+            .join(format!("neoethos-codex-noauth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        std::fs::write(&path, r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null}"#)
+            .unwrap();
+
+        let store = AuthStore::new(path);
+        let err = store.load().unwrap_err();
+        assert!(
+            matches!(err, CodexError::AuthStoreParse(_)),
+            "expected AuthStoreParse, got {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

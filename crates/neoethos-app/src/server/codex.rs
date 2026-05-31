@@ -289,7 +289,10 @@ pub async fn chat(
 
     match client.chat(request).await {
         Ok(resp) => {
-            let model = resp.model.unwrap_or_else(|| "gpt-5-codex".to_string());
+            // F-291: display fallback aligned with the only accepted
+            // Codex model. resp.model is normally already set to the
+            // request model by the client, so this is belt-and-braces.
+            let model = resp.model.unwrap_or_else(|| "gpt-5.5".to_string());
             let response = resp
                 .choices
                 .into_iter()

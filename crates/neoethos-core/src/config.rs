@@ -961,15 +961,13 @@ impl Default for NewsConfig {
             news_backfill_enabled: true,
             news_backfill_days: 30,
             news_local_glob: String::new(),
-            // Note — hardcoded snapshot dates rot fast.
-            // OpenAI deprecates specific dated snapshots ~3 months after
-            // release; pinning to one means every fresh install eventually
-            // hits "model not found" until the operator hand-edits the
-            // YAML. Default to the family ("gpt-5-nano") which OpenAI
-            // resolves to the current stable snapshot. Operators who need
-            // reproducibility can still pin a dated snapshot in their
-            // config.yaml — the field is preserved.
-            openai_model: "gpt-5-nano".to_string(),
+            // News-blackout LLM model for the PUBLIC OpenAI API (used
+            // with the operator's own OPENAI_API_KEY). NOT the AI Helper
+            // model — that's the ChatGPT-subscription Codex endpoint,
+            // hardwired to `gpt-5.5` in neoethos-codex (F-291). Default
+            // to `gpt-4o-mini`, matching the (currently hardcoded) model
+            // in `domain/news_filter.rs` and avoiding dated-snapshot rot.
+            openai_model: "gpt-4o-mini".to_string(),
             openai_api_key_env: "OPENAI_API_KEY".to_string(),
             openai_max_tokens: 256,
             openai_max_events_per_fetch: 50,

@@ -62,17 +62,16 @@ pub struct ChatMessage {
 /// to sensible defaults; the only required value is `messages`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionRequest {
-    /// Defaults to "gpt-5" — the standard ChatGPT-subscription
-    /// model. Callers can override to `gpt-5-thinking` or any other
-    /// model the account has access to.
+    /// Defaults to "gpt-5.5" — the ONLY model the ChatGPT-subscription
+    /// Codex endpoint accepts (see [`ChatCompletionRequest::simple`]).
+    /// Callers can override, but every other name we tested returns
+    /// HTTP 400 "not supported when using Codex with a ChatGPT account".
     ///
-    /// **2026-05-26 fix (Κωνσταντίνος)**: was previously `gpt-5-codex`
-    /// per the assumption that ChatGPT subscriptions could call the
-    /// Codex CLI's privileged model. Verified empirically against
-    /// `/backend-api/codex/responses`: ChatGPT subscription accounts
-    /// get HTTP 400 with `"The 'gpt-5-codex' model is not supported
-    /// when using Codex with a ChatGPT account."` The actual model
-    /// the API accepts for personal subscriptions is plain `gpt-5`.
+    /// **F-291 (2026-05-29)**: was `gpt-5`. Verified empirically against
+    /// `/backend-api/codex/responses` with a live subscription token:
+    /// `gpt-5`, `gpt-5-codex`, `gpt-5-mini`, `gpt-5-thinking`,
+    /// `gpt-5-nano`, `gpt-4o`, `o1`/`o3`/`o4-mini`, `codex-1`,
+    /// `codex-mini` ALL 400; only `gpt-5.5` is accepted.
     pub model: String,
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,7 +88,9 @@ pub struct ChatCompletionRequest {
 impl ChatCompletionRequest {
     pub fn simple(prompt: &str) -> Self {
         Self {
-            model: "gpt-5".to_string(),
+            // F-291: gpt-5.5 is the only model the ChatGPT-subscription
+            // Codex endpoint accepts.
+            model: "gpt-5.5".to_string(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: prompt.to_string(),
@@ -208,11 +209,11 @@ impl CodexClient {
             model: request.model.clone(),
             input,
             instructions,
-            // `stream: false` returns the full response as a single JSON
-            // body. The Codex CLI uses streaming for incremental tokens
-            // but we don't surface incremental output in the AI Helper
-            // panel yet, so the simpler synchronous flow is fine.
-            stream: false,
+            // **F-291**: MUST be true — the endpoint rejects a
+            // non-streaming request ("Stream must be set to true"). We
+            // still drain the whole SSE stream synchronously below; the
+            // AI Helper panel doesn't render incremental tokens yet.
+            stream: true,
             // `store: false` matches the Codex CLI's stateless default —
             // we send the whole prompt every time and the server doesn't
             // persist a thread for us to reference later.
@@ -225,7 +226,8 @@ impl CodexClient {
             .http
             .post(&url)
             .bearer_auth(auth.access_token.expose())
-            .header("Accept", "application/json")
+            // **F-291**: SSE response — ask for the event stream.
+            .header("Accept", "text/event-stream")
             .header("Content-Type", "application/json")
             // **2026-05-29 (F-291 Cycle 3 research)**: the official Codex
             // CLI source (github.com/openai/codex/codex-rs/core/src/
@@ -328,10 +330,25 @@ impl CodexClient {
             });
         }
 
-        // Parse Responses API output and remap to the Chat Completions
-        // shape our caller (server::codex::chat) expects.
-        let api_response: ResponsesApiResponse = serde_json::from_str(&text)?;
-        Ok(api_response.into_chat_completion(&request.model))
+        // **F-291**: the success body is an SSE event stream (the
+        // `text()` above already drained it to completion since we don't
+        // surface incremental tokens yet). Aggregate the `output_text`
+        // deltas + usage and remap to the Chat Completions shape our
+        // caller (server::codex::chat) expects.
+        let (assistant_text, usage) = parse_sse_response(&text);
+        Ok(ChatCompletionResponse {
+            id: None,
+            model: Some(request.model.clone()),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: assistant_text,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage,
+        })
     }
 }
 
@@ -342,18 +359,28 @@ impl CodexClient {
 // crate: callers see the legacy `ChatCompletion{Request,Response}`
 // API only.
 
+/// Fallback `instructions` when the caller didn't supply a system
+/// message. The Codex `/responses` endpoint REQUIRES a non-empty
+/// `instructions` string ("Instructions are required") so we never
+/// send an empty one.
+const DEFAULT_INSTRUCTIONS: &str =
+    "You are NeoEthos AI Helper, a concise assistant embedded in a Rust \
+     forex trading terminal. Answer clearly and briefly. You can discuss \
+     trading, markets, economics, and how to use the platform.";
+
 #[derive(Debug, Serialize)]
 struct ResponsesApiRequest {
     model: String,
-    /// Concatenated user/assistant messages — single string.
-    input: String,
-    /// Optional system prompt. Distinct from `input` in the Responses
-    /// API: instructions persist for the whole turn but don't count
-    /// as user input.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    instructions: Option<String>,
-    /// Synchronous response (one JSON object). `true` would switch to
-    /// SSE event-stream which we don't currently consume.
+    /// **F-291 (2026-05-29)**: MUST be a list of message objects. A
+    /// bare string is rejected with "Input must be a list".
+    input: Vec<ResponsesInputItem>,
+    /// **F-291**: REQUIRED and non-empty. Sending none (or an empty
+    /// string) returns "Instructions are required".
+    instructions: String,
+    /// **F-291**: MUST be `true`. The endpoint only speaks SSE; a
+    /// non-streaming request returns "Stream must be set to true".
+    /// We drain the whole event stream synchronously in `chat()` and
+    /// aggregate the text deltas (no incremental UI surface yet).
     stream: bool,
     /// Whether ChatGPT should persist this turn in server-side memory.
     /// Codex CLI sends `false` for stateless use.
@@ -363,124 +390,131 @@ struct ResponsesApiRequest {
     max_output_tokens: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ResponsesApiResponse {
-    #[serde(default)]
-    #[allow(dead_code)] // surfaced via ChatCompletionResponse.id in future
-    id: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    output: Vec<ResponsesOutputItem>,
-    #[serde(default)]
-    usage: Option<ResponsesUsage>,
+/// One message in the Responses-API `input` list.
+#[derive(Debug, Serialize, PartialEq)]
+struct ResponsesInputItem {
+    role: String,
+    content: Vec<ResponsesInputContent>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ResponsesOutputItem {
-    #[serde(rename = "type", default)]
-    item_type: String,
-    /// Deserialized so the wire-shape stays accurate but currently
-    /// unused — the consuming code filters by `item_type == "message"`
-    /// and reads `content[].text` directly. If a future caller needs
-    /// to distinguish between assistant/system replies it can read
-    /// this field; until then `#[allow(dead_code)]` keeps the build
-    /// warning-free.
-    #[serde(default)]
-    #[allow(dead_code)]
-    role: Option<String>,
-    #[serde(default)]
-    content: Vec<ResponsesContent>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponsesContent {
-    #[serde(rename = "type", default)]
+/// One content part inside an input message. The Codex endpoint
+/// expects parts typed `input_text`.
+#[derive(Debug, Serialize, PartialEq)]
+struct ResponsesInputContent {
+    #[serde(rename = "type")]
     content_type: String,
-    #[serde(default)]
-    text: Option<String>,
+    text: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ResponsesUsage {
-    #[serde(default)]
-    input_tokens: u32,
-    #[serde(default)]
-    output_tokens: u32,
-    #[serde(default)]
-    total_tokens: u32,
-}
+/// Parse a Responses-API SSE body into `(aggregated_text, usage)`.
+///
+/// The endpoint emits Server-Sent Event frames, one JSON object per
+/// `data:` line:
+/// ```text
+/// event: response.output_text.delta
+/// data: {"type":"response.output_text.delta","delta":"Hello",...}
+///
+/// event: response.completed
+/// data: {"type":"response.completed","response":{"usage":{...}}}
+/// ```
+/// We concatenate every `response.output_text.delta` `delta`, and read
+/// token usage from the terminal `response.completed` frame when
+/// present. If no deltas arrived we fall back to the cumulative `text`
+/// carried by a `response.output_text.done` frame so a reply is never
+/// silently dropped. Unknown frame types are ignored — the wire format
+/// gains event types over time and we only depend on the text ones.
+fn parse_sse_response(body: &str) -> (String, Option<ChatUsage>) {
+    let mut text = String::new();
+    let mut done_text: Option<String> = None;
+    let mut usage: Option<ChatUsage> = None;
 
-impl ResponsesApiResponse {
-    /// Map a Responses-API reply into the Chat-Completions shape that
-    /// the rest of NeoEthos already speaks. The model id falls back
-    /// to the request's model when the server omitted one (it usually
-    /// echoes it back, but we don't depend on that).
-    fn into_chat_completion(self, request_model: &str) -> ChatCompletionResponse {
-        // Concatenate every `output_text` payload across all output
-        // items. The Codex/Responses API can emit multiple
-        // `output` items (e.g. tool calls + final message); we only
-        // care about the textual `message` items here. Joining with
-        // newlines preserves multi-segment replies without losing
-        // structure.
-        let assistant_text: String = self
-            .output
-            .iter()
-            .filter(|item| item.item_type == "message")
-            .flat_map(|item| item.content.iter())
-            .filter(|c| c.content_type == "output_text")
-            .filter_map(|c| c.text.as_deref())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let model = self
-            .model
-            .unwrap_or_else(|| request_model.to_string());
-
-        ChatCompletionResponse {
-            id: self.id,
-            model: Some(model),
-            choices: vec![ChatChoice {
-                index: 0,
-                message: ChatMessage {
-                    role: "assistant".to_string(),
-                    content: assistant_text,
-                },
-                finish_reason: Some("stop".to_string()),
-            }],
-            usage: self.usage.map(|u| ChatUsage {
-                prompt_tokens: u.input_tokens,
-                completion_tokens: u.output_tokens,
-                total_tokens: if u.total_tokens > 0 {
-                    u.total_tokens
-                } else {
-                    u.input_tokens + u.output_tokens
-                },
-            }),
+    for line in body.lines() {
+        let payload = match line.strip_prefix("data:") {
+            Some(p) => p.trim(),
+            None => continue,
+        };
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(payload) {
+            Ok(v) => v,
+            Err(_) => continue, // tolerate keep-alive / partial frames
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("response.output_text.delta") => {
+                if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
+                    text.push_str(d);
+                }
+            }
+            Some("response.output_text.done") => {
+                if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+                    done_text = Some(t.to_string());
+                }
+            }
+            Some("response.completed") | Some("response.done") => {
+                if let Some(u) = v.pointer("/response/usage") {
+                    let input_tokens =
+                        u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0)
+                            as u32;
+                    let output_tokens =
+                        u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0)
+                            as u32;
+                    let total_tokens = u
+                        .get("total_tokens")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or((input_tokens + output_tokens) as u64)
+                        as u32;
+                    usage = Some(ChatUsage {
+                        prompt_tokens: input_tokens,
+                        completion_tokens: output_tokens,
+                        total_tokens,
+                    });
+                }
+            }
+            _ => {}
         }
     }
+
+    // Prefer the streamed deltas; fall back to the done-frame's
+    // cumulative text only when no deltas were seen.
+    let final_text = if text.is_empty() {
+        done_text.unwrap_or_default()
+    } else {
+        text
+    };
+    (final_text, usage)
 }
 
-/// Split Chat-Completions-shaped messages into the Responses-API
-/// pair `(instructions, input)`. Public for the unit tests in this
-/// crate; not part of the external API.
-fn split_messages(messages: &[ChatMessage]) -> (Option<String>, String) {
+/// Split Chat-Completions-shaped messages into the Responses-API pair
+/// `(instructions, input)`. System messages collapse into the single
+/// `instructions` string (defaulting to [`DEFAULT_INSTRUCTIONS`] when
+/// absent — the endpoint requires non-empty); every other role becomes
+/// an input message object. Public for the unit tests in this crate;
+/// not part of the external API.
+fn split_messages(messages: &[ChatMessage]) -> (String, Vec<ResponsesInputItem>) {
     let mut instructions: Vec<&str> = Vec::new();
-    let mut conversation: Vec<String> = Vec::new();
+    let mut input: Vec<ResponsesInputItem> = Vec::new();
     for m in messages {
         match m.role.to_ascii_lowercase().as_str() {
             "system" => instructions.push(m.content.as_str()),
-            "user" => conversation.push(m.content.clone()),
-            "assistant" => conversation.push(format!("Assistant: {}", m.content)),
-            other => conversation.push(format!("{other}: {}", m.content)),
+            role => input.push(ResponsesInputItem {
+                role: if role == "assistant" {
+                    "assistant".to_string()
+                } else {
+                    "user".to_string()
+                },
+                content: vec![ResponsesInputContent {
+                    content_type: "input_text".to_string(),
+                    text: m.content.clone(),
+                }],
+            }),
         }
     }
     let instructions = if instructions.is_empty() {
-        None
+        DEFAULT_INSTRUCTIONS.to_string()
     } else {
-        Some(instructions.join("\n\n"))
+        instructions.join("\n\n")
     };
-    let input = conversation.join("\n\n");
     (instructions, input)
 }
 
@@ -491,7 +525,7 @@ mod tests {
     #[test]
     fn simple_request_defaults_to_user_message() {
         let req = ChatCompletionRequest::simple("hello world");
-        assert_eq!(req.model, "gpt-5");
+        assert_eq!(req.model, "gpt-5.5");
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, "user");
         assert_eq!(req.messages[0].content, "hello world");
@@ -502,14 +536,11 @@ mod tests {
     fn serializes_without_optional_nulls() {
         let req = ChatCompletionRequest::simple("hi");
         let json = serde_json::to_string(&req).unwrap();
-        // **2026-05-29 fix (F-291)**: was previously asserting
-        // `"model":"gpt-5-codex"` — wrong since the 2026-05-26 switch
-        // to `gpt-5` per the per-account-rejection investigation
-        // (`gpt-5-codex` is rejected with the per-account error,
-        // `gpt-5` is the documented ChatGPT subscription model id).
-        // The test would have silently broken on the next CI run; pin
-        // it to the actual default now so the contract is enforced.
-        assert!(json.contains("\"model\":\"gpt-5\""));
+        // **F-291 (2026-05-29 Cycle 4)**: pinned to `gpt-5.5` — the only
+        // model the live ChatGPT-subscription Codex endpoint accepts.
+        // (Was `gpt-5`, which 400s with the per-account error; the
+        // 2026-05-26 `gpt-5-codex`→`gpt-5` switch was a half-fix.)
+        assert!(json.contains("\"model\":\"gpt-5.5\""));
         assert!(json.contains("\"messages\""));
         // Skipped if None — these should NOT appear in the body.
         assert!(!json.contains("max_tokens"));
@@ -544,12 +575,19 @@ mod tests {
             },
         ];
         let (instructions, input) = split_messages(&messages);
-        assert_eq!(instructions.as_deref(), Some("Be concise."));
-        assert_eq!(input, "Hello");
+        assert_eq!(instructions, "Be concise.");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].role, "user");
+        assert_eq!(input[0].content[0].content_type, "input_text");
+        assert_eq!(input[0].content[0].text, "Hello");
     }
 
     #[test]
-    fn split_messages_concatenates_user_and_assistant_history() {
+    fn split_messages_defaults_instructions_when_no_system() {
+        // **F-291**: the endpoint requires a non-empty `instructions`
+        // string, so a conversation with no system message must still
+        // produce one (the default), and every non-system turn becomes
+        // its own input message object with its role preserved.
         let messages = vec![
             ChatMessage {
                 role: "user".to_string(),
@@ -565,67 +603,86 @@ mod tests {
             },
         ];
         let (instructions, input) = split_messages(&messages);
-        assert_eq!(instructions, None);
-        assert!(input.contains("What is forex?"));
-        assert!(input.contains("Assistant: Foreign exchange."));
-        assert!(input.contains("Tell me more."));
+        assert_eq!(instructions, DEFAULT_INSTRUCTIONS);
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0].role, "user");
+        assert_eq!(input[1].role, "assistant");
+        assert_eq!(input[2].role, "user");
+        assert_eq!(input[1].content[0].text, "Foreign exchange.");
     }
 
     #[test]
-    fn responses_api_maps_to_chat_completion() {
-        let api_resp = ResponsesApiResponse {
-            id: Some("resp_xxx".to_string()),
-            model: Some("gpt-5".to_string()),
-            output: vec![ResponsesOutputItem {
-                item_type: "message".to_string(),
-                role: Some("assistant".to_string()),
-                content: vec![ResponsesContent {
-                    content_type: "output_text".to_string(),
-                    text: Some("Hi there.".to_string()),
-                }],
-            }],
-            usage: Some(ResponsesUsage {
-                input_tokens: 10,
-                output_tokens: 5,
-                total_tokens: 15,
-            }),
+    fn responses_request_serializes_as_input_list_with_instructions() {
+        // **F-291** wire contract: `input` is a list, `instructions` is
+        // a non-empty string, `stream` is true. Any of these wrong and
+        // the endpoint 400s before it even checks model entitlement.
+        let (instructions, input) = split_messages(&[ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }]);
+        let req = ResponsesApiRequest {
+            model: "gpt-5.5".to_string(),
+            input,
+            instructions,
+            stream: true,
+            store: false,
+            max_output_tokens: None,
         };
-        let chat = api_resp.into_chat_completion("gpt-5");
-        assert_eq!(chat.choices.len(), 1);
-        assert_eq!(chat.choices[0].message.role, "assistant");
-        assert_eq!(chat.choices[0].message.content, "Hi there.");
-        assert_eq!(chat.usage.as_ref().unwrap().total_tokens, 15);
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"input\":["), "input must serialize as a list");
+        assert!(json.contains("\"type\":\"input_text\""));
+        assert!(json.contains("\"stream\":true"));
+        assert!(json.contains("\"instructions\":\""));
+        assert!(
+            !json.contains("\"instructions\":\"\""),
+            "instructions must be non-empty"
+        );
     }
 
     #[test]
-    fn responses_api_ignores_non_message_outputs() {
-        // The Responses API can emit tool_call items etc. Make sure
-        // we only pull text from `message` items so we don't trip
-        // on unrelated structures.
-        let api_resp = ResponsesApiResponse {
-            id: None,
-            model: None,
-            output: vec![
-                ResponsesOutputItem {
-                    item_type: "tool_call".to_string(),
-                    role: None,
-                    content: vec![ResponsesContent {
-                        content_type: "output_text".to_string(),
-                        text: Some("ignored".to_string()),
-                    }],
-                },
-                ResponsesOutputItem {
-                    item_type: "message".to_string(),
-                    role: Some("assistant".to_string()),
-                    content: vec![ResponsesContent {
-                        content_type: "output_text".to_string(),
-                        text: Some("kept".to_string()),
-                    }],
-                },
-            ],
-            usage: None,
-        };
-        let chat = api_resp.into_chat_completion("gpt-5");
-        assert_eq!(chat.choices[0].message.content, "kept");
+    fn parse_sse_aggregates_text_deltas_and_usage() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n",
+            "\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\", world\"}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":3,\"total_tokens\":13}}}\n",
+            "\n",
+        );
+        let (text, usage) = parse_sse_response(body);
+        assert_eq!(text, "Hello, world");
+        let u = usage.unwrap();
+        assert_eq!(u.prompt_tokens, 10);
+        assert_eq!(u.completion_tokens, 3);
+        assert_eq!(u.total_tokens, 13);
+    }
+
+    #[test]
+    fn parse_sse_falls_back_to_done_frame_when_no_deltas() {
+        let body = concat!(
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"text\":\"Full reply.\"}\n",
+            "\n",
+        );
+        let (text, usage) = parse_sse_response(body);
+        assert_eq!(text, "Full reply.");
+        assert!(usage.is_none());
+    }
+
+    #[test]
+    fn parse_sse_tolerates_keepalive_and_garbage_lines() {
+        let body = concat!(
+            ": keep-alive comment\n",
+            "data: \n",
+            "data: not-json\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n",
+            "data: [DONE]\n",
+        );
+        let (text, _usage) = parse_sse_response(body);
+        assert_eq!(text, "ok");
     }
 }
