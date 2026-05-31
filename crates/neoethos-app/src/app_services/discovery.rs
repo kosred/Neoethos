@@ -1236,6 +1236,19 @@ pub struct ModelTargetEntry {
     pub sharpe_ratio: f64,
     pub win_rate: f64,
     pub trades_count: u64,
+    /// **F-330**: peak-to-trough drawdown as a PERCENTAGE. The GA's
+    /// `Gene::max_drawdown` is a fraction (0.25 = 25%); we ×100 at
+    /// write time so the promotion gate + UI speak percentages
+    /// consistently. `#[serde(default)]` keeps pre-F-330
+    /// model_targets.json files readable (they get 0.0, which the gate
+    /// treats as "no drawdown recorded" — a permissive default for
+    /// legacy files rather than a spurious rejection).
+    #[serde(default)]
+    pub max_drawdown_pct: f64,
+    /// **F-330**: gross profit / gross loss. Defaulted for backward
+    /// compat with pre-F-330 files.
+    #[serde(default)]
+    pub profit_factor: f64,
 }
 
 /// Current `ModelTargetsFile::schema_version`. Bump when the schema
@@ -1277,6 +1290,9 @@ fn write_model_targets_for_discovery(
             sharpe_ratio: gene.sharpe_ratio,
             win_rate: gene.win_rate,
             trades_count: gene.trades_count as u64,
+            // F-330: Gene stores drawdown as a fraction; gate + UI use %.
+            max_drawdown_pct: gene.max_drawdown * 100.0,
+            profit_factor: gene.profit_factor,
         })
         .collect();
     let file = ModelTargetsFile {
