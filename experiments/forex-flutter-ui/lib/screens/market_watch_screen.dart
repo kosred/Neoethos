@@ -37,6 +37,39 @@ import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import 'chart_screen.dart';
+
+/// F-334: open a symbol's chart (with the inline buy/sell overlay) in a
+/// fullscreen dialog. Sets the shared `chartSymbolProvider` so the
+/// ChartScreen renders the tapped symbol, then pushes the chart route.
+void _openSymbolChart(BuildContext context, WidgetRef ref, String symbol) {
+  ref.read(chartSymbolProvider.notifier).state = symbol;
+  Navigator.of(context).push(
+    MaterialPageRoute<void>(
+      fullscreenDialog: true,
+      builder: (_) => Scaffold(
+        backgroundColor: ForexAiTokens.appBg,
+        appBar: AppBar(
+          backgroundColor: ForexAiTokens.panelBg,
+          elevation: 0,
+          iconTheme: const IconThemeData(color: ForexAiTokens.textPrimary),
+          title: Text(
+            '$symbol · Chart',
+            style: const TextStyle(
+              color: ForexAiTokens.textPrimary,
+              fontSize: ForexAiTokens.fsSubtitle,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+        body: const Padding(
+          padding: EdgeInsets.all(ForexAiTokens.spSm),
+          child: SingleChildScrollView(child: ChartScreen()),
+        ),
+      ),
+    ),
+  );
+}
 
 class MarketWatchScreen extends ConsumerWidget {
   const MarketWatchScreen({super.key});
@@ -218,7 +251,7 @@ class _Pill extends StatelessWidget {
 // Watchlist table (left, main focus)
 // ---------------------------------------------------------------------------
 
-class _WatchlistPanel extends StatelessWidget {
+class _WatchlistPanel extends ConsumerWidget {
   final AsyncValue<LiveSpotsSnapshot> spotsAsync;
   final AsyncValue<AccountSnapshot> accountAsync;
   final AsyncValue<IntelligenceSnapshot> intelAsync;
@@ -230,7 +263,7 @@ class _WatchlistPanel extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return Container(
       decoration: BoxDecoration(
         color: ForexAiTokens.panelBg,
@@ -302,6 +335,13 @@ class _WatchlistPanel extends StatelessWidget {
                       strategy: strategyBySymbol[sorted[i].symbolName],
                       ensembleAcc: acc,
                       stripe: i.isOdd,
+                      // F-334: tap a row → open that symbol's chart
+                      // (with the inline buy/sell overlay).
+                      onTap: () => _openSymbolChart(
+                        context,
+                        ref,
+                        sorted[i].symbolName,
+                      ),
                     ),
                   ),
                 );
@@ -385,12 +425,16 @@ class _SymbolRow extends StatelessWidget {
   final DiscoveryTarget? strategy;
   final double? ensembleAcc;
   final bool stripe;
+  /// F-334: tapping a row opens that symbol's chart (with inline
+  /// buy/sell). Supplied by the parent which owns the Riverpod ref.
+  final VoidCallback? onTap;
   const _SymbolRow({
     required this.spot,
     required this.positionsOnSymbol,
     required this.strategy,
     required this.ensembleAcc,
     required this.stripe,
+    this.onTap,
   });
 
   @override
@@ -409,7 +453,12 @@ class _SymbolRow extends StatelessWidget {
             ? ('Live', ForexAiTokens.buy)
             : ('Off', ForexAiTokens.textFaint);
 
-    return Container(
+    return InkWell(
+      onTap: onTap,
+      mouseCursor: onTap == null
+          ? MouseCursor.defer
+          : SystemMouseCursors.click,
+      child: Container(
       decoration: BoxDecoration(
         color: stripe
             ? ForexAiTokens.appBg.withValues(alpha: 0.4)
@@ -534,6 +583,7 @@ class _SymbolRow extends StatelessWidget {
             ),
           ),
         ],
+      ),
       ),
     );
   }

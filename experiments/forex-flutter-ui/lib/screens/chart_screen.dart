@@ -24,6 +24,7 @@ import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/inline_buy_sell.dart';
 import '../widgets/symbol_picker.dart';
 import '_placeholder.dart';
 
@@ -949,25 +950,37 @@ class _ChartCanvasWithOverlaysState
         ),
         SizedBox(
           height: 320,
-          child: Listener(
-            onPointerSignal: (event) {
-              if (event is PointerScrollEvent) {
-                _zoom(event.scrollDelta.dy < 0 ? 1.15 : 0.85);
-              }
-            },
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onHorizontalDragUpdate: (details) =>
-                  _pan((-details.delta.dx / 8).round()),
-              child: CustomPaint(
-                painter: _CandlestickPainter(
-                  snapshot: widget.snapshot,
-                  overlays: overlayLines,
-                  viewport: _viewport,
+          child: Stack(
+            children: [
+              Listener(
+                onPointerSignal: (event) {
+                  if (event is PointerScrollEvent) {
+                    _zoom(event.scrollDelta.dy < 0 ? 1.15 : 0.85);
+                  }
+                },
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onHorizontalDragUpdate: (details) =>
+                      _pan((-details.delta.dx / 8).round()),
+                  child: CustomPaint(
+                    painter: _CandlestickPainter(
+                      snapshot: widget.snapshot,
+                      overlays: overlayLines,
+                      viewport: _viewport,
+                    ),
+                    size: Size.infinite,
+                  ),
                 ),
-                size: Size.infinite,
               ),
-            ),
+              // F-334: one-click buy/sell at the live price, overlaid
+              // top-right of the chart (cTrader/TradingView style).
+              // Renders nothing until a fresh tick exists for the symbol.
+              Positioned(
+                top: 8,
+                right: 8,
+                child: InlineBuySell(symbol: widget.snapshot.symbol),
+              ),
+            ],
           ),
         ),
         if (overlayLines.isNotEmpty) ...[
