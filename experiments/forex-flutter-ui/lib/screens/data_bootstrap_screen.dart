@@ -73,6 +73,61 @@ class _BodyState extends ConsumerState<_Body> {
   bool _importBusy = false;
   String? _importResult;
 
+  // Data-directory editor state. The backend already accepts an
+  // absolute `data_dir` (POST /settings) — the only reason this lives
+  // here (and not just buried in Settings → App) is discoverability:
+  // an operator landing on the Data tab to bootstrap history is
+  // exactly who needs to repoint the folder when the inventory shows
+  // the wrong symbol count. Prefilled from the snapshot in initState.
+  late final TextEditingController _dataDirCtrl;
+  bool _dataDirBusy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _dataDirCtrl = TextEditingController(text: widget.snapshot.dataDir);
+  }
+
+  Future<void> _onApplyDataDir() async {
+    final dir = _dataDirCtrl.text.trim();
+    if (dir.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          backgroundColor: ForexAiTokens.sell,
+          content: Text('Data directory cannot be blank'),
+        ),
+      );
+      return;
+    }
+    setState(() => _dataDirBusy = true);
+    try {
+      await ref.read(backendClientProvider).saveSettings(dataDir: dir);
+      // Re-scan so Inventory + symbol count reflect the new folder.
+      ref.invalidate(dataBootstrapProvider);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: ForexAiTokens.buy,
+          content: Text('Data directory set to $dir'),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    } on DioException catch (e) {
+      if (!mounted) return;
+      showTranslatedErrorSnackbar(context, e, prefix: 'Save failed');
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: ForexAiTokens.sell,
+          content: Text('Save failed: $e'),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _dataDirBusy = false);
+    }
+  }
+
   Future<void> _pickDate({required bool isFrom}) async {
     final initial = isFrom ? _fromDate : _toDate;
     final picked = await showDatePicker(
@@ -190,9 +245,78 @@ class _BodyState extends ConsumerState<_Body> {
             DateTime.fromMillisecondsSinceEpoch(snapshot.lastTouchedUnixMs!));
     final dateFmt = DateFormat('yyyy-MM-dd');
 
+    final dataDirExists = snapshot.dataDirExists;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        SectionCard(
+          title: 'Data directory',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                "Point this at your historical-data folder (the one "
+                "containing symbol=EURUSD/ etc.). Relative paths resolve "
+                "against the app's working directory; use an absolute "
+                "path to be sure.",
+                style: TextStyle(
+                  color: ForexAiTokens.textMuted,
+                  fontSize: 12,
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _dataDirCtrl,
+                enabled: !_dataDirBusy,
+                style: const TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 13,
+                  color: ForexAiTokens.textPrimary,
+                ),
+                decoration: const InputDecoration(
+                  labelText: 'Folder path',
+                  hintText: r'Absolute path, e.g. C:\Users\you\forex-ai\data',
+                  isDense: true,
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 6),
+              // Live status: reflects the *currently scanned* folder
+              // (the snapshot), which updates after Apply re-fetches.
+              Text(
+                dataDirExists
+                    ? '✓ ${snapshot.symbols.length} symbols found'
+                    : '✗ directory not found / empty',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: dataDirExists
+                      ? ForexAiTokens.buy
+                      : ForexAiTokens.sell,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  FilledButton.icon(
+                    onPressed: _dataDirBusy ? null : _onApplyDataDir,
+                    icon: const Icon(Icons.folder_open, size: 18),
+                    label: const Text('Apply'),
+                  ),
+                  if (_dataDirBusy) ...[
+                    const SizedBox(width: 12),
+                    const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ],
+                ],
+              ),
+            ],
+          ),
+        ),
         SectionCard(
           title: 'Inventory',
           child: Column(
@@ -406,6 +530,7 @@ class _BodyState extends ConsumerState<_Body> {
   @override
   void dispose() {
     _importPathCtrl.dispose();
+    _dataDirCtrl.dispose();
     super.dispose();
   }
 }
