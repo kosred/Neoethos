@@ -42,14 +42,15 @@
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
 
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE, build_account_auth_request, build_application_auth_request,
-    build_subscribe_spots_request, parse_ctrader_error_payload, parse_open_api_envelope,
+    CTRADER_OA_HEARTBEAT_PAYLOAD_TYPE, CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE,
+    build_account_auth_request, build_application_auth_request, build_subscribe_spots_request,
+    parse_ctrader_error_payload, parse_open_api_envelope,
 };
 use crate::app_services::live_spots;
 
@@ -328,13 +329,57 @@ fn run_blocking(config: LiveSpotsStreamerConfig) -> Result<()> {
         "spot stream subscribed; entering read loop"
     );
 
+    // **2026-05-31 fix — outgoing app heartbeat.** cTrader's Open API
+    // closes a streaming connection (CloseFrame "Bye") after ~60 s when
+    // the client doesn't send a ProtoHeartbeatEvent, EVEN if the
+    // transport-level WebSocket ping/pong is healthy. The old loop only
+    // replied to incoming pings and never sent its own heartbeat, so the
+    // spot stream died every ~65 s and Market Watch showed "no live
+    // spots" (and position pnl_pips fell back to 0 with no live price).
+    // We now (a) set a short read timeout so the blocking `read()`
+    // returns periodically, and (b) send a JSON heartbeat (payloadType
+    // 51) every ~10 s — the same cadence the account session uses
+    // (ctrader_session.rs:93).
+    set_spot_read_timeout(&mut socket, Duration::from_secs(5));
+    let heartbeat_every = Duration::from_secs(10);
+    let mut last_heartbeat = Instant::now();
+
     // 4. Read loop. Spot events flow in forever; everything else
-    //    (ping/pong, account disconnect, errors) is handled
-    //    inline.
+    //    (ping/pong, account disconnect, errors) is handled inline.
     loop {
-        let frame = socket
-            .read()
-            .context("failed to read frame from cTrader spot stream")?;
+        // Send an app-level heartbeat on schedule so cTrader keeps the
+        // stream open. A half-duplex send between reads is safe on a
+        // sync tungstenite socket.
+        if last_heartbeat.elapsed() >= heartbeat_every {
+            let hb = format!(
+                r#"{{"clientMsgId":"spot-hb","payloadType":{CTRADER_OA_HEARTBEAT_PAYLOAD_TYPE},"payload":{{}}}}"#
+            );
+            socket
+                .send(Message::Text(hb.into()))
+                .context("failed to send spot-stream heartbeat")?;
+            last_heartbeat = Instant::now();
+        }
+
+        let frame = match socket.read() {
+            Ok(f) => f,
+            // Read timeout (set above) — no frame this interval. Loop
+            // back so the heartbeat scheduler runs. tungstenite surfaces
+            // the socket timeout as WouldBlock (*nix) or TimedOut
+            // (Windows); both just mean "nothing to read right now".
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "failed to read frame from cTrader spot stream: {e}"
+                ));
+            }
+        };
         let payload_text = match frame {
             Message::Text(t) => t.to_string(),
             Message::Binary(b) => {
@@ -399,6 +444,26 @@ fn run_blocking(config: LiveSpotsStreamerConfig) -> Result<()> {
                 continue;
             }
         }
+    }
+}
+
+/// Set a read timeout on the underlying TCP socket so the blocking
+/// [`WebSocket::read`] returns periodically (instead of blocking until
+/// the next frame arrives), letting the heartbeat scheduler in the read
+/// loop run. Best-effort: if setting the timeout fails we just fall back
+/// to the old blocking behaviour — no worse than before the fix.
+fn set_spot_read_timeout(socket: &mut CTraderSocket, dur: Duration) {
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(tcp) => {
+            let _ = tcp.set_read_timeout(Some(dur));
+        }
+        MaybeTlsStream::Rustls(tls) => {
+            // rustls 0.23 exposes the wrapped TcpStream as the public
+            // `sock` field on StreamOwned.
+            let _ = tls.sock.set_read_timeout(Some(dur));
+        }
+        // native-tls isn't compiled in for this target; nothing to do.
+        _ => {}
     }
 }
 
