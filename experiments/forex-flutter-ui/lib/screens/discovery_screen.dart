@@ -799,10 +799,17 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                 : 'Queue partial — ${failed.length} failures: '
                     '${failed.join('; ')}';
       });
+      // A clean run can flash by in 4s, but a failure now carries an
+      // actionable diagnosis (which funnel stage rejected everything +
+      // the fix) — give the operator time to read it, and a dismiss
+      // action so it isn't a transient flash.
+      final hadFailures = !aborted && failed.isNotEmpty;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(_queueSummary),
-          duration: const Duration(seconds: 4),
+          duration: Duration(seconds: hadFailures ? 18 : 4),
+          backgroundColor: hadFailures ? const Color(0xFF7F1D1D) : null,
+          showCloseIcon: hadFailures,
         ),
       );
     }
