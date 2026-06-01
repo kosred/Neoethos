@@ -677,7 +677,7 @@ class _ChartSourceBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final text = snapshot.isDiskCache
-        ? 'Cached chart data · broker live candles pending'
+        ? 'Cached candles — broker unreachable, showing last saved data'
         : 'Chart data source: ${snapshot.source}';
     return Container(
       width: double.infinity,

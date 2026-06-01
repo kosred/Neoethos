@@ -99,6 +99,8 @@ class TopBar extends ConsumerWidget {
           const _Badge(label: 'PRO', kind: _BadgeKind.pro),
           const SizedBox(width: ForexAiTokens.spXs),
           _Badge(label: badgeLabel, kind: badgeKind),
+          const SizedBox(width: ForexAiTokens.spXs),
+          const _AccountSwitcher(),
           const _VSep(),
           Expanded(
             child: SingleChildScrollView(
@@ -184,6 +186,118 @@ class TopBar extends ConsumerWidget {
         ],
       ),
     );
+  }
+}
+
+/// Accessible cTrader account switcher in the top bar (operator
+/// feedback: the 7-account picker was buried under Settings → App). Lists
+/// every account the OAuth grant exposes (DEMO/LIVE badged), marks the
+/// active one, and switches on tap. The switch reorders
+/// broker_credentials.toml server-side and takes effect on the next
+/// backend start — the SnackBar says so.
+class _AccountSwitcher extends ConsumerWidget {
+  const _AccountSwitcher();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final accounts =
+        ref.watch(brokerAccountsProvider).valueOrNull?.accounts ?? const [];
+    final currentId =
+        ref.watch(brokerStatusProvider).valueOrNull?.accountId ?? '';
+    if (accounts.isEmpty) {
+      // No OAuth grant loaded yet — nothing to switch between.
+      return const SizedBox.shrink();
+    }
+    return PopupMenuButton<String>(
+      tooltip: 'Switch cTrader account (applies on restart)',
+      offset: const Offset(0, 36),
+      color: ForexAiTokens.panelBg,
+      onSelected: (id) => _select(context, ref, id),
+      itemBuilder: (_) => [
+        for (final a in accounts)
+          PopupMenuItem<String>(
+            value: a.accountId,
+            height: 38,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _Badge(
+                  label: (a.isLive ?? false) ? 'LIVE' : 'DEMO',
+                  kind: (a.isLive ?? false)
+                      ? _BadgeKind.live
+                      : _BadgeKind.idle,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  a.accountId,
+                  style: TextStyle(
+                    fontSize: ForexAiTokens.fsBody,
+                    fontWeight: a.accountId == currentId
+                        ? FontWeight.w800
+                        : FontWeight.w500,
+                    color: ForexAiTokens.textPrimary,
+                  ),
+                ),
+                if (a.accountId == currentId) ...[
+                  const SizedBox(width: 8),
+                  const Icon(Icons.check, size: 14, color: ForexAiTokens.buy),
+                ],
+              ],
+            ),
+          ),
+      ],
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 8),
+        decoration: BoxDecoration(
+          color: ForexAiTokens.appBg,
+          border: Border.all(color: ForexAiTokens.border),
+          borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.account_circle_outlined,
+                size: 14, color: ForexAiTokens.textMuted),
+            const SizedBox(width: 5),
+            Text(
+              currentId.isEmpty ? 'Account' : currentId,
+              style: const TextStyle(
+                fontSize: ForexAiTokens.fsCaption,
+                fontWeight: FontWeight.w700,
+                color: ForexAiTokens.textPrimary,
+              ),
+            ),
+            const Icon(Icons.arrow_drop_down,
+                size: 16, color: ForexAiTokens.textMuted),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _select(BuildContext context, WidgetRef ref, String id) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final r = await ref
+          .read(backendClientProvider)
+          .selectBrokerAccount(accountId: id);
+      final ok = r['ok'] == true;
+      ref.invalidate(brokerStatusProvider);
+      ref.invalidate(accountSnapshotProvider);
+      messenger.showSnackBar(SnackBar(
+        backgroundColor: ok ? ForexAiTokens.buy : ForexAiTokens.warning,
+        duration: const Duration(seconds: 5),
+        content: Text(ok
+            ? 'Active account → $id. Restart NeoEthos to apply.'
+            : 'Account select returned an unexpected response.'),
+      ));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(
+        backgroundColor: ForexAiTokens.sell,
+        duration: const Duration(seconds: 5),
+        content: Text('Account switch failed: $e'),
+      ));
+    }
   }
 }
 
