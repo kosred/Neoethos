@@ -751,6 +751,35 @@ class BackendClient {
     return ChartSnapshot.fromJson(response.data!);
   }
 
+  /// `/chart/history?symbol=&timeframe=&beforeMs=&limit=` — the next page
+  /// of OLDER candles (strictly before `beforeMs`) for TradingView-style
+  /// scroll-back. Broker-only, never persisted to disk. `hasMore == false`
+  /// means the broker has no older bars, so the caller stops paginating.
+  Future<ChartHistoryPage> fetchChartHistory({
+    required String symbol,
+    required String timeframe,
+    required int beforeMs,
+    int limit = 500,
+  }) async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '/chart/history',
+      queryParameters: {
+        'symbol': symbol,
+        'timeframe': timeframe,
+        'beforeMs': beforeMs,
+        'limit': limit,
+      },
+    );
+    if (response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/chart/history returned empty body',
+      );
+    }
+    return ChartHistoryPage.fromJson(response.data!);
+  }
+
   /// `/indicators?symbol=…&timeframe=…&indicator=…&period=…&limit=…`
   /// — compute a single indicator overlay for the chart. Backed by
   /// vector_ta. Returns a list of named lines; single-output
@@ -1474,6 +1503,29 @@ class ChartSnapshot {
 
   bool get isDiskCache => source == 'disk-cache';
   bool get isBrokerSource => source == 'broker';
+}
+
+/// One page of older candles from `/chart/history` (scroll-back). The
+/// candles are oldest→newest, all strictly before the requested cursor,
+/// so the caller can splice them onto the FRONT of its list.
+class ChartHistoryPage {
+  final List<ChartCandle> candles;
+
+  /// `false` once the broker returns nothing older — stop paginating.
+  final bool hasMore;
+  final String source;
+  const ChartHistoryPage({
+    required this.candles,
+    required this.hasMore,
+    required this.source,
+  });
+  factory ChartHistoryPage.fromJson(Map<String, dynamic> j) => ChartHistoryPage(
+        candles: ((j['candles'] as List?) ?? const [])
+            .map((e) => ChartCandle.fromJson(e as Map<String, dynamic>))
+            .toList(growable: false),
+        hasMore: (j['hasMore'] as bool?) ?? false,
+        source: (j['source'] as String?) ?? 'unknown',
+      );
 }
 
 /// One series produced by `/indicators`. Multi-output indicators

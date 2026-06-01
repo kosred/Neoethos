@@ -14,6 +14,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:k_chart_plus/k_chart_plus.dart';
 
 import '../api/backend_client.dart';
+import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../theme/theme.dart';
 
@@ -30,23 +31,61 @@ class _ProChartState extends ConsumerState<ProChart> {
   bool _boll = false;
   String? _secondary = 'MACD'; // MACD | KDJ | RSI | WR | null
 
+  // ── Scroll-back pagination (F-344) ─────────────────────────────────
+  // Older candles fetched on-demand from /chart/history as the operator
+  // pans left past the oldest loaded bar — TradingView model: held only
+  // in memory, never persisted. `_older` is oldest→newest, all strictly
+  // before the snapshot's first candle. Reset when the symbol/TF changes.
+  final List<ChartCandle> _older = [];
+  bool _loadingMore = false;
+  bool _exhausted = false;
+  String _seriesKey = '';
+
+  /// Soft memory bound. Covers ≥2 years on M15+ and a large window on M1
+  /// without letting an endless M1 scroll-back grow the list unbounded
+  /// (k_chart_plus keeps every candle live in memory). At the cap we stop
+  /// paginating; switch to a higher timeframe to see further back.
+  static const int _maxOlder = 50000;
+
   @override
   Widget build(BuildContext context) {
     final snap = widget.snapshot;
     final digits = _digits(snap.symbol);
 
-    // k-line series from broker candles.
-    final data = snap.candles
-        .map((c) => KLineEntity.fromCustom(
-              time: c.tsMs ?? 0,
-              open: c.open,
-              high: c.high,
-              low: c.low,
-              close: c.close,
-              vol: c.volume,
-              amount: null,
-            ))
-        .toList();
+    // Reset the scroll-back buffer when the symbol or timeframe changes —
+    // older bars from EURUSD M1 must never bleed into GBPUSD H1. Safe to
+    // mutate directly here (no setState): we're already inside build.
+    final key = '${snap.symbol}|${snap.timeframe}';
+    if (key != _seriesKey) {
+      _seriesKey = key;
+      _older.clear();
+      _loadingMore = false;
+      _exhausted = false;
+    }
+
+    // k-line series = paged-in older candles + the snapshot's window.
+    final data = <KLineEntity>[
+      for (final c in _older)
+        KLineEntity.fromCustom(
+          time: c.tsMs ?? 0,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          vol: c.volume,
+          amount: null,
+        ),
+      for (final c in snap.candles)
+        KLineEntity.fromCustom(
+          time: c.tsMs ?? 0,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          vol: c.volume,
+          amount: null,
+        ),
+    ];
 
     // Live forming candle: fold the freshest tick into the last bar so the
     // rightmost candle moves in real time.
@@ -101,14 +140,57 @@ class _ProChartState extends ConsumerState<ProChart> {
                   mBaseHeight: 300,
                   timeFormat: TimeFormat.YEAR_MONTH_DAY,
                   detailBuilder: (KLineEntity e) => _detail(e, digits),
-                  onLoadMore: (bool loadMore) {
-                    // loadMore == true → user reached the oldest loaded
-                    // bar. Scroll-back history fetch lands in a follow-up.
+                  onLoadMore: (bool isRightEdge) {
+                    // k_chart_plus fires onLoadMore(false) when the user
+                    // pans to the OLDEST loaded bar (left edge) and
+                    // onLoadMore(true) at the newest (right). We only
+                    // page older history; the live spot stream keeps the
+                    // right edge current.
+                    if (!isRightEdge) _fetchOlder(snap);
                   },
                 ),
         ),
       ],
     );
+  }
+
+  /// Fetch the next page of OLDER candles from the broker and splice them
+  /// onto the front of `_older`. Guarded against re-entrancy and against
+  /// running once the broker has no more history (or the soft cap is hit).
+  Future<void> _fetchOlder(ChartSnapshot snap) async {
+    if (_loadingMore || _exhausted) return;
+    if (_older.length >= _maxOlder) {
+      _exhausted = true;
+      return;
+    }
+    // Cursor = the oldest candle we currently hold.
+    final ChartCandle? oldest = _older.isNotEmpty
+        ? _older.first
+        : (snap.candles.isNotEmpty ? snap.candles.first : null);
+    final cursor = oldest?.tsMs;
+    if (cursor == null) return; // no timestamps → can't page
+
+    _loadingMore = true;
+    try {
+      final page = await ref.read(backendClientProvider).fetchChartHistory(
+            symbol: snap.symbol,
+            timeframe: snap.timeframe,
+            beforeMs: cursor,
+            limit: 500,
+          );
+      if (!mounted) return;
+      setState(() {
+        // Backend guarantees every bar is strictly before the cursor, so
+        // there's no overlap — prepend in order (oldest→newest).
+        _older.insertAll(0, page.candles);
+        if (!page.hasMore || page.candles.isEmpty) _exhausted = true;
+      });
+    } catch (_) {
+      // Broker hiccup — don't hammer it; the in-flight flag is cleared
+      // below so the next pan retries.
+    } finally {
+      _loadingMore = false;
+    }
   }
 
   Widget _toolbar() {
