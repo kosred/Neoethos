@@ -176,12 +176,27 @@ pub fn try_spawn_with_defaults_blocking() -> bool {
         }
     };
 
+    // F-338: subscribe to the operator's Market Watch set (config
+    // `system.watchlist`); fall back to the 8 majors when it's unset.
+    let watchlist: Vec<String> =
+        neoethos_core::Settings::from_yaml(&crate::server::state::current_config_path())
+            .map(|s| s.system.watchlist)
+            .unwrap_or_default();
+    let want_symbols: Vec<String> = if watchlist.is_empty() {
+        DEFAULT_STREAMED_SYMBOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        watchlist
+    };
+
     let mut resolved: Vec<StreamedSymbol> = Vec::new();
-    for want in DEFAULT_STREAMED_SYMBOLS {
+    for want in &want_symbols {
         if let Some(s) = bundle
             .symbols
             .iter()
-            .find(|s| s.symbol_name.eq_ignore_ascii_case(want))
+            .find(|s| s.symbol_name.eq_ignore_ascii_case(want.as_str()))
         {
             // GROUP D remediation (operator directive 2026-05-25):
             // route pip-digits through the canonical

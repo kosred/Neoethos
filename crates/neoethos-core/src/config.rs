@@ -13,6 +13,12 @@ use std::path::PathBuf;
 pub struct SystemConfig {
     pub symbol: String,
     pub symbols: Vec<String>,
+    /// Market Watch live-tick subscription set (F-338). Empty → the spot
+    /// streamer falls back to `DEFAULT_STREAMED_SYMBOLS` (the 8 majors).
+    /// The operator edits this from Market Watch; it takes effect on the
+    /// next backend start.
+    #[serde(default)]
+    pub watchlist: Vec<String>,
     /// Operator's account currency for cost-model FX conversions
     /// (commission, swap, pnl_conversion_fee → account ccy) and the
     /// risk-gate sizing math.
@@ -109,6 +115,7 @@ impl Default for SystemConfig {
             // (see `risk_gate::prop_firm_pre_trade_check` Batch B Pass 3).
             symbol: String::new(),
             symbols: Vec::new(),
+            watchlist: Vec::new(),
             // F-304 fix (2026-05-28): empty default forces operator/
             // broker-session population, matching `symbol`. The
             // cost-model NaN-sentinel guard rejects empty values
