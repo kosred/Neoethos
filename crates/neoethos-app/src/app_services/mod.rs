@@ -32,7 +32,6 @@ pub mod ctrader_messages;
 pub mod ctrader_money;
 pub mod ctrader_openapi;
 pub mod ctrader_proto_messages;
-pub mod ctrader_session;
 pub mod ctrader_state_machine;
 pub mod ctrader_streaming;
 pub mod ctrader_tls;

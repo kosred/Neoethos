@@ -15,9 +15,8 @@ use crate::app_services::ctrader_messages::{
     CTraderOpenApiJsonMessage,
 };
 use crate::app_services::ctrader_openapi::{
-    ProtoHeartbeatEvent, ProtoMessage, ProtoOAAccountAuthReq, ProtoOAApplicationAuthReq,
-    ProtoOAGetTrendbarsReq, ProtoOAGetTrendbarsRes, ProtoOAPayloadType, ProtoOAReconcileReq,
-    ProtoOAReconcileRes, ProtoOATrendbarPeriod, ProtoPayloadType,
+    ProtoMessage, ProtoOAGetTrendbarsReq, ProtoOAGetTrendbarsRes, ProtoOAPayloadType,
+    ProtoOAReconcileReq, ProtoOAReconcileRes, ProtoOATrendbarPeriod,
 };
 use anyhow::{Context, Result, anyhow};
 use protobuf::{Message, Serialize};
@@ -38,49 +37,6 @@ pub fn build_proto_message<M: Message + Serialize>(
     envelope
         .serialize()
         .context("failed to serialize ProtoMessage envelope")
-}
-
-pub fn build_app_auth_req(
-    client_id: &str,
-    client_secret: &str,
-    client_msg_id: Option<String>,
-) -> Result<Vec<u8>> {
-    let mut req = ProtoOAApplicationAuthReq::new();
-    let mut mut_req = req.as_mut();
-    mut_req.set_clientId(client_id.to_string());
-    mut_req.set_clientSecret(client_secret.to_string());
-
-    build_proto_message(
-        i32::from(ProtoOAPayloadType::ProtoOaApplicationAuthReq) as u32,
-        &req,
-        client_msg_id,
-    )
-}
-
-pub fn build_account_auth_req(
-    account_id: i64,
-    access_token: &str,
-    client_msg_id: Option<String>,
-) -> Result<Vec<u8>> {
-    let mut req = ProtoOAAccountAuthReq::new();
-    let mut mut_req = req.as_mut();
-    mut_req.set_ctidTraderAccountId(account_id);
-    mut_req.set_accessToken(access_token.to_string());
-
-    build_proto_message(
-        i32::from(ProtoOAPayloadType::ProtoOaAccountAuthReq) as u32,
-        &req,
-        client_msg_id,
-    )
-}
-
-pub fn build_heartbeat() -> Result<Vec<u8>> {
-    let req = ProtoHeartbeatEvent::new();
-    build_proto_message(
-        i32::from(ProtoPayloadType::HeartbeatEvent) as u32,
-        &req,
-        None,
-    )
 }
 
 pub fn parse_proto_message(data: &[u8]) -> Result<ProtoMessage> {

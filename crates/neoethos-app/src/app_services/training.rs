@@ -356,6 +356,7 @@ fn completed_snapshot_from(
     snapshot
 }
 
+#[cfg(test)]
 pub fn failed_snapshot(err: anyhow::Error) -> JobSnapshot {
     failed_snapshot_from(JobSnapshot::new(JobKind::Training), err)
 }
@@ -396,102 +397,6 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
         ..JobReport::default()
     };
     snapshot
-}
-
-/// Multi-symbol training envelope: fan-out template that builds N
-/// single-symbol `TrainingRequest`s sharing a common config /
-/// models-dir / base-TF and launches them as independent jobs. Mirrors
-/// [`MultiSymbolDiscoveryRequest`] for symmetry — the
-/// `TrainingOrchestrator::train_symbol` core is single-symbol, so
-/// "train across 10 pairs" today means 10 independent training jobs.
-/// True multi-symbol portfolio-fused training is queued for v0.5
-/// alongside the `neoethos-search` portfolio-fusion work.
-///
-/// Audit gap #1 part 2 / roadmap §2 multi-symbol training entry point.
-#[allow(dead_code)]
-// mirrors `MultiSymbolDiscoveryRequest` —
-// scaffolding for the "All Majors" preset that
-// fans out N single-symbol jobs. Tests below
-// exercise validate/lower.
-#[derive(Debug, Clone)]
-pub struct MultiSymbolTrainingRequest {
-    pub config_path: String,
-    pub models_dir: PathBuf,
-    pub symbols: Vec<String>,
-    pub base_tf: String,
-}
-
-#[allow(dead_code)] // see struct allow above
-impl MultiSymbolTrainingRequest {
-    pub fn validate(&self) -> Result<()> {
-        if self.symbols.is_empty() {
-            anyhow::bail!("multi-symbol training request needs at least one symbol");
-        }
-        if self.symbols.iter().any(|s| s.trim().is_empty()) {
-            anyhow::bail!("multi-symbol training request contains an empty symbol");
-        }
-        if self.base_tf.trim().is_empty() {
-            anyhow::bail!("multi-symbol training request base timeframe must not be empty");
-        }
-        if self.config_path.trim().is_empty() {
-            anyhow::bail!("multi-symbol training request config path must not be empty");
-        }
-        if self.models_dir.as_os_str().is_empty() {
-            anyhow::bail!("multi-symbol training request models directory must not be empty");
-        }
-        Ok(())
-    }
-
-    /// Lower the multi-symbol envelope to N single-symbol requests
-    /// in the same order as `self.symbols`. Each one passes its own
-    /// `validate()` if the parent passed.
-    pub fn into_single_symbol_requests(self) -> Vec<TrainingRequest> {
-        let MultiSymbolTrainingRequest {
-            config_path,
-            models_dir,
-            symbols,
-            base_tf,
-        } = self;
-        symbols
-            .into_iter()
-            .map(|sym| TrainingRequest {
-                config_path: config_path.clone(),
-                models_dir: models_dir.clone(),
-                symbol: sym,
-                base_tf: base_tf.clone(),
-            })
-            .collect()
-    }
-}
-
-/// Start one training job per symbol. Returns a `Vec` of handles in
-/// symbol-order. Per-symbol startup errors return a `failed_snapshot`
-/// in the corresponding slot — the batch never aborts halfway.
-#[allow(dead_code)] // entry point for MultiSymbolTrainingRequest above
-pub fn start_multi_symbol_training_job(
-    request: MultiSymbolTrainingRequest,
-    tx: mpsc::Sender<ServiceEvent>,
-) -> Result<Vec<TrainingJobHandle>> {
-    request.validate()?;
-    let singles = request.into_single_symbol_requests();
-    let mut handles = Vec::with_capacity(singles.len());
-    for req in singles {
-        match start_training_job(req, tx.clone()) {
-            Ok(handle) => handles.push(handle),
-            Err(err) => {
-                tracing::warn!(
-                    target: "neoethos_app::training::multi",
-                    error = %err,
-                    "multi-symbol training: per-symbol job failed to start"
-                );
-                handles.push(TrainingJobHandle {
-                    snapshot: failed_snapshot(err),
-                    cancel: CancellationFlag::new(),
-                });
-            }
-        }
-    }
-    Ok(handles)
 }
 
 pub fn start_training_job(
@@ -988,67 +893,4 @@ mod tests {
         );
     }
 
-    // ── Multi-symbol training fan-out (audit gap #1 part 2) ──────────
-
-    fn sample_multi(symbols: Vec<&str>) -> MultiSymbolTrainingRequest {
-        MultiSymbolTrainingRequest {
-            config_path: "config.yaml".to_string(),
-            models_dir: PathBuf::from("models"),
-            symbols: symbols.into_iter().map(String::from).collect(),
-            base_tf: "M5".to_string(),
-        }
-    }
-
-    #[test]
-    fn multi_symbol_training_validate_rejects_empty_symbol_list() {
-        let req = sample_multi(vec![]);
-        let err = req.validate().expect_err("empty symbols must reject");
-        assert!(err.to_string().contains("at least one symbol"));
-    }
-
-    #[test]
-    fn multi_symbol_training_validate_rejects_whitespace_in_list() {
-        let req = sample_multi(vec!["EURUSD", "  "]);
-        assert!(req.validate().is_err());
-    }
-
-    #[test]
-    fn multi_symbol_training_validate_rejects_empty_base_tf() {
-        let mut req = sample_multi(vec!["EURUSD"]);
-        req.base_tf.clear();
-        assert!(req.validate().is_err());
-    }
-
-    #[test]
-    fn multi_symbol_training_validate_rejects_empty_models_dir() {
-        let mut req = sample_multi(vec!["EURUSD"]);
-        req.models_dir = PathBuf::new();
-        assert!(req.validate().is_err());
-    }
-
-    #[test]
-    fn multi_symbol_training_validate_rejects_empty_config_path() {
-        let mut req = sample_multi(vec!["EURUSD"]);
-        req.config_path.clear();
-        assert!(req.validate().is_err());
-    }
-
-    #[test]
-    fn multi_symbol_into_single_symbol_requests_preserves_order_and_config() {
-        let req = sample_multi(vec!["EURUSD", "GBPUSD", "XAUUSD"]);
-        let singles = req.into_single_symbol_requests();
-        assert_eq!(singles.len(), 3);
-        assert_eq!(singles[0].symbol, "EURUSD");
-        assert_eq!(singles[1].symbol, "GBPUSD");
-        assert_eq!(singles[2].symbol, "XAUUSD");
-        for r in &singles {
-            assert_eq!(r.config_path, "config.yaml");
-            assert_eq!(r.base_tf, "M5");
-            assert_eq!(r.models_dir, PathBuf::from("models"));
-            assert!(
-                r.validate().is_ok(),
-                "fan-out child failed its own validate"
-            );
-        }
-    }
 }

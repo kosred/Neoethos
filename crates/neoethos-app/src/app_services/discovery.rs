@@ -561,6 +561,7 @@ pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -
     snapshot
 }
 
+#[cfg(test)]
 pub fn failed_snapshot(kind: JobKind, err: anyhow::Error) -> JobSnapshot {
     failed_snapshot_from(JobSnapshot::new(kind), err)
 }
@@ -601,124 +602,6 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
         ..JobReport::default()
     };
     snapshot
-}
-
-/// Multi-symbol discovery request: fan-out template that builds N
-/// single-symbol `DiscoveryRequest`s, one per symbol, and starts them
-/// as independent jobs.
-///
-/// Why this lives alongside the single-symbol entry point rather than
-/// replacing it: the discovery pipeline (`load_symbol_dataset` →
-/// `prepare_multitimeframe_features` → `ensure_non_empty_portfolio` →
-/// `save_*`) is single-symbol throughout. Truly multi-symbol fitness
-/// evaluation requires the §2 v0.5.0 portfolio-fusion work to land
-/// first. In the meantime, "search 100 pairs" is N independent
-/// genetic searches that share config — which is exactly what the UI
-/// mockup's "All Majors" / "EUR pairs" preset buttons should do.
-///
-/// Audit gap #1: closes the multi-symbol DiscoveryRequest entry point
-/// requirement.
-#[allow(dead_code)]
-// scaffolding for "All Majors" / "EUR pairs" preset
-// buttons — wiring tracked in the operator notes;
-// tests below exercise validate/lower paths so
-// contract regressions still get caught.
-#[derive(Debug, Clone)]
-pub struct MultiSymbolDiscoveryRequest {
-    /// Shared data root for every symbol in the batch.
-    pub data_root: PathBuf,
-    /// At least one symbol; empty input is an error.
-    pub symbols: Vec<String>,
-    pub base_tf: String,
-    pub higher_tfs: Vec<String>,
-    pub config: DiscoveryConfig,
-    pub prop_firm_rules: PropFirmRiskRules,
-}
-
-#[allow(dead_code)] // pairs with the struct allow above
-impl MultiSymbolDiscoveryRequest {
-    pub fn validate(&self) -> Result<()> {
-        if self.symbols.is_empty() {
-            anyhow::bail!("multi-symbol discovery request needs at least one symbol");
-        }
-        if self.symbols.iter().any(|s| s.trim().is_empty()) {
-            anyhow::bail!("multi-symbol discovery request contains an empty symbol");
-        }
-        if self.base_tf.trim().is_empty() {
-            anyhow::bail!("multi-symbol discovery request base timeframe must not be empty");
-        }
-        if self.data_root.as_os_str().is_empty() {
-            anyhow::bail!("multi-symbol discovery request data root must not be empty");
-        }
-        // De-duplication is the caller's responsibility — passing two
-        // identical symbols would spawn two redundant jobs but the
-        // pipeline does not corrupt itself.
-        Ok(())
-    }
-
-    /// Lower the multi-symbol envelope to N single-symbol requests
-    /// that the existing `start_discovery_job` consumes verbatim.
-    pub fn into_single_symbol_requests(self) -> Vec<DiscoveryRequest> {
-        let MultiSymbolDiscoveryRequest {
-            data_root,
-            symbols,
-            base_tf,
-            higher_tfs,
-            config,
-            prop_firm_rules,
-        } = self;
-        symbols
-            .into_iter()
-            .map(|sym| DiscoveryRequest {
-                data_root: data_root.clone(),
-                symbol: sym,
-                base_tf: base_tf.clone(),
-                higher_tfs: higher_tfs.clone(),
-                config: config.clone(),
-                prop_firm_rules: prop_firm_rules.clone(),
-            })
-            .collect()
-    }
-}
-
-/// Start one discovery job per symbol in the batch. Each job runs
-/// independently and emits its own `ServiceEvent::DiscoveryUpdated`
-/// stream on the shared channel — the UI multiplexes them by job id.
-///
-/// Returns a `Vec<DiscoveryJobHandle>` in symbol-order so the caller
-/// can cancel any subset by symbol position. If `start_discovery_job`
-/// fails for any individual symbol the corresponding slot returns
-/// the failed snapshot from `failed_snapshot`; the rest still run.
-#[allow(dead_code)] // entry point for the preset-button wiring; see
-// MultiSymbolDiscoveryRequest above
-pub fn start_multi_symbol_discovery_job(
-    request: MultiSymbolDiscoveryRequest,
-    tx: mpsc::Sender<ServiceEvent>,
-) -> Result<Vec<DiscoveryJobHandle>> {
-    request.validate()?;
-    let single_requests = request.into_single_symbol_requests();
-    let mut handles = Vec::with_capacity(single_requests.len());
-    for req in single_requests {
-        match start_discovery_job(req, tx.clone()) {
-            Ok(handle) => handles.push(handle),
-            Err(err) => {
-                // Don't fail the whole batch — surface the
-                // per-symbol failure as a degraded snapshot in the
-                // returned vector. The UI then sees an immediate
-                // Failed state for that one symbol.
-                tracing::warn!(
-                    target: "neoethos_app::discovery::multi",
-                    error = %err,
-                    "multi-symbol discovery: per-symbol job failed to start"
-                );
-                handles.push(DiscoveryJobHandle {
-                    snapshot: failed_snapshot(JobKind::Discovery, err),
-                    cancel: CancellationFlag::new(),
-                });
-            }
-        }
-    }
-    Ok(handles)
 }
 
 pub fn start_discovery_job(
