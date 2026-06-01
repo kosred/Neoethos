@@ -75,11 +75,14 @@ pub struct AppShared {
     pub discover_form: FormState,
     /// Editable form for Train page parameters.
     pub train_form: FormState,
+    /// Chart page state — selected symbol/timeframe + cached candles.
+    pub chart_state: crate::tui::pages::chart::ChartState,
 }
 
 impl AppShared {
     fn new(data_root: PathBuf) -> Self {
         let root_str = data_root.display().to_string();
+        let chart_state = crate::tui::pages::chart::ChartState::new(&data_root);
         Self {
             data_root,
             build_version: env!("CARGO_PKG_VERSION"),
@@ -90,6 +93,7 @@ impl AppShared {
             hits: Vec::new(),
             discover_form: make_discover_form(&root_str),
             train_form: make_train_form(&root_str),
+            chart_state,
         }
     }
 
@@ -211,6 +215,7 @@ impl App {
             KeyCode::Char('7') => self.current = Page::AutoLoop,
             KeyCode::Char('8') => self.current = Page::Config,
             KeyCode::Char('9') => self.current = Page::Logs,
+            KeyCode::Char('0') => self.current = Page::Chart,
             // Refresh: re-stamp last_refresh so the next render's
             // dataset summary is recomputed from disk and the status
             // bar shows "Refreshed Xs ago". The help text on every
@@ -349,7 +354,7 @@ fn render_top_bar(area: Rect, buf: &mut ratatui::buffer::Buffer, app: &mut App) 
     // Brand
     let brand = Paragraph::new(vec![Line::from(vec![
         Span::styled(
-            " FOREX AI ",
+            " NeoEthos ",
             Style::default()
                 .bg(theme::ACCENT)
                 .fg(theme::APP_BG)

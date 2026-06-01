@@ -8,6 +8,7 @@ use ratatui::{buffer::Buffer, layout::Rect};
 use crate::tui::app::AppShared;
 
 pub mod auto_loop;
+pub mod chart;
 pub mod config_view;
 pub mod dashboard;
 pub mod discover;
@@ -30,6 +31,7 @@ pub enum Page {
     AutoLoop,
     Config,
     Logs,
+    Chart,
 }
 
 impl Page {
@@ -43,6 +45,7 @@ impl Page {
         Page::AutoLoop,
         Page::Config,
         Page::Logs,
+        Page::Chart,
     ];
 
     pub fn label(self) -> &'static str {
@@ -56,6 +59,7 @@ impl Page {
             Page::AutoLoop => "AutoLoop",
             Page::Config => "Config",
             Page::Logs => "Logs",
+            Page::Chart => "Chart",
         }
     }
 
@@ -91,6 +95,12 @@ impl Page {
             Page::AutoLoop => &[("Tab", "page"), ("L", "launch"), ("Q", "quit")],
             Page::Config => &[("Tab", "page"), ("Q", "quit")],
             Page::Logs => &[("Tab", "page"), ("Q", "quit")],
+            Page::Chart => &[
+                ("←→", "symbol"),
+                ("↑↓", "timeframe"),
+                ("Tab", "page"),
+                ("Q", "quit"),
+            ],
         }
     }
 
@@ -105,6 +115,7 @@ impl Page {
             Page::AutoLoop => auto_loop::draw(area, buf, shared),
             Page::Config => config_view::draw(area, buf, shared),
             Page::Logs => logs::draw(area, buf, shared),
+            Page::Chart => chart::draw(area, buf, shared),
         }
     }
 
@@ -115,6 +126,7 @@ impl Page {
             Page::Discover => discover::handle_key(code, shared),
             Page::Train => train::handle_key(code, shared),
             Page::AutoLoop => auto_loop::handle_key(code, shared),
+            Page::Chart => chart::handle_key(code, shared),
             _ => false,
         }
     }

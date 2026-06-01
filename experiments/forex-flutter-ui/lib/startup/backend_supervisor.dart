@@ -249,7 +249,18 @@ class BackendSupervisor {
         // backend then thought it was orphaned, showed a Win32
         // MessageBox, and blocked port 7423 forever. CLI flags
         // survive the detached spawn cleanly.
-        const ['--server', '--launched-by-flutter'],
+        // 2026-06-01 settings-persistence defense-in-depth: pass an
+        // ABSOLUTE --config so the engine load, install_config_path, and
+        // the /settings GET/POST handlers all resolve the SAME user-data
+        // config.yaml regardless of CWD (see state.rs current_config_path
+        // fix). Without this, saved settings could land in a different
+        // file than the one the engine reads on next launch.
+        [
+          '--server',
+          '--launched-by-flutter',
+          '--config',
+          '${_userDataDir().path}${Platform.pathSeparator}config.yaml',
+        ],
         workingDirectory: workDir.path,
         includeParentEnvironment: true,
         mode: ProcessStartMode.detached,

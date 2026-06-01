@@ -220,6 +220,9 @@ pub struct FetchOutcomeDto {
     pub bar_count: usize,
     pub has_more: bool,
     pub written_path: String,
+    /// Unix-millis of the oldest bar returned (serialized `oldestMs`); null when
+    /// 0 bars. UI uses it to show actual history depth + warn on shallow data.
+    pub oldest_ms: Option<i64>,
 }
 
 pub async fn fetch(State(state): State<AppApiState>, Json(body): Json<FetchBody>) -> Response {
@@ -269,6 +272,7 @@ pub async fn fetch(State(state): State<AppApiState>, Json(body): Json<FetchBody>
                 bar_count: outcome.bar_count,
                 has_more: outcome.has_more,
                 written_path: outcome.written_path.display().to_string(),
+                oldest_ms: outcome.oldest_ms,
             })
             .into_response()
         }

@@ -45,6 +45,7 @@ pub mod hardware;
 pub mod health;
 pub mod indicators;
 pub mod intelligence;
+pub mod journal;
 pub mod knob_catalog;
 pub mod live_spots;
 pub mod orders;
@@ -194,6 +195,10 @@ pub fn router(state: AppApiState) -> Router {
         // persisted (TradingView model — panning back costs zero disk).
         .route("/chart/history", get(chart::chart_history))
         .route("/indicators", get(indicators::indicators))
+        // Trade journal (#flagship): closed-trade log + computed stats
+        // (myfxbook-style). Reads the JSONL store under <data_dir>/journal/.
+        .route("/journal/trades", get(journal::trades))
+        .route("/journal/stats", get(journal::stats))
         .route("/diagnostics/report", post(diagnostics::report))
         // ── Trade-management confirmation flow (#136) ──────────
         .route("/actions/pending", get(pending_actions::list))

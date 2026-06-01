@@ -114,7 +114,14 @@ pub fn current_config_path() -> PathBuf {
     CONFIG_PATH
         .get()
         .cloned()
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+        // F-settings-persistence (2026-06-01): the fallback MUST be the same
+        // canonical user-data config the engine loads on boot
+        // (`%LOCALAPPDATA%\neoethos\config.yaml` via `user_config_path`), NOT a
+        // CWD-relative "config.yaml". Otherwise the `/settings` GET/POST
+        // handlers read+write a DIFFERENT file than `Settings::load` reads on
+        // next launch, so saved settings silently vanish (operator: "settings
+        // show defaults / it keeps nothing").
+        .unwrap_or_else(neoethos_core::config::user_config_path)
 }
 
 /// A minimal, render-ready account snapshot. Same shape as the

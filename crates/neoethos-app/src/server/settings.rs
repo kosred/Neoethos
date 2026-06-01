@@ -49,6 +49,16 @@ pub struct SettingsDto {
     /// news events. See [`NewsTradingMode`].
     pub news_trading_mode: String,
     pub news_trading_mode_display_name: String,
+    // ── Discovery search budget/quality knobs (models.prop_search_*) ──
+    // Surfaced (2026-06-01) so the UI/CLI can tune search depth — the
+    // operator's L40 VPS vs local budget — without hand-editing raw YAML.
+    pub search_population: usize,
+    pub search_generations: usize,
+    pub search_max_hours: f64,
+    pub search_max_indicators: usize,
+    pub search_portfolio_size: usize,
+    pub search_corr_threshold: f64,
+    pub search_max_rows: usize,
 }
 
 /// Partial-update payload for `POST /settings`. All fields optional —
@@ -64,6 +74,14 @@ pub struct SettingsUpdateDto {
     pub openai_model: Option<String>,
     /// Snake_case id of a [`NewsTradingMode`] variant.
     pub news_trading_mode: Option<String>,
+    // Discovery search knobs (models.prop_search_*) — all optional.
+    pub search_population: Option<usize>,
+    pub search_generations: Option<usize>,
+    pub search_max_hours: Option<f64>,
+    pub search_max_indicators: Option<usize>,
+    pub search_portfolio_size: Option<usize>,
+    pub search_corr_threshold: Option<f64>,
+    pub search_max_rows: Option<usize>,
 }
 
 pub async fn settings(State(_state): State<AppApiState>) -> Response {
@@ -364,6 +382,32 @@ pub async fn update_settings(
             Err(resp) => return resp.into_response(),
         }
     }
+    // ── Discovery search knobs (clamp to sane floors so a fat-fingered
+    // 0 can't wedge the GA) ──────────────────────────────────────────
+    if let Some(v) = payload.search_population {
+        settings.models.prop_search_population = v.max(10);
+    }
+    if let Some(v) = payload.search_generations {
+        settings.models.prop_search_generations = v.max(1);
+    }
+    if let Some(v) = payload.search_max_hours {
+        // 0 = no time cap; otherwise clamp to a 30-day ceiling.
+        settings.models.prop_search_max_hours = v.clamp(0.0, 720.0);
+    }
+    if let Some(v) = payload.search_max_indicators {
+        // 0 = "use all features" (sentinel honoured downstream).
+        settings.models.prop_search_max_indicators = v;
+    }
+    if let Some(v) = payload.search_portfolio_size {
+        settings.models.prop_search_portfolio_size = v.max(1);
+    }
+    if let Some(v) = payload.search_corr_threshold {
+        settings.models.prop_search_corr_threshold = v.clamp(0.0, 1.0);
+    }
+    if let Some(v) = payload.search_max_rows {
+        settings.models.prop_search_max_rows = v; // 0 = full dataset
+    }
+
     if let Err(err) = settings.save(config_path()) {
         tracing::error!(
             target: "neoethos_app::server::settings",
@@ -400,5 +444,12 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         openai_model: settings.news.openai_model.clone(),
         news_trading_mode: mode.as_str().to_string(),
         news_trading_mode_display_name: mode.display_name().to_string(),
+        search_population: settings.models.prop_search_population,
+        search_generations: settings.models.prop_search_generations,
+        search_max_hours: settings.models.prop_search_max_hours,
+        search_max_indicators: settings.models.prop_search_max_indicators,
+        search_portfolio_size: settings.models.prop_search_portfolio_size,
+        search_corr_threshold: settings.models.prop_search_corr_threshold,
+        search_max_rows: settings.models.prop_search_max_rows,
     }
 }

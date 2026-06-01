@@ -4,6 +4,51 @@ All notable changes to NeoEthos are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.35] — 2026-06-01
+
+A professional-desk release: a full myfxbook-style trade journal,
+tunable strategy-discovery search budget, a settings-persistence fix,
+deeper history downloads, and hardened on-disk data — plus a TUI
+candlestick chart. All new write paths follow a defensive-coding
+standard (no `.unwrap()`/panics on fallible or integration paths;
+failures degrade to clear, actionable log messages).
+
+### Added
+- **Trade journal / performance analytics (myfxbook-style)** — closed
+  trades and an equity curve are persisted (append-only JSONL under
+  `<data_dir>/journal/`) and surfaced in a new **Journal** tab on the
+  Positions screen. A pure stats engine computes net/gross P&L, profit
+  factor, win rate, average win/loss, payoff ratio, expectancy, largest
+  win/loss and max consecutive losers, plus equity-derived max drawdown
+  (absolute + %), recovery factor and Sharpe. New `GET /journal/trades`
+  and `GET /journal/stats` endpoints. The journal is filled automatically
+  from live broker deals during the account-refresh heartbeat —
+  idempotent on position id, off the main thread, best-effort (a journal
+  hiccup never affects trading).
+- **Tunable Discovery search budget** — Settings → Discovery exposes and
+  persists seven search knobs (population, generations, max-hours,
+  max-indicators, portfolio size, correlation threshold, max rows) so the
+  search depth can differ between a local box and a VPS.
+- **TUI candlestick chart** — a new terminal-UI page renders OHLCV
+  candles (Braille canvas) for any local symbol / timeframe.
+- **History-download depth readout** — the data bootstrap screen reports
+  the oldest bar fetched (date + approximate years of depth) and warns
+  when a broker's retention is shallow.
+
+### Fixed
+- **Settings did not persist** — handlers wrote a CWD-relative config
+  instead of the live per-user `config.yaml` the engine loads; the path
+  now resolves to the same `%LOCALAPPDATA%\neoethos\config.yaml`.
+- **Truncated history downloads** — the historical-bar chunk ceiling was a
+  fixed 100, silently capping long spans; it is now derived from the
+  requested span (clamped) so multi-year fetches complete.
+- **On-disk data hardening** — the Vortex read/convert path detects
+  implausibly small / truncated `.vortex` files and column-length
+  mismatches with clear errors instead of surfacing corrupt OHLCV.
+
+### Changed
+- Version bumped to 0.4.35 across all crates and the Flutter UI.
+
 ## [0.4.20] — 2026-06-01
 
 Operator-requested live-desk gaps, plus fixes caught by an exhaustive

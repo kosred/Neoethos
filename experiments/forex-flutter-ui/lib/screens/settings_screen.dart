@@ -564,6 +564,14 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
   /// Snake_case id matching `crate::config::NewsTradingMode`.
   /// Defaults to `block_on_news` (safe).
   late String _newsTradingMode;
+  // Discovery search-budget knobs (models.prop_search_*).
+  late final TextEditingController _searchPopCtrl;
+  late final TextEditingController _searchGenCtrl;
+  late final TextEditingController _searchMaxHoursCtrl;
+  late final TextEditingController _searchMaxIndCtrl;
+  late final TextEditingController _searchPortfolioCtrl;
+  late final TextEditingController _searchCorrCtrl;
+  late final TextEditingController _searchMaxRowsCtrl;
   bool _busy = false;
   String? _message;
   bool _messageOk = false;
@@ -579,6 +587,16 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
     _newsTradingMode = s.newsTradingMode.isEmpty
         ? 'block_on_news'
         : s.newsTradingMode;
+    _searchPopCtrl = TextEditingController(text: '${s.searchPopulation}');
+    _searchGenCtrl = TextEditingController(text: '${s.searchGenerations}');
+    _searchMaxHoursCtrl =
+        TextEditingController(text: s.searchMaxHours.toString());
+    _searchMaxIndCtrl = TextEditingController(text: '${s.searchMaxIndicators}');
+    _searchPortfolioCtrl =
+        TextEditingController(text: '${s.searchPortfolioSize}');
+    _searchCorrCtrl =
+        TextEditingController(text: s.searchCorrThreshold.toString());
+    _searchMaxRowsCtrl = TextEditingController(text: '${s.searchMaxRows}');
   }
 
   @override
@@ -604,6 +622,13 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
     _dataDirCtrl.dispose();
     _newsSourceCtrl.dispose();
     _openaiModelCtrl.dispose();
+    _searchPopCtrl.dispose();
+    _searchGenCtrl.dispose();
+    _searchMaxHoursCtrl.dispose();
+    _searchMaxIndCtrl.dispose();
+    _searchPortfolioCtrl.dispose();
+    _searchCorrCtrl.dispose();
+    _searchMaxRowsCtrl.dispose();
     super.dispose();
   }
 
@@ -628,6 +653,13 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
             newsCalendarSource: newsSource,
             openaiModel: _openaiModelCtrl.text.trim(),
             newsTradingMode: _newsTradingMode,
+            searchPopulation: int.tryParse(_searchPopCtrl.text.trim()),
+            searchGenerations: int.tryParse(_searchGenCtrl.text.trim()),
+            searchMaxHours: double.tryParse(_searchMaxHoursCtrl.text.trim()),
+            searchMaxIndicators: int.tryParse(_searchMaxIndCtrl.text.trim()),
+            searchPortfolioSize: int.tryParse(_searchPortfolioCtrl.text.trim()),
+            searchCorrThreshold: double.tryParse(_searchCorrCtrl.text.trim()),
+            searchMaxRows: int.tryParse(_searchMaxRowsCtrl.text.trim()),
           );
       if (!mounted) return;
       setState(() {
@@ -668,6 +700,24 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
     );
   }
 
+  /// Compact labeled number field for a discovery search knob.
+  Widget _knob(TextEditingController c, String label, String help) => SizedBox(
+        width: 168,
+        child: TextField(
+          controller: c,
+          enabled: !_busy,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: InputDecoration(
+            labelText: label,
+            isDense: true,
+            border: const OutlineInputBorder(),
+            helperText: help,
+            helperMaxLines: 3,
+            helperStyle: const TextStyle(fontSize: 10),
+          ),
+        ),
+      );
+
   @override
   Widget build(BuildContext context) {
     return SectionCard(
@@ -693,6 +743,43 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
                   'Where Vortex bars + discovery artifacts live. '
                   'Relative paths resolve against the binary\'s CWD.',
             ),
+          ),
+          const SizedBox(height: 10),
+          // ── Discovery search budget (models.prop_search_*) ──────────
+          ExpansionTile(
+            tilePadding: EdgeInsets.zero,
+            childrenPadding: const EdgeInsets.only(bottom: 8),
+            title: const Text(
+              'Discovery search budget',
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+            subtitle: const Text(
+              'How hard/long Discovery searches. Bigger = more strategies, '
+              'slower. Tune for your machine (L40 VPS vs local).',
+              style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+            ),
+            children: [
+              Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: [
+                  _knob(_searchMaxHoursCtrl, 'Max hours / run',
+                      '0 = no time cap. GA stops at this OR generations.'),
+                  _knob(_searchGenCtrl, 'Generations',
+                      'Evolution iterations. Raise with Max hours for depth.'),
+                  _knob(_searchPopCtrl, 'Population',
+                      'Genes per island (×8 islands). Wider search/gen.'),
+                  _knob(_searchMaxIndCtrl, 'Max indicators',
+                      '0 = use all features. Cap to simplify strategies.'),
+                  _knob(_searchPortfolioCtrl, 'Portfolio size',
+                      'Max strategies kept per symbol/TF.'),
+                  _knob(_searchCorrCtrl, 'Corr threshold',
+                      '0-1. Reject if |corr| ≥ this vs the portfolio.'),
+                  _knob(_searchMaxRowsCtrl, 'Max rows',
+                      '0 = full dataset. Cap bars/run for speed.'),
+                ],
+              ),
+            ],
           ),
           const SizedBox(height: 10),
           Row(

@@ -181,15 +181,36 @@ pub enum VortexIntegrity {
     LegacyNoMarker,
     /// No `data.vortex` in the folder — folder exists but is empty.
     Missing,
+    /// `data.vortex` exists but is implausibly small
+    /// (< [`VORTEX_MIN_PLAUSIBLE_BYTES`]) — a truncated or aborted write.
+    /// Rejected even when a stale `.complete` marker is present: the
+    /// 2026-06-01 corruption was an 84 KB EURUSD M1 / 9 KB EURUSD H1 that
+    /// still carried `.complete` and was wrongly classified `Complete`.
+    Truncated,
 }
+
+/// Minimum plausible byte size of a real `data.vortex` file. The
+/// smallest legitimate frame seen in production (W1 / MN1, a few hundred
+/// bars) is ~10 KB, so a 256-byte floor catches near-empty / garbage
+/// stubs with a wide margin against false-positives. It does NOT catch a
+/// file that is structurally valid but semantically short (too few bars
+/// for its timeframe); that case is surfaced as a diagnostic warning in
+/// [`load_symbol_timeframe`] via the `data.parquet` size ratio.
+pub const VORTEX_MIN_PLAUSIBLE_BYTES: u64 = 256;
 
 /// Inspect a `(symbol, timeframe)` directory and classify its load
 /// readiness. See [`VortexIntegrity`] for the state machine.
 pub fn vortex_integrity(dir: impl AsRef<Path>) -> VortexIntegrity {
     let dir = dir.as_ref();
     let vortex = dir.join("data.vortex");
-    if !vortex.exists() {
+    let Ok(meta) = std::fs::metadata(&vortex) else {
         return VortexIntegrity::Missing;
+    };
+    // Size-gate BEFORE trusting the markers: a truncated/aborted write can
+    // leave a tiny `data.vortex` next to a stale `.complete` marker, which
+    // the marker-only logic below would mis-classify as `Complete`.
+    if meta.len() < VORTEX_MIN_PLAUSIBLE_BYTES {
+        return VortexIntegrity::Truncated;
     }
     let complete = dir.join("data.vortex.complete").exists();
     let partial = dir.join("data.vortex.partial").exists();
@@ -274,6 +295,19 @@ pub fn discover_timeframes(root: impl AsRef<Path>, symbol: &str) -> Result<Vec<S
                             );
                         }
                     }
+                    VortexIntegrity::Truncated => {
+                        // Truncated/aborted write (tiny data.vortex). Reject
+                        // like StalePartial — the blob can't be trusted even
+                        // if a stale .complete marker is present.
+                        if !warned_once_for(symbol, &format!("{tf}/truncated")) {
+                            tracing::warn!(
+                                target: "neoethos_data::discover_timeframes",
+                                symbol = symbol,
+                                timeframe = %tf,
+                                "REJECTED: data.vortex is implausibly small (truncated or aborted write). Re-run data bootstrap for this timeframe."
+                            );
+                        }
+                    }
                     VortexIntegrity::Missing => {
                         // Folder exists but no data.vortex inside — silent
                         // skip; the bootstrap may be in its very first
@@ -331,6 +365,15 @@ pub fn load_symbol_timeframe(
                     timeframe
                 );
             }
+            VortexIntegrity::Truncated => {
+                bail!(
+                    "vortex dataset {} {} REJECTED: data.vortex is implausibly small \
+                     (truncated or aborted write left a stale .complete marker). \
+                     Re-run data bootstrap for this timeframe.",
+                    symbol,
+                    timeframe
+                );
+            }
             VortexIntegrity::Missing => {
                 // Shouldn't happen — path.exists() already checked — but
                 // guard against TOCTOU race where the file vanishes
@@ -339,6 +382,34 @@ pub fn load_symbol_timeframe(
             }
         }
     }
+
+    // Diagnostic only (never rejects): a structurally-valid but
+    // semantically-short data.vortex (too few bars for its timeframe) can
+    // pass the integrity gate. When a data.parquet source sits beside it,
+    // a vortex that is a tiny fraction of the parquet size is almost
+    // certainly truncated — surface the diagnostic F-307 was meant to
+    // provide, without deleting or rejecting anything.
+    if let Some(parent) = path.parent() {
+        let vortex_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let parquet_bytes = std::fs::metadata(parent.join("data.parquet"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if parquet_bytes > 0
+            && vortex_bytes > 0
+            && vortex_bytes.saturating_mul(50) < parquet_bytes
+            && !warned_once_for(symbol, &format!("{timeframe}/ratio"))
+        {
+            tracing::warn!(
+                target: "neoethos_data::load_symbol_timeframe",
+                symbol = symbol,
+                timeframe = timeframe,
+                vortex_bytes,
+                parquet_bytes,
+                "data.vortex is <2% of its data.parquet source — likely a truncated/incomplete conversion. Re-run data bootstrap if candles look short."
+            );
+        }
+    }
+
     load_vortex(path)
 }
 
@@ -622,13 +693,42 @@ fn vortex_array_to_ohlcv(array: vortex_array::ArrayRef) -> Result<Ohlcv> {
         )
     };
 
+    let open = get_col(&["open", "o"])?;
+    let high = get_col(&["high", "h"])?;
+    let low = get_col(&["low", "l"])?;
+    let close = get_col(&["close", "c"])?;
+    let volume = get_col(&["volume", "vol", "v"]).ok();
+
+    // Read-path structural check: a corrupt/truncated file can decode into
+    // columns of different lengths, after which positional indexing
+    // downstream (`ohlcv.open[i]`, chart rendering, feature extraction)
+    // would panic out of bounds. The write path validates every row in
+    // `normalize_ohlcv`; mirror a cheap length check here so a bad file
+    // fails with a clear error instead of a later panic.
+    let n = close.len();
+    let ts_len = timestamp.as_ref().map_or(n, |t| t.len());
+    if open.len() != n
+        || high.len() != n
+        || low.len() != n
+        || ts_len != n
+        || volume.as_ref().is_some_and(|v| v.len() != n)
+    {
+        bail!(
+            "Vortex column length mismatch (timestamp={ts_len} open={} high={} low={} close={n}) \
+             — the file is corrupt or truncated; re-import it.",
+            open.len(),
+            high.len(),
+            low.len(),
+        );
+    }
+
     Ok(Ohlcv {
         timestamp,
-        open: get_col(&["open", "o"])?,
-        high: get_col(&["high", "h"])?,
-        low: get_col(&["low", "l"])?,
-        close: get_col(&["close", "c"])?,
-        volume: get_col(&["volume", "vol", "v"]).ok(),
+        open,
+        high,
+        low,
+        close,
+        volume,
     })
 }
 
@@ -931,14 +1031,33 @@ mod tests {
     }
 
     fn write_valid_ohlcv_vortex(path: &Path) -> Result<()> {
+        // 64 rows so the resulting file is comfortably above
+        // VORTEX_MIN_PLAUSIBLE_BYTES. The integrity tests assert marker
+        // classification, not size, but the size gate runs first — keep
+        // their fixtures clear of it.
+        let n = 64usize;
+        let base_ms = 1_700_000_000_000_i64;
+        let mut timestamp = Vec::with_capacity(n);
+        let mut open = Vec::with_capacity(n);
+        let mut high = Vec::with_capacity(n);
+        let mut low = Vec::with_capacity(n);
+        let mut close = Vec::with_capacity(n);
+        for i in 0..n {
+            let base = 1.0 + (i as f64) * 0.001;
+            timestamp.push(base_ms + (i as i64) * 60_000);
+            open.push(base);
+            high.push(base + 0.002);
+            low.push(base - 0.002);
+            close.push(base + 0.001);
+        }
         write_ohlcv_vortex(
             path,
             &Ohlcv {
-                timestamp: Some(vec![1_i64, 2]),
-                open: vec![1.0_f64, 1.1],
-                high: vec![1.2_f64, 1.3],
-                low: vec![0.9_f64, 1.0],
-                close: vec![1.05_f64, 1.2],
+                timestamp: Some(timestamp),
+                open,
+                high,
+                low,
+                close,
                 volume: None,
             },
         )
@@ -975,8 +1094,12 @@ mod tests {
         fs::create_dir_all(&m5_dir)?;
 
         write_valid_ohlcv_vortex(&m1_dir.join("data.vortex"))?;
-        let mut corrupt = fs::File::create(m5_dir.join("data.vortex"))?;
-        std::io::Write::write_all(&mut corrupt, b"not a vortex file")?;
+        // >= VORTEX_MIN_PLAUSIBLE_BYTES + a .complete marker so the
+        // integrity gate passes and the failure comes from the byte-level
+        // Vortex parser rejecting non-Vortex content (the test's intent),
+        // not from the size/marker gate.
+        fs::write(m5_dir.join("data.vortex"), vec![0u8; 1024])?;
+        fs::write(m5_dir.join("data.vortex.complete"), b"")?;
 
         let err = load_symbol_dataset(&root, "EURUSD")
             .expect_err("discovered unreadable timeframe must fail the dataset load");
@@ -998,8 +1121,12 @@ mod tests {
         fs::create_dir_all(&m5_dir)?;
 
         write_valid_ohlcv_vortex(&m1_dir.join("data.vortex"))?;
-        let mut corrupt = fs::File::create(m5_dir.join("data.vortex"))?;
-        std::io::Write::write_all(&mut corrupt, b"not a vortex file")?;
+        // >= VORTEX_MIN_PLAUSIBLE_BYTES + a .complete marker so the
+        // integrity gate passes and the failure comes from the byte-level
+        // Vortex parser rejecting non-Vortex content (the test's intent),
+        // not from the size/marker gate.
+        fs::write(m5_dir.join("data.vortex"), vec![0u8; 1024])?;
+        fs::write(m5_dir.join("data.vortex.complete"), b"")?;
 
         let err = load_symbol_dataset_with_timeframes(&root, "EURUSD", &["M1", "M5"])
             .expect_err("requested unreadable timeframe must fail the dataset load");
@@ -1074,6 +1201,20 @@ mod tests {
         let dir = make_tf_dir(&root, "TEST", "M1")?;
         write_valid_ohlcv_vortex(&dir.join("data.vortex"))?;
         assert_eq!(vortex_integrity(&dir), VortexIntegrity::LegacyNoMarker);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn vortex_integrity_truncated_when_below_size_floor() -> Result<()> {
+        // A truncated/aborted write leaves a tiny data.vortex; even WITH a
+        // stale .complete marker it must classify as Truncated, not
+        // Complete (the 2026-06-01 corruption mode).
+        let root = unique_temp_root("integ_truncated");
+        let dir = make_tf_dir(&root, "TEST", "M1")?;
+        fs::write(dir.join("data.vortex"), vec![0u8; 64])?; // < VORTEX_MIN_PLAUSIBLE_BYTES
+        fs::write(dir.join("data.vortex.complete"), b"")?;
+        assert_eq!(vortex_integrity(&dir), VortexIntegrity::Truncated);
         fs::remove_dir_all(&root)?;
         Ok(())
     }

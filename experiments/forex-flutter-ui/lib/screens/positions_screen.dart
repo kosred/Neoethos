@@ -30,6 +30,17 @@ import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../theme/theme.dart';
 
+/// Trade-journal stats (computed server-side from closed trades + equity).
+final journalStatsProvider = FutureProvider.autoDispose<JournalStats>((ref) {
+  return ref.read(backendClientProvider).fetchJournalStats();
+});
+
+/// Closed-trade log, most-recent first (capped).
+final journalTradesProvider =
+    FutureProvider.autoDispose<List<ClosedTrade>>((ref) {
+  return ref.read(backendClientProvider).fetchJournalTrades(limit: 200);
+});
+
 class PositionsScreen extends ConsumerWidget {
   const PositionsScreen({super.key});
 
@@ -38,24 +49,198 @@ class PositionsScreen extends ConsumerWidget {
     final accountAsync = ref.watch(accountSnapshotProvider);
     final spotsAsync = ref.watch(liveSpotsProvider);
 
+    return DefaultTabController(
+      length: 2,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const TabBar(
+            isScrollable: true,
+            tabAlignment: TabAlignment.start,
+            tabs: [Tab(text: 'Live'), Tab(text: 'Journal')],
+          ),
+          const SizedBox(height: ForexAiTokens.spSm),
+          Expanded(
+            child: TabBarView(
+              children: [
+                // ── Live tab — the existing positions hub ──
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _MetricsStrip(accountAsync: accountAsync),
+                    const SizedBox(height: ForexAiTokens.spSm),
+                    Expanded(
+                      flex: 3,
+                      child: _OpenPositionsTable(
+                        accountAsync: accountAsync,
+                        spotsAsync: spotsAsync,
+                      ),
+                    ),
+                    const SizedBox(height: ForexAiTokens.spSm),
+                    const Expanded(flex: 2, child: _PendingOrdersTable()),
+                  ],
+                ),
+                // ── Journal tab — closed trades + computed stats ──
+                const _JournalTab(),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Journal tab (#flagship) — closed-trade log + professional stats
+// ---------------------------------------------------------------------------
+
+class _JournalTab extends ConsumerWidget {
+  const _JournalTab();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final statsAsync = ref.watch(journalStatsProvider);
+    final tradesAsync = ref.watch(journalTradesProvider);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _MetricsStrip(accountAsync: accountAsync),
+        statsAsync.when(
+          loading: () => const SizedBox(
+            height: 56,
+            child: Center(child: CircularProgressIndicator()),
+          ),
+          error: (e, _) => Padding(
+            padding: const EdgeInsets.all(8),
+            child: Text(
+              'Stats unavailable: ${describeError(e)}',
+              style: const TextStyle(fontSize: 11, color: ForexAiTokens.sell),
+            ),
+          ),
+          data: (s) => _JournalStatCards(stats: s),
+        ),
         const SizedBox(height: ForexAiTokens.spSm),
         Expanded(
-          flex: 3,
-          child: _OpenPositionsTable(
-            accountAsync: accountAsync,
-            spotsAsync: spotsAsync,
+          child: tradesAsync.when(
+            loading: () => const Center(child: CircularProgressIndicator()),
+            error: (e, _) => Center(
+              child: Text(
+                'Could not load trades: ${describeError(e)}',
+                style: const TextStyle(color: ForexAiTokens.sell),
+              ),
+            ),
+            data: (trades) => trades.isEmpty
+                ? const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(24),
+                      child: Text(
+                        'No closed trades yet.\nThey appear here as the bot closes positions.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: ForexAiTokens.textMuted),
+                      ),
+                    ),
+                  )
+                : _ClosedTradesTable(trades: trades),
           ),
         ),
-        const SizedBox(height: ForexAiTokens.spSm),
-        const Expanded(
-          flex: 2,
-          child: _PendingOrdersTable(),
-        ),
       ],
+    );
+  }
+}
+
+class _JournalStatCards extends StatelessWidget {
+  final JournalStats stats;
+  const _JournalStatCards({required this.stats});
+
+  Widget _chip(String label, String value, {Color? accent}) => SizedBox(
+        width: 132,
+        child: Card(
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  label,
+                  style: const TextStyle(
+                    fontSize: 10,
+                    color: ForexAiTokens.textMuted,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  value,
+                  style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: accent,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    String f2(double v) => v.toStringAsFixed(2);
+    String optF(double? v) => v == null ? '—' : v.toStringAsFixed(2);
+    final netAccent = stats.netProfit > 0
+        ? ForexAiTokens.buy
+        : stats.netProfit < 0
+            ? ForexAiTokens.sell
+            : null;
+    return Wrap(
+      spacing: ForexAiTokens.spSm,
+      runSpacing: ForexAiTokens.spSm,
+      children: [
+        _chip('Net P/L', f2(stats.netProfit), accent: netAccent),
+        _chip('Trades', '${stats.totalTrades}'),
+        _chip('Win rate', '${stats.winRatePct.toStringAsFixed(1)}%'),
+        _chip('Profit factor', optF(stats.profitFactor)),
+        _chip('Expectancy', f2(stats.expectancy)),
+        _chip('Max DD', '${stats.maxDrawdownPct.toStringAsFixed(1)}%'),
+        _chip('Sharpe', optF(stats.sharpe)),
+      ],
+    );
+  }
+}
+
+class _ClosedTradesTable extends StatelessWidget {
+  final List<ClosedTrade> trades;
+  const _ClosedTradesTable({required this.trades});
+
+  @override
+  Widget build(BuildContext context) {
+    final df = DateFormat('yyyy-MM-dd HH:mm');
+    return ListView.separated(
+      itemCount: trades.length,
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (context, i) {
+        final t = trades[i];
+        final when = t.exitTsMs != null
+            ? df.format(DateTime.fromMillisecondsSinceEpoch(t.exitTsMs!))
+            : '—';
+        final pnlColor = t.netProfit > 0
+            ? ForexAiTokens.buy
+            : t.netProfit < 0
+                ? ForexAiTokens.sell
+                : null;
+        return ListTile(
+          dense: true,
+          title: Text('${t.symbol}   ${t.side}   ${t.lots} lots'),
+          subtitle: Text(
+            when,
+            style: const TextStyle(fontSize: 10, color: ForexAiTokens.textMuted),
+          ),
+          trailing: Text(
+            t.netProfit.toStringAsFixed(2),
+            style: TextStyle(fontWeight: FontWeight.w600, color: pnlColor),
+          ),
+        );
+      },
     );
   }
 }

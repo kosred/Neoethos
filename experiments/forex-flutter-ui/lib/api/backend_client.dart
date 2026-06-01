@@ -259,6 +259,52 @@ class BackendClient {
     return KnobCatalog.fromJson(response.data!);
   }
 
+  /// `GET /journal/stats` — computed trade-journal performance stats.
+  Future<JournalStats> fetchJournalStats({int? fromMs, int? toMs}) async {
+    final qp = <String, dynamic>{};
+    if (fromMs != null) qp['fromMs'] = fromMs;
+    if (toMs != null) qp['toMs'] = toMs;
+    final response = await _dio.get<Map<String, dynamic>>(
+      '/journal/stats',
+      queryParameters: qp,
+    );
+    if (response.statusCode != 200 || response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/journal/stats failed: ${response.statusCode}',
+      );
+    }
+    return JournalStats.fromJson(response.data!);
+  }
+
+  /// `GET /journal/trades` — closed trades, most-recent first.
+  Future<List<ClosedTrade>> fetchJournalTrades({
+    int? fromMs,
+    int? toMs,
+    int? limit,
+  }) async {
+    final qp = <String, dynamic>{};
+    if (fromMs != null) qp['fromMs'] = fromMs;
+    if (toMs != null) qp['toMs'] = toMs;
+    if (limit != null) qp['limit'] = limit;
+    final response = await _dio.get<List<dynamic>>(
+      '/journal/trades',
+      queryParameters: qp,
+    );
+    if (response.statusCode != 200 || response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/journal/trades failed: ${response.statusCode}',
+      );
+    }
+    return response.data!
+        .whereType<Map<String, dynamic>>()
+        .map(ClosedTrade.fromJson)
+        .toList();
+  }
+
   /// `GET /settings/presets` — fetch the named preset bundles
   /// (Conservative / Balanced / Aggressive). Each preset is a
   /// mapping of knob id → value that the operator can apply with
@@ -291,6 +337,13 @@ class BackendClient {
     String? newsCalendarSource,
     String? openaiModel,
     String? newsTradingMode,
+    int? searchPopulation,
+    int? searchGenerations,
+    double? searchMaxHours,
+    int? searchMaxIndicators,
+    int? searchPortfolioSize,
+    double? searchCorrThreshold,
+    int? searchMaxRows,
   }) async {
     final body = <String, dynamic>{};
     if (dataDir != null) body['dataDir'] = dataDir;
@@ -302,6 +355,21 @@ class BackendClient {
     }
     if (openaiModel != null) body['openaiModel'] = openaiModel;
     if (newsTradingMode != null) body['newsTradingMode'] = newsTradingMode;
+    if (searchPopulation != null) body['searchPopulation'] = searchPopulation;
+    if (searchGenerations != null) {
+      body['searchGenerations'] = searchGenerations;
+    }
+    if (searchMaxHours != null) body['searchMaxHours'] = searchMaxHours;
+    if (searchMaxIndicators != null) {
+      body['searchMaxIndicators'] = searchMaxIndicators;
+    }
+    if (searchPortfolioSize != null) {
+      body['searchPortfolioSize'] = searchPortfolioSize;
+    }
+    if (searchCorrThreshold != null) {
+      body['searchCorrThreshold'] = searchCorrThreshold;
+    }
+    if (searchMaxRows != null) body['searchMaxRows'] = searchMaxRows;
 
     final response = await _dio.post<Map<String, dynamic>>(
       '/settings',
@@ -1195,6 +1263,17 @@ class SettingsSnapshot {
   /// for safe back-compat.
   final String newsTradingMode;
   final String newsTradingModeDisplayName;
+
+  // Discovery search knobs (models.prop_search_*) — 2026-06-01. Let the
+  // operator tune search depth/budget from the UI (L40 VPS vs local).
+  final int searchPopulation;
+  final int searchGenerations;
+  final double searchMaxHours;
+  final int searchMaxIndicators;
+  final int searchPortfolioSize;
+  final double searchCorrThreshold;
+  final int searchMaxRows;
+
   const SettingsSnapshot({
     required this.dataDir,
     required this.newsCalendarEnabled,
@@ -1202,6 +1281,13 @@ class SettingsSnapshot {
     required this.openaiModel,
     required this.newsTradingMode,
     required this.newsTradingModeDisplayName,
+    this.searchPopulation = 100,
+    this.searchGenerations = 20,
+    this.searchMaxHours = 24,
+    this.searchMaxIndicators = 0,
+    this.searchPortfolioSize = 4,
+    this.searchCorrThreshold = 0.85,
+    this.searchMaxRows = 0,
   });
 
   factory SettingsSnapshot.fromJson(Map<String, dynamic> j) => SettingsSnapshot(
@@ -1212,6 +1298,136 @@ class SettingsSnapshot {
         newsTradingMode: (j['newsTradingMode'] as String?) ?? '',
         newsTradingModeDisplayName:
             (j['newsTradingModeDisplayName'] as String?) ?? '',
+        searchPopulation: (j['searchPopulation'] as num?)?.toInt() ?? 100,
+        searchGenerations: (j['searchGenerations'] as num?)?.toInt() ?? 20,
+        searchMaxHours: (j['searchMaxHours'] as num?)?.toDouble() ?? 24,
+        searchMaxIndicators: (j['searchMaxIndicators'] as num?)?.toInt() ?? 0,
+        searchPortfolioSize: (j['searchPortfolioSize'] as num?)?.toInt() ?? 4,
+        searchCorrThreshold:
+            (j['searchCorrThreshold'] as num?)?.toDouble() ?? 0.85,
+        searchMaxRows: (j['searchMaxRows'] as num?)?.toInt() ?? 0,
+      );
+}
+
+/// Computed trade-journal performance stats (mirrors the Rust
+/// `JournalStats` wire DTO). Defensive parsing: missing/null fields fall
+/// back to safe defaults so a partial payload never crashes the UI.
+class JournalStats {
+  final int totalTrades;
+  final int wins;
+  final int losses;
+  final int breakeven;
+  final double winRatePct;
+  final double netProfit;
+  final double grossProfit;
+  final double grossLoss;
+  final double? profitFactor;
+  final double avgWin;
+  final double avgLoss;
+  final double? payoffRatio;
+  final double expectancy;
+  final double largestWin;
+  final double largestLoss;
+  final int maxConsecutiveWins;
+  final int maxConsecutiveLosses;
+  final double maxDrawdownAbs;
+  final double maxDrawdownPct;
+  final double? recoveryFactor;
+  final double? sharpe;
+  const JournalStats({
+    this.totalTrades = 0,
+    this.wins = 0,
+    this.losses = 0,
+    this.breakeven = 0,
+    this.winRatePct = 0,
+    this.netProfit = 0,
+    this.grossProfit = 0,
+    this.grossLoss = 0,
+    this.profitFactor,
+    this.avgWin = 0,
+    this.avgLoss = 0,
+    this.payoffRatio,
+    this.expectancy = 0,
+    this.largestWin = 0,
+    this.largestLoss = 0,
+    this.maxConsecutiveWins = 0,
+    this.maxConsecutiveLosses = 0,
+    this.maxDrawdownAbs = 0,
+    this.maxDrawdownPct = 0,
+    this.recoveryFactor,
+    this.sharpe,
+  });
+
+  factory JournalStats.fromJson(Map<String, dynamic> j) => JournalStats(
+        totalTrades: (j['totalTrades'] as num?)?.toInt() ?? 0,
+        wins: (j['wins'] as num?)?.toInt() ?? 0,
+        losses: (j['losses'] as num?)?.toInt() ?? 0,
+        breakeven: (j['breakeven'] as num?)?.toInt() ?? 0,
+        winRatePct: (j['winRatePct'] as num?)?.toDouble() ?? 0,
+        netProfit: (j['netProfit'] as num?)?.toDouble() ?? 0,
+        grossProfit: (j['grossProfit'] as num?)?.toDouble() ?? 0,
+        grossLoss: (j['grossLoss'] as num?)?.toDouble() ?? 0,
+        profitFactor: (j['profitFactor'] as num?)?.toDouble(),
+        avgWin: (j['avgWin'] as num?)?.toDouble() ?? 0,
+        avgLoss: (j['avgLoss'] as num?)?.toDouble() ?? 0,
+        payoffRatio: (j['payoffRatio'] as num?)?.toDouble(),
+        expectancy: (j['expectancy'] as num?)?.toDouble() ?? 0,
+        largestWin: (j['largestWin'] as num?)?.toDouble() ?? 0,
+        largestLoss: (j['largestLoss'] as num?)?.toDouble() ?? 0,
+        maxConsecutiveWins: (j['maxConsecutiveWins'] as num?)?.toInt() ?? 0,
+        maxConsecutiveLosses: (j['maxConsecutiveLosses'] as num?)?.toInt() ?? 0,
+        maxDrawdownAbs: (j['maxDrawdownAbs'] as num?)?.toDouble() ?? 0,
+        maxDrawdownPct: (j['maxDrawdownPct'] as num?)?.toDouble() ?? 0,
+        recoveryFactor: (j['recoveryFactor'] as num?)?.toDouble(),
+        sharpe: (j['sharpe'] as num?)?.toDouble(),
+      );
+}
+
+/// One closed round-trip trade (mirrors the Rust `ClosedTrade` wire DTO).
+class ClosedTrade {
+  final int positionId;
+  final String symbol;
+  final String side;
+  final double lots;
+  final int? entryTsMs;
+  final double? entryPrice;
+  final int? exitTsMs;
+  final double? exitPrice;
+  final double grossProfit;
+  final double commission;
+  final double swap;
+  final double netProfit;
+  final double? balanceAfter;
+  const ClosedTrade({
+    required this.positionId,
+    required this.symbol,
+    required this.side,
+    required this.lots,
+    this.entryTsMs,
+    this.entryPrice,
+    this.exitTsMs,
+    this.exitPrice,
+    required this.grossProfit,
+    required this.commission,
+    required this.swap,
+    required this.netProfit,
+    this.balanceAfter,
+  });
+
+  factory ClosedTrade.fromJson(Map<String, dynamic> j) => ClosedTrade(
+        positionId: (j['positionId'] as num?)?.toInt() ?? 0,
+        symbol: (j['symbol'] as String?) ?? '',
+        side: (j['side'] as String?) ?? '',
+        lots: (j['lots'] as num?)?.toDouble() ?? 0,
+        entryTsMs: (j['entryTsMs'] as num?)?.toInt(),
+        entryPrice: (j['entryPrice'] as num?)?.toDouble(),
+        exitTsMs: (j['exitTsMs'] as num?)?.toInt(),
+        exitPrice: (j['exitPrice'] as num?)?.toDouble(),
+        grossProfit: (j['grossProfit'] as num?)?.toDouble() ?? 0,
+        commission: (j['commission'] as num?)?.toDouble() ?? 0,
+        swap: (j['swap'] as num?)?.toDouble() ?? 0,
+        netProfit: (j['netProfit'] as num?)?.toDouble() ?? 0,
+        balanceAfter: (j['balanceAfter'] as num?)?.toDouble(),
       );
 }
 

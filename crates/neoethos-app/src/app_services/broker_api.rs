@@ -86,6 +86,9 @@ pub struct HistoricalDownloadOutcome {
     pub bar_count: usize,
     pub has_more: bool,
     pub written_path: PathBuf,
+    /// Unix-millis of the oldest bar the broker actually returned across all
+    /// chunks (None when 0 bars came back). Lets the UI show real depth.
+    pub oldest_ms: Option<i64>,
 }
 
 /// Resolve broker credentials + token bundle into the four primitives
@@ -386,8 +389,19 @@ pub fn download_history_blocking(
     let mut all_bars: Vec<HistoricalBar> = Vec::new();
     let mut cursor_to = to_ms;
     let mut has_more_overall = false;
-    let max_chunks = 100; // hard cap so a misconfigured range can't loop forever
-    let mut chunk_count = 0;
+    // Adaptive cap (2026-06-01): a flat 100 capped low-TF pulls far below the
+    // requested span (M1 3-day chunks × 100 = ~0.82y) — the loop died before
+    // the broker's own empty-response terminator ever fired. Size the cap to
+    // the actual requested range so deep history isn't silently truncated,
+    // with a generous ceiling so a pathological range still can't loop forever.
+    const CHUNK_CEILING: i64 = 20_000;
+    let span_ms = to_ms - from_ms; // > 0, guarded at fn entry
+    // Manual ceil-div — `i64::div_ceil` is unstable (int_roundings). Both
+    // operands are > 0 here, so (a + b − 1) / b is exact.
+    let needed_chunks =
+        (span_ms.saturating_add(chunk_ms).saturating_sub(1) / chunk_ms).saturating_add(2);
+    let max_chunks = needed_chunks.clamp(1, CHUNK_CEILING) as usize;
+    let mut chunk_count: usize = 0;
     while cursor_to > from_ms && chunk_count < max_chunks {
         let cursor_from = (cursor_to - chunk_ms).max(from_ms);
         let request = CTraderChartHistoryRequest {
@@ -424,6 +438,10 @@ pub fn download_history_blocking(
     all_bars.sort_by_key(|b| b.timestamp_ms);
     all_bars.dedup_by_key(|b| b.timestamp_ms);
 
+    // Oldest bar actually returned (sorted ascending above) — surfaced so the UI
+    // can show how deep the broker really went vs the requested range.
+    let oldest_ms = all_bars.first().map(|b| b.timestamp_ms);
+
     let normalized = bars_to_normalized(&all_bars);
     let written_path = write_bootstrap_vortex(data_root, symbol, timeframe, &normalized)?;
 
@@ -433,6 +451,7 @@ pub fn download_history_blocking(
         bar_count: all_bars.len(),
         has_more: has_more_overall,
         written_path,
+        oldest_ms,
     })
 }
 

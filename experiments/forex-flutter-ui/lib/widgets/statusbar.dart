@@ -74,7 +74,7 @@ class StatusBar extends ConsumerWidget {
           const _StatusSep(),
           const _StatusItem(label: 'News blackout', value: '—'),
           const Spacer(),
-          const _StatusItem(label: 'v0.4.20'),
+          const _StatusItem(label: 'v0.4.35'),
         ],
       ),
     );

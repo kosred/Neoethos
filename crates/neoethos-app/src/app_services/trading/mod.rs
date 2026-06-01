@@ -1908,6 +1908,11 @@ impl TradingSession {
         background::spawn_background_task("runtime_refresh", tx.clone(), move || {
             match backend.load_account_runtime(&request) {
                 Ok(runtime) => {
+                    // Best-effort: feed realized deals + an equity point into
+                    // the trade journal before the snapshot moves onto the
+                    // event bus. Runs in this background task (off the main
+                    // thread); never blocks or fails the refresh.
+                    crate::app_services::journal_reconcile::reconcile_best_effort(&runtime);
                     let _ = tx.blocking_send(
                         crate::app_services::ServiceEvent::CTraderConnectUpdated(runtime),
                     );

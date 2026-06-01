@@ -212,11 +212,28 @@ class _BodyState extends ConsumerState<_Body> {
       final count = (r['barCount'] as num?)?.toInt() ?? 0;
       final hasMore = r['hasMore'] == true;
       final path = (r['writtenPath'] as String?) ?? '';
-      final tail = hasMore
-          ? ' — broker says hasMore=true; widen range or split into chunks'
-          : '';
-      setState(() => _lastResult =
-          '$count bars written to $path$tail');
+      final oldestMs = (r['oldestMs'] as num?)?.toInt();
+      String d(DateTime t) =>
+          '${t.year}-${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')}';
+      final buf = StringBuffer('$count bars written to $path');
+      if (oldestMs != null && count > 0) {
+        final oldest = DateTime.fromMillisecondsSinceEpoch(oldestMs);
+        final years = _toDate.difference(oldest).inDays / 365.0;
+        buf.write(
+            '\nOldest bar: ${d(oldest)} (~${years.toStringAsFixed(1)}y deep).');
+        // Did the broker stop well short of the requested start?
+        if (oldest.difference(_fromDate).inDays > 30) {
+          buf.write(
+              '\n⚠ cTrader returned only back to ${d(oldest)}, not your '
+              'requested ${d(_fromDate)} — cTrader history is depth-limited '
+              '(~2-3y for most symbols). For deeper history, import an '
+              'MT5/CSV/Parquet file below.');
+        }
+      }
+      if (hasMore) {
+        buf.write('\n(broker hasMore=true — widen range or split into chunks)');
+      }
+      setState(() => _lastResult = buf.toString());
       ref.invalidate(dataBootstrapProvider);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
