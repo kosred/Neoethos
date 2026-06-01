@@ -39,17 +39,22 @@ dependencies:
   go_router: ^14.2.0
 
   # Charts — fl_chart for the Dashboard equity sparkline and the
-  # Chart panel placeholder. Will swap to candlestick rendering in
-  # a follow-up (the Rust backend already provides OHLC data).
+  # fl_chart — kept for simple line/spark panels elsewhere.
   fl_chart: ^0.68.0
 
+  # k_chart_plus — professional candlestick/k-line chart: pan/zoom,
+  # MA/BOLL main overlays + MACD/KDJ/RSI/WR sub-panels, onLoadMore for
+  # scroll-back history. Replaces the custom CustomPaint chart so the
+  # NeoEthos chart reaches TradingView/cTrader parity (operator request).
+  k_chart_plus: ^1.0.4
+
   # Date / time formatting + duration helpers.
-  # 2026-05-26: bumped 0.19.0 → 0.20.0. CHANGELOG confirms no breaking
-  # changes for `DateFormat` (yyyy-MM-dd HH:mm, HH:mm:ss, MMM d patterns)
-  # or `NumberFormat` (#,##0, +#,##0.0;-#,##0.0 patterns) — only Dart
-  # SDK constraint update + internal bug fixes. All 12 call sites in
-  # `lib/` use standard ICU patterns that resolve identically.
-  intl: ^0.20.0
+  # Pinned to ^0.19.0 to satisfy k_chart_plus (which caps intl at
+  # ^0.19.0). 0.19↔0.20 are CHANGELOG-compatible for the `DateFormat`
+  # (yyyy-MM-dd HH:mm, HH:mm:ss, MMM d) and `NumberFormat`
+  # (#,##0, +#,##0.0;-#,##0.0) patterns all 12 `lib/` call sites use, so
+  # this downgrade is behaviour-neutral.
+  intl: ^0.19.0
 
   # Logging - flows into the backend log stream eventually.
   logger: ^2.4.0

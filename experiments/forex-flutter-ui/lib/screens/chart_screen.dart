@@ -25,6 +25,7 @@ import '../state/live_spots_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '../widgets/inline_buy_sell.dart';
+import '../widgets/pro_chart.dart';
 import '../widgets/symbol_picker.dart';
 import '_placeholder.dart';
 
@@ -660,8 +661,22 @@ class _ChartBody extends ConsumerWidget {
                   timeframe: snapshot.timeframe,
                   slot: slot,
                 )
-              else
-                _ChartCanvasWithOverlays(snapshot: snapshot, slot: slot),
+              else ...[
+                // F-334: one-click buy/sell strip, right-aligned just
+                // above the chart.
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: InlineBuySell(symbol: snapshot.symbol),
+                  ),
+                ),
+                // F-336: professional k-line chart (k_chart_plus) —
+                // candlesticks + MA/BOLL overlays + MACD/KDJ/RSI/WR
+                // sub-panels + pan/zoom + live forming candle. Replaces
+                // the custom CustomPaint canvas.
+                ProChart(snapshot: snapshot),
+              ],
             ],
           ),
         ),
