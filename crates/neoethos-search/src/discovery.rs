@@ -738,14 +738,134 @@ pub enum DiscoveryProgress {
 }
 
 pub fn ensure_non_empty_portfolio(result: &DiscoveryResult, context: &str) -> Result<()> {
-    if result.portfolio.is_empty() {
-        anyhow::bail!(
-            "Discovery produced an empty portfolio for {} (candidates={})",
-            context,
-            result.candidates.len()
-        );
+    if !result.portfolio.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    // F-343 (#14): an empty portfolio is the most common — and most
+    // confusing — discovery outcome. Instead of a generic "produced an
+    // empty portfolio", turn the rejection funnel into an actionable
+    // diagnosis: which stage threw everything away, the reasons it gave,
+    // and a concrete remedy the operator can act on.
+    let diagnosis = result
+        .funnel_profile
+        .as_ref()
+        .map(describe_empty_portfolio_funnel)
+        .unwrap_or_else(|| {
+            format!(
+                "{} candidates were generated but none survived filtering \
+                 (no funnel profile was captured — this is a bug; check the logs).",
+                result.candidates.len()
+            )
+        });
+    anyhow::bail!("Discovery produced no strategies for {context}. {diagnosis}");
+}
+
+/// Turn a rejection [`FunnelProfile`] into a one-paragraph, operator-
+/// actionable explanation of WHY the portfolio is empty: the bottleneck
+/// stage, the reasons it rejected things, and a concrete remedy.
+fn describe_empty_portfolio_funnel(funnel: &crate::funnel_profile::FunnelProfile) -> String {
+    // Prefer the funnel's own bottleneck; fall back to the stage that
+    // rejected the most among stages that actually received input.
+    let bottleneck = if !funnel.bottleneck_stage.is_empty() {
+        funnel
+            .stages
+            .iter()
+            .find(|s| s.name == funnel.bottleneck_stage)
+    } else {
+        None
+    }
+    .or_else(|| {
+        funnel
+            .stages
+            .iter()
+            .filter(|s| s.count_in > 0)
+            .max_by_key(|s| s.rejected)
+    });
+
+    let Some(stage) = bottleneck else {
+        return "The search produced nothing at all — no candidate strategies were \
+                generated. Try a longer history window or more generations."
+            .to_string();
+    };
+
+    let reasons = if stage.top_reasons.is_empty() {
+        String::new()
+    } else {
+        let joined = stage
+            .top_reasons
+            .iter()
+            .take(3)
+            .map(|(reason, n)| format!("{reason}×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" Top reasons: {joined}.")
+    };
+
+    format!(
+        "Bottleneck: stage '{}' let {} of {} through (rejected {}).{} Hint: {}",
+        stage.name,
+        stage.count_out,
+        stage.count_in,
+        stage.rejected,
+        reasons,
+        remedy_for_stage(&stage.name),
+    )
+}
+
+/// Map a canonical funnel stage name to a concrete remedy. Stage names
+/// are the 16 defined in [`crate::funnel_profile`].
+fn remedy_for_stage(stage: &str) -> &'static str {
+    match stage {
+        "data_loaded" | "rows_after_trimming" => {
+            "not enough history — fetch more bars (Settings → Data) or pick a higher timeframe."
+        }
+        "features_built" | "features_after_prefilter" => {
+            "the feature prefilter removed everything — widen the indicator set or check the \
+             imported data for gaps."
+        }
+        "stage1_candidates_generated" | "profitable_archive_size" => {
+            "the genetic search found no profitable seeds — raise population / generations, or \
+             allow more indicators per strategy."
+        }
+        "full_is_evaluated" | "passed_base_filter" => {
+            "every candidate failed the base filter — relax max-drawdown / min-profit in the \
+             discovery filters."
+        }
+        "nonzero_signals" => {
+            "strategies generated zero trades — relax entry thresholds or verify indicator \
+             warm-up has enough bars."
+        }
+        "passed_min_trades" => {
+            "candidates traded too rarely — lower the min-trades requirement or use a longer \
+             window."
+        }
+        "passed_quality" => {
+            "the quality screen rejected all survivors — lower the min Sharpe / win-rate / \
+             profit-factor, or enable opportunistic mode."
+        }
+        "passed_prop_firm_window" => {
+            "nothing passed the prop-firm window gate — loosen the FTMO rule set, or switch off \
+             the prop-firm gate if you're not targeting a challenge."
+        }
+        "passed_correlation" => {
+            "survivors were too correlated with each other — raise the correlation threshold to \
+             admit more of them."
+        }
+        "passed_walkforward" => {
+            "strategies didn't hold up out-of-sample (walk-forward) — widen the search or reduce \
+             the number of walk-forward splits."
+        }
+        "passed_cpcv" => {
+            "strategies failed CPCV cross-validation — lower the CPCV min-phi tolerance or disable \
+             CPCV for this run."
+        }
+        "export_ready" => {
+            "candidates passed every gate but failed final export-readiness — check the \
+             validation-gate configuration."
+        }
+        _ => "review the saved funnel JSON (cache/discovery/<symbol>_<tf>.json) for the full \
+              stage-by-stage breakdown.",
+    }
 }
 
 fn row_cap_for_config(config: &DiscoveryConfig) -> usize {

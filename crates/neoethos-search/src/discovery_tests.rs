@@ -1456,3 +1456,44 @@ fn propfirm_mode_leaves_m1_min_trades_per_month_unchanged() {
     let cfg = cfg.with_env_runtime_overrides();
     assert_eq!(cfg.filtering.min_trades_per_month, 15.0);
 }
+
+// ── F-343 (#14): actionable empty-portfolio diagnosis ────────────────
+
+#[test]
+fn empty_portfolio_diagnosis_names_bottleneck_and_remedy() {
+    use crate::funnel_profile::{FunnelProfile, FunnelStage};
+
+    let mut funnel = FunnelProfile::new("EURUSD", "M1");
+    // Quality screen is the bottleneck: 412 in, 0 out.
+    let mut quality = FunnelStage::new("passed_quality");
+    quality.record(412, 0);
+    quality.top_reasons = vec![
+        ("low_sharpe".to_string(), 210),
+        ("low_profit_factor".to_string(), 150),
+    ];
+    funnel.stages = vec![FunnelStage::passthrough("passed_min_trades", 412), quality];
+    funnel.bottleneck_stage = "passed_quality".to_string();
+
+    let msg = describe_empty_portfolio_funnel(&funnel);
+    assert!(msg.contains("passed_quality"), "names the stage: {msg}");
+    assert!(msg.contains("low_sharpe×210"), "surfaces reasons: {msg}");
+    assert!(
+        msg.contains("Sharpe") || msg.contains("win-rate"),
+        "gives a remedy: {msg}"
+    );
+}
+
+#[test]
+fn empty_portfolio_diagnosis_falls_back_when_no_bottleneck_set() {
+    use crate::funnel_profile::{FunnelProfile, FunnelStage};
+
+    let mut funnel = FunnelProfile::new("GBPUSD", "H1");
+    let mut base = FunnelStage::new("passed_base_filter");
+    base.record(80, 0); // most-rejecting stage, bottleneck_stage left empty
+    funnel.stages = vec![FunnelStage::passthrough("data_loaded", 80), base];
+    funnel.bottleneck_stage = String::new();
+
+    let msg = describe_empty_portfolio_funnel(&funnel);
+    assert!(msg.contains("passed_base_filter"), "infers bottleneck: {msg}");
+    assert!(msg.contains("max-drawdown") || msg.contains("min-profit"));
+}
