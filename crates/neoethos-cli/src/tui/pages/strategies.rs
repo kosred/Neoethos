@@ -147,34 +147,119 @@ fn scan_portfolios() -> Vec<PortfolioSummary> {
     out
 }
 
+/// Array fields, in preference order, that hold the strategy objects in
+/// the various portfolio shapes we write:
+///   - `portfolio`  — the curated set (modern `discovery.rs` output)
+///   - `best_genes` — talib-knowledge files
+///   - `genes`      — GA checkpoints / `strategy_gene` dumps
+///   - `candidates` / `survivors` / `strategies` — other writers
+/// A bare `[...]` array (no wrapper object) is also handled.
+const STRATEGY_ARRAY_KEYS: &[&str] = &[
+    "portfolio",
+    "best_genes",
+    "genes",
+    "strategies",
+    "candidates",
+    "survivors",
+];
+
+/// (mtime_secs, len) → count cache so the 71 MB knowledge file isn't
+/// re-read and re-scanned on every redraw. Keyed per path; a changed
+/// mtime or size invalidates the entry.
+fn count_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, u64, usize)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, u64, usize)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 fn count_strategies(path: &std::path::Path) -> usize {
-    // Cheap: assume the file is a JSON array and count top-level commas + 1.
-    // For empty arrays we return 0. For non-array files we return 0.
+    let meta = std::fs::metadata(path).ok();
+    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mtime = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if let Ok(cache) = count_cache().lock() {
+        if let Some(&(c_mtime, c_len, c_count)) = cache.get(path) {
+            if c_mtime == mtime && c_len == len {
+                return c_count;
+            }
+        }
+    }
+
+    let count = compute_strategy_count(path);
+    if let Ok(mut cache) = count_cache().lock() {
+        cache.insert(path.to_path_buf(), (mtime, len, count));
+    }
+    count
+}
+
+fn compute_strategy_count(path: &std::path::Path) -> usize {
     let Ok(text) = std::fs::read_to_string(path) else {
         return 0;
     };
     let trimmed = text.trim_start();
-    if !trimmed.starts_with('[') {
+    // Two shapes in the wild: a bare `[ {...}, … ]` array, or an object
+    // that wraps the strategies in one of `STRATEGY_ARRAY_KEYS`. Locate
+    // the relevant array's opening `[`, then count the objects directly
+    // inside it.
+    let array_start = if trimmed.starts_with('[') {
+        Some(0)
+    } else {
+        STRATEGY_ARRAY_KEYS.iter().find_map(|key| {
+            let needle = format!("\"{key}\"");
+            let kpos = trimmed.find(&needle)?;
+            trimmed[kpos..].find('[').map(|rel| kpos + rel)
+        })
+    };
+    let Some(start) = array_start else {
         return 0;
-    }
-    // Empty array fast-path.
-    if trimmed.starts_with("[]") {
-        return 0;
-    }
-    // Count top-level `{` openings (each strategy is one object).
-    let mut depth: i32 = 0;
-    let mut count = 0;
-    for ch in trimmed.chars() {
+    };
+    count_objects_in_array(&trimmed[start..])
+}
+
+/// `s` begins at the `[` of a strategy array. Count the objects whose
+/// opening `{` sits at the array's immediate element depth. String-aware
+/// so braces inside quoted values (indicator names, notes) don't inflate
+/// the count; stops at the array's matching `]`.
+fn count_objects_in_array(s: &str) -> usize {
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut bracket_depth: i32 = 0; // [] nesting
+    let mut brace_depth: i32 = 0; // {} nesting
+    let mut count = 0usize;
+    for ch in s.chars() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
         match ch {
+            '"' => in_str = true,
+            '[' => bracket_depth += 1,
+            ']' => {
+                bracket_depth -= 1;
+                if bracket_depth == 0 {
+                    break;
+                }
+            }
             '{' => {
-                if depth == 0 {
+                if bracket_depth == 1 && brace_depth == 0 {
                     count += 1;
                 }
-                depth += 1;
+                brace_depth += 1;
             }
-            '}' => {
-                depth -= 1;
-            }
+            '}' => brace_depth -= 1,
             _ => {}
         }
     }
@@ -202,4 +287,63 @@ fn format_ts(unix: u64) -> String {
     // good enough for "is this fresh?" — full date support would
     // need a chrono dep we have not added to neoethos-cli.
     format!("{h:02}:{m:02}:{s:02} UTC")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_wrapped_best_genes_object() {
+        // The talib-knowledge shape that used to report 0 — an object
+        // whose strategies live in a `best_genes` array.
+        let json = r#"{
+            "generated_at": "2026-02-16T19:59:16Z",
+            "symbol": "EURUSD",
+            "best_genes": [
+                {"indicators": ["CDLSHORTLINE"], "score": 1.2},
+                {"indicators": ["CDLKICKING"], "score": 0.9},
+                {"indicators": ["CDLTRISTAR"], "score": 0.7}
+            ]
+        }"#;
+        let start = json.find('[').unwrap();
+        assert_eq!(count_objects_in_array(&json[start..]), 3);
+    }
+
+    #[test]
+    fn counts_bare_array() {
+        let json = r#"[ {"a":1}, {"b":2} ]"#;
+        assert_eq!(count_objects_in_array(json), 2);
+    }
+
+    #[test]
+    fn prefers_portfolio_over_candidates() {
+        // Modern discovery output carries both; the STRATEGIES column
+        // should reflect the curated `portfolio`, not the wider pool.
+        let json = r#"{
+            "portfolio": [ {"id":1}, {"id":2} ],
+            "candidates": [ {"id":3}, {"id":4}, {"id":5}, {"id":6} ]
+        }"#;
+        let trimmed = json.trim_start();
+        let key = STRATEGY_ARRAY_KEYS
+            .iter()
+            .find(|k| trimmed.contains(&format!("\"{k}\"")))
+            .unwrap();
+        assert_eq!(*key, "portfolio");
+        let kpos = trimmed.find("\"portfolio\"").unwrap();
+        let start = kpos + trimmed[kpos..].find('[').unwrap();
+        assert_eq!(count_objects_in_array(&trimmed[start..]), 2);
+    }
+
+    #[test]
+    fn ignores_braces_inside_strings() {
+        // A brace inside a quoted value must not inflate the count.
+        let json = r#"[ {"note":"a { brace } here"}, {"note":"plain"} ]"#;
+        assert_eq!(count_objects_in_array(json), 2);
+    }
+
+    #[test]
+    fn empty_array_is_zero() {
+        assert_eq!(count_objects_in_array("[]"), 0);
+    }
 }
