@@ -312,75 +312,79 @@ pub fn compute_single_indicator(
         kv.push(vector_ta::indicators::dispatch::ParamKV { key, value });
     }
 
-    let req = IndicatorComputeRequest {
-        indicator_id,
-        output_id: None,
-        data: data_ref,
-        params: &kv,
-        kernel: Kernel::Auto,
-    };
-    let output =
-        compute_cpu(req).map_err(|e| anyhow::anyhow!("vector_ta dispatch failed: {e:?}"))?;
-
-    let rows = output.rows;
-    let out_cols = output.cols.max(1);
-    let mut lines = Vec::with_capacity(out_cols);
-
-    match output.series {
-        IndicatorSeries::F64(v) => {
-            if out_cols <= 1 {
-                let values = if v.len() == n {
-                    v
-                } else if v.len() > n {
-                    v.into_iter().take(n).collect()
+    // Look up the indicator's declared outputs. Multi-output indicators
+    // (MACD, Bollinger Bands, Stochastic, …) REQUIRE an explicit
+    // `output_id` per series in vector_ta — dispatching them with
+    // `output_id: None` fails with "output_id is required for
+    // multi-output indicators". Single-output indicators use `None`
+    // (the library's default output).
+    let output_ids: Vec<Option<&'static str>> =
+        vector_ta::indicators::registry::list_indicators()
+            .iter()
+            .find(|i| i.id == indicator_id)
+            .map(|info| {
+                if info.outputs.len() <= 1 {
+                    vec![None]
                 } else {
-                    anyhow::bail!("indicator returned {} values, expected ≥{}", v.len(), n);
-                };
-                lines.push(IndicatorLine {
-                    name: indicator_id.to_string(),
-                    values,
-                });
-            } else if v.len() == rows * out_cols && rows >= n {
-                // Row-major decomposition into per-column series.
-                for c in 0..out_cols {
-                    let mut col_data = Vec::with_capacity(n);
-                    for r in 0..n {
-                        col_data.push(v[r * out_cols + c]);
-                    }
-                    lines.push(IndicatorLine {
-                        name: format!("{indicator_id}_line{c}"),
-                        values: col_data,
-                    });
+                    info.outputs.iter().map(|o| Some(o.id)).collect()
                 }
-            } else {
-                anyhow::bail!(
-                    "indicator multi-output shape mismatch: rows={} cols={} len={} n={}",
-                    rows,
-                    out_cols,
-                    v.len(),
-                    n
-                );
-            }
-        }
-        IndicatorSeries::I32(v) => {
-            if v.len() == n {
-                lines.push(IndicatorLine {
-                    name: indicator_id.to_string(),
-                    values: v.into_iter().map(|x| x as f64).collect(),
-                });
-            }
-        }
-        IndicatorSeries::Bool(v) => {
-            if v.len() == n {
-                lines.push(IndicatorLine {
-                    name: indicator_id.to_string(),
-                    values: v.into_iter().map(|x| if x { 1.0 } else { 0.0 }).collect(),
-                });
-            }
-        }
+            })
+            .unwrap_or_else(|| vec![None]);
+
+    let mut lines = Vec::with_capacity(output_ids.len());
+    for out_id in output_ids {
+        let req = IndicatorComputeRequest {
+            indicator_id,
+            output_id: out_id,
+            data: data_ref,
+            params: &kv,
+            kernel: Kernel::Auto,
+        };
+        let output = compute_cpu(req).map_err(|e| {
+            anyhow::anyhow!("vector_ta dispatch failed ({indicator_id}/{out_id:?}): {e:?}")
+        })?;
+        let values = flatten_indicator_series(output.series, n)?;
+        // Single-output → bare indicator id (e.g. "sma"); multi-output →
+        // "<id>_<output>" (e.g. "macd_signal") so the chart legend can
+        // split on '_' and show the per-line label.
+        let name = match out_id {
+            Some(id) => format!("{indicator_id}_{id}"),
+            None => indicator_id.to_string(),
+        };
+        lines.push(IndicatorLine { name, values });
     }
 
     Ok(lines)
+}
+
+/// Flatten a vector_ta series for ONE output into exactly `n` values.
+/// vector_ta reports a 1-D series as rows=1 × cols=n, so we key off the
+/// value count, not the rows/cols metadata — the previous `rows == n`
+/// assumption rejected every single-output series with a "shape
+/// mismatch" error.
+fn flatten_indicator_series(series: IndicatorSeries, n: usize) -> anyhow::Result<Vec<f64>> {
+    match series {
+        IndicatorSeries::F64(v) => normalize_indicator_len(v, n),
+        IndicatorSeries::I32(v) => {
+            normalize_indicator_len(v.into_iter().map(|x| x as f64).collect(), n)
+        }
+        IndicatorSeries::Bool(v) => normalize_indicator_len(
+            v.into_iter().map(|x| if x { 1.0 } else { 0.0 }).collect(),
+            n,
+        ),
+    }
+}
+
+fn normalize_indicator_len(v: Vec<f64>, n: usize) -> anyhow::Result<Vec<f64>> {
+    if v.len() == n {
+        Ok(v)
+    } else if v.len() > n {
+        // Bar-aligned from the start; take the leading n (warmup padding
+        // lives at the head and stays aligned with candle index 0).
+        Ok(v.into_iter().take(n).collect())
+    } else {
+        anyhow::bail!("indicator returned {} values, expected ≥{}", v.len(), n)
+    }
 }
 
 #[cfg(test)]

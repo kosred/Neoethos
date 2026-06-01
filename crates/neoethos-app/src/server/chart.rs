@@ -42,7 +42,7 @@ use neoethos_data::{discover_timeframes, load_symbol_timeframe_tail};
 
 use super::state::AppApiState;
 
-const DEFAULT_LIMIT: usize = 200;
+const DEFAULT_LIMIT: usize = 500;
 const MAX_LIMIT: usize = 2000;
 
 #[derive(Debug, serde::Deserialize)]
@@ -59,22 +59,25 @@ pub struct ChartQuery {
 /// Vortex files is "disk-cache" / "empty" so the UI can render the
 /// right banner. Phase 2 plumbs the broker source through.
 ///
-/// **Phase 1 variant set**: only `DiskCache` and `Empty` exist today
-/// because the broker historical-bars wiring (`ProtoOAGetTrendbarsReq`)
-/// hasn't landed yet. The `Broker` variant was removed during the
-/// 2026-05-25 verbose-build pass after operator feedback that
-/// `#[allow(dead_code)]` is not a fix — it silences instead of
-/// solving. When Phase 2 lands and `AppApiState` exposes a broker
-/// session handle, REINTRODUCE the variant here AND in the Flutter
-/// `ChartDataSource` enum together, so the producer and consumer
-/// stay in lockstep. Until then the UI only needs to render two
-/// banners ("cached" and "empty") which matches what this endpoint
-/// can emit.
+/// **Phase 2 (2026-06-01)** — `Broker` reintroduced. `load_chart` now
+/// fetches live trendbars straight from cTrader (`ProtoOAGetTrendbarsReq`
+/// via `broker_api::fetch_recent_chart_bars_blocking`) and tags the
+/// response `broker` when the broker session served the candles; it
+/// falls back to `DiskCache` (local Vortex files) only when the broker
+/// is unreachable, and `Empty` when neither has data. The Flutter
+/// `ChartSnapshot.isBrokerSource` (`source == "broker"`) already
+/// consumes this tag to hide the "cached" banner — producer and
+/// consumer stay in lockstep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChartDataSource {
+    /// Live OHLCV bars fetched from the cTrader broker historical-bars
+    /// API. The authoritative, current source — UI shows no "cached"
+    /// banner.
+    Broker,
     /// Data loaded from the local Vortex cache. Use for offline
-    /// replay / backtests. UI should surface a "cached" banner.
+    /// replay / backtests, or when the broker is unreachable. UI
+    /// should surface a "cached" banner.
     DiskCache,
     /// No data available from any source.
     Empty,
@@ -224,37 +227,90 @@ pub fn load_chart(
     // single timeframe). Now we ask `discover_timeframes` for the
     // dropdown list (cheap directory listing, cached per #79) and load
     // only the requested timeframe's Vortex file.
-    let mut available_timeframes = discover_timeframes(&settings.system.data_dir, &symbol)
-        .map_err(|e| anyhow::anyhow!("timeframe discovery failed for {symbol}: {e}"))?;
+    // Local timeframe list for the dropdown. Non-fatal: a symbol with no
+    // local cache can still be charted straight from the broker below, and
+    // the broker timeframe gets appended on a successful live fetch.
+    let mut available_timeframes =
+        discover_timeframes(&settings.system.data_dir, &symbol).unwrap_or_default();
     available_timeframes.sort();
-    if !available_timeframes.contains(&timeframe) {
-        anyhow::bail!(
-            "timeframe '{timeframe}' not in dataset for {symbol} \
-             (available: {})",
-            available_timeframes.join(", ")
-        );
-    }
 
-    // #155: ask the data layer for just the trailing `limit` rows so
-    // we don't allocate a million-row Ohlcv only to slice the last 200.
-    let ohlcv =
-        load_symbol_timeframe_tail(&settings.system.data_dir, &symbol, &timeframe, limit)
-            .map_err(|e| anyhow::anyhow!("dataset load failed for {symbol} {timeframe}: {e}"))?;
-
-    let total = ohlcv.len();
-    let timestamps = ohlcv.timestamp.as_deref();
-    let volumes = ohlcv.volume.as_deref();
-
-    let candles: Vec<CandleDto> = (0..total)
-        .map(|idx| CandleDto {
-            ts_ms: timestamps.and_then(|ts| ts.get(idx)).copied(),
-            open: ohlcv.open[idx],
-            high: ohlcv.high[idx],
-            low: ohlcv.low[idx],
-            close: ohlcv.close[idx],
-            volume: volumes.and_then(|v| v.get(idx)).copied().unwrap_or(0.0),
-        })
-        .collect();
+    // Phase 2 — broker-passthrough: fetch LIVE trendbars straight from
+    // cTrader first (the authoritative, current source). Fall back to the
+    // local Vortex cache only when the broker is unreachable / has no
+    // session. This is what makes the chart show *current* candles instead
+    // of a stale bootstrap snapshot.
+    let (candles, source): (Vec<CandleDto>, ChartDataSource) =
+        match crate::app_services::broker_api::fetch_recent_chart_bars_blocking(
+            &symbol, &timeframe, limit,
+        ) {
+            Ok(bars) if !bars.is_empty() => {
+                // The broker serves this timeframe even if the local cache
+                // doesn't — make sure the dropdown lists it.
+                if !available_timeframes.contains(&timeframe) {
+                    available_timeframes.push(timeframe.clone());
+                    available_timeframes.sort();
+                }
+                let candles = bars
+                    .iter()
+                    .map(|b| CandleDto {
+                        ts_ms: Some(b.timestamp_ms),
+                        open: b.open,
+                        high: b.high,
+                        low: b.low,
+                        close: b.close,
+                        volume: b.volume.unwrap_or(0) as f64,
+                    })
+                    .collect();
+                (candles, ChartDataSource::Broker)
+            }
+            broker_result => {
+                if let Err(err) = &broker_result {
+                    tracing::debug!(
+                        target: "neoethos_app::server::chart",
+                        symbol = %symbol,
+                        timeframe = %timeframe,
+                        error = %err,
+                        "broker chart fetch failed; falling back to local Vortex cache"
+                    );
+                }
+                // Disk fallback requires the timeframe to exist locally.
+                if !available_timeframes.contains(&timeframe) {
+                    anyhow::bail!(
+                        "timeframe '{timeframe}' not available for {symbol} from \
+                         broker or local cache (cached: {})",
+                        available_timeframes.join(", ")
+                    );
+                }
+                // #155: trailing `limit` rows only — avoid loading a
+                // million-row Ohlcv just to slice the tail.
+                let ohlcv = load_symbol_timeframe_tail(
+                    &settings.system.data_dir,
+                    &symbol,
+                    &timeframe,
+                    limit,
+                )
+                .map_err(|e| anyhow::anyhow!("dataset load failed for {symbol} {timeframe}: {e}"))?;
+                let total = ohlcv.len();
+                let timestamps = ohlcv.timestamp.as_deref();
+                let volumes = ohlcv.volume.as_deref();
+                let candles: Vec<CandleDto> = (0..total)
+                    .map(|idx| CandleDto {
+                        ts_ms: timestamps.and_then(|ts| ts.get(idx)).copied(),
+                        open: ohlcv.open[idx],
+                        high: ohlcv.high[idx],
+                        low: ohlcv.low[idx],
+                        close: ohlcv.close[idx],
+                        volume: volumes.and_then(|v| v.get(idx)).copied().unwrap_or(0.0),
+                    })
+                    .collect();
+                let source = if candles.is_empty() {
+                    ChartDataSource::Empty
+                } else {
+                    ChartDataSource::DiskCache
+                };
+                (candles, source)
+            }
+        };
 
     let (price_min, price_max) = if candles.is_empty() {
         (0.0, 0.0)
@@ -281,16 +337,6 @@ pub fn load_chart(
             price_max,
             price_change_pct
         )
-    };
-
-    // G7 Phase 1: every successful disk-load is tagged `DiskCache`.
-    // Phase 2 will branch HERE on broker-connection state and tag
-    // the response `Broker` when the bars came from the live cTrader
-    // historical-bars API.
-    let source = if candles.is_empty() {
-        ChartDataSource::Empty
-    } else {
-        ChartDataSource::DiskCache
     };
 
     Ok(ChartDto {

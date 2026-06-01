@@ -804,6 +804,136 @@ pub fn start_discovery_job(
             }
         };
 
+        // ── Auto-fetch missing history (operator-chosen over a hard
+        // fail) ───────────────────────────────────────────────────────
+        // Discovery's `ensure_sufficient_history` floor (set via
+        // FOREX_BOT_MIN_HISTORY_YEARS) aborts when the local cache is too
+        // short. If the base timeframe is below the floor, pull the
+        // required window straight from cTrader and reload before
+        // building features — so Discovery runs on real broker history
+        // instead of failing.
+        let mut dataset = dataset;
+        let min_years = std::env::var("FOREX_BOT_MIN_HISTORY_YEARS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        if min_years > 0 {
+            let have = dataset
+                .frames
+                .get(&request.base_tf)
+                .map(|f| f.close.len())
+                .unwrap_or(0);
+            let required = (min_years as usize).saturating_mul(
+                neoethos_search::discovery::approx_bars_per_year(&request.base_tf),
+            );
+            if required > 0 && have < required {
+                snapshot.progress = JobProgress {
+                    percent: Some(0.15),
+                    stage: "fetching_history".to_string(),
+                    message: format!(
+                        "history short for {} {} ({}/{} bars) — auto-fetching ~{}y from cTrader…",
+                        request.symbol, request.base_tf, have, required, min_years
+                    ),
+                };
+                send_event(&tx, ServiceEvent::DiscoveryUpdated(snapshot.clone()));
+                log_discovery_event(
+                    "ui_discovery_job",
+                    "FETCHING",
+                    format!(
+                        "auto-fetching ~{}y of {} {} from cTrader (have {} / need {} bars)",
+                        min_years, request.symbol, request.base_tf, have, required
+                    ),
+                );
+                let fetch_symbol = request.symbol.clone();
+                let fetch_tf = request.base_tf.clone();
+                let fetch_root = request.data_root.clone();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                // Calendar window + 1-month cushion so weekend/holiday
+                // gaps don't starve the trading-bar count.
+                let day_ms: i64 = 24 * 60 * 60 * 1000;
+                let from_ms = now_ms - ((min_years as i64) * 365 + 30) * day_ms;
+                let fetched = tokio::task::spawn_blocking(move || {
+                    crate::app_services::broker_api::download_history_blocking(
+                        &fetch_symbol,
+                        &fetch_tf,
+                        from_ms,
+                        now_ms,
+                        &fetch_root,
+                    )
+                })
+                .await;
+                match fetched {
+                    Ok(Ok(outcome)) => {
+                        log_discovery_event(
+                            "ui_discovery_job",
+                            "FETCHED",
+                            format!(
+                                "auto-fetched {} bars of {} {} from cTrader",
+                                outcome.bar_count, request.symbol, request.base_tf
+                            ),
+                        );
+                        let reload = request.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            load_symbol_dataset(&reload.data_root, &reload.symbol)
+                        })
+                        .await
+                        {
+                            Ok(Ok(reloaded)) => dataset = reloaded,
+                            Ok(Err(err)) => {
+                                let failed = failed_snapshot_from(snapshot, err);
+                                send_event(&tx, ServiceEvent::DiscoveryUpdated(failed.clone()));
+                                log_discovery_event(
+                                    "ui_discovery_job",
+                                    "FAILED",
+                                    failed.report.summary.clone(),
+                                );
+                                return;
+                            }
+                            Err(err) => {
+                                let failed = failed_snapshot_from(
+                                    snapshot,
+                                    anyhow::anyhow!("history reload join error: {err}"),
+                                );
+                                send_event(&tx, ServiceEvent::DiscoveryUpdated(failed.clone()));
+                                log_discovery_event(
+                                    "ui_discovery_job",
+                                    "FAILED",
+                                    failed.report.summary.clone(),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        // Broker fetch failed — proceed and let the
+                        // downstream `ensure_sufficient_history` surface
+                        // the precise error rather than masking it here.
+                        log_discovery_event(
+                            "ui_discovery_job",
+                            "FETCH_FAILED",
+                            format!(
+                                "auto-fetch of {} {} failed: {err}",
+                                request.symbol, request.base_tf
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        log_discovery_event(
+                            "ui_discovery_job",
+                            "FETCH_FAILED",
+                            format!(
+                                "auto-fetch join error for {} {}: {err}",
+                                request.symbol, request.base_tf
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
         snapshot.progress = JobProgress {
             percent: Some(0.35),
             stage: "preparing_features".to_string(),

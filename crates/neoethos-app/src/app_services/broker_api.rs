@@ -358,6 +358,79 @@ fn timeframe_chunk_ms(tf: &str) -> i64 {
     }
 }
 
+/// Fetch the most recent `limit` OHLCV bars for `symbol`/`timeframe`
+/// straight from the cTrader broker (`ProtoOAGetTrendbarsReq`) with NO
+/// disk write — the chart's broker-passthrough path (the authoritative,
+/// *current* source). Returns bars sorted oldest→newest, trimmed to the
+/// trailing `limit`. Opens a fresh WSS connection + re-auths, same as the
+/// history-download path, so callers must run it on a blocking task.
+pub fn fetch_recent_chart_bars_blocking(
+    symbol: &str,
+    timeframe: &str,
+    limit: usize,
+) -> Result<Vec<HistoricalBar>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let creds = resolve_creds()?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let step_ms = chart_bar_step_ms(timeframe);
+    // Window wide enough to contain `limit` bars with generous headroom
+    // for weekends / holidays / illiquid gaps (markets aren't open 24/7,
+    // so a tight window would starve the requested count). cTrader caps a
+    // single response at ~5000 bars and `count` bounds the result, so one
+    // request covers a chart (limit ≤ MAX_LIMIT = 2000).
+    let span_ms = step_ms
+        .saturating_mul(limit as i64)
+        .saturating_mul(3)
+        .max(step_ms);
+    let from_ms = now_ms.saturating_sub(span_ms);
+    let request = CTraderChartHistoryRequest {
+        client_id: creds.client_id.clone(),
+        client_secret: creds.client_secret.clone(),
+        access_token: creds.access_token.clone(),
+        environment: creds.environment,
+        account_id: creds.account_id_str.clone(),
+        symbol_name: symbol.to_string(),
+        timeframe: timeframe.to_string(),
+        from_timestamp_ms: from_ms,
+        to_timestamp_ms: now_ms,
+        count: Some(limit as u32),
+    };
+    let CTraderHistoricalBarsFetchResult { mut bars, .. } =
+        load_historical_bars_only(&request)?;
+    bars.sort_by_key(|b| b.timestamp_ms);
+    bars.dedup_by_key(|b| b.timestamp_ms);
+    // The broker may return a few more than requested — keep trailing N.
+    if bars.len() > limit {
+        bars.drain(0..bars.len() - limit);
+    }
+    Ok(bars)
+}
+
+/// Duration of a single bar for the canonical timeframe, in ms. Used to
+/// size the broker fetch window in [`fetch_recent_chart_bars_blocking`].
+fn chart_bar_step_ms(tf: &str) -> i64 {
+    let m: i64 = 60 * 1000;
+    match tf.trim().to_ascii_uppercase().as_str() {
+        "M1" => m,
+        "M3" => 3 * m,
+        "M5" => 5 * m,
+        "M15" => 15 * m,
+        "M30" => 30 * m,
+        "H1" => 60 * m,
+        "H4" => 240 * m,
+        "H12" => 720 * m,
+        "D1" => 1440 * m,
+        "W1" => 7 * 1440 * m,
+        "MN1" => 30 * 1440 * m,
+        _ => m,
+    }
+}
+
 /// Side of a manual market order. Mirrors `CTraderTradeSide` but kept
 /// here so the server module doesn't depend on the cTrader-internal
 /// enum directly.

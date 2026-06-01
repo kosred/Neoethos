@@ -1622,11 +1622,12 @@ pub fn ensure_sufficient_history(
         anyhow::bail!(
             "Insufficient history for {symbol} {timeframe}: have {actual_bars} bars, \
              need at least {required_bars} (≈ {min_history_years} years × {bars_per_year} \
-             bars/yr). Remediation: (1) import a longer window via Data Bootstrap, \
-             OR (2) auto-fetch from cTrader history API (POST /data/fetch-history?\
-             symbol={symbol}&timeframe={timeframe}&years={min_history_years}), \
-             OR (3) lower min_history_years if you accept the over-fitting risk. \
-             Operator policy 2026-05-24: refuse synthetic / insufficient data."
+             bars/yr). Remediation: (1) Settings → Data → 'Download history from broker' \
+             with a ~{min_history_years}-year window for {symbol} {timeframe}, then re-run \
+             Discovery; OR (2) relax the floor via the FOREX_BOT_MIN_HISTORY_YEARS \
+             environment variable — set it to 0 to run on whatever data exists \
+             (accepts the over-fitting risk). Operator policy 2026-05-24: refuse \
+             synthetic / insufficient data."
         );
     }
     Ok(())
@@ -1637,7 +1638,7 @@ pub fn ensure_sufficient_history(
 /// unknown timeframes — the caller's `saturating_mul` will then make
 /// `required_bars = 0` so the check effectively skips for non-canonical
 /// inputs (which should already have been rejected upstream).
-fn approx_bars_per_year(tf: &str) -> usize {
+pub fn approx_bars_per_year(tf: &str) -> usize {
     // 220 trading days × hours × bars-per-hour, conservatively. The
     // FX market is 24/5 but we use 220 days × 24 hours instead of
     // 252 × 24 to leave headroom for holiday gaps. For weekly /
