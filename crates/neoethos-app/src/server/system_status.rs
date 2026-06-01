@@ -34,6 +34,25 @@ pub struct EnginesDto {
     /// currently active. Empty when all three are Idle.
     pub discovery_summary: String,
     pub training_summary: String,
+    /// F-340 (Feature #14): live discovery progress mirrored from the
+    /// running job's `JobSnapshot`. `discoveryStage` is the coarse phase
+    /// label (e.g. `"search_generations"`), `""` when idle.
+    pub discovery_stage: String,
+    /// 0.0..=1.0 completion fraction for the active discovery run;
+    /// 0.0 when idle.
+    pub discovery_percent: f64,
+    /// The live `(name, value)` counters the discovery job accumulates
+    /// (candidates evaluated, generations done, …). Empty when idle.
+    pub discovery_counters: Vec<EngineCounterDto>,
+}
+
+/// F-340 (Feature #14): one live counter from a running engine's
+/// `JobReport`. Serialized as `{ "name": String, "value": u64 }`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineCounterDto {
+    pub name: String,
+    pub value: u64,
 }
 
 /// Engine-state endpoint. Reads the latest `EngineRunState` written
@@ -41,6 +60,10 @@ pub struct EnginesDto {
 /// start handlers spawn. Auto-Trader still reports `"Idle"` — it ships
 /// in a follow-up wiring along with the order-ticket endpoints.
 pub async fn engines(State(state): State<AppApiState>) -> Json<EnginesDto> {
+    // F-340 (Feature #14): pull the live discovery progress triple
+    // (stage, percent, counters) alongside the existing state/summary.
+    let (discovery_stage, discovery_percent, discovery_counters) =
+        state.engine_progress(JobKind::Discovery).await;
     Json(EnginesDto {
         discovery: state
             .engine_state(JobKind::Discovery)
@@ -55,6 +78,12 @@ pub async fn engines(State(state): State<AppApiState>) -> Json<EnginesDto> {
         auto_trader: "Idle".to_string(),
         discovery_summary: state.engine_summary(JobKind::Discovery).await,
         training_summary: state.engine_summary(JobKind::Training).await,
+        discovery_stage,
+        discovery_percent,
+        discovery_counters: discovery_counters
+            .into_iter()
+            .map(|(name, value)| EngineCounterDto { name, value })
+            .collect(),
     })
 }
 

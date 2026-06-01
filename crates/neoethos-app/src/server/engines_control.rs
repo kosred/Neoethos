@@ -491,13 +491,33 @@ fn spawn_state_drainer(
             };
             let Some(snap) = snapshot else { continue };
             terminal_state = Some(snap.state);
+            let run_state = EngineRunState::from(snap.state);
             state
-                .update_engine(
-                    kind,
-                    EngineRunState::from(snap.state),
-                    snap.report.summary.clone(),
-                )
+                .update_engine(kind, run_state, snap.report.summary.clone())
                 .await;
+            // F-340 (Feature #14): mirror the live discovery/training
+            // progress (stage + percent + counters) from the same
+            // JobSnapshot into the slot so `/engines/status` can expose
+            // the rich counters the GA loop accumulates. Only do this
+            // while the engine is still Running — `update_engine` wipes
+            // the progress on any terminal state, and re-populating it
+            // here would leave a stale "search_generations / 0.83"
+            // line hanging around after the run finished.
+            if matches!(run_state, EngineRunState::Running) {
+                // `JobProgress::percent` is `Option<f32>` in 0.0..=1.0;
+                // default to 0.0 when the job hasn't reported a fraction
+                // yet. `JobReport::counters` is already a `(name, u64)`
+                // list — forward it verbatim.
+                let percent = snap.progress.percent.unwrap_or(0.0) as f64;
+                state
+                    .set_engine_progress(
+                        kind,
+                        snap.progress.stage.clone(),
+                        percent,
+                        snap.report.counters.clone(),
+                    )
+                    .await;
+            }
         }
         // Channel closed — make sure we don't leave a dangling
         // "Running" state if the producer side dropped without a

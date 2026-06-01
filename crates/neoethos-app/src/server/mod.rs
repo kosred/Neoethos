@@ -54,6 +54,7 @@ pub mod settings;
 pub mod state;
 pub mod strategy_lab;
 pub mod system_status;
+pub mod watchlist;
 
 use anyhow::Context;
 use axum::Router;
@@ -184,6 +185,10 @@ pub fn router(state: AppApiState) -> Router {
         // above). The polling route is kept as a fallback for HTTP
         // clients without SSE support + for the cold-start snapshot.
         .route("/live/spots/stream", get(live_spots::stream))
+        // F-338 (Feature #12): editable Market Watch watchlist. GET
+        // returns the saved `system.watchlist`; POST replaces it and
+        // re-subscribes the live spot stream within ~5 s (no restart).
+        .route("/watchlist", get(watchlist::get).post(watchlist::post))
         .route("/chart", get(chart::chart))
         // Scroll-back pagination: older bars on demand, broker-only, never
         // persisted (TradingView model — panning back costs zero disk).

@@ -42,9 +42,20 @@
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
+
+/// F-338 (Feature #12): monotonically-increasing "which streamer
+/// generation is current" counter. Every spawned streamer captures the
+/// value at spawn time (`my_gen`); when [`restart_streamer`] bumps it,
+/// the in-flight read loop notices `STREAM_GENERATION != my_gen` on its
+/// next ~5 s read-timeout tick, closes its socket, and self-terminates
+/// — while a freshly-spawned streamer (carrying the new generation)
+/// takes over with the updated watchlist. This lets a Market Watch edit
+/// re-subscribe the live stream within ~5 s with no app restart.
+static STREAM_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
@@ -251,6 +262,35 @@ pub fn try_spawn_with_defaults_blocking() -> bool {
     true
 }
 
+/// F-338 (Feature #12): re-subscribe the live spot stream to the
+/// current `system.watchlist` without an app restart.
+///
+/// Bumps [`STREAM_GENERATION`] so any in-flight streamer self-terminates
+/// on its next ~5 s read tick (see the generation check at the top of
+/// the `run_blocking` read loop), then re-runs the canonical spawn
+/// entrypoint [`try_spawn_with_defaults_blocking`] — which RE-READS
+/// `system.watchlist` from `config.yaml`, re-resolves symbol ids against
+/// the broker, and spawns a fresh streamer carrying the bumped
+/// generation. The new streamer therefore subscribes to the edited
+/// symbol set while the old one cleanly exits.
+///
+/// Returns whatever the entrypoint returns: `false` when the new
+/// streamer could not be spawned (missing creds/token, broker
+/// unreachable, none of the watchlist symbols resolvable, …). Note the
+/// generation is bumped UNCONDITIONALLY — even on a `false` return the
+/// old streamer still stops, which is the correct behaviour: a
+/// watchlist edit should never leave a stream subscribed to the stale
+/// symbol set.
+///
+/// Runs the same blocking work as [`try_spawn_with_defaults_blocking`]
+/// (broker round-trip to list symbols), so callers on the async runtime
+/// (e.g. the `POST /watchlist` handler) must invoke it via
+/// `tokio::task::spawn_blocking`.
+pub fn restart_streamer() -> bool {
+    STREAM_GENERATION.fetch_add(1, Relaxed);
+    try_spawn_with_defaults_blocking()
+}
+
 /// Spawn the streamer as a background async task. Returns
 /// immediately; the task owns its own retry loop and won't be
 /// observable to the caller.
@@ -262,15 +302,20 @@ pub fn try_spawn_with_defaults_blocking() -> bool {
 /// connection state should read the `live_spots::snapshot_all()`
 /// freshness timestamps.
 pub fn spawn(config: LiveSpotsStreamerConfig) {
+    // F-338 (Feature #12): snapshot the current generation. The read
+    // loop carries this `my_gen` and self-terminates the moment
+    // `restart_streamer` bumps the global past it.
+    let my_gen = STREAM_GENERATION.load(Relaxed);
     tokio::spawn(async move {
         loop {
             tracing::info!(
                 target: "neoethos_app::live_spots_streamer",
                 symbols = config.symbols.len(),
+                generation = my_gen,
                 "connecting to cTrader spot stream"
             );
             let cfg = config.clone();
-            let outcome = tokio::task::spawn_blocking(move || run_blocking(cfg)).await;
+            let outcome = tokio::task::spawn_blocking(move || run_blocking(cfg, my_gen)).await;
             match outcome {
                 Ok(Ok(())) => {
                     tracing::warn!(
@@ -293,12 +338,25 @@ pub fn spawn(config: LiveSpotsStreamerConfig) {
                     );
                 }
             }
+            // F-338 (Feature #12): if a newer streamer generation has
+            // been installed (watchlist edit → `restart_streamer`), this
+            // streamer has been superseded — STOP rather than reconnect.
+            // The freshly-spawned streamer owns the live stream now.
+            if STREAM_GENERATION.load(Relaxed) != my_gen {
+                tracing::info!(
+                    target: "neoethos_app::live_spots_streamer",
+                    generation = my_gen,
+                    current = STREAM_GENERATION.load(Relaxed),
+                    "spot streamer superseded by a newer generation — exiting reconnect loop"
+                );
+                break;
+            }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 }
 
-fn run_blocking(config: LiveSpotsStreamerConfig) -> Result<()> {
+fn run_blocking(config: LiveSpotsStreamerConfig, my_gen: u64) -> Result<()> {
     let url = format!("wss://{}:5036", config.endpoint_host);
     crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
     let (mut socket, _) = connect(url.as_str())
@@ -362,6 +420,19 @@ fn run_blocking(config: LiveSpotsStreamerConfig) -> Result<()> {
     // 4. Read loop. Spot events flow in forever; everything else
     //    (ping/pong, account disconnect, errors) is handled inline.
     loop {
+        // F-338 (Feature #12): bail out the moment the operator edits
+        // the watchlist (which bumps STREAM_GENERATION via
+        // `restart_streamer`). Returning `Ok(())` lets the outer reconnect
+        // loop observe the generation mismatch and exit cleanly instead
+        // of reconnecting. The 5 s read-timeout cadence set above
+        // guarantees this check runs within ~5 s of the bump.
+        if STREAM_GENERATION.load(Relaxed) != my_gen {
+            tracing::info!(
+                target: "neoethos_app::live_spots_streamer",
+                "watchlist changed — closing spot stream to re-subscribe"
+            );
+            return Ok(());
+        }
         // Send an app-level heartbeat on schedule so cTrader keeps the
         // stream open. A half-duplex send between reads is safe on a
         // sync tungstenite socket.

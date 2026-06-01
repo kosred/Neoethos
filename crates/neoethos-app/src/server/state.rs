@@ -244,6 +244,17 @@ pub struct EngineSlot {
     pub state: EngineRunState,
     pub cancel: Option<CancellationFlag>,
     pub summary: String,
+    /// F-340 (Feature #14): live discovery/training progress mirrored
+    /// from the `JobSnapshot` the ServiceEvent drainer processes.
+    /// `stage` is the coarse phase label (e.g. `"search_generations"`),
+    /// empty when idle. `percent` is 0.0..=1.0, 0.0 when idle.
+    /// `counters` is the live `(name, value)` counter list, empty when
+    /// idle. Reset to defaults whenever the engine reaches a terminal
+    /// (non-Running) state so `/engines/status` reports clean numbers
+    /// the instant a run finishes.
+    pub stage: String,
+    pub percent: f64,
+    pub counters: Vec<(String, u64)>,
 }
 
 impl Default for EngineRunState {
@@ -455,6 +466,20 @@ impl AppApiState {
         }
     }
 
+    /// F-340 (Feature #14): read the live progress triple
+    /// `(stage, percent, counters)` for the given engine. Returns
+    /// `("", 0.0, [])` for the Bootstrap variant (it has no slot) and
+    /// for any engine that is idle / has been reset on terminal.
+    pub async fn engine_progress(&self, kind: JobKind) -> (String, f64, Vec<(String, u64)>) {
+        let inner = self.inner.read().await;
+        let slot = match kind {
+            JobKind::Discovery => &inner.discovery,
+            JobKind::Training => &inner.training,
+            JobKind::Bootstrap => return (String::new(), 0.0, Vec::new()),
+        };
+        (slot.stage.clone(), slot.percent, slot.counters.clone())
+    }
+
     /// Mark an engine as Running and remember its cancel flag so a
     /// later `/stop` can signal it. Called by the discovery/training
     /// `start` endpoints right after `start_*_job` returns.
@@ -487,7 +512,40 @@ impl AppApiState {
         // nothing left to cancel.
         if !matches!(state, EngineRunState::Running) {
             slot.cancel = None;
+            // F-340 (Feature #14): also wipe the live progress so
+            // `/engines/status` reports `("", 0.0, [])` the instant a
+            // run finishes — a stale "search_generations / 0.83" line
+            // hanging around after a Succeeded run would mislead the UI.
+            slot.stage.clear();
+            slot.percent = 0.0;
+            slot.counters.clear();
         }
+    }
+
+    /// F-340 (Feature #14): mirror the live `JobSnapshot` progress
+    /// (`stage`, `percent`, `counters`) into the engine slot. Called by
+    /// the engines_control ServiceEvent drainer alongside
+    /// [`update_engine`] on every non-terminal update so
+    /// `/engines/status` exposes the rich counters the discovery job
+    /// accumulates. `percent` is clamped to 0.0..=1.0. Terminal cleanup
+    /// is handled by [`update_engine`], so this setter only ever writes
+    /// "live" values.
+    pub async fn set_engine_progress(
+        &self,
+        kind: JobKind,
+        stage: String,
+        percent: f64,
+        counters: Vec<(String, u64)>,
+    ) {
+        let mut inner = self.inner.write().await;
+        let slot = match kind {
+            JobKind::Discovery => &mut inner.discovery,
+            JobKind::Training => &mut inner.training,
+            JobKind::Bootstrap => return,
+        };
+        slot.stage = stage;
+        slot.percent = percent.clamp(0.0, 1.0);
+        slot.counters = counters;
     }
 
     /// Defensive guard: if the ServiceEvent channel closes without a
