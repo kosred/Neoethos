@@ -599,6 +599,33 @@ final Map<String, _HelpSection> _helpContentEl = {
       ]),
     ],
   ),
+  'chart': const _HelpSection(
+    title: 'Γράφημα',
+    blocks: [
+      _H3('Ζωντανά δεδομένα — όχι αποθηκευμένα'),
+      _P([
+        ('Το γράφημα δείχνει ', false),
+        ('ζωντανά κεριά κατευθείαν από τον broker', true),
+        (' (cTrader trendbars), όχι κάποιο παλιό snapshot από τον δίσκο. Το τελευταίο κερί κινείται σε πραγματικό χρόνο από το spot stream.', false),
+      ]),
+      _H4('Scroll-back — δες χρόνια πίσω (όπως στο TradingView)'),
+      _P([
+        ('Σύρε το γράφημα ', false),
+        ('αριστερά', true),
+        (' πέρα από το παλιότερο φορτωμένο κερί και το NeoEthos κατεβάζει αυτόματα την επόμενη σελίδα παλιότερων κεριών ζωντανά από τον broker. ', false),
+        ('Μένουν μόνο στη μνήμη — δεν γεμίζουν τον δίσκο.', true),
+        (' Μπορείς να γυρίσεις 2 χρόνια πίσω χωρίς κανένα byte στον δίσκο.', false),
+      ]),
+      _Tip('Για πολύ μακρινό scroll-back σε M1 (εκατομμύρια κεριά), γύρνα σε μεγαλύτερο timeframe (H1/H4/D1) — όπως κάνει και κάθε professional terminal.'),
+      _H4('Χειρισμός'),
+      _UL([
+        [('Zoom: ', true), ('scroll / pinch πάνω στο γράφημα', false)],
+        [('Crosshair OHLC: ', true), ('long-press (κράτα πατημένο) για να δεις open/high/low/close σε κάθε κερί', false)],
+        [('Overlays / sub-panels: ', true), ('κουμπιά MA · BOLL (πάνω) και MACD · KDJ · RSI · WR (κάτω) — υπολογίζονται live στα broker δεδομένα', false)],
+        [('Account switcher: ', true), ('αλλαγή λογαριασμού (DEMO/LIVE) από το dropdown στο top bar', false)],
+      ]),
+    ],
+  ),
   'ai': const _HelpSection(
     title: 'AI Engine',
     blocks: [
@@ -655,6 +682,34 @@ final Map<String, _HelpSection> _helpContentEl = {
       _Tip('⚠ 75-90% των retail FX traders χάνουν χρήματα. Risky Mode = aggressive ≠ ασφαλές. Πάντα δοκίμασε για εβδομάδες σε Demo.'),
     ],
   ),
+  'data': const _HelpSection(
+    title: 'Δεδομένα & Δίσκος',
+    blocks: [
+      _H3('Από πού έρχονται τα δεδομένα'),
+      _P([
+        ('Υπάρχουν ', false),
+        ('δύο ξεχωριστές πηγές', true),
+        (' και είναι σημαντικό να ξέρεις τη διαφορά:', false),
+      ]),
+      _UL([
+        [('Ζωντανά (broker): ', true), ('Γράφημα, Market Watch, indicators, scroll-back. Έρχονται κατευθείαν από τον broker και ', false), ('ΔΕΝ αποθηκεύονται στον δίσκο.', true)],
+        [('Τοπικός Vortex cache: ', true), ('Μόνο το Discovery και το Training χρειάζονται αποθηκευμένο ιστορικό για backtest/εκπαίδευση — ', false), ('αυτό', true), (' γράφεται στον δίσκο.', false)],
+      ]),
+      _H4('Τι γράφει στον δίσκο'),
+      _UL([
+        [('Data Bootstrap', true), (' (Settings → Data): ρητό κατέβασμα ιστορικού παραθύρου για ένα symbol/timeframe.', false)],
+        [('Discovery auto-fetch: ', true), ('αν δεν υπάρχει αρκετό ιστορικό όταν τρέχεις discovery, το κατεβάζει αυτόματα (~N χρόνια, ελέγχεται από το FOREX_BOT_MIN_HISTORY_YEARS) και το αποθηκεύει.', false)],
+        [('data_dir: ', true), ('ο φάκελος αποθήκευσης — ορίζεται στο Settings → Data.', false)],
+      ]),
+      _Tip('Το να βλέπεις γράφημα — ακόμα και να γυρνάς χρόνια πίσω — ΔΕΝ γεμίζει τον δίσκο. Μόνο το Data Bootstrap και το Discovery αποθηκεύουν ιστορικά, επειδή το backtest/training τα χρειάζεται.'),
+      _H4('Υποστηριζόμενα symbols'),
+      _P([
+        ('Η λίστα symbols έρχεται από τον broker, αλλά περιορίζεται σε ', false),
+        ('forex, μέταλλα, δείκτες και εμπορεύματα', true),
+        (' — οι μετοχές και τα ETF του broker αποκλείονται αυτόματα (η μηχανή δεν τα διαπραγματεύεται).', false),
+      ]),
+    ],
+  ),
   'shortcuts': const _HelpSection(
     title: 'Συντομεύσεις',
     blocks: [
@@ -698,7 +753,7 @@ final Map<String, _HelpSection> _helpContentEl = {
       _P([
         ('Γιατί έχω "no strategies found" στο Discovery;', true),
       ]),
-      _P([('Συνήθως είναι ένα από: (α) λίγα bars στο data dir — τρέξε Data Bootstrap πρώτα, (β) πολύ αυστηρά Promotion thresholds — άνοιξε το Strategy Lab → Validation και ελέγξε ποιες μετρικές κόβουν τις στρατηγικές, (γ) λάθος account currency — δες Settings → Account.', false)]),
+      _P([('Πλέον το NeoEthos σου λέει ', false), ('ακριβώς ποιο στάδιο', true), (' του pipeline έκοψε τα πάντα και τι να κάνεις — διάβασε το μήνυμα αποτυχίας (π.χ. "stage \'passed_quality\' rejected 412 of 412 — lower min Sharpe / win-rate, or enable opportunistic mode"). Οι συνηθισμένες αιτίες: (α) λίγα bars — τρέξε Data Bootstrap ή άσε το auto-fetch, (β) πολύ αυστηρά thresholds — χαλάρωσέ τα στο στάδιο που αναφέρει το μήνυμα, (γ) λάθος account currency — δες Settings → Account.', false)]),
     ],
   ),
 };
@@ -752,6 +807,33 @@ final Map<String, _HelpSection> _helpContentEn = {
       ]),
     ],
   ),
+  'chart': const _HelpSection(
+    title: 'Chart',
+    blocks: [
+      _H3('Live data — not stored'),
+      _P([
+        ('The chart shows ', false),
+        ('live candles straight from the broker', true),
+        (' (cTrader trendbars), not a stale snapshot off disk. The last candle moves in real time from the spot stream.', false),
+      ]),
+      _H4('Scroll-back — pan years into the past (TradingView model)'),
+      _P([
+        ('Drag the chart ', false),
+        ('left', true),
+        (' past the oldest loaded candle and NeoEthos auto-loads the next page of older bars live from the broker. ', false),
+        ('They stay in memory only — they never touch the disk.', true),
+        (' Pan two years back at zero disk cost.', false),
+      ]),
+      _Tip('For very deep scroll-back on M1 (millions of candles), switch to a higher timeframe (H1/H4/D1) — same as any professional terminal.'),
+      _H4('Controls'),
+      _UL([
+        [('Zoom: ', true), ('scroll / pinch on the chart', false)],
+        [('OHLC crosshair: ', true), ('long-press to read open/high/low/close on any candle', false)],
+        [('Overlays / sub-panels: ', true), ('MA · BOLL (top) and MACD · KDJ · RSI · WR (bottom) — computed live on broker data', false)],
+        [('Account switcher: ', true), ('change account (DEMO/LIVE) from the top-bar dropdown', false)],
+      ]),
+    ],
+  ),
   'ai': const _HelpSection(
     title: 'AI Engine',
     blocks: [
@@ -788,6 +870,34 @@ final Map<String, _HelpSection> _helpContentEn = {
       _Tip('⚠ 75-90% of retail FX traders lose money. Risky Mode = aggressive ≠ safe. Always validate on demo for weeks first.'),
     ],
   ),
+  'data': const _HelpSection(
+    title: 'Data & Disk',
+    blocks: [
+      _H3('Where data comes from'),
+      _P([
+        ('There are ', false),
+        ('two separate sources', true),
+        (' — the difference matters:', false),
+      ]),
+      _UL([
+        [('Live (broker): ', true), ('Chart, Market Watch, indicators, scroll-back. Straight from the broker and ', false), ('NOT written to disk.', true)],
+        [('Local Vortex cache: ', true), ('only Discovery and Training need stored history for backtest/training — ', false), ('that', true), (' is written to disk.', false)],
+      ]),
+      _H4('What writes to disk'),
+      _UL([
+        [('Data Bootstrap', true), (' (Settings → Data): explicit download of a history window for a symbol/timeframe.', false)],
+        [('Discovery auto-fetch: ', true), ('if there isn\'t enough history when you run discovery, it downloads it automatically (~N years, controlled by FOREX_BOT_MIN_HISTORY_YEARS) and stores it.', false)],
+        [('data_dir: ', true), ('the storage folder — set in Settings → Data.', false)],
+      ]),
+      _Tip('Viewing a chart — even panning years back — does NOT fill the disk. Only Data Bootstrap and Discovery persist history, because backtest/training needs it.'),
+      _H4('Supported symbols'),
+      _P([
+        ('The symbol list comes from the broker but is restricted to ', false),
+        ('forex, metals, indices and commodities', true),
+        (' — the broker\'s stocks and ETFs are excluded automatically (the engine never trades them).', false),
+      ]),
+    ],
+  ),
   'shortcuts': const _HelpSection(
     title: 'Shortcuts',
     blocks: [
@@ -813,7 +923,7 @@ final Map<String, _HelpSection> _helpContentEn = {
       _P([('Where are my credentials stored?', true)]),
       _P([('Locally on disk (Windows Credential Manager + broker_credentials.toml). Never sent to an external server. NeoEthos has no cloud sync.', false)]),
       _P([('Why does Discovery say "no strategies found"?', true)]),
-      _P([('Usually one of: (a) too few bars in the data dir — run Data Bootstrap first, (b) Promotion thresholds too strict — check Strategy Lab → Validation, (c) wrong account currency — check Settings → Account.', false)]),
+      _P([('NeoEthos now tells you ', false), ('exactly which pipeline stage', true), (' rejected everything and what to do — read the failure message (e.g. "stage \'passed_quality\' rejected 412 of 412 — lower min Sharpe / win-rate, or enable opportunistic mode"). Common causes: (a) too few bars — run Data Bootstrap or let auto-fetch handle it, (b) thresholds too strict — relax them at the stage the message names, (c) wrong account currency — check Settings → Account.', false)]),
     ],
   ),
 };
