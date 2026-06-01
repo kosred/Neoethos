@@ -19,7 +19,8 @@ use crate::app_services::ctrader_bootstrap::NormalizedBar;
 use crate::app_services::ctrader_data::{
     CTraderChartHistoryRequest, CTraderHistoricalBarsFetchResult, CTraderLightSymbolInfo,
     CTraderResolvedSymbol, CTraderSymbolLookupRequest, CTraderSymbolsListResult, HistoricalBar,
-    load_historical_bars_only, parse_symbols_list_response, resolve_symbol,
+    load_historical_bars_only, parse_asset_class_list_response,
+    parse_symbol_category_list_response, parse_symbols_list_response, resolve_symbol,
 };
 use crate::app_services::ctrader_execution::{
     CTraderExecutionBackend, CTraderExecutionOutcome, CTraderExecutionRequest,
@@ -31,7 +32,8 @@ use crate::app_services::ctrader_messages::{
 };
 use crate::app_services::ctrader_messages::{
     CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, build_account_auth_request,
-    build_application_auth_request, build_symbols_list_request,
+    build_application_auth_request, build_asset_class_list_request,
+    build_symbol_category_list_request, build_symbols_list_request,
 };
 use crate::app_services::secure_store::production_ctrader_token_store;
 use crate::app_services::trading::CTraderEnvironment;
@@ -44,6 +46,13 @@ pub struct BrokerSymbolsBundle {
     pub environment: &'static str,
     pub symbols: Vec<CTraderLightSymbolInfo>,
     pub archived_symbols: Vec<String>,
+    /// F-341: `symbol_id → canonical asset bucket` ("forex" | "metals" |
+    /// "indices" | "commodities"). Built from the broker's own
+    /// asset-class / symbol-category tables. Empty when the broker's
+    /// classification RPCs failed (in which case `symbols` is the
+    /// unfiltered list — we never blank the Markets tab over a
+    /// classification hiccup).
+    pub asset_class_by_id: std::collections::HashMap<i64, String>,
 }
 
 /// What `/broker/accounts` returns. Sourced from
@@ -219,14 +228,21 @@ pub fn fetch_broker_symbols_blocking() -> Result<BrokerSymbolsBundle> {
         .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
 
     let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
+    // F-341: one connection, five requests — symbols list + the broker's
+    // own asset-class and symbol-category tables. The latter two let us
+    // restrict the catalog to forex/metals/indices/commodities (dropping
+    // the broker's 700+ equities & ETFs the engine never trades) using
+    // the broker's classification, not name-pattern guesses.
     let responses = transport.send_sequence(&[
         build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
         build_account_auth_request(account_id, &creds.access_token, "account-auth-1"),
         build_symbols_list_request(account_id, false, "symbols-1"),
+        build_asset_class_list_request(account_id, "asset-classes-1"),
+        build_symbol_category_list_request(account_id, "symbol-categories-1"),
     ])?;
     if responses.len() < 3 {
         return Err(anyhow!(
-            "expected 3 cTrader symbols-list responses, received {}",
+            "expected ≥3 cTrader symbols-list responses, received {}",
             responses.len()
         ));
     }
@@ -237,12 +253,107 @@ pub fn fetch_broker_symbols_blocking() -> Result<BrokerSymbolsBundle> {
         archived_symbols,
     } = parse_symbols_list_response(&responses[2])?;
 
+    // Build `category_id → canonical bucket` from the broker tables.
+    // Best-effort: if either RPC is missing or unparseable we log and
+    // fall through to the unfiltered list (an empty bucket map), so a
+    // classification hiccup never blanks the Markets tab.
+    let category_bucket: std::collections::HashMap<i64, &'static str> = (|| {
+        let classes = parse_asset_class_list_response(responses.get(3)?).ok()?;
+        let categories = parse_symbol_category_list_response(responses.get(4)?).ok()?;
+        // class_id → canonical bucket, keeping only the forex-ai classes.
+        let class_bucket: std::collections::HashMap<i64, &'static str> = classes
+            .iter()
+            .filter(|c| crate::app_services::capture_symbols::is_forex_ai_asset_class(&c.name))
+            .map(|c| (c.id, canonical_asset_bucket(&c.name)))
+            .collect();
+        Some(
+            categories
+                .iter()
+                .filter_map(|cat| {
+                    class_bucket
+                        .get(&cat.asset_class_id)
+                        .map(|bucket| (cat.id, *bucket))
+                })
+                .collect(),
+        )
+    })()
+    .unwrap_or_default();
+
+    if category_bucket.is_empty() {
+        // Classification unavailable — return everything, untagged. The
+        // UI picker falls back to its own name heuristics in this case.
+        tracing::warn!(
+            "broker symbol classification unavailable; returning all {} symbols unfiltered",
+            symbols.len()
+        );
+        return Ok(BrokerSymbolsBundle {
+            account_id,
+            environment: creds.env_label,
+            symbols,
+            archived_symbols,
+            asset_class_by_id: std::collections::HashMap::new(),
+        });
+    }
+
+    // Keep only symbols whose category resolves to a forex-ai bucket;
+    // tag each kept symbol with that bucket for the UI category chips.
+    let total_raw = symbols.len();
+    let mut asset_class_by_id: std::collections::HashMap<i64, String> =
+        std::collections::HashMap::new();
+    let filtered: Vec<CTraderLightSymbolInfo> = symbols
+        .into_iter()
+        .filter(|s| {
+            match s
+                .symbol_category_id
+                .and_then(|cid| category_bucket.get(&cid))
+            {
+                Some(bucket) => {
+                    asset_class_by_id.insert(s.symbol_id, (*bucket).to_string());
+                    true
+                }
+                // Unknown / uncategorised → drop (matches the bootstrap's
+                // conservative "no category = not forex" stance).
+                None => false,
+            }
+        })
+        .collect();
+
+    tracing::info!(
+        "broker symbols classified: kept {} of {} (forex/metals/indices/commodities)",
+        filtered.len(),
+        total_raw
+    );
+
     Ok(BrokerSymbolsBundle {
         account_id,
         environment: creds.env_label,
-        symbols,
+        symbols: filtered,
         archived_symbols,
+        asset_class_by_id,
     })
+}
+
+/// Map a broker asset-class name onto one of the four canonical buckets
+/// the UI groups by. Order matters: "metal" / "indic" / "commodit" are
+/// checked before the forex default so e.g. "Spot Metals" lands in
+/// `metals` rather than the catch-all. Only called for names that
+/// already passed [`is_forex_ai_asset_class`].
+fn canonical_asset_bucket(class_name: &str) -> &'static str {
+    let lower = class_name.to_ascii_lowercase();
+    if lower.contains("metal") {
+        "metals"
+    } else if lower.contains("indic") || lower.contains("index") {
+        "indices"
+    } else if lower.contains("commodit")
+        || lower.contains("energ")
+        || lower.contains("oil")
+        || lower.contains("gas")
+    {
+        "commodities"
+    } else {
+        // forex / fx / currencies — the remaining keep-list classes.
+        "forex"
+    }
 }
 
 /// Download historical bars for [from_ms, to_ms] and write the result

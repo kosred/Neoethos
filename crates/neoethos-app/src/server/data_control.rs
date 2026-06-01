@@ -77,6 +77,11 @@ pub struct BrokerSymbolDto {
     pub symbol_name: String,
     pub enabled: bool,
     pub description: Option<String>,
+    /// F-341: canonical asset bucket from the broker's classification —
+    /// "forex" | "metals" | "indices" | "commodities". `None` when the
+    /// broker's class tables were unavailable (the list is then
+    /// unfiltered and the UI falls back to name heuristics).
+    pub asset_class: Option<String>,
 }
 
 pub async fn symbols(State(state): State<AppApiState>) -> Response {
@@ -95,6 +100,7 @@ pub async fn symbols(State(state): State<AppApiState>) -> Response {
                 .collect();
             state.set_symbol_catalog(catalog).await;
 
+            let asset_class_by_id = bundle.asset_class_by_id;
             let dto = BrokerSymbolsDto {
                 account_id: bundle.account_id,
                 environment: bundle.environment.to_string(),
@@ -103,6 +109,7 @@ pub async fn symbols(State(state): State<AppApiState>) -> Response {
                     .symbols
                     .into_iter()
                     .map(|s| BrokerSymbolDto {
+                        asset_class: asset_class_by_id.get(&s.symbol_id).cloned(),
                         symbol_id: s.symbol_id,
                         symbol_name: s.symbol_name,
                         enabled: s.enabled,
