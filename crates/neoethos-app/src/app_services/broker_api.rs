@@ -522,8 +522,68 @@ pub fn fetch_recent_chart_bars_blocking(
     Ok(bars)
 }
 
+/// Fetch up to `limit` OHLCV bars ENDING strictly before `before_ms`,
+/// straight from the broker with **NO disk write** — the chart's
+/// scroll-back pagination path. This is the TradingView model: when the
+/// operator pans left past the oldest loaded candle, the client asks for
+/// the next page of older history, holds it only in memory, and never
+/// persists it. Two years of scroll-back therefore costs zero disk — the
+/// local Vortex cache is only ever written by the explicit Data
+/// Bootstrap / discovery auto-fetch paths, never by viewing a chart.
+///
+/// Returns bars sorted oldest→newest, every one with
+/// `timestamp_ms < before_ms`, so the client can splice the result onto
+/// the front of its list without overlap. Empty result ⇒ the broker has
+/// nothing older (we've reached the start of its coverage). Opens a fresh
+/// WSS connection + re-auths, so callers must run it on a blocking task.
+pub fn fetch_chart_bars_before_blocking(
+    symbol: &str,
+    timeframe: &str,
+    before_ms: i64,
+    limit: usize,
+) -> Result<Vec<HistoricalBar>> {
+    if limit == 0 || before_ms <= 0 {
+        return Ok(Vec::new());
+    }
+    let creds = resolve_creds()?;
+    let step_ms = chart_bar_step_ms(timeframe);
+    // Same generous headroom as the recent-bars path: markets aren't open
+    // 24/7, so the wall-clock window must be wider than `limit × step` to
+    // actually contain `limit` bars. `count` bounds the response so the
+    // wide window never over-fetches.
+    let span_ms = step_ms
+        .saturating_mul(limit as i64)
+        .saturating_mul(3)
+        .max(step_ms);
+    let from_ms = before_ms.saturating_sub(span_ms).max(0);
+    let request = CTraderChartHistoryRequest {
+        client_id: creds.client_id.clone(),
+        client_secret: creds.client_secret.clone(),
+        access_token: creds.access_token.clone(),
+        environment: creds.environment,
+        account_id: creds.account_id_str.clone(),
+        symbol_name: symbol.to_string(),
+        timeframe: timeframe.to_string(),
+        from_timestamp_ms: from_ms,
+        to_timestamp_ms: before_ms,
+        count: Some(limit as u32),
+    };
+    let CTraderHistoricalBarsFetchResult { mut bars, .. } =
+        load_historical_bars_only(&request)?;
+    bars.sort_by_key(|b| b.timestamp_ms);
+    bars.dedup_by_key(|b| b.timestamp_ms);
+    // Drop any bar at/after the cursor so the page is strictly older.
+    bars.retain(|b| b.timestamp_ms < before_ms);
+    if bars.len() > limit {
+        let cut = bars.len() - limit;
+        bars.drain(0..cut);
+    }
+    Ok(bars)
+}
+
 /// Duration of a single bar for the canonical timeframe, in ms. Used to
-/// size the broker fetch window in [`fetch_recent_chart_bars_blocking`].
+/// size the broker fetch window in [`fetch_recent_chart_bars_blocking`]
+/// and [`fetch_chart_bars_before_blocking`].
 fn chart_bar_step_ms(tf: &str) -> i64 {
     let m: i64 = 60 * 1000;
     match tf.trim().to_ascii_uppercase().as_str() {

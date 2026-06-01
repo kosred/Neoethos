@@ -184,6 +184,9 @@ pub fn router(state: AppApiState) -> Router {
         // clients without SSE support + for the cold-start snapshot.
         .route("/live/spots/stream", get(live_spots::stream))
         .route("/chart", get(chart::chart))
+        // Scroll-back pagination: older bars on demand, broker-only, never
+        // persisted (TradingView model — panning back costs zero disk).
+        .route("/chart/history", get(chart::chart_history))
         .route("/indicators", get(indicators::indicators))
         .route("/diagnostics/report", post(diagnostics::report))
         // ── Trade-management confirmation flow (#136) ──────────

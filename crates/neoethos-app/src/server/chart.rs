@@ -211,6 +211,139 @@ pub async fn chart(State(state): State<AppApiState>, Query(q): Query<ChartQuery>
     }
 }
 
+// ─── GET /chart/history ───────────────────────────────────────────────────
+//
+// Scroll-back pagination. The Flutter chart calls this from k_chart_plus's
+// `onLoadMore` when the operator pans left past the oldest loaded candle:
+// it returns the next page of OLDER bars (strictly before `beforeMs`),
+// fetched live from the broker and held only in the client's memory. This
+// is the TradingView model — panning two years back costs ZERO disk; the
+// local Vortex cache is written only by explicit Data Bootstrap / discovery
+// auto-fetch, never by viewing a chart.
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChartHistoryQuery {
+    pub symbol: Option<String>,
+    pub timeframe: Option<String>,
+    /// Cursor: return bars STRICTLY OLDER than this unix-ms timestamp
+    /// (the time of the oldest candle the client currently holds).
+    pub before_ms: i64,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChartHistoryDto {
+    pub symbol: String,
+    pub timeframe: String,
+    pub candle_count: usize,
+    /// Older candles, oldest→newest, all strictly before the cursor.
+    pub candles: Vec<CandleDto>,
+    /// `false` once the broker returns an empty page — the client stops
+    /// asking for more.
+    pub has_more: bool,
+    pub source: ChartDataSource,
+}
+
+pub async fn chart_history(
+    State(_state): State<AppApiState>,
+    Query(q): Query<ChartHistoryQuery>,
+) -> Response {
+    let symbol = q
+        .symbol
+        .unwrap_or_else(|| "EURUSD".to_string())
+        .trim()
+        .to_uppercase();
+    let timeframe = q
+        .timeframe
+        .unwrap_or_else(|| "M1".to_string())
+        .trim()
+        .to_uppercase();
+    let before_ms = q.before_ms;
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT).max(1);
+
+    if before_ms <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "beforeMs must be a positive unix-millis cursor",
+            })),
+        )
+            .into_response();
+    }
+
+    let symbol_for_dto = symbol.clone();
+    let timeframe_for_dto = timeframe.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::app_services::broker_api::fetch_chart_bars_before_blocking(
+            &symbol, &timeframe, before_ms, limit,
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(bars)) => {
+            let candles: Vec<CandleDto> = bars
+                .iter()
+                .map(|b| CandleDto {
+                    ts_ms: Some(b.timestamp_ms),
+                    open: b.open,
+                    high: b.high,
+                    low: b.low,
+                    close: b.close,
+                    volume: b.volume.unwrap_or(0) as f64,
+                })
+                .collect();
+            let source = if candles.is_empty() {
+                ChartDataSource::Empty
+            } else {
+                ChartDataSource::Broker
+            };
+            Json(ChartHistoryDto {
+                symbol: symbol_for_dto,
+                timeframe: timeframe_for_dto,
+                candle_count: candles.len(),
+                // A non-empty page means there may be more older bars; an
+                // empty page means we've reached the broker's earliest
+                // coverage, so the client stops paginating.
+                has_more: !candles.is_empty(),
+                candles,
+                source,
+            })
+            .into_response()
+        }
+        // Broker unreachable / no session: 200 with an empty page so the
+        // chart simply stops scrolling back rather than throwing — older
+        // history just isn't available right now.
+        Ok(Err(err)) => {
+            tracing::debug!(
+                target: "neoethos_app::server::chart",
+                symbol = %symbol_for_dto,
+                timeframe = %timeframe_for_dto,
+                error = %err,
+                "chart history fetch failed; returning empty page"
+            );
+            Json(ChartHistoryDto {
+                symbol: symbol_for_dto,
+                timeframe: timeframe_for_dto,
+                candle_count: 0,
+                candles: Vec::new(),
+                has_more: false,
+                source: ChartDataSource::Empty,
+            })
+            .into_response()
+        }
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("chart history task panicked: {join_err}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// Load OHLC candles for a symbol/timeframe from the local data dir.
 pub fn load_chart(
     config_path: &PathBuf,
