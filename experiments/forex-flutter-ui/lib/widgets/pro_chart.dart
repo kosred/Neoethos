@@ -1,13 +1,22 @@
 // Professional candlestick chart (F-336) — k_chart_plus.
 //
 // Replaces the custom CustomPaint chart with a TradingView/cTrader-grade
-// k-line: pinch/scroll pan + zoom, MA/BOLL price overlays + MACD/KDJ/RSI/
-// WR sub-panels (computed client-side by k_chart_plus, so they "just
-// work" regardless of the /indicators endpoint), a live "now price"
-// line, and a long-press OHLC crosshair. Fed by the backend's
-// broker-passthrough candles (source=broker) plus the live spot stream
-// for the forming candle. `onLoadMore` is wired for future scroll-back
-// history (needs a `before`-timestamp chart endpoint — follow-up).
+// k-line: pinch/scroll pan + zoom, client-side price overlays (SMA/EMA/
+// BOLL) + sub-panels (RSI/MACD/Stoch) computed by k_chart_plus over the
+// candle data (so they "just work" regardless of the /indicators
+// endpoint and stay pan/zoom aware), a live "now price" line, and a
+// long-press OHLC crosshair. Fed by the backend's broker-passthrough
+// candles (source=broker) plus the live spot stream for the forming
+// candle. `onLoadMore` pages older history in from /chart/history.
+//
+// F-360: the chart's indicator set is driven ENTIRELY by the chip row
+// on the Chart screen (one unified control — no second toolbar here).
+// The chips map to k_chart_plus indicators where one exists; the three
+// indicators k_chart_plus can't compute (ATR, ADX, VWAP) are taken from
+// the server's /indicators endpoint and drawn in a thin strip below the
+// k-line (see `_ServerIndicatorStrip`).
+
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -18,19 +27,50 @@ import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../theme/theme.dart';
 
+/// Chip ids that k_chart_plus computes client-side. Anything NOT in here
+/// (atr/adx/vwap) has no k_chart_plus equivalent and is server-fed.
+const kChartClientIndicators = <String>{
+  'sma',
+  'ema',
+  'bollinger_bands',
+  'rsi',
+  'macd',
+  'stoch',
+};
+
+/// Chip ids that have no k_chart_plus equivalent — computed server-side
+/// (vector_ta via /indicators) and drawn in the strip below the k-line.
+/// VWAP is price-valued; ATR/ADX are oscillators. All three share the
+/// strip, each auto-scaled to its own min/max.
+const kChartServerIndicators = <String>['vwap', 'atr', 'adx'];
+
 class ProChart extends ConsumerStatefulWidget {
   final ChartSnapshot snapshot;
-  const ProChart({super.key, required this.snapshot});
+
+  /// The chip-row state for this panel (slot A or B). ProChart rebuilds
+  /// its k_chart_plus indicator lists from this set on every build, so
+  /// toggling a chip immediately changes what the chart draws.
+  final StateProvider<Set<String>> activeIndicators;
+
+  /// The per-indicator server fetch for this panel — family-keyed by
+  /// indicator id. Used ONLY for atr/adx/vwap (the ones k_chart_plus
+  /// can't compute). Same provider the chip row's `_ChartSlot.indicator`
+  /// field points at, so panel A and panel B stay independent.
+  final AutoDisposeFutureProviderFamily<IndicatorSnapshot, String>
+      indicatorFamily;
+
+  const ProChart({
+    super.key,
+    required this.snapshot,
+    required this.activeIndicators,
+    required this.indicatorFamily,
+  });
 
   @override
   ConsumerState<ProChart> createState() => _ProChartState();
 }
 
 class _ProChartState extends ConsumerState<ProChart> {
-  bool _ma = true;
-  bool _boll = false;
-  String? _secondary = 'MACD'; // MACD | KDJ | RSI | WR | null
-
   // ── Scroll-back pagination (F-344) ─────────────────────────────────
   // Older candles fetched on-demand from /chart/history as the operator
   // pans left past the oldest loaded bar — TradingView model: held only
@@ -51,6 +91,7 @@ class _ProChartState extends ConsumerState<ProChart> {
   Widget build(BuildContext context) {
     final snap = widget.snapshot;
     final digits = _digits(snap.symbol);
+    final active = ref.watch(widget.activeIndicators);
 
     // Reset the scroll-back buffer when the symbol or timeframe changes —
     // older bars from EURUSD M1 must never bleed into GBPUSD H1. Safe to
@@ -99,25 +140,36 @@ class _ProChartState extends ConsumerState<ProChart> {
       if (mid < last.low) last.low = mid;
     }
 
+    // ── Build the k_chart_plus indicator lists FROM THE CHIP ROW. ──────
+    // Rebuilt on every build from `active`, then re-run through
+    // DataUtil.calculateAll below — so toggling a chip immediately
+    // changes what the chart renders. SMA/EMA use a single 20-period
+    // line (the chip is a coarse on/off, not a per-period editor); BOLL
+    // uses k_chart_plus's standard 20/2. Stoch maps to KDJ (KDJ IS the
+    // stochastic oscillator — see the package's kdj_indicator.dart,
+    // `name: 'stoch'`).
     final mainIndicators = <MainIndicator>[
-      if (_ma) MAIndicator(calcParams: const [5, 10, 30]),
-      if (_boll) BOLLIndicator(),
+      if (active.contains('sma')) MAIndicator(calcParams: const [20]),
+      if (active.contains('ema')) EMAIndicator(calcParams: const [20]),
+      if (active.contains('bollinger_bands')) BOLLIndicator(),
     ];
     final secondaryIndicators = <SecondaryIndicator>[
-      if (_secondary == 'MACD') MACDIndicator(),
-      if (_secondary == 'KDJ') KDJIndicator(),
-      if (_secondary == 'RSI') RSIIndicator(),
-      if (_secondary == 'WR') WRIndicator(),
+      if (active.contains('macd')) MACDIndicator(),
+      if (active.contains('rsi')) RSIIndicator(),
+      if (active.contains('stoch')) KDJIndicator(),
     ];
     if (data.isNotEmpty) {
       DataUtil.calculateAll(data, mainIndicators, secondaryIndicators);
     }
 
+    // The server-fed indicators the operator has switched on. Only these
+    // trigger a /indicators round-trip + the bottom strip.
+    final serverActive =
+        kChartServerIndicators.where(active.contains).toList(growable: false);
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _toolbar(),
-        const SizedBox(height: 6),
         SizedBox(
           height: 440,
           child: data.isEmpty
@@ -150,6 +202,17 @@ class _ProChartState extends ConsumerState<ProChart> {
                   },
                 ),
         ),
+        // ── Server-fed strip (ATR/ADX/VWAP) ────────────────────────────
+        // k_chart_plus has no equivalent for these and exposes no
+        // custom-line hook, so we draw them ourselves from /indicators.
+        // Right-aligned to the trailing window (the server returns the
+        // last N candles, same tail the chart shows at the right edge).
+        for (final id in serverActive)
+          _ServerIndicatorStrip(
+            indicatorId: id,
+            digits: digits,
+            family: widget.indicatorFamily,
+          ),
       ],
     );
   }
@@ -191,68 +254,6 @@ class _ProChartState extends ConsumerState<ProChart> {
     } finally {
       _loadingMore = false;
     }
-  }
-
-  Widget _toolbar() {
-    Widget chip(String label, bool on, VoidCallback onTap) => GestureDetector(
-          onTap: onTap,
-          child: Container(
-            margin: const EdgeInsets.only(right: 6, bottom: 4),
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-            decoration: BoxDecoration(
-              color: on
-                  ? ForexAiTokens.accent.withValues(alpha: 0.18)
-                  : ForexAiTokens.appBg,
-              border: Border.all(
-                color: on ? ForexAiTokens.accent : ForexAiTokens.border,
-              ),
-              borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
-            ),
-            child: Text(
-              label,
-              style: TextStyle(
-                fontSize: 11,
-                fontWeight: FontWeight.w700,
-                color: on ? ForexAiTokens.accent : ForexAiTokens.textMuted,
-              ),
-            ),
-          ),
-        );
-    return Wrap(
-      crossAxisAlignment: WrapCrossAlignment.center,
-      children: [
-        const Padding(
-          padding: EdgeInsets.only(right: 8, bottom: 4),
-          child: Text(
-            'OVERLAY',
-            style: TextStyle(
-              fontSize: 9,
-              letterSpacing: 0.5,
-              color: ForexAiTokens.textMuted,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ),
-        chip('MA', _ma, () => setState(() => _ma = !_ma)),
-        chip('BOLL', _boll, () => setState(() => _boll = !_boll)),
-        const SizedBox(width: 12),
-        const Padding(
-          padding: EdgeInsets.only(right: 8, bottom: 4),
-          child: Text(
-            'SUB-PANEL',
-            style: TextStyle(
-              fontSize: 9,
-              letterSpacing: 0.5,
-              color: ForexAiTokens.textMuted,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ),
-        for (final s in const ['MACD', 'KDJ', 'RSI', 'WR'])
-          chip(s, _secondary == s,
-              () => setState(() => _secondary = _secondary == s ? null : s)),
-      ],
-    );
   }
 
   Widget _detail(KLineEntity e, int digits) {
@@ -324,4 +325,166 @@ class _ProChartState extends ConsumerState<ProChart> {
         selectFillColor: ForexAiTokens.panelBg,
         selectBorderColor: ForexAiTokens.border,
       );
+}
+
+/// A thin sub-panel for ONE server-computed indicator (ATR / ADX / VWAP).
+/// k_chart_plus can't compute these and exposes no external-line hook, so
+/// we fetch the series from /indicators (already pan-window-correct: the
+/// server returns the trailing N candles) and paint it ourselves. Each
+/// strip auto-scales to its own min/max so ATR's tiny values and VWAP's
+/// price-level values both fill the band.
+class _ServerIndicatorStrip extends ConsumerWidget {
+  final String indicatorId;
+  final int digits;
+  final AutoDisposeFutureProviderFamily<IndicatorSnapshot, String> family;
+  const _ServerIndicatorStrip({
+    required this.indicatorId,
+    required this.digits,
+    required this.family,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final async = ref.watch(family(indicatorId));
+    return Container(
+      margin: const EdgeInsets.only(top: 6),
+      padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
+      decoration: BoxDecoration(
+        color: ForexAiTokens.panelBg.withValues(alpha: 0.5),
+        border: Border.all(color: ForexAiTokens.border),
+        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+      ),
+      child: async.when(
+        loading: () => _label('${_title()} · loading…'),
+        error: (e, _) => _label('${_title()} · unavailable'),
+        data: (snap) {
+          // Pick the first finite line. atr/adx/vwap are single-output,
+          // so there is exactly one line; guard for an empty/all-NaN
+          // payload (too-short history) so we degrade to a hint instead
+          // of painting nothing.
+          final values = snap.lines.isEmpty
+              ? const <double>[]
+              : snap.lines.first.values;
+          final finite = values.where((v) => v.isFinite).toList(growable: false);
+          if (finite.isEmpty) {
+            return _label('${_title()} · no data (window too short)');
+          }
+          final last = values.lastWhere((v) => v.isFinite,
+              orElse: () => double.nan);
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _label(
+                '${_title()} · ${last.isFinite ? last.toStringAsFixed(_strDigits()) : '—'}',
+              ),
+              const SizedBox(height: 2),
+              SizedBox(
+                height: 40,
+                width: double.infinity,
+                child: CustomPaint(
+                  painter: _LinePainter(
+                    values: values,
+                    color: _color(),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  String _title() {
+    switch (indicatorId) {
+      case 'atr':
+        return 'ATR';
+      case 'adx':
+        return 'ADX';
+      case 'vwap':
+        return 'VWAP';
+      default:
+        return indicatorId.toUpperCase();
+    }
+  }
+
+  // VWAP is a price level → show full pip precision. ATR/ADX read better
+  // with fewer decimals.
+  int _strDigits() => indicatorId == 'vwap' ? digits : 2;
+
+  Color _color() {
+    switch (indicatorId) {
+      case 'atr':
+        return ForexAiTokens.warning;
+      case 'adx':
+        return ForexAiTokens.accent;
+      case 'vwap':
+        return ForexAiTokens.buy;
+      default:
+        return ForexAiTokens.textPrimary;
+    }
+  }
+
+  Widget _label(String text) => Text(
+        text,
+        style: const TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w700,
+          color: ForexAiTokens.textMuted,
+        ),
+      );
+}
+
+/// Auto-scaling polyline over a value series, painted left→right with the
+/// freshest value at the right edge. NaN warm-up entries break the line
+/// (no segment drawn across a gap) so the leading flat-zero artefact the
+/// old custom painter had can't reappear.
+class _LinePainter extends CustomPainter {
+  final List<double> values;
+  final Color color;
+  const _LinePainter({required this.values, required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (values.length < 2) return;
+    double lo = double.infinity, hi = double.negativeInfinity;
+    for (final v in values) {
+      if (!v.isFinite) continue;
+      lo = math.min(lo, v);
+      hi = math.max(hi, v);
+    }
+    if (!lo.isFinite || !hi.isFinite) return;
+    final span = (hi - lo).abs() < 1e-12 ? 1.0 : (hi - lo);
+
+    final dx = size.width / (values.length - 1);
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 1.2
+      ..style = PaintingStyle.stroke
+      ..isAntiAlias = true;
+
+    final path = Path();
+    var pen = false; // whether the path currently has a live point
+    for (int i = 0; i < values.length; i++) {
+      final v = values[i];
+      if (!v.isFinite) {
+        pen = false; // break the line across the gap
+        continue;
+      }
+      final x = dx * i;
+      // Invert Y: high values near the top. Pad 3px top/bottom.
+      final y = 3 + (size.height - 6) * (1 - (v - lo) / span);
+      if (!pen) {
+        path.moveTo(x, y);
+        pen = true;
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _LinePainter old) =>
+      old.values != values || old.color != color;
 }

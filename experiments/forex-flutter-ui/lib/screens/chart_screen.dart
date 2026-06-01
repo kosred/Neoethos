@@ -39,17 +39,6 @@ const _indicatorChips = <String>[
   'vwap',
 ];
 
-/// Which indicators render directly on the price chart (share the
-/// candle's Y-axis range). The others would need a separate sub-panel
-/// with its own Y-axis — that lands in a follow-up; for now toggling
-/// them on shows the chip as active but doesn't draw anything.
-const _priceBandOverlays = <String>{
-  'sma',
-  'ema',
-  'bollinger_bands',
-  'vwap',
-};
-
 String _indicatorLabel(String id) {
   switch (id) {
     case 'sma':
@@ -479,19 +468,23 @@ class _ChartPanel extends ConsumerWidget {
                   builder: (ctx, indRef, _) {
                     final active =
                         indRef.watch(slot.activeIndicators).contains(ind);
-                    // F-268 (2026-05-28): oscillator-pending hint.
-                    // Indicators NOT in `_priceBandOverlays` don't
-                    // render any line on the price canvas yet — the
-                    // user reported "chip activates but no overlay
-                    // drawn" as a bug. The Wrap below already shows
-                    // a small text note, but the chips themselves
-                    // looked identical to working overlays. Mark
-                    // oscillators with a leading "• " bullet so the
-                    // distinction is visible at the click site, and
-                    // wrap in a Tooltip explaining the pending state.
-                    final isOscillator = !_priceBandOverlays.contains(ind);
+                    // F-360: the chip row is the ONE unified indicator
+                    // control. Every chip now actually draws on the live
+                    // k_chart_plus chart below. Two render paths:
+                    //   • client-side (k_chart_plus computes it over the
+                    //     candles, pan/zoom-aware) — SMA/EMA/BBands/RSI/
+                    //     MACD/Stoch.
+                    //   • server-fed (ATR/ADX/VWAP have no k_chart_plus
+                    //     equivalent) — pulled from /indicators and drawn
+                    //     in a strip under the k-line.
+                    // We mark the server-fed ones with a leading "• " and
+                    // a tooltip so the operator knows why those three look
+                    // slightly different (separate strip vs on the
+                    // candles), but BOTH paths render for real.
+                    final serverFed =
+                        kChartServerIndicators.contains(ind);
                     final chip = _Chip(
-                      label: isOscillator
+                      label: serverFed
                           ? '• ${_indicatorLabel(ind)}'
                           : _indicatorLabel(ind),
                       selected: active,
@@ -507,14 +500,14 @@ class _ChartPanel extends ConsumerWidget {
                         notifier.state = next;
                       },
                     );
-                    return isOscillator
+                    return serverFed
                         ? Tooltip(
                             message:
-                                '${_indicatorLabel(ind)} is an oscillator '
-                                '— renders in a sub-panel (not the price '
-                                'canvas). Sub-panel rendering is parked; '
-                                'toggling on/off still affects the '
-                                'oscillator-status text below the chart.',
+                                '${_indicatorLabel(ind)} has no native '
+                                'k_chart_plus form, so it is computed '
+                                'server-side and drawn in its own strip '
+                                'below the candles (auto-scaled). VWAP is '
+                                'a price level; ATR/ADX are oscillators.',
                             child: chip,
                           )
                         : chip;
@@ -657,11 +650,18 @@ class _ChartBody extends ConsumerWidget {
                     child: InlineBuySell(symbol: snapshot.symbol),
                   ),
                 ),
-                // F-336: professional k-line chart (k_chart_plus) —
-                // candlesticks + MA/BOLL overlays + MACD/KDJ/RSI/WR
-                // sub-panels + pan/zoom + live forming candle. Replaces
-                // the custom CustomPaint canvas.
-                ProChart(snapshot: snapshot),
+                // F-336/F-360: professional k-line chart (k_chart_plus).
+                // The chip row above (slot.activeIndicators) is the ONE
+                // unified indicator control — ProChart rebuilds its
+                // k_chart_plus overlay/sub-panel lists from that set and
+                // pulls ATR/ADX/VWAP from `slot.indicator` (/indicators)
+                // for the strip below the k-line. Pan/zoom + live forming
+                // candle + scroll-back all preserved.
+                ProChart(
+                  snapshot: snapshot,
+                  activeIndicators: slot.activeIndicators,
+                  indicatorFamily: slot.indicator,
+                ),
               ],
             ],
           ),
