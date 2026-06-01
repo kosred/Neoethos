@@ -115,34 +115,3 @@ class SectionCard extends StatelessWidget {
   }
 }
 
-class PendingStub extends StatelessWidget {
-  final String title;
-  final String subtitle;
-  const PendingStub({super.key, required this.title, required this.subtitle});
-  @override
-  Widget build(BuildContext context) {
-    // Wrap in SingleChildScrollView so the placeholder copy + section
-    // card fit cleanly in narrow / short test viewports (the default
-    // 800x600 flutter_test surface trips a RenderFlex overflow
-    // otherwise). The dock panel already supplies horizontal padding,
-    // so we only need vertical scroll here.
-    return SingleChildScrollView(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          ViewHeader(title: title, subtitle: subtitle),
-          const SectionCard(
-            title: 'Pending — Flutter wiring',
-            child: Text(
-              'Αυτό το panel θα συνδεθεί στο Rust backend μέσω REST/SSE '
-              'στην επόμενη φάση. Το shell (topbar, sidebar, statusbar, '
-              'theme) λειτουργεί ήδη — εδώ θα έρθει το πραγματικό '
-              'wiring με data από το neoethos backend + Gemma.',
-              style: TextStyle(color: ForexAiTokens.textMuted),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
