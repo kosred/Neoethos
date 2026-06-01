@@ -8,6 +8,7 @@ import '../api/backend_client.dart' show EnginesSnapshot;
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/multi_symbol_picker.dart';
 import '_placeholder.dart';
 import 'widgets/engine_controls.dart';
 
@@ -475,8 +476,31 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
           icon: const Icon(Icons.add, size: 16),
           label: const Text('Add'),
         ),
+        const SizedBox(width: 8),
+        // F-337: multi-select pairs from the broker catalog (checkboxes +
+        // search) instead of typing tickers one by one.
+        OutlinedButton.icon(
+          onPressed: _queueRunning ? null : _browsePairs,
+          icon: const Icon(Icons.checklist, size: 16),
+          label: const Text('Browse'),
+        ),
       ],
     );
+  }
+
+  /// F-337: open the multi-select catalog picker, seeded with the current
+  /// queue, and replace the queue with the operator's checked selection.
+  Future<void> _browsePairs() async {
+    final picked = await showMultiSymbolPicker(
+      context,
+      preselected: _symbolQueue.toSet(),
+    );
+    if (picked == null || !mounted) return;
+    setState(() {
+      _symbolQueue
+        ..clear()
+        ..addAll(picked);
+    });
   }
 
   Widget _queueListChips() {
