@@ -206,28 +206,73 @@ fn load_and_compute(
 ) -> anyhow::Result<(usize, Vec<IndicatorLine>)> {
     // F-553/F-576 closure (2026-05-25): resolved via the process-wide
     // install so a non-default `--config` flag still works.
-    let config_path = super::state::current_config_path();
-    let settings = Settings::from_yaml(&config_path)
-        .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
-    let dataset = load_symbol_dataset(&settings.system.data_dir, &symbol)
-        .map_err(|e| anyhow::anyhow!("dataset load failed for {symbol}: {e}"))?;
-    let ohlcv = dataset.frames.get(&timeframe).ok_or_else(|| {
-        anyhow::anyhow!(
-            "timeframe '{timeframe}' not in dataset for {symbol} (available: {})",
-            dataset
-                .frames
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
+    // Broker-passthrough (mirrors /chart): compute on LIVE broker bars so
+    // indicators work on every timeframe even when the local cache is
+    // short — EURUSD H1 had only 25 disk bars, too few for MACD's 26+9
+    // warm-up, so it 500'd. Fetch extra bars for the warm-up, then trim to
+    // `limit`. Falls back to the local Vortex cache when the broker is
+    // unreachable.
+    let fetch_count = (limit + 300).min(MAX_LIMIT);
+    let broker_ohlcv: Option<neoethos_data::Ohlcv> =
+        crate::app_services::broker_api::fetch_recent_chart_bars_blocking(
+            &symbol,
+            &timeframe,
+            fetch_count,
         )
-    })?;
+        .ok()
+        .filter(|bars| !bars.is_empty())
+        .map(|bars| {
+            let n = bars.len();
+            let mut timestamp = Vec::with_capacity(n);
+            let mut open = Vec::with_capacity(n);
+            let mut high = Vec::with_capacity(n);
+            let mut low = Vec::with_capacity(n);
+            let mut close = Vec::with_capacity(n);
+            let mut volume = Vec::with_capacity(n);
+            for b in &bars {
+                timestamp.push(b.timestamp_ms);
+                open.push(b.open);
+                high.push(b.high);
+                low.push(b.low);
+                close.push(b.close);
+                volume.push(b.volume.unwrap_or(0) as f64);
+            }
+            neoethos_data::Ohlcv {
+                timestamp: Some(timestamp),
+                open,
+                high,
+                low,
+                close,
+                volume: Some(volume),
+            }
+        });
 
-    // Compute on the entire dataset, then trim to the trailing
-    // `limit` candles to match `/chart` semantics. Trimming after
-    // compute avoids edge effects at the start of the window
-    // (indicators need warm-up bars).
-    let lines_full = compute_single_indicator(ohlcv, &indicator, &params)?;
+    let ohlcv: neoethos_data::Ohlcv = match broker_ohlcv {
+        Some(b) => b,
+        None => {
+            let config_path = super::state::current_config_path();
+            let settings = Settings::from_yaml(&config_path)
+                .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
+            let dataset = load_symbol_dataset(&settings.system.data_dir, &symbol)
+                .map_err(|e| anyhow::anyhow!("dataset load failed for {symbol}: {e}"))?;
+            dataset.frames.get(&timeframe).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "timeframe '{timeframe}' not in dataset for {symbol} (available: {})",
+                    dataset
+                        .frames
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?
+        }
+    };
+
+    // Compute on the full series, then trim to the trailing `limit`
+    // candles to match `/chart` semantics — trimming after compute avoids
+    // edge effects at the window start (indicators need warm-up bars).
+    let lines_full = compute_single_indicator(&ohlcv, &indicator, &params)?;
     let total = ohlcv.len();
     let start = total.saturating_sub(limit);
     let trimmed: Vec<IndicatorLine> = lines_full
