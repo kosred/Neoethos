@@ -81,9 +81,17 @@ class AppShell extends ConsumerWidget {
               },
             ),
           },
+          // F-339: wrap the whole shell in a SelectionArea so the operator
+          // can select + copy ANY text (balances, account IDs, errors,
+          // log lines, config values). Flutter Text is non-selectable by
+          // default — without this, nothing in the app could be copied.
+          // The chart opens as a separate route, so its drag-to-pan isn't
+          // affected by this selection layer.
           child: Focus(
             autofocus: true,
-            child: _ShellGrid(activeId: activeId),
+            child: SelectionArea(
+              child: _ShellGrid(activeId: activeId),
+            ),
           ),
         ),
       ),
