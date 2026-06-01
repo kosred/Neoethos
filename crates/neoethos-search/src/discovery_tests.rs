@@ -86,8 +86,11 @@ fn empty_portfolio_is_an_explicit_error() {
     let err = ensure_non_empty_portfolio(&result, "EURUSD M1")
         .expect_err("expected empty discovery portfolio to fail");
     let msg = err.to_string();
-    assert!(msg.contains("empty portfolio"), "unexpected error: {msg}");
-    assert!(msg.contains("candidates=1"), "unexpected error: {msg}");
+    // F-343: the message is now an actionable diagnosis. With no funnel
+    // profile captured it still names the context + candidate count.
+    assert!(msg.contains("no strategies"), "unexpected error: {msg}");
+    assert!(msg.contains("EURUSD M1"), "unexpected error: {msg}");
+    assert!(msg.contains("1 candidate"), "unexpected error: {msg}");
 }
 
 #[test]

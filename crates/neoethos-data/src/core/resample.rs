@@ -15,7 +15,10 @@ pub fn parse_timeframe_to_minutes(tf: &str) -> Result<i64> {
         "D1" => Ok(1440),
         "W1" => Ok(10080),
         "MN1" => Ok(43200),
-        _ => bail!("unsupported timeframe: {}", tf),
+        _ => bail!(
+            "Unsupported timeframe: '{}'. Valid: M1, M5, M15, M30, H1, H4, H12, D1, W1, MN1.",
+            tf
+        ),
     }
 }
 

@@ -33,6 +33,7 @@ use serde::Deserialize;
 
 use crate::app_services::discovery::{ModelTargetsFile, model_targets_path_for};
 
+use super::errors::{actionable_error, internal_panic};
 use super::state::AppApiState;
 
 /// Root dir for trained models (what Training writes).
@@ -74,18 +75,13 @@ pub async fn promotion_status(
         tokio::task::spawn_blocking(move || evaluate_promotion_for(&symbol, &base_tf)).await;
     match result {
         Ok(Ok(dto)) => Json(dto).into_response(),
-        Ok(Err(err)) => (
+        Ok(Err(err)) => actionable_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("blocking task panicked: {join_err}")
-            })),
-        )
-            .into_response(),
+            "Could not evaluate the promotion gate. Run Discovery first to produce a \
+             portfolio for this symbol/timeframe, then retry.",
+            &err,
+        ),
+        Err(join_err) => internal_panic("Evaluating the promotion gate", join_err),
     }
 }
 
@@ -201,18 +197,13 @@ pub async fn promote(
             // (portfolio quality) didn't meet the precondition.
             (StatusCode::PRECONDITION_FAILED, Json(dto)).into_response()
         }
-        Ok(Err(err)) => (
+        Ok(Err(err)) => actionable_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("blocking task panicked: {join_err}")
-            })),
-        )
-            .into_response(),
+            "Promotion failed. Make sure Discovery finished and the models folder has valid \
+             artifacts for this symbol/timeframe.",
+            &err,
+        ),
+        Err(join_err) => internal_panic("Promoting the strategy", join_err),
     }
 }
 

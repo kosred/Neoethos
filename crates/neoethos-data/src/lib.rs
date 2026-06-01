@@ -306,7 +306,11 @@ pub fn load_symbol_timeframe(
 ) -> Result<Ohlcv> {
     let path = symbol_timeframe_vortex_path(root, symbol, timeframe);
     if !path.exists() {
-        bail!("vortex dataset not found: {}", path.display());
+        bail!(
+            "Vortex dataset not found for {} {} at {}. \
+             Run Data Bootstrap (or `neoethos-cli import`) to download history first.",
+            symbol, timeframe, path.display()
+        );
     }
     // F-307 (2026-05-28): belt-and-braces integrity gate. Most callers
     // arrive here via `discover_timeframes` which already filters out
@@ -484,7 +488,15 @@ pub fn normalize_ohlcv(ohlcv: &Ohlcv) -> Result<Ohlcv> {
         || ohlcv.close.len() != expected_len
         || volume.is_some_and(|values| values.len() != expected_len)
     {
-        bail!("OHLCV column length mismatch");
+        bail!(
+            "OHLCV column length mismatch: timestamps={} open={} high={} low={} close={} — \
+             the file may be corrupted; re-import it.",
+            expected_len,
+            ohlcv.open.len(),
+            ohlcv.high.len(),
+            ohlcv.low.len(),
+            ohlcv.close.len()
+        );
     }
 
     let mut rows = Vec::with_capacity(expected_len);
@@ -604,7 +616,10 @@ fn vortex_array_to_ohlcv(array: vortex_array::ArrayRef) -> Result<Ohlcv> {
                 return extract_non_null_primitive_vec::<f64>(field, name);
             }
         }
-        bail!("missing OHLCV column {:?}", names)
+        bail!(
+            "Missing OHLCV column(s) {:?} — re-import the source; the file may use an older schema.",
+            names
+        )
     };
 
     Ok(Ohlcv {
@@ -625,7 +640,10 @@ fn extract_non_null_primitive_vec<T: NativePType>(
         .all_valid()
         .with_context(|| format!("failed to inspect {label} validity"))?
     {
-        bail!("{label} contains nulls");
+        bail!(
+            "Column '{label}' has null values — the source data has gaps; \
+             re-import after filling/trimming them."
+        );
     }
 
     Ok(array.to_primitive().as_slice::<T>().to_vec())
@@ -638,7 +656,11 @@ fn validate_ohlcv_row(row: &OhlcvRow) -> Result<()> {
         || !row.close.is_finite()
         || row.volume.is_some_and(|value| !value.is_finite())
     {
-        bail!("non-finite OHLCV value detected");
+        bail!(
+            "NaN/Inf in OHLCV at timestamp {} (open={} high={} low={} close={}) — \
+             re-import and verify the price data is clean.",
+            row.timestamp, row.open, row.high, row.low, row.close
+        );
     }
     if row.high < row.low
         || row.open < row.low
@@ -646,7 +668,11 @@ fn validate_ohlcv_row(row: &OhlcvRow) -> Result<()> {
         || row.close < row.low
         || row.close > row.high
     {
-        bail!("invalid OHLC row detected");
+        bail!(
+            "Invalid OHLC row at timestamp {} (open={} high={} low={} close={}) — \
+             source has bad candles; re-import or trim them.",
+            row.timestamp, row.open, row.high, row.low, row.close
+        );
     }
     if row.volume.is_some_and(|value| value < 0.0) {
         bail!("negative volume detected");
@@ -771,7 +797,10 @@ pub fn prepare_multitimeframe_features_with_options(
     let base_ohlcv = ds
         .frames
         .get(base_tf)
-        .ok_or_else(|| anyhow::anyhow!("base tf missing"))?;
+        .ok_or_else(|| anyhow::anyhow!(
+            "Base timeframe '{}' is missing from dataset '{}' — resample it first.",
+            base_tf, ds.symbol
+        ))?;
     let base_ns = base_ohlcv
         .timestamp
         .as_ref()

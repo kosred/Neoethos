@@ -21,6 +21,7 @@ use crate::app_services::broker_api::{
 };
 use crate::app_services::ctrader_errors::translate_anyhow;
 
+use super::errors::internal_panic;
 use super::state::AppApiState;
 
 #[derive(Debug, serde::Deserialize)]
@@ -186,18 +187,24 @@ fn outcome_to_response(
             // an optional Re-authenticate / Open Settings CTA, instead
             // of the raw "errorCode=CH_ACCESS_TOKEN_INVALID" string the
             // operator would otherwise see.
-            let mut body = serde_json::json!({"error": err.to_string()});
+            let raw = err.to_string();
             if let Some(t) = translate_anyhow(&err) {
-                body["translation"] = serde_json::to_value(&t).unwrap_or(serde_json::Value::Null);
+                let body = serde_json::json!({
+                    "error": t.message,
+                    "detail": raw,
+                    "translation": t,
+                });
+                (StatusCode::BAD_GATEWAY, Json(body)).into_response()
+            } else {
+                let body = serde_json::json!({
+                    "error": "Broker request failed — could not reach cTrader. Make sure \
+                              you're authenticated (Broker Setup → Re-authenticate) and \
+                              connected.",
+                    "detail": raw,
+                });
+                (StatusCode::BAD_GATEWAY, Json(body)).into_response()
             }
-            (StatusCode::BAD_GATEWAY, Json(body)).into_response()
         }
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("execution task panicked: {join_err}"),
-            })),
-        )
-            .into_response(),
+        Err(join_err) => internal_panic("Submitting the order", join_err),
     }
 }

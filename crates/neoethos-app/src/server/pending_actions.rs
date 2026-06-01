@@ -25,6 +25,7 @@ use crate::app_services::pending_actions::{
     ActionKind, ActionStatus, list_all, mark_completed, mark_confirmed, mark_rejected,
 };
 
+use super::errors::{actionable_error, internal_panic};
 use super::state::AppApiState;
 
 /// `GET /actions/pending` — returns the full queue (live + recent
@@ -131,28 +132,16 @@ pub async fn confirm(
                 Ok(Err(err)) => {
                     let note = format!("broker rejected close: {err}");
                     mark_completed(&id, ActionStatus::Failed, note.clone());
-                    (
+                    actionable_error(
                         StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "error": note,
-                            "code": "broker_failed",
-                            "action_id": id,
-                        })),
+                        "The trade action could not be completed — refresh and try again.",
+                        &err,
                     )
-                        .into_response()
                 }
                 Err(join_err) => {
                     let note = format!("close_position blocking task panicked: {join_err}");
-                    mark_completed(&id, ActionStatus::Failed, note.clone());
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "error": note,
-                            "code": "broker_panic",
-                            "action_id": id,
-                        })),
-                    )
-                        .into_response()
+                    mark_completed(&id, ActionStatus::Failed, note);
+                    internal_panic("Completing the trade action", join_err)
                 }
             }
         }
@@ -173,14 +162,11 @@ pub async fn reject(
             "action": snap,
         }))
         .into_response(),
-        Err(err) => (
+        Err(err) => actionable_error(
             StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": err.to_string(),
-                "code": "reject_failed",
-            })),
-        )
-            .into_response(),
+            "The trade action could not be completed — refresh and try again.",
+            &err,
+        ),
     }
 }
 

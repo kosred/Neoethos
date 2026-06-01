@@ -36,6 +36,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use zip::write::SimpleFileOptions;
 
+use super::errors::{actionable_error, internal_panic};
 use super::state::AppApiState;
 
 #[derive(Debug, Deserialize)]
@@ -87,18 +88,13 @@ pub async fn report(State(state): State<AppApiState>, Json(req): Json<ReportRequ
     let config_path = state.config_path().to_path_buf();
     match tokio::task::spawn_blocking(move || build_bundle(&req, &config_path)).await {
         Ok(Ok(resp)) => Json(resp).into_response(),
-        Ok(Err(err)) => (
+        Ok(Err(err)) => actionable_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("diagnostics task panicked: {join_err}"),
-            })),
-        )
-            .into_response(),
+            "Could not generate the diagnostic report. Try again; if it keeps failing, \
+             restart the app.",
+            &err,
+        ),
+        Err(join_err) => internal_panic("Generating diagnostics", join_err),
     }
 }
 

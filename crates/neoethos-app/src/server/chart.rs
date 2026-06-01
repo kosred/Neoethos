@@ -40,6 +40,7 @@ use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
 use neoethos_data::{discover_timeframes, load_symbol_timeframe_tail};
 
+use super::errors::{actionable_error, internal_panic};
 use super::state::AppApiState;
 
 const DEFAULT_LIMIT: usize = 500;
@@ -195,19 +196,14 @@ pub async fn chart(State(state): State<AppApiState>, Query(q): Query<ChartQuery>
         }
         // load_chart's or_else above always returns Ok, so this arm
         // is only reachable if a future change re-introduces a fatal
-        // error path; surface it as 500 so the UI banner makes sense.
-        Ok(Err(err)) => (
+        // error path; surface a friendly message so the UI banner helps.
+        Ok(Err(err)) => actionable_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("blocking task panicked: {join_err}"),
-            })),
-        )
-            .into_response(),
+            "Chart data could not be loaded. If the broker is connected, refresh; \
+             otherwise open Data Bootstrap and download a window for this symbol/timeframe.",
+            &err,
+        ),
+        Err(join_err) => internal_panic("Loading chart data", join_err),
     }
 }
 
@@ -334,13 +330,7 @@ pub async fn chart_history(
             })
             .into_response()
         }
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("chart history task panicked: {join_err}"),
-            })),
-        )
-            .into_response(),
+        Err(join_err) => internal_panic("Loading older chart bars", join_err),
     }
 }
 

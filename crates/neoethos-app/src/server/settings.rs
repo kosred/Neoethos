@@ -23,6 +23,7 @@ use axum::response::{IntoResponse, Response};
 use neoethos_core::{NewsTradingMode, Settings};
 use std::path::PathBuf;
 
+use super::errors::actionable_error;
 use super::state::AppApiState;
 
 /// Path to the canonical `config.yaml` this server reads + writes.
@@ -101,14 +102,15 @@ pub async fn settings_raw_yaml(State(_state): State<AppApiState>) -> Response {
             "path": absolute.display().to_string(),
         }))
         .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("failed to read {}: {err}", path.display()),
-                "code": "config_read_failed",
-            })),
-        )
-            .into_response(),
+        Err(err) => {
+            let err = anyhow::anyhow!("{err}");
+            actionable_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not read config.yaml. Make sure the app can read its data folder, \
+                 then reload Settings.",
+                &err,
+            )
+        }
     }
 }
 
@@ -215,14 +217,13 @@ pub async fn update_settings_raw_yaml(
     // (4) Atomic write via temp file + rename so a crash mid-write
     // can't truncate the live config.
     if let Err(err) = write_atomic(&path, &payload.yaml) {
-        return (
+        let err = anyhow::anyhow!("{err}");
+        return actionable_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("failed to persist config.yaml: {err}"),
-                "code": "config_save_failed",
-            })),
-        )
-            .into_response();
+            "Settings could not be saved. Close any editor that may have config.yaml open \
+             and make sure the folder is writable, then try again.",
+            &err,
+        );
     }
 
     tracing::info!(
@@ -369,14 +370,13 @@ pub async fn update_settings(
             error = %err,
             "failed to write config.yaml from POST /settings"
         );
-        return (
+        let err = anyhow::anyhow!("{err}");
+        return actionable_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("failed to persist settings: {err}"),
-                "code": "config_save_failed",
-            })),
-        )
-            .into_response();
+            "Settings could not be saved. Close any editor that may have config.yaml open \
+             and make sure the folder is writable, then try again.",
+            &err,
+        );
     }
 
     tracing::info!(

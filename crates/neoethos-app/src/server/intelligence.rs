@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
 
+use super::errors::{actionable_error, internal_panic};
 use super::state::AppApiState;
 
 #[derive(Debug, serde::Serialize)]
@@ -53,18 +54,13 @@ pub async fn intelligence(State(_state): State<AppApiState>) -> Response {
     let result = tokio::task::spawn_blocking(scan_intelligence).await;
     match result {
         Ok(Ok(dto)) => Json(dto).into_response(),
-        Ok(Err(err)) => (
+        Ok(Err(err)) => actionable_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("blocking task panicked: {join_err}")
-            })),
-        )
-            .into_response(),
+            "Could not read the models directory. Run Discovery and Training first, \
+             or check the app data folder is accessible.",
+            &err,
+        ),
+        Err(join_err) => internal_panic("Loading intelligence", join_err),
     }
 }
 

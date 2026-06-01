@@ -29,6 +29,7 @@ use crate::app_services::discovery::{DiscoveryRequest, start_discovery_job};
 use crate::app_services::jobs::{JobKind, JobState};
 use crate::app_services::training::{TrainingRequest, start_training_job};
 
+use super::errors::actionable_error;
 use super::state::AppApiState;
 
 /// Shared request body for `start` endpoints — picks the symbol +
@@ -123,11 +124,12 @@ pub async fn discovery_start(
     let data_root = match resolve_data_root().await {
         Ok(p) => p,
         Err(err) => {
-            return (
+            return actionable_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
-            )
-                .into_response();
+                "Discovery can't start — config.yaml couldn't be loaded. \
+                 Check the data directory path in Settings, then try again.",
+                &err,
+            );
         }
     };
 
@@ -231,11 +233,12 @@ pub async fn discovery_start(
     let handle = match start_discovery_job(request, tx) {
         Ok(h) => h,
         Err(err) => {
-            return (
+            return actionable_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": err.to_string()})),
-            )
-                .into_response();
+                "Discovery failed to start. Make sure a symbol and timeframe are selected, \
+                 then try again.",
+                &err,
+            );
         }
     };
 
@@ -311,11 +314,12 @@ pub async fn training_start(
     let handle = match start_training_job(request, tx) {
         Ok(h) => h,
         Err(err) => {
-            return (
+            return actionable_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": err.to_string()})),
-            )
-                .into_response();
+                "Training failed to start. Make sure Discovery finished for this \
+                 symbol/timeframe and model_targets.json exists in the models folder.",
+                &err,
+            );
         }
     };
 

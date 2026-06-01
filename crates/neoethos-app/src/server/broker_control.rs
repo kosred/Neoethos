@@ -23,6 +23,7 @@ use crate::app_services::broker_api::fetch_broker_accounts_blocking;
 use crate::app_services::broker_persistence::{load_broker_settings, save_broker_settings};
 use crate::app_services::reauth::run_reauth_flow_blocking;
 
+use super::errors::{actionable_error, internal_panic};
 use super::state::AppApiState;
 
 // ─── GET / POST /broker/credentials ───────────────────────────────────────
@@ -74,11 +75,7 @@ pub async fn credentials_get(State(_state): State<AppApiState>) -> Response {
             }))
             .into_response()
         }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("settings load panicked: {err}")})),
-        )
-            .into_response(),
+        Err(join_err) => internal_panic("Loading saved credentials", join_err),
     }
 }
 
@@ -169,18 +166,13 @@ pub async fn credentials_post(
             "message": "Credentials saved. Open Broker Setup → Re-authenticate to fetch a fresh token.",
         }))
         .into_response(),
-        Ok(Err(err)) => (
+        Ok(Err(err)) => actionable_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("save task panicked: {join_err}"),
-            })),
-        )
-            .into_response(),
+            "Could not save your cTrader credentials. Make sure the app data folder \
+             (%APPDATA%\\neoethos) is writable, then try again.",
+            &err,
+        ),
+        Err(join_err) => internal_panic("Saving credentials", join_err),
     }
 }
 
@@ -324,18 +316,13 @@ pub async fn account_select(
             })),
         )
             .into_response(),
-        Ok(Err(err)) => (
+        Ok(Err(err)) => actionable_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("account-select task panicked: {join_err}"),
-            })),
-        )
-            .into_response(),
+            "Failed to save the selected account. Make sure broker_credentials.toml isn't \
+             locked by another process, then try again.",
+            &err,
+        ),
+        Err(join_err) => internal_panic("Selecting the account", join_err),
     }
 }
 
@@ -354,13 +341,13 @@ pub async fn reauth(State(_state): State<AppApiState>) -> Response {
                 error = %err,
                 "POST /broker/reauth: OAuth flow failed"
             );
-            (
+            actionable_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": err.to_string(),
-                })),
+                "Authentication failed. Make sure no other app is using the OAuth callback \
+                 port, then try Broker Setup → Re-authenticate. If the consent page didn't \
+                 open, check your default browser.",
+                &err,
             )
-                .into_response()
         }
         Err(join_err) => {
             tracing::error!(
@@ -368,13 +355,7 @@ pub async fn reauth(State(_state): State<AppApiState>) -> Response {
                 error = %join_err,
                 "POST /broker/reauth: blocking task panicked"
             );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("reauth task panicked: {join_err}"),
-                })),
-            )
-                .into_response()
+            internal_panic("Re-authentication", join_err)
         }
     }
 }

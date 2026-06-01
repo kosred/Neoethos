@@ -203,7 +203,10 @@ pub fn import_one_file(
         "jsonl" => parse_jsonl(path),
         "parquet" => parse_parquet(path),
         "vortex" => parse_vortex(path),
-        other => bail!("internal: detected unsupported format {}", other),
+        other => bail!(
+            "Unsupported file format '{}'. Supported: csv, tsv, json, jsonl, parquet, vortex.",
+            other
+        ),
     };
 
     let ohlcv = match ohlcv {
@@ -266,7 +269,12 @@ pub fn import_one_file(
             format,
             rows: row_count,
             status: ImportStatus::Skipped,
-            message: "could not infer symbol/timeframe from path".to_string(),
+            message: format!(
+                "Could not infer symbol/timeframe from '{}'. \
+                 Organise files as <root>/EURUSD/M5/data.csv or name them EURUSD_M5_2024.csv, \
+                 or pass --symbol/--timeframe.",
+                path.display()
+            ),
         });
     };
 

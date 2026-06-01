@@ -891,7 +891,11 @@ fn trim_recent_history(
     let ohlcv_rows = ohlcv.close.len();
     let available_rows = frame_rows.min(ohlcv_rows);
     if available_rows == 0 {
-        anyhow::bail!("cannot run discovery on empty history");
+        anyhow::bail!(
+            "Cannot run discovery on empty history for {} {} — \
+             import at least the minimum bars (run `neoethos-cli import`) then retry.",
+            config.evaluation_symbol, config.timeframe_label
+        );
     }
 
     let mut start_idx = 0usize;
@@ -1352,7 +1356,17 @@ fn build_discovery_validation_artifacts(
     }
     let n = validation_row_count(features, ohlcv)?;
     if portfolio_signals.iter().any(|signals| signals.len() != n) {
-        anyhow::bail!("discovery validation requires portfolio signals aligned to feature rows");
+        let mismatched = portfolio_signals
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.len() != n)
+            .map(|(i, s)| format!("signals[{}].len()={}", i, s.len()))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "Internal bug: discovery validation requires portfolio signals aligned to feature rows \
+             (expected {} rows, {}). Please report this with config.yaml and the discovery log.",
+            n, mismatched
+        );
     }
 
     let temporal_contract = discovery_temporal_contract(config, &features.names)?;
@@ -3247,7 +3261,8 @@ pub fn ensure_portfolio_export_ready(result: &DiscoveryResult) -> Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "portfolio export requires validation gates: walkforward_passed={} cpcv_passed={}",
+        "Portfolio export requires passing validation gates (walkforward_passed={} cpcv_passed={}). \
+         Lower the walk-forward splits or disable CPCV in config.yaml and re-run.",
         result.validation_gates.walkforward_passed,
         result.validation_gates.cpcv_passed
     );

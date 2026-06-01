@@ -38,6 +38,7 @@ pub mod chart;
 pub mod chart_cache;
 pub mod codex;
 pub mod data_control;
+pub mod errors;
 pub mod diagnostics;
 pub mod engines_control;
 pub mod hardware;

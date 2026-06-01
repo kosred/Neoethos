@@ -26,6 +26,7 @@ use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
 use neoethos_data::{IndicatorLine, compute_single_indicator, load_symbol_dataset};
 
+use super::errors::{actionable_error, internal_panic};
 use super::state::AppApiState;
 
 /// Top-10 indicators we surface on the Chart screen. Adding a new
@@ -182,18 +183,14 @@ pub async fn indicators(
                 .collect(),
         })
         .into_response(),
-        Ok(Err(err)) => (
+        Ok(Err(err)) => actionable_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("indicator task panicked: {join_err}"),
-            })),
-        )
-            .into_response(),
+            "Could not compute this indicator. If the chart shows candles for this \
+             symbol/timeframe, try a different period; otherwise the data window may \
+             be too short — scroll the chart to load more history, then retry.",
+            &err,
+        ),
+        Err(join_err) => internal_panic("Computing the indicator", join_err),
     }
 }
 

@@ -88,7 +88,11 @@ impl FeatureCache {
 pub fn feature_frame_to_vortex(frame: &FeatureFrame) -> Result<vortex_array::ArrayRef> {
     let n_rows = frame.data.nrows();
     if frame.timestamps.len() != n_rows {
-        bail!("feature frame timestamp/data row mismatch");
+        bail!(
+            "Feature frame timestamp/data row mismatch: timestamps={} data_rows={} — \
+             the feature cache is corrupt; delete cache/features/ and re-run to rebuild.",
+            frame.timestamps.len(), n_rows
+        );
     }
     if frame.names.len() != frame.data.ncols() {
         bail!("feature frame name/data column mismatch");
@@ -138,7 +142,11 @@ pub fn vortex_to_feature_frame(array: vortex_array::ArrayRef) -> Result<FeatureF
             .with_context(|| format!("missing feature field {field_name}"))?;
         let values = extract_non_null_primitive_vec::<f32>(field, &field_name)?;
         if values.len() != n_rows {
-            bail!("feature field {field_name} row mismatch");
+            bail!(
+                "Feature field '{}' has {} rows but expected {} — \
+                 the feature cache is corrupt; delete cache/features/ and re-run to rebuild.",
+                field_name, values.len(), n_rows
+            );
         }
         names.push(field_name);
         columns.push(values);
@@ -167,7 +175,10 @@ fn extract_non_null_primitive_vec<T: NativePType>(
         .all_valid()
         .with_context(|| format!("failed to inspect {label} validity"))?
     {
-        bail!("{label} contains nulls");
+        bail!(
+            "Column '{label}' has null values — the source data has gaps; \
+             re-import after filling/trimming them."
+        );
     }
 
     Ok(array.to_primitive().as_slice::<T>().to_vec())

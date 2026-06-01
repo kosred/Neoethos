@@ -34,6 +34,7 @@ use neoethos_codex::{
     ChatCompletionRequest, ChatMessage, StoredAuth, exchange_code,
 };
 
+use super::errors::actionable_error;
 use super::state::AppApiState;
 
 // ─── GET /auth/codex/status ───────────────────────────────────────────────
@@ -127,13 +128,12 @@ pub async fn start(State(state): State<AppApiState>) -> Response {
     let listener = match CallbackServer::bind().await {
         Ok(l) => l,
         Err(err) => {
-            return (
+            let err = anyhow::anyhow!("{err}");
+            return actionable_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": err.to_string(),
-                })),
-            )
-                .into_response();
+                "The AI Desk request failed. Check your AI provider settings and try again.",
+                &err,
+            );
         }
     };
 
@@ -314,7 +314,6 @@ pub async fn chat(
             .into_response()
         }
         Err(err) => {
-            let message = err.to_string();
             let status = match &err {
                 neoethos_codex::CodexError::NotAuthenticated => StatusCode::UNAUTHORIZED,
                 neoethos_codex::CodexError::ApiCall { status, .. } => {
@@ -322,7 +321,12 @@ pub async fn chat(
                 }
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            (status, Json(serde_json::json!({"error": message}))).into_response()
+            let err = anyhow::anyhow!("{err}");
+            actionable_error(
+                status,
+                "The AI Desk request failed. Check your AI provider settings and try again.",
+                &err,
+            )
         }
     }
 }

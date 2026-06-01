@@ -236,7 +236,11 @@ fn required_i64_column(df: &DataFrame, names: &[&str]) -> Result<Vec<i64>> {
         }
     }
 
-    bail!("missing required column {:?}", names)
+    bail!(
+        "Missing required column {:?} in parquet file. \
+         Expected: timestamp, open, high, low, close (aliases o/h/l/c).",
+        names
+    )
 }
 
 fn required_f64_column(df: &DataFrame, names: &[&str]) -> Result<Vec<f64>> {
@@ -256,7 +260,11 @@ fn required_f64_column(df: &DataFrame, names: &[&str]) -> Result<Vec<f64>> {
         }
     }
 
-    bail!("missing required column {:?}", names)
+    bail!(
+        "Missing required column {:?} in parquet file. \
+         Expected: timestamp, open, high, low, close (aliases o/h/l/c).",
+        names
+    )
 }
 
 fn optional_f64_column(df: &DataFrame, names: &[&str]) -> Result<Option<Vec<f64>>> {
@@ -281,7 +289,10 @@ fn optional_f64_column(df: &DataFrame, names: &[&str]) -> Result<Option<Vec<f64>
 
 fn verify_equivalent_ohlcv(expected: &Ohlcv, actual: &Ohlcv) -> Result<()> {
     if expected.timestamp != actual.timestamp {
-        bail!("timestamp mismatch after parquet -> vortex conversion");
+        bail!(
+            "Timestamp mismatch after parquet -> vortex conversion; the converted file was discarded — \
+             re-run `neoethos-cli migrate-data`."
+        );
     }
 
     verify_f64_vec("open", &expected.open, &actual.open)?;

@@ -18,6 +18,7 @@ use crate::app_services::broker_api::{
 };
 use crate::app_services::ctrader_errors::translate_anyhow;
 
+use super::errors::internal_panic;
 use super::state::AppApiState;
 
 /// Build a 502 BAD_GATEWAY response that includes the cTrader error
@@ -25,10 +26,20 @@ use super::state::AppApiState;
 /// render a friendly banner + action button instead of the raw
 /// "errorCode=CH_ACCESS_TOKEN_INVALID" gibberish.
 fn broker_gateway_error(err: anyhow::Error) -> Response {
-    let mut body = serde_json::json!({"error": err.to_string()});
+    let raw = err.to_string();
     if let Some(t) = translate_anyhow(&err) {
-        body["translation"] = serde_json::to_value(&t).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({
+            "error": t.message,
+            "detail": raw,
+            "translation": t,
+        });
+        return (StatusCode::BAD_GATEWAY, Json(body)).into_response();
     }
+    let body = serde_json::json!({
+        "error": "Broker request failed — could not reach cTrader. Make sure you're \
+                  authenticated (Broker Setup → Re-authenticate) and connected.",
+        "detail": raw,
+    });
     (StatusCode::BAD_GATEWAY, Json(body)).into_response()
 }
 
@@ -121,13 +132,7 @@ pub async fn symbols(State(state): State<AppApiState>) -> Response {
             Json(dto).into_response()
         }
         Ok(Err(err)) => broker_gateway_error(err),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("symbols task panicked: {join_err}"),
-            })),
-        )
-            .into_response(),
+        Err(join_err) => internal_panic("Loading broker symbols", join_err),
     }
 }
 
@@ -189,13 +194,7 @@ pub async fn accounts(State(_state): State<AppApiState>) -> Response {
             Json(dto).into_response()
         }
         Ok(Err(err)) => broker_gateway_error(err),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("accounts task panicked: {join_err}"),
-            })),
-        )
-            .into_response(),
+        Err(join_err) => internal_panic("Loading broker accounts", join_err),
     }
 }
 
@@ -274,13 +273,7 @@ pub async fn fetch(State(state): State<AppApiState>, Json(body): Json<FetchBody>
             .into_response()
         }
         Ok(Err(err)) => broker_gateway_error(err),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("fetch task panicked: {join_err}"),
-            })),
-        )
-            .into_response(),
+        Err(join_err) => internal_panic("Downloading market data", join_err),
     }
 }
 
@@ -389,17 +382,15 @@ pub async fn import_file(
             super::chart_cache::clear_symbol(&dto.symbol);
             Json(dto).into_response()
         }
-        Ok(Err(err)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("import task panicked: {join_err}"),
-            })),
-        )
-            .into_response(),
+        Ok(Err(err)) => {
+            let friendly_err = anyhow::anyhow!("{err}");
+            super::errors::actionable_error(
+                StatusCode::BAD_REQUEST,
+                "File import failed. Supported formats: CSV, TSV, Parquet, JSON, JSONL, Arrow. \
+                 Check the path is correct and the file isn't open elsewhere.",
+                &friendly_err,
+            )
+        }
+        Err(join_err) => internal_panic("Importing the file", join_err),
     }
 }

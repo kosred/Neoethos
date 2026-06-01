@@ -35,7 +35,11 @@ impl BatchDiscoverySummary {
     fn finalize(self) -> Result<Self> {
         if self.portfolios_saved == 0 {
             anyhow::bail!(
-                "Batch discovery produced no usable portfolios (symbols={}, work_units={}, skipped_symbols={}, skipped_timeframes={}, feature_failures={}, empty_portfolios={}, discovery_failures={})",
+                "Batch discovery produced no usable portfolios \
+                 (symbols={}, work_units={}, skipped_symbols={}, skipped_timeframes={}, \
+                 feature_failures={}, empty_portfolios={}, discovery_failures={}). \
+                 Check cache/discovery/*.json funnel files for per-pair rejection reasons, \
+                 or run a single pair to see the detailed funnel.",
                 self.symbols_seen,
                 self.work_units_seen,
                 self.skipped_symbols,

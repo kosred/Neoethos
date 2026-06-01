@@ -53,21 +53,27 @@ impl SearchCheckpointScope {
     fn validate_resume(&self, expected: &Self) -> Result<()> {
         if self.config_hash != expected.config_hash {
             bail!(
-                "checkpoint config hash mismatch: stored={} expected={}",
+                "Search checkpoint from a previous run can't be resumed — config hash mismatch \
+                 (stored={} expected={}). \
+                 Delete cache/search/<symbol>_<tf>.checkpoint to start fresh.",
                 self.config_hash,
                 expected.config_hash
             );
         }
         if self.dataset_hash != expected.dataset_hash {
             bail!(
-                "checkpoint dataset hash mismatch: stored={} expected={}",
+                "Search checkpoint from a previous run can't be resumed — dataset hash mismatch \
+                 (stored={} expected={}). \
+                 Delete cache/search/<symbol>_<tf>.checkpoint to start fresh.",
                 self.dataset_hash,
                 expected.dataset_hash
             );
         }
         if self.search_space_hash != expected.search_space_hash {
             bail!(
-                "checkpoint search-space hash mismatch: stored={} expected={}",
+                "Search checkpoint from a previous run can't be resumed — search-space hash mismatch \
+                 (stored={} expected={}). \
+                 Delete cache/search/<symbol>_<tf>.checkpoint to start fresh.",
                 self.search_space_hash,
                 expected.search_space_hash
             );
@@ -98,7 +104,9 @@ impl SearchCheckpointScope {
     fn validate_resume_field(&self, label: &str, stored: &str, expected: &str) -> Result<()> {
         if stored != expected {
             bail!(
-                "checkpoint {label} hash mismatch: stored={} expected={}",
+                "Search checkpoint from a previous run can't be resumed — {label} hash mismatch \
+                 (stored={} expected={}). \
+                 Delete cache/search/<symbol>_<tf>.checkpoint to start fresh.",
                 stored,
                 expected
             );

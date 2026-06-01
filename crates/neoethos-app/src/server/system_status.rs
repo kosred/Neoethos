@@ -19,6 +19,7 @@ use neoethos_core::Settings;
 use crate::app_services::broker_persistence::load_broker_settings;
 use crate::app_services::jobs::JobKind;
 
+use super::errors::{actionable_error, internal_panic};
 use super::state::AppApiState;
 
 // ─── /engines/status ──────────────────────────────────────────────────────
@@ -82,17 +83,13 @@ pub struct BrokerStatusDto {
 pub async fn broker_status(State(state): State<AppApiState>) -> Response {
     let settings = match tokio::task::spawn_blocking(load_broker_settings).await {
         Ok(s) => s,
-        Err(err) => {
+        Err(join_err) => {
             tracing::warn!(
                 target: "neoethos_app::server::system_status",
-                error = %err,
+                error = %join_err,
                 "load_broker_settings panicked"
             );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "broker settings load failed"})),
-            )
-                .into_response();
+            return internal_panic("Loading broker status", join_err);
         }
     };
 
@@ -160,18 +157,12 @@ pub async fn data_bootstrap(State(state): State<AppApiState>) -> Response {
 
     match result {
         Ok(Ok(dto)) => Json(dto).into_response(),
-        Ok(Err(err)) => (
+        Ok(Err(err)) => actionable_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("blocking task panicked: {join_err}")
-            })),
-        )
-            .into_response(),
+            "Could not read the data inventory. Check the data directory in Settings → Data.",
+            &err,
+        ),
+        Err(join_err) => internal_panic("Loading the data inventory", join_err),
     }
 }
 

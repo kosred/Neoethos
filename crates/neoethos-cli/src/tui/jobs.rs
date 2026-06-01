@@ -232,7 +232,10 @@ impl JobManager {
             }
             Err(err) => {
                 let mut log = VecDeque::with_capacity(RING_BUFFER_LINES);
-                log.push_back(format!("failed to spawn: {}", err));
+                log.push_back(format!(
+                    "Failed to launch neoethos-cli ({}). Verify the binary is on PATH or re-install.",
+                    err
+                ));
                 self.jobs.push(Job {
                     label,
                     command_summary,
