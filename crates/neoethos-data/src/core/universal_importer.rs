@@ -438,21 +438,20 @@ pub fn parse_parquet_public(path: &Path) -> Result<Ohlcv> {
 /// Parse a CSV / TSV file, auto-detecting which header column maps to
 /// timestamp / open / high / low / close / volume.
 fn parse_csv(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
-    // #206 MT5-friendliness: MetaTrader 5 exports files with a `.csv`
-    // extension that are actually TAB-separated. If the caller told us
-    // "this is csv" but the first non-comment line contains tabs and no
-    // commas, flip to tab-mode automatically. Sniffing only kicks in
-    // when the caller said csv — explicit `tab_separated=true` is
-    // honoured as-is so we don't second-guess a known TSV.
-    let effective_tab = if tab_separated {
-        true
-    } else {
-        sniff_csv_is_tab_separated(path).unwrap_or(false)
-    };
+    // Auto-detect the delimiter: comma (US/default), semicolon (EU-locale
+    // exports — Excel/MT in de/el/fr where ',' is the decimal separator),
+    // or tab (MetaTrader 5 `.csv` files are really TSV). Sniffed from the
+    // header buffer; an explicit `tab_separated=true` forces tab. Without
+    // this, EU `time;open;…` files were read as ONE column and failed
+    // with "missing 'open' column".
+    let delimiter = detect_delimiter(path, tab_separated);
 
     let mut rdr = csv::ReaderBuilder::new()
-        .delimiter(if effective_tab { b'\t' } else { b',' })
+        .delimiter(delimiter)
         .has_headers(true)
+        // Tolerate ragged rows (trailing separators / uneven exports)
+        // instead of aborting the whole file on one short line.
+        .flexible(true)
         .from_path(path)
         .with_context(|| format!("open csv {}", path.display()))?;
 
@@ -467,10 +466,18 @@ fn parse_csv(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
     // per-row below before calling `parse_timestamp_cell`.
     let date_col = map.get("date_part").copied();
     let time_col = map.get("time_part").copied();
-    let open_col = map.get("open").context("missing 'open' column")?;
-    let high_col = map.get("high").context("missing 'high' column")?;
-    let low_col = map.get("low").context("missing 'low' column")?;
-    let close_col = map.get("close").context("missing 'close' column")?;
+    let open_col = map
+        .get("open")
+        .with_context(|| missing_col_err("open", &headers))?;
+    let high_col = map
+        .get("high")
+        .with_context(|| missing_col_err("high", &headers))?;
+    let low_col = map
+        .get("low")
+        .with_context(|| missing_col_err("low", &headers))?;
+    let close_col = map
+        .get("close")
+        .with_context(|| missing_col_err("close", &headers))?;
     let volume_col = map.get("volume").copied();
 
     let mut ts: Vec<i64> = Vec::new();
@@ -529,6 +536,20 @@ fn parse_csv(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
             Some(volume)
         },
     })
+}
+
+/// Actionable "missing column" error that shows which headers WERE found,
+/// so the operator can see why their file didn't map instead of a bare
+/// "missing 'open' column".
+fn missing_col_err(name: &str, headers: &csv::StringRecord) -> String {
+    let found: Vec<&str> = headers.iter().collect();
+    format!(
+        "CSV is missing a recognizable '{name}' column. Headers found: [{}]. \
+         Expected an OHLC header (e.g. open/high/low/close, o/h/l/c, or MT5 \
+         <OPEN>…). Note: the first row must be a header — a numeric-only \
+         first row is read as headers.",
+        found.join(", ")
+    )
 }
 
 /// Build a normalised column-name → index map. Many sources use slightly
@@ -601,28 +622,67 @@ fn build_column_map<'a, I: Iterator<Item = &'a str>>(headers: I) -> HashMap<Stri
     out
 }
 
-/// #206 Sniff whether a `.csv`-extensioned file is actually tab-separated
-/// (which MetaTrader 5 does by default). Reads only the first 4 KB and
-/// returns `Some(true)` if that buffer contains more tabs than commas.
-/// `None` for empty/unreadable files so the caller falls back to its
-/// default. We never look past the first 4 KB to keep the check cheap.
-fn sniff_csv_is_tab_separated(path: &Path) -> Option<bool> {
+/// Detect the CSV delimiter from the header buffer: comma (default),
+/// semicolon (EU-locale exports), or tab (MetaTrader 5 TSV-as-`.csv`).
+/// `force_tab=true` (explicit TSV) short-circuits to tab. Reads only the
+/// first 4 KB to stay cheap. Tab/semicolon need a clear majority so a
+/// stray separator inside a comment — or a comma decimal inside a
+/// semicolon file — doesn't flip the choice.
+fn detect_delimiter(path: &Path, force_tab: bool) -> u8 {
+    if force_tab {
+        return b'\t';
+    }
     use std::io::Read;
     let mut buf = [0u8; 4096];
-    let mut f = std::fs::File::open(path).ok()?;
-    let n = f.read(&mut buf).ok()?;
-    if n == 0 {
-        return None;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return b',';
+    };
+    let Ok(n) = f.read(&mut buf) else {
+        return b',';
+    };
+    let slice = &buf[..n];
+    let tabs = slice.iter().filter(|b| **b == b'\t').count();
+    let semis = slice.iter().filter(|b| **b == b';').count();
+    let commas = slice.iter().filter(|b| **b == b',').count();
+    if tabs >= 5 && tabs > commas && tabs > semis {
+        b'\t'
+    } else if semis >= 3 && semis > commas {
+        // EU `time;open;…` exports: semicolons outnumber the comma
+        // decimals inside the values.
+        b';'
+    } else {
+        b','
     }
-    let tabs = buf[..n].iter().filter(|b| **b == b'\t').count();
-    let commas = buf[..n].iter().filter(|b| **b == b',').count();
-    // Strict majority required so an MT4 CSV with one stray tab in a
-    // comment line isn't misclassified.
-    Some(tabs > commas && tabs >= 5)
 }
 
 fn parse_f64(s: &str) -> f64 {
-    s.trim().replace(',', "").parse::<f64>().unwrap_or(0.0)
+    parse_f64_checked(s).unwrap_or(0.0)
+}
+
+/// Parse a numeric cell, disambiguating the comma's role so European
+/// locale data isn't silently corrupted:
+///   - `1,234.56` (US thousands grouping) → strip the commas → 1234.56
+///   - `1,2345`    (European decimal comma) → comma becomes the dot →
+///     1.2345  (the old `replace(',', "")` turned this into 12345.0 — a
+///     silent ~10000× price corruption on locale-formatted exports)
+///   - `1.2345`    (plain) → unchanged
+/// Returns `None` on a genuinely unparseable cell so the caller can
+/// count/quarantine it instead of poisoning the series with a stray 0.0.
+fn parse_f64_checked(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let normalized = if t.contains('.') && t.contains(',') {
+        // Both present → comma groups thousands, dot is the decimal.
+        t.replace(',', "")
+    } else if t.contains(',') {
+        // Comma only → it's the decimal separator (de/el/fr/… exports).
+        t.replace(',', ".")
+    } else {
+        t.to_string()
+    };
+    normalized.parse::<f64>().ok()
 }
 
 /// Try several common timestamp formats. Returns ms-since-epoch
@@ -835,6 +895,43 @@ mod tests {
         assert_eq!(detect_format(Path::new("data.vortex")), "vortex");
         assert_eq!(detect_format(Path::new("README.md")), "ignored");
         assert_eq!(detect_format(Path::new("blob.bin")), "unknown");
+    }
+
+    #[test]
+    fn parse_f64_handles_locale_decimal_comma() {
+        // Plain dot decimal — unchanged.
+        assert_eq!(parse_f64("1.16500"), 1.165);
+        // European decimal comma — must NOT become 116500.0 (the old bug).
+        assert_eq!(parse_f64("1,16500"), 1.165);
+        assert_eq!(parse_f64("0,7183"), 0.7183);
+        // US thousands grouping — strip the commas.
+        assert_eq!(parse_f64("1,234.56"), 1234.56);
+        assert_eq!(parse_f64("159"), 159.0);
+        // Unparseable / empty → 0.0 via parse_f64, None via the checked
+        // variant so callers can quarantine instead of poisoning the series.
+        assert_eq!(parse_f64("abc"), 0.0);
+        assert_eq!(parse_f64_checked("abc"), None);
+        assert_eq!(parse_f64_checked(""), None);
+    }
+
+    #[test]
+    fn parse_csv_eu_semicolon_comma_decimal() {
+        // EU-locale export: ';' delimiter + ',' decimal. Must parse
+        // correctly instead of failing with "missing 'open' column"
+        // (the bug that quarantined the operator's files).
+        let tmp = std::env::temp_dir().join("neoethos_eu_csv_test.csv");
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        writeln!(f, "time;open;high;low;close;volume").unwrap();
+        writeln!(f, "2024-01-01 00:00:00;1,10000;1,20000;1,00000;1,15000;100").unwrap();
+        writeln!(f, "2024-01-01 00:01:00;1,15000;1,25000;1,10000;1,20000;120").unwrap();
+        drop(f);
+        let ohlcv = parse_csv(&tmp, false).expect("EU semicolon CSV must parse");
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(ohlcv.open.len(), 2);
+        // Prices must be ~1.x, NOT 110000 (the decimal-comma corruption).
+        assert!((ohlcv.open[0] - 1.10).abs() < 1e-9, "open[0]={}", ohlcv.open[0]);
+        assert!((ohlcv.high[0] - 1.20).abs() < 1e-9, "high[0]={}", ohlcv.high[0]);
+        assert!((ohlcv.close[1] - 1.20).abs() < 1e-9, "close[1]={}", ohlcv.close[1]);
     }
 
     #[test]
