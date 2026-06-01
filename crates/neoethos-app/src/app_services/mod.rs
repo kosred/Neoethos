@@ -8,15 +8,6 @@ pub mod bootstrap_writer;
 // of reading `std::env::var` directly.
 pub mod env_overrides;
 pub mod broker_config;
-// `broker_control` — RESTORED 2026-05-21. Same wrongful-delete fix
-// as `dxtrade` above. The global OnceLock crossbeam channel is the
-// designed-but-not-yet-installed bridge between the streaming worker
-// and the UI loop for HardwareKill / ConnectionRestored signals.
-// Streaming Task #3 today routes via `ServiceEvent` instead, but the
-// broker_control path stays available for cases where a Send-Sync
-// global is preferable to a tokio mpsc (e.g. a panic-safe HALT path
-// from a non-async worker).
-pub mod broker_control;
 pub mod broker_persistence;
 pub mod ctrader_account;
 pub mod ctrader_auth;

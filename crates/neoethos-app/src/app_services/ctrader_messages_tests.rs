@@ -656,10 +656,10 @@ fn auth_token_error_classifier_rejects_unrelated_codes() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// v0.4.5 cTrader native Protobuf-over-TCP transport tests.
+// cTrader native Protobuf wire-codec + transport-selector tests.
 //
-// Covers the wire-layer codec + the transport-selector env-var contract.
-// No network calls; live broker fixture is gated behind `#[ignore]`.
+// Covers the length-prefix framing codec (ctrader_proto_messages) + the
+// transport-selector env-var contract. No network calls.
 // See `docs/audits/research/ctrader_api_full_reference.md` §10 item #3
 // for the migration scope (reconcile + historical bars).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -671,9 +671,8 @@ fn protobuf_transport_length_prefix_round_trips_for_reconcile_request() {
     };
 
     // Build a framed reconcile request through the public Protobuf
-    // builder used by the transport (matches what
-    // `ProductionCTraderOpenApiProtobufTransport::send_sequence_protobuf`
-    // writes to the wire).
+    // length-prefix codec (the 4-byte big-endian prefix + serialised
+    // ProtoMessage envelope on the wire).
     let framed = build_reconcile_req_proto(
         9_999_001,
         true,
@@ -750,28 +749,4 @@ fn transport_selector_picks_protobuf_when_env_set() {
     }
     assert_eq!(selected, CTraderTransportKind::Protobuf);
     assert_eq!(selected.label(), "protobuf");
-}
-
-#[test]
-#[ignore = "needs cTrader broker fixture / live demo credentials"]
-fn protobuf_transport_full_reconcile_against_live_demo() {
-    // Integration check for the end-to-end Protobuf-over-TCP path
-    // against the live demo proxy on port 5035. Marked `#[ignore]`
-    // because it requires (a) live network access to
-    // `demo.ctraderapi.com:5035`, (b) the `ctrader-protobuf-streaming`
-    // Cargo feature to be enabled at build time, and (c) a valid
-    // OAuth account auth pre-amble that the test does NOT perform —
-    // it only exercises the framing + reconcile parsing once a real
-    // session is open.
-    //
-    // To run manually:
-    //   cargo test --no-default-features \
-    //              --features ctrader-protobuf-streaming \
-    //              -- --ignored protobuf_transport_full_reconcile_against_live_demo
-    //
-    // No synthetic broker payloads — this test deliberately does
-    // nothing under default `cargo test` so we never fabricate cTrader
-    // responses just to satisfy a unit-test green tick. The codec
-    // round-trip above plus the transport selector tests cover the
-    // pure-Rust surface; a live fixture is needed to verify the wire.
 }

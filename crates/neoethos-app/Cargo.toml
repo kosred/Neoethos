@@ -44,16 +44,6 @@ gpu-rocm = [
 # build matrices; behaves as gpu-vulkan via MoltenVK.
 gpu-apple = ["gpu-vulkan"]
 native-tree-models = ["neoethos-models/tree-models"]
-# Enable the native Protobuf-over-TCP transport (port 5035) for the cTrader
-# Open API. Wire-format only; the higher-level Rust API surface is unchanged.
-# v0.4.5 migration scope: reconcile (ProtoOAReconcileReq/Res) +
-# historical-bars (ProtoOAGetTrendbarsReq/Res). All other endpoints fall
-# back to the default JSON-WSS path. See
-# `docs/audits/research/ctrader_api_full_reference.md` §10 item #3 for
-# the bandwidth + JSON field-name-drift rationale (~3× saving).
-# Runtime opt-in is via `FOREX_BOT_CTRADER_TRANSPORT=protobuf` plus this
-# feature being enabled at build time.
-ctrader-protobuf-streaming = ["dep:webpki-roots"]
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
@@ -127,10 +117,8 @@ secrecy = "0.10"
 # Keep a direct edge so cTrader code can install the process-level
 # CryptoProvider before tungstenite builds a ClientConfig; without this,
 # the mixed reqwest/object_store feature graph can enable both ring and
-# aws-lc-rs and rustls 0.23 panics at runtime. webpki-roots stays gated
-# behind the native Protobuf-over-TCP transport.
+# aws-lc-rs and rustls 0.23 panics at runtime.
 rustls = { version = "0.23", default-features = true, features = ["ring", "std", "tls12"] }
-webpki-roots = { version = "0.26", optional = true }
 
 # ── Flutter migration (Phase 1) ─────────────────────────────────────────────
 # axum is the HTTP layer the Flutter front-end talks to. Latest stable 0.8.x

@@ -60,9 +60,12 @@ pub fn parse_proto_message(data: &[u8]) -> Result<ProtoMessage> {
 // help-centre text is describing the native-platform translation; we
 // follow the SDK behaviour.
 //
-// This codec is the wire-format-only layer; the higher-level transport
-// that frames + sends + receives messages over TLS+TCP lives in
-// `ctrader_messages.rs` (`ProductionCTraderOpenApiProtobufTransport`).
+// This codec is the wire-format-only layer (framing + per-endpoint
+// builders + Protobuf→JSON adapters). It is exercised by the
+// `protobuf_transport_*` codec round-trip tests; the native-Protobuf
+// TLS+TCP transport that would consume it end-to-end is not currently
+// wired (the live path uses the JSON-WSS transport in
+// `ctrader_messages.rs`).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Maximum size (bytes) of a single framed Protobuf payload. Spotware
