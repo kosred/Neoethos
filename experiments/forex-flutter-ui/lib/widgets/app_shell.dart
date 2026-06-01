@@ -61,35 +61,36 @@ class AppShell extends ConsumerWidget {
     ref.watch(backendHealthProvider);
     return Scaffold(
       backgroundColor: ForexAiTokens.appBg,
-      body: Shortcuts(
-        // F1 + `?` both open Help. The `?` shortcut requires Shift on a
-        // US keyboard, so we register both the bare `?` key and the
-        // Shift+/ combo so it works regardless of how Flutter resolves
-        // the keyboard layout on Windows.
-        shortcuts: <LogicalKeySet, Intent>{
-          LogicalKeySet(LogicalKeyboardKey.f1): const _ShowHelpIntent(),
-          LogicalKeySet(LogicalKeyboardKey.question): const _ShowHelpIntent(),
-          LogicalKeySet(LogicalKeyboardKey.shift, LogicalKeyboardKey.slash):
-              const _ShowHelpIntent(),
-        },
-        child: Actions(
-          actions: <Type, Action<Intent>>{
-            _ShowHelpIntent: CallbackAction<_ShowHelpIntent>(
-              onInvoke: (_) {
-                showHelpDialog(context);
-                return null;
-              },
-            ),
+      // F-339: SelectionArea wraps the ENTIRE shell (above Shortcuts/
+      // Actions/Focus) so the operator can select + copy ANY text —
+      // balances, account IDs, errors, log lines, config values. It must
+      // be an ANCESTOR of the autofocus Focus node: as a descendant its
+      // Ctrl+C copy shortcut sits below the focus chain and never fires.
+      // The chart opens as a separate route, so its drag-to-pan is
+      // unaffected.
+      body: SelectionArea(
+        child: Shortcuts(
+          // F1 + `?` both open Help. The `?` shortcut requires Shift on a
+          // US keyboard, so we register both the bare `?` key and the
+          // Shift+/ combo so it works regardless of how Flutter resolves
+          // the keyboard layout on Windows.
+          shortcuts: <LogicalKeySet, Intent>{
+            LogicalKeySet(LogicalKeyboardKey.f1): const _ShowHelpIntent(),
+            LogicalKeySet(LogicalKeyboardKey.question): const _ShowHelpIntent(),
+            LogicalKeySet(LogicalKeyboardKey.shift, LogicalKeyboardKey.slash):
+                const _ShowHelpIntent(),
           },
-          // F-339: wrap the whole shell in a SelectionArea so the operator
-          // can select + copy ANY text (balances, account IDs, errors,
-          // log lines, config values). Flutter Text is non-selectable by
-          // default — without this, nothing in the app could be copied.
-          // The chart opens as a separate route, so its drag-to-pan isn't
-          // affected by this selection layer.
-          child: Focus(
-            autofocus: true,
-            child: SelectionArea(
+          child: Actions(
+            actions: <Type, Action<Intent>>{
+              _ShowHelpIntent: CallbackAction<_ShowHelpIntent>(
+                onInvoke: (_) {
+                  showHelpDialog(context);
+                  return null;
+                },
+              ),
+            },
+            child: Focus(
+              autofocus: true,
               child: _ShellGrid(activeId: activeId),
             ),
           ),
