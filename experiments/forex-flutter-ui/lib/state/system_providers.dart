@@ -147,7 +147,11 @@ final chartProvider =
   final symbol = ref.watch(chartSymbolProvider);
   final tf = ref.watch(chartTimeframeProvider);
   final client = ref.read(backendClientProvider);
-  return client.fetchChart(symbol: symbol, timeframe: tf, limit: 200);
+  // F-344: 500-bar initial window (was 200). Panning left past the
+  // oldest bar pages in MORE from the broker on demand (ProChart
+  // onLoadMore → /chart/history), so this is just the starting view,
+  // never a cap.
+  return client.fetchChart(symbol: symbol, timeframe: tf, limit: 500);
 });
 
 // ─── Chart panel B (comparison mode) ────────────────────────────────
@@ -179,7 +183,11 @@ final chartProviderB =
   final symbol = ref.watch(chartSymbolProviderB);
   final tf = ref.watch(chartTimeframeProviderB);
   final client = ref.read(backendClientProvider);
-  return client.fetchChart(symbol: symbol, timeframe: tf, limit: 200);
+  // F-344: 500-bar initial window (was 200). Panning left past the
+  // oldest bar pages in MORE from the broker on demand (ProChart
+  // onLoadMore → /chart/history), so this is just the starting view,
+  // never a cap.
+  return client.fetchChart(symbol: symbol, timeframe: tf, limit: 500);
 });
 
 /// `/data/bootstrap` — local data-dir inventory.

@@ -119,6 +119,10 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
             subtitle: 'Genetic search → portfolio',
           ),
           _hyperparamsCard(),
+          // F-14: compact live-stats panel. Renders only while a
+          // discovery run is active (counters non-empty); otherwise
+          // collapses to SizedBox.shrink so it never adds dead space.
+          _DiscoveryLiveStats(snapshot: async.valueOrNull),
           _queueCard(async),
           // Single-pair controls render only when the queue is empty.
           // Once the operator adds a symbol to the queue, the queue
@@ -872,6 +876,214 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
             style: const TextStyle(
               fontSize: 10,
               color: ForexAiTokens.textMuted,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// F-14: compact LIVE STATS panel for an in-flight discovery run.
+///
+/// Reads the same `EnginesSnapshot` the rest of the screen already
+/// polls (no extra request). It surfaces the named counters the
+/// backend streams (`generation`, `population`, `candidates`,
+/// `filtered_candidates`, `portfolio`, `archived_profitable`, …) as a
+/// chip grid with friendly labels, plus a humanised stage line and a
+/// thin progress bar from `discoveryPercent`. Renders nothing when the
+/// run is idle / has emitted no counters yet.
+class _DiscoveryLiveStats extends StatelessWidget {
+  final EnginesSnapshot? snapshot;
+  const _DiscoveryLiveStats({required this.snapshot});
+
+  /// Snake_case counter name → friendly label. Anything not in the map
+  /// falls back to a title-cased version of the raw name, so a new
+  /// backend counter still renders (just with a generic label) instead
+  /// of being silently dropped.
+  static const Map<String, String> _counterLabels = {
+    'generation': 'Generation',
+    'generations': 'Generations',
+    'population': 'Population',
+    'candidates': 'Candidates',
+    'filtered_candidates': 'Filtered',
+    'portfolio': 'Portfolio',
+    'archived_profitable': 'Archived profitable',
+    'evaluated': 'Evaluated',
+    'survivors': 'Survivors',
+  };
+
+  /// Pairing rules: render "current / total" when both halves of a
+  /// counter pair are present (e.g. `generation` 3 of `generations`
+  /// 5 → "Generation · 3 / 5"). Maps the "current" name to its
+  /// "total" name.
+  static const Map<String, String> _counterPairTotals = {
+    'generation': 'generations',
+  };
+
+  String _humaniseStage(String raw) {
+    if (raw.isEmpty) return '';
+    final cleaned = raw.replaceAll('_', ' ').replaceAll('-', ' ').trim();
+    if (cleaned.isEmpty) return '';
+    return cleaned[0].toUpperCase() + cleaned.substring(1);
+  }
+
+  String _labelFor(String name) {
+    final mapped = _counterLabels[name];
+    if (mapped != null) return mapped;
+    // Fallback: title-case the snake_case name.
+    return name
+        .split('_')
+        .where((w) => w.isNotEmpty)
+        .map((w) => w[0].toUpperCase() + w.substring(1))
+        .join(' ');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final snap = snapshot;
+    // Only render for an active run with at least one counter to show.
+    if (snap == null ||
+        !snap.discoveryRunning ||
+        snap.discoveryCounters.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    final byName = <String, int>{
+      for (final c in snap.discoveryCounters) c.name: c.value,
+    };
+    // Names consumed as the "total" half of a pair so we don't also
+    // render them as a standalone chip.
+    final consumedTotals = <String>{};
+    for (final entry in _counterPairTotals.entries) {
+      if (byName.containsKey(entry.key) && byName.containsKey(entry.value)) {
+        consumedTotals.add(entry.value);
+      }
+    }
+
+    final chips = <Widget>[];
+    for (final c in snap.discoveryCounters) {
+      if (consumedTotals.contains(c.name)) continue;
+      final totalName = _counterPairTotals[c.name];
+      final hasPair = totalName != null && byName.containsKey(totalName);
+      final valueText =
+          hasPair ? '${c.value} / ${byName[totalName]}' : '${c.value}';
+      chips.add(_StatChip(label: _labelFor(c.name), value: valueText));
+    }
+
+    if (chips.isEmpty) return const SizedBox.shrink();
+
+    final stage = _humaniseStage(snap.discoveryStage);
+    final percent = snap.discoveryPercent.clamp(0.0, 1.0);
+    final pctLabel = '${(percent * 100).toStringAsFixed(0)}%';
+
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(
+                  Icons.insights,
+                  size: 16,
+                  color: ForexAiTokens.accent,
+                ),
+                const SizedBox(width: 6),
+                const Text(
+                  'Live stats',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: ForexAiTokens.fsBody,
+                    letterSpacing: 0.4,
+                    color: ForexAiTokens.textPrimary,
+                  ),
+                ),
+                const Spacer(),
+                Text(
+                  pctLabel,
+                  style: const TextStyle(
+                    fontSize: ForexAiTokens.fsCaption,
+                    fontWeight: FontWeight.w700,
+                    color: ForexAiTokens.accent,
+                    fontFeatures: [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ],
+            ),
+            if (stage.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(
+                stage,
+                style: const TextStyle(
+                  fontSize: ForexAiTokens.fsCaption,
+                  color: ForexAiTokens.textMuted,
+                ),
+              ),
+            ],
+            const SizedBox(height: 8),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+              child: LinearProgressIndicator(
+                value: percent,
+                minHeight: 4,
+                backgroundColor: ForexAiTokens.appBg,
+                valueColor: const AlwaysStoppedAnimation<Color>(
+                  ForexAiTokens.accent,
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: chips,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// One labelled stat tile inside the F-14 live-stats panel.
+class _StatChip extends StatelessWidget {
+  final String label;
+  final String value;
+  const _StatChip({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: ForexAiTokens.appBg,
+        border: Border.all(color: ForexAiTokens.border),
+        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label.toUpperCase(),
+            style: const TextStyle(
+              fontSize: ForexAiTokens.fsCaption - 1,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.6,
+              color: ForexAiTokens.textFaint,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            value,
+            style: const TextStyle(
+              fontSize: ForexAiTokens.fsBody,
+              fontWeight: FontWeight.w800,
+              color: ForexAiTokens.textPrimary,
+              fontFeatures: [FontFeature.tabularFigures()],
             ),
           ),
         ],

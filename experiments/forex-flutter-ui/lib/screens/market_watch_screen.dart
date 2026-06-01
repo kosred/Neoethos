@@ -38,6 +38,7 @@ import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/multi_symbol_picker.dart';
 import 'chart_screen.dart';
 
 /// F-334: open a symbol's chart (with the inline buy/sell overlay) in a
@@ -136,7 +137,7 @@ class MarketWatchScreen extends ConsumerWidget {
 // Summary strip (top)
 // ---------------------------------------------------------------------------
 
-class _SummaryStrip extends StatelessWidget {
+class _SummaryStrip extends ConsumerWidget {
   final AsyncValue<LiveSpotsSnapshot> spotsAsync;
   final AsyncValue<AccountSnapshot> accountAsync;
 
@@ -145,8 +146,47 @@ class _SummaryStrip extends StatelessWidget {
     required this.accountAsync,
   });
 
+  /// F-12: open the multi-symbol picker seeded with the current
+  /// watchlist, then persist the operator's selection. On success we
+  /// invalidate [liveSpotsProvider] so Market Watch re-subscribes and
+  /// the table reflects the new symbol set.
+  Future<void> _editWatchlist(BuildContext context, WidgetRef ref) async {
+    final client = ref.read(backendClientProvider);
+    // Capture the messenger BEFORE any await so we never touch a
+    // possibly-unmounted `context` across the async gap.
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final current = await client.fetchWatchlist();
+      if (!context.mounted) return;
+      final picked = await showMultiSymbolPicker(
+        context,
+        preselected: current.toSet(),
+      );
+      if (picked == null) return; // cancelled
+      final result = await client.saveWatchlist(picked);
+      // Re-subscribe the live spot stream to the new symbol set.
+      ref.invalidate(liveSpotsProvider);
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            'Watchlist updated — ${result.saved} '
+            'symbol${result.saved == 1 ? '' : 's'}, re-subscribing…',
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      showTranslatedErrorSnackbar(
+        context,
+        e,
+        prefix: 'Could not update watchlist',
+      );
+    }
+  }
+
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final spots = spotsAsync.valueOrNull;
     final acc = accountAsync.valueOrNull;
     final symbolCount = spots?.symbolCount ?? 0;
@@ -196,6 +236,23 @@ class _SummaryStrip extends StatelessWidget {
             // the table is honestly empty, not just hidden.
             label: '0 pending',
             color: ForexAiTokens.textFaint,
+          ),
+          const SizedBox(width: 12),
+          // F-12: edit the streamer's watchlist (multi-symbol picker).
+          OutlinedButton.icon(
+            onPressed: () => _editWatchlist(context, ref),
+            icon: const Icon(Icons.playlist_add_check, size: 16),
+            label: const Text('Edit watchlist'),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: ForexAiTokens.accent,
+              side: const BorderSide(color: ForexAiTokens.border),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              visualDensity: VisualDensity.compact,
+              textStyle: const TextStyle(
+                fontSize: ForexAiTokens.fsCaption,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
           ),
           const Spacer(),
           if (ageSeconds != null)

@@ -330,6 +330,36 @@ class BackendClient {
     return EnginesSnapshot.fromJson(response.data!);
   }
 
+  /// `GET /watchlist` (F-12) — the symbols the spot streamer is
+  /// currently subscribed to. Returns the bare `symbols` list so the
+  /// Market Watch "Edit watchlist" picker can round-trip the current
+  /// selection.
+  Future<List<String>> fetchWatchlist() async {
+    final response = await _dio.get<Map<String, dynamic>>('/watchlist');
+    final raw = response.data?['symbols'] as List?;
+    return (raw ?? const []).map((e) => e as String).toList(growable: false);
+  }
+
+  /// `POST /watchlist` (F-12) — replace the streamer's subscription
+  /// list. The backend persists the new set, re-subscribes the live
+  /// spot stream, and reports back how many it `saved`, the canonical
+  /// `symbols` it landed on, and whether it had to `restart` the
+  /// streamer to apply. Returns a [WatchlistSaveResult].
+  Future<WatchlistSaveResult> saveWatchlist(List<String> symbols) async {
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/watchlist',
+      data: {'symbols': symbols},
+    );
+    if (response.statusCode != 200 || response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: 'POST /watchlist failed: ${response.statusCode}',
+      );
+    }
+    return WatchlistSaveResult.fromJson(response.data!);
+  }
+
   /// `/broker/status` — current broker connection state.
   Future<BrokerStatus> fetchBrokerStatus() async {
     final response = await _dio.get<Map<String, dynamic>>('/broker/status');
@@ -1185,18 +1215,46 @@ class SettingsSnapshot {
       );
 }
 
+/// One named live-discovery counter row from `/engines/status`
+/// (F-14). The backend emits raw snake_case `name`s (`generation`,
+/// `population`, `candidates`, `filtered_candidates`, `portfolio`,
+/// `archived_profitable`, …); the Discovery screen maps the meaningful
+/// ones to friendly labels.
+class EngineCounter {
+  final String name;
+  final int value;
+  const EngineCounter({required this.name, required this.value});
+
+  factory EngineCounter.fromJson(Map<String, dynamic> j) => EngineCounter(
+        name: (j['name'] as String?) ?? '',
+        value: (j['value'] as num?)?.toInt() ?? 0,
+      );
+}
+
 class EnginesSnapshot {
   final String discovery;
   final String training;
   final String autoTrader;
   final String discoverySummary;
   final String trainingSummary;
+
+  /// F-14 live discovery telemetry. `discoveryStage` is the current
+  /// pipeline phase (`""` when idle), `discoveryPercent` is overall
+  /// progress in 0.0..1.0, and `discoveryCounters` are the named
+  /// generation / population / candidate tallies for the live stats
+  /// panel. All default to empty/zero on servers that predate F-14.
+  final String discoveryStage;
+  final double discoveryPercent;
+  final List<EngineCounter> discoveryCounters;
   const EnginesSnapshot({
     required this.discovery,
     required this.training,
     required this.autoTrader,
     required this.discoverySummary,
     required this.trainingSummary,
+    this.discoveryStage = '',
+    this.discoveryPercent = 0.0,
+    this.discoveryCounters = const [],
   });
   factory EnginesSnapshot.fromJson(Map<String, dynamic> j) => EnginesSnapshot(
         discovery: j['discovery'] as String,
@@ -1204,10 +1262,39 @@ class EnginesSnapshot {
         autoTrader: j['autoTrader'] as String,
         discoverySummary: (j['discoverySummary'] as String?) ?? '',
         trainingSummary: (j['trainingSummary'] as String?) ?? '',
+        discoveryStage: (j['discoveryStage'] as String?) ?? '',
+        discoveryPercent: (j['discoveryPercent'] as num?)?.toDouble() ?? 0.0,
+        discoveryCounters: ((j['discoveryCounters'] as List?) ?? const [])
+            .map((e) => EngineCounter.fromJson(e as Map<String, dynamic>))
+            .toList(growable: false),
       );
 
   bool get discoveryRunning => discovery.toLowerCase() == 'running';
   bool get trainingRunning => training.toLowerCase() == 'running';
+}
+
+/// Result of `POST /watchlist` (F-12). `saved` is the count the backend
+/// persisted, `symbols` is the canonical list it landed on (may differ
+/// from what was sent — de-duped / normalised), and `restarted` flags
+/// whether the spot streamer had to be torn down + re-subscribed.
+class WatchlistSaveResult {
+  final int saved;
+  final bool restarted;
+  final List<String> symbols;
+  const WatchlistSaveResult({
+    required this.saved,
+    required this.restarted,
+    required this.symbols,
+  });
+
+  factory WatchlistSaveResult.fromJson(Map<String, dynamic> j) =>
+      WatchlistSaveResult(
+        saved: (j['saved'] as num?)?.toInt() ?? 0,
+        restarted: (j['restarted'] as bool?) ?? false,
+        symbols: ((j['symbols'] as List?) ?? const [])
+            .map((e) => e as String)
+            .toList(growable: false),
+      );
 }
 
 class BrokerStatus {

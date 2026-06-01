@@ -178,7 +178,7 @@ class ChartScreen extends ConsumerWidget {
                   title: multi ? 'Charts (A + B)' : 'Chart',
                   subtitle: multi
                       ? 'Compare two symbols · max 2 panels (deliberate UX constraint)'
-                      : 'Local OHLC · symbol / timeframe / 200 candles',
+                      : 'Live broker candles · drag left to load more history (no 200 cap)',
                 ),
               ),
               const SizedBox(width: 12),
