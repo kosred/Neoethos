@@ -1938,7 +1938,7 @@ mod tests {
             // Re-auth on the second WSS connection (before symbol-by-id):
             Ok(r#"{"clientMsgId":"app-auth-2","payloadType":2101,"payload":{}}"#.to_string()),
             Ok(r#"{"clientMsgId":"account-auth-2","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{"symbol":[{"symbolId":14,"digits":5,"pipPosition":4,"tradingMode":"ENABLED"}]}}"#.to_string()),
+            Ok(r#"{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{"symbol":[{"symbolId":14,"digits":5,"pipPosition":4,"tradingMode":0}]}}"#.to_string()),
             Ok(r#"{"clientMsgId":"trendbars-1","payloadType":2138,"payload":{"period":"M5","symbolId":14,"trendbar":[{"volume":9,"low":109950,"deltaOpen":50,"deltaClose":125,"deltaHigh":225,"utcTimestampInMinutes":28500000}],"hasMore":false}}"#.to_string()),
             Ok(r#"{"clientMsgId":"ticks-bid-1","payloadType":2146,"payload":{"symbolId":14,"hasMore":false,"tickData":[{"timestamp":1710000000000,"tick":109990},{"timestamp":200,"tick":109970}]}}"#.to_string()),
             Ok(r#"{"clientMsgId":"ticks-ask-1","payloadType":2146,"payload":{"symbolId":14,"hasMore":false,"tickData":[{"timestamp":1710000000000,"tick":110010},{"timestamp":200,"tick":109990}]}}"#.to_string()),
@@ -2030,7 +2030,7 @@ mod tests {
             // Re-auth on the second WSS connection (before symbol-by-id):
             Ok(r#"{"clientMsgId":"app-auth-2","payloadType":2101,"payload":{}}"#.to_string()),
             Ok(r#"{"clientMsgId":"account-auth-2","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{"symbol":[{"symbolId":14,"digits":5,"pipPosition":4,"tradingMode":"ENABLED"}]}}"#.to_string()),
+            Ok(r#"{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{"symbol":[{"symbolId":14,"digits":5,"pipPosition":4,"tradingMode":0}]}}"#.to_string()),
             // Re-auth on the third WSS connection (before trendbars):
             Ok(r#"{"clientMsgId":"app-auth-3","payloadType":2101,"payload":{}}"#.to_string()),
             Ok(r#"{"clientMsgId":"account-auth-3","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),

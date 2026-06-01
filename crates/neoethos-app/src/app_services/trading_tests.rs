@@ -2375,19 +2375,31 @@ fn dual_mode_separation_risky_mode_does_not_mutate_prop_firm_risk_config() {
 fn dual_mode_separation_reenable_resets_bankroll_and_kill_switches() {
     // Disable then re-enable: no carryover. The manager is freshly
     // constructed each time; bankroll resets to `starting_bankroll`,
-    // stage cursor resets to 0, kill switches are clear.
+    // the stage cursor is re-derived from that bankroll (NOT forced to
+    // 0 — `locate_stage_idx` maps a $100 bankroll to a mid-ladder
+    // stage), and kill switches are clear.
     let mut session = TradingSession::new();
     let cfg = signed_risky_mode_config();
     session
         .enable_risky_mode(cfg.clone(), 100.0)
         .expect("first enable");
 
-    // Trip the per-day kill switch by losing more than the daily cap.
+    // The stage a fresh $100 enable resolves to — the re-enabled
+    // session must land on this exact same stage (no drawdown drift).
+    let fresh_stage_idx = session
+        .risky_mode_state()
+        .expect("first-enable state snapshot")
+        .current_stage_idx;
+
+    // Trip a sticky kill switch so we can prove the re-enable clears
+    // it. `last_kill_switch_trip` only tracks the sticky tiers
+    // (Manual / HardwareConnLoss) — the per-day/-month/-stage tiers
+    // are evaluated lazily at the gate (`check_trade_allowed`) and are
+    // never persisted here (see `record_trade_outcome`, which is a pure
+    // accumulator). Use the real manual-halt API to set the trip.
     {
         let rm = session.risky_mode_manager_mut().expect("manager");
-        let stage = *rm.current_stage();
-        let cap_usd = stage.daily_loss_cap_fraction * rm.current_bankroll_usd();
-        rm.record_trade_outcome(-(cap_usd + 5.0));
+        rm.trip_manual_halt();
     }
     assert!(
         session
@@ -2395,7 +2407,7 @@ fn dual_mode_separation_reenable_resets_bankroll_and_kill_switches() {
             .expect("manager")
             .last_kill_switch_trip()
             .is_some(),
-        "kill switch should have tripped after exceeding daily cap"
+        "manual halt should have set a sticky kill-switch trip"
     );
 
     // Disable + re-enable.
@@ -2405,7 +2417,8 @@ fn dual_mode_separation_reenable_resets_bankroll_and_kill_switches() {
         .expect("second enable");
 
     // The new manager has fresh state: bankroll back to start, no
-    // kill-switch trips, stage 0.
+    // kill-switch trips, and the stage cursor re-derived from the
+    // starting bankroll (matching a brand-new enable).
     let rm = session.risky_mode_manager().expect("re-enabled manager");
     let snapshot = session
         .risky_mode_state()
@@ -2416,8 +2429,9 @@ fn dual_mode_separation_reenable_resets_bankroll_and_kill_switches() {
          the previous session's drawdown"
     );
     assert_eq!(
-        snapshot.current_stage_idx, 0,
-        "stage cursor should reset to 0 after a fresh enable"
+        snapshot.current_stage_idx, fresh_stage_idx,
+        "stage cursor should re-derive from the starting bankroll on a \
+         fresh enable, not carry the previous session's stage drift"
     );
     assert!(
         rm.last_kill_switch_trip().is_none(),

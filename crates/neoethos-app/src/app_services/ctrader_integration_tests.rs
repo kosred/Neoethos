@@ -111,7 +111,7 @@ mod ctrader_integration_tests {
 
     fn symbol_by_id_ok(symbol_id: i64, digits: i32) -> String {
         format!(
-            r#"{{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{{"symbol":[{{"symbolId":{symbol_id},"digits":{digits},"pipPosition":4,"tradingMode":"ENABLED"}}]}}}}"#
+            r#"{{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{{"symbol":[{{"symbolId":{symbol_id},"digits":{digits},"pipPosition":4,"tradingMode":0}}]}}}}"#
         )
     }
 

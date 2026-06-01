@@ -353,7 +353,9 @@ mod tests {
         assert!(log_name.starts_with("neoethos."));
         assert!(log_name.ends_with(".log"));
         assert_eq!(state.hardware.cpu_cores, num_cpus::get() as i32);
-        assert!(state.hardware.gpu_enabled);
+        // F-265 (2026-05-25): the pessimistic default is
+        // `gpu_enabled: false`; the hardware probe flips it on later.
+        assert!(!state.hardware.gpu_enabled);
         // FTMO preset defaults — approx-equal because the values are
         // now computed from `PropFirmConstraints` f32 constants (the
         // multiply-cast introduces sub-ULP drift, e.g. 0.10 * 0.7 in
@@ -394,7 +396,10 @@ mod tests {
         let state = HardwareState::default();
 
         assert_eq!(state.cpu_cores, num_cpus::get() as i32);
-        assert!(state.gpu_enabled);
+        // F-265 (2026-05-25): GPU defaults to OFF (pessimistic). The
+        // banner must not claim acceleration before the hardware probe
+        // (system::detect_*) has confirmed a GPU is present.
+        assert!(!state.gpu_enabled);
     }
 
     #[test]
