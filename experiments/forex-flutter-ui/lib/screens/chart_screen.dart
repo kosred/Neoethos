@@ -39,6 +39,25 @@ const _indicatorChips = <String>[
   'vwap',
 ];
 
+/// F-361: the right-click multi-select menu groups the same 9 indicators
+/// into "Price overlays" (drawn on/over the candles) and "Oscillators"
+/// (sub-panels / strips). These are display groupings only — every id
+/// still lives in the one `activeIndicators` set the chip row uses, so
+/// the two controls stay in lock-step.
+const _priceOverlayIndicators = <String>[
+  'sma',
+  'ema',
+  'bollinger_bands',
+  'vwap',
+];
+const _oscillatorIndicators = <String>[
+  'rsi',
+  'macd',
+  'stoch',
+  'atr',
+  'adx',
+];
+
 String _indicatorLabel(String id) {
   switch (id) {
     case 'sma':
@@ -457,63 +476,112 @@ class _ChartPanel extends ConsumerWidget {
                   ],
                 ),
         ),
-        SectionCard(
-          title: 'Panel ${slot.label} · Indicators',
-          child: Wrap(
-            spacing: 6,
-            runSpacing: 6,
-            children: [
-              for (final ind in _indicatorChips)
-                Consumer(
-                  builder: (ctx, indRef, _) {
-                    final active =
-                        indRef.watch(slot.activeIndicators).contains(ind);
-                    // F-360: the chip row is the ONE unified indicator
-                    // control. Every chip now actually draws on the live
-                    // k_chart_plus chart below. Two render paths:
-                    //   • client-side (k_chart_plus computes it over the
-                    //     candles, pan/zoom-aware) — SMA/EMA/BBands/RSI/
-                    //     MACD/Stoch.
-                    //   • server-fed (ATR/ADX/VWAP have no k_chart_plus
-                    //     equivalent) — pulled from /indicators and drawn
-                    //     in a strip under the k-line.
-                    // We mark the server-fed ones with a leading "• " and
-                    // a tooltip so the operator knows why those three look
-                    // slightly different (separate strip vs on the
-                    // candles), but BOTH paths render for real.
-                    final serverFed =
-                        kChartServerIndicators.contains(ind);
-                    final chip = _Chip(
-                      label: serverFed
-                          ? '• ${_indicatorLabel(ind)}'
-                          : _indicatorLabel(ind),
-                      selected: active,
-                      onTap: () {
-                        final notifier =
-                            indRef.read(slot.activeIndicators.notifier);
-                        final next = {...notifier.state};
-                        if (next.contains(ind)) {
-                          next.remove(ind);
-                        } else {
-                          next.add(ind);
-                        }
-                        notifier.state = next;
-                      },
-                    );
-                    return serverFed
-                        ? Tooltip(
-                            message:
-                                '${_indicatorLabel(ind)} has no native '
-                                'k_chart_plus form, so it is computed '
-                                'server-side and drawn in its own strip '
-                                'below the candles (auto-scaled). VWAP is '
-                                'a price level; ATR/ADX are oscillators.',
-                            child: chip,
-                          )
-                        : chip;
-                  },
+        // F-361: right-click anywhere on the Indicators card opens a
+        // multi-select menu (price overlays + oscillators, each with a
+        // checkbox) anchored at the cursor. It's an additional, richer
+        // add path that shares the SAME `slot.activeIndicators` provider
+        // as the chip row below — both stay in sync. We put the
+        // onSecondaryTapDown handler HERE on the panel header card, NOT
+        // on the KChartWidget, so k_chart_plus keeps full ownership of
+        // its pan/zoom/long-press gestures (scroll-back pagination,
+        // crosshair) untouched. HitTestBehavior.opaque so the gap around
+        // the chips also catches the right-click.
+        GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onSecondaryTapDown: (details) => _showIndicatorMenu(
+            context,
+            slot,
+            details.globalPosition,
+          ),
+          child: SectionCard(
+            title: 'Panel ${slot.label} · Indicators',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    for (final ind in _indicatorChips)
+                      Consumer(
+                        builder: (ctx, indRef, _) {
+                          final active = indRef
+                              .watch(slot.activeIndicators)
+                              .contains(ind);
+                          // F-360: the chip row is the at-a-glance active
+                          // view + quick toggle. Every chip actually draws
+                          // on the live k_chart_plus chart below. Two
+                          // render paths:
+                          //   • client-side (k_chart_plus computes it over
+                          //     the candles, pan/zoom-aware) — SMA/EMA/
+                          //     BBands/RSI/MACD/Stoch.
+                          //   • server-fed (ATR/ADX/VWAP have no
+                          //     k_chart_plus equivalent) — pulled from
+                          //     /indicators and drawn in a strip under the
+                          //     k-line.
+                          // We mark the server-fed ones with a leading "• "
+                          // and a tooltip so the operator knows why those
+                          // three look slightly different (separate strip
+                          // vs on the candles), but BOTH paths render for
+                          // real.
+                          final serverFed =
+                              kChartServerIndicators.contains(ind);
+                          final chip = _Chip(
+                            label: serverFed
+                                ? '• ${_indicatorLabel(ind)}'
+                                : _indicatorLabel(ind),
+                            selected: active,
+                            onTap: () {
+                              final notifier =
+                                  indRef.read(slot.activeIndicators.notifier);
+                              final next = {...notifier.state};
+                              if (next.contains(ind)) {
+                                next.remove(ind);
+                              } else {
+                                next.add(ind);
+                              }
+                              notifier.state = next;
+                            },
+                          );
+                          return serverFed
+                              ? Tooltip(
+                                  message:
+                                      '${_indicatorLabel(ind)} has no native '
+                                      'k_chart_plus form, so it is computed '
+                                      'server-side and drawn in its own strip '
+                                      'below the candles (auto-scaled). VWAP '
+                                      'is a price level; ATR/ADX are '
+                                      'oscillators.',
+                                  child: chip,
+                                )
+                              : chip;
+                        },
+                      ),
+                  ],
                 ),
-            ],
+                const SizedBox(height: 6),
+                // Discoverability hint for the right-click add path.
+                const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.ads_click,
+                      size: 11,
+                      color: ForexAiTokens.textMuted,
+                    ),
+                    SizedBox(width: 4),
+                    Text(
+                      'Right-click for the multi-select indicator menu',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontStyle: FontStyle.italic,
+                        color: ForexAiTokens.textMuted,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
         async.when(
@@ -522,6 +590,51 @@ class _ChartPanel extends ConsumerWidget {
           error: (err, _) => BackendErrorWidget(error: err, title: 'Chart data unavailable'),
         ),
       ],
+    );
+  }
+
+  /// F-361: open the multi-select indicator menu anchored at the cursor.
+  ///
+  /// Implemented as a translucent-barrier dialog (NOT a `PopupMenuItem`
+  /// list) precisely so it STAYS OPEN while the operator ticks several
+  /// boxes — a `showMenu`/`PopupMenuButton` dismisses on every item tap,
+  /// which is the opposite of what the operator asked for. Each checkbox
+  /// writes straight through to `slot.activeIndicators` so the chart +
+  /// the chip row update live on every tick; the menu closes only on the
+  /// "Done" button or a tap on the barrier outside it.
+  void _showIndicatorMenu(
+    BuildContext context,
+    _ChartSlot slot,
+    Offset globalPosition,
+  ) {
+    final overlaySize = MediaQuery.of(context).size;
+    showDialog<void>(
+      context: context,
+      // Translucent (not transparent) so it reads as a modal layer but
+      // the chart stays visible behind it.
+      barrierColor: Colors.black.withValues(alpha: 0.15),
+      barrierLabel: 'Indicator menu',
+      builder: (dialogCtx) {
+        // Clamp the anchor so the ~300px-wide / up-to-440px-tall card
+        // never spills off-screen when the operator right-clicks near an
+        // edge.
+        const menuW = 300.0;
+        const menuH = 440.0;
+        final left =
+            globalPosition.dx.clamp(8.0, (overlaySize.width - menuW - 8.0).clamp(8.0, double.infinity));
+        final top =
+            globalPosition.dy.clamp(8.0, (overlaySize.height - menuH - 8.0).clamp(8.0, double.infinity));
+        return Stack(
+          children: [
+            Positioned(
+              left: left,
+              top: top,
+              width: menuW,
+              child: _IndicatorMultiSelectMenu(slot: slot),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -816,6 +929,152 @@ class _AutoFetchPromptState extends ConsumerState<_AutoFetchPrompt> {
             ),
           ],
         ],
+      ),
+    );
+  }
+}
+
+/// F-361: the multi-select indicator menu body shown by the chart
+/// panel's right-click. A scrollable card with two labelled groups —
+/// "Price overlays" and "Oscillators" — each entry a CheckboxListTile
+/// bound to the SAME `slot.activeIndicators` provider the chip row uses.
+///
+/// It watches that provider (via the enclosing Consumer), so every tick
+/// rebuilds the checkboxes from the canonical set and the chip row +
+/// ProChart update simultaneously. Because this is a dialog body (not a
+/// PopupMenuItem), ticking a box does NOT dismiss it — the operator can
+/// toggle several in one session, then close with "Done" or by tapping
+/// the barrier.
+class _IndicatorMultiSelectMenu extends ConsumerWidget {
+  final _ChartSlot slot;
+  const _IndicatorMultiSelectMenu({required this.slot});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final active = ref.watch(slot.activeIndicators);
+
+    void toggle(String id) {
+      final notifier = ref.read(slot.activeIndicators.notifier);
+      final next = {...notifier.state};
+      if (next.contains(id)) {
+        next.remove(id);
+      } else {
+        next.add(id);
+      }
+      notifier.state = next;
+    }
+
+    Widget groupHeader(String text) => Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+          child: Text(
+            text.toUpperCase(),
+            style: const TextStyle(
+              fontSize: 10,
+              letterSpacing: 0.5,
+              fontWeight: FontWeight.w800,
+              color: ForexAiTokens.textMuted,
+            ),
+          ),
+        );
+
+    Widget row(String id) {
+      final serverFed = kChartServerIndicators.contains(id);
+      return CheckboxListTile(
+        dense: true,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+        controlAffinity: ListTileControlAffinity.leading,
+        value: active.contains(id),
+        activeColor: ForexAiTokens.accent,
+        // The dialog stays open: this only flips the provider; the menu
+        // rebuilds from the watch above. No Navigator.pop here.
+        onChanged: (_) => toggle(id),
+        title: Text(
+          _indicatorLabel(id),
+          style: const TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: ForexAiTokens.textPrimary,
+          ),
+        ),
+        subtitle: serverFed
+            ? const Text(
+                'server strip',
+                style: TextStyle(fontSize: 9, color: ForexAiTokens.textMuted),
+              )
+            : null,
+      );
+    }
+
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        constraints: const BoxConstraints(maxHeight: 440),
+        decoration: BoxDecoration(
+          color: ForexAiTokens.panelBg,
+          border: Border.all(color: ForexAiTokens.border),
+          borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+          boxShadow: const [
+            BoxShadow(color: Colors.black54, blurRadius: 12, offset: Offset(0, 4)),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 8, 2),
+              child: Row(
+                children: [
+                  const Icon(Icons.tune, size: 14, color: ForexAiTokens.accent),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Indicators · Panel ${slot.label}',
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w800,
+                      color: ForexAiTokens.textPrimary,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 8),
+            Flexible(
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    groupHeader('Price overlays'),
+                    for (final id in _priceOverlayIndicators) row(id),
+                    groupHeader('Oscillators'),
+                    for (final id in _oscillatorIndicators) row(id),
+                  ],
+                ),
+              ),
+            ),
+            const Divider(height: 8),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 2, 8, 8),
+              child: Row(
+                children: [
+                  Text(
+                    '${active.length} active · tick several, then Done',
+                    style: const TextStyle(
+                      fontSize: 10,
+                      color: ForexAiTokens.textMuted,
+                    ),
+                  ),
+                  const Spacer(),
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: const Text('Done'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
