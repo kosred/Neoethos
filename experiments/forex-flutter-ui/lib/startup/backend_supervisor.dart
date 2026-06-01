@@ -31,6 +31,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 /// F-270 (2026-05-28): rich `/healthz` probe result. The boolean
 /// `probeHealth()` API used elsewhere collapses this to just `alive`;
@@ -441,7 +442,7 @@ class BackendSupervisor {
     try {
       final userYaml = userConfig.readAsStringSync();
       final bundleYaml = bundleConfig.readAsStringSync();
-      final upgraded = _mergeMissingScalarFields(
+      final upgraded = mergeMissingScalarFields(
         userYaml: userYaml,
         bundleYaml: bundleYaml,
       );
@@ -479,9 +480,10 @@ class BackendSupervisor {
   /// appends them at the end of the matching section in the user file.
   /// Returns null if no fields are missing (no write needed).
   ///
-  /// Public to make the unit tests in `test/backend_supervisor_test.dart`
-  /// straightforward — pure-function semantics, no I/O.
-  static _MergeResult? _mergeMissingScalarFields({
+  /// `@visibleForTesting` + public so `test/backend_supervisor_test.dart`
+  /// can exercise it directly — pure-function semantics, no I/O.
+  @visibleForTesting
+  static MergeResult? mergeMissingScalarFields({
     required String userYaml,
     required String bundleYaml,
   }) {
@@ -571,7 +573,7 @@ class BackendSupervisor {
     if (!userYaml.endsWith('\n') && result.endsWith('\n')) {
       result = result.substring(0, result.length - 1);
     }
-    return _MergeResult(yaml: result, added: addedKeys);
+    return MergeResult(yaml: result, added: addedKeys);
   }
 
   /// Parse `yaml` into a map of `section name -> {scalar key -> field}`.
@@ -579,7 +581,7 @@ class BackendSupervisor {
   /// NOT the start of a nested block (i.e. doesn't end with `:` alone,
   /// doesn't begin with a list/object literal continuation). Nested
   /// objects, lists, and multi-line strings are intentionally skipped
-  /// — see the heuristic notes on `_mergeMissingScalarFields`.
+  /// — see the heuristic notes on `mergeMissingScalarFields`.
   static Map<String, Map<String, _Field>> _scalarFieldsBySection(
     String yaml,
   ) {
@@ -725,10 +727,11 @@ class _MissingField {
   const _MissingField({required this.key, required this.block});
 }
 
-/// Result of `_mergeMissingScalarFields` — the patched YAML plus the
-/// list of `section.key` identifiers actually added, for logging.
-class _MergeResult {
+/// Result of [BackendSupervisor.mergeMissingScalarFields] — the patched
+/// YAML plus the list of `section.key` identifiers actually added (for
+/// logging + test assertions).
+class MergeResult {
   final String yaml;
   final List<String> added;
-  const _MergeResult({required this.yaml, required this.added});
+  const MergeResult({required this.yaml, required this.added});
 }
