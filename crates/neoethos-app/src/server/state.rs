@@ -197,9 +197,9 @@ pub struct AppApiState {
     /// channel every tick; when a message arrives, it runs an
     /// immediate `refresh_once` instead of waiting for the 5 s
     /// timer. Senders:
-    ///   1. The future cTrader `OAExecutionEvent` handler in
-    ///      `ctrader_session` (fill / close / margin-call push from
-    ///      the broker → instant account refresh on the bridge).
+    ///   1. The future cTrader `OAExecutionEvent` handler (fill /
+    ///      close / margin-call push from the broker → instant
+    ///      account refresh on the bridge).
     ///   2. `POST /account/snapshot/refresh` — operator-triggered
     ///      force-refresh button in the UI.
     ///

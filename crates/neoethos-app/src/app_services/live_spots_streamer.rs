@@ -411,8 +411,7 @@ fn run_blocking(config: LiveSpotsStreamerConfig, my_gen: u64) -> Result<()> {
     // spots" (and position pnl_pips fell back to 0 with no live price).
     // We now (a) set a short read timeout so the blocking `read()`
     // returns periodically, and (b) send a JSON heartbeat (payloadType
-    // 51) every ~10 s — the same cadence the account session uses
-    // (ctrader_session.rs:93).
+    // 51) every ~10 s — the same cadence the account session uses.
     set_spot_read_timeout(&mut socket, Duration::from_secs(5));
     let heartbeat_every = Duration::from_secs(10);
     let mut last_heartbeat = Instant::now();
