@@ -88,27 +88,32 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
   @override
   Widget build(BuildContext context) {
     final status = ref.watch(codexStatusProvider);
-    return SingleChildScrollView(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const ViewHeader(
-            title: 'AI Helper',
-            subtitle: 'ChatGPT subscription · no API key',
-          ),
-          status.when(
-            data: (s) =>
-                s.authenticated ? _chatUi(s) : _ConnectCard(status: s),
+    // Pin to the available height — AI Desk gives this screen a bounded
+    // box (Expanded → TabBarView), so the chat input row stays visible at
+    // the bottom instead of being pushed below the fold by a
+    // MediaQuery-sized message box. Non-chat states stay scrollable.
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const ViewHeader(
+          title: 'AI Helper',
+          subtitle: 'ChatGPT subscription · no API key',
+        ),
+        Expanded(
+          child: status.when(
+            data: (s) => s.authenticated
+                ? _chatUi(s)
+                : SingleChildScrollView(child: _ConnectCard(status: s)),
             loading: () => const _Loading(),
-            error: (err, _) => _Error(error: err.toString()),
+            error: (err, _) =>
+                SingleChildScrollView(child: _Error(error: err.toString())),
           ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 
   Widget _chatUi(CodexStatusSnapshot s) {
-    final size = MediaQuery.of(context).size;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -144,14 +149,33 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
             ],
           ),
         ),
-        SectionCard(
-          title: 'Chat',
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SizedBox(
-                height: (size.height - 360).clamp(220, 800),
-                child: _messages.isEmpty
+        Expanded(
+          // Custom expanding card (not SectionCard) so the message list
+          // fills all available height and the input row pins to the
+          // bottom. SectionCard lays its child at natural height, which
+          // would collapse the inner Expanded.
+          child: Container(
+            padding: const EdgeInsets.all(ForexAiTokens.spMd),
+            margin: const EdgeInsets.only(top: ForexAiTokens.spSm),
+            decoration: BoxDecoration(
+              color: ForexAiTokens.surfaceAlt,
+              border: Border.all(color: ForexAiTokens.border),
+              borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Chat',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: ForexAiTokens.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: ForexAiTokens.spXs),
+                Expanded(
+                  child: _messages.isEmpty
                     ? const Center(
                         child: Text(
                           'Ask anything. Trading questions, market\n'
@@ -204,6 +228,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
                 ],
               ),
             ],
+          ),
           ),
         ),
       ],

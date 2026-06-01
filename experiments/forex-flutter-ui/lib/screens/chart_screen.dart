@@ -948,6 +948,19 @@ class _ChartCanvasWithOverlaysState
             ],
           ),
         ),
+        // F-334: one-click buy/sell strip, right-aligned just above the
+        // candles. Placed in the normal column flow (NOT a Stack overlay
+        // on top of the Size.infinite CustomPaint, which never laid the
+        // overlay out) so it is always visible. Renders a compact
+        // "awaiting price" stub until a live tick exists, an amber
+        // "stale" marker when the tick ages, else live SELL/BUY.
+        Align(
+          alignment: Alignment.centerRight,
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: InlineBuySell(symbol: widget.snapshot.symbol),
+          ),
+        ),
         SizedBox(
           height: 320,
           child: Stack(
@@ -971,14 +984,6 @@ class _ChartCanvasWithOverlaysState
                     size: Size.infinite,
                   ),
                 ),
-              ),
-              // F-334: one-click buy/sell at the live price, overlaid
-              // top-right of the chart (cTrader/TradingView style).
-              // Renders nothing until a fresh tick exists for the symbol.
-              Positioned(
-                top: 8,
-                right: 8,
-                child: InlineBuySell(symbol: widget.snapshot.symbol),
               ),
             ],
           ),

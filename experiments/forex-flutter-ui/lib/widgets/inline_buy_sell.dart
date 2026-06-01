@@ -105,12 +105,23 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
     final bid = tick?.bid;
     final ask = tick?.ask;
 
-    // No live price yet → render nothing (don't fake a price).
-    if (bid == null || ask == null || (tick?.isStale ?? true)) {
-      return const SizedBox.shrink();
+    // Only hide when there is NO price at all. A briefly-stale tick must
+    // NOT make the quick-trade panel vanish — the demo majors routinely
+    // gap 15–20 s between ticks, and a panel that flickers in and out is
+    // worse than one showing a slightly-aged indicative price. Market
+    // orders fill at the broker's live price regardless of the bid/ask
+    // shown here; staleness is surfaced with an amber marker instead.
+    if (bid == null || ask == null) {
+      // No tick for this symbol yet (SSE warming up, or a charted symbol
+      // with no live subscription). Show a compact placeholder rather
+      // than vanishing — keeps the quick-trade affordance discoverable
+      // and tells the operator a price is being awaited.
+      return _QuickTradeStub(symbol: widget.symbol);
     }
 
     final digits = _priceDigits(widget.symbol);
+    final stale = tick?.isStale ?? false;
+    final freshSecs = tick?.freshnessSeconds ?? 0.0;
 
     return Container(
       padding: const EdgeInsets.all(6),
@@ -126,6 +137,34 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          // Freshness marker — green "live" dot when the tick is fresh,
+          // amber "stale Ns" when the last tick aged past the window.
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 6,
+                height: 6,
+                margin: const EdgeInsets.only(right: 4),
+                decoration: BoxDecoration(
+                  color: stale ? ForexAiTokens.warning : ForexAiTokens.buy,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              Text(
+                stale ? 'stale ${freshSecs.toStringAsFixed(0)}s' : 'live',
+                style: TextStyle(
+                  fontSize: 8,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.5,
+                  color: stale
+                      ? ForexAiTokens.warning
+                      : ForexAiTokens.textMuted,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -134,6 +173,7 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
                 price: bid.toStringAsFixed(digits),
                 color: ForexAiTokens.sell,
                 busy: _busy,
+                stale: stale,
                 onTap: () => _placeOrder('sell'),
               ),
               const SizedBox(width: 6),
@@ -148,6 +188,7 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
                 price: ask.toStringAsFixed(digits),
                 color: ForexAiTokens.buy,
                 busy: _busy,
+                stale: stale,
                 onTap: () => _placeOrder('buy'),
               ),
             ],
@@ -183,12 +224,14 @@ class _SideButton extends StatelessWidget {
   final String price;
   final Color color;
   final bool busy;
+  final bool stale;
   final VoidCallback onTap;
   const _SideButton({
     required this.label,
     required this.price,
     required this.color,
     required this.busy,
+    required this.stale,
     required this.onTap,
   });
 
@@ -215,10 +258,11 @@ class _SideButton extends StatelessWidget {
           ),
           Text(
             price,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 11,
               fontWeight: FontWeight.w700,
-              fontFeatures: [FontFeature.tabularFigures()],
+              color: stale ? Colors.white70 : Colors.white,
+              fontFeatures: const [FontFeature.tabularFigures()],
             ),
           ),
         ],
@@ -272,6 +316,48 @@ class _VolumeStepper extends StatelessWidget {
           ],
         ),
       ],
+    );
+  }
+}
+
+/// Compact placeholder shown in the chart's top-right when no live tick
+/// exists yet for the symbol. Keeps the quick-trade panel discoverable
+/// instead of leaving a blank corner (F-334 follow-up).
+class _QuickTradeStub extends StatelessWidget {
+  final String symbol;
+  const _QuickTradeStub({required this.symbol});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: BoxDecoration(
+        color: ForexAiTokens.panelBg.withValues(alpha: 0.94),
+        border: Border.all(color: ForexAiTokens.border),
+        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+      ),
+      child: const Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 10,
+            height: 10,
+            child: CircularProgressIndicator(
+              strokeWidth: 1.6,
+              color: ForexAiTokens.textMuted,
+            ),
+          ),
+          SizedBox(width: 6),
+          Text(
+            'Quick trade · awaiting price',
+            style: TextStyle(
+              fontSize: 9,
+              fontWeight: FontWeight.w600,
+              color: ForexAiTokens.textMuted,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
