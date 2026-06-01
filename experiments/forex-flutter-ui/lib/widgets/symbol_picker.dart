@@ -362,7 +362,8 @@ class TimeframePicker extends ConsumerWidget {
       ),
       error: (err, _) => _StatusPlaceholder(
         label: label,
-        message: 'Timeframe list unavailable: $err',
+        message: 'Timeframes unavailable — authenticate in Broker Setup '
+            'to load them.',
         tone: ForexAiTokens.warning,
       ),
     );

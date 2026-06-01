@@ -5,9 +5,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart' show EnginesSnapshot;
+import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/backend_error_widget.dart';
 import '../widgets/multi_symbol_picker.dart';
 import '_placeholder.dart';
 import 'widgets/engine_controls.dart';
@@ -159,8 +161,10 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                     'baby-sitting each one.',
               ),
               loading: () => const _Loading(),
-              error: (err, _) =>
-                  _Error(error: err is DioException ? _formatDio(err) : '$err'),
+              error: (err, _) => BackendErrorWidget(
+                error: err,
+                title: 'Discovery status unavailable',
+              ),
             ),
         ],
       ),
@@ -465,7 +469,8 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
               style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
             ),
             error: (err, _) => Text(
-              'TF err: $err',
+              'Could not load timeframes — ${describeError(err)}. '
+              'Authenticate in Broker Setup, then refresh.',
               style: const TextStyle(fontSize: 11, color: ForexAiTokens.warning),
             ),
           ),
@@ -713,20 +718,24 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
           portfolioSize: _portfolioSize,
         );
       } on DioException catch (e) {
-        failed.add('$symbol: ${_formatDio(e)}');
+        failed.add('$symbol: ${describeError(e)}');
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text('Queue aborted on $symbol: ${_formatDio(e)}'),
+            content: Text(
+              'Discovery stopped on $symbol — ${describeError(e)}.',
+            ),
             backgroundColor: const Color(0xFFB71C1C),
             duration: const Duration(seconds: 4),
           ));
         }
         break;
       } catch (e) {
-        failed.add('$symbol: $e');
+        failed.add('$symbol: ${describeError(e)}');
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text('Queue aborted on $symbol: $e'),
+            content: Text(
+              'Discovery stopped on $symbol — ${describeError(e)}.',
+            ),
             backgroundColor: const Color(0xFFB71C1C),
             duration: const Duration(seconds: 4),
           ));
@@ -871,12 +880,6 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
   }
 }
 
-String _formatDio(DioException e) {
-  final body = e.response?.data;
-  if (body is Map && body['error'] is String) return body['error'] as String;
-  return e.message ?? e.toString();
-}
-
 class _Loading extends StatelessWidget {
   const _Loading();
   @override
@@ -889,15 +892,3 @@ class _Loading extends StatelessWidget {
       );
 }
 
-class _Error extends StatelessWidget {
-  final String error;
-  const _Error({required this.error});
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        child: Text(
-          'Backend unreachable: $error',
-          style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
-        ),
-      );
-}

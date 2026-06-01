@@ -15,6 +15,7 @@ import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/backend_error_widget.dart';
 import '../widgets/symbol_picker.dart';
 import '_placeholder.dart';
 
@@ -82,7 +83,8 @@ class _NewsScreenState extends ConsumerState<NewsScreen> {
           status.when(
             data: (s) => s.authenticated ? _readyUi(s) : _connectHint(s),
             loading: () => const _Loading(),
-            error: (err, _) => _Error(error: err.toString()),
+            error: (err, _) => BackendErrorWidget(
+                    error: err, title: 'News feed unavailable'),
           ),
         ],
       ),
@@ -233,15 +235,3 @@ class _Loading extends StatelessWidget {
       );
 }
 
-class _Error extends StatelessWidget {
-  final String error;
-  const _Error({required this.error});
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        child: Text(
-          'Backend unreachable: $error',
-          style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
-        ),
-      );
-}

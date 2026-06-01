@@ -33,6 +33,7 @@ import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
 import '../api/currency_format.dart';
+import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../state/system_providers.dart';
@@ -288,7 +289,9 @@ class _WatchlistPanel extends ConsumerWidget {
                   ),
                 ),
               ),
-              error: (err, _) => _ErrorBlock(message: err.toString()),
+              error: (err, _) => _ErrorBlock(
+                message: 'Live prices unavailable — ${describeError(err)}',
+              ),
               data: (snap) {
                 if (snap.spots.isEmpty) {
                   return const Center(
@@ -656,7 +659,9 @@ class _OpenPositionsPanel extends StatelessWidget {
           Expanded(
             child: accountAsync.when(
               loading: () => const _LoadingLine(),
-              error: (err, _) => _ErrorBlock(message: err.toString()),
+              error: (err, _) => _ErrorBlock(
+                message: 'Positions unavailable — ${describeError(err)}',
+              ),
               data: (_) {
                 if (positions.isEmpty) {
                   return const _EmptyLine(message: 'No open positions.');

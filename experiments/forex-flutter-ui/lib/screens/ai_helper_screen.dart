@@ -15,6 +15,7 @@ import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/backend_error_widget.dart';
 import '_placeholder.dart';
 
 class _Message {
@@ -105,8 +106,9 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
                 ? _chatUi(s)
                 : SingleChildScrollView(child: _ConnectCard(status: s)),
             loading: () => const _Loading(),
-            error: (err, _) =>
-                SingleChildScrollView(child: _Error(error: err.toString())),
+            error: (err, _) => SingleChildScrollView(
+                child: BackendErrorWidget(
+                    error: err, title: 'AI Desk unavailable')),
           ),
         ),
       ],
@@ -246,7 +248,8 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: ForexAiTokens.sell,
-          content: Text('Logout failed: $e'),
+          content: Text(
+              'Could not sign out from AI Desk — ${describeError(e)}.'),
         ),
       );
     }
@@ -472,15 +475,3 @@ class _Loading extends StatelessWidget {
       );
 }
 
-class _Error extends StatelessWidget {
-  final String error;
-  const _Error({required this.error});
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        child: Text(
-          'Backend unreachable: $error',
-          style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
-        ),
-      );
-}

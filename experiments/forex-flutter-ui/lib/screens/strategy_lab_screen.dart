@@ -26,6 +26,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
+import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -452,7 +453,9 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _error = '$e';
+        _error = 'Backtest could not start — ${describeError(e)}. '
+            'Ensure the engine is healthy and the symbol has local data '
+            '(Data Bootstrap).';
         _loading = false;
       });
     }
@@ -477,20 +480,18 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
       );
     } on DioException catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Promotion failed: ${_formatPromotionError(e)}'),
-            backgroundColor: ForexAiTokens.sell,
-          ),
+        showTranslatedErrorSnackbar(
+          context,
+          e,
+          prefix: 'Could not promote to live',
         );
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Promotion failed: $e'),
-            backgroundColor: ForexAiTokens.sell,
-          ),
+        showTranslatedErrorSnackbar(
+          context,
+          e,
+          prefix: 'Could not promote to live',
         );
       }
     } finally {

@@ -32,6 +32,7 @@ import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/backend_error_widget.dart';
 import '_placeholder.dart';
 import 'advanced_settings_screen.dart';
 import 'broker_setup_screen.dart';
@@ -382,7 +383,7 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
           asyncSettings.when(
             data: (s) => _configCard(s),
             loading: () => const _Loading(),
-            error: (err, _) => _Error(error: err.toString()),
+            error: (err, _) => BackendErrorWidget(error: err, title: "Settings couldn't load"),
           ),
           // **2026-05-25 — task #238 supersedes #193**: the live
           // knob editor (`/settings/knob-catalog`) replaces the
@@ -651,7 +652,7 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
         _messageOk = false;
         _message = e.toString();
       });
-      _showSnack('Save failed: $e', ok: false);
+      _showSnack('Settings could not be saved — ${describeError(e)}. Check write access to the config folder and retry.', ok: false);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -1214,7 +1215,7 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
         _controller.text = _yamlOnDisk!;
       });
     } catch (err) {
-      if (mounted) setState(() => _error = err.toString());
+      if (mounted) setState(() => _error = 'config.yaml could not be read — ${describeError(err)}');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -1260,7 +1261,7 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
         });
       }
     } catch (err) {
-      if (mounted) setState(() => _error = err.toString());
+      if (mounted) setState(() => _error = 'Could not write config — ${describeError(err)}');
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -1461,16 +1462,4 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
   }
 }
 
-class _Error extends StatelessWidget {
-  final String error;
-  const _Error({required this.error});
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        child: Text(
-          'Backend unreachable: $error',
-          style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
-        ),
-      );
-}
 

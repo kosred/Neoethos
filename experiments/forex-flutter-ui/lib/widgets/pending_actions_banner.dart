@@ -26,6 +26,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
+import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/pending_actions_provider.dart';
 import '../theme/theme.dart';
@@ -115,12 +116,11 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
       // logs.
       final ok = resp['ok'] == true;
       if (!ok) {
-        final code = resp['code']?.toString() ?? 'unknown';
         final err = resp['error']?.toString() ?? 'confirm failed';
         if (mounted) {
           setState(() {
             _submitting = false;
-            _error = '[$code] $err';
+            _error = 'Action could not complete — $err. Refresh and try again.';
           });
         }
         return;
@@ -134,7 +134,8 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
       if (mounted) {
         setState(() {
           _submitting = false;
-          _error = e.toString();
+          _error = 'Action could not complete — ${describeError(e)}. '
+              'Refresh and try again.';
         });
       }
     }
@@ -160,12 +161,11 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
       );
       final ok = resp['ok'] == true;
       if (!ok) {
-        final code = resp['code']?.toString() ?? 'unknown';
         final err = resp['error']?.toString() ?? 'reject failed';
         if (mounted) {
           setState(() {
             _submitting = false;
-            _error = '[$code] $err';
+            _error = 'Action could not complete — $err. Refresh and try again.';
           });
         }
         return;
@@ -175,7 +175,8 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
       if (mounted) {
         setState(() {
           _submitting = false;
-          _error = e.toString();
+          _error = 'Action could not complete — ${describeError(e)}. '
+              'Refresh and try again.';
         });
       }
     }

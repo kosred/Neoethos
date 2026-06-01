@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 import '../api/backend_client.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/backend_error_widget.dart';
 import '_placeholder.dart';
 
 /// Intelligence — shows the current model swarm inventory: which
@@ -29,7 +30,8 @@ class IntelligenceScreen extends ConsumerWidget {
           async.when(
             data: (s) => _Body(snapshot: s),
             loading: () => const _Loading(),
-            error: (err, _) => _Error(error: err.toString()),
+            error: (err, _) => BackendErrorWidget(
+                    error: err, title: 'Intelligence unavailable'),
           ),
         ],
       ),
@@ -244,15 +246,3 @@ class _Loading extends StatelessWidget {
       );
 }
 
-class _Error extends StatelessWidget {
-  final String error;
-  const _Error({required this.error});
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        child: Text(
-          'Backend unreachable: $error',
-          style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
-        ),
-      );
-}

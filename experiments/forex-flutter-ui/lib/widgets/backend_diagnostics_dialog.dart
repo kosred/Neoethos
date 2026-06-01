@@ -26,6 +26,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
+import '../api/error_translation.dart';
 import '../startup/backend_supervisor.dart';
 import '../startup/backend_watchdog.dart';
 import '../theme/theme.dart';
@@ -85,7 +86,11 @@ class _BackendDiagnosticsDialogState
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: ForexAiTokens.sell,
-          content: Text('Restart failed: $e'),
+          content: Text(
+            'Restart command failed — ${describeError(e)}. '
+            'Try ending the neoethos-core process in Task Manager, '
+            'then relaunch.',
+          ),
         ),
       );
     } finally {

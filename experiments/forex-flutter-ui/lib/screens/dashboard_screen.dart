@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
 import '../api/currency_format.dart';
+import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -401,7 +402,7 @@ class _ErrorBanner extends StatelessWidget {
         ? 'Connecting to broker… the bridge is up but cTrader hasn\'t '
             'replied yet. Live numbers will appear once the first '
             'refresh completes (≤ 5s).'
-        : 'Backend unreachable: $error';
+        : 'Dashboard data unavailable — ${describeError(error)}';
     final colour = isBrokerNotReady
         ? ForexAiTokens.textMuted
         : ForexAiTokens.sell;

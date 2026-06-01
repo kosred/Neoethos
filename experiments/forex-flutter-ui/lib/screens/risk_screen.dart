@@ -18,6 +18,7 @@ import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/backend_error_widget.dart';
 import '_placeholder.dart';
 
 class RiskScreen extends ConsumerWidget {
@@ -38,7 +39,8 @@ class RiskScreen extends ConsumerWidget {
           async.when(
             data: (r) => _Body(snapshot: r),
             loading: () => const _Loading(),
-            error: (err, _) => _Error(error: err.toString()),
+            error: (err, _) => BackendErrorWidget(
+                    error: err, title: 'Risk settings unavailable'),
           ),
         ],
       ),
@@ -372,15 +374,3 @@ class _Loading extends StatelessWidget {
       );
 }
 
-class _Error extends StatelessWidget {
-  final String error;
-  const _Error({required this.error});
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        child: Text(
-          'Backend unreachable: $error',
-          style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
-        ),
-      );
-}

@@ -25,6 +25,7 @@ import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
 import '../api/currency_format.dart';
+import '../api/error_translation.dart';
 import '../screens/help_screen.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
@@ -294,8 +295,11 @@ class _AccountSwitcher extends ConsumerWidget {
     } catch (e) {
       messenger.showSnackBar(SnackBar(
         backgroundColor: ForexAiTokens.sell,
-        duration: const Duration(seconds: 5),
-        content: Text('Account switch failed: $e'),
+        duration: const Duration(seconds: 6),
+        content: Text(
+          'Account switch failed — active account unchanged. '
+          '${describeError(e)}',
+        ),
       ));
     }
   }

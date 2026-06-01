@@ -14,6 +14,7 @@ import '../api/backend_client.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/backend_error_widget.dart';
 import '_placeholder.dart';
 
 /// #185: ISO 4217 currency codes for the majors + commonly-traded
@@ -132,7 +133,8 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
           brokerSymbols.when(
             data: (snap) => _symbolsCard(snap),
             loading: () => const _Loading(),
-            error: (err, _) => _Error(error: err.toString()),
+            error: (err, _) => BackendErrorWidget(
+                    error: err, title: 'Markets unavailable'),
           ),
         ],
       ),
@@ -284,20 +286,6 @@ class _Loading extends StatelessWidget {
       );
 }
 
-class _Error extends StatelessWidget {
-  final String error;
-  const _Error({required this.error});
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        child: Text(
-          'Broker symbol catalog unavailable: $error\n'
-          'Configure credentials in Settings, then Re-authenticate in '
-          'Broker Setup.',
-          style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
-        ),
-      );
-}
 
 class _Th extends StatelessWidget {
   final String text;

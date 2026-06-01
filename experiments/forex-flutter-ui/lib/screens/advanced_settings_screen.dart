@@ -40,6 +40,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../widgets/backend_error_widget.dart';
 import '../state/account_provider.dart';
 import '../theme/theme.dart';
 
@@ -85,10 +86,10 @@ class AdvancedSettingsScreen extends ConsumerWidget {
       backgroundColor: ForexAiTokens.appBg,
       body: catalog.when(
         loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) => _ErrorView(error: e),
+        error: (e, _) => BackendErrorWidget(error: e, title: 'Advanced settings unavailable'),
         data: (cat) => presets.when(
           loading: () => const Center(child: CircularProgressIndicator()),
-          error: (e, _) => _ErrorView(error: e),
+          error: (e, _) => BackendErrorWidget(error: e, title: 'Advanced settings unavailable'),
           data: (presetCat) => _Body(catalog: cat, presets: presetCat),
         ),
       ),
@@ -96,32 +97,6 @@ class AdvancedSettingsScreen extends ConsumerWidget {
   }
 }
 
-class _ErrorView extends StatelessWidget {
-  final Object error;
-  const _ErrorView({required this.error});
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.error_outline,
-                size: 48, color: Color(0xFFB71C1C)),
-            const SizedBox(height: 12),
-            Text(
-              'Could not load the knob catalog: $error',
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: ForexAiTokens.textMuted),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
 
 class _Body extends ConsumerStatefulWidget {
   final KnobCatalog catalog;

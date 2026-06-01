@@ -25,6 +25,7 @@ import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
 import '../api/currency_format.dart';
+import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../theme/theme.dart';
@@ -211,7 +212,7 @@ class _OpenPositionsTable extends ConsumerWidget {
           Expanded(
             child: accountAsync.when(
               loading: () => const _LoadingLine(),
-              error: (err, _) => _ErrorBlock(message: err.toString()),
+              error: (err, _) => _ErrorBlock(error: err),
               data: (acc) {
                 if (acc.positions.isEmpty) {
                   return const _EmptyLine(
@@ -307,11 +308,11 @@ class _OpenPositionsTable extends ConsumerWidget {
           .refreshNow();
     } catch (e) {
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          backgroundColor: ForexAiTokens.sell,
-          content: Text('Close failed: $e'),
-        ),
+      showTranslatedErrorSnackbar(
+        context,
+        e,
+        prefix: 'Position close was not confirmed — '
+            'check the Positions list; if it still shows open, try again',
       );
     }
   }
@@ -665,13 +666,13 @@ class _EmptyLine extends StatelessWidget {
 }
 
 class _ErrorBlock extends StatelessWidget {
-  final String message;
-  const _ErrorBlock({required this.message});
+  final Object error;
+  const _ErrorBlock({required this.error});
   @override
   Widget build(BuildContext context) => Padding(
         padding: const EdgeInsets.all(ForexAiTokens.spMd),
         child: Text(
-          'Error: $message',
+          describeError(error),
           style: const TextStyle(
             fontSize: ForexAiTokens.fsCaption,
             color: ForexAiTokens.sell,

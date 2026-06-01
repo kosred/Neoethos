@@ -19,6 +19,7 @@ import 'package:dio/dio.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../widgets/backend_error_widget.dart';
 import '../charts/chart_viewport.dart';
 import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
@@ -540,7 +541,7 @@ class _ChartPanel extends ConsumerWidget {
         async.when(
           data: (c) => _ChartBody(snapshot: c, slot: slot),
           loading: () => const _Loading(),
-          error: (err, _) => _Error(error: err.toString()),
+          error: (err, _) => BackendErrorWidget(error: err, title: 'Chart data unavailable'),
         ),
       ],
     );
@@ -786,7 +787,7 @@ class _AutoFetchPromptState extends ConsumerState<_AutoFetchPrompt> {
       // Re-pull the chart now that bars exist on disk.
       ref.invalidate(widget.slot.chart);
     } catch (err) {
-      if (mounted) setState(() => _error = err.toString());
+      if (mounted) setState(() => _error = 'Could not download ${widget.symbol} history — ${describeError(err)}. Check your broker connection and try again.');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -1400,15 +1401,3 @@ class _Loading extends StatelessWidget {
       );
 }
 
-class _Error extends StatelessWidget {
-  final String error;
-  const _Error({required this.error});
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        child: Text(
-          'Chart failed: $error',
-          style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
-        ),
-      );
-}

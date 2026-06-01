@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
 import '../state/account_provider.dart';
+import '../widgets/backend_error_widget.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
@@ -25,7 +26,7 @@ class BrokerSetupScreen extends ConsumerWidget {
           async.when(
             data: (b) => _Body(status: b),
             loading: () => const _Loading(),
-            error: (err, _) => _Error(error: err.toString()),
+            error: (err, _) => BackendErrorWidget(error: err, title: "Couldn't reach the engine"),
           ),
         ],
       ),
@@ -234,15 +235,3 @@ class _Loading extends StatelessWidget {
       );
 }
 
-class _Error extends StatelessWidget {
-  final String error;
-  const _Error({required this.error});
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        child: Text(
-          'Backend unreachable: $error',
-          style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
-        ),
-      );
-}

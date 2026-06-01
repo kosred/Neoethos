@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
+import '../api/error_translation.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 
@@ -101,7 +102,8 @@ class _MultiSymbolPickerDialogState
                       const Center(child: CircularProgressIndicator()),
                   error: (e, _) => Center(
                     child: Text(
-                      'catalog error: $e',
+                      'Symbol list could not be loaded — ${describeError(e)}. '
+                      'Authenticate in Broker Setup first.',
                       style: const TextStyle(color: ForexAiTokens.sell),
                     ),
                   ),

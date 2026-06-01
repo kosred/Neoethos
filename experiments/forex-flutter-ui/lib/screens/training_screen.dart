@@ -1,10 +1,10 @@
-import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/backend_error_widget.dart';
 import '_placeholder.dart';
 import 'widgets/engine_controls.dart';
 
@@ -48,19 +48,13 @@ class TrainingScreen extends ConsumerWidget {
                   'Discovery.',
             ),
             loading: () => const _Loading(),
-            error: (err, _) =>
-                _Error(error: err is DioException ? _formatDio(err) : '$err'),
+            error: (err, _) => BackendErrorWidget(
+                    error: err, title: 'Training status unavailable'),
           ),
         ],
       ),
     );
   }
-}
-
-String _formatDio(DioException e) {
-  final body = e.response?.data;
-  if (body is Map && body['error'] is String) return body['error'] as String;
-  return e.message ?? e.toString();
 }
 
 class _Loading extends StatelessWidget {
@@ -75,15 +69,3 @@ class _Loading extends StatelessWidget {
       );
 }
 
-class _Error extends StatelessWidget {
-  final String error;
-  const _Error({required this.error});
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        child: Text(
-          'Backend unreachable: $error',
-          style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
-        ),
-      );
-}
