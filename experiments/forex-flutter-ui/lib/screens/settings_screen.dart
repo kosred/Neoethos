@@ -414,16 +414,18 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
       );
     }
     return SectionCard(
-      title: 'cTrader Credentials',
+      title: 'cTrader Credentials (optional — built-in by default)',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text(
-            'Get these from the Spotware Open API portal '
-            '(https://openapi.ctrader.com → Applications → your app). '
-            'They are saved to %APPDATA%/neoethos/broker_credentials.toml '
-            '— never committed to git. After saving, open Broker Setup '
-            '→ Re-authenticate to fetch a fresh OAuth token.',
+            'NeoEthos ships with built-in cTrader application credentials, so '
+            'you normally do NOT enter anything here — just open '
+            'Account → Re-authenticate to sign into your OWN cTrader account '
+            'in the browser. The fields below are OPTIONAL: only for advanced '
+            'users who want to use their own cTrader Open API app '
+            '(https://openapi.ctrader.com → Applications). Saved to '
+            '%APPDATA%/neoethos/broker_credentials.toml, never committed to git.',
             style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
           ),
           const SizedBox(height: 12),
