@@ -43,7 +43,6 @@ pub struct SettingsDto {
     pub data_dir: String,
     pub news_calendar_enabled: bool,
     pub news_calendar_source: String,
-    pub openai_model: String,
     /// `block_on_news` | `allow_always` | `warn_only`. Controls how
     /// the gate behaves during the kill window around high-impact
     /// news events. See [`NewsTradingMode`].
@@ -71,7 +70,6 @@ pub struct SettingsUpdateDto {
     pub data_dir: Option<String>,
     pub news_calendar_enabled: Option<bool>,
     pub news_calendar_source: Option<String>,
-    pub openai_model: Option<String>,
     /// Snake_case id of a [`NewsTradingMode`] variant.
     pub news_trading_mode: Option<String>,
     // Discovery search knobs (models.prop_search_*) — all optional.
@@ -302,8 +300,6 @@ fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
 /// - `data_dir` is trimmed; rejected if blank (we never want a
 ///   silently-empty path that breaks downstream readers).
 /// - `news_calendar_source` is trimmed; rejected if blank (same reason).
-/// - `openai_model` is trimmed but allowed blank (an empty model name
-///   disables the LLM news pipeline — operator-intentional).
 /// - Booleans pass straight through.
 pub async fn update_settings(
     State(_state): State<AppApiState>,
@@ -358,10 +354,6 @@ pub async fn update_settings(
                 .into_response();
         }
         settings.news.news_calendar_source = trimmed.to_string();
-    }
-    if let Some(raw) = payload.openai_model {
-        // Blank is allowed — operator-intentional "disable LLM news".
-        settings.news.openai_model = raw.trim().to_string();
     }
     if let Some(raw) = payload.news_trading_mode {
         let parsed = NewsTradingMode::parse(&raw).ok_or(()).map_err(|_| {
@@ -441,7 +433,6 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         data_dir: settings.system.data_dir.display().to_string(),
         news_calendar_enabled: settings.news.news_calendar_enabled,
         news_calendar_source: settings.news.news_calendar_source.clone(),
-        openai_model: settings.news.openai_model.clone(),
         news_trading_mode: mode.as_str().to_string(),
         news_trading_mode_display_name: mode.display_name().to_string(),
         search_population: settings.models.prop_search_population,

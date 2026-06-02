@@ -334,7 +334,6 @@ class _DirtyBanner extends ConsumerWidget {
                 ? edits['news.calendar_enabled'] as bool
                 : null,
             newsCalendarSource: edits['news.calendar_source']?.toString(),
-            openaiModel: edits['ai.openai_model']?.toString(),
             newsTradingMode: edits['news.trading_mode']?.toString(),
           );
       ref.read(knobEditsProvider.notifier).state = {};
@@ -719,6 +718,19 @@ class _NumberInputState extends State<_NumberInput> {
 
   String _fmt(num n) => widget.isInt ? n.toInt().toString() : n.toString();
 
+  /// Discrete slider steps so a wide-range knob no longer changes "too
+  /// fast" on a tiny drag. Ints snap to whole units (capped for perf);
+  /// floats get a smooth-but-bounded 200 steps. The text box stays the
+  /// authoritative way to enter an exact value.
+  int _sliderDivisions() {
+    final span = (widget.maxValue! - widget.minValue!).abs();
+    if (widget.isInt) {
+      final s = span.round();
+      return s < 1 ? 1 : (s > 1000 ? 1000 : s);
+    }
+    return 200;
+  }
+
   @override
   Widget build(BuildContext context) {
     final hasRange = widget.minValue != null && widget.maxValue != null;
@@ -755,12 +767,20 @@ class _NumberInputState extends State<_NumberInput> {
             child: Slider(
               min: widget.minValue!,
               max: widget.maxValue!,
+              divisions: _sliderDivisions(),
+              label: _fmt(widget.value),
               value: widget.value.toDouble().clamp(
                   widget.minValue!, widget.maxValue!),
               onChanged: (v) {
+                // Snap ints to whole units; mirror into the text box
+                // (exact entry) without dropping the caret to position 0.
                 final adjusted = widget.isInt ? v.round() : v;
                 widget.onChanged(adjusted);
-                _ctl.text = _fmt(adjusted);
+                final t = _fmt(adjusted);
+                _ctl.value = TextEditingValue(
+                  text: t,
+                  selection: TextSelection.collapsed(offset: t.length),
+                );
               },
             ),
           ),

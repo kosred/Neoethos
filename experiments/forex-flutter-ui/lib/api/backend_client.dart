@@ -335,7 +335,6 @@ class BackendClient {
     String? dataDir,
     bool? newsCalendarEnabled,
     String? newsCalendarSource,
-    String? openaiModel,
     String? newsTradingMode,
     int? searchPopulation,
     int? searchGenerations,
@@ -353,7 +352,6 @@ class BackendClient {
     if (newsCalendarSource != null) {
       body['newsCalendarSource'] = newsCalendarSource;
     }
-    if (openaiModel != null) body['openaiModel'] = openaiModel;
     if (newsTradingMode != null) body['newsTradingMode'] = newsTradingMode;
     if (searchPopulation != null) body['searchPopulation'] = searchPopulation;
     if (searchGenerations != null) {
@@ -1255,7 +1253,6 @@ class SettingsSnapshot {
   final String dataDir;
   final bool newsCalendarEnabled;
   final String newsCalendarSource;
-  final String openaiModel;
 
   /// Snake_case news-trading mode id from
   /// `crate::config::NewsTradingMode`. Empty when the backend
@@ -1278,7 +1275,6 @@ class SettingsSnapshot {
     required this.dataDir,
     required this.newsCalendarEnabled,
     required this.newsCalendarSource,
-    required this.openaiModel,
     required this.newsTradingMode,
     required this.newsTradingModeDisplayName,
     this.searchPopulation = 100,
@@ -1294,7 +1290,6 @@ class SettingsSnapshot {
         dataDir: j['dataDir'] as String,
         newsCalendarEnabled: j['newsCalendarEnabled'] as bool,
         newsCalendarSource: j['newsCalendarSource'] as String,
-        openaiModel: j['openaiModel'] as String,
         newsTradingMode: (j['newsTradingMode'] as String?) ?? '',
         newsTradingModeDisplayName:
             (j['newsTradingModeDisplayName'] as String?) ?? '',

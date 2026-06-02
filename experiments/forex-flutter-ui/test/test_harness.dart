@@ -185,7 +185,6 @@ List<Override> testProviderOverrides() => [
           dataDir: 'test-data',
           newsCalendarEnabled: true,
           newsCalendarSource: 'test',
-          openaiModel: 'gpt-4o-mini',
           newsTradingMode: 'block_on_news',
           newsTradingModeDisplayName: 'Pause during news (safe default)',
         ),

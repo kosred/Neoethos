@@ -559,7 +559,6 @@ class _AppSettingsCard extends ConsumerStatefulWidget {
 class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
   late final TextEditingController _dataDirCtrl;
   late final TextEditingController _newsSourceCtrl;
-  late final TextEditingController _openaiModelCtrl;
   late bool _newsEnabled;
   /// Snake_case id matching `crate::config::NewsTradingMode`.
   /// Defaults to `block_on_news` (safe).
@@ -582,7 +581,6 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
     final s = widget.snapshot;
     _dataDirCtrl = TextEditingController(text: s.dataDir);
     _newsSourceCtrl = TextEditingController(text: s.newsCalendarSource);
-    _openaiModelCtrl = TextEditingController(text: s.openaiModel);
     _newsEnabled = s.newsCalendarEnabled;
     _newsTradingMode = s.newsTradingMode.isEmpty
         ? 'block_on_news'
@@ -612,16 +610,12 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
     if (!_busy && _newsSourceCtrl.text != s.newsCalendarSource) {
       _newsSourceCtrl.text = s.newsCalendarSource;
     }
-    if (!_busy && _openaiModelCtrl.text != s.openaiModel) {
-      _openaiModelCtrl.text = s.openaiModel;
-    }
   }
 
   @override
   void dispose() {
     _dataDirCtrl.dispose();
     _newsSourceCtrl.dispose();
-    _openaiModelCtrl.dispose();
     _searchPopCtrl.dispose();
     _searchGenCtrl.dispose();
     _searchMaxHoursCtrl.dispose();
@@ -635,8 +629,6 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
   Future<void> _save() async {
     final dataDir = _dataDirCtrl.text.trim();
     final newsSource = _newsSourceCtrl.text.trim();
-    // openai_model is allowed blank intentionally — see backend
-    // doc-comment in server/settings.rs::update_settings.
     if (dataDir.isEmpty) {
       _showSnack('Data directory cannot be blank', ok: false);
       return;
@@ -651,7 +643,6 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
             dataDir: dataDir,
             newsCalendarEnabled: _newsEnabled,
             newsCalendarSource: newsSource,
-            openaiModel: _openaiModelCtrl.text.trim(),
             newsTradingMode: _newsTradingMode,
             searchPopulation: int.tryParse(_searchPopCtrl.text.trim()),
             searchGenerations: int.tryParse(_searchGenCtrl.text.trim()),
@@ -877,19 +868,6 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
             selected: _newsTradingMode == 'warn_only',
             busy: _busy,
             onPick: () => setState(() => _newsTradingMode = 'warn_only'),
-          ),
-          const SizedBox(height: 14),
-          TextField(
-            controller: _openaiModelCtrl,
-            enabled: !_busy,
-            decoration: const InputDecoration(
-              labelText: 'LLM model name (legacy "openai_model" field)',
-              isDense: true,
-              border: OutlineInputBorder(),
-              helperText:
-                  'Used by the news pipeline. Leave blank to disable LLM '
-                  'news ingestion.',
-            ),
           ),
           const SizedBox(height: 14),
           Row(
