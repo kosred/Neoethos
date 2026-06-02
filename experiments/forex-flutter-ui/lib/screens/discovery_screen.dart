@@ -26,12 +26,19 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
   // `DiscoveryConfig::default()` so the "Estimated time" string is
   // accurate from the first render. The user can drag any slider to
   // override; sending `null` keeps the engine default.
+  // These are only the pre-config fallbacks shown for the split-second
+  // before the user's saved config arrives; build() overwrites them from
+  // `settingsProvider` (the single source of truth). Kept non-tiny so a
+  // run started before settings load is never a shallow 5-generation one.
   int _population = 100;
-  int _generations = 5;
+  int _generations = 100;
   int _maxIndicators = 12;
   int _targetCandidates = 200;
   int _portfolioSize = 100;
   bool _advancedOpen = false;
+  // Pull the GA knobs from the user's config exactly once (no hardcoded
+  // shallow defaults — the operator's saved values are authoritative).
+  bool _loadedConfigDefaults = false;
 
   // #264 (2026-05-29): Higher-timeframe multi-select. Defaults mirror
   // the backend's `DEFAULT_HIGHER_TFS = ["M5", "M15", "H1"]` in
@@ -110,6 +117,27 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
   @override
   Widget build(BuildContext context) {
     final async = ref.watch(enginesProvider);
+    // Single source of truth: seed the GA hyperparameters from the user's
+    // saved config the first time settings arrive. No hardcoded shallow
+    // defaults — the operator's values (e.g. generations=1000) flow
+    // straight through. The user can still override via the sliders below.
+    final settingsAsync = ref.watch(settingsProvider);
+    if (!_loadedConfigDefaults) {
+      settingsAsync.whenData((s) {
+        _loadedConfigDefaults = true;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          setState(() {
+            _population = s.searchPopulation.clamp(20, 1000).toInt();
+            _generations = s.searchGenerations.clamp(5, 2000).toInt();
+            if (s.searchMaxIndicators > 0) {
+              _maxIndicators = s.searchMaxIndicators.clamp(3, 30).toInt();
+            }
+            _portfolioSize = s.searchPortfolioSize.clamp(5, 200).toInt();
+          });
+        });
+      });
+    }
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -198,8 +226,8 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
             label: 'Population',
             value: _population,
             min: 20,
-            max: 500,
-            divisions: 24,
+            max: 1000,
+            divisions: 49,
             onChanged: (v) => setState(() => _population = v.round()),
             hint: 'Number of genomes per generation. Larger = '
                 'more exploration but slower.',
@@ -207,9 +235,9 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
           _slider(
             label: 'Generations',
             value: _generations,
-            min: 1,
-            max: 50,
-            divisions: 49,
+            min: 5,
+            max: 2000,
+            divisions: 399,
             onChanged: (v) => setState(() => _generations = v.round()),
             hint: 'Evolutionary rounds. Diminishing returns past ~20 '
                 'for short-horizon strategies.',

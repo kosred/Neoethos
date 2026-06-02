@@ -1282,7 +1282,7 @@ class SettingsSnapshot {
     required this.newsTradingMode,
     required this.newsTradingModeDisplayName,
     this.searchPopulation = 100,
-    this.searchGenerations = 20,
+    this.searchGenerations = 50,
     this.searchMaxHours = 24,
     this.searchMaxIndicators = 0,
     this.searchPortfolioSize = 4,
@@ -1299,7 +1299,7 @@ class SettingsSnapshot {
         newsTradingModeDisplayName:
             (j['newsTradingModeDisplayName'] as String?) ?? '',
         searchPopulation: (j['searchPopulation'] as num?)?.toInt() ?? 100,
-        searchGenerations: (j['searchGenerations'] as num?)?.toInt() ?? 20,
+        searchGenerations: (j['searchGenerations'] as num?)?.toInt() ?? 50,
         searchMaxHours: (j['searchMaxHours'] as num?)?.toDouble() ?? 24,
         searchMaxIndicators: (j['searchMaxIndicators'] as num?)?.toInt() ?? 0,
         searchPortfolioSize: (j['searchPortfolioSize'] as num?)?.toInt() ?? 4,
