@@ -43,6 +43,9 @@ pub struct SettingsDto {
     pub data_dir: String,
     /// UI language code (`"en"` | `"el"`) — see `SystemConfig::ui_locale`.
     pub ui_locale: String,
+    /// Top-level trading mode (`"risky"` | `"prop_firm"`) — see
+    /// `SystemConfig::trading_mode`. Drives discovery + risk orientation.
+    pub trading_mode: String,
     pub news_calendar_enabled: bool,
     pub news_calendar_source: String,
     /// `block_on_news` | `allow_always` | `warn_only`. Controls how
@@ -73,6 +76,8 @@ pub struct SettingsUpdateDto {
     /// `"en"` | `"el"`. Unknown values are rejected (400) so a stale UI can't
     /// wedge an unsupported locale into config.yaml.
     pub ui_locale: Option<String>,
+    /// `"risky"` | `"prop_firm"`. Unknown values are rejected (400).
+    pub trading_mode: Option<String>,
     pub news_calendar_enabled: Option<bool>,
     pub news_calendar_source: Option<String>,
     /// Snake_case id of a [`NewsTradingMode`] variant.
@@ -360,6 +365,23 @@ pub async fn update_settings(
         }
         settings.system.ui_locale = code;
     }
+    if let Some(raw) = payload.trading_mode {
+        let mode = raw.trim().to_ascii_lowercase();
+        if mode != "risky" && mode != "prop_firm" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "unknown trading_mode `{}`. Expected one of: risky, prop_firm.",
+                        raw
+                    ),
+                    "code": "invalid_trading_mode",
+                })),
+            )
+                .into_response();
+        }
+        settings.system.trading_mode = mode;
+    }
     if let Some(b) = payload.news_calendar_enabled {
         settings.news.news_calendar_enabled = b;
     }
@@ -454,6 +476,7 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
     SettingsDto {
         data_dir: settings.system.data_dir.display().to_string(),
         ui_locale: settings.system.ui_locale.clone(),
+        trading_mode: settings.system.trading_mode.clone(),
         news_calendar_enabled: settings.news.news_calendar_enabled,
         news_calendar_source: settings.news.news_calendar_source.clone(),
         news_trading_mode: mode.as_str().to_string(),

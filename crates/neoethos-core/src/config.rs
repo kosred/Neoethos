@@ -48,6 +48,18 @@ pub struct SystemConfig {
     /// separate Flutter store. The backend does not consume it; it is surfaced
     /// via GET / POST `/settings` for the Settings language picker.
     pub ui_locale: String,
+    /// Top-level **trading mode** — the single master switch the operator picks
+    /// in the Risk screen. Two mutually-exclusive values:
+    ///   - `"risky"`     → aggressive capital multiplication (small balance →
+    ///     large target, ASAP). Drives discovery into `DiscoveryMode::Risky`
+    ///     (high-risk filter floors, growth-tilted ranking, no prop-firm gate).
+    ///   - `"prop_firm"` → safety / stability: pass prop-firm challenges and
+    ///     bank a steady monthly return. Drives `DiscoveryMode::PropFirm` (FTMO
+    ///     window-pass gate) and the active `risk.preset` constraints.
+    /// Search/discovery + risk framing orient around this one choice. An
+    /// explicit `models.discovery_mode = "strict"` is a power-user escape hatch
+    /// that overrides the discovery side only. Default `"prop_firm"`.
+    pub trading_mode: String,
     pub multi_resolution_enabled: bool,
     pub multi_resolution_timeframes: Vec<String>,
     pub multi_resolution_prefix_base: bool,
@@ -158,6 +170,7 @@ impl Default for SystemConfig {
             account_currency: String::new(),
             data_dir: PathBuf::from("data"),
             ui_locale: "en".to_string(),
+            trading_mode: "prop_firm".to_string(),
             multi_resolution_enabled: true,
             multi_resolution_timeframes: CANONICAL_TIMEFRAMES
                 .iter()

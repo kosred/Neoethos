@@ -41,7 +41,97 @@ class RiskScreen extends ConsumerWidget {
             data: (r) => _Body(snapshot: r),
             loading: () => const _Loading(),
             error: (err, _) => BackendErrorWidget(
-                    error: err, title: l10n.riskSettingsUnavailable),
+                error: err, title: l10n.riskSettingsUnavailable),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Top-level Trading Mode selector — the master switch. Persists
+/// `system.trading_mode` via `POST /settings`; the backend then orients
+/// discovery (Risky vs Prop-Firm) and risk around the choice. Mutually
+/// exclusive by construction: a single two-value segmented control.
+class _TradingModeCard extends ConsumerStatefulWidget {
+  const _TradingModeCard();
+
+  @override
+  ConsumerState<_TradingModeCard> createState() => _TradingModeCardState();
+}
+
+class _TradingModeCardState extends ConsumerState<_TradingModeCard> {
+  bool _saving = false;
+
+  Future<void> _setMode(String mode, String current) async {
+    if (mode == current || _saving) return;
+    final l10n = AppLocalizations.of(context)!;
+    setState(() => _saving = true);
+    try {
+      await ref.read(backendClientProvider).saveSettings(tradingMode: mode);
+      if (!mounted) return;
+      ref.invalidate(settingsProvider);
+      ref.invalidate(riskProvider);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: NeoethosTokens.buy,
+          content: Text(l10n.tradingModeSwitched(mode)),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showTranslatedErrorSnackbar(context, e,
+          prefix: l10n.tradingModeSwitchFailed);
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final current =
+        ref.watch(settingsProvider).valueOrNull?.tradingMode ?? 'prop_firm';
+    final isRisky = current == 'risky';
+    return SectionCard(
+      title: l10n.tradingModeTitle,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            l10n.tradingModeSubtitle,
+            style:
+                const TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
+          ),
+          const SizedBox(height: 10),
+          SegmentedButton<String>(
+            segments: [
+              ButtonSegment(
+                value: 'risky',
+                label: Text(l10n.tradingModeRisky),
+                icon: const Icon(Icons.rocket_launch_outlined, size: 16),
+              ),
+              ButtonSegment(
+                value: 'prop_firm',
+                label: Text(l10n.tradingModePropFirm),
+                icon: const Icon(Icons.verified_user_outlined, size: 16),
+              ),
+            ],
+            selected: {isRisky ? 'risky' : 'prop_firm'},
+            showSelectedIcon: false,
+            onSelectionChanged:
+                _saving ? null : (sel) => _setMode(sel.first, current),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            isRisky
+                ? l10n.tradingModeRiskyExplainer
+                : l10n.tradingModePropFirmExplainer,
+            style: TextStyle(
+              fontSize: 11,
+              color: isRisky ? NeoethosTokens.warning : NeoethosTokens.buy,
+            ),
           ),
         ],
       ),
@@ -102,11 +192,11 @@ class _BodyState extends ConsumerState<_Body> {
     // Back-compat: pre-preset backends return empty `preset`. Treat as
     // FTMO for display purposes so older servers don't render a blank
     // dropdown.
-    final activePresetId =
-        snap.preset.isEmpty ? 'ftmo' : snap.preset;
+    final activePresetId = snap.preset.isEmpty ? 'ftmo' : snap.preset;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        const _TradingModeCard(),
         SectionCard(
           title: l10n.riskSectionPropFirmPreset,
           child: _PresetPicker(
@@ -162,8 +252,8 @@ class _BodyState extends ConsumerState<_Body> {
           title: l10n.riskSectionEditingCaps,
           child: Text(
             l10n.riskEditingCapsBody,
-            style: const TextStyle(
-                color: NeoethosTokens.textMuted, fontSize: 12),
+            style:
+                const TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
           ),
         ),
       ],
@@ -245,8 +335,7 @@ class _PresetPicker extends StatelessWidget {
         const SizedBox(height: 12),
         Text(
           l10n.riskSwitchFirmExplainer,
-          style: const TextStyle(
-              fontSize: 11, color: NeoethosTokens.textMuted),
+          style: const TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
         ),
         const SizedBox(height: 10),
         ...available.map(
@@ -374,9 +463,7 @@ class _Loading extends StatelessWidget {
         padding: const EdgeInsets.symmetric(vertical: 16),
         child: Text(
           AppLocalizations.of(context)!.riskLoading,
-          style: const TextStyle(
-              color: NeoethosTokens.textMuted, fontSize: 12),
+          style: const TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }
-

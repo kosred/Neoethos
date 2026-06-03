@@ -445,7 +445,10 @@ impl DiscoveryConfig {
                 .prop_search_sensitivity_commission_per_lot
                 .max(0.0),
             adaptive_thresholds: model_settings.discovery_runtime.adaptive_thresholds,
-            mode: discovery_mode_from_config(&model_settings.discovery_mode),
+            mode: resolve_discovery_mode(
+                &settings.system.trading_mode,
+                &model_settings.discovery_mode,
+            ),
             prop_firm_gate_params: model_settings.discovery_runtime.prop_firm_gate.clone(),
         }
     }
@@ -535,6 +538,28 @@ impl DiscoveryConfig {
             }
 
             self.prop_firm_gate = Some(self.derive_prop_firm_gate());
+        }
+
+        if matches!(mode, DiscoveryMode::Risky) {
+            // Risky / capital-multiplication mode: KEEP the aggressive,
+            // high-drawdown strategies that the strict / prop-firm floors would
+            // reject, but impose NO FTMO window-pass gate — we are not passing a
+            // challenge, we are compounding a small balance toward a large
+            // target. Deep drawdown is acceptable; the growth-tilted ranking
+            // (see `calculate_income_score`) prefers the fastest compounders.
+            // Floors stay loose-but-sane so genuinely broken genes (negative
+            // edge, never-trading) still drop out.
+            self.filtering.max_dd = 0.60;
+            self.filtering.min_profit = 0.0;
+            self.filtering.min_trades = 1.0;
+            self.filtering.min_sharpe = -5.0;
+            self.filtering.min_win_rate = 0.0;
+            self.filtering.min_profit_factor = 0.0;
+            self.filtering.anomaly_guard = false;
+            self.cpcv_min_phi = 0.0;
+            self.min_trades_per_day = 0.001;
+            // No TF-scaling of trade-frequency floors and NO prop_firm_gate:
+            // Risky is judged purely on growth, not challenge-passing.
         }
         self
     }
@@ -1938,10 +1963,10 @@ where
     // Risky (gate absent — Strict / Risky modes fall here). Distinguishing
     // Strict vs Risky requires inspecting filtering thresholds; that nuance
     // lives in the report itself so the operator can tell modes apart.
-    let mode_label = if config.prop_firm_gate.is_some() {
-        "PropFirm"
-    } else {
-        "Risky"
+    let mode_label = match config.mode {
+        DiscoveryMode::Strict => "Strict",
+        DiscoveryMode::PropFirm => "PropFirm",
+        DiscoveryMode::Risky => "Risky",
     };
     funnel.set_mode(mode_label);
 
@@ -2308,6 +2333,13 @@ pub enum DiscoveryMode {
     /// selection. Designed to deliver portfolios that can pass an
     /// actual prop-firm challenge in 60 days per phase.
     PropFirm,
+    /// Aggressive capital-multiplication mode (the user-facing "Risky"
+    /// trading mode). High-risk-tolerant filter floors, a growth-tilted
+    /// candidate ranking (fitness-dominated, NO drawdown tax) and NO
+    /// prop-firm window-pass gate. Optimises for the fastest compounding of a
+    /// small balance toward a large target, accepting deep drawdown and a high
+    /// ruin probability by design.
+    Risky,
 }
 
 /// Map the config `models.discovery_mode` string to a [`DiscoveryMode`].
@@ -2320,6 +2352,29 @@ pub enum DiscoveryMode {
 fn discovery_mode_from_config(value: &str) -> DiscoveryMode {
     match value.trim().to_ascii_lowercase().as_str() {
         "strict" | "legacy" => DiscoveryMode::Strict,
+        _ => DiscoveryMode::PropFirm,
+    }
+}
+
+/// Resolve the active [`DiscoveryMode`] from the operator's top-level
+/// `system.trading_mode` (the user-facing master switch) and the advanced
+/// `models.discovery_mode` escape hatch.
+///
+/// Precedence:
+///  1. An explicit `models.discovery_mode = "strict"` / `"legacy"` forces the
+///     strict unicorn-hunting pipeline regardless of trading mode (power user).
+///  2. Otherwise `system.trading_mode` decides: `"risky"` (or `"growth"`) →
+///     [`DiscoveryMode::Risky`]; anything else (incl. the `"prop_firm"`
+///     default) → [`DiscoveryMode::PropFirm`].
+fn resolve_discovery_mode(trading_mode: &str, discovery_mode: &str) -> DiscoveryMode {
+    if matches!(
+        discovery_mode_from_config(discovery_mode),
+        DiscoveryMode::Strict
+    ) {
+        return DiscoveryMode::Strict;
+    }
+    match trading_mode.trim().to_ascii_lowercase().as_str() {
+        "risky" | "growth" => DiscoveryMode::Risky,
         _ => DiscoveryMode::PropFirm,
     }
 }
@@ -2545,19 +2600,32 @@ where
     // Sort by an income-focused ranking score to find reliably profitable ones
     let mut ranked_candidates: Vec<(usize, Gene)> = candidates.into_iter().enumerate().collect();
 
+    // Ranking score. PropFirm / Strict use the income-focused blend
+    // (consistency, win-rate, drawdown-safety, profit-factor). Risky /
+    // capital-multiplication uses a growth-tilted score: fitness-dominated
+    // (fitness is the GA's own growth objective) with NO drawdown tax, so the
+    // fastest compounder wins even on a deep equity curve.
+    let risky_ranking = matches!(config.mode, DiscoveryMode::Risky);
     let calculate_income_score = |gene: &Gene| -> f64 {
-        let pf_capped = gene.profit_factor.min(3.0) / 3.0; // Normalized 0-1
-        let safety = (1.0 - gene.max_drawdown / 0.07).clamp(0.0, 1.0);
-        let consistency_score = gene.consistency; // 0-1
-        let win_rate_score = gene.win_rate; // 0-1
+        if risky_ranking {
+            let pf = (gene.profit_factor.max(0.0)).min(5.0) / 5.0; // 0-1, up to 5x
+            gene.fitness.max(0.0) * (0.70 + 0.20 * pf + 0.10 * gene.win_rate)
+        } else {
+            let pf_capped = gene.profit_factor.min(3.0) / 3.0; // Normalized 0-1
+            let safety = (1.0 - gene.max_drawdown / 0.07).clamp(0.0, 1.0);
+            let consistency_score = gene.consistency; // 0-1
+            let win_rate_score = gene.win_rate; // 0-1
 
-        let multiplier =
-            (consistency_score * 0.4) + (win_rate_score * 0.3) + (safety * 0.2) + (pf_capped * 0.1);
+            let multiplier = (consistency_score * 0.4)
+                + (win_rate_score * 0.3)
+                + (safety * 0.2)
+                + (pf_capped * 0.1);
 
-        // Bonus for high consistency (proxy for 10/12+ positive months)
-        let bonus = if consistency_score > 0.8 { 2.0 } else { 1.0 };
+            // Bonus for high consistency (proxy for 10/12+ positive months)
+            let bonus = if consistency_score > 0.8 { 2.0 } else { 1.0 };
 
-        gene.fitness * multiplier * bonus
+            gene.fitness * multiplier * bonus
+        }
     };
 
     ranked_candidates.sort_by(|(idx_a, a), (idx_b, b)| {

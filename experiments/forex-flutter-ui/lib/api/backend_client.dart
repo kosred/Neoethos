@@ -386,6 +386,7 @@ class BackendClient {
   Future<SettingsSnapshot> saveSettings({
     String? dataDir,
     String? uiLocale,
+    String? tradingMode,
     bool? newsCalendarEnabled,
     String? newsCalendarSource,
     String? newsTradingMode,
@@ -400,6 +401,7 @@ class BackendClient {
     final body = <String, dynamic>{};
     if (dataDir != null) body['dataDir'] = dataDir;
     if (uiLocale != null) body['uiLocale'] = uiLocale;
+    if (tradingMode != null) body['tradingMode'] = tradingMode;
     if (newsCalendarEnabled != null) {
       body['newsCalendarEnabled'] = newsCalendarEnabled;
     }
@@ -1310,6 +1312,12 @@ class SettingsSnapshot {
   /// Defaults to `'en'` for back-compat with a backend that predates the
   /// field. Drives the Settings language picker + the startup locale.
   final String localeCode;
+
+  /// Top-level trading mode (`'risky'` | `'prop_firm'`) from
+  /// `SystemConfig.trading_mode`. Defaults to `'prop_firm'` for back-compat
+  /// with a backend that predates the field. Drives the Risk-screen mode
+  /// selector + the Risky-Mode card.
+  final String tradingMode;
   final bool newsCalendarEnabled;
   final String newsCalendarSource;
 
@@ -1333,6 +1341,7 @@ class SettingsSnapshot {
   const SettingsSnapshot({
     required this.dataDir,
     this.localeCode = 'en',
+    this.tradingMode = 'prop_firm',
     required this.newsCalendarEnabled,
     required this.newsCalendarSource,
     required this.newsTradingMode,
@@ -1349,6 +1358,7 @@ class SettingsSnapshot {
   factory SettingsSnapshot.fromJson(Map<String, dynamic> j) => SettingsSnapshot(
         dataDir: j['dataDir'] as String,
         localeCode: (j['uiLocale'] as String?) ?? 'en',
+        tradingMode: (j['tradingMode'] as String?) ?? 'prop_firm',
         newsCalendarEnabled: j['newsCalendarEnabled'] as bool,
         newsCalendarSource: j['newsCalendarSource'] as String,
         newsTradingMode: (j['newsTradingMode'] as String?) ?? '',
