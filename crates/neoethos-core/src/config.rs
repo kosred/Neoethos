@@ -923,11 +923,11 @@ impl Default for DataRuntimeConfig {
 
 /// Tree-model (LightGBM / XGBoost / CatBoost) device + training knobs —
 /// config-driven replacement for the `NEOETHOS_BOT_TREE_DEVICE` / `_GPU_ONLY`
-/// / `_EARLY_STOP_*` env vars. Platform-standard GPU-selection knobs
-/// (`CUDA_VISIBLE_DEVICES`, …) are NOT app config and stay honored. (The
-/// cross-cutting `cpu_threads` budget — read in core/search/models, so it
-/// needs a single system-level knob — and the `FOREX_GPU_COUNT` → `gpu_count`
-/// remnant are separate follow-ups.)
+/// / `_EARLY_STOP_*` env vars and the `FOREX_GPU_COUNT` rebrand remnant.
+/// Platform-standard GPU-selection knobs (`CUDA_VISIBLE_DEVICES`, …) are NOT
+/// app config and stay honored. (The cross-cutting `cpu_threads` budget — read
+/// in core/search/models, so it needs a single system-level knob — is a
+/// separate follow-up.)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TreeRuntimeConfig {
@@ -939,6 +939,10 @@ pub struct TreeRuntimeConfig {
     /// Require GPU for tree training — no silent CPU fallback. Was
     /// `NEOETHOS_BOT_GPU_ONLY`.
     pub gpu_only: bool,
+    /// Explicit GPU count; `None` = auto-detect (the standard
+    /// `*_VISIBLE_DEVICES` vars, then `nvidia-smi` / `rocm`). Was the
+    /// `FOREX_GPU_COUNT` rebrand remnant.
+    pub gpu_count: Option<usize>,
     /// Early-stop patience override for tree-model training; `None` (the
     /// default) = use each model's built-in default. Was
     /// `NEOETHOS_BOT_EARLY_STOP_PATIENCE`.
@@ -953,6 +957,7 @@ impl Default for TreeRuntimeConfig {
         Self {
             device: "auto".to_string(),
             gpu_only: false,
+            gpu_count: None,
             early_stop_patience: None,
             early_stop_min_delta: None,
         }

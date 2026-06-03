@@ -37,6 +37,7 @@ pub struct TreeModelConfig {
 pub struct TreeRuntimeOverrides {
     pub device: String,
     pub gpu_only: bool,
+    pub gpu_count: Option<usize>,
     pub early_stop_patience: Option<usize>,
     pub early_stop_min_delta: Option<f64>,
 }
@@ -46,6 +47,7 @@ impl Default for TreeRuntimeOverrides {
         Self {
             device: "auto".to_string(),
             gpu_only: false,
+            gpu_count: None,
             early_stop_patience: None,
             early_stop_min_delta: None,
         }
@@ -65,6 +67,7 @@ impl TreeRuntimeOverrides {
                 c.device.clone()
             },
             gpu_only: c.gpu_only,
+            gpu_count: c.gpu_count,
             early_stop_patience: c.early_stop_patience,
             early_stop_min_delta: c.early_stop_min_delta,
         }
@@ -304,7 +307,6 @@ pub fn gpu_count() -> usize {
     }
 
     if let Some(count) = env_gpu_count(&[
-        "FOREX_GPU_VISIBLE_DEVICES",
         "GPU_VISIBLE_DEVICES",
         "CUDA_VISIBLE_DEVICES",
         "NVIDIA_VISIBLE_DEVICES",
@@ -315,10 +317,11 @@ pub fn gpu_count() -> usize {
         return count;
     }
 
-    if let Ok(value) = env::var("FOREX_GPU_COUNT")
-        && let Ok(parsed) = value.trim().parse::<usize>()
-    {
-        return parsed;
+    // Explicit config override (was the `FOREX_GPU_COUNT` env var). Sits after
+    // the standard `*_VISIBLE_DEVICES` probe — the same precedence
+    // `FOREX_GPU_COUNT` had — and before the nvidia-smi / rocm subprocess probes.
+    if let Some(count) = current_tree_runtime().gpu_count {
+        return count;
     }
 
     if let Some(count) = nvidia_smi_gpu_count() {
@@ -418,7 +421,7 @@ pub fn cpu_threads_from_params(params: &HashMap<String, ParamValue>, default: us
 
 #[cfg(test)]
 mod tests {
-    use super::{gpu_count, parse_device_preference};
+    use super::parse_device_preference;
 
     #[test]
     fn parse_device_preference_accepts_vendor_aliases() {
@@ -434,16 +437,5 @@ mod tests {
             parse_device_preference("cpu"),
             super::DevicePreference::Cpu
         ));
-    }
-
-    #[test]
-    fn gpu_count_reads_generic_override() {
-        unsafe {
-            std::env::set_var("FOREX_GPU_COUNT", "3");
-        }
-        assert_eq!(gpu_count(), 3);
-        unsafe {
-            std::env::remove_var("FOREX_GPU_COUNT");
-        }
     }
 }
