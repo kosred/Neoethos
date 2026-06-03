@@ -408,7 +408,8 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         //   1. `--account-currency` CLI flag (operator-explicit)
         //   2. `Settings.system.account_currency` (from config.yaml or
         //      cTrader trader profile written back by the bridge)
-        //   3. `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` env override (legacy)
+        // (The legacy `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` env override was
+        // removed in v0.4.36 — config / CLI is the source.)
         // Empty propagates downstream — the cost-model NaN guard will
         // reject the run with a clear error message rather than
         // silently producing NaN spread/pip values that the sanitizer
@@ -420,7 +421,6 @@ fn cmd_discover(args: &[String]) -> Result<()> {
                     .map(|s| s.system.account_currency.clone())
                     .filter(|c| !c.trim().is_empty())
             })
-            .or_else(|| std::env::var("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY").ok())
             .unwrap_or_default();
         let population: usize = parse_flag(args, "--population")
             .and_then(|v| v.parse().ok())

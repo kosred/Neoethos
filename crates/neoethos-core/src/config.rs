@@ -29,8 +29,9 @@ pub struct SystemConfig {
     ///     is alive — the `/account/snapshot` bridge resolves
     ///     `ProtoOATrader.depositAssetId` → currency name via the
     ///     asset table and writes it back here (Phase D follow-up).
-    ///  3. Env-var fallback `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` honoured
-    ///     by `prop_firm_account_currency()` for the live risk gate.
+    ///
+    /// (The legacy `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` env fallback was
+    /// retired in v0.4.36 — config is the single source.)
     ///
     /// **Empty string (`""`) is the deliberate fail-loud default**
     /// matching the `symbol` field's policy — `DiscoveryConfig::

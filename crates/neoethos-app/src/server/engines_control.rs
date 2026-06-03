@@ -180,13 +180,10 @@ pub async fn discovery_start(
     };
     // Body-supplied symbol always wins (operator picked it on the UI).
     config.evaluation_symbol = symbol.clone();
-    // Account currency: prefer Settings (already loaded into config by
-    // from_settings), fall back to env-var, empty propagates to guard.
-    if config.evaluation_account_currency.trim().is_empty() {
-        if let Ok(env_ccy) = std::env::var("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY") {
-            config.evaluation_account_currency = env_ccy;
-        }
-    }
+    // Account currency comes from Settings (loaded into config by
+    // from_settings). An empty value propagates to the guard, which bails with
+    // an actionable error. Config is the single source — the legacy
+    // `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` env fallback was removed in v0.4.36.
     if let Some(p) = body.population.filter(|&p| p > 0) {
         config.population = p;
     }
