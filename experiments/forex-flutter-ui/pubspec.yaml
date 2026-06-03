@@ -4,7 +4,7 @@ description: >
   Talks to the Rust backend (neoethos-app + neoethos-codex) over REST.
   Mirrors the layout / design tokens of mockups/ui_mockup.html.
 publish_to: 'none'
-version: 0.4.35+1
+version: 0.4.36+1
 
 environment:
   sdk: '>=3.4.0 <4.0.0'

@@ -27,7 +27,7 @@ class NavTab {
 /// of them silently breaks last-active-tab restore for existing users.
 const List<NavTab> kNavTabs = [
   NavTab('Dashboard', '▦', 'Dashboard',
-      "Account equity, engine health, today's PnL, Risky Mode card"),
+      "Account equity, engine health, today's PnL"),
   NavTab('MarketWatch', '⌖', 'Market Watch',
       'Symbols + live quotes + per-symbol strategy/confidence/auto + '
           'open positions + pending orders'),
