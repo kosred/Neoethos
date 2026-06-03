@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::process::Command;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DevicePreference {
@@ -25,6 +26,66 @@ pub struct TreeModelConfig {
     pub device_pref: DevicePreference,
     pub gpu_only: bool,
     pub cpu_threads: Option<usize>,
+}
+
+/// Process-wide tree-model runtime config, installed once from the operator's
+/// `Settings` at startup via [`install_tree_runtime_from_settings`]. The
+/// early-stop reader ([`get_early_stop_params`]) consults this instead of the
+/// old `NEOETHOS_BOT_EARLY_STOP_*` env vars (v0.4.36 config-consolidation).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeRuntimeOverrides {
+    pub early_stop_patience: Option<usize>,
+    pub early_stop_min_delta: Option<f64>,
+}
+
+impl Default for TreeRuntimeOverrides {
+    fn default() -> Self {
+        Self {
+            early_stop_patience: None,
+            early_stop_min_delta: None,
+        }
+    }
+}
+
+impl TreeRuntimeOverrides {
+    /// Build from the operator's config (was the `NEOETHOS_BOT_EARLY_STOP_*`
+    /// env vars). A `tree_runtime_from_settings_default_matches_default` test
+    /// guarantees a fresh `Settings` reproduces [`Self::default`].
+    pub fn from_settings(s: &neoethos_core::Settings) -> Self {
+        let c = &s.models.tree_runtime;
+        Self {
+            early_stop_patience: c.early_stop_patience,
+            early_stop_min_delta: c.early_stop_min_delta,
+        }
+    }
+}
+
+static TREE_RUNTIME: OnceLock<TreeRuntimeOverrides> = OnceLock::new();
+
+/// Install the tree-model runtime config from `Settings` (call once at
+/// startup, before any model training). The first install wins.
+pub fn install_tree_runtime_from_settings(s: &neoethos_core::Settings) {
+    let _ = TREE_RUNTIME.set(TreeRuntimeOverrides::from_settings(s));
+}
+
+/// Current tree-model runtime config (defaults if never installed — e.g. in
+/// unit tests — preserving the historical env-absent behavior).
+pub fn current_tree_runtime() -> &'static TreeRuntimeOverrides {
+    TREE_RUNTIME.get_or_init(TreeRuntimeOverrides::default)
+}
+
+#[cfg(test)]
+mod tree_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn tree_runtime_from_settings_default_matches_default() {
+        let s = neoethos_core::Settings::default();
+        assert_eq!(
+            TreeRuntimeOverrides::from_settings(&s),
+            TreeRuntimeOverrides::default()
+        );
+    }
 }
 
 pub fn cpu_threads_hint() -> usize {
@@ -287,14 +348,12 @@ pub fn gpu_count() -> usize {
 }
 
 pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) -> (usize, f64) {
-    let p = env::var("NEOETHOS_BOT_EARLY_STOP_PATIENCE")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    let rt = current_tree_runtime();
+    let p = rt
+        .early_stop_patience
+        .filter(|p| *p > 0)
         .unwrap_or(default_patience);
-    let d = env::var("NEOETHOS_BOT_EARLY_STOP_MIN_DELTA")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default_min_delta);
+    let d = rt.early_stop_min_delta.unwrap_or(default_min_delta);
     (p, d)
 }
 

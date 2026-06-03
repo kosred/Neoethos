@@ -70,29 +70,16 @@ impl EarlyStopper {
     }
 }
 
-/// Return (patience, min_delta) with optional env overrides.
-/// Derived from legacy get_early_stop_params (lines 51-69)
+/// Return (patience, min_delta) with optional config overrides (was the
+/// `NEOETHOS_BOT_EARLY_STOP_*` env vars; now config-driven via
+/// `tree_models::config::current_tree_runtime`).
 pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) -> (usize, f64) {
-    let mut patience = default_patience;
-    let mut min_delta = default_min_delta;
-
-    // Try to read env var for patience
-    if let Ok(env_pat) = std::env::var("NEOETHOS_BOT_EARLY_STOP_PATIENCE")
-        && !env_pat.is_empty()
-        && let Ok(val) = env_pat.parse::<usize>()
-        && val > 0
-    {
-        patience = val;
-    }
-
-    // Try to read env var for min_delta
-    if let Ok(env_delta) = std::env::var("NEOETHOS_BOT_EARLY_STOP_MIN_DELTA")
-        && !env_delta.is_empty()
-        && let Ok(val) = env_delta.parse::<f64>()
-    {
-        min_delta = val;
-    }
-
+    let rt = crate::tree_models::config::current_tree_runtime();
+    let patience = rt
+        .early_stop_patience
+        .filter(|p| *p > 0)
+        .unwrap_or(default_patience);
+    let min_delta = rt.early_stop_min_delta.unwrap_or(default_min_delta);
     (patience, min_delta)
 }
 

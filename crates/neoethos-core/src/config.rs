@@ -612,6 +612,9 @@ pub struct ModelsConfig {
     /// `NEOETHOS_BOT_NORMALIZE_FEATURES` / `..._REBUILD_STALE_HIGHER_TFS`
     /// env vars). See [`DataRuntimeConfig`].
     pub data_runtime: DataRuntimeConfig,
+    /// Tree-model training knobs (config-driven replacement for the
+    /// `NEOETHOS_BOT_EARLY_STOP_*` env vars). See [`TreeRuntimeConfig`].
+    pub tree_runtime: TreeRuntimeConfig,
     pub prop_metric_weight: f64,
     pub prop_accuracy_weight: f64,
     pub prop_min_trades: usize,
@@ -918,6 +921,32 @@ impl Default for DataRuntimeConfig {
     }
 }
 
+/// Tree-model (LightGBM / XGBoost / CatBoost) training knobs —
+/// config-driven replacement for the `NEOETHOS_BOT_EARLY_STOP_*` env vars.
+/// This struct will grow to also own the device / GPU / thread knobs
+/// (`NEOETHOS_BOT_TREE_DEVICE` / `_GPU_ONLY` / `_CPU_THREADS` / the
+/// `FOREX_GPU_COUNT` remnant) as the v0.4.36 config-consolidation continues.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TreeRuntimeConfig {
+    /// Early-stop patience override for tree-model training; `None` (the
+    /// default) = use each model's built-in default. Was
+    /// `NEOETHOS_BOT_EARLY_STOP_PATIENCE`.
+    pub early_stop_patience: Option<usize>,
+    /// Early-stop min-delta override; `None` = use the model's default.
+    /// Was `NEOETHOS_BOT_EARLY_STOP_MIN_DELTA`.
+    pub early_stop_min_delta: Option<f64>,
+}
+
+impl Default for TreeRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            early_stop_patience: None,
+            early_stop_min_delta: None,
+        }
+    }
+}
+
 impl Default for ModelsConfig {
     fn default() -> Self {
         let mut hpo_trials_by_model = HashMap::new();
@@ -1130,6 +1159,7 @@ impl Default for ModelsConfig {
             seen_signature_runtime: SeenSignatureRuntimeConfig::default(),
             smc_search_runtime: SmcSearchRuntimeConfig::default(),
             data_runtime: DataRuntimeConfig::default(),
+            tree_runtime: TreeRuntimeConfig::default(),
             prop_metric_weight: 1.0,
             prop_accuracy_weight: 0.1,
             prop_min_trades: 0,
