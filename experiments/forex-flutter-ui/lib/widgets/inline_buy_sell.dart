@@ -20,6 +20,7 @@
 //     Ticket remains for considered entries with custom SL/TP.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../l10n/app_localizations.dart';
@@ -37,14 +38,45 @@ class InlineBuySell extends ConsumerStatefulWidget {
 
 class _InlineBuySellState extends ConsumerState<InlineBuySell> {
   double _volumeLots = 0.01;
+  // Editable lot field. Operators kept asking why a 1-lot trade took ~100
+  // taps on the 0.01 stepper — now they can TYPE the size ("1", "0.5", …) and
+  // click Buy/Sell; the +/- steppers stay for fine 0.01 nudges. `_volumeLots`
+  // is the source of truth for the order; the field is synced both ways.
+  late final TextEditingController _volumeCtrl =
+      TextEditingController(text: _volumeLots.toStringAsFixed(2));
   bool _busy = false;
   String? _lastError;
+
+  @override
+  void dispose() {
+    _volumeCtrl.dispose();
+    super.dispose();
+  }
+
+  /// Typed input → parse + clamp into `_volumeLots`. We deliberately do NOT
+  /// rewrite the controller here so typing stays smooth (no caret jumps); the
+  /// field shows exactly what was typed and the order uses the clamped value.
+  /// Steppers + pre-send normalisation rewrite the field instead.
+  void _onVolumeChanged(String text) {
+    final v = double.tryParse(text.trim());
+    if (v != null) _volumeLots = v.clamp(0.01, 100.0);
+  }
 
   Future<void> _placeOrder(String side) async {
     if (_busy) return;
     // Capture the localizations before the await — the BuildContext must
     // not be used across the async gap.
     final l10n = AppLocalizations.of(context)!;
+    // Reflect the clamped size that will actually be sent (e.g. a typed "200"
+    // shows as the 100-lot cap) so the field, the SnackBar, and the broker
+    // all agree.
+    final normalized = _volumeLots.toStringAsFixed(2);
+    if (_volumeCtrl.text != normalized) {
+      _volumeCtrl.value = TextEditingValue(
+        text: normalized,
+        selection: TextSelection.collapsed(offset: normalized.length),
+      );
+    }
     setState(() {
       _busy = true;
       _lastError = null;
@@ -65,8 +97,7 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
           status.toLowerCase().contains('submit');
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor:
-              ok ? NeoethosTokens.buy : NeoethosTokens.warning,
+          backgroundColor: ok ? NeoethosTokens.buy : NeoethosTokens.warning,
           duration: const Duration(seconds: 3),
           content: Text(
             l10n.inlineTradeOrderResult(
@@ -103,6 +134,13 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
       _volumeLots = (_volumeLots + delta).clamp(0.01, 100.0);
       // Round to 2 dp to avoid float drift (0.01 + 0.01 = 0.0200000004).
       _volumeLots = double.parse(_volumeLots.toStringAsFixed(2));
+      // Button nudge (not typing) → safe to rewrite the field; caret at the
+      // end so a follow-up keystroke appends naturally.
+      final s = _volumeLots.toStringAsFixed(2);
+      _volumeCtrl.value = TextEditingValue(
+        text: s,
+        selection: TextSelection.collapsed(offset: s.length),
+      );
     });
   }
 
@@ -139,7 +177,8 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
         border: Border.all(color: NeoethosTokens.border),
         borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
         boxShadow: const [
-          BoxShadow(color: Color(0x40000000), blurRadius: 6, offset: Offset(0, 2)),
+          BoxShadow(
+              color: Color(0x40000000), blurRadius: 6, offset: Offset(0, 2)),
         ],
       ),
       child: Column(
@@ -168,9 +207,8 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
                   fontSize: 8,
                   fontWeight: FontWeight.w700,
                   letterSpacing: 0.5,
-                  color: stale
-                      ? NeoethosTokens.warning
-                      : NeoethosTokens.textMuted,
+                  color:
+                      stale ? NeoethosTokens.warning : NeoethosTokens.textMuted,
                 ),
               ),
             ],
@@ -188,8 +226,9 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
                 onTap: () => _placeOrder('sell'),
               ),
               const SizedBox(width: 6),
-              _VolumeStepper(
-                volume: _volumeLots,
+              _VolumeField(
+                controller: _volumeCtrl,
+                onChanged: _onVolumeChanged,
                 onDec: () => _bumpVolume(-0.01),
                 onInc: () => _bumpVolume(0.01),
               ),
@@ -282,12 +321,14 @@ class _SideButton extends StatelessWidget {
   }
 }
 
-class _VolumeStepper extends StatelessWidget {
-  final double volume;
+class _VolumeField extends StatelessWidget {
+  final TextEditingController controller;
+  final ValueChanged<String> onChanged;
   final VoidCallback onDec;
   final VoidCallback onInc;
-  const _VolumeStepper({
-    required this.volume,
+  const _VolumeField({
+    required this.controller,
+    required this.onChanged,
     required this.onDec,
     required this.onInc,
   });
@@ -311,15 +352,29 @@ class _VolumeStepper extends StatelessWidget {
           children: [
             _StepBtn(icon: Icons.remove, onTap: onDec),
             SizedBox(
-              width: 34,
-              child: Text(
-                volume.toStringAsFixed(2),
+              width: 48,
+              child: TextField(
+                controller: controller,
+                onChanged: onChanged,
                 textAlign: TextAlign.center,
+                keyboardType:
+                    const TextInputType.numberWithOptions(decimal: true),
+                // Digits + a single decimal point only.
+                inputFormatters: [
+                  FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+                ],
                 style: const TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w700,
                   color: NeoethosTokens.textPrimary,
                   fontFeatures: [FontFeature.tabularFigures()],
+                ),
+                decoration: const InputDecoration(
+                  isDense: true,
+                  contentPadding:
+                      EdgeInsets.symmetric(horizontal: 2, vertical: 4),
+                  border: OutlineInputBorder(),
+                  hintText: '0.01',
                 ),
               ),
             ),
