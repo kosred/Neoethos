@@ -492,7 +492,7 @@ impl GeneticStrategyExpert {
             (features, ohlcv)
         };
 
-        let resolved_config = self.discovery_config().with_env_runtime_overrides();
+        let resolved_config = self.discovery_config().apply_mode_overrides();
         // Surface the resolved determinism policy so operators can
         // correlate neoethos-models genetic-search runs with the typed
         // policy persisted on the discovery profile (Phase 51).

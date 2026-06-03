@@ -983,7 +983,7 @@ pub fn start_discovery_job(
             let rows = features.data.nrows().min(wfv_feat_bound);
             is_features.data = features.data.slice(ndarray::s![..rows, ..]).to_owned();
 
-            let resolved_config = search_request.config.clone().with_env_runtime_overrides();
+            let resolved_config = search_request.config.clone().apply_mode_overrides();
             let mut result = run_discovery_cycle_with_progress(
                 &is_features,
                 &is_ohlcv,

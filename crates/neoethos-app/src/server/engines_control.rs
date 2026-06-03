@@ -213,9 +213,10 @@ pub async fn discovery_start(
     // Apply this AFTER the body-supplied GA knob overrides above so
     // the operator's UI-tuned population/generations/etc. survive,
     // and AFTER the `evaluation_symbol`/`evaluation_account_currency`
-    // overrides so the env-driven mode resolution + ladder install
-    // see the final config — not the from-yaml-defaults version.
-    config = config.with_env_runtime_overrides();
+    // mode-dependent overrides (config-driven mode from
+    // models.discovery_mode + the prop-firm window-pass gate) so they see
+    // the final config — not the from-yaml-defaults version.
+    config = config.apply_mode_overrides();
 
     let request = DiscoveryRequest {
         data_root,

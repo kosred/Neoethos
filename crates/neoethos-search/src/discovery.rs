@@ -32,10 +32,10 @@ use std::path::Path;
 /// These values change *production* discovery semantics (which features are
 /// kept, how much data the stage-1 funnel sees, what counts as in-sample for
 /// the prefilter), so they belong in typed config rather than ambient env
-/// state. Callers that still want to honour the env vars must opt in via
-/// [`DiscoveryRuntimeOverrides::from_env`] or
-/// [`DiscoveryConfig::with_env_runtime_overrides`] — the discovery cycle
-/// itself no longer reads the environment.
+/// state. These are configured via `models.discovery_runtime` (typed config)
+/// and resolved by [`DiscoveryRuntimeOverrides::from_settings`]; the legacy
+/// [`DiscoveryRuntimeOverrides::from_env`] reader is retained for reference
+/// only — the discovery cycle no longer reads the environment for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage1Window {
     /// Slice from the most recent rows. Captures the latest regime but is
@@ -242,9 +242,10 @@ pub struct DiscoveryConfig {
     /// When `Some`, the discovery pipeline replaces its full-history
     /// walkforward consistency gate with a "passes prop-firm rules on
     /// N random 30-day windows ≥ pass_rate" gate. Populated from
-    /// `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_GATE=1` and friends in
-    /// `with_env_runtime_overrides`. `None` keeps the production
-    /// behavior unchanged.
+    /// the FTMO baseline (+ the `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` overrides
+    /// that `derive_prop_firm_gate` still reads — Stage B tail) when
+    /// `apply_mode_overrides` runs in PropFirm mode. `None` keeps the
+    /// production behavior unchanged.
     pub prop_firm_gate: Option<PropFirmGateOverrides>,
     /// 2026-05-26 operator directive (dual-mode product): Monte-Carlo
     /// perturbation runs per surviving candidate. Previously hardcoded 100.
@@ -262,6 +263,13 @@ pub struct DiscoveryConfig {
     /// `run_discovery_cycle` before gene initialisation. Default `false`
     /// reproduces the env-absent behaviour.
     pub adaptive_thresholds: bool,
+    /// Discovery search regime (config-driven via `models.discovery_mode`).
+    /// `PropFirm` (default) applies permissive filter floors + the FTMO
+    /// window-pass gate; `Strict` keeps the full `FilteringConfig` floors.
+    /// Replaces the env-only `resolve_discovery_mode()` that read
+    /// `NEOETHOS_BOT_DISCOVERY_MODE` / `_PERMISSIVE`. Consumed by
+    /// `apply_mode_overrides`.
+    pub mode: DiscoveryMode,
 }
 
 /// Configuration for the prop-firm window-pass gate.
@@ -320,6 +328,9 @@ impl Default for DiscoveryConfig {
             sensitivity_spread_pips: 2.0,
             sensitivity_commission_per_lot: 7.0,
             adaptive_thresholds: false,
+            // Env-absent default reproduces the retired
+            // resolve_discovery_mode() fallback (PropFirm).
+            mode: DiscoveryMode::PropFirm,
         }
     }
 }
@@ -428,6 +439,7 @@ impl DiscoveryConfig {
                 .prop_search_sensitivity_commission_per_lot
                 .max(0.0),
             adaptive_thresholds: model_settings.discovery_runtime.adaptive_thresholds,
+            mode: discovery_mode_from_config(&model_settings.discovery_mode),
         }
     }
 
@@ -442,19 +454,17 @@ impl DiscoveryConfig {
     /// Env vars are still honored as overrides for the rare cases
     /// where the operator wants to lock in a specific value, but the
     /// happy-path call needs none of them.
-    pub fn with_env_runtime_overrides(mut self) -> Self {
-        // Stage A config-consolidation (2026-06-03): `runtime_overrides`
-        // (prefilter / funnel / stage1-window / min-history) now come from
-        // `models.discovery_runtime` via `DiscoveryConfig::from_settings`
-        // (→ `DiscoveryRuntimeOverrides::from_settings`), not the env — so we
-        // no longer clobber them here. This builder retains the legacy mode /
-        // min-trades-per-day / prop-firm-gate env reads (Stage B migration);
-        // the name is kept until those move to config too.
-        let mode = resolve_discovery_mode();
-
-        if let Some(value) = read_env_f64("NEOETHOS_BOT_DISCOVERY_MIN_TRADES_PER_DAY") {
-            self.min_trades_per_day = value.max(0.0);
-        }
+    pub fn apply_mode_overrides(mut self) -> Self {
+        // Config-consolidation (2026-06-03): the mode comes from `self.mode`
+        // (set by `from_settings` from `models.discovery_mode`) and the
+        // discovery runtime knobs from `self.runtime_overrides` (set by
+        // `from_settings` from `models.discovery_runtime`) — neither is read
+        // from the environment any more. This applies the mode-dependent
+        // overrides: PropFirm permissive filter floors, TF-scaled
+        // trade-frequency floors, and the FTMO window-pass gate. (The FTMO
+        // *rule parameters* are still derived inside `derive_prop_firm_gate`
+        // — that env read is the Stage B tail.)
+        let mode = self.mode;
 
         if matches!(mode, DiscoveryMode::PropFirm) {
             // Permissive filter floor — the GA's output is judged by the
@@ -473,9 +483,11 @@ impl DiscoveryConfig {
             // of triggering frequently, and the prop-firm window-pass
             // gate downstream already filters out genuinely useless
             // strategies on its own.
-            if std::env::var("NEOETHOS_BOT_DISCOVERY_MIN_TRADES_PER_DAY").is_err() {
-                self.min_trades_per_day = 0.001;
-            }
+            // Permissive PropFirm trade-frequency floor — this was the
+            // env-absent default of the retired
+            // NEOETHOS_BOT_DISCOVERY_MIN_TRADES_PER_DAY override; the
+            // window-pass gate downstream filters genuinely useless genes.
+            self.min_trades_per_day = 0.001;
 
             // F-305 fix (2026-05-28): scale `min_trades_per_month` by TF
             // bar density. The operator's `config.yaml` sets the value
@@ -2289,10 +2301,11 @@ fn read_env_usize(name: &str) -> Option<usize> {
         .and_then(|v| v.trim().parse::<usize>().ok())
 }
 
-/// Three discovery modes. The default is `PropFirm` — every other path
-/// would have to be explicitly opted into via `NEOETHOS_BOT_DISCOVERY_MODE`.
+/// Discovery search modes. The default is `PropFirm`; `Strict` is opted into
+/// via `models.discovery_mode = "strict"` in config (mapped by
+/// `discovery_mode_from_config`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiscoveryMode {
+pub enum DiscoveryMode {
     /// Production-grade strict pipeline (legacy walkforward + CPCV +
     /// MC-perturbation gates). Use only when looking for unicorn
     /// strategies that survive every consistency test in the codebase.
@@ -2304,21 +2317,16 @@ enum DiscoveryMode {
     PropFirm,
 }
 
-fn resolve_discovery_mode() -> DiscoveryMode {
-    let value = std::env::var("NEOETHOS_BOT_DISCOVERY_MODE")
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase());
-    match value.as_deref() {
-        Some("strict") | Some("legacy") => DiscoveryMode::Strict,
-        // Back-compat: the older opt-in env var still selects prop-firm.
-        _ if std::env::var("NEOETHOS_BOT_DISCOVERY_PERMISSIVE")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .filter(|v| matches!(v.as_str(), "0" | "false" | "off" | "no"))
-            .is_some() =>
-        {
-            DiscoveryMode::Strict
-        }
+/// Map the config `models.discovery_mode` string to a [`DiscoveryMode`].
+/// `"strict"` / `"legacy"` → `Strict`; anything else (including the default
+/// `"prop_firm"`) → `PropFirm`. Config-driven replacement for the env-only
+/// `resolve_discovery_mode` that read `NEOETHOS_BOT_DISCOVERY_MODE` and the
+/// legacy `NEOETHOS_BOT_DISCOVERY_PERMISSIVE` back-compat toggle. The
+/// permissive-toggle path is retired with the env var — operators select the
+/// regime through `config.yaml` / the UI now.
+fn discovery_mode_from_config(value: &str) -> DiscoveryMode {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "strict" | "legacy" => DiscoveryMode::Strict,
         _ => DiscoveryMode::PropFirm,
     }
 }

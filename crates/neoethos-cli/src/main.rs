@@ -494,7 +494,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             filtering: defaults.filtering,
             ..defaults.clone()
         }
-        .with_env_runtime_overrides();
+        .apply_mode_overrides();
         let result = neoethos_search::run_discovery_cycle(&features, base_ohlcv, &config)?;
         if let Some(parent) = std::path::Path::new(&out).parent()
             && !parent.as_os_str().is_empty()

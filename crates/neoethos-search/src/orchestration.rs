@@ -123,7 +123,7 @@ impl DiscoveryOrchestrator {
                         continue;
                     }
                 };
-                let mut runtime_config = self.config.clone().with_env_runtime_overrides();
+                let mut runtime_config = self.config.clone().apply_mode_overrides();
                 runtime_config.timeframe_label = tf.clone();
                 // Previously this used `?` and aborted the whole batch on a
                 // single discovery failure, while every other error in the
