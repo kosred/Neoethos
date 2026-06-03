@@ -26,6 +26,7 @@ import 'package:intl/intl.dart';
 import '../api/backend_client.dart';
 import '../api/currency_format.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../screens/help_screen.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
@@ -38,6 +39,7 @@ class TopBar extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final asyncSnapshot = ref.watch(accountSnapshotProvider);
     final brokerStatus = ref.watch(brokerStatusProvider);
     final engines = ref.watch(enginesProvider).valueOrNull;
@@ -56,14 +58,14 @@ class TopBar extends ConsumerWidget {
         b.environment.toLowerCase() == 'live'
             ? ('LIVE', _BadgeKind.live)
             : ('DEMO', _BadgeKind.idle),
-      AsyncData() => ('OFFLINE', _BadgeKind.offline),
-      AsyncError() => ('OFFLINE', _BadgeKind.offline),
+      AsyncData() => (l10n.badgeOffline, _BadgeKind.offline),
+      AsyncError() => (l10n.badgeOffline, _BadgeKind.offline),
       _ => switch (asyncSnapshot) {
-          AsyncData() => ('CONNECTING', _BadgeKind.idle),
+          AsyncData() => (l10n.badgeConnecting, _BadgeKind.idle),
           AsyncError(error: final e) when e is BrokerNotReadyException =>
-            ('CONNECTING', _BadgeKind.idle),
-          AsyncError() => ('OFFLINE', _BadgeKind.offline),
-          _ => ('CONNECTING', _BadgeKind.idle),
+            (l10n.badgeConnecting, _BadgeKind.idle),
+          AsyncError() => (l10n.badgeOffline, _BadgeKind.offline),
+          _ => (l10n.badgeConnecting, _BadgeKind.idle),
         },
     };
 
@@ -109,7 +111,7 @@ class TopBar extends ConsumerWidget {
               child: Row(
                 children: [
                   _RibbonItem(
-                    label: 'Balance',
+                    label: l10n.ribbonBalance,
                     value: ribbonValue(snap?.balance),
                   ),
                   _RibbonItem(
@@ -122,7 +124,7 @@ class TopBar extends ConsumerWidget {
                     value: ribbonValue(snap?.freeMargin),
                   ),
                   _RibbonItem(
-                    label: 'Open',
+                    label: l10n.ribbonOpen,
                     value: snap == null ? '—' : '${snap.positions.length}',
                     valueAccent: snap != null && snap.positions.isNotEmpty
                         ? _ValueAccent.accent
@@ -136,15 +138,15 @@ class TopBar extends ConsumerWidget {
           // `/engines/status`. Until the POST start/stop endpoints
           // land they're read-only mirrors of whatever the bridge is
           // doing, but they no longer lie about state.
-          _AutoPill(label: 'Auto-Discover', on: discoveryOn),
+          _AutoPill(label: l10n.autoDiscover, on: discoveryOn),
           const SizedBox(width: NeoethosTokens.spXs),
-          _AutoPill(label: 'Auto-Train', on: trainingOn),
+          _AutoPill(label: l10n.autoTrain, on: trainingOn),
           const SizedBox(width: NeoethosTokens.spSm),
           IconButton(
             onPressed: () => ref
                 .read(accountSnapshotProvider.notifier)
                 .refreshNow(),
-            tooltip: 'Refresh account snapshot now',
+            tooltip: l10n.tooltipRefreshSnapshot,
             icon: const Icon(Icons.refresh, color: NeoethosTokens.textMuted),
           ),
           // Help — F1 keyboard shortcut also opens this. Greek + English
@@ -152,7 +154,7 @@ class TopBar extends ConsumerWidget {
           // Shortcuts, FAQ). Lifted from the Codex mockup in F-329.
           IconButton(
             onPressed: () => showHelpDialog(context),
-            tooltip: 'Help (F1) — Welcome guide, trading, AI, risk, FAQs',
+            tooltip: l10n.tooltipHelp,
             icon: const Icon(Icons.help_outline,
                 color: NeoethosTokens.textMuted),
           ),
@@ -164,7 +166,7 @@ class TopBar extends ConsumerWidget {
           // that broke.
           IconButton(
             onPressed: () => showReportIssueDialog(context),
-            tooltip: 'Report an issue — bundles logs + emails support',
+            tooltip: l10n.tooltipReportIssue,
             icon: const Icon(Icons.bug_report_outlined,
                 color: NeoethosTokens.textMuted),
           ),
@@ -173,7 +175,7 @@ class TopBar extends ConsumerWidget {
           // operator can audit a healthy backend too.
           IconButton(
             onPressed: () => showBackendDiagnosticsDialog(context),
-            tooltip: 'Backend diagnostics — view supervisor log + restart',
+            tooltip: l10n.tooltipBackendDiagnostics,
             icon: const Icon(Icons.monitor_heart_outlined,
                 color: NeoethosTokens.textMuted),
           ),
@@ -201,6 +203,7 @@ class _AccountSwitcher extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final accounts =
         ref.watch(brokerAccountsProvider).valueOrNull?.accounts ?? const [];
     final currentId =
@@ -210,7 +213,7 @@ class _AccountSwitcher extends ConsumerWidget {
       return const SizedBox.shrink();
     }
     return PopupMenuButton<String>(
-      tooltip: 'Switch cTrader account (applies on restart)',
+      tooltip: l10n.accountSwitcherTooltip,
       offset: const Offset(0, 36),
       color: NeoethosTokens.panelBg,
       onSelected: (id) => _select(context, ref, id),
@@ -261,7 +264,7 @@ class _AccountSwitcher extends ConsumerWidget {
                 size: 14, color: NeoethosTokens.textMuted),
             const SizedBox(width: 5),
             Text(
-              currentId.isEmpty ? 'Account' : currentId,
+              currentId.isEmpty ? l10n.accountLabel : currentId,
               style: const TextStyle(
                 fontSize: NeoethosTokens.fsCaption,
                 fontWeight: FontWeight.w700,
@@ -277,6 +280,7 @@ class _AccountSwitcher extends ConsumerWidget {
   }
 
   Future<void> _select(BuildContext context, WidgetRef ref, String id) async {
+    final l10n = AppLocalizations.of(context)!;
     final messenger = ScaffoldMessenger.of(context);
     try {
       final r = await ref
@@ -289,17 +293,14 @@ class _AccountSwitcher extends ConsumerWidget {
         backgroundColor: ok ? NeoethosTokens.buy : NeoethosTokens.warning,
         duration: const Duration(seconds: 5),
         content: Text(ok
-            ? 'Active account → $id. Restart NeoEthos to apply.'
-            : 'Account select returned an unexpected response.'),
+            ? l10n.accountSwitchedRestart(id)
+            : l10n.accountSwitchUnexpected),
       ));
     } catch (e) {
       messenger.showSnackBar(SnackBar(
         backgroundColor: NeoethosTokens.sell,
         duration: const Duration(seconds: 6),
-        content: Text(
-          'Account switch failed — active account unchanged. '
-          '${describeError(e)}',
-        ),
+        content: Text(l10n.accountSwitchFailed(describeError(e))),
       ));
     }
   }
