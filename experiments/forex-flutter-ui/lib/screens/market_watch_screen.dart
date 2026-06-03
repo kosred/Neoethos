@@ -34,6 +34,7 @@ import 'package:intl/intl.dart';
 import '../api/backend_client.dart';
 import '../api/currency_format.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../state/system_providers.dart';
@@ -56,7 +57,7 @@ void _openSymbolChart(BuildContext context, WidgetRef ref, String symbol) {
           elevation: 0,
           iconTheme: const IconThemeData(color: NeoethosTokens.textPrimary),
           title: Text(
-            '$symbol · Chart',
+            AppLocalizations.of(context)!.marketWatchChartTitle(symbol),
             style: const TextStyle(
               color: NeoethosTokens.textPrimary,
               fontSize: NeoethosTokens.fsSubtitle,
@@ -155,6 +156,7 @@ class _SummaryStrip extends ConsumerWidget {
     // Capture the messenger BEFORE any await so we never touch a
     // possibly-unmounted `context` across the async gap.
     final messenger = ScaffoldMessenger.of(context);
+    final l10n = AppLocalizations.of(context)!;
     try {
       final current = await client.fetchWatchlist();
       if (!context.mounted) return;
@@ -168,10 +170,7 @@ class _SummaryStrip extends ConsumerWidget {
       ref.invalidate(liveSpotsProvider);
       messenger.showSnackBar(
         SnackBar(
-          content: Text(
-            'Watchlist updated — ${result.saved} '
-            'symbol${result.saved == 1 ? '' : 's'}, re-subscribing…',
-          ),
+          content: Text(l10n.marketWatchUpdated(result.saved)),
           duration: const Duration(seconds: 4),
         ),
       );
@@ -180,7 +179,7 @@ class _SummaryStrip extends ConsumerWidget {
       showTranslatedErrorSnackbar(
         context,
         e,
-        prefix: 'Could not update watchlist',
+        prefix: l10n.marketWatchUpdateFailed,
       );
     }
   }
@@ -210,9 +209,9 @@ class _SummaryStrip extends ConsumerWidget {
       ),
       child: Row(
         children: [
-          const Text(
-            'Watchlist',
-            style: TextStyle(
+          Text(
+            AppLocalizations.of(context)!.marketWatchTitle,
+            style: const TextStyle(
               fontSize: NeoethosTokens.fsBody + 1,
               fontWeight: FontWeight.w800,
               letterSpacing: 0.4,
@@ -221,20 +220,21 @@ class _SummaryStrip extends ConsumerWidget {
           ),
           const SizedBox(width: 12),
           _Pill(
-            label: '$visibleCount of $symbolCount symbols',
+            label: AppLocalizations.of(context)!
+                .marketWatchSymbolsCount(visibleCount, symbolCount),
             color: NeoethosTokens.accent,
           ),
           const SizedBox(width: 8),
           _Pill(
-            label: '$openCount open',
+            label: AppLocalizations.of(context)!.marketWatchOpenCount(openCount),
             color: openCount > 0 ? NeoethosTokens.buy : NeoethosTokens.textFaint,
           ),
           const SizedBox(width: 8),
-          const _Pill(
+          _Pill(
             // Pending orders endpoint hasn't shipped yet; mark explicitly
             // as 0 rather than hiding the pill — operator should know
             // the table is honestly empty, not just hidden.
-            label: '0 pending',
+            label: AppLocalizations.of(context)!.marketWatchPendingCount(0),
             color: NeoethosTokens.textFaint,
           ),
           const SizedBox(width: 12),
@@ -242,7 +242,7 @@ class _SummaryStrip extends ConsumerWidget {
           OutlinedButton.icon(
             onPressed: () => _editWatchlist(context, ref),
             icon: const Icon(Icons.playlist_add_check, size: 16),
-            label: const Text('Edit watchlist'),
+            label: Text(AppLocalizations.of(context)!.marketWatchEditWatchlist),
             style: OutlinedButton.styleFrom(
               foregroundColor: NeoethosTokens.accent,
               side: const BorderSide(color: NeoethosTokens.border),
@@ -257,7 +257,7 @@ class _SummaryStrip extends ConsumerWidget {
           const Spacer(),
           if (ageSeconds != null)
             Text(
-              'Updated ${ageSeconds}s ago',
+              AppLocalizations.of(context)!.marketWatchUpdatedAgo(ageSeconds),
               style: const TextStyle(
                 fontSize: NeoethosTokens.fsCaption,
                 color: NeoethosTokens.textMuted,
@@ -265,9 +265,9 @@ class _SummaryStrip extends ConsumerWidget {
               ),
             )
           else
-            const Text(
-              'Streaming …',
-              style: TextStyle(
+            Text(
+              AppLocalizations.of(context)!.marketWatchStreaming,
+              style: const TextStyle(
                 fontSize: NeoethosTokens.fsCaption,
                 color: NeoethosTokens.textFaint,
                 fontStyle: FontStyle.italic,
@@ -334,12 +334,12 @@ class _WatchlistPanel extends ConsumerWidget {
           const _WatchlistHeader(),
           Expanded(
             child: spotsAsync.when(
-              loading: () => const Center(
+              loading: () => Center(
                 child: Padding(
-                  padding: EdgeInsets.all(NeoethosTokens.spLg),
+                  padding: const EdgeInsets.all(NeoethosTokens.spLg),
                   child: Text(
-                    'Waiting for first SSE tick…',
-                    style: TextStyle(
+                    AppLocalizations.of(context)!.marketWatchWaitingTick,
+                    style: const TextStyle(
                       fontSize: NeoethosTokens.fsBody,
                       color: NeoethosTokens.textMuted,
                     ),
@@ -347,18 +347,18 @@ class _WatchlistPanel extends ConsumerWidget {
                 ),
               ),
               error: (err, _) => _ErrorBlock(
-                message: 'Live prices unavailable — ${describeError(err)}',
+                message: AppLocalizations.of(context)!
+                    .marketWatchPricesUnavailable(describeError(err)),
               ),
               data: (snap) {
                 if (snap.spots.isEmpty) {
-                  return const Center(
+                  return Center(
                     child: Padding(
-                      padding: EdgeInsets.all(NeoethosTokens.spLg),
+                      padding: const EdgeInsets.all(NeoethosTokens.spLg),
                       child: Text(
-                        'No live spots yet — broker may still be warming '
-                            'up or no symbols subscribed.',
+                        AppLocalizations.of(context)!.marketWatchNoSpots,
                         textAlign: TextAlign.center,
-                        style: TextStyle(
+                        style: const TextStyle(
                           fontSize: NeoethosTokens.fsBody,
                           color: NeoethosTokens.textMuted,
                         ),
@@ -427,22 +427,39 @@ class _WatchlistHeader extends StatelessWidget {
         ),
       ),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      child: const Row(
+      child: Row(
         children: [
-          _HeaderCell(text: 'Symbol', width: 96, align: Alignment.centerLeft),
-          _HeaderCell(text: 'Bid', width: 72, align: Alignment.centerRight),
-          _HeaderCell(text: 'Ask', width: 72, align: Alignment.centerRight),
-          _HeaderCell(text: 'Spread', width: 52, align: Alignment.centerRight),
-          _HeaderCell(text: 'Trades', width: 48, align: Alignment.centerRight),
+          _HeaderCell(
+            text: AppLocalizations.of(context)!.thSymbol,
+            width: 96,
+            align: Alignment.centerLeft,
+          ),
+          const _HeaderCell(text: 'Bid', width: 72, align: Alignment.centerRight),
+          const _HeaderCell(text: 'Ask', width: 72, align: Alignment.centerRight),
+          const _HeaderCell(
+              text: 'Spread', width: 52, align: Alignment.centerRight),
+          _HeaderCell(
+            text: AppLocalizations.of(context)!.marketWatchColTrades,
+            width: 48,
+            align: Alignment.centerRight,
+          ),
           Expanded(
             child: _HeaderCell(
-              text: 'Strategy',
+              text: AppLocalizations.of(context)!.marketWatchColStrategy,
               width: null,
               align: Alignment.centerLeft,
             ),
           ),
-          _HeaderCell(text: 'Conf.', width: 48, align: Alignment.centerRight),
-          _HeaderCell(text: 'Status', width: 60, align: Alignment.center),
+          _HeaderCell(
+            text: AppLocalizations.of(context)!.marketWatchColConfidence,
+            width: 48,
+            align: Alignment.centerRight,
+          ),
+          _HeaderCell(
+            text: AppLocalizations.of(context)!.marketWatchColStatus,
+            width: 60,
+            align: Alignment.center,
+          ),
         ],
       ),
     );
@@ -506,12 +523,13 @@ class _SymbolRow extends StatelessWidget {
         ? null
         : _isJpy(spot.symbolName) ? spread * 100 : spread * 10000;
 
+    final l10n = AppLocalizations.of(context)!;
     final stale = spot.freshnessSeconds > 5;
     final (statusLabel, statusColor) = stale
-        ? ('Stale', NeoethosTokens.warning)
+        ? (l10n.marketWatchStatusStale, NeoethosTokens.warning)
         : (bid != null && ask != null)
-            ? ('Live', NeoethosTokens.buy)
-            : ('Off', NeoethosTokens.textFaint);
+            ? (l10n.marketWatchStatusLive, NeoethosTokens.buy)
+            : (l10n.marketWatchStatusOff, NeoethosTokens.textFaint);
 
     return InkWell(
       onTap: onTap,
@@ -710,18 +728,22 @@ class _OpenPositionsPanel extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _PanelTitle(
-            title: 'Open Positions',
+            title: AppLocalizations.of(context)!.openPositions,
             count: positions.length,
           ),
           Expanded(
             child: accountAsync.when(
               loading: () => const _LoadingLine(),
               error: (err, _) => _ErrorBlock(
-                message: 'Positions unavailable — ${describeError(err)}',
+                message: AppLocalizations.of(context)!
+                    .marketWatchPositionsUnavailable(describeError(err)),
               ),
               data: (_) {
                 if (positions.isEmpty) {
-                  return const _EmptyLine(message: 'No open positions.');
+                  return _EmptyLine(
+                    message: AppLocalizations.of(context)!
+                        .marketWatchNoPositions,
+                  );
                 }
                 return Scrollbar(
                   child: ListView.builder(
@@ -794,7 +816,9 @@ class _PositionRow extends StatelessWidget {
               borderRadius: BorderRadius.circular(3),
             ),
             child: Text(
-              isBuy ? 'BUY' : 'SELL',
+              isBuy
+                  ? AppLocalizations.of(context)!.marketWatchBuy
+                  : AppLocalizations.of(context)!.marketWatchSell,
               style: TextStyle(
                 fontSize: NeoethosTokens.fsCaption - 1,
                 fontWeight: FontWeight.w800,
@@ -817,7 +841,8 @@ class _PositionRow extends StatelessWidget {
                   ),
                 ),
                 Text(
-                  'since $since · #${position.positionId}',
+                  AppLocalizations.of(context)!
+                      .marketWatchSince(since, position.positionId),
                   style: const TextStyle(
                     fontSize: NeoethosTokens.fsCaption,
                     color: NeoethosTokens.textFaint,
@@ -870,17 +895,16 @@ class _PendingOrdersPanel extends StatelessWidget {
         border: Border.all(color: NeoethosTokens.border),
         borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
-      child: const Column(
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _PanelTitle(title: 'Pending Orders', count: 0),
+          _PanelTitle(
+            title: AppLocalizations.of(context)!.marketWatchPendingOrders,
+            count: 0,
+          ),
           Expanded(
             child: _EmptyLine(
-              message:
-                  'No pending orders.\n'
-                  'Limit/Stop entries will surface here once the '
-                  '/orders/pending endpoint ships (deferred to a '
-                  'broker-side change).',
+              message: AppLocalizations.of(context)!.marketWatchNoPending,
             ),
           ),
         ],
@@ -944,12 +968,12 @@ class _PanelTitle extends StatelessWidget {
 class _LoadingLine extends StatelessWidget {
   const _LoadingLine();
   @override
-  Widget build(BuildContext context) => const Center(
+  Widget build(BuildContext context) => Center(
         child: Padding(
-          padding: EdgeInsets.all(NeoethosTokens.spMd),
+          padding: const EdgeInsets.all(NeoethosTokens.spMd),
           child: Text(
-            'Loading…',
-            style: TextStyle(
+            AppLocalizations.of(context)!.commonLoading,
+            style: const TextStyle(
               fontSize: NeoethosTokens.fsBody,
               color: NeoethosTokens.textMuted,
             ),
@@ -985,7 +1009,7 @@ class _ErrorBlock extends StatelessWidget {
   Widget build(BuildContext context) => Padding(
         padding: const EdgeInsets.all(NeoethosTokens.spMd),
         child: Text(
-          'Error: $message',
+          AppLocalizations.of(context)!.marketWatchErrorPrefix(message),
           style: const TextStyle(
             fontSize: NeoethosTokens.fsCaption,
             color: NeoethosTokens.sell,

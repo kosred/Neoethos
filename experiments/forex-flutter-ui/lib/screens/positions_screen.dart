@@ -26,6 +26,7 @@ import 'package:intl/intl.dart';
 import '../api/backend_client.dart';
 import '../api/currency_format.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../theme/theme.dart';
@@ -49,15 +50,19 @@ class PositionsScreen extends ConsumerWidget {
     final accountAsync = ref.watch(accountSnapshotProvider);
     final spotsAsync = ref.watch(liveSpotsProvider);
 
+    final l10n = AppLocalizations.of(context)!;
     return DefaultTabController(
       length: 2,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const TabBar(
+          TabBar(
             isScrollable: true,
             tabAlignment: TabAlignment.start,
-            tabs: [Tab(text: 'Live'), Tab(text: 'Journal')],
+            tabs: [
+              Tab(text: l10n.positionsTabLive),
+              Tab(text: l10n.positionsTabJournal),
+            ],
           ),
           const SizedBox(height: NeoethosTokens.spSm),
           Expanded(
@@ -100,6 +105,7 @@ class _JournalTab extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final statsAsync = ref.watch(journalStatsProvider);
     final tradesAsync = ref.watch(journalTradesProvider);
     return Column(
@@ -113,7 +119,7 @@ class _JournalTab extends ConsumerWidget {
           error: (e, _) => Padding(
             padding: const EdgeInsets.all(8),
             child: Text(
-              'Stats unavailable: ${describeError(e)}',
+              l10n.positionsStatsUnavailable(describeError(e)),
               style: const TextStyle(fontSize: 11, color: NeoethosTokens.sell),
             ),
           ),
@@ -125,18 +131,20 @@ class _JournalTab extends ConsumerWidget {
             loading: () => const Center(child: CircularProgressIndicator()),
             error: (e, _) => Center(
               child: Text(
-                'Could not load trades: ${describeError(e)}',
+                l10n.positionsTradesLoadError(describeError(e)),
                 style: const TextStyle(color: NeoethosTokens.sell),
               ),
             ),
             data: (trades) => trades.isEmpty
-                ? const Center(
+                ? Center(
                     child: Padding(
-                      padding: EdgeInsets.all(24),
+                      padding: const EdgeInsets.all(24),
                       child: Text(
-                        'No closed trades yet.\nThey appear here as the bot closes positions.',
+                        l10n.positionsJournalEmpty,
                         textAlign: TextAlign.center,
-                        style: TextStyle(color: NeoethosTokens.textMuted),
+                        style: const TextStyle(
+                          color: NeoethosTokens.textMuted,
+                        ),
                       ),
                     ),
                   )
@@ -185,6 +193,7 @@ class _JournalStatCards extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     String f2(double v) => v.toStringAsFixed(2);
     String optF(double? v) => v == null ? '—' : v.toStringAsFixed(2);
     final netAccent = stats.netProfit > 0
@@ -197,10 +206,10 @@ class _JournalStatCards extends StatelessWidget {
       runSpacing: NeoethosTokens.spSm,
       children: [
         _chip('Net P/L', f2(stats.netProfit), accent: netAccent),
-        _chip('Trades', '${stats.totalTrades}'),
+        _chip(l10n.positionsStatTrades, '${stats.totalTrades}'),
         _chip('Win rate', '${stats.winRatePct.toStringAsFixed(1)}%'),
         _chip('Profit factor', optF(stats.profitFactor)),
-        _chip('Expectancy', f2(stats.expectancy)),
+        _chip(l10n.positionsStatExpectancy, f2(stats.expectancy)),
         _chip('Max DD', '${stats.maxDrawdownPct.toStringAsFixed(1)}%'),
         _chip('Sharpe', optF(stats.sharpe)),
       ],
@@ -214,6 +223,7 @@ class _ClosedTradesTable extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final df = DateFormat('yyyy-MM-dd HH:mm');
     return ListView.separated(
       itemCount: trades.length,
@@ -230,7 +240,7 @@ class _ClosedTradesTable extends StatelessWidget {
                 : null;
         return ListTile(
           dense: true,
-          title: Text('${t.symbol}   ${t.side}   ${t.lots} lots'),
+          title: Text(l10n.positionsClosedTradeRow(t.symbol, t.side, t.lots)),
           subtitle: Text(
             when,
             style: const TextStyle(fontSize: 10, color: NeoethosTokens.textMuted),
@@ -255,6 +265,7 @@ class _MetricsStrip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final acc = accountAsync.valueOrNull;
     final positions = acc?.positions ?? const <Position>[];
     final openCount = positions.length;
@@ -268,7 +279,7 @@ class _MetricsStrip extends StatelessWidget {
     return Row(
       children: [
         _MetricCard(
-          label: 'Open positions',
+          label: l10n.positionsMetricOpen,
           value: openCount == 0 ? '—' : '$openCount',
           accent: openCount > 0 ? NeoethosTokens.accent : null,
         ),
@@ -290,8 +301,8 @@ class _MetricsStrip extends StatelessWidget {
                       : null,
         ),
         const SizedBox(width: NeoethosTokens.spSm),
-        const _MetricCard(
-          label: "Today's realised",
+        _MetricCard(
+          label: l10n.positionsMetricTodayRealised,
           // Realised PnL endpoint hasn't shipped yet — explicit `—`
           // beats a misleading "$0" placeholder.
           value: '—',
@@ -369,6 +380,7 @@ class _OpenPositionsTable extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     return Container(
       decoration: BoxDecoration(
         color: NeoethosTokens.panelBg,
@@ -379,10 +391,10 @@ class _OpenPositionsTable extends ConsumerWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _PanelTitle(
-            title: 'Open Positions',
+            title: l10n.openPositions,
             count: accountAsync.valueOrNull?.positions.length ?? 0,
             trailing: IconButton(
-              tooltip: 'Refresh snapshot',
+              tooltip: l10n.positionsRefreshTooltip,
               iconSize: 16,
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
@@ -400,10 +412,8 @@ class _OpenPositionsTable extends ConsumerWidget {
               error: (err, _) => _ErrorBlock(error: err),
               data: (acc) {
                 if (acc.positions.isEmpty) {
-                  return const _EmptyLine(
-                    message: 'No open positions.\n'
-                        'Trades placed via Market Watch → Order Ticket '
-                        'will appear here within ~2 s.',
+                  return _EmptyLine(
+                    message: l10n.positionsEmpty,
                   );
                 }
                 final spotByName = <String, LiveSpotTick>{};
@@ -442,22 +452,27 @@ class _OpenPositionsTable extends ConsumerWidget {
     WidgetRef ref,
     Position position,
   ) async {
+    final l10n = AppLocalizations.of(context)!;
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: NeoethosTokens.panelBg,
         title: Text(
-          'Close ${_prettySymbol(position.symbol)} ${position.side.toUpperCase()} '
-              '${position.volume.toStringAsFixed(2)} lots?',
+          l10n.positionsCloseTitle(
+            _prettySymbol(position.symbol),
+            position.side.toUpperCase(),
+            position.volume.toStringAsFixed(2),
+          ),
           style: const TextStyle(
             color: NeoethosTokens.textPrimary,
             fontSize: 14,
           ),
         ),
         content: Text(
-          'Position #${position.positionId} · current PnL '
-              '${position.pnlPips.toStringAsFixed(1)} pips. '
-              'This sends a market close to the broker — irreversible.',
+          l10n.positionsCloseDetail(
+            position.positionId,
+            position.pnlPips.toStringAsFixed(1),
+          ),
           style: const TextStyle(
             color: NeoethosTokens.textMuted,
             fontSize: 13,
@@ -466,14 +481,14 @@ class _OpenPositionsTable extends ConsumerWidget {
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(false),
-            child: const Text('Cancel'),
+            child: Text(l10n.commonCancel),
           ),
           FilledButton(
             style: FilledButton.styleFrom(
               backgroundColor: NeoethosTokens.sell,
             ),
             onPressed: () => Navigator.of(ctx).pop(true),
-            child: const Text('Close position'),
+            child: Text(l10n.positionsCloseConfirmAction),
           ),
         ],
       ),
@@ -496,8 +511,7 @@ class _OpenPositionsTable extends ConsumerWidget {
       showTranslatedErrorSnackbar(
         context,
         e,
-        prefix: 'Position close was not confirmed — '
-            'check the Positions list; if it still shows open, try again',
+        prefix: l10n.positionsCloseError,
       );
     }
   }
@@ -506,6 +520,7 @@ class _OpenPositionsTable extends ConsumerWidget {
 class _PositionsHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: const BoxDecoration(
@@ -514,16 +529,25 @@ class _PositionsHeader extends StatelessWidget {
           bottom: BorderSide(color: NeoethosTokens.border),
         ),
       ),
-      child: const Row(
+      child: Row(
         children: [
-          SizedBox(width: 56, child: _HeaderCell('Side')),
-          SizedBox(width: 100, child: _HeaderCell('Symbol')),
-          SizedBox(width: 70, child: _HeaderCell('Volume', right: true)),
-          SizedBox(width: 80, child: _HeaderCell('Current', right: true)),
-          SizedBox(width: 80, child: _HeaderCell('PnL pips', right: true)),
-          SizedBox(width: 100, child: _HeaderCell('PnL', right: true)),
-          Expanded(child: _HeaderCell('Since · ID')),
-          SizedBox(width: 80, child: _HeaderCell('Action', right: true)),
+          SizedBox(width: 56, child: _HeaderCell(l10n.thSide)),
+          SizedBox(width: 100, child: _HeaderCell(l10n.thSymbol)),
+          SizedBox(
+            width: 70,
+            child: _HeaderCell(l10n.thVolume, right: true),
+          ),
+          SizedBox(
+            width: 80,
+            child: _HeaderCell(l10n.positionsThCurrent, right: true),
+          ),
+          const SizedBox(width: 80, child: _HeaderCell('PnL pips', right: true)),
+          const SizedBox(width: 100, child: _HeaderCell('PnL', right: true)),
+          Expanded(child: _HeaderCell(l10n.positionsThSinceId)),
+          SizedBox(
+            width: 80,
+            child: _HeaderCell(l10n.positionsThAction, right: true),
+          ),
         ],
       ),
     );
@@ -563,6 +587,7 @@ class _PositionDetailRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final isBuy = position.side.toLowerCase() == 'buy';
     final sideColor = isBuy ? NeoethosTokens.buy : NeoethosTokens.sell;
     final pnlColor = position.pnlUsd > 0
@@ -604,7 +629,7 @@ class _PositionDetailRow extends StatelessWidget {
                 borderRadius: BorderRadius.circular(3),
               ),
               child: Text(
-                isBuy ? 'BUY' : 'SELL',
+                isBuy ? l10n.positionsSideBuy : l10n.positionsSideSell,
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: NeoethosTokens.fsCaption - 1,
@@ -705,9 +730,9 @@ class _PositionDetailRow extends StatelessWidget {
                 minimumSize: const Size(0, 26),
                 tapTargetSize: MaterialTapTargetSize.shrinkWrap,
               ),
-              child: const Text(
-                'Close',
-                style: TextStyle(
+              child: Text(
+                l10n.commonClose,
+                style: const TextStyle(
                   fontSize: NeoethosTokens.fsCaption,
                   fontWeight: FontWeight.w700,
                 ),
@@ -729,23 +754,20 @@ class _PendingOrdersTable extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return Container(
       decoration: BoxDecoration(
         color: NeoethosTokens.panelBg,
         border: Border.all(color: NeoethosTokens.border),
         borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
-      child: const Column(
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _PanelTitle(title: 'Pending Orders', count: 0),
+          _PanelTitle(title: l10n.positionsPendingTitle, count: 0),
           Expanded(
             child: _EmptyLine(
-              message:
-                  'No pending orders.\n\n'
-                  'Limit / Stop entries placed via Order Ticket appear '
-                  'here. The dedicated /orders/pending broker endpoint '
-                  'is deferred until the live-pending-fill flow ships.',
+              message: l10n.positionsPendingEmpty,
             ),
           ),
         ],
@@ -816,12 +838,12 @@ class _PanelTitle extends StatelessWidget {
 class _LoadingLine extends StatelessWidget {
   const _LoadingLine();
   @override
-  Widget build(BuildContext context) => const Center(
+  Widget build(BuildContext context) => Center(
         child: Padding(
-          padding: EdgeInsets.all(NeoethosTokens.spMd),
+          padding: const EdgeInsets.all(NeoethosTokens.spMd),
           child: Text(
-            'Loading…',
-            style: TextStyle(
+            AppLocalizations.of(context)!.commonLoading,
+            style: const TextStyle(
               fontSize: NeoethosTokens.fsBody,
               color: NeoethosTokens.textMuted,
             ),
