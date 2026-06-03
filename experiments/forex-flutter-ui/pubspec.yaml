@@ -14,6 +14,13 @@ dependencies:
   flutter:
     sdk: flutter
 
+  # i18n (2026-06-03) — Flutter's bundled localization delegates
+  # (Material / Widgets / Cupertino) for the el (Greek) + en locales.
+  # The arb-based gen-l10n tool emits lib/l10n/app_localizations.dart
+  # (enabled by `generate: true` below); `intl` is already pinned ^0.19.0.
+  flutter_localizations:
+    sdk: flutter
+
   # State management — Riverpod chosen over BLoC because the screen
   # graph is small (14 panels) and Riverpod's compile-time-safe
   # providers fit the "thin client over a Rust backend" model.
@@ -53,8 +60,11 @@ dependencies:
   # ^0.19.0). 0.19↔0.20 are CHANGELOG-compatible for the `DateFormat`
   # (yyyy-MM-dd HH:mm, HH:mm:ss, MMM d) and `NumberFormat`
   # (#,##0, +#,##0.0;-#,##0.0) patterns all 12 `lib/` call sites use, so
-  # this downgrade is behaviour-neutral.
-  intl: ^0.19.0
+  # this is behaviour-neutral. 2026-06-03: bumped ^0.19.0 -> ^0.20.0 because
+  # flutter_localizations (added for i18n) requires intl 0.20.2; k_chart_plus
+  # still caps at ^0.19.0 so a dependency_override (below) forces 0.20.2 across
+  # the graph — safe per the 0.19<->0.20 compatibility note above.
+  intl: ^0.20.0
 
   # Logging - flows into the backend log stream eventually.
   logger: ^2.4.0
@@ -74,6 +84,14 @@ dependencies:
 
   cupertino_icons: ^1.0.8
 
+dependency_overrides:
+  # flutter_localizations (Flutter SDK, added 2026-06-03 for i18n) requires
+  # intl 0.20.2, but k_chart_plus's pubspec caps intl at ^0.19.0. 0.19<->0.20
+  # are CHANGELOG-compatible for the DateFormat / NumberFormat patterns both
+  # k_chart_plus and our call sites use (see the intl dependency note above),
+  # so forcing 0.20.2 across the dependency graph is behaviour-neutral.
+  intl: 0.20.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -82,6 +100,9 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  # Enable gen-l10n: arb files in lib/l10n -> lib/l10n/app_localizations.dart
+  # (see l10n.yaml). Run `flutter gen-l10n` (or `flutter pub get`) to refresh.
+  generate: true
   # Asset folders for future use (icons, custom fonts).
   # assets:
   #   - assets/icons/

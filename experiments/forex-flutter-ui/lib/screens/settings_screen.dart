@@ -29,7 +29,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
+import '../state/locale_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '../widgets/backend_error_widget.dart';
@@ -379,6 +381,7 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
             title: 'Settings',
             subtitle: 'cTrader credentials · app configuration',
           ),
+          const _LanguageCard(),
           _credentialsCard(),
           asyncSettings.when(
             data: (s) => _configCard(s),
@@ -544,6 +547,47 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
     // (`_dataDirCtrl` etc.) survive parent rebuilds when the user
     // toggles the cTrader credentials form above.
     return _AppSettingsCard(snapshot: s);
+  }
+}
+
+/// Settings → App: UI language picker (Stage 1a, 2026-06-03). Writes the
+/// in-memory [localeProvider]; persistence to the backend config lands in
+/// Stage 1b. Its own labels come from [AppLocalizations], so flipping the
+/// segments re-renders this card — and the whole app — in the chosen language
+/// immediately, which is the live proof the i18n wiring works.
+class _LanguageCard extends ConsumerWidget {
+  const _LanguageCard();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
+    final current = ref.watch(localeProvider).languageCode;
+    return SectionCard(
+      title: l10n.language,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            l10n.languageHint,
+            style: const TextStyle(
+              fontSize: 11,
+              color: NeoethosTokens.textMuted,
+            ),
+          ),
+          const SizedBox(height: 10),
+          SegmentedButton<String>(
+            segments: [
+              ButtonSegment(value: 'en', label: Text(l10n.languageEnglish)),
+              ButtonSegment(value: 'el', label: Text(l10n.languageGreek)),
+            ],
+            selected: {current == 'el' ? 'el' : 'en'},
+            showSelectedIcon: false,
+            onSelectionChanged: (sel) =>
+                ref.read(localeProvider.notifier).setLanguage(sel.first),
+          ),
+        ],
+      ),
+    );
   }
 }
 

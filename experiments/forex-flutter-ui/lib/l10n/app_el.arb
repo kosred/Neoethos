@@ -1,0 +1,15 @@
+{
+  "@@locale": "el",
+  "appTitle": "NeoEthos",
+  "language": "Γλώσσα",
+  "languageEnglish": "English",
+  "languageGreek": "Ελληνικά",
+  "languageHint": "Επίλεξε τη γλώσσα του περιβάλλοντος. Εφαρμόζεται αμέσως σε όλη την εφαρμογή.",
+  "settingsTitle": "Ρυθμίσεις",
+  "commonSave": "Αποθήκευση",
+  "commonCancel": "Άκυρο",
+  "commonClose": "Κλείσιμο",
+  "commonRetry": "Επανάληψη",
+  "commonLoading": "Φόρτωση…",
+  "commonError": "Σφάλμα"
+}

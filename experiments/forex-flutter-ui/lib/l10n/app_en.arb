@@ -1,0 +1,51 @@
+{
+  "@@locale": "en",
+  "appTitle": "NeoEthos",
+  "@appTitle": {
+    "description": "Application title shown in the window / title bar"
+  },
+  "language": "Language",
+  "@language": {
+    "description": "Settings label for the UI language selector"
+  },
+  "languageEnglish": "English",
+  "@languageEnglish": {
+    "description": "Endonym for the English language option (shown in both locales)"
+  },
+  "languageGreek": "Ελληνικά",
+  "@languageGreek": {
+    "description": "Endonym for the Greek language option (shown in both locales)"
+  },
+  "languageHint": "Choose the interface language. It applies immediately across the app.",
+  "@languageHint": {
+    "description": "Helper text under the Settings language picker"
+  },
+  "settingsTitle": "Settings",
+  "@settingsTitle": {
+    "description": "Settings screen title"
+  },
+  "commonSave": "Save",
+  "@commonSave": {
+    "description": "Generic Save button label"
+  },
+  "commonCancel": "Cancel",
+  "@commonCancel": {
+    "description": "Generic Cancel button label"
+  },
+  "commonClose": "Close",
+  "@commonClose": {
+    "description": "Generic Close button label"
+  },
+  "commonRetry": "Retry",
+  "@commonRetry": {
+    "description": "Generic Retry button label"
+  },
+  "commonLoading": "Loading…",
+  "@commonLoading": {
+    "description": "Generic loading placeholder"
+  },
+  "commonError": "Error",
+  "@commonError": {
+    "description": "Generic error label"
+  }
+}

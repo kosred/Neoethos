@@ -22,7 +22,9 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'l10n/app_localizations.dart';
 import 'startup/backend_supervisor.dart';
+import 'state/locale_provider.dart';
 import 'theme/theme.dart';
 import 'widgets/app_shell.dart';
 
@@ -42,15 +44,23 @@ Future<void> main() async {
   runApp(const ProviderScope(child: NeoethosApp()));
 }
 
-class NeoethosApp extends StatelessWidget {
+class NeoethosApp extends ConsumerWidget {
   const NeoethosApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final locale = ref.watch(localeProvider);
     return MaterialApp(
       title: 'neoethos',
       debugShowCheckedModeBanner: false,
       theme: buildNeoethosTheme(),
+      // i18n: AppLocalizations bundles its own delegate + the Global
+      // Material/Widgets/Cupertino delegates and the supported locale list
+      // (en, el). `locale` is driven by localeProvider (the Settings language
+      // picker); null would defer to the platform locale.
+      locale: locale,
+      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
       home: const AppShell(),
     );
   }
