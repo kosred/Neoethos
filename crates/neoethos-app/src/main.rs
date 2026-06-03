@@ -40,22 +40,6 @@ struct Args {
     #[arg(long, default_value_t = false)]
     auto_training: bool,
 
-    /// Run the live cTrader API test harness.
-    #[arg(long, default_value_t = false)]
-    api_test: bool,
-
-    /// Output path for the api-test JSON report.
-    #[arg(long, default_value = "api-test-report.json")]
-    api_test_output: String,
-
-    /// Add a 1-second pause between api-test flows.
-    #[arg(long, default_value_t = false)]
-    api_test_slow: bool,
-
-    /// Restrict the api-test run to flows whose `name` matches this glob.
-    #[arg(long)]
-    api_test_only: Option<String>,
-
     /// Run as a headless HTTP API server on port 7423.
     ///
     /// This is the default behavior as of v0.4.20. Passing `--server`
@@ -209,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.models.data_runtime.normalize_features,
         settings.models.data_runtime.rebuild_stale_higher_tfs,
     );
+    crate::app_services::env_overrides::install_app_runtime_overrides(settings.app_runtime.clone());
     let runtime = AppRuntimeConfig::from_settings(
         args.config.clone(),
         args.local,
@@ -227,18 +212,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         ),
     )?;
-
-    if args.api_test {
-        info!("Starting neoethos-app in API-TEST mode (cTrader demo)...");
-        let cfg = app_services::api_test::ApiTestConfig {
-            environment: app_services::api_test::ApiTestEnvironment::Demo,
-            output_path: std::path::PathBuf::from(&args.api_test_output),
-            slow: args.api_test_slow,
-            only_filter: args.api_test_only.clone(),
-        };
-        app_services::api_test::run_api_test_suite(cfg).await?;
-        return Ok(());
-    }
 
     if args.validation_mode {
         // Mutually exclusive with the existing headless auto-* paths.
@@ -590,7 +563,6 @@ fn system_time_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{AppRuntimeConfig, app_record};
-    use crate::app_state::DataSource;
     use neoethos_core::Settings;
     use std::path::PathBuf;
 
@@ -624,25 +596,5 @@ mod tests {
         assert_eq!(record.operation, "headless_start");
         assert_eq!(record.status, "STARTED");
         assert_eq!(record.message, "headless startup");
-    }
-
-    #[test]
-    fn trading_panel_mode_disables_live_controls_in_local_mode() {
-        let mode = crate::app_services::trading::panel_mode(DataSource::Local, false);
-
-        assert_eq!(
-            mode,
-            crate::app_services::trading::TradingPanelMode::LocalOnly
-        );
-    }
-
-    #[test]
-    fn trading_panel_mode_switches_to_connected_when_ctrader_is_connected() {
-        let mode = crate::app_services::trading::panel_mode(DataSource::CTrader, true);
-
-        assert_eq!(
-            mode,
-            crate::app_services::trading::TradingPanelMode::Connected
-        );
     }
 }

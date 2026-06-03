@@ -106,13 +106,6 @@ impl CTraderAuthSession {
         self.state = CTraderAuthState::RestoredFromStorage;
     }
 
-    pub fn replace_persisted_token_bundle(&mut self, token_bundle: CTraderTokenBundle) {
-        self.token_bundle = Some(token_bundle);
-        if !matches!(self.state, CTraderAuthState::AccountsAvailable) {
-            self.state = CTraderAuthState::RestoredFromStorage;
-        }
-    }
-
     pub fn set_discovered_accounts(&mut self, accounts: Vec<CTraderDiscoveredAccount>) {
         self.discovered_accounts = accounts.clone();
         self.accounts = accounts

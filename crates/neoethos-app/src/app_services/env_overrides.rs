@@ -121,21 +121,49 @@ pub const DEFAULT_PNL_AUDIT_DRIFT_FRACTION: f64 = 0.001;
 pub const DEFAULT_PNL_CIRCUIT_BREAKER_FRACTION: f64 = 0.01;
 
 // ---------------------------------------------------------------------------
+// Config-driven cache (config-consolidation S3-app)
+// ---------------------------------------------------------------------------
+//
+// The behavior getters below now read a
+// `neoethos_core::config::AppRuntimeConfig` installed once at startup from the
+// single `Settings` — NOT `std::env`. The `ENV_*` consts above are retained
+// only for documentation + the knob catalog's `env_var` field. Clamping stays
+// in the getters (same bounds the env readers used) so an out-of-range config
+// value can't wedge the trading loop. The PATH overrides further down stay on
+// env (test/CI fixtures, like the broker-credentials path).
+
+static APP_RUNTIME: std::sync::OnceLock<neoethos_core::config::AppRuntimeConfig> =
+    std::sync::OnceLock::new();
+
+/// Install the app/server/trading runtime config once at startup. The binary
+/// passes `settings.app_runtime`. Idempotent — the first install wins.
+pub fn install_app_runtime_overrides(cfg: neoethos_core::config::AppRuntimeConfig) {
+    let _ = APP_RUNTIME.set(cfg);
+}
+
+/// The installed app-runtime config, or the deterministic defaults when no
+/// install has happened (tests / very early startup).
+fn app_runtime() -> neoethos_core::config::AppRuntimeConfig {
+    APP_RUNTIME.get().cloned().unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 // Typed getters
 // ---------------------------------------------------------------------------
 
-/// Resolve the HTTP server bind address. Env-var override or default.
-/// Logs a `tracing::warn!` when the env var is set but unparseable.
+/// Resolve the HTTP server bind address from config. Logs a `tracing::warn!`
+/// when the configured value is non-empty but unparseable, then falls back.
 pub fn server_bind_addr() -> SocketAddr {
-    if let Ok(raw) = env::var(ENV_SERVER_BIND) {
-        if let Ok(parsed) = raw.parse::<SocketAddr>() {
-            return parsed;
-        }
+    let raw = app_runtime().server_bind;
+    if let Ok(parsed) = raw.parse::<SocketAddr>() {
+        return parsed;
+    }
+    if !raw.trim().is_empty() {
         tracing::warn!(
             target: "neoethos_app::env_overrides",
             raw = %raw,
             fallback = %DEFAULT_BIND_ADDR,
-            "{ENV_SERVER_BIND} set but unparseable; falling back to default"
+            "app_runtime.server_bind unparseable; falling back to default"
         );
     }
     DEFAULT_BIND_ADDR
@@ -144,83 +172,49 @@ pub fn server_bind_addr() -> SocketAddr {
 /// cTrader read-timeout (seconds). 0 disables the timeout. Clamped to
 /// `[0, 3600]` so a typo can't wedge the trading loop indefinitely.
 pub fn ctrader_read_timeout_secs() -> u64 {
-    env::var(ENV_CTRADER_READ_TIMEOUT_SECS)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_CTRADER_READ_TIMEOUT_SECS)
-        .min(3600)
+    app_runtime().ctrader_read_timeout_secs.min(3600)
 }
 
 /// Maximum cTrader execution attempts. Clamped `[1, 5]`.
 pub fn ctrader_max_attempts() -> u32 {
-    env::var(ENV_CTRADER_MAX_ATTEMPTS)
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_CTRADER_MAX_ATTEMPTS)
-        .clamp(1, 5)
+    app_runtime().ctrader_max_attempts.clamp(1, 5)
 }
 
 /// cTrader retry backoff base (ms). Clamped `[10, 2000]`.
 pub fn ctrader_backoff_base_ms() -> u64 {
-    env::var(ENV_CTRADER_BACKOFF_BASE_MS)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_CTRADER_BACKOFF_BASE_MS)
-        .clamp(10, 2_000)
+    app_runtime().ctrader_backoff_base_ms.clamp(10, 2_000)
 }
 
-/// Whether partial fills are accepted. `true` only for `1` / `true` / `yes`
-/// (case-sensitive on `yes` for backward compat). Default `false`.
+/// Whether partial fills are accepted. Default `false`.
 pub fn ctrader_allow_partial_fill() -> bool {
-    env::var(ENV_CTRADER_ALLOW_PARTIAL_FILL)
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    app_runtime().ctrader_allow_partial_fill
 }
 
 /// Maximum streaming poll attempts. Clamped `[1, 5]`.
 pub fn ctrader_stream_max_attempts() -> u32 {
-    env::var(ENV_CTRADER_STREAM_MAX_ATTEMPTS)
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_CTRADER_MAX_ATTEMPTS)
-        .clamp(1, 5)
+    app_runtime().ctrader_stream_max_attempts.clamp(1, 5)
 }
 
 /// Streaming retry backoff base (ms). Clamped `[10, 2000]`.
 pub fn ctrader_stream_backoff_base_ms() -> u64 {
-    env::var(ENV_CTRADER_STREAM_BACKOFF_BASE_MS)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_CTRADER_BACKOFF_BASE_MS)
-        .clamp(10, 2_000)
+    app_runtime().ctrader_stream_backoff_base_ms.clamp(10, 2_000)
 }
 
-/// Chart-merge quote side. Parser tolerates whitespace + case. Unknown
-/// values fall back to the operator's choice via the caller's defaulting
-/// (this module just returns `None` for "no usable override").
+/// Chart-merge quote side (`mid`/`bid`/`ask`); `None` when the configured
+/// value is empty (the caller then uses its own default).
 pub fn chart_merge_side_raw() -> Option<String> {
-    env::var(ENV_CHART_MERGE_SIDE)
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty())
+    let v = app_runtime().chart_merge_side.trim().to_ascii_lowercase();
+    if v.is_empty() { None } else { Some(v) }
 }
 
 /// PnL audit drift threshold. Clamped `[1e-5, 0.05]`.
 pub fn pnl_audit_drift_fraction() -> f64 {
-    env::var(ENV_PNL_AUDIT_DRIFT_FRACTION)
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(DEFAULT_PNL_AUDIT_DRIFT_FRACTION)
-        .clamp(1e-5, 0.05)
+    app_runtime().pnl_audit_drift_fraction.clamp(1e-5, 0.05)
 }
 
 /// PnL circuit-breaker threshold. Clamped `[1e-4, 0.20]`.
 pub fn pnl_circuit_breaker_fraction() -> f64 {
-    env::var(ENV_PNL_CIRCUIT_BREAKER_FRACTION)
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(DEFAULT_PNL_CIRCUIT_BREAKER_FRACTION)
-        .clamp(1e-4, 0.20)
+    app_runtime().pnl_circuit_breaker_fraction.clamp(1e-4, 0.20)
 }
 
 /// Live-journal path override. `None` when unset → callers fall back to
@@ -373,5 +367,23 @@ mod tests {
             DEFAULT_BIND_ADDR.to_string(),
             "127.0.0.1:7423"
         );
+    }
+
+    #[test]
+    fn getters_with_default_config_match_documented_defaults() {
+        // Config-consolidation S3-app behavior-preservation: with no install
+        // (default config), the getters reproduce the legacy env-unset
+        // defaults exactly. No test installs a non-default config, so the
+        // process-wide OnceLock stays at Default here.
+        assert_eq!(ctrader_read_timeout_secs(), 30);
+        assert_eq!(ctrader_max_attempts(), 3);
+        assert_eq!(ctrader_backoff_base_ms(), 200);
+        assert_eq!(ctrader_stream_max_attempts(), 3);
+        assert_eq!(ctrader_stream_backoff_base_ms(), 200);
+        assert!(!ctrader_allow_partial_fill());
+        assert!(chart_merge_side_raw().is_none());
+        assert!((pnl_audit_drift_fraction() - 0.001).abs() < 1e-9);
+        assert!((pnl_circuit_breaker_fraction() - 0.01).abs() < 1e-9);
+        assert_eq!(server_bind_addr().to_string(), "127.0.0.1:7423");
     }
 }

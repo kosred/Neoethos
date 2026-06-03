@@ -1,7 +1,7 @@
 //! Bridge live broker deals → the trade journal.
 //!
-//! Called best-effort from the heartbeat runtime-refresh background task
-//! (`trading::mod` after a successful `load_account_runtime`). Converts
+//! Called best-effort from the production account-refresh path
+//! (`server::bridge` after a successful `load_account_runtime`). Converts
 //! each REALIZED (closing) deal in `recent_deals` into a [`ClosedTrade`]
 //! (idempotent on `position_id`) and appends an equity sample whenever a
 //! new trade closes.

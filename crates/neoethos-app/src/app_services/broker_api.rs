@@ -36,7 +36,7 @@ use crate::app_services::ctrader_messages::{
     build_symbol_category_list_request, build_symbols_list_request,
 };
 use crate::app_services::secure_store::production_ctrader_token_store;
-use crate::app_services::trading::CTraderEnvironment;
+use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 
 /// What `/broker/symbols` ultimately returns over the wire — kept here
 /// so the server module just shovels it to JSON.

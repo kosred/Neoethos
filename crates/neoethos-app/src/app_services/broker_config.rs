@@ -10,7 +10,7 @@
 //! lines still work; new code in `neoethos-cli` imports the same
 //! names directly from `neoethos_core::broker_config`.
 
-use crate::app_services::trading::TradingAdapterKind;
+use crate::app_services::trading_types::TradingAdapterKind;
 
 pub use neoethos_core::broker_config::{
     BROKER_CREDENTIALS_SCHEMA_VERSION, BrokerAccountTarget, BrokerSettingsState,
@@ -144,7 +144,7 @@ fn count_enabled_targets(accounts: &[BrokerAccountTarget]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_services::trading::TradingAdapterKind;
+    use crate::app_services::trading_types::TradingAdapterKind;
 
     #[test]
     fn ctrader_readiness_requires_oauth_fields_and_counts_targets() {

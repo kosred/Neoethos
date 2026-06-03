@@ -1,4 +1,3 @@
-pub mod api_test;
 pub mod backoff;
 pub mod bootstrap_writer;
 // **F-CORE3 cluster consolidation (2026-05-25)**: canonical registry of
@@ -24,7 +23,6 @@ pub mod ctrader_money;
 pub mod ctrader_openapi;
 pub mod ctrader_proto_messages;
 pub mod ctrader_state_machine;
-pub mod ctrader_streaming;
 pub mod ctrader_tls;
 pub mod discovery;
 // `dxtrade` — RESTORED 2026-05-21 after a wrongful deletion the same
@@ -58,7 +56,7 @@ pub mod news_research;
 pub mod pending_actions;
 pub mod risky_mode_persistence;
 pub mod secure_store;
-pub mod trading;
+pub mod trading_types;
 pub mod training;
 pub mod validation;
 
@@ -68,33 +66,29 @@ use crate::app_services::jobs::JobSnapshot;
 pub enum ServiceEvent {
     DiscoveryUpdated(JobSnapshot),
     TrainingUpdated(JobSnapshot),
-    // Sent by trading::session::start_connect (allow-listed legacy TradingSession
-    // method) and inspected only via Debug logging on the event bus.
+    // Was sent by the now-removed legacy TradingSession connect path; retained
+    // as the event-bus shape pending Flutter live-status wiring.
     #[allow(dead_code)]
     CTraderConnectUpdated(crate::app_services::ctrader_account::CTraderAccountRuntimeSnapshot),
-    // Sent by trading::session at 3 sites for the bootstrap progress stream;
-    // the inner snapshot is currently only surfaced via Debug logging on the
-    // event bus. Field read is provided for the future bootstrap-progress UI.
+    // Was sent by the now-removed legacy TradingSession bootstrap path; retained
+    // as the event-bus shape for the future bootstrap-progress UI.
     #[allow(dead_code)]
     BootstrapUpdated(JobSnapshot),
-    // Sent by trading::session at start_connect failure paths; inspected only
-    // via Debug logging until the Flutter UI subscribes for live status text.
+    // Was sent by the now-removed legacy TradingSession connect path; retained
+    // as the event-bus shape until the Flutter UI subscribes for live status.
     #[allow(dead_code)]
     ConnectOutcome(Result<String, String>),
     /// Background chart-data fetch completed. The UI should refresh the
     /// chart panel without blocking the render thread on WebSocket I/O.
-    // Constructed in trading::session::1150; inner snapshot consumed via
-    // Debug logging on the event bus until the chart panel reads it directly.
+    // Was constructed by the now-removed legacy TradingSession chart fetcher;
+    // retained as the event-bus shape until the Flutter chart panel reads it.
     #[allow(dead_code)]
-    ChartDataUpdated(Box<crate::app_services::trading::MarketChartSnapshot>),
-    /// A background OS thread spawned via
-    /// `app_services::trading::background::spawn_background_task` panicked.
-    /// The panic was caught inside the worker so the process is not killed,
-    /// but the operator MUST see it — previously a panic in (e.g.) the chart
-    /// fetcher left the UI showing "Running…" forever because the join
-    /// handle was simply discarded.
-    // Fields are read by trading::background tests (panic_with_string_payload_is_surfaced,
-    // panic_with_static_str_payload_is_surfaced); production reads via Debug logging.
+    ChartDataUpdated(Box<crate::app_services::trading_types::MarketChartSnapshot>),
+    /// A background OS thread panicked, caught inside the worker so the
+    /// process is not killed — but the operator MUST see it rather than have
+    /// the join handle silently discarded (which once left the UI showing
+    /// "Running…" forever). Retained as the event-bus shape from the
+    /// now-removed legacy background-task spawner.
     #[allow(dead_code)]
     BackgroundTaskPanic {
         task: String,

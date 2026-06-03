@@ -32,8 +32,9 @@
 //! - Symbol list is static at startup. When the user opens a
 //!   chart for a symbol we didn't pre-subscribe to, that chart's
 //!   "live" price won't update via this stream until a restart.
-//!   The chart's existing on-demand `load_live_chart_update`
-//!   path still works as a fallback.
+//!   The chart's on-demand `/chart` endpoint (broker-API pull via
+//!   `broker_api::fetch_recent_chart_bars_blocking`) still serves
+//!   fresh bars in the meantime.
 //! - No heartbeat send. cTrader's docs say streaming clients
 //!   should heartbeat every ~30 s; today's flow just reads
 //!   incoming PING and replies PONG, which keeps the connection
@@ -617,7 +618,7 @@ struct LooseSpotPayload {
     timestamp: Option<i64>,
 }
 
-/// Less-strict cousin of `ctrader_streaming::parse_spot_event`.
+/// Lenient cTrader spot-event parser.
 /// Returns `(symbol_id, bid, ask, broker_timestamp_ms)` for any
 /// spot event whose symbol is in our subscription list. Returns
 /// `None` for events with an unknown symbol (e.g. a leftover
@@ -645,8 +646,7 @@ fn parse_spot_event_loose(
     Some((symbol_meta.symbol_id, bid, ask, env.payload.timestamp))
 }
 
-/// Replicates the private `scaled_price` in `ctrader_streaming`
-/// to avoid widening that module's surface. The math is:
+/// Scales a cTrader integer price to a float. The math is:
 /// `raw_int / 100_000 * 10^digits`, rounded to `digits` decimals.
 fn scale_price(value: i64, digits: i32) -> f64 {
     let raw = value as f64 / 100_000.0;

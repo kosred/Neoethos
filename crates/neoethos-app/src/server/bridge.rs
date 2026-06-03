@@ -35,11 +35,16 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::app_services::broker_api::fetch_broker_symbols_blocking;
+use crate::app_services::broker_config::BrokerSettingsState;
 use crate::app_services::broker_persistence::load_broker_settings;
 use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeRequest, CTraderPositionSnapshot, load_account_runtime,
 };
-use crate::app_services::ctrader_live_auth::CTraderEnvironment;
+use crate::app_services::ctrader_auth::CTraderTokenBundle;
+use crate::app_services::ctrader_live_auth::{
+    CTraderEnvironment, CTraderLiveAuthBackend, CTraderTokenRefreshRequest,
+    ProductionCTraderLiveAuthBackend,
+};
 use crate::app_services::ctrader_messages::ProductionCTraderOpenApiTransport;
 use crate::app_services::live_spots::get_tick;
 use crate::app_services::pnl::{BrokerPositionPnL, fetch_unrealized_pnl_for_all_positions};
@@ -318,6 +323,74 @@ async fn run(state: AppApiState) {
     }
 }
 
+/// Best-effort cTrader OAuth token refresh. If the saved bundle is within
+/// the refresh-ahead window (or already expired) and has a `refresh_token`,
+/// exchange it for a fresh access token and persist the new bundle to the
+/// keyring. On ANY failure the original bundle is returned unchanged, so the
+/// caller proceeds exactly as before — a stale token simply fails the next
+/// account call as it would have anyway (no regression).
+///
+/// This closes the production token-expiry gap: before v0.4.36 the legacy
+/// `TradingSession` heartbeat refreshed tokens, but it never ran in
+/// production. Without this, a long-running server's OAuth token silently
+/// expired at the first TTL boundary and every account fetch broke until a
+/// manual interactive browser re-auth. Runs blocking (HTTP + keyring I/O) —
+/// call only from inside a `spawn_blocking` task.
+fn refresh_ctrader_token_if_needed(
+    settings: &BrokerSettingsState,
+    bundle: CTraderTokenBundle,
+) -> CTraderTokenBundle {
+    // 30-minute refresh-ahead window: refresh once the token is within half
+    // an hour of expiry (or already expired) so an active session never
+    // races the boundary mid-request.
+    const REFRESH_WINDOW_SECS: i64 = 1800;
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => return bundle, // clock before epoch — skip the refresh
+    };
+    if !bundle.needs_refresh_at(now, REFRESH_WINDOW_SECS) || bundle.refresh_token.is_empty() {
+        return bundle;
+    }
+    let ctrader = &settings.ctrader;
+    if ctrader.client_id.is_empty() || ctrader.client_secret.is_empty() {
+        return bundle;
+    }
+    let request = CTraderTokenRefreshRequest {
+        client_id: ctrader.client_id.clone(),
+        client_secret: ctrader.client_secret.clone(),
+        refresh_token: bundle.refresh_token.clone(),
+        scope: bundle.scope.clone(),
+    };
+    let backend = ProductionCTraderLiveAuthBackend;
+    match backend.refresh_token_bundle(&request) {
+        Ok(fresh) => {
+            if let Err(e) = production_ctrader_token_store().save_token_bundle(&fresh) {
+                tracing::warn!(
+                    target: "neoethos_app::ctrader_auth",
+                    error = %e,
+                    "refreshed cTrader OAuth token but could not persist it to the keyring; \
+                     using the fresh token for this session only"
+                );
+            } else {
+                tracing::info!(
+                    target: "neoethos_app::ctrader_auth",
+                    "refreshed cTrader OAuth token ahead of expiry and persisted the new bundle"
+                );
+            }
+            fresh
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "neoethos_app::ctrader_auth",
+                error = %e,
+                "cTrader OAuth token refresh failed; falling back to the existing token \
+                 (it may be expired — a manual re-auth may be required)"
+            );
+            bundle
+        }
+    }
+}
+
 /// Pull saved creds + access token, hit cTrader, return a render-ready
 /// snapshot. Reads through `state.symbol_catalog` so positions are
 /// labelled with real tickers (`EURUSD`) instead of the legacy
@@ -333,6 +406,12 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         let t = production_ctrader_token_store()
             .load_token_bundle_with_legacy_fallback()
             .map_err(|e| anyhow::anyhow!("load_token_bundle failed: {e}"))?;
+        // Best-effort OAuth token refresh ahead of expiry (see the fn's
+        // doc-comment). Closes the production token-expiry gap left when
+        // the legacy TradingSession heartbeat — which used to drive token
+        // refresh — was removed in v0.4.36. Non-fatal: on any failure the
+        // existing token is kept, so this never regresses the refresh path.
+        let t = t.map(|bundle| refresh_ctrader_token_if_needed(&s, bundle));
         Ok::<_, anyhow::Error>((s, t))
     })
     .await
@@ -382,6 +461,19 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
     let snapshot = tokio::task::spawn_blocking(move || load_account_runtime(&request))
         .await
         .map_err(|e| anyhow::anyhow!("blocking account-runtime task panicked: {e}"))??;
+
+    // Reconcile the trade journal from this fresh snapshot's realized deals.
+    // This is the production replacement for the retired legacy TradingSession
+    // heartbeat that used to drive journal reconcile (removed with the egui
+    // surface in v0.4.36). This account/dashboard endpoint is the live
+    // cTrader-account fetch the Flutter UI polls, so reconciling here captures
+    // every closing deal on the next refresh — idempotent on `position_id`.
+    // Fire-and-forget on the blocking pool so journal disk I/O never delays
+    // this response (the journal contract: never blocks the refresh).
+    let snapshot_for_journal = snapshot.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::app_services::journal_reconcile::reconcile_best_effort(&snapshot_for_journal);
+    });
 
     // Step 3: convert to wire payload. Equity is balance + unrealized
     // PnL — the prop-firm-correct number per the comment in

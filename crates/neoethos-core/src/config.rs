@@ -1303,6 +1303,55 @@ impl Default for NewsConfig {
     }
 }
 
+/// App / server / trading-runtime knobs — config-driven replacement for the
+/// `neoethos-app` env_overrides registry (HTTP server bind, cTrader
+/// connection retry/backoff/timeout, partial-fill acceptance, chart-merge
+/// quote side, PnL audit / circuit-breaker thresholds). The app installs
+/// these into its `env_overrides` cache at startup so the trading layer reads
+/// the single config instead of `std::env`. Clamping is applied by the
+/// getters (same bounds the env readers used).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AppRuntimeConfig {
+    /// HTTP server bind address `host:port` (default `127.0.0.1:7423`).
+    pub server_bind: String,
+    /// cTrader execution read-timeout (seconds); 0 disables. Clamped [0,3600].
+    pub ctrader_read_timeout_secs: u64,
+    /// cTrader execution attempts (initial + retries). Clamped [1,5].
+    pub ctrader_max_attempts: u32,
+    /// cTrader retry backoff base (ms). Clamped [10,2000].
+    pub ctrader_backoff_base_ms: u64,
+    /// Accept partial fills as final (default false).
+    pub ctrader_allow_partial_fill: bool,
+    /// cTrader streaming poll attempts. Clamped [1,5].
+    pub ctrader_stream_max_attempts: u32,
+    /// cTrader streaming backoff base (ms). Clamped [10,2000].
+    pub ctrader_stream_backoff_base_ms: u64,
+    /// Chart-merge quote side (`mid`/`bid`/`ask`); empty → caller default.
+    pub chart_merge_side: String,
+    /// PnL audit drift threshold (fraction of notional). Clamped [1e-5,0.05].
+    pub pnl_audit_drift_fraction: f64,
+    /// PnL circuit-breaker threshold (fraction). Clamped [1e-4,0.20].
+    pub pnl_circuit_breaker_fraction: f64,
+}
+
+impl Default for AppRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            server_bind: "127.0.0.1:7423".to_string(),
+            ctrader_read_timeout_secs: 30,
+            ctrader_max_attempts: 3,
+            ctrader_backoff_base_ms: 200,
+            ctrader_allow_partial_fill: false,
+            ctrader_stream_max_attempts: 3,
+            ctrader_stream_backoff_base_ms: 200,
+            chart_merge_side: String::new(),
+            pnl_audit_drift_fraction: 0.001,
+            pnl_circuit_breaker_fraction: 0.01,
+        }
+    }
+}
+
 /// Main settings structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1311,6 +1360,9 @@ pub struct Settings {
     pub risk: RiskConfig,
     pub models: ModelsConfig,
     pub news: NewsConfig,
+    /// App / server / trading-runtime knobs (config-driven replacement for
+    /// the `neoethos-app` env_overrides registry). See [`AppRuntimeConfig`].
+    pub app_runtime: AppRuntimeConfig,
     pub secrets_file: PathBuf,
 }
 
@@ -1321,6 +1373,7 @@ impl Default for Settings {
             risk: RiskConfig::default(),
             models: ModelsConfig::default(),
             news: NewsConfig::default(),
+            app_runtime: AppRuntimeConfig::default(),
             secrets_file: PathBuf::from("keys.txt"),
         }
     }

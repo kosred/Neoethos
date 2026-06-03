@@ -77,8 +77,7 @@ const ENV_OVERRIDE_VAR: &str =
 /// On-disk representation of the operator's Risky Mode arm decision.
 ///
 /// All fields are wizard-set values that the running app reads at
-/// session boot to decide whether to auto-arm Risky Mode via
-/// [`crate::app_services::trading::TradingSession::enable_risky_mode`].
+/// session boot to decide whether to auto-arm Risky Mode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RiskyModeStateFile {
     /// Phase-D4 schema version. Defaults to v1 (pre-versioning shape)
