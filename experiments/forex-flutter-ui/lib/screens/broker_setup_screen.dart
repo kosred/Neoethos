@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../widgets/backend_error_widget.dart';
 import '../state/system_providers.dart';
@@ -14,19 +15,20 @@ class BrokerSetupScreen extends ConsumerWidget {
   const BrokerSetupScreen({super.key});
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final async = ref.watch(brokerStatusProvider);
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const ViewHeader(
-            title: 'Broker Setup',
-            subtitle: 'cTrader / DXtrade · OAuth + account targets',
+          ViewHeader(
+            title: l10n.brokerSetupTitle,
+            subtitle: l10n.brokerSetupSubtitle,
           ),
           async.when(
             data: (b) => _Body(status: b),
             loading: () => const _Loading(),
-            error: (err, _) => BackendErrorWidget(error: err, title: "Couldn't reach the engine"),
+            error: (err, _) => BackendErrorWidget(error: err, title: l10n.brokerSetupUnreachable),
           ),
         ],
       ),
@@ -45,25 +47,20 @@ class _BodyState extends ConsumerState<_Body> {
   bool _reauthBusy = false;
 
   Future<void> _onReauth() async {
+    final l10n = AppLocalizations.of(context)!;
     final confirm = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Re-authenticate with cTrader?'),
-        content: const Text(
-          'A browser window will open on the Spotware consent screen. '
-          'After you click "Continue", the new token is saved to the OS '
-          'keyring and the existing session picks it up on the next '
-          '5-second refresh — no restart needed.\n\n'
-          'Typical wall-clock time: 10–30 seconds.',
-        ),
+        title: Text(l10n.brokerSetupReauthDialogTitle),
+        content: Text(l10n.brokerSetupReauthDialogBody),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
+            child: Text(l10n.commonCancel),
           ),
           FilledButton(
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Open browser'),
+            child: Text(l10n.brokerSetupOpenBrowser),
           ),
         ],
       ),
@@ -82,14 +79,14 @@ class _BodyState extends ConsumerState<_Body> {
         SnackBar(
           backgroundColor: NeoethosTokens.buy,
           content: Text(
-            (result['message'] as String?) ?? 'OAuth refresh complete',
+            (result['message'] as String?) ?? l10n.brokerSetupOauthRefreshComplete,
           ),
           duration: const Duration(seconds: 4),
         ),
       );
     } on DioException catch (e) {
       if (!mounted) return;
-      showTranslatedErrorSnackbar(context, e, prefix: 'Re-auth failed');
+      showTranslatedErrorSnackbar(context, e, prefix: l10n.brokerSetupReauthFailed);
     } finally {
       if (mounted) setState(() => _reauthBusy = false);
     }
@@ -97,12 +94,13 @@ class _BodyState extends ConsumerState<_Body> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final status = widget.status;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         SectionCard(
-          title: 'Active Session',
+          title: l10n.brokerSetupActiveSession,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -120,7 +118,9 @@ class _BodyState extends ConsumerState<_Body> {
                   ),
                   const SizedBox(width: 8),
                   Text(
-                    status.connected ? 'Connected' : 'Disconnected',
+                    status.connected
+                        ? l10n.brokerSetupConnected
+                        : l10n.brokerSetupDisconnected,
                     style: TextStyle(
                       fontWeight: FontWeight.w700,
                       color: status.connected
@@ -131,25 +131,21 @@ class _BodyState extends ConsumerState<_Body> {
                 ],
               ),
               const SizedBox(height: 8),
-              _Row('Adapter', status.adapter),
-              _Row('Environment', status.environment),
+              _Row(l10n.brokerSetupRowAdapter, status.adapter),
+              _Row(l10n.brokerSetupRowEnvironment, status.environment),
               _Row('Account ID', status.accountId),
-              _Row('Client ID prefix', status.clientIdPrefix),
+              _Row(l10n.brokerSetupRowClientIdPrefix, status.clientIdPrefix),
             ],
           ),
         ),
         SectionCard(
-          title: 'Re-authenticate',
+          title: l10n.brokerSetupReauthTitle,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                'Run the OAuth flow if the token expired or you see '
-                'RET_ACCOUNT_DISABLED in the logs. Opens the Spotware '
-                'consent screen in your default browser, captures the '
-                'redirect on loopback, swaps the auth code for a fresh '
-                'trading-scope token, and writes it to the OS keyring.',
-                style: TextStyle(
+              Text(
+                l10n.brokerSetupReauthDescription,
+                style: const TextStyle(
                   color: NeoethosTokens.textMuted,
                   fontSize: 12,
                 ),
@@ -160,7 +156,7 @@ class _BodyState extends ConsumerState<_Body> {
                   FilledButton.icon(
                     onPressed: _reauthBusy ? null : _onReauth,
                     icon: const Icon(Icons.refresh, size: 18),
-                    label: const Text('Re-authenticate'),
+                    label: Text(l10n.brokerSetupReauthButton),
                   ),
                   if (_reauthBusy) ...[
                     const SizedBox(width: 16),
@@ -170,9 +166,9 @@ class _BodyState extends ConsumerState<_Body> {
                       child: CircularProgressIndicator(strokeWidth: 2),
                     ),
                     const SizedBox(width: 8),
-                    const Text(
-                      'Waiting for browser approval…',
-                      style: TextStyle(
+                    Text(
+                      l10n.brokerSetupWaitingApproval,
+                      style: const TextStyle(
                         color: NeoethosTokens.textMuted,
                         fontSize: 12,
                       ),
@@ -226,11 +222,11 @@ class _Row extends StatelessWidget {
 class _Loading extends StatelessWidget {
   const _Loading();
   @override
-  Widget build(BuildContext context) => const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16),
         child: Text(
-          'Loading broker status…',
-          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+          AppLocalizations.of(context)!.brokerSetupLoadingStatus,
+          style: const TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

@@ -40,6 +40,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../widgets/backend_error_widget.dart';
 import '../state/account_provider.dart';
 import '../theme/theme.dart';
@@ -78,6 +79,7 @@ class AdvancedSettingsScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final catalog = ref.watch(knobCatalogProvider);
     final presets = ref.watch(knobPresetsProvider);
     return Scaffold(
@@ -86,10 +88,10 @@ class AdvancedSettingsScreen extends ConsumerWidget {
       backgroundColor: NeoethosTokens.appBg,
       body: catalog.when(
         loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) => BackendErrorWidget(error: e, title: 'Advanced settings unavailable'),
+        error: (e, _) => BackendErrorWidget(error: e, title: l10n.advSettingsUnavailable),
         data: (cat) => presets.when(
           loading: () => const Center(child: CircularProgressIndicator()),
-          error: (e, _) => BackendErrorWidget(error: e, title: 'Advanced settings unavailable'),
+          error: (e, _) => BackendErrorWidget(error: e, title: l10n.advSettingsUnavailable),
           data: (presetCat) => _Body(catalog: cat, presets: presetCat),
         ),
       ),
@@ -132,6 +134,7 @@ class _BodyState extends ConsumerState<_Body> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final query = ref.watch(searchQueryProvider).toLowerCase();
     final activePreset = ref.watch(activePresetProvider);
     final selectedSection = ref.watch(selectedSectionProvider);
@@ -177,7 +180,7 @@ class _BodyState extends ConsumerState<_Body> {
                 child: TextField(
                   controller: _searchCtl,
                   decoration: InputDecoration(
-                    hintText: 'Search ${widget.catalog.knobs.length} knobs · label · help text',
+                    hintText: l10n.advSettingsSearchHint(widget.catalog.knobs.length),
                     prefixIcon: const Icon(Icons.search, size: 18),
                     suffixIcon: query.isEmpty
                         ? null
@@ -232,11 +235,11 @@ class _BodyState extends ConsumerState<_Body> {
                             .state = section,
                       ),
                     if (visibleSections.isEmpty)
-                      const Padding(
-                        padding: EdgeInsets.all(16),
+                      Padding(
+                        padding: const EdgeInsets.all(16),
                         child: Text(
-                          'No knobs match the search.',
-                          style: TextStyle(
+                          l10n.advSettingsNoKnobsMatch,
+                          style: const TextStyle(
                             color: NeoethosTokens.textMuted,
                             fontSize: 12,
                           ),
@@ -257,12 +260,12 @@ class _BodyState extends ConsumerState<_Body> {
                           activePreset: activePreset,
                         ),
                       if (sectionKnobs.isEmpty)
-                        const Padding(
-                          padding: EdgeInsets.all(32),
+                        Padding(
+                          padding: const EdgeInsets.all(32),
                           child: Center(
                             child: Text(
-                              'Pick a section on the left.',
-                              style: TextStyle(
+                              l10n.advSettingsPickSection,
+                              style: const TextStyle(
                                 color: NeoethosTokens.textMuted,
                               ),
                             ),
@@ -286,6 +289,7 @@ class _DirtyBanner extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
@@ -297,21 +301,20 @@ class _DirtyBanner extends ConsumerWidget {
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-              '$count unsaved change${count == 1 ? "" : "s"} — '
-              'click Save to apply, or Revert to discard.',
+              l10n.advSettingsUnsavedChanges(count),
               style: const TextStyle(fontSize: 12),
             ),
           ),
           TextButton(
             onPressed: () =>
                 ref.read(knobEditsProvider.notifier).state = {},
-            child: const Text('Revert'),
+            child: Text(l10n.advSettingsRevert),
           ),
           const SizedBox(width: 4),
           FilledButton.icon(
             onPressed: () => _save(context, ref),
             icon: const Icon(Icons.save, size: 16),
-            label: const Text('Save'),
+            label: Text(l10n.commonSave),
           ),
         ],
       ),
@@ -319,6 +322,7 @@ class _DirtyBanner extends ConsumerWidget {
   }
 
   Future<void> _save(BuildContext context, WidgetRef ref) async {
+    final l10n = AppLocalizations.of(context)!;
     final edits = ref.read(knobEditsProvider);
     if (edits.isEmpty) return;
     try {
@@ -340,15 +344,15 @@ class _DirtyBanner extends ConsumerWidget {
       ref.invalidate(knobCatalogProvider);
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Settings saved.'),
-            duration: Duration(seconds: 2),
+          SnackBar(
+            content: Text(l10n.advSettingsSaved),
+            duration: const Duration(seconds: 2),
           ),
         );
       }
     } on DioException catch (e) {
       if (context.mounted) {
-        showTranslatedErrorSnackbar(context, e, prefix: 'Settings save');
+        showTranslatedErrorSnackbar(context, e, prefix: l10n.advSettingsSaveErrorPrefix);
       }
     }
   }
@@ -361,13 +365,14 @@ class _PresetChips extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     const order = ['conservative', 'balanced', 'aggressive'];
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        const Text(
-          'Preset:',
-          style: TextStyle(
+        Text(
+          l10n.advSettingsPresetLabel,
+          style: const TextStyle(
             fontSize: 11,
             color: NeoethosTokens.textMuted,
             fontWeight: FontWeight.w600,
@@ -379,7 +384,7 @@ class _PresetChips extends ConsumerWidget {
             padding: const EdgeInsets.only(right: 6),
             child: ChoiceChip(
               label: Text(
-                presets.presets[p] ?? _capitalise(p),
+                presets.presets[p] ?? _presetLabel(l10n, p),
                 style: const TextStyle(fontSize: 11),
               ),
               selected: p == activePreset,
@@ -389,6 +394,21 @@ class _PresetChips extends ConsumerWidget {
           ),
       ],
     );
+  }
+
+  /// Localized name for the built-in presets. Falls back to a
+  /// capitalised raw id for any preset the backend adds later.
+  static String _presetLabel(AppLocalizations l10n, String p) {
+    switch (p) {
+      case 'conservative':
+        return l10n.advSettingsPresetConservative;
+      case 'balanced':
+        return l10n.advSettingsPresetBalanced;
+      case 'aggressive':
+        return l10n.advSettingsPresetAggressive;
+      default:
+        return _capitalise(p);
+    }
   }
 
   static String _capitalise(String s) =>
@@ -467,6 +487,7 @@ class _KnobRowState extends ConsumerState<_KnobRow> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final edits = ref.watch(knobEditsProvider);
     final overridden = edits.containsKey(widget.knob.id);
     final effective =
@@ -527,7 +548,7 @@ class _KnobRowState extends ConsumerState<_KnobRow> {
                 ),
               ),
               IconButton(
-                tooltip: 'Reset to backend default',
+                tooltip: l10n.advSettingsResetToDefault,
                 onPressed: overridden ? reset : null,
                 icon: const Icon(Icons.restart_alt, size: 16),
                 visualDensity: VisualDensity.compact,
@@ -535,8 +556,9 @@ class _KnobRowState extends ConsumerState<_KnobRow> {
                 padding: const EdgeInsets.all(4),
               ),
               IconButton(
-                tooltip:
-                    _expanded ? 'Hide help' : 'Show help (${widget.knob.envVar})',
+                tooltip: _expanded
+                    ? l10n.advSettingsHideHelp
+                    : l10n.advSettingsShowHelp(widget.knob.envVar),
                 onPressed: () => setState(() => _expanded = !_expanded),
                 icon: Icon(
                   _expanded ? Icons.expand_less : Icons.info_outline,
@@ -579,8 +601,10 @@ class _KnobRowState extends ConsumerState<_KnobRow> {
                   if (widget.knob.envVar.isNotEmpty) ...[
                     const SizedBox(height: 4),
                     Text(
-                      'Env var: ${widget.knob.envVar}  ·  '
-                      'Default: ${widget.knob.defaultValue}',
+                      l10n.advSettingsEnvVarDefault(
+                        widget.knob.envVar,
+                        '${widget.knob.defaultValue}',
+                      ),
                       style: const TextStyle(
                         fontSize: 10,
                         color: NeoethosTokens.textFaint,

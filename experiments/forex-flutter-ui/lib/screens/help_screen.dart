@@ -18,6 +18,7 @@
 
 import 'package:flutter/material.dart';
 
+import '../l10n/app_localizations.dart';
 import '../theme/theme.dart';
 
 /// Public entrypoint — opens the Help screen as a full-screen dialog,
@@ -50,12 +51,12 @@ class _HelpScreenState extends State<HelpScreen> {
     _section = widget.initialSection;
   }
 
-  Map<String, _HelpSection> get _doc =>
-      _lang == 'el' ? _helpContentEl : _helpContentEn;
+  Map<String, _HelpSection> _docFor(BuildContext context) =>
+      _lang == 'el' ? _helpContentEl : _helpContentEn(context);
 
   @override
   Widget build(BuildContext context) {
-    final sections = _doc;
+    final sections = _docFor(context);
     final active = sections[_section] ?? sections.values.first;
     return Scaffold(
       backgroundColor: NeoethosTokens.appBg,
@@ -64,9 +65,9 @@ class _HelpScreenState extends State<HelpScreen> {
         elevation: 0,
         title: Row(
           children: [
-            const Text(
-              'NeoEthos · Help',
-              style: TextStyle(
+            Text(
+              AppLocalizations.of(context)!.helpTitle,
+              style: const TextStyle(
                 color: NeoethosTokens.textPrimary,
                 fontSize: NeoethosTokens.fsSubtitle,
                 fontWeight: FontWeight.w700,
@@ -762,168 +763,169 @@ final Map<String, _HelpSection> _helpContentEl = {
 // English content (shorter — covers the essentials)
 // ---------------------------------------------------------------------------
 
-final Map<String, _HelpSection> _helpContentEn = {
-  'welcome': const _HelpSection(
-    title: 'Welcome',
-    blocks: [
-      _H3('NeoEthos — Quick overview'),
-      _P([
-        ('NeoEthos is a ', false),
-        ('Rust-based trading terminal', true),
-        (' with built-in AI. It connects to a broker (cTrader; DXtrade soon), supports manual trading with indicators and drawing tools, and has two AI engines: ', false),
-        ('Discovery', true),
-        (' (genetic strategy search) and ', false),
-        ('Training', true),
-        (' (ensemble ML training). Every value comes from the broker — nothing is hardcoded.', false),
-      ]),
-      _H4('Recommended flow for new users'),
-      _OL([
-        [('Open a Demo account', true), (' at a cTrader broker (Pepperstone, IC Markets, FxPro, Vantage, Axi)', false)],
-        [('Connect the broker', true), (' via Settings → Account → "Connect with cTrader"', false)],
-        [('Pick pairs', true), (' in Market Watch — start with EUR/USD or GBP/USD', false)],
-        [('Place a small manual trade', true), (' (0.01 lots) to confirm everything works', false)],
-        [('Run Strategy Lab → Discovery', true), (' to find strategies (10-30 minutes)', false)],
-        [('Run Training', true), (' on those strategies', false)],
-        [('Validate for 2 weeks', true), (' on demo before considering live', false)],
-      ]),
-      _Tip('Reminder: 75-90% of retail FX traders lose money. Always validate on demo for weeks before increasing risk.'),
-    ],
-  ),
-  'trading': const _HelpSection(
-    title: 'Trading',
-    blocks: [
-      _H3('Manual trading'),
-      _P([
-        ('The ', false),
-        ('Market Watch → Order Ticket', true),
-        (' shows BUY (green) and SELL (red) buttons with the current bid/ask. Before submitting:', false),
-      ]),
-      _UL([
-        [('Order type: ', true), ('Market (immediate), Limit (wait for better entry), Stop (wait for breakout)', false)],
-        [('Lots: ', true), ('position size. 0.01 lot = 1,000 units (micro lot). For EUR/USD a pip ≈ \$0.10 per 0.01 lot', false)],
-        [('Auto Lot: ', true), ('automatic lot sizing from your risk %', false)],
-        [('SL/TP (ATR): ', true), ('Stop Loss & Take Profit based on volatility', false)],
-        [('R:R: ', true), ('Risk/Reward ratio — 1:2 means for every \$1 risk you target \$2 profit', false)],
-      ]),
-    ],
-  ),
-  'chart': const _HelpSection(
-    title: 'Chart',
-    blocks: [
-      _H3('Live data — not stored'),
-      _P([
-        ('The chart shows ', false),
-        ('live candles straight from the broker', true),
-        (' (cTrader trendbars), not a stale snapshot off disk. The last candle moves in real time from the spot stream.', false),
-      ]),
-      _H4('Scroll-back — pan years into the past (TradingView model)'),
-      _P([
-        ('Drag the chart ', false),
-        ('left', true),
-        (' past the oldest loaded candle and NeoEthos auto-loads the next page of older bars live from the broker. ', false),
-        ('They stay in memory only — they never touch the disk.', true),
-        (' Pan two years back at zero disk cost.', false),
-      ]),
-      _Tip('For very deep scroll-back on M1 (millions of candles), switch to a higher timeframe (H1/H4/D1) — same as any professional terminal.'),
-      _H4('Controls'),
-      _UL([
-        [('Zoom: ', true), ('scroll / pinch on the chart', false)],
-        [('OHLC crosshair: ', true), ('long-press to read open/high/low/close on any candle', false)],
-        [('Overlays / sub-panels: ', true), ('MA · BOLL (top) and MACD · KDJ · RSI · WR (bottom) — computed live on broker data', false)],
-        [('Account switcher: ', true), ('change account (DEMO/LIVE) from the top-bar dropdown', false)],
-      ]),
-    ],
-  ),
-  'ai': const _HelpSection(
-    title: 'AI Engine',
-    blocks: [
-      _H3('Strategy Lab — How the pipeline works'),
-      _P([
-        ('One unified 5-stage flow: Data Ready → Discovery → Training → Validation → Promotion Gate. Each stage has its own params and the next consumes the previous automatically.', false),
-      ]),
-      _H4('Discovery — Genetic strategy search'),
-      _P([('Creates random strategies from indicator combinations, evaluates them on history, keeps the best and crosses them over generations.', false)]),
-      _H4('Training — Multi-model ensemble'),
-      _P([
-        ('Features (indicators, OHLCV, volatility, session, news) feed 30 models in parallel — Tree (LightGBM, XGBoost, CatBoost), Deep (MLP, KAN, TabNet), Time-series (NBeats, TiDE, PatchTST, TimesNet, Transformer), Meta (logistic, calibration, stacker, HMM regime), RL+Exit (DQN, ExitAgent). ', false),
-        ('Genetic/NeuroEvo/NEAT are Discovery-only — not ensemble voters.', true),
-      ]),
-      _H4('Validation + Promotion Gate'),
-      _P([('Before a trained ensemble reaches live, it passes Walk-Forward Analysis, Monte Carlo sensitivity sweeps, and a Promotion Gate that checks Sharpe, Calmar, win rate and drawdown.', false)]),
-    ],
-  ),
-  'risk': const _HelpSection(
-    title: 'Risk',
-    blocks: [
-      _H3('Risk management — 3 modes'),
-      _UL([
-        [('🏦 Standard account: ', true), ('regular retail. Risk 0.5-2% per trade, daily DD ≤ 5%.', false)],
-        [('🏆 Prop firm challenge: ', true), ('hard daily/total drawdown limits (FTMO, FundedNext etc.).', false)],
-        [('⚡ Risky Mode (account multiplication): ', true), ('aggressive compounding from a small balance (\$20 → \$50K). Includes time-to-target percentiles (p10/p50/p90) and probability-of-ruin via Brownian Barrier.', false)],
-      ]),
-      _H4('How Risky Mode works'),
-      _P([
-        ('Risky Mode is ', false),
-        ('NOT', true),
-        (' a hardcoded "20 pip challenge". It is Kelly-aligned compounding with 11 logarithmic stages from \$20 → \$50K. Time-to-target ETA via Brownian inversion + Beasley-Springer-Moro inverse-normal-CDF (~1e-5 accuracy). Goal: grow the account as fast as safely possible.', false),
-      ]),
-      _Tip('⚠ 75-90% of retail FX traders lose money. Risky Mode = aggressive ≠ safe. Always validate on demo for weeks first.'),
-    ],
-  ),
-  'data': const _HelpSection(
-    title: 'Data & Disk',
-    blocks: [
-      _H3('Where data comes from'),
-      _P([
-        ('There are ', false),
-        ('two separate sources', true),
-        (' — the difference matters:', false),
-      ]),
-      _UL([
-        [('Live (broker): ', true), ('Chart, Market Watch, indicators, scroll-back. Straight from the broker and ', false), ('NOT written to disk.', true)],
-        [('Local Vortex cache: ', true), ('only Discovery and Training need stored history for backtest/training — ', false), ('that', true), (' is written to disk.', false)],
-      ]),
-      _H4('What writes to disk'),
-      _UL([
-        [('Data Bootstrap', true), (' (Settings → Data): explicit download of a history window for a symbol/timeframe.', false)],
-        [('Discovery auto-fetch: ', true), ('if there isn\'t enough history when you run discovery, it downloads it automatically (~N years, controlled by NEOETHOS_BOT_MIN_HISTORY_YEARS) and stores it.', false)],
-        [('data_dir: ', true), ('the storage folder — set in Settings → Data.', false)],
-      ]),
-      _Tip('Viewing a chart — even panning years back — does NOT fill the disk. Only Data Bootstrap and Discovery persist history, because backtest/training needs it.'),
-      _H4('Supported symbols'),
-      _P([
-        ('The symbol list comes from the broker but is restricted to ', false),
-        ('forex, metals, indices and commodities', true),
-        (' — the broker\'s stocks and ETFs are excluded automatically (the engine never trades them).', false),
-      ]),
-    ],
-  ),
-  'shortcuts': const _HelpSection(
-    title: 'Shortcuts',
-    blocks: [
-      _H3('Keyboard'),
-      _KbdRow(['F1'], 'Open Help (this window)'),
-      _KbdRow(['Ctrl', 'K'],
-          'Command palette — search tabs / symbols / actions (lands in F1-323)'),
-      _KbdRow(['Esc'], 'Close any modal / palette / context menu'),
-      _KbdRow(['?'], 'Show this help'),
-      _KbdRow(['↑', '↓', '↵'], 'Navigate inside the search palette'),
-      _KbdRow(['Right-click'],
-          'Context menu on chips, symbols, timeframes, chart'),
-    ],
-  ),
-  'faq': const _HelpSection(
-    title: 'FAQ',
-    blocks: [
-      _H3('Frequent questions'),
-      _P([('Is AI auto-trading safe?', true)]),
-      _P([('Not on its own. Only enable auto-trade after weeks of demo validation. Risk Guard and the Risky Mode kill-switch enforce drawdown limits at all times.', false)]),
-      _P([('How much RAM/CPU?', true)]),
-      _P([('Basic: 4 cores, 8 GB. Discovery + Training in parallel: 8-16 cores, 16-32 GB. GPU (Vulkan, CUDA, ROCm) benefits the deep timeseries models.', false)]),
-      _P([('Where are my credentials stored?', true)]),
-      _P([('Locally on disk (Windows Credential Manager + broker_credentials.toml). Never sent to an external server. NeoEthos has no cloud sync.', false)]),
-      _P([('Why does Discovery say "no strategies found"?', true)]),
-      _P([('NeoEthos now tells you ', false), ('exactly which pipeline stage', true), (' rejected everything and what to do — read the failure message (e.g. "stage \'passed_quality\' rejected 412 of 412 — lower min Sharpe / win-rate, or enable opportunistic mode"). Common causes: (a) too few bars — run Data Bootstrap or let auto-fetch handle it, (b) thresholds too strict — relax them at the stage the message names, (c) wrong account currency — check Settings → Account.', false)]),
-    ],
-  ),
-};
+Map<String, _HelpSection> _helpContentEn(BuildContext context) {
+  final l10n = AppLocalizations.of(context)!;
+  return {
+    'welcome': _HelpSection(
+      title: l10n.helpWelcomeTitle,
+      blocks: [
+        _H3(l10n.helpWelcomeOverviewHeading),
+        _P([
+          (l10n.helpWelcomeOverviewP1, false),
+          ('Rust-based trading terminal', true),
+          (l10n.helpWelcomeOverviewP2, false),
+          ('Discovery', true),
+          (l10n.helpWelcomeOverviewP3, false),
+          ('Training', true),
+          (l10n.helpWelcomeOverviewP4, false),
+        ]),
+        _H4(l10n.helpWelcomeFlowHeading),
+        _OL([
+          [(l10n.helpWelcomeStep1Label, true), (l10n.helpWelcomeStep1Body, false)],
+          [(l10n.helpWelcomeStep2Label, true), (' Settings → Account → "Connect with cTrader"', false)],
+          [(l10n.helpWelcomeStep3Label, true), (l10n.helpWelcomeStep3Body, false)],
+          [(l10n.helpWelcomeStep4Label, true), (l10n.helpWelcomeStep4Body, false)],
+          [('Run Strategy Lab → Discovery', true), (l10n.helpWelcomeStep5Body, false)],
+          [(l10n.helpWelcomeStep6Label, true), (l10n.helpWelcomeStep6Body, false)],
+          [(l10n.helpWelcomeStep7Label, true), (l10n.helpWelcomeStep7Body, false)],
+        ]),
+        _Tip(l10n.helpWelcomeTip),
+      ],
+    ),
+    'trading': _HelpSection(
+      title: 'Trading',
+      blocks: [
+        _H3(l10n.helpTradingManualHeading),
+        _P([
+          (l10n.helpTradingManualP1, false),
+          ('Market Watch → Order Ticket', true),
+          (l10n.helpTradingManualP2, false),
+        ]),
+        _UL([
+          [('Order type: ', true), (l10n.helpTradingOrderType, false)],
+          [('Lots: ', true), (l10n.helpTradingLots, false)],
+          [('Auto Lot: ', true), (l10n.helpTradingAutoLot, false)],
+          [('SL/TP (ATR): ', true), (l10n.helpTradingSlTp, false)],
+          [('R:R: ', true), (l10n.helpTradingRr, false)],
+        ]),
+      ],
+    ),
+    'chart': _HelpSection(
+      title: l10n.chartTitle,
+      blocks: [
+        _H3(l10n.helpChartLiveHeading),
+        _P([
+          (l10n.helpChartLiveP1, false),
+          (l10n.helpChartLiveP1Bold, true),
+          (l10n.helpChartLiveP2, false),
+        ]),
+        _H4(l10n.helpChartScrollbackHeading),
+        _P([
+          (l10n.helpChartScrollbackP1, false),
+          (l10n.helpChartScrollbackLeft, true),
+          (l10n.helpChartScrollbackP2, false),
+          (l10n.helpChartScrollbackP3Bold, true),
+          (l10n.helpChartScrollbackP4, false),
+        ]),
+        _Tip(l10n.helpChartTip),
+        _H4(l10n.helpChartControlsHeading),
+        _UL([
+          [(l10n.helpChartZoomLabel, true), (l10n.helpChartZoomBody, false)],
+          [(l10n.helpChartCrosshairLabel, true), (l10n.helpChartCrosshairBody, false)],
+          [(l10n.helpChartOverlaysLabel, true), (l10n.helpChartOverlaysBody, false)],
+          [(l10n.helpChartAccountSwitcherLabel, true), (l10n.helpChartAccountSwitcherBody, false)],
+        ]),
+      ],
+    ),
+    'ai': _HelpSection(
+      title: l10n.helpAiTitle,
+      blocks: [
+        _H3(l10n.helpAiPipelineHeading),
+        _P([
+          (l10n.helpAiPipelineP1, false),
+        ]),
+        _H4(l10n.helpAiDiscoveryHeading),
+        _P([(l10n.helpAiDiscoveryP1, false)]),
+        _H4(l10n.helpAiTrainingHeading),
+        _P([
+          (l10n.helpAiTrainingP1, false),
+          (l10n.helpAiTrainingP1Bold, true),
+        ]),
+        _H4(l10n.helpAiValidationHeading),
+        _P([(l10n.helpAiValidationP1, false)]),
+      ],
+    ),
+    'risk': _HelpSection(
+      title: l10n.helpRiskTitle,
+      blocks: [
+        _H3(l10n.helpRiskHeading),
+        _UL([
+          [(l10n.helpRiskStandardLabel, true), (l10n.helpRiskStandardBody, false)],
+          [(l10n.helpRiskPropFirmLabel, true), (l10n.helpRiskPropFirmBody, false)],
+          [(l10n.helpRiskRiskyLabel, true), (l10n.helpRiskRiskyBody, false)],
+        ]),
+        _H4(l10n.helpRiskRiskyHeading),
+        _P([
+          (l10n.helpRiskRiskyP1, false),
+          ('NOT', true),
+          (l10n.helpRiskRiskyP2, false),
+        ]),
+        _Tip(l10n.helpRiskTip),
+      ],
+    ),
+    'data': _HelpSection(
+      title: l10n.helpDataTitle,
+      blocks: [
+        _H3(l10n.helpDataSourceHeading),
+        _P([
+          (l10n.helpDataSourceP1, false),
+          (l10n.helpDataSourceP1Bold, true),
+          (l10n.helpDataSourceP2, false),
+        ]),
+        _UL([
+          [(l10n.helpDataLiveLabel, true), (l10n.helpDataLiveBody, false), (l10n.helpDataLiveBodyBold, true)],
+          [(l10n.helpDataCacheLabel, true), (l10n.helpDataCacheBody, false), (l10n.helpDataCacheBodyBold, true), (l10n.helpDataCacheBody2, false)],
+        ]),
+        _H4(l10n.helpDataWritesHeading),
+        _UL([
+          [('Data Bootstrap', true), (l10n.helpDataBootstrapBody, false)],
+          [('Discovery auto-fetch: ', true), (l10n.helpDataAutofetchBody, false)],
+          [('data_dir: ', true), (l10n.helpDataDirBody, false)],
+        ]),
+        _Tip(l10n.helpDataTip),
+        _H4(l10n.helpDataSymbolsHeading),
+        _P([
+          (l10n.helpDataSymbolsP1, false),
+          (l10n.helpDataSymbolsP1Bold, true),
+          (l10n.helpDataSymbolsP2, false),
+        ]),
+      ],
+    ),
+    'shortcuts': _HelpSection(
+      title: l10n.helpShortcutsTitle,
+      blocks: [
+        _H3(l10n.helpShortcutsKeyboardHeading),
+        _KbdRow(const ['F1'], l10n.helpShortcutF1),
+        _KbdRow(const ['Ctrl', 'K'], l10n.helpShortcutCtrlK),
+        _KbdRow(const ['Esc'], l10n.helpShortcutEsc),
+        _KbdRow(const ['?'], l10n.helpShortcutQuestion),
+        _KbdRow(const ['↑', '↓', '↵'], l10n.helpShortcutArrows),
+        _KbdRow(const ['Right-click'], l10n.helpShortcutRightClick),
+      ],
+    ),
+    'faq': _HelpSection(
+      title: l10n.helpFaqTitle,
+      blocks: [
+        _H3(l10n.helpFaqHeading),
+        _P([(l10n.helpFaq1Question, true)]),
+        _P([(l10n.helpFaq1Answer, false)]),
+        _P([(l10n.helpFaq2Question, true)]),
+        _P([(l10n.helpFaq2Answer, false)]),
+        _P([(l10n.helpFaq3Question, true)]),
+        _P([(l10n.helpFaq3Answer, false)]),
+        _P([(l10n.helpFaq4Question, true)]),
+        _P([(l10n.helpFaq4Answer, false)]),
+      ],
+    ),
+  };
+}

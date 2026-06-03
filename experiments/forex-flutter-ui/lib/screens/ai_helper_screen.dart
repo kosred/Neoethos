@@ -12,6 +12,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -45,6 +46,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
   }
 
   Future<void> _send() async {
+    final l10n = AppLocalizations.of(context)!;
     final prompt = _inputCtrl.text.trim();
     if (prompt.isEmpty || _busy) return;
     setState(() {
@@ -66,7 +68,8 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
       final msg = describeError(e);
       if (!mounted) return;
       setState(() {
-        _messages.add(_Message(fromUser: false, text: 'Error: $msg'));
+        _messages.add(
+            _Message(fromUser: false, text: l10n.aiHelperErrorPrefix(msg)));
       });
     } finally {
       if (mounted) setState(() => _busy = false);
@@ -88,6 +91,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final status = ref.watch(codexStatusProvider);
     // Pin to the available height — AI Desk gives this screen a bounded
     // box (Expanded → TabBarView), so the chat input row stays visible at
@@ -96,9 +100,9 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const ViewHeader(
-          title: 'AI Helper',
-          subtitle: 'ChatGPT subscription · no API key',
+        ViewHeader(
+          title: l10n.aiHelperTitle,
+          subtitle: l10n.aiHelperSubtitle,
         ),
         Expanded(
           child: status.when(
@@ -108,7 +112,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
             loading: () => const _Loading(),
             error: (err, _) => SingleChildScrollView(
                 child: BackendErrorWidget(
-                    error: err, title: 'AI Desk unavailable')),
+                    error: err, title: l10n.aiHelperDeskUnavailable)),
           ),
         ),
       ],
@@ -116,11 +120,12 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
   }
 
   Widget _chatUi(CodexStatusSnapshot s) {
+    final l10n = AppLocalizations.of(context)!;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         SectionCard(
-          title: 'Ready',
+          title: l10n.aiHelperReady,
           child: Row(
             children: [
               Container(
@@ -135,8 +140,8 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
               Expanded(
                 child: Text(
                   s.email != null && s.email!.isNotEmpty
-                      ? 'Signed in as ${s.email}'
-                      : 'Signed in via ChatGPT subscription',
+                      ? l10n.aiHelperSignedInAs(s.email!)
+                      : l10n.aiHelperSignedInSubscription,
                   style: const TextStyle(
                     fontSize: 11,
                     color: NeoethosTokens.textMuted,
@@ -146,7 +151,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
               TextButton.icon(
                 onPressed: _busy ? null : _logout,
                 icon: const Icon(Icons.logout, size: 14),
-                label: const Text('Sign out'),
+                label: Text(l10n.aiHelperSignOut),
               ),
             ],
           ),
@@ -167,9 +172,9 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'Chat',
-                  style: TextStyle(
+                Text(
+                  l10n.aiHelperChat,
+                  style: const TextStyle(
                     fontSize: 13,
                     fontWeight: FontWeight.w700,
                     color: NeoethosTokens.textPrimary,
@@ -178,13 +183,11 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
                 const SizedBox(height: NeoethosTokens.spXs),
                 Expanded(
                   child: _messages.isEmpty
-                    ? const Center(
+                    ? Center(
                         child: Text(
-                          'Ask anything. Trading questions, market\n'
-                          'history, strategy ideas — proxied through\n'
-                          'your ChatGPT subscription.',
+                          l10n.aiHelperEmptyHint,
                           textAlign: TextAlign.center,
-                          style: TextStyle(
+                          style: const TextStyle(
                             fontSize: 12,
                             color: NeoethosTokens.textMuted,
                           ),
@@ -207,10 +210,10 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
                       enabled: !_busy,
                       maxLines: null,
                       onSubmitted: (_) => _send(),
-                      decoration: const InputDecoration(
-                        hintText: 'Type your question…',
+                      decoration: InputDecoration(
+                        hintText: l10n.aiHelperInputHint,
                         isDense: true,
-                        border: OutlineInputBorder(),
+                        border: const OutlineInputBorder(),
                       ),
                       inputFormatters: const [],
                     ),
@@ -225,7 +228,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
                         : const Icon(Icons.send, size: 16),
-                    label: Text(_busy ? 'Generating…' : 'Send'),
+                    label: Text(_busy ? l10n.aiHelperGenerating : l10n.aiHelperSend),
                   ),
                 ],
               ),
@@ -238,6 +241,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
   }
 
   Future<void> _logout() async {
+    final l10n = AppLocalizations.of(context)!;
     try {
       await ref.read(backendClientProvider).logoutCodex();
       ref.invalidate(codexStatusProvider);
@@ -248,8 +252,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: NeoethosTokens.sell,
-          content: Text(
-              'Could not sign out from AI Desk — ${describeError(e)}.'),
+          content: Text(l10n.aiHelperSignOutFailed(describeError(e))),
         ),
       );
     }
@@ -262,6 +265,7 @@ class _MessageBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final isUser = message.fromUser;
     final bg = isUser
         ? NeoethosTokens.accent.withValues(alpha: 0.18)
@@ -277,7 +281,7 @@ class _MessageBubble extends StatelessWidget {
           SizedBox(
             width: 56,
             child: Text(
-              isUser ? 'you' : 'codex',
+              isUser ? l10n.aiHelperRoleYou : 'codex',
               style: TextStyle(
                 fontSize: 10,
                 fontWeight: FontWeight.w700,
@@ -327,6 +331,7 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
   String? _error;
 
   Future<void> _start() async {
+    final l10n = AppLocalizations.of(context)!;
     setState(() {
       _starting = true;
       _error = null;
@@ -334,7 +339,7 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
     try {
       final start = await ref.read(backendClientProvider).startCodexLogin();
       if (start.authorizeUrl.isEmpty) {
-        throw StateError('Backend returned empty authorize URL');
+        throw StateError(l10n.aiHelperConnectEmptyUrl);
       }
       final uri = Uri.parse(start.authorizeUrl);
       final launched = await launchUrl(
@@ -342,7 +347,7 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
         mode: LaunchMode.externalApplication,
       );
       if (!launched) {
-        throw StateError('Could not open browser for ${start.authorizeUrl}');
+        throw StateError(l10n.aiHelperConnectBrowserFailed(start.authorizeUrl));
       }
       if (!mounted) return;
       setState(() => _polling = true);
@@ -386,18 +391,16 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final s = widget.status;
     return SectionCard(
-      title: 'Connect your ChatGPT subscription',
+      title: l10n.aiHelperConnectTitle,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'AI Helper proxies through your ChatGPT subscription — no '
-            'OpenAI API key required. Click Connect to sign in with '
-            'your ChatGPT account; we never see or store your '
-            'password.',
-            style: TextStyle(
+          Text(
+            l10n.aiHelperConnectBody,
+            style: const TextStyle(
               fontSize: 12,
               color: NeoethosTokens.textPrimary,
             ),
@@ -405,7 +408,7 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
           if (s.authPath.isNotEmpty) ...[
             const SizedBox(height: 8),
             Text(
-              'Auth state will be saved to: ${s.authPath}',
+              l10n.aiHelperConnectAuthPath(s.authPath),
               style: const TextStyle(
                 fontSize: 10,
                 color: NeoethosTokens.textMuted,
@@ -415,7 +418,7 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
           if (_error != null) ...[
             const SizedBox(height: 8),
             Text(
-              'Connection error: $_error',
+              l10n.aiHelperConnectError(_error!),
               style: const TextStyle(
                 color: NeoethosTokens.sell,
                 fontSize: 11,
@@ -424,7 +427,7 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
           ] else if (s.lastError != null && s.lastError!.isNotEmpty) ...[
             const SizedBox(height: 8),
             Text(
-              'Previous attempt failed: ${s.lastError}',
+              l10n.aiHelperConnectPreviousFailed(s.lastError!),
               style: const TextStyle(
                 color: NeoethosTokens.warning,
                 fontSize: 11,
@@ -445,15 +448,17 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
                     : const Icon(Icons.link, size: 16),
                 label: Text(
                   _polling
-                      ? 'Waiting for browser…'
-                      : (_starting ? 'Starting…' : 'Connect ChatGPT'),
+                      ? l10n.aiHelperConnectWaiting
+                      : (_starting
+                          ? l10n.aiHelperConnectStarting
+                          : l10n.aiHelperConnectButton),
                 ),
               ),
               const SizedBox(width: 8),
               OutlinedButton.icon(
                 onPressed: () => ref.invalidate(codexStatusProvider),
                 icon: const Icon(Icons.refresh, size: 16),
-                label: const Text('Re-check status'),
+                label: Text(l10n.aiHelperRecheckStatus),
               ),
             ],
           ),
@@ -466,11 +471,11 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
 class _Loading extends StatelessWidget {
   const _Loading();
   @override
-  Widget build(BuildContext context) => const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16),
         child: Text(
-          'Checking ChatGPT subscription…',
-          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+          AppLocalizations.of(context)!.aiHelperCheckingSubscription,
+          style: const TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }
