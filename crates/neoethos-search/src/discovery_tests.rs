@@ -7,25 +7,10 @@
 // workspace. See task #224.
 use super::*;
 
-/// Task #66 — env-var tests in this file mutate process-global
-/// `NEOETHOS_BOT_DISCOVERY_*` variables. Cargo runs tests in parallel by
-/// default, so two tests can read each other's writes and the
-/// `prop_firm_gate_auto_enables_with_no_env_at_all` test flakes
-/// intermittently in CI. Every test that touches env vars MUST take
-/// this mutex for the duration of its `set_var`/`remove_var` calls +
-/// the `apply_mode_overrides()` read.
-///
-/// We do NOT introduce `serial_test` as a dep — a plain
-/// `Mutex<()>` is sufficient and keeps the dependency surface flat.
-/// `PoisonError` is unwrapped via `into_inner` so a panic in one test
-/// doesn't take out the rest of the suite.
-static ENV_VAR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn env_var_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_VAR_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-}
+// Task #66's ENV_VAR_TEST_LOCK / env_var_test_lock() helper was removed in the
+// 2026-06-03 config-consolidation: the discovery tests no longer mutate
+// process-global NEOETHOS_BOT_DISCOVERY_* env vars (mode + runtime knobs + the
+// prop-firm gate are all config-driven now), so there is nothing to serialise.
 
 use crate::FilteringConfig;
 
@@ -263,26 +248,21 @@ fn portfolio_export_succeeds_when_prop_firm_window_passed_even_without_walkforwa
 }
 
 #[test]
-fn prop_firm_gate_env_overrides_populate_discovery_config() {
-    let _env_guard = env_var_test_lock();
-    // SAFETY: tests that read process-wide env may race. The
-    // `env_var_test_lock` above serialises every test in this file
-    // that touches `NEOETHOS_BOT_DISCOVERY_*` so the set / read / unset
-    // sequence is atomic from the test's point of view.
-    unsafe {
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_MODE");
-        std::env::set_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PASS_RATE", "0.42");
-        std::env::set_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS", "17");
-        std::env::set_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS", "21");
-        std::env::set_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT", "0.08");
+fn prop_firm_gate_config_overrides_populate_discovery_config() {
+    // Config-driven gate params: set models.discovery_runtime.prop_firm_gate
+    // (carried on DiscoveryConfig.prop_firm_gate_params) instead of the retired
+    // NEOETHOS_BOT_DISCOVERY_PROP_FIRM_* env vars. No env, no lock needed.
+    let cfg = DiscoveryConfig {
+        prop_firm_gate_params: neoethos_core::config::PropFirmGateConfig {
+            pass_rate: 0.42,
+            n_windows: 17,
+            window_days: 21,
+            profit_target_pct: Some(0.08),
+            ..Default::default()
+        },
+        ..Default::default()
     }
-    let cfg = DiscoveryConfig::default().apply_mode_overrides();
-    unsafe {
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PASS_RATE");
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS");
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS");
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT");
-    }
+    .apply_mode_overrides();
     let pf = cfg
         .prop_firm_gate
         .expect("default mode is PropFirm — gate must be auto-enabled");
@@ -294,21 +274,11 @@ fn prop_firm_gate_env_overrides_populate_discovery_config() {
 }
 
 #[test]
-fn prop_firm_gate_auto_enables_with_no_env_at_all() {
-    let _env_guard = env_var_test_lock();
-    // The whole point: zero env vars should still produce a smart,
-    // ready-to-run prop-firm config.
-    unsafe {
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_MODE");
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PERMISSIVE");
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PASS_RATE");
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS");
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS");
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT");
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT");
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MAX_DD_PCT");
-        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MIN_TRADING_DAYS");
-    }
+fn prop_firm_gate_auto_enables_with_default_config() {
+    // The whole point: a default config (zero overrides) still produces a
+    // smart, ready-to-run prop-firm config — the FTMO baseline. No env vars
+    // involved any more; the gate params come from
+    // models.discovery_runtime.prop_firm_gate (all defaults here).
     let cfg = DiscoveryConfig::default().apply_mode_overrides();
     let pf = cfg.prop_firm_gate.expect("default = PropFirm mode");
     // FTMO baseline: 5%/10%/10%/5 days, 60-day window

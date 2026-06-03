@@ -270,6 +270,11 @@ pub struct DiscoveryConfig {
     /// `NEOETHOS_BOT_DISCOVERY_MODE` / `_PERMISSIVE`. Consumed by
     /// `apply_mode_overrides`.
     pub mode: DiscoveryMode,
+    /// Prop-firm window-pass gate parameters (config-driven via
+    /// `models.discovery_runtime.prop_firm_gate`). Consumed by
+    /// `derive_prop_firm_gate` when `apply_mode_overrides` runs in PropFirm
+    /// mode. Replaces the `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` env overrides.
+    pub prop_firm_gate_params: neoethos_core::config::PropFirmGateConfig,
 }
 
 /// Configuration for the prop-firm window-pass gate.
@@ -331,6 +336,7 @@ impl Default for DiscoveryConfig {
             // Env-absent default reproduces the retired
             // resolve_discovery_mode() fallback (PropFirm).
             mode: DiscoveryMode::PropFirm,
+            prop_firm_gate_params: neoethos_core::config::PropFirmGateConfig::default(),
         }
     }
 }
@@ -440,6 +446,7 @@ impl DiscoveryConfig {
                 .max(0.0),
             adaptive_thresholds: model_settings.discovery_runtime.adaptive_thresholds,
             mode: discovery_mode_from_config(&model_settings.discovery_mode),
+            prop_firm_gate_params: model_settings.discovery_runtime.prop_firm_gate.clone(),
         }
     }
 
@@ -533,42 +540,41 @@ impl DiscoveryConfig {
     }
 
     fn derive_prop_firm_gate(&self) -> PropFirmGateOverrides {
-        // FTMO baseline; operator can override individual fields by
-        // setting the matching env var, but the defaults are the
-        // standard challenge rules so the happy-path call needs nothing.
+        // FTMO baseline; the operator overrides individual fields via
+        // `models.discovery_runtime.prop_firm_gate`, but a `None`/default
+        // keeps the standard challenge rule so the happy-path config needs
+        // nothing. (Config-driven replacement for the
+        // `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` env overrides.)
+        let cfg = &self.prop_firm_gate_params;
         let mut rules = PropFirmRiskRules::default();
         rules.min_profit_target_pct =
             PropFirmConstraints::FTMO_STANDARD.challenge_profit_target_pct as f64;
         rules.require_profit_target = true;
-        if let Some(v) = read_env_f64("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT") {
+        if let Some(v) = cfg.max_daily_loss_pct {
             rules.max_daily_loss_pct = v;
         }
-        if let Some(v) = read_env_f64("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MAX_DD_PCT") {
+        if let Some(v) = cfg.max_overall_drawdown_pct {
             rules.max_overall_drawdown_pct = v;
         }
-        if let Some(v) = read_env_f64("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT") {
+        if let Some(v) = cfg.profit_target_pct {
             rules.min_profit_target_pct = v;
             rules.require_profit_target = v > 0.0;
         }
-        if let Some(v) = read_env_usize("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MIN_TRADING_DAYS") {
+        if let Some(v) = cfg.min_trading_days {
             rules.min_trading_days = v;
         }
         // 60 days = the longest standard prop-firm phase (FTMO Phase 2);
         // a strategy that passes a 60-day window with a 10% target also
         // passes the easier Phase 1 rules at 30 days, so a single
         // measurement covers both.
-        let window_days = read_env_usize("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS")
-            .unwrap_or(60)
-            .max(1);
-        // n_windows is auto-tuned later from dataset length when this
-        // override stays at its sentinel value (0).
-        let n_windows = read_env_usize("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS").unwrap_or(0);
+        let window_days = cfg.window_days.max(1);
+        // n_windows is auto-tuned later from dataset length when this stays
+        // at its sentinel value (0).
+        let n_windows = cfg.n_windows;
         // No hard pass-rate threshold by default — the gate ranks
         // candidates and lets the corr-diversification step pick the
-        // top survivors. A non-zero env value still acts as a floor.
-        let pass_rate = read_env_f64("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PASS_RATE")
-            .map(|v| v.clamp(0.0, 1.0))
-            .unwrap_or(0.0);
+        // top survivors. A non-zero config value still acts as a floor.
+        let pass_rate = cfg.pass_rate.clamp(0.0, 1.0);
         PropFirmGateOverrides {
             rules,
             n_windows,
@@ -2286,19 +2292,6 @@ fn validate_regime_robustness(
     }
 
     true
-}
-
-fn read_env_f64(name: &str) -> Option<f64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite())
-}
-
-fn read_env_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
 }
 
 /// Discovery search modes. The default is `PropFirm`; `Strict` is opted into

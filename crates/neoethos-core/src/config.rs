@@ -771,6 +771,10 @@ pub struct DiscoveryRuntimeConfig {
     /// so leave off for multi-symbol sweeps until per-symbol install lands
     /// (F-277b). (was `NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS`)
     pub adaptive_thresholds: bool,
+    /// Prop-firm window-pass gate parameters (FTMO baseline + overrides).
+    /// See [`PropFirmGateConfig`]. (was the
+    /// `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` env overrides)
+    pub prop_firm_gate: PropFirmGateConfig,
 }
 
 impl Default for DiscoveryRuntimeConfig {
@@ -782,6 +786,56 @@ impl Default for DiscoveryRuntimeConfig {
             stage1_window: "earliest".to_string(),
             min_history_years: 0,
             adaptive_thresholds: false,
+            prop_firm_gate: PropFirmGateConfig::default(),
+        }
+    }
+}
+
+/// Prop-firm window-pass gate parameters — the config-driven replacement for
+/// the `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` env overrides read by
+/// `derive_prop_firm_gate`. The `Option` rule fields default to `None`,
+/// meaning "use the FTMO baseline" (`PropFirmRiskRules::default` /
+/// `FTMO_STANDARD`) — exactly reproducing the env-absent behaviour; set a
+/// value to override that specific rule (e.g. to target a non-FTMO firm's
+/// challenge from the UI / TUI).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PropFirmGateConfig {
+    /// Max daily-loss fraction (e.g. `0.05` = 5%). `None` = FTMO baseline.
+    /// (was `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT`)
+    pub max_daily_loss_pct: Option<f64>,
+    /// Max overall-drawdown fraction (e.g. `0.10` = 10%). `None` = FTMO
+    /// baseline. (was `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MAX_DD_PCT`)
+    pub max_overall_drawdown_pct: Option<f64>,
+    /// Challenge profit-target fraction (e.g. `0.10` = 10%); `0` disables the
+    /// target requirement. `None` = `FTMO_STANDARD` target. (was
+    /// `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT`)
+    pub profit_target_pct: Option<f64>,
+    /// Minimum trading days the strategy must be active. `None` = FTMO
+    /// baseline. (was `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MIN_TRADING_DAYS`)
+    pub min_trading_days: Option<usize>,
+    /// Length (days) of each random evaluation window. Default `60` (the
+    /// longest standard prop-firm phase). (was
+    /// `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS`)
+    pub window_days: usize,
+    /// Number of random windows to score. `0` = auto-tune from dataset
+    /// length. (was `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS`)
+    pub n_windows: usize,
+    /// Hard pass-rate floor in `[0, 1]`. `0` = ranking-only (no hard
+    /// threshold). (was `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PASS_RATE`)
+    pub pass_rate: f64,
+}
+
+impl Default for PropFirmGateConfig {
+    fn default() -> Self {
+        Self {
+            max_daily_loss_pct: None,
+            max_overall_drawdown_pct: None,
+            profit_target_pct: None,
+            min_trading_days: None,
+            window_days: 60,
+            n_windows: 0,
+            pass_rate: 0.0,
         }
     }
 }
