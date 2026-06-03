@@ -11,8 +11,32 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../l10n/app_localizations.dart';
 import '../state/nav.dart';
 import '../theme/theme.dart';
+
+/// Maps a stable [NavTab.id] to its localized sidebar label. The English
+/// fallbacks in nav.dart's `kNavTabs` stay as-is for non-localized contexts
+/// (analytics, breadcrumbs, last-active-tab persistence); only the visible
+/// rail label is localized here.
+String _navTitle(AppLocalizations l10n, String id) {
+  switch (id) {
+    case 'Dashboard':
+      return l10n.navDashboard;
+    case 'MarketWatch':
+      return l10n.navMarketWatch;
+    case 'StrategyLab':
+      return l10n.navStrategyLab;
+    case 'Positions':
+      return l10n.navPositions;
+    case 'AiDesk':
+      return l10n.navAiDesk;
+    case 'Settings':
+      return l10n.navSettings;
+    default:
+      return id;
+  }
+}
 
 class Sidebar extends ConsumerWidget {
   const Sidebar({super.key});
@@ -169,7 +193,7 @@ class _NavItem extends StatelessWidget {
                 const SizedBox(width: 10),
                 Expanded(
                   child: Text(
-                    tab.title,
+                    _navTitle(AppLocalizations.of(context)!, tab.id),
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       fontSize: NeoethosTokens.fsBody,

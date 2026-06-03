@@ -4,6 +4,18 @@
   "@appTitle": {
     "description": "Application title shown in the window / title bar"
   },
+  "navDashboard": "Dashboard",
+  "@navDashboard": { "description": "Sidebar nav label: account overview panel" },
+  "navMarketWatch": "Market Watch",
+  "@navMarketWatch": { "description": "Sidebar nav label: live quotes + positions" },
+  "navStrategyLab": "Strategy Lab",
+  "@navStrategyLab": { "description": "Sidebar nav label: discovery/training pipeline" },
+  "navPositions": "Positions",
+  "@navPositions": { "description": "Sidebar nav label: open positions + activity" },
+  "navAiDesk": "AI Desk",
+  "@navAiDesk": { "description": "Sidebar nav label: AI ensemble + assistant" },
+  "navSettings": "Settings",
+  "@navSettings": { "description": "Sidebar nav label: settings tab" },
   "language": "Language",
   "@language": {
     "description": "Settings label for the UI language selector"

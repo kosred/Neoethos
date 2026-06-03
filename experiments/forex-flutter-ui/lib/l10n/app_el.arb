@@ -1,6 +1,12 @@
 {
   "@@locale": "el",
   "appTitle": "NeoEthos",
+  "navDashboard": "Πίνακας",
+  "navMarketWatch": "Αγορά",
+  "navStrategyLab": "Στρατηγικές",
+  "navPositions": "Θέσεις",
+  "navAiDesk": "Κέντρο AI",
+  "navSettings": "Ρυθμίσεις",
   "language": "Γλώσσα",
   "languageEnglish": "English",
   "languageGreek": "Ελληνικά",
