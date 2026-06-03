@@ -46,6 +46,13 @@ pub struct SettingsDto {
     /// Top-level trading mode (`"risky"` | `"prop_firm"`) — see
     /// `SystemConfig::trading_mode`. Drives discovery + risk orientation.
     pub trading_mode: String,
+    /// Risky-Mode goal — see `SystemConfig::risky_*`. Start/target balances
+    /// (account ccy) + horizon (days). The operator sets these and they
+    /// pressure the Risky discovery search toward strategies that can hit the
+    /// target in time.
+    pub risky_start_balance: f64,
+    pub risky_target_balance: f64,
+    pub risky_horizon_days: u32,
     pub news_calendar_enabled: bool,
     pub news_calendar_source: String,
     /// `block_on_news` | `allow_always` | `warn_only`. Controls how
@@ -78,6 +85,9 @@ pub struct SettingsUpdateDto {
     pub ui_locale: Option<String>,
     /// `"risky"` | `"prop_firm"`. Unknown values are rejected (400).
     pub trading_mode: Option<String>,
+    pub risky_start_balance: Option<f64>,
+    pub risky_target_balance: Option<f64>,
+    pub risky_horizon_days: Option<u32>,
     pub news_calendar_enabled: Option<bool>,
     pub news_calendar_source: Option<String>,
     /// Snake_case id of a [`NewsTradingMode`] variant.
@@ -382,6 +392,22 @@ pub async fn update_settings(
         }
         settings.system.trading_mode = mode;
     }
+    // Risky-Mode goal (positive values only; the search + projection read these).
+    if let Some(v) = payload.risky_start_balance {
+        if v > 0.0 {
+            settings.system.risky_start_balance_usd = v;
+        }
+    }
+    if let Some(v) = payload.risky_target_balance {
+        if v > 0.0 {
+            settings.system.risky_target_balance_usd = v;
+        }
+    }
+    if let Some(v) = payload.risky_horizon_days {
+        if v > 0 {
+            settings.system.risky_horizon_days = v;
+        }
+    }
     if let Some(b) = payload.news_calendar_enabled {
         settings.news.news_calendar_enabled = b;
     }
@@ -477,6 +503,9 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         data_dir: settings.system.data_dir.display().to_string(),
         ui_locale: settings.system.ui_locale.clone(),
         trading_mode: settings.system.trading_mode.clone(),
+        risky_start_balance: settings.system.risky_start_balance_usd,
+        risky_target_balance: settings.system.risky_target_balance_usd,
+        risky_horizon_days: settings.system.risky_horizon_days,
         news_calendar_enabled: settings.news.news_calendar_enabled,
         news_calendar_source: settings.news.news_calendar_source.clone(),
         news_trading_mode: mode.as_str().to_string(),

@@ -64,9 +64,10 @@ pub struct SystemConfig {
     /// start, where to reach, and by when; in Risky mode these PRESSURE the
     /// strategy search to surface portfolios that can compound from start to
     /// target within the horizon (see `DiscoveryConfig::risky_*` + the
-    /// target-aware candidate ranking). Defaults 100 -> 10,000 in 180 days
-    /// (~6 months — beyond that it is closer to normal trading, per the
-    /// operator's Risky-vs-normal distinction).
+    /// target-aware candidate ranking). Sizing is a fraction of the *current*
+    /// balance, so risk compounds with the bankroll. Defaults 100 -> 50,000 in
+    /// 180 days (~6 months — beyond that it is closer to normal trading, per
+    /// the operator's Risky-vs-normal distinction). Fully operator-editable.
     pub risky_start_balance_usd: f64,
     pub risky_target_balance_usd: f64,
     pub risky_horizon_days: u32,
@@ -182,7 +183,7 @@ impl Default for SystemConfig {
             ui_locale: "en".to_string(),
             trading_mode: "prop_firm".to_string(),
             risky_start_balance_usd: 100.0,
-            risky_target_balance_usd: 10000.0,
+            risky_target_balance_usd: 50000.0,
             risky_horizon_days: 180,
             multi_resolution_enabled: true,
             multi_resolution_timeframes: CANONICAL_TIMEFRAMES

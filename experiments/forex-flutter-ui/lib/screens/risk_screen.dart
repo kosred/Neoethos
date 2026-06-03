@@ -10,6 +10,7 @@
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
@@ -133,8 +134,144 @@ class _TradingModeCardState extends ConsumerState<_TradingModeCard> {
               color: isRisky ? NeoethosTokens.warning : NeoethosTokens.buy,
             ),
           ),
+          if (isRisky) ...[
+            const SizedBox(height: 14),
+            const _RiskyGoalFields(),
+          ],
         ],
       ),
+    );
+  }
+}
+
+/// Risky-Mode goal editor — only shown when Risky is the active mode. The
+/// operator sets start balance, target balance, and horizon (days); on Apply
+/// these persist to `system.risky_*` and PRESSURE the discovery search to find
+/// strategies that can compound from start to target within the horizon
+/// (sized as a fraction of the live balance, so risk compounds with it).
+class _RiskyGoalFields extends ConsumerStatefulWidget {
+  const _RiskyGoalFields();
+
+  @override
+  ConsumerState<_RiskyGoalFields> createState() => _RiskyGoalFieldsState();
+}
+
+class _RiskyGoalFieldsState extends ConsumerState<_RiskyGoalFields> {
+  final _startCtrl = TextEditingController();
+  final _targetCtrl = TextEditingController();
+  final _horizonCtrl = TextEditingController();
+  bool _seeded = false;
+  bool _saving = false;
+
+  @override
+  void dispose() {
+    _startCtrl.dispose();
+    _targetCtrl.dispose();
+    _horizonCtrl.dispose();
+    super.dispose();
+  }
+
+  /// Seed the fields once from the first settings snapshot we see; after that
+  /// the operator owns the text and we don't clobber their edits on rebuild.
+  void _seed(SettingsSnapshot s) {
+    if (_seeded) return;
+    _seeded = true;
+    _startCtrl.text = s.riskyStartBalance.toStringAsFixed(0);
+    _targetCtrl.text = s.riskyTargetBalance.toStringAsFixed(0);
+    _horizonCtrl.text = s.riskyHorizonDays.toString();
+  }
+
+  Future<void> _save() async {
+    if (_saving) return;
+    final l10n = AppLocalizations.of(context)!;
+    final start = double.tryParse(_startCtrl.text.trim());
+    final target = double.tryParse(_targetCtrl.text.trim());
+    final horizon = int.tryParse(_horizonCtrl.text.trim());
+    setState(() => _saving = true);
+    try {
+      await ref.read(backendClientProvider).saveSettings(
+            riskyStartBalance: (start != null && start > 0) ? start : null,
+            riskyTargetBalance: (target != null && target > 0) ? target : null,
+            riskyHorizonDays: (horizon != null && horizon > 0) ? horizon : null,
+          );
+      if (!mounted) return;
+      ref.invalidate(settingsProvider);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: NeoethosTokens.buy,
+          content: Text(l10n.riskyGoalSaved),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showTranslatedErrorSnackbar(context, e, prefix: l10n.riskyGoalSaveFailed);
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Widget _numField(TextEditingController c, String label) => TextField(
+        controller: c,
+        keyboardType: const TextInputType.numberWithOptions(decimal: true),
+        inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
+        style: const TextStyle(fontSize: 12),
+        decoration: InputDecoration(
+          labelText: label,
+          isDense: true,
+          border: const OutlineInputBorder(),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final settings = ref.watch(settingsProvider).valueOrNull;
+    if (settings != null) _seed(settings);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          l10n.riskyGoalTitle,
+          style: const TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+            color: NeoethosTokens.textPrimary,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(child: _numField(_startCtrl, l10n.riskyGoalStart)),
+            const SizedBox(width: 8),
+            Expanded(child: _numField(_targetCtrl, l10n.riskyGoalTarget)),
+            const SizedBox(width: 8),
+            SizedBox(
+              width: 84,
+              child: _numField(_horizonCtrl, l10n.riskyGoalHorizon),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: FilledButton.icon(
+            onPressed: _saving ? null : _save,
+            icon: const Icon(Icons.flag_outlined, size: 16),
+            label: Text(l10n.riskyGoalApply),
+            style: FilledButton.styleFrom(
+              backgroundColor: NeoethosTokens.accent,
+              visualDensity: VisualDensity.compact,
+            ),
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          l10n.riskyGoalHint,
+          style: const TextStyle(fontSize: 10, color: NeoethosTokens.textMuted),
+        ),
+      ],
     );
   }
 }

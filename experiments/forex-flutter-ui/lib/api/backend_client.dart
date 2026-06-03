@@ -387,6 +387,9 @@ class BackendClient {
     String? dataDir,
     String? uiLocale,
     String? tradingMode,
+    double? riskyStartBalance,
+    double? riskyTargetBalance,
+    int? riskyHorizonDays,
     bool? newsCalendarEnabled,
     String? newsCalendarSource,
     String? newsTradingMode,
@@ -402,6 +405,13 @@ class BackendClient {
     if (dataDir != null) body['dataDir'] = dataDir;
     if (uiLocale != null) body['uiLocale'] = uiLocale;
     if (tradingMode != null) body['tradingMode'] = tradingMode;
+    if (riskyStartBalance != null) {
+      body['riskyStartBalance'] = riskyStartBalance;
+    }
+    if (riskyTargetBalance != null) {
+      body['riskyTargetBalance'] = riskyTargetBalance;
+    }
+    if (riskyHorizonDays != null) body['riskyHorizonDays'] = riskyHorizonDays;
     if (newsCalendarEnabled != null) {
       body['newsCalendarEnabled'] = newsCalendarEnabled;
     }
@@ -1318,6 +1328,13 @@ class SettingsSnapshot {
   /// with a backend that predates the field. Drives the Risk-screen mode
   /// selector + the Risky-Mode card.
   final String tradingMode;
+
+  /// Risky-Mode goal from `SystemConfig::risky_*` — start/target balance
+  /// (account ccy) + horizon (days). The operator edits these; they pressure
+  /// the Risky discovery search. Defaults mirror the backend (100/50000/180).
+  final double riskyStartBalance;
+  final double riskyTargetBalance;
+  final int riskyHorizonDays;
   final bool newsCalendarEnabled;
   final String newsCalendarSource;
 
@@ -1342,6 +1359,9 @@ class SettingsSnapshot {
     required this.dataDir,
     this.localeCode = 'en',
     this.tradingMode = 'prop_firm',
+    this.riskyStartBalance = 100.0,
+    this.riskyTargetBalance = 50000.0,
+    this.riskyHorizonDays = 180,
     required this.newsCalendarEnabled,
     required this.newsCalendarSource,
     required this.newsTradingMode,
@@ -1359,6 +1379,11 @@ class SettingsSnapshot {
         dataDir: j['dataDir'] as String,
         localeCode: (j['uiLocale'] as String?) ?? 'en',
         tradingMode: (j['tradingMode'] as String?) ?? 'prop_firm',
+        riskyStartBalance:
+            (j['riskyStartBalance'] as num?)?.toDouble() ?? 100.0,
+        riskyTargetBalance:
+            (j['riskyTargetBalance'] as num?)?.toDouble() ?? 50000.0,
+        riskyHorizonDays: (j['riskyHorizonDays'] as num?)?.toInt() ?? 180,
         newsCalendarEnabled: j['newsCalendarEnabled'] as bool,
         newsCalendarSource: j['newsCalendarSource'] as String,
         newsTradingMode: (j['newsTradingMode'] as String?) ?? '',

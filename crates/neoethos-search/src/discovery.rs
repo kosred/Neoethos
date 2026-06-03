@@ -346,10 +346,10 @@ impl Default for DiscoveryConfig {
             // resolve_discovery_mode() fallback (PropFirm).
             mode: DiscoveryMode::PropFirm,
             prop_firm_gate_params: neoethos_core::config::PropFirmGateConfig::default(),
-            // Risky-Mode goal defaults (mirror SystemConfig): 100 -> 10,000 in
+            // Risky-Mode goal defaults (mirror SystemConfig): 100 -> 50,000 in
             // 180 days. Ignored unless mode == Risky.
             risky_start_balance: 100.0,
-            risky_target_balance: 10000.0,
+            risky_target_balance: 50000.0,
             risky_horizon_days: 180.0,
         }
     }
