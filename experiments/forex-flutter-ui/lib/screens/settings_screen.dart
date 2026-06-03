@@ -582,8 +582,20 @@ class _LanguageCard extends ConsumerWidget {
             ],
             selected: {current == 'el' ? 'el' : 'en'},
             showSelectedIcon: false,
-            onSelectionChanged: (sel) =>
-                ref.read(localeProvider.notifier).setLanguage(sel.first),
+            onSelectionChanged: (sel) async {
+              final code = sel.first;
+              // Apply immediately for a snappy switch, then persist to
+              // config.yaml (system.ui_locale) so it survives restarts.
+              ref.read(localeProvider.notifier).setLanguage(code);
+              try {
+                await ref
+                    .read(backendClientProvider)
+                    .saveSettings(uiLocale: code);
+              } catch (_) {
+                // Non-fatal: the in-memory switch already applied; the
+                // choice just isn't persisted until the next successful save.
+              }
+            },
           ),
         ],
       ),

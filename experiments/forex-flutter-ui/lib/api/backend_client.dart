@@ -385,6 +385,7 @@ class BackendClient {
   /// surface that via `describeError()` in `error_translation.dart`.
   Future<SettingsSnapshot> saveSettings({
     String? dataDir,
+    String? uiLocale,
     bool? newsCalendarEnabled,
     String? newsCalendarSource,
     String? newsTradingMode,
@@ -398,6 +399,7 @@ class BackendClient {
   }) async {
     final body = <String, dynamic>{};
     if (dataDir != null) body['dataDir'] = dataDir;
+    if (uiLocale != null) body['uiLocale'] = uiLocale;
     if (newsCalendarEnabled != null) {
       body['newsCalendarEnabled'] = newsCalendarEnabled;
     }
@@ -1303,6 +1305,11 @@ class PropFirmPresetSummary {
 
 class SettingsSnapshot {
   final String dataDir;
+
+  /// UI language code (`'en'` | `'el'`) from `SystemConfig.ui_locale`.
+  /// Defaults to `'en'` for back-compat with a backend that predates the
+  /// field. Drives the Settings language picker + the startup locale.
+  final String localeCode;
   final bool newsCalendarEnabled;
   final String newsCalendarSource;
 
@@ -1325,6 +1332,7 @@ class SettingsSnapshot {
 
   const SettingsSnapshot({
     required this.dataDir,
+    this.localeCode = 'en',
     required this.newsCalendarEnabled,
     required this.newsCalendarSource,
     required this.newsTradingMode,
@@ -1340,6 +1348,7 @@ class SettingsSnapshot {
 
   factory SettingsSnapshot.fromJson(Map<String, dynamic> j) => SettingsSnapshot(
         dataDir: j['dataDir'] as String,
+        localeCode: (j['uiLocale'] as String?) ?? 'en',
         newsCalendarEnabled: j['newsCalendarEnabled'] as bool,
         newsCalendarSource: j['newsCalendarSource'] as String,
         newsTradingMode: (j['newsTradingMode'] as String?) ?? '',

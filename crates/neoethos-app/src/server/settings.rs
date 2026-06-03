@@ -41,6 +41,8 @@ fn config_path() -> std::path::PathBuf {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsDto {
     pub data_dir: String,
+    /// UI language code (`"en"` | `"el"`) — see `SystemConfig::ui_locale`.
+    pub ui_locale: String,
     pub news_calendar_enabled: bool,
     pub news_calendar_source: String,
     /// `block_on_news` | `allow_always` | `warn_only`. Controls how
@@ -68,6 +70,9 @@ pub struct SettingsDto {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsUpdateDto {
     pub data_dir: Option<String>,
+    /// `"en"` | `"el"`. Unknown values are rejected (400) so a stale UI can't
+    /// wedge an unsupported locale into config.yaml.
+    pub ui_locale: Option<String>,
     pub news_calendar_enabled: Option<bool>,
     pub news_calendar_source: Option<String>,
     /// Snake_case id of a [`NewsTradingMode`] variant.
@@ -338,6 +343,23 @@ pub async fn update_settings(
         }
         settings.system.data_dir = PathBuf::from(trimmed);
     }
+    if let Some(raw) = payload.ui_locale {
+        let code = raw.trim().to_ascii_lowercase();
+        if code != "en" && code != "el" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "unknown ui_locale `{}`. Expected one of: en, el.",
+                        raw
+                    ),
+                    "code": "invalid_ui_locale",
+                })),
+            )
+                .into_response();
+        }
+        settings.system.ui_locale = code;
+    }
     if let Some(b) = payload.news_calendar_enabled {
         settings.news.news_calendar_enabled = b;
     }
@@ -431,6 +453,7 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
     let mode = settings.news.news_trading_mode;
     SettingsDto {
         data_dir: settings.system.data_dir.display().to_string(),
+        ui_locale: settings.system.ui_locale.clone(),
         news_calendar_enabled: settings.news.news_calendar_enabled,
         news_calendar_source: settings.news.news_calendar_source.clone(),
         news_trading_mode: mode.as_str().to_string(),

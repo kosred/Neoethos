@@ -42,6 +42,12 @@ pub struct SystemConfig {
     #[serde(default)]
     pub account_currency: String,
     pub data_dir: PathBuf,
+    /// UI language for the Flutter front-end: `"en"` (default) or `"el"`
+    /// (Greek). Persisted here so the choice survives restarts and travels
+    /// with config.yaml — the app's single source of truth — rather than a
+    /// separate Flutter store. The backend does not consume it; it is surfaced
+    /// via GET / POST `/settings` for the Settings language picker.
+    pub ui_locale: String,
     pub multi_resolution_enabled: bool,
     pub multi_resolution_timeframes: Vec<String>,
     pub multi_resolution_prefix_base: bool,
@@ -151,6 +157,7 @@ impl Default for SystemConfig {
             // value.
             account_currency: String::new(),
             data_dir: PathBuf::from("data"),
+            ui_locale: "en".to_string(),
             multi_resolution_enabled: true,
             multi_resolution_timeframes: CANONICAL_TIMEFRAMES
                 .iter()
