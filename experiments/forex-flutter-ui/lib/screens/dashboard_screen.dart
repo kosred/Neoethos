@@ -10,7 +10,6 @@ import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
-import 'widgets/growth_mode_card.dart';
 
 /// Dashboard — live numbers from the Rust HTTP server.
 ///
@@ -76,11 +75,10 @@ class DashboardScreen extends ConsumerWidget {
         ),
         if (snapshot.hasError) _ErrorBanner(error: snapshot.error!),
         _StatRow(snapshot: snapshot),
-        // Growth Mode card — surfaces the "from €100 to thousands"
-        // pitch that's the moat versus generic broker UIs. Lives
-        // right above Open Positions so it's the first non-stat
-        // panel the operator sees.
-        const GrowthModeCard(),
+        // (The old "Growth Mode" card was removed 2026-06-03: it was a
+        // guess-fed projection surface and a duplicate of Risky Mode, which is
+        // now a first-class Trading Mode set from the Risk screen — the goal
+        // there pressures the discovery search directly.)
         SectionCard(
           title: l10n.openPositions,
           child: _PositionsTable(snapshot: snapshot),
