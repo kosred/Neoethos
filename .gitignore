@@ -77,16 +77,10 @@ crates/neoethos-app/data/
 /resources/models/*.gguf
 /resources/models/*.gguf.tmp
 
-# Phase Flutter UI scaffold — build artefacts
-crates/forex-flutter-ui/build/
-crates/forex-flutter-ui/.dart_tool/
-crates/forex-flutter-ui/.flutter-plugins
-crates/forex-flutter-ui/.flutter-plugins-dependencies
-crates/forex-flutter-ui/.metadata
-crates/forex-flutter-ui/pubspec.lock
-crates/forex-flutter-ui/windows/
-crates/forex-flutter-ui/linux/
-crates/forex-flutter-ui/macos/
+# Flutter UI build artefacts: the project at experiments/forex-flutter-ui/
+# ships its own nested .gitignore (build/, .dart_tool/, ephemeral, …), so no
+# root-level entries are needed. (The old crates/forex-flutter-ui/* block here
+# was stale — the UI moved crates/ → experiments/ — and was dropped 2026-06-03.)
 
 # God-file split drafts (2026-05-18 cleanup pass).
 # These directories hold draft re-organisations of large source files

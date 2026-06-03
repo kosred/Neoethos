@@ -8,7 +8,7 @@
 # Μετά verify με `flutter --version` + `flutter doctor` + εκτελεί
 # `flutter config --enable-windows-desktop` ώστε το desktop target
 # να είναι έτοιμο για `flutter create .` στο
-# crates/forex-flutter-ui/.
+# experiments/forex-flutter-ui/.
 #
 # Disk: ~3 GB. Αν C: < 5 GB free, abort.
 
@@ -150,7 +150,7 @@ Step 6 'flutter doctor'
 flutter doctor 2>&1 | Out-Host
 
 Step 7 'Bootstrap forex-flutter-ui'
-$flutterUi = Join-Path $PSScriptRoot '..\crates\forex-flutter-ui' | Resolve-Path
+$flutterUi = Join-Path $PSScriptRoot '..\experiments\forex-flutter-ui' | Resolve-Path
 Push-Location $flutterUi
 try {
     if (-not (Test-Path 'windows')) {
@@ -165,6 +165,6 @@ try {
 Write-Host ""
 Write-Host "=================================================" -ForegroundColor Green
 Write-Host "  Flutter ready." -ForegroundColor Green
-Write-Host "  Next: cd crates\forex-flutter-ui ; flutter test" -ForegroundColor Green
+Write-Host "  Next: cd experiments\forex-flutter-ui ; flutter test" -ForegroundColor Green
 Write-Host "        then: flutter run -d windows" -ForegroundColor Green
 Write-Host "=================================================" -ForegroundColor Green
