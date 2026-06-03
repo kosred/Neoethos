@@ -103,24 +103,23 @@ mod tree_runtime_tests {
 }
 
 pub fn cpu_threads_hint() -> usize {
-    fn read_threads_env(keys: &[&str]) -> Option<usize> {
-        for key in keys {
-            if let Ok(val) = env::var(key)
-                && let Ok(parsed) = val.trim().parse::<usize>()
-                && parsed > 0
-            {
-                return Some(parsed);
-            }
-        }
-        None
+    // Config-driven CPU budget (was NEOETHOS_BOT_RUST_THREADS / _CPU_THREADS /
+    // _CPU_BUDGET). Reads the single core hardware knob so the models and the
+    // core hardware planner agree on the budget. The standard rayon
+    // RAYON_NUM_THREADS is still honored as a fallback, then cores-1.
+    if let Some(n) = neoethos_core::system::current_hardware_runtime_overrides()
+        .cpu_budget
+        .filter(|n| *n > 0)
+    {
+        return n;
     }
-    read_threads_env(&[
-        "NEOETHOS_BOT_RUST_THREADS",
-        "NEOETHOS_BOT_CPU_THREADS",
-        "NEOETHOS_BOT_CPU_BUDGET",
-        "RAYON_NUM_THREADS",
-    ])
-    .unwrap_or_else(|| num_cpus::get().saturating_sub(1).max(1))
+    if let Ok(val) = env::var("RAYON_NUM_THREADS")
+        && let Ok(parsed) = val.trim().parse::<usize>()
+        && parsed > 0
+    {
+        return parsed;
+    }
+    num_cpus::get().saturating_sub(1).max(1)
 }
 
 pub fn tree_device_preference() -> DevicePreference {
@@ -157,17 +156,9 @@ pub fn gpu_only_mode_for(_model_name: &str) -> bool {
     current_tree_runtime().gpu_only
 }
 
-pub fn cpu_threads_hint_for(model_name: &str) -> usize {
-    let model_key = format!(
-        "NEOETHOS_BOT_{}_THREADS",
-        model_name.trim().to_ascii_uppercase().replace('-', "_")
-    );
-    if let Ok(value) = env::var(&model_key)
-        && let Ok(parsed) = value.trim().parse::<usize>()
-        && parsed > 0
-    {
-        return parsed;
-    }
+pub fn cpu_threads_hint_for(_model_name: &str) -> usize {
+    // Per-model NEOETHOS_BOT_{MODEL}_THREADS folded into the single config-driven
+    // CPU budget via cpu_threads_hint() (v0.4.36 config-consolidation).
     cpu_threads_hint()
 }
 

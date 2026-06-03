@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use ndarray::Array2;
 use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 use rayon::prelude::*;
-use std::env;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -14,26 +13,10 @@ use tracing::info;
 use crate::base::dataframe_to_float32_array;
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 
-fn read_threads_env(keys: &[&str]) -> Option<usize> {
-    for key in keys {
-        if let Ok(val) = env::var(key)
-            && let Ok(parsed) = val.trim().parse::<usize>()
-            && parsed > 0
-        {
-            return Some(parsed);
-        }
-    }
-    None
-}
-
 fn rust_threads_hint() -> usize {
-    read_threads_env(&[
-        "NEOETHOS_BOT_RUST_THREADS",
-        "NEOETHOS_BOT_CPU_THREADS",
-        "NEOETHOS_BOT_CPU_BUDGET",
-        "RAYON_NUM_THREADS",
-    ])
-    .unwrap_or_else(|| num_cpus::get().saturating_sub(1).max(1))
+    // Shares the single config-driven CPU budget with tree-model training
+    // (core hardware knob -> RAYON_NUM_THREADS -> cores-1).
+    crate::tree_models::config::cpu_threads_hint()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

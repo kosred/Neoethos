@@ -190,6 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // config, not the environment (S2a: genetic search; the rest staged).
     neoethos_search::install_search_runtime_overrides_from_settings(&settings);
     neoethos_models::tree_models::config::install_tree_runtime_from_settings(&settings);
+    neoethos_core::system::install_hardware_runtime_overrides_from_settings(&settings);
     neoethos_data::install_data_runtime_overrides(
         settings.models.data_runtime.normalize_features,
         settings.models.data_runtime.rebuild_stale_higher_tfs,

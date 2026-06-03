@@ -81,6 +81,21 @@ impl HardwareRuntimeOverrides {
         }
     }
 
+    /// Config-driven constructor (was [`Self::from_env`]). A
+    /// `hardware_from_settings_default_matches_default` test guarantees a fresh
+    /// `Settings` reproduces [`Self::default`] (= the env-absent `from_env`).
+    pub fn from_settings(s: &crate::config::Settings) -> Self {
+        let c = &s.system.hardware;
+        Self {
+            cpu_budget: c.cpu_budget,
+            training_precision: c.training_precision,
+            cuda_precisions: c.cuda_precisions.clone(),
+            rocm_precisions: c.rocm_precisions.clone(),
+            wgpu_precisions: c.wgpu_precisions.clone(),
+            wgpu_device_names: c.wgpu_device_names.clone(),
+        }
+    }
+
     pub fn precision_override(
         &self,
         backend: AcceleratorBackend,
@@ -259,7 +274,7 @@ impl HardwareExecutionPlan {
         Self::from_settings_profile_and_overrides(
             settings,
             profile,
-            &HardwareRuntimeOverrides::from_env(),
+            &HardwareRuntimeOverrides::from_settings(settings),
         )
     }
 
@@ -562,9 +577,24 @@ impl Default for HardwareProbe {
     }
 }
 
+static HARDWARE_RUNTIME_OVERRIDES: std::sync::OnceLock<HardwareRuntimeOverrides> =
+    std::sync::OnceLock::new();
+
+/// Install the process-wide hardware runtime overrides from `Settings` (call
+/// once at startup, before any `HardwareProbe::new`). The first install wins.
+pub fn install_hardware_runtime_overrides_from_settings(s: &crate::config::Settings) {
+    let _ = HARDWARE_RUNTIME_OVERRIDES.set(HardwareRuntimeOverrides::from_settings(s));
+}
+
+/// Current hardware runtime overrides (defaults if never installed — e.g. in
+/// unit tests — preserving the historical env-absent behaviour).
+pub fn current_hardware_runtime_overrides() -> &'static HardwareRuntimeOverrides {
+    HARDWARE_RUNTIME_OVERRIDES.get_or_init(HardwareRuntimeOverrides::default)
+}
+
 impl HardwareProbe {
     pub fn new() -> Self {
-        Self::with_runtime_overrides(HardwareRuntimeOverrides::from_env())
+        Self::with_runtime_overrides(current_hardware_runtime_overrides().clone())
     }
 
     pub fn with_runtime_overrides(runtime_overrides: HardwareRuntimeOverrides) -> Self {
@@ -946,7 +976,7 @@ impl<'a> AutoTuner<'a> {
     }
 
     fn evaluate_hints(&self) -> AutoTuneHints {
-        let runtime_overrides = HardwareRuntimeOverrides::from_env();
+        let runtime_overrides = HardwareRuntimeOverrides::from_settings(self.settings);
         let plan = HardwareExecutionPlan::from_settings_profile_and_overrides(
             self.settings,
             self.profile.clone(),
@@ -1010,7 +1040,7 @@ impl<'a> AutoTuner<'a> {
     }
 
     fn resolve_cpu_budget(&self, total_cores: usize) -> usize {
-        resolve_cpu_budget(total_cores, &HardwareRuntimeOverrides::from_env())
+        resolve_cpu_budget(total_cores, &HardwareRuntimeOverrides::from_settings(self.settings))
     }
 
     fn apply_thread_env_defaults(&self, hints: &AutoTuneHints) {
@@ -1145,6 +1175,18 @@ fn resolve_cpu_budget(total_cores: usize, runtime_overrides: &HardwareRuntimeOve
 mod tests {
     use super::*;
     use crate::contracts::BackendKind;
+
+    #[test]
+    fn hardware_from_settings_default_matches_default() {
+        // A fresh Settings reproduces the env-absent HardwareRuntimeOverrides
+        // (all None / empty), so the env -> config migration is
+        // behaviour-preserving for default operators.
+        let s = crate::config::Settings::default();
+        assert_eq!(
+            HardwareRuntimeOverrides::from_settings(&s),
+            HardwareRuntimeOverrides::default()
+        );
+    }
 
     fn profile(gpus: usize, vram_gb: f64) -> HardwareProfile {
         HardwareProfile {

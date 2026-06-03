@@ -14,6 +14,7 @@ fn main() -> Result<()> {
     let startup_settings = neoethos_core::Settings::load().unwrap_or_default();
     neoethos_search::install_search_runtime_overrides_from_settings(&startup_settings);
     neoethos_models::tree_models::config::install_tree_runtime_from_settings(&startup_settings);
+    neoethos_core::system::install_hardware_runtime_overrides_from_settings(&startup_settings);
     neoethos_data::install_data_runtime_overrides(
         startup_settings.models.data_runtime.normalize_features,
         startup_settings.models.data_runtime.rebuild_stale_higher_tfs,

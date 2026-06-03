@@ -95,6 +95,32 @@ pub struct SystemConfig {
     pub smc_atr_displacement: f64,
     pub smc_max_levels: usize,
     pub smc_use_cuda: bool,
+    /// Hardware / accelerator runtime knobs (config-driven replacement for the
+    /// env vars read by `HardwareRuntimeOverrides::from_env`). See
+    /// [`HardwareConfig`].
+    #[serde(default)]
+    pub hardware: HardwareConfig,
+}
+
+/// Hardware / accelerator runtime knobs — config-driven replacement for the env
+/// vars read by [`crate::system::HardwareRuntimeOverrides::from_env`]:
+/// `NEOETHOS_BOT_CPU_BUDGET`, `NEOETHOS_BOT_TRAIN_PRECISION` (+ the legacy
+/// `FOREX_TRAIN_PRECISION` remnant), `NEOETHOS_BOT_{CUDA,ROCM,WGPU}_PRECISIONS`,
+/// `NEOETHOS_BOT_WGPU_DEVICES`. All-`None`/empty defaults reproduce the
+/// historical env-absent behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HardwareConfig {
+    /// CPU thread budget for model training; `None` = auto (cores-based).
+    pub cpu_budget: Option<usize>,
+    /// Forced training precision; `None` = auto per accelerator.
+    pub training_precision: Option<crate::system::TrainingPrecision>,
+    /// Per-backend precision ladders; `None` = engine defaults.
+    pub cuda_precisions: Option<Vec<crate::system::TrainingPrecision>>,
+    pub rocm_precisions: Option<Vec<crate::system::TrainingPrecision>>,
+    pub wgpu_precisions: Option<Vec<crate::system::TrainingPrecision>>,
+    /// Explicit Vulkan/WGPU device names; empty = auto-enumerate.
+    pub wgpu_device_names: Vec<String>,
 }
 
 impl Default for SystemConfig {
@@ -181,6 +207,7 @@ impl Default for SystemConfig {
             smc_atr_displacement: 0.0,
             smc_max_levels: 0,
             smc_use_cuda: false,
+            hardware: HardwareConfig::default(),
         }
     }
 }
