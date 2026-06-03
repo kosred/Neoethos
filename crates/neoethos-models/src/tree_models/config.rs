@@ -30,10 +30,13 @@ pub struct TreeModelConfig {
 
 /// Process-wide tree-model runtime config, installed once from the operator's
 /// `Settings` at startup via [`install_tree_runtime_from_settings`]. The
-/// early-stop reader ([`get_early_stop_params`]) consults this instead of the
-/// old `NEOETHOS_BOT_EARLY_STOP_*` env vars (v0.4.36 config-consolidation).
+/// device / GPU / early-stop readers below consult this instead of the old
+/// `NEOETHOS_BOT_TREE_DEVICE` / `_GPU_ONLY` / `_EARLY_STOP_*` env vars
+/// (v0.4.36 config-consolidation).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TreeRuntimeOverrides {
+    pub device: String,
+    pub gpu_only: bool,
     pub early_stop_patience: Option<usize>,
     pub early_stop_min_delta: Option<f64>,
 }
@@ -41,6 +44,8 @@ pub struct TreeRuntimeOverrides {
 impl Default for TreeRuntimeOverrides {
     fn default() -> Self {
         Self {
+            device: "auto".to_string(),
+            gpu_only: false,
             early_stop_patience: None,
             early_stop_min_delta: None,
         }
@@ -54,6 +59,12 @@ impl TreeRuntimeOverrides {
     pub fn from_settings(s: &neoethos_core::Settings) -> Self {
         let c = &s.models.tree_runtime;
         Self {
+            device: if c.device.trim().is_empty() {
+                "auto".to_string()
+            } else {
+                c.device.clone()
+            },
+            gpu_only: c.gpu_only,
             early_stop_patience: c.early_stop_patience,
             early_stop_min_delta: c.early_stop_min_delta,
         }
@@ -113,26 +124,11 @@ pub fn tree_device_preference() -> DevicePreference {
     tree_device_preference_for("tree")
 }
 
-pub fn tree_device_preference_for(model_name: &str) -> DevicePreference {
-    let model_key = format!(
-        "NEOETHOS_BOT_{}_DEVICE",
-        model_name.trim().to_ascii_uppercase().replace('-', "_")
-    );
-    let raw = env::var(&model_key)
-        .or_else(|_| env::var("NEOETHOS_BOT_TREE_DEVICE"))
-        .unwrap_or_else(|_| "auto".to_string())
-        .trim()
-        .to_lowercase();
-    match raw.as_str() {
-        "cpu" => DevicePreference::Cpu,
-        value if value == "gpu" || value == "cuda" || value.starts_with("cuda:") => {
-            DevicePreference::Gpu
-        }
-        "auto" => DevicePreference::Auto,
-        "0" | "false" | "no" | "off" => DevicePreference::Cpu,
-        "1" | "true" | "yes" | "on" => DevicePreference::Gpu,
-        _ => DevicePreference::Auto,
-    }
+pub fn tree_device_preference_for(_model_name: &str) -> DevicePreference {
+    // Config-driven (was NEOETHOS_BOT_{MODEL}_DEVICE → NEOETHOS_BOT_TREE_DEVICE).
+    // Per-model overrides are folded into the single global `device` knob;
+    // `parse_device_preference` applies the same string vocabulary as before.
+    parse_device_preference(&current_tree_runtime().device)
 }
 
 pub fn parse_device_preference(value: &str) -> DevicePreference {
@@ -152,21 +148,10 @@ pub fn gpu_only_mode() -> bool {
     gpu_only_mode_for("tree")
 }
 
-pub fn gpu_only_mode_for(model_name: &str) -> bool {
-    let model_key = format!(
-        "NEOETHOS_BOT_{}_GPU_ONLY",
-        model_name.trim().to_ascii_uppercase().replace('-', "_")
-    );
-    env::var(&model_key)
-        .or_else(|_| env::var("NEOETHOS_BOT_GPU_ONLY"))
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+pub fn gpu_only_mode_for(_model_name: &str) -> bool {
+    // Config-driven (was NEOETHOS_BOT_{MODEL}_GPU_ONLY → NEOETHOS_BOT_GPU_ONLY).
+    // Per-model overrides are folded into the single global `gpu_only` knob.
+    current_tree_runtime().gpu_only
 }
 
 pub fn cpu_threads_hint_for(model_name: &str) -> usize {

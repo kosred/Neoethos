@@ -921,14 +921,24 @@ impl Default for DataRuntimeConfig {
     }
 }
 
-/// Tree-model (LightGBM / XGBoost / CatBoost) training knobs —
-/// config-driven replacement for the `NEOETHOS_BOT_EARLY_STOP_*` env vars.
-/// This struct will grow to also own the device / GPU / thread knobs
-/// (`NEOETHOS_BOT_TREE_DEVICE` / `_GPU_ONLY` / `_CPU_THREADS` / the
-/// `FOREX_GPU_COUNT` remnant) as the v0.4.36 config-consolidation continues.
+/// Tree-model (LightGBM / XGBoost / CatBoost) device + training knobs —
+/// config-driven replacement for the `NEOETHOS_BOT_TREE_DEVICE` / `_GPU_ONLY`
+/// / `_EARLY_STOP_*` env vars. Platform-standard GPU-selection knobs
+/// (`CUDA_VISIBLE_DEVICES`, …) are NOT app config and stay honored. (The
+/// cross-cutting `cpu_threads` budget — read in core/search/models, so it
+/// needs a single system-level knob — and the `FOREX_GPU_COUNT` → `gpu_count`
+/// remnant are separate follow-ups.)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TreeRuntimeConfig {
+    /// Device preference for tree-model training: `"auto"` | `"cpu"` |
+    /// `"gpu"` | `"cuda"` | `"cuda:N"`. `""` is treated as `"auto"`. Was
+    /// `NEOETHOS_BOT_TREE_DEVICE` (the per-model `_{MODEL}_DEVICE` overrides
+    /// are folded into this single global knob).
+    pub device: String,
+    /// Require GPU for tree training — no silent CPU fallback. Was
+    /// `NEOETHOS_BOT_GPU_ONLY`.
+    pub gpu_only: bool,
     /// Early-stop patience override for tree-model training; `None` (the
     /// default) = use each model's built-in default. Was
     /// `NEOETHOS_BOT_EARLY_STOP_PATIENCE`.
@@ -941,6 +951,8 @@ pub struct TreeRuntimeConfig {
 impl Default for TreeRuntimeConfig {
     fn default() -> Self {
         Self {
+            device: "auto".to_string(),
+            gpu_only: false,
             early_stop_patience: None,
             early_stop_min_delta: None,
         }
