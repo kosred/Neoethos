@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart' show EnginesSnapshot;
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -116,6 +117,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final async = ref.watch(enginesProvider);
     // Single source of truth: seed the GA hyperparameters from the user's
     // saved config the first time settings arrive. No hardcoded shallow
@@ -142,11 +144,11 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const ViewHeader(
-            title: 'Strategy Discovery Engine',
-            subtitle: 'Genetic search → portfolio',
+          ViewHeader(
+            title: l10n.discoveryTitle,
+            subtitle: l10n.discoverySubtitle,
           ),
-          _hyperparamsCard(),
+          _hyperparamsCard(context),
           // F-14: compact live-stats panel. Renders only while a
           // discovery run is active (counters non-empty); otherwise
           // collapses to SizedBox.shrink so it never adds dead space.
@@ -160,7 +162,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
           if (_symbolQueue.isEmpty)
             async.when(
               data: (e) => EngineControls(
-                kind: 'Discovery',
+                kind: l10n.engineDiscovery,
                 running: e.discoveryRunning,
                 state: e.discovery,
                 summary: e.discoverySummary,
@@ -180,22 +182,12 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                         ),
                 stop: () => ref.read(backendClientProvider).stopDiscovery(),
                 onChanged: () => ref.invalidate(enginesProvider),
-                description:
-                    'Discovery runs a genetic algorithm over the configured '
-                    'symbol/timeframe to evolve a portfolio of candidate '
-                    'strategies. Tune the GA knobs above before pressing '
-                    'Start; defaults come from config.yaml. Once a run '
-                    'completes, the selected portfolio lands in '
-                    'models_targets.json and Training picks it up '
-                    'automatically.\n\n'
-                    'Queue mode: add 2+ symbols to the queue above to run '
-                    'discovery sequentially across multiple pairs without '
-                    'baby-sitting each one.',
+                description: l10n.discoveryEngineControlsDescription,
               ),
               loading: () => const _Loading(),
               error: (err, _) => BackendErrorWidget(
                 error: err,
-                title: 'Discovery status unavailable',
+                title: l10n.discoveryStatusUnavailable,
               ),
             ),
         ],
@@ -203,19 +195,22 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
     );
   }
 
-  Widget _hyperparamsCard() {
+  Widget _hyperparamsCard(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final eta = _formatEta(_estimatedSeconds());
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: ExpansionTile(
-        title: const Text(
-          'Advanced: GA hyperparameters + higher timeframes',
-          style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+        title: Text(
+          l10n.discoveryAdvancedTitle,
+          style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
         ),
         subtitle: Text(
-          'Estimated runtime: $eta · pop × gen × candidates = '
-          '${_population * _generations * _targetCandidates} evaluations · '
-          '${_higherTfs.length} higher-TF',
+          l10n.discoveryAdvancedSubtitle(
+            eta,
+            _population * _generations * _targetCandidates,
+            _higherTfs.length,
+          ),
           style: const TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
         ),
         initiallyExpanded: _advancedOpen,
@@ -223,54 +218,49 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
         children: [
           _higherTfChips(),
           _slider(
-            label: 'Population',
+            label: l10n.discoverySliderPopulation,
             value: _population,
             min: 20,
             max: 1000,
             divisions: 49,
             onChanged: (v) => setState(() => _population = v.round()),
-            hint: 'Number of genomes per generation. Larger = '
-                'more exploration but slower.',
+            hint: l10n.discoverySliderPopulationHint,
           ),
           _slider(
-            label: 'Generations',
+            label: l10n.discoverySliderGenerations,
             value: _generations,
             min: 5,
             max: 2000,
             divisions: 399,
             onChanged: (v) => setState(() => _generations = v.round()),
-            hint: 'Evolutionary rounds. Diminishing returns past ~20 '
-                'for short-horizon strategies.',
+            hint: l10n.discoverySliderGenerationsHint,
           ),
           _slider(
-            label: 'Max indicators per strategy',
+            label: l10n.discoverySliderMaxIndicators,
             value: _maxIndicators,
             min: 3,
             max: 30,
             divisions: 27,
             onChanged: (v) => setState(() => _maxIndicators = v.round()),
-            hint: 'Cap on indicator features per candidate. Higher = '
-                'more expressive but easier to overfit.',
+            hint: l10n.discoverySliderMaxIndicatorsHint,
           ),
           _slider(
-            label: 'Target candidates',
+            label: l10n.discoverySliderTargetCandidates,
             value: _targetCandidates,
             min: 50,
             max: 1000,
             divisions: 19,
             onChanged: (v) => setState(() => _targetCandidates = v.round()),
-            hint: 'Number of evaluated candidates to keep before '
-                'portfolio selection.',
+            hint: l10n.discoverySliderTargetCandidatesHint,
           ),
           _slider(
-            label: 'Portfolio size',
+            label: l10n.discoverySliderPortfolioSize,
             value: _portfolioSize,
             min: 5,
             max: 200,
             divisions: 39,
             onChanged: (v) => setState(() => _portfolioSize = v.round()),
-            hint: 'Final selected portfolio size — what Training will '
-                'pick up.',
+            hint: l10n.discoverySliderPortfolioSizeHint,
           ),
         ],
       ),
@@ -287,31 +277,29 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
   /// gets {M5,M15,H1}). We keep at least one chip selected at all
   /// times.
   Widget _higherTfChips() {
+    final l10n = AppLocalizations.of(context)!;
     final tfAsync = ref.watch(brokerTimeframesProvider);
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'Higher timeframes (multi-select)',
-            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+          Text(
+            l10n.discoveryHigherTfTitle,
+            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: 4),
-          const Text(
-            'Discovery cross-confirms entries against these higher TFs in '
-            'addition to the base TF. Default mirrors backend '
-            'DEFAULT_HIGHER_TFS (M5/M15/H1).',
-            style: TextStyle(fontSize: 10, color: NeoethosTokens.textMuted),
+          Text(
+            l10n.discoveryHigherTfExplainer,
+            style: const TextStyle(fontSize: 10, color: NeoethosTokens.textMuted),
           ),
           const SizedBox(height: 8),
           tfAsync.when(
             data: (list) {
               if (list.isEmpty) {
-                return const Text(
-                  '/broker/timeframes returned an empty list — check '
-                  'neoethos_core::CANONICAL_TIMEFRAMES.',
-                  style: TextStyle(fontSize: 11, color: NeoethosTokens.sell),
+                return Text(
+                  l10n.discoveryTimeframesEmpty,
+                  style: const TextStyle(fontSize: 11, color: NeoethosTokens.sell),
                 );
               }
               return Wrap(
@@ -341,13 +329,11 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                                   _higherTfs.remove(tf);
                                 } else {
                                   ScaffoldMessenger.of(context)
-                                      .showSnackBar(const SnackBar(
+                                      .showSnackBar(SnackBar(
                                     content: Text(
-                                      'Keep at least one higher TF — '
-                                      'empty selection would silently '
-                                      'fall back to the server default.',
+                                      l10n.discoveryKeepOneTf,
                                     ),
-                                    duration: Duration(seconds: 2),
+                                    duration: const Duration(seconds: 2),
                                   ));
                                 }
                               });
@@ -356,12 +342,12 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                 ],
               );
             },
-            loading: () => const Text(
-              'Loading /broker/timeframes…',
-              style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
+            loading: () => Text(
+              l10n.discoveryLoadingTimeframes,
+              style: const TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
             ),
             error: (err, _) => Text(
-              'Cannot fetch timeframes from broker: $err',
+              l10n.discoveryTimeframesFetchError(err.toString()),
               style: const TextStyle(fontSize: 11, color: NeoethosTokens.warning),
             ),
           ),
@@ -377,6 +363,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
   ///   4. Run / Stop queue buttons + cursor progress
   ///   5. Live status line from the running discovery
   Widget _queueCard(AsyncValue<EnginesSnapshot> enginesAsync) {
+    final l10n = AppLocalizations.of(context)!;
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: Padding(
@@ -388,10 +375,10 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
               children: [
                 const Icon(Icons.queue, size: 16),
                 const SizedBox(width: 6),
-                const Text(
-                  'Multi-pair queue (sequential)',
-                  style:
-                      TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+                Text(
+                  l10n.discoveryQueueTitle,
+                  style: const TextStyle(
+                      fontWeight: FontWeight.w600, fontSize: 13),
                 ),
                 const Spacer(),
                 if (_symbolQueue.isNotEmpty)
@@ -403,17 +390,14 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                               _queueCursor = -1;
                             }),
                     icon: const Icon(Icons.clear_all, size: 14),
-                    label: const Text('Clear queue'),
+                    label: Text(l10n.discoveryClearQueue),
                   ),
               ],
             ),
             const SizedBox(height: 4),
-            const Text(
-              'Add 2+ symbols to run discovery sequentially. Each symbol '
-              'uses the same base TF + higher-TF set + GA knobs. The '
-              'next symbol starts only after the previous one reaches '
-              'a terminal state (Succeeded / Failed / Cancelled).',
-              style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
+            Text(
+              l10n.discoveryQueueExplainer,
+              style: const TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
             ),
             const SizedBox(height: 10),
             _queueAddRow(),
@@ -434,6 +418,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
   }
 
   Widget _queueAddRow() {
+    final l10n = AppLocalizations.of(context)!;
     final tfAsync = ref.watch(brokerTimeframesProvider);
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -444,12 +429,11 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
             controller: _queueSymbolController,
             enabled: !_queueRunning,
             textCapitalization: TextCapitalization.characters,
-            decoration: const InputDecoration(
-              labelText: 'Symbol (e.g. EURUSD)',
+            decoration: InputDecoration(
+              labelText: l10n.discoverySymbolLabel,
               isDense: true,
-              border: OutlineInputBorder(),
-              helperText: 'Type the broker ticker exactly. Validation '
-                  'happens server-side at run time.',
+              border: const OutlineInputBorder(),
+              helperText: l10n.discoverySymbolHelper,
             ),
             onSubmitted: (_) => _addToQueue(),
           ),
@@ -460,9 +444,9 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
           child: tfAsync.when(
             data: (list) {
               if (list.isEmpty) {
-                return const Text(
-                  'TF list empty',
-                  style: TextStyle(fontSize: 11, color: NeoethosTokens.sell),
+                return Text(
+                  l10n.discoveryTfListEmpty,
+                  style: const TextStyle(fontSize: 11, color: NeoethosTokens.sell),
                 );
               }
               final current =
@@ -473,10 +457,10 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                 });
               }
               return InputDecorator(
-                decoration: const InputDecoration(
-                  labelText: 'Base TF',
+                decoration: InputDecoration(
+                  labelText: l10n.discoveryBaseTfLabel,
                   isDense: true,
-                  border: OutlineInputBorder(),
+                  border: const OutlineInputBorder(),
                 ),
                 child: DropdownButtonHideUnderline(
                   child: DropdownButton<String>(
@@ -496,13 +480,12 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                 ),
               );
             },
-            loading: () => const Text(
-              'Loading TFs…',
-              style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
+            loading: () => Text(
+              l10n.discoveryLoadingTfs,
+              style: const TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
             ),
             error: (err, _) => Text(
-              'Could not load timeframes — ${describeError(err)}. '
-              'Authenticate in Broker Setup, then refresh.',
+              l10n.discoveryTfLoadError(describeError(err)),
               style: const TextStyle(fontSize: 11, color: NeoethosTokens.warning),
             ),
           ),
@@ -511,7 +494,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
         FilledButton.icon(
           onPressed: _queueRunning ? null : _addToQueue,
           icon: const Icon(Icons.add, size: 16),
-          label: const Text('Add'),
+          label: Text(l10n.discoveryAddButton),
         ),
         const SizedBox(width: 8),
         // F-337: multi-select pairs from the broker catalog (checkboxes +
@@ -519,7 +502,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
         OutlinedButton.icon(
           onPressed: _queueRunning ? null : _browsePairs,
           icon: const Icon(Icons.checklist, size: 16),
-          label: const Text('Browse'),
+          label: Text(l10n.discoveryBrowseButton),
         ),
       ],
     );
@@ -542,11 +525,11 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
 
   Widget _queueListChips() {
     if (_symbolQueue.isEmpty) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 4),
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
         child: Text(
-          'Queue empty — single-pair controls are active below.',
-          style: TextStyle(
+          AppLocalizations.of(context)!.discoveryQueueEmpty,
+          style: const TextStyle(
             fontSize: 11,
             color: NeoethosTokens.textFaint,
             fontStyle: FontStyle.italic,
@@ -613,6 +596,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
   }
 
   Widget _queueControlsRow(AsyncValue<EnginesSnapshot> enginesAsync) {
+    final l10n = AppLocalizations.of(context)!;
     final backendRunning =
         enginesAsync.valueOrNull?.discoveryRunning ?? false;
     return Row(
@@ -620,9 +604,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
         FilledButton.icon(
           onPressed: (_queueRunning || backendRunning) ? null : _runQueue,
           icon: const Icon(Icons.play_arrow, size: 16),
-          label: Text(_symbolQueue.length == 1
-              ? 'Run 1 symbol'
-              : 'Run queue (${_symbolQueue.length} symbols)'),
+          label: Text(l10n.discoveryRunQueueButton(_symbolQueue.length)),
         ),
         const SizedBox(width: 8),
         OutlinedButton.icon(
@@ -637,13 +619,14 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
           ),
           onPressed: _queueRunning ? _abortQueue : null,
           icon: const Icon(Icons.stop, size: 16),
-          label: const Text('Cancel queue'),
+          label: Text(l10n.discoveryCancelQueue),
         ),
       ],
     );
   }
 
   Widget _queueProgressRow(AsyncValue<EnginesSnapshot> enginesAsync) {
+    final l10n = AppLocalizations.of(context)!;
     final progress = (_queueCursor + 1).clamp(0, _symbolQueue.length);
     final percent =
         _symbolQueue.isEmpty ? 0.0 : progress / _symbolQueue.length;
@@ -657,8 +640,11 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
       children: [
         Text(
           _queueRunning
-              ? 'Queue progress: ${_queueCursor + 1}/${_symbolQueue.length}'
-                  '${activeSymbol.isEmpty ? '' : ' — $activeSymbol'}'
+              ? (activeSymbol.isEmpty
+                  ? l10n.discoveryQueueProgress(
+                      _queueCursor + 1, _symbolQueue.length)
+                  : l10n.discoveryQueueProgressSymbol(
+                      _queueCursor + 1, _symbolQueue.length, activeSymbol))
               : _queueSummary,
           style: const TextStyle(
             fontSize: 12,
@@ -689,7 +675,8 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
     if (_symbolQueue.contains(symbol)) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('$symbol is already in the queue.'),
+          content:
+              Text(AppLocalizations.of(context)!.discoverySymbolInQueue(symbol)),
           duration: const Duration(seconds: 2),
         ),
       );
@@ -711,10 +698,11 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
   ///   3. If the operator clicked Cancel mid-flight, break.
   Future<void> _runQueue() async {
     if (_symbolQueue.isEmpty || _queueRunning) return;
+    final l10n = AppLocalizations.of(context)!;
     if (_higherTfs.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text('Select at least one higher TF before starting.'),
-        duration: Duration(seconds: 2),
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(l10n.discoverySelectHigherTf),
+        duration: const Duration(seconds: 2),
       ));
       return;
     }
@@ -754,7 +742,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
             content: Text(
-              'Discovery stopped on $symbol — ${describeError(e)}.',
+              l10n.discoveryStoppedOn(symbol, describeError(e)),
             ),
             backgroundColor: const Color(0xFFB71C1C),
             duration: const Duration(seconds: 4),
@@ -766,7 +754,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
             content: Text(
-              'Discovery stopped on $symbol — ${describeError(e)}.',
+              l10n.discoveryStoppedOn(symbol, describeError(e)),
             ),
             backgroundColor: const Color(0xFFB71C1C),
             duration: const Duration(seconds: 4),
@@ -833,12 +821,12 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
         _queueRunning = false;
         _queueCursor = -1;
         _queueSummary = aborted
-            ? 'Queue cancelled (${_symbolQueue.length} symbols staged)'
+            ? l10n.discoveryQueueCancelled(_symbolQueue.length)
             : failed.isEmpty
-                ? 'Queue complete — ran ${_symbolQueue.length} symbols '
-                    'on $_queueBaseTf'
-                : 'Queue partial — ${failed.length} failures: '
-                    '${failed.join('; ')}';
+                ? l10n.discoveryQueueComplete(
+                    _symbolQueue.length, _queueBaseTf)
+                : l10n.discoveryQueuePartial(
+                    failed.length, failed.join('; '));
       });
       // A clean run can flash by in 4s, but a failure now carries an
       // actionable diagnosis (which funnel stage rejected everything +
@@ -925,22 +913,6 @@ class _DiscoveryLiveStats extends StatelessWidget {
   final EnginesSnapshot? snapshot;
   const _DiscoveryLiveStats({required this.snapshot});
 
-  /// Snake_case counter name → friendly label. Anything not in the map
-  /// falls back to a title-cased version of the raw name, so a new
-  /// backend counter still renders (just with a generic label) instead
-  /// of being silently dropped.
-  static const Map<String, String> _counterLabels = {
-    'generation': 'Generation',
-    'generations': 'Generations',
-    'population': 'Population',
-    'candidates': 'Candidates',
-    'filtered_candidates': 'Filtered',
-    'portfolio': 'Portfolio',
-    'archived_profitable': 'Archived profitable',
-    'evaluated': 'Evaluated',
-    'survivors': 'Survivors',
-  };
-
   /// Pairing rules: render "current / total" when both halves of a
   /// counter pair are present (e.g. `generation` 3 of `generations`
   /// 5 → "Generation · 3 / 5"). Maps the "current" name to its
@@ -956,9 +928,32 @@ class _DiscoveryLiveStats extends StatelessWidget {
     return cleaned[0].toUpperCase() + cleaned.substring(1);
   }
 
-  String _labelFor(String name) {
-    final mapped = _counterLabels[name];
-    if (mapped != null) return mapped;
+  /// Snake_case backend counter name → localized friendly label.
+  /// Anything not in the switch falls back to a title-cased version of
+  /// the raw name, so a new backend counter still renders (just with a
+  /// generic label) instead of being silently dropped.
+  String _labelFor(BuildContext context, String name) {
+    final l10n = AppLocalizations.of(context)!;
+    switch (name) {
+      case 'generation':
+        return l10n.discoveryCounterGeneration;
+      case 'generations':
+        return l10n.discoveryCounterGenerations;
+      case 'population':
+        return l10n.discoveryCounterPopulation;
+      case 'candidates':
+        return l10n.discoveryCounterCandidates;
+      case 'filtered_candidates':
+        return l10n.discoveryCounterFiltered;
+      case 'portfolio':
+        return l10n.discoveryCounterPortfolio;
+      case 'archived_profitable':
+        return l10n.discoveryCounterArchivedProfitable;
+      case 'evaluated':
+        return l10n.discoveryCounterEvaluated;
+      case 'survivors':
+        return l10n.discoveryCounterSurvivors;
+    }
     // Fallback: title-case the snake_case name.
     return name
         .split('_')
@@ -996,11 +991,12 @@ class _DiscoveryLiveStats extends StatelessWidget {
       final hasPair = totalName != null && byName.containsKey(totalName);
       final valueText =
           hasPair ? '${c.value} / ${byName[totalName]}' : '${c.value}';
-      chips.add(_StatChip(label: _labelFor(c.name), value: valueText));
+      chips.add(_StatChip(label: _labelFor(context, c.name), value: valueText));
     }
 
     if (chips.isEmpty) return const SizedBox.shrink();
 
+    final l10n = AppLocalizations.of(context)!;
     final stage = _humaniseStage(snap.discoveryStage);
     final percent = snap.discoveryPercent.clamp(0.0, 1.0);
     final pctLabel = '${(percent * 100).toStringAsFixed(0)}%';
@@ -1020,9 +1016,9 @@ class _DiscoveryLiveStats extends StatelessWidget {
                   color: NeoethosTokens.accent,
                 ),
                 const SizedBox(width: 6),
-                const Text(
-                  'Live stats',
-                  style: TextStyle(
+                Text(
+                  l10n.discoveryLiveStats,
+                  style: const TextStyle(
                     fontWeight: FontWeight.w700,
                     fontSize: NeoethosTokens.fsBody,
                     letterSpacing: 0.4,
@@ -1123,11 +1119,11 @@ class _StatChip extends StatelessWidget {
 class _Loading extends StatelessWidget {
   const _Loading();
   @override
-  Widget build(BuildContext context) => const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16),
         child: Text(
-          'Loading engine state…',
-          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+          AppLocalizations.of(context)!.discoveryLoadingEngineState,
+          style: const TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

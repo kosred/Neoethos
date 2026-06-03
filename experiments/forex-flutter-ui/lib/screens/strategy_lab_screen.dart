@@ -27,6 +27,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -44,17 +45,14 @@ class _StrategyLabScreenState extends ConsumerState<StrategyLabScreen>
     with SingleTickerProviderStateMixin {
   late final TabController _controller;
 
-  static const _stages = [
-    'Discovery',
-    'Training',
-    'Validation',
-    'Promotion Gate',
-  ];
+  // Number of pipeline tabs. The localized labels are built in [build]
+  // from the current context (see [_stageLabels]).
+  static const _stageCount = 4;
 
   @override
   void initState() {
     super.initState();
-    _controller = TabController(length: _stages.length, vsync: this);
+    _controller = TabController(length: _stageCount, vsync: this);
   }
 
   @override
@@ -65,12 +63,19 @@ class _StrategyLabScreenState extends ConsumerState<StrategyLabScreen>
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final stageLabels = [
+      l10n.engineDiscovery,
+      l10n.engineTraining,
+      l10n.strategyLabStageValidation,
+      l10n.strategyLabStagePromotionGate,
+    ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         const _PipelineStrip(),
         const SizedBox(height: NeoethosTokens.spSm),
-        _StageTabs(controller: _controller, stages: _stages),
+        _StageTabs(controller: _controller, stages: stageLabels),
         const SizedBox(height: NeoethosTokens.spSm),
         Expanded(
           child: TabBarView(
@@ -98,43 +103,45 @@ class _PipelineStrip extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final engines = ref.watch(enginesProvider).valueOrNull;
     final intel = ref.watch(intelligenceProvider).valueOrNull;
 
     final stages = <_StageCell>[
-      const _StageCell(
+      _StageCell(
         index: 1,
-        title: 'Data Ready',
+        title: l10n.strategyLabStageDataReady,
         // The /broker/symbols probe runs at app start; if the broker
         // is up at all this stage is satisfied. Operator only needs
         // to bootstrap historical data if it's missing on disk.
-        subtitle: 'Broker symbols subscribed',
+        subtitle: l10n.strategyLabDataReadySubtitle,
         status: _StageStatus.done,
       ),
       _StageCell(
         index: 2,
-        title: 'Discovery',
+        title: l10n.engineDiscovery,
         subtitle: engines == null
-            ? 'Idle'
-            : _enginePhrase(engines.discovery, 'GA search'),
+            ? l10n.statusIdle
+            : _enginePhrase(l10n, engines.discovery, l10n.strategyLabGaSearch),
         status: _statusFor(engines?.discovery),
       ),
       _StageCell(
         index: 3,
-        title: 'Training',
+        title: l10n.engineTraining,
         subtitle: engines == null
-            ? 'Idle'
-            : _enginePhrase(engines.training, 'Ensemble fit'),
+            ? l10n.statusIdle
+            : _enginePhrase(
+                l10n, engines.training, l10n.strategyLabEnsembleFit),
         status: _statusFor(engines?.training),
       ),
       _StageCell(
         index: 4,
-        title: 'Validation',
+        title: l10n.strategyLabStageValidation,
         subtitle: intel == null
             ? '—'
             : intel.walkforwardSplits == null ||
                     intel.walkforwardSplits == 0
-                ? 'Awaiting WFA'
+                ? l10n.strategyLabAwaitingWfa
                 : '${intel.walkforwardSplits} WFA splits · '
                     '${intel.walkforwardAvgAccuracy == null
                         ? '—'
@@ -143,10 +150,10 @@ class _PipelineStrip extends ConsumerWidget {
       ),
       _StageCell(
         index: 5,
-        title: 'Promotion Gate',
+        title: l10n.strategyLabStagePromotionGate,
         subtitle: intel == null || (intel.walkforwardSplits ?? 0) == 0
-            ? 'Awaiting validation'
-            : 'Manual review (F-330 ships auto-gate)',
+            ? l10n.strategyLabAwaitingValidation
+            : l10n.strategyLabPromotionManualReview,
         status: _promotionStatus(intel),
       ),
     ];
@@ -194,15 +201,16 @@ class _PipelineStrip extends ConsumerWidget {
     }
   }
 
-  static String _enginePhrase(String state, String what) {
+  static String _enginePhrase(
+      AppLocalizations l10n, String state, String what) {
     switch (state.toLowerCase()) {
       case 'running':
-        return '$what running…';
+        return l10n.strategyLabPhraseRunning(what);
       case 'error':
       case 'failed':
-        return '$what failed';
+        return l10n.strategyLabPhraseFailed(what);
       case 'idle':
-        return '$what idle';
+        return l10n.strategyLabPhraseIdle(what);
       default:
         return state;
     }
@@ -242,12 +250,13 @@ class _StageCell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final (statusLabel, statusColor) = switch (status) {
-      _StageStatus.done => ('READY', NeoethosTokens.buy),
-      _StageStatus.running => ('RUN', NeoethosTokens.accent),
-      _StageStatus.warn => ('CHECK', NeoethosTokens.warning),
-      _StageStatus.error => ('ERROR', NeoethosTokens.sell),
-      _StageStatus.idle => ('IDLE', NeoethosTokens.textFaint),
+      _StageStatus.done => (l10n.strategyLabBadgeReady, NeoethosTokens.buy),
+      _StageStatus.running => (l10n.strategyLabBadgeRun, NeoethosTokens.accent),
+      _StageStatus.warn => (l10n.strategyLabBadgeCheck, NeoethosTokens.warning),
+      _StageStatus.error => (l10n.strategyLabBadgeError, NeoethosTokens.sell),
+      _StageStatus.idle => (l10n.strategyLabBadgeIdle, NeoethosTokens.textFaint),
     };
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
@@ -378,21 +387,19 @@ class _ValidationStub extends ConsumerWidget {
   const _ValidationStub();
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final intel = ref.watch(intelligenceProvider).valueOrNull;
     final splits = intel?.walkforwardSplits ?? 0;
     final acc = intel?.walkforwardAvgAccuracy;
     return _PlaceholderCard(
       ticket: 'F-330',
-      title: 'Validation',
+      title: l10n.strategyLabStageValidation,
       body: splits == 0
-          ? 'No walk-forward run yet. Once Training completes, the WFA '
-              'sweep populates this panel with split-by-split accuracy + '
-              'Sharpe / Calmar / win-rate per fold.'
-          : '$splits WFA splits completed. Average accuracy: '
-              '${acc == null ? "—" : "${(acc * 100).toStringAsFixed(1)}%"}.\n\n'
-              'The detailed per-split table + sensitivity sweep + Monte '
-              'Carlo confidence intervals land with F-330 (backend '
-              'orchestrator) and the proper per-stage param cards.',
+          ? l10n.strategyLabValidationBodyEmpty
+          : l10n.strategyLabValidationBodyDone(
+              splits,
+              acc == null ? '—' : '${(acc * 100).toStringAsFixed(1)}%',
+            ),
     );
   }
 }
@@ -429,6 +436,7 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
   }
 
   Future<void> _load() async {
+    final l10n = AppLocalizations.of(context)!;
     setState(() {
       _loading = true;
       _error = null;
@@ -453,15 +461,14 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _error = 'Backtest could not start — ${describeError(e)}. '
-            'Ensure the engine is healthy and the symbol has local data '
-            '(Data Bootstrap).';
+        _error = l10n.strategyLabBacktestStartError(describeError(e));
         _loading = false;
       });
     }
   }
 
   Future<void> _promote() async {
+    final l10n = AppLocalizations.of(context)!;
     setState(() => _promoting = true);
     try {
       final client = ref.read(backendClientProvider);
@@ -483,7 +490,7 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
         showTranslatedErrorSnackbar(
           context,
           e,
-          prefix: 'Could not promote to live',
+          prefix: l10n.strategyLabPromoteError,
         );
       }
     } catch (e) {
@@ -491,7 +498,7 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
         showTranslatedErrorSnackbar(
           context,
           e,
-          prefix: 'Could not promote to live',
+          prefix: l10n.strategyLabPromoteError,
         );
       }
     } finally {
@@ -524,22 +531,23 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
   }
 
   Widget _body() {
+    final l10n = AppLocalizations.of(context)!;
     if (_loading) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 40),
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 40),
         child: Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              SizedBox(
+              const SizedBox(
                 width: 22,
                 height: 22,
                 child: CircularProgressIndicator(strokeWidth: 2.4),
               ),
-              SizedBox(height: NeoethosTokens.spMd),
+              const SizedBox(height: NeoethosTokens.spMd),
               Text(
-                'Checking promotion gate…',
-                style: TextStyle(
+                l10n.strategyLabCheckingGate,
+                style: const TextStyle(
                   color: NeoethosTokens.textMuted,
                   fontSize: NeoethosTokens.fsBody,
                 ),
@@ -555,13 +563,14 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Row(
+          Row(
             children: [
-              Icon(Icons.error_outline, color: NeoethosTokens.sell, size: 18),
-              SizedBox(width: NeoethosTokens.spSm),
+              const Icon(Icons.error_outline,
+                  color: NeoethosTokens.sell, size: 18),
+              const SizedBox(width: NeoethosTokens.spSm),
               Text(
-                'Could not load promotion gate',
-                style: TextStyle(
+                l10n.strategyLabGateLoadError,
+                style: const TextStyle(
                   fontSize: NeoethosTokens.fsSubtitle,
                   fontWeight: FontWeight.w700,
                   color: NeoethosTokens.textPrimary,
@@ -584,7 +593,7 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
             child: OutlinedButton.icon(
               onPressed: _load,
               icon: const Icon(Icons.refresh, size: 16),
-              label: const Text('Retry'),
+              label: Text(l10n.commonRetry),
             ),
           ),
         ],
@@ -595,9 +604,11 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
   }
 
   Widget _content(PromotionStatus s) {
+    final l10n = AppLocalizations.of(context)!;
     final promoted = s.decision.promoted;
     final badgeColor = promoted ? NeoethosTokens.buy : NeoethosTokens.warning;
-    final badgeLabel = promoted ? 'ELIGIBLE' : 'BLOCKED';
+    final badgeLabel =
+        promoted ? l10n.strategyLabBadgeEligible : l10n.strategyLabBadgeBlocked;
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -606,9 +617,9 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
         // Header: title + symbol/tf + status badge + refresh.
         Row(
           children: [
-            const Text(
-              'Promotion Gate',
-              style: TextStyle(
+            Text(
+              l10n.strategyLabStagePromotionGate,
+              style: const TextStyle(
                 fontSize: NeoethosTokens.fsSubtitle,
                 fontWeight: FontWeight.w700,
                 color: NeoethosTokens.textPrimary,
@@ -626,7 +637,7 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
             _statusBadge(badgeLabel, badgeColor),
             const SizedBox(width: NeoethosTokens.spSm),
             IconButton(
-              tooltip: 'Refresh',
+              tooltip: l10n.strategyLabRefreshTooltip,
               onPressed: _loading ? null : _load,
               icon: const Icon(Icons.refresh, size: 18),
               color: NeoethosTokens.textMuted,
@@ -649,8 +660,8 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
           child: Text(
             s.decision.summary.isEmpty
                 ? (promoted
-                    ? 'Portfolio is eligible for promotion.'
-                    : 'Portfolio is not eligible for promotion yet.')
+                    ? l10n.strategyLabSummaryEligible
+                    : l10n.strategyLabSummaryNotEligible)
                 : s.decision.summary,
             style: TextStyle(
               fontSize: NeoethosTokens.fsBody,
@@ -663,24 +674,23 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
         const SizedBox(height: NeoethosTokens.spLg),
 
         // Portfolio + aggregate metrics.
-        const _SectionLabel('PORTFOLIO'),
+        _SectionLabel(l10n.strategyLabSectionPortfolio),
         const SizedBox(height: NeoethosTokens.spSm),
         _metricsGrid(s),
         const SizedBox(height: NeoethosTokens.spLg),
 
         // Criteria breakdown.
         if (s.decision.criteria.isNotEmpty) ...[
-          const _SectionLabel('GATE CRITERIA'),
+          _SectionLabel(l10n.strategyLabSectionGateCriteria),
           const SizedBox(height: NeoethosTokens.spSm),
           for (final c in s.decision.criteria) _criterionRow(c),
           const SizedBox(height: NeoethosTokens.spLg),
         ] else ...[
-          const Padding(
-            padding: EdgeInsets.only(bottom: NeoethosTokens.spLg),
+          Padding(
+            padding: const EdgeInsets.only(bottom: NeoethosTokens.spLg),
             child: Text(
-              'No criteria evaluated yet — run Discovery + Training to '
-              'build a portfolio for this symbol/timeframe.',
-              style: TextStyle(
+              l10n.strategyLabNoCriteria,
+              style: const TextStyle(
                 fontSize: NeoethosTokens.fsBody,
                 color: NeoethosTokens.textMuted,
                 height: 1.4,
@@ -704,7 +714,9 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
                     ),
                   )
                 : const Icon(Icons.upload, size: 16),
-            label: Text(_promoting ? 'Promoting…' : 'Promote to Live'),
+            label: Text(_promoting
+                ? l10n.strategyLabPromoting
+                : l10n.strategyLabPromoteToLive),
             style: FilledButton.styleFrom(
               backgroundColor: NeoethosTokens.buy,
               disabledBackgroundColor:
@@ -737,9 +749,10 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
   }
 
   Widget _metricsGrid(PromotionStatus s) {
+    final l10n = AppLocalizations.of(context)!;
     final agg = s.aggregate;
     final tiles = <Widget>[
-      _metricTile('Portfolio size', '${s.portfolioSize}'),
+      _metricTile(l10n.strategyLabMetricPortfolioSize, '${s.portfolioSize}'),
       if (agg != null) ...[
         _metricTile('Sharpe', agg.sharpe.toStringAsFixed(2)),
         _metricTile('Win rate', '${(agg.winRate * 100).toStringAsFixed(1)}%'),
@@ -748,11 +761,12 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
           'Max drawdown',
           '${agg.maxDrawdownPct.toStringAsFixed(1)}%',
         ),
-        _metricTile('Trades', '${agg.trades}'),
+        _metricTile(l10n.strategyLabMetricTrades, '${agg.trades}'),
       ],
     ];
     if (agg == null) {
-      tiles.add(_metricTile('Metrics', 'No portfolio yet'));
+      tiles.add(
+          _metricTile(l10n.strategyLabMetricMetrics, l10n.strategyLabNoPortfolioYet));
     }
     return Wrap(
       spacing: NeoethosTokens.spSm,

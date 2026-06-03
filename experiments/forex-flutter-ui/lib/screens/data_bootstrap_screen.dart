@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../widgets/backend_error_widget.dart';
 import '../state/system_providers.dart';
@@ -26,19 +27,20 @@ class DataBootstrapScreen extends ConsumerWidget {
   const DataBootstrapScreen({super.key});
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final inventory = ref.watch(dataBootstrapProvider);
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const ViewHeader(
-            title: 'Data Bootstrap',
-            subtitle: 'Local OHLCV inventory · historical download',
+          ViewHeader(
+            title: l10n.dataBootstrapTitle,
+            subtitle: l10n.dataBootstrapSubtitle,
           ),
           inventory.when(
             data: (d) => _Body(snapshot: d),
             loading: () => const _Loading(),
-            error: (err, _) => BackendErrorWidget(error: err, title: 'Data tools unavailable'),
+            error: (err, _) => BackendErrorWidget(error: err, title: l10n.dataBootstrapToolsUnavailable),
           ),
         ],
       ),
@@ -90,12 +92,13 @@ class _BodyState extends ConsumerState<_Body> {
   }
 
   Future<void> _onApplyDataDir() async {
+    final l10n = AppLocalizations.of(context)!;
     final dir = _dataDirCtrl.text.trim();
     if (dir.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
+        SnackBar(
           backgroundColor: NeoethosTokens.sell,
-          content: Text('Data directory cannot be blank'),
+          content: Text(l10n.dataBootstrapDirBlank),
         ),
       );
       return;
@@ -109,19 +112,19 @@ class _BodyState extends ConsumerState<_Body> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: NeoethosTokens.buy,
-          content: Text('Data directory set to $dir'),
+          content: Text(l10n.dataBootstrapDirSet(dir)),
           duration: const Duration(seconds: 3),
         ),
       );
     } on DioException catch (e) {
       if (!mounted) return;
-      showTranslatedErrorSnackbar(context, e, prefix: 'Save failed');
+      showTranslatedErrorSnackbar(context, e, prefix: l10n.dataBootstrapSaveFailed);
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: NeoethosTokens.sell,
-          content: Text('Data directory could not be saved — ${describeError(e)}. Make sure the path exists and the app can write to it.'),
+          content: Text(l10n.dataBootstrapDirSaveError(describeError(e))),
         ),
       );
     } finally {
@@ -148,6 +151,7 @@ class _BodyState extends ConsumerState<_Body> {
   }
 
   Future<void> _onImport() async {
+    final l10n = AppLocalizations.of(context)!;
     final path = _importPathCtrl.text.trim();
     if (path.isEmpty) return;
     final symbol = _symbol.trim().toUpperCase();
@@ -165,34 +169,35 @@ class _BodyState extends ConsumerState<_Body> {
       final written = (r['writtenPath'] as String?) ?? '';
       final fmt = (r['sourceFormat'] as String?) ?? '?';
       setState(
-          () => _importResult = 'Imported $fmt → $written');
+          () => _importResult = l10n.dataBootstrapImportedResult(fmt, written));
       ref.invalidate(dataBootstrapProvider);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: NeoethosTokens.buy,
-          content: Text('Imported $symbol $_timeframe from $fmt'),
+          content: Text(l10n.dataBootstrapImportedSnack(symbol, _timeframe, fmt)),
           duration: const Duration(seconds: 3),
         ),
       );
     } on DioException catch (e) {
       final msg = describeError(e);
-      setState(() => _importResult = 'Failed: $msg');
+      setState(() => _importResult = l10n.dataBootstrapFailedResult(msg));
       if (!mounted) return;
-      showTranslatedErrorSnackbar(context, e, prefix: 'Import failed');
+      showTranslatedErrorSnackbar(context, e, prefix: l10n.dataBootstrapImportFailed);
     } finally {
       if (mounted) setState(() => _importBusy = false);
     }
   }
 
   Future<void> _onDownload() async {
+    final l10n = AppLocalizations.of(context)!;
     final symbol = _symbol.trim().toUpperCase();
     if (symbol.isEmpty) return;
     if (_toDate.isBefore(_fromDate)) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
+        SnackBar(
           backgroundColor: NeoethosTokens.sell,
-          content: Text('From-date must be before to-date'),
+          content: Text(l10n.dataBootstrapFromBeforeTo),
         ),
       );
       return;
@@ -215,23 +220,19 @@ class _BodyState extends ConsumerState<_Body> {
       final oldestMs = (r['oldestMs'] as num?)?.toInt();
       String d(DateTime t) =>
           '${t.year}-${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')}';
-      final buf = StringBuffer('$count bars written to $path');
+      final buf = StringBuffer(l10n.dataBootstrapBarsWritten(count, path));
       if (oldestMs != null && count > 0) {
         final oldest = DateTime.fromMillisecondsSinceEpoch(oldestMs);
         final years = _toDate.difference(oldest).inDays / 365.0;
         buf.write(
-            '\nOldest bar: ${d(oldest)} (~${years.toStringAsFixed(1)}y deep).');
+            '\n${l10n.dataBootstrapOldestBar(d(oldest), years.toStringAsFixed(1))}');
         // Did the broker stop well short of the requested start?
         if (oldest.difference(_fromDate).inDays > 30) {
-          buf.write(
-              '\n⚠ cTrader returned only back to ${d(oldest)}, not your '
-              'requested ${d(_fromDate)} — cTrader history is depth-limited '
-              '(~2-3y for most symbols). For deeper history, import an '
-              'MT5/CSV/Parquet file below.');
+          buf.write('\n${l10n.dataBootstrapDepthWarning(d(oldest), d(_fromDate))}');
         }
       }
       if (hasMore) {
-        buf.write('\n(broker hasMore=true — widen range or split into chunks)');
+        buf.write('\n${l10n.dataBootstrapHasMore}');
       }
       setState(() => _lastResult = buf.toString());
       ref.invalidate(dataBootstrapProvider);
@@ -239,15 +240,15 @@ class _BodyState extends ConsumerState<_Body> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: NeoethosTokens.buy,
-          content: Text('Downloaded $count $symbol $_timeframe bars'),
+          content: Text(l10n.dataBootstrapDownloadedSnack(count, symbol, _timeframe)),
           duration: const Duration(seconds: 3),
         ),
       );
     } on DioException catch (e) {
       final msg = describeError(e);
-      setState(() => _lastResult = 'Failed: $msg');
+      setState(() => _lastResult = l10n.dataBootstrapFailedResult(msg));
       if (!mounted) return;
-      showTranslatedErrorSnackbar(context, e, prefix: 'Download failed');
+      showTranslatedErrorSnackbar(context, e, prefix: l10n.dataBootstrapDownloadFailed);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -255,6 +256,7 @@ class _BodyState extends ConsumerState<_Body> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final snapshot = widget.snapshot;
     final dtFmt = DateFormat('yyyy-MM-dd HH:mm');
     final mtime = snapshot.lastTouchedUnixMs == null
@@ -269,16 +271,13 @@ class _BodyState extends ConsumerState<_Body> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         SectionCard(
-          title: 'Data directory',
+          title: l10n.dataBootstrapDataDirTitle,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                "Point this at your historical-data folder (the one "
-                "containing symbol=EURUSD/ etc.). Relative paths resolve "
-                "against the app's working directory; use an absolute "
-                "path to be sure.",
-                style: TextStyle(
+              Text(
+                l10n.dataBootstrapDataDirHelp,
+                style: const TextStyle(
                   color: NeoethosTokens.textMuted,
                   fontSize: 12,
                 ),
@@ -292,11 +291,11 @@ class _BodyState extends ConsumerState<_Body> {
                   fontSize: 13,
                   color: NeoethosTokens.textPrimary,
                 ),
-                decoration: const InputDecoration(
-                  labelText: 'Folder path',
-                  hintText: r'Absolute path, e.g. C:\Users\you\forex-ai\data',
+                decoration: InputDecoration(
+                  labelText: l10n.dataBootstrapFolderPathLabel,
+                  hintText: l10n.dataBootstrapFolderPathHint,
                   isDense: true,
-                  border: OutlineInputBorder(),
+                  border: const OutlineInputBorder(),
                 ),
               ),
               const SizedBox(height: 6),
@@ -304,8 +303,8 @@ class _BodyState extends ConsumerState<_Body> {
               // (the snapshot), which updates after Apply re-fetches.
               Text(
                 dataDirExists
-                    ? '✓ ${snapshot.symbols.length} symbols found'
-                    : '✗ directory not found / empty',
+                    ? l10n.dataBootstrapSymbolsFound(snapshot.symbols.length)
+                    : l10n.dataBootstrapDirNotFound,
                 style: TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w600,
@@ -320,7 +319,7 @@ class _BodyState extends ConsumerState<_Body> {
                   FilledButton.icon(
                     onPressed: _dataDirBusy ? null : _onApplyDataDir,
                     icon: const Icon(Icons.folder_open, size: 18),
-                    label: const Text('Apply'),
+                    label: Text(l10n.dataBootstrapApply),
                   ),
                   if (_dataDirBusy) ...[
                     const SizedBox(width: 12),
@@ -336,24 +335,24 @@ class _BodyState extends ConsumerState<_Body> {
           ),
         ),
         SectionCard(
-          title: 'Inventory',
+          title: l10n.dataBootstrapInventoryTitle,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _Row('Data directory', snapshot.dataDir),
+              _Row(l10n.dataBootstrapRowDataDir, snapshot.dataDir),
               _Row(
-                'Directory exists',
-                snapshot.dataDirExists ? 'YES' : 'NO',
+                l10n.dataBootstrapRowDirExists,
+                snapshot.dataDirExists ? l10n.dataBootstrapYes : l10n.dataBootstrapNo,
                 accent: snapshot.dataDirExists
                     ? NeoethosTokens.buy
                     : NeoethosTokens.sell,
               ),
-              _Row('Files', '${snapshot.fileCount}'),
-              _Row('Last touched', mtime),
+              _Row(l10n.dataBootstrapRowFiles, '${snapshot.fileCount}'),
+              _Row(l10n.dataBootstrapRowLastTouched, mtime),
               _Row(
-                'Symbols mapped',
+                l10n.dataBootstrapRowSymbolsMapped,
                 snapshot.symbols.isEmpty
-                    ? '(none)'
+                    ? l10n.dataBootstrapNone
                     : '${snapshot.symbols.length}',
               ),
             ],
@@ -361,7 +360,7 @@ class _BodyState extends ConsumerState<_Body> {
         ),
         if (snapshot.symbols.isNotEmpty)
           SectionCard(
-            title: 'Symbol directories',
+            title: l10n.dataBootstrapSymbolDirsTitle,
             child: Wrap(
               spacing: 6,
               runSpacing: 6,
@@ -390,17 +389,13 @@ class _BodyState extends ConsumerState<_Body> {
             ),
           ),
         SectionCard(
-          title: 'Download history from broker',
+          title: l10n.dataBootstrapDownloadTitle,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                'Pull as many years of OHLCV as the broker has on file. '
-                'Symbol is anything in the broker catalog (forex pairs, '
-                'metals, indices). Wide ranges may need multiple downloads '
-                '— if the response shows hasMore=true, narrow the window '
-                'and re-fetch the missing tail.',
-                style: TextStyle(
+              Text(
+                l10n.dataBootstrapDownloadHelp,
+                style: const TextStyle(
                   color: NeoethosTokens.textMuted,
                   fontSize: 12,
                 ),
@@ -435,7 +430,7 @@ class _BodyState extends ConsumerState<_Body> {
                     child: OutlinedButton.icon(
                       onPressed: _busy ? null : () => _pickDate(isFrom: true),
                       icon: const Icon(Icons.calendar_today, size: 14),
-                      label: Text('From: ${dateFmt.format(_fromDate)}'),
+                      label: Text(l10n.dataBootstrapFromDate(dateFmt.format(_fromDate))),
                     ),
                   ),
                   const SizedBox(width: 8),
@@ -443,7 +438,7 @@ class _BodyState extends ConsumerState<_Body> {
                     child: OutlinedButton.icon(
                       onPressed: _busy ? null : () => _pickDate(isFrom: false),
                       icon: const Icon(Icons.calendar_today, size: 14),
-                      label: Text('To: ${dateFmt.format(_toDate)}'),
+                      label: Text(l10n.dataBootstrapToDate(dateFmt.format(_toDate))),
                     ),
                   ),
                 ],
@@ -454,7 +449,7 @@ class _BodyState extends ConsumerState<_Body> {
                   FilledButton.icon(
                     onPressed: _busy ? null : _onDownload,
                     icon: const Icon(Icons.cloud_download, size: 18),
-                    label: const Text('Download'),
+                    label: Text(l10n.dataBootstrapDownload),
                   ),
                   if (_busy) ...[
                     const SizedBox(width: 12),
@@ -485,15 +480,13 @@ class _BodyState extends ConsumerState<_Body> {
           // parquet, json, jsonl, arrow, ipc, feather). This unblocks the
           // "I have years of MT4/MT5 history exported as CSV, don't make
           // me re-download" workflow.
-          title: 'Import a local OHLCV file',
+          title: l10n.dataBootstrapImportTitle,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                'Paste the full path to a CSV, TSV, Parquet, JSON, JSONL '
-                'or Arrow/IPC file. The Symbol + Timeframe selected above '
-                'decide where the converted Vortex file lands on disk.',
-                style: TextStyle(
+              Text(
+                l10n.dataBootstrapImportHelp,
+                style: const TextStyle(
                   color: NeoethosTokens.textMuted,
                   fontSize: 12,
                 ),
@@ -502,12 +495,11 @@ class _BodyState extends ConsumerState<_Body> {
               TextField(
                 controller: _importPathCtrl,
                 enabled: !_importBusy,
-                decoration: const InputDecoration(
-                  labelText: 'Source path',
-                  hintText:
-                      r'C:\Users\you\Downloads\EURUSD_H1_2023.csv',
+                decoration: InputDecoration(
+                  labelText: l10n.dataBootstrapSourcePathLabel,
+                  hintText: r'C:\Users\you\Downloads\EURUSD_H1_2023.csv',
                   isDense: true,
-                  border: OutlineInputBorder(),
+                  border: const OutlineInputBorder(),
                 ),
               ),
               const SizedBox(height: 12),
@@ -516,7 +508,7 @@ class _BodyState extends ConsumerState<_Body> {
                   FilledButton.icon(
                     onPressed: _importBusy ? null : _onImport,
                     icon: const Icon(Icons.file_upload, size: 18),
-                    label: const Text('Import file'),
+                    label: Text(l10n.dataBootstrapImportFile),
                   ),
                   if (_importBusy) ...[
                     const SizedBox(width: 12),
@@ -592,11 +584,11 @@ class _Row extends StatelessWidget {
 class _Loading extends StatelessWidget {
   const _Loading();
   @override
-  Widget build(BuildContext context) => const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16),
         child: Text(
-          'Scanning data directory…',
-          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+          AppLocalizations.of(context)!.dataBootstrapScanning,
+          style: const TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

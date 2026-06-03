@@ -15,6 +15,7 @@ import 'package:dio/dio.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../widgets/backend_error_widget.dart';
 import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
@@ -156,6 +157,7 @@ class ChartScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final multi = ref.watch(multiChartEnabledProvider);
     final activeSymbol = ref.watch(_slotA.symbol);
     final activeTimeframe = ref.watch(_slotA.timeframe);
@@ -168,10 +170,10 @@ class ChartScreen extends ConsumerWidget {
             children: [
               Expanded(
                 child: ViewHeader(
-                  title: multi ? 'Charts (A + B)' : 'Chart',
+                  title: multi ? l10n.chartTitleMulti : l10n.chartTitle,
                   subtitle: multi
-                      ? 'Compare two symbols · max 2 panels (deliberate UX constraint)'
-                      : 'Live broker candles · drag left to load more history (no 200 cap)',
+                      ? l10n.chartSubtitleMulti
+                      : l10n.chartSubtitleSingle,
                 ),
               ),
               const SizedBox(width: 12),
@@ -186,7 +188,7 @@ class ChartScreen extends ConsumerWidget {
                   activeTimeframe,
                 ),
                 icon: const Icon(Icons.psychology_alt_outlined),
-                label: const Text('Ask AI'),
+                label: Text(l10n.chartAskAi),
               ),
             ],
           ),
@@ -196,7 +198,7 @@ class ChartScreen extends ConsumerWidget {
           // the trade thesis. The "vs 16" in the task title is the
           // anti-goal we're avoiding.
           SectionCard(
-            title: 'Layout',
+            title: l10n.chartLayout,
             child: Row(
               children: [
                 Switch(
@@ -208,11 +210,8 @@ class ChartScreen extends ConsumerWidget {
                 Expanded(
                   child: Text(
                     multi
-                        ? 'Comparison mode ON — panel A + panel B side-by-side. '
-                            'Each panel has its own symbol, timeframe, and '
-                            'indicators.'
-                        : 'Single chart. Toggle ON to compare two symbols '
-                            'side-by-side (max 2 — no 4/8/16 grid by design).',
+                        ? l10n.chartLayoutComparisonOn
+                        : l10n.chartLayoutSingle,
                     style: const TextStyle(
                       fontSize: 11,
                       color: NeoethosTokens.textMuted,
@@ -290,6 +289,9 @@ class _ContextualAiSheetState extends ConsumerState<_ContextualAiSheet> {
   Future<void> _send() async {
     final q = _input.text.trim();
     if (q.isEmpty || _busy) return;
+    // Capture the localized error prefix before the await — the
+    // BuildContext may be gone by the time the future resolves.
+    final l10n = AppLocalizations.of(context)!;
     // Inject the chart context as a soft prefix the model can use
     // without echoing back. Keep terse.
     final prompt =
@@ -308,8 +310,8 @@ class _ContextualAiSheetState extends ConsumerState<_ContextualAiSheet> {
       setState(() => _msgs.add((user: false, text: r.response.trim())));
     } on DioException catch (e) {
       if (!mounted) return;
-      setState(
-          () => _msgs.add((user: false, text: 'Error: ${describeError(e)}')));
+      setState(() => _msgs.add(
+          (user: false, text: '${l10n.commonError}: ${describeError(e)}')));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -317,6 +319,7 @@ class _ContextualAiSheetState extends ConsumerState<_ContextualAiSheet> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: const BoxDecoration(
@@ -333,7 +336,7 @@ class _ContextualAiSheetState extends ConsumerState<_ContextualAiSheet> {
                   color: NeoethosTokens.textPrimary),
               const SizedBox(width: 8),
               Text(
-                'Ask AI · ${widget.symbol} ${widget.timeframe}',
+                l10n.chartAskAiContext(widget.symbol, widget.timeframe),
                 style: const TextStyle(
                   fontWeight: FontWeight.w700,
                   fontSize: 14,
@@ -383,10 +386,10 @@ class _ContextualAiSheetState extends ConsumerState<_ContextualAiSheet> {
                 child: TextField(
                   controller: _input,
                   enabled: !_busy,
-                  decoration: const InputDecoration(
-                    hintText: 'Ask about this chart…',
+                  decoration: InputDecoration(
+                    hintText: l10n.chartAskHint,
                     isDense: true,
-                    border: OutlineInputBorder(),
+                    border: const OutlineInputBorder(),
                   ),
                   onSubmitted: (_) => _send(),
                 ),
@@ -401,7 +404,7 @@ class _ContextualAiSheetState extends ConsumerState<_ContextualAiSheet> {
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
                     : const Icon(Icons.send, size: 16),
-                label: const Text('Send'),
+                label: Text(l10n.chartSend),
               ),
             ],
           ),
@@ -420,6 +423,7 @@ class _ChartPanel extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final symbol = ref.watch(slot.symbol);
     final timeframe = ref.watch(slot.timeframe);
     final async = ref.watch(slot.chart);
@@ -441,22 +445,24 @@ class _ChartPanel extends ConsumerWidget {
           // gets EURUSD / EURJPY / EURGBP / EURCAD as suggestions. The
           // catalog count is appended to the label so users still know
           // how many symbols the broker exposed.
-          title: 'Panel ${slot.label} · Symbol',
+          title: l10n.chartPanelSymbol(slot.label),
           child: SymbolPicker(
             value: symbol,
-            label: 'Symbol',
+            label: l10n.thSymbol,
             onChanged: (s) => ref.read(slot.symbol.notifier).state = s,
           ),
         ),
         SectionCard(
-          title: 'Panel ${slot.label} · Timeframe'
-              '${brokerTimeframes.hasValue ? ' · ${timeframeChoices.length} canonical' : ''}',
+          title: l10n.chartPanelTimeframe(slot.label) +
+              (brokerTimeframes.hasValue
+                  ? l10n.chartTimeframeCanonical(timeframeChoices.length)
+                  : ''),
           child: timeframeChoices.isEmpty
               ? Text(
                   brokerTimeframes.hasError
-                      ? 'Timeframe list unavailable: '
-                          '${brokerTimeframes.error}'
-                      : 'Loading timeframes…',
+                      ? l10n.chartTimeframeUnavailable(
+                          brokerTimeframes.error.toString())
+                      : l10n.chartTimeframeLoading,
                   style: const TextStyle(
                     fontSize: 11,
                     color: NeoethosTokens.warning,
@@ -494,7 +500,7 @@ class _ChartPanel extends ConsumerWidget {
             details.globalPosition,
           ),
           child: SectionCard(
-            title: 'Panel ${slot.label} · Indicators',
+            title: l10n.chartPanelIndicators(slot.label),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -545,13 +551,8 @@ class _ChartPanel extends ConsumerWidget {
                           );
                           return serverFed
                               ? Tooltip(
-                                  message:
-                                      '${_indicatorLabel(ind)} has no native '
-                                      'k_chart_plus form, so it is computed '
-                                      'server-side and drawn in its own strip '
-                                      'below the candles (auto-scaled). VWAP '
-                                      'is a price level; ATR/ADX are '
-                                      'oscillators.',
+                                  message: l10n.chartServerFedTooltip(
+                                      _indicatorLabel(ind)),
                                   child: chip,
                                 )
                               : chip;
@@ -561,18 +562,18 @@ class _ChartPanel extends ConsumerWidget {
                 ),
                 const SizedBox(height: 6),
                 // Discoverability hint for the right-click add path.
-                const Row(
+                Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(
+                    const Icon(
                       Icons.ads_click,
                       size: 11,
                       color: NeoethosTokens.textMuted,
                     ),
-                    SizedBox(width: 4),
+                    const SizedBox(width: 4),
                     Text(
-                      'Right-click for the multi-select indicator menu',
-                      style: TextStyle(
+                      l10n.chartRightClickHint,
+                      style: const TextStyle(
                         fontSize: 10,
                         fontStyle: FontStyle.italic,
                         color: NeoethosTokens.textMuted,
@@ -587,7 +588,8 @@ class _ChartPanel extends ConsumerWidget {
         async.when(
           data: (c) => _ChartBody(snapshot: c, slot: slot),
           loading: () => const _Loading(),
-          error: (err, _) => BackendErrorWidget(error: err, title: 'Chart data unavailable'),
+          error: (err, _) =>
+              BackendErrorWidget(error: err, title: l10n.chartDataUnavailable),
         ),
       ],
     );
@@ -607,13 +609,14 @@ class _ChartPanel extends ConsumerWidget {
     _ChartSlot slot,
     Offset globalPosition,
   ) {
+    final l10n = AppLocalizations.of(context)!;
     final overlaySize = MediaQuery.of(context).size;
     showDialog<void>(
       context: context,
       // Translucent (not transparent) so it reads as a modal layer but
       // the chart stays visible behind it.
       barrierColor: Colors.black.withValues(alpha: 0.15),
-      barrierLabel: 'Indicator menu',
+      barrierLabel: l10n.chartIndicatorMenuLabel,
       builder: (dialogCtx) {
         // Clamp the anchor so the ~300px-wide / up-to-440px-tall card
         // never spills off-screen when the operator right-clicks near an
@@ -646,6 +649,7 @@ class _ChartBody extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final changePos = snapshot.priceChangePct >= 0;
     // Live tick overlay (#137): if the streamer has a fresh tick
     // for this symbol, prefer it over the historical-bar latestClose
@@ -679,8 +683,8 @@ class _ChartBody extends ConsumerWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         SectionCard(
-          title:
-              'Panel ${slot.label} · ${snapshot.symbol} · ${snapshot.timeframe}',
+          title: l10n.chartPanelHeader(
+              slot.label, snapshot.symbol, snapshot.timeframe),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -699,9 +703,9 @@ class _ChartBody extends ConsumerWidget {
                   ),
                   if (livePrice != null) ...[
                     const SizedBox(width: 6),
-                    const Tooltip(
-                      message: 'Live tick (sub-2 s)',
-                      child: Icon(
+                    Tooltip(
+                      message: l10n.chartLiveTick,
+                      child: const Icon(
                         Icons.bolt,
                         size: 16,
                         color: NeoethosTokens.buy,
@@ -724,9 +728,10 @@ class _ChartBody extends ConsumerWidget {
                   const Spacer(),
                   Text(
                     hasData
-                        ? 'range ${snapshot.priceMin.toStringAsFixed(5)} – '
-                            '${snapshot.priceMax.toStringAsFixed(5)}'
-                        : 'no data — run Data Bootstrap',
+                        ? l10n.chartRange(
+                            snapshot.priceMin.toStringAsFixed(5),
+                            snapshot.priceMax.toStringAsFixed(5))
+                        : l10n.chartNoDataBootstrap,
                     style: const TextStyle(
                       fontSize: 11,
                       color: NeoethosTokens.textMuted,
@@ -790,9 +795,10 @@ class _ChartSourceBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final text = snapshot.isDiskCache
-        ? 'Cached candles — broker unreachable, showing last saved data'
-        : 'Chart data source: ${snapshot.source}';
+        ? l10n.chartCachedCandles
+        : l10n.chartDataSource(snapshot.source);
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
@@ -865,6 +871,9 @@ class _AutoFetchPromptState extends ConsumerState<_AutoFetchPrompt> {
   }
 
   Future<void> _fetch() async {
+    // Capture the localizations before the await so we can build the
+    // error message even if the element is disposed mid-fetch.
+    final l10n = AppLocalizations.of(context)!;
     setState(() {
       _busy = true;
       _error = null;
@@ -885,7 +894,10 @@ class _AutoFetchPromptState extends ConsumerState<_AutoFetchPrompt> {
       // Re-pull the chart now that bars exist on disk.
       ref.invalidate(widget.slot.chart);
     } catch (err) {
-      if (mounted) setState(() => _error = 'Could not download ${widget.symbol} history — ${describeError(err)}. Check your broker connection and try again.');
+      if (mounted) {
+        setState(() => _error =
+            l10n.chartFetchFailed(widget.symbol, describeError(err)));
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -893,12 +905,13 @@ class _AutoFetchPromptState extends ConsumerState<_AutoFetchPrompt> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 24),
       child: Column(
         children: [
           Text(
-            'No candles on disk for ${widget.symbol} ${widget.timeframe}.',
+            l10n.chartNoCandles(widget.symbol, widget.timeframe),
             style: const TextStyle(
               color: NeoethosTokens.textMuted,
               fontSize: 12,
@@ -914,9 +927,7 @@ class _AutoFetchPromptState extends ConsumerState<_AutoFetchPrompt> {
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
                 : const Icon(Icons.cloud_download_outlined),
-            label: Text(_busy
-                ? 'Fetching last 30 days from broker…'
-                : 'Fetch last 30 days from broker'),
+            label: Text(_busy ? l10n.chartFetchingBroker : l10n.chartFetchBroker),
           ),
           if (_error != null) ...[
             const SizedBox(height: 8),
@@ -951,6 +962,7 @@ class _IndicatorMultiSelectMenu extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final active = ref.watch(slot.activeIndicators);
 
     void toggle(String id) {
@@ -997,9 +1009,10 @@ class _IndicatorMultiSelectMenu extends ConsumerWidget {
           ),
         ),
         subtitle: serverFed
-            ? const Text(
-                'server strip',
-                style: TextStyle(fontSize: 9, color: NeoethosTokens.textMuted),
+            ? Text(
+                l10n.chartServerStrip,
+                style: const TextStyle(
+                    fontSize: 9, color: NeoethosTokens.textMuted),
               )
             : null,
       );
@@ -1028,7 +1041,7 @@ class _IndicatorMultiSelectMenu extends ConsumerWidget {
                   const Icon(Icons.tune, size: 14, color: NeoethosTokens.accent),
                   const SizedBox(width: 6),
                   Text(
-                    'Indicators · Panel ${slot.label}',
+                    l10n.chartIndicatorsPanel(slot.label),
                     style: const TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.w800,
@@ -1045,9 +1058,9 @@ class _IndicatorMultiSelectMenu extends ConsumerWidget {
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    groupHeader('Price overlays'),
+                    groupHeader(l10n.chartGroupPriceOverlays),
                     for (final id in _priceOverlayIndicators) row(id),
-                    groupHeader('Oscillators'),
+                    groupHeader(l10n.chartGroupOscillators),
                     for (final id in _oscillatorIndicators) row(id),
                   ],
                 ),
@@ -1059,7 +1072,7 @@ class _IndicatorMultiSelectMenu extends ConsumerWidget {
               child: Row(
                 children: [
                   Text(
-                    '${active.length} active · tick several, then Done',
+                    l10n.chartActiveCount(active.length),
                     style: const TextStyle(
                       fontSize: 10,
                       color: NeoethosTokens.textMuted,
@@ -1068,7 +1081,7 @@ class _IndicatorMultiSelectMenu extends ConsumerWidget {
                   const Spacer(),
                   TextButton(
                     onPressed: () => Navigator.of(context).pop(),
-                    child: const Text('Done'),
+                    child: Text(l10n.chartDone),
                   ),
                 ],
               ),
@@ -1125,12 +1138,15 @@ class _Chip extends StatelessWidget {
 class _Loading extends StatelessWidget {
   const _Loading();
   @override
-  Widget build(BuildContext context) => const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
-        child: Text(
-          'Loading candles…',
-          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
-        ),
-      );
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 16),
+      child: Text(
+        l10n.chartLoadingCandles,
+        style: const TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+      ),
+    );
+  }
 }
 
