@@ -60,6 +60,16 @@ pub struct SystemConfig {
     /// explicit `models.discovery_mode = "strict"` is a power-user escape hatch
     /// that overrides the discovery side only. Default `"prop_firm"`.
     pub trading_mode: String,
+    /// Risky-Mode goal — capital multiplication. The operator sets where to
+    /// start, where to reach, and by when; in Risky mode these PRESSURE the
+    /// strategy search to surface portfolios that can compound from start to
+    /// target within the horizon (see `DiscoveryConfig::risky_*` + the
+    /// target-aware candidate ranking). Defaults 100 -> 10,000 in 180 days
+    /// (~6 months — beyond that it is closer to normal trading, per the
+    /// operator's Risky-vs-normal distinction).
+    pub risky_start_balance_usd: f64,
+    pub risky_target_balance_usd: f64,
+    pub risky_horizon_days: u32,
     pub multi_resolution_enabled: bool,
     pub multi_resolution_timeframes: Vec<String>,
     pub multi_resolution_prefix_base: bool,
@@ -171,6 +181,9 @@ impl Default for SystemConfig {
             data_dir: PathBuf::from("data"),
             ui_locale: "en".to_string(),
             trading_mode: "prop_firm".to_string(),
+            risky_start_balance_usd: 100.0,
+            risky_target_balance_usd: 10000.0,
+            risky_horizon_days: 180,
             multi_resolution_enabled: true,
             multi_resolution_timeframes: CANONICAL_TIMEFRAMES
                 .iter()

@@ -275,6 +275,15 @@ pub struct DiscoveryConfig {
     /// `derive_prop_firm_gate` when `apply_mode_overrides` runs in PropFirm
     /// mode. Replaces the `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` env overrides.
     pub prop_firm_gate_params: neoethos_core::config::PropFirmGateConfig,
+    /// Risky-Mode capital-multiplication goal (config-driven via `system.risky_*`).
+    /// When `mode == Risky` these PRESSURE the candidate ranking: each strategy
+    /// is scored by how well it could compound from `risky_start_balance` to
+    /// `risky_target_balance` within `risky_horizon_days` at safe (half-Kelly)
+    /// sizing of its own measured edge — so the search surfaces strategies that
+    /// can actually hit the operator's goal in time. Ignored in Strict/PropFirm.
+    pub risky_start_balance: f64,
+    pub risky_target_balance: f64,
+    pub risky_horizon_days: f64,
 }
 
 /// Configuration for the prop-firm window-pass gate.
@@ -337,6 +346,11 @@ impl Default for DiscoveryConfig {
             // resolve_discovery_mode() fallback (PropFirm).
             mode: DiscoveryMode::PropFirm,
             prop_firm_gate_params: neoethos_core::config::PropFirmGateConfig::default(),
+            // Risky-Mode goal defaults (mirror SystemConfig): 100 -> 10,000 in
+            // 180 days. Ignored unless mode == Risky.
+            risky_start_balance: 100.0,
+            risky_target_balance: 10000.0,
+            risky_horizon_days: 180.0,
         }
     }
 }
@@ -450,6 +464,9 @@ impl DiscoveryConfig {
                 &model_settings.discovery_mode,
             ),
             prop_firm_gate_params: model_settings.discovery_runtime.prop_firm_gate.clone(),
+            risky_start_balance: settings.system.risky_start_balance_usd,
+            risky_target_balance: settings.system.risky_target_balance_usd,
+            risky_horizon_days: settings.system.risky_horizon_days as f64,
         }
     }
 
@@ -2606,10 +2623,66 @@ where
     // (fitness is the GA's own growth objective) with NO drawdown tax, so the
     // fastest compounder wins even on a deep equity curve.
     let risky_ranking = matches!(config.mode, DiscoveryMode::Risky);
+    // Target-aware Risky ranking precompute: the required TOTAL log-growth to
+    // get from the operator's start balance to their target, and the dataset
+    // span in days (to scale each gene's trade cadence to the horizon). This is
+    // the "pressure on the search" — the goal flows into selection.
+    let required_log_growth = if risky_ranking && config.risky_start_balance > 0.0 {
+        (config.risky_target_balance / config.risky_start_balance)
+            .max(1.0)
+            .ln()
+    } else {
+        0.0
+    };
+    let span_days = if features.timestamps.len() >= 2 {
+        ((features.timestamps[features.timestamps.len() - 1] - features.timestamps[0]).max(0)
+            as f64)
+            / 86_400_000.0
+    } else {
+        0.0
+    };
     let calculate_income_score = |gene: &Gene| -> f64 {
         if risky_ranking {
-            let pf = (gene.profit_factor.max(0.0)).min(5.0) / 5.0; // 0-1, up to 5x
-            gene.fitness.max(0.0) * (0.70 + 0.20 * pf + 0.10 * gene.win_rate)
+            // Per-trade edge from the gene's OWN measured stats.
+            let p = gene.win_rate.clamp(0.0, 1.0);
+            let pf = gene.profit_factor.max(0.0);
+            // Kelly fraction f* = p·(pf−1)/pf (0 when no edge); half-Kelly,
+            // capped at 25% so a single loss never wipes the bankroll.
+            let f_star = if pf > 1.0 && p > 0.0 {
+                p * (pf - 1.0) / pf
+            } else {
+                0.0
+            };
+            let f = (f_star * 0.5).clamp(0.0, 0.25);
+            // Reward-to-risk implied by (pf, p): avg_win / avg_loss.
+            let rr = if p > 0.0 && p < 1.0 {
+                pf * (1.0 - p) / p
+            } else {
+                0.0
+            };
+            // Expected per-trade log-growth at f (the Kelly growth rate).
+            let g_trade = if f > 0.0 && rr > 0.0 {
+                p * (1.0 + rr * f).ln() + (1.0 - p) * (1.0 - f).ln()
+            } else {
+                0.0
+            };
+            // Trades this gene would fire over the horizon (scale its backtest
+            // cadence to the horizon length).
+            let trades_in_horizon = if span_days > 0.0 {
+                gene.trades_count as f64 / span_days * config.risky_horizon_days
+            } else {
+                0.0
+            };
+            let achievable = g_trade * trades_in_horizon;
+            // Score by how close to (or past) the required growth, capped so a
+            // high-variance overshoot does not win on luck; a mild fitness tilt
+            // breaks ties toward robust genes.
+            let ratio = if required_log_growth > 0.0 {
+                (achievable / required_log_growth).max(0.0)
+            } else {
+                achievable.max(0.0)
+            };
+            ratio.min(3.0) * (0.7 + 0.3 * gene.fitness.max(0.0).min(1.0))
         } else {
             let pf_capped = gene.profit_factor.min(3.0) / 3.0; // Normalized 0-1
             let safety = (1.0 - gene.max_drawdown / 0.07).clamp(0.0, 1.0);
