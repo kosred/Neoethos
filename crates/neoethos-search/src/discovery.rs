@@ -157,6 +157,31 @@ impl DiscoveryRuntimeOverrides {
         overrides
     }
 
+    /// Config-driven replacement for [`from_env`]: reads the discovery
+    /// runtime knobs from `models.discovery_runtime` instead of the
+    /// `NEOETHOS_BOT_*` environment. The validation mirrors `from_env`
+    /// (out-of-range values fall back to the default) so config defaults
+    /// reproduce the env-absent behaviour exactly.
+    pub fn from_settings(settings: &neoethos_core::Settings) -> Self {
+        let cfg = &settings.models.discovery_runtime;
+        let mut overrides = Self::default();
+        overrides.prefilter_top_k = cfg.prefilter_top_k;
+        if cfg.prefilter_insample_frac.is_finite()
+            && cfg.prefilter_insample_frac > 0.0
+            && cfg.prefilter_insample_frac <= 1.0
+        {
+            overrides.prefilter_insample_frac = cfg.prefilter_insample_frac;
+        }
+        if cfg.funnel_stage1_pct.is_finite() {
+            overrides.funnel_stage1_pct = cfg.funnel_stage1_pct.clamp(0.01, 1.0);
+        }
+        if let Some(window) = Stage1Window::from_env_str(&cfg.stage1_window) {
+            overrides.stage1_window = window;
+        }
+        overrides.min_history_years = cfg.min_history_years;
+        overrides
+    }
+
     fn resolved_funnel_stage1_pct(&self) -> f64 {
         if self.funnel_stage1_pct.is_finite() {
             self.funnel_stage1_pct.clamp(0.01, 1.0)
@@ -232,6 +257,11 @@ pub struct DiscoveryConfig {
     /// Commission per lot used in the sensitivity test. Previously
     /// hardcoded $7/lot.
     pub sensitivity_commission_per_lot: f64,
+    /// Opt-in adaptive coarse-threshold ladder (config-driven replacement
+    /// for the `NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS` env flag). Read by
+    /// `run_discovery_cycle` before gene initialisation. Default `false`
+    /// reproduces the env-absent behaviour.
+    pub adaptive_thresholds: bool,
 }
 
 /// Configuration for the prop-firm window-pass gate.
@@ -289,6 +319,7 @@ impl Default for DiscoveryConfig {
             mc_min_profitable: 70,
             sensitivity_spread_pips: 2.0,
             sensitivity_commission_per_lot: 7.0,
+            adaptive_thresholds: false,
         }
     }
 }
@@ -380,7 +411,7 @@ impl DiscoveryConfig {
             initial_balance: settings.risk.initial_balance.max(1.0),
             max_regime_loss_pct: 3.0,
             higher_timeframes: settings.system.higher_timeframes.clone(),
-            runtime_overrides: DiscoveryRuntimeOverrides::default(),
+            runtime_overrides: DiscoveryRuntimeOverrides::from_settings(settings),
             prop_firm_gate: None,
             // 2026-05-26 operator directive (dual-mode product): Settings is
             // now the single source of truth for these knobs. The corr_threshold
@@ -396,6 +427,7 @@ impl DiscoveryConfig {
             sensitivity_commission_per_lot: model_settings
                 .prop_search_sensitivity_commission_per_lot
                 .max(0.0),
+            adaptive_thresholds: model_settings.discovery_runtime.adaptive_thresholds,
         }
     }
 
@@ -411,8 +443,13 @@ impl DiscoveryConfig {
     /// where the operator wants to lock in a specific value, but the
     /// happy-path call needs none of them.
     pub fn with_env_runtime_overrides(mut self) -> Self {
-        self.runtime_overrides = DiscoveryRuntimeOverrides::from_env();
-
+        // Stage A config-consolidation (2026-06-03): `runtime_overrides`
+        // (prefilter / funnel / stage1-window / min-history) now come from
+        // `models.discovery_runtime` via `DiscoveryConfig::from_settings`
+        // (→ `DiscoveryRuntimeOverrides::from_settings`), not the env — so we
+        // no longer clobber them here. This builder retains the legacy mode /
+        // min-trades-per-day / prop-firm-gate env reads (Stage B migration);
+        // the name is kept until those move to config too.
         let mode = resolve_discovery_mode();
 
         if let Some(value) = read_env_f64("NEOETHOS_BOT_DISCOVERY_MIN_TRADES_PER_DAY") {
@@ -1895,7 +1932,7 @@ where
     // for z-score-normalised features with unit-ish variance, but real
     // datasets vary widely in magnitude (XAGUSD M1 vs EURUSD D1 differ
     // by ~10×). When the operator opts in via
-    // `NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS=1`, derive a per-dataset
+    // `models.discovery_runtime.adaptive_thresholds`, derive a per-dataset
     // ladder from the actual feature cube — gene init then picks
     // thresholds at percentile points of the dataset's own signal
     // magnitude distribution.
@@ -1905,10 +1942,7 @@ where
     // symbols would inherit the first symbol's ladder. The operator
     // should disable the feature for production multi-symbol sweeps
     // until F-277b adds per-symbol installation (deferred).
-    if std::env::var("NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
+    if config.adaptive_thresholds {
         if let Some(ladder) =
             crate::genetic::derive_adaptive_threshold_ladder_from_features(&features.data)
         {

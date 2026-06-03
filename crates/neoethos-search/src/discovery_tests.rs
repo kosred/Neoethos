@@ -1460,6 +1460,20 @@ fn propfirm_mode_leaves_m1_min_trades_per_month_unchanged() {
     assert_eq!(cfg.filtering.min_trades_per_month, 15.0);
 }
 
+#[test]
+fn discovery_runtime_from_settings_default_matches_env_default() {
+    // Stage A config-consolidation behaviour lock: with config at its
+    // defaults, `DiscoveryRuntimeOverrides::from_settings` reproduces the
+    // env-absent `default()` (== `from_env()` with no NEOETHOS_BOT_* set)
+    // exactly — so existing deployments are unaffected by the env→config move
+    // of prefilter / funnel / stage1-window / min-history knobs.
+    let s = neoethos_core::Settings::default();
+    assert_eq!(
+        DiscoveryRuntimeOverrides::from_settings(&s),
+        DiscoveryRuntimeOverrides::default(),
+    );
+}
+
 // ── F-343 (#14): actionable empty-portfolio diagnosis ────────────────
 
 #[test]

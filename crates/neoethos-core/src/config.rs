@@ -617,6 +617,11 @@ pub struct ModelsConfig {
     /// Genetic-search runtime knobs (config-driven replacement for the
     /// `NEOETHOS_BOT_*` search env vars). See [`SearchRuntimeConfig`].
     pub search_runtime: SearchRuntimeConfig,
+    /// Discovery-pipeline runtime knobs (config-driven replacement for the
+    /// `NEOETHOS_BOT_PREFILTER_*` / `NEOETHOS_BOT_FUNNEL_STAGE1_*` /
+    /// `NEOETHOS_BOT_MIN_HISTORY_YEARS` / `NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS`
+    /// env vars). See [`DiscoveryRuntimeConfig`].
+    pub discovery_runtime: DiscoveryRuntimeConfig,
     /// Strategy-evaluation runtime knobs (config-driven replacement for
     /// the `NEOETHOS_BOT_PROP_*` cost + SMC-weight env vars). See
     /// [`EvalRuntimeConfig`].
@@ -729,6 +734,54 @@ impl Default for SearchRuntimeConfig {
             immigrant_ratio: 0.25,
             survivor_fraction: 0.10,
             selection_temperature: 0.75,
+        }
+    }
+}
+
+/// Discovery-pipeline runtime knobs — the config-driven replacement for the
+/// legacy `NEOETHOS_BOT_PREFILTER_TOP_K`, `NEOETHOS_BOT_PREFILTER_INSAMPLE`,
+/// `NEOETHOS_BOT_FUNNEL_STAGE1_PCT`, `NEOETHOS_BOT_FUNNEL_STAGE1_WINDOW`,
+/// `NEOETHOS_BOT_MIN_HISTORY_YEARS`, and `NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS`
+/// env vars. Consumed by `DiscoveryConfig::from_settings` (via
+/// `DiscoveryRuntimeOverrides::from_settings`) — the operator sets these from
+/// the UI / TUI, never the environment. Defaults reproduce the previous
+/// env-absent behaviour exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DiscoveryRuntimeConfig {
+    /// Max features kept after the in-sample correlation prefilter; `0`
+    /// disables the prefilter. (was `NEOETHOS_BOT_PREFILTER_TOP_K`)
+    pub prefilter_top_k: usize,
+    /// Fraction of rows treated as in-sample when ranking features; must be
+    /// in `(0, 1]`. (was `NEOETHOS_BOT_PREFILTER_INSAMPLE`)
+    pub prefilter_insample_frac: f64,
+    /// Fraction of rows fed to the multi-stage funnel's first stage; clamped
+    /// to `[0.01, 1.0]`. (was `NEOETHOS_BOT_FUNNEL_STAGE1_PCT`)
+    pub funnel_stage1_pct: f64,
+    /// Where to slice the stage-1 fast-eval rows: `"earliest"` (default,
+    /// OOS-safe), `"latest"`, or `"random"`. (was
+    /// `NEOETHOS_BOT_FUNNEL_STAGE1_WINDOW`)
+    pub stage1_window: String,
+    /// Minimum historical-data window (years) discovery requires before it
+    /// runs; `0` skips the pre-flight check. (was
+    /// `NEOETHOS_BOT_MIN_HISTORY_YEARS`)
+    pub min_history_years: u32,
+    /// Opt-in: derive a per-dataset adaptive coarse-threshold ladder from the
+    /// feature cube. Experimental — the install is process-global (OnceLock),
+    /// so leave off for multi-symbol sweeps until per-symbol install lands
+    /// (F-277b). (was `NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS`)
+    pub adaptive_thresholds: bool,
+}
+
+impl Default for DiscoveryRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            prefilter_top_k: 50,
+            prefilter_insample_frac: 0.70,
+            funnel_stage1_pct: 0.25,
+            stage1_window: "earliest".to_string(),
+            min_history_years: 0,
+            adaptive_thresholds: false,
         }
     }
 }
@@ -1197,6 +1250,7 @@ impl Default for ModelsConfig {
             embargo_minutes: 120,
             discovery_mode: "prop_firm".to_string(),
             search_runtime: SearchRuntimeConfig::default(),
+            discovery_runtime: DiscoveryRuntimeConfig::default(),
             eval_runtime: EvalRuntimeConfig::default(),
             quality_runtime: QualityRuntimeConfig::default(),
             backtest_runtime: BacktestRuntimeConfig::default(),
