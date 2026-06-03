@@ -14,6 +14,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -23,6 +24,7 @@ class StatusBar extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final asyncAccount = ref.watch(accountSnapshotProvider);
     final brokerAsync = ref.watch(brokerStatusProvider);
     final enginesAsync = ref.watch(enginesProvider);
@@ -32,25 +34,31 @@ class StatusBar extends ConsumerWidget {
     // from accountSnapshotProvider so the bar isn't empty on cold start.
     final (brokerValue, brokerOk) = brokerAsync.maybeWhen(
       data: (b) => (
-        '${b.adapter} · ${b.environment}${b.connected ? "" : " · offline"}',
+        '${b.adapter} · ${b.environment}${b.connected ? "" : " · ${l10n.statusOffline}"}',
         b.connected,
       ),
       orElse: () => switch (asyncAccount) {
-        AsyncData() => ('cTrader · connecting', false),
+        AsyncData() => ('cTrader · ${l10n.statusConnecting}', false),
         AsyncError(error: final e) when e is BrokerNotReadyException =>
-          ('cTrader · connecting', false),
-        AsyncError() => ('cTrader · offline', false),
-        _ => ('cTrader · connecting', false),
+          ('cTrader · ${l10n.statusConnecting}', false),
+        AsyncError() => ('cTrader · ${l10n.statusOffline}', false),
+        _ => ('cTrader · ${l10n.statusConnecting}', false),
       },
     );
 
     final (engineValue, engineRunning) = enginesAsync.maybeWhen(
       data: (e) {
         bool running(String s) => s.toLowerCase() == 'running';
-        if (running(e.discovery)) return ('Discovery · running', true);
-        if (running(e.training)) return ('Training · running', true);
-        if (running(e.autoTrader)) return ('Auto-trader · running', true);
-        return ('Idle', false);
+        if (running(e.discovery)) {
+          return ('${l10n.engineDiscovery} · ${l10n.statusRunning}', true);
+        }
+        if (running(e.training)) {
+          return ('${l10n.engineTraining} · ${l10n.statusRunning}', true);
+        }
+        if (running(e.autoTrader)) {
+          return ('${l10n.engineAutoTrader} · ${l10n.statusRunning}', true);
+        }
+        return (l10n.statusIdle, false);
       },
       orElse: () => ('—', false),
     );
@@ -67,12 +75,12 @@ class StatusBar extends ConsumerWidget {
           _StatusItem(label: 'Broker', value: brokerValue, success: brokerOk),
           const _StatusSep(),
           _StatusItem(
-            label: 'Engine',
+            label: l10n.statusEngine,
             value: engineValue,
             success: engineRunning,
           ),
           const _StatusSep(),
-          const _StatusItem(label: 'News blackout', value: '—'),
+          _StatusItem(label: l10n.statusNewsBlackout, value: '—'),
           const Spacer(),
           const _StatusItem(label: 'v0.4.35'),
         ],
