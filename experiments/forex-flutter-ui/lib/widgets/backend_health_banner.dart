@@ -15,6 +15,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../l10n/app_localizations.dart';
 import '../startup/backend_watchdog.dart';
 import '../theme/theme.dart';
 import 'backend_diagnostics_dialog.dart';
@@ -24,15 +25,13 @@ class BackendHealthBanner extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final health = ref.watch(backendHealthProvider);
     if (!health.isDegraded) return const SizedBox.shrink();
 
     final attempts = health.respawnAttempts;
-    final attemptSuffix = attempts == 0
-        ? ''
-        : attempts == 1
-            ? ' (restart #1 in progress)'
-            : ' (restart #$attempts in progress)';
+    final attemptSuffix =
+        attempts == 0 ? '' : l10n.backendHealthRestartProgress(attempts);
 
     return Material(
       color: NeoethosTokens.sell.withValues(alpha: 0.16),
@@ -63,7 +62,7 @@ class BackendHealthBanner extends ConsumerWidget {
               const SizedBox(width: NeoethosTokens.spSm),
               Expanded(
                 child: Text(
-                  'Backend reconnecting…$attemptSuffix',
+                  l10n.backendHealthReconnecting(attemptSuffix),
                   style: const TextStyle(
                     fontSize: NeoethosTokens.fsBody,
                     fontWeight: FontWeight.w700,
@@ -71,9 +70,9 @@ class BackendHealthBanner extends ConsumerWidget {
                   ),
                 ),
               ),
-              const Text(
-                'Click for diagnostics',
-                style: TextStyle(
+              Text(
+                l10n.backendHealthClickForDiagnostics,
+                style: const TextStyle(
                   fontSize: NeoethosTokens.fsCaption,
                   color: NeoethosTokens.textMuted,
                 ),

@@ -29,6 +29,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
+import '../l10n/app_localizations.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 
@@ -51,7 +52,8 @@ class SymbolPicker extends ConsumerStatefulWidget {
 
   /// Label rendered above the field (e.g. `"Symbol"`, `"Pair"`). The
   /// catalog count is appended automatically when the provider has data.
-  final String label;
+  /// When null, a localized default ("Symbol") is used.
+  final String? label;
 
   /// When true (default), only enabled-and-forex-shaped symbols are
   /// shown. Equities and crypto are filtered out — that's what the
@@ -64,7 +66,7 @@ class SymbolPicker extends ConsumerStatefulWidget {
     required this.value,
     required this.onChanged,
     this.enabled = true,
-    this.label = 'Symbol',
+    this.label,
     this.forexOnlyDefault = true,
   });
 
@@ -95,6 +97,7 @@ class _SymbolPickerState extends ConsumerState<SymbolPicker> {
   }
 
   Widget _buildPicker(BrokerSymbolsSnapshot snap) {
+    final l10n = AppLocalizations.of(context)!;
     // #184: filter universe by selected category. `all` is intentionally
     // unfiltered (other than `enabled`) so the user can fall back to the
     // raw broker list if our heuristics misclassify something.
@@ -107,13 +110,16 @@ class _SymbolPickerState extends ConsumerState<SymbolPicker> {
 
     final names = source.map((s) => s.symbolName).toList(growable: false);
     final categoryLabel = switch (_category) {
-      _SymbolCategory.forex => 'forex',
-      _SymbolCategory.metals => 'metals',
-      _SymbolCategory.equities => 'equities/indices',
-      _SymbolCategory.all => 'all',
+      _SymbolCategory.forex => l10n.symbolPickerCatForexLong,
+      _SymbolCategory.metals => l10n.symbolPickerCatMetalsLong,
+      _SymbolCategory.equities => l10n.symbolPickerCatEquitiesLong,
+      _SymbolCategory.all => l10n.symbolPickerCatAllLong,
     };
-    final activeLabel =
-        '${widget.label} · ${names.length} $categoryLabel from broker';
+    final activeLabel = l10n.symbolPickerActiveLabel(
+      widget.label ?? l10n.symbolPickerDefaultLabel,
+      names.length,
+      categoryLabel,
+    );
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -150,8 +156,7 @@ class _SymbolPickerState extends ConsumerState<SymbolPicker> {
                 labelText: activeLabel,
                 isDense: true,
                 border: const OutlineInputBorder(),
-                helperText:
-                    'Type to filter the broker catalog. Pick from suggestions.',
+                helperText: l10n.symbolPickerHelper,
               ),
               onChanged: (v) {
                 // Mirror to the parent on every keystroke too — the
@@ -245,16 +250,21 @@ class _SymbolPickerState extends ConsumerState<SymbolPicker> {
             for (final entry in [
               (
                 _SymbolCategory.forex,
-                'Forex (${snap.forexLikeEnabled.length})'
+                l10n.symbolPickerChipForex(snap.forexLikeEnabled.length)
               ),
-              (_SymbolCategory.metals, 'Metals (${snap.metalsEnabled.length})'),
+              (
+                _SymbolCategory.metals,
+                l10n.symbolPickerChipMetals(snap.metalsEnabled.length)
+              ),
               (
                 _SymbolCategory.equities,
-                'Equities/Indices (${snap.equitiesAndIndicesEnabled.length})'
+                l10n.symbolPickerChipEquities(
+                    snap.equitiesAndIndicesEnabled.length)
               ),
               (
                 _SymbolCategory.all,
-                'All (${snap.symbols.where((s) => s.enabled).length})'
+                l10n.symbolPickerChipAll(
+                    snap.symbols.where((s) => s.enabled).length)
               ),
             ])
               FilterChip(
@@ -276,18 +286,19 @@ class _SymbolPickerState extends ConsumerState<SymbolPicker> {
   }
 
   Widget _buildLoading() {
+    final l10n = AppLocalizations.of(context)!;
     return _StatusPlaceholder(
-      label: widget.label,
-      message: 'Loading broker symbol catalog from /broker/symbols…',
+      label: widget.label ?? l10n.symbolPickerDefaultLabel,
+      message: l10n.symbolPickerLoading,
       tone: NeoethosTokens.textMuted,
     );
   }
 
   Widget _buildError(Object err) {
+    final l10n = AppLocalizations.of(context)!;
     return _StatusPlaceholder(
-      label: widget.label,
-      message:
-          'Broker symbol catalog unavailable: $err\nOpen Settings → save cTrader credentials → Broker Setup → Re-authenticate.',
+      label: widget.label ?? l10n.symbolPickerDefaultLabel,
+      message: l10n.symbolPickerError(err.toString()),
       tone: NeoethosTokens.warning,
     );
   }
@@ -298,27 +309,27 @@ class TimeframePicker extends ConsumerWidget {
   final String value;
   final ValueChanged<String> onChanged;
   final bool enabled;
-  final String label;
+  final String? label;
 
   const TimeframePicker({
     super.key,
     required this.value,
     required this.onChanged,
     this.enabled = true,
-    this.label = 'Timeframe',
+    this.label,
   });
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
+    final resolvedLabel = label ?? l10n.symbolPickerTfDefaultLabel;
     final tfAsync = ref.watch(brokerTimeframesProvider);
     return tfAsync.when(
       data: (list) {
         if (list.isEmpty) {
           return _StatusPlaceholder(
-            label: label,
-            message: '/broker/timeframes returned an empty list — the '
-                'server contract is broken; check neoethos_core::'
-                'CANONICAL_TIMEFRAMES.',
+            label: resolvedLabel,
+            message: l10n.symbolPickerTfEmptyContract,
             tone: NeoethosTokens.sell,
           );
         }
@@ -333,7 +344,7 @@ class TimeframePicker extends ConsumerWidget {
         }
         return InputDecorator(
           decoration: InputDecoration(
-            labelText: '$label · ${list.length} canonical TFs',
+            labelText: l10n.symbolPickerTfActiveLabel(resolvedLabel, list.length),
             isDense: true,
             border: const OutlineInputBorder(),
           ),
@@ -356,14 +367,13 @@ class TimeframePicker extends ConsumerWidget {
         );
       },
       loading: () => _StatusPlaceholder(
-        label: label,
-        message: 'Loading timeframes from /broker/timeframes…',
+        label: resolvedLabel,
+        message: l10n.symbolPickerTfLoading,
         tone: NeoethosTokens.textMuted,
       ),
       error: (err, _) => _StatusPlaceholder(
-        label: label,
-        message: 'Timeframes unavailable — authenticate in Broker Setup '
-            'to load them.',
+        label: resolvedLabel,
+        message: l10n.symbolPickerTfError,
         tone: NeoethosTokens.warning,
       ),
     );

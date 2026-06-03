@@ -27,6 +27,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/pending_actions_provider.dart';
 import '../theme/theme.dart';
@@ -71,6 +72,7 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
   String? _error;
 
   Future<void> _handleConfirm() async {
+    final l10n = AppLocalizations.of(context)!;
     setState(() {
       _submitting = true;
       _error = null;
@@ -98,9 +100,7 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
         if (match == null) {
           setState(() {
             _submitting = false;
-            _error =
-                'Position #${posId ?? 0} not found in current snapshot — '
-                'it may have already been closed. Click Reject to dismiss.';
+            _error = l10n.pendingActionsPositionNotFound(posId ?? 0);
           });
           return;
         }
@@ -116,11 +116,11 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
       // logs.
       final ok = resp['ok'] == true;
       if (!ok) {
-        final err = resp['error']?.toString() ?? 'confirm failed';
+        final err = resp['error']?.toString() ?? l10n.pendingActionsConfirmFailed;
         if (mounted) {
           setState(() {
             _submitting = false;
-            _error = 'Action could not complete — $err. Refresh and try again.';
+            _error = l10n.pendingActionsActionFailed(err);
           });
         }
         return;
@@ -134,14 +134,14 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
       if (mounted) {
         setState(() {
           _submitting = false;
-          _error = 'Action could not complete — ${describeError(e)}. '
-              'Refresh and try again.';
+          _error = l10n.pendingActionsActionFailed(describeError(e));
         });
       }
     }
   }
 
   Future<void> _handleReject() async {
+    final l10n = AppLocalizations.of(context)!;
     final reason = await showDialog<String?>(
       context: context,
       builder: (_) => const _RejectReasonDialog(),
@@ -161,11 +161,11 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
       );
       final ok = resp['ok'] == true;
       if (!ok) {
-        final err = resp['error']?.toString() ?? 'reject failed';
+        final err = resp['error']?.toString() ?? l10n.pendingActionsRejectFailed;
         if (mounted) {
           setState(() {
             _submitting = false;
-            _error = 'Action could not complete — $err. Refresh and try again.';
+            _error = l10n.pendingActionsActionFailed(err);
           });
         }
         return;
@@ -175,8 +175,7 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
       if (mounted) {
         setState(() {
           _submitting = false;
-          _error = 'Action could not complete — ${describeError(e)}. '
-              'Refresh and try again.';
+          _error = l10n.pendingActionsActionFailed(describeError(e));
         });
       }
     }
@@ -184,12 +183,14 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final a = widget.action;
     final secondsLeft = a.secondsUntilExpiry();
     // Backend TTL is 60 s — show the countdown so the operator
     // knows they're about to time out.
-    final countdownLabel =
-        secondsLeft <= 0 ? 'expiring' : '${secondsLeft}s left';
+    final countdownLabel = secondsLeft <= 0
+        ? l10n.pendingActionsExpiring
+        : l10n.pendingActionsSecondsLeft(secondsLeft);
 
     return Container(
       margin: const EdgeInsets.only(bottom: NeoethosTokens.spSm),
@@ -210,10 +211,10 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
                 size: 20,
               ),
               const SizedBox(width: NeoethosTokens.spSm),
-              const Expanded(
+              Expanded(
                 child: Text(
-                  'LLM proposal awaiting your decision',
-                  style: TextStyle(
+                  l10n.pendingActionsTitle,
+                  style: const TextStyle(
                     fontWeight: FontWeight.w700,
                     color: NeoethosTokens.textPrimary,
                     fontSize: NeoethosTokens.fsSubtitle,
@@ -255,7 +256,7 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
           ),
           const SizedBox(height: 4),
           Text(
-            a.reason.isEmpty ? '(no rationale provided)' : a.reason,
+            a.reason.isEmpty ? l10n.pendingActionsNoRationale : a.reason,
             style: const TextStyle(
               color: NeoethosTokens.textMuted,
               fontSize: NeoethosTokens.fsBody,
@@ -291,7 +292,7 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
                   side: const BorderSide(color: NeoethosTokens.sell),
                   minimumSize: const Size(0, NeoethosTokens.btnHeight),
                 ),
-                child: const Text('Reject'),
+                child: Text(l10n.pendingActionsReject),
               ),
               const SizedBox(width: NeoethosTokens.spSm),
               FilledButton(
@@ -310,7 +311,7 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
                           color: NeoethosTokens.textPrimary,
                         ),
                       )
-                    : const Text('Confirm'),
+                    : Text(l10n.pendingActionsConfirm),
               ),
             ],
           ),
@@ -342,19 +343,20 @@ class _RejectReasonDialogState extends State<_RejectReasonDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return AlertDialog(
       backgroundColor: NeoethosTokens.panelBg,
-      title: const Text(
-        'Reject proposal',
-        style: TextStyle(color: NeoethosTokens.textPrimary),
+      title: Text(
+        l10n.pendingActionsRejectDialogTitle,
+        style: const TextStyle(color: NeoethosTokens.textPrimary),
       ),
       content: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'Optional reason (surfaced back to the LLM for context):',
-            style: TextStyle(
+          Text(
+            l10n.pendingActionsRejectReasonLabel,
+            style: const TextStyle(
               color: NeoethosTokens.textMuted,
               fontSize: NeoethosTokens.fsBody,
             ),
@@ -365,12 +367,12 @@ class _RejectReasonDialogState extends State<_RejectReasonDialog> {
             autofocus: true,
             maxLines: 3,
             style: const TextStyle(color: NeoethosTokens.textPrimary),
-            decoration: const InputDecoration(
-              hintText: 'e.g. market is too thin to close here',
-              hintStyle: TextStyle(color: NeoethosTokens.textFaint),
+            decoration: InputDecoration(
+              hintText: l10n.pendingActionsRejectReasonHint,
+              hintStyle: const TextStyle(color: NeoethosTokens.textFaint),
               filled: true,
               fillColor: NeoethosTokens.surfaceBg,
-              border: OutlineInputBorder(),
+              border: const OutlineInputBorder(),
             ),
           ),
         ],
@@ -378,9 +380,9 @@ class _RejectReasonDialogState extends State<_RejectReasonDialog> {
       actions: [
         TextButton(
           onPressed: () => Navigator.of(context).pop(null),
-          child: const Text(
-            'Cancel',
-            style: TextStyle(color: NeoethosTokens.textMuted),
+          child: Text(
+            l10n.commonCancel,
+            style: const TextStyle(color: NeoethosTokens.textMuted),
           ),
         ),
         FilledButton(
@@ -389,7 +391,7 @@ class _RejectReasonDialogState extends State<_RejectReasonDialog> {
           ),
           onPressed: () =>
               Navigator.of(context).pop(_controller.text.trim()),
-          child: const Text('Reject'),
+          child: Text(l10n.pendingActionsReject),
         ),
       ],
     );

@@ -23,6 +23,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../api/currency_format.dart';
+import '../../l10n/app_localizations.dart';
 import '../../state/account_provider.dart';
 import '../../state/system_providers.dart';
 import '../../theme/theme.dart';
@@ -59,26 +60,27 @@ extension GrowthAggressionExt on GrowthAggression {
     }
   }
 
-  String get label {
+  /// Localized short label for the aggression chip.
+  String label(AppLocalizations l10n) {
     switch (this) {
       case GrowthAggression.steady:
-        return 'Steady';
+        return l10n.growthCardAggSteady;
       case GrowthAggression.balanced:
-        return 'Balanced';
+        return l10n.growthCardAggBalanced;
       case GrowthAggression.aggressive:
-        return 'Aggressive';
+        return l10n.growthCardAggAggressive;
     }
   }
 
-  /// Honest copy — Risky/Growth Mode is high-risk throughout the band.
-  String get tagline {
+  /// Localized honest copy — Risky/Growth Mode is high-risk throughout the band.
+  String tagline(AppLocalizations l10n) {
     switch (this) {
       case GrowthAggression.steady:
-        return '30% risk/trade · lowest aggression in the Risky band';
+        return l10n.growthCardTaglineSteady;
       case GrowthAggression.balanced:
-        return '40% risk/trade · mid Risky band';
+        return l10n.growthCardTaglineBalanced;
       case GrowthAggression.aggressive:
-        return '50% risk/trade · max aggression, highest ruin odds';
+        return l10n.growthCardTaglineAggressive;
     }
   }
 }
@@ -91,6 +93,7 @@ class GrowthModeCard extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final snapshot = ref.watch(accountSnapshotProvider).valueOrNull;
     final starting = ref.watch(growthStartingBalanceProvider);
     final target = ref.watch(growthTargetBalanceProvider);
@@ -110,7 +113,7 @@ class GrowthModeCard extends ConsumerWidget {
     );
 
     return SectionCard(
-      title: 'Growth Mode · ML-driven small-account multiplier',
+      title: l10n.growthCardTitle,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -135,7 +138,7 @@ class GrowthModeCard extends ConsumerWidget {
             children: [
               Expanded(
                 child: _CurrencyField(
-                  label: 'Started with',
+                  label: l10n.growthCardStartedWith,
                   currency: currency,
                   value: starting,
                   onChanged: (v) =>
@@ -145,7 +148,7 @@ class GrowthModeCard extends ConsumerWidget {
               const SizedBox(width: 12),
               Expanded(
                 child: _CurrencyField(
-                  label: 'Target',
+                  label: l10n.growthCardTarget,
                   currency: currency,
                   value: target,
                   onChanged: (v) =>
@@ -163,7 +166,7 @@ class GrowthModeCard extends ConsumerWidget {
                 Padding(
                   padding: const EdgeInsets.only(right: 6),
                   child: _RiskChip(
-                    label: a.label,
+                    label: a.label(l10n),
                     selected: a == aggression,
                     onTap: () =>
                         ref.read(growthAggressionProvider.notifier).state = a,
@@ -174,7 +177,7 @@ class GrowthModeCard extends ConsumerWidget {
           ),
           const SizedBox(height: 4),
           Text(
-            aggression.tagline,
+            aggression.tagline(l10n),
             style: const TextStyle(
               fontSize: 10,
               color: NeoethosTokens.textFaint,
@@ -183,18 +186,19 @@ class GrowthModeCard extends ConsumerWidget {
           const SizedBox(height: 12),
           // Projection — computed by the engine, not the UI.
           if (target <= currentEquity)
-            const Text(
-              'Target reached — set a higher one to keep compounding.',
-              style: TextStyle(
+            Text(
+              l10n.growthCardTargetReached,
+              style: const TextStyle(
                 fontSize: 12,
                 color: NeoethosTokens.buy,
                 fontWeight: FontWeight.w500,
               ),
             )
           else if (currentEquity <= 0)
-            const Text(
-              'Set a starting balance (or connect the broker) to see the projection.',
-              style: TextStyle(fontSize: 12, color: NeoethosTokens.textMuted),
+            Text(
+              l10n.growthCardSetStarting,
+              style: const TextStyle(
+                  fontSize: 12, color: NeoethosTokens.textMuted),
             )
           else
             _ScenarioSection(
@@ -203,12 +207,9 @@ class GrowthModeCard extends ConsumerWidget {
               riskFraction: aggression.riskFraction,
             ),
           const SizedBox(height: 8),
-          const Text(
-            'Powered by NeoEthos Discovery (GA over 33-model ensemble) + '
-            'risk-aware Auto-Trader. Days + ruin are the live engine\'s own '
-            'estimate (risky_mode), not promises — real growth depends on '
-            'regime + discipline.',
-            style: TextStyle(
+          Text(
+            l10n.growthCardFooter,
+            style: const TextStyle(
               fontSize: 10,
               color: NeoethosTokens.textFaint,
             ),
@@ -411,6 +412,7 @@ class _ScenarioSection extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final async = ref.watch(riskyScenariosProvider((
       startingUsd: currentEquity,
       targetUsd: target,
@@ -427,9 +429,9 @@ class _ScenarioSection extends ConsumerWidget {
           ),
         ),
       ),
-      error: (_, __) => const Text(
-        'Projection unavailable — backend offline.',
-        style: TextStyle(
+      error: (_, __) => Text(
+        l10n.growthCardProjectionUnavailable,
+        style: const TextStyle(
           fontSize: 11,
           color: NeoethosTokens.textFaint,
           fontStyle: FontStyle.italic,
@@ -444,9 +446,9 @@ class _ScenarioSection extends ConsumerWidget {
             children: [
               Expanded(
                 child: _ScenarioCard(
-                  label: 'Lucky',
-                  subtitle: 'top 10% of paths',
-                  time: _formatDays(s.bestCaseDays),
+                  label: l10n.growthCardScenLucky,
+                  subtitle: l10n.growthCardScenLuckySub,
+                  time: _formatDays(l10n, s.bestCaseDays),
                   color: const Color(0xFF2E7D32),
                   icon: Icons.rocket_launch_outlined,
                 ),
@@ -454,9 +456,9 @@ class _ScenarioSection extends ConsumerWidget {
               const SizedBox(width: 8),
               Expanded(
                 child: _ScenarioCard(
-                  label: 'Typical',
-                  subtitle: 'expected',
-                  time: _formatDays(s.expectedDays),
+                  label: l10n.growthCardScenTypical,
+                  subtitle: l10n.growthCardScenTypicalSub,
+                  time: _formatDays(l10n, s.expectedDays),
                   color: const Color(0xFF1565C0),
                   icon: Icons.timeline,
                   emphasized: true,
@@ -465,9 +467,9 @@ class _ScenarioSection extends ConsumerWidget {
               const SizedBox(width: 8),
               Expanded(
                 child: _ScenarioCard(
-                  label: 'Slow',
-                  subtitle: 'conservative',
-                  time: _formatDays(s.conservativeDays),
+                  label: l10n.growthCardScenSlow,
+                  subtitle: l10n.growthCardScenSlowSub,
+                  time: _formatDays(l10n, s.conservativeDays),
                   color: const Color(0xFFB28704),
                   icon: Icons.hourglass_bottom_outlined,
                 ),
@@ -476,12 +478,12 @@ class _ScenarioSection extends ConsumerWidget {
           ),
           const SizedBox(height: 8),
           Text(
-            'Computed by the live Risky-Mode engine at '
-            '${(s.riskFraction * 100).round()}% risk/trade '
-            '(win ${(s.winRate * 100).round()}%, '
-            '${s.rewardToRisk.toStringAsFixed(1)}R, '
-            '${s.tradesPerDay.round()} trades/day). Updates when you change '
-            'the inputs above.',
+            l10n.growthCardComputedBy(
+              (s.riskFraction * 100).round(),
+              (s.winRate * 100).round(),
+              s.rewardToRisk.toStringAsFixed(1),
+              s.tradesPerDay.round(),
+            ),
             style: const TextStyle(
               fontSize: 10,
               color: NeoethosTokens.textFaint,
@@ -495,16 +497,16 @@ class _ScenarioSection extends ConsumerWidget {
 
 /// Auto-format engine days into the most readable unit. `null` = the
 /// configured edge can't reach target on average (non-positive growth).
-String _formatDays(int? days) {
-  if (days == null) return 'not reachable';
-  if (days <= 0) return 'now';
-  if (days <= 60) return '$days days';
+String _formatDays(AppLocalizations l10n, int? days) {
+  if (days == null) return l10n.growthCardDaysNotReachable;
+  if (days <= 0) return l10n.growthCardDaysNow;
+  if (days <= 60) return l10n.growthCardDaysDays(days);
   if (days <= 730) {
     final months = (days / 30.4).round();
-    return '$months months';
+    return l10n.growthCardDaysMonths(months);
   }
   final years = (days / 365.25).toStringAsFixed(1);
-  return '$years years';
+  return l10n.growthCardDaysYears(years);
 }
 
 class _RuinGauge extends StatelessWidget {
@@ -513,6 +515,7 @@ class _RuinGauge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final pct = (probability * 100).round();
     final inN = probability > 0 ? (1 / probability).round() : 1000;
 
@@ -520,13 +523,13 @@ class _RuinGauge extends StatelessWidget {
     final String tier;
     if (pct < 5) {
       color = const Color(0xFF2E7D32);
-      tier = 'low';
+      tier = l10n.growthCardRuinTierLow;
     } else if (pct < 25) {
       color = const Color(0xFFE65100);
-      tier = 'meaningful';
+      tier = l10n.growthCardRuinTierMeaningful;
     } else {
       color = const Color(0xFFB71C1C);
-      tier = 'high';
+      tier = l10n.growthCardRuinTierHigh;
     }
 
     return Container(
@@ -548,9 +551,9 @@ class _RuinGauge extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.baseline,
                   textBaseline: TextBaseline.alphabetic,
                   children: [
-                    const Text(
-                      'Chance of blowing the account: ',
-                      style: TextStyle(
+                    Text(
+                      l10n.growthCardRuinChance,
+                      style: const TextStyle(
                         fontSize: 12,
                         color: NeoethosTokens.textMuted,
                       ),
@@ -567,7 +570,7 @@ class _RuinGauge extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  'About 1 in $inN runs at this risk profile ends in ruin · $tier risk',
+                  l10n.growthCardRuinDetail(inN, tier),
                   style: const TextStyle(
                     fontSize: 11,
                     color: NeoethosTokens.textFaint,

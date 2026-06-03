@@ -21,6 +21,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../api/backend_client.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -93,6 +94,7 @@ class _NewsPanelState extends ConsumerState<NewsPanel> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final async = ref.watch(newsFeedProvider);
     final autoScrolling = !_hovering && _expanded == null;
     return Container(
@@ -107,10 +109,10 @@ class _NewsPanelState extends ConsumerState<NewsPanel> {
         children: [
           Row(
             children: [
-              const Expanded(
+              Expanded(
                 child: Text(
-                  'MARKET NEWS',
-                  style: TextStyle(
+                  l10n.newsTitle,
+                  style: const TextStyle(
                     fontSize: NeoethosTokens.fsCaption,
                     fontWeight: FontWeight.w800,
                     letterSpacing: 0.6,
@@ -143,9 +145,9 @@ class _NewsPanelState extends ConsumerState<NewsPanel> {
           const SizedBox(height: 8),
           async.when(
             loading: () => const _NewsSkeleton(),
-            error: (_, __) => const Text(
-              'News desk offline — retrying…',
-              style: TextStyle(
+            error: (_, __) => Text(
+              l10n.newsOffline,
+              style: const TextStyle(
                 fontSize: NeoethosTokens.fsCaption,
                 color: NeoethosTokens.textFaint,
                 fontStyle: FontStyle.italic,
@@ -159,6 +161,7 @@ class _NewsPanelState extends ConsumerState<NewsPanel> {
   }
 
   Widget _buildContent(NewsFeed feed) {
+    final l10n = AppLocalizations.of(context)!;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -179,11 +182,11 @@ class _NewsPanelState extends ConsumerState<NewsPanel> {
             ),
           ),
         if (feed.items.isEmpty)
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 8),
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
             child: Text(
-              'No headlines right now.',
-              style: TextStyle(
+              l10n.newsNoHeadlines,
+              style: const TextStyle(
                 fontSize: NeoethosTokens.fsCaption,
                 color: NeoethosTokens.textFaint,
               ),
@@ -216,6 +219,7 @@ class _NewsPanelState extends ConsumerState<NewsPanel> {
   }
 
   Widget _briefing(String summary) {
+    final l10n = AppLocalizations.of(context)!;
     final collapsed = !_briefingExpanded;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
@@ -232,10 +236,10 @@ class _NewsPanelState extends ConsumerState<NewsPanel> {
             children: [
               const Icon(Icons.auto_awesome, size: 12, color: NeoethosTokens.accent),
               const SizedBox(width: 5),
-              const Expanded(
+              Expanded(
                 child: Text(
-                  'AI BRIEFING',
-                  style: TextStyle(
+                  l10n.newsAiBriefing,
+                  style: const TextStyle(
                     fontSize: NeoethosTokens.fsCaption - 1,
                     fontWeight: FontWeight.w800,
                     letterSpacing: 0.5,
@@ -272,6 +276,7 @@ class _NewsPanelState extends ConsumerState<NewsPanel> {
   }
 
   Widget _connectHint() {
+    final l10n = AppLocalizations.of(context)!;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(NeoethosTokens.spSm),
@@ -280,10 +285,9 @@ class _NewsPanelState extends ConsumerState<NewsPanel> {
         border: Border.all(color: NeoethosTokens.border),
         borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
-      child: const Text(
-        'Connect your ChatGPT subscription (Settings → AI Desk) for an AI '
-        'market briefing over these headlines.',
-        style: TextStyle(
+      child: Text(
+        l10n.newsConnectHint,
+        style: const TextStyle(
           fontSize: NeoethosTokens.fsCaption - 1,
           color: NeoethosTokens.textFaint,
           height: 1.4,
@@ -309,6 +313,7 @@ class _NewsRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
       child: Column(
@@ -353,7 +358,7 @@ class _NewsRow extends StatelessWidget {
                 Padding(
                   padding: const EdgeInsets.only(left: 12, top: 2),
                   child: Text(
-                    '${item.source}${_age(item.publishedMs)}',
+                    '${item.source}${_age(context, item.publishedMs)}',
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
                       fontSize: NeoethosTokens.fsCaption - 2,
@@ -384,9 +389,9 @@ class _NewsRow extends StatelessWidget {
                 child: OutlinedButton.icon(
                   onPressed: item.link.isEmpty ? null : onOpen,
                   icon: const Icon(Icons.open_in_new, size: 13),
-                  label: const Text(
-                    'Open in browser',
-                    style: TextStyle(
+                  label: Text(
+                    l10n.newsOpenInBrowser,
+                    style: const TextStyle(
                       fontSize: NeoethosTokens.fsCaption - 1,
                       fontWeight: FontWeight.w600,
                     ),
@@ -415,15 +420,16 @@ class _NewsRow extends StatelessWidget {
   }
 
   /// Compact relative-age suffix (" · 2h", " · now", "" when undated).
-  String _age(int? ms) {
+  String _age(BuildContext context, int? ms) {
     if (ms == null || ms <= 0) return '';
+    final l10n = AppLocalizations.of(context)!;
     final then = DateTime.fromMillisecondsSinceEpoch(ms);
     final d = DateTime.now().difference(then);
     if (d.isNegative) return '';
-    if (d.inMinutes < 1) return ' · now';
-    if (d.inMinutes < 60) return ' · ${d.inMinutes}m';
-    if (d.inHours < 24) return ' · ${d.inHours}h';
-    return ' · ${d.inDays}d';
+    if (d.inMinutes < 1) return ' · ${l10n.newsAgeNow}';
+    if (d.inMinutes < 60) return ' · ${l10n.newsAgeMinutes(d.inMinutes)}';
+    if (d.inHours < 24) return ' · ${l10n.newsAgeHours(d.inHours)}';
+    return ' · ${l10n.newsAgeDays(d.inDays)}';
   }
 }
 

@@ -27,6 +27,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../startup/backend_supervisor.dart';
 import '../startup/backend_watchdog.dart';
 import '../theme/theme.dart';
@@ -66,6 +67,7 @@ class _BackendDiagnosticsDialogState
   }
 
   Future<void> _restartBackend() async {
+    final l10n = AppLocalizations.of(context)!;
     setState(() => _restarting = true);
     try {
       await ref.read(backendHealthProvider.notifier).manualRestart();
@@ -74,11 +76,9 @@ class _BackendDiagnosticsDialogState
       _loadLogTail();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
+        SnackBar(
           backgroundColor: NeoethosTokens.accent,
-          content: Text(
-            'Backend restart requested — watchdog will confirm in ~3 s.',
-          ),
+          content: Text(l10n.backendDiagRestartRequested),
         ),
       );
     } catch (e) {
@@ -86,11 +86,7 @@ class _BackendDiagnosticsDialogState
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: NeoethosTokens.sell,
-          content: Text(
-            'Restart command failed — ${describeError(e)}. '
-            'Try ending the neoethos-core process in Task Manager, '
-            'then relaunch.',
-          ),
+          content: Text(l10n.backendDiagRestartFailed(describeError(e))),
         ),
       );
     } finally {
@@ -99,14 +95,15 @@ class _BackendDiagnosticsDialogState
   }
 
   Future<void> _copyLogPath() async {
+    final l10n = AppLocalizations.of(context)!;
     final path = BackendSupervisor.instance.logFilePath;
     await Clipboard.setData(ClipboardData(text: path));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
+      SnackBar(
         backgroundColor: NeoethosTokens.buy,
-        content: Text('Log path copied to clipboard.'),
-        duration: Duration(seconds: 2),
+        content: Text(l10n.backendDiagLogPathCopied),
+        duration: const Duration(seconds: 2),
       ),
     );
   }
@@ -129,24 +126,25 @@ class _BackendDiagnosticsDialogState
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final health = ref.watch(backendHealthProvider);
     final logPath = BackendSupervisor.instance.logFilePath;
     final pid = BackendSupervisor.instance.childPid;
 
     final statusLabel = health.status == BackendHealthStatus.online
-        ? 'Online'
-        : 'Reconnecting…';
+        ? l10n.backendDiagStatusOnline
+        : l10n.backendDiagStatusReconnecting;
     final statusColor = health.status == BackendHealthStatus.online
         ? NeoethosTokens.buy
         : NeoethosTokens.sell;
 
     final lastSeen = health.lastSeenAt;
     final lastSeenLabel = lastSeen == null
-        ? 'never'
+        ? l10n.backendDiagNever
         : DateFormat('HH:mm:ss').format(lastSeen.toLocal());
 
     return AlertDialog(
-      title: const Text('Backend diagnostics'),
+      title: Text(l10n.backendDiagTitle),
       content: SizedBox(
         width: 640,
         height: 480,
@@ -173,20 +171,20 @@ class _BackendDiagnosticsDialogState
                   ),
                 ),
                 const SizedBox(width: NeoethosTokens.spLg),
-                _MetaItem(label: 'Last /healthz OK', value: lastSeenLabel),
+                _MetaItem(label: l10n.backendDiagMetaLastHealthz, value: lastSeenLabel),
                 const SizedBox(width: NeoethosTokens.spLg),
                 _MetaItem(
-                  label: 'Consecutive failures',
+                  label: l10n.backendDiagMetaConsecutiveFailures,
                   value: '${health.consecutiveFailures}',
                 ),
                 const SizedBox(width: NeoethosTokens.spLg),
                 _MetaItem(
-                  label: 'Respawn attempts',
+                  label: l10n.backendDiagMetaRespawnAttempts,
                   value: '${health.respawnAttempts}',
                 ),
                 const SizedBox(width: NeoethosTokens.spLg),
                 _MetaItem(
-                  label: 'Child PID',
+                  label: l10n.backendDiagMetaChildPid,
                   value: pid == null ? '—' : '$pid',
                 ),
               ],
@@ -210,17 +208,17 @@ class _BackendDiagnosticsDialogState
                 ),
                 IconButton(
                   onPressed: _copyLogPath,
-                  tooltip: 'Copy log path',
+                  tooltip: l10n.backendDiagCopyLogPath,
                   icon: const Icon(Icons.copy, size: 14),
                 ),
                 IconButton(
                   onPressed: _openLogFolder,
-                  tooltip: 'Show in file manager',
+                  tooltip: l10n.backendDiagShowInFileManager,
                   icon: const Icon(Icons.folder_open, size: 14),
                 ),
                 IconButton(
                   onPressed: _loadLogTail,
-                  tooltip: 'Refresh log',
+                  tooltip: l10n.backendDiagRefreshLog,
                   icon: const Icon(Icons.refresh, size: 14),
                 ),
               ],
@@ -239,9 +237,7 @@ class _BackendDiagnosticsDialogState
                   child: SingleChildScrollView(
                     reverse: true,
                     child: SelectableText(
-                      _logTail.isEmpty
-                          ? '<log empty — backend has not written anything yet>'
-                          : _logTail,
+                      _logTail.isEmpty ? l10n.backendDiagLogEmpty : _logTail,
                       style: const TextStyle(
                         fontSize: 11,
                         fontFamily: 'Consolas',
@@ -260,7 +256,7 @@ class _BackendDiagnosticsDialogState
         TextButton(
           onPressed:
               _restarting ? null : () => Navigator.of(context).pop(),
-          child: const Text('Close'),
+          child: Text(l10n.commonClose),
         ),
         FilledButton.icon(
           onPressed: _restarting ? null : _restartBackend,
@@ -271,7 +267,9 @@ class _BackendDiagnosticsDialogState
                   child: CircularProgressIndicator(strokeWidth: 2),
                 )
               : const Icon(Icons.restart_alt, size: 16),
-          label: Text(_restarting ? 'Restarting…' : 'Restart backend'),
+          label: Text(_restarting
+              ? l10n.backendDiagRestarting
+              : l10n.backendDiagRestartBackend),
         ),
       ],
     );

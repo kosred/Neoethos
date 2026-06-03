@@ -65,25 +65,26 @@ class _SettingsScreenState extends State<SettingsScreen>
   // (Account / App) is on the left and the rarely-touched ones
   // (Hardware / Data) are on the right. The Help link sits in the
   // top-right corner of the tab strip instead of being a tab body.
-  static const _tabs = [
-    ('Account', '🔐',
-        'cTrader OAuth + saved client_id/secret'),
-    ('App', '⚙',
-        'Data dir, news source, LLM model, news-trading mode, raw YAML'),
-    ('Risk', '⚠',
-        'Prop-firm preset + drawdown caps + per-trade risk'),
-    ('Advanced', '🛠',
-        '42+ search-pipeline knobs — population, GA params, thresholds'),
-    ('Hardware', '🖥',
-        'CPU / GPU detection (read-only)'),
-    ('Data', '📂',
-        'Historical bootstrap + CSV/Parquet import'),
-  ];
+  // Labels + tooltips are localized at build time (see `_localizedTabs`);
+  // only the count is fixed here so the TabController can be sized in
+  // initState without a BuildContext.
+  static const _tabCount = 6;
+
+  /// (label, icon, tooltip) tuples sourced from [AppLocalizations]. The
+  /// emoji icons stay verbatim; only the chrome text is translated.
+  List<(String, String, String)> _localizedTabs(AppLocalizations l10n) => [
+        (l10n.settingsTabAccount, '🔐', l10n.settingsTabAccountTooltip),
+        (l10n.settingsTabApp, '⚙', l10n.settingsTabAppTooltip),
+        (l10n.settingsTabRisk, '⚠', l10n.settingsTabRiskTooltip),
+        (l10n.settingsTabAdvanced, '🛠', l10n.settingsTabAdvancedTooltip),
+        (l10n.settingsTabHardware, '🖥', l10n.settingsTabHardwareTooltip),
+        (l10n.settingsTabData, '📂', l10n.settingsTabDataTooltip),
+      ];
 
   @override
   void initState() {
     super.initState();
-    _controller = TabController(length: _tabs.length, vsync: this);
+    _controller = TabController(length: _tabCount, vsync: this);
   }
 
   @override
@@ -94,10 +95,11 @@ class _SettingsScreenState extends State<SettingsScreen>
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _SettingsTabStrip(controller: _controller, tabs: _tabs),
+        _SettingsTabStrip(controller: _controller, tabs: _localizedTabs(l10n)),
         const SizedBox(height: NeoethosTokens.spSm),
         Expanded(
           child: TabBarView(
@@ -136,6 +138,7 @@ class _SettingsTabStrip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return Container(
       decoration: BoxDecoration(
         color: NeoethosTokens.panelBg,
@@ -178,9 +181,9 @@ class _SettingsTabStrip extends StatelessWidget {
             onPressed: () => showHelpDialog(context),
             icon: const Icon(Icons.help_outline,
                 size: 16, color: NeoethosTokens.textMuted),
-            label: const Text(
-              'Help (F1)',
-              style: TextStyle(
+            label: Text(
+              l10n.settingsHelpF1,
+              style: const TextStyle(
                 fontSize: NeoethosTokens.fsCaption,
                 fontWeight: FontWeight.w600,
                 color: NeoethosTokens.textMuted,
@@ -259,6 +262,7 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
   }
 
   Future<void> _save() async {
+    final l10n = AppLocalizations.of(context)!;
     final clientId = _clientIdCtrl.text.trim();
     final clientSecret = _clientSecretCtrl.text.trim();
     final accountId = _accountIdCtrl.text.trim();
@@ -279,11 +283,9 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
     final clientSecretMissing = clientSecret.isEmpty && !_secretConfigured;
     if (clientIdMissing || clientSecretMissing) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
+        SnackBar(
           backgroundColor: NeoethosTokens.sell,
-          content: Text(
-            'Client ID and Client Secret are required (no saved value to fall back on)',
-          ),
+          content: Text(l10n.settingsCredentialsRequired),
         ),
       );
       return;
@@ -298,7 +300,8 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
           );
       if (!mounted) return;
       final ok = r['ok'] == true;
-      final msg = (r['message'] as String?) ?? (ok ? 'Saved' : 'Unknown response');
+      final msg = (r['message'] as String?) ??
+          (ok ? l10n.settingsSaved : l10n.settingsUnknownResponse);
       setState(() {
         _resultOk = ok;
         _resultMessage = msg;
@@ -322,7 +325,7 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
         _resultOk = false;
         _resultMessage = msg;
       });
-      showTranslatedErrorSnackbar(context, e, prefix: 'Save failed');
+      showTranslatedErrorSnackbar(context, e, prefix: l10n.settingsSaveFailed);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -339,6 +342,7 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
   /// must NOT fire on the picker's automatic stale-id correction (that
   /// path calls `onPicked` only).
   Future<void> _selectAccount(String accountId) async {
+    final l10n = AppLocalizations.of(context)!;
     final id = accountId.trim();
     if (id.isEmpty) return;
     try {
@@ -358,35 +362,38 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
           backgroundColor: ok ? NeoethosTokens.buy : NeoethosTokens.warning,
           content: Text(
             ok
-                ? 'Active account → $selected. Restart NeoEthos to apply.'
-                : 'Account select returned an unexpected response.',
+                ? l10n.accountSwitchedRestart(selected)
+                : l10n.accountSwitchUnexpected,
           ),
           duration: const Duration(seconds: 6),
         ),
       );
     } on DioException catch (e) {
       if (!mounted) return;
-      showTranslatedErrorSnackbar(context, e, prefix: 'Account select failed');
+      showTranslatedErrorSnackbar(context, e,
+          prefix: l10n.settingsAccountSelectFailed);
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final asyncSettings = ref.watch(settingsProvider);
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const ViewHeader(
-            title: 'Settings',
-            subtitle: 'cTrader credentials · app configuration',
+          ViewHeader(
+            title: l10n.settingsTitle,
+            subtitle: l10n.settingsHeaderSubtitle,
           ),
           const _LanguageCard(),
-          _credentialsCard(),
+          _credentialsCard(context),
           asyncSettings.when(
             data: (s) => _configCard(s),
             loading: () => const _Loading(),
-            error: (err, _) => BackendErrorWidget(error: err, title: "Settings couldn't load"),
+            error: (err, _) => BackendErrorWidget(
+                error: err, title: l10n.settingsCouldNotLoad),
           ),
           // **2026-05-25 — task #238 supersedes #193**: the live
           // knob editor (`/settings/knob-catalog`) replaces the
@@ -403,33 +410,30 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
     );
   }
 
-  Widget _credentialsCard() {
+  Widget _credentialsCard(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     if (!_loaded) {
-      return const SectionCard(
-        title: 'cTrader Credentials',
+      return SectionCard(
+        title: l10n.settingsCredentialsTitle,
         child: Padding(
-          padding: EdgeInsets.symmetric(vertical: 12),
+          padding: const EdgeInsets.symmetric(vertical: 12),
           child: Text(
-            'Loading…',
-            style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+            l10n.commonLoading,
+            style: const TextStyle(
+                color: NeoethosTokens.textMuted, fontSize: 12),
           ),
         ),
       );
     }
     return SectionCard(
-      title: 'cTrader Credentials (optional — built-in by default)',
+      title: l10n.settingsCredentialsTitleOptional,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'NeoEthos ships with built-in cTrader application credentials, so '
-            'you normally do NOT enter anything here — just open '
-            'Account → Re-authenticate to sign into your OWN cTrader account '
-            'in the browser. The fields below are OPTIONAL: only for advanced '
-            'users who want to use their own cTrader Open API app '
-            '(https://openapi.ctrader.com → Applications). Saved to '
-            '%APPDATA%/neoethos/broker_credentials.toml, never committed to git.',
-            style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+          Text(
+            l10n.settingsCredentialsIntro,
+            style: const TextStyle(
+                color: NeoethosTokens.textMuted, fontSize: 12),
           ),
           const SizedBox(height: 12),
           TextField(
@@ -452,10 +456,10 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
               isDense: true,
               border: const OutlineInputBorder(),
               hintText: _secretConfigured
-                  ? 'Saved: $_secretMask (leave blank to keep)'
-                  : 'Paste your secret here',
+                  ? l10n.settingsClientSecretSavedHint(_secretMask)
+                  : l10n.settingsClientSecretPasteHint,
               helperText: _secretConfigured
-                  ? 'A secret is already saved. Leave blank to keep it.'
+                  ? l10n.settingsClientSecretSavedHelper
                   : null,
             ),
           ),
@@ -479,13 +483,12 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
                   controller: _accountIdCtrl,
                   enabled: !_busy,
                   keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
+                  decoration: InputDecoration(
                     labelText: 'Account ID (cTID)',
                     isDense: true,
-                    border: OutlineInputBorder(),
-                    hintText: 'numeric, e.g. 5789955',
-                    helperText:
-                        'Will switch to a live dropdown once cTrader OAuth completes.',
+                    border: const OutlineInputBorder(),
+                    hintText: l10n.settingsAccountIdHint,
+                    helperText: l10n.settingsAccountIdHelper,
                   ),
                 ),
               )),
@@ -519,7 +522,9 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
                     : const Icon(Icons.save, size: 16),
-                label: Text(_busy ? 'Saving…' : 'Save credentials'),
+                label: Text(_busy
+                    ? l10n.settingsSavingCredentials
+                    : l10n.settingsSaveCredentials),
               ),
               if (_resultMessage != null) ...[
                 const SizedBox(width: 12),
@@ -685,14 +690,15 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
   }
 
   Future<void> _save() async {
+    final l10n = AppLocalizations.of(context)!;
     final dataDir = _dataDirCtrl.text.trim();
     final newsSource = _newsSourceCtrl.text.trim();
     if (dataDir.isEmpty) {
-      _showSnack('Data directory cannot be blank', ok: false);
+      _showSnack(l10n.dataBootstrapDirBlank, ok: false);
       return;
     }
     if (newsSource.isEmpty) {
-      _showSnack('News calendar source cannot be blank', ok: false);
+      _showSnack(l10n.settingsNewsSourceBlank, ok: false);
       return;
     }
     setState(() => _busy = true);
@@ -713,12 +719,12 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
       if (!mounted) return;
       setState(() {
         _messageOk = true;
-        _message = 'Saved · config.yaml updated';
+        _message = l10n.settingsConfigUpdated;
       });
       // Refresh the snapshot so the parent screen and any other
       // consumers of settingsProvider see the new value.
       ref.invalidate(settingsProvider);
-      _showSnack('Settings saved to config.yaml', ok: true);
+      _showSnack(l10n.settingsSavedToConfig, ok: true);
     } on DioException catch (e) {
       if (!mounted) return;
       final msg = describeError(e);
@@ -726,14 +732,14 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
         _messageOk = false;
         _message = msg;
       });
-      showTranslatedErrorSnackbar(context, e, prefix: 'Save failed');
+      showTranslatedErrorSnackbar(context, e, prefix: l10n.settingsSaveFailed);
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _messageOk = false;
         _message = e.toString();
       });
-      _showSnack('Settings could not be saved — ${describeError(e)}. Check write access to the config folder and retry.', ok: false);
+      _showSnack(l10n.settingsSaveError(describeError(e)), ok: false);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -769,28 +775,26 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return SectionCard(
-      title: 'App Settings',
+      title: l10n.settingsAppSettingsTitle,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'These fields write directly into config.yaml. Unchanged '
-            'lines (risk, models, the 200+ knobs the UI doesn\'t '
-            'show) are preserved on every save.',
-            style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
+          Text(
+            l10n.settingsAppSettingsIntro,
+            style: const TextStyle(
+                fontSize: 11, color: NeoethosTokens.textMuted),
           ),
           const SizedBox(height: 12),
           TextField(
             controller: _dataDirCtrl,
             enabled: !_busy,
-            decoration: const InputDecoration(
-              labelText: 'Data directory',
+            decoration: InputDecoration(
+              labelText: l10n.settingsDataDirLabel,
               isDense: true,
-              border: OutlineInputBorder(),
-              helperText:
-                  'Where Vortex bars + discovery artifacts live. '
-                  'Relative paths resolve against the binary\'s CWD.',
+              border: const OutlineInputBorder(),
+              helperText: l10n.settingsDataDirHelper,
             ),
           ),
           const SizedBox(height: 10),
@@ -798,34 +802,35 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
           ExpansionTile(
             tilePadding: EdgeInsets.zero,
             childrenPadding: const EdgeInsets.only(bottom: 8),
-            title: const Text(
-              'Discovery search budget',
-              style: TextStyle(fontWeight: FontWeight.w600),
+            title: Text(
+              l10n.settingsSearchBudgetTitle,
+              style: const TextStyle(fontWeight: FontWeight.w600),
             ),
-            subtitle: const Text(
-              'How hard/long Discovery searches. Bigger = more strategies, '
-              'slower. Tune for your machine (L40 VPS vs local).',
-              style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
+            subtitle: Text(
+              l10n.settingsSearchBudgetSubtitle,
+              style: const TextStyle(
+                  fontSize: 11, color: NeoethosTokens.textMuted),
             ),
             children: [
               Wrap(
                 spacing: 12,
                 runSpacing: 12,
                 children: [
-                  _knob(_searchMaxHoursCtrl, 'Max hours / run',
-                      '0 = no time cap. GA stops at this OR generations.'),
-                  _knob(_searchGenCtrl, 'Generations',
-                      'Evolution iterations. Raise with Max hours for depth.'),
-                  _knob(_searchPopCtrl, 'Population',
-                      'Genes per island (×8 islands). Wider search/gen.'),
-                  _knob(_searchMaxIndCtrl, 'Max indicators',
-                      '0 = use all features. Cap to simplify strategies.'),
-                  _knob(_searchPortfolioCtrl, 'Portfolio size',
-                      'Max strategies kept per symbol/TF.'),
-                  _knob(_searchCorrCtrl, 'Corr threshold',
-                      '0-1. Reject if |corr| ≥ this vs the portfolio.'),
-                  _knob(_searchMaxRowsCtrl, 'Max rows',
-                      '0 = full dataset. Cap bars/run for speed.'),
+                  _knob(_searchMaxHoursCtrl, l10n.settingsKnobMaxHoursLabel,
+                      l10n.settingsKnobMaxHoursHelp),
+                  _knob(_searchGenCtrl, l10n.settingsKnobGenerationsLabel,
+                      l10n.settingsKnobGenerationsHelp),
+                  _knob(_searchPopCtrl, l10n.settingsKnobPopulationLabel,
+                      l10n.settingsKnobPopulationHelp),
+                  _knob(_searchMaxIndCtrl, l10n.settingsKnobMaxIndicatorsLabel,
+                      l10n.settingsKnobMaxIndicatorsHelp),
+                  _knob(_searchPortfolioCtrl,
+                      l10n.settingsKnobPortfolioSizeLabel,
+                      l10n.settingsKnobPortfolioSizeHelp),
+                  _knob(_searchCorrCtrl, l10n.settingsKnobCorrThresholdLabel,
+                      l10n.settingsKnobCorrThresholdHelp),
+                  _knob(_searchMaxRowsCtrl, l10n.settingsKnobMaxRowsLabel,
+                      l10n.settingsKnobMaxRowsHelp),
                 ],
               ),
             ],
@@ -837,11 +842,11 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
                 child: TextField(
                   controller: _newsSourceCtrl,
                   enabled: !_busy,
-                  decoration: const InputDecoration(
-                    labelText: 'News calendar source',
+                  decoration: InputDecoration(
+                    labelText: l10n.settingsNewsSourceLabel,
                     isDense: true,
-                    border: OutlineInputBorder(),
-                    helperText: 'e.g. "forexfactory", "investing", "test".',
+                    border: const OutlineInputBorder(),
+                    helperText: l10n.settingsNewsSourceHelper,
                   ),
                 ),
               ),
@@ -858,7 +863,9 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
                     ),
                     const SizedBox(width: 4),
                     Text(
-                      _newsEnabled ? 'Calendar ON' : 'Calendar OFF',
+                      _newsEnabled
+                          ? l10n.settingsCalendarOn
+                          : l10n.settingsCalendarOff,
                       style: TextStyle(
                         fontSize: 11,
                         color: _newsEnabled
@@ -877,52 +884,41 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
           // WarnOnly are opt-in for operators with event-driven
           // strategies (breakout-on-news, news-fade) who explicitly
           // want to trade through high-impact events.
-          const Text(
-            'News-trading mode',
-            style: TextStyle(
+          Text(
+            l10n.settingsNewsModeTitle,
+            style: const TextStyle(
               fontSize: 12,
               fontWeight: FontWeight.w700,
               color: NeoethosTokens.textPrimary,
             ),
           ),
           const SizedBox(height: 4),
-          const Text(
-            'How the gate treats high-impact news. The kill window is '
-            'set by `news_kill_window_min` in config.yaml (30 min '
-            'default). The default is to pause new orders; flip to '
-            'one of the others if your strategy is event-driven.',
-            style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
+          Text(
+            l10n.settingsNewsModeDescription,
+            style: const TextStyle(
+                fontSize: 11, color: NeoethosTokens.textMuted),
           ),
           const SizedBox(height: 8),
           _NewsTradingModeRow(
             id: 'block_on_news',
-            label: 'Pause during news (safe default)',
-            description:
-                'No new orders inside the kill window. Existing '
-                'positions keep their SL/TP.',
+            label: l10n.settingsNewsModeBlockLabel,
+            description: l10n.settingsNewsModeBlockDescription,
             selected: _newsTradingMode == 'block_on_news',
             busy: _busy,
             onPick: () => setState(() => _newsTradingMode = 'block_on_news'),
           ),
           _NewsTradingModeRow(
             id: 'allow_always',
-            label: 'Play through news (event-driven strategies)',
-            description:
-                'No automatic block. Use for breakout-on-news, '
-                'fade-the-spike, or any strategy whose edge IS the '
-                'news event. The UI still shows a banner while a '
-                'high-impact print is imminent.',
+            label: l10n.settingsNewsModeAllowLabel,
+            description: l10n.settingsNewsModeAllowDescription,
             selected: _newsTradingMode == 'allow_always',
             busy: _busy,
             onPick: () => setState(() => _newsTradingMode = 'allow_always'),
           ),
           _NewsTradingModeRow(
             id: 'warn_only',
-            label: 'Warn only — don\'t block',
-            description:
-                'Visual warning in the kill window but no order block. '
-                'For operators who want a heads-up without the gate '
-                'overriding their judgment.',
+            label: l10n.settingsNewsModeWarnLabel,
+            description: l10n.settingsNewsModeWarnDescription,
             selected: _newsTradingMode == 'warn_only',
             busy: _busy,
             onPick: () => setState(() => _newsTradingMode = 'warn_only'),
@@ -939,7 +935,9 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
                     : const Icon(Icons.save, size: 16),
-                label: Text(_busy ? 'Saving…' : 'Save settings'),
+                label: Text(_busy
+                    ? l10n.settingsSavingSettings
+                    : l10n.settingsSaveSettings),
               ),
               if (_message != null) ...[
                 const SizedBox(width: 12),
@@ -997,6 +995,7 @@ class _AccountPicker extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final async = ref.watch(brokerAccountsProvider);
     return async.when(
       data: (snap) {
@@ -1006,11 +1005,9 @@ class _AccountPicker extends ConsumerWidget {
             children: [
               fallback,
               const SizedBox(height: 4),
-              const Text(
-                'Token granted access to 0 accounts. Open Broker Setup '
-                '→ Re-authenticate and tick at least one account on '
-                'the Spotware consent screen.',
-                style: TextStyle(
+              Text(
+                l10n.settingsAccountPickerEmpty,
+                style: const TextStyle(
                   fontSize: 10,
                   color: NeoethosTokens.warning,
                 ),
@@ -1032,12 +1029,10 @@ class _AccountPicker extends ConsumerWidget {
         }
         return InputDecorator(
           decoration: InputDecoration(
-            labelText:
-                'Account · ${snap.accountCount} from /broker/accounts (live)',
+            labelText: l10n.settingsAccountPickerLabel(snap.accountCount),
             isDense: true,
             border: const OutlineInputBorder(),
-            helperText:
-                'Picked from the cTrader OAuth grant — no more typing cTIDs by hand.',
+            helperText: l10n.settingsAccountPickerHelper,
           ),
           child: DropdownButtonHideUnderline(
             child: DropdownButton<String>(
@@ -1114,9 +1109,7 @@ class _AccountPicker extends ConsumerWidget {
           fallback,
           const SizedBox(height: 4),
           Text(
-            'Account picker unavailable: $err\n'
-            'Save credentials, then Broker Setup → Re-authenticate '
-            'before the dropdown can populate.',
+            l10n.settingsAccountPickerError('$err'),
             style: const TextStyle(
               fontSize: 10,
               color: NeoethosTokens.warning,
@@ -1214,11 +1207,12 @@ class _NewsTradingModeRow extends StatelessWidget {
 class _Loading extends StatelessWidget {
   const _Loading();
   @override
-  Widget build(BuildContext context) => const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16),
         child: Text(
-          'Loading settings…',
-          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+          AppLocalizations.of(context)!.settingsLoadingSettings,
+          style: const TextStyle(
+              color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }
@@ -1233,16 +1227,15 @@ class _AdvancedKnobEditorCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return SectionCard(
-      title: 'Advanced runtime knobs',
+      title: l10n.settingsAdvancedKnobsTitle,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'Live editor for the ~42 catalogued knobs. Apply a preset '
-            '(Conservative / Balanced / Aggressive), or tweak any '
-            'individual knob with inline help.',
-            style: TextStyle(
+          Text(
+            l10n.settingsAdvancedKnobsIntro,
+            style: const TextStyle(
               fontSize: 12,
               color: NeoethosTokens.textMuted,
             ),
@@ -1256,7 +1249,7 @@ class _AdvancedKnobEditorCard extends StatelessWidget {
                     MaterialPageRoute<void>(
                       builder: (_) => Scaffold(
                         appBar: AppBar(
-                          title: const Text('Advanced settings'),
+                          title: Text(l10n.settingsAdvancedSettingsTitle),
                         ),
                         body: const AdvancedSettingsScreen(),
                       ),
@@ -1264,7 +1257,7 @@ class _AdvancedKnobEditorCard extends StatelessWidget {
                   );
                 },
                 icon: const Icon(Icons.tune, size: 16),
-                label: const Text('Open advanced editor'),
+                label: Text(l10n.settingsOpenAdvancedEditor),
               ),
             ],
           ),
@@ -1324,6 +1317,7 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
   bool get _dirty => _yamlOnDisk != null && _controller.text != _yamlOnDisk;
 
   Future<void> _load() async {
+    final l10n = AppLocalizations.of(context)!;
     setState(() {
       _loading = true;
       _error = null;
@@ -1338,13 +1332,16 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
         _controller.text = _yamlOnDisk!;
       });
     } catch (err) {
-      if (mounted) setState(() => _error = 'config.yaml could not be read — ${describeError(err)}');
+      if (mounted) {
+        setState(() => _error = l10n.settingsYamlReadError(describeError(err)));
+      }
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
 
   Future<void> _save() async {
+    final l10n = AppLocalizations.of(context)!;
     if (_yamlOnDisk == null || !_dirty) return;
     setState(() {
       _saving = true;
@@ -1367,24 +1364,26 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
         });
         if (mounted) {
           final bytes = (r['bytesWritten'] as num?)?.toInt() ?? 0;
+          final backup = r['backupPath'] != null
+              ? l10n.settingsYamlBackupAt('${r['backupPath']}')
+              : '';
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text(
-                'config.yaml saved ($bytes bytes). '
-                '${r['backupPath'] != null ? "Backup at ${r['backupPath']}" : ""}',
-              ),
+              content: Text(l10n.settingsYamlSaved(bytes, backup)),
               duration: const Duration(seconds: 4),
             ),
           );
         }
       } else {
         setState(() {
-          _error = (r['error'] as String?) ?? 'unknown error';
+          _error = (r['error'] as String?) ?? l10n.settingsUnknownError;
           _errorHint = r['hint'] as String?;
         });
       }
     } catch (err) {
-      if (mounted) setState(() => _error = 'Could not write config — ${describeError(err)}');
+      if (mounted) {
+        setState(() => _error = l10n.settingsYamlWriteError(describeError(err)));
+      }
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -1401,14 +1400,16 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: ExpansionTile(
         title: Row(
           children: [
-            const Text(
-              'Advanced: full config.yaml',
-              style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+            Text(
+              l10n.settingsRawConfigTitle,
+              style: const TextStyle(
+                  fontWeight: FontWeight.w600, fontSize: 13),
             ),
             if (_dirty) ...[
               const SizedBox(width: 8),
@@ -1419,9 +1420,9 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
                   color: const Color(0xFFE65100),
                   borderRadius: BorderRadius.circular(3),
                 ),
-                child: const Text(
-                  'UNSAVED',
-                  style: TextStyle(
+                child: Text(
+                  l10n.settingsUnsavedBadge,
+                  style: const TextStyle(
                     fontSize: 9,
                     color: Colors.white,
                     fontWeight: FontWeight.w700,
@@ -1433,10 +1434,8 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
         ),
         subtitle: Text(
           _path == null
-              ? 'Expand to edit every config knob. Save validates against '
-                  'the typed Settings schema before writing — a typo here '
-                  'surfaces as an error, not a silent failure later.'
-              : 'Source: $_path',
+              ? l10n.settingsRawConfigSubtitle
+              : l10n.settingsRawConfigSource('$_path'),
           style: const TextStyle(
             fontSize: 11,
             color: NeoethosTokens.textMuted,
@@ -1466,7 +1465,7 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
                                   strokeWidth: 2),
                             )
                           : const Icon(Icons.refresh, size: 16),
-                      label: const Text('Reload from disk'),
+                      label: Text(l10n.settingsReloadFromDisk),
                     ),
                     const SizedBox(width: 8),
                     FilledButton.icon(
@@ -1484,14 +1483,14 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
                               ),
                             )
                           : const Icon(Icons.save, size: 16),
-                      label: const Text('Save changes'),
+                      label: Text(l10n.settingsSaveChanges),
                     ),
                     const SizedBox(width: 8),
                     if (_dirty)
                       OutlinedButton.icon(
                         onPressed: _saving ? null : _revert,
                         icon: const Icon(Icons.undo, size: 16),
-                        label: const Text('Revert'),
+                        label: Text(l10n.settingsRevert),
                       ),
                   ],
                 ),
@@ -1569,9 +1568,9 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
                     ),
                   )
                 else if (_loading)
-                  const Text(
-                    'Fetching config.yaml…',
-                    style: TextStyle(
+                  Text(
+                    l10n.settingsFetchingConfig,
+                    style: const TextStyle(
                       fontSize: 11,
                       color: NeoethosTokens.textMuted,
                     ),

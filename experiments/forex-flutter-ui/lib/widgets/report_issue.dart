@@ -23,6 +23,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../theme/theme.dart';
 
@@ -95,6 +96,7 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
   /// recipient + subject + body. Uses platform shell out — no
   /// url_launcher dep.
   Future<void> _openMail() async {
+    final l10n = AppLocalizations.of(context)!;
     final r = _result;
     if (r == null) return;
     final encodedSubject = Uri.encodeComponent(r.emailSubject);
@@ -117,8 +119,11 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
         SnackBar(
           backgroundColor: NeoethosTokens.warning,
           content: Text(
-            'Could not open mail client ($e). Email '
-            '${r.emailRecipient} manually and attach ${r.zipPath}.',
+            l10n.reportIssueMailOpenFailed(
+              e.toString(),
+              r.emailRecipient,
+              r.zipPath,
+            ),
           ),
         ),
       );
@@ -126,15 +131,16 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
   }
 
   Future<void> _copyPath() async {
+    final l10n = AppLocalizations.of(context)!;
     final r = _result;
     if (r == null) return;
     await Clipboard.setData(ClipboardData(text: r.zipPath));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
+      SnackBar(
         backgroundColor: NeoethosTokens.buy,
-        content: Text('File path copied — paste it into your mail attach dialog'),
-        duration: Duration(seconds: 3),
+        content: Text(l10n.reportIssuePathCopied),
+        duration: const Duration(seconds: 3),
       ),
     );
   }
@@ -160,21 +166,22 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return AlertDialog(
-      title: const Text('Report an issue'),
+      title: Text(l10n.reportIssueTitle),
       content: SizedBox(
         width: 480,
         child: SingleChildScrollView(
           child: _result == null
-              ? _buildForm()
-              : _buildResult(_result!),
+              ? _buildForm(context)
+              : _buildResult(context, _result!),
         ),
       ),
       actions: _result == null
           ? [
               TextButton(
                 onPressed: _building ? null : () => Navigator.pop(context),
-                child: const Text('Cancel'),
+                child: Text(l10n.commonCancel),
               ),
               FilledButton.icon(
                 onPressed: _building ? null : _generate,
@@ -185,65 +192,60 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
                     : const Icon(Icons.bug_report, size: 16),
-                label: Text(_building ? 'Bundling…' : 'Generate report'),
+                label: Text(
+                  _building ? l10n.reportIssueBundling : l10n.reportIssueGenerate,
+                ),
               ),
             ]
           : [
               TextButton(
                 onPressed: () => Navigator.pop(context),
-                child: const Text('Close'),
+                child: Text(l10n.commonClose),
               ),
               OutlinedButton.icon(
                 onPressed: _revealOnDesktop,
                 icon: const Icon(Icons.folder_open, size: 16),
-                label: const Text('Show file'),
+                label: Text(l10n.reportIssueShowFile),
               ),
               OutlinedButton.icon(
                 onPressed: _copyPath,
                 icon: const Icon(Icons.copy, size: 16),
-                label: const Text('Copy path'),
+                label: Text(l10n.reportIssueCopyPath),
               ),
               FilledButton.icon(
                 onPressed: _openMail,
                 icon: const Icon(Icons.mail, size: 16),
-                label: const Text('Open mail'),
+                label: Text(l10n.reportIssueOpenMail),
               ),
             ],
     );
   }
 
-  Widget _buildForm() {
+  Widget _buildForm(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
-          'Something not working? Click Generate report and we will '
-          'collect a small bundle (today\'s logs + redacted config + '
-          'system info) into a .zip on your Desktop. Then we open your '
-          'mail client so you can send it to NeoEthos support.',
-          style: TextStyle(fontSize: 12, color: NeoethosTokens.textPrimary),
+        Text(
+          l10n.reportIssueIntro,
+          style: const TextStyle(fontSize: 12, color: NeoethosTokens.textPrimary),
         ),
         const SizedBox(height: 10),
         TextField(
           controller: _descCtrl,
           minLines: 3,
           maxLines: 6,
-          decoration: const InputDecoration(
-            labelText: 'What were you doing when it broke? (optional)',
-            border: OutlineInputBorder(),
+          decoration: InputDecoration(
+            labelText: l10n.reportIssueDescriptionLabel,
+            border: const OutlineInputBorder(),
             isDense: true,
-            hintText:
-                'e.g. "Tried to BUY EURUSD 0.1 lot, got Order failed: '
-                'Markets are closed" — but I checked, market should '
-                'be open',
+            hintText: l10n.reportIssueDescriptionHint,
           ),
         ),
         const SizedBox(height: 8),
-        const Text(
-          'Privacy: client_secret + access_token are masked before '
-          'they enter the zip. The bundle never leaves your machine '
-          'unless you send it.',
-          style: TextStyle(
+        Text(
+          l10n.reportIssuePrivacy,
+          style: const TextStyle(
             fontSize: 10,
             color: NeoethosTokens.textFaint,
           ),
@@ -251,7 +253,7 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
         if (_error != null) ...[
           const SizedBox(height: 10),
           Text(
-            'Bundle failed: $_error',
+            l10n.reportIssueBundleFailed(_error.toString()),
             style: const TextStyle(fontSize: 11, color: NeoethosTokens.sell),
           ),
         ],
@@ -259,7 +261,8 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
     );
   }
 
-  Widget _buildResult(DiagnosticReport r) {
+  Widget _buildResult(BuildContext context, DiagnosticReport r) {
+    final l10n = AppLocalizations.of(context)!;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -268,7 +271,7 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
             const Icon(Icons.check_circle, size: 18, color: NeoethosTokens.buy),
             const SizedBox(width: 6),
             Text(
-              'Bundle ready · ${r.sizeLabel}',
+              l10n.reportIssueBundleReady(r.sizeLabel),
               style: const TextStyle(
                 fontWeight: FontWeight.w700,
                 color: NeoethosTokens.buy,
@@ -277,9 +280,9 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
           ],
         ),
         const SizedBox(height: 8),
-        const Text(
-          'File on your Desktop:',
-          style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
+        Text(
+          l10n.reportIssueFileOnDesktop,
+          style: const TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
         ),
         SelectableText(
           r.zipPath,
@@ -290,9 +293,9 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
           ),
         ),
         const SizedBox(height: 10),
-        const Text(
-          'What\'s inside:',
-          style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
+        Text(
+          l10n.reportIssueWhatsInside,
+          style: const TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
         ),
         const SizedBox(height: 4),
         Wrap(
@@ -320,18 +323,16 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
         ),
         const SizedBox(height: 12),
         Text(
-          'Recipient: ${r.emailRecipient}',
+          l10n.reportIssueRecipient(r.emailRecipient),
           style: const TextStyle(
             fontSize: 11,
             color: NeoethosTokens.textMuted,
           ),
         ),
         const SizedBox(height: 8),
-        const Text(
-          'Click "Open mail" — your default mail client opens with '
-          'the recipient + subject prefilled. Drag the zip from your '
-          'Desktop into the message before you send.',
-          style: TextStyle(
+        Text(
+          l10n.reportIssueOpenMailHint,
+          style: const TextStyle(
             fontSize: 11,
             color: NeoethosTokens.textPrimary,
           ),

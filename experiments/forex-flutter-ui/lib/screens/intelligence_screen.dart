@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
+import '../l10n/app_localizations.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '../widgets/backend_error_widget.dart';
@@ -18,20 +19,21 @@ class IntelligenceScreen extends ConsumerWidget {
   const IntelligenceScreen({super.key});
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final async = ref.watch(intelligenceProvider);
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const ViewHeader(
-            title: 'Intelligence',
-            subtitle: 'Trained model artifacts · discovery targets',
+          ViewHeader(
+            title: l10n.intelligenceTitle,
+            subtitle: l10n.intelligenceSubtitle,
           ),
           async.when(
             data: (s) => _Body(snapshot: s),
             loading: () => const _Loading(),
             error: (err, _) => BackendErrorWidget(
-                    error: err, title: 'Intelligence unavailable'),
+                    error: err, title: l10n.intelligenceUnavailable),
           ),
         ],
       ),
@@ -45,6 +47,7 @@ class _Body extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final dtFmt = DateFormat('yyyy-MM-dd HH:mm');
     final lastTouched = snapshot.lastTouchedUnixMs == null
         ? '—'
@@ -52,36 +55,39 @@ class _Body extends StatelessWidget {
             snapshot.lastTouchedUnixMs!));
     final avgAcc = snapshot.walkforwardAvgAccuracy;
     final accStr = (avgAcc == null || avgAcc == 0.0)
-        ? '— (walkforward has not run yet)'
+        ? l10n.intelligenceWalkforwardNotRun
         : '${(avgAcc * 100).toStringAsFixed(2)} %';
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         SectionCard(
-          title: 'Inventory',
+          title: l10n.intelligenceInventory,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _Row('Models directory', snapshot.modelsDir),
+              _Row(l10n.intelligenceModelsDirectory, snapshot.modelsDir),
               _Row(
-                'Directory exists',
-                snapshot.modelsDirExists ? 'YES' : 'NO',
+                l10n.intelligenceDirectoryExists,
+                snapshot.modelsDirExists
+                    ? l10n.intelligenceYes
+                    : l10n.intelligenceNo,
                 accent: snapshot.modelsDirExists
                     ? NeoethosTokens.buy
                     : NeoethosTokens.sell,
               ),
-              _Row('Artifact count', '${snapshot.artifactCount}'),
-              _Row('Last touched', lastTouched),
-              _Row('Walkforward splits',
+              _Row(l10n.intelligenceArtifactCount,
+                  '${snapshot.artifactCount}'),
+              _Row(l10n.intelligenceLastTouched, lastTouched),
+              _Row(l10n.intelligenceWalkforwardSplits,
                   '${snapshot.walkforwardSplits ?? 0}'),
-              _Row('Walkforward avg accuracy', accStr),
+              _Row(l10n.intelligenceWalkforwardAvgAccuracy, accStr),
             ],
           ),
         ),
         if (snapshot.artifacts.isNotEmpty)
           SectionCard(
-            title: 'Model artifacts',
+            title: l10n.intelligenceModelArtifacts,
             child: Wrap(
               spacing: 6,
               runSpacing: 6,
@@ -110,13 +116,11 @@ class _Body extends StatelessWidget {
             ),
           ),
         SectionCard(
-          title: 'Discovery targets',
+          title: l10n.intelligenceDiscoveryTargets,
           child: snapshot.discoveryTargets.isEmpty
-              ? const Text(
-                  'No model_targets.json found yet. Run Discovery once '
-                  '(Strategy Discovery Engine screen) and the picked '
-                  'portfolio will land here.',
-                  style: TextStyle(
+              ? Text(
+                  l10n.intelligenceNoTargets,
+                  style: const TextStyle(
                     color: NeoethosTokens.textMuted,
                     fontSize: 12,
                   ),
@@ -237,11 +241,12 @@ class _Row extends StatelessWidget {
 class _Loading extends StatelessWidget {
   const _Loading();
   @override
-  Widget build(BuildContext context) => const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16),
         child: Text(
-          'Scanning models directory…',
-          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+          AppLocalizations.of(context)!.intelligenceScanningModels,
+          style: const TextStyle(
+              color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

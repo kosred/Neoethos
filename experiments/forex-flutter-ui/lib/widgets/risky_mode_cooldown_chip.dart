@@ -34,6 +34,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
+import '../l10n/app_localizations.dart';
 import '../theme/theme.dart';
 
 /// Compact chip showing the remaining cooldown. Drop it next to the
@@ -115,6 +116,7 @@ class _RiskyModeCooldownChipState extends State<RiskyModeCooldownChip> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final secs = _localCountdown;
     if (secs == null || secs < 0) return const SizedBox.shrink();
 
@@ -136,7 +138,7 @@ class _RiskyModeCooldownChipState extends State<RiskyModeCooldownChip> {
     }
 
     return Tooltip(
-      message: _modalCopy(secs),
+      message: _modalCopy(l10n, secs),
       preferBelow: false,
       child: InkWell(
         onTap: () => _showLockoutModal(context, secs),
@@ -162,8 +164,8 @@ class _RiskyModeCooldownChipState extends State<RiskyModeCooldownChip> {
                 children: [
                   Text(
                     secs <= 0
-                        ? 'Risky Mode re-arm available'
-                        : 'Re-arm in ${_formatRelative(secs)}',
+                        ? l10n.riskyChipReArmAvailable
+                        : l10n.riskyChipReArmIn(_formatRelative(secs)),
                     style: TextStyle(
                       color: text,
                       fontSize: 11,
@@ -173,7 +175,7 @@ class _RiskyModeCooldownChipState extends State<RiskyModeCooldownChip> {
                   ),
                   if (secs > 0)
                     Text(
-                      'Available at ${_formatAbsolute(secs)} (local)',
+                      l10n.riskyChipAvailableAt(_formatAbsolute(l10n, secs)),
                       style: TextStyle(
                         color: text.withValues(alpha: 0.8),
                         fontSize: 10,
@@ -201,7 +203,7 @@ class _RiskyModeCooldownChipState extends State<RiskyModeCooldownChip> {
   /// "16:23 tomorrow" / "16:23 today" / "16:23 on May 27".
   /// Always operator-local time — never UTC for a user-facing
   /// countdown.
-  static String _formatAbsolute(int secs) {
+  static String _formatAbsolute(AppLocalizations l10n, int secs) {
     final eta = DateTime.now().add(Duration(seconds: secs));
     final now = DateTime.now();
     final formatter = DateFormat('HH:mm');
@@ -209,27 +211,26 @@ class _RiskyModeCooldownChipState extends State<RiskyModeCooldownChip> {
     final today = DateTime(now.year, now.month, now.day);
     final tomorrow = today.add(const Duration(days: 1));
     final etaDay = DateTime(eta.year, eta.month, eta.day);
-    if (etaDay == today) return '$clock today';
-    if (etaDay == tomorrow) return '$clock tomorrow';
+    if (etaDay == today) return l10n.riskyChipToday(clock);
+    if (etaDay == tomorrow) return l10n.riskyChipTomorrow(clock);
     final dateFormatter = DateFormat('MMM d');
-    return '$clock on ${dateFormatter.format(eta)}';
+    return l10n.riskyChipOnDate(clock, dateFormatter.format(eta));
   }
 
-  static String _modalCopy(int secs) {
-    return 'Risky Mode is locked until ${_formatAbsolute(secs)} '
-        'because the kill-switch tripped. This 24-hour cooldown is '
-        'enforced and cannot be overridden.';
+  static String _modalCopy(AppLocalizations l10n, int secs) {
+    return l10n.riskyChipModalCopy(_formatAbsolute(l10n, secs));
   }
 
   void _showLockoutModal(BuildContext context, int secs) {
+    final l10n = AppLocalizations.of(context)!;
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Row(
+        title: Row(
           children: [
-            Icon(Icons.lock_clock, color: Color(0xFFB71C1C)),
-            SizedBox(width: 8),
-            Text('Risky Mode locked'),
+            const Icon(Icons.lock_clock, color: Color(0xFFB71C1C)),
+            const SizedBox(width: 8),
+            Text(l10n.riskyChipModalTitle),
           ],
         ),
         content: SizedBox(
@@ -238,7 +239,7 @@ class _RiskyModeCooldownChipState extends State<RiskyModeCooldownChip> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(_modalCopy(secs)),
+              Text(_modalCopy(l10n, secs)),
               const SizedBox(height: 16),
               Container(
                 padding: const EdgeInsets.all(12),
@@ -249,20 +250,17 @@ class _RiskyModeCooldownChipState extends State<RiskyModeCooldownChip> {
                     color: const Color(0xFFB71C1C).withValues(alpha: 0.3),
                   ),
                 ),
-                child: const Column(
+                child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Why a cooldown?',
-                      style: TextStyle(fontWeight: FontWeight.w600),
+                      l10n.riskyChipWhyCooldown,
+                      style: const TextStyle(fontWeight: FontWeight.w600),
                     ),
-                    SizedBox(height: 6),
+                    const SizedBox(height: 6),
                     Text(
-                      'A kill-switch trip means the daily loss budget '
-                      'or stage-DD ceiling was breached. Re-arming '
-                      'inside 24 h tends to chase losses; the cooldown '
-                      'forces an emotional reset.',
-                      style: TextStyle(
+                      l10n.riskyChipWhyBody,
+                      style: const TextStyle(
                         color: NeoethosTokens.textMuted,
                         fontSize: 12,
                       ),
@@ -276,7 +274,7 @@ class _RiskyModeCooldownChipState extends State<RiskyModeCooldownChip> {
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('OK'),
+            child: Text(l10n.riskyChipOk),
           ),
         ],
       ),

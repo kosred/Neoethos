@@ -9,6 +9,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 
@@ -44,6 +45,7 @@ class _MultiSymbolPickerDialogState
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final async = ref.watch(brokerSymbolsProvider);
     return Dialog(
       backgroundColor: NeoethosTokens.panelBg,
@@ -57,9 +59,9 @@ class _MultiSymbolPickerDialogState
             children: [
               Row(
                 children: [
-                  const Text(
-                    'Select pairs',
-                    style: TextStyle(
+                  Text(
+                    l10n.multiSymbolPickerTitle,
+                    style: const TextStyle(
                       fontSize: 15,
                       fontWeight: FontWeight.w700,
                       color: NeoethosTokens.textPrimary,
@@ -67,7 +69,7 @@ class _MultiSymbolPickerDialogState
                   ),
                   const Spacer(),
                   Text(
-                    '${_selected.length} selected',
+                    l10n.multiSymbolPickerSelectedCount(_selected.length),
                     style: const TextStyle(
                       fontSize: 12,
                       color: NeoethosTokens.accent,
@@ -82,11 +84,11 @@ class _MultiSymbolPickerDialogState
                 onChanged: (v) =>
                     setState(() => _query = v.trim().toUpperCase()),
                 textCapitalization: TextCapitalization.characters,
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
                   isDense: true,
-                  prefixIcon: Icon(Icons.search, size: 18),
-                  hintText: 'Search ticker…',
-                  border: OutlineInputBorder(),
+                  prefixIcon: const Icon(Icons.search, size: 18),
+                  hintText: l10n.multiSymbolPickerSearchHint,
+                  border: const OutlineInputBorder(),
                 ),
               ),
               const SizedBox(height: 8),
@@ -102,8 +104,7 @@ class _MultiSymbolPickerDialogState
                       const Center(child: CircularProgressIndicator()),
                   error: (e, _) => Center(
                     child: Text(
-                      'Symbol list could not be loaded — ${describeError(e)}. '
-                      'Authenticate in Broker Setup first.',
+                      l10n.multiSymbolPickerLoadError(describeError(e)),
                       style: const TextStyle(color: NeoethosTokens.sell),
                     ),
                   ),
@@ -115,7 +116,7 @@ class _MultiSymbolPickerDialogState
                 children: [
                   TextButton(
                     onPressed: () => Navigator.pop(context),
-                    child: const Text('Cancel'),
+                    child: Text(l10n.commonCancel),
                   ),
                   const SizedBox(width: 8),
                   FilledButton(
@@ -123,7 +124,7 @@ class _MultiSymbolPickerDialogState
                         ? null
                         : () => Navigator.pop(
                             context, _selected.toList()..sort()),
-                    child: Text('Add ${_selected.length}'),
+                    child: Text(l10n.multiSymbolPickerAddCount(_selected.length)),
                   ),
                 ],
               ),
@@ -135,11 +136,12 @@ class _MultiSymbolPickerDialogState
   }
 
   Widget _catChip(_Cat c) {
+    final l10n = AppLocalizations.of(context)!;
     final label = switch (c) {
-      _Cat.forex => 'Forex',
-      _Cat.metals => 'Metals',
-      _Cat.equities => 'Equities',
-      _Cat.all => 'All',
+      _Cat.forex => l10n.symbolCatForex,
+      _Cat.metals => l10n.symbolCatMetals,
+      _Cat.equities => l10n.symbolCatEquities,
+      _Cat.all => l10n.symbolCatAll,
     };
     final on = _cat == c;
     return GestureDetector(
@@ -179,9 +181,9 @@ class _MultiSymbolPickerDialogState
             .where((s) => s.symbolName.toUpperCase().contains(_query))
             .toList();
     if (filtered.isEmpty) {
-      return const Center(
-        child: Text('No matches',
-            style: TextStyle(color: NeoethosTokens.textMuted)),
+      return Center(
+        child: Text(AppLocalizations.of(context)!.multiSymbolPickerNoMatches,
+            style: const TextStyle(color: NeoethosTokens.textMuted)),
       );
     }
     return ListView.builder(

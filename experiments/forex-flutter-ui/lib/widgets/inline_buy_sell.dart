@@ -22,6 +22,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../theme/theme.dart';
@@ -41,6 +42,9 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
 
   Future<void> _placeOrder(String side) async {
     if (_busy) return;
+    // Capture the localizations before the await — the BuildContext must
+    // not be used across the async gap.
+    final l10n = AppLocalizations.of(context)!;
     setState(() {
       _busy = true;
       _lastError = null;
@@ -65,8 +69,12 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
               ok ? NeoethosTokens.buy : NeoethosTokens.warning,
           duration: const Duration(seconds: 3),
           content: Text(
-            '${side.toUpperCase()} ${widget.symbol} '
-            '${_volumeLots.toStringAsFixed(2)} lots — $status',
+            l10n.inlineTradeOrderResult(
+              side.toUpperCase(),
+              widget.symbol,
+              _volumeLots.toStringAsFixed(2),
+              status,
+            ),
           ),
         ),
       );
@@ -74,17 +82,17 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
       ref.read(accountSnapshotProvider.notifier).refreshNow();
     } catch (e) {
       if (!mounted) return;
-      setState(() => _lastError = _shortError(e.toString()));
+      setState(() => _lastError = _shortError(l10n, e.toString()));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
-  String _shortError(String raw) {
+  String _shortError(AppLocalizations l10n, String raw) {
     // Pull a human line out of a DioException / backend error body.
     final lower = raw.toLowerCase();
     if (lower.contains('502') || lower.contains('bad gateway')) {
-      return 'Broker rejected (502) — session may be reconnecting.';
+      return l10n.inlineTradeBrokerRejected502;
     }
     if (raw.length > 90) return '${raw.substring(0, 90)}…';
     return raw;
@@ -100,6 +108,7 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final spots = ref.watch(liveSpotsProvider).valueOrNull;
     final tick = spots?.lookup(widget.symbol);
     final bid = tick?.bid;
@@ -152,7 +161,9 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
                 ),
               ),
               Text(
-                stale ? 'stale ${freshSecs.toStringAsFixed(0)}s' : 'live',
+                stale
+                    ? l10n.inlineTradeStale(freshSecs.toStringAsFixed(0))
+                    : l10n.inlineTradeLive,
                 style: TextStyle(
                   fontSize: 8,
                   fontWeight: FontWeight.w700,
@@ -169,7 +180,7 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
             mainAxisSize: MainAxisSize.min,
             children: [
               _SideButton(
-                label: 'SELL',
+                label: l10n.inlineTradeSell,
                 price: bid.toStringAsFixed(digits),
                 color: NeoethosTokens.sell,
                 busy: _busy,
@@ -184,7 +195,7 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
               ),
               const SizedBox(width: 6),
               _SideButton(
-                label: 'BUY',
+                label: l10n.inlineTradeBuy,
                 price: ask.toStringAsFixed(digits),
                 color: NeoethosTokens.buy,
                 busy: _busy,
@@ -329,6 +340,7 @@ class _QuickTradeStub extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
       decoration: BoxDecoration(
@@ -336,10 +348,10 @@ class _QuickTradeStub extends StatelessWidget {
         border: Border.all(color: NeoethosTokens.border),
         borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
-      child: const Row(
+      child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          SizedBox(
+          const SizedBox(
             width: 10,
             height: 10,
             child: CircularProgressIndicator(
@@ -347,10 +359,10 @@ class _QuickTradeStub extends StatelessWidget {
               color: NeoethosTokens.textMuted,
             ),
           ),
-          SizedBox(width: 6),
+          const SizedBox(width: 6),
           Text(
-            'Quick trade · awaiting price',
-            style: TextStyle(
+            l10n.inlineTradeAwaitingPrice,
+            style: const TextStyle(
               fontSize: 9,
               fontWeight: FontWeight.w600,
               color: NeoethosTokens.textMuted,

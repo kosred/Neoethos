@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../startup/backend_watchdog.dart';
 import '../theme/theme.dart';
 
@@ -19,8 +20,9 @@ class BackendErrorWidget extends ConsumerWidget {
   final Object error;
 
   /// One-line context for THIS screen, e.g. "Settings couldn't load".
-  /// The translated detail renders beneath it.
-  final String title;
+  /// The translated detail renders beneath it. When null, a localized
+  /// generic "couldn't reach the engine" title is used.
+  final String? title;
 
   /// Show the "Restart engine" button. Leave true for connectivity /
   /// backend-down errors (the common case); set false for errors a
@@ -30,13 +32,15 @@ class BackendErrorWidget extends ConsumerWidget {
   const BackendErrorWidget({
     super.key,
     required this.error,
-    this.title = 'Couldn’t reach the engine',
+    this.title,
     this.showRestart = true,
   });
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final detail = describeError(error);
+    final resolvedTitle = title ?? l10n.backendErrorDefaultTitle;
     return Padding(
       padding: const EdgeInsets.all(NeoethosTokens.spMd),
       child: Column(
@@ -54,7 +58,7 @@ class BackendErrorWidget extends ConsumerWidget {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  title,
+                  resolvedTitle,
                   style: const TextStyle(
                     fontSize: NeoethosTokens.fsBody,
                     fontWeight: FontWeight.w700,
@@ -76,10 +80,9 @@ class BackendErrorWidget extends ConsumerWidget {
             ),
           ],
           const SizedBox(height: 4),
-          const Text(
-            'Check the status indicator at the top-right — if it is red, '
-            'the engine is not running.',
-            style: TextStyle(
+          Text(
+            l10n.backendErrorCheckIndicator,
+            style: const TextStyle(
               fontSize: NeoethosTokens.fsCaption,
               height: 1.45,
               color: NeoethosTokens.textFaint,
@@ -91,14 +94,14 @@ class BackendErrorWidget extends ConsumerWidget {
               onPressed: () {
                 ref.read(backendHealthProvider.notifier).manualRestart();
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Restarting the engine…'),
-                    duration: Duration(seconds: 3),
+                  SnackBar(
+                    content: Text(l10n.backendErrorRestarting),
+                    duration: const Duration(seconds: 3),
                   ),
                 );
               },
               icon: const Icon(Icons.refresh, size: 16),
-              label: const Text('Restart engine'),
+              label: Text(l10n.backendErrorRestartEngine),
             ),
           ],
         ],
