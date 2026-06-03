@@ -15,7 +15,7 @@ pub enum CodexError {
     #[error("OAuth callback timed out after {0}s. Try clicking Connect again.")]
     CallbackTimeout(u64),
 
-    #[error("OAuth callback received an error from OpenAI: {0}")]
+    #[error("OAuth callback received an error from the sign-in provider: {0}")]
     CallbackError(String),
 
     #[error("OAuth state mismatch — the callback did not match the request we sent. Aborting to defend against CSRF.")]

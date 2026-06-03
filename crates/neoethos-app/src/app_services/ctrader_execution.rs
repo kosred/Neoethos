@@ -446,7 +446,7 @@ impl ProductionCTraderExecutionBackend {
         // in `read_matching_response` previously blocked indefinitely; with a
         // timeout the I/O error bubbles up, the caller drops the session,
         // and the next `execute_via_session` retry re-authenticates.
-        // Override via `FOREX_BOT_CTRADER_READ_TIMEOUT_SECS` (0 disables).
+        // Override via `NEOETHOS_BOT_CTRADER_READ_TIMEOUT_SECS` (0 disables).
         // F-CORE3 closure (2026-05-25): routed through the canonical
         // `env_overrides::ctrader_read_timeout_secs` getter so the var
         // is grep-able from one place + clamped consistently.
@@ -688,7 +688,7 @@ impl CTraderExecutionBackend for StubCTraderExecutionBackend {
 }
 
 /// Maximum number of attempts (initial + retries) for a single
-/// `execute_via_session` call. Tunable via `FOREX_BOT_CTRADER_MAX_ATTEMPTS`
+/// `execute_via_session` call. Tunable via `NEOETHOS_BOT_CTRADER_MAX_ATTEMPTS`
 /// (clamped to `[1, 5]`; default 3). The default is deliberately small —
 /// retry safety relies on the broker deduping by `clientOrderId`.
 ///
@@ -700,7 +700,7 @@ fn ctrader_max_attempts() -> u32 {
 }
 
 /// Base backoff in ms for retries; tunable via
-/// `FOREX_BOT_CTRADER_BACKOFF_BASE_MS` (clamped to `[10, 2000]`; default 200).
+/// `NEOETHOS_BOT_CTRADER_BACKOFF_BASE_MS` (clamped to `[10, 2000]`; default 200).
 ///
 /// **F-CORE3 closure (2026-05-25)**: thin shim over the canonical
 /// `env_overrides::ctrader_backoff_base_ms` typed getter.
@@ -991,7 +991,7 @@ fn validate_execution_outcome(
     // `filled_volume < requested_volume`. We bail here on Failed and flag
     // PartialFill as an error so the trading loop can decide between retry
     // for the residual or cancel-and-log. Set
-    // `FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL=1` to opt back into the previous
+    // `NEOETHOS_BOT_CTRADER_ALLOW_PARTIAL_FILL=1` to opt back into the previous
     // permissive behaviour (e.g. for replay tests).
     if matches!(outcome.status, CTraderExecutionStatus::Failed) {
         anyhow::bail!(
@@ -1006,7 +1006,7 @@ fn validate_execution_outcome(
         if !allow_partial {
             anyhow::bail!(
                 "cTrader execution returned PartialFill (deal_id={:?}, requested={:?}, filled={:?}); \
-                 set FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL=1 to accept partial fills",
+                 set NEOETHOS_BOT_CTRADER_ALLOW_PARTIAL_FILL=1 to accept partial fills",
                 outcome.deal_id,
                 outcome.requested_lot_size,
                 outcome.filled_lot_size

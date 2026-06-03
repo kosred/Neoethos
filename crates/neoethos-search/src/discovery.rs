@@ -27,7 +27,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// Typed runtime knobs that previously lived only in `FOREX_BOT_*` env vars.
+/// Typed runtime knobs that previously lived only in `NEOETHOS_BOT_*` env vars.
 ///
 /// These values change *production* discovery semantics (which features are
 /// kept, how much data the stage-1 funnel sees, what counts as in-sample for
@@ -100,7 +100,7 @@ impl Default for DiscoveryRuntimeOverrides {
             // empty portfolio because the strategies overfit) rather than
             // a hard "Failed: insufficient history" preflight stop. Operators
             // who want the strict 10y gate back can set
-            // `FOREX_BOT_MIN_HISTORY_YEARS=10` via env.
+            // `NEOETHOS_BOT_MIN_HISTORY_YEARS=10` via env.
             //
             // F-096 history (2026-05-24, now superseded): the previous
             // default was 10 because synthetic-data leaks into discovery
@@ -113,33 +113,33 @@ impl Default for DiscoveryRuntimeOverrides {
 }
 
 impl DiscoveryRuntimeOverrides {
-    /// One-shot read of the legacy `FOREX_BOT_*` env vars. This is the only
+    /// One-shot read of the legacy `NEOETHOS_BOT_*` env vars. This is the only
     /// place in `neoethos-search` that consults the environment for these
     /// knobs; production callers should prefer constructing the struct from
     /// typed config.
     pub fn from_env() -> Self {
         let mut overrides = Self::default();
-        if let Some(top_k) = std::env::var("FOREX_BOT_PREFILTER_TOP_K")
+        if let Some(top_k) = std::env::var("NEOETHOS_BOT_PREFILTER_TOP_K")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
         {
             overrides.prefilter_top_k = top_k;
         }
-        if let Some(insample) = std::env::var("FOREX_BOT_PREFILTER_INSAMPLE")
+        if let Some(insample) = std::env::var("NEOETHOS_BOT_PREFILTER_INSAMPLE")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
         {
             overrides.prefilter_insample_frac = insample;
         }
-        if let Some(stage1) = std::env::var("FOREX_BOT_FUNNEL_STAGE1_PCT")
+        if let Some(stage1) = std::env::var("NEOETHOS_BOT_FUNNEL_STAGE1_PCT")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite())
         {
             overrides.funnel_stage1_pct = stage1.clamp(0.01, 1.0);
         }
-        if let Some(window) = std::env::var("FOREX_BOT_FUNNEL_STAGE1_WINDOW")
+        if let Some(window) = std::env::var("NEOETHOS_BOT_FUNNEL_STAGE1_WINDOW")
             .ok()
             .and_then(|v| Stage1Window::from_env_str(&v))
         {
@@ -148,7 +148,7 @@ impl DiscoveryRuntimeOverrides {
         // F-096: minimum-history-years env override. 0 disables the
         // check (for test runners and `--allow-short-history` operator
         // flag). Production deployments leave it at the default 10y.
-        if let Some(years) = std::env::var("FOREX_BOT_MIN_HISTORY_YEARS")
+        if let Some(years) = std::env::var("NEOETHOS_BOT_MIN_HISTORY_YEARS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
         {
@@ -211,13 +211,13 @@ pub struct DiscoveryConfig {
     pub max_regime_loss_pct: f64,
     /// Higher timeframes to include in multitimeframe feature preparation.
     pub higher_timeframes: Vec<String>,
-    /// Typed replacements for the legacy `FOREX_BOT_PREFILTER_*` /
-    /// `FOREX_BOT_FUNNEL_STAGE1_PCT` env vars.
+    /// Typed replacements for the legacy `NEOETHOS_BOT_PREFILTER_*` /
+    /// `NEOETHOS_BOT_FUNNEL_STAGE1_PCT` env vars.
     pub runtime_overrides: DiscoveryRuntimeOverrides,
     /// When `Some`, the discovery pipeline replaces its full-history
     /// walkforward consistency gate with a "passes prop-firm rules on
     /// N random 30-day windows ≥ pass_rate" gate. Populated from
-    /// `FOREX_BOT_DISCOVERY_PROP_FIRM_GATE=1` and friends in
+    /// `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_GATE=1` and friends in
     /// `with_env_runtime_overrides`. `None` keeps the production
     /// behavior unchanged.
     pub prop_firm_gate: Option<PropFirmGateOverrides>,
@@ -337,7 +337,7 @@ impl DiscoveryConfig {
             // currency, populated from one of:
             //  - `config.yaml` `system.account_currency`
             //  - cTrader trader profile (bridge writes back at startup)
-            //  - `FOREX_BOT_PROP_ACCOUNT_CURRENCY` env override
+            //  - `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` env override
             // Empty propagates downstream so the cost-model NaN guard
             // can reject runs that haven't bound a real currency. The
             // previous F-007 fix used `String::new()` here unconditionally,
@@ -401,7 +401,7 @@ impl DiscoveryConfig {
 
     /// Resolve runtime knobs. The system prefers self-tuning over
     /// hand-rolled env vars: if the caller does not opt out via
-    /// `FOREX_BOT_DISCOVERY_MODE=strict`, discovery enters its
+    /// `NEOETHOS_BOT_DISCOVERY_MODE=strict`, discovery enters its
     /// "smart prop-firm" mode automatically — permissive filters,
     /// FTMO-rule scoring on N random 60-day windows, ranking-based
     /// portfolio selection (no thresholds to tune), window count
@@ -415,7 +415,7 @@ impl DiscoveryConfig {
 
         let mode = resolve_discovery_mode();
 
-        if let Some(value) = read_env_f64("FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY") {
+        if let Some(value) = read_env_f64("NEOETHOS_BOT_DISCOVERY_MIN_TRADES_PER_DAY") {
             self.min_trades_per_day = value.max(0.0);
         }
 
@@ -436,7 +436,7 @@ impl DiscoveryConfig {
             // of triggering frequently, and the prop-firm window-pass
             // gate downstream already filters out genuinely useless
             // strategies on its own.
-            if std::env::var("FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY").is_err() {
+            if std::env::var("NEOETHOS_BOT_DISCOVERY_MIN_TRADES_PER_DAY").is_err() {
                 self.min_trades_per_day = 0.001;
             }
 
@@ -491,33 +491,33 @@ impl DiscoveryConfig {
         rules.min_profit_target_pct =
             PropFirmConstraints::FTMO_STANDARD.challenge_profit_target_pct as f64;
         rules.require_profit_target = true;
-        if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT") {
+        if let Some(v) = read_env_f64("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT") {
             rules.max_daily_loss_pct = v;
         }
-        if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DD_PCT") {
+        if let Some(v) = read_env_f64("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MAX_DD_PCT") {
             rules.max_overall_drawdown_pct = v;
         }
-        if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT") {
+        if let Some(v) = read_env_f64("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT") {
             rules.min_profit_target_pct = v;
             rules.require_profit_target = v > 0.0;
         }
-        if let Some(v) = read_env_usize("FOREX_BOT_DISCOVERY_PROP_FIRM_MIN_TRADING_DAYS") {
+        if let Some(v) = read_env_usize("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MIN_TRADING_DAYS") {
             rules.min_trading_days = v;
         }
         // 60 days = the longest standard prop-firm phase (FTMO Phase 2);
         // a strategy that passes a 60-day window with a 10% target also
         // passes the easier Phase 1 rules at 30 days, so a single
         // measurement covers both.
-        let window_days = read_env_usize("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS")
+        let window_days = read_env_usize("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS")
             .unwrap_or(60)
             .max(1);
         // n_windows is auto-tuned later from dataset length when this
         // override stays at its sentinel value (0).
-        let n_windows = read_env_usize("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS").unwrap_or(0);
+        let n_windows = read_env_usize("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS").unwrap_or(0);
         // No hard pass-rate threshold by default — the gate ranks
         // candidates and lets the corr-diversification step pick the
         // top survivors. A non-zero env value still acts as a floor.
-        let pass_rate = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE")
+        let pass_rate = read_env_f64("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PASS_RATE")
             .map(|v| v.clamp(0.0, 1.0))
             .unwrap_or(0.0);
         PropFirmGateOverrides {
@@ -609,7 +609,7 @@ pub struct DiscoveryValidationGates {
     pub cpcv_profitable_fold_ratio: f64,
     pub temporal_contract_hash: Option<String>,
     /// Set when the prop-firm window-pass gate
-    /// (`FOREX_BOT_DISCOVERY_PROP_FIRM_GATE=1`) replaces the walkforward
+    /// (`NEOETHOS_BOT_DISCOVERY_PROP_FIRM_GATE=1`) replaces the walkforward
     /// + CPCV consistency gates. Each portfolio member has already passed
     /// FTMO-style rules on at least `pass_rate` of N random 30-day
     /// windows from the dataset; this is what an actual prop-firm
@@ -1737,7 +1737,7 @@ struct GeneExport<'a> {
 /// `min_history_years` defaults to **0** (use whatever data exists, ratio-
 /// split via `prop_search_val_years` downstream — see operator directive
 /// 2026-05-26 in `DiscoveryRuntimeOverrides::default`). Set to a positive
-/// integer either via `FOREX_BOT_MIN_HISTORY_YEARS` env or explicitly in
+/// integer either via `NEOETHOS_BOT_MIN_HISTORY_YEARS` env or explicitly in
 /// the override struct to re-instate a hard floor.
 pub fn ensure_sufficient_history(
     ohlcv: &Ohlcv,
@@ -1758,7 +1758,7 @@ pub fn ensure_sufficient_history(
              need at least {required_bars} (≈ {min_history_years} years × {bars_per_year} \
              bars/yr). Remediation: (1) Settings → Data → 'Download history from broker' \
              with a ~{min_history_years}-year window for {symbol} {timeframe}, then re-run \
-             Discovery; OR (2) relax the floor via the FOREX_BOT_MIN_HISTORY_YEARS \
+             Discovery; OR (2) relax the floor via the NEOETHOS_BOT_MIN_HISTORY_YEARS \
              environment variable — set it to 0 to run on whatever data exists \
              (accepts the over-fitting risk). Operator policy 2026-05-24: refuse \
              synthetic / insufficient data."
@@ -1837,7 +1837,7 @@ where
             "run_discovery_cycle: DiscoveryConfig.evaluation_account_currency \
              is empty. Set `system.account_currency` in config.yaml (or via \
              the cTrader trader-profile bridge when the broker session is \
-             alive), or pass the env var FOREX_BOT_PROP_ACCOUNT_CURRENCY. \
+             alive), or pass the env var NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY. \
              Empty currency causes the cost model to return NaN spread/pip \
              values that the sanitizer scrubs to 0.0 — every GA candidate \
              ends up with 0 trades and the operator sees no diagnostic."
@@ -1895,7 +1895,7 @@ where
     // for z-score-normalised features with unit-ish variance, but real
     // datasets vary widely in magnitude (XAGUSD M1 vs EURUSD D1 differ
     // by ~10×). When the operator opts in via
-    // `FOREX_BOT_PROP_ADAPTIVE_THRESHOLDS=1`, derive a per-dataset
+    // `NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS=1`, derive a per-dataset
     // ladder from the actual feature cube — gene init then picks
     // thresholds at percentile points of the dataset's own signal
     // magnitude distribution.
@@ -1905,7 +1905,7 @@ where
     // symbols would inherit the first symbol's ladder. The operator
     // should disable the feature for production multi-symbol sweeps
     // until F-277b adds per-symbol installation (deferred).
-    if std::env::var("FOREX_BOT_PROP_ADAPTIVE_THRESHOLDS")
+    if std::env::var("NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
@@ -2256,7 +2256,7 @@ fn read_env_usize(name: &str) -> Option<usize> {
 }
 
 /// Three discovery modes. The default is `PropFirm` — every other path
-/// would have to be explicitly opted into via `FOREX_BOT_DISCOVERY_MODE`.
+/// would have to be explicitly opted into via `NEOETHOS_BOT_DISCOVERY_MODE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscoveryMode {
     /// Production-grade strict pipeline (legacy walkforward + CPCV +
@@ -2271,13 +2271,13 @@ enum DiscoveryMode {
 }
 
 fn resolve_discovery_mode() -> DiscoveryMode {
-    let value = std::env::var("FOREX_BOT_DISCOVERY_MODE")
+    let value = std::env::var("NEOETHOS_BOT_DISCOVERY_MODE")
         .ok()
         .map(|v| v.trim().to_ascii_lowercase());
     match value.as_deref() {
         Some("strict") | Some("legacy") => DiscoveryMode::Strict,
         // Back-compat: the older opt-in env var still selects prop-firm.
-        _ if std::env::var("FOREX_BOT_DISCOVERY_PERMISSIVE")
+        _ if std::env::var("NEOETHOS_BOT_DISCOVERY_PERMISSIVE")
             .ok()
             .map(|v| v.trim().to_ascii_lowercase())
             .filter(|v| matches!(v.as_str(), "0" | "false" | "off" | "no"))

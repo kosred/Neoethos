@@ -424,7 +424,7 @@ pub async fn update_settings(
 }
 
 fn dto_from_settings(settings: &Settings) -> SettingsDto {
-    // `data_dir` lives on `SystemConfig`; `openai_model` lives on
+    // `data_dir` lives on `SystemConfig`; the news fields live on
     // `NewsConfig` (verified in `crates/neoethos-core/src/config.rs`).
     // Keep the JSON keys flat so the Flutter side doesn't have to
     // mirror the Rust nesting.

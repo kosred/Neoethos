@@ -183,7 +183,7 @@ pub async fn discovery_start(
     // Account currency: prefer Settings (already loaded into config by
     // from_settings), fall back to env-var, empty propagates to guard.
     if config.evaluation_account_currency.trim().is_empty() {
-        if let Ok(env_ccy) = std::env::var("FOREX_BOT_PROP_ACCOUNT_CURRENCY") {
+        if let Ok(env_ccy) = std::env::var("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY") {
             config.evaluation_account_currency = env_ccy;
         }
     }

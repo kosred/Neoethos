@@ -69,9 +69,9 @@ class _StrategyLabScreenState extends ConsumerState<StrategyLabScreen>
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         const _PipelineStrip(),
-        const SizedBox(height: ForexAiTokens.spSm),
+        const SizedBox(height: NeoethosTokens.spSm),
         _StageTabs(controller: _controller, stages: _stages),
-        const SizedBox(height: ForexAiTokens.spSm),
+        const SizedBox(height: NeoethosTokens.spSm),
         Expanded(
           child: TabBarView(
             controller: _controller,
@@ -153,13 +153,13 @@ class _PipelineStrip extends ConsumerWidget {
 
     return Container(
       padding: const EdgeInsets.symmetric(
-        horizontal: ForexAiTokens.spMd,
+        horizontal: NeoethosTokens.spMd,
         vertical: 8,
       ),
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Row(
         children: [
@@ -170,7 +170,7 @@ class _PipelineStrip extends ConsumerWidget {
                 padding: EdgeInsets.symmetric(horizontal: 4),
                 child: Icon(
                   Icons.chevron_right,
-                  color: ForexAiTokens.textFaint,
+                  color: NeoethosTokens.textFaint,
                   size: 18,
                 ),
               ),
@@ -243,18 +243,18 @@ class _StageCell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final (statusLabel, statusColor) = switch (status) {
-      _StageStatus.done => ('READY', ForexAiTokens.buy),
-      _StageStatus.running => ('RUN', ForexAiTokens.accent),
-      _StageStatus.warn => ('CHECK', ForexAiTokens.warning),
-      _StageStatus.error => ('ERROR', ForexAiTokens.sell),
-      _StageStatus.idle => ('IDLE', ForexAiTokens.textFaint),
+      _StageStatus.done => ('READY', NeoethosTokens.buy),
+      _StageStatus.running => ('RUN', NeoethosTokens.accent),
+      _StageStatus.warn => ('CHECK', NeoethosTokens.warning),
+      _StageStatus.error => ('ERROR', NeoethosTokens.sell),
+      _StageStatus.idle => ('IDLE', NeoethosTokens.textFaint),
     };
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
       decoration: BoxDecoration(
-        color: ForexAiTokens.appBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.appBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -288,9 +288,9 @@ class _StageCell extends StatelessWidget {
                   title,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
-                    fontSize: ForexAiTokens.fsBody,
+                    fontSize: NeoethosTokens.fsBody,
                     fontWeight: FontWeight.w800,
-                    color: ForexAiTokens.textPrimary,
+                    color: NeoethosTokens.textPrimary,
                   ),
                 ),
               ),
@@ -321,8 +321,8 @@ class _StageCell extends StatelessWidget {
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsCaption,
-              color: ForexAiTokens.textMuted,
+              fontSize: NeoethosTokens.fsCaption,
+              color: NeoethosTokens.textMuted,
               height: 1.3,
             ),
           ),
@@ -345,22 +345,22 @@ class _StageTabs extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: TabBar(
         controller: controller,
         isScrollable: true,
-        labelColor: ForexAiTokens.accent,
-        unselectedLabelColor: ForexAiTokens.textMuted,
-        indicatorColor: ForexAiTokens.accent,
+        labelColor: NeoethosTokens.accent,
+        unselectedLabelColor: NeoethosTokens.textMuted,
+        indicatorColor: NeoethosTokens.accent,
         labelStyle: const TextStyle(
-          fontSize: ForexAiTokens.fsBody,
+          fontSize: NeoethosTokens.fsBody,
           fontWeight: FontWeight.w700,
         ),
         unselectedLabelStyle: const TextStyle(
-          fontSize: ForexAiTokens.fsBody,
+          fontSize: NeoethosTokens.fsBody,
           fontWeight: FontWeight.w500,
         ),
         tabs: [for (final s in stages) Tab(text: s)],
@@ -475,7 +475,7 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
         SnackBar(
           content: Text(result.message),
           backgroundColor:
-              result.promoted ? ForexAiTokens.buy : ForexAiTokens.warning,
+              result.promoted ? NeoethosTokens.buy : NeoethosTokens.warning,
         ),
       );
     } on DioException catch (e) {
@@ -508,13 +508,13 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 640),
         child: SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(vertical: ForexAiTokens.spMd),
+          padding: const EdgeInsets.symmetric(vertical: NeoethosTokens.spMd),
           child: Container(
-            padding: const EdgeInsets.all(ForexAiTokens.spLg),
+            padding: const EdgeInsets.all(NeoethosTokens.spLg),
             decoration: BoxDecoration(
-              color: ForexAiTokens.panelBg,
-              border: Border.all(color: ForexAiTokens.border),
-              borderRadius: BorderRadius.circular(ForexAiTokens.rMd),
+              color: NeoethosTokens.panelBg,
+              border: Border.all(color: NeoethosTokens.border),
+              borderRadius: BorderRadius.circular(NeoethosTokens.rMd),
             ),
             child: _body(),
           ),
@@ -536,12 +536,12 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
                 height: 22,
                 child: CircularProgressIndicator(strokeWidth: 2.4),
               ),
-              SizedBox(height: ForexAiTokens.spMd),
+              SizedBox(height: NeoethosTokens.spMd),
               Text(
                 'Checking promotion gate…',
                 style: TextStyle(
-                  color: ForexAiTokens.textMuted,
-                  fontSize: ForexAiTokens.fsBody,
+                  color: NeoethosTokens.textMuted,
+                  fontSize: NeoethosTokens.fsBody,
                 ),
               ),
             ],
@@ -557,28 +557,28 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
         children: [
           const Row(
             children: [
-              Icon(Icons.error_outline, color: ForexAiTokens.sell, size: 18),
-              SizedBox(width: ForexAiTokens.spSm),
+              Icon(Icons.error_outline, color: NeoethosTokens.sell, size: 18),
+              SizedBox(width: NeoethosTokens.spSm),
               Text(
                 'Could not load promotion gate',
                 style: TextStyle(
-                  fontSize: ForexAiTokens.fsSubtitle,
+                  fontSize: NeoethosTokens.fsSubtitle,
                   fontWeight: FontWeight.w700,
-                  color: ForexAiTokens.textPrimary,
+                  color: NeoethosTokens.textPrimary,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: ForexAiTokens.spSm),
+          const SizedBox(height: NeoethosTokens.spSm),
           Text(
             _error!,
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsBody,
-              color: ForexAiTokens.textMuted,
+              fontSize: NeoethosTokens.fsBody,
+              color: NeoethosTokens.textMuted,
               height: 1.4,
             ),
           ),
-          const SizedBox(height: ForexAiTokens.spMd),
+          const SizedBox(height: NeoethosTokens.spMd),
           Align(
             alignment: Alignment.centerLeft,
             child: OutlinedButton.icon(
@@ -596,7 +596,7 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
 
   Widget _content(PromotionStatus s) {
     final promoted = s.decision.promoted;
-    final badgeColor = promoted ? ForexAiTokens.buy : ForexAiTokens.warning;
+    final badgeColor = promoted ? NeoethosTokens.buy : NeoethosTokens.warning;
     final badgeLabel = promoted ? 'ELIGIBLE' : 'BLOCKED';
 
     return Column(
@@ -609,42 +609,42 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
             const Text(
               'Promotion Gate',
               style: TextStyle(
-                fontSize: ForexAiTokens.fsSubtitle,
+                fontSize: NeoethosTokens.fsSubtitle,
                 fontWeight: FontWeight.w700,
-                color: ForexAiTokens.textPrimary,
+                color: NeoethosTokens.textPrimary,
               ),
             ),
-            const SizedBox(width: ForexAiTokens.spSm),
+            const SizedBox(width: NeoethosTokens.spSm),
             Text(
               '${s.symbol} · ${s.baseTf}',
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsCaption,
-                color: ForexAiTokens.textMuted,
+                fontSize: NeoethosTokens.fsCaption,
+                color: NeoethosTokens.textMuted,
               ),
             ),
             const Spacer(),
             _statusBadge(badgeLabel, badgeColor),
-            const SizedBox(width: ForexAiTokens.spSm),
+            const SizedBox(width: NeoethosTokens.spSm),
             IconButton(
               tooltip: 'Refresh',
               onPressed: _loading ? null : _load,
               icon: const Icon(Icons.refresh, size: 18),
-              color: ForexAiTokens.textMuted,
+              color: NeoethosTokens.textMuted,
               constraints: const BoxConstraints.tightFor(width: 32, height: 32),
               padding: EdgeInsets.zero,
             ),
           ],
         ),
-        const SizedBox(height: ForexAiTokens.spMd),
+        const SizedBox(height: NeoethosTokens.spMd),
 
         // Decision summary.
         Container(
           width: double.infinity,
-          padding: const EdgeInsets.all(ForexAiTokens.spMd),
+          padding: const EdgeInsets.all(NeoethosTokens.spMd),
           decoration: BoxDecoration(
             color: badgeColor.withValues(alpha: 0.10),
             border: Border.all(color: badgeColor.withValues(alpha: 0.45)),
-            borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+            borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
           ),
           child: Text(
             s.decision.summary.isEmpty
@@ -653,36 +653,36 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
                     : 'Portfolio is not eligible for promotion yet.')
                 : s.decision.summary,
             style: TextStyle(
-              fontSize: ForexAiTokens.fsBody,
+              fontSize: NeoethosTokens.fsBody,
               color: badgeColor,
               height: 1.4,
               fontWeight: FontWeight.w600,
             ),
           ),
         ),
-        const SizedBox(height: ForexAiTokens.spLg),
+        const SizedBox(height: NeoethosTokens.spLg),
 
         // Portfolio + aggregate metrics.
         const _SectionLabel('PORTFOLIO'),
-        const SizedBox(height: ForexAiTokens.spSm),
+        const SizedBox(height: NeoethosTokens.spSm),
         _metricsGrid(s),
-        const SizedBox(height: ForexAiTokens.spLg),
+        const SizedBox(height: NeoethosTokens.spLg),
 
         // Criteria breakdown.
         if (s.decision.criteria.isNotEmpty) ...[
           const _SectionLabel('GATE CRITERIA'),
-          const SizedBox(height: ForexAiTokens.spSm),
+          const SizedBox(height: NeoethosTokens.spSm),
           for (final c in s.decision.criteria) _criterionRow(c),
-          const SizedBox(height: ForexAiTokens.spLg),
+          const SizedBox(height: NeoethosTokens.spLg),
         ] else ...[
           const Padding(
-            padding: EdgeInsets.only(bottom: ForexAiTokens.spLg),
+            padding: EdgeInsets.only(bottom: NeoethosTokens.spLg),
             child: Text(
               'No criteria evaluated yet — run Discovery + Training to '
               'build a portfolio for this symbol/timeframe.',
               style: TextStyle(
-                fontSize: ForexAiTokens.fsBody,
-                color: ForexAiTokens.textMuted,
+                fontSize: NeoethosTokens.fsBody,
+                color: NeoethosTokens.textMuted,
                 height: 1.4,
               ),
             ),
@@ -700,15 +700,15 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
                     height: 16,
                     child: CircularProgressIndicator(
                       strokeWidth: 2,
-                      color: ForexAiTokens.textPrimary,
+                      color: NeoethosTokens.textPrimary,
                     ),
                   )
                 : const Icon(Icons.upload, size: 16),
             label: Text(_promoting ? 'Promoting…' : 'Promote to Live'),
             style: FilledButton.styleFrom(
-              backgroundColor: ForexAiTokens.buy,
+              backgroundColor: NeoethosTokens.buy,
               disabledBackgroundColor:
-                  ForexAiTokens.border.withValues(alpha: 0.5),
+                  NeoethosTokens.border.withValues(alpha: 0.5),
             ),
           ),
         ),
@@ -722,12 +722,12 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.16),
         border: Border.all(color: color.withValues(alpha: 0.6)),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Text(
         label,
         style: TextStyle(
-          fontSize: ForexAiTokens.fsCaption,
+          fontSize: NeoethosTokens.fsCaption,
           fontWeight: FontWeight.w800,
           letterSpacing: 0.5,
           color: color,
@@ -755,8 +755,8 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
       tiles.add(_metricTile('Metrics', 'No portfolio yet'));
     }
     return Wrap(
-      spacing: ForexAiTokens.spSm,
-      runSpacing: ForexAiTokens.spSm,
+      spacing: NeoethosTokens.spSm,
+      runSpacing: NeoethosTokens.spSm,
       children: tiles,
     );
   }
@@ -765,13 +765,13 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
     return Container(
       width: 120,
       padding: const EdgeInsets.symmetric(
-        horizontal: ForexAiTokens.spMd,
-        vertical: ForexAiTokens.spSm,
+        horizontal: NeoethosTokens.spMd,
+        vertical: NeoethosTokens.spSm,
       ),
       decoration: BoxDecoration(
-        color: ForexAiTokens.appBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.appBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -780,19 +780,19 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
           Text(
             label.toUpperCase(),
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsCaption - 1,
+              fontSize: NeoethosTokens.fsCaption - 1,
               letterSpacing: 0.6,
               fontWeight: FontWeight.w700,
-              color: ForexAiTokens.textFaint,
+              color: NeoethosTokens.textFaint,
             ),
           ),
           const SizedBox(height: 2),
           Text(
             value,
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsBody,
+              fontSize: NeoethosTokens.fsBody,
               fontWeight: FontWeight.w700,
-              color: ForexAiTokens.textPrimary,
+              color: NeoethosTokens.textPrimary,
             ),
           ),
         ],
@@ -801,7 +801,7 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
   }
 
   Widget _criterionRow(PromotionCriterion c) {
-    final color = c.passed ? ForexAiTokens.buy : ForexAiTokens.sell;
+    final color = c.passed ? NeoethosTokens.buy : NeoethosTokens.sell;
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
       child: Row(
@@ -811,21 +811,21 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
             size: 16,
             color: color,
           ),
-          const SizedBox(width: ForexAiTokens.spSm),
+          const SizedBox(width: NeoethosTokens.spSm),
           Expanded(
             child: Text(
               c.name,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsBody,
-                color: ForexAiTokens.textPrimary,
+                fontSize: NeoethosTokens.fsBody,
+                color: NeoethosTokens.textPrimary,
               ),
             ),
           ),
           Text(
             '${_fmtNum(c.actual)} ${c.comparison} ${_fmtNum(c.threshold)}',
             style: TextStyle(
-              fontSize: ForexAiTokens.fsBody,
+              fontSize: NeoethosTokens.fsBody,
               fontWeight: FontWeight.w700,
               fontFeatures: const [FontFeature.tabularFigures()],
               color: color,
@@ -863,10 +863,10 @@ class _SectionLabel extends StatelessWidget {
   Widget build(BuildContext context) => Text(
         text,
         style: const TextStyle(
-          fontSize: ForexAiTokens.fsCaption,
+          fontSize: NeoethosTokens.fsCaption,
           letterSpacing: 1.0,
           fontWeight: FontWeight.w700,
-          color: ForexAiTokens.textMuted,
+          color: NeoethosTokens.textMuted,
         ),
       );
 }
@@ -887,11 +887,11 @@ class _PlaceholderCard extends StatelessWidget {
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 600),
         child: Container(
-          padding: const EdgeInsets.all(ForexAiTokens.spLg),
+          padding: const EdgeInsets.all(NeoethosTokens.spLg),
           decoration: BoxDecoration(
-            color: ForexAiTokens.panelBg,
-            border: Border.all(color: ForexAiTokens.border),
-            borderRadius: BorderRadius.circular(ForexAiTokens.rMd),
+            color: NeoethosTokens.panelBg,
+            border: Border.all(color: NeoethosTokens.border),
+            borderRadius: BorderRadius.circular(NeoethosTokens.rMd),
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -905,19 +905,19 @@ class _PlaceholderCard extends StatelessWidget {
                       horizontal: 8,
                     ),
                     decoration: BoxDecoration(
-                      color: ForexAiTokens.accentMuted,
+                      color: NeoethosTokens.accentMuted,
                       borderRadius:
-                          BorderRadius.circular(ForexAiTokens.rSm),
+                          BorderRadius.circular(NeoethosTokens.rSm),
                       border: Border.all(
-                        color: ForexAiTokens.accent.withValues(alpha: 0.5),
+                        color: NeoethosTokens.accent.withValues(alpha: 0.5),
                       ),
                     ),
                     child: Text(
                       ticket,
                       style: const TextStyle(
-                        fontSize: ForexAiTokens.fsCaption,
+                        fontSize: NeoethosTokens.fsCaption,
                         fontWeight: FontWeight.w700,
-                        color: ForexAiTokens.accent,
+                        color: NeoethosTokens.accent,
                       ),
                     ),
                   ),
@@ -925,19 +925,19 @@ class _PlaceholderCard extends StatelessWidget {
                   Text(
                     title,
                     style: const TextStyle(
-                      fontSize: ForexAiTokens.fsSubtitle,
+                      fontSize: NeoethosTokens.fsSubtitle,
                       fontWeight: FontWeight.w700,
-                      color: ForexAiTokens.textPrimary,
+                      color: NeoethosTokens.textPrimary,
                     ),
                   ),
                 ],
               ),
-              const SizedBox(height: ForexAiTokens.spMd),
+              const SizedBox(height: NeoethosTokens.spMd),
               Text(
                 body,
                 style: const TextStyle(
-                  fontSize: ForexAiTokens.fsBody,
-                  color: ForexAiTokens.textMuted,
+                  fontSize: NeoethosTokens.fsBody,
+                  color: NeoethosTokens.textMuted,
                   height: 1.5,
                 ),
               ),

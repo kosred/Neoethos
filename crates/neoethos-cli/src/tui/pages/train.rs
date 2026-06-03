@@ -352,7 +352,7 @@ pub fn launch_now(shared: &mut AppShared) {
         .to_string();
 
     // train command doesn't honor --root; the training_orchestrator reads
-    // FOREX_BOT_DATA_ROOT instead. We inject it on the child subprocess
+    // NEOETHOS_BOT_DATA_ROOT instead. We inject it on the child subprocess
     // only (via Command::env in spawn_with_env) — NEVER on the parent TUI
     // process. The TUI is already multi-threaded by the time this runs
     // (tokio runtime, rayon worker pool, ratatui input thread, ...) and
@@ -367,7 +367,7 @@ pub fn launch_now(shared: &mut AppShared) {
         "--models-dir".to_string(),
         models_dir,
     ];
-    let envs = vec![("FOREX_BOT_DATA_ROOT".to_string(), root)];
+    let envs = vec![("NEOETHOS_BOT_DATA_ROOT".to_string(), root)];
     shared.jobs.spawn_with_env("train", args, envs);
     shared.status = "Spawned train".to_string();
 }

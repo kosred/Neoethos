@@ -61,13 +61,13 @@ class TranslatedError {
   Color get tone {
     switch (severity) {
       case 'info':
-        return ForexAiTokens.textMuted;
+        return NeoethosTokens.textMuted;
       case 'warning':
-        return ForexAiTokens.warning;
+        return NeoethosTokens.warning;
       case 'critical':
       case 'error':
       default:
-        return ForexAiTokens.sell;
+        return NeoethosTokens.sell;
     }
   }
 }
@@ -126,7 +126,7 @@ void showTranslatedErrorSnackbar(
 }) {
   final translation = extractTranslation(error);
   final body = describeError(error);
-  final bg = translation?.tone ?? ForexAiTokens.sell;
+  final bg = translation?.tone ?? NeoethosTokens.sell;
 
   SnackBarAction? action;
   if (translation != null &&

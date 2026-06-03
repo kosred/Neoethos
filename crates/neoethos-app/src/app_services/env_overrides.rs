@@ -1,8 +1,8 @@
 //! Centralised env-var overrides for `neoethos-app`.
 //!
 //! Mirror of `neoethos_core::env_overrides` for the app crate's
-//! own knobs. Single grep-able file for every `FOREX_BOT_CTRADER_*`,
-//! `FOREX_BOT_PNL_*`, and `NEOETHOS_*` runtime override that the
+//! own knobs. Single grep-able file for every `NEOETHOS_BOT_CTRADER_*`,
+//! `NEOETHOS_BOT_PNL_*`, and `NEOETHOS_*` runtime override that the
 //! HTTP server / trading layer honours.
 //!
 //! ## Why this exists (F-CORE3 cluster consolidation, 2026-05-25)
@@ -47,46 +47,46 @@ pub const ENV_SERVER_BIND: &str = "NEOETHOS_SERVER_BIND";
 
 /// Maximum TCP read time (seconds) for `execute_via_session`. 0 disables
 /// the timeout. Clamped to `[0, 3600]`; default 30s.
-pub const ENV_CTRADER_READ_TIMEOUT_SECS: &str = "FOREX_BOT_CTRADER_READ_TIMEOUT_SECS";
+pub const ENV_CTRADER_READ_TIMEOUT_SECS: &str = "NEOETHOS_BOT_CTRADER_READ_TIMEOUT_SECS";
 
 /// Maximum attempts (initial + retries) per cTrader execution call.
 /// Clamped to `[1, 5]`; default 3. Retry safety relies on the broker
 /// deduping by `clientOrderId`.
-pub const ENV_CTRADER_MAX_ATTEMPTS: &str = "FOREX_BOT_CTRADER_MAX_ATTEMPTS";
+pub const ENV_CTRADER_MAX_ATTEMPTS: &str = "NEOETHOS_BOT_CTRADER_MAX_ATTEMPTS";
 
 /// Base backoff (ms) for cTrader retries; doubles per attempt with
 /// 0-99ms jitter, capped at 5s total. Clamped to `[10, 2000]`; default 200.
-pub const ENV_CTRADER_BACKOFF_BASE_MS: &str = "FOREX_BOT_CTRADER_BACKOFF_BASE_MS";
+pub const ENV_CTRADER_BACKOFF_BASE_MS: &str = "NEOETHOS_BOT_CTRADER_BACKOFF_BASE_MS";
 
 /// Whether partial fills are accepted as final (`1`/`true`/`yes` → on).
 /// Default off — partial fills error out so the risk-per-trade math
 /// stays consistent.
-pub const ENV_CTRADER_ALLOW_PARTIAL_FILL: &str = "FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL";
+pub const ENV_CTRADER_ALLOW_PARTIAL_FILL: &str = "NEOETHOS_BOT_CTRADER_ALLOW_PARTIAL_FILL";
 
 /// Maximum attempts for the streaming chart-update poll. Clamped
 /// `[1, 5]`; default 3. Stateless polls are safe to retry.
-pub const ENV_CTRADER_STREAM_MAX_ATTEMPTS: &str = "FOREX_BOT_CTRADER_STREAM_MAX_ATTEMPTS";
+pub const ENV_CTRADER_STREAM_MAX_ATTEMPTS: &str = "NEOETHOS_BOT_CTRADER_STREAM_MAX_ATTEMPTS";
 
 /// Base backoff (ms) for the streaming layer. Clamped `[10, 2000]`;
 /// default 200.
-pub const ENV_CTRADER_STREAM_BACKOFF_BASE_MS: &str = "FOREX_BOT_CTRADER_STREAM_BACKOFF_BASE_MS";
+pub const ENV_CTRADER_STREAM_BACKOFF_BASE_MS: &str = "NEOETHOS_BOT_CTRADER_STREAM_BACKOFF_BASE_MS";
 
 /// Quote side (`mid` / `bid` / `ask`) used for chart-merge when a
 /// single price is required (e.g. latest-close display). Default `mid`.
-pub const ENV_CHART_MERGE_SIDE: &str = "FOREX_BOT_CHART_MERGE_SIDE";
+pub const ENV_CHART_MERGE_SIDE: &str = "NEOETHOS_BOT_CHART_MERGE_SIDE";
 
 /// PnL drift threshold (fraction of notional) above which an audit
 /// warning is logged. Clamped `[1e-5, 0.05]`; default 0.001 (10bp).
-pub const ENV_PNL_AUDIT_DRIFT_FRACTION: &str = "FOREX_BOT_PNL_AUDIT_DRIFT_FRACTION";
+pub const ENV_PNL_AUDIT_DRIFT_FRACTION: &str = "NEOETHOS_BOT_PNL_AUDIT_DRIFT_FRACTION";
 
 /// PnL drift threshold (fraction of notional) that halts the auto-trader.
 /// Clamped `[1e-4, 0.20]` so the breaker cannot be silenced by a typo.
 /// Default 0.01 (1%).
-pub const ENV_PNL_CIRCUIT_BREAKER_FRACTION: &str = "FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION";
+pub const ENV_PNL_CIRCUIT_BREAKER_FRACTION: &str = "NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION";
 
 /// Override path for the live trading journal. Test/CI use; production
 /// reads from the platform user-data-dir.
-pub const ENV_LIVE_JOURNAL_PATH: &str = "FOREX_BOT_LIVE_JOURNAL_PATH";
+pub const ENV_LIVE_JOURNAL_PATH: &str = "NEOETHOS_BOT_LIVE_JOURNAL_PATH";
 
 /// Override path for the pending-actions store. Test/CI use.
 pub const ENV_PENDING_ACTIONS_PATH: &str = "NEOETHOS_PENDING_ACTIONS_PATH";
@@ -321,35 +321,35 @@ mod tests {
         assert_eq!(ENV_SERVER_BIND, "NEOETHOS_SERVER_BIND");
         assert_eq!(
             ENV_CTRADER_READ_TIMEOUT_SECS,
-            "FOREX_BOT_CTRADER_READ_TIMEOUT_SECS"
+            "NEOETHOS_BOT_CTRADER_READ_TIMEOUT_SECS"
         );
-        assert_eq!(ENV_CTRADER_MAX_ATTEMPTS, "FOREX_BOT_CTRADER_MAX_ATTEMPTS");
+        assert_eq!(ENV_CTRADER_MAX_ATTEMPTS, "NEOETHOS_BOT_CTRADER_MAX_ATTEMPTS");
         assert_eq!(
             ENV_CTRADER_BACKOFF_BASE_MS,
-            "FOREX_BOT_CTRADER_BACKOFF_BASE_MS"
+            "NEOETHOS_BOT_CTRADER_BACKOFF_BASE_MS"
         );
         assert_eq!(
             ENV_CTRADER_ALLOW_PARTIAL_FILL,
-            "FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL"
+            "NEOETHOS_BOT_CTRADER_ALLOW_PARTIAL_FILL"
         );
         assert_eq!(
             ENV_CTRADER_STREAM_MAX_ATTEMPTS,
-            "FOREX_BOT_CTRADER_STREAM_MAX_ATTEMPTS"
+            "NEOETHOS_BOT_CTRADER_STREAM_MAX_ATTEMPTS"
         );
         assert_eq!(
             ENV_CTRADER_STREAM_BACKOFF_BASE_MS,
-            "FOREX_BOT_CTRADER_STREAM_BACKOFF_BASE_MS"
+            "NEOETHOS_BOT_CTRADER_STREAM_BACKOFF_BASE_MS"
         );
-        assert_eq!(ENV_CHART_MERGE_SIDE, "FOREX_BOT_CHART_MERGE_SIDE");
+        assert_eq!(ENV_CHART_MERGE_SIDE, "NEOETHOS_BOT_CHART_MERGE_SIDE");
         assert_eq!(
             ENV_PNL_AUDIT_DRIFT_FRACTION,
-            "FOREX_BOT_PNL_AUDIT_DRIFT_FRACTION"
+            "NEOETHOS_BOT_PNL_AUDIT_DRIFT_FRACTION"
         );
         assert_eq!(
             ENV_PNL_CIRCUIT_BREAKER_FRACTION,
-            "FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION"
+            "NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION"
         );
-        assert_eq!(ENV_LIVE_JOURNAL_PATH, "FOREX_BOT_LIVE_JOURNAL_PATH");
+        assert_eq!(ENV_LIVE_JOURNAL_PATH, "NEOETHOS_BOT_LIVE_JOURNAL_PATH");
         assert_eq!(ENV_PENDING_ACTIONS_PATH, "NEOETHOS_PENDING_ACTIONS_PATH");
         assert_eq!(
             ENV_RISKY_MODE_STATE_PATH,

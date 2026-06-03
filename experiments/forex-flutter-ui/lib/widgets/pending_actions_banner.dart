@@ -192,12 +192,12 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
         secondsLeft <= 0 ? 'expiring' : '${secondsLeft}s left';
 
     return Container(
-      margin: const EdgeInsets.only(bottom: ForexAiTokens.spSm),
-      padding: const EdgeInsets.all(ForexAiTokens.spMd),
+      margin: const EdgeInsets.only(bottom: NeoethosTokens.spSm),
+      padding: const EdgeInsets.all(NeoethosTokens.spMd),
       decoration: BoxDecoration(
-        color: ForexAiTokens.accentSoft,
-        border: Border.all(color: ForexAiTokens.accent),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rMd),
+        color: NeoethosTokens.accentSoft,
+        border: Border.all(color: NeoethosTokens.accent),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rMd),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -206,50 +206,50 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
             children: [
               const Icon(
                 Icons.psychology_alt_outlined,
-                color: ForexAiTokens.accent,
+                color: NeoethosTokens.accent,
                 size: 20,
               ),
-              const SizedBox(width: ForexAiTokens.spSm),
+              const SizedBox(width: NeoethosTokens.spSm),
               const Expanded(
                 child: Text(
                   'LLM proposal awaiting your decision',
                   style: TextStyle(
                     fontWeight: FontWeight.w700,
-                    color: ForexAiTokens.textPrimary,
-                    fontSize: ForexAiTokens.fsSubtitle,
+                    color: NeoethosTokens.textPrimary,
+                    fontSize: NeoethosTokens.fsSubtitle,
                   ),
                 ),
               ),
               Container(
                 padding: const EdgeInsets.symmetric(
-                  horizontal: ForexAiTokens.spSm,
+                  horizontal: NeoethosTokens.spSm,
                   vertical: 2,
                 ),
                 decoration: BoxDecoration(
                   color: secondsLeft <= 10
-                      ? ForexAiTokens.warning
-                      : ForexAiTokens.accentMuted,
-                  borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+                      ? NeoethosTokens.warning
+                      : NeoethosTokens.accentMuted,
+                  borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
                 ),
                 child: Text(
                   countdownLabel,
                   style: TextStyle(
                     color: secondsLeft <= 10
                         ? Colors.black
-                        : ForexAiTokens.textPrimary,
-                    fontSize: ForexAiTokens.fsCaption,
+                        : NeoethosTokens.textPrimary,
+                    fontSize: NeoethosTokens.fsCaption,
                     fontWeight: FontWeight.w600,
                   ),
                 ),
               ),
             ],
           ),
-          const SizedBox(height: ForexAiTokens.spSm),
+          const SizedBox(height: NeoethosTokens.spSm),
           Text(
             a.summary,
             style: const TextStyle(
-              color: ForexAiTokens.textPrimary,
-              fontSize: ForexAiTokens.fsBody,
+              color: NeoethosTokens.textPrimary,
+              fontSize: NeoethosTokens.fsBody,
               fontWeight: FontWeight.w600,
             ),
           ),
@@ -257,49 +257,49 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
           Text(
             a.reason.isEmpty ? '(no rationale provided)' : a.reason,
             style: const TextStyle(
-              color: ForexAiTokens.textMuted,
-              fontSize: ForexAiTokens.fsBody,
+              color: NeoethosTokens.textMuted,
+              fontSize: NeoethosTokens.fsBody,
               fontStyle: FontStyle.italic,
             ),
           ),
           if (_error != null) ...[
-            const SizedBox(height: ForexAiTokens.spSm),
+            const SizedBox(height: NeoethosTokens.spSm),
             Container(
-              padding: const EdgeInsets.all(ForexAiTokens.spSm),
+              padding: const EdgeInsets.all(NeoethosTokens.spSm),
               decoration: BoxDecoration(
-                color: ForexAiTokens.surfaceBg,
-                border: Border.all(color: ForexAiTokens.sell),
-                borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+                color: NeoethosTokens.surfaceBg,
+                border: Border.all(color: NeoethosTokens.sell),
+                borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
               ),
               child: Text(
                 _error!,
                 style: const TextStyle(
-                  color: ForexAiTokens.sellStrong,
-                  fontSize: ForexAiTokens.fsCaption,
+                  color: NeoethosTokens.sellStrong,
+                  fontSize: NeoethosTokens.fsCaption,
                 ),
               ),
             ),
           ],
-          const SizedBox(height: ForexAiTokens.spMd),
+          const SizedBox(height: NeoethosTokens.spMd),
           Row(
             mainAxisAlignment: MainAxisAlignment.end,
             children: [
               OutlinedButton(
                 onPressed: _submitting ? null : _handleReject,
                 style: OutlinedButton.styleFrom(
-                  foregroundColor: ForexAiTokens.sell,
-                  side: const BorderSide(color: ForexAiTokens.sell),
-                  minimumSize: const Size(0, ForexAiTokens.btnHeight),
+                  foregroundColor: NeoethosTokens.sell,
+                  side: const BorderSide(color: NeoethosTokens.sell),
+                  minimumSize: const Size(0, NeoethosTokens.btnHeight),
                 ),
                 child: const Text('Reject'),
               ),
-              const SizedBox(width: ForexAiTokens.spSm),
+              const SizedBox(width: NeoethosTokens.spSm),
               FilledButton(
                 onPressed: _submitting ? null : _handleConfirm,
                 style: FilledButton.styleFrom(
-                  backgroundColor: ForexAiTokens.accent,
-                  foregroundColor: ForexAiTokens.textPrimary,
-                  minimumSize: const Size(0, ForexAiTokens.btnHeight),
+                  backgroundColor: NeoethosTokens.accent,
+                  foregroundColor: NeoethosTokens.textPrimary,
+                  minimumSize: const Size(0, NeoethosTokens.btnHeight),
                 ),
                 child: _submitting
                     ? const SizedBox(
@@ -307,7 +307,7 @@ class _BannerCardState extends ConsumerState<_BannerCard> {
                         height: 14,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
-                          color: ForexAiTokens.textPrimary,
+                          color: NeoethosTokens.textPrimary,
                         ),
                       )
                     : const Text('Confirm'),
@@ -343,10 +343,10 @@ class _RejectReasonDialogState extends State<_RejectReasonDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      backgroundColor: ForexAiTokens.panelBg,
+      backgroundColor: NeoethosTokens.panelBg,
       title: const Text(
         'Reject proposal',
-        style: TextStyle(color: ForexAiTokens.textPrimary),
+        style: TextStyle(color: NeoethosTokens.textPrimary),
       ),
       content: Column(
         mainAxisSize: MainAxisSize.min,
@@ -355,21 +355,21 @@ class _RejectReasonDialogState extends State<_RejectReasonDialog> {
           const Text(
             'Optional reason (surfaced back to the LLM for context):',
             style: TextStyle(
-              color: ForexAiTokens.textMuted,
-              fontSize: ForexAiTokens.fsBody,
+              color: NeoethosTokens.textMuted,
+              fontSize: NeoethosTokens.fsBody,
             ),
           ),
-          const SizedBox(height: ForexAiTokens.spSm),
+          const SizedBox(height: NeoethosTokens.spSm),
           TextField(
             controller: _controller,
             autofocus: true,
             maxLines: 3,
-            style: const TextStyle(color: ForexAiTokens.textPrimary),
+            style: const TextStyle(color: NeoethosTokens.textPrimary),
             decoration: const InputDecoration(
               hintText: 'e.g. market is too thin to close here',
-              hintStyle: TextStyle(color: ForexAiTokens.textFaint),
+              hintStyle: TextStyle(color: NeoethosTokens.textFaint),
               filled: true,
-              fillColor: ForexAiTokens.surfaceBg,
+              fillColor: NeoethosTokens.surfaceBg,
               border: OutlineInputBorder(),
             ),
           ),
@@ -380,12 +380,12 @@ class _RejectReasonDialogState extends State<_RejectReasonDialog> {
           onPressed: () => Navigator.of(context).pop(null),
           child: const Text(
             'Cancel',
-            style: TextStyle(color: ForexAiTokens.textMuted),
+            style: TextStyle(color: NeoethosTokens.textMuted),
           ),
         ),
         FilledButton(
           style: FilledButton.styleFrom(
-            backgroundColor: ForexAiTokens.sell,
+            backgroundColor: NeoethosTokens.sell,
           ),
           onPressed: () =>
               Navigator.of(context).pop(_controller.text.trim()),

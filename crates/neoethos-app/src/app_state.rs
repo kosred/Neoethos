@@ -81,16 +81,16 @@ impl AppState {
             .first()
             .cloned()
             .unwrap_or_else(|| "EURUSD".to_string());
+        // News-blackout LLM gate. Provider is Perplexity — the ChatGPT
+        // subscription (Codex) is reserved for the news desk, not this
+        // pre-trade gate. Enabled iff the operator turned on Perplexity
+        // news in config.
         let mut llm_news_filter = neoethos_core::domain::news_filter::NewsFilter::new(
-            settings.news.openai_news_enabled,
+            settings.news.perplexity_enabled,
             settings.news.news_lookahead_minutes as i64,
             settings.news.news_kill_window_min as i64,
         );
-        llm_news_filter.llm_provider = if settings.news.openai_news_enabled {
-            "openai".to_string()
-        } else {
-            "perplexity".to_string()
-        };
+        llm_news_filter.llm_provider = "perplexity".to_string();
 
         Self {
             data_source: if runtime.start_local {

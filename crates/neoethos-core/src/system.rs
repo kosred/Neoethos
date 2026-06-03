@@ -60,15 +60,15 @@ pub struct HardwareRuntimeOverrides {
 impl HardwareRuntimeOverrides {
     pub fn from_env() -> Self {
         Self {
-            cpu_budget: parse_env_usize("FOREX_BOT_CPU_BUDGET"),
-            training_precision: ["FOREX_BOT_TRAIN_PRECISION", "FOREX_TRAIN_PRECISION"]
+            cpu_budget: parse_env_usize("NEOETHOS_BOT_CPU_BUDGET"),
+            training_precision: ["NEOETHOS_BOT_TRAIN_PRECISION", "FOREX_TRAIN_PRECISION"]
                 .iter()
                 .find_map(|key| env::var(key).ok())
                 .and_then(|value| parse_training_precision(&value)),
-            cuda_precisions: parse_env_precisions("FOREX_BOT_CUDA_PRECISIONS"),
-            rocm_precisions: parse_env_precisions("FOREX_BOT_ROCM_PRECISIONS"),
-            wgpu_precisions: parse_env_precisions("FOREX_BOT_WGPU_PRECISIONS"),
-            wgpu_device_names: env::var("FOREX_BOT_WGPU_DEVICES")
+            cuda_precisions: parse_env_precisions("NEOETHOS_BOT_CUDA_PRECISIONS"),
+            rocm_precisions: parse_env_precisions("NEOETHOS_BOT_ROCM_PRECISIONS"),
+            wgpu_precisions: parse_env_precisions("NEOETHOS_BOT_WGPU_PRECISIONS"),
+            wgpu_device_names: env::var("NEOETHOS_BOT_WGPU_DEVICES")
                 .ok()
                 .map(|raw| {
                     raw.split(',')

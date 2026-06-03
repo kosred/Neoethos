@@ -305,6 +305,58 @@ class BackendClient {
         .toList();
   }
 
+  /// `GET /news/feed` — market headlines (public RSS, fetched
+  /// server-side) plus a Codex market briefing. `force` bypasses the
+  /// backend's fetch-coalescing cache (wired to the panel's refresh
+  /// button).
+  Future<NewsFeed> fetchNewsFeed({bool force = false}) async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '/news/feed',
+      queryParameters: force ? <String, dynamic>{'force': true} : null,
+    );
+    if (response.statusCode != 200 || response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/news/feed failed: ${response.statusCode}',
+      );
+    }
+    return NewsFeed.fromJson(response.data!);
+  }
+
+  /// `GET /risky/scenarios` — Risky/Growth time-to-target projection
+  /// computed by the engine's own Brownian math (no hardcoded growth
+  /// rates). `riskFraction` is clamped server-side to the signed Risky
+  /// band [0.30, 0.50].
+  Future<RiskyScenario> fetchRiskyScenarios({
+    double? startingUsd,
+    double? targetUsd,
+    double? riskFraction,
+    double? winRate,
+    double? rewardToRisk,
+    double? tradesPerDay,
+  }) async {
+    final qp = <String, dynamic>{};
+    if (startingUsd != null) qp['startingUsd'] = startingUsd;
+    if (targetUsd != null) qp['targetUsd'] = targetUsd;
+    if (riskFraction != null) qp['riskFraction'] = riskFraction;
+    if (winRate != null) qp['winRate'] = winRate;
+    if (rewardToRisk != null) qp['rewardToRisk'] = rewardToRisk;
+    if (tradesPerDay != null) qp['tradesPerDay'] = tradesPerDay;
+    final response = await _dio.get<Map<String, dynamic>>(
+      '/risky/scenarios',
+      queryParameters: qp,
+    );
+    if (response.statusCode != 200 || response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/risky/scenarios failed: ${response.statusCode}',
+      );
+    }
+    return RiskyScenario.fromJson(response.data!);
+  }
+
   /// `GET /settings/presets` — fetch the named preset bundles
   /// (Conservative / Balanced / Aggressive). Each preset is a
   /// mapping of knob id → value that the operator can apply with
@@ -1423,6 +1475,109 @@ class ClosedTrade {
         swap: (j['swap'] as num?)?.toDouble() ?? 0,
         netProfit: (j['netProfit'] as num?)?.toDouble() ?? 0,
         balanceAfter: (j['balanceAfter'] as num?)?.toDouble(),
+      );
+}
+
+/// One headline from the AI news desk (`GET /news/feed`).
+class NewsItem {
+  final String title;
+  final String link;
+  final String source;
+  final int? publishedMs;
+  final String blurb;
+  const NewsItem({
+    required this.title,
+    required this.link,
+    required this.source,
+    this.publishedMs,
+    required this.blurb,
+  });
+
+  factory NewsItem.fromJson(Map<String, dynamic> j) => NewsItem(
+        title: (j['title'] as String?) ?? '',
+        link: (j['link'] as String?) ?? '',
+        source: (j['source'] as String?) ?? '',
+        publishedMs: (j['publishedMs'] as num?)?.toInt(),
+        blurb: (j['blurb'] as String?) ?? '',
+      );
+}
+
+/// `GET /news/feed` payload: public-RSS headlines + a Codex market
+/// briefing. `aiAvailable` is false when the operator hasn't connected
+/// their ChatGPT subscription — the panel then shows headlines only.
+class NewsFeed {
+  final List<NewsItem> items;
+  final String aiSummary;
+  final bool aiAvailable;
+  final int generatedAtMs;
+  final String notice;
+  const NewsFeed({
+    required this.items,
+    required this.aiSummary,
+    required this.aiAvailable,
+    required this.generatedAtMs,
+    required this.notice,
+  });
+
+  factory NewsFeed.fromJson(Map<String, dynamic> j) => NewsFeed(
+        items: ((j['items'] as List<dynamic>?) ?? const [])
+            .whereType<Map<String, dynamic>>()
+            .map(NewsItem.fromJson)
+            .toList(),
+        aiSummary: (j['aiSummary'] as String?) ?? '',
+        aiAvailable: (j['aiAvailable'] as bool?) ?? false,
+        generatedAtMs: (j['generatedAtMs'] as num?)?.toInt() ?? 0,
+        notice: (j['notice'] as String?) ?? '',
+      );
+}
+
+/// `GET /risky/scenarios` payload — Risky/Growth Mode time-to-target
+/// projection, computed by the live engine (`risky_mode.rs`
+/// `time_to_target_scenarios`). The `_days` fields are null when the
+/// configured edge has non-positive expected log-growth (target not
+/// reachable on average). `ruinProbability` is the engine's
+/// Brownian-barrier estimate — NOT a UI heuristic.
+class RiskyScenario {
+  final double startingUsd;
+  final double targetUsd;
+  final double riskFraction;
+  final double winRate;
+  final double rewardToRisk;
+  final double tradesPerDay;
+  final int? bestCaseDays;
+  final int? expectedDays;
+  final int? conservativeDays;
+  final double ruinProbability;
+  final double riskFractionMin;
+  final double riskFractionMax;
+  const RiskyScenario({
+    required this.startingUsd,
+    required this.targetUsd,
+    required this.riskFraction,
+    required this.winRate,
+    required this.rewardToRisk,
+    required this.tradesPerDay,
+    this.bestCaseDays,
+    this.expectedDays,
+    this.conservativeDays,
+    required this.ruinProbability,
+    required this.riskFractionMin,
+    required this.riskFractionMax,
+  });
+
+  factory RiskyScenario.fromJson(Map<String, dynamic> j) => RiskyScenario(
+        startingUsd: (j['startingUsd'] as num?)?.toDouble() ?? 0,
+        targetUsd: (j['targetUsd'] as num?)?.toDouble() ?? 0,
+        riskFraction: (j['riskFraction'] as num?)?.toDouble() ?? 0,
+        winRate: (j['winRate'] as num?)?.toDouble() ?? 0,
+        rewardToRisk: (j['rewardToRisk'] as num?)?.toDouble() ?? 0,
+        tradesPerDay: (j['tradesPerDay'] as num?)?.toDouble() ?? 0,
+        bestCaseDays: (j['bestCaseDays'] as num?)?.toInt(),
+        expectedDays: (j['expectedDays'] as num?)?.toInt(),
+        conservativeDays: (j['conservativeDays'] as num?)?.toInt(),
+        ruinProbability: (j['ruinProbability'] as num?)?.toDouble() ?? 0,
+        riskFractionMin: (j['riskFractionMin'] as num?)?.toDouble() ?? 0.30,
+        riskFractionMax: (j['riskFractionMax'] as num?)?.toDouble() ?? 0.50,
       );
 }
 

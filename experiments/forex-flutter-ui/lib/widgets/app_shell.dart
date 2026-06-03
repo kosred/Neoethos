@@ -60,7 +60,7 @@ class AppShell extends ConsumerWidget {
     // we'd never poll at all.
     ref.watch(backendHealthProvider);
     return Scaffold(
-      backgroundColor: ForexAiTokens.appBg,
+      backgroundColor: NeoethosTokens.appBg,
       // F-339: SelectionArea wraps the ENTIRE shell (above Shortcuts/
       // Actions/Focus) so the operator can select + copy ANY text —
       // balances, account IDs, errors, log lines, config values. It must
@@ -129,8 +129,8 @@ class _ShellGrid extends StatelessWidget {
               const Sidebar(),
               Expanded(
                 child: Container(
-                  color: ForexAiTokens.appBg,
-                  padding: const EdgeInsets.all(ForexAiTokens.spSm),
+                  color: NeoethosTokens.appBg,
+                  padding: const EdgeInsets.all(NeoethosTokens.spSm),
                   child: _DockArea(activeId: activeId),
                 ),
               ),
@@ -174,9 +174,9 @@ class _DockArea extends StatelessWidget {
               Text(
                 tab.title,
                 style: const TextStyle(
-                  fontSize: ForexAiTokens.fsSubtitle,
+                  fontSize: NeoethosTokens.fsSubtitle,
                   fontWeight: FontWeight.w700,
-                  color: ForexAiTokens.textPrimary,
+                  color: NeoethosTokens.textPrimary,
                 ),
               ),
               const SizedBox(width: 8),
@@ -185,8 +185,8 @@ class _DockArea extends StatelessWidget {
                   tab.description,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
-                    fontSize: ForexAiTokens.fsCaption,
-                    color: ForexAiTokens.textMuted,
+                    fontSize: NeoethosTokens.fsCaption,
+                    color: NeoethosTokens.textMuted,
                   ),
                 ),
               ),
@@ -196,11 +196,11 @@ class _DockArea extends StatelessWidget {
         Expanded(
           child: Container(
             decoration: BoxDecoration(
-              color: ForexAiTokens.panelBg,
-              border: Border.all(color: ForexAiTokens.border),
-              borderRadius: BorderRadius.circular(ForexAiTokens.rMd),
+              color: NeoethosTokens.panelBg,
+              border: Border.all(color: NeoethosTokens.border),
+              borderRadius: BorderRadius.circular(NeoethosTokens.rMd),
             ),
-            padding: const EdgeInsets.all(ForexAiTokens.spLg),
+            padding: const EdgeInsets.all(NeoethosTokens.spLg),
             child: _viewForId(activeId),
           ),
         ),

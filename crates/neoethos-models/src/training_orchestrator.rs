@@ -227,7 +227,7 @@ impl TrainingOrchestrator {
         let planned_models: Vec<String> =
             configs.iter().map(|config| config.name.clone()).collect();
 
-        let data_root = std::env::var("FOREX_BOT_DATA_ROOT")
+        let data_root = std::env::var("NEOETHOS_BOT_DATA_ROOT")
             .unwrap_or_else(|_| self.settings.system.data_dir.to_string_lossy().to_string());
         let dataset = load_symbol_dataset(&data_root, symbol)?;
 
@@ -2321,8 +2321,8 @@ fn embargo_rows_for_timeframe(base_tf: &str, embargo_minutes: usize) -> usize {
     // can't allow train→val with no time gap on intraday models. 20 bars on
     // the base timeframe is the floor (~20 minutes on M1, ~5h on M15) — long
     // enough to bracket the typical label horizon for sub-hour forecasters.
-    // Override via FOREX_BOT_PROP_MIN_EMBARGO_BARS.
-    let min_floor: usize = std::env::var("FOREX_BOT_PROP_MIN_EMBARGO_BARS")
+    // Override via NEOETHOS_BOT_PROP_MIN_EMBARGO_BARS.
+    let min_floor: usize = std::env::var("NEOETHOS_BOT_PROP_MIN_EMBARGO_BARS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(20);

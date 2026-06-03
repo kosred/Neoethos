@@ -28,13 +28,13 @@ const BACKTEST_CORE_METRIC_WIDTH: usize = 7;
 // shape.
 //
 // Knobs covered (env-var name → typed field):
-// - `FOREX_BOT_SEARCH_EVAL_PRECISION` / `FOREX_BOT_TRAIN_PRECISION` /
+// - `NEOETHOS_BOT_SEARCH_EVAL_PRECISION` / `NEOETHOS_BOT_TRAIN_PRECISION` /
 //   `FOREX_TRAIN_PRECISION` → `requested_precision: TrainingPrecision`
-// - `FOREX_BOT_SEARCH_EVAL_CUDA_KERNEL` → `eval_kernel_enabled: bool`
-// - `FOREX_BOT_SEARCH_BACKTEST_CUDA_KERNEL` → `backtest_kernel_enabled: bool`
-// - `FOREX_BOT_SEARCH_EVAL_KERNEL_UNITS` → `eval_kernel_units_override: Option<u32>`
-// - `FOREX_BOT_SEARCH_BACKTEST_KERNEL_UNITS` → `backtest_kernel_units_override: Option<u32>`
-// - `FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE` → `cuda_device_id: usize`
+// - `NEOETHOS_BOT_SEARCH_EVAL_CUDA_KERNEL` → `eval_kernel_enabled: bool`
+// - `NEOETHOS_BOT_SEARCH_BACKTEST_CUDA_KERNEL` → `backtest_kernel_enabled: bool`
+// - `NEOETHOS_BOT_SEARCH_EVAL_KERNEL_UNITS` → `eval_kernel_units_override: Option<u32>`
+// - `NEOETHOS_BOT_SEARCH_BACKTEST_KERNEL_UNITS` → `backtest_kernel_units_override: Option<u32>`
+// - `NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE` → `cuda_device_id: usize`
 //
 // Vulkan note: the wgpu-vulkan backend is wired via feature
 // aggregation (`vulkan` cargo feature). It doesn't read any of these
@@ -58,22 +58,22 @@ impl CudaEnvKnobs {
         Self {
             requested_precision: read_requested_precision_from_env(),
             eval_kernel_enabled: read_kernel_enabled_from_env(
-                "FOREX_BOT_SEARCH_EVAL_CUDA_KERNEL",
+                "NEOETHOS_BOT_SEARCH_EVAL_CUDA_KERNEL",
             ),
             backtest_kernel_enabled: read_kernel_enabled_from_env(
-                "FOREX_BOT_SEARCH_BACKTEST_CUDA_KERNEL",
+                "NEOETHOS_BOT_SEARCH_BACKTEST_CUDA_KERNEL",
             ),
             eval_kernel_units_override: read_kernel_units_from_env(
-                "FOREX_BOT_SEARCH_EVAL_KERNEL_UNITS",
+                "NEOETHOS_BOT_SEARCH_EVAL_KERNEL_UNITS",
             ),
             // Backtest units fall back to eval units when the explicit
             // backtest knob is unset — preserves the original semantics
             // (`signal_kernel_units` and `backtest_kernel_units` both
             // honoured EVAL_KERNEL_UNITS as the umbrella default).
             backtest_kernel_units_override: read_kernel_units_from_env(
-                "FOREX_BOT_SEARCH_BACKTEST_KERNEL_UNITS",
+                "NEOETHOS_BOT_SEARCH_BACKTEST_KERNEL_UNITS",
             )
-            .or_else(|| read_kernel_units_from_env("FOREX_BOT_SEARCH_EVAL_KERNEL_UNITS")),
+            .or_else(|| read_kernel_units_from_env("NEOETHOS_BOT_SEARCH_EVAL_KERNEL_UNITS")),
             cuda_device_id: read_cuda_device_id_from_env(),
         }
     }
@@ -87,8 +87,8 @@ fn cuda_env_knobs() -> CudaEnvKnobs {
 
 fn read_requested_precision_from_env() -> TrainingPrecision {
     [
-        "FOREX_BOT_SEARCH_EVAL_PRECISION",
-        "FOREX_BOT_TRAIN_PRECISION",
+        "NEOETHOS_BOT_SEARCH_EVAL_PRECISION",
+        "NEOETHOS_BOT_TRAIN_PRECISION",
         "FOREX_TRAIN_PRECISION",
     ]
     .iter()
@@ -114,7 +114,7 @@ fn read_kernel_units_from_env(name: &str) -> Option<u32> {
 }
 
 fn read_cuda_device_id_from_env() -> usize {
-    match std::env::var("FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE") {
+    match std::env::var("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE") {
         // Not set: pick device 0 silently — the canonical default.
         Err(_) => 0,
         Ok(raw) => match raw.trim().parse::<usize>() {
@@ -128,7 +128,7 @@ fn read_cuda_device_id_from_env() -> usize {
                 tracing::warn!(
                     target: "neoethos_search::gpu",
                     raw = %raw,
-                    "FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE is set but not a valid \
+                    "NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE is set but not a valid \
                      non-negative integer; falling back to device 0."
                 );
                 0

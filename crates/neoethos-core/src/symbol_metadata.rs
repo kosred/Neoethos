@@ -694,7 +694,7 @@ pub fn canonical_symbol(symbol: &str) -> String {
 static GLOBAL_TABLE: OnceLock<SymbolMetadataTable> = OnceLock::new();
 
 /// Resolve the canonical metadata file path. Operators can override
-/// via `FOREX_BOT_SYMBOL_METADATA` env. Default: `data/symbol_metadata.json`
+/// via `NEOETHOS_BOT_SYMBOL_METADATA` env. Default: `data/symbol_metadata.json`
 /// relative to CWD, falling back to the packaged
 /// `assets/symbol_metadata/defaults.json` for fresh checkouts.
 ///
@@ -704,7 +704,7 @@ static GLOBAL_TABLE: OnceLock<SymbolMetadataTable> = OnceLock::new();
 /// every reconcile, and the asset version is only used when no
 /// operator file exists yet.
 pub fn metadata_path() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("FOREX_BOT_SYMBOL_METADATA") {
+    if let Ok(p) = std::env::var("NEOETHOS_BOT_SYMBOL_METADATA") {
         return std::path::PathBuf::from(p);
     }
     let cwd_path = std::path::PathBuf::from("data").join("symbol_metadata.json");

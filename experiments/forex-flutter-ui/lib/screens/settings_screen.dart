@@ -96,7 +96,7 @@ class _SettingsScreenState extends State<SettingsScreen>
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _SettingsTabStrip(controller: _controller, tabs: _tabs),
-        const SizedBox(height: ForexAiTokens.spSm),
+        const SizedBox(height: NeoethosTokens.spSm),
         Expanded(
           child: TabBarView(
             controller: _controller,
@@ -136,9 +136,9 @@ class _SettingsTabStrip extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       padding: const EdgeInsets.only(right: 4),
       child: Row(
@@ -147,15 +147,15 @@ class _SettingsTabStrip extends StatelessWidget {
             child: TabBar(
               controller: controller,
               isScrollable: true,
-              labelColor: ForexAiTokens.accent,
-              unselectedLabelColor: ForexAiTokens.textMuted,
-              indicatorColor: ForexAiTokens.accent,
+              labelColor: NeoethosTokens.accent,
+              unselectedLabelColor: NeoethosTokens.textMuted,
+              indicatorColor: NeoethosTokens.accent,
               labelStyle: const TextStyle(
-                fontSize: ForexAiTokens.fsBody,
+                fontSize: NeoethosTokens.fsBody,
                 fontWeight: FontWeight.w700,
               ),
               unselectedLabelStyle: const TextStyle(
-                fontSize: ForexAiTokens.fsBody,
+                fontSize: NeoethosTokens.fsBody,
                 fontWeight: FontWeight.w500,
               ),
               tabs: [
@@ -175,13 +175,13 @@ class _SettingsTabStrip extends StatelessWidget {
           TextButton.icon(
             onPressed: () => showHelpDialog(context),
             icon: const Icon(Icons.help_outline,
-                size: 16, color: ForexAiTokens.textMuted),
+                size: 16, color: NeoethosTokens.textMuted),
             label: const Text(
               'Help (F1)',
               style: TextStyle(
-                fontSize: ForexAiTokens.fsCaption,
+                fontSize: NeoethosTokens.fsCaption,
                 fontWeight: FontWeight.w600,
-                color: ForexAiTokens.textMuted,
+                color: NeoethosTokens.textMuted,
               ),
             ),
             style: TextButton.styleFrom(
@@ -278,7 +278,7 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
     if (clientIdMissing || clientSecretMissing) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          backgroundColor: ForexAiTokens.sell,
+          backgroundColor: NeoethosTokens.sell,
           content: Text(
             'Client ID and Client Secret are required (no saved value to fall back on)',
           ),
@@ -308,7 +308,7 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
       ref.invalidate(accountSnapshotProvider);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor: ok ? ForexAiTokens.buy : ForexAiTokens.warning,
+          backgroundColor: ok ? NeoethosTokens.buy : NeoethosTokens.warning,
           content: Text(msg),
           duration: const Duration(seconds: 5),
         ),
@@ -353,7 +353,7 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
       ref.invalidate(accountSnapshotProvider);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor: ok ? ForexAiTokens.buy : ForexAiTokens.warning,
+          backgroundColor: ok ? NeoethosTokens.buy : NeoethosTokens.warning,
           content: Text(
             ok
                 ? 'Active account → $selected. Restart NeoEthos to apply.'
@@ -408,7 +408,7 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
           padding: EdgeInsets.symmetric(vertical: 12),
           child: Text(
             'Loading…',
-            style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+            style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
           ),
         ),
       );
@@ -426,7 +426,7 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
             'users who want to use their own cTrader Open API app '
             '(https://openapi.ctrader.com → Applications). Saved to '
             '%APPDATA%/neoethos/broker_credentials.toml, never committed to git.',
-            style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+            style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
           ),
           const SizedBox(height: 12),
           TextField(
@@ -526,8 +526,8 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
                     style: TextStyle(
                       fontSize: 11,
                       color: _resultOk
-                          ? ForexAiTokens.buy
-                          : ForexAiTokens.sell,
+                          ? NeoethosTokens.buy
+                          : NeoethosTokens.sell,
                     ),
                   ),
                 ),
@@ -686,7 +686,7 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
   void _showSnack(String msg, {required bool ok}) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        backgroundColor: ok ? ForexAiTokens.buy : ForexAiTokens.sell,
+        backgroundColor: ok ? NeoethosTokens.buy : NeoethosTokens.sell,
         content: Text(msg),
         duration: const Duration(seconds: 4),
       ),
@@ -722,7 +722,7 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
             'These fields write directly into config.yaml. Unchanged '
             'lines (risk, models, the 200+ knobs the UI doesn\'t '
             'show) are preserved on every save.',
-            style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+            style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
           ),
           const SizedBox(height: 12),
           TextField(
@@ -749,7 +749,7 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
             subtitle: const Text(
               'How hard/long Discovery searches. Bigger = more strategies, '
               'slower. Tune for your machine (L40 VPS vs local).',
-              style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+              style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
             ),
             children: [
               Wrap(
@@ -806,8 +806,8 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
                       style: TextStyle(
                         fontSize: 11,
                         color: _newsEnabled
-                            ? ForexAiTokens.buy
-                            : ForexAiTokens.textFaint,
+                            ? NeoethosTokens.buy
+                            : NeoethosTokens.textFaint,
                       ),
                     ),
                   ],
@@ -826,7 +826,7 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
             style: TextStyle(
               fontSize: 12,
               fontWeight: FontWeight.w700,
-              color: ForexAiTokens.textPrimary,
+              color: NeoethosTokens.textPrimary,
             ),
           ),
           const SizedBox(height: 4),
@@ -835,7 +835,7 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
             'set by `news_kill_window_min` in config.yaml (30 min '
             'default). The default is to pause new orders; flip to '
             'one of the others if your strategy is event-driven.',
-            style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+            style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
           ),
           const SizedBox(height: 8),
           _NewsTradingModeRow(
@@ -893,8 +893,8 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
                     style: TextStyle(
                       fontSize: 11,
                       color: _messageOk
-                          ? ForexAiTokens.buy
-                          : ForexAiTokens.sell,
+                          ? NeoethosTokens.buy
+                          : NeoethosTokens.sell,
                     ),
                   ),
                 ),
@@ -956,7 +956,7 @@ class _AccountPicker extends ConsumerWidget {
                 'the Spotware consent screen.',
                 style: TextStyle(
                   fontSize: 10,
-                  color: ForexAiTokens.warning,
+                  color: NeoethosTokens.warning,
                 ),
               ),
             ],
@@ -1000,8 +1000,8 @@ class _AccountPicker extends ConsumerWidget {
                           ),
                           decoration: BoxDecoration(
                             color: (a.isLive == true)
-                                ? ForexAiTokens.sell.withValues(alpha: 0.25)
-                                : ForexAiTokens.buy.withValues(alpha: 0.2),
+                                ? NeoethosTokens.sell.withValues(alpha: 0.25)
+                                : NeoethosTokens.buy.withValues(alpha: 0.2),
                             borderRadius: BorderRadius.circular(3),
                           ),
                           child: Text(
@@ -1063,7 +1063,7 @@ class _AccountPicker extends ConsumerWidget {
             'before the dropdown can populate.',
             style: const TextStyle(
               fontSize: 10,
-              color: ForexAiTokens.warning,
+              color: NeoethosTokens.warning,
             ),
           ),
         ],
@@ -1098,10 +1098,10 @@ class _NewsTradingModeRow extends StatelessWidget {
         padding: const EdgeInsets.all(8),
         decoration: BoxDecoration(
           color: selected
-              ? ForexAiTokens.accent.withValues(alpha: 0.12)
-              : ForexAiTokens.surfaceBg,
+              ? NeoethosTokens.accent.withValues(alpha: 0.12)
+              : NeoethosTokens.surfaceBg,
           border: Border.all(
-            color: selected ? ForexAiTokens.accent : ForexAiTokens.border,
+            color: selected ? NeoethosTokens.accent : NeoethosTokens.border,
           ),
           borderRadius: BorderRadius.circular(4),
         ),
@@ -1116,11 +1116,11 @@ class _NewsTradingModeRow extends StatelessWidget {
                 shape: BoxShape.circle,
                 border: Border.all(
                   color: selected
-                      ? ForexAiTokens.accent
-                      : ForexAiTokens.border,
+                      ? NeoethosTokens.accent
+                      : NeoethosTokens.border,
                   width: 2,
                 ),
-                color: selected ? ForexAiTokens.accent : Colors.transparent,
+                color: selected ? NeoethosTokens.accent : Colors.transparent,
               ),
             ),
             Expanded(
@@ -1133,8 +1133,8 @@ class _NewsTradingModeRow extends StatelessWidget {
                       fontSize: 12,
                       fontWeight: FontWeight.w700,
                       color: selected
-                          ? ForexAiTokens.accent
-                          : ForexAiTokens.textPrimary,
+                          ? NeoethosTokens.accent
+                          : NeoethosTokens.textPrimary,
                     ),
                   ),
                   const SizedBox(height: 2),
@@ -1142,7 +1142,7 @@ class _NewsTradingModeRow extends StatelessWidget {
                     description,
                     style: const TextStyle(
                       fontSize: 10,
-                      color: ForexAiTokens.textMuted,
+                      color: NeoethosTokens.textMuted,
                     ),
                   ),
                 ],
@@ -1162,7 +1162,7 @@ class _Loading extends StatelessWidget {
         padding: EdgeInsets.symmetric(vertical: 16),
         child: Text(
           'Loading settings…',
-          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }
@@ -1188,7 +1188,7 @@ class _AdvancedKnobEditorCard extends StatelessWidget {
             'individual knob with inline help.',
             style: TextStyle(
               fontSize: 12,
-              color: ForexAiTokens.textMuted,
+              color: NeoethosTokens.textMuted,
             ),
           ),
           const SizedBox(height: 10),
@@ -1383,7 +1383,7 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
               : 'Source: $_path',
           style: const TextStyle(
             fontSize: 11,
-            color: ForexAiTokens.textMuted,
+            color: NeoethosTokens.textMuted,
           ),
         ),
         initiallyExpanded: _open,
@@ -1457,7 +1457,7 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
                           _error!,
                           style: const TextStyle(
                             fontSize: 11,
-                            color: ForexAiTokens.sell,
+                            color: NeoethosTokens.sell,
                           ),
                         ),
                         if (_errorHint != null) ...[
@@ -1467,7 +1467,7 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
                             style: const TextStyle(
                               fontSize: 10,
                               fontStyle: FontStyle.italic,
-                              color: ForexAiTokens.textMuted,
+                              color: NeoethosTokens.textMuted,
                             ),
                           ),
                         ],
@@ -1481,11 +1481,11 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
                   Container(
                     width: double.infinity,
                     decoration: BoxDecoration(
-                      color: ForexAiTokens.surfaceBg,
+                      color: NeoethosTokens.surfaceBg,
                       border: Border.all(
                         color: _dirty
                             ? const Color(0xFFE65100)
-                            : ForexAiTokens.border,
+                            : NeoethosTokens.border,
                       ),
                       borderRadius: BorderRadius.circular(4),
                     ),
@@ -1496,7 +1496,7 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
                       style: const TextStyle(
                         fontFamily: 'monospace',
                         fontSize: 11,
-                        color: ForexAiTokens.textPrimary,
+                        color: NeoethosTokens.textPrimary,
                       ),
                       decoration: const InputDecoration(
                         border: InputBorder.none,
@@ -1517,7 +1517,7 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
                     'Fetching config.yaml…',
                     style: TextStyle(
                       fontSize: 11,
-                      color: ForexAiTokens.textMuted,
+                      color: NeoethosTokens.textMuted,
                     ),
                   ),
               ],

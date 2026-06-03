@@ -315,7 +315,7 @@ pub(super) fn prop_firm_pre_trade_check(
         // grep-able source for the env-var name.
         neoethos_core::env_overrides::prop_firm_account_currency().ok_or_else(|| {
             anyhow::anyhow!(
-                "Risk gate cannot size order: FOREX_BOT_PROP_ACCOUNT_CURRENCY \
+                "Risk gate cannot size order: NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY \
                  is unset. The account currency must be supplied by the broker \
                  (cTrader trader profile) — no synthetic default allowed."
             )
@@ -331,7 +331,7 @@ pub(super) fn prop_firm_pre_trade_check(
     // compute the real per-pip account-currency value via the neoethos-search
     // cost model and reject the order if it would exceed the configured
     // `risk_per_trade` percentage. Override the live FX rate the model
-    // needs for cross pairs via `FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE`.
+    // needs for cross pairs via `NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE`.
     //
     // Note — entry-estimate fallback for Market orders.
     // Pre-fix: a Market order carries neither `limit_price` nor `stop_price`,
@@ -376,14 +376,14 @@ pub(super) fn prop_firm_pre_trade_check(
         let metadata = neoethos_core::symbol_metadata::resolve(symbol).ok_or_else(|| {
             anyhow::anyhow!(
                 "Risk gate cannot size order: no cTrader symbol metadata for {symbol}. \
-                 Populate data/symbol_metadata.json (or the FOREX_BOT_SYMBOL_METADATA \
+                 Populate data/symbol_metadata.json (or the NEOETHOS_BOT_SYMBOL_METADATA \
                  override) from the cTrader ProtoOASymbol records before trading."
             )
         })?;
         // Pip value in account currency per standard lot. We hard-fail
         // for cross pairs without a quote→account conversion rate
         // rather than silently using a possibly-wrong fallback.
-        // `FOREX_BOT_PROP_ACCOUNT_CURRENCY` / `FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE`
+        // `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` / `NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE`
         // are reserved for operator overrides only — never synthesized.
         // **F-565 fix (2026-05-25 — F-CORE3 Phase B)**: both env reads
         // route through the canonical `neoethos_core::env_overrides`
@@ -391,7 +391,7 @@ pub(super) fn prop_firm_pre_trade_check(
         let account_currency = neoethos_core::env_overrides::prop_firm_account_currency()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Risk gate cannot size order: FOREX_BOT_PROP_ACCOUNT_CURRENCY \
+                    "Risk gate cannot size order: NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY \
                      is unset. The account currency must be supplied by the broker \
                      (cTrader trader profile) — no synthetic default allowed."
                 )
@@ -407,7 +407,7 @@ pub(super) fn prop_firm_pre_trade_check(
             return Err(anyhow::anyhow!(
                 "Risk gate cannot size order: pip value for {symbol} in {account_currency} \
                  is not resolvable (cross-pair without quote→account FX rate?). \
-                 Set FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE or supply a broker-sourced \
+                 Set NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE or supply a broker-sourced \
                  conversion rate; no synthetic fallback is permitted."
             ));
         }

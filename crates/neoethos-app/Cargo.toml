@@ -73,6 +73,11 @@ reqwest = { version = "0.13.3", default-features = true, features = ["blocking",
 # reqwest does — avoids divergence between request validation and
 # actual request issuance.
 url = "2.5"
+# feed-rs parses RSS + Atom robustly (CDATA, namespaces, both RFC-822
+# and RFC-3339 dates) so the news desk ingests public no-API-key
+# financial feeds without a fragile hand-rolled XML scraper. Pure Rust;
+# reuses quick-xml / chrono / mime which are already in the dep tree.
+feed-rs = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"  # aligned with workspace.dependencies (2026-05-26)
 # F-312 (2026-05-29): POST /settings/raw needs to validate that the

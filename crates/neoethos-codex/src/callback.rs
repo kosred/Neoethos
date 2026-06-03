@@ -243,7 +243,7 @@ small { display:block; margin-top:20px; color:#9ca3af; font-size:12px; }
 </style></head>
 <body><div class="card">
 <h1>✗ Authentication failed</h1>
-<p>OpenAI returned an error or the request was malformed. Close this tab, return to NeoEthos, and click Connect ChatGPT again.</p>
+<p>The sign-in provider returned an error or the request was malformed. Close this tab, return to NeoEthos, and click Connect ChatGPT again.</p>
 <small>NeoEthos · neoethos-codex</small>
 </div></body></html>"#;
 

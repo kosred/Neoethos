@@ -216,7 +216,7 @@ class _SymbolPickerState extends ConsumerState<SymbolPicker> {
                                   descr ?? '',
                                   style: const TextStyle(
                                     fontSize: 11,
-                                    color: ForexAiTokens.textMuted,
+                                    color: NeoethosTokens.textMuted,
                                   ),
                                   overflow: TextOverflow.ellipsis,
                                 ),
@@ -279,7 +279,7 @@ class _SymbolPickerState extends ConsumerState<SymbolPicker> {
     return _StatusPlaceholder(
       label: widget.label,
       message: 'Loading broker symbol catalog from /broker/symbols…',
-      tone: ForexAiTokens.textMuted,
+      tone: NeoethosTokens.textMuted,
     );
   }
 
@@ -288,7 +288,7 @@ class _SymbolPickerState extends ConsumerState<SymbolPicker> {
       label: widget.label,
       message:
           'Broker symbol catalog unavailable: $err\nOpen Settings → save cTrader credentials → Broker Setup → Re-authenticate.',
-      tone: ForexAiTokens.warning,
+      tone: NeoethosTokens.warning,
     );
   }
 }
@@ -319,7 +319,7 @@ class TimeframePicker extends ConsumerWidget {
             message: '/broker/timeframes returned an empty list — the '
                 'server contract is broken; check neoethos_core::'
                 'CANONICAL_TIMEFRAMES.',
-            tone: ForexAiTokens.sell,
+            tone: NeoethosTokens.sell,
           );
         }
         // If the live list doesn't contain the saved pick (canonical
@@ -358,13 +358,13 @@ class TimeframePicker extends ConsumerWidget {
       loading: () => _StatusPlaceholder(
         label: label,
         message: 'Loading timeframes from /broker/timeframes…',
-        tone: ForexAiTokens.textMuted,
+        tone: NeoethosTokens.textMuted,
       ),
       error: (err, _) => _StatusPlaceholder(
         label: label,
         message: 'Timeframes unavailable — authenticate in Broker Setup '
             'to load them.',
-        tone: ForexAiTokens.warning,
+        tone: NeoethosTokens.warning,
       ),
     );
   }

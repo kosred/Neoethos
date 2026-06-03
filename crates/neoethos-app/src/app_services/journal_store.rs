@@ -184,6 +184,7 @@ pub fn record_closed_trade(data_dir: &Path, trade: &ClosedTrade) -> Result<bool>
 /// Fire-and-forget variant for the trading/refresh hot path — logs a
 /// warning instead of propagating, so a journal failure never aborts a
 /// trade or stalls the account-refresh loop.
+#[allow(dead_code)] // wired into reconcile hot-path shortly
 pub fn record_closed_trade_best_effort(data_dir: &Path, trade: &ClosedTrade) {
     if let Err(e) = record_closed_trade(data_dir, trade) {
         tracing::warn!(

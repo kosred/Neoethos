@@ -56,12 +56,12 @@ class StatusBar extends ConsumerWidget {
     );
 
     return Container(
-      height: ForexAiTokens.statusbarHeight,
+      height: NeoethosTokens.statusbarHeight,
       decoration: const BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border(top: BorderSide(color: ForexAiTokens.border)),
+        color: NeoethosTokens.panelBg,
+        border: Border(top: BorderSide(color: NeoethosTokens.border)),
       ),
-      padding: const EdgeInsets.symmetric(horizontal: ForexAiTokens.spMd),
+      padding: const EdgeInsets.symmetric(horizontal: NeoethosTokens.spMd),
       child: Row(
         children: [
           _StatusItem(label: 'Broker', value: brokerValue, success: brokerOk),
@@ -89,14 +89,14 @@ class _StatusItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = success ? ForexAiTokens.buy : ForexAiTokens.textPrimary;
+    final color = success ? NeoethosTokens.buy : NeoethosTokens.textPrimary;
     return Row(
       children: [
         Text(
           label,
           style: const TextStyle(
-            fontSize: ForexAiTokens.fsCaption,
-            color: ForexAiTokens.textMuted,
+            fontSize: NeoethosTokens.fsCaption,
+            color: NeoethosTokens.textMuted,
           ),
         ),
         if (value != null) ...[
@@ -104,7 +104,7 @@ class _StatusItem extends StatelessWidget {
           Text(
             value!,
             style: TextStyle(
-              fontSize: ForexAiTokens.fsCaption,
+              fontSize: NeoethosTokens.fsCaption,
               fontWeight: FontWeight.w700,
               color: color,
             ),
@@ -121,7 +121,7 @@ class _StatusSep extends StatelessWidget {
   Widget build(BuildContext context) => Container(
         width: 1,
         height: 12,
-        color: ForexAiTokens.border,
-        margin: const EdgeInsets.symmetric(horizontal: ForexAiTokens.spMd),
+        color: NeoethosTokens.border,
+        margin: const EdgeInsets.symmetric(horizontal: NeoethosTokens.spMd),
       );
 }

@@ -21,14 +21,14 @@ class Sidebar extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final active = ref.watch(activeTabProvider);
     return Container(
-      width: ForexAiTokens.sidebarWidth,
+      width: NeoethosTokens.sidebarWidth,
       decoration: const BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border(right: BorderSide(color: ForexAiTokens.border)),
+        color: NeoethosTokens.panelBg,
+        border: Border(right: BorderSide(color: NeoethosTokens.border)),
       ),
       padding: const EdgeInsets.symmetric(
-        vertical: ForexAiTokens.spMd,
-        horizontal: ForexAiTokens.spSm,
+        vertical: NeoethosTokens.spMd,
+        horizontal: NeoethosTokens.spSm,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -37,7 +37,7 @@ class Sidebar extends ConsumerWidget {
           // anchors a small wordmark above the nav rather than relying
           // on the TopBar alone.
           const _BrandBlock(),
-          const SizedBox(height: ForexAiTokens.spMd),
+          const SizedBox(height: NeoethosTokens.spMd),
           Expanded(
             child: ListView(
               padding: EdgeInsets.zero,
@@ -79,9 +79,9 @@ class _BrandBlock extends StatelessWidget {
             width: 22,
             height: 22,
             decoration: BoxDecoration(
-              color: ForexAiTokens.accent.withValues(alpha: 0.18),
+              color: NeoethosTokens.accent.withValues(alpha: 0.18),
               border: Border.all(
-                color: ForexAiTokens.accent.withValues(alpha: 0.55),
+                color: NeoethosTokens.accent.withValues(alpha: 0.55),
               ),
               borderRadius: BorderRadius.circular(6),
             ),
@@ -91,7 +91,7 @@ class _BrandBlock extends StatelessWidget {
               style: TextStyle(
                 fontSize: 12,
                 fontWeight: FontWeight.w700,
-                color: ForexAiTokens.accent,
+                color: NeoethosTokens.accent,
               ),
             ),
           ),
@@ -101,10 +101,10 @@ class _BrandBlock extends StatelessWidget {
               'NeoEthos',
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
-                fontSize: ForexAiTokens.fsBody + 1,
+                fontSize: NeoethosTokens.fsBody + 1,
                 fontWeight: FontWeight.w700,
                 letterSpacing: 0.3,
-                color: ForexAiTokens.textPrimary,
+                color: NeoethosTokens.textPrimary,
               ),
             ),
           ),
@@ -139,13 +139,13 @@ class _NavItem extends StatelessWidget {
             padding: const EdgeInsets.only(left: 10, right: 8),
             decoration: BoxDecoration(
               color: active
-                  ? ForexAiTokens.accentMuted
+                  ? NeoethosTokens.accentMuted
                   : Colors.transparent,
-              borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+              borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
               border: active
                   ? const Border(
                       left: BorderSide(
-                        color: ForexAiTokens.accent,
+                        color: NeoethosTokens.accent,
                         width: 3,
                       ),
                     )
@@ -160,8 +160,8 @@ class _NavItem extends StatelessWidget {
                     style: TextStyle(
                       fontSize: 15,
                       color: active
-                          ? ForexAiTokens.accent
-                          : ForexAiTokens.textFaint,
+                          ? NeoethosTokens.accent
+                          : NeoethosTokens.textFaint,
                     ),
                     textAlign: TextAlign.center,
                   ),
@@ -172,11 +172,11 @@ class _NavItem extends StatelessWidget {
                     tab.title,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                      fontSize: ForexAiTokens.fsBody,
+                      fontSize: NeoethosTokens.fsBody,
                       fontWeight: active ? FontWeight.w600 : FontWeight.w500,
                       color: active
-                          ? ForexAiTokens.textPrimary
-                          : ForexAiTokens.textMuted,
+                          ? NeoethosTokens.textPrimary
+                          : NeoethosTokens.textMuted,
                     ),
                   ),
                 ),

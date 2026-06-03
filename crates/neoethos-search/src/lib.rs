@@ -75,6 +75,7 @@ pub use eval::{
     BacktestMetrics, BacktestRuntimeOverrides, BacktestSettings,
     current_backtest_runtime_overrides, evaluate_population_core, fast_evaluate_strategy_core,
     install_backtest_runtime_overrides, install_backtest_runtime_overrides_from_env,
+    install_backtest_runtime_overrides_from_settings,
     simulate_trades_core,
 };
 // `pub use gauntlet::{GauntletConfig, StrategyGauntlet};` — DELETED 2026-05-26.
@@ -88,10 +89,14 @@ pub use genetic::{
     evaluate_genes, evolve_search, evolve_search_with_progress,
     evolve_search_with_progress_and_limits, install_genetic_search_runtime_overrides,
     install_genetic_search_runtime_overrides_from_env,
+    install_genetic_search_runtime_overrides_from_settings,
     install_seen_signature_memory_runtime_overrides,
-    install_seen_signature_memory_runtime_overrides_from_env, install_smc_search_config_from_env,
+    install_seen_signature_memory_runtime_overrides_from_env,
+    install_seen_signature_memory_runtime_overrides_from_settings, install_smc_search_config_from_env,
+    install_smc_search_config_from_settings,
     install_strategy_evaluation_runtime_overrides,
-    install_strategy_evaluation_runtime_overrides_from_env, month_day_indices, random_search,
+    install_strategy_evaluation_runtime_overrides_from_env,
+    install_strategy_evaluation_runtime_overrides_from_settings, month_day_indices, random_search,
     signals_for_gene,
 };
 pub use neoethos_core::contracts::DeterminismPolicy;
@@ -101,6 +106,7 @@ pub use quality::{
     QualityRuntimeOverrides, StrategyMetrics, StrategyQualityAnalyzer, StrategyRanker, Trade,
     current_quality_runtime_overrides, install_quality_runtime_overrides,
     install_quality_runtime_overrides_from_env,
+    install_quality_runtime_overrides_from_settings,
 };
 pub use stop_target::{StopTargetSettings, compute_stop_distance_series, infer_stop_target_pips};
 pub use validation::{
@@ -126,7 +132,7 @@ pub use validation::{
 };
 
 /// Convenience entry point that installs every typed runtime-override
-/// boundary from the legacy `FOREX_BOT_*` env vars in a single call.
+/// boundary from the legacy `NEOETHOS_BOT_*` env vars in a single call.
 /// Production binaries (`neoethos-cli`, `neoethos-app`) invoke this once at
 /// startup so the search crate itself never reads `std::env` during a run.
 pub fn install_search_runtime_overrides_from_env() {
@@ -136,4 +142,19 @@ pub fn install_search_runtime_overrides_from_env() {
     install_strategy_evaluation_runtime_overrides_from_env();
     install_smc_search_config_from_env();
     install_seen_signature_memory_runtime_overrides_from_env();
+}
+
+/// Config-driven entry point — installs the typed runtime-override
+/// boundaries from the single [`neoethos_core::Settings`] instead of the
+/// environment. **Config-consolidation S2 (in progress):** the
+/// genetic-search boundary now reads config (`models.search_runtime`);
+/// the remaining five still read env until their migration lands.
+/// Production binaries call this once at startup after loading `Settings`.
+pub fn install_search_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
+    install_backtest_runtime_overrides_from_settings(s); // ✓ S2d config
+    install_quality_runtime_overrides_from_settings(s); // ✓ S2c config
+    install_genetic_search_runtime_overrides_from_settings(s); // ✓ S2a config
+    install_strategy_evaluation_runtime_overrides_from_settings(s); // ✓ S2b config
+    install_smc_search_config_from_settings(s); // ✓ S2e config
+    install_seen_signature_memory_runtime_overrides_from_settings(s); // ✓ S2f config
 }

@@ -5,7 +5,7 @@
 //! When the local Gemma runtime is unavailable (no GGUF on disk,
 //! incompatible model, low VRAM, or the inference crashed as in #197 /
 //! #208), an operator with an active ChatGPT Plus or Pro subscription
-//! can authenticate via the same PKCE OAuth flow that OpenAI's own
+//! can authenticate via the same PKCE OAuth flow that the official
 //! `codex` CLI uses, and route AI Helper chats through their
 //! subscription instead.
 //!
@@ -24,7 +24,7 @@
 //!   authenticated with `codex login` get picked up automatically;
 //!   we never force a second flow.
 //! - [`client`] — minimal `chat/completions` proxy. Mirrors the
-//!   OpenAI Chat Completions request/response shape so callers can
+//!   Chat Completions request/response shape so callers can
 //!   reuse their existing prompt scaffolding.
 //! - [`error`] — `CodexError` umbrella for HTTP / token / JSON
 //!   failures.
@@ -34,7 +34,7 @@
 //! That code path is tightly coupled to the cTrader endpoints
 //! (Spotware-specific scopes, `client_id` + `client_secret`,
 //! Authorization Code without PKCE). Codex uses a *public* client
-//! (no secret, PKCE-only) against OpenAI's issuer, which is a
+//! (no secret, PKCE-only) against the Codex (ChatGPT) issuer, which is a
 //! materially different flow. Sharing code between the two would
 //! require an OAuth abstraction layer that costs more than just
 //! writing ~250 lines of straightforward PKCE.
@@ -64,7 +64,7 @@ pub use error::CodexError;
 pub use oauth::{AuthorizationRequest, TokenBundle, exchange_code};
 pub use pkce::PkceChallenge;
 
-/// Published OAuth client ID for the OpenAI Codex CLI. This is a
+/// Published OAuth client ID for the official Codex CLI. This is a
 /// public identifier — not a secret — taken from the official
 /// `codex` source. Hard-coding it here means our flow is
 /// interoperable with the Codex CLI: an operator who runs
@@ -90,7 +90,7 @@ pub const CODEX_CALLBACK_PORT: u16 = 1455;
 /// the chat-UI's own endpoint and rejects external-shaped bodies
 /// with 422 "Invalid conversation body").
 ///
-/// The `/codex/responses` endpoint speaks the OpenAI Responses API
+/// The `/codex/responses` endpoint speaks the Responses API
 /// format: `{model, input, stream, …}` rather than the Chat
 /// Completions `{messages: [...]}` shape. Response body is a plain
 /// JSON object containing `output: [{content: [{type: "output_text",

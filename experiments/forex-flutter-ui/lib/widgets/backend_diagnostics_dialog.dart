@@ -75,7 +75,7 @@ class _BackendDiagnosticsDialogState
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          backgroundColor: ForexAiTokens.accent,
+          backgroundColor: NeoethosTokens.accent,
           content: Text(
             'Backend restart requested — watchdog will confirm in ~3 s.',
           ),
@@ -85,7 +85,7 @@ class _BackendDiagnosticsDialogState
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor: ForexAiTokens.sell,
+          backgroundColor: NeoethosTokens.sell,
           content: Text(
             'Restart command failed — ${describeError(e)}. '
             'Try ending the neoethos-core process in Task Manager, '
@@ -104,7 +104,7 @@ class _BackendDiagnosticsDialogState
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        backgroundColor: ForexAiTokens.buy,
+        backgroundColor: NeoethosTokens.buy,
         content: Text('Log path copied to clipboard.'),
         duration: Duration(seconds: 2),
       ),
@@ -137,8 +137,8 @@ class _BackendDiagnosticsDialogState
         ? 'Online'
         : 'Reconnecting…';
     final statusColor = health.status == BackendHealthStatus.online
-        ? ForexAiTokens.buy
-        : ForexAiTokens.sell;
+        ? NeoethosTokens.buy
+        : NeoethosTokens.sell;
 
     final lastSeen = health.lastSeenAt;
     final lastSeenLabel = lastSeen == null
@@ -168,35 +168,35 @@ class _BackendDiagnosticsDialogState
                   statusLabel,
                   style: TextStyle(
                     fontWeight: FontWeight.w700,
-                    fontSize: ForexAiTokens.fsBody,
+                    fontSize: NeoethosTokens.fsBody,
                     color: statusColor,
                   ),
                 ),
-                const SizedBox(width: ForexAiTokens.spLg),
+                const SizedBox(width: NeoethosTokens.spLg),
                 _MetaItem(label: 'Last /healthz OK', value: lastSeenLabel),
-                const SizedBox(width: ForexAiTokens.spLg),
+                const SizedBox(width: NeoethosTokens.spLg),
                 _MetaItem(
                   label: 'Consecutive failures',
                   value: '${health.consecutiveFailures}',
                 ),
-                const SizedBox(width: ForexAiTokens.spLg),
+                const SizedBox(width: NeoethosTokens.spLg),
                 _MetaItem(
                   label: 'Respawn attempts',
                   value: '${health.respawnAttempts}',
                 ),
-                const SizedBox(width: ForexAiTokens.spLg),
+                const SizedBox(width: NeoethosTokens.spLg),
                 _MetaItem(
                   label: 'Child PID',
                   value: pid == null ? '—' : '$pid',
                 ),
               ],
             ),
-            const SizedBox(height: ForexAiTokens.spMd),
+            const SizedBox(height: NeoethosTokens.spMd),
             // Log path bar
             Row(
               children: [
                 const Icon(Icons.description,
-                    size: 14, color: ForexAiTokens.textMuted),
+                    size: 14, color: NeoethosTokens.textMuted),
                 const SizedBox(width: 6),
                 Expanded(
                   child: SelectableText(
@@ -204,7 +204,7 @@ class _BackendDiagnosticsDialogState
                     style: const TextStyle(
                       fontSize: 11,
                       fontFamily: 'Consolas',
-                      color: ForexAiTokens.textMuted,
+                      color: NeoethosTokens.textMuted,
                     ),
                   ),
                 ),
@@ -225,16 +225,16 @@ class _BackendDiagnosticsDialogState
                 ),
               ],
             ),
-            const SizedBox(height: ForexAiTokens.spXs),
+            const SizedBox(height: NeoethosTokens.spXs),
             // Log tail
             Expanded(
               child: Container(
                 decoration: BoxDecoration(
-                  color: ForexAiTokens.appBg,
-                  border: Border.all(color: ForexAiTokens.border),
-                  borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+                  color: NeoethosTokens.appBg,
+                  border: Border.all(color: NeoethosTokens.border),
+                  borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
                 ),
-                padding: const EdgeInsets.all(ForexAiTokens.spSm),
+                padding: const EdgeInsets.all(NeoethosTokens.spSm),
                 child: Scrollbar(
                   child: SingleChildScrollView(
                     reverse: true,
@@ -245,7 +245,7 @@ class _BackendDiagnosticsDialogState
                       style: const TextStyle(
                         fontSize: 11,
                         fontFamily: 'Consolas',
-                        color: ForexAiTokens.textPrimary,
+                        color: NeoethosTokens.textPrimary,
                         height: 1.35,
                       ),
                     ),
@@ -292,18 +292,18 @@ class _MetaItem extends StatelessWidget {
         Text(
           label.toUpperCase(),
           style: const TextStyle(
-            fontSize: ForexAiTokens.fsCaption - 1,
+            fontSize: NeoethosTokens.fsCaption - 1,
             letterSpacing: 0.8,
             fontWeight: FontWeight.w700,
-            color: ForexAiTokens.textMuted,
+            color: NeoethosTokens.textMuted,
           ),
         ),
         Text(
           value,
           style: const TextStyle(
-            fontSize: ForexAiTokens.fsBody,
+            fontSize: NeoethosTokens.fsBody,
             fontWeight: FontWeight.w700,
-            color: ForexAiTokens.textPrimary,
+            color: NeoethosTokens.textPrimary,
           ),
         ),
       ],

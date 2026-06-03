@@ -50,7 +50,7 @@ class NeoethosApp extends StatelessWidget {
     return MaterialApp(
       title: 'neoethos',
       debugShowCheckedModeBanner: false,
-      theme: buildForexAiTheme(),
+      theme: buildNeoethosTheme(),
       home: const AppShell(),
     );
   }

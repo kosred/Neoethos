@@ -143,7 +143,7 @@ export LIBTORCH="$LIBTORCH_DIR"
 export TORCH_CUDA_VERSION=$LIBTORCH_CUDA
 export PATH="\$HOME/.local/bin:/usr/local/cuda-${CUDA_TOOLKIT_PKG##*-}.0/bin:\$PATH"
 export LD_LIBRARY_PATH="\$LIBTORCH/lib:/usr/local/cuda-${CUDA_TOOLKIT_PKG##*-}.0/lib64:\$HOME/neoethos/target/release:\$HOME/neoethos/target/release/deps:\${LD_LIBRARY_PATH:-}"
-export FOREX_BOT_DATA_ROOT="$DATA_DIR"
+export NEOETHOS_BOT_DATA_ROOT="$DATA_DIR"
 # --- end neoethos vps env ---
 EOF
   log "  Appended env block to ~/.bashrc"
@@ -166,8 +166,8 @@ Next steps:
   source ~/.bashrc           # load env vars in this shell
   cd $REPO_DIR
   cargo build --release -p neoethos-cli --features "neoethos-search/gpu neoethos-models/neuro-evolution-gpu neoethos-models/statistical-gpu"
-  ./target/release/neoethos-cli migrate-data --root \$FOREX_BOT_DATA_ROOT
-  ./target/release/neoethos-cli search --symbol EURUSD --base H4 --higher D1 --genes 64 --generations 5 --root \$FOREX_BOT_DATA_ROOT
+  ./target/release/neoethos-cli migrate-data --root \$NEOETHOS_BOT_DATA_ROOT
+  ./target/release/neoethos-cli search --symbol EURUSD --base H4 --higher D1 --genes 64 --generations 5 --root \$NEOETHOS_BOT_DATA_ROOT
 
 EOF
 

@@ -207,7 +207,7 @@ class _EngineControlsState extends State<EngineControls> {
             'Only do this if you are sure the worker is stuck. Otherwise '
             'just wait — the next epoch / generation boundary may be '
             'imminent.',
-            style: const TextStyle(color: ForexAiTokens.textMuted, fontSize: 13),
+            style: const TextStyle(color: NeoethosTokens.textMuted, fontSize: 13),
           ),
         ),
         actions: [
@@ -255,7 +255,7 @@ class _EngineControlsState extends State<EngineControls> {
   @override
   Widget build(BuildContext context) {
     final runningColor =
-        widget.running ? ForexAiTokens.buy : ForexAiTokens.textFaint;
+        widget.running ? NeoethosTokens.buy : NeoethosTokens.textFaint;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -282,8 +282,8 @@ class _EngineControlsState extends State<EngineControls> {
                       fontSize: 14,
                       fontWeight: FontWeight.w700,
                       color: widget.running
-                          ? ForexAiTokens.buy
-                          : ForexAiTokens.textPrimary,
+                          ? NeoethosTokens.buy
+                          : NeoethosTokens.textPrimary,
                     ),
                   ),
                 ],
@@ -294,7 +294,7 @@ class _EngineControlsState extends State<EngineControls> {
                   widget.summary,
                   style: const TextStyle(
                     fontSize: 12,
-                    color: ForexAiTokens.textMuted,
+                    color: NeoethosTokens.textMuted,
                   ),
                 ),
               ],
@@ -374,7 +374,7 @@ class _EngineControlsState extends State<EngineControls> {
                             side: BorderSide(
                               color: widget.running
                                   ? const Color(0xFFB71C1C)
-                                  : ForexAiTokens.textFaint,
+                                  : NeoethosTokens.textFaint,
                             ),
                           ),
                           onPressed:
@@ -394,7 +394,7 @@ class _EngineControlsState extends State<EngineControls> {
                   // already inherits const-ness to nested literals.
                   style: TextStyle(
                     fontSize: 11,
-                    color: ForexAiTokens.textMuted,
+                    color: NeoethosTokens.textMuted,
                     fontStyle: FontStyle.italic,
                   ),
                 ),
@@ -411,7 +411,7 @@ class _EngineControlsState extends State<EngineControls> {
           child: Text(
             widget.description,
             style: const TextStyle(
-              color: ForexAiTokens.textMuted,
+              color: NeoethosTokens.textMuted,
               fontSize: 12,
             ),
           ),

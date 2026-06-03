@@ -29,7 +29,7 @@ pub struct SystemConfig {
     ///     is alive — the `/account/snapshot` bridge resolves
     ///     `ProtoOATrader.depositAssetId` → currency name via the
     ///     asset table and writes it back here (Phase D follow-up).
-    ///  3. Env-var fallback `FOREX_BOT_PROP_ACCOUNT_CURRENCY` honoured
+    ///  3. Env-var fallback `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` honoured
     ///     by `prop_firm_account_currency()` for the live risk gate.
     ///
     /// **Empty string (`""`) is the deliberate fail-loud default**
@@ -581,6 +581,37 @@ pub struct ModelsConfig {
     pub label_take_profit_rr: f64,
     pub walkforward_splits: usize,
     pub embargo_minutes: usize,
+    /// Discovery search regime: `"prop_firm"` (default — permissive
+    /// quality floors so the prop-firm gauntlet does the heavy lifting)
+    /// or `"strict"` (full FilteringConfig floors). Was the env-only
+    /// `NEOETHOS_BOT_DISCOVERY_MODE`; now a first-class config knob the
+    /// operator sets from the UI / TUI — never the environment.
+    pub discovery_mode: String,
+    /// Genetic-search runtime knobs (config-driven replacement for the
+    /// `NEOETHOS_BOT_*` search env vars). See [`SearchRuntimeConfig`].
+    pub search_runtime: SearchRuntimeConfig,
+    /// Strategy-evaluation runtime knobs (config-driven replacement for
+    /// the `NEOETHOS_BOT_PROP_*` cost + SMC-weight env vars). See
+    /// [`EvalRuntimeConfig`].
+    pub eval_runtime: EvalRuntimeConfig,
+    /// Strategy-quality scoring knobs (config-driven replacement for the
+    /// `NEOETHOS_BOT_PROP_*` monthly-quality env vars). See
+    /// [`QualityRuntimeConfig`].
+    pub quality_runtime: QualityRuntimeConfig,
+    /// Backtest-evaluation runtime knobs (config-driven replacement for
+    /// the `NEOETHOS_BOT_BACKTEST_*` env vars). See [`BacktestRuntimeConfig`].
+    pub backtest_runtime: BacktestRuntimeConfig,
+    /// Seen-signature dedup-memory knobs (config-driven replacement for
+    /// the `NEOETHOS_BOT_PROP_SEEN_*` env vars). See
+    /// [`SeenSignatureRuntimeConfig`].
+    pub seen_signature_runtime: SeenSignatureRuntimeConfig,
+    /// SMC search-injection knobs (config-driven replacement for the
+    /// `NEOETHOS_BOT_PROP_SMC_*` env vars). See [`SmcSearchRuntimeConfig`].
+    pub smc_search_runtime: SmcSearchRuntimeConfig,
+    /// Data-layer behavior knobs (config-driven replacement for the
+    /// `NEOETHOS_BOT_NORMALIZE_FEATURES` / `..._REBUILD_STALE_HIGHER_TFS`
+    /// env vars). See [`DataRuntimeConfig`].
+    pub data_runtime: DataRuntimeConfig,
     pub prop_metric_weight: f64,
     pub prop_accuracy_weight: f64,
     pub prop_min_trades: usize,
@@ -606,6 +637,285 @@ pub struct ModelsConfig {
     pub tabnet_hidden_dim: usize,
     pub phase5_filter_meta_blender: bool,
     pub phase5_core_models: Vec<String>,
+}
+
+/// Genetic-search runtime knobs — the config-driven replacement for the
+/// `NEOETHOS_BOT_*` genetic-search env vars (RNG seed, novelty weighting,
+/// tournament / archive sizing, SMC-gate curve, archive scoring, selection
+/// policy). Mirrors `neoethos_search::genetic::GeneticSearchRuntimeOverrides`,
+/// which the search crate now builds via `from_settings(&Settings)` so the
+/// operator sets these from config / UI / TUI — never the environment.
+///
+/// Defaults here MUST match that override struct's `Default`; a
+/// `from_settings(&Settings::default()) == default()` unit test in
+/// `neoethos-search` enforces it. Empty strings on the policy / archive-mode
+/// fields mean "use the engine default" (so the config default need not
+/// duplicate the parser vocabulary).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SearchRuntimeConfig {
+    pub seed: Option<u64>,
+    pub novelty_weight: f64,
+    pub stagnation_patience: usize,
+    pub tournament_size_override: Option<usize>,
+    pub archive_cap_override: Option<usize>,
+    pub seen_retry_attempts: usize,
+    pub smc_gate_start: f32,
+    pub smc_gate_end: f32,
+    pub smc_gate_curve: f32,
+    pub smc_gate_stagnation_step: f32,
+    pub disable_smc_gate: bool,
+    pub archive_mode: String,
+    pub archive_min_net: f64,
+    pub archive_min_pf: f64,
+    pub archive_min_sharpe: f64,
+    pub parent_selection: String,
+    pub survivor_selection: String,
+    pub immigrant_ratio: f64,
+    pub survivor_fraction: f64,
+    pub selection_temperature: f64,
+}
+
+impl Default for SearchRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            seed: None,
+            novelty_weight: 0.0,
+            stagnation_patience: 2,
+            tournament_size_override: None,
+            archive_cap_override: None,
+            seen_retry_attempts: 16,
+            smc_gate_start: 0.75,
+            smc_gate_end: 0.35,
+            smc_gate_curve: 1.0,
+            smc_gate_stagnation_step: 0.03,
+            disable_smc_gate: false,
+            archive_mode: String::new(),
+            archive_min_net: 0.0,
+            archive_min_pf: 1.0,
+            archive_min_sharpe: 0.0,
+            parent_selection: String::new(),
+            survivor_selection: String::new(),
+            immigrant_ratio: 0.25,
+            survivor_fraction: 0.10,
+            selection_temperature: 0.75,
+        }
+    }
+}
+
+/// Strategy-evaluation runtime knobs — the config-driven replacement for
+/// the `NEOETHOS_BOT_PROP_*` cost-profile + SMC-weight env vars (symbol /
+/// currency / pip-value / spread / commission overrides used by
+/// `infer_market_cost_profile`, and the 12 SMC indicator weights +
+/// gate threshold used by `EvaluationConfig::default`). Mirrors
+/// `neoethos_search::genetic::StrategyEvaluationRuntimeOverrides`; the
+/// search crate builds it via `from_settings(&Settings)`. Defaults MUST
+/// match that struct's `Default` (a `from_settings(&Settings::default())
+/// == default()` test enforces it). `None` cost fields mean "no
+/// override" (production callers pass explicit values).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct EvalRuntimeConfig {
+    pub symbol: Option<String>,
+    pub account_currency: Option<String>,
+    pub pip_value: Option<f64>,
+    pub quote_to_account_rate: Option<f64>,
+    pub pip_value_per_lot: Option<f64>,
+    pub spread_pips: Option<f64>,
+    pub commission_per_trade: Option<f64>,
+    pub reject_pip_fallback: bool,
+    pub smc_gate_threshold: f32,
+    pub smc_w_ob: f32,
+    pub smc_w_fvg: f32,
+    pub smc_w_liq: f32,
+    pub smc_w_mtf: f32,
+    pub smc_w_premium: f32,
+    pub smc_w_inducement: f32,
+    pub smc_w_bos: f32,
+    pub smc_w_choch: f32,
+    pub smc_w_eqh: f32,
+    pub smc_w_eql: f32,
+    pub smc_w_displacement: f32,
+}
+
+impl Default for EvalRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            symbol: None,
+            account_currency: None,
+            pip_value: None,
+            quote_to_account_rate: None,
+            pip_value_per_lot: None,
+            spread_pips: None,
+            commission_per_trade: None,
+            reject_pip_fallback: false,
+            smc_gate_threshold: 0.75,
+            smc_w_ob: 1.0,
+            smc_w_fvg: 1.0,
+            smc_w_liq: 1.0,
+            smc_w_mtf: 1.0,
+            smc_w_premium: 1.0,
+            smc_w_inducement: 1.0,
+            smc_w_bos: 1.0,
+            smc_w_choch: 1.0,
+            smc_w_eqh: 1.0,
+            smc_w_eql: 1.0,
+            smc_w_displacement: 1.0,
+        }
+    }
+}
+
+/// Strategy-quality scoring knobs — config-driven replacement for the
+/// `NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH` /
+/// `NEOETHOS_BOT_TRADING_DAYS_PER_MONTH` env vars. Mirrors
+/// `neoethos_search::quality::QualityRuntimeOverrides`; a
+/// `from_settings(&Settings::default()) == default()` test enforces the
+/// matching defaults.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct QualityRuntimeConfig {
+    /// Minimum trades a calendar month needs to count toward monthly
+    /// win-rate / avg-return scoring.
+    pub min_trades_per_month: usize,
+    /// Trading days per month used to convert observed trading days into
+    /// a months-traded estimate.
+    pub trading_days_per_month: f64,
+}
+
+impl Default for QualityRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            min_trades_per_month: 4,
+            trading_days_per_month: 21.0,
+        }
+    }
+}
+
+/// Backtest-evaluation runtime knobs — config-driven replacement for the
+/// `NEOETHOS_BOT_BACKTEST_*` + `NEOETHOS_BOT_RUST_THREADS` env vars.
+/// Mirrors `neoethos_search::eval::BacktestRuntimeOverrides`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BacktestRuntimeConfig {
+    /// Starting equity for canonical backtest PnL accounting (> 0).
+    pub initial_equity: f64,
+    /// Max monthly PnL buckets retained for consistency math (> 0).
+    pub month_capacity: usize,
+    /// Explicit rayon thread-pool size. `None` → one worker per logical
+    /// core (rayon default).
+    pub rayon_threads: Option<usize>,
+}
+
+impl Default for BacktestRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            initial_equity: 100_000.0,
+            month_capacity: 240,
+            rayon_threads: None,
+        }
+    }
+}
+
+/// Seen-signature memory knobs — config-driven replacement for the
+/// `NEOETHOS_BOT_PROP_SEEN_*` env vars (dedup-memory flush cadence,
+/// load/entry caps, and on-disk path). Mirrors
+/// `neoethos_search::genetic::SeenSignatureMemoryRuntimeOverrides`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SeenSignatureRuntimeConfig {
+    pub flush_every: usize,
+    pub load_max: usize,
+    /// `0` → unbounded (`usize::MAX`); otherwise the entry cap.
+    pub max_entries: usize,
+    /// Optional on-disk seen-signature file. Empty / unset → in-memory only.
+    pub file_path: Option<String>,
+}
+
+impl Default for SeenSignatureRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            flush_every: 4096,
+            load_max: 3_000_000,
+            max_entries: 3_000_000,
+            file_path: None,
+        }
+    }
+}
+
+/// SMC (smart-money-concept) search-injection knobs — config-driven
+/// replacement for the `NEOETHOS_BOT_PROP_SMC_*` env vars (the per-flag
+/// enable probabilities, the force-ratio + min-flags that seed each GA
+/// generation with SMC-aware genes, and the master `force_enabled`
+/// toggle). Mirrors `neoethos_search::genetic::SmcSearchConfig`
+/// (probabilities are clamped to `[0,1]`; `force_enabled = false` zeroes
+/// `force_ratio` + `min_flags`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SmcSearchRuntimeConfig {
+    pub force_ratio: f64,
+    pub min_flags: usize,
+    /// Master toggle — `false` disables SMC forcing (zeroes force_ratio +
+    /// min_flags). Was `NEOETHOS_BOT_PROP_SMC_FORCE_ENABLED`.
+    pub force_enabled: bool,
+    pub p_ob: f64,
+    pub p_fvg: f64,
+    pub p_liq: f64,
+    pub p_premium: f64,
+    pub p_inducement: f64,
+    pub p_mtf: f64,
+    pub p_bos: f64,
+    pub p_choch: f64,
+    pub p_eqh: f64,
+    pub p_eql: f64,
+    pub p_displacement: f64,
+}
+
+impl Default for SmcSearchRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            force_ratio: 0.30,
+            min_flags: 1,
+            force_enabled: true,
+            p_ob: 0.50,
+            p_fvg: 0.50,
+            p_liq: 0.50,
+            p_premium: 0.50,
+            p_inducement: 0.50,
+            p_mtf: 0.85,
+            p_bos: 0.50,
+            p_choch: 0.50,
+            p_eqh: 0.50,
+            p_eql: 0.50,
+            p_displacement: 0.50,
+        }
+    }
+}
+
+/// Data-layer behavior knobs — config-driven replacement for the
+/// `NEOETHOS_BOT_NORMALIZE_FEATURES` / `NEOETHOS_BOT_REBUILD_STALE_HIGHER_TFS`
+/// env vars. Both default OFF (opt-in). Consumed by the data crate via
+/// `neoethos_data::install_data_runtime_overrides(...)` at startup.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DataRuntimeConfig {
+    /// Per-column robust z-score normalization of the feature matrix
+    /// before the GA search (was `NEOETHOS_BOT_NORMALIZE_FEATURES`).
+    /// OFF by default — enabling without re-calibrating GA thresholds
+    /// changes discovery for symbols that currently work.
+    pub normalize_features: bool,
+    /// Auto-rebuild a present-but-stale higher timeframe from the base
+    /// instead of NaN-ing the stale tail (was
+    /// `NEOETHOS_BOT_REBUILD_STALE_HIGHER_TFS`). OFF by default.
+    pub rebuild_stale_higher_tfs: bool,
+}
+
+impl Default for DataRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            normalize_features: false,
+            rebuild_stale_higher_tfs: false,
+        }
+    }
 }
 
 impl Default for ModelsConfig {
@@ -812,6 +1122,14 @@ impl Default for ModelsConfig {
             label_take_profit_rr: 0.0,
             walkforward_splits: 20,
             embargo_minutes: 120,
+            discovery_mode: "prop_firm".to_string(),
+            search_runtime: SearchRuntimeConfig::default(),
+            eval_runtime: EvalRuntimeConfig::default(),
+            quality_runtime: QualityRuntimeConfig::default(),
+            backtest_runtime: BacktestRuntimeConfig::default(),
+            seen_signature_runtime: SeenSignatureRuntimeConfig::default(),
+            smc_search_runtime: SmcSearchRuntimeConfig::default(),
+            data_runtime: DataRuntimeConfig::default(),
             prop_metric_weight: 1.0,
             prop_accuracy_weight: 0.1,
             prop_min_trades: 0,
@@ -924,11 +1242,6 @@ pub struct NewsConfig {
     pub news_backfill_enabled: bool,
     pub news_backfill_days: usize,
     pub news_local_glob: String,
-    pub openai_model: String,
-    pub openai_api_key_env: String,
-    pub openai_max_tokens: usize,
-    pub openai_max_events_per_fetch: usize,
-    pub openai_news_enabled: bool,
     pub perplexity_enabled: bool,
     pub perplexity_api_key_env: String,
     pub perplexity_model: String,
@@ -957,9 +1270,16 @@ impl Default for NewsConfig {
             news_event_risk_pct: 0.001,
             enable_news: true,
             news_sources: vec!["rss".to_string()],
+            // Public, no-API-key financial NEWS feeds for the AI news
+            // desk (GET /news/feed). Operator-editable in Settings → News.
+            // NB: the economic *calendar* lives in `news_calendar_source`
+            // (ForexFactory's ffcal XML is a custom calendar format, not
+            // RSS), so it intentionally does NOT belong in this list.
             rss_feeds: vec![
-                "https://www.forexfactory.com/ffcal_week_this.xml".to_string(),
                 "https://www.dailyfx.com/feeds/market-news".to_string(),
+                "https://www.forexlive.com/feed/news".to_string(),
+                "https://feeds.marketwatch.com/marketwatch/topstories/".to_string(),
+                "https://feeds.marketwatch.com/marketwatch/marketpulse/".to_string(),
             ],
             enable_llm_helper: true,
             llm_helper_enabled: true,
@@ -968,17 +1288,6 @@ impl Default for NewsConfig {
             news_backfill_enabled: true,
             news_backfill_days: 30,
             news_local_glob: String::new(),
-            // News-blackout LLM model for the PUBLIC OpenAI API (used
-            // with the operator's own OPENAI_API_KEY). NOT the AI Helper
-            // model — that's the ChatGPT-subscription Codex endpoint,
-            // hardwired to `gpt-5.5` in neoethos-codex (F-291). Default
-            // to `gpt-4o-mini`, matching the (currently hardcoded) model
-            // in `domain/news_filter.rs` and avoiding dated-snapshot rot.
-            openai_model: "gpt-4o-mini".to_string(),
-            openai_api_key_env: "OPENAI_API_KEY".to_string(),
-            openai_max_tokens: 256,
-            openai_max_events_per_fetch: 50,
-            openai_news_enabled: true,
             perplexity_enabled: true,
             perplexity_api_key_env: "PPLX_API_KEY".to_string(),
             perplexity_model: "sonar".to_string(),
@@ -1177,39 +1486,39 @@ impl Settings {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        if let Some(symbol) = lookup("FOREX_BOT_SYMBOL") {
+        if let Some(symbol) = lookup("NEOETHOS_BOT_SYMBOL") {
             self.system.symbol = symbol;
         }
 
-        let data_root = lookup("FOREX_BOT_DATA_ROOT").or_else(|| lookup("FOREX_BOT_DATA_DIR"));
+        let data_root = lookup("NEOETHOS_BOT_DATA_ROOT").or_else(|| lookup("NEOETHOS_BOT_DATA_DIR"));
         if let Some(data_root) = data_root {
             self.system.data_dir = PathBuf::from(data_root);
         }
 
-        if let Some(base_tf) = lookup("FOREX_BOT_BASE_TIMEFRAME") {
+        if let Some(base_tf) = lookup("NEOETHOS_BOT_BASE_TIMEFRAME") {
             self.system.base_timeframe = base_tf;
         }
 
-        if let Some(higher_tfs) = lookup("FOREX_BOT_HIGHER_TFS") {
+        if let Some(higher_tfs) = lookup("NEOETHOS_BOT_HIGHER_TFS") {
             let parsed = Self::parse_csv_list(&higher_tfs);
             if !parsed.is_empty() {
                 self.system.higher_timeframes = parsed;
             }
         }
 
-        if let Some(device) = lookup("FOREX_BOT_DEVICE") {
+        if let Some(device) = lookup("NEOETHOS_BOT_DEVICE") {
             self.system.device = device;
         }
 
-        if let Some(preference) = lookup("FOREX_BOT_ENABLE_GPU_PREFERENCE") {
+        if let Some(preference) = lookup("NEOETHOS_BOT_ENABLE_GPU_PREFERENCE") {
             self.system.enable_gpu_preference = preference;
         }
 
-        if let Some(tree_device) = lookup("FOREX_BOT_TREE_DEVICE") {
+        if let Some(tree_device) = lookup("NEOETHOS_BOT_TREE_DEVICE") {
             self.models.tree_device_preference = tree_device;
         }
 
-        if let Some(model_names) = lookup("FOREX_BOT_ML_MODELS") {
+        if let Some(model_names) = lookup("NEOETHOS_BOT_ML_MODELS") {
             let parsed = Self::parse_csv_list(&model_names);
             if !parsed.is_empty() {
                 self.models.ml_models = parsed;
@@ -1217,94 +1526,94 @@ impl Settings {
         }
 
         if let Some(num_transformers) =
-            lookup("FOREX_BOT_NUM_TRANSFORMERS").and_then(|value| value.parse::<usize>().ok())
+            lookup("NEOETHOS_BOT_NUM_TRANSFORMERS").and_then(|value| value.parse::<usize>().ok())
         {
             self.models.num_transformers = num_transformers.max(1);
         }
 
-        if let Some(model_names) = lookup("FOREX_BOT_PHASE5_CORE_MODELS") {
+        if let Some(model_names) = lookup("NEOETHOS_BOT_PHASE5_CORE_MODELS") {
             let parsed = Self::parse_csv_list(&model_names);
             if !parsed.is_empty() {
                 self.models.phase5_core_models = parsed;
             }
         }
 
-        if let Some(model_names) = lookup("FOREX_BOT_REGIME_TREND_MODELS") {
+        if let Some(model_names) = lookup("NEOETHOS_BOT_REGIME_TREND_MODELS") {
             let parsed = Self::parse_csv_list(&model_names);
             if !parsed.is_empty() {
                 self.models.regime_trend_models = parsed;
             }
         }
 
-        if let Some(model_names) = lookup("FOREX_BOT_REGIME_RANGE_MODELS") {
+        if let Some(model_names) = lookup("NEOETHOS_BOT_REGIME_RANGE_MODELS") {
             let parsed = Self::parse_csv_list(&model_names);
             if !parsed.is_empty() {
                 self.models.regime_range_models = parsed;
             }
         }
 
-        if let Some(model_names) = lookup("FOREX_BOT_REGIME_NEUTRAL_MODELS") {
+        if let Some(model_names) = lookup("NEOETHOS_BOT_REGIME_NEUTRAL_MODELS") {
             let parsed = Self::parse_csv_list(&model_names);
             if !parsed.is_empty() {
                 self.models.regime_neutral_models = parsed;
             }
         }
 
-        if let Some(enabled) = lookup("FOREX_BOT_PHASE5_FILTER_META_BLENDER") {
+        if let Some(enabled) = lookup("NEOETHOS_BOT_PHASE5_FILTER_META_BLENDER") {
             self.models.phase5_filter_meta_blender = matches!(
                 enabled.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );
         }
 
-        if let Some(enabled) = lookup("FOREX_BOT_REGIME_ROUTER_ENABLED") {
+        if let Some(enabled) = lookup("NEOETHOS_BOT_REGIME_ROUTER_ENABLED") {
             self.models.regime_router_enabled = matches!(
                 enabled.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );
         }
 
-        if let Some(min_models) = lookup("FOREX_BOT_REGIME_ROUTER_MIN_MODELS")
+        if let Some(min_models) = lookup("NEOETHOS_BOT_REGIME_ROUTER_MIN_MODELS")
             .and_then(|value| value.parse::<usize>().ok())
         {
             self.models.regime_router_min_models = min_models.max(1);
         }
 
-        if let Some(method) = lookup("FOREX_BOT_CALIBRATION_METHOD") {
+        if let Some(method) = lookup("NEOETHOS_BOT_CALIBRATION_METHOD") {
             self.models.calibration_method = method;
         }
 
         if let Some(min_rows) =
-            lookup("FOREX_BOT_CALIBRATION_MIN_ROWS").and_then(|value| value.parse::<usize>().ok())
+            lookup("NEOETHOS_BOT_CALIBRATION_MIN_ROWS").and_then(|value| value.parse::<usize>().ok())
         {
             self.models.calibration_min_rows = min_rows.max(1);
         }
 
         if let Some(holdout_pct) =
-            lookup("FOREX_BOT_TRAIN_HOLDOUT_PCT").and_then(|value| value.parse::<f64>().ok())
+            lookup("NEOETHOS_BOT_TRAIN_HOLDOUT_PCT").and_then(|value| value.parse::<f64>().ok())
         {
             self.models.train_holdout_pct = holdout_pct;
         }
 
         if let Some(label_horizon) =
-            lookup("FOREX_BOT_LABEL_HORIZON_BARS").and_then(|value| value.parse::<usize>().ok())
+            lookup("NEOETHOS_BOT_LABEL_HORIZON_BARS").and_then(|value| value.parse::<usize>().ok())
         {
             self.models.label_horizon_bars = label_horizon;
         }
 
-        if let Some(meta_hold) = lookup("FOREX_BOT_META_LABEL_MAX_HOLD_BARS")
+        if let Some(meta_hold) = lookup("NEOETHOS_BOT_META_LABEL_MAX_HOLD_BARS")
             .and_then(|value| value.parse::<usize>().ok())
         {
             self.risk.meta_label_max_hold_bars = meta_hold.max(1);
         }
 
         if let Some(conf_threshold) =
-            lookup("FOREX_BOT_PROP_CONF_THRESHOLD").and_then(|value| value.parse::<f64>().ok())
+            lookup("NEOETHOS_BOT_PROP_CONF_THRESHOLD").and_then(|value| value.parse::<f64>().ok())
         {
             self.models.prop_conf_threshold = conf_threshold;
         }
 
-        if let Some(use_rllib_agent) = lookup("FOREX_BOT_USE_RLLIB_AGENT") {
+        if let Some(use_rllib_agent) = lookup("NEOETHOS_BOT_USE_RLLIB_AGENT") {
             self.models.use_rllib_agent = matches!(
                 use_rllib_agent.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
@@ -1312,30 +1621,30 @@ impl Settings {
         }
 
         if let Some(rllib_workers) =
-            lookup("FOREX_BOT_RLLIB_NUM_WORKERS").and_then(|value| value.parse::<usize>().ok())
+            lookup("NEOETHOS_BOT_RLLIB_NUM_WORKERS").and_then(|value| value.parse::<usize>().ok())
         {
             self.models.rllib_num_workers = rllib_workers;
         }
 
-        if let Some(auto_enable_rllib) = lookup("FOREX_BOT_AUTO_ENABLE_RLLIB") {
+        if let Some(auto_enable_rllib) = lookup("NEOETHOS_BOT_AUTO_ENABLE_RLLIB") {
             self.models.auto_enable_rllib = matches!(
                 auto_enable_rllib.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );
         }
 
-        if let Some(prop_search_device) = lookup("FOREX_BOT_PROP_SEARCH_DEVICE") {
+        if let Some(prop_search_device) = lookup("NEOETHOS_BOT_PROP_SEARCH_DEVICE") {
             self.models.prop_search_device = prop_search_device;
         }
 
-        if let Some(prop_search_async) = lookup("FOREX_BOT_PROP_SEARCH_ASYNC") {
+        if let Some(prop_search_async) = lookup("NEOETHOS_BOT_PROP_SEARCH_ASYNC") {
             self.models.prop_search_async = matches!(
                 prop_search_async.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );
         }
 
-        if let Some(prop_search_async_wait) = lookup("FOREX_BOT_PROP_SEARCH_ASYNC_WAIT") {
+        if let Some(prop_search_async_wait) = lookup("NEOETHOS_BOT_PROP_SEARCH_ASYNC_WAIT") {
             self.models.prop_search_async_wait = matches!(
                 prop_search_async_wait.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
@@ -1396,62 +1705,62 @@ mod tests {
         let mut settings = Settings::default();
         let overrides = HashMap::from([
             (
-                "FOREX_BOT_ENABLE_GPU_PREFERENCE".to_string(),
+                "NEOETHOS_BOT_ENABLE_GPU_PREFERENCE".to_string(),
                 "gpu".to_string(),
             ),
-            ("FOREX_BOT_TREE_DEVICE".to_string(), "cuda".to_string()),
-            ("FOREX_BOT_NUM_TRANSFORMERS".to_string(), "4".to_string()),
+            ("NEOETHOS_BOT_TREE_DEVICE".to_string(), "cuda".to_string()),
+            ("NEOETHOS_BOT_NUM_TRANSFORMERS".to_string(), "4".to_string()),
             (
-                "FOREX_BOT_ML_MODELS".to_string(),
+                "NEOETHOS_BOT_ML_MODELS".to_string(),
                 "lightgbm, xgboost , neat".to_string(),
             ),
             (
-                "FOREX_BOT_PHASE5_CORE_MODELS".to_string(),
+                "NEOETHOS_BOT_PHASE5_CORE_MODELS".to_string(),
                 "transformer, tabnet".to_string(),
             ),
             (
-                "FOREX_BOT_PHASE5_FILTER_META_BLENDER".to_string(),
+                "NEOETHOS_BOT_PHASE5_FILTER_META_BLENDER".to_string(),
                 "false".to_string(),
             ),
             (
-                "FOREX_BOT_REGIME_ROUTER_ENABLED".to_string(),
+                "NEOETHOS_BOT_REGIME_ROUTER_ENABLED".to_string(),
                 "true".to_string(),
             ),
             (
-                "FOREX_BOT_REGIME_ROUTER_MIN_MODELS".to_string(),
+                "NEOETHOS_BOT_REGIME_ROUTER_MIN_MODELS".to_string(),
                 "3".to_string(),
             ),
             (
-                "FOREX_BOT_CALIBRATION_METHOD".to_string(),
+                "NEOETHOS_BOT_CALIBRATION_METHOD".to_string(),
                 "temperature".to_string(),
             ),
             (
-                "FOREX_BOT_CALIBRATION_MIN_ROWS".to_string(),
+                "NEOETHOS_BOT_CALIBRATION_MIN_ROWS".to_string(),
                 "512".to_string(),
             ),
-            ("FOREX_BOT_TRAIN_HOLDOUT_PCT".to_string(), "0.3".to_string()),
-            ("FOREX_BOT_LABEL_HORIZON_BARS".to_string(), "24".to_string()),
+            ("NEOETHOS_BOT_TRAIN_HOLDOUT_PCT".to_string(), "0.3".to_string()),
+            ("NEOETHOS_BOT_LABEL_HORIZON_BARS".to_string(), "24".to_string()),
             (
-                "FOREX_BOT_META_LABEL_MAX_HOLD_BARS".to_string(),
+                "NEOETHOS_BOT_META_LABEL_MAX_HOLD_BARS".to_string(),
                 "144".to_string(),
             ),
             (
-                "FOREX_BOT_PROP_CONF_THRESHOLD".to_string(),
+                "NEOETHOS_BOT_PROP_CONF_THRESHOLD".to_string(),
                 "0.72".to_string(),
             ),
-            ("FOREX_BOT_USE_RLLIB_AGENT".to_string(), "1".to_string()),
-            ("FOREX_BOT_RLLIB_NUM_WORKERS".to_string(), "6".to_string()),
-            ("FOREX_BOT_AUTO_ENABLE_RLLIB".to_string(), "off".to_string()),
+            ("NEOETHOS_BOT_USE_RLLIB_AGENT".to_string(), "1".to_string()),
+            ("NEOETHOS_BOT_RLLIB_NUM_WORKERS".to_string(), "6".to_string()),
+            ("NEOETHOS_BOT_AUTO_ENABLE_RLLIB".to_string(), "off".to_string()),
             (
-                "FOREX_BOT_PROP_SEARCH_DEVICE".to_string(),
+                "NEOETHOS_BOT_PROP_SEARCH_DEVICE".to_string(),
                 "cuda:0".to_string(),
             ),
             (
-                "FOREX_BOT_PROP_SEARCH_ASYNC".to_string(),
+                "NEOETHOS_BOT_PROP_SEARCH_ASYNC".to_string(),
                 "true".to_string(),
             ),
             (
-                "FOREX_BOT_PROP_SEARCH_ASYNC_WAIT".to_string(),
+                "NEOETHOS_BOT_PROP_SEARCH_ASYNC_WAIT".to_string(),
                 "true".to_string(),
             ),
         ]);

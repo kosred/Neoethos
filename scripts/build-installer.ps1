@@ -69,7 +69,7 @@ Write-Host "==> Running make-release-bundle.ps1..." -ForegroundColor Cyan
 & $bundleScript -Profile $Profile
 # 2026-05-26: `$LASTEXITCODE` is only set by native executables. PowerShell
 # scripts (like make-release-bundle.ps1) leave it at its previous value if
-# they don't `exit` explicitly — meaning a stale non-zero code from earlier
+# they don't `exit` explicitly - meaning a stale non-zero code from earlier
 # in the parent script triggered a false failure. Guard with `-gt 0` AND
 # allow `$null` (= never set in this run, i.e. clean) to pass.
 if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -gt 0) {
@@ -90,7 +90,7 @@ Write-Host "==> Compiling installer/neoethos.nsi..." -ForegroundColor Cyan
 # in the .nsi via `..\` references and want them resolved relative to the
 # .nsi's location which is the default behaviour when not /NOCD'd, so let
 # makensis cd into installer/.
-# Note: the .nsi uses `..\LICENSE` etc — relative to installer/ — so we
+# Note: the .nsi uses `..\LICENSE` etc - relative to installer/ - so we
 # cd there explicitly and let makensis resolve from cwd.
 Push-Location (Split-Path $nsiScript -Parent)
 try {
@@ -103,7 +103,7 @@ try {
 # ── 4. Verify output ─────────────────────────────────────────────────────────
 $installerExe = Join-Path $repoRoot 'dist\NeoEthos-Setup-0.4.35.exe'
 if (-not (Test-Path $installerExe)) {
-    throw "Installer was not produced at $installerExe — check makensis output above for errors."
+    throw "Installer was not produced at $installerExe - check makensis output above for errors."
 }
 $installerSize = (Get-Item $installerExe).Length
 $sizeMB = [math]::Round($installerSize / 1MB, 1)
@@ -116,4 +116,4 @@ Write-Host "End-user workflow:" -ForegroundColor Cyan
 Write-Host "  1. Download NeoEthos-Setup-0.4.35.exe (one file)."
 Write-Host "  2. Double-click to install. Follow the wizard."
 Write-Host "  3. Launch via Start Menu or Desktop shortcut."
-Write-Host "  4. Never see bin\neoethos-app.exe — it's hidden."
+Write-Host "  4. Never see bin\neoethos-app.exe - it's hidden."

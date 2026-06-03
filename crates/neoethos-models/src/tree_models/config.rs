@@ -40,9 +40,9 @@ pub fn cpu_threads_hint() -> usize {
         None
     }
     read_threads_env(&[
-        "FOREX_BOT_RUST_THREADS",
-        "FOREX_BOT_CPU_THREADS",
-        "FOREX_BOT_CPU_BUDGET",
+        "NEOETHOS_BOT_RUST_THREADS",
+        "NEOETHOS_BOT_CPU_THREADS",
+        "NEOETHOS_BOT_CPU_BUDGET",
         "RAYON_NUM_THREADS",
     ])
     .unwrap_or_else(|| num_cpus::get().saturating_sub(1).max(1))
@@ -54,11 +54,11 @@ pub fn tree_device_preference() -> DevicePreference {
 
 pub fn tree_device_preference_for(model_name: &str) -> DevicePreference {
     let model_key = format!(
-        "FOREX_BOT_{}_DEVICE",
+        "NEOETHOS_BOT_{}_DEVICE",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
     let raw = env::var(&model_key)
-        .or_else(|_| env::var("FOREX_BOT_TREE_DEVICE"))
+        .or_else(|_| env::var("NEOETHOS_BOT_TREE_DEVICE"))
         .unwrap_or_else(|_| "auto".to_string())
         .trim()
         .to_lowercase();
@@ -93,11 +93,11 @@ pub fn gpu_only_mode() -> bool {
 
 pub fn gpu_only_mode_for(model_name: &str) -> bool {
     let model_key = format!(
-        "FOREX_BOT_{}_GPU_ONLY",
+        "NEOETHOS_BOT_{}_GPU_ONLY",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
     env::var(&model_key)
-        .or_else(|_| env::var("FOREX_BOT_GPU_ONLY"))
+        .or_else(|_| env::var("NEOETHOS_BOT_GPU_ONLY"))
         .ok()
         .map(|v| {
             matches!(
@@ -110,7 +110,7 @@ pub fn gpu_only_mode_for(model_name: &str) -> bool {
 
 pub fn cpu_threads_hint_for(model_name: &str) -> usize {
     let model_key = format!(
-        "FOREX_BOT_{}_THREADS",
+        "NEOETHOS_BOT_{}_THREADS",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
     if let Ok(value) = env::var(&model_key)
@@ -287,11 +287,11 @@ pub fn gpu_count() -> usize {
 }
 
 pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) -> (usize, f64) {
-    let p = env::var("FOREX_BOT_EARLY_STOP_PATIENCE")
+    let p = env::var("NEOETHOS_BOT_EARLY_STOP_PATIENCE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default_patience);
-    let d = env::var("FOREX_BOT_EARLY_STOP_MIN_DELTA")
+    let d = env::var("NEOETHOS_BOT_EARLY_STOP_MIN_DELTA")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default_min_delta);

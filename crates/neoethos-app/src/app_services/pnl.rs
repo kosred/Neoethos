@@ -94,7 +94,7 @@ use std::collections::HashMap;
 ///
 /// Above this value the audit emits `warn!`; below it the comparison
 /// stays at `debug!`. Tunable via the
-/// `FOREX_BOT_PNL_AUDIT_DRIFT_FRACTION` env var so an operator can
+/// `NEOETHOS_BOT_PNL_AUDIT_DRIFT_FRACTION` env var so an operator can
 /// tighten or loosen the alarm without a rebuild.
 pub const DEFAULT_PNL_AUDIT_DRIFT_FRACTION: f64 = 0.001;
 
@@ -108,7 +108,7 @@ pub const DEFAULT_PNL_AUDIT_DRIFT_FRACTION: f64 = 0.001;
 /// block further new-order submissions until an operator acknowledges.
 /// One full order of magnitude above the audit `warn!` threshold so
 /// that ordinary stale-quote noise does not trip the breaker. Tunable
-/// via `FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION`.
+/// via `NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION`.
 pub const DEFAULT_PNL_CIRCUIT_BREAKER_FRACTION: f64 = 0.01;
 
 /// Effective drift threshold, clamped to `[1e-5, 0.05]` to keep the

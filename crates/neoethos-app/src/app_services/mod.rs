@@ -2,7 +2,7 @@ pub mod api_test;
 pub mod backoff;
 pub mod bootstrap_writer;
 // **F-CORE3 cluster consolidation (2026-05-25)**: canonical registry of
-// every `FOREX_BOT_CTRADER_*` / `FOREX_BOT_PNL_*` / `NEOETHOS_*` env
+// every `NEOETHOS_BOT_CTRADER_*` / `NEOETHOS_BOT_PNL_*` / `NEOETHOS_*` env
 // override the app crate honours. Mirror of `neoethos_core::env_overrides`.
 // Call-sites elsewhere consult `env_overrides::*` typed getters instead
 // of reading `std::env::var` directly.
@@ -54,6 +54,7 @@ pub mod pnl;
 pub mod reauth;
 pub mod live_spots;
 pub mod live_spots_streamer;
+pub mod news_research;
 pub mod pending_actions;
 pub mod risky_mode_persistence;
 pub mod secure_store;

@@ -201,8 +201,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
     }
 
-    neoethos_search::install_search_runtime_overrides_from_env();
     let settings = Settings::from_yaml(&args.config)?;
+    // Config-consolidation: search runtime overrides come from the single
+    // config, not the environment (S2a: genetic search; the rest staged).
+    neoethos_search::install_search_runtime_overrides_from_settings(&settings);
+    neoethos_data::install_data_runtime_overrides(
+        settings.models.data_runtime.normalize_features,
+        settings.models.data_runtime.rebuild_stale_higher_tfs,
+    );
     let runtime = AppRuntimeConfig::from_settings(
         args.config.clone(),
         args.local,

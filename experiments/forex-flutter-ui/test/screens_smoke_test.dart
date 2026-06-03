@@ -29,7 +29,7 @@ import 'test_harness.dart';
 Widget _wrap(Widget screen) => ProviderScope(
       overrides: testProviderOverrides(),
       child: MaterialApp(
-        theme: buildForexAiTheme(),
+        theme: buildNeoethosTheme(),
         home: Scaffold(body: screen),
       ),
     );

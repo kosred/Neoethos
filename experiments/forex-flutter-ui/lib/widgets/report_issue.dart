@@ -115,7 +115,7 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor: ForexAiTokens.warning,
+          backgroundColor: NeoethosTokens.warning,
           content: Text(
             'Could not open mail client ($e). Email '
             '${r.emailRecipient} manually and attach ${r.zipPath}.',
@@ -132,7 +132,7 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        backgroundColor: ForexAiTokens.buy,
+        backgroundColor: NeoethosTokens.buy,
         content: Text('File path copied — paste it into your mail attach dialog'),
         duration: Duration(seconds: 3),
       ),
@@ -221,7 +221,7 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
           'collect a small bundle (today\'s logs + redacted config + '
           'system info) into a .zip on your Desktop. Then we open your '
           'mail client so you can send it to NeoEthos support.',
-          style: TextStyle(fontSize: 12, color: ForexAiTokens.textPrimary),
+          style: TextStyle(fontSize: 12, color: NeoethosTokens.textPrimary),
         ),
         const SizedBox(height: 10),
         TextField(
@@ -245,14 +245,14 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
           'unless you send it.',
           style: TextStyle(
             fontSize: 10,
-            color: ForexAiTokens.textFaint,
+            color: NeoethosTokens.textFaint,
           ),
         ),
         if (_error != null) ...[
           const SizedBox(height: 10),
           Text(
             'Bundle failed: $_error',
-            style: const TextStyle(fontSize: 11, color: ForexAiTokens.sell),
+            style: const TextStyle(fontSize: 11, color: NeoethosTokens.sell),
           ),
         ],
       ],
@@ -265,13 +265,13 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
       children: [
         Row(
           children: [
-            const Icon(Icons.check_circle, size: 18, color: ForexAiTokens.buy),
+            const Icon(Icons.check_circle, size: 18, color: NeoethosTokens.buy),
             const SizedBox(width: 6),
             Text(
               'Bundle ready · ${r.sizeLabel}',
               style: const TextStyle(
                 fontWeight: FontWeight.w700,
-                color: ForexAiTokens.buy,
+                color: NeoethosTokens.buy,
               ),
             ),
           ],
@@ -279,20 +279,20 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
         const SizedBox(height: 8),
         const Text(
           'File on your Desktop:',
-          style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+          style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
         ),
         SelectableText(
           r.zipPath,
           style: const TextStyle(
             fontSize: 11,
-            color: ForexAiTokens.textPrimary,
+            color: NeoethosTokens.textPrimary,
             fontFamily: 'Consolas',
           ),
         ),
         const SizedBox(height: 10),
         const Text(
           'What\'s inside:',
-          style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+          style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
         ),
         const SizedBox(height: 4),
         Wrap(
@@ -303,8 +303,8 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                 decoration: BoxDecoration(
-                  color: ForexAiTokens.surfaceBg,
-                  border: Border.all(color: ForexAiTokens.border),
+                  color: NeoethosTokens.surfaceBg,
+                  border: Border.all(color: NeoethosTokens.border),
                   borderRadius: BorderRadius.circular(3),
                 ),
                 child: Text(
@@ -312,7 +312,7 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
                   style: const TextStyle(
                     fontSize: 10,
                     fontFamily: 'Consolas',
-                    color: ForexAiTokens.textPrimary,
+                    color: NeoethosTokens.textPrimary,
                   ),
                 ),
               ),
@@ -323,7 +323,7 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
           'Recipient: ${r.emailRecipient}',
           style: const TextStyle(
             fontSize: 11,
-            color: ForexAiTokens.textMuted,
+            color: NeoethosTokens.textMuted,
           ),
         ),
         const SizedBox(height: 8),
@@ -333,7 +333,7 @@ class _ReportIssueDialogState extends ConsumerState<_ReportIssueDialog> {
           'Desktop into the message before you send.',
           style: TextStyle(
             fontSize: 11,
-            color: ForexAiTokens.textPrimary,
+            color: NeoethosTokens.textPrimary,
           ),
         ),
       ],

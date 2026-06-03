@@ -62,10 +62,10 @@ class _Body extends StatelessWidget {
                 'Average load',
                 pctFmt.format(snapshot.cpuLoadAvg),
                 accent: snapshot.cpuLoadAvg > 0.85
-                    ? ForexAiTokens.sell
+                    ? NeoethosTokens.sell
                     : snapshot.cpuLoadAvg > 0.50
-                        ? ForexAiTokens.warning
-                        : ForexAiTokens.buy,
+                        ? NeoethosTokens.warning
+                        : NeoethosTokens.buy,
               ),
             ],
           ),
@@ -112,7 +112,7 @@ class _Row extends StatelessWidget {
                 label,
                 style: const TextStyle(
                   fontSize: 12,
-                  color: ForexAiTokens.textMuted,
+                  color: NeoethosTokens.textMuted,
                 ),
               ),
             ),
@@ -122,7 +122,7 @@ class _Row extends StatelessWidget {
                 style: TextStyle(
                   fontSize: 12,
                   fontWeight: FontWeight.w600,
-                  color: accent ?? ForexAiTokens.textPrimary,
+                  color: accent ?? NeoethosTokens.textPrimary,
                 ),
                 overflow: TextOverflow.ellipsis,
               ),
@@ -147,7 +147,7 @@ class _Loading extends StatelessWidget {
             SizedBox(width: 8),
             Text(
               'Probing hardware…',
-              style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+              style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
             ),
           ],
         ),

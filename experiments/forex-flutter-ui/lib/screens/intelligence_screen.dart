@@ -68,8 +68,8 @@ class _Body extends StatelessWidget {
                 'Directory exists',
                 snapshot.modelsDirExists ? 'YES' : 'NO',
                 accent: snapshot.modelsDirExists
-                    ? ForexAiTokens.buy
-                    : ForexAiTokens.sell,
+                    ? NeoethosTokens.buy
+                    : NeoethosTokens.sell,
               ),
               _Row('Artifact count', '${snapshot.artifactCount}'),
               _Row('Last touched', lastTouched),
@@ -93,16 +93,16 @@ class _Body extends StatelessWidget {
                       vertical: 3,
                     ),
                     decoration: BoxDecoration(
-                      color: ForexAiTokens.surfaceBg,
-                      border: Border.all(color: ForexAiTokens.border),
-                      borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+                      color: NeoethosTokens.surfaceBg,
+                      border: Border.all(color: NeoethosTokens.border),
+                      borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
                     ),
                     child: Text(
                       a,
                       style: const TextStyle(
                         fontSize: 11,
                         fontWeight: FontWeight.w600,
-                        color: ForexAiTokens.textPrimary,
+                        color: NeoethosTokens.textPrimary,
                       ),
                     ),
                   ),
@@ -117,7 +117,7 @@ class _Body extends StatelessWidget {
                   '(Strategy Discovery Engine screen) and the picked '
                   'portfolio will land here.',
                   style: TextStyle(
-                    color: ForexAiTokens.textMuted,
+                    color: NeoethosTokens.textMuted,
                     fontSize: 12,
                   ),
                 )
@@ -156,7 +156,7 @@ class _TargetRow extends StatelessWidget {
               style: const TextStyle(
                 fontSize: 12,
                 fontWeight: FontWeight.w700,
-                color: ForexAiTokens.accent,
+                color: NeoethosTokens.accent,
               ),
             ),
           ),
@@ -165,7 +165,7 @@ class _TargetRow extends StatelessWidget {
               target.strategyId,
               style: const TextStyle(
                 fontSize: 12,
-                color: ForexAiTokens.textPrimary,
+                color: NeoethosTokens.textPrimary,
               ),
               overflow: TextOverflow.ellipsis,
             ),
@@ -176,7 +176,7 @@ class _TargetRow extends StatelessWidget {
               'sh $sharpe',
               style: const TextStyle(
                 fontSize: 11,
-                color: ForexAiTokens.textMuted,
+                color: NeoethosTokens.textMuted,
               ),
               textAlign: TextAlign.right,
             ),
@@ -187,7 +187,7 @@ class _TargetRow extends StatelessWidget {
               'wr $winRate',
               style: const TextStyle(
                 fontSize: 11,
-                color: ForexAiTokens.textMuted,
+                color: NeoethosTokens.textMuted,
               ),
               textAlign: TextAlign.right,
             ),
@@ -214,7 +214,7 @@ class _Row extends StatelessWidget {
                 label,
                 style: const TextStyle(
                   fontSize: 12,
-                  color: ForexAiTokens.textMuted,
+                  color: NeoethosTokens.textMuted,
                 ),
               ),
             ),
@@ -224,7 +224,7 @@ class _Row extends StatelessWidget {
                 style: TextStyle(
                   fontSize: 12,
                   fontWeight: FontWeight.w600,
-                  color: accent ?? ForexAiTokens.textPrimary,
+                  color: accent ?? NeoethosTokens.textPrimary,
                 ),
                 overflow: TextOverflow.ellipsis,
               ),
@@ -241,7 +241,7 @@ class _Loading extends StatelessWidget {
         padding: EdgeInsets.symmetric(vertical: 16),
         child: Text(
           'Scanning models directory…',
-          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

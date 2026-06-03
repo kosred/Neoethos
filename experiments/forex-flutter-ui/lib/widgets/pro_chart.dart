@@ -176,7 +176,7 @@ class _ProChartState extends ConsumerState<ProChart> {
               ? const Center(
                   child: Text(
                     'No candles',
-                    style: TextStyle(color: ForexAiTokens.textMuted),
+                    style: TextStyle(color: NeoethosTokens.textMuted),
                   ),
                 )
               : KChartWidget(
@@ -269,7 +269,7 @@ class _ProChartState extends ConsumerState<ProChart> {
                   k,
                   style: const TextStyle(
                     fontSize: 10,
-                    color: ForexAiTokens.textMuted,
+                    color: NeoethosTokens.textMuted,
                   ),
                 ),
               ),
@@ -278,7 +278,7 @@ class _ProChartState extends ConsumerState<ProChart> {
                 style: const TextStyle(
                   fontSize: 10,
                   fontWeight: FontWeight.w700,
-                  color: ForexAiTokens.textPrimary,
+                  color: NeoethosTokens.textPrimary,
                 ),
               ),
             ],
@@ -287,9 +287,9 @@ class _ProChartState extends ConsumerState<ProChart> {
     return Container(
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg.withValues(alpha: 0.96),
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg.withValues(alpha: 0.96),
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -312,18 +312,18 @@ class _ProChartState extends ConsumerState<ProChart> {
   }
 
   KChartColors _colors() => const KChartColors(
-        bgColor: ForexAiTokens.appBg,
-        upColor: ForexAiTokens.buy,
-        dnColor: ForexAiTokens.sell,
-        volColor: ForexAiTokens.accent,
-        gridColor: ForexAiTokens.border,
-        defaultTextColor: ForexAiTokens.textMuted,
-        nowPriceUpColor: ForexAiTokens.buy,
-        nowPriceDnColor: ForexAiTokens.sell,
-        maxColor: ForexAiTokens.textPrimary,
-        minColor: ForexAiTokens.textPrimary,
-        selectFillColor: ForexAiTokens.panelBg,
-        selectBorderColor: ForexAiTokens.border,
+        bgColor: NeoethosTokens.appBg,
+        upColor: NeoethosTokens.buy,
+        dnColor: NeoethosTokens.sell,
+        volColor: NeoethosTokens.accent,
+        gridColor: NeoethosTokens.border,
+        defaultTextColor: NeoethosTokens.textMuted,
+        nowPriceUpColor: NeoethosTokens.buy,
+        nowPriceDnColor: NeoethosTokens.sell,
+        maxColor: NeoethosTokens.textPrimary,
+        minColor: NeoethosTokens.textPrimary,
+        selectFillColor: NeoethosTokens.panelBg,
+        selectBorderColor: NeoethosTokens.border,
       );
 }
 
@@ -350,9 +350,9 @@ class _ServerIndicatorStrip extends ConsumerWidget {
       margin: const EdgeInsets.only(top: 6),
       padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg.withValues(alpha: 0.5),
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg.withValues(alpha: 0.5),
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: async.when(
         loading: () => _label('${_title()} · loading…'),
@@ -415,13 +415,13 @@ class _ServerIndicatorStrip extends ConsumerWidget {
   Color _color() {
     switch (indicatorId) {
       case 'atr':
-        return ForexAiTokens.warning;
+        return NeoethosTokens.warning;
       case 'adx':
-        return ForexAiTokens.accent;
+        return NeoethosTokens.accent;
       case 'vwap':
-        return ForexAiTokens.buy;
+        return NeoethosTokens.buy;
       default:
-        return ForexAiTokens.textPrimary;
+        return NeoethosTokens.textPrimary;
     }
   }
 
@@ -430,7 +430,7 @@ class _ServerIndicatorStrip extends ConsumerWidget {
         style: const TextStyle(
           fontSize: 10,
           fontWeight: FontWeight.w700,
-          color: ForexAiTokens.textMuted,
+          color: NeoethosTokens.textMuted,
         ),
       );
 }

@@ -254,7 +254,7 @@ mod tests {
         // Make sure the env var isn't set for this test by overriding
         // to empty. Any other test setting the path will not interfere.
         unsafe {
-            env::remove_var("FOREX_BOT_LIVE_JOURNAL_PATH");
+            env::remove_var("NEOETHOS_BOT_LIVE_JOURNAL_PATH");
         }
         let entry =
             LiveTradeJournalEntry::from_outcome("noop", &sample_request(), &sample_outcome());

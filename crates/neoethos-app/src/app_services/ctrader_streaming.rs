@@ -429,7 +429,7 @@ pub fn load_live_chart_update(
 }
 
 /// Maximum number of attempts (initial + retries) for `load_live_chart_update`.
-/// Tunable via `FOREX_BOT_CTRADER_STREAM_MAX_ATTEMPTS` (clamped to `[1, 5]`;
+/// Tunable via `NEOETHOS_BOT_CTRADER_STREAM_MAX_ATTEMPTS` (clamped to `[1, 5]`;
 /// default 3). Retry is safe here because each call is a stateless poll.
 ///
 /// **F-CORE3 closure (2026-05-25)**: thin shim over the canonical
@@ -438,7 +438,7 @@ fn streaming_max_attempts() -> u32 {
     crate::app_services::env_overrides::ctrader_stream_max_attempts()
 }
 
-/// Base backoff in ms; tunable via `FOREX_BOT_CTRADER_STREAM_BACKOFF_BASE_MS`
+/// Base backoff in ms; tunable via `NEOETHOS_BOT_CTRADER_STREAM_BACKOFF_BASE_MS`
 /// (clamped to `[10, 2000]`; default 200).
 ///
 /// **F-CORE3 closure (2026-05-25)**: thin shim over the canonical

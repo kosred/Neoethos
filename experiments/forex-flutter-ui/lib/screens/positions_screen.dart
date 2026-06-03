@@ -59,7 +59,7 @@ class PositionsScreen extends ConsumerWidget {
             tabAlignment: TabAlignment.start,
             tabs: [Tab(text: 'Live'), Tab(text: 'Journal')],
           ),
-          const SizedBox(height: ForexAiTokens.spSm),
+          const SizedBox(height: NeoethosTokens.spSm),
           Expanded(
             child: TabBarView(
               children: [
@@ -68,7 +68,7 @@ class PositionsScreen extends ConsumerWidget {
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     _MetricsStrip(accountAsync: accountAsync),
-                    const SizedBox(height: ForexAiTokens.spSm),
+                    const SizedBox(height: NeoethosTokens.spSm),
                     Expanded(
                       flex: 3,
                       child: _OpenPositionsTable(
@@ -76,7 +76,7 @@ class PositionsScreen extends ConsumerWidget {
                         spotsAsync: spotsAsync,
                       ),
                     ),
-                    const SizedBox(height: ForexAiTokens.spSm),
+                    const SizedBox(height: NeoethosTokens.spSm),
                     const Expanded(flex: 2, child: _PendingOrdersTable()),
                   ],
                 ),
@@ -114,19 +114,19 @@ class _JournalTab extends ConsumerWidget {
             padding: const EdgeInsets.all(8),
             child: Text(
               'Stats unavailable: ${describeError(e)}',
-              style: const TextStyle(fontSize: 11, color: ForexAiTokens.sell),
+              style: const TextStyle(fontSize: 11, color: NeoethosTokens.sell),
             ),
           ),
           data: (s) => _JournalStatCards(stats: s),
         ),
-        const SizedBox(height: ForexAiTokens.spSm),
+        const SizedBox(height: NeoethosTokens.spSm),
         Expanded(
           child: tradesAsync.when(
             loading: () => const Center(child: CircularProgressIndicator()),
             error: (e, _) => Center(
               child: Text(
                 'Could not load trades: ${describeError(e)}',
-                style: const TextStyle(color: ForexAiTokens.sell),
+                style: const TextStyle(color: NeoethosTokens.sell),
               ),
             ),
             data: (trades) => trades.isEmpty
@@ -136,7 +136,7 @@ class _JournalTab extends ConsumerWidget {
                       child: Text(
                         'No closed trades yet.\nThey appear here as the bot closes positions.',
                         textAlign: TextAlign.center,
-                        style: TextStyle(color: ForexAiTokens.textMuted),
+                        style: TextStyle(color: NeoethosTokens.textMuted),
                       ),
                     ),
                   )
@@ -165,7 +165,7 @@ class _JournalStatCards extends StatelessWidget {
                   label,
                   style: const TextStyle(
                     fontSize: 10,
-                    color: ForexAiTokens.textMuted,
+                    color: NeoethosTokens.textMuted,
                   ),
                 ),
                 const SizedBox(height: 2),
@@ -188,13 +188,13 @@ class _JournalStatCards extends StatelessWidget {
     String f2(double v) => v.toStringAsFixed(2);
     String optF(double? v) => v == null ? '—' : v.toStringAsFixed(2);
     final netAccent = stats.netProfit > 0
-        ? ForexAiTokens.buy
+        ? NeoethosTokens.buy
         : stats.netProfit < 0
-            ? ForexAiTokens.sell
+            ? NeoethosTokens.sell
             : null;
     return Wrap(
-      spacing: ForexAiTokens.spSm,
-      runSpacing: ForexAiTokens.spSm,
+      spacing: NeoethosTokens.spSm,
+      runSpacing: NeoethosTokens.spSm,
       children: [
         _chip('Net P/L', f2(stats.netProfit), accent: netAccent),
         _chip('Trades', '${stats.totalTrades}'),
@@ -224,16 +224,16 @@ class _ClosedTradesTable extends StatelessWidget {
             ? df.format(DateTime.fromMillisecondsSinceEpoch(t.exitTsMs!))
             : '—';
         final pnlColor = t.netProfit > 0
-            ? ForexAiTokens.buy
+            ? NeoethosTokens.buy
             : t.netProfit < 0
-                ? ForexAiTokens.sell
+                ? NeoethosTokens.sell
                 : null;
         return ListTile(
           dense: true,
           title: Text('${t.symbol}   ${t.side}   ${t.lots} lots'),
           subtitle: Text(
             when,
-            style: const TextStyle(fontSize: 10, color: ForexAiTokens.textMuted),
+            style: const TextStyle(fontSize: 10, color: NeoethosTokens.textMuted),
           ),
           trailing: Text(
             t.netProfit.toStringAsFixed(2),
@@ -270,26 +270,26 @@ class _MetricsStrip extends StatelessWidget {
         _MetricCard(
           label: 'Open positions',
           value: openCount == 0 ? '—' : '$openCount',
-          accent: openCount > 0 ? ForexAiTokens.accent : null,
+          accent: openCount > 0 ? NeoethosTokens.accent : null,
         ),
-        const SizedBox(width: ForexAiTokens.spSm),
+        const SizedBox(width: NeoethosTokens.spSm),
         _MetricCard(
           label: 'Used margin',
           value: usedMargin == null ? '—' : fmt.format(usedMargin),
         ),
-        const SizedBox(width: ForexAiTokens.spSm),
+        const SizedBox(width: NeoethosTokens.spSm),
         _MetricCard(
           label: 'Floating PnL',
           value: openCount == 0 ? '—' : fmt.format(floating),
           accent: openCount == 0
               ? null
               : floating > 0
-                  ? ForexAiTokens.buy
+                  ? NeoethosTokens.buy
                   : floating < 0
-                      ? ForexAiTokens.sell
+                      ? NeoethosTokens.sell
                       : null,
         ),
-        const SizedBox(width: ForexAiTokens.spSm),
+        const SizedBox(width: NeoethosTokens.spSm),
         const _MetricCard(
           label: "Today's realised",
           // Realised PnL endpoint hasn't shipped yet — explicit `—`
@@ -313,17 +313,17 @@ class _MetricCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = accent ?? ForexAiTokens.textPrimary;
+    final color = accent ?? NeoethosTokens.textPrimary;
     return Expanded(
       child: Container(
         padding: const EdgeInsets.symmetric(
-          horizontal: ForexAiTokens.spMd,
+          horizontal: NeoethosTokens.spMd,
           vertical: 10,
         ),
         decoration: BoxDecoration(
-          color: ForexAiTokens.panelBg,
-          border: Border.all(color: ForexAiTokens.border),
-          borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+          color: NeoethosTokens.panelBg,
+          border: Border.all(color: NeoethosTokens.border),
+          borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -332,17 +332,17 @@ class _MetricCard extends StatelessWidget {
             Text(
               label.toUpperCase(),
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsCaption - 1,
+                fontSize: NeoethosTokens.fsCaption - 1,
                 fontWeight: FontWeight.w800,
                 letterSpacing: 0.8,
-                color: ForexAiTokens.textMuted,
+                color: NeoethosTokens.textMuted,
               ),
             ),
             const SizedBox(height: 4),
             Text(
               value,
               style: TextStyle(
-                fontSize: ForexAiTokens.fsSubtitle + 2,
+                fontSize: NeoethosTokens.fsSubtitle + 2,
                 fontWeight: FontWeight.w800,
                 color: color,
                 fontFeatures: const [FontFeature.tabularFigures()],
@@ -371,9 +371,9 @@ class _OpenPositionsTable extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     return Container(
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -390,7 +390,7 @@ class _OpenPositionsTable extends ConsumerWidget {
                   .read(accountSnapshotProvider.notifier)
                   .refreshNow(),
               icon: const Icon(Icons.refresh,
-                  color: ForexAiTokens.textMuted),
+                  color: NeoethosTokens.textMuted),
             ),
           ),
           _PositionsHeader(),
@@ -445,12 +445,12 @@ class _OpenPositionsTable extends ConsumerWidget {
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: ForexAiTokens.panelBg,
+        backgroundColor: NeoethosTokens.panelBg,
         title: Text(
           'Close ${_prettySymbol(position.symbol)} ${position.side.toUpperCase()} '
               '${position.volume.toStringAsFixed(2)} lots?',
           style: const TextStyle(
-            color: ForexAiTokens.textPrimary,
+            color: NeoethosTokens.textPrimary,
             fontSize: 14,
           ),
         ),
@@ -459,7 +459,7 @@ class _OpenPositionsTable extends ConsumerWidget {
               '${position.pnlPips.toStringAsFixed(1)} pips. '
               'This sends a market close to the broker — irreversible.',
           style: const TextStyle(
-            color: ForexAiTokens.textMuted,
+            color: NeoethosTokens.textMuted,
             fontSize: 13,
           ),
         ),
@@ -470,7 +470,7 @@ class _OpenPositionsTable extends ConsumerWidget {
           ),
           FilledButton(
             style: FilledButton.styleFrom(
-              backgroundColor: ForexAiTokens.sell,
+              backgroundColor: NeoethosTokens.sell,
             ),
             onPressed: () => Navigator.of(ctx).pop(true),
             child: const Text('Close position'),
@@ -509,9 +509,9 @@ class _PositionsHeader extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: const BoxDecoration(
-        color: ForexAiTokens.appBg,
+        color: NeoethosTokens.appBg,
         border: Border(
-          bottom: BorderSide(color: ForexAiTokens.border),
+          bottom: BorderSide(color: NeoethosTokens.border),
         ),
       ),
       child: const Row(
@@ -539,10 +539,10 @@ class _HeaderCell extends StatelessWidget {
         text.toUpperCase(),
         textAlign: right ? TextAlign.right : TextAlign.left,
         style: const TextStyle(
-          fontSize: ForexAiTokens.fsCaption - 1,
+          fontSize: NeoethosTokens.fsCaption - 1,
           fontWeight: FontWeight.w800,
           letterSpacing: 0.8,
-          color: ForexAiTokens.textFaint,
+          color: NeoethosTokens.textFaint,
         ),
       );
 }
@@ -564,12 +564,12 @@ class _PositionDetailRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isBuy = position.side.toLowerCase() == 'buy';
-    final sideColor = isBuy ? ForexAiTokens.buy : ForexAiTokens.sell;
+    final sideColor = isBuy ? NeoethosTokens.buy : NeoethosTokens.sell;
     final pnlColor = position.pnlUsd > 0
-        ? ForexAiTokens.buy
+        ? NeoethosTokens.buy
         : position.pnlUsd < 0
-            ? ForexAiTokens.sell
-            : ForexAiTokens.textMuted;
+            ? NeoethosTokens.sell
+            : NeoethosTokens.textMuted;
     final since = position.openTimestampMs == null
         ? '—'
         : DateFormat('HH:mm:ss').format(
@@ -585,10 +585,10 @@ class _PositionDetailRow extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
         color: stripe
-            ? ForexAiTokens.appBg.withValues(alpha: 0.4)
+            ? NeoethosTokens.appBg.withValues(alpha: 0.4)
             : Colors.transparent,
         border: const Border(
-          bottom: BorderSide(color: ForexAiTokens.border, width: 0.4),
+          bottom: BorderSide(color: NeoethosTokens.border, width: 0.4),
         ),
       ),
       child: Row(
@@ -607,7 +607,7 @@ class _PositionDetailRow extends StatelessWidget {
                 isBuy ? 'BUY' : 'SELL',
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                  fontSize: ForexAiTokens.fsCaption - 1,
+                  fontSize: NeoethosTokens.fsCaption - 1,
                   fontWeight: FontWeight.w800,
                   color: sideColor,
                 ),
@@ -619,9 +619,9 @@ class _PositionDetailRow extends StatelessWidget {
             child: Text(
               _prettySymbol(position.symbol),
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsBody,
+                fontSize: NeoethosTokens.fsBody,
                 fontWeight: FontWeight.w700,
-                color: ForexAiTokens.textPrimary,
+                color: NeoethosTokens.textPrimary,
                 fontFeatures: [FontFeature.tabularFigures()],
               ),
             ),
@@ -632,9 +632,9 @@ class _PositionDetailRow extends StatelessWidget {
               position.volume.toStringAsFixed(2),
               textAlign: TextAlign.right,
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsBody,
+                fontSize: NeoethosTokens.fsBody,
                 fontWeight: FontWeight.w700,
-                color: ForexAiTokens.textPrimary,
+                color: NeoethosTokens.textPrimary,
                 fontFeatures: [FontFeature.tabularFigures()],
               ),
             ),
@@ -645,8 +645,8 @@ class _PositionDetailRow extends StatelessWidget {
               currentText,
               textAlign: TextAlign.right,
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsBody,
-                color: ForexAiTokens.textMuted,
+                fontSize: NeoethosTokens.fsBody,
+                color: NeoethosTokens.textMuted,
                 fontFeatures: [FontFeature.tabularFigures()],
               ),
             ),
@@ -657,7 +657,7 @@ class _PositionDetailRow extends StatelessWidget {
               position.pnlPips.toStringAsFixed(1),
               textAlign: TextAlign.right,
               style: TextStyle(
-                fontSize: ForexAiTokens.fsBody,
+                fontSize: NeoethosTokens.fsBody,
                 fontWeight: FontWeight.w800,
                 color: pnlColor,
                 fontFeatures: const [FontFeature.tabularFigures()],
@@ -670,7 +670,7 @@ class _PositionDetailRow extends StatelessWidget {
               '$currencySymbol${position.pnlUsd.toStringAsFixed(2)}',
               textAlign: TextAlign.right,
               style: TextStyle(
-                fontSize: ForexAiTokens.fsBody,
+                fontSize: NeoethosTokens.fsBody,
                 fontWeight: FontWeight.w800,
                 color: pnlColor,
                 fontFeatures: const [FontFeature.tabularFigures()],
@@ -684,8 +684,8 @@ class _PositionDetailRow extends StatelessWidget {
                 '$since · #${position.positionId}',
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
-                  fontSize: ForexAiTokens.fsCaption,
-                  color: ForexAiTokens.textFaint,
+                  fontSize: NeoethosTokens.fsCaption,
+                  color: NeoethosTokens.textFaint,
                   fontFeatures: [FontFeature.tabularFigures()],
                 ),
               ),
@@ -696,9 +696,9 @@ class _PositionDetailRow extends StatelessWidget {
             child: OutlinedButton(
               onPressed: onClose,
               style: OutlinedButton.styleFrom(
-                foregroundColor: ForexAiTokens.sell,
+                foregroundColor: NeoethosTokens.sell,
                 side: BorderSide(
-                  color: ForexAiTokens.sell.withValues(alpha: 0.55),
+                  color: NeoethosTokens.sell.withValues(alpha: 0.55),
                 ),
                 padding:
                     const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -708,7 +708,7 @@ class _PositionDetailRow extends StatelessWidget {
               child: const Text(
                 'Close',
                 style: TextStyle(
-                  fontSize: ForexAiTokens.fsCaption,
+                  fontSize: NeoethosTokens.fsCaption,
                   fontWeight: FontWeight.w700,
                 ),
               ),
@@ -731,9 +731,9 @@ class _PendingOrdersTable extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: const Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -773,9 +773,9 @@ class _PanelTitle extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: const BoxDecoration(
-        color: ForexAiTokens.appBg,
+        color: NeoethosTokens.appBg,
         border: Border(
-          bottom: BorderSide(color: ForexAiTokens.border),
+          bottom: BorderSide(color: NeoethosTokens.border),
         ),
       ),
       child: Row(
@@ -783,25 +783,25 @@ class _PanelTitle extends StatelessWidget {
           Text(
             title.toUpperCase(),
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsCaption,
+              fontSize: NeoethosTokens.fsCaption,
               fontWeight: FontWeight.w800,
               letterSpacing: 0.8,
-              color: ForexAiTokens.textMuted,
+              color: NeoethosTokens.textMuted,
             ),
           ),
           const SizedBox(width: 6),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
             decoration: BoxDecoration(
-              color: ForexAiTokens.accentMuted,
+              color: NeoethosTokens.accentMuted,
               borderRadius: BorderRadius.circular(3),
             ),
             child: Text(
               '$count',
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsCaption - 1,
+                fontSize: NeoethosTokens.fsCaption - 1,
                 fontWeight: FontWeight.w800,
-                color: ForexAiTokens.accent,
+                color: NeoethosTokens.accent,
               ),
             ),
           ),
@@ -818,12 +818,12 @@ class _LoadingLine extends StatelessWidget {
   @override
   Widget build(BuildContext context) => const Center(
         child: Padding(
-          padding: EdgeInsets.all(ForexAiTokens.spMd),
+          padding: EdgeInsets.all(NeoethosTokens.spMd),
           child: Text(
             'Loading…',
             style: TextStyle(
-              fontSize: ForexAiTokens.fsBody,
-              color: ForexAiTokens.textMuted,
+              fontSize: NeoethosTokens.fsBody,
+              color: NeoethosTokens.textMuted,
             ),
           ),
         ),
@@ -836,14 +836,14 @@ class _EmptyLine extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Center(
         child: Padding(
-          padding: const EdgeInsets.all(ForexAiTokens.spMd),
+          padding: const EdgeInsets.all(NeoethosTokens.spMd),
           child: Text(
             message,
             textAlign: TextAlign.center,
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsCaption,
+              fontSize: NeoethosTokens.fsCaption,
               height: 1.4,
-              color: ForexAiTokens.textFaint,
+              color: NeoethosTokens.textFaint,
             ),
           ),
         ),
@@ -855,12 +855,12 @@ class _ErrorBlock extends StatelessWidget {
   const _ErrorBlock({required this.error});
   @override
   Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.all(ForexAiTokens.spMd),
+        padding: const EdgeInsets.all(NeoethosTokens.spMd),
         child: Text(
           describeError(error),
           style: const TextStyle(
-            fontSize: ForexAiTokens.fsCaption,
-            color: ForexAiTokens.sell,
+            fontSize: NeoethosTokens.fsCaption,
+            color: NeoethosTokens.sell,
             height: 1.4,
           ),
         ),

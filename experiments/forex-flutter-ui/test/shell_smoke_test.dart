@@ -94,9 +94,9 @@ void main() {
 
   test('design tokens pin TradingView dark scheme', () {
     // Sanity: the hex values match the mockup CSS variables.
-    expect(ForexAiTokens.appBg, const Color(0xFF0E1116));
-    expect(ForexAiTokens.accent, const Color(0xFF2962FF));
-    expect(ForexAiTokens.buy, const Color(0xFF26A69A));
-    expect(ForexAiTokens.sell, const Color(0xFFEF5350));
+    expect(NeoethosTokens.appBg, const Color(0xFF0E1116));
+    expect(NeoethosTokens.accent, const Color(0xFF2962FF));
+    expect(NeoethosTokens.buy, const Color(0xFF26A69A));
+    expect(NeoethosTokens.sell, const Color(0xFFEF5350));
   });
 }

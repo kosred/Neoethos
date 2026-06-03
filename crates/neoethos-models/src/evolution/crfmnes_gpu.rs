@@ -100,17 +100,17 @@ fn candidate_loss_kernel(
 }
 
 pub(crate) fn neuro_evo_cuda_kernel_enabled(policy: &str) -> bool {
-    crate::common::cuda_kernel_enabled(policy, "FOREX_BOT_NEURO_EVO_CUDA_KERNEL")
+    crate::common::cuda_kernel_enabled(policy, "NEOETHOS_BOT_NEURO_EVO_CUDA_KERNEL")
 }
 
 fn cuda_device_id(policy: &str) -> usize {
-    crate::common::cuda_device_id_from_policy(policy, "FOREX_BOT_NEURO_EVO_CUDA_DEVICE", None)
+    crate::common::cuda_device_id_from_policy(policy, "NEOETHOS_BOT_NEURO_EVO_CUDA_DEVICE", None)
 }
 
 fn kernel_units(client: &ComputeClient<CudaRuntime>) -> u32 {
     crate::common::cuda_kernel_units(
         client.properties().hardware.max_units_per_cube,
-        "FOREX_BOT_NEURO_EVO_KERNEL_UNITS",
+        "NEOETHOS_BOT_NEURO_EVO_KERNEL_UNITS",
     )
 }
 

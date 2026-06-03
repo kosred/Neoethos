@@ -239,13 +239,13 @@ mod tests {
         sm.mark_failed(
             5,
             "ApplicationAuth invalid client_id",
-            Some("set FOREX_BOT_CTRADER_CLIENT_ID env".to_string()),
+            Some("set NEOETHOS_BOT_CTRADER_CLIENT_ID env".to_string()),
         );
         let s = &sm.steps[4];
         assert_eq!(s.status, CTraderStepStatus::Failed);
         assert_eq!(
             s.retry_hint.as_deref(),
-            Some("set FOREX_BOT_CTRADER_CLIENT_ID env")
+            Some("set NEOETHOS_BOT_CTRADER_CLIENT_ID env")
         );
     }
 

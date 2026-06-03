@@ -48,9 +48,11 @@ pub mod intelligence;
 pub mod journal;
 pub mod knob_catalog;
 pub mod live_spots;
+pub mod news;
 pub mod orders;
 pub mod pending_actions;
 pub mod risk;
+pub mod risky;
 pub mod settings;
 pub mod state;
 pub mod strategy_lab;
@@ -93,8 +95,15 @@ pub fn router(state: AppApiState) -> Router {
         // `OAExecutionEvent` handler will use.
         .route("/account/snapshot/refresh", post(account::refresh))
         .route("/hardware", get(hardware::hardware))
+        // The AI news desk: public no-API-key RSS headlines fetched
+        // server-side + a Codex (ChatGPT subscription) market briefing.
+        // `?force=true` bypasses the fetch-coalescing cache.
+        .route("/news/feed", get(news::feed))
         .route("/risk", get(risk::risk))
         .route("/risk/preset", post(risk::update_preset))
+        // Risky/Growth Mode time-to-target projection, computed by the
+        // live engine's own math (no hardcoded growth rates in the UI).
+        .route("/risky/scenarios", get(risky::scenarios))
         .route(
             "/settings",
             get(settings::settings).post(settings::update_settings),

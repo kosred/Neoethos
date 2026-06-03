@@ -35,18 +35,18 @@ class BackendHealthBanner extends ConsumerWidget {
             : ' (restart #$attempts in progress)';
 
     return Material(
-      color: ForexAiTokens.sell.withValues(alpha: 0.16),
+      color: NeoethosTokens.sell.withValues(alpha: 0.16),
       child: InkWell(
         onTap: () => showBackendDiagnosticsDialog(context),
         child: Container(
           width: double.infinity,
           padding: const EdgeInsets.symmetric(
-            horizontal: ForexAiTokens.spLg,
-            vertical: ForexAiTokens.spSm,
+            horizontal: NeoethosTokens.spLg,
+            vertical: NeoethosTokens.spSm,
           ),
           decoration: const BoxDecoration(
             border: Border(
-              bottom: BorderSide(color: ForexAiTokens.sell, width: 1),
+              bottom: BorderSide(color: NeoethosTokens.sell, width: 1),
             ),
           ),
           child: Row(
@@ -57,32 +57,32 @@ class BackendHealthBanner extends ConsumerWidget {
                 child: CircularProgressIndicator(
                   strokeWidth: 2,
                   valueColor:
-                      AlwaysStoppedAnimation<Color>(ForexAiTokens.sell),
+                      AlwaysStoppedAnimation<Color>(NeoethosTokens.sell),
                 ),
               ),
-              const SizedBox(width: ForexAiTokens.spSm),
+              const SizedBox(width: NeoethosTokens.spSm),
               Expanded(
                 child: Text(
                   'Backend reconnecting…$attemptSuffix',
                   style: const TextStyle(
-                    fontSize: ForexAiTokens.fsBody,
+                    fontSize: NeoethosTokens.fsBody,
                     fontWeight: FontWeight.w700,
-                    color: ForexAiTokens.sell,
+                    color: NeoethosTokens.sell,
                   ),
                 ),
               ),
               const Text(
                 'Click for diagnostics',
                 style: TextStyle(
-                  fontSize: ForexAiTokens.fsCaption,
-                  color: ForexAiTokens.textMuted,
+                  fontSize: NeoethosTokens.fsCaption,
+                  color: NeoethosTokens.textMuted,
                 ),
               ),
-              const SizedBox(width: ForexAiTokens.spXs),
+              const SizedBox(width: NeoethosTokens.spXs),
               const Icon(
                 Icons.chevron_right,
                 size: 16,
-                color: ForexAiTokens.textMuted,
+                color: NeoethosTokens.textMuted,
               ),
             ],
           ),

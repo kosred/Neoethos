@@ -94,7 +94,7 @@ class _BodyState extends ConsumerState<_Body> {
     if (dir.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          backgroundColor: ForexAiTokens.sell,
+          backgroundColor: NeoethosTokens.sell,
           content: Text('Data directory cannot be blank'),
         ),
       );
@@ -108,7 +108,7 @@ class _BodyState extends ConsumerState<_Body> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor: ForexAiTokens.buy,
+          backgroundColor: NeoethosTokens.buy,
           content: Text('Data directory set to $dir'),
           duration: const Duration(seconds: 3),
         ),
@@ -120,7 +120,7 @@ class _BodyState extends ConsumerState<_Body> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor: ForexAiTokens.sell,
+          backgroundColor: NeoethosTokens.sell,
           content: Text('Data directory could not be saved — ${describeError(e)}. Make sure the path exists and the app can write to it.'),
         ),
       );
@@ -170,7 +170,7 @@ class _BodyState extends ConsumerState<_Body> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor: ForexAiTokens.buy,
+          backgroundColor: NeoethosTokens.buy,
           content: Text('Imported $symbol $_timeframe from $fmt'),
           duration: const Duration(seconds: 3),
         ),
@@ -191,7 +191,7 @@ class _BodyState extends ConsumerState<_Body> {
     if (_toDate.isBefore(_fromDate)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          backgroundColor: ForexAiTokens.sell,
+          backgroundColor: NeoethosTokens.sell,
           content: Text('From-date must be before to-date'),
         ),
       );
@@ -238,7 +238,7 @@ class _BodyState extends ConsumerState<_Body> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor: ForexAiTokens.buy,
+          backgroundColor: NeoethosTokens.buy,
           content: Text('Downloaded $count $symbol $_timeframe bars'),
           duration: const Duration(seconds: 3),
         ),
@@ -279,7 +279,7 @@ class _BodyState extends ConsumerState<_Body> {
                 "against the app's working directory; use an absolute "
                 "path to be sure.",
                 style: TextStyle(
-                  color: ForexAiTokens.textMuted,
+                  color: NeoethosTokens.textMuted,
                   fontSize: 12,
                 ),
               ),
@@ -290,7 +290,7 @@ class _BodyState extends ConsumerState<_Body> {
                 style: const TextStyle(
                   fontFamily: 'monospace',
                   fontSize: 13,
-                  color: ForexAiTokens.textPrimary,
+                  color: NeoethosTokens.textPrimary,
                 ),
                 decoration: const InputDecoration(
                   labelText: 'Folder path',
@@ -310,8 +310,8 @@ class _BodyState extends ConsumerState<_Body> {
                   fontSize: 11,
                   fontWeight: FontWeight.w600,
                   color: dataDirExists
-                      ? ForexAiTokens.buy
-                      : ForexAiTokens.sell,
+                      ? NeoethosTokens.buy
+                      : NeoethosTokens.sell,
                 ),
               ),
               const SizedBox(height: 12),
@@ -345,8 +345,8 @@ class _BodyState extends ConsumerState<_Body> {
                 'Directory exists',
                 snapshot.dataDirExists ? 'YES' : 'NO',
                 accent: snapshot.dataDirExists
-                    ? ForexAiTokens.buy
-                    : ForexAiTokens.sell,
+                    ? NeoethosTokens.buy
+                    : NeoethosTokens.sell,
               ),
               _Row('Files', '${snapshot.fileCount}'),
               _Row('Last touched', mtime),
@@ -373,16 +373,16 @@ class _BodyState extends ConsumerState<_Body> {
                       vertical: 3,
                     ),
                     decoration: BoxDecoration(
-                      color: ForexAiTokens.surfaceBg,
-                      border: Border.all(color: ForexAiTokens.border),
-                      borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+                      color: NeoethosTokens.surfaceBg,
+                      border: Border.all(color: NeoethosTokens.border),
+                      borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
                     ),
                     child: Text(
                       s,
                       style: const TextStyle(
                         fontSize: 11,
                         fontWeight: FontWeight.w600,
-                        color: ForexAiTokens.textPrimary,
+                        color: NeoethosTokens.textPrimary,
                       ),
                     ),
                   ),
@@ -401,7 +401,7 @@ class _BodyState extends ConsumerState<_Body> {
                 '— if the response shows hasMore=true, narrow the window '
                 'and re-fetch the missing tail.',
                 style: TextStyle(
-                  color: ForexAiTokens.textMuted,
+                  color: NeoethosTokens.textMuted,
                   fontSize: 12,
                 ),
               ),
@@ -472,7 +472,7 @@ class _BodyState extends ConsumerState<_Body> {
                   _lastResult!,
                   style: const TextStyle(
                     fontSize: 11,
-                    color: ForexAiTokens.textMuted,
+                    color: NeoethosTokens.textMuted,
                   ),
                 ),
               ],
@@ -494,7 +494,7 @@ class _BodyState extends ConsumerState<_Body> {
                 'or Arrow/IPC file. The Symbol + Timeframe selected above '
                 'decide where the converted Vortex file lands on disk.',
                 style: TextStyle(
-                  color: ForexAiTokens.textMuted,
+                  color: NeoethosTokens.textMuted,
                   fontSize: 12,
                 ),
               ),
@@ -534,7 +534,7 @@ class _BodyState extends ConsumerState<_Body> {
                   _importResult!,
                   style: const TextStyle(
                     fontSize: 11,
-                    color: ForexAiTokens.textMuted,
+                    color: NeoethosTokens.textMuted,
                   ),
                 ),
               ],
@@ -569,7 +569,7 @@ class _Row extends StatelessWidget {
                 label,
                 style: const TextStyle(
                   fontSize: 12,
-                  color: ForexAiTokens.textMuted,
+                  color: NeoethosTokens.textMuted,
                 ),
               ),
             ),
@@ -579,7 +579,7 @@ class _Row extends StatelessWidget {
                 style: TextStyle(
                   fontSize: 12,
                   fontWeight: FontWeight.w600,
-                  color: accent ?? ForexAiTokens.textPrimary,
+                  color: accent ?? NeoethosTokens.textPrimary,
                 ),
                 overflow: TextOverflow.ellipsis,
               ),
@@ -596,7 +596,7 @@ class _Loading extends StatelessWidget {
         padding: EdgeInsets.symmetric(vertical: 16),
         child: Text(
           'Scanning data directory…',
-          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

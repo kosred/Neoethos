@@ -3,7 +3,7 @@ use neoethos_data::{FeatureFrame, Ohlcv};
 use rand::Rng;
 use std::sync::OnceLock;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SmcSearchConfig {
     pub force_ratio: f64,
     pub min_flags: usize,
@@ -37,7 +37,7 @@ impl Default for SmcSearchConfig {
             // strategies on D1/H4.
             //
             // Operator can still pin the old value via:
-            //   FOREX_BOT_PROP_SMC_FORCE_RATIO=0.65
+            //   NEOETHOS_BOT_PROP_SMC_FORCE_RATIO=0.65
             // — env override at `read_smc_search_config_from_env` below.
             force_ratio: 0.30,
             min_flags: 1,
@@ -85,23 +85,23 @@ fn smc_env_bool(name: &str, default: bool) -> bool {
 }
 
 fn read_smc_search_config_from_env() -> SmcSearchConfig {
-    let default_p = smc_env_f64("FOREX_BOT_PROP_SMC_ENABLE_P", 0.50).clamp(0.0, 1.0);
+    let default_p = smc_env_f64("NEOETHOS_BOT_PROP_SMC_ENABLE_P", 0.50).clamp(0.0, 1.0);
     let mut cfg = SmcSearchConfig {
-        force_ratio: smc_env_f64("FOREX_BOT_PROP_SMC_FORCE_RATIO", 0.30).clamp(0.0, 1.0),
-        min_flags: smc_env_usize("FOREX_BOT_PROP_SMC_MIN_FLAGS", 1),
-        p_ob: smc_env_f64("FOREX_BOT_PROP_SMC_P_OB", default_p).clamp(0.0, 1.0),
-        p_fvg: smc_env_f64("FOREX_BOT_PROP_SMC_P_FVG", default_p).clamp(0.0, 1.0),
-        p_liq: smc_env_f64("FOREX_BOT_PROP_SMC_P_LIQ", default_p).clamp(0.0, 1.0),
-        p_premium: smc_env_f64("FOREX_BOT_PROP_SMC_P_PREMIUM", default_p).clamp(0.0, 1.0),
-        p_inducement: smc_env_f64("FOREX_BOT_PROP_SMC_P_INDUCEMENT", default_p).clamp(0.0, 1.0),
-        p_mtf: smc_env_f64("FOREX_BOT_PROP_SMC_P_MTF", 0.85).clamp(0.0, 1.0),
-        p_bos: smc_env_f64("FOREX_BOT_PROP_SMC_P_BOS", default_p).clamp(0.0, 1.0),
-        p_choch: smc_env_f64("FOREX_BOT_PROP_SMC_P_CHOCH", default_p).clamp(0.0, 1.0),
-        p_eqh: smc_env_f64("FOREX_BOT_PROP_SMC_P_EQH", default_p).clamp(0.0, 1.0),
-        p_eql: smc_env_f64("FOREX_BOT_PROP_SMC_P_EQL", default_p).clamp(0.0, 1.0),
-        p_displacement: smc_env_f64("FOREX_BOT_PROP_SMC_P_DISPLACEMENT", default_p).clamp(0.0, 1.0),
+        force_ratio: smc_env_f64("NEOETHOS_BOT_PROP_SMC_FORCE_RATIO", 0.30).clamp(0.0, 1.0),
+        min_flags: smc_env_usize("NEOETHOS_BOT_PROP_SMC_MIN_FLAGS", 1),
+        p_ob: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_OB", default_p).clamp(0.0, 1.0),
+        p_fvg: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_FVG", default_p).clamp(0.0, 1.0),
+        p_liq: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_LIQ", default_p).clamp(0.0, 1.0),
+        p_premium: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_PREMIUM", default_p).clamp(0.0, 1.0),
+        p_inducement: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_INDUCEMENT", default_p).clamp(0.0, 1.0),
+        p_mtf: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_MTF", 0.85).clamp(0.0, 1.0),
+        p_bos: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_BOS", default_p).clamp(0.0, 1.0),
+        p_choch: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_CHOCH", default_p).clamp(0.0, 1.0),
+        p_eqh: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_EQH", default_p).clamp(0.0, 1.0),
+        p_eql: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_EQL", default_p).clamp(0.0, 1.0),
+        p_displacement: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_DISPLACEMENT", default_p).clamp(0.0, 1.0),
     };
-    if !smc_env_bool("FOREX_BOT_PROP_SMC_FORCE_ENABLED", true) {
+    if !smc_env_bool("NEOETHOS_BOT_PROP_SMC_FORCE_ENABLED", true) {
         cfg.force_ratio = 0.0;
         cfg.min_flags = 0;
     }
@@ -110,25 +110,71 @@ fn read_smc_search_config_from_env() -> SmcSearchConfig {
 
 impl SmcSearchConfig {
     /// Returns the cached SMC search config, lazily reading the
-    /// `FOREX_BOT_PROP_SMC_*` env vars at most once per process. Existing
+    /// `NEOETHOS_BOT_PROP_SMC_*` env vars at most once per process. Existing
     /// callers (`evolve_search`, `neoethos-models::genetic`) keep their
     /// `SmcSearchConfig::from_env()` API; the change is that subsequent
     /// invocations no longer re-walk `std::env`.
     pub fn from_env() -> Self {
         *SMC_SEARCH_CONFIG_CACHE.get_or_init(read_smc_search_config_from_env)
     }
+
+    /// Config-driven constructor (was the `NEOETHOS_BOT_PROP_SMC_*` env
+    /// vars). Probabilities are clamped to `[0,1]` and `force_enabled =
+    /// false` zeroes `force_ratio` + `min_flags`, exactly like the env
+    /// reader. A `smc_search_from_settings_default_matches_env_default`
+    /// test guarantees a fresh `Settings` reproduces [`Self::default`].
+    pub fn from_settings(s: &neoethos_core::Settings) -> Self {
+        let c = &s.models.smc_search_runtime;
+        let mut cfg = SmcSearchConfig {
+            force_ratio: c.force_ratio.clamp(0.0, 1.0),
+            min_flags: c.min_flags,
+            p_ob: c.p_ob.clamp(0.0, 1.0),
+            p_fvg: c.p_fvg.clamp(0.0, 1.0),
+            p_liq: c.p_liq.clamp(0.0, 1.0),
+            p_premium: c.p_premium.clamp(0.0, 1.0),
+            p_inducement: c.p_inducement.clamp(0.0, 1.0),
+            p_mtf: c.p_mtf.clamp(0.0, 1.0),
+            p_bos: c.p_bos.clamp(0.0, 1.0),
+            p_choch: c.p_choch.clamp(0.0, 1.0),
+            p_eqh: c.p_eqh.clamp(0.0, 1.0),
+            p_eql: c.p_eql.clamp(0.0, 1.0),
+            p_displacement: c.p_displacement.clamp(0.0, 1.0),
+        };
+        if !c.force_enabled {
+            cfg.force_ratio = 0.0;
+            cfg.min_flags = 0;
+        }
+        cfg
+    }
 }
 
 /// Eagerly install the SMC search config from the legacy
-/// `FOREX_BOT_PROP_SMC_*` env vars. Idempotent — calling this from a
+/// `NEOETHOS_BOT_PROP_SMC_*` env vars. Idempotent — calling this from a
 /// binary's `main` simply forces the cache to populate at startup.
 pub fn install_smc_search_config_from_env() {
     let _ = SMC_SEARCH_CONFIG_CACHE.set(read_smc_search_config_from_env());
 }
 
+/// Config-driven install — reads the SMC search knobs from the single
+/// `Settings` instead of the environment. Idempotent.
+pub fn install_smc_search_config_from_settings(s: &neoethos_core::Settings) {
+    let _ = SMC_SEARCH_CONFIG_CACHE.set(SmcSearchConfig::from_settings(s));
+}
+
 #[cfg(test)]
 mod overrides_tests {
     use super::*;
+
+    #[test]
+    fn smc_search_from_settings_default_matches_env_default() {
+        // Behavior-preservation gate (config-consolidation S2e): a fresh
+        // `Settings` reproduces the engine SMC-search defaults exactly.
+        let s = neoethos_core::Settings::default();
+        assert_eq!(
+            SmcSearchConfig::from_settings(&s),
+            SmcSearchConfig::default()
+        );
+    }
 
     #[test]
     fn smc_search_config_default_matches_documented_defaults() {

@@ -64,7 +64,7 @@ class _Loading extends StatelessWidget {
         padding: EdgeInsets.symmetric(vertical: 16),
         child: Text(
           'Loading engine state…',
-          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

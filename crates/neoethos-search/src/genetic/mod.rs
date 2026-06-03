@@ -24,7 +24,8 @@ pub use evolution_math::{
     current_seen_signature_memory_runtime_overrides, current_threshold_ladder,
     derive_adaptive_threshold_ladder_from_features, gene_signature_hash, generate_random_genes,
     install_adaptive_threshold_ladder, install_seen_signature_memory_runtime_overrides,
-    install_seen_signature_memory_runtime_overrides_from_env, mutate, new_random_gene,
+    install_seen_signature_memory_runtime_overrides_from_env,
+    install_seen_signature_memory_runtime_overrides_from_settings, mutate, new_random_gene,
     reset_gene_metrics, select_parent_index, select_survivor_indices,
     unique_candidate_or_retry,
 };
@@ -39,8 +40,10 @@ pub use runtime_overrides::{
     StrategyEvaluationRuntimeOverrides, current_determinism_policy,
     current_genetic_search_runtime_overrides, current_strategy_evaluation_runtime_overrides,
     install_genetic_search_runtime_overrides, install_genetic_search_runtime_overrides_from_env,
+    install_genetic_search_runtime_overrides_from_settings,
     install_strategy_evaluation_runtime_overrides,
     install_strategy_evaluation_runtime_overrides_from_env,
+    install_strategy_evaluation_runtime_overrides_from_settings,
 };
 pub use search_engine::{
     evaluate_genes, evolve_search, evolve_search_with_progress,
@@ -50,6 +53,7 @@ pub use search_engine::{
 pub use seed_templates::seed_professional_templates;
 pub use smc_indicators::{
     SmcSearchConfig, build_smc_arrays, derive_smc_arrays, enforce_min_structural_smc_flags,
-    enforce_population_smc_ratio, install_smc_search_config_from_env, randomize_smc_flags,
+    enforce_population_smc_ratio, install_smc_search_config_from_env,
+    install_smc_search_config_from_settings, randomize_smc_flags,
 };
 pub use strategy_gene::{EvaluationConfig, FilteringConfig, Gene, SearchResult};

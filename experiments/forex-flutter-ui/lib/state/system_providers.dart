@@ -96,6 +96,32 @@ final intelligenceProvider =
   return client.fetchIntelligence();
 });
 
+/// `/news/feed` — AI news desk: public-RSS headlines + a Codex market
+/// briefing. autoDispose with a slow 5-minute self-refresh so a long
+/// session surfaces fresh headlines; the backend coalesces the actual
+/// RSS + Codex fetches behind a ~10-min cache, so the poll is cheap.
+/// The panel's refresh button forces a fresh pull (NewsPanel._refresh).
+final newsFeedProvider = FutureProvider.autoDispose<NewsFeed>((ref) async {
+  final timer = Timer(const Duration(minutes: 5), () => ref.invalidateSelf());
+  ref.onDispose(timer.cancel);
+  final client = ref.read(backendClientProvider);
+  return client.fetchNewsFeed();
+});
+
+/// `/risky/scenarios` — Risky/Growth Mode time-to-target projection,
+/// computed by the engine. Family-keyed by (starting, target, fraction)
+/// — a record, so structural equality keys the cache — so the Growth
+/// card re-fetches only when the operator edits those inputs.
+final riskyScenariosProvider = FutureProvider.autoDispose.family<RiskyScenario,
+    ({double startingUsd, double targetUsd, double riskFraction})>((ref, q) {
+  final client = ref.read(backendClientProvider);
+  return client.fetchRiskyScenarios(
+    startingUsd: q.startingUsd,
+    targetUsd: q.targetUsd,
+    riskFraction: q.riskFraction,
+  );
+});
+
 /// `/broker/symbols` — broker-offered catalog. Heavy call (830+ symbols
 /// on a typical cTrader account) so kept autoDispose; the UI caches it
 /// in a ConsumerStatefulWidget while needed.

@@ -80,7 +80,7 @@ impl Default for AuthorizationRequest {
 }
 
 /// Token-endpoint response. We only model the fields we actually
-/// consume; OpenAI's response includes more (id_token claims, etc.)
+/// consume; the issuer's response includes more (id_token claims, etc.)
 /// and we keep them in [`Self::raw`] so the persistence layer can
 /// round-trip them verbatim into `~/.codex/auth.json`.
 #[derive(Debug, Clone)]

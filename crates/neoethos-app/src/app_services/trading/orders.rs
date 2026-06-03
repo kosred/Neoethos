@@ -456,7 +456,7 @@ impl TradingSession {
                          position #{position_id} (broker_net={broker_net:.4} vs local={local:.4}, \
                          drift={:.4}% > threshold {:.4}% of notional {notional:.2}). \
                          New orders blocked until operator acknowledges via \
-                         FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION override or a fresh reconcile.",
+                         NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION override or a fresh reconcile.",
                         drift_fraction * 100.0,
                         threshold_fraction * 100.0,
                     );

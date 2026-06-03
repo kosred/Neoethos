@@ -39,7 +39,7 @@ pub fn cuda_flatten_features(
 
 /// Returns `true` if the given env var holds one of the standard
 /// "disabled" tokens. Used to gate per-model CUDA kernels via
-/// `FOREX_BOT_<NAME>_CUDA_KERNEL=0`. Centralized so we do not have
+/// `NEOETHOS_BOT_<NAME>_CUDA_KERNEL=0`. Centralized so we do not have
 /// three exact-copy `matches!` blocks across the GPU files.
 pub fn is_kernel_disabled_env(name: &str) -> bool {
     matches!(
@@ -174,40 +174,40 @@ mod tests {
     #[test]
     fn kernel_enabled_requires_gpu_policy() {
         unsafe {
-            std::env::remove_var("FOREX_BOT_TEST_CUDA_KERNEL");
+            std::env::remove_var("NEOETHOS_BOT_TEST_CUDA_KERNEL");
         }
-        assert!(cuda_kernel_enabled("gpu", "FOREX_BOT_TEST_CUDA_KERNEL"));
-        assert!(cuda_kernel_enabled("gpu:1", "FOREX_BOT_TEST_CUDA_KERNEL"));
-        assert!(!cuda_kernel_enabled("cpu", "FOREX_BOT_TEST_CUDA_KERNEL"));
-        assert!(!cuda_kernel_enabled("auto", "FOREX_BOT_TEST_CUDA_KERNEL"));
+        assert!(cuda_kernel_enabled("gpu", "NEOETHOS_BOT_TEST_CUDA_KERNEL"));
+        assert!(cuda_kernel_enabled("gpu:1", "NEOETHOS_BOT_TEST_CUDA_KERNEL"));
+        assert!(!cuda_kernel_enabled("cpu", "NEOETHOS_BOT_TEST_CUDA_KERNEL"));
+        assert!(!cuda_kernel_enabled("auto", "NEOETHOS_BOT_TEST_CUDA_KERNEL"));
     }
 
     #[test]
     fn kernel_enabled_respects_disable_env() {
         unsafe {
-            std::env::set_var("FOREX_BOT_TEST_DISABLE_KERNEL", "false");
+            std::env::set_var("NEOETHOS_BOT_TEST_DISABLE_KERNEL", "false");
         }
-        assert!(!cuda_kernel_enabled("gpu", "FOREX_BOT_TEST_DISABLE_KERNEL"));
+        assert!(!cuda_kernel_enabled("gpu", "NEOETHOS_BOT_TEST_DISABLE_KERNEL"));
         unsafe {
-            std::env::set_var("FOREX_BOT_TEST_DISABLE_KERNEL", "1");
+            std::env::set_var("NEOETHOS_BOT_TEST_DISABLE_KERNEL", "1");
         }
-        assert!(cuda_kernel_enabled("gpu", "FOREX_BOT_TEST_DISABLE_KERNEL"));
+        assert!(cuda_kernel_enabled("gpu", "NEOETHOS_BOT_TEST_DISABLE_KERNEL"));
         unsafe {
-            std::env::remove_var("FOREX_BOT_TEST_DISABLE_KERNEL");
+            std::env::remove_var("NEOETHOS_BOT_TEST_DISABLE_KERNEL");
         }
     }
 
     #[test]
     fn cuda_device_id_parses_policy_suffix() {
         unsafe {
-            std::env::remove_var("FOREX_BOT_TEST_DEVICE");
+            std::env::remove_var("NEOETHOS_BOT_TEST_DEVICE");
         }
         assert_eq!(
-            cuda_device_id_from_policy("gpu:3", "FOREX_BOT_TEST_DEVICE", None),
+            cuda_device_id_from_policy("gpu:3", "NEOETHOS_BOT_TEST_DEVICE", None),
             3
         );
         assert_eq!(
-            cuda_device_id_from_policy("gpu", "FOREX_BOT_TEST_DEVICE", None),
+            cuda_device_id_from_policy("gpu", "NEOETHOS_BOT_TEST_DEVICE", None),
             0
         );
     }
@@ -215,33 +215,33 @@ mod tests {
     #[test]
     fn cuda_device_id_prefers_env_var() {
         unsafe {
-            std::env::set_var("FOREX_BOT_TEST_DEVICE_EXPLICIT", "5");
+            std::env::set_var("NEOETHOS_BOT_TEST_DEVICE_EXPLICIT", "5");
         }
         assert_eq!(
-            cuda_device_id_from_policy("gpu:1", "FOREX_BOT_TEST_DEVICE_EXPLICIT", None),
+            cuda_device_id_from_policy("gpu:1", "NEOETHOS_BOT_TEST_DEVICE_EXPLICIT", None),
             5
         );
         unsafe {
-            std::env::remove_var("FOREX_BOT_TEST_DEVICE_EXPLICIT");
+            std::env::remove_var("NEOETHOS_BOT_TEST_DEVICE_EXPLICIT");
         }
     }
 
     #[test]
     fn cuda_kernel_units_clamps_to_max() {
         unsafe {
-            std::env::remove_var("FOREX_BOT_TEST_UNITS");
+            std::env::remove_var("NEOETHOS_BOT_TEST_UNITS");
         }
-        assert_eq!(cuda_kernel_units(64, "FOREX_BOT_TEST_UNITS"), 64);
+        assert_eq!(cuda_kernel_units(64, "NEOETHOS_BOT_TEST_UNITS"), 64);
         unsafe {
-            std::env::set_var("FOREX_BOT_TEST_UNITS", "32");
+            std::env::set_var("NEOETHOS_BOT_TEST_UNITS", "32");
         }
-        assert_eq!(cuda_kernel_units(64, "FOREX_BOT_TEST_UNITS"), 32);
+        assert_eq!(cuda_kernel_units(64, "NEOETHOS_BOT_TEST_UNITS"), 32);
         unsafe {
-            std::env::set_var("FOREX_BOT_TEST_UNITS", "9999");
+            std::env::set_var("NEOETHOS_BOT_TEST_UNITS", "9999");
         }
-        assert_eq!(cuda_kernel_units(64, "FOREX_BOT_TEST_UNITS"), 64);
+        assert_eq!(cuda_kernel_units(64, "NEOETHOS_BOT_TEST_UNITS"), 64);
         unsafe {
-            std::env::remove_var("FOREX_BOT_TEST_UNITS");
+            std::env::remove_var("NEOETHOS_BOT_TEST_UNITS");
         }
     }
 

@@ -77,7 +77,7 @@ pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) ->
     let mut min_delta = default_min_delta;
 
     // Try to read env var for patience
-    if let Ok(env_pat) = std::env::var("FOREX_BOT_EARLY_STOP_PATIENCE")
+    if let Ok(env_pat) = std::env::var("NEOETHOS_BOT_EARLY_STOP_PATIENCE")
         && !env_pat.is_empty()
         && let Ok(val) = env_pat.parse::<usize>()
         && val > 0
@@ -86,7 +86,7 @@ pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) ->
     }
 
     // Try to read env var for min_delta
-    if let Ok(env_delta) = std::env::var("FOREX_BOT_EARLY_STOP_MIN_DELTA")
+    if let Ok(env_delta) = std::env::var("NEOETHOS_BOT_EARLY_STOP_MIN_DELTA")
         && !env_delta.is_empty()
         && let Ok(val) = env_delta.parse::<f64>()
     {
@@ -723,7 +723,7 @@ pub fn detect_feature_drift(
     }
 
     // HPC FIX: Regime-Aware Drift Thresholding (lines 405-417)
-    let base_threshold = std::env::var("FOREX_BOT_DRIFT_THRESHOLD")
+    let base_threshold = std::env::var("NEOETHOS_BOT_DRIFT_THRESHOLD")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.20);

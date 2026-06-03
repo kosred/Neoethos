@@ -16,7 +16,7 @@ pub struct NewsFilter {
     /// secret bytes have a single fixed location in memory which is
     /// zeroized on drop). The `Debug` impl masks the value as `[REDACTED]`
     /// and `serde::Serialize` is opt-in, so accidental logging or
-    /// serialization cannot exfiltrate the operator's OpenAI/Perplexity
+    /// serialization cannot exfiltrate the operator's Perplexity
     /// bearer token. Access the underlying string via [`ExposeSecret`].
     ///
     /// The zeroize upstream docs explicitly recommend `secrecy` over
@@ -24,7 +24,7 @@ pub struct NewsFilter {
     /// realloc-on-push can leave un-zeroed copies of the secret on the
     /// heap.
     pub api_key: Option<SecretString>,
-    pub llm_provider: String, // "openai" or "perplexity"
+    pub llm_provider: String, // LLM sentiment provider (currently "perplexity")
     pub blackout_minutes_before: i64,
     pub blackout_minutes_after: i64,
     pub current_status: String, // "SAFE" or "BLACKOUT"
@@ -159,23 +159,14 @@ impl NewsFilter {
 
         let client = reqwest::blocking::Client::new();
 
-        // F-107 fix (2026-05-25): endpoints + model names are still
-        // hardcoded HERE because this domain-layer filter is the
-        // single canonical place they live. The previous audit
-        // concern was that they were *duplicated* between this file
-        // and the app/news_sources module — that duplication was
-        // resolved when the news watcher migrated to call this
-        // helper. The values stay near the API call so a future
-        // OpenAI / Perplexity migration is one PR, not a
-        // multi-file grep-and-replace.
-        // `llm_provider` defaults to "openai" — anything else falls
-        // back to Perplexity. Allowed values are documented in
-        // `config.yaml`'s `news.llm_provider` field.
-        let (endpoint, model) = if self.llm_provider == "openai" {
-            ("https://api.openai.com/v1/chat/completions", "gpt-4o-mini")
-        } else {
-            ("https://api.perplexity.ai/chat/completions", "sonar-pro")
-        };
+        // Endpoint + model live HERE — the single canonical place for
+        // this domain-layer gate (resolves the old duplication with the
+        // app news watcher). Perplexity's Sonar is the ONLY supported
+        // provider: OpenAI / ChatGPT-API support was removed per operator
+        // directive, and the ChatGPT *subscription* (Codex) path is
+        // reserved for the news desk, not this pre-trade gate.
+        let (endpoint, model) =
+            ("https://api.perplexity.ai/chat/completions", "sonar-pro");
 
         let body = serde_json::json!({
             "model": model,
@@ -323,7 +314,7 @@ mod tests {
     #[test]
     fn blackout_reason_includes_status_provider_and_window() {
         let mut f = enabled_blackout();
-        f.llm_provider = "openai".to_string();
+        f.llm_provider = "perplexity".to_string();
         f.blackout_minutes_before = 30;
         f.blackout_minutes_after = 15;
         let reason = f.blackout_reason();
@@ -332,7 +323,7 @@ mod tests {
             "reason must include status: {reason}"
         );
         assert!(
-            reason.contains("openai"),
+            reason.contains("perplexity"),
             "reason must include provider: {reason}"
         );
         assert!(

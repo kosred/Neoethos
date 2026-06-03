@@ -129,12 +129,10 @@ pub fn ensure_timeframes_with_resample(
     // F-308 max-age guard would just NaN-out the stale tail; with it,
     // the operator gets a fresh tail derived from the base.
     //
-    // Gated behind FOREX_BOT_REBUILD_STALE_HIGHER_TFS=1 because
+    // Gated behind NEOETHOS_BOT_REBUILD_STALE_HIGHER_TFS=1 because
     // unsolicited auto-rebuild could surprise operators who keep
     // intentionally-stale higher-TF data (e.g. a fixed regime window).
-    let rebuild_stale = std::env::var("FOREX_BOT_REBUILD_STALE_HIGHER_TFS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let rebuild_stale = crate::current_data_runtime_overrides().rebuild_stale_higher_tfs;
     let base_last_ts = base_ohlcv
         .timestamp
         .as_ref()

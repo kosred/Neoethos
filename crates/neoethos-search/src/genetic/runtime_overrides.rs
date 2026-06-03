@@ -1,4 +1,4 @@
-//! Typed boundary for the legacy `FOREX_BOT_*` env vars that previously
+//! Typed boundary for the legacy `NEOETHOS_BOT_*` env vars that previously
 //! reached deep into the genetic search engine on every call. These knobs
 //! change *production* search semantics — RNG seed, novelty weighting,
 //! tournament size, stagnation patience, archive capacity, SMC gate
@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 /// been exceeded.
 ///
 /// `disable_gate` is the operator's hard-bypass escape hatch (legacy
-/// `FOREX_BOT_DISABLE_SMC_GATE=1` env var, now read once at startup
+/// `NEOETHOS_BOT_DISABLE_SMC_GATE=1` env var, now read once at startup
 /// through this typed boundary): when set, the gate collapses (active
 /// SMC sum forced to 0) so the raw signal passes through. Lets operators
 /// isolate "SMC indicators don't trigger on this symbol" from genuine
@@ -86,7 +86,7 @@ impl Default for ArchiveScoringOverrides {
 }
 
 /// Selection-policy knobs that previously lived in
-/// `FOREX_BOT_PROP_PARENT_SELECTION` / `SURVIVOR_SELECTION` /
+/// `NEOETHOS_BOT_PROP_PARENT_SELECTION` / `SURVIVOR_SELECTION` /
 /// `RANDOM_IMMIGRANTS` / `SURVIVOR_FRACTION` (or `ELITE_FRACTION`) /
 /// `SELECTION_TEMPERATURE`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -137,7 +137,7 @@ impl SelectionPolicyOverrides {
 }
 
 /// Typed replacement for the search-engine's most production-affecting
-/// `FOREX_BOT_*` env vars.
+/// `NEOETHOS_BOT_*` env vars.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeneticSearchRuntimeOverrides {
     /// Optional deterministic RNG seed for the genetic search. `None`
@@ -180,90 +180,145 @@ impl Default for GeneticSearchRuntimeOverrides {
 }
 
 impl GeneticSearchRuntimeOverrides {
-    /// One-shot read of the legacy `FOREX_BOT_*` search env vars. This is
+    /// One-shot read of the legacy `NEOETHOS_BOT_*` search env vars. This is
     /// the only place the genetic search consults the environment for
     /// these knobs.
     pub fn from_env() -> Self {
         let mut overrides = Self::default();
 
-        if let Some(seed) = env_u64("FOREX_BOT_SEARCH_SEED") {
+        if let Some(seed) = env_u64("NEOETHOS_BOT_SEARCH_SEED") {
             overrides.seed = Some(seed);
         }
-        if let Some(weight) = env_f64_finite("FOREX_BOT_NOVELTY_WEIGHT") {
+        if let Some(weight) = env_f64_finite("NEOETHOS_BOT_NOVELTY_WEIGHT") {
             overrides.novelty_weight = weight;
         }
-        if let Some(patience) = env_usize_positive("FOREX_BOT_PROP_STAGNATION_GENS") {
+        if let Some(patience) = env_usize_positive("NEOETHOS_BOT_PROP_STAGNATION_GENS") {
             overrides.stagnation_patience = patience;
         }
-        if let Some(tournament) = env_usize_positive("FOREX_BOT_PROP_TOURNAMENT_SIZE") {
+        if let Some(tournament) = env_usize_positive("NEOETHOS_BOT_PROP_TOURNAMENT_SIZE") {
             overrides.tournament_size_override = Some(tournament);
         }
-        if let Some(cap) = env_usize_positive("FOREX_BOT_PROP_ARCHIVE_CAP") {
+        if let Some(cap) = env_usize_positive("NEOETHOS_BOT_PROP_ARCHIVE_CAP") {
             overrides.archive_cap_override = Some(cap);
         }
-        if let Some(retry) = env_usize_positive("FOREX_BOT_PROP_SEEN_RETRY") {
+        if let Some(retry) = env_usize_positive("NEOETHOS_BOT_PROP_SEEN_RETRY") {
             overrides.seen_retry_attempts = retry;
         }
 
         // SMC gate curve.
-        if let Some(start) = env_f32_finite("FOREX_BOT_PROP_SMC_GATE_START")
-            .or_else(|| env_f32_finite("FOREX_BOT_PROP_SMC_GATE"))
+        if let Some(start) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_GATE_START")
+            .or_else(|| env_f32_finite("NEOETHOS_BOT_PROP_SMC_GATE"))
         {
             overrides.smc_gate.start = start;
         }
-        if let Some(end) = env_f32_finite("FOREX_BOT_PROP_SMC_GATE_END") {
+        if let Some(end) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_GATE_END") {
             overrides.smc_gate.end = end;
         }
-        if let Some(curve) = env_f32_finite("FOREX_BOT_PROP_SMC_GATE_CURVE") {
+        if let Some(curve) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_GATE_CURVE") {
             overrides.smc_gate.curve = curve;
         }
-        if let Some(step) = env_f32_finite("FOREX_BOT_PROP_SMC_GATE_STAGNATION_STEP") {
+        if let Some(step) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_GATE_STAGNATION_STEP") {
             overrides.smc_gate.stagnation_step = step;
         }
-        // Hard bypass: legacy `FOREX_BOT_DISABLE_SMC_GATE=1` env var.
+        // Hard bypass: legacy `NEOETHOS_BOT_DISABLE_SMC_GATE=1` env var.
         // F-CORE3 closure (2026-05-25): previously read inline inside
         // `signals_for_gene_full` (search_engine.rs) and the GA's
         // per-gene signal-synthesis loop (eval.rs::synthesize_signals_cpu).
         // Now consolidated to this typed boundary so the env is hit at
         // most once per process.
-        if env_truthy("FOREX_BOT_DISABLE_SMC_GATE") {
+        if env_truthy("NEOETHOS_BOT_DISABLE_SMC_GATE") {
             overrides.smc_gate.disable_gate = true;
         }
 
         // Archive scoring thresholds.
-        if let Some(mode) = env_string_lowercase("FOREX_BOT_PROP_ARCHIVE_MODE") {
+        if let Some(mode) = env_string_lowercase("NEOETHOS_BOT_PROP_ARCHIVE_MODE") {
             overrides.archive_scoring.mode = mode;
         }
-        if let Some(min_net) = env_f64_finite("FOREX_BOT_PROP_ARCHIVE_MIN_NET") {
+        if let Some(min_net) = env_f64_finite("NEOETHOS_BOT_PROP_ARCHIVE_MIN_NET") {
             overrides.archive_scoring.min_net = min_net;
         }
-        if let Some(min_pf) = env_f64_finite("FOREX_BOT_PROP_ARCHIVE_MIN_PF") {
+        if let Some(min_pf) = env_f64_finite("NEOETHOS_BOT_PROP_ARCHIVE_MIN_PF") {
             overrides.archive_scoring.min_pf = min_pf;
         }
-        if let Some(min_sharpe) = env_f64_finite("FOREX_BOT_PROP_ARCHIVE_MIN_SHARPE") {
+        if let Some(min_sharpe) = env_f64_finite("NEOETHOS_BOT_PROP_ARCHIVE_MIN_SHARPE") {
             overrides.archive_scoring.min_sharpe = min_sharpe;
         }
 
         // Selection policy.
-        if let Some(immigrants) = env_f64_finite("FOREX_BOT_PROP_RANDOM_IMMIGRANTS") {
+        if let Some(immigrants) = env_f64_finite("NEOETHOS_BOT_PROP_RANDOM_IMMIGRANTS") {
             overrides.selection.immigrant_ratio = immigrants;
         }
-        let survivor_fraction = env_f64_finite("FOREX_BOT_PROP_SURVIVOR_FRACTION")
-            .or_else(|| env_f64_finite("FOREX_BOT_PROP_ELITE_FRACTION"));
+        let survivor_fraction = env_f64_finite("NEOETHOS_BOT_PROP_SURVIVOR_FRACTION")
+            .or_else(|| env_f64_finite("NEOETHOS_BOT_PROP_ELITE_FRACTION"));
         if let Some(value) = survivor_fraction {
             overrides.selection.survivor_fraction = value;
         }
-        if let Some(parent) = env_string_lowercase("FOREX_BOT_PROP_PARENT_SELECTION") {
+        if let Some(parent) = env_string_lowercase("NEOETHOS_BOT_PROP_PARENT_SELECTION") {
             overrides.selection.parent = ParentSelectionPolicy::parse(&parent);
         }
-        if let Some(survivor) = env_string_lowercase("FOREX_BOT_PROP_SURVIVOR_SELECTION") {
+        if let Some(survivor) = env_string_lowercase("NEOETHOS_BOT_PROP_SURVIVOR_SELECTION") {
             overrides.selection.survivor = SurvivorSelectionPolicy::parse(&survivor);
         }
-        if let Some(temp) = env_f64_finite("FOREX_BOT_PROP_SELECTION_TEMPERATURE") {
+        if let Some(temp) = env_f64_finite("NEOETHOS_BOT_PROP_SELECTION_TEMPERATURE") {
             overrides.selection.temperature = temp;
         }
 
         overrides
+    }
+
+    /// Config-driven constructor — the operator sets these knobs in the
+    /// single `Settings` (config / UI / TUI), never the environment.
+    /// Mirrors [`Self::from_env`] field-for-field; an empty policy /
+    /// archive-mode string means "keep the engine default" so the config
+    /// default need not duplicate the parser vocabulary. The
+    /// `from_settings_default_matches_env_default` test guarantees a
+    /// fresh `Settings` reproduces [`Self::default`] exactly (no behavior
+    /// change vs the pre-config build).
+    pub fn from_settings(s: &neoethos_core::Settings) -> Self {
+        let c = &s.models.search_runtime;
+        let defaults = Self::default();
+        Self {
+            seed: c.seed,
+            novelty_weight: c.novelty_weight,
+            stagnation_patience: c.stagnation_patience,
+            tournament_size_override: c.tournament_size_override,
+            archive_cap_override: c.archive_cap_override,
+            seen_retry_attempts: c.seen_retry_attempts,
+            smc_gate: SmcGateOverrides {
+                start: c.smc_gate_start,
+                end: c.smc_gate_end,
+                curve: c.smc_gate_curve,
+                stagnation_step: c.smc_gate_stagnation_step,
+                disable_gate: c.disable_smc_gate,
+            },
+            archive_scoring: ArchiveScoringOverrides {
+                mode: if c.archive_mode.trim().is_empty() {
+                    defaults.archive_scoring.mode.clone()
+                } else {
+                    c.archive_mode.trim().to_ascii_lowercase()
+                },
+                min_net: c.archive_min_net,
+                min_pf: c.archive_min_pf,
+                min_sharpe: c.archive_min_sharpe,
+            },
+            selection: SelectionPolicyOverrides {
+                parent: if c.parent_selection.trim().is_empty() {
+                    defaults.selection.parent
+                } else {
+                    ParentSelectionPolicy::parse(&c.parent_selection.trim().to_ascii_lowercase())
+                },
+                survivor: if c.survivor_selection.trim().is_empty() {
+                    defaults.selection.survivor
+                } else {
+                    SurvivorSelectionPolicy::parse(
+                        &c.survivor_selection.trim().to_ascii_lowercase(),
+                    )
+                },
+                immigrant_ratio: c.immigrant_ratio,
+                survivor_fraction: c.survivor_fraction,
+                temperature: c.selection_temperature,
+            },
+        }
     }
 
     /// Resolved SMC gate fields with audit-aligned clamping applied.
@@ -336,13 +391,13 @@ impl GeneticSearchRuntimeOverrides {
 }
 
 /// Optional symbol/currency/cost knobs that the legacy
-/// `FOREX_BOT_PROP_SYMBOL` / `ACCOUNT_CURRENCY` / `PIP_VALUE` /
+/// `NEOETHOS_BOT_PROP_SYMBOL` / `ACCOUNT_CURRENCY` / `PIP_VALUE` /
 /// `QUOTE_TO_ACCOUNT_RATE` / `PIP_VALUE_PER_LOT` / `SPREAD_PIPS` /
 /// `COMMISSION` env vars used to populate. Each field is `None` when no
 /// override has been installed; production callers that pass explicit
 /// values continue to bypass these fallbacks.
 ///
-/// `reject_pip_fallback` mirrors the legacy `FOREX_BOT_REJECT_PIP_FALLBACK=1`
+/// `reject_pip_fallback` mirrors the legacy `NEOETHOS_BOT_REJECT_PIP_FALLBACK=1`
 /// env var (F-CORE3 closure, 2026-05-25): when set, the cross-pair
 /// pip-value fallback `bail!()`s instead of silently returning the
 /// quote-currency pip value. Previously read inline inside
@@ -362,38 +417,38 @@ pub struct CostProfileRuntimeOverrides {
 
 impl CostProfileRuntimeOverrides {
     fn populate_from_env(&mut self) {
-        if let Some(value) = env_string_nonempty("FOREX_BOT_PROP_SYMBOL") {
+        if let Some(value) = env_string_nonempty("NEOETHOS_BOT_PROP_SYMBOL") {
             self.symbol = Some(value);
         }
-        if let Some(value) = env_string_nonempty("FOREX_BOT_PROP_ACCOUNT_CURRENCY") {
+        if let Some(value) = env_string_nonempty("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY") {
             self.account_currency = Some(value);
         }
-        if let Some(value) = env_f64_positive_finite("FOREX_BOT_PROP_PIP_VALUE") {
+        if let Some(value) = env_f64_positive_finite("NEOETHOS_BOT_PROP_PIP_VALUE") {
             self.pip_value = Some(value);
         }
-        if let Some(value) = env_f64_positive_finite("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE") {
+        if let Some(value) = env_f64_positive_finite("NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE") {
             self.quote_to_account_rate = Some(value);
         }
-        if let Some(value) = env_f64_positive_finite("FOREX_BOT_PROP_PIP_VALUE_PER_LOT") {
+        if let Some(value) = env_f64_positive_finite("NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT") {
             self.pip_value_per_lot = Some(value);
         }
-        if let Some(value) = env_f64_non_negative_finite("FOREX_BOT_PROP_SPREAD_PIPS") {
+        if let Some(value) = env_f64_non_negative_finite("NEOETHOS_BOT_PROP_SPREAD_PIPS") {
             self.spread_pips = Some(value);
         }
-        if let Some(value) = env_f64_non_negative_finite("FOREX_BOT_PROP_COMMISSION") {
+        if let Some(value) = env_f64_non_negative_finite("NEOETHOS_BOT_PROP_COMMISSION") {
             self.commission_per_trade = Some(value);
         }
-        // F-CORE3 closure (2026-05-25): legacy `FOREX_BOT_REJECT_PIP_FALLBACK=1`
+        // F-CORE3 closure (2026-05-25): legacy `NEOETHOS_BOT_REJECT_PIP_FALLBACK=1`
         // was previously read inline inside `reject_cross_pair_fallback()`
         // in `strategy_gene.rs`; now consolidated to this typed boundary.
-        if env_truthy("FOREX_BOT_REJECT_PIP_FALLBACK") {
+        if env_truthy("NEOETHOS_BOT_REJECT_PIP_FALLBACK") {
             self.reject_pip_fallback = true;
         }
     }
 }
 
 /// SMC weight knobs that previously lived in the
-/// `FOREX_BOT_PROP_SMC_W_*` env vars and the `FOREX_BOT_PROP_SMC_GATE`
+/// `NEOETHOS_BOT_PROP_SMC_W_*` env vars and the `NEOETHOS_BOT_PROP_SMC_GATE`
 /// fallback used by `EvaluationConfig::default`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SmcWeightRuntimeOverrides {
@@ -432,40 +487,40 @@ impl Default for SmcWeightRuntimeOverrides {
 
 impl SmcWeightRuntimeOverrides {
     fn populate_from_env(&mut self) {
-        if let Some(value) = env_f32_finite("FOREX_BOT_PROP_SMC_GATE") {
+        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_GATE") {
             self.gate_threshold = value;
         }
-        if let Some(value) = env_f32_finite("FOREX_BOT_PROP_SMC_W_OB") {
+        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_OB") {
             self.w_ob = value;
         }
-        if let Some(value) = env_f32_finite("FOREX_BOT_PROP_SMC_W_FVG") {
+        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_FVG") {
             self.w_fvg = value;
         }
-        if let Some(value) = env_f32_finite("FOREX_BOT_PROP_SMC_W_LIQ") {
+        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_LIQ") {
             self.w_liq = value;
         }
-        if let Some(value) = env_f32_finite("FOREX_BOT_PROP_SMC_W_MTF") {
+        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_MTF") {
             self.w_mtf = value;
         }
-        if let Some(value) = env_f32_finite("FOREX_BOT_PROP_SMC_W_PREMIUM") {
+        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_PREMIUM") {
             self.w_premium = value;
         }
-        if let Some(value) = env_f32_finite("FOREX_BOT_PROP_SMC_W_INDUCEMENT") {
+        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_INDUCEMENT") {
             self.w_inducement = value;
         }
-        if let Some(value) = env_f32_finite("FOREX_BOT_PROP_SMC_W_BOS") {
+        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_BOS") {
             self.w_bos = value;
         }
-        if let Some(value) = env_f32_finite("FOREX_BOT_PROP_SMC_W_CHOCH") {
+        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_CHOCH") {
             self.w_choch = value;
         }
-        if let Some(value) = env_f32_finite("FOREX_BOT_PROP_SMC_W_EQH") {
+        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_EQH") {
             self.w_eqh = value;
         }
-        if let Some(value) = env_f32_finite("FOREX_BOT_PROP_SMC_W_EQL") {
+        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_EQL") {
             self.w_eql = value;
         }
-        if let Some(value) = env_f32_finite("FOREX_BOT_PROP_SMC_W_DISPLACEMENT") {
+        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_DISPLACEMENT") {
             self.w_displacement = value;
         }
     }
@@ -473,10 +528,10 @@ impl SmcWeightRuntimeOverrides {
 
 /// Typed runtime overrides for `EvaluationConfig::default` and
 /// `infer_market_cost_profile`. Cost knobs replace the
-/// `FOREX_BOT_PROP_SYMBOL` / `ACCOUNT_CURRENCY` / `PIP_VALUE` /
+/// `NEOETHOS_BOT_PROP_SYMBOL` / `ACCOUNT_CURRENCY` / `PIP_VALUE` /
 /// `QUOTE_TO_ACCOUNT_RATE` / `PIP_VALUE_PER_LOT` / `SPREAD_PIPS` /
 /// `COMMISSION` env vars; SMC weight knobs replace the
-/// `FOREX_BOT_PROP_SMC_W_*` and `FOREX_BOT_PROP_SMC_GATE` env vars used
+/// `NEOETHOS_BOT_PROP_SMC_W_*` and `NEOETHOS_BOT_PROP_SMC_GATE` env vars used
 /// at evaluation-config construction time.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StrategyEvaluationRuntimeOverrides {
@@ -485,13 +540,62 @@ pub struct StrategyEvaluationRuntimeOverrides {
 }
 
 impl StrategyEvaluationRuntimeOverrides {
-    /// One-shot read of the legacy `FOREX_BOT_PROP_*` evaluation env
+    /// One-shot read of the legacy `NEOETHOS_BOT_PROP_*` evaluation env
     /// vars.
     pub fn from_env() -> Self {
         let mut overrides = Self::default();
         overrides.cost_profile.populate_from_env();
         overrides.smc_weights.populate_from_env();
         overrides
+    }
+
+    /// Config-driven constructor — reads the cost-profile + SMC-weight
+    /// knobs from the single `Settings` (config / UI / TUI) instead of the
+    /// environment. Mirrors [`Self::from_env`]; `None` cost fields stay
+    /// `None`. Numeric cost overrides are validated the same way the env
+    /// reader validated them (positive / non-negative finite). A
+    /// `from_settings(&Settings::default()) == default()` test guarantees
+    /// no behavior change vs the pre-config build.
+    pub fn from_settings(s: &neoethos_core::Settings) -> Self {
+        let c = &s.models.eval_runtime;
+        Self {
+            cost_profile: CostProfileRuntimeOverrides {
+                symbol: c
+                    .symbol
+                    .clone()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
+                account_currency: c
+                    .account_currency
+                    .clone()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
+                pip_value: c.pip_value.filter(|v| v.is_finite() && *v > 0.0),
+                quote_to_account_rate: c
+                    .quote_to_account_rate
+                    .filter(|v| v.is_finite() && *v > 0.0),
+                pip_value_per_lot: c.pip_value_per_lot.filter(|v| v.is_finite() && *v > 0.0),
+                spread_pips: c.spread_pips.filter(|v| v.is_finite() && *v >= 0.0),
+                commission_per_trade: c
+                    .commission_per_trade
+                    .filter(|v| v.is_finite() && *v >= 0.0),
+                reject_pip_fallback: c.reject_pip_fallback,
+            },
+            smc_weights: SmcWeightRuntimeOverrides {
+                gate_threshold: c.smc_gate_threshold,
+                w_ob: c.smc_w_ob,
+                w_fvg: c.smc_w_fvg,
+                w_liq: c.smc_w_liq,
+                w_mtf: c.smc_w_mtf,
+                w_premium: c.smc_w_premium,
+                w_inducement: c.smc_w_inducement,
+                w_bos: c.smc_w_bos,
+                w_choch: c.smc_w_choch,
+                w_eqh: c.smc_w_eqh,
+                w_eql: c.smc_w_eql,
+                w_displacement: c.smc_w_displacement,
+            },
+        }
     }
 }
 
@@ -507,11 +611,18 @@ pub fn install_strategy_evaluation_runtime_overrides(
     STRATEGY_EVALUATION_RUNTIME_OVERRIDES.set(overrides)
 }
 
-/// Convenience wrapper that resolves the legacy `FOREX_BOT_PROP_*`
+/// Convenience wrapper that resolves the legacy `NEOETHOS_BOT_PROP_*`
 /// evaluation env vars once and installs them. Idempotent.
 pub fn install_strategy_evaluation_runtime_overrides_from_env() {
     let _ =
         STRATEGY_EVALUATION_RUNTIME_OVERRIDES.set(StrategyEvaluationRuntimeOverrides::from_env());
+}
+
+/// Config-driven install — reads the strategy-evaluation knobs from the
+/// single `Settings` instead of the environment. Idempotent.
+pub fn install_strategy_evaluation_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
+    let _ = STRATEGY_EVALUATION_RUNTIME_OVERRIDES
+        .set(StrategyEvaluationRuntimeOverrides::from_settings(s));
 }
 
 /// Returns the currently installed strategy-evaluation runtime
@@ -599,10 +710,16 @@ pub fn install_genetic_search_runtime_overrides(
     GENETIC_SEARCH_RUNTIME_OVERRIDES.set(overrides)
 }
 
-/// Convenience wrapper that resolves the legacy `FOREX_BOT_*` search env
+/// Convenience wrapper that resolves the legacy `NEOETHOS_BOT_*` search env
 /// vars once and installs them. Idempotent.
 pub fn install_genetic_search_runtime_overrides_from_env() {
     let _ = GENETIC_SEARCH_RUNTIME_OVERRIDES.set(GeneticSearchRuntimeOverrides::from_env());
+}
+
+/// Config-driven install — reads the genetic-search knobs from the single
+/// `Settings` instead of the environment. Idempotent (first install wins).
+pub fn install_genetic_search_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
+    let _ = GENETIC_SEARCH_RUNTIME_OVERRIDES.set(GeneticSearchRuntimeOverrides::from_settings(s));
 }
 
 /// Returns the currently installed genetic search runtime overrides, or
@@ -647,6 +764,31 @@ mod tests {
         assert!((defaults.selection.immigrant_ratio - 0.25).abs() < 1e-9);
         assert!((defaults.selection.survivor_fraction - 0.10).abs() < 1e-9);
         assert!((defaults.selection.temperature - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn from_settings_default_matches_env_default() {
+        // Behavior-preservation gate: an operator who sets nothing must
+        // get byte-identical overrides to the pre-config (env-default)
+        // build. Guards the duplicated defaults in
+        // `neoethos_core::config::SearchRuntimeConfig::default()`.
+        let s = neoethos_core::Settings::default();
+        assert_eq!(
+            GeneticSearchRuntimeOverrides::from_settings(&s),
+            GeneticSearchRuntimeOverrides::default()
+        );
+    }
+
+    #[test]
+    fn strategy_eval_from_settings_default_matches_env_default() {
+        // Behavior-preservation gate for the eval (cost-profile + SMC
+        // weight) knobs — a fresh `Settings` must reproduce the engine
+        // defaults exactly.
+        let s = neoethos_core::Settings::default();
+        assert_eq!(
+            StrategyEvaluationRuntimeOverrides::from_settings(&s),
+            StrategyEvaluationRuntimeOverrides::default()
+        );
     }
 
     #[test]

@@ -317,19 +317,3 @@ news:
   news_backfill_days: 0  # 0 = full data span
   enable_llm_helper: true
   llm_helper_enabled: true
-  # This is the **news-blackout LLM model** for the public OpenAI
-  # Chat-Completions API (`https://api.openai.com/v1/chat/completions`,
-  # used with your own `OPENAI_API_KEY`). It is SEPARATE from the
-  # AI Helper, which talks to the ChatGPT-subscription Codex endpoint
-  # and is hardwired to `gpt-5.5` in
-  # `crates/neoethos-codex/src/client.rs` (F-291 — the only model that
-  # endpoint accepts; do NOT put `gpt-5.5` here, it is not a valid
-  # public-API model name).
-  #
-  # NOTE (tech-debt): the news-blackout filter in
-  # `crates/neoethos-core/src/domain/news_filter.rs` currently uses a
-  # hardcoded `gpt-4o-mini`, so this field is advisory until that call
-  # site is wired to read it. Kept as a valid public model so that
-  # wiring is a one-line change rather than also a config fix.
-  openai_model: "gpt-4o-mini"
-  openai_max_tokens: 1000

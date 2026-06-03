@@ -31,7 +31,7 @@ at the bottom.
 
 ## Section 1 — Broker connectivity (cTrader)
 
-### `FOREX_BOT_CTRADER_READ_TIMEOUT_SECS`
+### `NEOETHOS_BOT_CTRADER_READ_TIMEOUT_SECS`
 - **Type:** `u64`, `[0, 3600]` (0 disables timeout)
 - **Default:** `30`
 - **Effect:** caps the underlying TCP read inside `execute_via_session`.
@@ -46,7 +46,7 @@ at the bottom.
 - **When to raise:** if you see intermittent timeouts on a slow
   consumer connection.
 
-### `FOREX_BOT_CTRADER_MAX_ATTEMPTS`
+### `NEOETHOS_BOT_CTRADER_MAX_ATTEMPTS`
 - **Type:** `u32`, clamped `[1, 5]`
 - **Default:** `3`
 - **Effect:** maximum attempts (initial + retries) for a single
@@ -56,7 +56,7 @@ at the bottom.
 - **Balanced:** `3`
 - **Aggressive:** `5` (more retries; only if you trust the broker's dedup)
 
-### `FOREX_BOT_CTRADER_BACKOFF_BASE_MS`
+### `NEOETHOS_BOT_CTRADER_BACKOFF_BASE_MS`
 - **Type:** `u64`, clamped `[10, 2000]`
 - **Default:** `200`
 - **Effect:** base backoff in ms for cTrader retries. Actual delay
@@ -65,7 +65,7 @@ at the bottom.
 - **Balanced:** `200`
 - **Aggressive:** `100`
 
-### `FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL`
+### `NEOETHOS_BOT_CTRADER_ALLOW_PARTIAL_FILL`
 - **Type:** `bool` (`1` / `true` / `yes` → on; anything else → off)
 - **Default:** `false`
 - **Effect:** when `false`, partial fills are rejected and bubble up
@@ -74,7 +74,7 @@ at the bottom.
 - **Balanced:** `false`
 - **Aggressive:** `true` (accept what you can get on illiquid pairs)
 
-### `FOREX_BOT_CTRADER_STREAM_MAX_ATTEMPTS`
+### `NEOETHOS_BOT_CTRADER_STREAM_MAX_ATTEMPTS`
 - **Type:** `u32`, clamped `[1, 5]`
 - **Default:** `3`
 - **Effect:** maximum attempts for `load_live_chart_update`
@@ -82,13 +82,13 @@ at the bottom.
 - **Recommendation:** keep at default unless you see explicit
   streaming retry errors in the log.
 
-### `FOREX_BOT_CTRADER_STREAM_BACKOFF_BASE_MS`
+### `NEOETHOS_BOT_CTRADER_STREAM_BACKOFF_BASE_MS`
 - **Type:** `u64`, clamped `[10, 2000]`
 - **Default:** `200`
-- **Effect:** same as `FOREX_BOT_CTRADER_BACKOFF_BASE_MS` but for the
+- **Effect:** same as `NEOETHOS_BOT_CTRADER_BACKOFF_BASE_MS` but for the
   streaming layer.
 
-### `FOREX_BOT_CHART_MERGE_SIDE`
+### `NEOETHOS_BOT_CHART_MERGE_SIDE`
 - **Type:** enum `mid` | `bid` | `ask` (case-insensitive)
 - **Default:** `mid`
 - **Effect:** chooses which side of the spread the chart-merge layer
@@ -108,7 +108,7 @@ at the bottom.
 
 ## Section 2 — Risk & PnL safety
 
-### `FOREX_BOT_PROP_ACCOUNT_CURRENCY`
+### `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY`
 - **Type:** ISO-4217 currency code (`USD`, `EUR`, `GBP`, `JPY`, etc.)
 - **Default:** **unset → hard-fail at the risk gate.** No synthetic
   default per real-data directive (2026-05-24).
@@ -121,7 +121,7 @@ at the bottom.
   Operator-supplied via Settings → Broker Setup once at account
   configuration time; never auto-defaulted.
 
-### `FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE`
+### `NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE`
 - **Type:** `f64`, finite + `> 0.0`
 - **Default:** `None` (cross-pair pip-value math fails without it)
 - **Effect:** live quote→account FX rate override for cross pairs.
@@ -131,7 +131,7 @@ at the bottom.
 - **Recommendation:** set only for offline backtests / paper trading
   where no live broker is connected.
 
-### `FOREX_BOT_PNL_AUDIT_DRIFT_FRACTION`
+### `NEOETHOS_BOT_PNL_AUDIT_DRIFT_FRACTION`
 - **Type:** `f64`, clamped `[1e-5, 0.05]`
 - **Default:** `0.001` (0.1 %)
 - **Effect:** drift threshold for the PnL audit log. When broker-side
@@ -142,7 +142,7 @@ at the bottom.
 - **Balanced:** `0.001` (10bp — default)
 - **Aggressive:** `0.005` (50bp — only loud drift)
 
-### `FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION`
+### `NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION`
 - **Type:** `f64`, clamped `[1e-4, 0.20]`
 - **Default:** `0.01` (1 %)
 - **Effect:** circuit-breaker threshold. When drift exceeds this
@@ -186,7 +186,7 @@ at the bottom.
 
 ## Section 3 — Discovery / GA search
 
-### `FOREX_BOT_SEARCH_SEED`
+### `NEOETHOS_BOT_SEARCH_SEED`
 - **Type:** `u64` (any non-negative integer)
 - **Default:** `None` → non-deterministic (OS RNG)
 - **Effect:** RNG seed for the genetic search. Setting any value
@@ -194,7 +194,7 @@ at the bottom.
 - **Recommendation:** set during validation runs to compare changes.
   Leave unset for production search.
 
-### `FOREX_BOT_NOVELTY_WEIGHT`
+### `NEOETHOS_BOT_NOVELTY_WEIGHT`
 - **Type:** `f64`, finite
 - **Default:** `0.0` (novelty disabled)
 - **Effect:** weight applied to the novelty bonus during candidate
@@ -205,7 +205,7 @@ at the bottom.
 - **Balanced:** `0.05`
 - **Aggressive:** `0.15`
 
-### `FOREX_BOT_PROP_STAGNATION_GENS`
+### `NEOETHOS_BOT_PROP_STAGNATION_GENS`
 - **Type:** `usize`, `>= 1`
 - **Default:** `2`
 - **Effect:** number of stagnant generations the search tolerates
@@ -214,7 +214,7 @@ at the bottom.
 - **Balanced:** `2`
 - **Aggressive:** `5` (let the search push through stagnation)
 
-### `FOREX_BOT_PROP_TOURNAMENT_SIZE`
+### `NEOETHOS_BOT_PROP_TOURNAMENT_SIZE`
 - **Type:** `usize`, `>= 2`
 - **Default:** `max(population / 12, 3)`
 - **Effect:** tournament size for selection. Larger tournaments →
@@ -222,7 +222,7 @@ at the bottom.
 - **Recommendation:** leave at default unless you know your search
   is converging too slowly (raise) or losing diversity (lower).
 
-### `FOREX_BOT_PROP_ARCHIVE_CAP`
+### `NEOETHOS_BOT_PROP_ARCHIVE_CAP`
 - **Type:** `usize`, clamped `[population, 200_000]`
 - **Default:** derived as `min(population × generations, 50_000)`
 - **Effect:** maximum genes stored in the archive. Larger archive →
@@ -230,7 +230,7 @@ at the bottom.
 - **Recommendation:** default unless RAM-constrained or running a
   very-long deep search.
 
-### `FOREX_BOT_PROP_SMC_GATE_START` / `_END` / `_CURVE` / `_STAGNATION_STEP`
+### `NEOETHOS_BOT_PROP_SMC_GATE_START` / `_END` / `_CURVE` / `_STAGNATION_STEP`
 - **Type:** `f32`, finite
 - **Defaults:** start `0.75`, end `0.35`, curve `1.0`, stagnation_step `0.03`
 - **Effect:** the SMC-gate threshold curve. Starts at `start`, eases
@@ -242,7 +242,7 @@ at the bottom.
 - **Balanced:** defaults
 - **Aggressive:** `start: 0.65, end: 0.25, curve: 0.7` (permissive)
 
-### `FOREX_BOT_DISABLE_SMC_GATE`
+### `NEOETHOS_BOT_DISABLE_SMC_GATE`
 - **Type:** `bool` (`1` / `true` / `TRUE`)
 - **Default:** `false`
 - **Effect:** hard-bypass for the SMC gate. When `true`, the gate
@@ -252,7 +252,7 @@ at the bottom.
 - **Conservative/Balanced/Aggressive:** all `false` for production.
   Diagnostic-only toggle.
 
-### `FOREX_BOT_PROP_ARCHIVE_MODE` / `_MIN_NET` / `_MIN_PF` / `_MIN_SHARPE`
+### `NEOETHOS_BOT_PROP_ARCHIVE_MODE` / `_MIN_NET` / `_MIN_PF` / `_MIN_SHARPE`
 - **Type:** mode = `net` | `pf` | `sharpe`; floors = `f64`
 - **Defaults:** mode `net`, min_net `0.0`, min_pf `1.0`, min_sharpe `0.0`
 - **Effect:** archive admission criteria. Strategies must clear the
@@ -261,7 +261,7 @@ at the bottom.
 - **Balanced:** defaults
 - **Aggressive:** `mode: pf, min_pf: 1.1` (more candidates archived)
 
-### `FOREX_BOT_PROP_PARENT_SELECTION` / `_SURVIVOR_SELECTION`
+### `NEOETHOS_BOT_PROP_PARENT_SELECTION` / `_SURVIVOR_SELECTION`
 - **Type:** enum `rank_weighted` | `tournament` | `truncation`
 - **Defaults:** both `rank_weighted`
 - **Effect:** how the GA picks parents (for crossover) and survivors
@@ -270,7 +270,7 @@ at the bottom.
   is most aggressive (deterministic top-K).
 - **Recommendation:** keep at default unless you know what you're doing.
 
-### `FOREX_BOT_PROP_RANDOM_IMMIGRANTS` / `_SURVIVOR_FRACTION` / `_SELECTION_TEMPERATURE`
+### `NEOETHOS_BOT_PROP_RANDOM_IMMIGRANTS` / `_SURVIVOR_FRACTION` / `_SELECTION_TEMPERATURE`
 - **Defaults:** immigrants `0.25`, survivors `0.10`, temperature `0.75`
 - **Effect:** GA population-management knobs.
   - Immigrants: fraction of each generation replaced with random new genes (diversity injection)
@@ -280,18 +280,18 @@ at the bottom.
 - **Balanced:** defaults
 - **Aggressive:** `immigrants: 0.40, survivors: 0.05, temperature: 1.5`
 
-### `FOREX_BOT_PREFILTER_TOP_K` / `_INSAMPLE`
+### `NEOETHOS_BOT_PREFILTER_TOP_K` / `_INSAMPLE`
 - **Type:** `usize`
 - **Effect:** stage-1 pre-filter — only the top-K candidates by
   in-sample score advance to stage-2.
 - **Recommendation:** keep at default unless deep-tuning.
 
-### `FOREX_BOT_FUNNEL_STAGE1_PCT` / `_WINDOW`
+### `NEOETHOS_BOT_FUNNEL_STAGE1_PCT` / `_WINDOW`
 - **Type:** `f64` / `usize`
 - **Effect:** funnel scoring — what fraction of the in-sample window
   is used for stage-1, and the window size in bars.
 
-### `FOREX_BOT_MIN_HISTORY_YEARS`
+### `NEOETHOS_BOT_MIN_HISTORY_YEARS`
 - **Type:** `usize` (years)
 - **Default:** depends on `DiscoveryRuntimeOverrides`
 - **Effect:** minimum historical-data requirement before a symbol is
@@ -301,7 +301,7 @@ at the bottom.
 - **Balanced:** `3`
 - **Aggressive:** `2`
 
-### `FOREX_BOT_DISCOVERY_MODE`
+### `NEOETHOS_BOT_DISCOVERY_MODE`
 - **Type:** enum (operator's discovery-mode set)
 - **Effect:** which discovery-mode preset governs filtering.
   Permissive vs. strict vs. operator-tuned.
@@ -310,7 +310,7 @@ at the bottom.
 
 ## Section 4 — Cost model / pip-value
 
-### `FOREX_BOT_PROP_PIP_VALUE`
+### `NEOETHOS_BOT_PROP_PIP_VALUE`
 - **Type:** `f64`, positive + finite
 - **Default:** `None` → use the broker-supplied metadata
 - **Effect:** override the per-symbol pip value (account currency
@@ -319,10 +319,10 @@ at the bottom.
   which is sourced from cTrader `ProtoOASymbol` records.
 - **Recommendation:** leave unset; let the broker metadata drive.
 
-### `FOREX_BOT_PROP_PIP_VALUE_PER_LOT`
+### `NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT`
 - Same as above but expressed per-lot rather than per-pip-per-lot.
 
-### `FOREX_BOT_PROP_SPREAD_PIPS`
+### `NEOETHOS_BOT_PROP_SPREAD_PIPS`
 - **Type:** `f64`, non-negative + finite
 - **Default:** broker-quoted
 - **Effect:** override the spread (in pips) used during backtest
@@ -332,14 +332,14 @@ at the bottom.
 - **Balanced:** broker-quoted (None)
 - **Aggressive:** `0.0` (zero-friction; for theoretical comparisons)
 
-### `FOREX_BOT_PROP_COMMISSION`
+### `NEOETHOS_BOT_PROP_COMMISSION`
 - **Type:** `f64`, non-negative + finite
 - **Default:** broker-quoted (typically `$3-7 / round-trip / standard lot`)
 - **Effect:** override commission per trade.
 - **Recommendation:** stress-test with the worst-case commission your
   broker quotes for your account class.
 
-### `FOREX_BOT_REJECT_PIP_FALLBACK`
+### `NEOETHOS_BOT_REJECT_PIP_FALLBACK`
 - **Type:** `bool`
 - **Default:** `false`
 - **Effect:** when `true`, the cross-pair pip-value fallback
@@ -354,7 +354,7 @@ at the bottom.
 
 ## Section 5 — Quality / acceptance filtering
 
-### `FOREX_BOT_PROP_MIN_TRADES_PER_MONTH`
+### `NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH`
 - **Type:** `usize`
 - **Default:** `4`
 - **Effect:** strategies with fewer trades per month than this are
@@ -363,7 +363,7 @@ at the bottom.
 - **Balanced:** `4`
 - **Aggressive:** `2`
 
-### `FOREX_BOT_TRADING_DAYS_PER_MONTH`
+### `NEOETHOS_BOT_TRADING_DAYS_PER_MONTH`
 - **Type:** `f64`, `>= 1.0`
 - **Default:** `21.0`
 - **Effect:** trading days per month used in the normalization math.
@@ -375,19 +375,19 @@ at the bottom.
 
 ## Section 6 — Backtest runtime
 
-### `FOREX_BOT_BACKTEST_INITIAL_EQUITY`
+### `NEOETHOS_BOT_BACKTEST_INITIAL_EQUITY`
 - **Type:** `f64`, positive + finite
 - **Default:** `100_000.0`
 - **Effect:** starting equity for the backtest simulation.
   Independent of any live account.
 
-### `FOREX_BOT_BACKTEST_MAX_MONTH_BUCKETS`
+### `NEOETHOS_BOT_BACKTEST_MAX_MONTH_BUCKETS`
 - **Type:** `usize`
 - **Default:** `240` (20 years)
 - **Effect:** maximum month buckets the backtest will track for
   by-month statistics. Caps RAM on very-long history runs.
 
-### `FOREX_BOT_RUST_THREADS` / `RAYON_NUM_THREADS`
+### `NEOETHOS_BOT_RUST_THREADS` / `RAYON_NUM_THREADS`
 - **Type:** `usize`
 - **Default:** num CPU cores
 - **Effect:** Rayon worker thread count. Lower if you want to keep
@@ -397,7 +397,7 @@ at the bottom.
 - **Balanced:** all cores
 - **Aggressive:** all cores + lower OS process priority
 
-### `FOREX_BOT_SEARCH_EVAL_PRECISION` / `FOREX_BOT_TRAIN_PRECISION`
+### `NEOETHOS_BOT_SEARCH_EVAL_PRECISION` / `NEOETHOS_BOT_TRAIN_PRECISION`
 - **Type:** enum `fp32` | `bf16` | `fp16` | `bf4` | `fp8`
 - **Default:** `fp32`
 - **Effect:** numeric precision for evaluation. Lower precision is
@@ -408,10 +408,10 @@ at the bottom.
   rounding noise doesn't break your discovery results.
 
 ### CUDA-specific knobs (when `--features gpu`)
-- `FOREX_BOT_SEARCH_EVAL_CUDA_KERNEL` — `0/1` to disable/enable GPU eval kernel
-- `FOREX_BOT_SEARCH_BACKTEST_CUDA_KERNEL` — same for backtest kernel
-- `FOREX_BOT_SEARCH_EVAL_KERNEL_UNITS` — units-per-cube override
-- `FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE` — device index (default 0)
+- `NEOETHOS_BOT_SEARCH_EVAL_CUDA_KERNEL` — `0/1` to disable/enable GPU eval kernel
+- `NEOETHOS_BOT_SEARCH_BACKTEST_CUDA_KERNEL` — same for backtest kernel
+- `NEOETHOS_BOT_SEARCH_EVAL_KERNEL_UNITS` — units-per-cube override
+- `NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE` — device index (default 0)
 
 ---
 
@@ -428,13 +428,13 @@ at the bottom.
 - **Default:** `dirs::data_local_dir()` (Windows: `%LOCALAPPDATA%`)
 - **Effect:** override the user-data root (logs + state).
 
-### `FOREX_BOT_SYMBOL_METADATA`
+### `NEOETHOS_BOT_SYMBOL_METADATA`
 - **Type:** absolute file path
 - **Default:** `data/symbol_metadata.json` (auto-populated from cTrader)
 - **Effect:** override the symbol-metadata source file. Useful for
   offline backtests with a frozen symbol set.
 
-### `FOREX_BOT_LIVE_JOURNAL_PATH`
+### `NEOETHOS_BOT_LIVE_JOURNAL_PATH`
 - **Type:** absolute path
 - **Default:** under user-data-dir
 - **Effect:** override the live trading journal location.
@@ -518,6 +518,6 @@ The Flutter Settings screen renders this catalog by:
    effect.
 
 **Backward compatibility:** every knob continues to be settable via
-its legacy `FOREX_BOT_*` env var. The Settings screen and env vars
+its legacy `NEOETHOS_BOT_*` env var. The Settings screen and env vars
 both write into the same typed `*RuntimeOverrides` struct, so they
 are interchangeable at the read site.

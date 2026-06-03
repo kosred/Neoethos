@@ -216,7 +216,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
           'Estimated runtime: $eta · pop × gen × candidates = '
           '${_population * _generations * _targetCandidates} evaluations · '
           '${_higherTfs.length} higher-TF',
-          style: const TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+          style: const TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
         ),
         initiallyExpanded: _advancedOpen,
         onExpansionChanged: (v) => setState(() => _advancedOpen = v),
@@ -302,7 +302,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
             'Discovery cross-confirms entries against these higher TFs in '
             'addition to the base TF. Default mirrors backend '
             'DEFAULT_HIGHER_TFS (M5/M15/H1).',
-            style: TextStyle(fontSize: 10, color: ForexAiTokens.textMuted),
+            style: TextStyle(fontSize: 10, color: NeoethosTokens.textMuted),
           ),
           const SizedBox(height: 8),
           tfAsync.when(
@@ -311,7 +311,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                 return const Text(
                   '/broker/timeframes returned an empty list — check '
                   'neoethos_core::CANONICAL_TIMEFRAMES.',
-                  style: TextStyle(fontSize: 11, color: ForexAiTokens.sell),
+                  style: TextStyle(fontSize: 11, color: NeoethosTokens.sell),
                 );
               }
               return Wrap(
@@ -358,11 +358,11 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
             },
             loading: () => const Text(
               'Loading /broker/timeframes…',
-              style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+              style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
             ),
             error: (err, _) => Text(
               'Cannot fetch timeframes from broker: $err',
-              style: const TextStyle(fontSize: 11, color: ForexAiTokens.warning),
+              style: const TextStyle(fontSize: 11, color: NeoethosTokens.warning),
             ),
           ),
         ],
@@ -413,7 +413,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
               'uses the same base TF + higher-TF set + GA knobs. The '
               'next symbol starts only after the previous one reaches '
               'a terminal state (Succeeded / Failed / Cancelled).',
-              style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+              style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
             ),
             const SizedBox(height: 10),
             _queueAddRow(),
@@ -462,7 +462,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
               if (list.isEmpty) {
                 return const Text(
                   'TF list empty',
-                  style: TextStyle(fontSize: 11, color: ForexAiTokens.sell),
+                  style: TextStyle(fontSize: 11, color: NeoethosTokens.sell),
                 );
               }
               final current =
@@ -498,12 +498,12 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
             },
             loading: () => const Text(
               'Loading TFs…',
-              style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+              style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
             ),
             error: (err, _) => Text(
               'Could not load timeframes — ${describeError(err)}. '
               'Authenticate in Broker Setup, then refresh.',
-              style: const TextStyle(fontSize: 11, color: ForexAiTokens.warning),
+              style: const TextStyle(fontSize: 11, color: NeoethosTokens.warning),
             ),
           ),
         ),
@@ -548,7 +548,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
           'Queue empty — single-pair controls are active below.',
           style: TextStyle(
             fontSize: 11,
-            color: ForexAiTokens.textFaint,
+            color: NeoethosTokens.textFaint,
             fontStyle: FontStyle.italic,
           ),
         ),
@@ -568,9 +568,9 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
     final isActive = _queueRunning && index == _queueCursor;
     final isDone = _queueRunning && index < _queueCursor;
     final color = isActive
-        ? ForexAiTokens.buy
+        ? NeoethosTokens.buy
         : isDone
-            ? ForexAiTokens.textMuted
+            ? NeoethosTokens.textMuted
             : null;
     return Chip(
       avatar: Container(
@@ -579,10 +579,10 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
         decoration: BoxDecoration(
           shape: BoxShape.circle,
           color: isActive
-              ? ForexAiTokens.buy
+              ? NeoethosTokens.buy
               : isDone
-                  ? ForexAiTokens.textMuted
-                  : ForexAiTokens.textFaint,
+                  ? NeoethosTokens.textMuted
+                  : NeoethosTokens.textFaint,
         ),
         alignment: Alignment.center,
         child: Text(
@@ -632,7 +632,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
             side: BorderSide(
               color: _queueRunning
                   ? const Color(0xFFB71C1C)
-                  : ForexAiTokens.textFaint,
+                  : NeoethosTokens.textFaint,
             ),
           ),
           onPressed: _queueRunning ? _abortQueue : null,
@@ -674,7 +674,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
               liveSummary,
               style: const TextStyle(
                 fontSize: 11,
-                color: ForexAiTokens.textMuted,
+                color: NeoethosTokens.textMuted,
               ),
             ),
           ],
@@ -903,7 +903,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
             hint,
             style: const TextStyle(
               fontSize: 10,
-              color: ForexAiTokens.textMuted,
+              color: NeoethosTokens.textMuted,
             ),
           ),
         ],
@@ -1017,25 +1017,25 @@ class _DiscoveryLiveStats extends StatelessWidget {
                 const Icon(
                   Icons.insights,
                   size: 16,
-                  color: ForexAiTokens.accent,
+                  color: NeoethosTokens.accent,
                 ),
                 const SizedBox(width: 6),
                 const Text(
                   'Live stats',
                   style: TextStyle(
                     fontWeight: FontWeight.w700,
-                    fontSize: ForexAiTokens.fsBody,
+                    fontSize: NeoethosTokens.fsBody,
                     letterSpacing: 0.4,
-                    color: ForexAiTokens.textPrimary,
+                    color: NeoethosTokens.textPrimary,
                   ),
                 ),
                 const Spacer(),
                 Text(
                   pctLabel,
                   style: const TextStyle(
-                    fontSize: ForexAiTokens.fsCaption,
+                    fontSize: NeoethosTokens.fsCaption,
                     fontWeight: FontWeight.w700,
-                    color: ForexAiTokens.accent,
+                    color: NeoethosTokens.accent,
                     fontFeatures: [FontFeature.tabularFigures()],
                   ),
                 ),
@@ -1046,20 +1046,20 @@ class _DiscoveryLiveStats extends StatelessWidget {
               Text(
                 stage,
                 style: const TextStyle(
-                  fontSize: ForexAiTokens.fsCaption,
-                  color: ForexAiTokens.textMuted,
+                  fontSize: NeoethosTokens.fsCaption,
+                  color: NeoethosTokens.textMuted,
                 ),
               ),
             ],
             const SizedBox(height: 8),
             ClipRRect(
-              borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+              borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
               child: LinearProgressIndicator(
                 value: percent,
                 minHeight: 4,
-                backgroundColor: ForexAiTokens.appBg,
+                backgroundColor: NeoethosTokens.appBg,
                 valueColor: const AlwaysStoppedAnimation<Color>(
-                  ForexAiTokens.accent,
+                  NeoethosTokens.accent,
                 ),
               ),
             ),
@@ -1087,9 +1087,9 @@ class _StatChip extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: ForexAiTokens.appBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.appBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -1098,19 +1098,19 @@ class _StatChip extends StatelessWidget {
           Text(
             label.toUpperCase(),
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsCaption - 1,
+              fontSize: NeoethosTokens.fsCaption - 1,
               fontWeight: FontWeight.w700,
               letterSpacing: 0.6,
-              color: ForexAiTokens.textFaint,
+              color: NeoethosTokens.textFaint,
             ),
           ),
           const SizedBox(height: 2),
           Text(
             value,
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsBody,
+              fontSize: NeoethosTokens.fsBody,
               fontWeight: FontWeight.w800,
-              color: ForexAiTokens.textPrimary,
+              color: NeoethosTokens.textPrimary,
               fontFeatures: [FontFeature.tabularFigures()],
             ),
           ),
@@ -1127,7 +1127,7 @@ class _Loading extends StatelessWidget {
         padding: EdgeInsets.symmetric(vertical: 16),
         child: Text(
           'Loading engine state…',
-          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

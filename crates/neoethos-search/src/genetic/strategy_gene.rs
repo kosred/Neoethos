@@ -199,7 +199,7 @@ fn default_contract_size(symbol: &str) -> f64 {
 /// When `None`, we fall back to a price-hint-only model that is correct for
 /// pairs where account currency is base or quote, and approximate (but
 /// flagged via `tracing::warn`) for cross pairs. Set the env override
-/// `FOREX_BOT_PROP_PIP_VALUE_PER_LOT` to bypass this entirely when the
+/// `NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT` to bypass this entirely when the
 /// caller already knows the value (e.g. straight from cTrader metadata).
 fn estimate_pip_value_per_lot(
     symbol: &str,
@@ -231,7 +231,7 @@ fn estimate_pip_value_per_lot(
         if let Some(rate) = conv_rate {
             return (pip_value_quote * rate).max(1e-6);
         }
-        // No rate supplied. Strict mode (`FOREX_BOT_REJECT_PIP_FALLBACK=1`)
+        // No rate supplied. Strict mode (`NEOETHOS_BOT_REJECT_PIP_FALLBACK=1`)
         // returns NaN so downstream PnL collapses to NaN and the strategy
         // is rejected by the evaluator's existing fitness guard, surfacing
         // the misconfiguration instead of silently shipping wrong sizing.
@@ -243,7 +243,7 @@ fn estimate_pip_value_per_lot(
                 symbol,
                 account_currency = %account_currency,
                 "cross-pair pip_value_per_lot rejected: no quote→account FX rate \
-                 and FOREX_BOT_REJECT_PIP_FALLBACK=1; set FOREX_BOT_PROP_PIP_VALUE_PER_LOT \
+                 and NEOETHOS_BOT_REJECT_PIP_FALLBACK=1; set NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT \
                  or supply quote_to_account_rate"
             );
             return f64::NAN;
@@ -253,8 +253,8 @@ fn estimate_pip_value_per_lot(
             symbol,
             account_currency = %account_currency,
             "cross-pair pip_value_per_lot fallback (silently wrong) — set \
-             FOREX_BOT_PROP_PIP_VALUE_PER_LOT or supply quote_to_account_rate; \
-             enable FOREX_BOT_REJECT_PIP_FALLBACK=1 to fail fast"
+             NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT or supply quote_to_account_rate; \
+             enable NEOETHOS_BOT_REJECT_PIP_FALLBACK=1 to fail fast"
         );
         return pip_value_quote.max(1e-6);
     }
@@ -282,7 +282,7 @@ pub fn infer_market_cost_profile(
 ) -> MarketCostProfile {
     // Cost-profile fallbacks resolve through the typed
     // `CostProfileRuntimeOverrides` boundary so the legacy
-    // `FOREX_BOT_PROP_*` env vars are read at most once per process.
+    // `NEOETHOS_BOT_PROP_*` env vars are read at most once per process.
     let runtime_overrides = current_strategy_evaluation_runtime_overrides();
     let cost = runtime_overrides.cost_profile;
 

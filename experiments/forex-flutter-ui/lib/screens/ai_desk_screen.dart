@@ -53,7 +53,7 @@ class _AiDeskScreenState extends State<AiDeskScreen>
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _AiDeskSubNav(controller: _controller, sections: _sections),
-        const SizedBox(height: ForexAiTokens.spSm),
+        const SizedBox(height: NeoethosTokens.spSm),
         Expanded(
           child: TabBarView(
             controller: _controller,
@@ -81,22 +81,22 @@ class _AiDeskSubNav extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: TabBar(
         controller: controller,
         isScrollable: true,
-        labelColor: ForexAiTokens.accent,
-        unselectedLabelColor: ForexAiTokens.textMuted,
-        indicatorColor: ForexAiTokens.accent,
+        labelColor: NeoethosTokens.accent,
+        unselectedLabelColor: NeoethosTokens.textMuted,
+        indicatorColor: NeoethosTokens.accent,
         labelStyle: const TextStyle(
-          fontSize: ForexAiTokens.fsBody,
+          fontSize: NeoethosTokens.fsBody,
           fontWeight: FontWeight.w700,
         ),
         unselectedLabelStyle: const TextStyle(
-          fontSize: ForexAiTokens.fsBody,
+          fontSize: NeoethosTokens.fsBody,
           fontWeight: FontWeight.w500,
         ),
         tabs: [

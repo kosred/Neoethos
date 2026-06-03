@@ -104,8 +104,8 @@ re-using the broker's verbatim bytes is the entire point.
 The audit warn threshold (0.1 %) and the authoritative-mode circuit
 breaker (1 %) are both `pub const` at the top of
 `crates/neoethos-app/src/app_services/pnl.rs`. Both are operator-tunable
-through `FOREX_BOT_PNL_AUDIT_DRIFT_FRACTION` and
-`FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION`. Rationale lives in that
+through `NEOETHOS_BOT_PNL_AUDIT_DRIFT_FRACTION` and
+`NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION`. Rationale lives in that
 module's header doc comment.
 
 The threshold is evaluated against `netUnrealizedPnL` (not gross). The

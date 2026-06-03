@@ -307,7 +307,7 @@ pub struct SeenSignatureMemory {
 }
 
 /// Typed runtime knobs that previously lived only in
-/// `FOREX_BOT_PROP_SEEN_*` env vars. The seen-signature memory consults
+/// `NEOETHOS_BOT_PROP_SEEN_*` env vars. The seen-signature memory consults
 /// the cached overrides each time it is constructed, but the env vars
 /// themselves are read at most once per process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,18 +330,18 @@ impl Default for SeenSignatureMemoryRuntimeOverrides {
 }
 
 impl SeenSignatureMemoryRuntimeOverrides {
-    /// One-shot read of the legacy `FOREX_BOT_PROP_SEEN_*` env vars.
+    /// One-shot read of the legacy `NEOETHOS_BOT_PROP_SEEN_*` env vars.
     pub fn from_env() -> Self {
-        let flush_every = std::env::var("FOREX_BOT_PROP_SEEN_FLUSH_EVERY")
+        let flush_every = std::env::var("NEOETHOS_BOT_PROP_SEEN_FLUSH_EVERY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(4096)
             .max(1);
-        let load_max = std::env::var("FOREX_BOT_PROP_SEEN_LOAD_MAX")
+        let load_max = std::env::var("NEOETHOS_BOT_PROP_SEEN_LOAD_MAX")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(3_000_000);
-        let max_entries_raw = std::env::var("FOREX_BOT_PROP_SEEN_MAX_ENTRIES")
+        let max_entries_raw = std::env::var("NEOETHOS_BOT_PROP_SEEN_MAX_ENTRIES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(load_max);
@@ -350,7 +350,7 @@ impl SeenSignatureMemoryRuntimeOverrides {
         } else {
             max_entries_raw.max(1)
         };
-        let file_path = std::env::var("FOREX_BOT_PROP_SEEN_FILE")
+        let file_path = std::env::var("NEOETHOS_BOT_PROP_SEEN_FILE")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -360,6 +360,30 @@ impl SeenSignatureMemoryRuntimeOverrides {
             load_max,
             max_entries,
             file_path,
+        }
+    }
+
+    /// Config-driven constructor (was the `NEOETHOS_BOT_PROP_SEEN_*` env
+    /// vars). `max_entries == 0` means unbounded, like the env reader. A
+    /// `seen_signature_from_settings_default_matches_env_default` test
+    /// guarantees a fresh `Settings` reproduces [`Self::default`].
+    pub fn from_settings(s: &neoethos_core::Settings) -> Self {
+        let c = &s.models.seen_signature_runtime;
+        let max_entries = if c.max_entries == 0 {
+            usize::MAX
+        } else {
+            c.max_entries.max(1)
+        };
+        Self {
+            flush_every: c.flush_every.max(1),
+            load_max: c.load_max,
+            max_entries,
+            file_path: c
+                .file_path
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
         }
     }
 }
@@ -376,11 +400,18 @@ pub fn install_seen_signature_memory_runtime_overrides(
     SEEN_SIGNATURE_MEMORY_RUNTIME_OVERRIDES.set(overrides)
 }
 
-/// Convenience wrapper that resolves the legacy `FOREX_BOT_PROP_SEEN_*`
+/// Convenience wrapper that resolves the legacy `NEOETHOS_BOT_PROP_SEEN_*`
 /// env vars once and installs them. Idempotent.
 pub fn install_seen_signature_memory_runtime_overrides_from_env() {
     let _ = SEEN_SIGNATURE_MEMORY_RUNTIME_OVERRIDES
         .set(SeenSignatureMemoryRuntimeOverrides::from_env());
+}
+
+/// Config-driven install — reads the seen-signature knobs from the single
+/// `Settings` instead of the environment. Idempotent.
+pub fn install_seen_signature_memory_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
+    let _ = SEEN_SIGNATURE_MEMORY_RUNTIME_OVERRIDES
+        .set(SeenSignatureMemoryRuntimeOverrides::from_settings(s));
 }
 
 /// Returns the currently installed seen-signature-memory overrides, or
@@ -523,7 +554,7 @@ const STATIC_THRESHOLD_LADDER: [f32; 6] = [0.10, 0.20, 0.35, 0.50, 0.70, 0.90];
 /// from the actual feature-magnitude profile of the current discovery
 /// dataset. Installed once at the start of `run_discovery_cycle_with_progress`
 /// via `install_adaptive_threshold_ladder` when the operator opts in
-/// (`FOREX_BOT_PROP_ADAPTIVE_THRESHOLDS=1`). When None, gene init falls
+/// (`NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS=1`). When None, gene init falls
 /// back to the static z-score ladder above.
 ///
 /// Why: the static ladder is calibrated for the assumption that
@@ -1005,6 +1036,17 @@ mod tests {
         assert_eq!(defaults.load_max, 3_000_000);
         assert_eq!(defaults.max_entries, 3_000_000);
         assert!(defaults.file_path.is_none());
+    }
+
+    #[test]
+    fn seen_signature_from_settings_default_matches_env_default() {
+        // Behavior-preservation gate (config-consolidation S2f): a fresh
+        // `Settings` reproduces the engine seen-signature defaults exactly.
+        let s = neoethos_core::Settings::default();
+        assert_eq!(
+            SeenSignatureMemoryRuntimeOverrides::from_settings(&s),
+            SeenSignatureMemoryRuntimeOverrides::default()
+        );
     }
 
     #[test]

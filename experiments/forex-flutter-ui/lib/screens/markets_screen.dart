@@ -86,7 +86,7 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
                           ? 'Connection issue — positions unavailable.'
                           : 'No open positions on the connected account.',
                       style: const TextStyle(
-                        color: ForexAiTokens.textMuted,
+                        color: NeoethosTokens.textMuted,
                         fontSize: 12,
                       ),
                     ),
@@ -115,16 +115,16 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
                             p.side,
                             color: p.side.toUpperCase() == 'LONG' ||
                                     p.side.toUpperCase() == 'BUY'
-                                ? ForexAiTokens.buy
-                                : ForexAiTokens.sell,
+                                ? NeoethosTokens.buy
+                                : NeoethosTokens.sell,
                           ),
                           _Td(p.volume.toStringAsFixed(2)),
                           _Td('${pipFmt.format(p.pnlPips)} pips'),
                           _Td(
                             usdFmt.format(p.pnlUsd),
                             color: p.pnlUsd >= 0
-                                ? ForexAiTokens.buy
-                                : ForexAiTokens.sell,
+                                ? NeoethosTokens.buy
+                                : NeoethosTokens.sell,
                           ),
                         ]),
                     ],
@@ -196,7 +196,7 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
               child: Text(
                 'No symbols match the current filter.',
                 style: TextStyle(
-                  color: ForexAiTokens.textMuted,
+                  color: NeoethosTokens.textMuted,
                   fontSize: 12,
                 ),
               ),
@@ -233,24 +233,24 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
                       );
                     },
                     borderRadius:
-                        BorderRadius.circular(ForexAiTokens.rSm),
+                        BorderRadius.circular(NeoethosTokens.rSm),
                     child: Container(
                       padding: const EdgeInsets.symmetric(
                         horizontal: 8,
                         vertical: 3,
                       ),
                       decoration: BoxDecoration(
-                        color: ForexAiTokens.surfaceBg,
-                        border: Border.all(color: ForexAiTokens.border),
+                        color: NeoethosTokens.surfaceBg,
+                        border: Border.all(color: NeoethosTokens.border),
                         borderRadius:
-                            BorderRadius.circular(ForexAiTokens.rSm),
+                            BorderRadius.circular(NeoethosTokens.rSm),
                       ),
                       child: Text(
                         s.symbolName,
                         style: const TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
-                          color: ForexAiTokens.textPrimary,
+                          color: NeoethosTokens.textPrimary,
                         ),
                       ),
                     ),
@@ -264,7 +264,7 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
               'Type in the search box to narrow further.',
               style: const TextStyle(
                 fontSize: 10,
-                color: ForexAiTokens.textFaint,
+                color: NeoethosTokens.textFaint,
               ),
             ),
           ],
@@ -281,7 +281,7 @@ class _Loading extends StatelessWidget {
         padding: EdgeInsets.symmetric(vertical: 16),
         child: Text(
           'Loading broker symbol catalog…',
-          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }
@@ -298,7 +298,7 @@ class _Th extends StatelessWidget {
           style: const TextStyle(
             fontSize: 10,
             letterSpacing: 0.4,
-            color: ForexAiTokens.textMuted,
+            color: NeoethosTokens.textMuted,
             fontWeight: FontWeight.w700,
           ),
         ),
@@ -316,7 +316,7 @@ class _Td extends StatelessWidget {
           text,
           style: TextStyle(
             fontSize: 12,
-            color: color ?? ForexAiTokens.textPrimary,
+            color: color ?? NeoethosTokens.textPrimary,
           ),
         ),
       );

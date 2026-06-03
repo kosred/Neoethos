@@ -13,7 +13,7 @@ class ViewHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.only(bottom: ForexAiTokens.spSm),
+      padding: const EdgeInsets.only(bottom: NeoethosTokens.spSm),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.baseline,
         textBaseline: TextBaseline.alphabetic,
@@ -25,7 +25,7 @@ class ViewHeader extends StatelessWidget {
               subtitle!,
               style: const TextStyle(
                 fontSize: 12,
-                color: ForexAiTokens.textMuted,
+                color: NeoethosTokens.textMuted,
               ),
             ),
           ],
@@ -48,12 +48,12 @@ class StatCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(ForexAiTokens.spMd),
+      padding: const EdgeInsets.all(NeoethosTokens.spMd),
       constraints: const BoxConstraints(minHeight: 60),
       decoration: BoxDecoration(
-        color: ForexAiTokens.surfaceBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rMd),
+        color: NeoethosTokens.surfaceBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rMd),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -64,7 +64,7 @@ class StatCard extends StatelessWidget {
             style: const TextStyle(
               fontSize: 10,
               letterSpacing: 0.4,
-              color: ForexAiTokens.textMuted,
+              color: NeoethosTokens.textMuted,
             ),
           ),
           const SizedBox(height: 2),
@@ -73,7 +73,7 @@ class StatCard extends StatelessWidget {
             style: TextStyle(
               fontSize: 15,
               fontWeight: FontWeight.w700,
-              color: valueColor ?? ForexAiTokens.textPrimary,
+              color: valueColor ?? NeoethosTokens.textPrimary,
             ),
           ),
         ],
@@ -89,12 +89,12 @@ class SectionCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(ForexAiTokens.spMd),
-      margin: const EdgeInsets.only(top: ForexAiTokens.spSm),
+      padding: const EdgeInsets.all(NeoethosTokens.spMd),
+      margin: const EdgeInsets.only(top: NeoethosTokens.spSm),
       decoration: BoxDecoration(
-        color: ForexAiTokens.surfaceAlt,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.surfaceAlt,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -104,10 +104,10 @@ class SectionCard extends StatelessWidget {
             style: const TextStyle(
               fontSize: 13,
               fontWeight: FontWeight.w700,
-              color: ForexAiTokens.textPrimary,
+              color: NeoethosTokens.textPrimary,
             ),
           ),
-          const SizedBox(height: ForexAiTokens.spXs),
+          const SizedBox(height: NeoethosTokens.spXs),
           child,
         ],
       ),

@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// Typed replacement for the legacy `FOREX_BOT_PROP_MIN_TRADES_PER_MONTH`
-/// and `FOREX_BOT_TRADING_DAYS_PER_MONTH` env vars. Previously read inline
+/// Typed replacement for the legacy `NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH`
+/// and `NEOETHOS_BOT_TRADING_DAYS_PER_MONTH` env vars. Previously read inline
 /// inside monthly metric aggregation, both knobs change canonical strategy
 /// quality scoring, so they belong in typed runtime config.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,16 +31,16 @@ impl Default for QualityRuntimeOverrides {
 }
 
 impl QualityRuntimeOverrides {
-    /// One-shot read of the legacy `FOREX_BOT_PROP_*` quality env vars.
+    /// One-shot read of the legacy `NEOETHOS_BOT_PROP_*` quality env vars.
     pub fn from_env() -> Self {
         let mut overrides = Self::default();
-        if let Some(value) = std::env::var("FOREX_BOT_PROP_MIN_TRADES_PER_MONTH")
+        if let Some(value) = std::env::var("NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
         {
             overrides.min_trades_per_month = value;
         }
-        if let Some(value) = std::env::var("FOREX_BOT_TRADING_DAYS_PER_MONTH")
+        if let Some(value) = std::env::var("NEOETHOS_BOT_TRADING_DAYS_PER_MONTH")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 1.0)
@@ -48,6 +48,25 @@ impl QualityRuntimeOverrides {
             overrides.trading_days_per_month = value;
         }
         overrides
+    }
+
+    /// Config-driven constructor (was the `NEOETHOS_BOT_PROP_*` quality
+    /// env vars). `trading_days_per_month` is validated finite ≥ 1.0 like
+    /// the env reader. A `quality_from_settings_default_matches_env_default`
+    /// test guarantees a fresh `Settings` reproduces [`Self::default`].
+    pub fn from_settings(s: &neoethos_core::Settings) -> Self {
+        let c = &s.models.quality_runtime;
+        let trading_days = if c.trading_days_per_month.is_finite()
+            && c.trading_days_per_month >= 1.0
+        {
+            c.trading_days_per_month
+        } else {
+            Self::default().trading_days_per_month
+        };
+        Self {
+            min_trades_per_month: c.min_trades_per_month,
+            trading_days_per_month: trading_days,
+        }
     }
 
     fn resolved_trading_days_per_month(&self) -> f64 {
@@ -69,10 +88,16 @@ pub fn install_quality_runtime_overrides(
     QUALITY_RUNTIME_OVERRIDES.set(overrides)
 }
 
-/// Convenience wrapper that resolves the legacy `FOREX_BOT_PROP_*` quality
+/// Convenience wrapper that resolves the legacy `NEOETHOS_BOT_PROP_*` quality
 /// env vars once and installs them. Idempotent.
 pub fn install_quality_runtime_overrides_from_env() {
     let _ = QUALITY_RUNTIME_OVERRIDES.set(QualityRuntimeOverrides::from_env());
+}
+
+/// Config-driven install — reads the quality knobs from the single
+/// `Settings` instead of the environment. Idempotent.
+pub fn install_quality_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
+    let _ = QUALITY_RUNTIME_OVERRIDES.set(QualityRuntimeOverrides::from_settings(s));
 }
 
 /// Returns the currently installed quality runtime overrides, or the
@@ -796,6 +821,17 @@ mod overrides_tests {
         let defaults = QualityRuntimeOverrides::default();
         assert_eq!(defaults.min_trades_per_month, 4);
         assert!((defaults.trading_days_per_month - 21.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quality_from_settings_default_matches_env_default() {
+        // Behavior-preservation gate: a fresh `Settings` reproduces the
+        // engine quality defaults exactly (config-consolidation S2c).
+        let s = neoethos_core::Settings::default();
+        assert_eq!(
+            QualityRuntimeOverrides::from_settings(&s),
+            QualityRuntimeOverrides::default()
+        );
     }
 
     #[test]

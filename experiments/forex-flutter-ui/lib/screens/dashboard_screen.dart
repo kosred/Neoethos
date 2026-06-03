@@ -52,11 +52,11 @@ class DashboardScreen extends ConsumerWidget {
                       height: 16,
                       child: CircularProgressIndicator(
                         strokeWidth: 2,
-                        color: ForexAiTokens.textMuted,
+                        color: NeoethosTokens.textMuted,
                       ),
                     )
                   : const Icon(Icons.refresh,
-                      color: ForexAiTokens.textMuted, size: 20),
+                      color: NeoethosTokens.textMuted, size: 20),
               onPressed: snapshot.isLoading
                   ? null
                   : () => ref
@@ -134,10 +134,10 @@ class _StatRow extends StatelessWidget {
     final marginLevelColor = data == null || data.usedMargin == 0
         ? null
         : data.equity / data.usedMargin >= 2.0
-            ? ForexAiTokens.buy
+            ? NeoethosTokens.buy
             : data.equity / data.usedMargin >= 1.0
-                ? ForexAiTokens.warning
-                : ForexAiTokens.sell;
+                ? NeoethosTokens.warning
+                : NeoethosTokens.sell;
     final openCount = data == null
         ? (isFirstLoad ? '…' : '—')
         : '${data.positions.length}';
@@ -148,9 +148,9 @@ class _StatRow extends StatelessWidget {
     final equityColor = data == null
         ? null
         : data.equity > data.balance
-            ? ForexAiTokens.buy
+            ? NeoethosTokens.buy
             : data.equity < data.balance
-                ? ForexAiTokens.sell
+                ? NeoethosTokens.sell
                 : null;
 
     // Freshness badge — local time of the last successful refresh.
@@ -198,7 +198,7 @@ class _StatRow extends StatelessWidget {
             asOfLabel,
             style: const TextStyle(
               fontSize: 10,
-              color: ForexAiTokens.textFaint,
+              color: NeoethosTokens.textFaint,
             ),
           ),
         ],
@@ -219,7 +219,7 @@ class _PositionsTable extends StatelessWidget {
         padding: EdgeInsets.symmetric(vertical: 8),
         child: Text(
           'No open positions.',
-          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
     }
@@ -261,15 +261,15 @@ class _PositionsTable extends StatelessWidget {
             _Td(
               p.side,
               color: p.side.toUpperCase() == 'LONG' || p.side.toUpperCase() == 'BUY'
-                  ? ForexAiTokens.buy
-                  : ForexAiTokens.sell,
+                  ? NeoethosTokens.buy
+                  : NeoethosTokens.sell,
             ),
             _Td(p.volume.toStringAsFixed(2)),
             _Td(sinceLabel(p.openTimestampMs)),
             _Td('${pipFmt.format(p.pnlPips)} pips'),
             _Td(
               usdFmt.format(p.pnlUsd),
-              color: p.pnlUsd >= 0 ? ForexAiTokens.buy : ForexAiTokens.sell,
+              color: p.pnlUsd >= 0 ? NeoethosTokens.buy : NeoethosTokens.sell,
             ),
           ]),
       ],
@@ -302,17 +302,17 @@ class _AccountContextStrip extends StatelessWidget {
         : 'snapshot ${DateFormat('HH:mm:ss').format(asOf)} local';
     final environment = broker?.environment ?? '—';
     final envColor = environment.toLowerCase() == 'live'
-        ? ForexAiTokens.sell
+        ? NeoethosTokens.sell
         : environment.toLowerCase() == 'demo'
-            ? ForexAiTokens.accent
-            : ForexAiTokens.textFaint;
+            ? NeoethosTokens.accent
+            : NeoethosTokens.textFaint;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Row(
         children: [
@@ -341,7 +341,7 @@ class _AccountContextStrip extends StatelessWidget {
             asOfLabel,
             style: const TextStyle(
               fontSize: 11,
-              color: ForexAiTokens.textFaint,
+              color: NeoethosTokens.textFaint,
               fontFeatures: [FontFeature.tabularFigures()],
             ),
           ),
@@ -373,16 +373,16 @@ class _ContextChip extends StatelessWidget {
             fontSize: 10,
             letterSpacing: 0.8,
             fontWeight: FontWeight.w800,
-            color: ForexAiTokens.textFaint,
+            color: NeoethosTokens.textFaint,
           ),
         ),
         const SizedBox(width: 4),
         Text(
           value,
           style: TextStyle(
-            fontSize: ForexAiTokens.fsBody,
+            fontSize: NeoethosTokens.fsBody,
             fontWeight: FontWeight.w800,
-            color: color ?? ForexAiTokens.textPrimary,
+            color: color ?? NeoethosTokens.textPrimary,
             fontFeatures: const [FontFeature.tabularFigures()],
           ),
         ),
@@ -404,8 +404,8 @@ class _ErrorBanner extends StatelessWidget {
             'refresh completes (≤ 5s).'
         : 'Dashboard data unavailable — ${describeError(error)}';
     final colour = isBrokerNotReady
-        ? ForexAiTokens.textMuted
-        : ForexAiTokens.sell;
+        ? NeoethosTokens.textMuted
+        : NeoethosTokens.sell;
 
     return Container(
       margin: const EdgeInsets.only(top: 4, bottom: 8),
@@ -476,14 +476,14 @@ class _EngineHealthRow extends ConsumerWidget {
   Color? _colorFor(String value) {
     switch (value.toLowerCase()) {
       case 'running':
-        return ForexAiTokens.buy;
+        return NeoethosTokens.buy;
       case 'error':
       case 'failed':
-        return ForexAiTokens.sell;
+        return NeoethosTokens.sell;
       case 'idle':
-        return ForexAiTokens.textFaint;
+        return NeoethosTokens.textFaint;
       default:
-        return ForexAiTokens.textMuted;
+        return NeoethosTokens.textMuted;
     }
   }
 }
@@ -513,7 +513,7 @@ class _Th extends StatelessWidget {
           style: const TextStyle(
             fontSize: 10,
             letterSpacing: 0.4,
-            color: ForexAiTokens.textMuted,
+            color: NeoethosTokens.textMuted,
             fontWeight: FontWeight.w700,
           ),
         ),
@@ -531,7 +531,7 @@ class _Td extends StatelessWidget {
           text,
           style: TextStyle(
             fontSize: 12,
-            color: color ?? ForexAiTokens.textPrimary,
+            color: color ?? NeoethosTokens.textPrimary,
           ),
         ),
       );

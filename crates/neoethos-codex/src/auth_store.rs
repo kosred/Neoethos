@@ -1,6 +1,6 @@
 //! On-disk token persistence at `~/.codex/auth.json`.
 //!
-//! This path is **deliberately** what the official OpenAI Codex CLI
+//! This path is **deliberately** what the official Codex CLI
 //! uses. An operator who has already run `codex login` finds NeoEthos
 //! immediately authenticated; conversely, if they auth through
 //! NeoEthos first, `codex` will see the credentials. The schema we
@@ -373,7 +373,7 @@ impl AuthStore {
 
 /// Decode the `email` claim out of a JWT id_token. Returns `None`
 /// for any error (bad base64, bad JSON, no `email` field) — id_tokens
-/// from OpenAI almost always include it, but we don't want a missing
+/// from the issuer almost always include it, but we don't want a missing
 /// claim to block the whole login flow.
 fn parse_email_claim(id_token: &str) -> Option<String> {
     let payload = id_token.split('.').nth(1)?;

@@ -228,42 +228,42 @@ pub(crate) fn statistical_cuda_kernel_enabled(model_name: &str) -> bool {
     let requested = requested_policy(model_name);
     let normalized = normalize_statistical_device_policy(&requested);
     let model_env = format!(
-        "FOREX_BOT_{}_CUDA_KERNEL",
+        "NEOETHOS_BOT_{}_CUDA_KERNEL",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
     // Two-tier gate: subsystem-wide env can disable the kernel for all
     // statistical models, AND a per-model env can override that.
-    crate::common::cuda_kernel_enabled(&normalized, "FOREX_BOT_STATISTICAL_CUDA_KERNEL")
+    crate::common::cuda_kernel_enabled(&normalized, "NEOETHOS_BOT_STATISTICAL_CUDA_KERNEL")
         && !crate::common::is_kernel_disabled_env(&model_env)
 }
 
 fn requested_policy(model_name: &str) -> String {
     let model_key = format!(
-        "FOREX_BOT_{}_DEVICE",
+        "NEOETHOS_BOT_{}_DEVICE",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
     std::env::var(&model_key)
-        .or_else(|_| std::env::var("FOREX_BOT_META_DEVICE"))
+        .or_else(|_| std::env::var("NEOETHOS_BOT_META_DEVICE"))
         .unwrap_or_else(|_| "auto".to_string())
 }
 
 fn cuda_device_id(model_name: &str) -> usize {
     let model_key = format!(
-        "FOREX_BOT_{}_CUDA_DEVICE",
+        "NEOETHOS_BOT_{}_CUDA_DEVICE",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
     let normalized = normalize_statistical_device_policy(&requested_policy(model_name));
     crate::common::cuda_device_id_from_policy(
         &normalized,
         &model_key,
-        Some("FOREX_BOT_STATISTICAL_CUDA_DEVICE"),
+        Some("NEOETHOS_BOT_STATISTICAL_CUDA_DEVICE"),
     )
 }
 
 fn kernel_units(client: &ComputeClient<CudaRuntime>) -> u32 {
     crate::common::cuda_kernel_units(
         client.properties().hardware.max_units_per_cube,
-        "FOREX_BOT_STATISTICAL_KERNEL_UNITS",
+        "NEOETHOS_BOT_STATISTICAL_KERNEL_UNITS",
     )
 }
 

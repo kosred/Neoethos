@@ -80,7 +80,7 @@ class _BodyState extends ConsumerState<_Body> {
       ref.invalidate(accountSnapshotProvider);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor: ForexAiTokens.buy,
+          backgroundColor: NeoethosTokens.buy,
           content: Text(
             (result['message'] as String?) ?? 'OAuth refresh complete',
           ),
@@ -114,8 +114,8 @@ class _BodyState extends ConsumerState<_Body> {
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
                       color: status.connected
-                          ? ForexAiTokens.buy
-                          : ForexAiTokens.sell,
+                          ? NeoethosTokens.buy
+                          : NeoethosTokens.sell,
                     ),
                   ),
                   const SizedBox(width: 8),
@@ -124,8 +124,8 @@ class _BodyState extends ConsumerState<_Body> {
                     style: TextStyle(
                       fontWeight: FontWeight.w700,
                       color: status.connected
-                          ? ForexAiTokens.buy
-                          : ForexAiTokens.sell,
+                          ? NeoethosTokens.buy
+                          : NeoethosTokens.sell,
                     ),
                   ),
                 ],
@@ -150,7 +150,7 @@ class _BodyState extends ConsumerState<_Body> {
                 'redirect on loopback, swaps the auth code for a fresh '
                 'trading-scope token, and writes it to the OS keyring.',
                 style: TextStyle(
-                  color: ForexAiTokens.textMuted,
+                  color: NeoethosTokens.textMuted,
                   fontSize: 12,
                 ),
               ),
@@ -173,7 +173,7 @@ class _BodyState extends ConsumerState<_Body> {
                     const Text(
                       'Waiting for browser approval…',
                       style: TextStyle(
-                        color: ForexAiTokens.textMuted,
+                        color: NeoethosTokens.textMuted,
                         fontSize: 12,
                       ),
                     ),
@@ -203,7 +203,7 @@ class _Row extends StatelessWidget {
                 label,
                 style: const TextStyle(
                   fontSize: 12,
-                  color: ForexAiTokens.textMuted,
+                  color: NeoethosTokens.textMuted,
                 ),
               ),
             ),
@@ -213,7 +213,7 @@ class _Row extends StatelessWidget {
                 style: const TextStyle(
                   fontSize: 12,
                   fontWeight: FontWeight.w600,
-                  color: ForexAiTokens.textPrimary,
+                  color: NeoethosTokens.textPrimary,
                 ),
                 overflow: TextOverflow.ellipsis,
               ),
@@ -230,7 +230,7 @@ class _Loading extends StatelessWidget {
         padding: EdgeInsets.symmetric(vertical: 16),
         child: Text(
           'Loading broker status…',
-          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

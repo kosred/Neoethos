@@ -80,7 +80,7 @@ class BackendSupervisor {
   Future<bool> probeHealth({
     Duration timeout = const Duration(seconds: 2),
   }) async {
-    final result = await probeHealthDetail(timeout: timeout);
+    final result = await _probeHealthDetail(timeout: timeout);
     return result.alive;
   }
 
@@ -90,7 +90,7 @@ class BackendSupervisor {
   ///   - sibling Flutter UI's backend → refuse second launch
   ///   - stale backend (api-test, manual run, zombie) → attach
   /// where the previous probeHealth() boolean conflated both.
-  Future<_HealthProbeResult> probeHealthDetail({
+  Future<_HealthProbeResult> _probeHealthDetail({
     Duration timeout = const Duration(seconds: 2),
   }) async {
     final dio = Dio(BaseOptions(
@@ -184,7 +184,7 @@ class BackendSupervisor {
     _log('ensureRunning() start. Flutter exe: ${Platform.resolvedExecutable}');
     _log('CWD: ${Directory.current.path}');
 
-    final initialProbe = await probeHealthDetail(
+    final initialProbe = await _probeHealthDetail(
       timeout: const Duration(milliseconds: 500),
     );
     if (initialProbe.alive) {

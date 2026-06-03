@@ -38,7 +38,7 @@ class BackendErrorWidget extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final detail = describeError(error);
     return Padding(
-      padding: const EdgeInsets.all(ForexAiTokens.spMd),
+      padding: const EdgeInsets.all(NeoethosTokens.spMd),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -49,16 +49,16 @@ class BackendErrorWidget extends ConsumerWidget {
               const Padding(
                 padding: EdgeInsets.only(top: 1),
                 child: Icon(Icons.error_outline,
-                    size: 18, color: ForexAiTokens.sell),
+                    size: 18, color: NeoethosTokens.sell),
               ),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
                   title,
                   style: const TextStyle(
-                    fontSize: ForexAiTokens.fsBody,
+                    fontSize: NeoethosTokens.fsBody,
                     fontWeight: FontWeight.w700,
-                    color: ForexAiTokens.textPrimary,
+                    color: NeoethosTokens.textPrimary,
                   ),
                 ),
               ),
@@ -69,9 +69,9 @@ class BackendErrorWidget extends ConsumerWidget {
             Text(
               detail,
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsCaption,
+                fontSize: NeoethosTokens.fsCaption,
                 height: 1.45,
-                color: ForexAiTokens.textMuted,
+                color: NeoethosTokens.textMuted,
               ),
             ),
           ],
@@ -80,9 +80,9 @@ class BackendErrorWidget extends ConsumerWidget {
             'Check the status indicator at the top-right — if it is red, '
             'the engine is not running.',
             style: TextStyle(
-              fontSize: ForexAiTokens.fsCaption,
+              fontSize: NeoethosTokens.fsCaption,
               height: 1.45,
-              color: ForexAiTokens.textFaint,
+              color: NeoethosTokens.textFaint,
             ),
           ),
           if (showRestart) ...[

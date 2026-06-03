@@ -58,28 +58,28 @@ class _HelpScreenState extends State<HelpScreen> {
     final sections = _doc;
     final active = sections[_section] ?? sections.values.first;
     return Scaffold(
-      backgroundColor: ForexAiTokens.appBg,
+      backgroundColor: NeoethosTokens.appBg,
       appBar: AppBar(
-        backgroundColor: ForexAiTokens.panelBg,
+        backgroundColor: NeoethosTokens.panelBg,
         elevation: 0,
         title: Row(
           children: [
             const Text(
               'NeoEthos · Help',
               style: TextStyle(
-                color: ForexAiTokens.textPrimary,
-                fontSize: ForexAiTokens.fsSubtitle,
+                color: NeoethosTokens.textPrimary,
+                fontSize: NeoethosTokens.fsSubtitle,
                 fontWeight: FontWeight.w700,
               ),
             ),
-            const SizedBox(width: ForexAiTokens.spLg),
+            const SizedBox(width: NeoethosTokens.spLg),
             _LangToggle(
               lang: _lang,
               onChanged: (v) => setState(() => _lang = v),
             ),
           ],
         ),
-        iconTheme: const IconThemeData(color: ForexAiTokens.textPrimary),
+        iconTheme: const IconThemeData(color: NeoethosTokens.textPrimary),
       ),
       body: Row(
         children: [
@@ -91,8 +91,8 @@ class _HelpScreenState extends State<HelpScreen> {
           Expanded(
             child: SingleChildScrollView(
               padding: const EdgeInsets.symmetric(
-                horizontal: ForexAiTokens.spLg + 8,
-                vertical: ForexAiTokens.spLg,
+                horizontal: NeoethosTokens.spLg + 8,
+                vertical: NeoethosTokens.spLg,
               ),
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 760),
@@ -104,15 +104,15 @@ class _HelpScreenState extends State<HelpScreen> {
                       style: const TextStyle(
                         fontSize: 22,
                         fontWeight: FontWeight.w700,
-                        color: ForexAiTokens.textPrimary,
+                        color: NeoethosTokens.textPrimary,
                       ),
                     ),
-                    const SizedBox(height: ForexAiTokens.spMd),
+                    const SizedBox(height: NeoethosTokens.spMd),
                     for (final block in active.blocks) ...[
                       block.build(context),
-                      const SizedBox(height: ForexAiTokens.spSm),
+                      const SizedBox(height: NeoethosTokens.spSm),
                     ],
-                    const SizedBox(height: ForexAiTokens.spXl),
+                    const SizedBox(height: NeoethosTokens.spXl),
                   ],
                 ),
               ),
@@ -137,8 +137,8 @@ class _LangToggle extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       decoration: BoxDecoration(
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -172,14 +172,14 @@ class _LangChip extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
         decoration: BoxDecoration(
-          color: active ? ForexAiTokens.accentMuted : Colors.transparent,
+          color: active ? NeoethosTokens.accentMuted : Colors.transparent,
         ),
         child: Text(
           label,
           style: TextStyle(
-            fontSize: ForexAiTokens.fsCaption,
+            fontSize: NeoethosTokens.fsCaption,
             fontWeight: active ? FontWeight.w700 : FontWeight.w500,
-            color: active ? ForexAiTokens.accent : ForexAiTokens.textMuted,
+            color: active ? NeoethosTokens.accent : NeoethosTokens.textMuted,
           ),
         ),
       ),
@@ -206,12 +206,12 @@ class _SectionRail extends StatelessWidget {
     return Container(
       width: 220,
       decoration: const BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border(right: BorderSide(color: ForexAiTokens.border)),
+        color: NeoethosTokens.panelBg,
+        border: Border(right: BorderSide(color: NeoethosTokens.border)),
       ),
       padding: const EdgeInsets.symmetric(
-        vertical: ForexAiTokens.spMd,
-        horizontal: ForexAiTokens.spSm,
+        vertical: NeoethosTokens.spMd,
+        horizontal: NeoethosTokens.spSm,
       ),
       child: ListView(
         children: [
@@ -224,13 +224,13 @@ class _SectionRail extends StatelessWidget {
                     const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                 decoration: BoxDecoration(
                   color: active == entry.key
-                      ? ForexAiTokens.accentMuted
+                      ? NeoethosTokens.accentMuted
                       : Colors.transparent,
-                  borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+                  borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
                   border: active == entry.key
                       ? const Border(
                           left: BorderSide(
-                            color: ForexAiTokens.accent,
+                            color: NeoethosTokens.accent,
                             width: 3,
                           ),
                         )
@@ -239,13 +239,13 @@ class _SectionRail extends StatelessWidget {
                 child: Text(
                   entry.value.title,
                   style: TextStyle(
-                    fontSize: ForexAiTokens.fsBody,
+                    fontSize: NeoethosTokens.fsBody,
                     fontWeight: active == entry.key
                         ? FontWeight.w700
                         : FontWeight.w500,
                     color: active == entry.key
-                        ? ForexAiTokens.textPrimary
-                        : ForexAiTokens.textMuted,
+                        ? NeoethosTokens.textPrimary
+                        : NeoethosTokens.textMuted,
                   ),
                 ),
               ),
@@ -281,7 +281,7 @@ class _H3 implements _HelpBlock {
           style: const TextStyle(
             fontSize: 16,
             fontWeight: FontWeight.w700,
-            color: ForexAiTokens.textPrimary,
+            color: NeoethosTokens.textPrimary,
           ),
         ),
       );
@@ -298,7 +298,7 @@ class _H4 implements _HelpBlock {
           style: const TextStyle(
             fontSize: 14,
             fontWeight: FontWeight.w700,
-            color: ForexAiTokens.textPrimary,
+            color: NeoethosTokens.textPrimary,
           ),
         ),
       );
@@ -326,7 +326,7 @@ class _P implements _HelpBlock {
                     fontSize: 13.5,
                     height: 1.55,
                     fontWeight: bold ? FontWeight.w700 : FontWeight.w400,
-                    color: ForexAiTokens.textPrimary,
+                    color: NeoethosTokens.textPrimary,
                   ),
                 ),
             ],
@@ -356,7 +356,7 @@ class _UL implements _HelpBlock {
                       child: Icon(
                         Icons.circle,
                         size: 6,
-                        color: ForexAiTokens.accent,
+                        color: NeoethosTokens.accent,
                       ),
                     ),
                     Expanded(
@@ -372,7 +372,7 @@ class _UL implements _HelpBlock {
                                   fontWeight: bold
                                       ? FontWeight.w700
                                       : FontWeight.w400,
-                                  color: ForexAiTokens.textPrimary,
+                                  color: NeoethosTokens.textPrimary,
                                 ),
                               ),
                           ],
@@ -412,7 +412,7 @@ class _OL implements _HelpBlock {
                           style: const TextStyle(
                             fontSize: 13.5,
                             fontWeight: FontWeight.w700,
-                            color: ForexAiTokens.accent,
+                            color: NeoethosTokens.accent,
                           ),
                         ),
                       ),
@@ -430,7 +430,7 @@ class _OL implements _HelpBlock {
                                   fontWeight: bold
                                       ? FontWeight.w700
                                       : FontWeight.w400,
-                                  color: ForexAiTokens.textPrimary,
+                                  color: NeoethosTokens.textPrimary,
                                 ),
                               ),
                           ],
@@ -451,20 +451,20 @@ class _Tip implements _HelpBlock {
   @override
   Widget build(BuildContext context) => Container(
         margin: const EdgeInsets.symmetric(vertical: 10),
-        padding: const EdgeInsets.all(ForexAiTokens.spMd),
+        padding: const EdgeInsets.all(NeoethosTokens.spMd),
         decoration: BoxDecoration(
-          color: ForexAiTokens.warning.withValues(alpha: 0.12),
+          color: NeoethosTokens.warning.withValues(alpha: 0.12),
           border: Border.all(
-            color: ForexAiTokens.warning.withValues(alpha: 0.55),
+            color: NeoethosTokens.warning.withValues(alpha: 0.55),
           ),
-          borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+          borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
         ),
         child: Text(
           text,
           style: const TextStyle(
             fontSize: 13.5,
             height: 1.5,
-            color: ForexAiTokens.warning,
+            color: NeoethosTokens.warning,
             fontWeight: FontWeight.w600,
           ),
         ),
@@ -493,7 +493,7 @@ class _KbdRow implements _HelpBlock {
                         padding: EdgeInsets.symmetric(horizontal: 2),
                         child: Text('+',
                             style: TextStyle(
-                              color: ForexAiTokens.textFaint,
+                              color: NeoethosTokens.textFaint,
                               fontWeight: FontWeight.w600,
                             )),
                       ),
@@ -509,7 +509,7 @@ class _KbdRow implements _HelpBlock {
                   style: const TextStyle(
                     fontSize: 13.5,
                     height: 1.5,
-                    color: ForexAiTokens.textMuted,
+                    color: NeoethosTokens.textMuted,
                   ),
                 ),
               ),
@@ -526,8 +526,8 @@ class _KbdChip extends StatelessWidget {
   Widget build(BuildContext context) => Container(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
         decoration: BoxDecoration(
-          color: ForexAiTokens.appBg,
-          border: Border.all(color: ForexAiTokens.border),
+          color: NeoethosTokens.appBg,
+          border: Border.all(color: NeoethosTokens.border),
           borderRadius: BorderRadius.circular(4),
         ),
         child: Text(
@@ -536,7 +536,7 @@ class _KbdChip extends StatelessWidget {
             fontFamily: 'monospace',
             fontSize: 12,
             fontWeight: FontWeight.w700,
-            color: ForexAiTokens.textPrimary,
+            color: NeoethosTokens.textPrimary,
           ),
         ),
       );
@@ -698,7 +698,7 @@ final Map<String, _HelpSection> _helpContentEl = {
       _H4('Τι γράφει στον δίσκο'),
       _UL([
         [('Data Bootstrap', true), (' (Settings → Data): ρητό κατέβασμα ιστορικού παραθύρου για ένα symbol/timeframe.', false)],
-        [('Discovery auto-fetch: ', true), ('αν δεν υπάρχει αρκετό ιστορικό όταν τρέχεις discovery, το κατεβάζει αυτόματα (~N χρόνια, ελέγχεται από το FOREX_BOT_MIN_HISTORY_YEARS) και το αποθηκεύει.', false)],
+        [('Discovery auto-fetch: ', true), ('αν δεν υπάρχει αρκετό ιστορικό όταν τρέχεις discovery, το κατεβάζει αυτόματα (~N χρόνια, ελέγχεται από το NEOETHOS_BOT_MIN_HISTORY_YEARS) και το αποθηκεύει.', false)],
         [('data_dir: ', true), ('ο φάκελος αποθήκευσης — ορίζεται στο Settings → Data.', false)],
       ]),
       _Tip('Το να βλέπεις γράφημα — ακόμα και να γυρνάς χρόνια πίσω — ΔΕΝ γεμίζει τον δίσκο. Μόνο το Data Bootstrap και το Discovery αποθηκεύουν ιστορικά, επειδή το backtest/training τα χρειάζεται.'),
@@ -886,7 +886,7 @@ final Map<String, _HelpSection> _helpContentEn = {
       _H4('What writes to disk'),
       _UL([
         [('Data Bootstrap', true), (' (Settings → Data): explicit download of a history window for a symbol/timeframe.', false)],
-        [('Discovery auto-fetch: ', true), ('if there isn\'t enough history when you run discovery, it downloads it automatically (~N years, controlled by FOREX_BOT_MIN_HISTORY_YEARS) and stores it.', false)],
+        [('Discovery auto-fetch: ', true), ('if there isn\'t enough history when you run discovery, it downloads it automatically (~N years, controlled by NEOETHOS_BOT_MIN_HISTORY_YEARS) and stores it.', false)],
         [('data_dir: ', true), ('the storage folder — set in Settings → Data.', false)],
       ]),
       _Tip('Viewing a chart — even panning years back — does NOT fill the disk. Only Data Bootstrap and Discovery persist history, because backtest/training needs it.'),

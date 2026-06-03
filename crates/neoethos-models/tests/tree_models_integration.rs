@@ -384,7 +384,7 @@ mod catboost_tests {
             let err_msg = result.err().unwrap().to_string();
             assert!(
                 err_msg.contains("CatBoost CLI")
-                    || err_msg.contains("FOREX_BOT_CATBOOST_EXECUTABLE")
+                    || err_msg.contains("NEOETHOS_BOT_CATBOOST_EXECUTABLE")
                     || err_msg.contains("CATBOOST_EXECUTABLE"),
                 "Error should mention missing CatBoost CLI, got: {err_msg}"
             );

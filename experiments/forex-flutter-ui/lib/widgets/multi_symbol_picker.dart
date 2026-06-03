@@ -46,7 +46,7 @@ class _MultiSymbolPickerDialogState
   Widget build(BuildContext context) {
     final async = ref.watch(brokerSymbolsProvider);
     return Dialog(
-      backgroundColor: ForexAiTokens.panelBg,
+      backgroundColor: NeoethosTokens.panelBg,
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 520, maxHeight: 640),
         child: Padding(
@@ -62,7 +62,7 @@ class _MultiSymbolPickerDialogState
                     style: TextStyle(
                       fontSize: 15,
                       fontWeight: FontWeight.w700,
-                      color: ForexAiTokens.textPrimary,
+                      color: NeoethosTokens.textPrimary,
                     ),
                   ),
                   const Spacer(),
@@ -70,7 +70,7 @@ class _MultiSymbolPickerDialogState
                     '${_selected.length} selected',
                     style: const TextStyle(
                       fontSize: 12,
-                      color: ForexAiTokens.accent,
+                      color: NeoethosTokens.accent,
                       fontWeight: FontWeight.w700,
                     ),
                   ),
@@ -104,7 +104,7 @@ class _MultiSymbolPickerDialogState
                     child: Text(
                       'Symbol list could not be loaded — ${describeError(e)}. '
                       'Authenticate in Broker Setup first.',
-                      style: const TextStyle(color: ForexAiTokens.sell),
+                      style: const TextStyle(color: NeoethosTokens.sell),
                     ),
                   ),
                 ),
@@ -148,18 +148,18 @@ class _MultiSymbolPickerDialogState
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
         decoration: BoxDecoration(
           color: on
-              ? ForexAiTokens.accent.withValues(alpha: 0.18)
-              : ForexAiTokens.appBg,
+              ? NeoethosTokens.accent.withValues(alpha: 0.18)
+              : NeoethosTokens.appBg,
           border: Border.all(
-              color: on ? ForexAiTokens.accent : ForexAiTokens.border),
-          borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+              color: on ? NeoethosTokens.accent : NeoethosTokens.border),
+          borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
         ),
         child: Text(
           label,
           style: TextStyle(
             fontSize: 11,
             fontWeight: FontWeight.w700,
-            color: on ? ForexAiTokens.accent : ForexAiTokens.textMuted,
+            color: on ? NeoethosTokens.accent : NeoethosTokens.textMuted,
           ),
         ),
       ),
@@ -181,7 +181,7 @@ class _MultiSymbolPickerDialogState
     if (filtered.isEmpty) {
       return const Center(
         child: Text('No matches',
-            style: TextStyle(color: ForexAiTokens.textMuted)),
+            style: TextStyle(color: NeoethosTokens.textMuted)),
       );
     }
     return ListView.builder(
@@ -199,13 +199,13 @@ class _MultiSymbolPickerDialogState
             }
           }),
           controlAffinity: ListTileControlAffinity.leading,
-          activeColor: ForexAiTokens.accent,
+          activeColor: NeoethosTokens.accent,
           title: Text(
             s.symbolName,
             style: const TextStyle(
               fontSize: 13,
               fontWeight: FontWeight.w600,
-              color: ForexAiTokens.textPrimary,
+              color: NeoethosTokens.textPrimary,
             ),
           ),
           subtitle: s.description == null
@@ -215,7 +215,7 @@ class _MultiSymbolPickerDialogState
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
-                      fontSize: 10, color: ForexAiTokens.textMuted),
+                      fontSize: 10, color: NeoethosTokens.textMuted),
                 ),
         );
       },

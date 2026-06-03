@@ -11,7 +11,7 @@
 #     neoethos-app.exe          ← Rust backend (hidden from operator;
 #                                 auto-spawned by the UI exe)
 #   assets/branding/*.png       ← icons / splash
-#   (no model files — AI Helper runs against a ChatGPT subscription)
+#   (no model files - AI Helper runs against a ChatGPT subscription)
 #
 # Operator workflow: copy the whole `dist/NeoEthos/` folder anywhere,
 # double-click `forex_flutter_ui.exe`. The Flutter `BackendSupervisor`
@@ -38,7 +38,7 @@ Write-Host "Building NeoEthos release bundle from $repoRoot"
 Write-Host "  profile     : $Profile"
 Write-Host "  destination : $dst"
 
-# 1. Verify the artefacts exist. We don't (re)build here — the operator
+# 1. Verify the artefacts exist. We don't (re)build here - the operator
 #    runs `cargo build -p neoethos-app --release` and
 #    `flutter build windows --release` first; this script just collates.
 $rustExe = Join-Path $repoRoot ("target\$Profile\neoethos-app.exe")
@@ -66,7 +66,7 @@ Write-Host "Copying Flutter shell from $flutterDir"
 $srcUiExe = Join-Path $flutterDir 'NeoEthos.exe'
 if (-not (Test-Path $srcUiExe)) {
     # Flutter's CMakeLists pins BINARY_NAME as lowercase "neoethos" today;
-    # earlier rev was "NeoEthos". Either is fine — we rename to NeoEthos.exe
+    # earlier rev was "NeoEthos". Either is fine - we rename to NeoEthos.exe
     # at the destination.
     $srcUiExe = Join-Path $flutterDir 'neoethos.exe'
 }
@@ -82,7 +82,7 @@ Copy-Item -Path $srcUiExe -Destination (Join-Path $dst 'NeoEthos.exe')
 # `flutter build windows --release` also emits one DLL per Flutter plugin
 # (e.g. `url_launcher_windows_plugin.dll`). Loading the main exe with a
 # missing plugin DLL exits with 0xC0000135 STATUS_DLL_NOT_FOUND before
-# the BackendSupervisor ever runs — the UI window appears for ~50 ms and
+# the BackendSupervisor ever runs - the UI window appears for ~50 ms and
 # disappears with no error popup. Bundle every *.dll the Flutter build
 # produced so plugins resolve at startup.
 Copy-Item -Path (Join-Path $flutterDir '*.dll') -Destination $dst
@@ -90,7 +90,7 @@ Copy-Item -Path (Join-Path $flutterDir 'data') -Destination $dst -Recurse
 
 # 4. Copy Rust backend into a `bin/` subfolder so it stays out of the
 #    operator's way. BackendSupervisor's lookup #1 is exactly this
-#    `<exe-dir>/bin/neoethos-app.exe` path — the operator sees one
+#    `<exe-dir>/bin/neoethos-app.exe` path - the operator sees one
 #    NeoEthos.exe at the top of the bundle and nothing else.
 $binDir = Join-Path $dst 'bin'
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
@@ -118,9 +118,9 @@ foreach ($dll in @('catboostmodel.dll', 'xgboost.dll')) {
         # catboost.dll absent = the build script didn't run or the
         # cargo build didn't include `tree-models`. xgboost.dll absent
         # is usually fine (static-linked variant). We warn but don't
-        # fail — the operator can still ship without these and the
+        # fail - the operator can still ship without these and the
         # ensemble runs with the local-fallback tree experts.
-        Write-Warning "$dll not found next to $rustExe — make sure scripts\build-cargo-release.ps1 ran with the gpu-vulkan + tree-models features. Bundle will be missing this expert."
+        Write-Warning "$dll not found next to $rustExe - make sure scripts\build-cargo-release.ps1 ran with the gpu-vulkan + tree-models features. Bundle will be missing this expert."
     }
 }
 
@@ -147,7 +147,7 @@ WHAT TO DO:
 If you double-click "neoethos-app.exe" directly:
 - No window appears (the backend has no UI of its own)
 - The backend tries to start but has no config in this dir
-- You see "nothing happens" — but the process either errored out
+- You see "nothing happens" - but the process either errored out
   silently or is running invisibly on port 7423
 
 This folder is normally HIDDEN from File Explorer.
@@ -168,7 +168,7 @@ Copy-Item -Path (Join-Path $repoRoot 'assets') -Destination $dst -Recurse
 Copy-Item -Path (Join-Path $repoRoot 'LICENSE') -Destination $dst
 Copy-Item -Path (Join-Path $repoRoot 'README.md') -Destination $dst -ErrorAction SilentlyContinue
 
-# 6. (Gemma GGUF bundling removed — AI Helper now uses a ChatGPT
+# 6. (Gemma GGUF bundling removed - AI Helper now uses a ChatGPT
 #    subscription via neoethos-codex OAuth, no local model file is
 #    needed. The bundle stays ~250 MB regardless.)
 

@@ -2,7 +2,7 @@
 // (kept locally in Flutter after the legacy Rust UI removal).
 //
 // Single source of truth for color / typography / spacing /
-// dimensions so every widget reads from `ForexAiTheme.of(context)`
+// dimensions so every widget reads from `NeoethosTheme.of(context)`
 // instead of hard-coding hex values.
 //
 // TradingView-style dark theme. Light theme is intentionally out
@@ -14,7 +14,7 @@ import 'package:flutter/material.dart';
 /// All raw token values from the HTML mockup. Mirror the CSS
 /// custom-property names so a developer can grep across either
 /// codebase by token name.
-class ForexAiTokens {
+class NeoethosTokens {
   // Surfaces
   static const Color appBg = Color(0xFF0E1116);
   static const Color panelBg = Color(0xFF161B22);
@@ -77,103 +77,103 @@ class ForexAiTokens {
 /// `Theme.of(context)`. Wraps the raw tokens into Flutter's
 /// `ThemeData` so widgets can stay token-agnostic when they only
 /// need the standard surface / on-surface / primary axes.
-ThemeData buildForexAiTheme() {
+ThemeData buildNeoethosTheme() {
   const scheme = ColorScheme(
     brightness: Brightness.dark,
-    primary: ForexAiTokens.accent,
-    onPrimary: ForexAiTokens.textPrimary,
-    secondary: ForexAiTokens.accentHover,
-    onSecondary: ForexAiTokens.textPrimary,
-    error: ForexAiTokens.sell,
-    onError: ForexAiTokens.textPrimary,
-    surface: ForexAiTokens.panelBg,
-    onSurface: ForexAiTokens.textPrimary,
-    surfaceContainerHighest: ForexAiTokens.surfaceAlt,
-    outline: ForexAiTokens.border,
-    outlineVariant: ForexAiTokens.borderStrong,
+    primary: NeoethosTokens.accent,
+    onPrimary: NeoethosTokens.textPrimary,
+    secondary: NeoethosTokens.accentHover,
+    onSecondary: NeoethosTokens.textPrimary,
+    error: NeoethosTokens.sell,
+    onError: NeoethosTokens.textPrimary,
+    surface: NeoethosTokens.panelBg,
+    onSurface: NeoethosTokens.textPrimary,
+    surfaceContainerHighest: NeoethosTokens.surfaceAlt,
+    outline: NeoethosTokens.border,
+    outlineVariant: NeoethosTokens.borderStrong,
   );
 
   const textTheme = TextTheme(
     // Title row of a panel (e.g. "Operator Overview").
     titleLarge: TextStyle(
-      fontSize: ForexAiTokens.fsTitle,
+      fontSize: NeoethosTokens.fsTitle,
       fontWeight: FontWeight.w700,
-      color: ForexAiTokens.textPrimary,
+      color: NeoethosTokens.textPrimary,
     ),
     titleMedium: TextStyle(
-      fontSize: ForexAiTokens.fsSubtitle,
+      fontSize: NeoethosTokens.fsSubtitle,
       fontWeight: FontWeight.w700,
-      color: ForexAiTokens.textPrimary,
+      color: NeoethosTokens.textPrimary,
     ),
     bodyMedium: TextStyle(
-      fontSize: ForexAiTokens.fsBody,
-      color: ForexAiTokens.textPrimary,
+      fontSize: NeoethosTokens.fsBody,
+      color: NeoethosTokens.textPrimary,
     ),
     bodySmall: TextStyle(
-      fontSize: ForexAiTokens.fsCaption,
-      color: ForexAiTokens.textMuted,
+      fontSize: NeoethosTokens.fsCaption,
+      color: NeoethosTokens.textMuted,
     ),
     labelSmall: TextStyle(
-      fontSize: ForexAiTokens.fsCaption - 1,
+      fontSize: NeoethosTokens.fsCaption - 1,
       letterSpacing: 1.0,
       fontWeight: FontWeight.w700,
-      color: ForexAiTokens.textMuted,
+      color: NeoethosTokens.textMuted,
     ),
   );
 
   return ThemeData(
     useMaterial3: true,
     brightness: Brightness.dark,
-    scaffoldBackgroundColor: ForexAiTokens.appBg,
-    canvasColor: ForexAiTokens.panelBg,
+    scaffoldBackgroundColor: NeoethosTokens.appBg,
+    canvasColor: NeoethosTokens.panelBg,
     colorScheme: scheme,
     textTheme: textTheme,
     fontFamily: 'Segoe UI', // closest Windows match to the mockup's stack
-    dividerColor: ForexAiTokens.border,
+    dividerColor: NeoethosTokens.border,
     elevatedButtonTheme: ElevatedButtonThemeData(
       style: ElevatedButton.styleFrom(
-        backgroundColor: ForexAiTokens.accent,
-        foregroundColor: ForexAiTokens.textPrimary,
+        backgroundColor: NeoethosTokens.accent,
+        foregroundColor: NeoethosTokens.textPrimary,
         textStyle: const TextStyle(
-          fontSize: ForexAiTokens.fsBody,
+          fontSize: NeoethosTokens.fsBody,
           fontWeight: FontWeight.w700,
         ),
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+          borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
         ),
-        minimumSize: const Size(0, ForexAiTokens.btnHeight),
+        minimumSize: const Size(0, NeoethosTokens.btnHeight),
       ),
     ),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
-      fillColor: ForexAiTokens.surfaceBg,
+      fillColor: NeoethosTokens.surfaceBg,
       border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
-        borderSide: const BorderSide(color: ForexAiTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
+        borderSide: const BorderSide(color: NeoethosTokens.border),
       ),
       enabledBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
-        borderSide: const BorderSide(color: ForexAiTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
+        borderSide: const BorderSide(color: NeoethosTokens.border),
       ),
       focusedBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
-        borderSide: const BorderSide(color: ForexAiTokens.accent),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
+        borderSide: const BorderSide(color: NeoethosTokens.accent),
       ),
       contentPadding: const EdgeInsets.symmetric(
-        horizontal: ForexAiTokens.spMd,
-        vertical: ForexAiTokens.spSm,
+        horizontal: NeoethosTokens.spMd,
+        vertical: NeoethosTokens.spSm,
       ),
       labelStyle: const TextStyle(
-        color: ForexAiTokens.textMuted,
-        fontSize: ForexAiTokens.fsBody,
+        color: NeoethosTokens.textMuted,
+        fontSize: NeoethosTokens.fsBody,
       ),
     ),
     cardTheme: CardThemeData(
-      color: ForexAiTokens.surfaceBg,
+      color: NeoethosTokens.surfaceBg,
       elevation: 0,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(ForexAiTokens.rMd),
-        side: const BorderSide(color: ForexAiTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rMd),
+        side: const BorderSide(color: NeoethosTokens.border),
       ),
     ),
   );

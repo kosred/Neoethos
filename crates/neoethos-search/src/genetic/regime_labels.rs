@@ -99,7 +99,7 @@ impl Default for RegimeLabelPolicy {
 // `RegimeLabelPolicy::from_env` and its `env_i64` / `env_usize` / `env_f64`
 // helpers were retired during Phase 22 of the consolidated audit
 // follow-on: the constructor had no callers in this crate or any of its
-// dependents, so the only behavior was reading 11 `FOREX_BOT_REGIME_LABEL_*`
+// dependents, so the only behavior was reading 11 `NEOETHOS_BOT_REGIME_LABEL_*`
 // env vars on demand. Production code constructs `RegimeLabelPolicy`
 // through its struct fields directly; if a future feature needs
 // env-driven defaults, route them through a typed `*RuntimeOverrides`

@@ -57,17 +57,17 @@ pub const ENV_PROP_FIRM_PRESET: &str = "NEOETHOS_PROP_FIRM_PRESET";
 /// Required by `risk_gate::prop_firm_pre_trade_check` whenever an
 /// order carries a stop-loss. Empty / unset → hard-fail at the gate
 /// (no synthetic default per real-data directive 2026-05-24).
-pub const ENV_PROP_ACCOUNT_CURRENCY: &str = "FOREX_BOT_PROP_ACCOUNT_CURRENCY";
+pub const ENV_PROP_ACCOUNT_CURRENCY: &str = "NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY";
 
 /// Live quote→account FX rate override for the risk-gate's
 /// pip-value computation. Used for cross pairs where the broker
 /// hasn't shipped a real rate yet. Must be finite + > 0.0.
-pub const ENV_PROP_QUOTE_TO_ACCOUNT_RATE: &str = "FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE";
+pub const ENV_PROP_QUOTE_TO_ACCOUNT_RATE: &str = "NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE";
 
 /// Path to the operator's `symbol_metadata.json` override. When set
 /// and the file is loadable, replaces the on-disk `data/symbol_metadata.json`
 /// default. Read by `symbol_metadata::resolve` / load path.
-pub const ENV_SYMBOL_METADATA: &str = "FOREX_BOT_SYMBOL_METADATA";
+pub const ENV_SYMBOL_METADATA: &str = "NEOETHOS_BOT_SYMBOL_METADATA";
 
 /// Tracing-subscriber `RUST_LOG`-style filter (e.g. `debug,sqlx=warn`).
 /// Read by `logging::setup_logging`. When unset, the production
@@ -190,7 +190,7 @@ pub fn broker_credentials_path_override() -> Option<String> {
 /// startup logging block) can also surface them on the UI / CLI
 /// banner.
 ///
-/// The audit flagged `FOREX_BOT_DISABLE_SMC_GATE` and friends as a
+/// The audit flagged `NEOETHOS_BOT_DISABLE_SMC_GATE` and friends as a
 /// "behavior changes invisibly based on environment" risk. By
 /// emitting a structured `tracing::warn!` listing every active
 /// override at startup, operators see ALL overrides in one place
@@ -198,8 +198,8 @@ pub fn broker_credentials_path_override() -> Option<String> {
 ///
 /// This helper checks only the env-vars defined in this registry.
 /// Crates that own their own env-var namespace (e.g. `neoethos-search`
-/// has `FOREX_BOT_DISABLE_SMC_GATE`, `FOREX_BOT_NORMALIZE_FEATURES`,
-/// `FOREX_BOT_PREFILTER_*`, etc.) should call their own equivalent
+/// has `NEOETHOS_BOT_DISABLE_SMC_GATE`, `NEOETHOS_BOT_NORMALIZE_FEATURES`,
+/// `NEOETHOS_BOT_PREFILTER_*`, etc.) should call their own equivalent
 /// helper. Returning the names from each gets the binary a complete
 /// list for the chrome banner.
 pub fn active_overrides() -> Vec<&'static str> {
@@ -269,13 +269,13 @@ mod tests {
         assert_eq!(ENV_PROP_FIRM_PRESET, "NEOETHOS_PROP_FIRM_PRESET");
         assert_eq!(
             ENV_PROP_ACCOUNT_CURRENCY,
-            "FOREX_BOT_PROP_ACCOUNT_CURRENCY"
+            "NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY"
         );
         assert_eq!(
             ENV_PROP_QUOTE_TO_ACCOUNT_RATE,
-            "FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE"
+            "NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE"
         );
-        assert_eq!(ENV_SYMBOL_METADATA, "FOREX_BOT_SYMBOL_METADATA");
+        assert_eq!(ENV_SYMBOL_METADATA, "NEOETHOS_BOT_SYMBOL_METADATA");
         assert_eq!(ENV_LOG_FILTER, "RUST_LOG");
         assert_eq!(ENV_USER_DATA_DIR, "NEOETHOS_USER_DATA_DIR");
         assert_eq!(ENV_LAUNCHED_BY_FLUTTER, "NEOETHOS_LAUNCHED_BY_FLUTTER");

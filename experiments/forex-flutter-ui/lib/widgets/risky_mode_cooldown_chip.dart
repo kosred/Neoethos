@@ -263,7 +263,7 @@ class _RiskyModeCooldownChipState extends State<RiskyModeCooldownChip> {
                       'inside 24 h tends to chase losses; the cooldown '
                       'forces an emotional reset.',
                       style: TextStyle(
-                        color: ForexAiTokens.textMuted,
+                        color: NeoethosTokens.textMuted,
                         fontSize: 12,
                       ),
                     ),

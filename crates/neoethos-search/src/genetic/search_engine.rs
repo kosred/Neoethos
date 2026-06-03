@@ -255,7 +255,7 @@ pub fn signals_for_gene_full(
         .enumerate()
         .map(|(i, &f)| if f != 0 { smc_weights[i] } else { 0.0 })
         .sum();
-    // Hard bypass: when `FOREX_BOT_DISABLE_SMC_GATE=1` the gate
+    // Hard bypass: when `NEOETHOS_BOT_DISABLE_SMC_GATE=1` the gate
     // collapses (active_sum = 0 → raw signal passes through). Lets
     // operators isolate "SMC indicators don't trigger on this symbol"
     // from genuine signal-generation issues without recompiling.
@@ -648,7 +648,7 @@ where
     let n_indicators = features.data.ncols();
     let smc_cfg = SmcSearchConfig::from_env();
 
-    // All `FOREX_BOT_*` search-engine knobs are resolved through the typed
+    // All `NEOETHOS_BOT_*` search-engine knobs are resolved through the typed
     // `GeneticSearchRuntimeOverrides` boundary; the inline env reads that
     // used to live here are gone (P0-8).
     let genetic_runtime_overrides = current_genetic_search_runtime_overrides();

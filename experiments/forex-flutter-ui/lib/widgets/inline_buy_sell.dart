@@ -62,7 +62,7 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor:
-              ok ? ForexAiTokens.buy : ForexAiTokens.warning,
+              ok ? NeoethosTokens.buy : NeoethosTokens.warning,
           duration: const Duration(seconds: 3),
           content: Text(
             '${side.toUpperCase()} ${widget.symbol} '
@@ -126,9 +126,9 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
     return Container(
       padding: const EdgeInsets.all(6),
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg.withValues(alpha: 0.94),
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg.withValues(alpha: 0.94),
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
         boxShadow: const [
           BoxShadow(color: Color(0x40000000), blurRadius: 6, offset: Offset(0, 2)),
         ],
@@ -147,7 +147,7 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
                 height: 6,
                 margin: const EdgeInsets.only(right: 4),
                 decoration: BoxDecoration(
-                  color: stale ? ForexAiTokens.warning : ForexAiTokens.buy,
+                  color: stale ? NeoethosTokens.warning : NeoethosTokens.buy,
                   shape: BoxShape.circle,
                 ),
               ),
@@ -158,8 +158,8 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
                   fontWeight: FontWeight.w700,
                   letterSpacing: 0.5,
                   color: stale
-                      ? ForexAiTokens.warning
-                      : ForexAiTokens.textMuted,
+                      ? NeoethosTokens.warning
+                      : NeoethosTokens.textMuted,
                 ),
               ),
             ],
@@ -171,7 +171,7 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
               _SideButton(
                 label: 'SELL',
                 price: bid.toStringAsFixed(digits),
-                color: ForexAiTokens.sell,
+                color: NeoethosTokens.sell,
                 busy: _busy,
                 stale: stale,
                 onTap: () => _placeOrder('sell'),
@@ -186,7 +186,7 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
               _SideButton(
                 label: 'BUY',
                 price: ask.toStringAsFixed(digits),
-                color: ForexAiTokens.buy,
+                color: NeoethosTokens.buy,
                 busy: _busy,
                 stale: stale,
                 onTap: () => _placeOrder('buy'),
@@ -201,7 +201,7 @@ class _InlineBuySellState extends ConsumerState<InlineBuySell> {
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(
                 fontSize: 9,
-                color: ForexAiTokens.sell,
+                color: NeoethosTokens.sell,
               ),
             ),
           ],
@@ -291,7 +291,7 @@ class _VolumeStepper extends StatelessWidget {
           style: TextStyle(
             fontSize: 8,
             fontWeight: FontWeight.w700,
-            color: ForexAiTokens.textMuted,
+            color: NeoethosTokens.textMuted,
             letterSpacing: 0.5,
           ),
         ),
@@ -307,7 +307,7 @@ class _VolumeStepper extends StatelessWidget {
                 style: const TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w700,
-                  color: ForexAiTokens.textPrimary,
+                  color: NeoethosTokens.textPrimary,
                   fontFeatures: [FontFeature.tabularFigures()],
                 ),
               ),
@@ -332,9 +332,9 @@ class _QuickTradeStub extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg.withValues(alpha: 0.94),
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg.withValues(alpha: 0.94),
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: const Row(
         mainAxisSize: MainAxisSize.min,
@@ -344,7 +344,7 @@ class _QuickTradeStub extends StatelessWidget {
             height: 10,
             child: CircularProgressIndicator(
               strokeWidth: 1.6,
-              color: ForexAiTokens.textMuted,
+              color: NeoethosTokens.textMuted,
             ),
           ),
           SizedBox(width: 6),
@@ -353,7 +353,7 @@ class _QuickTradeStub extends StatelessWidget {
             style: TextStyle(
               fontSize: 9,
               fontWeight: FontWeight.w600,
-              color: ForexAiTokens.textMuted,
+              color: NeoethosTokens.textMuted,
             ),
           ),
         ],
@@ -376,11 +376,11 @@ class _StepBtn extends StatelessWidget {
         height: 20,
         alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: ForexAiTokens.appBg,
-          border: Border.all(color: ForexAiTokens.border),
+          color: NeoethosTokens.appBg,
+          border: Border.all(color: NeoethosTokens.border),
           borderRadius: BorderRadius.circular(4),
         ),
-        child: Icon(icon, size: 13, color: ForexAiTokens.textMuted),
+        child: Icon(icon, size: 13, color: NeoethosTokens.textMuted),
       ),
     );
   }

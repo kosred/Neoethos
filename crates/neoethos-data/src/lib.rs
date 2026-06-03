@@ -7,6 +7,59 @@ use vortex_array::ToCanonical;
 use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::dtype::NativePType;
 
+// ─── Data-layer runtime overrides (config-consolidation S3-data) ───────────
+// Config-driven replacement for the `NEOETHOS_BOT_NORMALIZE_FEATURES` /
+// `NEOETHOS_BOT_REBUILD_STALE_HIGHER_TFS` env vars. The binary installs these
+// from `Settings.models.data_runtime` once at startup (as plain bools, so this
+// foundation crate keeps NOT depending on neoethos-core); the feature builder
+// + resampler read the cached values instead of `std::env`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataRuntimeOverrides {
+    pub normalize_features: bool,
+    pub rebuild_stale_higher_tfs: bool,
+}
+
+impl Default for DataRuntimeOverrides {
+    fn default() -> Self {
+        Self {
+            normalize_features: false,
+            rebuild_stale_higher_tfs: false,
+        }
+    }
+}
+
+static DATA_RUNTIME_OVERRIDES: std::sync::OnceLock<DataRuntimeOverrides> =
+    std::sync::OnceLock::new();
+
+/// Install process-wide data-layer runtime overrides from config. The
+/// binaries call this once at startup with `settings.models.data_runtime.*`.
+/// Idempotent — the first install wins.
+pub fn install_data_runtime_overrides(normalize_features: bool, rebuild_stale_higher_tfs: bool) {
+    let _ = DATA_RUNTIME_OVERRIDES.set(DataRuntimeOverrides {
+        normalize_features,
+        rebuild_stale_higher_tfs,
+    });
+}
+
+/// Current data-layer runtime overrides, or the deterministic defaults (both
+/// OFF — matching the legacy env-unset behavior) when no install has happened.
+pub fn current_data_runtime_overrides() -> DataRuntimeOverrides {
+    DATA_RUNTIME_OVERRIDES.get().copied().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod data_runtime_overrides_tests {
+    use super::*;
+
+    #[test]
+    fn data_runtime_overrides_default_is_off() {
+        // Behavior-preservation: env-unset defaulted both knobs OFF.
+        let d = DataRuntimeOverrides::default();
+        assert!(!d.normalize_features);
+        assert!(!d.rebuild_stale_higher_tfs);
+    }
+}
+
 pub mod core;
 pub mod test_fixtures;
 // Re-export the canonical timeframe list so callers using neoethos-data
@@ -986,7 +1039,7 @@ pub fn prepare_multitimeframe_features_with_options(
     }
 
     // Per-column robust z-score (median + MAD * 1.4826) with NaN→0
-    // and clip to ±10. Opt-in via `FOREX_BOT_NORMALIZE_FEATURES=1`.
+    // and clip to ±10. Opt-in via `NEOETHOS_BOT_NORMALIZE_FEATURES=1`.
     //
     // Why opt-in: normalization is correct architecture (puts every
     // column on the same scale, kills NaN propagation, fixes the
@@ -997,10 +1050,7 @@ pub fn prepare_multitimeframe_features_with_options(
     // currently work (EURUSD/GBPUSD/AUDUSD). Threshold re-calibration
     // is a follow-up; until then operators opt in per-symbol when
     // they want to attack the JPY/XAU portfolio gap.
-    if matches!(
-        std::env::var("FOREX_BOT_NORMALIZE_FEATURES").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    ) {
+    if current_data_runtime_overrides().normalize_features {
         let _norm_stats = crate::core::normalization::normalize_feature_matrix(&mut merged);
     }
 

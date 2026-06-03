@@ -121,11 +121,11 @@ pub fn normalize_runtime_device_policy(policy: &str) -> String {
 
 pub fn requested_runtime_device_policy(model_name: &str) -> String {
     let model_key = format!(
-        "FOREX_BOT_{}_DEVICE",
+        "NEOETHOS_BOT_{}_DEVICE",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
     let requested = std::env::var(&model_key)
-        .or_else(|_| std::env::var("FOREX_BOT_META_DEVICE"))
+        .or_else(|_| std::env::var("NEOETHOS_BOT_META_DEVICE"))
         .unwrap_or_else(|_| "auto".to_string());
     normalize_runtime_device_policy(&requested)
 }
@@ -264,11 +264,11 @@ pub fn normalize_training_precision_policy(policy: &str) -> String {
 
 pub fn requested_training_precision_policy(model_name: &str) -> String {
     let model_key = format!(
-        "FOREX_BOT_{}_TRAIN_PRECISION",
+        "NEOETHOS_BOT_{}_TRAIN_PRECISION",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
     let requested = std::env::var(&model_key)
-        .or_else(|_| std::env::var("FOREX_BOT_TRAIN_PRECISION"))
+        .or_else(|_| std::env::var("NEOETHOS_BOT_TRAIN_PRECISION"))
         .or_else(|_| std::env::var("FOREX_TRAIN_PRECISION"))
         .unwrap_or_else(|_| "auto".to_string());
     normalize_training_precision_policy(&requested)
@@ -596,11 +596,11 @@ mod tests {
     #[test]
     fn gpu_policy_cpu_fallback_reason_detects_model_override() {
         unsafe {
-            std::env::set_var("FOREX_BOT_NEAT_DEVICE", "cuda:3");
+            std::env::set_var("NEOETHOS_BOT_NEAT_DEVICE", "cuda:3");
         }
         let reason = gpu_policy_cpu_fallback_reason("neat");
         unsafe {
-            std::env::remove_var("FOREX_BOT_NEAT_DEVICE");
+            std::env::remove_var("NEOETHOS_BOT_NEAT_DEVICE");
         }
         assert_eq!(
             reason.as_deref(),
@@ -661,13 +661,13 @@ mod tests {
     #[test]
     fn requested_training_precision_policy_prefers_model_scoped_env() {
         unsafe {
-            std::env::set_var("FOREX_BOT_DQN_TRAIN_PRECISION", "bf16");
-            std::env::set_var("FOREX_BOT_TRAIN_PRECISION", "fp32");
+            std::env::set_var("NEOETHOS_BOT_DQN_TRAIN_PRECISION", "bf16");
+            std::env::set_var("NEOETHOS_BOT_TRAIN_PRECISION", "fp32");
         }
         let requested = requested_training_precision_policy("dqn");
         unsafe {
-            std::env::remove_var("FOREX_BOT_DQN_TRAIN_PRECISION");
-            std::env::remove_var("FOREX_BOT_TRAIN_PRECISION");
+            std::env::remove_var("NEOETHOS_BOT_DQN_TRAIN_PRECISION");
+            std::env::remove_var("NEOETHOS_BOT_TRAIN_PRECISION");
         }
         assert_eq!(requested, "bf16");
     }

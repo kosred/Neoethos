@@ -28,11 +28,11 @@ pub fn runtime_backend_with_gpu_fallback(
     cpu_backend: &str,
 ) -> (Option<String>, Option<String>) {
     let model_key = format!(
-        "FOREX_BOT_{}_DEVICE",
+        "NEOETHOS_BOT_{}_DEVICE",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
     let requested = std::env::var(&model_key)
-        .or_else(|_| std::env::var("FOREX_BOT_META_DEVICE"))
+        .or_else(|_| std::env::var("NEOETHOS_BOT_META_DEVICE"))
         .unwrap_or_else(|_| "auto".to_string());
     let normalized = normalize_statistical_device_policy(&requested);
     let degraded_reason = if normalized == "gpu" || normalized.starts_with("gpu:") {
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn runtime_backend_marks_gpu_request_as_cpu_fallback() {
         unsafe {
-            std::env::set_var("FOREX_BOT_META_DEVICE", "gpu:0");
+            std::env::set_var("NEOETHOS_BOT_META_DEVICE", "gpu:0");
         }
         let (backend, degraded_reason) =
             runtime_backend_with_gpu_fallback("elasticnet", "cpu_backend");
@@ -269,7 +269,7 @@ mod tests {
                 .is_some_and(|reason| reason.contains("currently executes on CPU"))
         );
         unsafe {
-            std::env::remove_var("FOREX_BOT_META_DEVICE");
+            std::env::remove_var("NEOETHOS_BOT_META_DEVICE");
         }
     }
 }

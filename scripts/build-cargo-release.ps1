@@ -97,7 +97,7 @@ $vsInstall = & $vswhere -latest -prerelease `
 # install roots directly. This is the same fallback the cc-rs crate
 # uses internally.
 #
-# **2026-05-25 — preview-version guardrail**: explicitly EXCLUDE the VS
+# **2026-05-25 - preview-version guardrail**: explicitly EXCLUDE the VS
 # 2026 Insiders path (`...\Microsoft Visual Studio\18\BuildTools`). Its
 # MSVC 14.51.36231 ships vectorized STL symbols
 # (`__std_find_trivial_1`, `__std_rotate`, `_Thrd_sleep_for`, etc.) that
@@ -108,7 +108,7 @@ $vsInstall = & $vswhere -latest -prerelease `
 if (-not $vsInstall) {
     Write-Host "vswhere returned nothing - falling back to filesystem probe" -ForegroundColor Yellow
     # Ordered newest-stable-first: 2022 stable wins over 2019 stable.
-    # Insiders/preview VS18 path is INTENTIONALLY OMITTED — see comment above.
+    # Insiders/preview VS18 path is INTENTIONALLY OMITTED - see comment above.
     $candidates = @(
         'C:\Program Files\Microsoft Visual Studio\2022\BuildTools',
         'C:\Program Files\Microsoft Visual Studio\2022\Community',
@@ -132,7 +132,7 @@ if (-not $vsInstall) {
     }
 }
 
-# **2026-05-25 — also reject the preview VS18 path if vswhere returned it**.
+# **2026-05-25 - also reject the preview VS18 path if vswhere returned it**.
 # `vswhere -latest -prerelease` happily picks the Insiders install. The
 # subsequent vcvars64.bat injects 14.51.36231 LIB paths and the link
 # step fails on vectorized STL symbols. If we're handed that path, fall
@@ -322,7 +322,7 @@ if ($catboostDll) {
     }
 } elseif (Test-Path $dst) {
     # Build did not produce a fresh DLL but a stale one exists next to
-    # neoethos-app.exe — keep it (warm-cache re-runs hit this path).
+    # neoethos-app.exe - keep it (warm-cache re-runs hit this path).
     $sizeMB = [math]::Round((Get-Item $dst).Length / 1MB, 1)
     Write-Host "  [keep] catboostmodel.dll ($sizeMB MB) already at $dst (no fresh build output)" -ForegroundColor DarkGray
 } else {

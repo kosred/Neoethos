@@ -40,7 +40,7 @@ fn init_rayon() {
     RAYON_INIT.call_once(|| {
         // F-695 closure (2026-05-25 — F-CORE3): resolved through the
         // typed `BacktestRuntimeOverrides::rayon_threads` boundary so
-        // the env vars (`FOREX_BOT_RUST_THREADS` /
+        // the env vars (`NEOETHOS_BOT_RUST_THREADS` /
         // `RAYON_NUM_THREADS`) are read once at process startup.
         let threads = current_backtest_runtime_overrides().rayon_threads;
         if let Some(n) = threads {
@@ -363,7 +363,7 @@ impl BacktestSettings {
     }
 }
 
-/// Typed replacement for the legacy `FOREX_BOT_BACKTEST_*` env vars that
+/// Typed replacement for the legacy `NEOETHOS_BOT_BACKTEST_*` env vars that
 /// previously changed canonical backtest math (`initial_equity`,
 /// `month_capacity`) on every metric evaluation. The struct is the single
 /// place these values live; production callers install them once via
@@ -382,7 +382,7 @@ pub struct BacktestRuntimeOverrides {
     /// pool to `n` threads.
     ///
     /// **F-695 closure (2026-05-25 — F-CORE3)**: previously read inline
-    /// inside `init_rayon` via `env::var("FOREX_BOT_RUST_THREADS")` +
+    /// inside `init_rayon` via `env::var("NEOETHOS_BOT_RUST_THREADS")` +
     /// `env::var("RAYON_NUM_THREADS")`. Now consolidated to this typed
     /// boundary so the env is read once at process startup through
     /// `BacktestRuntimeOverrides::from_env`.
@@ -400,19 +400,19 @@ impl Default for BacktestRuntimeOverrides {
 }
 
 impl BacktestRuntimeOverrides {
-    /// One-shot read of the legacy `FOREX_BOT_BACKTEST_*` env vars. This is
+    /// One-shot read of the legacy `NEOETHOS_BOT_BACKTEST_*` env vars. This is
     /// the only place the backtest evaluator consults the environment for
     /// these knobs.
     pub fn from_env() -> Self {
         let mut overrides = Self::default();
-        if let Some(value) = env::var("FOREX_BOT_BACKTEST_INITIAL_EQUITY")
+        if let Some(value) = env::var("NEOETHOS_BOT_BACKTEST_INITIAL_EQUITY")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v > 0.0)
         {
             overrides.initial_equity = value;
         }
-        if let Some(value) = env::var("FOREX_BOT_BACKTEST_MAX_MONTH_BUCKETS")
+        if let Some(value) = env::var("NEOETHOS_BOT_BACKTEST_MAX_MONTH_BUCKETS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
@@ -423,7 +423,7 @@ impl BacktestRuntimeOverrides {
         // primary env var matches the audit-recommended NeoEthos naming;
         // the rayon-stdlib `RAYON_NUM_THREADS` is honoured as a fallback
         // so existing deployment scripts keep working unchanged.
-        if let Some(value) = env::var("FOREX_BOT_RUST_THREADS")
+        if let Some(value) = env::var("NEOETHOS_BOT_RUST_THREADS")
             .ok()
             .or_else(|| env::var("RAYON_NUM_THREADS").ok())
             .and_then(|v| v.parse::<usize>().ok())
@@ -432,6 +432,29 @@ impl BacktestRuntimeOverrides {
             overrides.rayon_threads = Some(value);
         }
         overrides
+    }
+
+    /// Config-driven constructor (was the `NEOETHOS_BOT_BACKTEST_*` env
+    /// vars). Numeric fields are validated (equity > 0, capacity > 0,
+    /// threads > 0) exactly like the env reader. A
+    /// `backtest_from_settings_default_matches_env_default` test guarantees
+    /// a fresh `Settings` reproduces [`Self::default`].
+    pub fn from_settings(s: &neoethos_core::Settings) -> Self {
+        let c = &s.models.backtest_runtime;
+        let d = Self::default();
+        Self {
+            initial_equity: if c.initial_equity.is_finite() && c.initial_equity > 0.0 {
+                c.initial_equity
+            } else {
+                d.initial_equity
+            },
+            month_capacity: if c.month_capacity > 0 {
+                c.month_capacity
+            } else {
+                d.month_capacity
+            },
+            rayon_threads: c.rayon_threads.filter(|v| *v > 0),
+        }
     }
 }
 
@@ -445,12 +468,18 @@ pub fn install_backtest_runtime_overrides(
     BACKTEST_RUNTIME_OVERRIDES.set(overrides)
 }
 
-/// Convenience wrapper that resolves the legacy `FOREX_BOT_BACKTEST_*` env
+/// Convenience wrapper that resolves the legacy `NEOETHOS_BOT_BACKTEST_*` env
 /// vars once and installs them. Idempotent: subsequent calls are ignored.
 pub fn install_backtest_runtime_overrides_from_env() {
     // DOCUMENTED-DEFAULT: OnceLock::set returning Err just means the first
     // installer won (the public API documents idempotency). Nothing to log.
     let _ = BACKTEST_RUNTIME_OVERRIDES.set(BacktestRuntimeOverrides::from_env());
+}
+
+/// Config-driven install — reads the backtest knobs from the single
+/// `Settings` instead of the environment. Idempotent.
+pub fn install_backtest_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
+    let _ = BACKTEST_RUNTIME_OVERRIDES.set(BacktestRuntimeOverrides::from_settings(s));
 }
 
 /// Returns the currently installed backtest runtime overrides, or the
@@ -1402,6 +1431,17 @@ mod overrides_tests {
         let defaults = BacktestRuntimeOverrides::default();
         assert!((defaults.initial_equity - 100_000.0).abs() < 1e-9);
         assert_eq!(defaults.month_capacity, 240);
+    }
+
+    #[test]
+    fn backtest_from_settings_default_matches_env_default() {
+        // Behavior-preservation gate (config-consolidation S2d): a fresh
+        // `Settings` reproduces the engine backtest defaults exactly.
+        let s = neoethos_core::Settings::default();
+        assert_eq!(
+            BacktestRuntimeOverrides::from_settings(&s),
+            BacktestRuntimeOverrides::default()
+        );
     }
 
     #[test]

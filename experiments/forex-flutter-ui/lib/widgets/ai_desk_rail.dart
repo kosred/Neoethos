@@ -25,6 +25,7 @@ import '../state/nav.dart';
 import '../state/pending_actions_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import 'news_panel.dart';
 
 /// Persists "is the rail expanded" across rebuilds within the session.
 /// Defaults to expanded — the rail is the whole point of the rebuild
@@ -41,8 +42,8 @@ class AiDeskRail extends ConsumerWidget {
     return Container(
       width: 280,
       decoration: const BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border(left: BorderSide(color: ForexAiTokens.border)),
+        color: NeoethosTokens.panelBg,
+        border: Border(left: BorderSide(color: NeoethosTokens.border)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -53,22 +54,24 @@ class AiDeskRail extends ConsumerWidget {
             onOpenFull: () =>
                 ref.read(activeTabProvider.notifier).state = 'AiDesk',
           ),
-          const Divider(height: 1, color: ForexAiTokens.border),
+          const Divider(height: 1, color: NeoethosTokens.border),
           const Expanded(
             child: SingleChildScrollView(
               padding: EdgeInsets.symmetric(
-                horizontal: ForexAiTokens.spMd,
-                vertical: ForexAiTokens.spMd,
+                horizontal: NeoethosTokens.spMd,
+                vertical: NeoethosTokens.spMd,
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
+                  NewsPanel(),
+                  SizedBox(height: NeoethosTokens.spMd),
                   _ModelsLoadedSection(),
-                  SizedBox(height: ForexAiTokens.spMd),
+                  SizedBox(height: NeoethosTokens.spMd),
                   _PerformanceSection(),
-                  SizedBox(height: ForexAiTokens.spMd),
+                  SizedBox(height: NeoethosTokens.spMd),
                   _ProposedActionSection(),
-                  SizedBox(height: ForexAiTokens.spMd),
+                  SizedBox(height: NeoethosTokens.spMd),
                   _DiscoveryTargetsSection(),
                 ],
               ),
@@ -93,8 +96,8 @@ class _CollapsedStrip extends ConsumerWidget {
     return Container(
       width: 36,
       decoration: const BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border(left: BorderSide(color: ForexAiTokens.border)),
+        color: NeoethosTokens.panelBg,
+        border: Border(left: BorderSide(color: NeoethosTokens.border)),
       ),
       child: Column(
         children: [
@@ -104,7 +107,7 @@ class _CollapsedStrip extends ConsumerWidget {
             onPressed: () =>
                 ref.read(aiDeskRailVisibleProvider.notifier).state = true,
             icon: const Icon(Icons.chevron_left,
-                color: ForexAiTokens.textMuted),
+                color: NeoethosTokens.textMuted),
           ),
           const SizedBox(height: 4),
           RotatedBox(
@@ -112,10 +115,10 @@ class _CollapsedStrip extends ConsumerWidget {
             child: Text(
               'AI DESK',
               style: TextStyle(
-                fontSize: ForexAiTokens.fsCaption - 1,
+                fontSize: NeoethosTokens.fsCaption - 1,
                 fontWeight: FontWeight.w800,
                 letterSpacing: 2,
-                color: ForexAiTokens.textFaint.withValues(alpha: 0.8),
+                color: NeoethosTokens.textFaint.withValues(alpha: 0.8),
               ),
             ),
           ),
@@ -127,9 +130,9 @@ class _CollapsedStrip extends ConsumerWidget {
                 vertical: 2,
               ),
               decoration: BoxDecoration(
-                color: ForexAiTokens.warning.withValues(alpha: 0.18),
+                color: NeoethosTokens.warning.withValues(alpha: 0.18),
                 border: Border.all(
-                  color: ForexAiTokens.warning.withValues(alpha: 0.6),
+                  color: NeoethosTokens.warning.withValues(alpha: 0.6),
                 ),
                 borderRadius: BorderRadius.circular(3),
               ),
@@ -138,7 +141,7 @@ class _CollapsedStrip extends ConsumerWidget {
                 style: const TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w800,
-                  color: ForexAiTokens.warning,
+                  color: NeoethosTokens.warning,
                 ),
               ),
             ),
@@ -162,7 +165,7 @@ class _Header extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.symmetric(
-        horizontal: ForexAiTokens.spMd,
+        horizontal: NeoethosTokens.spMd,
         vertical: 6,
       ),
       child: Row(
@@ -171,9 +174,9 @@ class _Header extends StatelessWidget {
             width: 22,
             height: 22,
             decoration: BoxDecoration(
-              color: ForexAiTokens.accent.withValues(alpha: 0.18),
+              color: NeoethosTokens.accent.withValues(alpha: 0.18),
               border: Border.all(
-                color: ForexAiTokens.accent.withValues(alpha: 0.55),
+                color: NeoethosTokens.accent.withValues(alpha: 0.55),
               ),
               borderRadius: BorderRadius.circular(5),
             ),
@@ -183,7 +186,7 @@ class _Header extends StatelessWidget {
               style: TextStyle(
                 fontSize: 13,
                 fontWeight: FontWeight.w700,
-                color: ForexAiTokens.accent,
+                color: NeoethosTokens.accent,
               ),
             ),
           ),
@@ -192,9 +195,9 @@ class _Header extends StatelessWidget {
             child: Text(
               'AI Desk',
               style: TextStyle(
-                fontSize: ForexAiTokens.fsBody + 1,
+                fontSize: NeoethosTokens.fsBody + 1,
                 fontWeight: FontWeight.w700,
-                color: ForexAiTokens.textPrimary,
+                color: NeoethosTokens.textPrimary,
               ),
             ),
           ),
@@ -205,7 +208,7 @@ class _Header extends StatelessWidget {
             constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
             onPressed: onOpenFull,
             icon: const Icon(Icons.open_in_full,
-                color: ForexAiTokens.textMuted),
+                color: NeoethosTokens.textMuted),
           ),
           IconButton(
             tooltip: 'Collapse',
@@ -214,7 +217,7 @@ class _Header extends StatelessWidget {
             constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
             onPressed: onCollapse,
             icon: const Icon(Icons.chevron_right,
-                color: ForexAiTokens.textMuted),
+                color: NeoethosTokens.textMuted),
           ),
         ],
       ),
@@ -239,11 +242,11 @@ class _SectionCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(ForexAiTokens.spMd),
+      padding: const EdgeInsets.all(NeoethosTokens.spMd),
       decoration: BoxDecoration(
-        color: ForexAiTokens.appBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.appBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -254,10 +257,10 @@ class _SectionCard extends StatelessWidget {
                 child: Text(
                   title,
                   style: const TextStyle(
-                    fontSize: ForexAiTokens.fsCaption,
+                    fontSize: NeoethosTokens.fsCaption,
                     fontWeight: FontWeight.w800,
                     letterSpacing: 0.6,
-                    color: ForexAiTokens.textMuted,
+                    color: NeoethosTokens.textMuted,
                   ),
                 ),
               ),
@@ -265,8 +268,8 @@ class _SectionCard extends StatelessWidget {
                 Text(
                   subtitle!,
                   style: const TextStyle(
-                    fontSize: ForexAiTokens.fsCaption,
-                    color: ForexAiTokens.textFaint,
+                    fontSize: NeoethosTokens.fsCaption,
+                    color: NeoethosTokens.textFaint,
                   ),
                 ),
             ],
@@ -295,17 +298,17 @@ class _KvRow extends StatelessWidget {
             child: Text(
               label,
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsCaption,
-                color: ForexAiTokens.textMuted,
+                fontSize: NeoethosTokens.fsCaption,
+                color: NeoethosTokens.textMuted,
               ),
             ),
           ),
           Text(
             value,
             style: TextStyle(
-              fontSize: ForexAiTokens.fsCaption,
+              fontSize: NeoethosTokens.fsCaption,
               fontWeight: FontWeight.w700,
-              color: valueColor ?? ForexAiTokens.textPrimary,
+              color: valueColor ?? NeoethosTokens.textPrimary,
             ),
           ),
         ],
@@ -338,8 +341,8 @@ class _ModelsLoadedSection extends ConsumerWidget {
             return const Text(
               'No models trained yet — run Strategy Lab → Training.',
               style: TextStyle(
-                fontSize: ForexAiTokens.fsCaption,
-                color: ForexAiTokens.textFaint,
+                fontSize: NeoethosTokens.fsCaption,
+                color: NeoethosTokens.textFaint,
                 height: 1.4,
               ),
             );
@@ -358,7 +361,7 @@ class _ModelsLoadedSection extends ConsumerWidget {
                       const Icon(
                         Icons.circle,
                         size: 6,
-                        color: ForexAiTokens.buy,
+                        color: NeoethosTokens.buy,
                       ),
                       const SizedBox(width: 6),
                       Expanded(
@@ -366,8 +369,8 @@ class _ModelsLoadedSection extends ConsumerWidget {
                           name,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
-                            fontSize: ForexAiTokens.fsCaption,
-                            color: ForexAiTokens.textPrimary,
+                            fontSize: NeoethosTokens.fsCaption,
+                            color: NeoethosTokens.textPrimary,
                             fontFeatures: [FontFeature.tabularFigures()],
                           ),
                         ),
@@ -381,8 +384,8 @@ class _ModelsLoadedSection extends ConsumerWidget {
                   child: Text(
                     '+${snap.artifactCount - sample.length} more',
                     style: const TextStyle(
-                      fontSize: ForexAiTokens.fsCaption,
-                      color: ForexAiTokens.textFaint,
+                      fontSize: NeoethosTokens.fsCaption,
+                      color: NeoethosTokens.textFaint,
                     ),
                   ),
                 ),
@@ -427,10 +430,10 @@ class _PerformanceSection extends ConsumerWidget {
                 valueColor: acc == null
                     ? null
                     : acc >= 0.55
-                        ? ForexAiTokens.buy
+                        ? NeoethosTokens.buy
                         : acc >= 0.50
-                            ? ForexAiTokens.warning
-                            : ForexAiTokens.sell,
+                            ? NeoethosTokens.warning
+                            : NeoethosTokens.sell,
               ),
               if (snap.artifactCount == 0 && acc == null)
                 const Padding(
@@ -438,8 +441,8 @@ class _PerformanceSection extends ConsumerWidget {
                   child: Text(
                     'Run validation to populate metrics.',
                     style: TextStyle(
-                      fontSize: ForexAiTokens.fsCaption,
-                      color: ForexAiTokens.textFaint,
+                      fontSize: NeoethosTokens.fsCaption,
+                      color: NeoethosTokens.textFaint,
                       height: 1.4,
                     ),
                   ),
@@ -474,8 +477,8 @@ class _ProposedActionSection extends ConsumerWidget {
             return const Text(
               'No pending proposals.',
               style: TextStyle(
-                fontSize: ForexAiTokens.fsCaption,
-                color: ForexAiTokens.textFaint,
+                fontSize: NeoethosTokens.fsCaption,
+                color: NeoethosTokens.textFaint,
                 height: 1.4,
               ),
             );
@@ -499,13 +502,13 @@ class _ProposalCard extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final headline = _formatHeadline(action);
     return Container(
-      padding: const EdgeInsets.all(ForexAiTokens.spSm),
+      padding: const EdgeInsets.all(NeoethosTokens.spSm),
       decoration: BoxDecoration(
-        color: ForexAiTokens.accentMuted,
+        color: NeoethosTokens.accentMuted,
         border: Border.all(
-          color: ForexAiTokens.accent.withValues(alpha: 0.5),
+          color: NeoethosTokens.accent.withValues(alpha: 0.5),
         ),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -513,9 +516,9 @@ class _ProposalCard extends ConsumerWidget {
           Text(
             headline,
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsBody,
+              fontSize: NeoethosTokens.fsBody,
               fontWeight: FontWeight.w800,
-              color: ForexAiTokens.textPrimary,
+              color: NeoethosTokens.textPrimary,
             ),
           ),
           const SizedBox(height: 4),
@@ -524,21 +527,21 @@ class _ProposalCard extends ConsumerWidget {
             maxLines: 3,
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsCaption,
-              color: ForexAiTokens.textMuted,
+              fontSize: NeoethosTokens.fsCaption,
+              color: NeoethosTokens.textMuted,
               height: 1.4,
             ),
           ),
-          const SizedBox(height: ForexAiTokens.spSm),
+          const SizedBox(height: NeoethosTokens.spSm),
           Row(
             children: [
               Expanded(
                 child: OutlinedButton(
                   onPressed: () => _reject(ref),
                   style: OutlinedButton.styleFrom(
-                    foregroundColor: ForexAiTokens.sell,
+                    foregroundColor: NeoethosTokens.sell,
                     side: BorderSide(
-                      color: ForexAiTokens.sell.withValues(alpha: 0.55),
+                      color: NeoethosTokens.sell.withValues(alpha: 0.55),
                     ),
                     padding:
                         const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -547,7 +550,7 @@ class _ProposalCard extends ConsumerWidget {
                   child: const Text(
                     'Reject',
                     style: TextStyle(
-                      fontSize: ForexAiTokens.fsCaption,
+                      fontSize: NeoethosTokens.fsCaption,
                       fontWeight: FontWeight.w700,
                     ),
                   ),
@@ -558,7 +561,7 @@ class _ProposalCard extends ConsumerWidget {
                 child: FilledButton(
                   onPressed: () => _confirm(ref),
                   style: FilledButton.styleFrom(
-                    backgroundColor: ForexAiTokens.buy,
+                    backgroundColor: NeoethosTokens.buy,
                     padding:
                         const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                     minimumSize: const Size(0, 28),
@@ -566,7 +569,7 @@ class _ProposalCard extends ConsumerWidget {
                   child: const Text(
                     'Confirm',
                     style: TextStyle(
-                      fontSize: ForexAiTokens.fsCaption,
+                      fontSize: NeoethosTokens.fsCaption,
                       fontWeight: FontWeight.w700,
                     ),
                   ),
@@ -629,8 +632,8 @@ class _DiscoveryTargetsSection extends ConsumerWidget {
             return const Text(
               'No discovery targets yet.',
               style: TextStyle(
-                fontSize: ForexAiTokens.fsCaption,
-                color: ForexAiTokens.textFaint,
+                fontSize: NeoethosTokens.fsCaption,
+                color: NeoethosTokens.textFaint,
                 height: 1.4,
               ),
             );
@@ -663,21 +666,21 @@ class _SymbolChip extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
       decoration: BoxDecoration(
-        color: ForexAiTokens.appBg,
+        color: NeoethosTokens.appBg,
         border: Border.all(
-          color: ForexAiTokens.border,
+          color: NeoethosTokens.border,
         ),
         borderRadius: BorderRadius.circular(3),
       ),
       child: Text(
         label,
         style: TextStyle(
-          fontSize: ForexAiTokens.fsCaption - 1,
+          fontSize: NeoethosTokens.fsCaption - 1,
           fontFamily: 'monospace',
           fontWeight: FontWeight.w600,
           color: faded
-              ? ForexAiTokens.textFaint
-              : ForexAiTokens.textPrimary,
+              ? NeoethosTokens.textFaint
+              : NeoethosTokens.textPrimary,
         ),
       ),
     );
@@ -702,7 +705,7 @@ class _Skeleton extends StatelessWidget {
             child: Container(
               height: 10,
               decoration: BoxDecoration(
-                color: ForexAiTokens.appBg,
+                color: NeoethosTokens.appBg,
                 borderRadius: BorderRadius.circular(3),
               ),
             ),
@@ -718,8 +721,8 @@ class _ErrorLine extends StatelessWidget {
   Widget build(BuildContext context) => const Text(
         'Backend offline — retrying…',
         style: TextStyle(
-          fontSize: ForexAiTokens.fsCaption,
-          color: ForexAiTokens.textFaint,
+          fontSize: NeoethosTokens.fsCaption,
+          color: NeoethosTokens.textFaint,
           fontStyle: FontStyle.italic,
         ),
       );

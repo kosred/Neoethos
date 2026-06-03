@@ -215,7 +215,7 @@ class ChartScreen extends ConsumerWidget {
                             'side-by-side (max 2 — no 4/8/16 grid by design).',
                     style: const TextStyle(
                       fontSize: 11,
-                      color: ForexAiTokens.textMuted,
+                      color: NeoethosTokens.textMuted,
                     ),
                   ),
                 ),
@@ -320,7 +320,7 @@ class _ContextualAiSheetState extends ConsumerState<_ContextualAiSheet> {
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: const BoxDecoration(
-        color: ForexAiTokens.panelBg,
+        color: NeoethosTokens.panelBg,
         borderRadius: BorderRadius.vertical(
           top: Radius.circular(16),
         ),
@@ -330,7 +330,7 @@ class _ContextualAiSheetState extends ConsumerState<_ContextualAiSheet> {
           Row(
             children: [
               const Icon(Icons.psychology_alt_outlined,
-                  color: ForexAiTokens.textPrimary),
+                  color: NeoethosTokens.textPrimary),
               const SizedBox(width: 8),
               Text(
                 'Ask AI · ${widget.symbol} ${widget.timeframe}',
@@ -364,8 +364,8 @@ class _ContextualAiSheetState extends ConsumerState<_ContextualAiSheet> {
                     ),
                     decoration: BoxDecoration(
                       color: m.user
-                          ? ForexAiTokens.buy.withValues(alpha: 0.15)
-                          : ForexAiTokens.surfaceBg,
+                          ? NeoethosTokens.buy.withValues(alpha: 0.15)
+                          : NeoethosTokens.surfaceBg,
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Text(
@@ -459,7 +459,7 @@ class _ChartPanel extends ConsumerWidget {
                       : 'Loading timeframes…',
                   style: const TextStyle(
                     fontSize: 11,
-                    color: ForexAiTokens.warning,
+                    color: NeoethosTokens.warning,
                   ),
                 )
               : Wrap(
@@ -567,7 +567,7 @@ class _ChartPanel extends ConsumerWidget {
                     Icon(
                       Icons.ads_click,
                       size: 11,
-                      color: ForexAiTokens.textMuted,
+                      color: NeoethosTokens.textMuted,
                     ),
                     SizedBox(width: 4),
                     Text(
@@ -575,7 +575,7 @@ class _ChartPanel extends ConsumerWidget {
                       style: TextStyle(
                         fontSize: 10,
                         fontStyle: FontStyle.italic,
-                        color: ForexAiTokens.textMuted,
+                        color: NeoethosTokens.textMuted,
                       ),
                     ),
                   ],
@@ -693,8 +693,8 @@ class _ChartBody extends ConsumerWidget {
                       fontSize: 24,
                       fontWeight: FontWeight.w800,
                       color: livePrice != null
-                          ? ForexAiTokens.buy
-                          : ForexAiTokens.textPrimary,
+                          ? NeoethosTokens.buy
+                          : NeoethosTokens.textPrimary,
                     ),
                   ),
                   if (livePrice != null) ...[
@@ -704,7 +704,7 @@ class _ChartBody extends ConsumerWidget {
                       child: Icon(
                         Icons.bolt,
                         size: 16,
-                        color: ForexAiTokens.buy,
+                        color: NeoethosTokens.buy,
                       ),
                     ),
                   ],
@@ -717,8 +717,8 @@ class _ChartBody extends ConsumerWidget {
                       fontSize: 14,
                       fontWeight: FontWeight.w700,
                       color: hasData
-                          ? (changePos ? ForexAiTokens.buy : ForexAiTokens.sell)
-                          : ForexAiTokens.textMuted,
+                          ? (changePos ? NeoethosTokens.buy : NeoethosTokens.sell)
+                          : NeoethosTokens.textMuted,
                     ),
                   ),
                   const Spacer(),
@@ -729,7 +729,7 @@ class _ChartBody extends ConsumerWidget {
                         : 'no data — run Data Bootstrap',
                     style: const TextStyle(
                       fontSize: 11,
-                      color: ForexAiTokens.textMuted,
+                      color: NeoethosTokens.textMuted,
                     ),
                   ),
                 ],
@@ -739,7 +739,7 @@ class _ChartBody extends ConsumerWidget {
                 snapshot.headline,
                 style: const TextStyle(
                   fontSize: 11,
-                  color: ForexAiTokens.textMuted,
+                  color: NeoethosTokens.textMuted,
                 ),
               ),
               if (!snapshot.isBrokerSource) ...[
@@ -797,17 +797,17 @@ class _ChartSourceBanner extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
       decoration: BoxDecoration(
-        color: ForexAiTokens.warning.withValues(alpha: 0.08),
+        color: NeoethosTokens.warning.withValues(alpha: 0.08),
         border:
-            Border.all(color: ForexAiTokens.warning.withValues(alpha: 0.35)),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+            Border.all(color: NeoethosTokens.warning.withValues(alpha: 0.35)),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Text(
         text,
         style: const TextStyle(
           fontSize: 11,
           fontWeight: FontWeight.w600,
-          color: ForexAiTokens.warning,
+          color: NeoethosTokens.warning,
         ),
       ),
     );
@@ -900,7 +900,7 @@ class _AutoFetchPromptState extends ConsumerState<_AutoFetchPrompt> {
           Text(
             'No candles on disk for ${widget.symbol} ${widget.timeframe}.',
             style: const TextStyle(
-              color: ForexAiTokens.textMuted,
+              color: NeoethosTokens.textMuted,
               fontSize: 12,
             ),
           ),
@@ -923,7 +923,7 @@ class _AutoFetchPromptState extends ConsumerState<_AutoFetchPrompt> {
             Text(
               _error!,
               style: const TextStyle(
-                color: ForexAiTokens.sell,
+                color: NeoethosTokens.sell,
                 fontSize: 11,
               ),
             ),
@@ -972,7 +972,7 @@ class _IndicatorMultiSelectMenu extends ConsumerWidget {
               fontSize: 10,
               letterSpacing: 0.5,
               fontWeight: FontWeight.w800,
-              color: ForexAiTokens.textMuted,
+              color: NeoethosTokens.textMuted,
             ),
           ),
         );
@@ -984,7 +984,7 @@ class _IndicatorMultiSelectMenu extends ConsumerWidget {
         contentPadding: const EdgeInsets.symmetric(horizontal: 8),
         controlAffinity: ListTileControlAffinity.leading,
         value: active.contains(id),
-        activeColor: ForexAiTokens.accent,
+        activeColor: NeoethosTokens.accent,
         // The dialog stays open: this only flips the provider; the menu
         // rebuilds from the watch above. No Navigator.pop here.
         onChanged: (_) => toggle(id),
@@ -993,13 +993,13 @@ class _IndicatorMultiSelectMenu extends ConsumerWidget {
           style: const TextStyle(
             fontSize: 12,
             fontWeight: FontWeight.w600,
-            color: ForexAiTokens.textPrimary,
+            color: NeoethosTokens.textPrimary,
           ),
         ),
         subtitle: serverFed
             ? const Text(
                 'server strip',
-                style: TextStyle(fontSize: 9, color: ForexAiTokens.textMuted),
+                style: TextStyle(fontSize: 9, color: NeoethosTokens.textMuted),
               )
             : null,
       );
@@ -1010,9 +1010,9 @@ class _IndicatorMultiSelectMenu extends ConsumerWidget {
       child: Container(
         constraints: const BoxConstraints(maxHeight: 440),
         decoration: BoxDecoration(
-          color: ForexAiTokens.panelBg,
-          border: Border.all(color: ForexAiTokens.border),
-          borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+          color: NeoethosTokens.panelBg,
+          border: Border.all(color: NeoethosTokens.border),
+          borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
           boxShadow: const [
             BoxShadow(color: Colors.black54, blurRadius: 12, offset: Offset(0, 4)),
           ],
@@ -1025,14 +1025,14 @@ class _IndicatorMultiSelectMenu extends ConsumerWidget {
               padding: const EdgeInsets.fromLTRB(12, 10, 8, 2),
               child: Row(
                 children: [
-                  const Icon(Icons.tune, size: 14, color: ForexAiTokens.accent),
+                  const Icon(Icons.tune, size: 14, color: NeoethosTokens.accent),
                   const SizedBox(width: 6),
                   Text(
                     'Indicators · Panel ${slot.label}',
                     style: const TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.w800,
-                      color: ForexAiTokens.textPrimary,
+                      color: NeoethosTokens.textPrimary,
                     ),
                   ),
                 ],
@@ -1062,7 +1062,7 @@ class _IndicatorMultiSelectMenu extends ConsumerWidget {
                     '${active.length} active · tick several, then Done',
                     style: const TextStyle(
                       fontSize: 10,
-                      color: ForexAiTokens.textMuted,
+                      color: NeoethosTokens.textMuted,
                     ),
                   ),
                   const Spacer(),
@@ -1094,7 +1094,7 @@ class _Chip extends StatelessWidget {
   Widget build(BuildContext context) {
     return InkWell(
       onTap: onTap,
-      borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+      borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       child: Container(
         padding: const EdgeInsets.symmetric(
           horizontal: 10,
@@ -1102,19 +1102,19 @@ class _Chip extends StatelessWidget {
         ),
         decoration: BoxDecoration(
           color: selected
-              ? ForexAiTokens.accent.withValues(alpha: 0.18)
-              : ForexAiTokens.surfaceBg,
+              ? NeoethosTokens.accent.withValues(alpha: 0.18)
+              : NeoethosTokens.surfaceBg,
           border: Border.all(
-            color: selected ? ForexAiTokens.accent : ForexAiTokens.border,
+            color: selected ? NeoethosTokens.accent : NeoethosTokens.border,
           ),
-          borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+          borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
         ),
         child: Text(
           label,
           style: TextStyle(
             fontSize: 11,
             fontWeight: FontWeight.w700,
-            color: selected ? ForexAiTokens.accent : ForexAiTokens.textPrimary,
+            color: selected ? NeoethosTokens.accent : NeoethosTokens.textPrimary,
           ),
         ),
       ),
@@ -1129,7 +1129,7 @@ class _Loading extends StatelessWidget {
         padding: EdgeInsets.symmetric(vertical: 16),
         child: Text(
           'Loading candles…',
-          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

@@ -82,8 +82,8 @@ class AdvancedSettingsScreen extends ConsumerWidget {
     final presets = ref.watch(knobPresetsProvider);
     return Scaffold(
       // 2026-05-26: `bgDeep` was a stale name; `appBg` (0xFF0E1116) is the
-      // matching deepest scaffold background in `ForexAiTokens`.
-      backgroundColor: ForexAiTokens.appBg,
+      // matching deepest scaffold background in `NeoethosTokens`.
+      backgroundColor: NeoethosTokens.appBg,
       body: catalog.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => BackendErrorWidget(error: e, title: 'Advanced settings unavailable'),
@@ -214,7 +214,7 @@ class _BodyState extends ConsumerState<_Body> {
                 margin: const EdgeInsets.fromLTRB(16, 8, 8, 16),
                 decoration: BoxDecoration(
                   // 2026-05-26: stale `bg` → canonical `panelBg`.
-                  color: ForexAiTokens.panelBg,
+                  color: NeoethosTokens.panelBg,
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: ListView(
@@ -237,7 +237,7 @@ class _BodyState extends ConsumerState<_Body> {
                         child: Text(
                           'No knobs match the search.',
                           style: TextStyle(
-                            color: ForexAiTokens.textMuted,
+                            color: NeoethosTokens.textMuted,
                             fontSize: 12,
                           ),
                         ),
@@ -263,7 +263,7 @@ class _BodyState extends ConsumerState<_Body> {
                             child: Text(
                               'Pick a section on the left.',
                               style: TextStyle(
-                                color: ForexAiTokens.textMuted,
+                                color: NeoethosTokens.textMuted,
                               ),
                             ),
                           ),
@@ -369,7 +369,7 @@ class _PresetChips extends ConsumerWidget {
           'Preset:',
           style: TextStyle(
             fontSize: 11,
-            color: ForexAiTokens.textMuted,
+            color: NeoethosTokens.textMuted,
             fontWeight: FontWeight.w600,
           ),
         ),
@@ -415,11 +415,11 @@ class _SectionTile extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         decoration: BoxDecoration(
           color: selected
-              ? ForexAiTokens.accent.withValues(alpha: 0.15)
+              ? NeoethosTokens.accent.withValues(alpha: 0.15)
               : Colors.transparent,
           border: Border(
             left: BorderSide(
-              color: selected ? ForexAiTokens.accent : Colors.transparent,
+              color: selected ? NeoethosTokens.accent : Colors.transparent,
               width: 3,
             ),
           ),
@@ -434,8 +434,8 @@ class _SectionTile extends StatelessWidget {
                   fontWeight:
                       selected ? FontWeight.w700 : FontWeight.w500,
                   color: selected
-                      ? ForexAiTokens.textPrimary
-                      : ForexAiTokens.textMuted,
+                      ? NeoethosTokens.textPrimary
+                      : NeoethosTokens.textMuted,
                 ),
               ),
             ),
@@ -443,7 +443,7 @@ class _SectionTile extends StatelessWidget {
               '$knobCount',
               style: const TextStyle(
                 fontSize: 10,
-                color: ForexAiTokens.textFaint,
+                color: NeoethosTokens.textFaint,
               ),
             ),
           ],
@@ -494,12 +494,12 @@ class _KnobRowState extends ConsumerState<_KnobRow> {
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         // 2026-05-26: stale `bg` → canonical `panelBg`.
-        color: ForexAiTokens.panelBg,
+        color: NeoethosTokens.panelBg,
         borderRadius: BorderRadius.circular(8),
         border: Border.all(
           color: overridden
               ? const Color(0xFFE65100).withValues(alpha: 0.4)
-              : ForexAiTokens.textFaint.withValues(alpha: 0.2),
+              : NeoethosTokens.textFaint.withValues(alpha: 0.2),
         ),
       ),
       child: Column(
@@ -555,7 +555,7 @@ class _KnobRowState extends ConsumerState<_KnobRow> {
                 widget.knob.helpShort,
                 style: const TextStyle(
                   fontSize: 11,
-                  color: ForexAiTokens.textMuted,
+                  color: NeoethosTokens.textMuted,
                 ),
               ),
             ),
@@ -566,7 +566,7 @@ class _KnobRowState extends ConsumerState<_KnobRow> {
               decoration: BoxDecoration(
                 // 2026-05-26: stale `bgDeep` → `appBg` (recessed inset
                 // matches the scaffold for a "carved-out" look).
-                color: ForexAiTokens.appBg,
+                color: NeoethosTokens.appBg,
                 borderRadius: BorderRadius.circular(4),
               ),
               child: Column(
@@ -583,7 +583,7 @@ class _KnobRowState extends ConsumerState<_KnobRow> {
                       'Default: ${widget.knob.defaultValue}',
                       style: const TextStyle(
                         fontSize: 10,
-                        color: ForexAiTokens.textFaint,
+                        color: NeoethosTokens.textFaint,
                         fontFamily: 'monospace',
                       ),
                     ),

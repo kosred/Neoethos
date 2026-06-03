@@ -68,7 +68,7 @@ class _BodyState extends ConsumerState<_Body> {
       ref.invalidate(riskProvider);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor: ForexAiTokens.buy,
+          backgroundColor: NeoethosTokens.buy,
           content: Text('Prop-firm preset switched to $presetId'),
           duration: const Duration(seconds: 3),
         ),
@@ -80,7 +80,7 @@ class _BodyState extends ConsumerState<_Body> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor: ForexAiTokens.sell,
+          backgroundColor: NeoethosTokens.sell,
           content: Text('Preset switch failed: $e'),
         ),
       );
@@ -148,8 +148,8 @@ class _BodyState extends ConsumerState<_Body> {
             'Stop-loss required',
             snap.requireStopLoss ? 'YES (enforced)' : 'NO (relaxed)',
             accent: snap.requireStopLoss
-                ? ForexAiTokens.buy
-                : ForexAiTokens.warning,
+                ? NeoethosTokens.buy
+                : NeoethosTokens.warning,
           ),
         ),
         const SectionCard(
@@ -160,7 +160,7 @@ class _BodyState extends ConsumerState<_Body> {
             'the caps from a new preset, edit config.yaml\'s risk '
             'section (or delete it and restart the backend so '
             'RiskConfig::default() rebuilds from the preset).',
-            style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+            style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
           ),
         ),
       ],
@@ -198,7 +198,7 @@ class _PresetPicker extends StatelessWidget {
               'Active preset:',
               style: TextStyle(
                 fontSize: 12,
-                color: ForexAiTokens.textMuted,
+                color: NeoethosTokens.textMuted,
               ),
             ),
             const SizedBox(width: 8),
@@ -206,12 +206,12 @@ class _PresetPicker extends StatelessWidget {
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
               decoration: BoxDecoration(
                 color: propFirmRulesEnabled
-                    ? ForexAiTokens.buy.withValues(alpha: 0.18)
-                    : ForexAiTokens.textFaint.withValues(alpha: 0.18),
+                    ? NeoethosTokens.buy.withValues(alpha: 0.18)
+                    : NeoethosTokens.textFaint.withValues(alpha: 0.18),
                 border: Border.all(
                   color: propFirmRulesEnabled
-                      ? ForexAiTokens.buy
-                      : ForexAiTokens.textFaint,
+                      ? NeoethosTokens.buy
+                      : NeoethosTokens.textFaint,
                 ),
                 borderRadius: BorderRadius.circular(4),
               ),
@@ -221,8 +221,8 @@ class _PresetPicker extends StatelessWidget {
                   fontSize: 11,
                   fontWeight: FontWeight.w700,
                   color: propFirmRulesEnabled
-                      ? ForexAiTokens.buy
-                      : ForexAiTokens.textPrimary,
+                      ? NeoethosTokens.buy
+                      : NeoethosTokens.textPrimary,
                 ),
               ),
             ),
@@ -232,7 +232,7 @@ class _PresetPicker extends StatelessWidget {
                 '(prop-firm gate disabled — own-money mode)',
                 style: TextStyle(
                   fontSize: 10,
-                  color: ForexAiTokens.textFaint,
+                  color: NeoethosTokens.textFaint,
                 ),
               ),
             ],
@@ -243,7 +243,7 @@ class _PresetPicker extends StatelessWidget {
           'Switch firm — each preset publishes its own daily/total DD '
           'ceilings and profit targets. Numbers below are approximate '
           'as of writing; verify against your contract before trading.',
-          style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+          style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
         ),
         const SizedBox(height: 10),
         ...available.map(
@@ -254,12 +254,12 @@ class _PresetPicker extends StatelessWidget {
               padding: const EdgeInsets.all(8),
               decoration: BoxDecoration(
                 color: p.id == activePresetId
-                    ? ForexAiTokens.accent.withValues(alpha: 0.12)
-                    : ForexAiTokens.surfaceBg,
+                    ? NeoethosTokens.accent.withValues(alpha: 0.12)
+                    : NeoethosTokens.surfaceBg,
                 border: Border.all(
                   color: p.id == activePresetId
-                      ? ForexAiTokens.accent
-                      : ForexAiTokens.border,
+                      ? NeoethosTokens.accent
+                      : NeoethosTokens.border,
                 ),
                 borderRadius: BorderRadius.circular(4),
               ),
@@ -276,12 +276,12 @@ class _PresetPicker extends StatelessWidget {
                       shape: BoxShape.circle,
                       border: Border.all(
                         color: p.id == activePresetId
-                            ? ForexAiTokens.accent
-                            : ForexAiTokens.border,
+                            ? NeoethosTokens.accent
+                            : NeoethosTokens.border,
                         width: 2,
                       ),
                       color: p.id == activePresetId
-                          ? ForexAiTokens.accent
+                          ? NeoethosTokens.accent
                           : Colors.transparent,
                     ),
                   ),
@@ -295,8 +295,8 @@ class _PresetPicker extends StatelessWidget {
                             fontSize: 13,
                             fontWeight: FontWeight.w700,
                             color: p.id == activePresetId
-                                ? ForexAiTokens.accent
-                                : ForexAiTokens.textPrimary,
+                                ? NeoethosTokens.accent
+                                : NeoethosTokens.textPrimary,
                           ),
                         ),
                         const SizedBox(height: 2),
@@ -307,7 +307,7 @@ class _PresetPicker extends StatelessWidget {
                           'Min ${p.minTradingDays} days',
                           style: const TextStyle(
                             fontSize: 10,
-                            color: ForexAiTokens.textMuted,
+                            color: NeoethosTokens.textMuted,
                           ),
                         ),
                       ],
@@ -345,7 +345,7 @@ class _Row extends StatelessWidget {
                 label,
                 style: const TextStyle(
                   fontSize: 12,
-                  color: ForexAiTokens.textMuted,
+                  color: NeoethosTokens.textMuted,
                 ),
               ),
             ),
@@ -354,7 +354,7 @@ class _Row extends StatelessWidget {
               style: TextStyle(
                 fontSize: 12,
                 fontWeight: FontWeight.w600,
-                color: accent ?? ForexAiTokens.textPrimary,
+                color: accent ?? NeoethosTokens.textPrimary,
               ),
             ),
           ],
@@ -369,7 +369,7 @@ class _Loading extends StatelessWidget {
         padding: EdgeInsets.symmetric(vertical: 16),
         child: Text(
           'Loading risk caps…',
-          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

@@ -8,8 +8,8 @@
 //!    `prop_search_val_candidates: 0` silently became `population` in one
 //!    place and `population * generations` in another.
 //! 2. **Side-channel env vars override behavior.** A user reading
-//!    `config.yaml` cannot tell that `FOREX_BOT_NORMALIZE_FEATURES=1`
-//!    or `FOREX_BOT_DISABLE_SMC_GATE=1` flips the search regime.
+//!    `config.yaml` cannot tell that `NEOETHOS_BOT_NORMALIZE_FEATURES=1`
+//!    or `NEOETHOS_BOT_DISABLE_SMC_GATE=1` flips the search regime.
 //!
 //! `ResolvedConfig` makes both visible. Every field is **resolved** —
 //! sentinels are converted to real numbers, env overrides are applied
@@ -91,9 +91,9 @@ pub struct ResolvedSearchConfig {
     pub walkforward_splits: usize,
     pub embargo_minutes: usize,
     pub mode: String,
-    /// `FOREX_BOT_NORMALIZE_FEATURES` resolved to bool.
+    /// `NEOETHOS_BOT_NORMALIZE_FEATURES` resolved to bool.
     pub normalize_features_env: bool,
-    /// `FOREX_BOT_DISABLE_SMC_GATE` resolved to bool.
+    /// `NEOETHOS_BOT_DISABLE_SMC_GATE` resolved to bool.
     pub disable_smc_gate_env: bool,
 }
 
@@ -149,14 +149,14 @@ impl ResolvedConfig {
             candidate_count_raw.max(1)
         };
         let min_trades_per_day_raw = s.models.prop_search_val_min_trades_per_day;
-        let mode = resolve_discovery_mode_str();
+        let mode = resolve_discovery_mode(s);
         let min_trades_per_day_resolved = if mode == "prop_firm" && min_trades_per_day_raw == 0.0 {
             0.001
         } else {
             min_trades_per_day_raw.max(0.0)
         };
-        let normalize_features_env = env_truthy("FOREX_BOT_NORMALIZE_FEATURES");
-        let disable_smc_gate_env = env_truthy("FOREX_BOT_DISABLE_SMC_GATE");
+        let normalize_features_env = env_truthy("NEOETHOS_BOT_NORMALIZE_FEATURES");
+        let disable_smc_gate_env = env_truthy("NEOETHOS_BOT_DISABLE_SMC_GATE");
 
         // Filters section --------------------------------------------------
         // **F-148 documentation (2026-05-25)** — these literals
@@ -270,32 +270,28 @@ impl ResolvedConfig {
             &mut display_fields,
             "search",
             "discovery_mode",
-            std::env::var("FOREX_BOT_DISCOVERY_MODE").unwrap_or_default(),
+            s.models.discovery_mode.clone(),
             mode.to_string(),
-            if std::env::var("FOREX_BOT_DISCOVERY_MODE").is_ok() {
-                ResolvedSource::EnvOverride
-            } else {
-                ResolvedSource::Default
-            },
-            Some("default = prop_firm; FOREX_BOT_DISCOVERY_MODE=strict opts out"),
+            ResolvedSource::Config,
+            Some("config models.discovery_mode: prop_firm (default) | strict"),
         );
         push_field(
             &mut display_fields,
             "search",
             "normalize_features",
-            std::env::var("FOREX_BOT_NORMALIZE_FEATURES").unwrap_or_default(),
+            std::env::var("NEOETHOS_BOT_NORMALIZE_FEATURES").unwrap_or_default(),
             normalize_features_env.to_string(),
             ResolvedSource::EnvOverride,
-            Some("FOREX_BOT_NORMALIZE_FEATURES=1; default off"),
+            Some("NEOETHOS_BOT_NORMALIZE_FEATURES=1; default off"),
         );
         push_field(
             &mut display_fields,
             "search",
             "disable_smc_gate",
-            std::env::var("FOREX_BOT_DISABLE_SMC_GATE").unwrap_or_default(),
+            std::env::var("NEOETHOS_BOT_DISABLE_SMC_GATE").unwrap_or_default(),
             disable_smc_gate_env.to_string(),
             ResolvedSource::EnvOverride,
-            Some("FOREX_BOT_DISABLE_SMC_GATE=1; diagnostic"),
+            Some("NEOETHOS_BOT_DISABLE_SMC_GATE=1; diagnostic"),
         );
         push_field(
             &mut display_fields,
@@ -445,12 +441,10 @@ fn env_truthy(name: &str) -> bool {
     )
 }
 
-fn resolve_discovery_mode_str() -> &'static str {
-    match std::env::var("FOREX_BOT_DISCOVERY_MODE")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+fn resolve_discovery_mode(s: &Settings) -> &'static str {
+    // Config-driven (was env-only `NEOETHOS_BOT_DISCOVERY_MODE`): the
+    // operator sets `models.discovery_mode` in config / UI / TUI.
+    match s.models.discovery_mode.trim().to_ascii_lowercase().as_str() {
         "strict" => "strict",
         _ => "prop_firm",
     }

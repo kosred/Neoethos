@@ -127,7 +127,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
                 width: 10,
                 height: 10,
                 decoration: const BoxDecoration(
-                  color: ForexAiTokens.buy,
+                  color: NeoethosTokens.buy,
                   shape: BoxShape.circle,
                 ),
               ),
@@ -139,7 +139,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
                       : 'Signed in via ChatGPT subscription',
                   style: const TextStyle(
                     fontSize: 11,
-                    color: ForexAiTokens.textMuted,
+                    color: NeoethosTokens.textMuted,
                   ),
                 ),
               ),
@@ -157,12 +157,12 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
           // bottom. SectionCard lays its child at natural height, which
           // would collapse the inner Expanded.
           child: Container(
-            padding: const EdgeInsets.all(ForexAiTokens.spMd),
-            margin: const EdgeInsets.only(top: ForexAiTokens.spSm),
+            padding: const EdgeInsets.all(NeoethosTokens.spMd),
+            margin: const EdgeInsets.only(top: NeoethosTokens.spSm),
             decoration: BoxDecoration(
-              color: ForexAiTokens.surfaceAlt,
-              border: Border.all(color: ForexAiTokens.border),
-              borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+              color: NeoethosTokens.surfaceAlt,
+              border: Border.all(color: NeoethosTokens.border),
+              borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -172,10 +172,10 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
                   style: TextStyle(
                     fontSize: 13,
                     fontWeight: FontWeight.w700,
-                    color: ForexAiTokens.textPrimary,
+                    color: NeoethosTokens.textPrimary,
                   ),
                 ),
-                const SizedBox(height: ForexAiTokens.spXs),
+                const SizedBox(height: NeoethosTokens.spXs),
                 Expanded(
                   child: _messages.isEmpty
                     ? const Center(
@@ -186,7 +186,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
                           textAlign: TextAlign.center,
                           style: TextStyle(
                             fontSize: 12,
-                            color: ForexAiTokens.textMuted,
+                            color: NeoethosTokens.textMuted,
                           ),
                         ),
                       )
@@ -247,7 +247,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          backgroundColor: ForexAiTokens.sell,
+          backgroundColor: NeoethosTokens.sell,
           content: Text(
               'Could not sign out from AI Desk — ${describeError(e)}.'),
         ),
@@ -264,11 +264,11 @@ class _MessageBubble extends StatelessWidget {
   Widget build(BuildContext context) {
     final isUser = message.fromUser;
     final bg = isUser
-        ? ForexAiTokens.accent.withValues(alpha: 0.18)
-        : ForexAiTokens.surfaceBg;
+        ? NeoethosTokens.accent.withValues(alpha: 0.18)
+        : NeoethosTokens.surfaceBg;
     final border = isUser
-        ? ForexAiTokens.accent.withValues(alpha: 0.45)
-        : ForexAiTokens.border;
+        ? NeoethosTokens.accent.withValues(alpha: 0.45)
+        : NeoethosTokens.border;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
@@ -281,7 +281,7 @@ class _MessageBubble extends StatelessWidget {
               style: TextStyle(
                 fontSize: 10,
                 fontWeight: FontWeight.w700,
-                color: isUser ? ForexAiTokens.accent : ForexAiTokens.buy,
+                color: isUser ? NeoethosTokens.accent : NeoethosTokens.buy,
               ),
             ),
           ),
@@ -291,13 +291,13 @@ class _MessageBubble extends StatelessWidget {
               decoration: BoxDecoration(
                 color: bg,
                 border: Border.all(color: border),
-                borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+                borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
               ),
               child: SelectableText(
                 message.text,
                 style: const TextStyle(
                   fontSize: 12,
-                  color: ForexAiTokens.textPrimary,
+                  color: NeoethosTokens.textPrimary,
                 ),
               ),
             ),
@@ -399,7 +399,7 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
             'password.',
             style: TextStyle(
               fontSize: 12,
-              color: ForexAiTokens.textPrimary,
+              color: NeoethosTokens.textPrimary,
             ),
           ),
           if (s.authPath.isNotEmpty) ...[
@@ -408,7 +408,7 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
               'Auth state will be saved to: ${s.authPath}',
               style: const TextStyle(
                 fontSize: 10,
-                color: ForexAiTokens.textMuted,
+                color: NeoethosTokens.textMuted,
               ),
             ),
           ],
@@ -417,7 +417,7 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
             Text(
               'Connection error: $_error',
               style: const TextStyle(
-                color: ForexAiTokens.sell,
+                color: NeoethosTokens.sell,
                 fontSize: 11,
               ),
             ),
@@ -426,7 +426,7 @@ class _ConnectCardState extends ConsumerState<_ConnectCard> {
             Text(
               'Previous attempt failed: ${s.lastError}',
               style: const TextStyle(
-                color: ForexAiTokens.warning,
+                color: NeoethosTokens.warning,
                 fontSize: 11,
               ),
             ),
@@ -470,7 +470,7 @@ class _Loading extends StatelessWidget {
         padding: EdgeInsets.symmetric(vertical: 16),
         child: Text(
           'Checking ChatGPT subscription…',
-          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

@@ -8,7 +8,7 @@
 use super::*;
 
 /// Task #66 — env-var tests in this file mutate process-global
-/// `FOREX_BOT_DISCOVERY_*` variables. Cargo runs tests in parallel by
+/// `NEOETHOS_BOT_DISCOVERY_*` variables. Cargo runs tests in parallel by
 /// default, so two tests can read each other's writes and the
 /// `prop_firm_gate_auto_enables_with_no_env_at_all` test flakes
 /// intermittently in CI. Every test that touches env vars MUST take
@@ -267,21 +267,21 @@ fn prop_firm_gate_env_overrides_populate_discovery_config() {
     let _env_guard = env_var_test_lock();
     // SAFETY: tests that read process-wide env may race. The
     // `env_var_test_lock` above serialises every test in this file
-    // that touches `FOREX_BOT_DISCOVERY_*` so the set / read / unset
+    // that touches `NEOETHOS_BOT_DISCOVERY_*` so the set / read / unset
     // sequence is atomic from the test's point of view.
     unsafe {
-        std::env::remove_var("FOREX_BOT_DISCOVERY_MODE");
-        std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE", "0.42");
-        std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS", "17");
-        std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS", "21");
-        std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT", "0.08");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_MODE");
+        std::env::set_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PASS_RATE", "0.42");
+        std::env::set_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS", "17");
+        std::env::set_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS", "21");
+        std::env::set_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT", "0.08");
     }
     let cfg = DiscoveryConfig::default().with_env_runtime_overrides();
     unsafe {
-        std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE");
-        std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS");
-        std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS");
-        std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PASS_RATE");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT");
     }
     let pf = cfg
         .prop_firm_gate
@@ -299,15 +299,15 @@ fn prop_firm_gate_auto_enables_with_no_env_at_all() {
     // The whole point: zero env vars should still produce a smart,
     // ready-to-run prop-firm config.
     unsafe {
-        std::env::remove_var("FOREX_BOT_DISCOVERY_MODE");
-        std::env::remove_var("FOREX_BOT_DISCOVERY_PERMISSIVE");
-        std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE");
-        std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS");
-        std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS");
-        std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT");
-        std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT");
-        std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DD_PCT");
-        std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_MIN_TRADING_DAYS");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_MODE");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PERMISSIVE");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PASS_RATE");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MAX_DD_PCT");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MIN_TRADING_DAYS");
     }
     let cfg = DiscoveryConfig::default().with_env_runtime_overrides();
     let pf = cfg.prop_firm_gate.expect("default = PropFirm mode");
@@ -336,11 +336,11 @@ fn prop_firm_gate_auto_enables_with_no_env_at_all() {
 fn prop_firm_gate_disabled_in_strict_mode() {
     let _env_guard = env_var_test_lock();
     unsafe {
-        std::env::set_var("FOREX_BOT_DISCOVERY_MODE", "strict");
+        std::env::set_var("NEOETHOS_BOT_DISCOVERY_MODE", "strict");
     }
     let cfg = DiscoveryConfig::default().with_env_runtime_overrides();
     unsafe {
-        std::env::remove_var("FOREX_BOT_DISCOVERY_MODE");
+        std::env::remove_var("NEOETHOS_BOT_DISCOVERY_MODE");
     }
     assert!(
         cfg.prop_firm_gate.is_none(),
@@ -1420,7 +1420,7 @@ fn propfirm_mode_scales_min_trades_per_month_for_d1() {
     // Note: env-var test lock not needed here — we read the mode
     // via `resolve_discovery_mode()` which is process-global, but
     // the default with no env is PropFirm anyway. Tests that mutate
-    // FOREX_BOT_DISCOVERY_MODE must use ENV_VAR_TEST_LOCK; we don't.
+    // NEOETHOS_BOT_DISCOVERY_MODE must use ENV_VAR_TEST_LOCK; we don't.
     let mut cfg = DiscoveryConfig::default();
     cfg.evaluation_symbol = "EURUSD".to_string();
     cfg.evaluation_account_currency = "USD".to_string();

@@ -50,22 +50,22 @@ void _openSymbolChart(BuildContext context, WidgetRef ref, String symbol) {
     MaterialPageRoute<void>(
       fullscreenDialog: true,
       builder: (_) => Scaffold(
-        backgroundColor: ForexAiTokens.appBg,
+        backgroundColor: NeoethosTokens.appBg,
         appBar: AppBar(
-          backgroundColor: ForexAiTokens.panelBg,
+          backgroundColor: NeoethosTokens.panelBg,
           elevation: 0,
-          iconTheme: const IconThemeData(color: ForexAiTokens.textPrimary),
+          iconTheme: const IconThemeData(color: NeoethosTokens.textPrimary),
           title: Text(
             '$symbol · Chart',
             style: const TextStyle(
-              color: ForexAiTokens.textPrimary,
-              fontSize: ForexAiTokens.fsSubtitle,
+              color: NeoethosTokens.textPrimary,
+              fontSize: NeoethosTokens.fsSubtitle,
               fontWeight: FontWeight.w700,
             ),
           ),
         ),
         body: const Padding(
-          padding: EdgeInsets.all(ForexAiTokens.spSm),
+          padding: EdgeInsets.all(NeoethosTokens.spSm),
           child: SingleChildScrollView(child: ChartScreen()),
         ),
       ),
@@ -89,7 +89,7 @@ class MarketWatchScreen extends ConsumerWidget {
           spotsAsync: spotsAsync,
           accountAsync: accountAsync,
         ),
-        const SizedBox(height: ForexAiTokens.spSm),
+        const SizedBox(height: NeoethosTokens.spSm),
         Expanded(
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -103,7 +103,7 @@ class MarketWatchScreen extends ConsumerWidget {
                   intelAsync: intelAsync,
                 ),
               ),
-              const SizedBox(width: ForexAiTokens.spSm),
+              const SizedBox(width: NeoethosTokens.spSm),
               // Right 1/3: stacked Open Positions + Pending Orders.
               Expanded(
                 flex: 2,
@@ -117,7 +117,7 @@ class MarketWatchScreen extends ConsumerWidget {
                         spotsAsync: spotsAsync,
                       ),
                     ),
-                    const SizedBox(height: ForexAiTokens.spSm),
+                    const SizedBox(height: NeoethosTokens.spSm),
                     const Expanded(
                       flex: 2,
                       child: _PendingOrdersPanel(),
@@ -200,34 +200,34 @@ class _SummaryStrip extends ConsumerWidget {
             .toInt();
     return Container(
       padding: const EdgeInsets.symmetric(
-        horizontal: ForexAiTokens.spMd,
+        horizontal: NeoethosTokens.spMd,
         vertical: 8,
       ),
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Row(
         children: [
           const Text(
             'Watchlist',
             style: TextStyle(
-              fontSize: ForexAiTokens.fsBody + 1,
+              fontSize: NeoethosTokens.fsBody + 1,
               fontWeight: FontWeight.w800,
               letterSpacing: 0.4,
-              color: ForexAiTokens.textPrimary,
+              color: NeoethosTokens.textPrimary,
             ),
           ),
           const SizedBox(width: 12),
           _Pill(
             label: '$visibleCount of $symbolCount symbols',
-            color: ForexAiTokens.accent,
+            color: NeoethosTokens.accent,
           ),
           const SizedBox(width: 8),
           _Pill(
             label: '$openCount open',
-            color: openCount > 0 ? ForexAiTokens.buy : ForexAiTokens.textFaint,
+            color: openCount > 0 ? NeoethosTokens.buy : NeoethosTokens.textFaint,
           ),
           const SizedBox(width: 8),
           const _Pill(
@@ -235,7 +235,7 @@ class _SummaryStrip extends ConsumerWidget {
             // as 0 rather than hiding the pill — operator should know
             // the table is honestly empty, not just hidden.
             label: '0 pending',
-            color: ForexAiTokens.textFaint,
+            color: NeoethosTokens.textFaint,
           ),
           const SizedBox(width: 12),
           // F-12: edit the streamer's watchlist (multi-symbol picker).
@@ -244,12 +244,12 @@ class _SummaryStrip extends ConsumerWidget {
             icon: const Icon(Icons.playlist_add_check, size: 16),
             label: const Text('Edit watchlist'),
             style: OutlinedButton.styleFrom(
-              foregroundColor: ForexAiTokens.accent,
-              side: const BorderSide(color: ForexAiTokens.border),
+              foregroundColor: NeoethosTokens.accent,
+              side: const BorderSide(color: NeoethosTokens.border),
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               visualDensity: VisualDensity.compact,
               textStyle: const TextStyle(
-                fontSize: ForexAiTokens.fsCaption,
+                fontSize: NeoethosTokens.fsCaption,
                 fontWeight: FontWeight.w700,
               ),
             ),
@@ -259,8 +259,8 @@ class _SummaryStrip extends ConsumerWidget {
             Text(
               'Updated ${ageSeconds}s ago',
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsCaption,
-                color: ForexAiTokens.textMuted,
+                fontSize: NeoethosTokens.fsCaption,
+                color: NeoethosTokens.textMuted,
                 fontFeatures: [FontFeature.tabularFigures()],
               ),
             )
@@ -268,8 +268,8 @@ class _SummaryStrip extends ConsumerWidget {
             const Text(
               'Streaming …',
               style: TextStyle(
-                fontSize: ForexAiTokens.fsCaption,
-                color: ForexAiTokens.textFaint,
+                fontSize: NeoethosTokens.fsCaption,
+                color: NeoethosTokens.textFaint,
                 fontStyle: FontStyle.italic,
               ),
             ),
@@ -291,12 +291,12 @@ class _Pill extends StatelessWidget {
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.14),
         border: Border.all(color: color.withValues(alpha: 0.55)),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Text(
         label,
         style: TextStyle(
-          fontSize: ForexAiTokens.fsCaption,
+          fontSize: NeoethosTokens.fsCaption,
           fontWeight: FontWeight.w700,
           color: color,
         ),
@@ -324,9 +324,9 @@ class _WatchlistPanel extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     return Container(
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -336,12 +336,12 @@ class _WatchlistPanel extends ConsumerWidget {
             child: spotsAsync.when(
               loading: () => const Center(
                 child: Padding(
-                  padding: EdgeInsets.all(ForexAiTokens.spLg),
+                  padding: EdgeInsets.all(NeoethosTokens.spLg),
                   child: Text(
                     'Waiting for first SSE tick…',
                     style: TextStyle(
-                      fontSize: ForexAiTokens.fsBody,
-                      color: ForexAiTokens.textMuted,
+                      fontSize: NeoethosTokens.fsBody,
+                      color: NeoethosTokens.textMuted,
                     ),
                   ),
                 ),
@@ -353,14 +353,14 @@ class _WatchlistPanel extends ConsumerWidget {
                 if (snap.spots.isEmpty) {
                   return const Center(
                     child: Padding(
-                      padding: EdgeInsets.all(ForexAiTokens.spLg),
+                      padding: EdgeInsets.all(NeoethosTokens.spLg),
                       child: Text(
                         'No live spots yet — broker may still be warming '
                             'up or no symbols subscribed.',
                         textAlign: TextAlign.center,
                         style: TextStyle(
-                          fontSize: ForexAiTokens.fsBody,
-                          color: ForexAiTokens.textMuted,
+                          fontSize: NeoethosTokens.fsBody,
+                          color: NeoethosTokens.textMuted,
                         ),
                       ),
                     ),
@@ -421,9 +421,9 @@ class _WatchlistHeader extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       decoration: const BoxDecoration(
-        color: ForexAiTokens.appBg,
+        color: NeoethosTokens.appBg,
         border: Border(
-          bottom: BorderSide(color: ForexAiTokens.border),
+          bottom: BorderSide(color: NeoethosTokens.border),
         ),
       ),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
@@ -468,10 +468,10 @@ class _HeaderCell extends StatelessWidget {
               ? TextAlign.center
               : TextAlign.left,
       style: const TextStyle(
-        fontSize: ForexAiTokens.fsCaption - 1,
+        fontSize: NeoethosTokens.fsCaption - 1,
         fontWeight: FontWeight.w800,
         letterSpacing: 0.8,
-        color: ForexAiTokens.textFaint,
+        color: NeoethosTokens.textFaint,
       ),
     );
     if (width == null) return Align(alignment: align, child: child);
@@ -508,10 +508,10 @@ class _SymbolRow extends StatelessWidget {
 
     final stale = spot.freshnessSeconds > 5;
     final (statusLabel, statusColor) = stale
-        ? ('Stale', ForexAiTokens.warning)
+        ? ('Stale', NeoethosTokens.warning)
         : (bid != null && ask != null)
-            ? ('Live', ForexAiTokens.buy)
-            : ('Off', ForexAiTokens.textFaint);
+            ? ('Live', NeoethosTokens.buy)
+            : ('Off', NeoethosTokens.textFaint);
 
     return InkWell(
       onTap: onTap,
@@ -521,11 +521,11 @@ class _SymbolRow extends StatelessWidget {
       child: Container(
       decoration: BoxDecoration(
         color: stripe
-            ? ForexAiTokens.appBg.withValues(alpha: 0.4)
+            ? NeoethosTokens.appBg.withValues(alpha: 0.4)
             : Colors.transparent,
         border: const Border(
           bottom: BorderSide(
-            color: ForexAiTokens.border,
+            color: NeoethosTokens.border,
             width: 0.4,
           ),
         ),
@@ -539,9 +539,9 @@ class _SymbolRow extends StatelessWidget {
               _prettySymbol(spot.symbolName),
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsBody,
+                fontSize: NeoethosTokens.fsBody,
                 fontWeight: FontWeight.w700,
-                color: ForexAiTokens.textPrimary,
+                color: NeoethosTokens.textPrimary,
                 fontFeatures: [FontFeature.tabularFigures()],
               ),
             ),
@@ -568,11 +568,11 @@ class _SymbolRow extends StatelessWidget {
               positionsOnSymbol == 0 ? '—' : '$positionsOnSymbol',
               textAlign: TextAlign.right,
               style: TextStyle(
-                fontSize: ForexAiTokens.fsBody,
+                fontSize: NeoethosTokens.fsBody,
                 fontWeight: FontWeight.w700,
                 color: positionsOnSymbol == 0
-                    ? ForexAiTokens.textFaint
-                    : ForexAiTokens.accent,
+                    ? NeoethosTokens.textFaint
+                    : NeoethosTokens.accent,
                 fontFeatures: const [FontFeature.tabularFigures()],
               ),
             ),
@@ -584,16 +584,16 @@ class _SymbolRow extends StatelessWidget {
                   ? const Text(
                       '—',
                       style: TextStyle(
-                        fontSize: ForexAiTokens.fsBody,
-                        color: ForexAiTokens.textFaint,
+                        fontSize: NeoethosTokens.fsBody,
+                        color: NeoethosTokens.textFaint,
                       ),
                     )
                   : Text(
                       '${strategy!.strategyId} · ${strategy!.baseTf}',
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
-                        fontSize: ForexAiTokens.fsBody,
-                        color: ForexAiTokens.textPrimary,
+                        fontSize: NeoethosTokens.fsBody,
+                        color: NeoethosTokens.textPrimary,
                       ),
                     ),
             ),
@@ -606,15 +606,15 @@ class _SymbolRow extends StatelessWidget {
                   : '${(ensembleAcc! * 100).toStringAsFixed(0)}%',
               textAlign: TextAlign.right,
               style: TextStyle(
-                fontSize: ForexAiTokens.fsBody,
+                fontSize: NeoethosTokens.fsBody,
                 fontWeight: FontWeight.w700,
                 color: ensembleAcc == null
-                    ? ForexAiTokens.textFaint
+                    ? NeoethosTokens.textFaint
                     : ensembleAcc! >= 0.55
-                        ? ForexAiTokens.buy
+                        ? NeoethosTokens.buy
                         : ensembleAcc! >= 0.50
-                            ? ForexAiTokens.warning
-                            : ForexAiTokens.sell,
+                            ? NeoethosTokens.warning
+                            : NeoethosTokens.sell,
                 fontFeatures: const [FontFeature.tabularFigures()],
               ),
             ),
@@ -634,7 +634,7 @@ class _SymbolRow extends StatelessWidget {
                 child: Text(
                   statusLabel,
                   style: TextStyle(
-                    fontSize: ForexAiTokens.fsCaption - 1,
+                    fontSize: NeoethosTokens.fsCaption - 1,
                     fontWeight: FontWeight.w800,
                     color: statusColor,
                   ),
@@ -669,13 +669,13 @@ class _NumberCell extends StatelessWidget {
         value == null ? '—' : value!.toStringAsFixed(digits),
         textAlign: TextAlign.right,
         style: TextStyle(
-          fontSize: ForexAiTokens.fsBody,
+          fontSize: NeoethosTokens.fsBody,
           fontWeight: faded ? FontWeight.w500 : FontWeight.w700,
           color: value == null
-              ? ForexAiTokens.textFaint
+              ? NeoethosTokens.textFaint
               : faded
-                  ? ForexAiTokens.textMuted
-                  : ForexAiTokens.textPrimary,
+                  ? NeoethosTokens.textMuted
+                  : NeoethosTokens.textPrimary,
           fontFeatures: const [FontFeature.tabularFigures()],
         ),
       ),
@@ -702,9 +702,9 @@ class _OpenPositionsPanel extends StatelessWidget {
     final currencySymbol = currencyGlyph(acc?.currency ?? 'USD');
     return Container(
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -753,10 +753,10 @@ class _PositionRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final isBuy = position.side.toLowerCase() == 'buy';
     final pnlColor = position.pnlUsd > 0
-        ? ForexAiTokens.buy
+        ? NeoethosTokens.buy
         : position.pnlUsd < 0
-            ? ForexAiTokens.sell
-            : ForexAiTokens.textMuted;
+            ? NeoethosTokens.sell
+            : NeoethosTokens.textMuted;
     final since = position.openTimestampMs == null
         ? '—'
         : DateFormat.Hm().format(
@@ -775,7 +775,7 @@ class _PositionRow extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: const BoxDecoration(
         border: Border(
-          bottom: BorderSide(color: ForexAiTokens.border, width: 0.4),
+          bottom: BorderSide(color: NeoethosTokens.border, width: 0.4),
         ),
       ),
       child: Row(
@@ -785,10 +785,10 @@ class _PositionRow extends StatelessWidget {
             padding:
                 const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
             decoration: BoxDecoration(
-              color: (isBuy ? ForexAiTokens.buy : ForexAiTokens.sell)
+              color: (isBuy ? NeoethosTokens.buy : NeoethosTokens.sell)
                   .withValues(alpha: 0.18),
               border: Border.all(
-                color: (isBuy ? ForexAiTokens.buy : ForexAiTokens.sell)
+                color: (isBuy ? NeoethosTokens.buy : NeoethosTokens.sell)
                     .withValues(alpha: 0.6),
               ),
               borderRadius: BorderRadius.circular(3),
@@ -796,9 +796,9 @@ class _PositionRow extends StatelessWidget {
             child: Text(
               isBuy ? 'BUY' : 'SELL',
               style: TextStyle(
-                fontSize: ForexAiTokens.fsCaption - 1,
+                fontSize: NeoethosTokens.fsCaption - 1,
                 fontWeight: FontWeight.w800,
-                color: isBuy ? ForexAiTokens.buy : ForexAiTokens.sell,
+                color: isBuy ? NeoethosTokens.buy : NeoethosTokens.sell,
               ),
             ),
           ),
@@ -810,17 +810,17 @@ class _PositionRow extends StatelessWidget {
                 Text(
                   '${_prettySymbol(position.symbol)} · $volume',
                   style: const TextStyle(
-                    fontSize: ForexAiTokens.fsBody,
+                    fontSize: NeoethosTokens.fsBody,
                     fontWeight: FontWeight.w700,
-                    color: ForexAiTokens.textPrimary,
+                    color: NeoethosTokens.textPrimary,
                     fontFeatures: [FontFeature.tabularFigures()],
                   ),
                 ),
                 Text(
                   'since $since · #${position.positionId}',
                   style: const TextStyle(
-                    fontSize: ForexAiTokens.fsCaption,
-                    color: ForexAiTokens.textFaint,
+                    fontSize: NeoethosTokens.fsCaption,
+                    color: NeoethosTokens.textFaint,
                     fontFeatures: [FontFeature.tabularFigures()],
                   ),
                 ),
@@ -833,7 +833,7 @@ class _PositionRow extends StatelessWidget {
               Text(
                 '$pnlPips pips',
                 style: TextStyle(
-                  fontSize: ForexAiTokens.fsBody,
+                  fontSize: NeoethosTokens.fsBody,
                   fontWeight: FontWeight.w800,
                   color: pnlColor,
                   fontFeatures: const [FontFeature.tabularFigures()],
@@ -842,7 +842,7 @@ class _PositionRow extends StatelessWidget {
               Text(
                 '$currencySymbol$pnlUsd',
                 style: TextStyle(
-                  fontSize: ForexAiTokens.fsCaption,
+                  fontSize: NeoethosTokens.fsCaption,
                   color: pnlColor.withValues(alpha: 0.8),
                   fontFeatures: const [FontFeature.tabularFigures()],
                 ),
@@ -866,9 +866,9 @@ class _PendingOrdersPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       decoration: BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border.all(color: ForexAiTokens.border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        color: NeoethosTokens.panelBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: const Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -903,9 +903,9 @@ class _PanelTitle extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: const BoxDecoration(
-        color: ForexAiTokens.appBg,
+        color: NeoethosTokens.appBg,
         border: Border(
-          bottom: BorderSide(color: ForexAiTokens.border),
+          bottom: BorderSide(color: NeoethosTokens.border),
         ),
       ),
       child: Row(
@@ -913,25 +913,25 @@ class _PanelTitle extends StatelessWidget {
           Text(
             title.toUpperCase(),
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsCaption,
+              fontSize: NeoethosTokens.fsCaption,
               fontWeight: FontWeight.w800,
               letterSpacing: 0.8,
-              color: ForexAiTokens.textMuted,
+              color: NeoethosTokens.textMuted,
             ),
           ),
           const SizedBox(width: 6),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
             decoration: BoxDecoration(
-              color: ForexAiTokens.accentMuted,
+              color: NeoethosTokens.accentMuted,
               borderRadius: BorderRadius.circular(3),
             ),
             child: Text(
               '$count',
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsCaption - 1,
+                fontSize: NeoethosTokens.fsCaption - 1,
                 fontWeight: FontWeight.w800,
-                color: ForexAiTokens.accent,
+                color: NeoethosTokens.accent,
               ),
             ),
           ),
@@ -946,12 +946,12 @@ class _LoadingLine extends StatelessWidget {
   @override
   Widget build(BuildContext context) => const Center(
         child: Padding(
-          padding: EdgeInsets.all(ForexAiTokens.spMd),
+          padding: EdgeInsets.all(NeoethosTokens.spMd),
           child: Text(
             'Loading…',
             style: TextStyle(
-              fontSize: ForexAiTokens.fsBody,
-              color: ForexAiTokens.textMuted,
+              fontSize: NeoethosTokens.fsBody,
+              color: NeoethosTokens.textMuted,
             ),
           ),
         ),
@@ -964,14 +964,14 @@ class _EmptyLine extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Center(
         child: Padding(
-          padding: const EdgeInsets.all(ForexAiTokens.spMd),
+          padding: const EdgeInsets.all(NeoethosTokens.spMd),
           child: Text(
             message,
             textAlign: TextAlign.center,
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsCaption,
+              fontSize: NeoethosTokens.fsCaption,
               height: 1.4,
-              color: ForexAiTokens.textFaint,
+              color: NeoethosTokens.textFaint,
             ),
           ),
         ),
@@ -983,12 +983,12 @@ class _ErrorBlock extends StatelessWidget {
   const _ErrorBlock({required this.message});
   @override
   Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.all(ForexAiTokens.spMd),
+        padding: const EdgeInsets.all(NeoethosTokens.spMd),
         child: Text(
           'Error: $message',
           style: const TextStyle(
-            fontSize: ForexAiTokens.fsCaption,
-            color: ForexAiTokens.sell,
+            fontSize: NeoethosTokens.fsCaption,
+            color: NeoethosTokens.sell,
             height: 1.4,
           ),
         ),

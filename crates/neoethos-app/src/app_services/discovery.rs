@@ -690,13 +690,13 @@ pub fn start_discovery_job(
         // ── Auto-fetch missing history (operator-chosen over a hard
         // fail) ───────────────────────────────────────────────────────
         // Discovery's `ensure_sufficient_history` floor (set via
-        // FOREX_BOT_MIN_HISTORY_YEARS) aborts when the local cache is too
+        // NEOETHOS_BOT_MIN_HISTORY_YEARS) aborts when the local cache is too
         // short. If the base timeframe is below the floor, pull the
         // required window straight from cTrader and reload before
         // building features — so Discovery runs on real broker history
         // instead of failing.
         let mut dataset = dataset;
-        let min_years = std::env::var("FOREX_BOT_MIN_HISTORY_YEARS")
+        let min_years = std::env::var("NEOETHOS_BOT_MIN_HISTORY_YEARS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);

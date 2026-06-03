@@ -428,12 +428,12 @@ fn runtime_backend_details_explain_requested_gpu_fallback_to_cpu() {
 #[test]
 fn runtime_backend_details_explain_requested_precision_when_unavailable() {
     unsafe {
-        std::env::set_var("FOREX_BOT_DQN_TRAIN_PRECISION", "bf16");
+        std::env::set_var("NEOETHOS_BOT_DQN_TRAIN_PRECISION", "bf16");
     }
     let learner = TradingReinforcementLearner::new();
     let (_backend, degraded_reason) = learner.runtime_backend_details();
     unsafe {
-        std::env::remove_var("FOREX_BOT_DQN_TRAIN_PRECISION");
+        std::env::remove_var("NEOETHOS_BOT_DQN_TRAIN_PRECISION");
     }
 
     let degraded_reason =

@@ -22,20 +22,9 @@ use crate::app_services::jobs::{CancellationFlag, JobKind};
 use crate::server::codex::CodexFlowState;
 use crate::server::engines_control::EngineRunState;
 
-/// Default config-file path when no CLI override is provided. Routes that
-/// read `Settings::from_yaml(...)` consult `AppApiState::config_path()`
-/// (when state is in scope) or [`current_config_path`] (for free fns)
-/// rather than hardcoding this literal so the CLI `--config` flag can
-/// propagate cleanly.
-///
-/// **F-553/F-576 closure (2026-05-25)**: previously hardcoded as the
-/// literal `"config.yaml"` in 9 sites across the server module. Now
-/// centralized here so the operator's CLI override flows through the
-/// typed `AppApiState` boundary (route handlers) and the process-wide
-/// install (free functions like `resolve_data_root`) instead of being
-/// lost on `cargo run` from a non-canonical working directory.
-pub const DEFAULT_CONFIG_PATH: &str = "config.yaml";
-
+/// Process-wide config-file path, defaulting to `"config.yaml"` when no
+/// CLI `--config` override is provided. Set once at startup via
+/// [`install_config_path`]; queried via [`current_config_path`].
 static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// **F-231-related closure (2026-05-25)** — process-wide handle to

@@ -80,27 +80,27 @@ class TopBar extends ConsumerWidget {
                 : _ValueAccent.plain;
 
     return Container(
-      height: ForexAiTokens.topbarHeight,
-      padding: const EdgeInsets.symmetric(horizontal: ForexAiTokens.spLg),
+      height: NeoethosTokens.topbarHeight,
+      padding: const EdgeInsets.symmetric(horizontal: NeoethosTokens.spLg),
       decoration: const BoxDecoration(
-        color: ForexAiTokens.panelBg,
-        border: Border(bottom: BorderSide(color: ForexAiTokens.border)),
+        color: NeoethosTokens.panelBg,
+        border: Border(bottom: BorderSide(color: NeoethosTokens.border)),
       ),
       child: Row(
         children: [
           const Text(
             'NeoEthos',
             style: TextStyle(
-              fontSize: ForexAiTokens.fsSubtitle + 1,
+              fontSize: NeoethosTokens.fsSubtitle + 1,
               fontWeight: FontWeight.w700,
-              color: ForexAiTokens.textPrimary,
+              color: NeoethosTokens.textPrimary,
             ),
           ),
-          const SizedBox(width: ForexAiTokens.spSm),
+          const SizedBox(width: NeoethosTokens.spSm),
           const _Badge(label: 'PRO', kind: _BadgeKind.pro),
-          const SizedBox(width: ForexAiTokens.spXs),
+          const SizedBox(width: NeoethosTokens.spXs),
           _Badge(label: badgeLabel, kind: badgeKind),
-          const SizedBox(width: ForexAiTokens.spXs),
+          const SizedBox(width: NeoethosTokens.spXs),
           const _AccountSwitcher(),
           const _VSep(),
           Expanded(
@@ -137,15 +137,15 @@ class TopBar extends ConsumerWidget {
           // land they're read-only mirrors of whatever the bridge is
           // doing, but they no longer lie about state.
           _AutoPill(label: 'Auto-Discover', on: discoveryOn),
-          const SizedBox(width: ForexAiTokens.spXs),
+          const SizedBox(width: NeoethosTokens.spXs),
           _AutoPill(label: 'Auto-Train', on: trainingOn),
-          const SizedBox(width: ForexAiTokens.spSm),
+          const SizedBox(width: NeoethosTokens.spSm),
           IconButton(
             onPressed: () => ref
                 .read(accountSnapshotProvider.notifier)
                 .refreshNow(),
             tooltip: 'Refresh account snapshot now',
-            icon: const Icon(Icons.refresh, color: ForexAiTokens.textMuted),
+            icon: const Icon(Icons.refresh, color: NeoethosTokens.textMuted),
           ),
           // Help — F1 keyboard shortcut also opens this. Greek + English
           // docs across 6 sections (Welcome, Trading, AI Engine, Risk,
@@ -154,7 +154,7 @@ class TopBar extends ConsumerWidget {
             onPressed: () => showHelpDialog(context),
             tooltip: 'Help (F1) — Welcome guide, trading, AI, risk, FAQs',
             icon: const Icon(Icons.help_outline,
-                color: ForexAiTokens.textMuted),
+                color: NeoethosTokens.textMuted),
           ),
           // Report Issue — single, always-visible entry point. End
           // users can't rebuild the app, so this is the canonical way
@@ -166,7 +166,7 @@ class TopBar extends ConsumerWidget {
             onPressed: () => showReportIssueDialog(context),
             tooltip: 'Report an issue — bundles logs + emails support',
             icon: const Icon(Icons.bug_report_outlined,
-                color: ForexAiTokens.textMuted),
+                color: NeoethosTokens.textMuted),
           ),
           // Backend diagnostics — supervisor.log tail + Restart button.
           // Always visible (not gated on degraded state) so the
@@ -175,7 +175,7 @@ class TopBar extends ConsumerWidget {
             onPressed: () => showBackendDiagnosticsDialog(context),
             tooltip: 'Backend diagnostics — view supervisor log + restart',
             icon: const Icon(Icons.monitor_heart_outlined,
-                color: ForexAiTokens.textMuted),
+                color: NeoethosTokens.textMuted),
           ),
           // **2026-05-25 — task #241**: dead "Notifications (TODO)"
           // button removed. The Backend diagnostics icon above is the
@@ -212,7 +212,7 @@ class _AccountSwitcher extends ConsumerWidget {
     return PopupMenuButton<String>(
       tooltip: 'Switch cTrader account (applies on restart)',
       offset: const Offset(0, 36),
-      color: ForexAiTokens.panelBg,
+      color: NeoethosTokens.panelBg,
       onSelected: (id) => _select(context, ref, id),
       itemBuilder: (_) => [
         for (final a in accounts)
@@ -232,16 +232,16 @@ class _AccountSwitcher extends ConsumerWidget {
                 Text(
                   a.accountId,
                   style: TextStyle(
-                    fontSize: ForexAiTokens.fsBody,
+                    fontSize: NeoethosTokens.fsBody,
                     fontWeight: a.accountId == currentId
                         ? FontWeight.w800
                         : FontWeight.w500,
-                    color: ForexAiTokens.textPrimary,
+                    color: NeoethosTokens.textPrimary,
                   ),
                 ),
                 if (a.accountId == currentId) ...[
                   const SizedBox(width: 8),
-                  const Icon(Icons.check, size: 14, color: ForexAiTokens.buy),
+                  const Icon(Icons.check, size: 14, color: NeoethosTokens.buy),
                 ],
               ],
             ),
@@ -250,26 +250,26 @@ class _AccountSwitcher extends ConsumerWidget {
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 8),
         decoration: BoxDecoration(
-          color: ForexAiTokens.appBg,
-          border: Border.all(color: ForexAiTokens.border),
-          borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+          color: NeoethosTokens.appBg,
+          border: Border.all(color: NeoethosTokens.border),
+          borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             const Icon(Icons.account_circle_outlined,
-                size: 14, color: ForexAiTokens.textMuted),
+                size: 14, color: NeoethosTokens.textMuted),
             const SizedBox(width: 5),
             Text(
               currentId.isEmpty ? 'Account' : currentId,
               style: const TextStyle(
-                fontSize: ForexAiTokens.fsCaption,
+                fontSize: NeoethosTokens.fsCaption,
                 fontWeight: FontWeight.w700,
-                color: ForexAiTokens.textPrimary,
+                color: NeoethosTokens.textPrimary,
               ),
             ),
             const Icon(Icons.arrow_drop_down,
-                size: 16, color: ForexAiTokens.textMuted),
+                size: 16, color: NeoethosTokens.textMuted),
           ],
         ),
       ),
@@ -286,7 +286,7 @@ class _AccountSwitcher extends ConsumerWidget {
       ref.invalidate(brokerStatusProvider);
       ref.invalidate(accountSnapshotProvider);
       messenger.showSnackBar(SnackBar(
-        backgroundColor: ok ? ForexAiTokens.buy : ForexAiTokens.warning,
+        backgroundColor: ok ? NeoethosTokens.buy : NeoethosTokens.warning,
         duration: const Duration(seconds: 5),
         content: Text(ok
             ? 'Active account → $id. Restart NeoEthos to apply.'
@@ -294,7 +294,7 @@ class _AccountSwitcher extends ConsumerWidget {
       ));
     } catch (e) {
       messenger.showSnackBar(SnackBar(
-        backgroundColor: ForexAiTokens.sell,
+        backgroundColor: NeoethosTokens.sell,
         duration: const Duration(seconds: 6),
         content: Text(
           'Account switch failed — active account unchanged. '
@@ -316,34 +316,34 @@ class _Badge extends StatelessWidget {
   Widget build(BuildContext context) {
     final (fg, bg, border) = switch (kind) {
       _BadgeKind.pro => (
-          ForexAiTokens.accent,
+          NeoethosTokens.accent,
           const Color(0x29002962),
-          ForexAiTokens.accent.withValues(alpha: 0.6),
+          NeoethosTokens.accent.withValues(alpha: 0.6),
         ),
       _BadgeKind.live => (
-          ForexAiTokens.buy,
-          ForexAiTokens.buy.withValues(alpha: 0.16),
-          ForexAiTokens.buy.withValues(alpha: 0.6),
+          NeoethosTokens.buy,
+          NeoethosTokens.buy.withValues(alpha: 0.16),
+          NeoethosTokens.buy.withValues(alpha: 0.6),
         ),
       _BadgeKind.offline => (
-          ForexAiTokens.sell,
-          ForexAiTokens.sell.withValues(alpha: 0.16),
-          ForexAiTokens.sell.withValues(alpha: 0.6),
+          NeoethosTokens.sell,
+          NeoethosTokens.sell.withValues(alpha: 0.16),
+          NeoethosTokens.sell.withValues(alpha: 0.6),
         ),
       _BadgeKind.local => (
-          ForexAiTokens.warning,
-          ForexAiTokens.warning.withValues(alpha: 0.16),
-          ForexAiTokens.warning.withValues(alpha: 0.6),
+          NeoethosTokens.warning,
+          NeoethosTokens.warning.withValues(alpha: 0.16),
+          NeoethosTokens.warning.withValues(alpha: 0.6),
         ),
       _BadgeKind.blackout => (
-          ForexAiTokens.sell,
-          ForexAiTokens.sell.withValues(alpha: 0.16),
-          ForexAiTokens.sell.withValues(alpha: 0.6),
+          NeoethosTokens.sell,
+          NeoethosTokens.sell.withValues(alpha: 0.16),
+          NeoethosTokens.sell.withValues(alpha: 0.6),
         ),
       _BadgeKind.idle => (
-          ForexAiTokens.textFaint,
-          ForexAiTokens.textFaint.withValues(alpha: 0.16),
-          ForexAiTokens.textFaint.withValues(alpha: 0.6),
+          NeoethosTokens.textFaint,
+          NeoethosTokens.textFaint.withValues(alpha: 0.16),
+          NeoethosTokens.textFaint.withValues(alpha: 0.6),
         ),
     };
     return Container(
@@ -351,12 +351,12 @@ class _Badge extends StatelessWidget {
       decoration: BoxDecoration(
         color: bg,
         border: Border.all(color: border),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Text(
         label,
         style: TextStyle(
-          fontSize: ForexAiTokens.fsCaption - 0.5,
+          fontSize: NeoethosTokens.fsCaption - 0.5,
           fontWeight: FontWeight.w700,
           letterSpacing: 0.4,
           color: fg,
@@ -372,8 +372,8 @@ class _VSep extends StatelessWidget {
   Widget build(BuildContext context) => Container(
         width: 1,
         height: 28,
-        color: ForexAiTokens.border,
-        margin: const EdgeInsets.symmetric(horizontal: ForexAiTokens.spSm),
+        color: NeoethosTokens.border,
+        margin: const EdgeInsets.symmetric(horizontal: NeoethosTokens.spSm),
       );
 }
 
@@ -392,13 +392,13 @@ class _RibbonItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final color = switch (valueAccent) {
-      _ValueAccent.plain => ForexAiTokens.textPrimary,
-      _ValueAccent.success => ForexAiTokens.buy,
-      _ValueAccent.danger => ForexAiTokens.sell,
-      _ValueAccent.accent => ForexAiTokens.accent,
+      _ValueAccent.plain => NeoethosTokens.textPrimary,
+      _ValueAccent.success => NeoethosTokens.buy,
+      _ValueAccent.danger => NeoethosTokens.sell,
+      _ValueAccent.accent => NeoethosTokens.accent,
     };
     return Padding(
-      padding: const EdgeInsets.only(right: ForexAiTokens.spLg),
+      padding: const EdgeInsets.only(right: NeoethosTokens.spLg),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
@@ -406,16 +406,16 @@ class _RibbonItem extends StatelessWidget {
           Text(
             label.toUpperCase(),
             style: const TextStyle(
-              fontSize: ForexAiTokens.fsCaption - 1,
+              fontSize: NeoethosTokens.fsCaption - 1,
               letterSpacing: 0.8,
               fontWeight: FontWeight.w700,
-              color: ForexAiTokens.textMuted,
+              color: NeoethosTokens.textMuted,
             ),
           ),
           Text(
             value,
             style: TextStyle(
-              fontSize: ForexAiTokens.fsBody,
+              fontSize: NeoethosTokens.fsBody,
               fontWeight: FontWeight.w700,
               color: color,
             ),
@@ -433,18 +433,18 @@ class _AutoPill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final fg = on ? ForexAiTokens.buy : ForexAiTokens.textFaint;
+    final fg = on ? NeoethosTokens.buy : NeoethosTokens.textFaint;
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 8),
       decoration: BoxDecoration(
         color: fg.withValues(alpha: 0.15),
         border: Border.all(color: fg.withValues(alpha: 0.55)),
-        borderRadius: BorderRadius.circular(ForexAiTokens.rSm),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
       ),
       child: Text(
         label,
         style: TextStyle(
-          fontSize: ForexAiTokens.fsCaption,
+          fontSize: NeoethosTokens.fsCaption,
           fontWeight: FontWeight.w700,
           color: fg,
         ),

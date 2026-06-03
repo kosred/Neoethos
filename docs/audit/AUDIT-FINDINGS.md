@@ -181,7 +181,7 @@ Every "synthetic fallback" identified in the audit must die. **Replacement polic
 2. **Auto-fetch ≥10 years per symbol** — if user hasn't provided data for the symbol being requested, auto-fetch from the live cTrader history API a MINIMUM of 10 years of bars before the run starts. Cache persistently so subsequent runs don't re-fetch.
 3. **`bail!` with specific cause** — ONLY when neither (1) nor (2) is possible (e.g. cTrader doesn't have 10y for an exotic / recent-IPO symbol). Error message names exactly what's missing so the user can decide (use less data, pick a different symbol, or import their own history).
 
-There is **NO fourth option**. No EURUSD-fallback, no synthetic-spread-by-asset-class, no $100k-default-balance, no 0.0002-flat-cost. The previous `FOREX_BOT_ALLOW_SYNTHETIC_*=1` env opt-ins are rejected — there is no opt-in for synthetic data.
+There is **NO fourth option**. No EURUSD-fallback, no synthetic-spread-by-asset-class, no $100k-default-balance, no 0.0002-flat-cost. The previous `NEOETHOS_BOT_ALLOW_SYNTHETIC_*=1` env opt-ins are rejected — there is no opt-in for synthetic data.
 
 The ban applies in priority order across the audit findings:
 
@@ -190,7 +190,7 @@ The ban applies in priority order across the audit findings:
 3. **Initial balance** — F-024: no $100k default. Caller passes the real account balance from cTrader or errors.
 4. **Historical data sufficiency** — **F-096 (new finding below)**: every discovery/training/validation entry point gets a pre-flight that bails when < 10y of bars are available for the chosen symbol+timeframe. Today's pipelines silently run on whatever data is on disk (could be 6 months) and produce overfit garbage.
 5. **Test fixtures** — parity.rs and eval.rs tests use hand-crafted price sequences. Migrate to **cached real broker samples** (one M5 EURUSD window pulled from cTrader + frozen as a fixture file). The `TODO(real-data)` comment at parity.rs:118-121 says exactly this.
-6. **Threshold-quantization env switch** — F-058 `FOREX_BOT_NORMALIZE_FEATURES`: pick ONE convention based on what the real feature pipeline emits and commit to it. No env-driven duality.
+6. **Threshold-quantization env switch** — F-058 `NEOETHOS_BOT_NORMALIZE_FEATURES`: pick ONE convention based on what the real feature pipeline emits and commit to it. No env-driven duality.
 
 ### 2. Deduplicate parallel implementations
 
@@ -338,11 +338,11 @@ Per operator directive: **no `cargo check` / `cargo build` run** between this ba
 - **Fix**: extract the per-bar simulation loop into a single `step` function called by both. Each variant only differs in whether it accumulates a `Trade` record. Estimated refactor ~150 LOC delta, no behavior change.
 - **Severity**: MEDIUM (no immediate correctness bug; latent drift risk)
 
-### F-005 (LOW) — `FOREX_BOT_DISABLE_SMC_GATE` env var hidden bypass
+### F-005 (LOW) — `NEOETHOS_BOT_DISABLE_SMC_GATE` env var hidden bypass
 - **Location**: lines 947-951 + same pattern in `genetic/search_engine.rs:261`
 - **What**: setting this env to "1"/"true"/"TRUE" silently bypasses the SMC indicator gate (sets `active_sum = 0`). Documented in the comment as "Lets operators isolate ... without recompiling".
 - **Why it matters**: behavior changes invisibly based on environment. A trader who set this once and forgot will get different results from someone who didn't. No log line announces the bypass.
-- **Fix**: at startup, if any `FOREX_BOT_*` env var is set, log a single `tracing::warn!` listing them so the operator can see what's been overridden.
+- **Fix**: at startup, if any `NEOETHOS_BOT_*` env var is set, log a single `tracing::warn!` listing them so the operator can see what's been overridden.
 - **Severity**: LOW
 
 ### F-006 (NOTE) — `init_rayon` IS wired (false alarm)
@@ -382,7 +382,7 @@ Per operator directive: **no `cargo check` / `cargo build` run** between this ba
 
 ### F-011 (MEDIUM) — `with_env_runtime_overrides` silently switches ~10 fields when mode=PropFirm
 - **Location**: `discovery.rs:325-357`
-- **What**: when `FOREX_BOT_DISCOVERY_MODE` resolves to `PropFirm`, the method overrides: `filtering.max_dd`, `filtering.min_profit`, `filtering.min_trades`, `filtering.min_sharpe`, `filtering.min_win_rate`, `filtering.min_profit_factor`, `filtering.anomaly_guard`, `cpcv_min_phi`, `min_trades_per_day`, and installs `prop_firm_gate`. Heavy silent behavior change driven by one env var, no startup log line announcing the mode.
+- **What**: when `NEOETHOS_BOT_DISCOVERY_MODE` resolves to `PropFirm`, the method overrides: `filtering.max_dd`, `filtering.min_profit`, `filtering.min_trades`, `filtering.min_sharpe`, `filtering.min_win_rate`, `filtering.min_profit_factor`, `filtering.anomaly_guard`, `cpcv_min_phi`, `min_trades_per_day`, and installs `prop_firm_gate`. Heavy silent behavior change driven by one env var, no startup log line announcing the mode.
 - **Why it matters**: identical inputs → wildly different discovery outputs depending on env. Reproducibility hazard. Operator could forget the env was set last week.
 - **Fix**: log a single `tracing::info!` at discovery start naming the resolved mode + which fields were overridden.
 - **Severity**: MEDIUM
@@ -594,7 +594,7 @@ Internally calls `infer_market_cost_profile(...)` and overrides the 6 cost-profi
 - **Fix**:
   1. Extend `neoethos_core::symbol_metadata::SymbolMetadata` with `typical_spread_pips: Option<f64>` and `commission_per_lot: Option<f64>`.
   2. Source these from cTrader symbol records (look in `ctrader_data` / `ctrader_messages` for `ProtoOASymbolCategory` parsing) when the user connects.
-  3. When metadata is missing, BAIL (fail-loudly) instead of silently using EURUSD-grade defaults. Add a `FOREX_BOT_ALLOW_SYNTHETIC_SPREADS=1` env override for backtests on symbols without real metadata.
+  3. When metadata is missing, BAIL (fail-loudly) instead of silently using EURUSD-grade defaults. Add a `NEOETHOS_BOT_ALLOW_SYNTHETIC_SPREADS=1` env override for backtests on symbols without real metadata.
 - **Severity**: MEDIUM (multi-symbol cost accuracy)
 
 ### F-030 (LOW) — `Gene::normalize()` hardcoded fallbacks for invalid genes
@@ -701,7 +701,7 @@ This module computes/derives 11 SMC indicator arrays from either OHLCV alone (`d
 - **Why it matters**: a user who doesn't ship SMC columns through the feature pipeline gets "SMC" signals that are simplified caricatures. The system is named "SMC-based" but degrades silently to toy patterns. No warning, no log, no documentation that this fallback is active.
 - **Fix**:
   1. At `build_smc_arrays` entry, log `tracing::warn!` listing WHICH SMC columns were missing → derived. Operator can then see "5 of 11 SMC columns derived heuristically".
-  2. Add a strict mode env (`FOREX_BOT_REQUIRE_REAL_SMC_COLUMNS=1`) that BAILS when any SMC column is missing — for production users who need real SMC, not toy heuristics.
+  2. Add a strict mode env (`NEOETHOS_BOT_REQUIRE_REAL_SMC_COLUMNS=1`) that BAILS when any SMC column is missing — for production users who need real SMC, not toy heuristics.
 - **Severity**: MEDIUM (silent fallback to simplified logic)
 
 ### F-040 (MEDIUM) — `apply_dir_fill_zeros` pattern conflates separate signals
@@ -919,12 +919,12 @@ This is the GA core: parent/survivor selection policies, crossover, mutate, gene
   4. Cross-check that this formula and `quality.rs::score_strategy` produce consistent ORDERING (not necessarily same scale) on a held-out fixture. If a gene that scores low here scores high there, one of the two is wrong.
 - **Severity**: CRITICAL (the GA optimises an unaudited formula)
 
-### F-058 (MEDIUM) — `FOREX_BOT_NORMALIZE_FEATURES` env switches threshold levels silently
+### F-058 (MEDIUM) — `NEOETHOS_BOT_NORMALIZE_FEATURES` env switches threshold levels silently
 - **Location**: `evolution_math.rs:530-547`
-- **What**: when the env is set, the GA uses thresholds `[0.30, 0.45, 0.60, 0.80, 1.00, 1.20]` (6 levels). Otherwise it uses `[0.15, 0.25, 0.35, 0.45, 0.55]` (5 levels). Same FOREX_BOT_*-hidden-bypass pattern as F-005, F-011, F-058.
+- **What**: when the env is set, the GA uses thresholds `[0.30, 0.45, 0.60, 0.80, 1.00, 1.20]` (6 levels). Otherwise it uses `[0.15, 0.25, 0.35, 0.45, 0.55]` (5 levels). Same NEOETHOS_BOT_*-hidden-bypass pattern as F-005, F-011, F-058.
 - **The comment explains why** (lines 525-540): the threshold range needs to match the feature magnitudes. Without re-calibration, empty-portfolio bug on EURJPY/XAUUSD. Good awareness in the comment, but no startup log of which mode is active.
 - **Why it matters**: changes the GA's threshold search space invisibly. A discovery run done last week with `=1` and this week without will produce different distributions of `long_threshold` / `short_threshold` even with identical seeds.
-- **Fix**: log at startup `tracing::info!` listing which FOREX_BOT_* env vars are set, including this one. Also: think about whether feature normalization should be ON by default (the comment suggests it's needed for non-EURUSD symbols).
+- **Fix**: log at startup `tracing::info!` listing which NEOETHOS_BOT_* env vars are set, including this one. Also: think about whether feature normalization should be ON by default (the comment suggests it's needed for non-EURUSD symbols).
 - **Severity**: MEDIUM (silent threshold-range change)
 
 ### F-059 (LOW) — `new_random_gene` SL/TP initialization magic
@@ -1007,7 +1007,7 @@ This module is the **third regime-classifier**, also implementing volatility est
 
 ## genetic/runtime_overrides.rs — `crates/neoethos-search/src/genetic/runtime_overrides.rs` (795 lines, **COMPLETE**)
 
-This is the **typed-boundary template** for all `FOREX_BOT_*` env vars. Well-designed, well-tested, well-documented. Audit doctrine: every other magic-number finding should migrate to a struct like the ones in this file.
+This is the **typed-boundary template** for all `NEOETHOS_BOT_*` env vars. Well-designed, well-tested, well-documented. Audit doctrine: every other magic-number finding should migrate to a struct like the ones in this file.
 
 ### F-068 (REFERENCE) — `runtime_overrides.rs` is the canonical template for config-extraction
 - **What**: this file already provides typed `from_env` → `OnceLock` → `current_*` accessor pattern with explicit clamping (`resolved_curve`, `resolved_temperature`, `effective_tournament_size`, `effective_archive_cap`, `effective_stagnation_patience`). Defaults documented in struct + tests.
@@ -1104,7 +1104,7 @@ This file is the `#[cfg(feature = "gpu")]` arm of a cfg-conditional duplicated m
 
 ### F-076 (NOTE) — `resolve_execution_mode` good defensive pattern
 - **Location**: `discovery_gpu.rs:154-230`
-- **What**: explicit handling of CUDA-requested-but-unavailable case with structured `tracing::error!` log and optional `FOREX_BOT_REQUIRE_GPU=1` opt-in to panic instead of silently falling back. Good operator-facing diagnostic.
+- **What**: explicit handling of CUDA-requested-but-unavailable case with structured `tracing::error!` log and optional `NEOETHOS_BOT_REQUIRE_GPU=1` opt-in to panic instead of silently falling back. Good operator-facing diagnostic.
 - **Severity**: NONE — reference example.
 
 ---
@@ -1184,7 +1184,7 @@ This is the **canonical SL/TP-faithful GPU evaluator** the doc-comment in `disco
 
 ### F-084 (NOTE) — Defensive env-var handling for CUDA device + precision
 - **Location**: `cubecl_eval.rs:549-571` (`cuda_device_id`), `489-499` (`requested_eval_precision`)
-- **What**: explicit `tracing::warn!` when `FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE` is set to a non-parseable value ("auto", "all", typo). Previously silently fell back to device 0; now shouts. Good operator-facing diagnostic, matches the F-076 pattern.
+- **What**: explicit `tracing::warn!` when `NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE` is set to a non-parseable value ("auto", "all", typo). Previously silently fell back to device 0; now shouts. Good operator-facing diagnostic, matches the F-076 pattern.
 - **Severity**: NONE — reference example.
 
 ---
@@ -1662,7 +1662,7 @@ No findings. Solid atomic-write pattern (temp file + fsync + rename), proper dir
   - **`baked_in_default` is `#[cfg(test)]`-only** — explicitly documented as test-fixture, never production.
   - **`pip_value_in_account` returns NaN** for cross pairs without conversion rates (fail-loud rather than silently wrong).
   - **Schema versioning** via `SchemaVersion::new(1)` + `ensure_schema_version_readable`.
-  - **Operator override** via `FOREX_BOT_SYMBOL_METADATA` env.
+  - **Operator override** via `NEOETHOS_BOT_SYMBOL_METADATA` env.
   - **Packaged asset fallback** for fresh checkouts — but that's a SNAPSHOT of broker data, not synthetic.
 - **The pattern other findings should adopt**:
   - F-002/F-003 (`BacktestSettings`): use this exact disk-backed shape.
@@ -1911,13 +1911,13 @@ No findings. Solid atomic-write pattern (temp file + fsync + rename), proper dir
 
 ### F-150 (MEDIUM) — Reads env vars directly in core (violates F-CORE3 typed-boundary)
 - **Location**: `resolved_config.rs:158-159, 260, 273, 282, 435-444`
-- **What**: `env_truthy("FOREX_BOT_NORMALIZE_FEATURES")`, `env_truthy("FOREX_BOT_DISABLE_SMC_GATE")`, and `resolve_discovery_mode_str()` all read `std::env::var` directly. The doctrine (per F-CORE3) is that env reads should happen once at app entry and be threaded as typed `*RuntimeOverrides`.
+- **What**: `env_truthy("NEOETHOS_BOT_NORMALIZE_FEATURES")`, `env_truthy("NEOETHOS_BOT_DISABLE_SMC_GATE")`, and `resolve_discovery_mode_str()` all read `std::env::var` directly. The doctrine (per F-CORE3) is that env reads should happen once at app entry and be threaded as typed `*RuntimeOverrides`.
 - **Fix**: route through `install_search_runtime_overrides_from_env()` (already exists in `neoethos-search`). Add `discovery_mode_runtime_override` to the typed overrides.
 - **Severity**: MEDIUM (drives same drift class as F-150 in TUI/CLI)
 
 ### F-151 (LOW) — `resolve_discovery_mode_str` defaults to `"prop_firm"` silently
 - **Location**: `resolved_config.rs:435-444`
-- **What**: if `FOREX_BOT_DISCOVERY_MODE` is unset, defaults to prop_firm. Operator who deletes the env var unintentionally flips into prop_firm rules without knowing.
+- **What**: if `NEOETHOS_BOT_DISCOVERY_MODE` is unset, defaults to prop_firm. Operator who deletes the env var unintentionally flips into prop_firm rules without knowing.
 - **Fix**: require explicit setting in config.yaml; operator-facing default should be visible.
 - **Severity**: LOW (per F-008/F-009 doctrine on visibility)
 
@@ -2056,7 +2056,7 @@ No findings. Solid atomic-write pattern (temp file + fsync + rename), proper dir
 
 ### F-173 (HIGH — DUP OF F-CORE3) — `apply_overrides_from_lookup` reads env vars in 165 lines
 - **Location**: `config.rs:1018-1186`
-- **What**: 30+ `FOREX_BOT_*` env var reads inline. Violates the typed-runtime-override doctrine (F-CORE3 / F-CORE7 reference: `HardwareRuntimeOverrides::from_env()` is the clean pattern).
+- **What**: 30+ `NEOETHOS_BOT_*` env var reads inline. Violates the typed-runtime-override doctrine (F-CORE3 / F-CORE7 reference: `HardwareRuntimeOverrides::from_env()` is the clean pattern).
 - **Fix**: extract to `SettingsRuntimeOverrides` struct with `from_env()` constructor; mirror `HardwareRuntimeOverrides`.
 - **Severity**: HIGH
 
@@ -2120,7 +2120,7 @@ No findings. Solid atomic-write pattern (temp file + fsync + rename), proper dir
 
 ### F-183 (REFERENCE) — `HardwareRuntimeOverrides::from_env()` is the typed-env-override reference
 - **Location**: `system.rs:61-82`
-- **What**: typed parsing of `FOREX_BOT_CPU_BUDGET`, `FOREX_BOT_TRAIN_PRECISION`, `FOREX_BOT_*_PRECISIONS`, `FOREX_BOT_WGPU_DEVICES` into the `HardwareRuntimeOverrides` struct. All other crates' `*_RuntimeOverrides::from_env()` should mirror this shape. F-CORE3/F-CORE7 baseline.
+- **What**: typed parsing of `NEOETHOS_BOT_CPU_BUDGET`, `NEOETHOS_BOT_TRAIN_PRECISION`, `NEOETHOS_BOT_*_PRECISIONS`, `NEOETHOS_BOT_WGPU_DEVICES` into the `HardwareRuntimeOverrides` struct. All other crates' `*_RuntimeOverrides::from_env()` should mirror this shape. F-CORE3/F-CORE7 baseline.
 - **Severity**: NONE — reference example.
 
 ### F-184 (LOW) — nvidia-smi Windows path list is hardcoded magic
@@ -2175,9 +2175,9 @@ Files audited so far: `lib.rs`, `core/mod.rs`, `core/universal_importer.rs`, `co
 
 ## lib.rs (821 lines, **COMPLETE**)
 
-### F-186 (MEDIUM — DUP OF F-150/F-173/F-CORE3) — `FOREX_BOT_NORMALIZE_FEATURES` env var read directly in data layer
+### F-186 (MEDIUM — DUP OF F-150/F-173/F-CORE3) — `NEOETHOS_BOT_NORMALIZE_FEATURES` env var read directly in data layer
 - **Location**: `lib.rs:707-712`
-- **What**: `prepare_multitimeframe_features_with_options` reads `FOREX_BOT_NORMALIZE_FEATURES` env var inline. Same F-CORE3 violation as resolved_config and config — should be a typed `FeaturePipelineRuntimeOverrides`.
+- **What**: `prepare_multitimeframe_features_with_options` reads `NEOETHOS_BOT_NORMALIZE_FEATURES` env var inline. Same F-CORE3 violation as resolved_config and config — should be a typed `FeaturePipelineRuntimeOverrides`.
 - **Fix**: extract to `crate::feature_pipeline_runtime_overrides` struct mirroring `HardwareRuntimeOverrides`.
 - **Severity**: MEDIUM
 
@@ -2690,7 +2690,7 @@ Files audited so far: `lib.rs`, `core/mod.rs`, `core/universal_importer.rs`, `co
 - F-200/F-201/F-202/F-233/F-235 TZ-implicit session/killzone hours appear in smc.rs, session_features.rs, risk.rs (F-133), config.rs — needs single `SessionConfig` driven by chrono-tz
 - F-225/F-226 ADX + Garman-Klass re-implemented despite vector_ta dep
 - F-249 `resample_ohlcv` likely silently broken since timestamp-ms normalization landed
-- F-CORE3 typed-boundary violations propagate: F-186 (FOREX_BOT_NORMALIZE_FEATURES) joins F-150/F-173/F-180
+- F-CORE3 typed-boundary violations propagate: F-186 (NEOETHOS_BOT_NORMALIZE_FEATURES) joins F-150/F-173/F-180
 
 **Phase 1 (search) + Phase 2 (core) + Phase 3 (data) total: 254 findings, 19 reference examples.**
 
@@ -3402,13 +3402,13 @@ main.rs (453), app_state.rs (404), app_services/mod.rs (98), trading/mod.rs (206
 - **F-412**: Session reuse with OnceLock<Mutex<...>>. Recent submissions cached for idempotency (30s TTL).
 - **F-413 (REFERENCE)**: `idempotency_fingerprint` per-request with EVERY field (account/symbol/side/type/volume/all SL/TP/label/position_id/client_order_id/etc.).
 - **F-414 (REFERENCE)**: 30s TTL cache + LRU eviction at 256 entries. Excludes Failed outcomes from cache.
-- **F-415 (REFERENCE)**: `ensure_authenticated` reads FOREX_BOT_CTRADER_READ_TIMEOUT_SECS (default 30s) to set TCP read timeout — prevents wedged loops.
+- **F-415 (REFERENCE)**: `ensure_authenticated` reads NEOETHOS_BOT_CTRADER_READ_TIMEOUT_SECS (default 30s) to set TCP read timeout — prevents wedged loops.
 - **F-416 (REFERENCE)**: `ensure_auth_payload` tags token-expiry errors with CTRADER_TOKEN_EXPIRED_SENTINEL.
 - **F-417 (REFERENCE)**: `execute_via_session` retry loop. Drops session+auth_key on every failure path for re-authentication.
-- **F-418 (NOTE — F-CORE3)**: env vars FOREX_BOT_CTRADER_MAX_ATTEMPTS (1-5) and FOREX_BOT_CTRADER_BACKOFF_BASE_MS (10-2000ms). Same F-CORE3 violation as F-400.
+- **F-418 (NOTE — F-CORE3)**: env vars NEOETHOS_BOT_CTRADER_MAX_ATTEMPTS (1-5) and NEOETHOS_BOT_CTRADER_BACKOFF_BASE_MS (10-2000ms). Same F-CORE3 violation as F-400.
 - **F-419 (REFERENCE)**: `parse_execution_event` comprehensive deal/order/position with money_digits scaling.
 - **F-420 (REFERENCE)**: `required_money_digits` defaults to 2 with "log loudly" — avoids 100× silent inflation.
-- **F-421 (REFERENCE)**: `validate_execution_outcome` D10 fix — surfaces broker rejections + PartialFill (default-deny, opt-in via FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL).
+- **F-421 (REFERENCE)**: `validate_execution_outcome` D10 fix — surfaces broker rejections + PartialFill (default-deny, opt-in via NEOETHOS_BOT_CTRADER_ALLOW_PARTIAL_FILL).
 - **F-422 (NOTE — F-CORE3 DUP)**: Same env-var pattern.
 - **F-423 (REFERENCE)**: `scaled_money` falls back to fiat default 2 on out-of-range with error log.
 
@@ -3492,7 +3492,7 @@ main.rs, app_state.rs, app_services/mod.rs, trading/mod.rs (2061), trading/order
 - **F-457**: File-local `#![allow(dead_code)]` justified for Flutter API surface.
 - **F-458**: Dual modes documented (audit / authoritative) with 0.1% audit + 1% circuit-breaker (10× separation between warn and trip).
 - **F-459**: Net-vs-gross PnL semantics comment explains swap absorption.
-- **F-460 (NOTE — F-CORE3 DUP)**: env vars FOREX_BOT_PNL_AUDIT_DRIFT_FRACTION, FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION with safety clamps preventing full-disable via typo.
+- **F-460 (NOTE — F-CORE3 DUP)**: env vars NEOETHOS_BOT_PNL_AUDIT_DRIFT_FRACTION, NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION with safety clamps preventing full-disable via typo.
 - **F-461**: `PnLDriftCircuitBreaker::Ok | Tripped { position_id, broker_net, local, notional, drift_fraction, threshold_fraction }` typed output.
 - **F-462**: Ghost-position diagnostics emit debug! for broker-only and local-only positions.
 - **F-463**: `evaluate_pnl_drift_circuit_breaker` skips positions without broker entry/local PnL/zero notional (logged debug, transient quote-feed glitch).
@@ -3706,10 +3706,10 @@ main.rs, app_state.rs, app_services/mod.rs, trading/mod.rs (2061), trading/order
 ## Smaller files batch D (5 × small-medium files)
 
 ### F-562..F-568 — live_journal, ctrader_auth, trading/risk_gate, ctrader_errors, secure_store
-- **F-562 (REFERENCE — append-only journal)**: `live_journal.rs` — `SCHEMA_VERSION=1`, JSONL one-per-line lazy-opened, `OnceLock<Mutex<()>>` writer lock, env-controlled `FOREX_BOT_LIVE_JOURNAL_PATH`. `with_environment_hint` appends `|env=<host>` to operator_action so schema stays stable (no typed environment field). Best-effort variant `record_live_outcome_best_effort` for fire-and-forget hot path with `tracing::warn` only — never aborts a successful trade.
+- **F-562 (REFERENCE — append-only journal)**: `live_journal.rs` — `SCHEMA_VERSION=1`, JSONL one-per-line lazy-opened, `OnceLock<Mutex<()>>` writer lock, env-controlled `NEOETHOS_BOT_LIVE_JOURNAL_PATH`. `with_environment_hint` appends `|env=<host>` to operator_action so schema stays stable (no typed environment field). Best-effort variant `record_live_outcome_best_effort` for fire-and-forget hot path with `tracing::warn` only — never aborts a successful trade.
 - **F-563 (REFERENCE — auth state)**: `ctrader_auth.rs` — 4-state machine (NotConfigured/ReadyToAuthorize/RestoredFromStorage/AccountsAvailable). `needs_refresh_at(now, refresh_window_secs)` — proactive refresh inside safety window OR already-expired. `restore_from_storage` clears stale discovered_accounts. Test coverage pins expired/refresh-window logic, and "restoring clears stale accounts."
 - **F-564 (REFERENCE — preserved-fix bundle)**: `trading/risk_gate.rs` — module docstring documents EVERY preserved fix: F5/F6 (overflow guard), F7 (pip_position [-10, 10] clamp), Batch 3b (broker min/max/step volume enforcement), Batch B Pass 3 (empty symbol rejection + no-synthetic-default). All risk-per-trade computation paths require authoritative cTrader symbol metadata; cross-pair without quote→account rate REJECTS with explicit "no synthetic fallback is permitted."
-- **F-565 (HIGH — F-CORE3 cluster)**: `trading/risk_gate.rs` lines 190, 266, 277 — THREE direct `std::env::var` reads inside the risk gate: `FOREX_BOT_PROP_ACCOUNT_CURRENCY` × 2, `FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE` × 1. Should route through typed-runtime-override registry. Track for final-release sweep (high-priority because this is risk-gate hot path).
+- **F-565 (HIGH — F-CORE3 cluster)**: `trading/risk_gate.rs` lines 190, 266, 277 — THREE direct `std::env::var` reads inside the risk gate: `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` × 2, `NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE` × 1. Should route through typed-runtime-override registry. Track for final-release sweep (high-priority because this is risk-gate hot path).
 - **F-566 (REFERENCE — error translation registry)**: `ctrader_errors.rs::translate_code` — comprehensive cTrader error code → user-friendly message + CTA registry. Categories: Auth/Authorization (`CH_ACCESS_TOKEN_INVALID`, `CH_ACCOUNT_NOT_AUTHORIZED`, `RET_ACCOUNT_DISABLED`, `CH_CLIENT_AUTH_FAILURE`), Order placement (`MARKET_CLOSED`, `INSUFFICIENT_FUNDS`, `INVALID_VOLUME`, `INVALID_PRICE`, `ORDER_NOT_FOUND`, `POSITION_NOT_FOUND`), Risk/prop-firm (`RISK_EXCEEDED`, `RET_LIMITS_EXCEEDED`), Data/catalog (`NO_HISTORICAL_DATA`), Network (`TIMED_OUT`, `CH_RATE_LIMIT_EXCEEDED`). Unknown codes → "critical" severity (Flutter renders Report button → email-logs flow). 3 extract patterns: `errorCode=XXX`, `"errorCode":"XXX"`, `code=Some("XXX")`.
 - **F-567 (REFERENCE — secure store + legacy migration)**: `secure_store.rs` — trait dispatch over `CTraderTokenStore` + `SecretStoreBackend` + concrete `KeyringSecretStoreBackend` + `MemorySecretStoreBackend` (cfg-test). `load_token_bundle_with_legacy_fallback` migrates from pre-v0.4.13 `neoethos.test`/`ctrader.account` entry name to canonical `neoethos`/`ctrader.default` on first read. `decode_token_bundle` requires non-empty access_token/refresh_token/token_type/scope — incomplete payload errors. Test `production_ctrader_token_store_identity_is_not_test_scoped` pins canonical entry names (defends against accidental `.test` suffix leak).
 - **F-568 (NOTE — verify post-#81 fix)**: secure_store.rs uses keyring crate that per task #81 was previously using MockCredential and never persisted token bundle. Task is marked completed but reverify current behavior: KeyringSecretStoreBackend is using real keyring::Entry. ✓
@@ -3863,14 +3863,14 @@ main.rs, app_state.rs, app_services/mod.rs, trading/mod.rs (2061), trading/order
 - **F-648 (HIGH — synthetic-default fallback chain)**: `default_symbol`/`default_base_tf`/`default_higher_tfs_csv`/`default_batch_timeframes_csv` prefer settings, but fall back to "EURUSD"/"M1"/""/"M1,M5,M15,H1,H4" when settings is None. F-CORE2 violation. Should bail! per operator no-synthetic directive.
 - **F-649 (REFERENCE — dual flag accept)**: `parse_root` supports `--data-path` (operator-facing, 2026-05-14) AND `--root` (legacy backwards-compat). `--data-path` wins because more explicit name.
 - **F-650 (REFERENCE — optional settings)**: `resolve_cli_settings` returns `Option<Settings>` — never errors on missing config.yaml; only errors when explicit `--config` is supplied and fails.
-- **F-651 (REFERENCE — env-mutation SAFETY doc)**: `cmd_auto_loop` `unsafe { std::env::set_var("FOREX_BOT_DATA_ROOT", &root) }` line 682 — comprehensive SAFETY doc explaining single-threaded init (before rayon/tokio threads spawn). Per std::env::set_var Linux/macOS docs.
+- **F-651 (REFERENCE — env-mutation SAFETY doc)**: `cmd_auto_loop` `unsafe { std::env::set_var("NEOETHOS_BOT_DATA_ROOT", &root) }` line 682 — comprehensive SAFETY doc explaining single-threaded init (before rayon/tokio threads spawn). Per std::env::set_var Linux/macOS docs.
 - **F-652 (REFERENCE — headless setup, task #61)**: `cmd_setup` with `show`/`ctrader`/`news`/`paths` subcommands. Does NOT write binary state (depends on neoethos-app schema, would create cycle). Prints paste-ready TOML templates with redirection comments to canonical paths.
 - **F-653 (REFERENCE — canonical user config dir)**: `canonical_user_config_dir` mirrors neoethos-app::broker_persistence::credentials_file_path resolution order (env override → dirs::config_dir → .local/neoethos). Single source of truth.
 - **F-654 (REFERENCE — credentials CLI parity)**: `cmd_credentials show/set` mirrors `POST /broker/credentials` merge semantics. Empty-secret semantics ("blank means keep current"). `redact_secret` prints `••••<last4> (len=N)`. Shared writer via `neoethos_core::broker_config::save_to_disk`.
 - **F-655 (REFERENCE — real-data-only enforcement)**: `print_dataset_discovery_summary` line 1209 — explicit comment "Real-data only: never silently fall back to a packaged demo dataset." Surfaces empty result so operator picks different folder. Skip-bucket breakdown shows UnsupportedTimeframe/UnknownExtension/TooLarge/Unreadable distinction.
 - **F-656 (HIGH — pre-1970 panic vector)**: `main.rs::system_time_string` line 1639 `.expect("system time should be after unix epoch")` — pre-1970 panic. Same pattern flagged elsewhere (F-138, F-282, F-356, F-510). Should use `map_err` + `anyhow::bail!` per F-594 reference pattern.
 - **F-657 (NOTE — clap migration deferred)**: `print_dataset_discovery_summary` docstring documents "When this codebase migrates to clap-derive, the `--data-path` argument should be annotated with `value_hint = clap::ValueHint::DirPath`". Tracks shell-completion roadmap item.
-- **F-658 (NOTE — F-CORE3 FOREX_BOT_DATA_ROOT)**: Line 682 — hardcoded env var name with SAFETY doc. Same F-CORE3 pattern as flagged elsewhere; acceptable as documented bridge for in-process orchestrator.
+- **F-658 (NOTE — F-CORE3 NEOETHOS_BOT_DATA_ROOT)**: Line 682 — hardcoded env var name with SAFETY doc. Same F-CORE3 pattern as flagged elsewhere; acceptable as documented bridge for in-process orchestrator.
 
 ---
 
@@ -3940,7 +3940,7 @@ The following findings document model patterns to replicate elsewhere:
 - **F-662 (REFERENCE — typed export-state machine)**: `export_state.rs::ExportState` — 6-state enum (NoCandidates/FiltersFailed/PortfolioSelected/ValidationFailed/ExportBlocked/ExportReady). `from_funnel` derives precise state from funnel counts. Replaces binary "no strategies / portfolio.json" outcome with typed states the spec requires. P10 fix.
 - **F-663 (REFERENCE — gauntlet quality floor)**: `gauntlet.rs` — DEFAULT_MIN_WIN_RATE=0.55, DEFAULT_MIN_PROFIT_FACTOR=1.2, DEFAULT_MAX_DRAWDOWN_PCT=0.07 (BELOW FTMO 0.10), DEFAULT_MAX_DAILY_DD=0.04 (BELOW FTMO 0.05). `debug_assert!` sanity-checks the gauntlet stays below prop firm ceilings. `warn_only` flag with FAILED reasons surfaced via `tracing::warn` rather than silently swallowed (previous behavior was a silent return).
 - **F-664 (REFERENCE — challenge optimizer)**: `challenge.rs::ChallengeTarget` — sources all numeric defaults from `PropFirmConstraints::FTMO_STANDARD` (no hardcoded magic numbers). Kelly criterion + pace + drawdown + quality factors composed multiplicatively, clamped to [0.001, 0.015]. Hard reduction to 0.0025 when daily/total DD ≥ 90% of cap.
-- **F-665 (REFERENCE — diversity archive)**: `genetic/diversity.rs` — `DiversityKey` (indicator_count/smc_mask/rr/trade/pf/dd binning) + `select_diverse_archive` with per-bucket cap. `DiversityArchiveConfig::from_env` was retired during Phase 19 because the only behavior was reading `FOREX_BOT_PROP_DIVERSE_*` env vars on demand. Production diversity caps now configured directly through typed fields. Operator-directive enforcement: "if a future feature needs env-driven defaults again, add them through a typed `*RuntimeOverrides` boundary like `GeneticSearchRuntimeOverrides` rather than reintroducing inline env reads."
+- **F-665 (REFERENCE — diversity archive)**: `genetic/diversity.rs` — `DiversityKey` (indicator_count/smc_mask/rr/trade/pf/dd binning) + `select_diverse_archive` with per-bucket cap. `DiversityArchiveConfig::from_env` was retired during Phase 19 because the only behavior was reading `NEOETHOS_BOT_PROP_DIVERSE_*` env vars on demand. Production diversity caps now configured directly through typed fields. Operator-directive enforcement: "if a future feature needs env-driven defaults again, add them through a typed `*RuntimeOverrides` boundary like `GeneticSearchRuntimeOverrides` rather than reintroducing inline env reads."
 - **F-666 (REFERENCE — orchestrator)**: `orchestration.rs::DiscoveryOrchestrator::run_batch` — per-symbol/per-timeframe loop with structured `BatchDiscoverySummary` counters (symbols_seen/work_units_seen/portfolios_saved/skipped_symbols/skipped_timeframes/feature_failures/empty_portfolios/discovery_failures/portfolios_with_missing_producer_evidence). `finalize` rejects zero-saved-portfolio batches with explicit message + counters. Previously a single discovery failure aborted the whole batch via `?`; now it counts toward `discovery_failures` and continues.
 - **F-667 (REFERENCE — portfolio optimizer)**: `portfolio.rs::PortfolioOptimizer` — sharpe + diversity + Kelly composition. `get_optimal_allocation` builds per-asset average correlation without full NxN matrix (O(n²/2) instead of O(n²)). Equal-weight fallback when not enough corr samples. Proper Kelly criterion `f* = p - (1-p)/b` with `b = avg_win/avg_loss`, clamped+fractional. `bounded_lookback_returns` filters non-finite values before truncation.
 - **F-668 (NOTE — .expect on win_map)**: `portfolio.rs::get_optimal_allocation` line 183 `win_map.get(s).expect("ranked allocation names should always resolve to win-rate metrics")` — invariant-violation panic if a name has no win_rate. Defended by the matching `sharpe_map.get(s).copied().unwrap_or_else(|| { warn })` pattern just above. Could regress if a future caller mutates sharpe_map without updating win_map. Flag for defensive refactor.
@@ -4506,19 +4506,19 @@ audit-trigger complaint ("all buttons fail / chart needs Data Bootstrap").
 ## Phase 8 — Resuming neoethos-search deep read (post-honesty checkpoint)
 
 ### F-695..F-704 — eval.rs (1211 LOC, COMPLETE)
-- **F-695 (HIGH — F-CORE3)**: `eval.rs::init_rayon` lines 42-46 — direct `env::var("FOREX_BOT_RUST_THREADS")` + `env::var("RAYON_NUM_THREADS")` reads. Should route through typed-runtime-override registry like the other knobs in this file already do.
+- **F-695 (HIGH — F-CORE3)**: `eval.rs::init_rayon` lines 42-46 — direct `env::var("NEOETHOS_BOT_RUST_THREADS")` + `env::var("RAYON_NUM_THREADS")` reads. Should route through typed-runtime-override registry like the other knobs in this file already do.
 - **F-696 (HIGH — TODO(real-data) synthetic-default)**: `BacktestSettings::default()` lines 217-244 explicitly carries TODO comment: "synthesizes cost-profile fields (pip_value, spread, commission) using the empty-symbol fallback in `infer_market_cost_profile` — i.e. EURUSD pip math on a USD account. Every backtest entry point should pass a real symbol via `for_symbol(...)` so this default is only used by code that never actually evaluates a strategy. Remove this synthetic fallback once all call sites have migrated." Operator no-synthetic-data violation in the default constructor.
 - **F-697 (REFERENCE — typed runtime override)**: `BacktestRuntimeOverrides` (initial_equity=100_000, month_capacity=240) with OnceLock-based install pattern + `BacktestSettings::initial_equity()`/`month_capacity()` accessors. F-CORE3 boundary done correctly — env vars read ONCE via `from_env`, then installed; downstream code reads typed struct.
 - **F-698 (REFERENCE — session-aware spread)**: `SessionSpreadProfile` (Asian 22-07 UTC / Overlap 07-16 / LateNY 16-22) with 3-bucket approximation. Documented rationale: "London/NY-overlap spread is typically 30-50% of the Asian spread."
 - **F-699 (REFERENCE — preserved-fix causal entry)**: Lines 595-614 — comprehensive preserved-fix docstring: "Causal entry: act on the signal observed at the PRIOR bar's close, fill at the CURRENT bar's close. Previously the code read `signals[i]` and immediately filled at `close[i]` — but the signal itself is computed from bar i's close/high/low, so the trade was peeking at the very bar it was supposed to execute on. This 1-bar shift removes that intra-bar look-ahead."
 - **F-700 (REFERENCE — preserved-fix half-spread split)**: Lines 609-611 + 567 — "Bug #1 fix: half-spread applied at entry (entry_px offset), half at exit". Matches real broker execution model.
-- **F-701 (HIGH — F-CORE3)**: `synthesize_signals_cpu` lines 947-951 — direct `env::var("FOREX_BOT_DISABLE_SMC_GATE")` read inside the per-gene synthesis loop. Should route through `SmcGateOverrides` typed boundary (which already exists in `runtime_overrides.rs`).
+- **F-701 (HIGH — F-CORE3)**: `synthesize_signals_cpu` lines 947-951 — direct `env::var("NEOETHOS_BOT_DISABLE_SMC_GATE")` read inside the per-gene synthesis loop. Should route through `SmcGateOverrides` typed boundary (which already exists in `runtime_overrides.rs`).
 - **F-702 (REFERENCE — NaN-scrub sanitize)**: Lines 658-673 — "Final NaN/inf scrub. A single non-finite slot would poison sorting in the GA (any comparison with NaN returns Equal via partial_cmp fallback)". Defends GA selection from numerical poisoning.
 - **F-703 (REFERENCE — GPU 3-tier fallback)**: `evaluate_population_core` lines 1020-1076 — full-CUDA → CUDA-signals+CPU-backtest → full-CPU fallback chain with `tracing::warn` at each fallback step. Defends against partial GPU misconfiguration.
-- **F-704 (REFERENCE — gate threshold computation)**: `synthesize_signals_cpu` lines 940-952 — SMC gate threshold = `gate_threshold.min(active_sum)` — never demands more SMC confirmation than the gene's flags actually support. Operator can `FOREX_BOT_DISABLE_SMC_GATE=1` bypass (F-701).
+- **F-704 (REFERENCE — gate threshold computation)**: `synthesize_signals_cpu` lines 940-952 — SMC gate threshold = `gate_threshold.min(active_sum)` — never demands more SMC confirmation than the gene's flags actually support. Operator can `NEOETHOS_BOT_DISABLE_SMC_GATE=1` bypass (F-701).
 
 ### F-705..F-711 — discovery.rs (300/2900 LOC read, partial)
-- **F-705 (HIGH — F-CORE3 cluster, 4 sites)**: `DiscoveryRuntimeOverrides::from_env` lines 95-120 — four direct `env::var` reads (FOREX_BOT_PREFILTER_TOP_K, FOREX_BOT_PREFILTER_INSAMPLE, FOREX_BOT_FUNNEL_STAGE1_PCT, FOREX_BOT_FUNNEL_STAGE1_WINDOW). The typed boundary IS designed correctly — the discovery cycle itself "no longer reads the environment" per docstring line 90. This is the install-point.
+- **F-705 (HIGH — F-CORE3 cluster, 4 sites)**: `DiscoveryRuntimeOverrides::from_env` lines 95-120 — four direct `env::var` reads (NEOETHOS_BOT_PREFILTER_TOP_K, NEOETHOS_BOT_PREFILTER_INSAMPLE, NEOETHOS_BOT_FUNNEL_STAGE1_PCT, NEOETHOS_BOT_FUNNEL_STAGE1_WINDOW). The typed boundary IS designed correctly — the discovery cycle itself "no longer reads the environment" per docstring line 90. This is the install-point.
 - **F-706 (HIGH — F-CORE2 synthetic-default)**: `DiscoveryConfig::default()` lines 203-204 — `evaluation_symbol: "EURUSD"`, `evaluation_account_currency: "USD"`. Same operator-directive violation pattern as eval.rs F-696. Should bail or be required.
 - **F-707 (HIGH — F-CORE2 hardcoded USD per-currency)**: `DiscoveryConfig::from_settings` line 275 — `evaluation_account_currency: "USD".to_string()` hardcoded even when reading from Settings. Should come from broker (`ProtoOATrader.depositAssetId` → currency lookup, see F-690).
 - **F-708 (REFERENCE — Stage1Window OOS safety)**: Lines 39-58 — `Stage1Window` enum (MostRecent/Earliest) with documented OOS-safe default. "MostRecent is catastrophic if the caller passed full data including the held-out OOS tail — stage 1 then trains directly on OOS rows."
@@ -4550,8 +4550,8 @@ remaining, validation.rs all 1855, cubecl_eval.rs 1078, search_engine.rs 1061,
 stop_target.rs 958, evolution_math.rs 946, quality.rs 786, etc.).
 
 ### F-712..F-738 — discovery.rs (2900 LOC, COMPLETE)
-- **F-712 (REFERENCE — DiscoveryMode self-tuning)**: `with_env_runtime_overrides` lines 314-357 — operator-friendly default `PropFirm` mode (permissive filters + FTMO window-pass scoring + ranking-based selection); `Strict` mode is the legacy walkforward+CPCV+MC gate. Operator opts in via `FOREX_BOT_DISCOVERY_MODE=strict`.
-- **F-713 (HIGH — F-CORE3 cluster, 6 env reads)**: `derive_prop_firm_gate` lines 367-396 — six direct env reads (`FOREX_BOT_DISCOVERY_PROP_FIRM_*`) for max_daily_loss/max_dd/profit_target/min_trading_days/window_days/n_windows/pass_rate. Should consolidate into typed PropFirmGateOverrides struct constructor.
+- **F-712 (REFERENCE — DiscoveryMode self-tuning)**: `with_env_runtime_overrides` lines 314-357 — operator-friendly default `PropFirm` mode (permissive filters + FTMO window-pass scoring + ranking-based selection); `Strict` mode is the legacy walkforward+CPCV+MC gate. Operator opts in via `NEOETHOS_BOT_DISCOVERY_MODE=strict`.
+- **F-713 (HIGH — F-CORE3 cluster, 6 env reads)**: `derive_prop_firm_gate` lines 367-396 — six direct env reads (`NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*`) for max_daily_loss/max_dd/profit_target/min_trading_days/window_days/n_windows/pass_rate. Should consolidate into typed PropFirmGateOverrides struct constructor.
 - **F-714 (REFERENCE — strict-live temporal contract)**: `discovery_temporal_contract` lines 815-853 — builds `TemporalFeatureContract::strict_live` with 4 stable_json_hash policies (feature/label/walkforward/live-readiness). Reproducibility anchor.
 - **F-715 (REFERENCE — preserved-fix causal label policy)**: Line 826 — label policy hash includes `"prior-bar-signal-next-bar-fill"` token. Pins eval.rs F-699 causal-entry fix at the contract level.
 - **F-716 (REFERENCE — CombinatorialPurgedCV)**: `evaluate_cpcv_gate` lines 937-1013 — proper CPCV implementation with embargo (cpcv_embargo_pct) and purge (cpcv_purge_pct). Per-fold profitability check: trade_count > 0 AND net_profit > 0 AND drawdown_ok.
@@ -4561,7 +4561,7 @@ stop_target.rs 958, evolution_math.rs 946, quality.rs 786, etc.).
 - **F-720 (REFERENCE — regime force-keep)**: Lines 1515-1518 — regime_* columns get `f32::INFINITY` correlation, force-kept through prefilter; actual_top_k = top_k + regime_count.
 - **F-721 (REFERENCE — regime robustness gate)**: `validate_regime_robustness` lines 1564-1627 — checks per-regime (trend/range × high_vol/low_vol) PnL bucket doesn't drop below `initial_balance * max_regime_loss_pct / 100`.
 - **F-722 (NOTE — read_env helpers wrap F-CORE3)**: Lines 1629-1640 — read_env_f64/usize centralize the F-CORE3 env reads (already counted in F-713).
-- **F-723 (REFERENCE — DiscoveryMode resolution)**: Lines 1644-1674 — operator can set `FOREX_BOT_DISCOVERY_MODE=strict|legacy` OR `FOREX_BOT_DISCOVERY_PERMISSIVE=0` for back-compat.
+- **F-723 (REFERENCE — DiscoveryMode resolution)**: Lines 1644-1674 — operator can set `NEOETHOS_BOT_DISCOVERY_MODE=strict|legacy` OR `NEOETHOS_BOT_DISCOVERY_PERMISSIVE=0` for back-compat.
 - **F-724 (REFERENCE — auto_tune_n_windows)**: Lines 1679-1693 — window count = full_spans × 3, clamped [20, 200].
 - **F-725 (REFERENCE — feature frame diagnostics)**: Lines 1785-1828 — pre-flight diagnostic: NaN frac, zero frac, min/max finite, mean abs finite. Detects "feature pipeline broken upstream" vs "downstream filtering rejected everything."
 - **F-726 (REFERENCE — income-focused ranking)**: `calculate_income_score` lines 1833-1846 — composite: consistency 0.4 + win_rate 0.3 + safety 0.2 + pf 0.1; bonus 2.0 if consistency > 0.8.
@@ -4609,12 +4609,12 @@ stop_target.rs 958, evolution_math.rs 946, quality.rs 786, etc.).
 ### F-757..F-768 — search_engine.rs (1061 LOC, COMPLETE)
 - **F-757 (REFERENCE — DeterminismPolicy → seed)**: `build_search_rng` lines 27-36 — `Deterministic { seed }` produces reproducible runs; `BestEffort`/`NonDeterministicAllowed` fall back to OS-derived seed. GPU path consumes same seed → CPU/GPU produce identical genomes for identical inputs.
 - **F-758 (REFERENCE — Item 6 SMC gate consistency)**: Lines 112-135 — comprehensive preserved-fix docstring: "the post-search filtering and Monte-Carlo perturbation paths in discovery.rs previously called this function but it implemented only the linear weighted-indicator threshold, ignoring gene.use_ob, use_fvg, use_bos, etc. and the SMC gate. The post-search 'min_trades' filter and the MC perturbation reward used a signal series that did NOT match what was actually evaluated and archived during search."
-- **F-759 (HIGH — F-CORE3 duplicate env read)**: Lines 262-266 — `signals_for_gene_full` duplicates the `env::var("FOREX_BOT_DISABLE_SMC_GATE")` check from `eval.rs::synthesize_signals_cpu` (F-701). Same pattern, two sites. Should consolidate into typed SmcGateOverrides.
+- **F-759 (HIGH — F-CORE3 duplicate env read)**: Lines 262-266 — `signals_for_gene_full` duplicates the `env::var("NEOETHOS_BOT_DISABLE_SMC_GATE")` check from `eval.rs::synthesize_signals_cpu` (F-701). Same pattern, two sites. Should consolidate into typed SmcGateOverrides.
 - **F-760 (REFERENCE — EvalDataCache)**: Lines 42-70 — caches indicators (transposed), months, days, smc_data across generations. "Computing this once outside the generation loop saves ~5-15% eval time."
 - **F-761 (HIGH — F-CORE2 pip_size fallback)**: Lines 492-496 — `if config.pip_value.is_finite() && config.pip_value > 0.0 { config.pip_value } else { 0.0001 }` — 0.0001 EURUSD pip fallback. F-CORE2 violation when symbol metadata not resolved.
 - **F-762 (HIGH — F-CORE2 default SL/TP)**: Lines 506-508 — `.unwrap_or((20.0, 40.0))` for SL/TP pips. 20/40 hardcoded synthetic fallback.
 - **F-763 (REFERENCE — Item 4 gene_signature_hash dedup)**: Lines 682-687 — preserved-fix Item 4: "dedupe by `gene_signature_hash` (a function of the canonical genome — sorted indices, weights, thresholds and SMC flags) instead of `strategy_id`. The strategy_id is randomly regenerated by crossover/mutate every generation, so two genomes that compute the same signal kept getting archived under different ids."
-- **F-764 (REFERENCE — typed runtime overrides P0-8)**: Lines 634-714 — comment: "All `FOREX_BOT_*` search-engine knobs are resolved through the typed `GeneticSearchRuntimeOverrides` boundary; the inline env reads that used to live here are gone (P0-8)." All knobs (smc_gate/selection/archive/novelty/tournament/stagnation_patience) flow through typed struct.
+- **F-764 (REFERENCE — typed runtime overrides P0-8)**: Lines 634-714 — comment: "All `NEOETHOS_BOT_*` search-engine knobs are resolved through the typed `GeneticSearchRuntimeOverrides` boundary; the inline env reads that used to live here are gone (P0-8)." All knobs (smc_gate/selection/archive/novelty/tournament/stagnation_patience) flow through typed struct.
 - **F-765 (REFERENCE — adaptive SMC gate curve)**: Lines 729-736 — gate ramps from gate_start to gate_end via `progress.powf(gate_curve)`. On stagnation: `gate_now -= gate_stagnation_step * stagnant_gens`. Permissive→strict adaptive ramp.
 - **F-766 (REFERENCE — novelty search Jaccard parallel)**: Lines 748-810 — preserved-fix: "Pre-compute all HashSets once and run the O(n²) Jaccard pass in parallel — turns a single-threaded bottleneck into Ncores× faster." Default OFF (`novelty_weight = 0`) — operator opts in for large populations.
 - **F-767 (REFERENCE — adaptive survivor/immigrant on stagnation)**: Lines 944-975 — when stagnant_gens >= stagnation_patience: survivor_fraction *= 0.75 (more turnover), immigrant_ratio.max(0.5) (50%+ random restart). Self-tuning escape from local optima.
@@ -4784,7 +4784,7 @@ Given findings density (~5 per 1000 LOC), neoethos-models likely surfaces **~250
 ### quality.rs (786 LOC, COMPLETE) — F-782..F-789
 
 - **F-782 (REFERENCE — typed QualityRuntimeOverrides)**: Lines 14-30. `QualityRuntimeOverrides` struct with `min_trades_per_month: u32 = 4` and `trading_days_per_month: f64 = 21.0`. `OnceLock<QualityRuntimeOverrides>` install pattern matches the `BacktestRuntimeOverrides`/`GeneticSearchRuntimeOverrides` typed boundary architecture established in F-697 / F-758.
-- **F-783 (HIGH — F-CORE3 env reads inside crate)**: Lines 37-49. `QualityRuntimeOverrides::from_env()` performs `std::env::var("FOREX_BOT_PROP_MIN_TRADES_PER_MONTH")` + `std::env::var("FOREX_BOT_TRADING_DAYS_PER_MONTH")` directly inside the search crate. Same F-CORE3 boundary-leak pattern as F-695..F-697 / F-712. The typed-override wrapper exists, but the env reads are still in the search crate rather than at the binary boundary (`neoethos-cli` / `neoethos-app`). Recommendation: keep `from_env()` available BUT call it only from `install_search_runtime_overrides_from_env()` at the binary boundary, never from within search-crate code.
+- **F-783 (HIGH — F-CORE3 env reads inside crate)**: Lines 37-49. `QualityRuntimeOverrides::from_env()` performs `std::env::var("NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH")` + `std::env::var("NEOETHOS_BOT_TRADING_DAYS_PER_MONTH")` directly inside the search crate. Same F-CORE3 boundary-leak pattern as F-695..F-697 / F-712. The typed-override wrapper exists, but the env reads are still in the search crate rather than at the binary boundary (`neoethos-cli` / `neoethos-app`). Recommendation: keep `from_env()` available BUT call it only from `install_search_runtime_overrides_from_env()` at the binary boundary, never from within search-crate code.
 - **F-784 (REFERENCE — quality analyzer default thresholds)**: Lines 141-155 (`StrategyQualityAnalyzer::default()`): min_sharpe=1.2, min_sortino=1.2, min_calmar=1.0, min_profit_factor=1.5, min_win_rate=0.50, max_dd_acceptable=0.15, min_monthly_return_pct=0.04, edge_significance_pvalue=0.01. These are statistically defensible production thresholds (Sortino >= 1.2 ~= 90th percentile prop-firm pass rate). Document them in `docs/quality-thresholds.md` so operators understand the contract.
 - **F-785 (REFERENCE — QA-2 Monte Carlo block bootstrap)**: Lines 282-339. Daily-PnL block bootstrap with 1000 iterations and ruin_threshold=0.50. Block bootstrap engaged when `>= 5` distinct calendar days; falls back to trade-level shuffle otherwise. p95 worst drawdown reported as `monte_carlo_p95_worst_drawdown`. This is the production-grade replacement for the trade-shuffle MC that violated temporal autocorrelation assumptions.
 - **F-786 (REFERENCE — QA-1 annualization fix)**: Lines 488-501 (`calculate_sharpe`) and 503-540 (`calculate_sortino`). Both now use `trades_per_year.sqrt()` scaling derived from actual trade frequency rather than the legacy daily √252 assumption. Critical for low-frequency strategies (~5 trades/month) where daily √252 over-annualizes by 10×+.
@@ -4794,12 +4794,12 @@ Given findings density (~5 per 1000 LOC), neoethos-models likely surfaces **~250
 
 ### runtime_overrides.rs (795 LOC) + smc_indicators.rs (659) + strategy_gene.rs (649) + regime_labels.rs (523) + checkpoint.rs (494)
 
-- **F-790 (REFERENCE — typed runtime-override registry)**: `runtime_overrides.rs` (795 LOC, COMPLETE) consolidates **34 distinct legacy `FOREX_BOT_*` env vars** into 4 typed structs: `GeneticSearchRuntimeOverrides` (10 fields), `SmcGateOverrides` (4 fields), `ArchiveScoringOverrides` (4 fields), `SelectionPolicyOverrides` (5 fields), `CostProfileRuntimeOverrides` (7 fields), `SmcWeightRuntimeOverrides` (12 fields). All env reads gated behind `from_env()` with explicit type validation + clamping. P0-8 audit target architecturally complete.
+- **F-790 (REFERENCE — typed runtime-override registry)**: `runtime_overrides.rs` (795 LOC, COMPLETE) consolidates **34 distinct legacy `NEOETHOS_BOT_*` env vars** into 4 typed structs: `GeneticSearchRuntimeOverrides` (10 fields), `SmcGateOverrides` (4 fields), `ArchiveScoringOverrides` (4 fields), `SelectionPolicyOverrides` (5 fields), `CostProfileRuntimeOverrides` (7 fields), `SmcWeightRuntimeOverrides` (12 fields). All env reads gated behind `from_env()` with explicit type validation + clamping. P0-8 audit target architecturally complete.
 - **F-791 (REFERENCE — DeterminismPolicy bridge)**: Lines 311-317 — `GeneticSearchRuntimeOverrides::determinism_policy()` maps `Some(seed) -> Deterministic{seed}` and `None -> NonDeterministicAllowed`. Public accessor `current_determinism_policy()` at line 577 routes through this for `ArtifactProvenance` records.
 - **F-792 (REFERENCE — audit-aligned clamping)**: Lines 121-127 (`resolved_temperature` max 1e-3), 113-118 (`resolved_survivor_fraction` clamp 0..0.95), 105-110 (`resolved_immigrant_ratio` clamp 0..0.95), 40-54 (SMC curve floor 0.1). Defends against env-var-driven config corruption.
 - **F-793 (HIGH — F-CORE3 still inside search crate)**: Lines 493-544 — eight env helper functions (`env_u64`, `env_string_nonempty`, `env_f64_positive_finite`, `env_f64_non_negative_finite`, `env_usize_positive`, `env_f64_finite`, `env_f32_finite`, `env_string_lowercase`) all live inside the search crate, not at the binary boundary. The OnceLock install pattern means the env is read at most once, but architecturally this still violates the F-CORE3 boundary. Recommendation: move the env-helper functions into a `binary_boundary` module or into `neoethos-cli`/`neoethos-app` directly so the search crate only sees typed structs.
 - **F-794 (REFERENCE — SMC search config typed boundary)**: `smc_indicators.rs::SmcSearchConfig` lines 6-42 — 13 probabilities (`p_ob`, `p_fvg`, `p_liq`, `p_premium`, `p_inducement`, `p_mtf`, `p_bos`, `p_choch`, `p_eqh`, `p_eql`, `p_displacement` + `force_ratio` + `min_flags`). `OnceLock<SmcSearchConfig>` cache.
-- **F-795 (HIGH — F-CORE3 13 SMC env vars)**: `smc_indicators.rs` lines 46-94 — `smc_env_f64` / `smc_env_usize` / `smc_env_bool` helpers read 13 `FOREX_BOT_PROP_SMC_*` env vars. Same boundary pattern as F-793.
+- **F-795 (HIGH — F-CORE3 13 SMC env vars)**: `smc_indicators.rs` lines 46-94 — `smc_env_f64` / `smc_env_usize` / `smc_env_bool` helpers read 13 `NEOETHOS_BOT_PROP_SMC_*` env vars. Same boundary pattern as F-793.
 - **F-796 (REFERENCE — SMC structural indicator derivation)**: `derive_smc_arrays` lines 335-510 — pure-OHLCV derivation of 11 SMC arrays (ob, fvg, liq_sweep, trend, premium_discount, inducement, bos, choch, eqh, eql, displacement). Lookback constants: `lookback=12`, `eq_lookback=20`, `displacement_lookback=20`.
 - **F-797 (REFERENCE — hardcoded SMC lookbacks)**: `smc_indicators.rs` lines 365-367 — magic lookback constants (12, 20, 20). Should ideally be runtime-overridable so operators can tune per-asset-class. LOW priority since the structural definitions are domain-canonical.
 - **F-798 (REFERENCE — Gene struct schema)**: `strategy_gene.rs` lines 6-41 — `Gene` has 30+ fields: signal terms (indices, weights), thresholds (long/short), fitness metrics (Sharpe, win_rate, max_drawdown, profit_factor, expectancy, trades_count), generation tag, strategy_id, 11 SMC flags, tp_pips/sl_pips, slice_pass_rate, consistency. Serde-deriving with `#[serde(default)]` on the late-added SMC flags for backwards compatibility.
@@ -4809,10 +4809,10 @@ Given findings density (~5 per 1000 LOC), neoethos-models likely surfaces **~250
 - **F-802 (HIGH — TODO(real-data) spread + commission)**: `strategy_gene.rs::infer_market_cost_profile` lines 323-330 — TODO: spread + commission magic defaults synthesized per asset-class (metal=2.5, crypto=8.0, fx=1.5, other=1.0; commission=$7.0). Needs cTrader `ProtoOASymbolCategory` extension with `typical_spread_pips` + `commission_per_lot` fields, or bail when metadata is missing.
 - **F-803 (REFERENCE — JPY pip heuristic 5th site)**: `strategy_gene.rs::default_pip_size` lines 137-140 — `Some((_base, quote)) if quote == "JPY" => 0.01`. 5th file with the JPY pip heuristic (also in eval.rs, settings_struct.rs, validation.rs, cubecl_eval.rs).
 - **F-804 (REFERENCE — Gene::is_anomalous calibrated)**: `strategy_gene.rs` lines 356-391 — anomaly detector with operator-tuned thresholds for 4-10%/mo on 10y window: `min_trades=120`, `max_dd=0.0025`, `min_win_rate=0.92`, `min_pf=12.0`, `min_profit=$10M`, `max_ppt=$100K`. Four suspicious patterns checked (combo, ppt, ultra, low-dd).
-- **F-805 (HIGH — F-CORE3 env read 8th site)**: `strategy_gene.rs::reject_cross_pair_fallback` lines 228-233 — reads `FOREX_BOT_REJECT_PIP_FALLBACK` env directly inside the function. Same F-CORE3 boundary-leak pattern. Should route through `CostProfileRuntimeOverrides`.
-- **F-806 (REFERENCE — cross-pair pip rejection)**: `strategy_gene.rs` lines 192-225 — cross-pair fallback path. Strict mode (`FOREX_BOT_REJECT_PIP_FALLBACK=1`) returns NaN so downstream PnL collapses; default mode logs at error level. Defends against silently wrong cross-pair sizing.
+- **F-805 (HIGH — F-CORE3 env read 8th site)**: `strategy_gene.rs::reject_cross_pair_fallback` lines 228-233 — reads `NEOETHOS_BOT_REJECT_PIP_FALLBACK` env directly inside the function. Same F-CORE3 boundary-leak pattern. Should route through `CostProfileRuntimeOverrides`.
+- **F-806 (REFERENCE — cross-pair pip rejection)**: `strategy_gene.rs` lines 192-225 — cross-pair fallback path. Strict mode (`NEOETHOS_BOT_REJECT_PIP_FALLBACK=1`) returns NaN so downstream PnL collapses; default mode logs at error level. Defends against silently wrong cross-pair sizing.
 - **F-807 (REFERENCE — regime windowing schema)**: `regime_labels.rs::RegimeLabelPolicy` lines 67-97 — defaults: window_days=90, step_days=30, min_bars_per_window=500, min_trades_per_window=8, min_pf=1.05, max_dd=0.20, min_quality_score=0.05, min_specialist_windows=2, min_specialist_score=0.30, min_always_on_hit_rate=0.55.
-- **F-808 (REFERENCE — typed regime label removal)**: `regime_labels.rs` lines 99-106 — comment documents Phase-22 retirement of `RegimeLabelPolicy::from_env()` along with 11 `FOREX_BOT_REGIME_LABEL_*` env vars. No callers existed, so the env reads were pure orphan code. Clean type-bounded API now.
+- **F-808 (REFERENCE — typed regime label removal)**: `regime_labels.rs` lines 99-106 — comment documents Phase-22 retirement of `RegimeLabelPolicy::from_env()` along with 11 `NEOETHOS_BOT_REGIME_LABEL_*` env vars. No callers existed, so the env reads were pure orphan code. Clean type-bounded API now.
 - **F-809 (REFERENCE — regime window quality score)**: `regime_labels.rs::window_quality_score` lines 266-292 — composite score weighting net(0.20) + sharpe(0.25) × trade-confidence + pf(0.20) + consistency(0.15) + win(0.10) + expectancy(0.10) − drawdown penalty(×8.0). Trade-confidence dampens sharpe contribution when trade count is small.
 - **F-810 (REFERENCE — specialist vs always-on classification)**: `regime_labels.rs::summarize_profile` lines 331-348 — specialist = `tradable_windows ≥ 2 && best_window_score ≥ 0.30`; always-on = `hit_rate ≥ 0.55 && tradable_rate ≥ 0.41 && fragility ≤ 0.35`. Defines the deployment_candidate flag downstream consumers use.
 - **F-811 (REFERENCE — SearchCheckpoint scope binding)**: `checkpoint.rs::SearchCheckpointScope` lines 17-108 — config_hash + dataset_hash + search_space_hash + temporal_scope (4 sub-hashes). Resume validates ALL six hashes match exactly via `validate_resume()` (lines 53-95). Drift on any hash bails. This is the temporal-contract enforcement layer extended to GA checkpoints.
@@ -4828,9 +4828,9 @@ Given findings density (~5 per 1000 LOC), neoethos-models likely surfaces **~250
 - **F-818 (REFERENCE — structure-based SL/TP)**: `stop_target.rs::swing_levels` lines 676-724 + `structure_distances` lines 726+ — pivot-high/pivot-low detection via 2k+1 swing window. SL = price − last_pivot_low (for long); TP = last_pivot_high − price. Falls back to ATR-distance when structure unavailable.
 - **F-819 (REFERENCE — typed selection policies)**: `evolution_math.rs::ParentSelectionPolicy` + `SurvivorSelectionPolicy` lines 200-263 — 4 parent policies (Uniform/RankWeighted/Softmax/Tournament), 4 survivor policies (Elitist/RankWeighted/Tournament/Generational). Tournament size + selection temperature passed through. Survivor selection delegates to parent helpers (RankWeighted/Tournament).
 - **F-820 (REFERENCE — gene signature hash)**: `evolution_math.rs::gene_signature_hash` lines 265-297 — FNV-1a over quantized fields. Weights quantized to 1e-4, thresholds to 1e-6, tp/sl to 1e-2. Discriminates 11 SMC flags + indicators + thresholds. Used for archive dedup.
-- **F-821 (HIGH — F-CORE3 4 SEEN env vars)**: `evolution_math.rs::SeenSignatureMemoryRuntimeOverrides::from_env` lines 332-365 — reads `FOREX_BOT_PROP_SEEN_FLUSH_EVERY` + `FOREX_BOT_PROP_SEEN_LOAD_MAX` + `FOREX_BOT_PROP_SEEN_MAX_ENTRIES` + `FOREX_BOT_PROP_SEEN_FILE` directly inside crate. Same F-CORE3 pattern as F-793/F-795/F-805 — 8th site.
+- **F-821 (HIGH — F-CORE3 4 SEEN env vars)**: `evolution_math.rs::SeenSignatureMemoryRuntimeOverrides::from_env` lines 332-365 — reads `NEOETHOS_BOT_PROP_SEEN_FLUSH_EVERY` + `NEOETHOS_BOT_PROP_SEEN_LOAD_MAX` + `NEOETHOS_BOT_PROP_SEEN_MAX_ENTRIES` + `NEOETHOS_BOT_PROP_SEEN_FILE` directly inside crate. Same F-CORE3 pattern as F-793/F-795/F-805 — 8th site.
 - **F-822 (REFERENCE — disk-backed FIFO LRU)**: `evolution_math.rs::SeenSignatureMemory` lines 395-510 — append-only LE-u64 binary disk format with text fallback (hex or decimal lines). LRU eviction when `max_entries` exceeded. Pending buffer flushed every `flush_every` insertions. Fix line 499-507: only clears `pending` after BOTH `write_all` AND `flush` succeed (avoids silent data loss on OS buffer-write failure).
-- **F-823 (HIGH — F-CORE3 NORMALIZE_FEATURES env)**: `evolution_math.rs::random_coarse_threshold` lines 530-547 — reads `FOREX_BOT_NORMALIZE_FEATURES` env DIRECTLY inside the hot path of new-gene generation. Same F-CORE3 leak. Worse than other sites: this is in a hot path so the env is read for EVERY new gene initialization. Recommendation: cache this in `GeneticSearchRuntimeOverrides`.
+- **F-823 (HIGH — F-CORE3 NORMALIZE_FEATURES env)**: `evolution_math.rs::random_coarse_threshold` lines 530-547 — reads `NEOETHOS_BOT_NORMALIZE_FEATURES` env DIRECTLY inside the hot path of new-gene generation. Same F-CORE3 leak. Worse than other sites: this is in a hot path so the env is read for EVERY new gene initialization. Recommendation: cache this in `GeneticSearchRuntimeOverrides`.
 - **F-824 (REFERENCE — calibrated thresholds for raw vs normalized features)**: Lines 530-547 (cont'd) — when NORMALIZE_FEATURES=1, thresholds drawn from [0.30..1.20]; otherwise [0.15..0.55]. Comment documents the empty-portfolio bug observed on EURJPY / XAUUSD when raw indicator magnitudes (e.g. RSI ∈ [0, 100]) interact with un-calibrated thresholds.
 - **F-825 (REFERENCE — crossover deterministic-rng requirement)**: `evolution_math.rs::crossover` lines 661-664 — explicit comment: "callers must pass the same `rng` they use elsewhere in the same search; using a fresh `rand::rng()` here would break the deterministic seed introduced for CPU/GPU parity." Documents F-757 (search_engine.rs) seed-routing requirement.
 
@@ -4853,7 +4853,7 @@ Given findings density (~5 per 1000 LOC), neoethos-models likely surfaces **~250
 | `eval.rs` | (recorded earlier in F-695..F-704) | several |
 | `discovery.rs` | (recorded earlier in F-712..F-738) | several |
 
-**Total surface area**: ~60 distinct `FOREX_BOT_*` env vars. The typed-override registry (`runtime_overrides.rs`) consolidates 28 of them; the remaining ~32 still leak through scattered helpers. Recommended remediation: phase-23 consolidation that moves ALL env reads into binary-boundary `install_*_from_env()` calls, with the search crate seeing only typed structs.
+**Total surface area**: ~60 distinct `NEOETHOS_BOT_*` env vars. The typed-override registry (`runtime_overrides.rs`) consolidates 28 of them; the remaining ~32 still leak through scattered helpers. Recommended remediation: phase-23 consolidation that moves ALL env reads into binary-boundary `install_*_from_env()` calls, with the search crate seeing only typed structs.
 
 ---
 
@@ -5031,11 +5031,11 @@ Path-qualified review pending. Likely candidates from earlier listing:
 ### lib.rs + parallel_trainer.rs + registry.rs + ensemble_inference/mod.rs + runtime/capabilities.rs + anomaly/forest_impl.rs head
 
 - **F-856 (REFERENCE — neoethos-models top-level taxonomy)**: `lib.rs` (75 LOC) declares 18 top-level modules across 7 axes: foundations (base, common, runtime), ML training (deep_models, ensemble, ensemble_inference, parallel_trainer, training_orchestrator, tree_models), pure-Rust experts (anomaly, evolution, forecasting, rl, statistical, streaming, burn_models), domain experts (genetic, exit_agent), infrastructure (hardware, evaluation_helpers, registry). Public re-exports surface ~25 expert types at the crate root.
-- **F-857 (HIGH — F-CORE3 env reads 10th site)**: `parallel_trainer.rs::rust_threads_hint` lines 17-37 — reads **4 env vars** in fallback chain: `FOREX_BOT_RUST_THREADS`, `FOREX_BOT_CPU_THREADS`, `FOREX_BOT_CPU_BUDGET`, `RAYON_NUM_THREADS`. 10th F-CORE3 site (after eval/discovery/quality/runtime_overrides/smc/strategy_gene/evolution_math×2/server_mod). Should route through typed-runtime-override registry.
+- **F-857 (HIGH — F-CORE3 env reads 10th site)**: `parallel_trainer.rs::rust_threads_hint` lines 17-37 — reads **4 env vars** in fallback chain: `NEOETHOS_BOT_RUST_THREADS`, `NEOETHOS_BOT_CPU_THREADS`, `NEOETHOS_BOT_CPU_BUDGET`, `RAYON_NUM_THREADS`. 10th F-CORE3 site (after eval/discovery/quality/runtime_overrides/smc/strategy_gene/evolution_math×2/server_mod). Should route through typed-runtime-override registry.
 - **F-858 (REFERENCE — ModelType enum 30 variants)**: `parallel_trainer.rs::ModelType` lines 309-341 — exhaustive 30-variant enum: LightGBM/XGBoost/CatBoost/SklearsTree/MLP/NBeats/NBeatsxNf/TiDE/TiDENf/TabNet/KAN/Transformer/PatchTST/TimesNet/ElasticNet/Logistic/BayesianLogit/MetaBlender/ProbabilityCalibrator/ConformalGate/MetaStack/ExitAgent/OnlinePassiveAggressive/OnlineHoeffding/IsolationForest/Dqn/SwarmForecaster/Genetic/NeuroEvo/Neat. Tracks every trained expert type.
 - **F-859 (REFERENCE — bounded rayon pool + Arc-shared payload)**: `parallel_trainer.rs::train_models_parallel_with_progress` lines 179-297 — explicit `ThreadPoolBuilder::new().num_threads(threads).build()` (not global!), `Arc<TrainingPayload>` cheap-clones across threads. `saturating_sub(1).max(1)` leaves one core for the OS. Progress callbacks fire per-model with Started/Succeeded/Failed events.
 - **F-860 (REFERENCE — 33-model expert registry)**: `runtime/capabilities.rs::KNOWN_MODEL_NAMES` lines 76-110 — 33 canonical expert names (snake_case). Source-of-truth for `ExpertRegistry::register` and the ensemble loader's "requested" list. Notice: 33 here vs 30 in `ModelType` enum — extras include xgboost variants (rf/dart) + nbeatsx_nf + tide_nf + catboost_alt that ModelType collapses.
-- **F-861 (HIGH — F-CORE3 env read 11th site)**: `runtime/capabilities.rs::requested_runtime_device_policy` lines 116-125 — reads `FOREX_BOT_<MODEL_NAME>_DEVICE` (33 distinct env vars!) + fallback to `FOREX_BOT_META_DEVICE`. Per-model device routing knobs. 11th F-CORE3 site, and the largest one (33 dynamically-constructed env vars).
+- **F-861 (HIGH — F-CORE3 env read 11th site)**: `runtime/capabilities.rs::requested_runtime_device_policy` lines 116-125 — reads `NEOETHOS_BOT_<MODEL_NAME>_DEVICE` (33 distinct env vars!) + fallback to `NEOETHOS_BOT_META_DEVICE`. Per-model device routing knobs. 11th F-CORE3 site, and the largest one (33 dynamically-constructed env vars).
 - **F-862 (REFERENCE — ModelFamily 9-variant taxonomy)**: `runtime/capabilities.rs::ModelFamily` lines 6-34 — Tree/Deep/Forecasting/Meta/Evolutionary/Exit/Adaptive/Anomaly/Rl. `CapabilityState` lines 36-52: Planned/Implemented/Verified. `ModelCapability::new` asserts non-empty name (panics in debug AND release — not a bail).
 - **F-863 (REFERENCE — registry capability resolution)**: `registry.rs::infer_dynamic_family` lines 33-88 — string-pattern matching for late-registered models (e.g. a custom expert not in `KNOWN_MODEL_NAMES`). Falls through 9 family branches by substring. Used by the dynamic registry path.
 - **F-864 (REFERENCE — feature-gated GPU detection)**: `registry.rs::supports_gpu_for_model` + `prefers_gpu_for_model` lines 150-174 — `cfg!(feature = "lightgbm-gpu")` / `"xgboost"` / `"catboost"` / `"reinforcement-learning-cuda"` / `"burn-wgpu-backend"`. Compile-time GPU capability tagging per family + per-model.
@@ -5079,7 +5079,7 @@ After Phase 14, the F-CORE3 systemic finding spans **11 distinct files** with di
 | `evolution_math.rs` (NORM) | 1 | NORMALIZE_FEATURES |
 | `server/mod.rs` | 1 | NEOETHOS_SERVER_BIND |
 | **`parallel_trainer.rs`** | 4 | rust_threads_hint |
-| **`capabilities.rs`** | **34 dynamic** | `FOREX_BOT_<MODEL>_DEVICE` × 33 + META_DEVICE |
+| **`capabilities.rs`** | **34 dynamic** | `NEOETHOS_BOT_<MODEL>_DEVICE` × 33 + META_DEVICE |
 | **TOTAL** | **~96 env vars** | 28 consolidated, ~68 still leaking |
 
 ### What still remains in neoethos-models (~49,000 LOC, 56 files)
@@ -5257,10 +5257,10 @@ Targeted depth on runtime infrastructure + statistical experts + hardware probe 
 
 - **F-888 (REFERENCE — RuntimePrediction validation)**: `runtime/prediction.rs` 268+ LOC. `RuntimePrediction::try_new` validates: each of 3 class_probabilities is finite + in `[0, 1]`, sum is close to 1.0, optional confidence is finite + in `[0, 1]`. `PredictionMetadata::new` asserts non-empty model_name (panics in release too — flag for task #218). `with_runtime_details` resolves `BackendKind`, `RuntimeMode`, and typed `RuntimeDegradedReason` from string label inputs. Provenance carried through every prediction.
 - **F-889 (CRITICAL — F-CORE3 12th site: tree_models/config.rs)**: `tree_models/config.rs` 366 LOC. Reads **~17 distinct env vars** + spawns **2 subprocesses** (`nvidia-smi`, `rocminfo`/`rocm-smi`):
-  - Threads: `FOREX_BOT_RUST_THREADS`, `FOREX_BOT_CPU_THREADS`, `FOREX_BOT_CPU_BUDGET`, `RAYON_NUM_THREADS`, `FOREX_BOT_<MODEL>_THREADS`
-  - Device prefs: `FOREX_BOT_<MODEL>_DEVICE`, `FOREX_BOT_TREE_DEVICE`, `FOREX_BOT_<MODEL>_GPU_ONLY`, `FOREX_BOT_GPU_ONLY`
+  - Threads: `NEOETHOS_BOT_RUST_THREADS`, `NEOETHOS_BOT_CPU_THREADS`, `NEOETHOS_BOT_CPU_BUDGET`, `RAYON_NUM_THREADS`, `NEOETHOS_BOT_<MODEL>_THREADS`
+  - Device prefs: `NEOETHOS_BOT_<MODEL>_DEVICE`, `NEOETHOS_BOT_TREE_DEVICE`, `NEOETHOS_BOT_<MODEL>_GPU_ONLY`, `NEOETHOS_BOT_GPU_ONLY`
   - GPU visibility: `FOREX_GPU_VISIBLE_DEVICES`, `GPU_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES`, `NVIDIA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `ROCM_VISIBLE_DEVICES`, `FOREX_GPU_COUNT`
-  - Early stop: `FOREX_BOT_EARLY_STOP_PATIENCE`, `FOREX_BOT_EARLY_STOP_MIN_DELTA`
+  - Early stop: `NEOETHOS_BOT_EARLY_STOP_PATIENCE`, `NEOETHOS_BOT_EARLY_STOP_MIN_DELTA`
 - **F-890 (HIGH — silent subprocess failures)**: `tree_models/config.rs::nvidia_smi_gpu_count` lines 170-180 + `rocm_gpu_count` lines 196-218 — spawn `Command::new("nvidia-smi")` / `"rocminfo"` / `"rocm-smi"`. Failures silently return `None` (caller falls through to next backend). No timeout — if the subprocess hangs (rare but documented on broken NVML installs), gpu_count() blocks forever. Recommendation: wrap in `Command::output()` with explicit `Duration::from_secs(2)` timeout via spawning + wait_timeout crate (already in workspace via duckdb's deps).
 - **F-891 (REFERENCE — staged atomic artifact pattern)**: `statistical/bayesian_impl.rs` lines 71-137 + `linear_impl.rs` lines 85-100. Same pattern in both: `staged_*_artifact_dir` (`.tmp_<model>_artifact`) → `backup_*_artifact_dir` (`.bak_<model>_artifact`) → atomic rename. On rename failure restores from backup with `tracing::error!` if restore also fails. Crash-safe artifact writes — won't leave a half-written artifact dir.
 - **F-892 (REFERENCE — financial split with embargo)**: `bayesian_impl.rs::split_train_val_indices` lines 47-69 + identical in `linear_impl.rs` lines 61-83. 20% validation + 2% embargo (only when rows >= 20). Best-practice for time-series ML to defend against look-ahead bias at the train→val boundary.
@@ -5320,7 +5320,7 @@ Operator directive: "μοντελα σε παρακαλω να εχουμε ολ
   - `runtime/hpo.rs::label_to_probability_index` lines 94-101: `0 → 0, 1 → 1, -1 → 2`
   
   **F-881 is a DOCUMENTATION bug ONLY**, not a runtime bug. The misleading docstring lives in `neoethos-models/ensemble_inference/mod.rs::ExpertOutputKind::Classification3` (lines 147-151) which says `[p_sell, p_neutral, p_buy]` — fix to say `[p_neutral, p_buy, p_sell]`. Task #219 tracks remediation. **NOT a ship-blocker.**
-- **F-898 (HIGH — F-CORE3 13th site in base.rs)**: `base.rs::get_early_stop_params` lines 75-97 — reads `FOREX_BOT_EARLY_STOP_PATIENCE` + `FOREX_BOT_EARLY_STOP_MIN_DELTA` (same 2 vars also read in `tree_models/config.rs::get_early_stop_params`). DUPLICATE env-read site.
+- **F-898 (HIGH — F-CORE3 13th site in base.rs)**: `base.rs::get_early_stop_params` lines 75-97 — reads `NEOETHOS_BOT_EARLY_STOP_PATIENCE` + `NEOETHOS_BOT_EARLY_STOP_MIN_DELTA` (same 2 vars also read in `tree_models/config.rs::get_early_stop_params`). DUPLICATE env-read site.
 - **F-899 (REFERENCE — TradingAction consistency)**: `rl/dqn_impl.rs::TradingAction` lines 32-60 — `Hold=0, Buy=1, Sell=2`. Matches the canonical 3-class index order from F-897. Internal consistency across families confirmed.
 
 ### Runtime infrastructure (10 files, ~1,400 LOC structural)
@@ -5360,7 +5360,7 @@ Operator directive: "μοντελα σε παρακαλω να εχουμε ολ
 |------|----------|-------|
 | `parallel_trainer.rs::rust_threads_hint` | 4 | Threads |
 | `tree_models/config.rs` | 17+ | **MASSIVE** — per-model device + threads + GPU detection + 7 GPU-visibility vars + subprocess spawns |
-| `runtime/capabilities.rs::requested_runtime_device_policy` | 34 dynamic | `FOREX_BOT_<MODEL>_DEVICE` × 33 + META_DEVICE |
+| `runtime/capabilities.rs::requested_runtime_device_policy` | 34 dynamic | `NEOETHOS_BOT_<MODEL>_DEVICE` × 33 + META_DEVICE |
 | `base.rs::get_early_stop_params` | 2 | DUPLICATE of tree_models/config |
 | `burn_models.rs` (precision policy) | 1 | requested_training_precision_policy |
 
@@ -5467,7 +5467,7 @@ The two crates that account for **70% of panic surface** (neoethos-models + neoe
 |------|----------|--------|
 | `neoethos-search/genetic/runtime_overrides.rs` | 28 | ✅ **CONSOLIDATOR** (keep) |
 | `neoethos-models/tree_models/config.rs` | **17** | ❌ MASSIVE — worst offender |
-| `neoethos-models/runtime/capabilities.rs` | 33 dynamic | ❌ `FOREX_BOT_<MODEL>_DEVICE` × 33 |
+| `neoethos-models/runtime/capabilities.rs` | 33 dynamic | ❌ `NEOETHOS_BOT_<MODEL>_DEVICE` × 33 |
 | `neoethos-search/genetic/smc_indicators.rs` | 13 | ❌ has own `OnceLock` cache |
 | `neoethos-models/parallel_trainer.rs` | 4 | ❌ `rust_threads_hint` |
 | `neoethos-search/genetic/evolution_math.rs` | 5 | ❌ SEEN + NORMALIZE_FEATURES |
@@ -6159,7 +6159,7 @@ Tracks which groups/tasks have been APPLIED to production code (vs just identifi
 - Baum-Welch EM training + Forward-Backward inference with row-normalized α/β for numerical stability
 - Bivariate Gaussian emissions over `(log_return, log_volatility)` with inline 2×2 inverse for fast PDF
 - Canonical 3-class state mapping: state 0=range→neutral, state 1=bullish→buy, state 2=bearish→sell (matches `base.rs` lines 128-135 + `default_three_class_label_mapping`)
-- `HmmRegimeConfig` typed runtime overrides (NOT `FOREX_BOT_HMM_*` env vars — F-CORE3 alignment)
+- `HmmRegimeConfig` typed runtime overrides (NOT `NEOETHOS_BOT_HMM_*` env vars — F-CORE3 alignment)
 - `KNOWN_MODEL_NAMES` updated to 34 entries
 - 5 unit tests: train+predict round-trip on synthetic two-regime data, OHLCV→features, artifact disk round-trip, insufficient-bars error, dataframe extraction
 - **Synergy with Risky Mode** (#226 dual-mode invariant): HMM posterior `P(range_state)` will feed Risky Mode position-sizer for adaptive risk-fraction in choppy markets
@@ -7001,7 +7001,7 @@ fallbacks are unreachable. When they are absent, a `tracing::warn!`
 fires naming the symbol so the operator can backfill.
 
 **F-058 — RESOLVED** — `random_coarse_threshold` dual-convention env
-switch `FOREX_BOT_NORMALIZE_FEATURES` removed. The "raw indicator"
+switch `NEOETHOS_BOT_NORMALIZE_FEATURES` removed. The "raw indicator"
 ladder was unreachable since #212 (vector_ta normalisation became
 default). Now hard-picks the normalised `[0.30, 0.45, 0.60, 0.80,
 1.00, 1.20]` ladder. Documented in source the calibration provenance.
@@ -7011,7 +7011,7 @@ timeframe, min_years)` helper added to discovery.rs + wired at the top
 of `run_discovery_cycle_with_progress`. `DiscoveryRuntimeOverrides`
 gained `min_history_years: u32` (default 10 per operator real-data
 directive 2026-05-24). Setting it to 0 skips the check for test
-fixtures / replay paths. Env override via `FOREX_BOT_MIN_HISTORY_YEARS`.
+fixtures / replay paths. Env override via `NEOETHOS_BOT_MIN_HISTORY_YEARS`.
 Bail message includes the symbol, actual vs required bar counts, and
 the three remediation paths (import / auto-fetch / lower threshold).
 
@@ -7571,7 +7571,7 @@ of what's landed so far.
 | F-id | Site | Phase B move |
 |------|------|--------------|
 | F-527 / F-834 | `default_bind_addr` reads `NEOETHOS_SERVER_BIND` | Add `bind_addr_override()` to env_overrides |
-| F-701 / F-759 | `FOREX_BOT_DISABLE_SMC_GATE` 2× sites in eval.rs + search_engine.rs | Add to `neoethos-search/runtime_overrides` (separate from core's env_overrides) |
+| F-701 / F-759 | `NEOETHOS_BOT_DISABLE_SMC_GATE` 2× sites in eval.rs + search_engine.rs | Add to `neoethos-search/runtime_overrides` (separate from core's env_overrides) |
 | F-705 | `DiscoveryRuntimeOverrides::from_env` 4 reads | Already typed boundary; just rename to `from_runtime_overrides` to drop direct env access |
 | F-713 | `derive_prop_firm_gate` 6 reads | Same — typed-boundary already exists |
 | F-783 / F-793 / F-795 / F-805 / F-821 / F-823 | 8 env helpers inside search crate | Move to `neoethos-search/runtime_overrides.rs` (parallel to core's env_overrides) |
@@ -7911,7 +7911,7 @@ pass applies: NO `#[allow(...)]` silencing — only real migrations.
 ### Sites closed (3)
 
 **F-701 / F-CORE3 site 1 — `eval.rs::synthesize_signals_cpu` line 1020:**
-- Previous: inline `std::env::var("FOREX_BOT_DISABLE_SMC_GATE")` on
+- Previous: inline `std::env::var("NEOETHOS_BOT_DISABLE_SMC_GATE")` on
   EVERY gene during per-gene signal synthesis. With population ≈ 240
   and 50+ generations per discovery run, that's ~12 000 redundant env
   reads per run.
@@ -7923,13 +7923,13 @@ pass applies: NO `#[allow(...)]` silencing — only real migrations.
   process startup).
 
 **F-759 / F-CORE3 site 2 — `genetic/search_engine.rs::signals_for_gene_full` line 263:**
-- Previous: same `FOREX_BOT_DISABLE_SMC_GATE` env read inline.
+- Previous: same `NEOETHOS_BOT_DISABLE_SMC_GATE` env read inline.
 - Fix: routes through the same typed `SmcGateOverrides::disable_gate`
   boundary as F-701. The doctrine commitment ("env read once, in
   `from_env`") now holds across both signal-evaluation hot paths.
 
 **F-805 / F-CORE3 site 3 — `genetic/strategy_gene.rs::reject_cross_pair_fallback` line 237-242:**
-- Previous: inline `std::env::var("FOREX_BOT_REJECT_PIP_FALLBACK")`
+- Previous: inline `std::env::var("NEOETHOS_BOT_REJECT_PIP_FALLBACK")`
   on every cross-pair pip-value fallback. Hot enough that prop-firm
   validation runs hit it ~thousands of times.
 - Fix: routes through
@@ -8152,7 +8152,7 @@ scope.
 ### New module
 
 **`crates/neoethos-app/src/app_services/env_overrides.rs`** (~270 LOC).
-Canonical registry of every `FOREX_BOT_CTRADER_*`, `FOREX_BOT_PNL_*`,
+Canonical registry of every `NEOETHOS_BOT_CTRADER_*`, `NEOETHOS_BOT_PNL_*`,
 and `NEOETHOS_*` env override the app crate honours. Each entry has:
 
 - `pub const NAME: &str` — grep-able single source for the env-var name
@@ -8168,18 +8168,18 @@ renames any of them breaks loudly.
 
 | File | Function | Env var | Now reads |
 |---|---|---|---|
-| `eval.rs::init_rayon` (search crate) | `init_rayon` | `FOREX_BOT_RUST_THREADS` / `RAYON_NUM_THREADS` | `current_backtest_runtime_overrides().rayon_threads` (new field on `BacktestRuntimeOverrides`) |
+| `eval.rs::init_rayon` (search crate) | `init_rayon` | `NEOETHOS_BOT_RUST_THREADS` / `RAYON_NUM_THREADS` | `current_backtest_runtime_overrides().rayon_threads` (new field on `BacktestRuntimeOverrides`) |
 | `server/mod.rs::default_bind_addr` | `default_bind_addr` | `NEOETHOS_SERVER_BIND` | `env_overrides::server_bind_addr()` |
-| `app_services/ctrader_execution.rs` | inline TCP-timeout | `FOREX_BOT_CTRADER_READ_TIMEOUT_SECS` | `env_overrides::ctrader_read_timeout_secs()` |
-| `app_services/ctrader_execution.rs` | `ctrader_max_attempts` | `FOREX_BOT_CTRADER_MAX_ATTEMPTS` | `env_overrides::ctrader_max_attempts()` |
-| `app_services/ctrader_execution.rs` | `ctrader_backoff_base_ms` | `FOREX_BOT_CTRADER_BACKOFF_BASE_MS` | `env_overrides::ctrader_backoff_base_ms()` |
-| `app_services/ctrader_execution.rs` | partial-fill check | `FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL` | `env_overrides::ctrader_allow_partial_fill()` |
-| `app_services/ctrader_streaming.rs` | `streaming_max_attempts` | `FOREX_BOT_CTRADER_STREAM_MAX_ATTEMPTS` | `env_overrides::ctrader_stream_max_attempts()` |
-| `app_services/ctrader_streaming.rs` | `streaming_backoff_base_ms` | `FOREX_BOT_CTRADER_STREAM_BACKOFF_BASE_MS` | `env_overrides::ctrader_stream_backoff_base_ms()` |
-| `app_services/ctrader_streaming.rs` | `MergeQuoteSide::from_env` | `FOREX_BOT_CHART_MERGE_SIDE` | `env_overrides::chart_merge_side_raw()` |
-| `app_services/pnl.rs` | `pnl_audit_drift_fraction` | `FOREX_BOT_PNL_AUDIT_DRIFT_FRACTION` | `env_overrides::pnl_audit_drift_fraction()` |
-| `app_services/pnl.rs` | `pnl_circuit_breaker_fraction` | `FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION` | `env_overrides::pnl_circuit_breaker_fraction()` |
-| `app_services/live_journal.rs` | `journal_path` | `FOREX_BOT_LIVE_JOURNAL_PATH` | `env_overrides::live_journal_path_override()` |
+| `app_services/ctrader_execution.rs` | inline TCP-timeout | `NEOETHOS_BOT_CTRADER_READ_TIMEOUT_SECS` | `env_overrides::ctrader_read_timeout_secs()` |
+| `app_services/ctrader_execution.rs` | `ctrader_max_attempts` | `NEOETHOS_BOT_CTRADER_MAX_ATTEMPTS` | `env_overrides::ctrader_max_attempts()` |
+| `app_services/ctrader_execution.rs` | `ctrader_backoff_base_ms` | `NEOETHOS_BOT_CTRADER_BACKOFF_BASE_MS` | `env_overrides::ctrader_backoff_base_ms()` |
+| `app_services/ctrader_execution.rs` | partial-fill check | `NEOETHOS_BOT_CTRADER_ALLOW_PARTIAL_FILL` | `env_overrides::ctrader_allow_partial_fill()` |
+| `app_services/ctrader_streaming.rs` | `streaming_max_attempts` | `NEOETHOS_BOT_CTRADER_STREAM_MAX_ATTEMPTS` | `env_overrides::ctrader_stream_max_attempts()` |
+| `app_services/ctrader_streaming.rs` | `streaming_backoff_base_ms` | `NEOETHOS_BOT_CTRADER_STREAM_BACKOFF_BASE_MS` | `env_overrides::ctrader_stream_backoff_base_ms()` |
+| `app_services/ctrader_streaming.rs` | `MergeQuoteSide::from_env` | `NEOETHOS_BOT_CHART_MERGE_SIDE` | `env_overrides::chart_merge_side_raw()` |
+| `app_services/pnl.rs` | `pnl_audit_drift_fraction` | `NEOETHOS_BOT_PNL_AUDIT_DRIFT_FRACTION` | `env_overrides::pnl_audit_drift_fraction()` |
+| `app_services/pnl.rs` | `pnl_circuit_breaker_fraction` | `NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION` | `env_overrides::pnl_circuit_breaker_fraction()` |
+| `app_services/live_journal.rs` | `journal_path` | `NEOETHOS_BOT_LIVE_JOURNAL_PATH` | `env_overrides::live_journal_path_override()` |
 | `app_services/pending_actions.rs` | `default_journal_path` | `NEOETHOS_PENDING_ACTIONS_PATH` | `env_overrides::pending_actions_path_override()` |
 | `app_services/risky_mode_persistence.rs` | `state_file_path` | `NEOETHOS_RISKY_MODE_STATE_PATH` | `env_overrides::risky_mode_state_path_override()` |
 
@@ -8289,15 +8289,15 @@ GPU-feature-gated CUDA backend) now route through a single
 `genetic::runtime_overrides` and `app_services::env_overrides`.
 
 **Knobs covered** (env-var → typed field):
-- `FOREX_BOT_SEARCH_EVAL_PRECISION` / `FOREX_BOT_TRAIN_PRECISION` /
+- `NEOETHOS_BOT_SEARCH_EVAL_PRECISION` / `NEOETHOS_BOT_TRAIN_PRECISION` /
   `FOREX_TRAIN_PRECISION` → `requested_precision: TrainingPrecision`
-- `FOREX_BOT_SEARCH_EVAL_CUDA_KERNEL` → `eval_kernel_enabled: bool`
-- `FOREX_BOT_SEARCH_BACKTEST_CUDA_KERNEL` → `backtest_kernel_enabled: bool`
-- `FOREX_BOT_SEARCH_EVAL_KERNEL_UNITS` → `eval_kernel_units_override`
-- `FOREX_BOT_SEARCH_BACKTEST_KERNEL_UNITS` →
+- `NEOETHOS_BOT_SEARCH_EVAL_CUDA_KERNEL` → `eval_kernel_enabled: bool`
+- `NEOETHOS_BOT_SEARCH_BACKTEST_CUDA_KERNEL` → `backtest_kernel_enabled: bool`
+- `NEOETHOS_BOT_SEARCH_EVAL_KERNEL_UNITS` → `eval_kernel_units_override`
+- `NEOETHOS_BOT_SEARCH_BACKTEST_KERNEL_UNITS` →
   `backtest_kernel_units_override` (falls back to EVAL_KERNEL_UNITS
   at struct-init time — preserves original semantics)
-- `FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE` → `cuda_device_id: usize`
+- `NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE` → `cuda_device_id: usize`
 
 **Implementation**: `CudaEnvKnobs::from_env` is called once per
 process via `OnceLock`; each former env-reading function (now

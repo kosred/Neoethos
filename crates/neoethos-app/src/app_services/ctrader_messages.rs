@@ -29,7 +29,7 @@ use tungstenite::{Message, connect};
 /// Unset → default (`json_wss`). Unknown value → JSON-WSS with a warn-
 /// level trace event (the binary stays usable even if the operator
 /// typoes the value).
-pub const CTRADER_TRANSPORT_ENV_VAR: &str = "FOREX_BOT_CTRADER_TRANSPORT";
+pub const CTRADER_TRANSPORT_ENV_VAR: &str = "NEOETHOS_BOT_CTRADER_TRANSPORT";
 
 /// `ProtoHeartbeatEvent` — sent every ~30 s by the cTrader Open API
 /// server (and by the client to keep the socket alive). Carries no
@@ -1416,7 +1416,7 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
 // operator-acknowledged batch (the directive treats orders as
 // money-critical).
 //
-// The opt-in is via the `FOREX_BOT_CTRADER_TRANSPORT` environment
+// The opt-in is via the `NEOETHOS_BOT_CTRADER_TRANSPORT` environment
 // variable (see `CTRADER_TRANSPORT_ENV_VAR`).
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1442,7 +1442,7 @@ impl CTraderTransportKind {
     }
 }
 
-/// Pick the cTrader transport based on `FOREX_BOT_CTRADER_TRANSPORT`.
+/// Pick the cTrader transport based on `NEOETHOS_BOT_CTRADER_TRANSPORT`.
 /// Returns `JsonWss` for unset / empty / unrecognised values (with a
 /// `tracing::warn!` for unrecognised values so the operator can spot a
 /// typo). Recognised values: `json_wss`, `protobuf` (case-insensitive,

@@ -261,7 +261,7 @@ Widget appHarness() => ProviderScope(
 Widget shellHarness() => ProviderScope(
       overrides: testProviderOverrides(),
       child: MaterialApp(
-        theme: buildForexAiTheme(),
+        theme: buildNeoethosTheme(),
         home: const AppShell(),
       ),
     );

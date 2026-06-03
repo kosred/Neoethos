@@ -529,7 +529,7 @@ impl CatBoostExpert {
 
     #[cfg(feature = "catboost")]
     fn resolve_executable(&self) -> Result<PathBuf> {
-        for key in ["FOREX_BOT_CATBOOST_EXECUTABLE", "CATBOOST_EXECUTABLE"] {
+        for key in ["NEOETHOS_BOT_CATBOOST_EXECUTABLE", "CATBOOST_EXECUTABLE"] {
             if let Ok(value) = std::env::var(key) {
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
@@ -554,7 +554,7 @@ impl CatBoostExpert {
         }
 
         bail!(
-            "CatBoost training requires an official CatBoost CLI binary; set FOREX_BOT_CATBOOST_EXECUTABLE or CATBOOST_EXECUTABLE, or place `catboost` on PATH"
+            "CatBoost training requires an official CatBoost CLI binary; set NEOETHOS_BOT_CATBOOST_EXECUTABLE or CATBOOST_EXECUTABLE, or place `catboost` on PATH"
         )
     }
 

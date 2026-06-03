@@ -1207,8 +1207,8 @@ fn sample_prop_firm_order() -> CTraderNewOrderRequest {
 // symbol-metadata JSON to disk in CI, replace these fixtures with a
 // loader that reads the real broker payload for the symbol/timeframe.
 
-// Tests that mutate `FOREX_BOT_PROP_ACCOUNT_CURRENCY` /
-// `FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE` MUST run in series — cargo
+// Tests that mutate `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` /
+// `NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE` MUST run in series — cargo
 // runs tests in a single process with a multi-threaded default pool,
 // and parallel env mutation is racy. The same `OnceLock<Mutex<()>>`
 // pattern that gates `NEOETHOS_LICENSE_PATH` in
@@ -1242,12 +1242,12 @@ impl Drop for PropFirmEnvGuard {
         // edition 2024.
         unsafe {
             match self.prior_account_currency.take() {
-                Some(v) => std::env::set_var("FOREX_BOT_PROP_ACCOUNT_CURRENCY", v),
-                None => std::env::remove_var("FOREX_BOT_PROP_ACCOUNT_CURRENCY"),
+                Some(v) => std::env::set_var("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY", v),
+                None => std::env::remove_var("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY"),
             }
             match self.prior_quote_rate.take() {
-                Some(v) => std::env::set_var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE", v),
-                None => std::env::remove_var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE"),
+                Some(v) => std::env::set_var("NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE", v),
+                None => std::env::remove_var("NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE"),
             }
         }
     }
@@ -1266,17 +1266,17 @@ fn install_prop_firm_test_env() -> PropFirmEnvGuard {
     let lock = prop_firm_env_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let prior_account_currency = std::env::var("FOREX_BOT_PROP_ACCOUNT_CURRENCY").ok();
-    let prior_quote_rate = std::env::var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE").ok();
+    let prior_account_currency = std::env::var("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY").ok();
+    let prior_quote_rate = std::env::var("NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE").ok();
     // SAFETY: tests in this binary share env; risk-gate tests must set
-    // FOREX_BOT_PROP_ACCOUNT_CURRENCY explicitly because production
+    // NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY explicitly because production
     // refuses to synthesize a default account currency. Mutation is
     // gated by the mutex held in `lock` above.
     unsafe {
-        std::env::set_var("FOREX_BOT_PROP_ACCOUNT_CURRENCY", "USD");
+        std::env::set_var("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY", "USD");
         // EURJPY-style cross test below requires this; USDJPY only uses
         // base==account, so it's safe to leave the rate present.
-        std::env::set_var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE", "0.0067");
+        std::env::set_var("NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE", "0.0067");
     }
     PropFirmEnvGuard {
         _lock: lock,
@@ -1461,14 +1461,14 @@ fn prop_firm_gate_rejects_when_account_currency_unset() {
     // an order rather than falling back to "USD". Reuse the same
     // `install_prop_firm_test_env` guard so this test takes the
     // suite-wide env mutex — otherwise a sibling test running in
-    // parallel can re-set `FOREX_BOT_PROP_ACCOUNT_CURRENCY` to "USD"
+    // parallel can re-set `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` to "USD"
     // between our `remove_var` below and the gate's `env::var` read,
     // which is the original flake. The guard's `Drop` restores
     // whatever value (if any) was in the env before this test ran.
     let _guard = install_prop_firm_test_env();
     // SAFETY: env mutation is gated by the mutex held in `_guard`.
     unsafe {
-        std::env::remove_var("FOREX_BOT_PROP_ACCOUNT_CURRENCY");
+        std::env::remove_var("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY");
     }
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
@@ -1476,7 +1476,7 @@ fn prop_firm_gate_rejects_when_account_currency_unset() {
         prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None, None)
             .unwrap_err();
     assert!(
-        err.to_string().contains("FOREX_BOT_PROP_ACCOUNT_CURRENCY")
+        err.to_string().contains("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY")
             || err.to_string().contains("symbol metadata"),
         "unexpected error: {err}"
     );

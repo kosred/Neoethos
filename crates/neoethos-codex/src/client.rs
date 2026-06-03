@@ -1,8 +1,8 @@
 //! Chat-completions client backed by a ChatGPT subscription token.
 //!
 //! Wraps a `reqwest::Client` + a [`StoredAuth`] and exposes
-//! [`CodexClient::chat`] — a single function that takes the OpenAI
-//! Chat Completions request shape and returns the same response
+//! [`CodexClient::chat`] — a single function that takes a Chat
+//! Completions request shape and returns the same response
 //! shape. The plumbing handles:
 //!
 //! - Auto-refresh: if the access_token has < 60s left, we refresh
@@ -12,12 +12,11 @@
 //!   `CodexError::ApiCall { status: 401, ... }` so the front-end
 //!   can prompt "click Re-auth ChatGPT" instead of "unknown error".
 //!
-//! The on-the-wire shape mirrors the OpenAI public Chat Completions
-//! API. ChatGPT-subscription accounts use a slightly different
-//! backend (`chatgpt.com/backend-api/conversation` rather than
-//! `api.openai.com/v1/chat/completions`) and a different model
-//! identifier (`gpt-5-codex` etc.); we encode the difference in
-//! `model` defaults but otherwise pass the request through.
+//! The on-the-wire request shape mirrors the familiar Chat Completions
+//! API. ChatGPT-subscription accounts talk to the privileged Codex
+//! backend (`chatgpt.com/backend-api/codex/responses`) with the
+//! `gpt-5.5` model identifier; we encode that in the `model` default
+//! but otherwise pass the request through.
 
 use std::sync::OnceLock;
 
@@ -50,7 +49,7 @@ fn process_installation_id() -> &'static str {
     })
 }
 
-/// One conversational turn. Matches the OpenAI shape exactly.
+/// One conversational turn. Matches the Chat Completions shape exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// "system", "user", or "assistant".
@@ -67,11 +66,10 @@ pub struct ChatCompletionRequest {
     /// Callers can override, but every other name we tested returns
     /// HTTP 400 "not supported when using Codex with a ChatGPT account".
     ///
-    /// **F-291 (2026-05-29)**: was `gpt-5`. Verified empirically against
-    /// `/backend-api/codex/responses` with a live subscription token:
-    /// `gpt-5`, `gpt-5-codex`, `gpt-5-mini`, `gpt-5-thinking`,
-    /// `gpt-5-nano`, `gpt-4o`, `o1`/`o3`/`o4-mini`, `codex-1`,
-    /// `codex-mini` ALL 400; only `gpt-5.5` is accepted.
+    /// **F-291 (2026-05-29)**: verified empirically against
+    /// `/backend-api/codex/responses` with a live subscription token —
+    /// every other model identifier we tried returned HTTP 400; only
+    /// `gpt-5.5` is accepted on the subscription path.
     pub model: String,
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,12 +180,12 @@ impl CodexClient {
     /// The caller maps non-2xx into HTTP responses for the UI.
     ///
     /// **2026-05-26 fix (Κωνσταντίνος)**: the dev's original assumption
-    /// that `/backend-api/conversation` accepts the OpenAI Chat
+    /// that `/backend-api/conversation` accepts the Chat
     /// Completions body was wrong — that endpoint is the chat-UI's
     /// internal flow and demands a UUID/author/parts wrapper, returning
     /// SSE. The official Codex CLI privileged path is actually
     /// `/backend-api/codex/responses`, which speaks the simpler
-    /// **OpenAI Responses API** format. We map our existing
+    /// **Responses API** format. We map our existing
     /// ChatCompletion{Request,Response} shapes to/from that format so
     /// the call-site signature stays unchanged — only the wire goes
     /// through the right pipe.
@@ -222,11 +220,10 @@ impl CodexClient {
             // NOT accepted by the ChatGPT-subscription Codex
             // `/responses` endpoint — it returns HTTP 400
             // "Unsupported parameter: max_output_tokens" the moment the
-            // UI passes a non-null `openai_max_tokens`. (The earlier
-            // smoke test missed it because it sent a prompt with no
-            // token cap.) The endpoint caps output server-side, so we
-            // simply don't send the field. `request.max_tokens` is
-            // still accepted on the public-API path elsewhere.
+            // UI passes a non-null token cap. (The earlier smoke test
+            // missed it because it sent a prompt with no token cap.) The
+            // endpoint caps output server-side, so we simply don't send
+            // the field.
         };
 
         let url = format!("{CODEX_API_BASE}/codex/responses");
@@ -262,9 +259,9 @@ impl CodexClient {
             // plan doesn't include Codex entitlement (Plus has limited
             // Codex; Pro/Team/Enterprise have more). In that case the
             // friendly-error fallback below is the best UX we can give —
-            // the next remediation step would be to switch to
-            // `api.openai.com/v1/chat/completions` with a user-provided
-            // API key, which breaks the "no API key needed" promise.
+            // the only remediation is for the operator to upgrade to (or
+            // sign in with) a ChatGPT plan that includes Codex
+            // entitlement. We never fall back to a paid API key.
             .header("OpenAI-Beta", "responses=v1")
             .header("OAI-Product-Sku", "codex")
             .header("x-codex-installation-id", process_installation_id())
@@ -322,11 +319,9 @@ impl CodexClient {
                     "Your ChatGPT plan does not entitle '{model}' via the \
                      Codex API. Codex access is currently limited to \
                      ChatGPT Pro / Team / Enterprise plans (Plus has \
-                     restricted access). Either upgrade the plan, sign \
+                     restricted access). Either upgrade the plan or sign \
                      in with a different account that has Codex \
-                     entitlement, or set an OpenAI API key in Settings \
-                     to fall back to the public chat-completions \
-                     endpoint.",
+                     entitlement.",
                     model = request.model,
                 )
             } else {

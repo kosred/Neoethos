@@ -8,7 +8,15 @@ mod tui;
 
 fn main() -> Result<()> {
     setup_logging(false)?;
-    neoethos_search::install_search_runtime_overrides_from_env();
+    // Config-consolidation: search runtime overrides come from the single
+    // config (canonical user config.yaml), not the environment. Falls back
+    // to defaults if it can't be loaded. (S2a: genetic search; rest staged.)
+    let startup_settings = neoethos_core::Settings::load().unwrap_or_default();
+    neoethos_search::install_search_runtime_overrides_from_settings(&startup_settings);
+    neoethos_data::install_data_runtime_overrides(
+        startup_settings.models.data_runtime.normalize_features,
+        startup_settings.models.data_runtime.rebuild_stale_higher_tfs,
+    );
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         // No subcommand → launch interactive TUI. Use `--help` for
@@ -399,7 +407,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         //   1. `--account-currency` CLI flag (operator-explicit)
         //   2. `Settings.system.account_currency` (from config.yaml or
         //      cTrader trader profile written back by the bridge)
-        //   3. `FOREX_BOT_PROP_ACCOUNT_CURRENCY` env override (legacy)
+        //   3. `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` env override (legacy)
         // Empty propagates downstream — the cost-model NaN guard will
         // reject the run with a clear error message rather than
         // silently producing NaN spread/pip values that the sanitizer
@@ -411,7 +419,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
                     .map(|s| s.system.account_currency.clone())
                     .filter(|c| !c.trim().is_empty())
             })
-            .or_else(|| std::env::var("FOREX_BOT_PROP_ACCOUNT_CURRENCY").ok())
+            .or_else(|| std::env::var("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY").ok())
             .unwrap_or_default();
         let population: usize = parse_flag(args, "--population")
             .and_then(|v| v.parse().ok())
@@ -724,7 +732,7 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
     let resolved = neoethos_core::resolved_config::ResolvedConfig::from_settings(&settings);
     let root = parse_root(args, Some(&settings));
 
-    // Set FOREX_BOT_DATA_ROOT for the in-process training orchestrator
+    // Set NEOETHOS_BOT_DATA_ROOT for the in-process training orchestrator
     // (cmd_train doesn't honor --root yet, see training_orchestrator.rs).
     // SAFETY: called before any thread spawn — we are still in
     // single-threaded init here (setup_logging and the search-runtime
@@ -735,7 +743,7 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
     // doing this inside the per-symbol loop would race with rayon worker
     // threads spawned by the prior cmd_discover call.
     unsafe {
-        std::env::set_var("FOREX_BOT_DATA_ROOT", &root);
+        std::env::set_var("NEOETHOS_BOT_DATA_ROOT", &root);
     }
     let symbols_raw = parse_flag(args, "--symbols").unwrap_or_default();
     let tfs_raw = parse_flag(args, "--timeframes")
@@ -840,7 +848,7 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
         }
 
         if !skip_training {
-            // FOREX_BOT_DATA_ROOT was set at the top of `cmd_auto_loop`
+            // NEOETHOS_BOT_DATA_ROOT was set at the top of `cmd_auto_loop`
             // before any thread spawned; cmd_train reads it via
             // training_orchestrator::train_symbol.
             let train_args: Vec<String> = vec![
