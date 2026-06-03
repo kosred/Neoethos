@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -12,18 +13,19 @@ class TrainingScreen extends ConsumerWidget {
   const TrainingScreen({super.key});
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final async = ref.watch(enginesProvider);
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const ViewHeader(
-            title: 'Model Swarm Training',
-            subtitle: 'Ensemble training pipeline',
+          ViewHeader(
+            title: l10n.trainingTitle,
+            subtitle: l10n.trainingSubtitle,
           ),
           async.when(
             data: (e) => EngineControls(
-              kind: 'Training',
+              kind: l10n.engineTraining,
               running: e.trainingRunning,
               state: e.training,
               summary: e.trainingSummary,
@@ -34,22 +36,11 @@ class TrainingScreen extends ConsumerWidget {
                       ),
               stop: () => ref.read(backendClientProvider).stopTraining(),
               onChanged: () => ref.invalidate(enginesProvider),
-              description:
-                  'Training drives the 33-model ensemble pipeline (tree, '
-                  'evolutionary, reinforcement-learning, statistical, '
-                  'anomaly-detection families) over the symbol/timeframe '
-                  'you chose. Per-epoch loss + accuracy stream into the '
-                  'sectioned log under the TRAINING section.\n\n'
-                  'Auto-start: if you launch Discovery first and it '
-                  'finishes cleanly (Succeeded), Training kicks off '
-                  'automatically against the same (symbol, timeframe) — '
-                  'the natural pipeline sequence. Manual Start here is '
-                  'still available for re-training without re-running '
-                  'Discovery.',
+              description: l10n.trainingEngineControlsDescription,
             ),
             loading: () => const _Loading(),
             error: (err, _) => BackendErrorWidget(
-                    error: err, title: 'Training status unavailable'),
+                    error: err, title: l10n.trainingStatusUnavailable),
           ),
         ],
       ),
@@ -60,11 +51,12 @@ class TrainingScreen extends ConsumerWidget {
 class _Loading extends StatelessWidget {
   const _Loading();
   @override
-  Widget build(BuildContext context) => const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16),
         child: Text(
-          'Loading engine state…',
-          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+          AppLocalizations.of(context)!.trainingLoadingEngineState,
+          style: const TextStyle(
+              color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

@@ -15,6 +15,7 @@ import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -26,21 +27,21 @@ class RiskScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final async = ref.watch(riskProvider);
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const ViewHeader(
-            title: 'Risk Settings',
-            subtitle:
-                'Prop-firm preset + caps · enforced by the Rust trading session',
+          ViewHeader(
+            title: l10n.riskTitle,
+            subtitle: l10n.riskSubtitle,
           ),
           async.when(
             data: (r) => _Body(snapshot: r),
             loading: () => const _Loading(),
             error: (err, _) => BackendErrorWidget(
-                    error: err, title: 'Risk settings unavailable'),
+                    error: err, title: l10n.riskSettingsUnavailable),
           ),
         ],
       ),
@@ -61,6 +62,7 @@ class _BodyState extends ConsumerState<_Body> {
 
   Future<void> _switchPreset(String presetId) async {
     if (presetId == widget.snapshot.preset) return;
+    final l10n = AppLocalizations.of(context)!;
     setState(() => _switching = true);
     try {
       await ref.read(backendClientProvider).savePropFirmPreset(presetId);
@@ -69,19 +71,20 @@ class _BodyState extends ConsumerState<_Body> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: NeoethosTokens.buy,
-          content: Text('Prop-firm preset switched to $presetId'),
+          content: Text(l10n.riskPresetSwitched(presetId)),
           duration: const Duration(seconds: 3),
         ),
       );
     } on DioException catch (e) {
       if (!mounted) return;
-      showTranslatedErrorSnackbar(context, e, prefix: 'Preset switch failed');
+      showTranslatedErrorSnackbar(context, e,
+          prefix: l10n.riskPresetSwitchFailed);
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: NeoethosTokens.sell,
-          content: Text('Preset switch failed: $e'),
+          content: Text(l10n.riskPresetSwitchFailedDetail(e.toString())),
         ),
       );
     } finally {
@@ -91,6 +94,7 @@ class _BodyState extends ConsumerState<_Body> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final pctFmt = NumberFormat.percentPattern('en_US')
       ..maximumFractionDigits = 2
       ..minimumFractionDigits = 2;
@@ -104,7 +108,7 @@ class _BodyState extends ConsumerState<_Body> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         SectionCard(
-          title: 'Prop-firm preset',
+          title: l10n.riskSectionPropFirmPreset,
           child: _PresetPicker(
             activePresetId: activePresetId,
             activePresetDisplay: snap.presetDisplayName.isEmpty
@@ -117,50 +121,49 @@ class _BodyState extends ConsumerState<_Body> {
           ),
         ),
         SectionCard(
-          title: 'Drawdown Limits (current)',
+          title: l10n.riskSectionDrawdownLimits,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _Row('Daily drawdown limit',
+              _Row(l10n.riskRowDailyDrawdownLimit,
                   pctFmt.format(snap.dailyDrawdownLimit)),
-              _Row('Total drawdown limit',
+              _Row(l10n.riskRowTotalDrawdownLimit,
                   pctFmt.format(snap.totalDrawdownLimit)),
             ],
           ),
         ),
         SectionCard(
-          title: 'Per-Trade Risk',
+          title: l10n.riskSectionPerTradeRisk,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _Row('Current per-trade risk',
+              _Row(l10n.riskRowCurrentPerTradeRisk,
                   pctFmt.format(snap.riskPerTrade)),
-              _Row('Min allowed', pctFmt.format(snap.minRiskPerTrade)),
-              _Row('Max allowed', pctFmt.format(snap.maxRiskPerTrade)),
-              _Row('Max lot size',
-                  '${snap.maxLotSize.toStringAsFixed(2)} lots'),
+              _Row(l10n.riskRowMinAllowed, pctFmt.format(snap.minRiskPerTrade)),
+              _Row(l10n.riskRowMaxAllowed, pctFmt.format(snap.maxRiskPerTrade)),
+              _Row(l10n.riskRowMaxLotSize,
+                  l10n.riskLotsValue(snap.maxLotSize.toStringAsFixed(2))),
             ],
           ),
         ),
         SectionCard(
-          title: 'Safety Rails',
+          title: l10n.riskSectionSafetyRails,
           child: _Row(
-            'Stop-loss required',
-            snap.requireStopLoss ? 'YES (enforced)' : 'NO (relaxed)',
+            l10n.riskRowStopLossRequired,
+            snap.requireStopLoss
+                ? l10n.riskStopLossEnforced
+                : l10n.riskStopLossRelaxed,
             accent: snap.requireStopLoss
                 ? NeoethosTokens.buy
                 : NeoethosTokens.warning,
           ),
         ),
-        const SectionCard(
-          title: 'Editing the numeric caps',
+        SectionCard(
+          title: l10n.riskSectionEditingCaps,
           child: Text(
-            'Switching the preset above DOES NOT overwrite numeric '
-            'caps you have already tuned in config.yaml. To re-seed '
-            'the caps from a new preset, edit config.yaml\'s risk '
-            'section (or delete it and restart the backend so '
-            'RiskConfig::default() rebuilds from the preset).',
-            style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+            l10n.riskEditingCapsBody,
+            style: const TextStyle(
+                color: NeoethosTokens.textMuted, fontSize: 12),
           ),
         ),
       ],
@@ -186,6 +189,7 @@ class _PresetPicker extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final pctFmt = NumberFormat.percentPattern('en_US')
       ..maximumFractionDigits = 1
       ..minimumFractionDigits = 1;
@@ -194,9 +198,9 @@ class _PresetPicker extends StatelessWidget {
       children: [
         Row(
           children: [
-            const Text(
-              'Active preset:',
-              style: TextStyle(
+            Text(
+              l10n.riskActivePreset,
+              style: const TextStyle(
                 fontSize: 12,
                 color: NeoethosTokens.textMuted,
               ),
@@ -228,9 +232,9 @@ class _PresetPicker extends StatelessWidget {
             ),
             if (!propFirmRulesEnabled) ...[
               const SizedBox(width: 8),
-              const Text(
-                '(prop-firm gate disabled — own-money mode)',
-                style: TextStyle(
+              Text(
+                l10n.riskPropFirmGateDisabled,
+                style: const TextStyle(
                   fontSize: 10,
                   color: NeoethosTokens.textFaint,
                 ),
@@ -239,11 +243,10 @@ class _PresetPicker extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 12),
-        const Text(
-          'Switch firm — each preset publishes its own daily/total DD '
-          'ceilings and profit targets. Numbers below are approximate '
-          'as of writing; verify against your contract before trading.',
-          style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
+        Text(
+          l10n.riskSwitchFirmExplainer,
+          style: const TextStyle(
+              fontSize: 11, color: NeoethosTokens.textMuted),
         ),
         const SizedBox(height: 10),
         ...available.map(
@@ -301,10 +304,12 @@ class _PresetPicker extends StatelessWidget {
                         ),
                         const SizedBox(height: 2),
                         Text(
-                          'Daily DD ${pctFmt.format(p.maxDailyLossPct)} · '
-                          'Total DD ${pctFmt.format(p.maxOverallDrawdownPct)} · '
-                          'Profit target ${pctFmt.format(p.challengeProfitTargetPct)} · '
-                          'Min ${p.minTradingDays} days',
+                          l10n.riskPresetDetail(
+                            pctFmt.format(p.maxDailyLossPct),
+                            pctFmt.format(p.maxOverallDrawdownPct),
+                            pctFmt.format(p.challengeProfitTargetPct),
+                            p.minTradingDays,
+                          ),
                           style: const TextStyle(
                             fontSize: 10,
                             color: NeoethosTokens.textMuted,
@@ -365,11 +370,12 @@ class _Row extends StatelessWidget {
 class _Loading extends StatelessWidget {
   const _Loading();
   @override
-  Widget build(BuildContext context) => const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16),
         child: Text(
-          'Loading risk caps…',
-          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+          AppLocalizations.of(context)!.riskLoading,
+          style: const TextStyle(
+              color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }

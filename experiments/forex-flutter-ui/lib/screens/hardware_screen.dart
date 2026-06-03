@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
+import '../l10n/app_localizations.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '../widgets/backend_error_widget.dart';
@@ -13,20 +14,21 @@ class HardwareScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final async = ref.watch(hardwareProvider);
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const ViewHeader(
-            title: 'Hardware',
-            subtitle: 'CPU / RAM / GPU snapshot from the Rust backend',
+          ViewHeader(
+            title: l10n.hardwareTitle,
+            subtitle: l10n.hardwareSubtitle,
           ),
           async.when(
             data: (h) => _Body(snapshot: h),
             loading: () => const _Loading(),
             error: (err, _) => BackendErrorWidget(
-                    error: err, title: 'Hardware status unavailable'),
+                    error: err, title: l10n.hardwareStatusUnavailable),
           ),
         ],
       ),
@@ -40,6 +42,7 @@ class _Body extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final mbFmt = NumberFormat('#,##0', 'en_US');
     final pctFmt = NumberFormat.percentPattern('en_US')
       ..maximumFractionDigits = 1;
@@ -52,14 +55,16 @@ class _Body extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _Row('Model', snapshot.cpuModel),
+              _Row(l10n.hardwareRowModel, snapshot.cpuModel),
               _Row(
                 'Cores',
-                '${snapshot.cpuCoresPhysical} physical · '
-                    '${snapshot.cpuCoresLogical} logical',
+                l10n.hardwareCoresValue(
+                  snapshot.cpuCoresPhysical,
+                  snapshot.cpuCoresLogical,
+                ),
               ),
               _Row(
-                'Average load',
+                l10n.hardwareRowAverageLoad,
                 pctFmt.format(snapshot.cpuLoadAvg),
                 accent: snapshot.cpuLoadAvg > 0.85
                     ? NeoethosTokens.sell
@@ -71,13 +76,14 @@ class _Body extends StatelessWidget {
           ),
         ),
         SectionCard(
-          title: 'Memory',
+          title: l10n.hardwareMemory,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _Row('Total', '${mbFmt.format(snapshot.ramTotalMb)} MB'),
-              _Row('Used', '${mbFmt.format(snapshot.ramUsedMb)} MB'),
-              _Row('Available', '${mbFmt.format(snapshot.ramAvailableMb)} MB'),
+              _Row(l10n.hardwareRowTotal, '${mbFmt.format(snapshot.ramTotalMb)} MB'),
+              _Row(l10n.hardwareRowUsed, '${mbFmt.format(snapshot.ramUsedMb)} MB'),
+              _Row(l10n.hardwareRowAvailable,
+                  '${mbFmt.format(snapshot.ramAvailableMb)} MB'),
             ],
           ),
         ),
@@ -86,8 +92,9 @@ class _Body extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _Row('Detected', snapshot.gpuAvailable ? 'Yes' : 'No'),
-              _Row('Name', snapshot.gpuName),
+              _Row(l10n.hardwareRowDetected,
+                  snapshot.gpuAvailable ? l10n.hardwareYes : l10n.hardwareNo),
+              _Row(l10n.hardwareRowName, snapshot.gpuName),
             ],
           ),
         ),
@@ -135,22 +142,26 @@ class _Row extends StatelessWidget {
 class _Loading extends StatelessWidget {
   const _Loading();
   @override
-  Widget build(BuildContext context) => const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
-        child: Row(
-          children: [
-            SizedBox(
-              width: 14,
-              height: 14,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-            SizedBox(width: 8),
-            Text(
-              'Probing hardware…',
-              style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
-            ),
-          ],
-        ),
-      );
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 16),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            l10n.hardwareProbing,
+            style: const TextStyle(
+                color: NeoethosTokens.textMuted, fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
 }
 

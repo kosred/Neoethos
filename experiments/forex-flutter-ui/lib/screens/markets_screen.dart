@@ -11,6 +11,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -62,6 +63,7 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final snapshot = ref.watch(accountSnapshotProvider);
     final positions = snapshot.valueOrNull?.positions ?? const [];
     final usdFmt = NumberFormat.currency(symbol: r'$', decimalDigits: 2);
@@ -72,19 +74,19 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const ViewHeader(
-            title: 'Markets',
-            subtitle: 'Open positions · broker symbol catalog',
+          ViewHeader(
+            title: l10n.marketsTitle,
+            subtitle: l10n.marketsSubtitle,
           ),
           SectionCard(
-            title: 'Open Positions',
+            title: l10n.openPositions,
             child: positions.isEmpty
                 ? Padding(
                     padding: const EdgeInsets.symmetric(vertical: 8),
                     child: Text(
                       snapshot.hasError
-                          ? 'Connection issue — positions unavailable.'
-                          : 'No open positions on the connected account.',
+                          ? l10n.marketsPositionsConnectionIssue
+                          : l10n.marketsNoOpenPositions,
                       style: const TextStyle(
                         color: NeoethosTokens.textMuted,
                         fontSize: 12,
@@ -101,12 +103,12 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
                       4: FlexColumnWidth(2),
                     },
                     children: [
-                      const TableRow(children: [
-                        _Th('Symbol'),
-                        _Th('Side'),
-                        _Th('Volume'),
-                        _Th('Pips'),
-                        _Th('PnL'),
+                      TableRow(children: [
+                        _Th(l10n.thSymbol),
+                        _Th(l10n.thSide),
+                        _Th(l10n.thVolume),
+                        const _Th('Pips'),
+                        const _Th('PnL'),
                       ]),
                       for (final p in positions)
                         TableRow(children: [
@@ -134,7 +136,7 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
             data: (snap) => _symbolsCard(snap),
             loading: () => const _Loading(),
             error: (err, _) => BackendErrorWidget(
-                    error: err, title: 'Markets unavailable'),
+                    error: err, title: l10n.marketsUnavailable),
           ),
         ],
       ),
@@ -142,6 +144,7 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
   }
 
   Widget _symbolsCard(BrokerSymbolsSnapshot snap) {
+    final l10n = AppLocalizations.of(context)!;
     final all = snap.symbols.where((s) => s.enabled).toList();
     final filtered = all.where((s) {
       if (_forexOnly && !_isStrictForexPair(s.symbolName)) {
@@ -161,16 +164,15 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
     // why "Forex only · 104" differs from "all enabled · 443" differs
     // from "catalog · 830".
     return SectionCard(
-      title:
-          'Broker Symbol Catalog · ${filtered.length} shown · '
-          '${all.length} enabled · ${snap.symbolCount} total',
+      title: l10n.marketsCatalogTitle(
+          filtered.length, all.length, snap.symbolCount),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
               FilterChip(
-                label: const Text('Forex only'),
+                label: Text(l10n.marketsForexOnly),
                 selected: _forexOnly,
                 onSelected: (v) => setState(() => _forexOnly = v),
               ),
@@ -178,11 +180,11 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
               Expanded(
                 child: TextField(
                   controller: _searchCtrl,
-                  decoration: const InputDecoration(
-                    labelText: 'Search',
+                  decoration: InputDecoration(
+                    labelText: l10n.marketsSearch,
                     isDense: true,
-                    border: OutlineInputBorder(),
-                    prefixIcon: Icon(Icons.search, size: 18),
+                    border: const OutlineInputBorder(),
+                    prefixIcon: const Icon(Icons.search, size: 18),
                   ),
                   onChanged: (v) => setState(() => _search = v.trim()),
                 ),
@@ -191,11 +193,11 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
           ),
           const SizedBox(height: 10),
           if (filtered.isEmpty)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 8),
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
               child: Text(
-                'No symbols match the current filter.',
-                style: TextStyle(
+                l10n.marketsNoSymbolsMatch,
+                style: const TextStyle(
                   color: NeoethosTokens.textMuted,
                   fontSize: 12,
                 ),
@@ -226,8 +228,7 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
                         SnackBar(
                           duration: const Duration(milliseconds: 1200),
                           content: Text(
-                            'Pinned ${s.symbolName} to Chart panel A. '
-                            'Open Chart to view candles.',
+                            l10n.marketsPinnedToChart(s.symbolName),
                           ),
                         ),
                       );
@@ -260,8 +261,7 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
           if (filtered.length > 120) ...[
             const SizedBox(height: 6),
             Text(
-              'Showing first 120 of ${filtered.length} matches. '
-              'Type in the search box to narrow further.',
+              l10n.marketsShowingFirst(120, filtered.length),
               style: const TextStyle(
                 fontSize: 10,
                 color: NeoethosTokens.textFaint,
@@ -277,13 +277,16 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
 class _Loading extends StatelessWidget {
   const _Loading();
   @override
-  Widget build(BuildContext context) => const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
-        child: Text(
-          'Loading broker symbol catalog…',
-          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
-        ),
-      );
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 16),
+      child: Text(
+        l10n.marketsLoadingCatalog,
+        style: const TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+      ),
+    );
+  }
 }
 
 

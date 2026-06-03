@@ -16,6 +16,7 @@ import 'package:flutter/material.dart';
 
 import 'ai_helper_screen.dart';
 import 'intelligence_screen.dart';
+import '../l10n/app_localizations.dart';
 import '../theme/theme.dart';
 
 class AiDeskScreen extends StatefulWidget {
@@ -29,16 +30,17 @@ class _AiDeskScreenState extends State<AiDeskScreen>
     with SingleTickerProviderStateMixin {
   late final TabController _controller;
 
-  static const _sections = [
-    ('Intelligence',
-        'Ensemble signals, feature importances, model artifacts'),
-    ('Assistant', 'ChatGPT-subscription chat assistant with tool calls'),
-  ];
+  static const _sectionCount = 2;
+
+  List<(String, String)> _sections(AppLocalizations l10n) => [
+        (l10n.aiDeskTabIntelligence, l10n.aiDeskTabIntelligenceTooltip),
+        (l10n.aiDeskTabAssistant, l10n.aiDeskTabAssistantTooltip),
+      ];
 
   @override
   void initState() {
     super.initState();
-    _controller = TabController(length: _sections.length, vsync: this);
+    _controller = TabController(length: _sectionCount, vsync: this);
   }
 
   @override
@@ -49,10 +51,11 @@ class _AiDeskScreenState extends State<AiDeskScreen>
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _AiDeskSubNav(controller: _controller, sections: _sections),
+        _AiDeskSubNav(controller: _controller, sections: _sections(l10n)),
         const SizedBox(height: NeoethosTokens.spSm),
         Expanded(
           child: TabBarView(
