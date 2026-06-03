@@ -209,52 +209,70 @@ class _SummaryStrip extends ConsumerWidget {
       ),
       child: Row(
         children: [
-          Text(
-            AppLocalizations.of(context)!.marketWatchTitle,
-            style: const TextStyle(
-              fontSize: NeoethosTokens.fsBody + 1,
-              fontWeight: FontWeight.w800,
-              letterSpacing: 0.4,
-              color: NeoethosTokens.textPrimary,
-            ),
-          ),
-          const SizedBox(width: 12),
-          _Pill(
-            label: AppLocalizations.of(context)!
-                .marketWatchSymbolsCount(visibleCount, symbolCount),
-            color: NeoethosTokens.accent,
-          ),
-          const SizedBox(width: 8),
-          _Pill(
-            label: AppLocalizations.of(context)!.marketWatchOpenCount(openCount),
-            color: openCount > 0 ? NeoethosTokens.buy : NeoethosTokens.textFaint,
-          ),
-          const SizedBox(width: 8),
-          _Pill(
-            // Pending orders endpoint hasn't shipped yet; mark explicitly
-            // as 0 rather than hiding the pill — operator should know
-            // the table is honestly empty, not just hidden.
-            label: AppLocalizations.of(context)!.marketWatchPendingCount(0),
-            color: NeoethosTokens.textFaint,
-          ),
-          const SizedBox(width: 12),
-          // F-12: edit the streamer's watchlist (multi-symbol picker).
-          OutlinedButton.icon(
-            onPressed: () => _editWatchlist(context, ref),
-            icon: const Icon(Icons.playlist_add_check, size: 16),
-            label: Text(AppLocalizations.of(context)!.marketWatchEditWatchlist),
-            style: OutlinedButton.styleFrom(
-              foregroundColor: NeoethosTokens.accent,
-              side: const BorderSide(color: NeoethosTokens.border),
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              visualDensity: VisualDensity.compact,
-              textStyle: const TextStyle(
-                fontSize: NeoethosTokens.fsCaption,
-                fontWeight: FontWeight.w700,
+          // Leading status group is horizontally scrollable so a cramped
+          // toolbar (both side rails open on a narrow window) never overflows
+          // by a few px; the freshness stamp stays pinned on the right.
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  Text(
+                    AppLocalizations.of(context)!.marketWatchTitle,
+                    style: const TextStyle(
+                      fontSize: NeoethosTokens.fsBody + 1,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 0.4,
+                      color: NeoethosTokens.textPrimary,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  _Pill(
+                    label: AppLocalizations.of(context)!
+                        .marketWatchSymbolsCount(visibleCount, symbolCount),
+                    color: NeoethosTokens.accent,
+                  ),
+                  const SizedBox(width: 8),
+                  _Pill(
+                    label: AppLocalizations.of(context)!
+                        .marketWatchOpenCount(openCount),
+                    color: openCount > 0
+                        ? NeoethosTokens.buy
+                        : NeoethosTokens.textFaint,
+                  ),
+                  const SizedBox(width: 8),
+                  _Pill(
+                    // Pending orders endpoint hasn't shipped yet; mark explicitly
+                    // as 0 rather than hiding the pill — operator should know
+                    // the table is honestly empty, not just hidden.
+                    label: AppLocalizations.of(context)!
+                        .marketWatchPendingCount(0),
+                    color: NeoethosTokens.textFaint,
+                  ),
+                  const SizedBox(width: 12),
+                  // F-12: edit the streamer's watchlist (multi-symbol picker).
+                  OutlinedButton.icon(
+                    onPressed: () => _editWatchlist(context, ref),
+                    icon: const Icon(Icons.playlist_add_check, size: 16),
+                    label: Text(
+                        AppLocalizations.of(context)!.marketWatchEditWatchlist),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: NeoethosTokens.accent,
+                      side: const BorderSide(color: NeoethosTokens.border),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 6),
+                      visualDensity: VisualDensity.compact,
+                      textStyle: const TextStyle(
+                        fontSize: NeoethosTokens.fsCaption,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
-          const Spacer(),
+          const SizedBox(width: 12),
           if (ageSeconds != null)
             Text(
               AppLocalizations.of(context)!.marketWatchUpdatedAgo(ageSeconds),
@@ -369,7 +387,8 @@ class _WatchlistPanel extends ConsumerWidget {
                 // Build per-symbol strategy + position-count maps for the
                 // join columns. Done once per build instead of inside the
                 // ListView.builder so each row is O(1).
-                final positions = accountAsync.valueOrNull?.positions ?? const <Position>[];
+                final positions =
+                    accountAsync.valueOrNull?.positions ?? const <Position>[];
                 final positionsBySymbol = <String, int>{};
                 for (final p in positions) {
                   positionsBySymbol[p.symbol] =
@@ -377,7 +396,8 @@ class _WatchlistPanel extends ConsumerWidget {
                 }
                 final intel = intelAsync.valueOrNull;
                 final strategyBySymbol = <String, DiscoveryTarget>{};
-                for (final t in intel?.discoveryTargets ?? const <DiscoveryTarget>[]) {
+                for (final t
+                    in intel?.discoveryTargets ?? const <DiscoveryTarget>[]) {
                   strategyBySymbol[t.symbol] = t;
                 }
                 final acc = intel?.walkforwardAvgAccuracy;
@@ -434,8 +454,10 @@ class _WatchlistHeader extends StatelessWidget {
             width: 96,
             align: Alignment.centerLeft,
           ),
-          const _HeaderCell(text: 'Bid', width: 72, align: Alignment.centerRight),
-          const _HeaderCell(text: 'Ask', width: 72, align: Alignment.centerRight),
+          const _HeaderCell(
+              text: 'Bid', width: 72, align: Alignment.centerRight),
+          const _HeaderCell(
+              text: 'Ask', width: 72, align: Alignment.centerRight),
           const _HeaderCell(
               text: 'Spread', width: 52, align: Alignment.centerRight),
           _HeaderCell(
@@ -502,6 +524,7 @@ class _SymbolRow extends StatelessWidget {
   final DiscoveryTarget? strategy;
   final double? ensembleAcc;
   final bool stripe;
+
   /// F-334: tapping a row opens that symbol's chart (with inline
   /// buy/sell). Supplied by the parent which owns the Riverpod ref.
   final VoidCallback? onTap;
@@ -521,7 +544,9 @@ class _SymbolRow extends StatelessWidget {
     final spread = (bid != null && ask != null) ? (ask - bid) : null;
     final spreadPips = spread == null
         ? null
-        : _isJpy(spot.symbolName) ? spread * 100 : spread * 10000;
+        : _isJpy(spot.symbolName)
+            ? spread * 100
+            : spread * 10000;
 
     final l10n = AppLocalizations.of(context)!;
     final stale = spot.freshnessSeconds > 5;
@@ -533,135 +558,134 @@ class _SymbolRow extends StatelessWidget {
 
     return InkWell(
       onTap: onTap,
-      mouseCursor: onTap == null
-          ? MouseCursor.defer
-          : SystemMouseCursors.click,
+      mouseCursor: onTap == null ? MouseCursor.defer : SystemMouseCursors.click,
       child: Container(
-      decoration: BoxDecoration(
-        color: stripe
-            ? NeoethosTokens.appBg.withValues(alpha: 0.4)
-            : Colors.transparent,
-        border: const Border(
-          bottom: BorderSide(
-            color: NeoethosTokens.border,
-            width: 0.4,
+        decoration: BoxDecoration(
+          color: stripe
+              ? NeoethosTokens.appBg.withValues(alpha: 0.4)
+              : Colors.transparent,
+          border: const Border(
+            bottom: BorderSide(
+              color: NeoethosTokens.border,
+              width: 0.4,
+            ),
           ),
         ),
-      ),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 96,
-            child: Text(
-              _prettySymbol(spot.symbolName),
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                fontSize: NeoethosTokens.fsBody,
-                fontWeight: FontWeight.w700,
-                color: NeoethosTokens.textPrimary,
-                fontFeatures: [FontFeature.tabularFigures()],
-              ),
-            ),
-          ),
-          _NumberCell(
-            value: bid,
-            width: 72,
-            digits: _isJpy(spot.symbolName) ? 3 : 5,
-          ),
-          _NumberCell(
-            value: ask,
-            width: 72,
-            digits: _isJpy(spot.symbolName) ? 3 : 5,
-          ),
-          _NumberCell(
-            value: spreadPips,
-            width: 52,
-            digits: 1,
-            faded: true,
-          ),
-          SizedBox(
-            width: 48,
-            child: Text(
-              positionsOnSymbol == 0 ? '—' : '$positionsOnSymbol',
-              textAlign: TextAlign.right,
-              style: TextStyle(
-                fontSize: NeoethosTokens.fsBody,
-                fontWeight: FontWeight.w700,
-                color: positionsOnSymbol == 0
-                    ? NeoethosTokens.textFaint
-                    : NeoethosTokens.accent,
-                fontFeatures: const [FontFeature.tabularFigures()],
-              ),
-            ),
-          ),
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 4),
-              child: strategy == null
-                  ? const Text(
-                      '—',
-                      style: TextStyle(
-                        fontSize: NeoethosTokens.fsBody,
-                        color: NeoethosTokens.textFaint,
-                      ),
-                    )
-                  : Text(
-                      '${strategy!.strategyId} · ${strategy!.baseTf}',
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: NeoethosTokens.fsBody,
-                        color: NeoethosTokens.textPrimary,
-                      ),
-                    ),
-            ),
-          ),
-          SizedBox(
-            width: 48,
-            child: Text(
-              ensembleAcc == null
-                  ? '—'
-                  : '${(ensembleAcc! * 100).toStringAsFixed(0)}%',
-              textAlign: TextAlign.right,
-              style: TextStyle(
-                fontSize: NeoethosTokens.fsBody,
-                fontWeight: FontWeight.w700,
-                color: ensembleAcc == null
-                    ? NeoethosTokens.textFaint
-                    : ensembleAcc! >= 0.55
-                        ? NeoethosTokens.buy
-                        : ensembleAcc! >= 0.50
-                            ? NeoethosTokens.warning
-                            : NeoethosTokens.sell,
-                fontFeatures: const [FontFeature.tabularFigures()],
-              ),
-            ),
-          ),
-          SizedBox(
-            width: 60,
-            child: Align(
-              alignment: Alignment.center,
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                decoration: BoxDecoration(
-                  color: statusColor.withValues(alpha: 0.14),
-                  border: Border.all(color: statusColor.withValues(alpha: 0.55)),
-                  borderRadius: BorderRadius.circular(3),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 96,
+              child: Text(
+                _prettySymbol(spot.symbolName),
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: NeoethosTokens.fsBody,
+                  fontWeight: FontWeight.w700,
+                  color: NeoethosTokens.textPrimary,
+                  fontFeatures: [FontFeature.tabularFigures()],
                 ),
-                child: Text(
-                  statusLabel,
-                  style: TextStyle(
-                    fontSize: NeoethosTokens.fsCaption - 1,
-                    fontWeight: FontWeight.w800,
-                    color: statusColor,
+              ),
+            ),
+            _NumberCell(
+              value: bid,
+              width: 72,
+              digits: _isJpy(spot.symbolName) ? 3 : 5,
+            ),
+            _NumberCell(
+              value: ask,
+              width: 72,
+              digits: _isJpy(spot.symbolName) ? 3 : 5,
+            ),
+            _NumberCell(
+              value: spreadPips,
+              width: 52,
+              digits: 1,
+              faded: true,
+            ),
+            SizedBox(
+              width: 48,
+              child: Text(
+                positionsOnSymbol == 0 ? '—' : '$positionsOnSymbol',
+                textAlign: TextAlign.right,
+                style: TextStyle(
+                  fontSize: NeoethosTokens.fsBody,
+                  fontWeight: FontWeight.w700,
+                  color: positionsOnSymbol == 0
+                      ? NeoethosTokens.textFaint
+                      : NeoethosTokens.accent,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
+            ),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: strategy == null
+                    ? const Text(
+                        '—',
+                        style: TextStyle(
+                          fontSize: NeoethosTokens.fsBody,
+                          color: NeoethosTokens.textFaint,
+                        ),
+                      )
+                    : Text(
+                        '${strategy!.strategyId} · ${strategy!.baseTf}',
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: NeoethosTokens.fsBody,
+                          color: NeoethosTokens.textPrimary,
+                        ),
+                      ),
+              ),
+            ),
+            SizedBox(
+              width: 48,
+              child: Text(
+                ensembleAcc == null
+                    ? '—'
+                    : '${(ensembleAcc! * 100).toStringAsFixed(0)}%',
+                textAlign: TextAlign.right,
+                style: TextStyle(
+                  fontSize: NeoethosTokens.fsBody,
+                  fontWeight: FontWeight.w700,
+                  color: ensembleAcc == null
+                      ? NeoethosTokens.textFaint
+                      : ensembleAcc! >= 0.55
+                          ? NeoethosTokens.buy
+                          : ensembleAcc! >= 0.50
+                              ? NeoethosTokens.warning
+                              : NeoethosTokens.sell,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
+            ),
+            SizedBox(
+              width: 60,
+              child: Align(
+                alignment: Alignment.center,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: statusColor.withValues(alpha: 0.14),
+                    border:
+                        Border.all(color: statusColor.withValues(alpha: 0.55)),
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                  child: Text(
+                    statusLabel,
+                    style: TextStyle(
+                      fontSize: NeoethosTokens.fsCaption - 1,
+                      fontWeight: FontWeight.w800,
+                      color: statusColor,
+                    ),
                   ),
                 ),
               ),
             ),
-          ),
-        ],
-      ),
+          ],
+        ),
       ),
     );
   }
@@ -741,8 +765,8 @@ class _OpenPositionsPanel extends StatelessWidget {
               data: (_) {
                 if (positions.isEmpty) {
                   return _EmptyLine(
-                    message: AppLocalizations.of(context)!
-                        .marketWatchNoPositions,
+                    message:
+                        AppLocalizations.of(context)!.marketWatchNoPositions,
                   );
                 }
                 return Scrollbar(
@@ -786,13 +810,12 @@ class _PositionRow extends StatelessWidget {
               position.openTimestampMs!,
             ),
           );
-    final volume = position.volume == 0 ? '—' : position.volume.toStringAsFixed(2);
-    final pnlPips = position.pnlPips == 0
-        ? '0.0'
-        : position.pnlPips.toStringAsFixed(1);
-    final pnlUsd = position.pnlUsd == 0
-        ? '0.00'
-        : position.pnlUsd.toStringAsFixed(2);
+    final volume =
+        position.volume == 0 ? '—' : position.volume.toStringAsFixed(2);
+    final pnlPips =
+        position.pnlPips == 0 ? '0.0' : position.pnlPips.toStringAsFixed(1);
+    final pnlUsd =
+        position.pnlUsd == 0 ? '0.00' : position.pnlUsd.toStringAsFixed(2);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: const BoxDecoration(
@@ -804,8 +827,7 @@ class _PositionRow extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Container(
-            padding:
-                const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
             decoration: BoxDecoration(
               color: (isBuy ? NeoethosTokens.buy : NeoethosTokens.sell)
                   .withValues(alpha: 0.18),

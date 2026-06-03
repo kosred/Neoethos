@@ -1,14 +1,13 @@
 # Project-level configuration.
 cmake_minimum_required(VERSION 3.14)
-project(forex_flutter_ui LANGUAGES CXX)
+project(neoethos_flutter_ui LANGUAGES CXX)
 
 # The name of the executable created for the application. The user-facing
 # binary is `neoethos.exe` - that is what operators double-click. The
-# Dart-side project name in `pubspec.yaml` remains `forex_flutter_ui`
-# because changing that would force a workspace-wide rename of every
-# `package:forex_flutter_ui/...` import for purely cosmetic benefit;
-# the .exe rename is enough to satisfy "one application, one
-# double-click target".
+# Dart-side project name in `pubspec.yaml` is `neoethos_flutter_ui`
+# (renamed 2026-06-03 from the legacy `forex_flutter_ui`). Only `test/`
+# references it via `package:neoethos_flutter_ui/...`; lib/ uses relative
+# imports, so the rename stayed contained.
 set(BINARY_NAME "neoethos")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent

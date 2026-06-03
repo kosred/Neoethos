@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:forex_flutter_ui/api/backend_client.dart';
+import 'package:neoethos_flutter_ui/api/backend_client.dart';
 
 void main() {
   test('ChartSnapshot parses backend source provenance', () {

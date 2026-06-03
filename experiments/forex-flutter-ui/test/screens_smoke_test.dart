@@ -16,13 +16,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:forex_flutter_ui/screens/chart_screen.dart';
-import 'package:forex_flutter_ui/screens/dashboard_screen.dart';
-import 'package:forex_flutter_ui/screens/data_bootstrap_screen.dart';
-import 'package:forex_flutter_ui/screens/discovery_screen.dart';
-import 'package:forex_flutter_ui/screens/markets_screen.dart';
-import 'package:forex_flutter_ui/screens/settings_screen.dart';
-import 'package:forex_flutter_ui/theme/theme.dart';
+import 'package:neoethos_flutter_ui/l10n/app_localizations.dart';
+import 'package:neoethos_flutter_ui/screens/chart_screen.dart';
+import 'package:neoethos_flutter_ui/screens/dashboard_screen.dart';
+import 'package:neoethos_flutter_ui/screens/data_bootstrap_screen.dart';
+import 'package:neoethos_flutter_ui/screens/discovery_screen.dart';
+import 'package:neoethos_flutter_ui/screens/markets_screen.dart';
+import 'package:neoethos_flutter_ui/screens/settings_screen.dart';
+import 'package:neoethos_flutter_ui/theme/theme.dart';
 
 import 'test_harness.dart';
 
@@ -30,6 +31,12 @@ Widget _wrap(Widget screen) => ProviderScope(
       overrides: testProviderOverrides(),
       child: MaterialApp(
         theme: buildNeoethosTheme(),
+        // i18n (2026-06-03): screens read AppLocalizations.of(context)!, so the
+        // wrapper must supply the localization delegates (else every screen
+        // build null-checks to death). Pin `en` for deterministic assertions.
+        locale: const Locale('en'),
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
         home: Scaffold(body: screen),
       ),
     );

@@ -16,6 +16,14 @@ class LocaleNotifier extends StateNotifier<Locale> {
     _loadFromConfig();
   }
 
+  /// Test-only seam: build the notifier WITHOUT the startup `/settings` fetch
+  /// the default constructor performs. Widget tests pump the whole app, and
+  /// that fetch otherwise leaves a Dio request timer pending past teardown
+  /// (tripping Flutter's "A Timer is still pending…" invariant). Production
+  /// always uses the default constructor — this path never runs outside tests.
+  @visibleForTesting
+  LocaleNotifier.noFetch(this._ref) : super(const Locale('en'));
+
   final Ref _ref;
 
   /// All language codes the UI ships translations for. Order is the display

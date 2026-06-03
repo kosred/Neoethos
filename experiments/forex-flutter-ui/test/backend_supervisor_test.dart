@@ -9,7 +9,7 @@
 
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:forex_flutter_ui/startup/backend_supervisor.dart';
+import 'package:neoethos_flutter_ui/startup/backend_supervisor.dart';
 
 void main() {
   group('BackendSupervisor.mergeMissingScalarFields', () {

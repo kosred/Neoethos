@@ -10,8 +10,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:forex_flutter_ui/state/nav.dart';
-import 'package:forex_flutter_ui/theme/theme.dart';
+import 'package:neoethos_flutter_ui/state/nav.dart';
+import 'package:neoethos_flutter_ui/theme/theme.dart';
 
 import 'test_harness.dart';
 

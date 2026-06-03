@@ -2,15 +2,17 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:forex_flutter_ui/api/backend_client.dart';
-import 'package:forex_flutter_ui/main.dart';
-import 'package:forex_flutter_ui/startup/backend_watchdog.dart';
-import 'package:forex_flutter_ui/state/account_provider.dart';
-import 'package:forex_flutter_ui/state/live_spots_provider.dart';
-import 'package:forex_flutter_ui/state/pending_actions_provider.dart';
-import 'package:forex_flutter_ui/state/system_providers.dart';
-import 'package:forex_flutter_ui/theme/theme.dart';
-import 'package:forex_flutter_ui/widgets/app_shell.dart';
+import 'package:neoethos_flutter_ui/api/backend_client.dart';
+import 'package:neoethos_flutter_ui/l10n/app_localizations.dart';
+import 'package:neoethos_flutter_ui/main.dart';
+import 'package:neoethos_flutter_ui/startup/backend_watchdog.dart';
+import 'package:neoethos_flutter_ui/state/account_provider.dart';
+import 'package:neoethos_flutter_ui/state/live_spots_provider.dart';
+import 'package:neoethos_flutter_ui/state/locale_provider.dart';
+import 'package:neoethos_flutter_ui/state/pending_actions_provider.dart';
+import 'package:neoethos_flutter_ui/state/system_providers.dart';
+import 'package:neoethos_flutter_ui/theme/theme.dart';
+import 'package:neoethos_flutter_ui/widgets/app_shell.dart';
 
 class TestAccountSnapshotNotifier extends AccountSnapshotNotifier {
   @override
@@ -251,6 +253,49 @@ List<Override> testProviderOverrides() => [
           lastTouchedUnixMs: 1716422400000,
         ),
       ),
+      // NewsPanel (mounted in the always-visible AiDeskRail) watches
+      // newsFeedProvider, whose real body opens a 5-minute self-refresh
+      // Timer AND fires a live `/news/feed` HTTP call. Unstubbed, that
+      // request's connection-timeout timer outlives the test teardown and
+      // trips the "Timer still pending after the widget tree was disposed"
+      // invariant. Stub it with an empty static feed like every other
+      // backend-backed provider here.
+      newsFeedProvider.overrideWith(
+        (ref) async => const NewsFeed(
+          items: [],
+          aiSummary: '',
+          aiAvailable: false,
+          generatedAtMs: 1716422400000,
+          notice: '',
+        ),
+      ),
+      // GrowthModeCard's _ScenarioSection (mounted on the Dashboard) watches
+      // the riskyScenariosProvider family, which fires a live `/risky/scenarios`
+      // Dio GET. Same leak shape as newsFeed: Dio's zero-duration request timer
+      // outlives teardown. Echo the query inputs back with a deterministic
+      // projection so the card renders a populated scenario without any I/O.
+      riskyScenariosProvider.overrideWith(
+        (ref, q) async => RiskyScenario(
+          startingUsd: q.startingUsd,
+          targetUsd: q.targetUsd,
+          riskFraction: q.riskFraction,
+          winRate: 0.55,
+          rewardToRisk: 1.5,
+          tradesPerDay: 3,
+          bestCaseDays: 30,
+          expectedDays: 60,
+          conservativeDays: 120,
+          ruinProbability: 0.05,
+          riskFractionMin: 0.0,
+          riskFractionMax: 1.0,
+        ),
+      ),
+      // NeoethosApp watches localeProvider, whose LocaleNotifier fires a
+      // `/settings` fetch on construction to read the persisted ui_locale.
+      // That live Dio call leaks a request timer past teardown. Use the
+      // no-fetch test constructor: pins `en` (matches the assertions) and
+      // skips all I/O.
+      localeProvider.overrideWith((ref) => LocaleNotifier.noFetch(ref)),
     ];
 
 Widget appHarness() => ProviderScope(
@@ -262,6 +307,14 @@ Widget shellHarness() => ProviderScope(
       overrides: testProviderOverrides(),
       child: MaterialApp(
         theme: buildNeoethosTheme(),
+        // i18n (2026-06-03): screens now read AppLocalizations.of(context)!,
+        // so the test MaterialApp must carry the localization delegates or
+        // every screen build hits a null-check crash. Pin `en` so the
+        // English-string assertions in the smoke tests stay deterministic
+        // regardless of the host platform locale.
+        locale: const Locale('en'),
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
         home: const AppShell(),
       ),
     );

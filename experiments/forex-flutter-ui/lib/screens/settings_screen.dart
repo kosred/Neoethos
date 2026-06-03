@@ -190,8 +190,7 @@ class _SettingsTabStrip extends StatelessWidget {
               ),
             ),
             style: TextButton.styleFrom(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
               minimumSize: Size.zero,
               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
             ),
@@ -243,7 +242,8 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
       setState(() {
         _clientIdCtrl.text = (r['clientId'] as String?) ?? '';
         _accountIdCtrl.text = (r['accountId'] as String?) ?? '';
-        _environment = (r['environment'] as String?) == 'Live' ? 'Live' : 'Demo';
+        _environment =
+            (r['environment'] as String?) == 'Live' ? 'Live' : 'Demo';
         _secretConfigured = (r['clientSecretConfigured'] as bool?) ?? false;
         _secretMask = (r['clientSecretMask'] as String?) ?? '';
         _loaded = true;
@@ -419,8 +419,8 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
           padding: const EdgeInsets.symmetric(vertical: 12),
           child: Text(
             l10n.commonLoading,
-            style: const TextStyle(
-                color: NeoethosTokens.textMuted, fontSize: 12),
+            style:
+                const TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
           ),
         ),
       );
@@ -432,8 +432,8 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
         children: [
           Text(
             l10n.settingsCredentialsIntro,
-            style: const TextStyle(
-                color: NeoethosTokens.textMuted, fontSize: 12),
+            style:
+                const TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
           ),
           const SizedBox(height: 12),
           TextField(
@@ -472,7 +472,8 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(child: _AccountPicker(
+              Expanded(
+                  child: _AccountPicker(
                 currentAccountId: _accountIdCtrl.text,
                 enabled: !_busy,
                 onPicked: (id) => setState(() {
@@ -533,9 +534,8 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
                     _resultMessage!,
                     style: TextStyle(
                       fontSize: 11,
-                      color: _resultOk
-                          ? NeoethosTokens.buy
-                          : NeoethosTokens.sell,
+                      color:
+                          _resultOk ? NeoethosTokens.buy : NeoethosTokens.sell,
                     ),
                   ),
                 ),
@@ -623,6 +623,7 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
   late final TextEditingController _dataDirCtrl;
   late final TextEditingController _newsSourceCtrl;
   late bool _newsEnabled;
+
   /// Snake_case id matching `crate::config::NewsTradingMode`.
   /// Defaults to `block_on_news` (safe).
   late String _newsTradingMode;
@@ -645,9 +646,8 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
     _dataDirCtrl = TextEditingController(text: s.dataDir);
     _newsSourceCtrl = TextEditingController(text: s.newsCalendarSource);
     _newsEnabled = s.newsCalendarEnabled;
-    _newsTradingMode = s.newsTradingMode.isEmpty
-        ? 'block_on_news'
-        : s.newsTradingMode;
+    _newsTradingMode =
+        s.newsTradingMode.isEmpty ? 'block_on_news' : s.newsTradingMode;
     _searchPopCtrl = TextEditingController(text: '${s.searchPopulation}');
     _searchGenCtrl = TextEditingController(text: '${s.searchGenerations}');
     _searchMaxHoursCtrl =
@@ -783,8 +783,8 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
         children: [
           Text(
             l10n.settingsAppSettingsIntro,
-            style: const TextStyle(
-                fontSize: 11, color: NeoethosTokens.textMuted),
+            style:
+                const TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
           ),
           const SizedBox(height: 12),
           TextField(
@@ -799,41 +799,51 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
           ),
           const SizedBox(height: 10),
           // ── Discovery search budget (models.prop_search_*) ──────────
-          ExpansionTile(
-            tilePadding: EdgeInsets.zero,
-            childrenPadding: const EdgeInsets.only(bottom: 8),
-            title: Text(
-              l10n.settingsSearchBudgetTitle,
-              style: const TextStyle(fontWeight: FontWeight.w600),
-            ),
-            subtitle: Text(
-              l10n.settingsSearchBudgetSubtitle,
-              style: const TextStyle(
-                  fontSize: 11, color: NeoethosTokens.textMuted),
-            ),
-            children: [
-              Wrap(
-                spacing: 12,
-                runSpacing: 12,
-                children: [
-                  _knob(_searchMaxHoursCtrl, l10n.settingsKnobMaxHoursLabel,
-                      l10n.settingsKnobMaxHoursHelp),
-                  _knob(_searchGenCtrl, l10n.settingsKnobGenerationsLabel,
-                      l10n.settingsKnobGenerationsHelp),
-                  _knob(_searchPopCtrl, l10n.settingsKnobPopulationLabel,
-                      l10n.settingsKnobPopulationHelp),
-                  _knob(_searchMaxIndCtrl, l10n.settingsKnobMaxIndicatorsLabel,
-                      l10n.settingsKnobMaxIndicatorsHelp),
-                  _knob(_searchPortfolioCtrl,
-                      l10n.settingsKnobPortfolioSizeLabel,
-                      l10n.settingsKnobPortfolioSizeHelp),
-                  _knob(_searchCorrCtrl, l10n.settingsKnobCorrThresholdLabel,
-                      l10n.settingsKnobCorrThresholdHelp),
-                  _knob(_searchMaxRowsCtrl, l10n.settingsKnobMaxRowsLabel,
-                      l10n.settingsKnobMaxRowsHelp),
-                ],
+          // ExpansionTile's header is a ListTile, which needs a Material
+          // ancestor for its ink; this card's SectionCard paints a coloured
+          // DecoratedBox between the tile and the page Material, so host the
+          // ink on a local transparent Material (no visual change).
+          Material(
+            type: MaterialType.transparency,
+            child: ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              childrenPadding: const EdgeInsets.only(bottom: 8),
+              title: Text(
+                l10n.settingsSearchBudgetTitle,
+                style: const TextStyle(fontWeight: FontWeight.w600),
               ),
-            ],
+              subtitle: Text(
+                l10n.settingsSearchBudgetSubtitle,
+                style: const TextStyle(
+                    fontSize: 11, color: NeoethosTokens.textMuted),
+              ),
+              children: [
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
+                  children: [
+                    _knob(_searchMaxHoursCtrl, l10n.settingsKnobMaxHoursLabel,
+                        l10n.settingsKnobMaxHoursHelp),
+                    _knob(_searchGenCtrl, l10n.settingsKnobGenerationsLabel,
+                        l10n.settingsKnobGenerationsHelp),
+                    _knob(_searchPopCtrl, l10n.settingsKnobPopulationLabel,
+                        l10n.settingsKnobPopulationHelp),
+                    _knob(
+                        _searchMaxIndCtrl,
+                        l10n.settingsKnobMaxIndicatorsLabel,
+                        l10n.settingsKnobMaxIndicatorsHelp),
+                    _knob(
+                        _searchPortfolioCtrl,
+                        l10n.settingsKnobPortfolioSizeLabel,
+                        l10n.settingsKnobPortfolioSizeHelp),
+                    _knob(_searchCorrCtrl, l10n.settingsKnobCorrThresholdLabel,
+                        l10n.settingsKnobCorrThresholdHelp),
+                    _knob(_searchMaxRowsCtrl, l10n.settingsKnobMaxRowsLabel,
+                        l10n.settingsKnobMaxRowsHelp),
+                  ],
+                ),
+              ],
+            ),
           ),
           const SizedBox(height: 10),
           Row(
@@ -895,8 +905,8 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
           const SizedBox(height: 4),
           Text(
             l10n.settingsNewsModeDescription,
-            style: const TextStyle(
-                fontSize: 11, color: NeoethosTokens.textMuted),
+            style:
+                const TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
           ),
           const SizedBox(height: 8),
           _NewsTradingModeRow(
@@ -946,9 +956,8 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
                     _message!,
                     style: TextStyle(
                       fontSize: 11,
-                      color: _messageOk
-                          ? NeoethosTokens.buy
-                          : NeoethosTokens.sell,
+                      color:
+                          _messageOk ? NeoethosTokens.buy : NeoethosTokens.sell,
                     ),
                   ),
                 ),
@@ -1019,9 +1028,8 @@ class _AccountPicker extends ConsumerWidget {
         // to first available — that's typically what the user meant
         // anyway, and the consent screen has already accepted it.
         final ids = snap.accounts.map((a) => a.accountId).toList();
-        final selected = ids.contains(currentAccountId)
-            ? currentAccountId
-            : ids.first;
+        final selected =
+            ids.contains(currentAccountId) ? currentAccountId : ids.first;
         if (selected != currentAccountId) {
           // Post-frame nudge so we don't setState during build.
           WidgetsBinding.instance
@@ -1164,9 +1172,8 @@ class _NewsTradingModeRow extends StatelessWidget {
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
                 border: Border.all(
-                  color: selected
-                      ? NeoethosTokens.accent
-                      : NeoethosTokens.border,
+                  color:
+                      selected ? NeoethosTokens.accent : NeoethosTokens.border,
                   width: 2,
                 ),
                 color: selected ? NeoethosTokens.accent : Colors.transparent,
@@ -1211,8 +1218,7 @@ class _Loading extends StatelessWidget {
         padding: const EdgeInsets.symmetric(vertical: 16),
         child: Text(
           AppLocalizations.of(context)!.settingsLoadingSettings,
-          style: const TextStyle(
-              color: NeoethosTokens.textMuted, fontSize: 12),
+          style: const TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
 }
@@ -1294,6 +1300,7 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
   String? _yamlOnDisk;
   String? _path;
   String? _error;
+
   /// Structured remediation hint from the backend's 400 body — e.g.
   /// "Common causes: typo in a field name, wrong type, missing
   /// required section." Surfaced inline next to the error so the
@@ -1382,7 +1389,8 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
       }
     } catch (err) {
       if (mounted) {
-        setState(() => _error = l10n.settingsYamlWriteError(describeError(err)));
+        setState(
+            () => _error = l10n.settingsYamlWriteError(describeError(err)));
       }
     } finally {
       if (mounted) setState(() => _saving = false);
@@ -1408,14 +1416,12 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
           children: [
             Text(
               l10n.settingsRawConfigTitle,
-              style: const TextStyle(
-                  fontWeight: FontWeight.w600, fontSize: 13),
+              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
             ),
             if (_dirty) ...[
               const SizedBox(width: 8),
               Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                 decoration: BoxDecoration(
                   color: const Color(0xFFE65100),
                   borderRadius: BorderRadius.circular(3),
@@ -1461,18 +1467,16 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
                           ? const SizedBox(
                               width: 14,
                               height: 14,
-                              child: CircularProgressIndicator(
-                                  strokeWidth: 2),
+                              child: CircularProgressIndicator(strokeWidth: 2),
                             )
                           : const Icon(Icons.refresh, size: 16),
                       label: Text(l10n.settingsReloadFromDisk),
                     ),
                     const SizedBox(width: 8),
                     FilledButton.icon(
-                      onPressed:
-                          (_saving || !_dirty || _yamlOnDisk == null)
-                              ? null
-                              : _save,
+                      onPressed: (_saving || !_dirty || _yamlOnDisk == null)
+                          ? null
+                          : _save,
                       icon: _saving
                           ? const SizedBox(
                               width: 14,
@@ -1583,5 +1587,3 @@ class _AdvancedConfigCardState extends ConsumerState<_AdvancedConfigCard> {
     );
   }
 }
-
-

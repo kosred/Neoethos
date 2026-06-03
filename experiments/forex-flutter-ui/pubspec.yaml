@@ -1,4 +1,4 @@
-name: forex_flutter_ui
+name: neoethos_flutter_ui
 description: >
   Flutter desktop/mobile front-end for neoethos.
   Talks to the Rust backend (neoethos-app + neoethos-codex) over REST.

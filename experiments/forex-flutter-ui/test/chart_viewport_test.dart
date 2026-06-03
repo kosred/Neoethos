@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:forex_flutter_ui/charts/chart_viewport.dart';
+import 'package:neoethos_flutter_ui/charts/chart_viewport.dart';
 
 void main() {
   test('ChartViewport.live anchors the last visible bars', () {

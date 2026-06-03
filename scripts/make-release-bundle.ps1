@@ -14,7 +14,7 @@
 #   (no model files - AI Helper runs against a ChatGPT subscription)
 #
 # Operator workflow: copy the whole `dist/NeoEthos/` folder anywhere,
-# double-click `forex_flutter_ui.exe`. The Flutter `BackendSupervisor`
+# double-click `NeoEthos.exe`. The Flutter `BackendSupervisor`
 # finds the co-located `neoethos-app.exe`, spawns it on port 7423, and
 # the UI talks to it. No installer required for testing.
 #
@@ -71,11 +71,12 @@ if (-not (Test-Path $srcUiExe)) {
     $srcUiExe = Join-Path $flutterDir 'neoethos.exe'
 }
 if (-not (Test-Path $srcUiExe)) {
-    # Fallback to the pre-rename binary name.
-    $srcUiExe = Join-Path $flutterDir 'forex_flutter_ui.exe'
+    # Fallback to the CMake project name if BINARY_NAME is ever unset.
+    # (Project renamed 2026-06-03; legacy builds emitted forex_flutter_ui.exe.)
+    $srcUiExe = Join-Path $flutterDir 'neoethos_flutter_ui.exe'
 }
 if (-not (Test-Path $srcUiExe)) {
-    throw "Could not find NeoEthos.exe / neoethos.exe / forex_flutter_ui.exe in $flutterDir - re-run flutter build windows --$Profile."
+    throw "Could not find NeoEthos.exe / neoethos.exe / neoethos_flutter_ui.exe in $flutterDir - re-run flutter build windows --$Profile."
 }
 Copy-Item -Path $srcUiExe -Destination (Join-Path $dst 'NeoEthos.exe')
 # 2026-05-26 fix: previously only `flutter_windows.dll` was copied, but
