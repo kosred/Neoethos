@@ -1,6 +1,6 @@
 [package]
 name = "neoethos-app"
-version = "0.4.35"
+version = "0.4.40"
 edition.workspace = true
 # SPDX dual-license matches the repo-root LICENSE file. Required by both
 # cargo-deb (which prefers `license` over `license-file` when generating

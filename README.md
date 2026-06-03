@@ -1,48 +1,83 @@
-# neoethos
+<div align="center">
 
-**A disciplined multi-model ML engine for FX strategy research and risk-aware execution.**
+# NeoEthos
 
-100% Pure Rust. Prop-firm compliant. Zero embedded Python on the hot path.
+### *A new ethos for trading — institutional-grade discipline, in the hands of one person.*
 
-## 🏗️ Architecture
-The project has been fully migrated from a hybrid Python/Rust structure to a **Pure Rust** architecture to eliminate GIL bottlenecks and ensure absolute safety.
+**Pure-Rust trading intelligence: it discovers its own strategies, sizes every trade by the math of survival, and answers to a single, honest goal you set.**
 
-- **`neoethos-app`**: Rust backend entry point for HTTP server, headless jobs, reauth, and API-test workflows.
-- **`neoethos-core`**: Core logic including Risk Management, Portfolio Optimization, and Configuration.
-- **`neoethos-data`**: High-speed OHLCV data engine with zero lookahead bias.
-- **`neoethos-models`**: Native Rust machine learning models (XGBoost, Neural Networks via Burn, etc.).
-- **`neoethos-search`**: Genetic algorithms and strategy discovery.
-- **`neoethos-news`**: Async news aggregation and sentiment analysis.
-- **`neoethos-cli`**: Command-line front-end for batch jobs and operator tasks.
+`100% Rust on the hot path` · `cTrader / FIX native` · `no Python at runtime` · `your machine, your data, your keys`
 
-Brokers are integrated entirely through native Rust transports (cTrader Open
-API over OAuth/WebSocket and FIX gateways). No embedded Python runtime is
-required at runtime — the project is 100% pure Rust on the hot path.
+</div>
 
-## 🚀 Getting Started
+---
 
-### Prerequisites
-- [Rust](https://rustup.rs/) (1.80+)
+## Why this exists
 
-### Build the Executable
+The serious tools — walk-forward validation, genetic strategy search, Kelly-aware sizing, prop-firm risk gates, a real model ensemble — have always lived behind institutional walls and five-figure subscriptions. The small trader gets a chart and a prayer.
+
+NeoEthos is the refusal of that. It puts the *whole pipeline* — research, discovery, risk, execution — on one person's laptop, in software that is auditable line by line and lies to no one (every number comes from the engine; nothing is invented for the UI).
+
+I could have sold this. I'd rather fight to build something larger than me. **So it stays free, for now** — a mission before it's a business. If it helps one person trade with discipline instead of hope, it has already paid for itself.
+
+## What it does
+
+- **Discovers strategies, doesn't ship guesses.** A genetic search breeds and tests strategies across timeframes, then survives them through walk-forward + CPCV gates so what reaches you has held up out-of-sample.
+- **Two honest modes, one master switch.** You pick the goal; *the search, the models, and the risk all re-orient around it.*
+- **Sizes for survival.** Position size is a fraction of the *live* balance (it compounds as you grow) derived from each strategy's measured edge — not a fixed, account-blowing percentage.
+- **A real model ensemble.** XGBoost, CatBoost, LightGBM, neural nets (Burn), KAN, N-BEATS, TabNet, TiDE and more — native Rust, no GIL, no embedded Python on the hot path.
+- **Live, broker-native.** cTrader Open API over OAuth/WebSocket (FIX gateways too). Your account, your keys, on your machine.
+- **A desktop app *and* a terminal.** A Flutter GUI (Greek / English) and a full ratatui TUI with live candlesticks — same engine underneath.
+
+## The two modes
+
+| | **Risky Mode** | **Prop-Firm Mode** |
+|---|---|---|
+| **Goal** | Multiply a small balance to a large target, as fast as the edge allows | Pass prop-firm challenges comfortably and bank a steady monthly return |
+| **You set** | start → target → horizon (e.g. €100 → €50,000 in 6 months) | the firm preset (FTMO, FundedNext, …) + drawdown caps |
+| **The search** | is *pressured* to find strategies that can hit your target in time | optimises for the firm's window-pass rules |
+| **The truth** | high risk, deep drawdown — and the odds are computed, not promised | safety and stability first |
+
+You set the goal. The math tells you the truth about it. The bot tries.
+
+## Architecture
+
+Fully pure-Rust — migrated off a Python/Rust hybrid to kill the GIL and earn memory safety end to end.
+
+- **`neoethos-core`** — risk management, portfolio optimisation, the single config that the UI/TUI edit
+- **`neoethos-data`** — high-speed OHLCV engine, zero look-ahead bias
+- **`neoethos-models`** — the native ML ensemble
+- **`neoethos-search`** — genetic discovery + the target-aware ranking
+- **`neoethos-app`** — HTTP backend, headless jobs, broker transports
+- **`neoethos-cli`** — the TUI + batch operator tasks
+
+## Getting started
+
+**Prerequisites:** [Rust](https://rustup.rs/) 1.80+ · [Flutter](https://flutter.dev) 3.22+ (for the GUI).
+
 ```bash
+# Build the backend
 cargo build --release -p neoethos-app
+
+# Desktop app (spawns the backend for you)
+cd experiments/forex-flutter-ui && flutter run -d windows
+
+# Or the terminal UI — live candlesticks, discovery, logs
+cargo run --release -p neoethos-cli
 ```
 
-### Running the Backend
-- **HTTP server mode:**
-  ```bash
-  ./target/release/neoethos-app --server
-  ```
-- **Headless job mode (Linux Server):**
-  ```bash
-  ./target/release/neoethos-app --headless --config config.yaml
-  ```
+Prefer a packaged install? Grab the Windows or Linux installer from the [latest release](../../releases/latest).
 
-## 📊 Documentation
+## Status
 
-The CHANGELOG records every release. Per-crate behaviour is documented
-inline in the source — start at each crate's `src/lib.rs` or `src/main.rs`.
+**v0.4.40** — the engine works end to end: discovery, both trading modes, risk-aware sizing, a bilingual desktop app, a live TUI. The road ahead: broker-agnostic adapters → a mobile monitor → a multi-node deployment. *v0.5 is "everything works."* We're close.
 
-## ⚖️ License
-Proprietary.
+## License
+
+Free to use, today. This is a gift while it earns the right to be more. The formal terms will follow the mission, not the other way around.
+
+<div align="center">
+
+*Built with discipline, in the open, by one person who believes the small trader deserves better tools.*
+
+</div>
