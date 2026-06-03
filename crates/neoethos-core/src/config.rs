@@ -339,15 +339,14 @@ impl Default for RiskConfig {
             ewma_lambda_by_timeframe.insert(tf.to_string(), lambda);
         }
 
-        // Honour the `NEOETHOS_PROP_FIRM_PRESET` env override at
-        // default-construction time. `config.yaml`'s `risk.preset` key
-        // overrides this when loaded (serde fills it post-construction);
-        // the env var is the next layer up so headless deployments can
-        // pin the preset without editing YAML.
-        let preset = std::env::var("NEOETHOS_PROP_FIRM_PRESET")
-            .ok()
-            .and_then(|raw| PropFirmPreset::parse(&raw))
-            .unwrap_or_default();
+        // Config is the single source: `config.yaml`'s `risk.preset` key drives
+        // the preset (serde fills it post-construction). The legacy
+        // `NEOETHOS_PROP_FIRM_PRESET` env override was retired in v0.4.36 —
+        // headless deployments set `risk.preset` in config.yaml instead. The
+        // default (`PropFirmPreset::default()`) is unchanged from the prior
+        // env-absent behaviour, so existing config.yaml / default users are
+        // unaffected; only env-only deployments must move the preset to YAML.
+        let preset = PropFirmPreset::default();
         let constraints = PropFirmConstraints::for_preset(preset);
         let runtime = PropFirmRuntimeDefaults::for_preset(preset);
         Self {
