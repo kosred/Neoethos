@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 import '../api/backend_client.dart';
 import '../api/currency_format.dart';
 import '../api/error_translation.dart';
+import '../l10n/app_localizations.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -25,6 +26,7 @@ class DashboardScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final snapshot = ref.watch(accountSnapshotProvider);
     final brokerAsync = ref.watch(brokerStatusProvider);
     return SingleChildScrollView(
@@ -38,14 +40,14 @@ class DashboardScreen extends ConsumerWidget {
         // operator sees the new state nearly instantly.
         Row(
           children: [
-            const Expanded(
+            Expanded(
               child: ViewHeader(
-                title: 'Operator Overview',
-                subtitle: 'Equity · open positions · engine status',
+                title: l10n.dashboardTitle,
+                subtitle: l10n.dashboardSubtitle,
               ),
             ),
             IconButton(
-              tooltip: 'Force refresh from broker (skip the 5 s safety timer)',
+              tooltip: l10n.dashboardRefreshTooltip,
               icon: snapshot.isLoading
                   ? const SizedBox(
                       width: 16,
@@ -80,12 +82,12 @@ class DashboardScreen extends ConsumerWidget {
         // panel the operator sees.
         const GrowthModeCard(),
         SectionCard(
-          title: 'Open Positions',
+          title: l10n.openPositions,
           child: _PositionsTable(snapshot: snapshot),
         ),
-        const SectionCard(
-          title: 'Engine Health',
-          child: _EngineHealthRow(),
+        SectionCard(
+          title: l10n.engineHealth,
+          child: const _EngineHealthRow(),
         ),
       ],
       ),
@@ -99,6 +101,7 @@ class _StatRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     // Use `valueOrNull` so an error during a periodic refresh keeps
     // the previous numbers on screen — we only fall back to em-dash
     // placeholders if no data has ever loaded.
@@ -162,7 +165,7 @@ class _StatRow extends StatelessWidget {
         : DateTime.fromMillisecondsSinceEpoch(data!.fetchedAtUnixMs!).toLocal();
     final asOfLabel = asOf == null
         ? null
-        : 'As of ${DateFormat('HH:mm:ss').format(asOf)} local';
+        : l10n.dashboardAsOf(DateFormat('HH:mm:ss').format(asOf));
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -180,7 +183,7 @@ class _StatRow extends StatelessWidget {
           shrinkWrap: true,
           physics: const NeverScrollableScrollPhysics(),
           children: [
-            StatCard(label: 'Balance', value: balance),
+            StatCard(label: l10n.ribbonBalance, value: balance),
             StatCard(label: 'Equity', value: equity, valueColor: equityColor),
             StatCard(label: 'Free Margin', value: freeMargin),
             StatCard(label: 'Used Margin', value: usedMargin),
@@ -189,7 +192,7 @@ class _StatRow extends StatelessWidget {
               value: marginLevel,
               valueColor: marginLevelColor,
             ),
-            StatCard(label: 'Open Positions', value: openCount),
+            StatCard(label: l10n.openPositions, value: openCount),
           ],
         ),
         if (asOfLabel != null) ...[
@@ -213,13 +216,14 @@ class _PositionsTable extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final positions = snapshot.valueOrNull?.positions ?? const [];
     if (positions.isEmpty) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 8),
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
         child: Text(
-          'No open positions.',
-          style: TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
+          l10n.dashboardNoPositions,
+          style: const TextStyle(color: NeoethosTokens.textMuted, fontSize: 12),
         ),
       );
     }
@@ -247,13 +251,13 @@ class _PositionsTable extends StatelessWidget {
         5: FlexColumnWidth(2),
       },
       children: [
-        const TableRow(children: [
-          _Th('Symbol'),
-          _Th('Side'),
-          _Th('Volume'),
-          _Th('Since'),
-          _Th('Pips'),
-          _Th('PnL'),
+        TableRow(children: [
+          _Th(l10n.thSymbol),
+          _Th(l10n.thSide),
+          _Th(l10n.thVolume),
+          _Th(l10n.thSince),
+          const _Th('Pips'),
+          const _Th('PnL'),
         ]),
         for (final p in positions)
           TableRow(children: [
@@ -291,6 +295,7 @@ class _AccountContextStrip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final acc = accountAsync.valueOrNull;
     final broker = brokerAsync.valueOrNull;
     final asOf = acc?.fetchedAtUnixMs == null
@@ -298,8 +303,8 @@ class _AccountContextStrip extends StatelessWidget {
         : DateTime.fromMillisecondsSinceEpoch(acc!.fetchedAtUnixMs!)
             .toLocal();
     final asOfLabel = asOf == null
-        ? 'no snapshot yet'
-        : 'snapshot ${DateFormat('HH:mm:ss').format(asOf)} local';
+        ? l10n.dashboardNoSnapshot
+        : l10n.dashboardSnapshotAt(DateFormat('HH:mm:ss').format(asOf));
     final environment = broker?.environment ?? '—';
     final envColor = environment.toLowerCase() == 'live'
         ? NeoethosTokens.sell
@@ -317,7 +322,7 @@ class _AccountContextStrip extends StatelessWidget {
       child: Row(
         children: [
           _ContextChip(
-            label: 'ACCOUNT',
+            label: l10n.chipAccount,
             value: broker?.accountId ?? '—',
           ),
           const SizedBox(width: 12),
@@ -327,13 +332,13 @@ class _AccountContextStrip extends StatelessWidget {
           ),
           const SizedBox(width: 12),
           _ContextChip(
-            label: 'ENVIRONMENT',
+            label: l10n.chipEnvironment,
             value: environment.toUpperCase(),
             color: envColor,
           ),
           const SizedBox(width: 12),
           _ContextChip(
-            label: 'CURRENCY',
+            label: l10n.chipCurrency,
             value: acc?.currency ?? '—',
           ),
           const Spacer(),
@@ -397,12 +402,11 @@ class _ErrorBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     final isBrokerNotReady = error is BrokerNotReadyException;
     final message = isBrokerNotReady
-        ? 'Connecting to broker… the bridge is up but cTrader hasn\'t '
-            'replied yet. Live numbers will appear once the first '
-            'refresh completes (≤ 5s).'
-        : 'Dashboard data unavailable — ${describeError(error)}';
+        ? l10n.dashboardConnecting
+        : l10n.dashboardDataUnavailable(describeError(error));
     final colour = isBrokerNotReady
         ? NeoethosTokens.textMuted
         : NeoethosTokens.sell;
@@ -439,13 +443,14 @@ class _EngineHealthRow extends ConsumerWidget {
   const _EngineHealthRow();
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
     final async = ref.watch(enginesProvider);
     return async.when(
       data: (e) => Row(
         children: [
           Expanded(
             child: StatCard(
-              label: 'Discovery',
+              label: l10n.engineDiscovery,
               value: e.discovery,
               valueColor: _colorFor(e.discovery),
             ),
@@ -453,7 +458,7 @@ class _EngineHealthRow extends ConsumerWidget {
           const SizedBox(width: 8),
           Expanded(
             child: StatCard(
-              label: 'Training',
+              label: l10n.engineTraining,
               value: e.training,
               valueColor: _colorFor(e.training),
             ),
@@ -461,7 +466,7 @@ class _EngineHealthRow extends ConsumerWidget {
           const SizedBox(width: 8),
           Expanded(
             child: StatCard(
-              label: 'Autonomous Trader',
+              label: l10n.statAutonomousTrader,
               value: e.autoTrader,
               valueColor: _colorFor(e.autoTrader),
             ),
@@ -491,15 +496,18 @@ class _EngineHealthRow extends ConsumerWidget {
 class _Skel extends StatelessWidget {
   const _Skel();
   @override
-  Widget build(BuildContext context) => const Row(
-        children: [
-          Expanded(child: StatCard(label: 'Discovery', value: '—')),
-          SizedBox(width: 8),
-          Expanded(child: StatCard(label: 'Training', value: '—')),
-          SizedBox(width: 8),
-          Expanded(child: StatCard(label: 'Autonomous Trader', value: '—')),
-        ],
-      );
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    return Row(
+      children: [
+        Expanded(child: StatCard(label: l10n.engineDiscovery, value: '—')),
+        const SizedBox(width: 8),
+        Expanded(child: StatCard(label: l10n.engineTraining, value: '—')),
+        const SizedBox(width: 8),
+        Expanded(child: StatCard(label: l10n.statAutonomousTrader, value: '—')),
+      ],
+    );
+  }
 }
 
 class _Th extends StatelessWidget {
