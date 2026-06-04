@@ -1,5 +1,6 @@
 use super::super::Ohlcv;
 use crate::core::all_indicators::ALL_INDICATORS;
+use rayon::prelude::*;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use vector_ta::indicators::dispatch::{
     IndicatorComputeRequest, IndicatorDataRef, IndicatorSeries, compute_cpu,
@@ -50,9 +51,9 @@ pub fn compute_classic_ta_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
         return vec![];
     }
 
-    let mut cols = Vec::new();
-
-    // 1. Pack data into VectorTA Candles struct
+    // 1. Pack data into VectorTA Candles struct (once; shared read-only
+    //    across the rayon workers below — `Candles` holds plain Vecs so it
+    //    is `Sync`).
     let timestamps = ohlcv.timestamp.clone().unwrap_or_else(|| vec![0i64; n]);
     let volume = ohlcv.volume.clone().unwrap_or_else(|| vec![0.0; n]);
 
@@ -65,84 +66,93 @@ pub fn compute_classic_ta_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
         volume,
     );
 
-    let data_ref = IndicatorDataRef::Candles {
-        candles: &candles,
-        source: None,
-    };
+    // 2. Dispatch to every known indicator — PARALLEL across indicators.
+    //    Each indicator is an independent pure function of the shared
+    //    `candles`, so the previous serial `for &id in ALL_INDICATORS`
+    //    loop becomes a rayon `par_iter`. `flat_map_iter` + `collect`
+    //    preserves the original column order exactly. The feature build
+    //    runs ONCE up-front (not inside the GA candidate `par_iter`), so
+    //    this does not nest with the discovery hot path. Each worker
+    //    re-creates the cheap `IndicatorDataRef` borrow of `candles`.
+    let mut cols: Vec<(String, Vec<f64>)> = ALL_INDICATORS
+        .par_iter()
+        .flat_map_iter(|&id| {
+            let mut out: Vec<(String, Vec<f64>)> = Vec::new();
+            let data_ref = IndicatorDataRef::Candles {
+                candles: &candles,
+                source: None,
+            };
+            let req = IndicatorComputeRequest {
+                indicator_id: id,
+                output_id: None,
+                data: data_ref,
+                params: &[],
+                kernel: Kernel::Auto,
+            };
+            // #212: a small subset of indicator/data combinations in
+            // vector-ta v0.2.9 panic instead of returning Err. Catch it
+            // per-indicator so one bad column never tears down the frame.
+            let computed = catch_unwind(AssertUnwindSafe(|| compute_cpu(req)));
+            let Ok(compute_result) = computed else {
+                tracing::warn!(
+                    target: "neoethos_data::hpc_ta",
+                    indicator = %id,
+                    rows = n,
+                    "vector-ta indicator kernel panicked; skipping column for this frame"
+                );
+                return out.into_iter();
+            };
+            if let Ok(output) = compute_result {
+                let rows = output.rows;
+                let out_cols = output.cols;
 
-    // 2. Dispatch to every known indicator using Default Parameters
-    for &id in ALL_INDICATORS {
-        let req = IndicatorComputeRequest {
-            indicator_id: id,
-            output_id: None,
-            data: data_ref,
-            params: &[],
-            kernel: Kernel::Auto,
-        };
-
-        // #212: a small subset of indicator/data combinations in
-        // vector-ta v0.2.9 panic instead of returning Err (e.g.
-        // `warm prefix exceeds row width`). The panic aborts the
-        // worker thread and tears down the TF run, so we catch it
-        // here, log once, and treat the indicator as unavailable
-        // for this frame.
-        let computed = catch_unwind(AssertUnwindSafe(|| compute_cpu(req)));
-        let Ok(compute_result) = computed else {
-            tracing::warn!(
-                target: "neoethos_data::hpc_ta",
-                indicator = %id,
-                rows = n,
-                "vector-ta indicator kernel panicked; skipping column for this frame"
-            );
-            continue;
-        };
-        if let Ok(output) = compute_result {
-            let rows = output.rows;
-            let out_cols = output.cols;
-
-            match output.series {
-                IndicatorSeries::F64(v) => {
-                    if out_cols <= 1 {
-                        // Single-output indicator
-                        if v.len() == n {
-                            cols.push((id.to_string(), v));
-                        } else if v.len() > n {
-                            let chunk: Vec<f64> = v.into_iter().take(n).collect();
-                            cols.push((id.to_string(), chunk));
-                        }
-                    } else {
-                        // Multi-output: decompose into separate columns
-                        // Data is stored row-major: [row0_col0, row0_col1, ..., row1_col0, ...]
-                        if v.len() == rows * out_cols && rows >= n {
-                            for c in 0..out_cols {
-                                let mut col_data = Vec::with_capacity(n);
-                                for r in 0..n {
-                                    col_data.push(v[r * out_cols + c]);
+                match output.series {
+                    IndicatorSeries::F64(v) => {
+                        if out_cols <= 1 {
+                            // Single-output indicator
+                            if v.len() == n {
+                                out.push((id.to_string(), v));
+                            } else if v.len() > n {
+                                let chunk: Vec<f64> = v.into_iter().take(n).collect();
+                                out.push((id.to_string(), chunk));
+                            }
+                        } else {
+                            // Multi-output: decompose into separate columns
+                            // Data is stored row-major: [row0_col0, row0_col1, ..., row1_col0, ...]
+                            if v.len() == rows * out_cols && rows >= n {
+                                for c in 0..out_cols {
+                                    let mut col_data = Vec::with_capacity(n);
+                                    for r in 0..n {
+                                        col_data.push(v[r * out_cols + c]);
+                                    }
+                                    out.push((format!("{}_line{}", id, c), col_data));
                                 }
-                                cols.push((format!("{}_line{}", id, c), col_data));
                             }
                         }
                     }
-                }
-                IndicatorSeries::I32(v) => {
-                    if v.len() == n {
-                        let cf: Vec<f64> = v.into_iter().map(|x| x as f64).collect();
-                        cols.push((id.to_string(), cf));
+                    IndicatorSeries::I32(v) => {
+                        if v.len() == n {
+                            let cf: Vec<f64> = v.into_iter().map(|x| x as f64).collect();
+                            out.push((id.to_string(), cf));
+                        }
                     }
-                }
-                IndicatorSeries::Bool(v) => {
-                    if v.len() == n {
-                        let cf: Vec<f64> =
-                            v.into_iter().map(|x| if x { 1.0 } else { 0.0 }).collect();
-                        cols.push((id.to_string(), cf));
+                    IndicatorSeries::Bool(v) => {
+                        if v.len() == n {
+                            let cf: Vec<f64> =
+                                v.into_iter().map(|x| if x { 1.0 } else { 0.0 }).collect();
+                            out.push((id.to_string(), cf));
+                        }
                     }
                 }
             }
-        }
-    }
+            out.into_iter()
+        })
+        .collect();
 
-    // 3. Multi-period variants for the most critical indicators
-    // The genetic engine benefits from seeing the same indicator at different lookback periods
+    // 3. Multi-period variants for the most critical indicators —
+    //    PARALLEL across the 18 indicators (each runs its own period
+    //    sweep serially inside the closure). Appended after the base
+    //    columns to preserve the original ordering exactly.
     let multi_period_ids = [
         "rsi",
         "ema",
@@ -165,70 +175,80 @@ pub fn compute_classic_ta_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
     ];
     let alt_periods = [7, 21, 50, 100, 200];
 
-    for &ind_id in &multi_period_ids {
-        for &period in &alt_periods {
-            // #212: pre-flight check — if the period is larger than the
-            // data length, vector-ta's `warm_prefix` exceeds the row
-            // width and the kernel panics at `helpers.rs:159` instead
-            // of returning Err. Skip the call entirely for these cases.
-            // The 1.25× safety margin matches the kernel's typical
-            // `first_valid_idx + period` formula plus a small headroom
-            // for indicators with extra warmup beyond the period itself.
-            if (period as f64) * 1.25 >= n as f64 {
-                continue;
-            }
-            let params = [vector_ta::indicators::dispatch::ParamKV {
-                key: "period",
-                value: vector_ta::indicators::dispatch::ParamValue::Int(period),
-            }];
-            let req = IndicatorComputeRequest {
-                indicator_id: ind_id,
-                output_id: None,
-                data: data_ref,
-                params: &params,
-                kernel: Kernel::Auto,
-            };
-            // #212: defense in depth — even after the pre-flight guard
-            // above, wrap the kernel call to ensure a panic in a
-            // less-common code path cannot tear down the TF run.
-            let computed = catch_unwind(AssertUnwindSafe(|| compute_cpu(req)));
-            let Ok(compute_result) = computed else {
-                tracing::warn!(
-                    target: "neoethos_data::hpc_ta",
-                    indicator = %ind_id,
-                    period = period,
-                    rows = n,
-                    "vector-ta multi-period kernel panicked; skipping column"
-                );
-                continue;
-            };
-            if let Ok(output) = compute_result {
-                match output.series {
-                    IndicatorSeries::F64(v) if v.len() == n => {
-                        cols.push((format!("{}_{}", ind_id, period), v));
-                    }
-                    IndicatorSeries::F64(v) if v.len() > n && output.cols <= 1 => {
-                        let chunk: Vec<f64> = v.into_iter().take(n).collect();
-                        cols.push((format!("{}_{}", ind_id, period), chunk));
-                    }
-                    IndicatorSeries::F64(v)
-                        if output.cols > 1
-                            && v.len() == output.rows * output.cols
-                            && output.rows >= n =>
-                    {
-                        for c in 0..output.cols {
-                            let mut col_data = Vec::with_capacity(n);
-                            for r in 0..n {
-                                col_data.push(v[r * output.cols + c]);
-                            }
-                            cols.push((format!("{}_{}_line{}", ind_id, period, c), col_data));
+    let multi_cols: Vec<(String, Vec<f64>)> = multi_period_ids
+        .par_iter()
+        .flat_map_iter(|&ind_id| {
+            let mut out: Vec<(String, Vec<f64>)> = Vec::new();
+            for &period in &alt_periods {
+                // #212: pre-flight check — if the period is larger than the
+                // data length, vector-ta's `warm_prefix` exceeds the row
+                // width and the kernel panics at `helpers.rs:159` instead
+                // of returning Err. Skip the call entirely for these cases.
+                // The 1.25× safety margin matches the kernel's typical
+                // `first_valid_idx + period` formula plus a small headroom
+                // for indicators with extra warmup beyond the period itself.
+                if (period as f64) * 1.25 >= n as f64 {
+                    continue;
+                }
+                let params = [vector_ta::indicators::dispatch::ParamKV {
+                    key: "period",
+                    value: vector_ta::indicators::dispatch::ParamValue::Int(period),
+                }];
+                let data_ref = IndicatorDataRef::Candles {
+                    candles: &candles,
+                    source: None,
+                };
+                let req = IndicatorComputeRequest {
+                    indicator_id: ind_id,
+                    output_id: None,
+                    data: data_ref,
+                    params: &params,
+                    kernel: Kernel::Auto,
+                };
+                // #212: defense in depth — even after the pre-flight guard
+                // above, wrap the kernel call to ensure a panic in a
+                // less-common code path cannot tear down the TF run.
+                let computed = catch_unwind(AssertUnwindSafe(|| compute_cpu(req)));
+                let Ok(compute_result) = computed else {
+                    tracing::warn!(
+                        target: "neoethos_data::hpc_ta",
+                        indicator = %ind_id,
+                        period = period,
+                        rows = n,
+                        "vector-ta multi-period kernel panicked; skipping column"
+                    );
+                    continue;
+                };
+                if let Ok(output) = compute_result {
+                    match output.series {
+                        IndicatorSeries::F64(v) if v.len() == n => {
+                            out.push((format!("{}_{}", ind_id, period), v));
                         }
+                        IndicatorSeries::F64(v) if v.len() > n && output.cols <= 1 => {
+                            let chunk: Vec<f64> = v.into_iter().take(n).collect();
+                            out.push((format!("{}_{}", ind_id, period), chunk));
+                        }
+                        IndicatorSeries::F64(v)
+                            if output.cols > 1
+                                && v.len() == output.rows * output.cols
+                                && output.rows >= n =>
+                        {
+                            for c in 0..output.cols {
+                                let mut col_data = Vec::with_capacity(n);
+                                for r in 0..n {
+                                    col_data.push(v[r * output.cols + c]);
+                                }
+                                out.push((format!("{}_{}_line{}", ind_id, period, c), col_data));
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
-        }
-    }
+            out.into_iter()
+        })
+        .collect();
+    cols.extend(multi_cols);
 
     cols
 }
