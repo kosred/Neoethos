@@ -41,13 +41,18 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
   // shallow defaults — the operator's saved values are authoritative).
   bool _loadedConfigDefaults = false;
 
-  // #264 (2026-05-29): Higher-timeframe multi-select. Defaults mirror
-  // the backend's `DEFAULT_HIGHER_TFS = ["M5", "M15", "H1"]` in
-  // `engines_control.rs:66` so an operator who never touches this
-  // chip row sees the same behaviour as the pre-#264 build. Picking
-  // any non-default subset overrides only the higher-TF context for
-  // the next discovery run.
-  final Set<String> _higherTfs = {'M5', 'M15', 'H1'};
+  // #264 (2026-05-29) · PARITY 2026-06-04: Higher-timeframe multi-select.
+  // EMPTY = "use the backend's config-resolved default ladder" — the SAME
+  // set a CLI `discover` with no `--higher` produces (the backend's
+  // `SystemConfig::resolve_higher_timeframes`, which honours
+  // `multi_resolution_timeframes` / `higher_timeframes` and may include
+  // lower TFs for a coarse base). The UI deliberately does NOT replicate
+  // that resolution — it can't without re-implementing the config logic and
+  // re-introducing the exact UI↔CLI drift this parity pass removed. So an
+  // untouched selection sends NO `higher_tfs` and the backend stays the
+  // single source of truth, identical to the CLI. Selecting any chip is an
+  // explicit per-run override.
+  final Set<String> _higherTfs = {};
 
   // #265 (2026-05-29): Sequential multi-pair queue. When the queue is
   // empty (`_symbolQueue.isEmpty`), the screen renders the existing
@@ -91,13 +96,21 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
   /// confirmation + portfolio diversification scoring). The constant
   /// is intentionally pessimistic — over-promising "5 minutes" and
   /// delivering "12 minutes" is much worse than the reverse.
+  /// Effective higher-TF count for the ETA + Advanced subtitle. An EMPTY chip
+  /// set means "the backend resolves the config default ladder"; for the
+  /// default config that is every canonical timeframe except the base (≈10,
+  /// since `multi_resolution_timeframes` defaults to all 11), so we surface
+  /// that pessimistic count instead of a misleading 0.
+  static const _defaultLadderHigherTfs = 10;
+  int _effectiveHigherTfCount() =>
+      _higherTfs.isEmpty ? _defaultLadderHigherTfs : _higherTfs.length;
+
   int _estimatedSeconds() {
     const msPerEval = 1.2;
-    // #264: fan-out tracks the actual higher-TF set size + 1 for the
-    // base TF. With the legacy `_higherTfs = {M5,M15,H1}` we still get
-    // the familiar ~6× constant (3 higher TFs × 2 cross-confirm passes
-    // = 6); narrowing the chip selection now also narrows the ETA.
-    final fanOut = (_higherTfs.length + 1) * 1.5;
+    // #264 · PARITY 2026-06-04: fan-out tracks the higher-TF set size + 1 for
+    // the base TF. An EMPTY chip set runs the backend's full config ladder, so
+    // `_effectiveHigherTfCount` estimates that path with the ladder count.
+    final fanOut = (_effectiveHigherTfCount() + 1) * 1.5;
     final evals = _population * _generations * _targetCandidates;
     final ms = evals * msPerEval * fanOut;
     return (ms / 1000).round();
@@ -209,7 +222,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
           l10n.discoveryAdvancedSubtitle(
             eta,
             _population * _generations * _targetCandidates,
-            _higherTfs.length,
+            _effectiveHigherTfCount(),
           ),
           style: const TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
         ),
@@ -267,15 +280,13 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
     );
   }
 
-  /// #264: Higher-timeframe chip row. Each chip is a `FilterChip`
-  /// over the canonical-timeframes list (from
-  /// `/broker/timeframes`, which mirrors
-  /// `neoethos_core::CANONICAL_TIMEFRAMES`). Empty selection is
-  /// rejected client-side — sending an empty list to the server
-  /// would fall back to DEFAULT_HIGHER_TFS silently, which is
-  /// confusing UX (operator thinks "no higher TFs" but actually
-  /// gets {M5,M15,H1}). We keep at least one chip selected at all
-  /// times.
+  /// #264 · PARITY 2026-06-04: Higher-timeframe chip row. Each chip is a
+  /// `FilterChip` over the canonical-timeframes list (from
+  /// `/broker/timeframes`, which mirrors `neoethos_core::CANONICAL_TIMEFRAMES`).
+  /// An EMPTY selection is VALID and is the default: it sends no `higher_tfs`
+  /// override, so the backend resolves the operator's config default ladder via
+  /// `SystemConfig::resolve_higher_timeframes` — identical to a CLI `discover`
+  /// with no `--higher`. Selecting chips overrides the ladder for that run only.
   Widget _higherTfChips() {
     final l10n = AppLocalizations.of(context)!;
     final tfAsync = ref.watch(brokerTimeframesProvider);
@@ -322,19 +333,14 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                               setState(() {
                                 if (sel) {
                                   _higherTfs.add(tf);
-                                } else if (_higherTfs.length > 1) {
-                                  // Refuse to deselect the LAST chip
-                                  // (empty list would silently fall
-                                  // back to the server default).
-                                  _higherTfs.remove(tf);
                                 } else {
-                                  ScaffoldMessenger.of(context)
-                                      .showSnackBar(SnackBar(
-                                    content: Text(
-                                      l10n.discoveryKeepOneTf,
-                                    ),
-                                    duration: const Duration(seconds: 2),
-                                  ));
+                                  // PARITY 2026-06-04: deselecting the last
+                                  // chip is now allowed — an empty set means
+                                  // "use the backend's config-resolved default
+                                  // ladder" (the run sends no higher_tfs
+                                  // override), so there is no silent surprise
+                                  // left to guard against.
+                                  _higherTfs.remove(tf);
                                 }
                               });
                             },
@@ -699,13 +705,10 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
   Future<void> _runQueue() async {
     if (_symbolQueue.isEmpty || _queueRunning) return;
     final l10n = AppLocalizations.of(context)!;
-    if (_higherTfs.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(l10n.discoverySelectHigherTf),
-        duration: const Duration(seconds: 2),
-      ));
-      return;
-    }
+    // PARITY 2026-06-04: an empty higher-TF set is VALID — it means "let the
+    // backend resolve the config default ladder" (no higher_tfs override),
+    // identical to a CLI `discover` with no `--higher`. So there is no longer
+    // an empty-selection gate here.
 
     setState(() {
       _queueRunning = true;

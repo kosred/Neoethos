@@ -68,8 +68,11 @@ pub async fn promotion_status(
     State(_state): State<AppApiState>,
     Query(q): Query<PromotionQuery>,
 ) -> Response {
-    let symbol = q.symbol.unwrap_or_else(|| "EURUSD".to_string());
-    let base_tf = q.base_tf.unwrap_or_else(|| "M5".to_string());
+    // 2026-06-04 PARITY: empty → resolved from config.yaml inside
+    // evaluate_promotion_for (shared SystemConfig resolvers), not a hardcoded
+    // "EURUSD"/"M5" that ignored the operator's configured symbol/base.
+    let symbol = q.symbol.unwrap_or_default();
+    let base_tf = q.base_tf.unwrap_or_default();
 
     let result =
         tokio::task::spawn_blocking(move || evaluate_promotion_for(&symbol, &base_tf)).await;
@@ -98,8 +101,21 @@ fn evaluate_promotion_for(symbol: &str, base_tf: &str) -> anyhow::Result<Promoti
     let settings = Settings::from_yaml(&config_path)
         .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
     let gate_config = load_gate_config(&settings);
+    // 2026-06-04 PARITY: an empty symbol/base (request omitted it) resolves to
+    // the configured default via the SAME shared SystemConfig resolvers the CLI
+    // and the discovery/training endpoints use — never a hardcoded EURUSD/M5.
+    let symbol = if symbol.trim().is_empty() {
+        settings.system.resolve_symbol()
+    } else {
+        symbol.trim().to_uppercase()
+    };
+    let base_tf = if base_tf.trim().is_empty() {
+        settings.system.resolve_base_timeframe()
+    } else {
+        base_tf.trim().to_uppercase()
+    };
     let data_root = settings.system.data_dir;
-    let path = model_targets_path_for(&data_root, symbol, base_tf);
+    let path = model_targets_path_for(&data_root, &symbol, &base_tf);
 
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -185,8 +201,10 @@ pub async fn promote(
     State(_state): State<AppApiState>,
     Json(body): Json<PromoteBody>,
 ) -> Response {
-    let symbol = body.symbol.unwrap_or_else(|| "EURUSD".to_string());
-    let base_tf = body.base_tf.unwrap_or_else(|| "M5".to_string());
+    // 2026-06-04 PARITY: empty → resolved from config.yaml inside
+    // evaluate_promotion_for, matching the discovery/training defaults.
+    let symbol = body.symbol.unwrap_or_default();
+    let base_tf = body.base_tf.unwrap_or_default();
 
     let result = tokio::task::spawn_blocking(move || promote_if_gated(&symbol, &base_tf)).await;
     match result {

@@ -461,7 +461,7 @@
   "discoverySliderPortfolioSize": "Portfolio size",
   "discoverySliderPortfolioSizeHint": "Final selected portfolio size — what Training will pick up.",
   "discoveryHigherTfTitle": "Higher timeframes (multi-select)",
-  "discoveryHigherTfExplainer": "Discovery cross-confirms entries against these higher TFs in addition to the base TF. Default mirrors backend DEFAULT_HIGHER_TFS (M5/M15/H1).",
+  "discoveryHigherTfExplainer": "Discovery cross-confirms entries against these higher TFs on top of the base TF. Leave all unselected to use your config's default ladder (identical to a CLI discover run); select specific chips to override it for this run only.",
   "discoveryTimeframesEmpty": "/broker/timeframes returned an empty list — check neoethos_core::CANONICAL_TIMEFRAMES.",
   "discoveryKeepOneTf": "Keep at least one higher TF — empty selection would silently fall back to the server default.",
   "discoveryLoadingTimeframes": "Loading /broker/timeframes…",

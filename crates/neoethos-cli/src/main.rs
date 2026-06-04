@@ -202,8 +202,8 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
     let root = parse_root(args, settings.as_ref());
     let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
     let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
-    let higher =
-        parse_flag(args, "--higher").unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref()));
+    let higher = parse_flag(args, "--higher")
+        .unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref(), &base));
     let higher_list: Vec<String> = higher
         .split(',')
         .filter(|s| !s.is_empty())
@@ -320,8 +320,8 @@ fn cmd_search(args: &[String]) -> Result<()> {
     let root = parse_root(args, settings.as_ref());
     let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
     let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
-    let higher =
-        parse_flag(args, "--higher").unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref()));
+    let higher = parse_flag(args, "--higher")
+        .unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref(), &base));
     let genes: usize = parse_flag(args, "--genes")
         .and_then(|v| v.parse().ok())
         .unwrap_or(defaults.population);
@@ -403,7 +403,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
         let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
         let higher = parse_flag(args, "--higher")
-            .unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref()));
+            .unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref(), &base));
         // F-304 fix (2026-05-28): bind the account currency for the
         // cost model. Resolution order:
         //   1. `--account-currency` CLI flag (operator-explicit)
@@ -828,8 +828,11 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
             sym.clone(),
             "--base".to_string(),
             tf.clone(),
-            "--higher".to_string(),
-            "H4".to_string(),
+            // 2026-06-04 parity: no hardcoded `--higher H4`. Omitting `--higher`
+            // lets cmd_discover resolve the higher-TF ladder from config relative
+            // to THIS base (`tf`) via the shared `resolve_higher_timeframes`, so
+            // every base in the sweep gets its correct top-down context — same as
+            // a standalone `discover` run (H4-as-base no longer self-references).
             "--root".to_string(),
             root.clone(),
             "--population".to_string(),
@@ -1383,8 +1386,12 @@ fn default_symbol(settings: Option<&neoethos_core::Settings>) -> String {
     // code rejects empty symbols (see `default_pip_size` returning NaN
     // for empty input → fitness guard rejects) so the operator gets a
     // clear "symbol required" error instead of silent EURUSD execution.
+    // SHARED resolution (2026-06-04 parity unification): the Some branch now
+    // delegates to `SystemConfig::resolve_symbol` in neoethos-core — the SAME
+    // function the app server calls — so UI and CLI can never diverge. Only the
+    // None-path F-CORE2 error logging stays CLI-specific.
     match settings {
-        Some(settings) => settings.system.symbol.clone(),
+        Some(settings) => settings.system.resolve_symbol(),
         None => {
             tracing::error!(
                 target: "neoethos_cli::defaults",
@@ -1400,8 +1407,9 @@ fn default_symbol(settings: Option<&neoethos_core::Settings>) -> String {
 fn default_base_tf(settings: Option<&neoethos_core::Settings>) -> String {
     // **F-648 / F-CORE2 closure (2026-05-25)**: previously fell back to
     // `"M1"` when settings was None. Same fix as `default_symbol`.
+    // 2026-06-04 parity: Some branch delegates to the shared core resolver.
     match settings {
-        Some(settings) => settings.system.base_timeframe.clone(),
+        Some(settings) => settings.system.resolve_base_timeframe(),
         None => {
             tracing::error!(
                 target: "neoethos_cli::defaults",
@@ -1414,41 +1422,13 @@ fn default_base_tf(settings: Option<&neoethos_core::Settings>) -> String {
     }
 }
 
-fn default_higher_tfs_csv(settings: Option<&neoethos_core::Settings>) -> String {
+/// Resolve the higher-TF CSV for the **effective** `base` (which may be a
+/// `--base` override, not the config base). Delegates the actual selection to
+/// the shared `SystemConfig::resolve_higher_timeframes` so the CLI and the app
+/// server always pick the same ladder.
+fn default_higher_tfs_csv(settings: Option<&neoethos_core::Settings>, base: &str) -> String {
     settings
-        .map(|settings| {
-            if settings.system.multi_resolution_enabled
-                && !settings.system.multi_resolution_timeframes.is_empty()
-            {
-                settings
-                    .system
-                    .multi_resolution_timeframes
-                    .iter()
-                    .filter(|timeframe| {
-                        !timeframe.eq_ignore_ascii_case(&settings.system.base_timeframe)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(",")
-            } else {
-                // Filter the configured higher TFs to those strictly ABOVE the
-                // base in canonical order. The base-agnostic config default is
-                // the FULL canonical set, so this yields the complete top-down
-                // ladder above the base (never a lower TF, which is meaningless
-                // as higher-TF context for a coarse base like H1).
-                let above = neoethos_core::canonical_higher_timeframes(
-                    &settings.system.base_timeframe,
-                );
-                settings
-                    .system
-                    .higher_timeframes
-                    .iter()
-                    .filter(|tf| above.iter().any(|a| a.eq_ignore_ascii_case(tf)))
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(",")
-            }
-        })
+        .map(|settings| settings.system.resolve_higher_timeframes(base).join(","))
         .unwrap_or_default()
 }
 

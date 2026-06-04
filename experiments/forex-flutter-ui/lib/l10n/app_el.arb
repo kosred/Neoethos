@@ -264,7 +264,7 @@
   "discoverySliderPortfolioSize": "Μέγεθος χαρτοφυλακίου",
   "discoverySliderPortfolioSizeHint": "Τελικό μέγεθος επιλεγμένου χαρτοφυλακίου — αυτό που θα παραλάβει η Εκπαίδευση.",
   "discoveryHigherTfTitle": "Υψηλότερα χρονικά πλαίσια (πολλαπλή επιλογή)",
-  "discoveryHigherTfExplainer": "Η Ανακάλυψη επιβεβαιώνει διασταυρωτικά τις εισόδους έναντι αυτών των υψηλότερων TF επιπλέον του βασικού TF. Η προεπιλογή αντικατοπτρίζει το backend DEFAULT_HIGHER_TFS (M5/M15/H1).",
+  "discoveryHigherTfExplainer": "Η Ανακάλυψη επιβεβαιώνει διασταυρωτικά τις εισόδους έναντι αυτών των υψηλότερων TF επιπλέον του βασικού TF. Άφησέ τα όλα αποεπιλεγμένα για να χρησιμοποιηθεί το προεπιλεγμένο ladder από το config σου (ίδιο με ένα CLI discover)· επίλεξε συγκεκριμένα chips για override μόνο σε αυτό το run.",
   "discoveryTimeframesEmpty": "Το /broker/timeframes επέστρεψε κενή λίστα — ελέγξτε το neoethos_core::CANONICAL_TIMEFRAMES.",
   "discoveryKeepOneTf": "Κρατήστε τουλάχιστον ένα υψηλότερο TF — η κενή επιλογή θα επέστρεφε σιωπηλά στην προεπιλογή του διακομιστή.",
   "discoveryLoadingTimeframes": "Φόρτωση /broker/timeframes…",

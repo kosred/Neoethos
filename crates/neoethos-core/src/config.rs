@@ -246,6 +246,53 @@ impl Default for SystemConfig {
     }
 }
 
+impl SystemConfig {
+    /// Resolve the effective **base timeframe** from config.
+    ///
+    /// THE single source of truth shared by BOTH the CLI (`default_base_tf`)
+    /// and the app server (`/engines/*/start`) so the two never diverge.
+    /// Operator mandate (2026-06-04): the bot must behave identically whether
+    /// driven from the UI or the CLI — no difference anywhere.
+    pub fn resolve_base_timeframe(&self) -> String {
+        self.base_timeframe.trim().to_string()
+    }
+
+    /// Resolve the effective **symbol** from config (shared by CLI + server).
+    pub fn resolve_symbol(&self) -> String {
+        self.symbol.trim().to_string()
+    }
+
+    /// Resolve the effective **higher timeframes** for an already-resolved
+    /// `base`, honouring `multi_resolution_enabled` / `multi_resolution_timeframes`
+    /// / `higher_timeframes` exactly. SHARED by CLI + server.
+    ///
+    /// - When multi-resolution is on and a non-empty explicit list is set, that
+    ///   list wins (minus any entry equal to `base`).
+    /// - Otherwise the configured `higher_timeframes` are filtered to those
+    ///   strictly *above* `base` in canonical order (never a lower/equal TF).
+    ///
+    /// The filter is relative to the **effective** `base` passed in (which may be
+    /// a CLI `--base` / payload override), not necessarily `self.base_timeframe`
+    /// — so an overridden base always gets the correct top-down ladder above it.
+    pub fn resolve_higher_timeframes(&self, base: &str) -> Vec<String> {
+        let base_trim = base.trim();
+        if self.multi_resolution_enabled && !self.multi_resolution_timeframes.is_empty() {
+            self.multi_resolution_timeframes
+                .iter()
+                .map(|tf| tf.trim().to_string())
+                .filter(|tf| !tf.is_empty() && !tf.eq_ignore_ascii_case(base_trim))
+                .collect()
+        } else {
+            let above = crate::contracts::canonical_higher_timeframes(base_trim);
+            self.higher_timeframes
+                .iter()
+                .map(|tf| tf.trim().to_string())
+                .filter(|tf| !tf.is_empty() && above.iter().any(|a| a.eq_ignore_ascii_case(tf)))
+                .collect()
+        }
+    }
+}
+
 /// Risk management configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1959,6 +2006,73 @@ mod tests {
         );
         assert_eq!(settings.risk.initial_balance, 10_000.0);
         assert!(!settings.models.ml_models.is_empty());
+    }
+
+    // ─── UI↔CLI parity: the shared timeframe/symbol resolvers ───────────────
+    // These lock the behaviour of `SystemConfig::resolve_*`, the SINGLE source
+    // of truth that BOTH `neoethos-cli` and the app server call. If this drifts,
+    // the two entry points would search differently from the same config —
+    // exactly the divergence the 2026-06-04 parity pass removed.
+
+    #[test]
+    fn resolve_higher_timeframes_default_config_multi_resolution() {
+        // Default: multi_resolution_enabled = true and the multi-res list is the
+        // FULL canonical set → "every configured TF except the effective base".
+        let sys = SystemConfig::default();
+
+        let m1 = sys.resolve_higher_timeframes("M1");
+        assert_eq!(
+            m1,
+            vec!["M3", "M5", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1"],
+            "M1 base → all canonical above M1"
+        );
+        assert!(!m1.iter().any(|tf| tf == "M1"), "base itself is excluded");
+
+        // base=H1: multi-resolution keeps LOWER TFs (M1..M30) as extra context
+        // too — only the base is dropped. The Flutter UI cannot replicate this,
+        // which is precisely why an untouched UI sends no override and lets this
+        // resolver decide (parity with the CLI).
+        let h1 = sys.resolve_higher_timeframes("H1");
+        assert!(h1.contains(&"M5".to_string()), "lower TFs retained under multi-res");
+        assert!(h1.contains(&"H4".to_string()), "higher TFs retained");
+        assert!(!h1.iter().any(|tf| tf == "H1"), "base itself is excluded");
+        assert_eq!(h1.len(), 10, "all 11 canonical minus the base");
+
+        // Effective-base relativity: an overridden base trims itself out even
+        // when it differs from `self.base_timeframe`.
+        assert!(!sys.resolve_higher_timeframes("H4").iter().any(|tf| tf == "H4"));
+    }
+
+    #[test]
+    fn resolve_higher_timeframes_multi_resolution_off_filters_strictly_above() {
+        // multi_resolution OFF → higher_timeframes filtered to strictly-above
+        // the base in canonical order (never a lower/equal TF).
+        let mut sys = SystemConfig::default();
+        sys.multi_resolution_enabled = false;
+        assert_eq!(
+            sys.resolve_higher_timeframes("H1"),
+            vec!["H4", "H12", "D1", "W1", "MN1"],
+            "H1 base, multi-res off → only canonical TFs strictly above H1"
+        );
+
+        // An operator exclusion in higher_timeframes is honoured, and entries
+        // not strictly above the base are dropped (D1/H4 kept, M5 below M1? no —
+        // M5 is above M1, so it stays; M1-equal would be dropped).
+        sys.higher_timeframes = vec!["H4".to_string(), "D1".to_string(), "M5".to_string()];
+        assert_eq!(
+            sys.resolve_higher_timeframes("H1"),
+            vec!["H4", "D1"],
+            "restricted higher_timeframes respected; M5 (below H1) excluded"
+        );
+    }
+
+    #[test]
+    fn resolve_base_and_symbol_trim_preserve_config_value() {
+        let mut sys = SystemConfig::default();
+        sys.base_timeframe = "  H4 ".to_string();
+        sys.symbol = " EURUSD ".to_string();
+        assert_eq!(sys.resolve_base_timeframe(), "H4");
+        assert_eq!(sys.resolve_symbol(), "EURUSD");
     }
 
     #[test]
