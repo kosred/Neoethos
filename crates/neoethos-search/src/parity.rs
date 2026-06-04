@@ -126,7 +126,7 @@ mod tests {
         FeatureFrame {
             timestamps,
             names: vec!["momentum".to_string(), "reversion".to_string()],
-            data: arr2(&[
+            data: neoethos_data::FeatureData::InMemory(arr2(&[
                 [0.10, -0.10],
                 [0.35, -0.20],
                 [0.60, -0.30],
@@ -139,7 +139,7 @@ mod tests {
                 [0.05, -0.05],
                 [-0.50, 0.55],
                 [-0.65, 0.70],
-            ]),
+            ])),
         }
     }
 

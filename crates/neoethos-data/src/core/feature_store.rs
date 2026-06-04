@@ -30,10 +30,11 @@
 //! is the `[n_features × n_samples]` matrix in C (row-major) order.
 
 use anyhow::{Context, Result, ensure};
-use memmap2::{Mmap, MmapMut};
+use memmap2::Mmap;
 use ndarray::ArrayView2;
 use std::fs::OpenOptions;
-use std::path::Path;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 
@@ -67,84 +68,92 @@ fn bytes_as_f32(b: &[u8]) -> &[f32] {
 /// per-TF and writes each TF's features at their global row offsets), then
 /// `finish()` to flush.
 pub struct FeatureStoreWriter {
-    mmap: MmapMut,
-    n_features: usize,
+    file: BufWriter<std::fs::File>,
     n_samples: usize,
+    n_written: usize,
 }
 
 impl FeatureStoreWriter {
-    pub fn create(path: &Path, n_features: usize, n_samples: usize) -> Result<Self> {
-        let len = n_features
-            .checked_mul(n_samples)
-            .and_then(|v| v.checked_mul(F32_BYTES))
-            .context("feature store size overflow (n_features * n_samples * 4)")?;
+    /// Create an empty append-mode writer. Stream features in with
+    /// [`Self::append_feature`] (one full `n_samples` series each); the feature
+    /// count is the number of appends and is returned by [`Self::finish`] — no
+    /// upfront total is needed, which is exactly what the per-TF build wants.
+    pub fn create(path: &Path, n_samples: usize) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         let file = OpenOptions::new()
-            .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(path)
             .with_context(|| format!("create feature store {}", path.display()))?;
-        file.set_len(len as u64)
-            .with_context(|| format!("set_len {} on feature store", len))?;
-        // SAFETY: we own the file, it is sized to `len`, and no other process
-        // maps it concurrently during the build.
-        let mmap = unsafe { MmapMut::map_mut(&file) }.context("mmap_mut feature store")?;
         Ok(Self {
-            mmap,
-            n_features,
+            file: BufWriter::with_capacity(1 << 20, file),
             n_samples,
+            n_written: 0,
         })
     }
 
     #[inline]
-    pub fn n_features(&self) -> usize {
-        self.n_features
-    }
-    #[inline]
     pub fn n_samples(&self) -> usize {
         self.n_samples
     }
+    #[inline]
+    pub fn n_features(&self) -> usize {
+        self.n_written
+    }
 
-    /// Write feature `idx`'s full series (`n_samples` values) at its row offset.
-    pub fn write_feature(&mut self, idx: usize, series: &[f32]) -> Result<()> {
-        ensure!(
-            idx < self.n_features,
-            "feature idx {idx} >= n_features {}",
-            self.n_features
-        );
+    /// Append one feature's full time series (`n_samples` values) as the next
+    /// feature-major row. Streaming (RAM-bounded) — no whole-matrix buffer.
+    pub fn append_feature(&mut self, series: &[f32]) -> Result<()> {
         ensure!(
             series.len() == self.n_samples,
             "feature series len {} != n_samples {}",
             series.len(),
             self.n_samples
         );
-        let start = idx * self.n_samples * F32_BYTES;
-        let bytes: &[u8] = f32_as_bytes(series);
-        self.mmap[start..start + bytes.len()].copy_from_slice(bytes);
+        self.file
+            .write_all(f32_as_bytes(series))
+            .context("append feature to store")?;
+        self.n_written += 1;
         Ok(())
     }
 
-    /// Flush all writes to disk.
-    pub fn finish(self) -> Result<()> {
-        self.mmap.flush().context("flush feature store")?;
-        Ok(())
+    /// Flush and return the number of features written.
+    pub fn finish(mut self) -> Result<usize> {
+        self.file.flush().context("flush feature store")?;
+        Ok(self.n_written)
     }
 }
 
 /// Read-only, mmap'd feature store — `[n_features × n_samples]` `f32`,
-/// feature-major. Cheap to clone-by-reopen; `feature_row` is zero-copy.
+/// feature-major. `feature_row` is zero-copy.
+///
+/// When `delete_on_drop` is set, the backing file is removed when the store
+/// drops (the mmap is unmapped first, as Windows refuses to delete a mapped
+/// file). This is the discovery path: a per-(symbol, timeframe) store can be
+/// ~13 GB for full M1 data, so leaving 14 symbols' stores on disk would
+/// accumulate ~180 GB. RAII cleanup ties each store's lifetime to the
+/// `FeatureFrame` (held in an `Arc`, so the file is removed exactly once when
+/// the last reference drops — typically at the end of that discovery run).
+#[derive(Debug)]
 pub struct FeatureStore {
-    mmap: Mmap,
+    /// `Option` so `Drop` can unmap (take) before deleting the file.
+    mmap: Option<Mmap>,
     n_features: usize,
     n_samples: usize,
+    path: PathBuf,
+    delete_on_drop: bool,
 }
 
 impl FeatureStore {
-    pub fn open(path: &Path, n_features: usize, n_samples: usize) -> Result<Self> {
+    pub fn open(
+        path: &Path,
+        n_features: usize,
+        n_samples: usize,
+        delete_on_drop: bool,
+    ) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .open(path)
@@ -163,10 +172,23 @@ impl FeatureStore {
             expect
         );
         Ok(Self {
-            mmap,
+            mmap: Some(mmap),
             n_features,
             n_samples,
+            path: path.to_path_buf(),
+            delete_on_drop,
         })
+    }
+
+    /// Bytes of the live mmap. Panics only if called after `Drop` took it,
+    /// which cannot happen through a live `&self`.
+    #[inline]
+    fn bytes(&self) -> &[f32] {
+        bytes_as_f32(
+            self.mmap
+                .as_ref()
+                .expect("feature store mmap is live for the store's lifetime"),
+        )
     }
 
     #[inline]
@@ -184,7 +206,7 @@ impl FeatureStore {
     #[inline]
     pub fn feature_row(&self, idx: usize) -> &[f32] {
         debug_assert!(idx < self.n_features);
-        let all: &[f32] = bytes_as_f32(&self.mmap);
+        let all: &[f32] = self.bytes();
         let start = idx * self.n_samples;
         &all[start..start + self.n_samples]
     }
@@ -193,12 +215,33 @@ impl FeatureStore {
     /// GA eval's `indicators` `ArrayView2` (so `view.row(idx)` is feature
     /// `idx`'s series, contiguous, OS-paged on demand).
     pub fn as_view(&self) -> ArrayView2<'_, f32> {
-        let all: &[f32] = bytes_as_f32(&self.mmap);
+        let all: &[f32] = self.bytes();
         ArrayView2::from_shape(
             (self.n_features, self.n_samples),
             &all[..self.n_features * self.n_samples],
         )
         .expect("feature store dimensions match the mmap length")
+    }
+}
+
+impl Drop for FeatureStore {
+    fn drop(&mut self) {
+        if self.delete_on_drop {
+            // Unmap BEFORE deleting — Windows denies removal of a mapped file.
+            self.mmap = None;
+            if let Err(e) = std::fs::remove_file(&self.path) {
+                // Best-effort: a leftover temp file is harmless (next run
+                // truncate-creates over it); only warn so disk creep is visible.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        target: "neoethos_data::feature_store",
+                        path = %self.path.display(),
+                        error = %e,
+                        "failed to remove feature store backing file on drop"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -213,13 +256,13 @@ mod tests {
         let path = dir.join("roundtrip.fstore");
         let (nf, ns) = (3usize, 5usize);
         {
-            let mut w = FeatureStoreWriter::create(&path, nf, ns).unwrap();
-            w.write_feature(0, &[0.0, 1.0, 2.0, 3.0, 4.0]).unwrap();
-            w.write_feature(2, &[20.0, 21.0, 22.0, 23.0, 24.0]).unwrap();
-            w.write_feature(1, &[10.0, 11.0, 12.0, 13.0, 14.0]).unwrap();
-            w.finish().unwrap();
+            let mut w = FeatureStoreWriter::create(&path, ns).unwrap();
+            w.append_feature(&[0.0, 1.0, 2.0, 3.0, 4.0]).unwrap();
+            w.append_feature(&[10.0, 11.0, 12.0, 13.0, 14.0]).unwrap();
+            w.append_feature(&[20.0, 21.0, 22.0, 23.0, 24.0]).unwrap();
+            assert_eq!(w.finish().unwrap(), nf);
         }
-        let s = FeatureStore::open(&path, nf, ns).unwrap();
+        let s = FeatureStore::open(&path, nf, ns, false).unwrap();
         assert_eq!(s.n_features(), nf);
         assert_eq!(s.n_samples(), ns);
         assert_eq!(s.feature_row(1), &[10.0, 11.0, 12.0, 13.0, 14.0]);
@@ -227,5 +270,26 @@ mod tests {
         assert_eq!(v.dim(), (nf, ns));
         assert_eq!(v.row(2).to_vec(), vec![20.0, 21.0, 22.0, 23.0, 24.0]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delete_on_drop_removes_backing_file() {
+        let dir = std::env::temp_dir().join("neoethos_fs_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("delete_on_drop.fstore");
+        {
+            let mut w = FeatureStoreWriter::create(&path, 2).unwrap();
+            w.append_feature(&[1.0, 2.0]).unwrap();
+            assert_eq!(w.finish().unwrap(), 1);
+        }
+        assert!(path.exists(), "store file should exist after writing");
+        {
+            let s = FeatureStore::open(&path, 1, 2, true).unwrap();
+            assert_eq!(s.feature_row(0), &[1.0, 2.0]);
+        } // store drops here → file removed
+        assert!(
+            !path.exists(),
+            "delete_on_drop store must remove its backing file on drop"
+        );
     }
 }

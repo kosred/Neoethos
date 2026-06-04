@@ -36,7 +36,8 @@ pub use contracts::{
     RuntimeSafetyIssue, RuntimeSafetyReport, SearchCheckpointArtifact,
     SearchCheckpointArtifactContract, TimestampPolicy, TimestampUnit, TrainingModelArtifact,
     TrainingModelArtifactContract, TypedArtifactEnvelope, ValidationEvidenceCheck,
-    ValidationEvidenceKind, ValidationEvidenceManifest, is_canonical_timeframe,
+    ValidationEvidenceKind, ValidationEvidenceManifest, canonical_higher_timeframes,
+    is_canonical_timeframe,
 };
 pub use domain::PropFirmConstraints;
 pub use domain::{

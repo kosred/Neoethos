@@ -6556,6 +6556,7 @@ dependencies = [
  "ndarray 0.17.2",
  "neoethos-core",
  "polars",
+ "rayon",
  "serde",
  "serde_json",
  "tracing",

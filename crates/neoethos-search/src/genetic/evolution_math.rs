@@ -615,19 +615,23 @@ fn random_coarse_threshold(rng: &mut impl Rng) -> f32 {
 ///
 /// Returns `None` when the cube is empty or has zero finite values.
 pub fn derive_adaptive_threshold_ladder_from_features(
-    feature_data: &ndarray::Array2<f32>,
+    features: &neoethos_data::FeatureFrame,
 ) -> Option<[f32; 6]> {
-    let n_cols = feature_data.ncols();
-    let n_rows = feature_data.nrows();
+    let n_cols = features.n_features();
+    let n_rows = features.n_samples();
     if n_cols == 0 || n_rows == 0 {
         return None;
     }
 
-    // Per-column median |value|.
+    // Per-column median |value|. `feature_column` yields one contiguous series
+    // per call — for the mmap backing this is a single feature-major row read,
+    // so the scan is sequential rather than strided across the whole matrix.
     let mut per_col_median_abs: Vec<f32> = Vec::with_capacity(n_cols);
     for c in 0..n_cols {
-        let mut abs_vals: Vec<f32> = (0..n_rows)
-            .map(|r| feature_data[(r, c)])
+        let mut abs_vals: Vec<f32> = features
+            .feature_column(c)
+            .iter()
+            .copied()
             .filter(|v| v.is_finite())
             .map(|v| v.abs())
             .collect();
@@ -1058,23 +1062,30 @@ mod tests {
 
     // ─── F-277 adaptive threshold ladder tests ────────────────────────
 
+    // The ladder fn moved from a raw `Array2` to the out-of-core-aware
+    // `FeatureFrame`; wrap each test cube (timestamps/names are irrelevant to
+    // the per-column magnitude math).
+    fn frame_of(a: ndarray::Array2<f32>) -> neoethos_data::FeatureFrame {
+        neoethos_data::FeatureFrame::from_array(Vec::new(), Vec::new(), a)
+    }
+
     #[test]
     fn derive_ladder_returns_none_for_empty_cube() {
         let empty: ndarray::Array2<f32> = ndarray::Array2::zeros((0, 0));
-        assert!(derive_adaptive_threshold_ladder_from_features(&empty).is_none());
+        assert!(derive_adaptive_threshold_ladder_from_features(&frame_of(empty)).is_none());
 
         let no_rows: ndarray::Array2<f32> = ndarray::Array2::zeros((0, 5));
-        assert!(derive_adaptive_threshold_ladder_from_features(&no_rows).is_none());
+        assert!(derive_adaptive_threshold_ladder_from_features(&frame_of(no_rows)).is_none());
 
         let no_cols: ndarray::Array2<f32> = ndarray::Array2::zeros((100, 0));
-        assert!(derive_adaptive_threshold_ladder_from_features(&no_cols).is_none());
+        assert!(derive_adaptive_threshold_ladder_from_features(&frame_of(no_cols)).is_none());
     }
 
     #[test]
     fn derive_ladder_returns_none_for_all_nan_cube() {
         let mut data: ndarray::Array2<f32> = ndarray::Array2::zeros((10, 3));
         data.fill(f32::NAN);
-        assert!(derive_adaptive_threshold_ladder_from_features(&data).is_none());
+        assert!(derive_adaptive_threshold_ladder_from_features(&frame_of(data)).is_none());
     }
 
     #[test]
@@ -1087,7 +1098,7 @@ mod tests {
             data[(r, 2)] = (r as f32) * 0.10; // 0..10.0 — large (will clamp)
             data[(r, 3)] = -(r as f32) * 0.02; // negative side
         }
-        let ladder = derive_adaptive_threshold_ladder_from_features(&data)
+        let ladder = derive_adaptive_threshold_ladder_from_features(&frame_of(data))
             .expect("non-degenerate cube must produce ladder");
         // Monotone ascending
         for i in 1..ladder.len() {

@@ -100,12 +100,10 @@ pub async fn discovery_start(
     let higher_tfs: Vec<String> = body
         .higher_tfs
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| {
-            DEFAULT_HIGHER_TFS
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect()
-        })
+        // Default: the FULL canonical top-down ladder above the base (every
+        // higher TF), not a hardcoded 3-TF subset — operator preference, and
+        // the out-of-core feature store makes the larger multi-TF cube viable.
+        .unwrap_or_else(|| neoethos_core::canonical_higher_timeframes(&base_tf))
         .into_iter()
         .map(|s| s.trim().to_uppercase())
         .filter(|s| !s.is_empty())

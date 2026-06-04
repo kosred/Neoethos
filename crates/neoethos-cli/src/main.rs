@@ -191,8 +191,8 @@ fn cmd_features(args: &[String]) -> Result<()> {
         "Features {} {} -> rows={}, cols={}",
         symbol,
         timeframe,
-        features.data.nrows(),
-        features.data.ncols()
+        features.n_samples(),
+        features.n_features()
     );
     Ok(())
 }
@@ -222,8 +222,8 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
         "Prepared {} base={} rows={} cols={}",
         symbol,
         base,
-        features.data.nrows(),
-        features.data.ncols()
+        features.n_samples(),
+        features.n_features()
     );
     Ok(())
 }
@@ -1431,7 +1431,22 @@ fn default_higher_tfs_csv(settings: Option<&neoethos_core::Settings>) -> String 
                     .collect::<Vec<_>>()
                     .join(",")
             } else {
-                settings.system.higher_timeframes.join(",")
+                // Filter the configured higher TFs to those strictly ABOVE the
+                // base in canonical order. The base-agnostic config default is
+                // the FULL canonical set, so this yields the complete top-down
+                // ladder above the base (never a lower TF, which is meaningless
+                // as higher-TF context for a coarse base like H1).
+                let above = neoethos_core::canonical_higher_timeframes(
+                    &settings.system.base_timeframe,
+                );
+                settings
+                    .system
+                    .higher_timeframes
+                    .iter()
+                    .filter(|tf| above.iter().any(|a| a.eq_ignore_ascii_case(tf)))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
             }
         })
         .unwrap_or_default()

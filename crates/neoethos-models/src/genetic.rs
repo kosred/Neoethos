@@ -266,7 +266,9 @@ impl GeneticStrategyExpert {
         Ok(FeatureFrame {
             timestamps: timestamps.unwrap_or_else(|| Self::timestamps_from_frame(df)),
             names: feature_columns_from_dataframe(df),
-            data: dataframe_to_float32_array(df).context("build genetic feature frame matrix")?,
+            data: neoethos_data::FeatureData::InMemory(
+                dataframe_to_float32_array(df).context("build genetic feature frame matrix")?,
+            ),
         })
     }
 
@@ -430,17 +432,17 @@ impl GeneticStrategyExpert {
             .filter_map(|idx| features.timestamps.get(*idx).copied())
             .collect::<Vec<_>>();
         let names = features.names.clone();
-        let mut data = Array2::<f32>::zeros((indices.len(), features.data.ncols()));
+        let mut data = Array2::<f32>::zeros((indices.len(), features.n_features()));
         for (out_row, src_row) in indices.iter().copied().enumerate() {
-            for col in 0..features.data.ncols() {
-                data[(out_row, col)] = features.data[(src_row, col)];
+            for col in 0..features.n_features() {
+                data[(out_row, col)] = features.feature_at(src_row, col);
             }
         }
 
         FeatureFrame {
             timestamps,
             names,
-            data,
+            data: neoethos_data::FeatureData::InMemory(data),
         }
     }
 
@@ -481,7 +483,7 @@ impl GeneticStrategyExpert {
 
     fn train_with_discovery(&self, features: &FeatureFrame, ohlcv: &Ohlcv) -> Result<Vec<Gene>> {
         let maybe_indices =
-            self.slice_rows_by_history_window(&features.timestamps, features.data.nrows());
+            self.slice_rows_by_history_window(&features.timestamps, features.n_samples());
         let scoped_features;
         let scoped_ohlcv;
         let (features, ohlcv) = if let Some(indices) = maybe_indices.as_ref() {
@@ -593,7 +595,7 @@ impl GeneticStrategyExpert {
 
     fn train_with_labels(&self, features: &FeatureFrame, y: &Series) -> Result<Vec<Gene>> {
         let labels = Self::labels_from_series(y)?;
-        let n_indicators = features.data.ncols();
+        let n_indicators = features.n_features();
         if n_indicators == 0 {
             bail!("genetic label-search requires at least one feature column");
         }
@@ -1036,7 +1038,7 @@ impl GeneticStrategyExpert {
     }
 
     fn training_summary(&self, features: &FeatureFrame) -> TrainingSummaryMetadata {
-        let dataset_rows = features.data.nrows();
+        let dataset_rows = features.n_samples();
         if matches!(self.backend_mode, GeneticBackendMode::DiscoveryBacked) {
             let train_rows = self
                 .slice_rows_by_history_window(&features.timestamps, dataset_rows)
@@ -1382,7 +1384,7 @@ impl GeneticStrategyExpert {
         }
 
         let features = self.feature_frame_for_prediction(x)?;
-        let n_samples = features.data.nrows();
+        let n_samples = features.n_samples();
         let mut probabilities = Array2::zeros((n_samples, 3));
 
         for gene in &self.portfolio {

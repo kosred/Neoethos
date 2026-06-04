@@ -32,16 +32,20 @@ default = []
 # `hpc_gpu_discovery` + `hpc` modules were removed (~3132 LOC of orphan
 # code targeting Hyperstack-N3 specifically); generic multi-GPU support
 # now lives inside `cubecl_eval.rs` itself and scales 1→N devices via
-# `tch::Cuda::device_count()`.
-gpu = ["dep:tch", "dep:cubecl", "dep:half"]
-# #205: vendor-aware aliases so the top-level binary can pick a path
-# without knowing the internals. Today cubecl/tch is CUDA-only, so
-# `gpu-cuda` is the only one that actually wires anything; `gpu-vulkan`
-# and `gpu-rocm` are silent no-ops at this layer (Burn-wgpu handles
-# Vulkan downstream in neoethos-models). When cubecl ships a Vulkan
-# kernel or tch ships ROCm, wire them here in the same shape.
-gpu-cuda = ["gpu"]
-gpu-vulkan = []
-gpu-rocm = []
+# `tch::Cuda::device_count()`. The concrete runtime is now selected by the
+# vendor aliases below; `gpu` itself binds NO runtime (so a Vulkan build never
+# compiles cubecl-cuda), and `tch` (CUDA device enumeration) moved to `gpu-cuda`.
+gpu = ["dep:cubecl", "dep:half"]
+# #205: vendor-aware aliases so the top-level binary can pick a backend
+# without knowing the internals. The `cubecl_eval.rs` GA kernels are generic
+# over `R: Runtime`, so each alias just selects the cubecl runtime:
+# - gpu-cuda   → CUDA (NVIDIA) + `tch` for device enumeration.
+# - gpu-vulkan → cubecl-wgpu via the naga→SPIR-V path (`wgpu`, NOT `wgpu-spirv`:
+#   the direct-SPIR-V passthrough crashes AMD's Vulkan driver). Runs on the
+#   integrated AMD GPU here and on any wgpu adapter (Vulkan/DX12/Metal).
+# - gpu-rocm   → cubecl HIP (AMD discrete, Linux).
+gpu-cuda = ["gpu", "dep:tch", "cubecl/cuda"]
+gpu-vulkan = ["gpu", "cubecl/wgpu"]
+gpu-rocm = ["gpu", "cubecl/hip"]
 strategy-db = ["dep:duckdb"]
 

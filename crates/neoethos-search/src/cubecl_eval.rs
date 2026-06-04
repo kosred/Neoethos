@@ -1,7 +1,10 @@
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
+#[cfg(feature = "gpu-cuda")]
 use cubecl::cuda::{CudaDevice, CudaRuntime};
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 use cubecl::prelude::*;
 use half::bf16;
 use ndarray::ArrayView2;
@@ -50,6 +53,9 @@ struct CudaEnvKnobs {
     backtest_kernel_enabled: bool,
     eval_kernel_units_override: Option<u32>,
     backtest_kernel_units_override: Option<u32>,
+    // Read only by the `gpu-cuda` device selector; unused on the wgpu/Vulkan
+    // path (which uses `WgpuDevice::DefaultDevice`).
+    #[allow(dead_code)]
     cuda_device_id: usize,
 }
 
@@ -135,6 +141,37 @@ fn read_cuda_device_id_from_env() -> usize {
             }
         },
     }
+}
+
+/// Create a `ComputeClient` for the active GPU runtime. The concrete runtime is
+/// chosen at COMPILE time by the GPU feature flag — CUDA under `gpu-cuda`,
+/// wgpu/Vulkan under `gpu-vulkan` — so every downstream kernel launch stays
+/// generic over `R: Runtime` and runs unchanged on whichever backend was built.
+/// (When both features are on, CUDA wins.)
+#[cfg(feature = "gpu-cuda")]
+fn create_gpu_client() -> Result<ComputeClient<CudaRuntime>> {
+    let device_id = cuda_device_id();
+    let device_count = tch::Cuda::device_count();
+    if device_count <= device_id as i64 {
+        bail!(
+            "GPU evaluator requested CUDA device {} but only {} CUDA devices are available",
+            device_id,
+            device_count
+        );
+    }
+    let device = CudaDevice::new(device_id);
+    Ok(CudaRuntime::client(&device))
+}
+
+/// wgpu/Vulkan twin of the `gpu-cuda` client factory above. Uses cubecl's
+/// `wgpu` (naga → SPIR-V) path, NOT `wgpu-spirv`: the direct SPIR-V passthrough
+/// crashes AMD's Vulkan driver, so naga emits validated SPIR-V. `DefaultDevice`
+/// selects the best adapter (the integrated AMD GPU here; the first discrete
+/// GPU on a workstation). Multi-adapter selection is a later (Stage c) step.
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+fn create_gpu_client() -> Result<ComputeClient<WgpuRuntime>> {
+    let device = WgpuDevice::DefaultDevice;
+    Ok(WgpuRuntime::client(&device))
 }
 
 #[cube(launch)]
@@ -711,6 +748,7 @@ fn backtest_kernel_units<R: Runtime>(client: &ComputeClient<R>) -> u32 {
         .max(1)
 }
 
+#[allow(dead_code)] // gpu-cuda device selection only; wgpu uses DefaultDevice
 fn cuda_device_id() -> usize {
     // F-CORE3 closure: typed boundary via `cuda_env_knobs()`. The
     // tracing::warn for unparseable values fires once at first read
@@ -861,7 +899,10 @@ fn validate_signal_kernel_inputs<F>(
     Ok(())
 }
 
-fn launch_signal_kernel<R: Runtime, F>(
+// `F` first so callers can `launch_signal_kernel::<f32>(&client, ...)` and have
+// `R` inferred from the client (turbofish is positional; the runtime is never
+// named at the call sites).
+fn launch_signal_kernel<F, R: Runtime>(
     client: &ComputeClient<R>,
     indicators_flat: &[F],
     gene_offsets: &[i32],
@@ -917,29 +958,36 @@ where
 
     let units = signal_kernel_units(client);
     let cubes = (total as u32).div_ceil(units);
+    // cubecl 0.10: `from_raw_parts(handle, len)` takes the Handle BY VALUE (no
+    // generic, no vectorization arg), so clone each (cheap, Arc-backed) to keep
+    // the originals alive for the read-back. Scalars are passed as raw values
+    // (the 0.10 `LaunchArg for T` impl, replacing 0.9's `ScalarArg::new`). The
+    // generated `launch` is infallible (returns `()`), so no `.context()?`.
     synthesize_signals_kernel::launch::<F, R>(
         client,
         CubeCount::Static(cubes, 1, 1),
         CubeDim::new_1d(units),
-        unsafe { ArrayArg::from_raw_parts::<F>(&indicators_handle, indicators_flat.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&gene_offsets_handle, gene_offsets.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&gene_indices_handle, gene_indices.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<F>(&gene_weights_handle, gene_weights.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<F>(&long_thr_handle, long_thr.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<F>(&short_thr_handle, short_thr.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&smc_data_handle, smc_data.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&gene_smc_flags_handle, gene_smc_flags.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<F>(&smc_weights_handle, smc_weights.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&output_handle, total, 1) },
-        ScalarArg::new(n_samples as u32),
-        ScalarArg::new(gate_threshold),
-    )
-    .context("launch cuda evaluator signal kernel")?;
+        unsafe { ArrayArg::from_raw_parts(indicators_handle.clone(), indicators_flat.len()) },
+        unsafe { ArrayArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len()) },
+        unsafe { ArrayArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len()) },
+        unsafe { ArrayArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len()) },
+        unsafe { ArrayArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
+        unsafe { ArrayArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
+        unsafe { ArrayArg::from_raw_parts(smc_data_handle.clone(), smc_data.len()) },
+        unsafe { ArrayArg::from_raw_parts(gene_smc_flags_handle.clone(), gene_smc_flags.len()) },
+        unsafe { ArrayArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
+        unsafe { ArrayArg::from_raw_parts(output_handle.clone(), total) },
+        n_samples as u32,
+        gate_threshold,
+    );
 
-    let bytes = client.read_one(output_handle);
+    let bytes = client.read_one_unchecked(output_handle);
     Ok(i32::from_bytes(&bytes).to_vec())
 }
 
+// Signal-only GPU path: kept for a future "GPU signals + CPU backtest" hybrid
+// lane. The current hybrid uses the full-eval kernel, so these are unused today.
+#[allow(dead_code)]
 fn materialize_i8_rows(flat: &[i32], n_genes: usize, n_samples: usize) -> Vec<Vec<i8>> {
     flat.chunks(n_samples)
         .take(n_genes)
@@ -983,23 +1031,12 @@ fn try_generate_signal_flat_cuda(
         bail!("cuda evaluator signal kernel received inconsistent dimensions");
     }
 
-    let device_id = cuda_device_id();
-    let device_count = tch::Cuda::device_count();
-    if device_count <= device_id as i64 {
-        bail!(
-            "cuda evaluator signal kernel requested device {} but only {} CUDA devices are available",
-            device_id,
-            device_count
-        );
-    }
+    let client = create_gpu_client()?;
 
     let indicators_flat = indicators.iter().copied().collect::<Vec<_>>();
     let smc_data_flat = flatten_i32_rows(smc_data);
     let gene_smc_flags_flat = flatten_i32_flags(gene_smc_flags);
     let precision = requested_eval_precision();
-
-    let device = CudaDevice::new(device_id);
-    let client = CudaRuntime::client(&device);
 
     if prefers_bf16(precision) {
         let indicators_bf16 = indicators_flat
@@ -1023,7 +1060,7 @@ fn try_generate_signal_flat_cuda(
             .map(|value| bf16::from_f32(*value))
             .collect::<Vec<_>>();
 
-        match launch_signal_kernel::<bf16>(
+        match launch_signal_kernel::<bf16, _>(
             &client,
             &indicators_bf16,
             gene_offsets,
@@ -1047,7 +1084,7 @@ fn try_generate_signal_flat_cuda(
         }
     }
 
-    launch_signal_kernel::<f32>(
+    launch_signal_kernel::<f32, _>(
         &client,
         &indicators_flat,
         gene_offsets,
@@ -1065,6 +1102,7 @@ fn try_generate_signal_flat_cuda(
     .context("launch fp32 cuda evaluator signal kernel")
 }
 
+#[allow(dead_code)] // signal-only GPU path; see materialize_i8_rows note above
 pub(crate) fn try_generate_signal_rows_cuda(
     indicators: ArrayView2<'_, f32>,
     gene_offsets: &[i32],
@@ -1189,52 +1227,50 @@ fn launch_backtest_kernel<R: Runtime>(
 
     let units = backtest_kernel_units(client);
     let cubes = (n_genes as u32).div_ceil(units);
+    // cubecl 0.10 migration: Handle-by-value `from_raw_parts(handle, len)`
+    // (clone to keep originals for read-back), raw-value scalars (no
+    // `ScalarArg::new`), infallible `launch` (no `.context()?`).
     backtest_population_kernel::launch::<R>(
         client,
         CubeCount::Static(cubes, 1, 1),
         CubeDim::new_1d(units),
-        unsafe { ArrayArg::from_raw_parts::<f32>(&close_handle, n_samples, 1) },
-        unsafe { ArrayArg::from_raw_parts::<f32>(&high_handle, n_samples, 1) },
-        unsafe { ArrayArg::from_raw_parts::<f32>(&low_handle, n_samples, 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&signals_handle, signals_flat.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&timestamp_delta_handle, n_samples, 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&month_handle, month_idx.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&day_handle, day_idx.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<f32>(&sl_handle, sl_pips.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<f32>(&tp_handle, tp_pips.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<f32>(&metrics_handle, metrics_len, 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&trade_counts_handle, n_genes, 1) },
-        unsafe { ArrayArg::from_raw_parts::<f32>(&monthly_handle, monthly_len, 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&month_counts_handle, n_genes, 1) },
-        ScalarArg::new(n_samples as u32),
-        ScalarArg::new(month_capacity as u32),
-        ScalarArg::new(settings.initial_equity() as f32),
-        ScalarArg::new(settings.max_hold_bars as u32),
-        ScalarArg::new(settings.min_hold_bars as u32),
-        ScalarArg::new(settings.max_trades_per_day as u32),
-        ScalarArg::new(saturating_i32(settings.gap_threshold_ms)),
-        ScalarArg::new(if use_timestamps { 1i32 } else { 0i32 }),
-        ScalarArg::new(if settings.trailing_enabled {
-            1i32
-        } else {
-            0i32
-        }),
-        ScalarArg::new(settings.trailing_atr_multiplier as f32),
-        ScalarArg::new(settings.trailing_be_trigger_r as f32),
-        ScalarArg::new(settings.spread_pips as f32),
-        ScalarArg::new(settings.commission_per_trade as f32),
-        ScalarArg::new(settings.pip_value_per_lot as f32),
+        unsafe { ArrayArg::from_raw_parts(close_handle.clone(), n_samples) },
+        unsafe { ArrayArg::from_raw_parts(high_handle.clone(), n_samples) },
+        unsafe { ArrayArg::from_raw_parts(low_handle.clone(), n_samples) },
+        unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), signals_flat.len()) },
+        unsafe { ArrayArg::from_raw_parts(timestamp_delta_handle.clone(), n_samples) },
+        unsafe { ArrayArg::from_raw_parts(month_handle.clone(), month_idx.len()) },
+        unsafe { ArrayArg::from_raw_parts(day_handle.clone(), day_idx.len()) },
+        unsafe { ArrayArg::from_raw_parts(sl_handle.clone(), sl_pips.len()) },
+        unsafe { ArrayArg::from_raw_parts(tp_handle.clone(), tp_pips.len()) },
+        unsafe { ArrayArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
+        unsafe { ArrayArg::from_raw_parts(trade_counts_handle.clone(), n_genes) },
+        unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
+        unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
+        n_samples as u32,
+        month_capacity as u32,
+        settings.initial_equity() as f32,
+        settings.max_hold_bars as u32,
+        settings.min_hold_bars as u32,
+        settings.max_trades_per_day as u32,
+        saturating_i32(settings.gap_threshold_ms),
+        if use_timestamps { 1i32 } else { 0i32 },
+        if settings.trailing_enabled { 1i32 } else { 0i32 },
+        settings.trailing_atr_multiplier as f32,
+        settings.trailing_be_trigger_r as f32,
+        settings.spread_pips as f32,
+        settings.commission_per_trade as f32,
+        settings.pip_value_per_lot as f32,
         // Phase C.3 (2026-05-28) — broker-supplied carry costs.
-        ScalarArg::new(settings.swap_long_pips_per_day as f32),
-        ScalarArg::new(settings.swap_short_pips_per_day as f32),
-        ScalarArg::new(settings.pnl_conversion_fee_rate as f32),
-    )
-    .context("launch cuda evaluator backtest kernel")?;
+        settings.swap_long_pips_per_day as f32,
+        settings.swap_short_pips_per_day as f32,
+        settings.pnl_conversion_fee_rate as f32,
+    );
 
-    let metrics_bytes = client.read_one(metrics_handle);
-    let trade_counts_bytes = client.read_one(trade_counts_handle);
-    let monthly_bytes = client.read_one(monthly_handle);
-    let month_counts_bytes = client.read_one(month_counts_handle);
+    let metrics_bytes = client.read_one_unchecked(metrics_handle);
+    let trade_counts_bytes = client.read_one_unchecked(trade_counts_handle);
+    let monthly_bytes = client.read_one_unchecked(monthly_handle);
+    let month_counts_bytes = client.read_one_unchecked(month_counts_handle);
 
     Ok((
         f32::from_bytes(&metrics_bytes).to_vec(),
@@ -1294,8 +1330,7 @@ pub(crate) fn try_evaluate_population_cuda(
         smc_weights,
     )?;
 
-    let device = CudaDevice::new(cuda_device_id());
-    let client = CudaRuntime::client(&device);
+    let client = create_gpu_client()?;
     let close_pips = normalize_prices_to_pips(close, settings.pip_value);
     let high_pips = normalize_prices_to_pips(high, settings.pip_value);
     let low_pips = normalize_prices_to_pips(low, settings.pip_value);

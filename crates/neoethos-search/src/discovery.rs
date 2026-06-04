@@ -984,7 +984,7 @@ fn trim_recent_history(
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
 ) -> Result<(FeatureFrame, Ohlcv, Option<usize>)> {
-    let frame_rows = features.data.nrows();
+    let frame_rows = features.n_samples();
     let ohlcv_rows = ohlcv.close.len();
     let available_rows = frame_rows.min(ohlcv_rows);
     if available_rows == 0 {
@@ -1008,13 +1008,19 @@ fn trim_recent_history(
         None
     };
 
-    let trimmed_features = FeatureFrame {
-        timestamps: features.timestamps[start_idx..available_rows].to_vec(),
-        names: features.names.clone(),
-        data: features
-            .data
-            .slice(ndarray::s![start_idx..available_rows, ..])
-            .to_owned(),
+    let trimmed_features = if start_idx == 0 && available_rows == frame_rows {
+        // No trim — pass the (possibly mmap-backed) frame through untouched so
+        // the full multi-resolution feature matrix is NEVER materialised into
+        // RAM. This is the hot path: discovery runs with `max_rows = 0`.
+        features.clone()
+    } else {
+        FeatureFrame {
+            timestamps: features.timestamps[start_idx..available_rows].to_vec(),
+            names: features.names.clone(),
+            data: neoethos_data::FeatureData::InMemory(
+                features.sample_window(start_idx, available_rows),
+            ),
+        }
     };
     let trimmed_ohlcv = slice_ohlcv(ohlcv, start_idx, available_rows);
     Ok((trimmed_features, trimmed_ohlcv, row_budget_applied))
@@ -1262,7 +1268,7 @@ fn discovery_temporal_contract(
 }
 
 fn validation_row_count(features: &FeatureFrame, ohlcv: &Ohlcv) -> Result<usize> {
-    let n = features.data.nrows();
+    let n = features.n_samples();
     if n == 0
         || features.timestamps.len() != n
         || ohlcv.close.len() != n
@@ -1283,7 +1289,7 @@ fn validation_row_count(features: &FeatureFrame, ohlcv: &Ohlcv) -> Result<usize>
 
 fn discovery_dataset_hash(features: &FeatureFrame, ohlcv: &Ohlcv) -> Result<String> {
     stable_json_hash(&DiscoveryDatasetFingerprint {
-        row_count: features.data.nrows(),
+        row_count: features.n_samples(),
         first_timestamp: features.timestamps.first().copied(),
         last_timestamp: features.timestamps.last().copied(),
         feature_names: &features.names,
@@ -1598,17 +1604,17 @@ pub fn compute_discovery_forward_test_artifacts(
                 })?;
             keep_indices.push(idx);
         }
-        let n_rows = tail_features.data.nrows();
+        let n_rows = tail_features.n_samples();
         let mut projected = ndarray::Array2::<f32>::zeros((n_rows, keep_indices.len()));
         for (new_idx, &orig_idx) in keep_indices.iter().enumerate() {
             projected
                 .column_mut(new_idx)
-                .assign(&tail_features.data.column(orig_idx));
+                .assign(&tail_features.feature_column(orig_idx));
         }
         std::borrow::Cow::Owned(FeatureFrame {
             timestamps: tail_features.timestamps.clone(),
             names: effective_feature_names.to_vec(),
-            data: projected,
+            data: neoethos_data::FeatureData::InMemory(projected),
         })
     };
     let tail_features = tail_features.as_ref();
@@ -1739,17 +1745,17 @@ pub fn compute_discovery_prop_firm_artifacts(
                 })?;
             keep_indices.push(idx);
         }
-        let n_rows = tail_features.data.nrows();
+        let n_rows = tail_features.n_samples();
         let mut projected = ndarray::Array2::<f32>::zeros((n_rows, keep_indices.len()));
         for (new_idx, &orig_idx) in keep_indices.iter().enumerate() {
             projected
                 .column_mut(new_idx)
-                .assign(&tail_features.data.column(orig_idx));
+                .assign(&tail_features.feature_column(orig_idx));
         }
         std::borrow::Cow::Owned(FeatureFrame {
             timestamps: tail_features.timestamps.clone(),
             names: effective_feature_names.to_vec(),
-            data: projected,
+            data: neoethos_data::FeatureData::InMemory(projected),
         })
     };
     let tail_features = tail_features.as_ref();
@@ -2004,7 +2010,7 @@ where
     // until F-277b adds per-symbol installation (deferred).
     if config.adaptive_thresholds {
         if let Some(ladder) =
-            crate::genetic::derive_adaptive_threshold_ladder_from_features(&features.data)
+            crate::genetic::derive_adaptive_threshold_ladder_from_features(&features)
         {
             match crate::genetic::install_adaptive_threshold_ladder(ladder) {
                 Ok(_) => tracing::info!(
@@ -2055,7 +2061,7 @@ where
     let (mut features, ohlcv, _) = trim_recent_history(features, ohlcv, config)?;
     let n_after_trim = ohlcv.close.len();
     funnel.record_stage("rows_after_trimming", n_input_rows, n_after_trim);
-    funnel.record_stage("features_built", 0, features.data.ncols());
+    funnel.record_stage("features_built", 0, features.n_features());
 
     // Feature Pre-filtering (Idea #3)
     let prefilter_top_k = config.runtime_overrides.prefilter_top_k;
@@ -2095,10 +2101,9 @@ where
     let features_stage1 = FeatureFrame {
         timestamps: features.timestamps[stage1_start..stage1_end].to_vec(),
         names: features.names.clone(),
-        data: features
-            .data
-            .slice(ndarray::s![stage1_start..stage1_end, ..])
-            .to_owned(),
+        data: neoethos_data::FeatureData::InMemory(
+            features.sample_window(stage1_start, stage1_end),
+        ),
     };
     progress_fn(DiscoveryProgress::SearchStarted {
         population: config.population,
@@ -2186,8 +2191,8 @@ fn prefilter_features(
     top_k: usize,
     insample_frac: f64,
 ) -> FeatureFrame {
-    let n_rows = features.data.nrows();
-    let n_cols = features.data.ncols();
+    let n_rows = features.n_samples();
+    let n_cols = features.n_features();
     if n_rows < 2 || n_cols <= top_k {
         return features.clone();
     }
@@ -2227,7 +2232,7 @@ fn prefilter_features(
         } else {
             // Restrict the column slice to the in-sample window so the
             // Pearson correlation only sees in-sample co-movement.
-            let col = features.data.column(col_idx);
+            let col = features.feature_column(col_idx);
             let col_full: Vec<f32> = col.iter().copied().collect();
             let col_train = &col_full[..train_end.saturating_sub(1)];
             let ret_train = &returns[..train_end.saturating_sub(1)];
@@ -2260,13 +2265,13 @@ fn prefilter_features(
         new_names.push(features.names[orig_col_idx].clone());
         new_data
             .column_mut(new_col_idx)
-            .assign(&features.data.column(orig_col_idx));
+            .assign(&features.feature_column(orig_col_idx));
     }
 
     FeatureFrame {
         timestamps: features.timestamps.clone(),
         names: new_names,
-        data: new_data,
+        data: neoethos_data::FeatureData::InMemory(new_data),
     }
 }
 
@@ -2307,12 +2312,12 @@ fn validate_regime_robustness(
         } else {
             t_len.saturating_sub(1)
         };
-        if idx >= features.data.nrows() {
+        if idx >= features.n_samples() {
             continue;
         }
 
-        let trend_str = features.data[(idx, t_idx)];
-        let vol_state = features.data[(idx, v_idx)];
+        let trend_str = features.feature_at(idx, t_idx);
+        let vol_state = features.feature_at(idx, v_idx);
 
         if trend_str > 0.25 {
             trend_pnl += trade.pnl;
@@ -2510,14 +2515,14 @@ where
     // GA's empty-portfolio outcome is downstream filtering vs the upstream
     // features being broken (NaN-saturated, all-zero, wrong magnitude).
     {
-        let total = features.data.len();
+        let total = features.n_values();
         let mut nan = 0usize;
         let mut zero = 0usize;
         let mut min_v = f32::INFINITY;
         let mut max_v = f32::NEG_INFINITY;
         let mut sum_abs = 0.0_f64;
         let mut finite_count = 0usize;
-        for &v in features.data.iter() {
+        for v in features.iter_values() {
             if v.is_nan() {
                 nan += 1;
             } else if v == 0.0 {
@@ -2541,8 +2546,8 @@ where
         };
         tracing::info!(
             target: "neoethos_search::funnel",
-            rows = features.data.nrows(),
-            cols = features.data.ncols(),
+            rows = features.n_samples(),
+            cols = features.n_features(),
             nan_frac = nan as f64 / total.max(1) as f64,
             zero_frac = zero as f64 / total.max(1) as f64,
             min_finite = if min_v.is_finite() { min_v as f64 } else { 0.0 },
@@ -2561,18 +2566,18 @@ where
         // last `min(rows, 1000)` rows and counts columns whose
         // (max−min) is essentially zero. A high count is the
         // unambiguous signal that the alignment / data pipeline broke.
-        let trailing = features.data.nrows().min(1000);
+        let trailing = features.n_samples().min(1000);
         if trailing > 1 {
-            let n_cols = features.data.ncols();
+            let n_cols = features.n_features();
             let mut zero_var_cols = 0usize;
             let mut named_examples: Vec<String> = Vec::new();
-            let start_row = features.data.nrows() - trailing;
+            let start_row = features.n_samples() - trailing;
             for c in 0..n_cols {
                 let mut col_min = f32::INFINITY;
                 let mut col_max = f32::NEG_INFINITY;
                 let mut finite_seen = 0usize;
-                for r in start_row..features.data.nrows() {
-                    let v = features.data[(r, c)];
+                for r in start_row..features.n_samples() {
+                    let v = features.feature_at(r, c);
                     if v.is_finite() {
                         finite_seen += 1;
                         if v < col_min {
@@ -2735,7 +2740,7 @@ where
     let min_trades = min_trades_required(
         &features.timestamps,
         config.min_trades_per_day,
-        features.data.nrows(),
+        features.n_samples(),
     );
     let ranked_total = ranked_candidates.len();
     // 2026-05-26 operator directive: now that GA produced candidates,
@@ -3592,8 +3597,24 @@ pub fn save_promotion_summary_json(path: impl AsRef<Path>, result: &DiscoveryRes
         producer_side_complete: bool,
         check_summary: Vec<(&'static str, &'static str)>,
         determinism_policy: neoethos_core::contracts::DeterminismPolicy,
+        /// Held-out out-of-sample verdict — the single most decision-relevant
+        /// promotion signal. Surfaced here (per-portfolio) so operators AND the
+        /// model-training corpus can weight each strategy by its honest OOS
+        /// reliability instead of in-sample metrics. `forward_test_passed` /
+        /// `prop_firm_passed` are `None` when no held-out artifact was produced
+        /// (e.g. the CLI full-data path or too short a tail), `Some(false)` when
+        /// the strategy lost money / breached prop rules on the unseen tail.
+        out_of_sample: OutOfSampleVerdict,
+    }
+    #[derive(Serialize)]
+    struct OutOfSampleVerdict {
+        forward_test_passed: Option<bool>,
+        prop_firm_passed: Option<bool>,
+        walkforward_passed: bool,
+        cpcv_passed: bool,
     }
     let hashes = discovery_per_kind_evidence_hashes(result)?;
+    let evidence = live_validation_evidence_from_discovery(result);
     let summary = PromotionSummary {
         producer_side_complete: hashes.all_producer_kinds_present(),
         check_summary: hashes.check_summary(),
@@ -3601,6 +3622,12 @@ pub fn save_promotion_summary_json(path: impl AsRef<Path>, result: &DiscoveryRes
         validation_evidence_missing_kinds: hashes.missing_kinds(),
         validation_evidence_hashes: &hashes,
         determinism_policy: crate::genetic::current_determinism_policy(),
+        out_of_sample: OutOfSampleVerdict {
+            forward_test_passed: evidence.forward_test_passed,
+            prop_firm_passed: evidence.prop_firm_passed,
+            walkforward_passed: evidence.walkforward_passed,
+            cpcv_passed: evidence.cpcv_passed,
+        },
     };
     write_json_atomic(path, &summary)
 }

@@ -244,7 +244,8 @@ impl TrainingOrchestrator {
         // will have NaN until the lookback window fills. The downstream
         // `dataframe_to_float32_array` strict-rejects any non-finite, so
         // we sanitise here. Labels are sliced in lock-step.
-        let (clean_data, clean_labels, dropped) = drop_nonfinite_rows(frame.data, labels);
+        let (clean_data, clean_labels, dropped) =
+            drop_nonfinite_rows(frame.to_dense_samples_major(), labels);
         if dropped > 0 {
             info!(
                 "Dropped {} warmup/non-finite feature rows before training (kept {} rows)",

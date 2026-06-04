@@ -50,7 +50,7 @@ impl EvalDataCache {
     pub fn build(features: &FeatureFrame, ohlcv: &Ohlcv) -> Self {
         let indicators = transpose_features(features);
         let (months, days) = month_day_indices(&features.timestamps);
-        let n_samples = features.data.nrows();
+        let n_samples = features.n_samples();
         let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
             build_smc_arrays(features, ohlcv);
         let mut smc_data = Vec::with_capacity(n_samples);
@@ -106,7 +106,11 @@ fn build_gene_arrays(genes: &[Gene]) -> GeneArrays {
 }
 
 fn transpose_features(frame: &FeatureFrame) -> Array2<f32> {
-    frame.data.t().to_owned()
+    // `as_indicators_view` is already `[features × samples]` for both backings
+    // (a transposed view of the in-RAM matrix, or the native mmap layout), so
+    // this is the GA's `indicators` exactly. Callers only ever pass the small
+    // prefiltered/windowed frame here, so the `to_owned` copy stays bounded.
+    frame.as_indicators_view().to_owned()
 }
 
 /// Compute the signal series for a `Gene` using the SAME SMC-gated logic as
@@ -139,13 +143,13 @@ pub fn signals_for_gene_with_config(
     gene: &Gene,
     config: &EvaluationConfig,
 ) -> Vec<i8> {
-    let n_samples = features.data.nrows();
+    let n_samples = features.n_samples();
     let mut combined = vec![0.0_f32; n_samples];
     for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
-        if *idx >= features.data.ncols() {
+        if *idx >= features.n_features() {
             continue;
         }
-        let col = features.data.column(*idx);
+        let col = features.feature_column(*idx);
         for (i, v) in col.iter().enumerate() {
             combined[i] += *weight * *v;
         }
@@ -212,13 +216,13 @@ pub fn signals_for_gene_full(
     gene: &Gene,
     config: &EvaluationConfig,
 ) -> Vec<i8> {
-    let n_samples = features.data.nrows();
+    let n_samples = features.n_samples();
     let mut combined = vec![0.0_f32; n_samples];
     for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
-        if *idx >= features.data.ncols() {
+        if *idx >= features.n_features() {
             continue;
         }
-        let col = features.data.column(*idx);
+        let col = features.feature_column(*idx);
         for (i, v) in col.iter().enumerate() {
             combined[i] += *weight * *v;
         }
@@ -400,10 +404,10 @@ pub fn evaluate_genes(
     genes: &[Gene],
     config: &EvaluationConfig,
 ) -> Result<Vec<[f64; 11]>> {
-    if features.data.nrows() == 0 || features.data.ncols() == 0 {
+    if features.n_samples() == 0 || features.n_features() == 0 {
         bail!("empty feature matrix");
     }
-    let n_samples = features.data.nrows();
+    let n_samples = features.n_samples();
     if ohlcv.close.len() != n_samples {
         bail!("ohlcv length does not match feature rows");
     }
@@ -547,7 +551,7 @@ pub fn random_search(
     n_genes: usize,
     max_indicators: usize,
 ) -> Result<SearchResult> {
-    let n_indicators = features.data.ncols();
+    let n_indicators = features.n_features();
     let smc_cfg = SmcSearchConfig::from_env();
     let mut rng = build_search_rng();
     let mut genes =
@@ -645,7 +649,7 @@ where
     if population == 0 {
         bail!("population must be > 0");
     }
-    let n_indicators = features.data.ncols();
+    let n_indicators = features.n_features();
     let smc_cfg = SmcSearchConfig::from_env();
 
     // All `NEOETHOS_BOT_*` search-engine knobs are resolved through the typed
@@ -957,7 +961,7 @@ where
             // mutated copies that produce the SAME signal collapse to one
             // archive entry regardless of their randomly-assigned strategy_id.
             let mut canonical = gene.clone();
-            canonical.normalize(features.data.ncols(), 1);
+            canonical.normalize(features.n_features(), 1);
             let hash = gene_signature_hash(&canonical);
             if !seen_gene_hashes.insert(hash) {
                 continue;

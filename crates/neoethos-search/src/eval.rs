@@ -1,7 +1,7 @@
 #[cfg(feature = "gpu")]
 use crate::cubecl_eval::{
     cuda_eval_backtest_kernel_enabled, cuda_eval_signal_kernel_enabled,
-    try_evaluate_population_cuda, try_generate_signal_rows_cuda,
+    try_evaluate_population_cuda,
 };
 use crate::quality::Trade;
 use ndarray::ArrayView2;
@@ -1278,6 +1278,63 @@ fn synthesize_signals_cpu(
     signals
 }
 
+/// Adaptive split state for the CPU+GPU hybrid evaluator. Tracks measured
+/// per-lane throughput (genes/sec) so each population eval routes the GPU the
+/// fraction of genes it can finish in the same wall-time the CPU finishes the
+/// rest — a weak iGPU converges to a small share, a fast discrete GPU to most.
+#[cfg(feature = "gpu")]
+mod hybrid_split {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    struct Rates {
+        cpu_genes_per_s: f64,
+        gpu_genes_per_s: f64,
+        samples: u32,
+    }
+    static RATES: OnceLock<Mutex<Rates>> = OnceLock::new();
+    fn rates() -> &'static Mutex<Rates> {
+        RATES.get_or_init(|| {
+            Mutex::new(Rates {
+                cpu_genes_per_s: 0.0,
+                gpu_genes_per_s: 0.0,
+                samples: 0,
+            })
+        })
+    }
+
+    /// Genes to route to the GPU lane for a population of `n_genes`. Before any
+    /// measurement, give the GPU a conservative 25 % so we learn its speed
+    /// without a big slowdown if it turns out weak.
+    pub fn gpu_count(n_genes: usize) -> usize {
+        let r = rates().lock().unwrap_or_else(|p| p.into_inner());
+        if r.samples == 0 || r.cpu_genes_per_s <= 0.0 || r.gpu_genes_per_s <= 0.0 {
+            return (n_genes / 4).clamp(1, n_genes.saturating_sub(1));
+        }
+        let frac = r.gpu_genes_per_s / (r.cpu_genes_per_s + r.gpu_genes_per_s);
+        ((n_genes as f64) * frac).round() as usize
+    }
+
+    /// Fold this generation's measured lane throughputs into the EMA.
+    pub fn update(gpu_genes: usize, gpu_t: Duration, cpu_genes: usize, cpu_t: Duration) {
+        let (gt, ct) = (gpu_t.as_secs_f64(), cpu_t.as_secs_f64());
+        if gt <= 0.0 || ct <= 0.0 || gpu_genes == 0 || cpu_genes == 0 {
+            return;
+        }
+        let gpu_gps = gpu_genes as f64 / gt;
+        let cpu_gps = cpu_genes as f64 / ct;
+        let mut r = rates().lock().unwrap_or_else(|p| p.into_inner());
+        if r.samples == 0 {
+            r.cpu_genes_per_s = cpu_gps;
+            r.gpu_genes_per_s = gpu_gps;
+        } else {
+            r.cpu_genes_per_s = 0.7 * r.cpu_genes_per_s + 0.3 * cpu_gps;
+            r.gpu_genes_per_s = 0.7 * r.gpu_genes_per_s + 0.3 * gpu_gps;
+        }
+        r.samples = r.samples.saturating_add(1);
+    }
+}
+
 pub fn evaluate_population_core(
     inputs: PopulationEvalInputs<'_>,
 ) -> Result<Vec<[f64; 11]>, String> {
@@ -1306,119 +1363,112 @@ pub fn evaluate_population_core(
     let n_genes = long_thr.len();
     let n_samples = close.len();
 
-    #[cfg(feature = "gpu")]
-    if cuda_eval_signal_kernel_enabled() && cuda_eval_backtest_kernel_enabled() {
-        match try_evaluate_population_cuda(
-            close,
-            high,
-            low,
+    // Per-gene CPU evaluation (signal synthesis + SL/TP backtest). Shared by
+    // the full-CPU path and the CPU lane of the CPU+GPU hybrid below.
+    let eval_gene_cpu = |g: usize| -> [f64; 11] {
+        let signals = synthesize_signals_cpu(
             indicators,
             gene_offsets,
             gene_indices,
             gene_weights,
             long_thr,
             short_thr,
-            month_idx,
-            day_idx,
-            timestamps,
-            sl_pips,
-            tp_pips,
             smc_data,
             gene_smc_flags,
             gate_threshold,
             weights,
-            settings,
-        ) {
-            Ok(results) => return Ok(results),
-            Err(err) => {
-                tracing::warn!(
-                    "full cuda evaluator unavailable, falling back to partial gpu/cpu evaluation: {err}"
-                );
+            g,
+            n_samples,
+        );
+        let mut gene_settings = settings.clone();
+        gene_settings.sl_pips = sl_pips[g];
+        gene_settings.tp_pips = tp_pips[g];
+        fast_evaluate_strategy_core(
+            close, high, low, &signals, month_idx, day_idx, timestamps, &gene_settings,
+        )
+    };
+
+    // ── CPU + GPU hybrid ──────────────────────────────────────────────────
+    //
+    // Run a GPU prefix `[0..gpu_count]` (the cubecl wgpu/CUDA kernel) and the
+    // CPU remainder `[gpu_count..n_genes]` (rayon) CONCURRENTLY, so the GPU and
+    // the CPU cores both work at once. The split adapts to measured per-lane
+    // throughput (`hybrid_split`), so neither lane idles waiting for the other
+    // — a weak iGPU converges to a small share, a fast discrete GPU to most.
+    // Genes are independent, so the merged result equals a whole-population
+    // evaluation; the only difference is the GPU lane's f32 vs the CPU lane's
+    // f64 (bounded by the cpu↔gpu parity test; the GA's determinism policy
+    // already permits this level of noise).
+    #[cfg(feature = "gpu")]
+    {
+        if cuda_eval_signal_kernel_enabled()
+            && cuda_eval_backtest_kernel_enabled()
+            && n_genes >= 4
+        {
+            let gpu_count = hybrid_split::gpu_count(n_genes);
+            if gpu_count > 0 && gpu_count < n_genes {
+                let gpu_entry_end = gene_offsets[gpu_count] as usize;
+                let (gpu_outcome, cpu_lane, cpu_dt) = std::thread::scope(|scope| {
+                    let gpu_thread = scope.spawn(|| {
+                        let t = std::time::Instant::now();
+                        let r = try_evaluate_population_cuda(
+                            close,
+                            high,
+                            low,
+                            indicators,
+                            &gene_offsets[..=gpu_count],
+                            &gene_indices[..gpu_entry_end],
+                            &gene_weights[..gpu_entry_end],
+                            &long_thr[..gpu_count],
+                            &short_thr[..gpu_count],
+                            month_idx,
+                            day_idx,
+                            timestamps,
+                            &sl_pips[..gpu_count],
+                            &tp_pips[..gpu_count],
+                            smc_data,
+                            &gene_smc_flags[..gpu_count],
+                            gate_threshold,
+                            weights,
+                            settings,
+                        );
+                        (r, t.elapsed())
+                    });
+                    let t = std::time::Instant::now();
+                    let cpu_lane: Vec<[f64; 11]> =
+                        (gpu_count..n_genes).into_par_iter().map(&eval_gene_cpu).collect();
+                    let cpu_dt = t.elapsed();
+                    (gpu_thread.join(), cpu_lane, cpu_dt)
+                });
+
+                match gpu_outcome {
+                    Ok((Ok(gpu_lane), gpu_dt)) if gpu_lane.len() == gpu_count => {
+                        hybrid_split::update(gpu_count, gpu_dt, n_genes - gpu_count, cpu_dt);
+                        let mut out = Vec::with_capacity(n_genes);
+                        out.extend_from_slice(&gpu_lane);
+                        out.extend_from_slice(&cpu_lane);
+                        return Ok(out);
+                    }
+                    Ok((Ok(_), _)) => tracing::warn!(
+                        "hybrid GPU lane returned the wrong gene count — recomputing on CPU"
+                    ),
+                    Ok((Err(e), _)) => {
+                        tracing::warn!("hybrid GPU lane failed ({e}) — recomputing on CPU")
+                    }
+                    Err(_) => tracing::warn!("hybrid GPU lane panicked — recomputing on CPU"),
+                }
+                // GPU lane unusable: keep the CPU lane we already computed and
+                // only (re)evaluate the GPU-assigned prefix on the CPU.
+                let mut out: Vec<[f64; 11]> =
+                    (0..gpu_count).into_par_iter().map(&eval_gene_cpu).collect();
+                out.extend_from_slice(&cpu_lane);
+                return Ok(out);
             }
         }
     }
 
-    #[cfg(feature = "gpu")]
-    let gpu_signal_rows = if cuda_eval_signal_kernel_enabled() {
-        match try_generate_signal_rows_cuda(
-            indicators,
-            gene_offsets,
-            gene_indices,
-            gene_weights,
-            long_thr,
-            short_thr,
-            smc_data,
-            gene_smc_flags,
-            gate_threshold,
-            weights,
-        ) {
-            Ok(rows) => Some(rows),
-            Err(err) => {
-                tracing::warn!(
-                    "cuda evaluator signal kernel unavailable, falling back to cpu evaluator synthesis: {err}"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let results: Vec<[f64; 11]> = (0..n_genes)
-        .into_par_iter()
-        .map(|g| {
-            #[cfg(feature = "gpu")]
-            let signals = if let Some(signal_rows) = gpu_signal_rows.as_ref() {
-                signal_rows[g].clone()
-            } else {
-                synthesize_signals_cpu(
-                    indicators,
-                    gene_offsets,
-                    gene_indices,
-                    gene_weights,
-                    long_thr,
-                    short_thr,
-                    smc_data,
-                    gene_smc_flags,
-                    gate_threshold,
-                    weights,
-                    g,
-                    n_samples,
-                )
-            };
-
-            #[cfg(not(feature = "gpu"))]
-            let signals = synthesize_signals_cpu(
-                indicators,
-                gene_offsets,
-                gene_indices,
-                gene_weights,
-                long_thr,
-                short_thr,
-                smc_data,
-                gene_smc_flags,
-                gate_threshold,
-                weights,
-                g,
-                n_samples,
-            );
-
-            let mut gene_settings = settings.clone();
-            gene_settings.sl_pips = sl_pips[g];
-            gene_settings.tp_pips = tp_pips[g];
-            fast_evaluate_strategy_core(
-                close,
-                high,
-                low,
-                &signals,
-                month_idx,
-                day_idx,
-                timestamps,
-                &gene_settings,
-            )
-        })
-        .collect();
-
+    // Full-CPU path: no GPU feature, GPU disabled, or a degenerate split.
+    let results: Vec<[f64; 11]> = (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect();
     Ok(results)
 }
 
@@ -1608,5 +1658,181 @@ mod overrides_tests {
         // Negative fee also rejected.
         let s = settings_with_carry(0.0, 0.0, -0.1, 10.0);
         assert!((apply_carry_and_fee(100.0, 1, 0, 0, &s) - 100.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod gpu_cpu_parity_tests {
+    //! Adversarial correctness gate for the GPU evaluator. The cubecl kernels
+    //! (`crate::cubecl_eval`) were ported cubecl 0.9 → 0.10 and had NEVER
+    //! compiled or run before, so this asserts the GPU population eval
+    //! reproduces the CPU reference (the path the shipped binary runs) on a
+    //! deterministic scenario. SMC gating is disabled (all-zero flags + zero
+    //! gate) so signals are pure indicator-threshold crossings — CPU and GPU
+    //! must agree, hence the metrics match within f32-vs-f64 rounding. Skips
+    //! cleanly when no GPU device is present.
+    use super::*;
+    use ndarray::Array2;
+
+    #[test]
+    fn gpu_population_eval_matches_cpu() {
+        let n_samples = 800usize;
+        let n_features = 6usize;
+        let n_genes = 4usize;
+
+        // Deterministic price wave large enough to trigger SL/TP exits.
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| 1.10 + ((i as f64) * 0.02).sin() * 0.01)
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0008).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0008).collect();
+
+        // [features × samples], values well clear of the ±0.3 thresholds.
+        let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
+            (((i + f * 11) as f32) * 0.05).sin() * 0.8
+        });
+
+        // CSR genes: each sums 2 features (weight 1.0).
+        let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
+        let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 4];
+        let gene_weights: Vec<f32> = vec![1.0; 8];
+        let long_thr: Vec<f32> = vec![0.3; n_genes];
+        let short_thr: Vec<f32> = vec![-0.3; n_genes];
+        let sl_pips: Vec<f64> = vec![25.0; n_genes];
+        let tp_pips: Vec<f64> = vec![50.0; n_genes];
+
+        // SMC gating OFF: zero flags + zero gate → signals pass through ungated.
+        let smc_data: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
+        let gene_smc_flags: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
+        let smc_weights = [0.0f32; 11];
+        let gate_threshold = 0.0f32;
+
+        // 1-minute bars; coarse month/day buckets.
+        let timestamps: Vec<i64> = (0..n_samples as i64).map(|i| i * 60_000).collect();
+        let month_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 43_200).collect();
+        let day_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 1_440).collect();
+
+        let settings = BacktestSettings::default();
+
+        // CPU reference — the path the shipped binary actually runs.
+        let cpu: Vec<[f64; 11]> = (0..n_genes)
+            .map(|g| {
+                let signals = synthesize_signals_cpu(
+                    indicators.view(),
+                    &gene_offsets,
+                    &gene_indices,
+                    &gene_weights,
+                    &long_thr,
+                    &short_thr,
+                    &smc_data,
+                    &gene_smc_flags,
+                    gate_threshold,
+                    &smc_weights,
+                    g,
+                    n_samples,
+                );
+                let mut s = settings.clone();
+                s.sl_pips = sl_pips[g];
+                s.tp_pips = tp_pips[g];
+                fast_evaluate_strategy_core(
+                    &close, &high, &low, &signals, &month_idx, &day_idx, &timestamps, &s,
+                )
+            })
+            .collect();
+
+        // GPU path — skip (don't fail) when no usable device is present.
+        let gpu = match crate::cubecl_eval::try_evaluate_population_cuda(
+            &close,
+            &high,
+            &low,
+            indicators.view(),
+            &gene_offsets,
+            &gene_indices,
+            &gene_weights,
+            &long_thr,
+            &short_thr,
+            &month_idx,
+            &day_idx,
+            &timestamps,
+            &sl_pips,
+            &tp_pips,
+            &smc_data,
+            &gene_smc_flags,
+            gate_threshold,
+            &smc_weights,
+            &settings,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("GPU parity test SKIPPED (no usable GPU device): {e}");
+                return;
+            }
+        };
+
+        assert_eq!(gpu.len(), n_genes, "gpu returned wrong gene count");
+
+        // Metric layout (see try_evaluate_population_cuda): index 7 is a
+        // reserved 0.0 slot; index 8 is the integer trade count.
+        for g in 0..n_genes {
+            let (ct, gt) = (cpu[g][8], gpu[g][8]);
+            assert!(
+                (ct - gt).abs() <= 1.0,
+                "gene {g} trade-count mismatch: cpu={ct} gpu={gt} (GPU kernel logic bug)"
+            );
+            for m in [0usize, 1, 2, 3, 4, 5, 6, 9, 10] {
+                let (c, v) = (cpu[g][m], gpu[g][m]);
+                // f32 GPU vs f64 CPU: tolerate accumulation rounding, catch
+                // gross logic divergence.
+                let tol = 1e-2 * c.abs().max(1.0) + 1e-3;
+                assert!(
+                    (c - v).abs() <= tol,
+                    "gene {g} metric[{m}] mismatch: cpu={c} gpu={v} tol={tol}"
+                );
+            }
+        }
+
+        // ── Hybrid (evaluate_population_core) must also match the CPU ──────
+        // Exercises the CPU+GPU split, the CSR prefix slicing, and the merge.
+        // (If the GPU lane errors at runtime it falls back to CPU, so this also
+        // passes on a GPU-less box — just exactly instead of within tolerance.)
+        let hybrid = evaluate_population_core(PopulationEvalInputs {
+            close: &close,
+            high: &high,
+            low: &low,
+            indicators: indicators.view(),
+            gene_offsets: &gene_offsets,
+            gene_indices: &gene_indices,
+            gene_weights: &gene_weights,
+            long_thr: &long_thr,
+            short_thr: &short_thr,
+            month_idx: &month_idx,
+            day_idx: &day_idx,
+            timestamps: &timestamps,
+            sl_pips: &sl_pips,
+            tp_pips: &tp_pips,
+            smc_data: &smc_data,
+            gene_smc_flags: &gene_smc_flags,
+            gate_threshold,
+            weights: &smc_weights,
+            settings: &settings,
+        })
+        .expect("hybrid population eval");
+        assert_eq!(hybrid.len(), n_genes, "hybrid returned wrong gene count");
+        for g in 0..n_genes {
+            assert!(
+                (cpu[g][8] - hybrid[g][8]).abs() <= 1.0,
+                "hybrid gene {g} trade-count: cpu={} hybrid={}",
+                cpu[g][8],
+                hybrid[g][8]
+            );
+            for m in [0usize, 1, 2, 3, 4, 5, 6, 9, 10] {
+                let (c, v) = (cpu[g][m], hybrid[g][m]);
+                let tol = 1e-2 * c.abs().max(1.0) + 1e-3;
+                assert!(
+                    (c - v).abs() <= tol,
+                    "hybrid gene {g} metric[{m}]: cpu={c} hybrid={v} tol={tol}"
+                );
+            }
+        }
     }
 }
