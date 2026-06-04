@@ -147,6 +147,9 @@ polars = { version = "0.52.0", features = ["lazy", "dtype-full", "temporal", "ti
 neoethos-core = { path = "../neoethos-core" }
 neoethos-data = { path = "../neoethos-data" }
 neoethos-search = { path = "../neoethos-search" }
+# The autonomous-trader engine. The `/autonomous/replay` endpoint drives the SAME
+# engine the CLI `trader-replay` command does (parity) over real on-disk history.
+neoethos-trader = { path = "../neoethos-trader" }
 # **2026-05-25 — task #236**: enable `tree-models` in the default
 # build so the 7 gradient-boosted tree experts
 # (lightgbm / xgboost x3 / catboost x2 / sklears_tree) get the real

@@ -22,6 +22,7 @@
 //! [`contracts::LiveBar`]s and the SignalEngine respectively.
 
 pub mod contracts;
+pub mod data_replay;
 pub mod decision;
 pub mod engine;
 pub mod execution;
@@ -37,6 +38,7 @@ pub use contracts::{
     KillSwitchTier, LiveBar, PortfolioEntry, RiskGate, Signal, SignalEngine, SignalSource,
     StrategySource, TradeIntent, TradeMode,
 };
+pub use data_replay::{load_bars_from_dir, replay_symbol_from_dir};
 pub use decision::{DecisionConfig, DecisionEngine};
 pub use engine::{AutonomousEngine, EngineConfig, EngineStats};
 pub use execution::MockExecutionAdapter;

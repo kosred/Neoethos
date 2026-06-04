@@ -79,6 +79,7 @@ fn main() -> Result<()> {
         "train" => cmd_train(&args[2..]),
         "search" => cmd_search(&args[2..]),
         "discover" => cmd_discover(&args[2..]),
+        "trader-replay" => cmd_trader_replay(&args[2..]),
         "batch-discover" => cmd_batch_discover(&args[2..]),
         "migrate-data" => cmd_migrate_data(&args[2..]),
         "import" => cmd_import(&args[2..]),
@@ -224,6 +225,49 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
         base,
         features.n_samples(),
         features.n_features()
+    );
+    Ok(())
+}
+
+/// `trader-replay --symbol EURUSD --base M1 [--root data]` — offline dry-run of
+/// the autonomous-trader engine over real on-disk history. Drives the SAME
+/// `neoethos_trader` engine the app's `/autonomous/replay` endpoint does (UI↔CLI
+/// parity) with ZERO broker calls, and prints the resulting EngineStats. Symbol
+/// and base resolve through the shared `SystemConfig` resolvers, same as
+/// `discover`.
+fn cmd_trader_replay(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?;
+    let root = parse_root(args, settings.as_ref());
+    let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
+    let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
+    if symbol.trim().is_empty() || base.trim().is_empty() {
+        anyhow::bail!(
+            "trader-replay needs --symbol and --base (or a reachable config.yaml \
+             with system.symbol / system.base_timeframe)"
+        );
+    }
+    let stats = neoethos_trader::replay_symbol_from_dir(
+        &root,
+        &symbol,
+        &base,
+        neoethos_trader::EngineConfig::default(),
+    )?;
+    println!("trader-replay {symbol} {base} (offline dry-run, zero broker calls):");
+    println!(
+        "  bars={} signals={} intents={} executed={} blocked={}",
+        stats.bars_processed,
+        stats.signals_evaluated,
+        stats.intents_emitted,
+        stats.intents_executed,
+        stats.intents_blocked
+    );
+    println!(
+        "  positions: opened={} closed={} open_now={}",
+        stats.positions_opened, stats.positions_closed, stats.open_positions
+    );
+    println!(
+        "  realized_pnl={:.5} equity={:.2}",
+        stats.realized_pnl, stats.equity
     );
     Ok(())
 }
@@ -1684,6 +1728,9 @@ fn print_help() {
     );
     println!(
         "  discover --symbol EURUSD --base M1 --higher H1,H4 --population 100 --generations 5 --max-indicators 12 --portfolio-size 100 --candidates 200 --corr 0.7 --min-trades 1 --out cache/vector_ta_knowledge.json --root data"
+    );
+    println!(
+        "  trader-replay --symbol EURUSD --base M1 [--root data]  Offline dry-run of the autonomous trader over on-disk history (zero broker calls; same engine as the app /autonomous/replay)."
     );
     println!("  migrate-data --root data [--force] [--delete-source]");
     println!("  stop-target --symbol EURUSD --timeframe M1 --pip 0.0001 --signal 1 --root data");

@@ -28,6 +28,9 @@ neoethos-core = { path = "../neoethos-core" }
 neoethos-data = { path = "../neoethos-data" }
 neoethos-models = { path = "../neoethos-models", features = ["tree-models", "pure-rust-ml"] }
 neoethos-search = { path = "../neoethos-search" }
+# The autonomous-trader engine. The CLI `trader-replay` command drives the SAME
+# engine the app does (parity) over real on-disk history for an offline dry-run.
+neoethos-trader = { path = "../neoethos-trader" }
 anyhow = "1.0"
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }

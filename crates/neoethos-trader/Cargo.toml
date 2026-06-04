@@ -16,6 +16,11 @@ edition.workspace = true
 # the trait seams in `contracts` during Phases 2–6. Keeping Phase 1 dependency-
 # light makes it fast to compile and trivially unit-testable.
 [dependencies]
+# The pure engine (contracts/engine/position/...) needs none of these heavy
+# crates — only `data_replay` does, to load real .vortex history off disk for
+# the offline dry-run that backs the CLI `trader-replay` command and the app
+# `/autonomous/replay` endpoint (same helper → identical EngineStats = parity).
+neoethos-data = { path = "../neoethos-data" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -27,6 +27,7 @@
 //! Tighten before exposing on non-loopback interfaces.
 
 pub mod account;
+pub mod autonomous;
 pub mod bridge;
 pub mod broker_control;
 pub mod chart;
@@ -151,6 +152,10 @@ pub fn router(state: AppApiState) -> Router {
             get(strategy_lab::promotion_status),
         )
         .route("/strategy_lab/promote", post(strategy_lab::promote))
+        // Autonomous trader (Phase 1.5): offline dry-run over on-disk history,
+        // the SAME engine + helper the CLI `trader-replay` drives → identical
+        // EngineStats from both front-ends.
+        .route("/autonomous/replay", post(autonomous::replay))
         .route("/broker/status", get(system_status::broker_status))
         .route("/broker/reauth", post(broker_control::reauth))
         .route(

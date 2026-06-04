@@ -6454,6 +6454,7 @@ dependencies = [
  "neoethos-data",
  "neoethos-models",
  "neoethos-search",
+ "neoethos-trader",
  "num_cpus",
  "open",
  "polars",
@@ -6495,6 +6496,7 @@ dependencies = [
  "neoethos-data",
  "neoethos-models",
  "neoethos-search",
+ "neoethos-trader",
  "ratatui 0.29.0",
  "serde",
  "serde_json",
@@ -6645,6 +6647,7 @@ version = "0.4.40"
 dependencies = [
  "anyhow",
  "chrono",
+ "neoethos-data",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
