@@ -6640,6 +6640,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "neoethos-trader"
+version = "0.4.40"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "never-say-never"
 version = "6.6.666"
 source = "registry+https://github.com/rust-lang/crates.io-index"

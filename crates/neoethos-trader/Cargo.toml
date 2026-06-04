@@ -1,0 +1,24 @@
+[package]
+name = "neoethos-trader"
+version = "0.4.40"
+edition.workspace = true
+
+# ── neoethos-trader ──────────────────────────────────────────────────────────
+# The autonomous live-trading ENGINE — the single library service that both the
+# UI (neoethos-app) and the CLI (neoethos-cli) drive as thin front-ends (see
+# docs/v0.5-autonomous-trader-design.md §1.1). Phase 1 (this crate's first cut)
+# is the SKELETON + OFFLINE REPLAY: the full bar→signal→decision→risk→exec→
+# position loop, provable end-to-end over historical bars with ZERO broker calls.
+#
+# Deliberately depends on NOTHING heavy yet: the real Gene / SoftVotingEnsemble
+# (neoethos-search/-models), the feature cube (neoethos-data), the cTrader
+# broker path (neoethos-app), and the core RiskManager (neoethos-core) plug into
+# the trait seams in `contracts` during Phases 2–6. Keeping Phase 1 dependency-
+# light makes it fast to compile and trivially unit-testable.
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
