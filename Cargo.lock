@@ -6647,7 +6647,9 @@ version = "0.4.40"
 dependencies = [
  "anyhow",
  "chrono",
+ "ndarray 0.17.2",
  "neoethos-data",
+ "neoethos-search",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

@@ -33,6 +33,7 @@ pub mod funnel_profile;
 // `FilteringConfig` in `genetic::strategy_gene` + the prop-firm validation
 // gates in `discovery.rs`. 194 LOC removed.
 pub mod genetic;
+pub mod live_portfolio;
 pub mod orchestration;
 pub mod parity;
 pub mod portfolio;
@@ -97,7 +98,11 @@ pub use genetic::{
     install_strategy_evaluation_runtime_overrides,
     install_strategy_evaluation_runtime_overrides_from_env,
     install_strategy_evaluation_runtime_overrides_from_settings, month_day_indices, random_search,
-    signals_for_gene,
+    signals_for_gene, signals_for_gene_full,
+};
+pub use live_portfolio::{
+    LIVE_PORTFOLIO_SCHEMA_VERSION, LivePortfolioArtifact, load_live_portfolio_json,
+    project_features_to_effective, save_live_portfolio_json,
 };
 pub use neoethos_core::contracts::DeterminismPolicy;
 pub use orchestration::{BatchDiscoverySummary, DiscoveryOrchestrator};

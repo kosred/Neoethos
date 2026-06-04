@@ -21,9 +21,19 @@ edition.workspace = true
 # the offline dry-run that backs the CLI `trader-replay` command and the app
 # `/autonomous/replay` endpoint (same helper → identical EngineStats = parity).
 neoethos-data = { path = "../neoethos-data" }
+# Phase 4: the discovered `Gene` + the EXACT signal/feature-projection code the GA
+# uses (`signals_for_gene_full`, `project_features_to_effective`) + the
+# `LivePortfolioArtifact` loader — reused, never re-implemented, so live signals
+# match backtest signals.
+neoethos-search = { path = "../neoethos-search" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+# Tests construct `FeatureData::InMemory(Array2)` fixtures for the gene-signal
+# parity checks; the non-test engine never touches ndarray directly.
+ndarray = { workspace = true }

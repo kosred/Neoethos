@@ -1107,6 +1107,26 @@ pub fn start_discovery_job(
                 std::fs::create_dir_all(parent)?;
             }
             save_portfolio_json(&out_path, &result)?;
+            // Phase 4 (2026-06-04): self-describing live portfolio artifact for
+            // the autonomous trader (parity with the CLI discover emit).
+            // Additive + non-fatal.
+            {
+                let live_path = out_path.with_extension("live_portfolio.json");
+                if let Err(err) = neoethos_search::save_live_portfolio_json(
+                    &live_path,
+                    &search_request.symbol,
+                    &search_request.base_tf,
+                    &resolved_config.higher_timeframes,
+                    &result,
+                ) {
+                    tracing::warn!(
+                        target: "neoethos_app::discovery",
+                        error = %err,
+                        path = %live_path.display(),
+                        "save_live_portfolio_json failed (non-fatal)"
+                    );
+                }
+            }
             save_discovery_profile_json(
                 out_path.with_extension("profile.json"),
                 &resolved_config,

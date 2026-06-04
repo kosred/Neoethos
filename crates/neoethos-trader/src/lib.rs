@@ -26,6 +26,7 @@ pub mod data_replay;
 pub mod decision;
 pub mod engine;
 pub mod execution;
+pub mod gene_signal;
 pub mod portfolio;
 pub mod position;
 pub mod replay;
@@ -38,7 +39,10 @@ pub use contracts::{
     KillSwitchTier, LiveBar, PortfolioEntry, RiskGate, Signal, SignalEngine, SignalSource,
     StrategySource, TradeIntent, TradeMode,
 };
-pub use data_replay::{load_bars_from_dir, replay_symbol_from_dir};
+pub use data_replay::{
+    load_bars_from_dir, ohlcv_to_livebars, replay_portfolio_from_dir, replay_symbol_from_dir,
+};
+pub use gene_signal::{PrecomputedSignalEngine, combine_gene_signals};
 pub use decision::{DecisionConfig, DecisionEngine};
 pub use engine::{AutonomousEngine, EngineConfig, EngineStats};
 pub use execution::MockExecutionAdapter;

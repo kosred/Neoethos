@@ -238,21 +238,34 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
 fn cmd_trader_replay(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?;
     let root = parse_root(args, settings.as_ref());
-    let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
-    let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
-    if symbol.trim().is_empty() || base.trim().is_empty() {
-        anyhow::bail!(
-            "trader-replay needs --symbol and --base (or a reachable config.yaml \
-             with system.symbol / system.base_timeframe)"
-        );
-    }
-    let stats = neoethos_trader::replay_symbol_from_dir(
-        &root,
-        &symbol,
-        &base,
-        neoethos_trader::EngineConfig::default(),
-    )?;
-    println!("trader-replay {symbol} {base} (offline dry-run, zero broker calls):");
+    // With --portfolio <live_portfolio.json>, run the REAL discovered genes
+    // (symbol/base come from the artifact). Without it, run the momentum stub on
+    // --symbol/--base. Both drive the SAME engine (parity with /autonomous/replay).
+    let stats = if let Some(portfolio) = parse_flag(args, "--portfolio") {
+        neoethos_trader::replay_portfolio_from_dir(
+            &root,
+            &portfolio,
+            neoethos_trader::EngineConfig::default(),
+        )?
+    } else {
+        let symbol =
+            parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
+        let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
+        if symbol.trim().is_empty() || base.trim().is_empty() {
+            anyhow::bail!(
+                "trader-replay needs --symbol and --base (or a reachable config.yaml with \
+                 system.symbol / system.base_timeframe), or pass \
+                 --portfolio <live_portfolio.json> to run the discovered genes"
+            );
+        }
+        neoethos_trader::replay_symbol_from_dir(
+            &root,
+            &symbol,
+            &base,
+            neoethos_trader::EngineConfig::default(),
+        )?
+    };
+    println!("trader-replay (offline dry-run, zero broker calls):");
     println!(
         "  bars={} signals={} intents={} executed={} blocked={}",
         stats.bars_processed,
@@ -585,6 +598,27 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         // disk, so the operator can post-mortem even when this fires.
         neoethos_search::ensure_non_empty_portfolio(&result, &format!("{} {}", symbol, base))?;
         neoethos_search::save_portfolio_json(&out, &result)?;
+        // Phase 4 (2026-06-04): also emit the self-describing live portfolio
+        // artifact (full genes + effective_feature_names + base/higher TFs +
+        // normalize flag) the autonomous trader loads to evaluate the discovered
+        // strategies with backtest parity. Additive + non-fatal.
+        {
+            let live_path = format!("{out}.live_portfolio.json");
+            if let Err(err) = neoethos_search::save_live_portfolio_json(
+                &live_path,
+                &symbol,
+                &base,
+                &config.higher_timeframes,
+                &result,
+            ) {
+                tracing::warn!(
+                    target: "neoethos_cli::discover",
+                    error = %err,
+                    path = %live_path,
+                    "save_live_portfolio_json failed (non-fatal)"
+                );
+            }
+        }
         let profile_path = format!("{out}.profile.json");
         neoethos_search::save_discovery_profile_json(&profile_path, &config, &result)?;
         if !result.canonical_backtest_artifacts.is_empty() {
@@ -1730,7 +1764,7 @@ fn print_help() {
         "  discover --symbol EURUSD --base M1 --higher H1,H4 --population 100 --generations 5 --max-indicators 12 --portfolio-size 100 --candidates 200 --corr 0.7 --min-trades 1 --out cache/vector_ta_knowledge.json --root data"
     );
     println!(
-        "  trader-replay --symbol EURUSD --base M1 [--root data]  Offline dry-run of the autonomous trader over on-disk history (zero broker calls; same engine as the app /autonomous/replay)."
+        "  trader-replay [--symbol EURUSD --base M1 | --portfolio <live_portfolio.json>] [--root data]  Offline dry-run of the autonomous trader over on-disk history (zero broker calls; same engine as /autonomous/replay). With --portfolio it runs the REAL discovered genes."
     );
     println!("  migrate-data --root data [--force] [--delete-source]");
     println!("  stop-target --symbol EURUSD --timeframe M1 --pip 0.0001 --signal 1 --root data");
