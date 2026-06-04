@@ -2,6 +2,7 @@ pub mod all_indicators;
 pub mod cross_pair_features;
 pub mod discover;
 pub mod feature_registry;
+pub mod feature_store;
 pub mod features;
 pub mod hpc_ta;
 pub mod indicators;
