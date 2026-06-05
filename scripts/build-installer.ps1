@@ -8,7 +8,7 @@
 #   3. Run makensis on installer/neoethos.nsi → dist/NeoEthos-Setup-*.exe.
 #
 # After this script completes, the deliverable is ONE file:
-#   dist\NeoEthos-Setup-0.4.41.exe
+#   dist\NeoEthos-Setup-0.4.42.exe
 #
 # That's what the end-user downloads + double-clicks. The installer:
 #   - Asks where to install (default: %ProgramFiles%\NeoEthos)
@@ -101,7 +101,7 @@ try {
 }
 
 # ── 4. Verify output ─────────────────────────────────────────────────────────
-$installerExe = Join-Path $repoRoot 'dist\NeoEthos-Setup-0.4.41.exe'
+$installerExe = Join-Path $repoRoot 'dist\NeoEthos-Setup-0.4.42.exe'
 if (-not (Test-Path $installerExe)) {
     throw "Installer was not produced at $installerExe - check makensis output above for errors."
 }
@@ -113,7 +113,7 @@ Write-Host "[OK] Installer built: $installerExe" -ForegroundColor Green
 Write-Host "     Size: $sizeMB MB"
 Write-Host ""
 Write-Host "End-user workflow:" -ForegroundColor Cyan
-Write-Host "  1. Download NeoEthos-Setup-0.4.41.exe (one file)."
+Write-Host "  1. Download NeoEthos-Setup-0.4.42.exe (one file)."
 Write-Host "  2. Double-click to install. Follow the wizard."
 Write-Host "  3. Launch via Start Menu or Desktop shortcut."
 Write-Host "  4. Never see bin\neoethos-app.exe - it's hidden."

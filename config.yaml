@@ -190,7 +190,7 @@ models:
   prop_search_val_candidates: 0
   prop_search_val_min_positive_months: 0
   prop_search_val_min_trades_per_month: 15
-  prop_search_val_min_trades_per_day: 0.5
+  prop_search_val_min_trades_per_day: 1.0  # operator 2026-06-05: >=1 trade per working day so we can actually observe what a strategy does
   prop_search_val_min_monthly_profit_pct: 0.0
   prop_search_val_log_trades: true
   prop_search_val_trade_log_max: 50
