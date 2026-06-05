@@ -76,7 +76,9 @@ thiserror   = "2.0.16"
 # and is already optimised at opt-level=3 regardless of cross-crate LTO. A
 # ~120-150MB binary is fine for GitHub + the shipped installer, and iteration
 # (incl. the VPS rebuild) becomes dramatically faster.
-lto = false
+lto = "thin"          # operator 2026-06-05: thin LTO (not fat) — cross-crate
+                      # inlining for faster code, but a fraction of fat's
+                      # compile cost (and mold + -Zthreads below offset it).
 codegen-units = 16
 strip = "symbols"
 panic = "unwind"
