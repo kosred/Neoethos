@@ -511,7 +511,29 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             .collect();
         let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
 
-        let dataset = neoethos_data::load_symbol_dataset(&root, &symbol)?;
+        // agent 2026-06-05 perf fix: load ONLY base + higher TFs, not every
+        // timeframe. `load_symbol_dataset` loaded EVERY canonical TF (incl M1's
+        // ~5.27M rows) for every combo, then `ensure_timeframes_with_resample`
+        // cloned the whole frame map — the dominant per-combo pre-GA cost
+        // (minutes, GPU idle). `ensure_timeframes_with_resample` skips TFs <= base
+        // and only resamples MISSING higher TFs from the base, so base + higher
+        // (filtered to what exists on disk) is sufficient. M1's 5.27M rows are now
+        // loaded only for the M1-base combo, not for every combo.
+        let mut want_tfs: Vec<String> = vec![base.clone()];
+        for h in &higher_list {
+            if !want_tfs.contains(h) {
+                want_tfs.push(h.clone());
+            }
+        }
+        want_tfs.retain(|tf| {
+            neoethos_data::symbol_timeframe_vortex_path(&root, &symbol, tf).exists()
+        });
+        if !want_tfs.iter().any(|t| t == &base) {
+            want_tfs.push(base.clone());
+        }
+        let want_refs: Vec<&str> = want_tfs.iter().map(|s| s.as_str()).collect();
+        let dataset =
+            neoethos_data::load_symbol_dataset_with_timeframes(&root, &symbol, &want_refs)?;
         let dataset = neoethos_data::ensure_timeframes_with_resample(
             &dataset,
             &base,
