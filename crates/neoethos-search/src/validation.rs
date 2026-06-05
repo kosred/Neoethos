@@ -429,6 +429,9 @@ pub fn compute_forward_test_summary(input: ForwardTestInput<'_>) -> Result<Forwa
         input.high,
         input.low,
         input.signals,
+        // Phase 1: legacy fixed-1-lot for the forward-test summary (no
+        // confidence threaded here yet) — `&[]` forces pos_lots = 1.0.
+        &[],
         input.months,
         input.days,
         input.timestamps,
@@ -1123,6 +1126,8 @@ pub fn embargoed_walkforward_backtest(
             slice_high,
             slice_low,
             slice_sig,
+            // Phase 1: legacy fixed-1-lot for the walk-forward slice eval.
+            &[],
             slice_months,
             slice_days,
             &[],
@@ -1384,6 +1389,12 @@ mod tests {
             swap_long_pips_per_day: 0.0,
             swap_short_pips_per_day: 0.0,
             pnl_conversion_fee_rate: 0.0,
+            // Risk-based sizing OFF for the flat-test fixture so the existing
+            // PnL assertions (pips × pip_value_per_lot) keep holding.
+            risk_based_sizing: false,
+            risk_per_trade_min: 0.005,
+            risk_per_trade_max: 0.03,
+            high_quality_confidence: 0.65,
         }
     }
 

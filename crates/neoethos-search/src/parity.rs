@@ -110,7 +110,8 @@ mod tests {
     use super::*;
     use crate::eval::{BacktestSettings, fast_evaluate_strategy_core};
     use crate::genetic::{
-        EvaluationConfig, Gene, evaluate_genes, month_day_indices, signals_for_gene,
+        EvaluationConfig, Gene, evaluate_genes, month_day_indices,
+        signals_and_confidence_for_gene_with_config,
     };
     use ndarray::arr2;
     use neoethos_data::{FeatureFrame, Ohlcv};
@@ -233,12 +234,19 @@ mod tests {
         let reference: Vec<[f64; 11]> = genes
             .iter()
             .map(|gene| {
-                let signals = signals_for_gene(&frame, gene);
+                // Match the population evaluator's risk-based sizing: it now
+                // synthesizes per-bar confidence and sizes accordingly. The
+                // scalar reference must thread the SAME confidence (computed
+                // identically from combined-score vs thresholds) or it would
+                // diverge from `evaluate_genes`.
+                let (signals, confidences) =
+                    signals_and_confidence_for_gene_with_config(&frame, gene, &config);
                 fast_evaluate_strategy_core(
                     &ohlcv.close,
                     &ohlcv.high,
                     &ohlcv.low,
                     &signals,
+                    &confidences,
                     &months,
                     &days,
                     &frame.timestamps,

@@ -143,6 +143,24 @@ pub fn signals_for_gene_with_config(
     gene: &Gene,
     config: &EvaluationConfig,
 ) -> Vec<i8> {
+    // Behaviour-identical thin wrapper: drop the confidence vector.
+    signals_and_confidence_for_gene_with_config(features, gene, config).0
+}
+
+/// Confidence-emitting variant of [`signals_for_gene_with_config`]. Returns
+/// the SAME signals plus a per-bar confidence in `[0,1]` used by the
+/// risk-based position sizer.
+///
+/// Confidence per bar: `0.0` when the signal is `0`; otherwise
+///   gap    = (long_threshold - short_threshold).abs().max(1e-6)
+///   long:  margin = combined[i] - long_threshold
+///   short: margin = short_threshold - combined[i]
+///   conf   = (margin / gap).clamp(0.0, 1.0)
+pub fn signals_and_confidence_for_gene_with_config(
+    features: &FeatureFrame,
+    gene: &Gene,
+    config: &EvaluationConfig,
+) -> (Vec<i8>, Vec<f32>) {
     let n_samples = features.n_samples();
     let mut combined = vec![0.0_f32; n_samples];
     for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
@@ -155,6 +173,8 @@ pub fn signals_for_gene_with_config(
         }
     }
     let mut signals = vec![0_i8; n_samples];
+    let mut confidences = vec![0.0_f32; n_samples];
+    let gap = (gene.long_threshold - gene.short_threshold).abs().max(1e-6);
 
     // Resolve gene SMC flags + per-flag weights identical to the in-search
     // evaluator. If no flag is enabled we short-circuit to the simple
@@ -173,38 +193,36 @@ pub fn signals_for_gene_with_config(
         gene.use_eql as i8,
         gene.use_displacement as i8,
     ];
-    let any_flag = flags.iter().any(|f| *f != 0);
-    if !any_flag {
-        for (i, slot) in signals.iter_mut().enumerate() {
-            let v = combined[i];
-            *slot = if v >= gene.long_threshold {
-                1
-            } else if v <= gene.short_threshold {
-                -1
-            } else {
-                0
-            };
-        }
-        return signals;
-    }
+    let _any_flag = flags.iter().any(|f| *f != 0);
 
     // Need OHLCV-derived SMC indicator series — compute the same way the
     // evaluator does. Without OHLCV we fall back to the un-gated path so
     // single-arg callers (no Ohlcv handy) keep working; gated callers
-    // should use `signals_for_gene_full`.
+    // should use `signals_for_gene_full`. (Both branches of the original
+    // code applied the identical un-gated threshold loop, so this is
+    // behaviour-preserving.)
     let _ = config; // reserved: future per-config gate threshold override
 
-    for (i, slot) in signals.iter_mut().enumerate() {
+    for i in 0..n_samples {
         let v = combined[i];
-        *slot = if v >= gene.long_threshold {
+        let sig = if v >= gene.long_threshold {
             1
         } else if v <= gene.short_threshold {
             -1
         } else {
             0
         };
+        signals[i] = sig;
+        if sig != 0 {
+            let margin = if sig == 1 {
+                v - gene.long_threshold
+            } else {
+                gene.short_threshold - v
+            };
+            confidences[i] = (margin / gap).clamp(0.0, 1.0);
+        }
     }
-    signals
+    (signals, confidences)
 }
 
 /// SMC-gated variant that mirrors `eval::synthesize_signals_cpu` exactly.
@@ -216,6 +234,27 @@ pub fn signals_for_gene_full(
     gene: &Gene,
     config: &EvaluationConfig,
 ) -> Vec<i8> {
+    // Behaviour-identical thin wrapper: drop the confidence vector.
+    signals_and_confidence_for_gene_full(features, ohlcv, gene, config).0
+}
+
+/// Confidence-emitting variant of [`signals_for_gene_full`]. Returns the
+/// SAME SMC-gated signals plus a per-bar confidence in `[0,1]` used by the
+/// risk-based position sizer. Confidence is computed from the RAW threshold
+/// crossing (pre-gate) and stored only for bars whose final (post-gate)
+/// signal is non-zero, so it aligns exactly with the signals slice.
+///
+/// Confidence per bar: `0.0` when the signal is `0`; otherwise
+///   gap    = (long_threshold - short_threshold).abs().max(1e-6)
+///   long:  margin = combined[i] - long_threshold
+///   short: margin = short_threshold - combined[i]
+///   conf   = (margin / gap).clamp(0.0, 1.0)
+pub fn signals_and_confidence_for_gene_full(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    gene: &Gene,
+    config: &EvaluationConfig,
+) -> (Vec<i8>, Vec<f32>) {
     let n_samples = features.n_samples();
     let mut combined = vec![0.0_f32; n_samples];
     for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
@@ -279,6 +318,8 @@ pub fn signals_for_gene_full(
         super::smc_indicators::build_smc_arrays(features, ohlcv);
 
     let mut signals = vec![0_i8; n_samples];
+    let mut confidences = vec![0.0_f32; n_samples];
+    let gap = (gene.long_threshold - gene.short_threshold).abs().max(1e-6);
     for i in 0..n_samples {
         let v = combined[i];
         let raw = if v >= gene.long_threshold {
@@ -291,8 +332,16 @@ pub fn signals_for_gene_full(
         if raw == 0 {
             continue;
         }
+        // Confidence of the raw threshold crossing (pre-gate).
+        let margin = if raw == 1 {
+            v - gene.long_threshold
+        } else {
+            gene.short_threshold - v
+        };
+        let conf = (margin / gap).clamp(0.0, 1.0);
         if active_sum <= 0.0 {
             signals[i] = raw;
+            confidences[i] = conf;
             continue;
         }
         let smc_row = [
@@ -313,9 +362,10 @@ pub fn signals_for_gene_full(
         }
         if score >= gate {
             signals[i] = raw;
+            confidences[i] = conf;
         }
     }
-    signals
+    (signals, confidences)
 }
 
 /// Evaluate genes using a pre-built EvalDataCache (avoids recomputing stable arrays each generation).

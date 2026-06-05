@@ -2,7 +2,8 @@ use crate::artifact_io::{stable_json_hash, write_json_atomic};
 use crate::eval::{BacktestMetrics, fast_evaluate_strategy_core, simulate_trades_core};
 use crate::genetic::strategy_gene::EvaluationConfig;
 use crate::genetic::{
-    Gene, evolve_search_with_progress_and_limits, month_day_indices, signals_for_gene_full,
+    Gene, evolve_search_with_progress_and_limits, month_day_indices,
+    signals_and_confidence_for_gene_full, signals_for_gene_full,
 };
 use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use crate::validation::{
@@ -1373,6 +1374,7 @@ fn walkforward_summary_passed(summary: &WalkforwardSummary) -> bool {
 fn evaluate_cpcv_gate(
     portfolio: &[Gene],
     portfolio_signals: &[Vec<i8>],
+    features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
     months: &[i64],
@@ -1421,8 +1423,14 @@ fn evaluate_cpcv_gate(
 
     let mut fold_count = 0usize;
     let mut profitable_folds = 0usize;
+    let eval_config = config.evaluation_config(ohlcv.close.last().copied());
     for (gene, signals) in portfolio.iter().zip(portfolio_signals) {
         let settings = discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
+        // Per-bar confidence for risk-based sizing — regenerated from the
+        // SAME gene + evaluation config that produced `signals` (and sliced
+        // per fold below, aligned to the price/signal slices).
+        let (_regen_signals, gene_confidences) =
+            signals_and_confidence_for_gene_full(features, ohlcv, gene, &eval_config);
         for (_, test_idx) in &splits {
             if test_idx.is_empty() {
                 continue;
@@ -1432,6 +1440,10 @@ fn evaluate_cpcv_gate(
             let high: Vec<f64> = absolute_idx.iter().map(|idx| ohlcv.high[*idx]).collect();
             let low: Vec<f64> = absolute_idx.iter().map(|idx| ohlcv.low[*idx]).collect();
             let sig: Vec<i8> = absolute_idx.iter().map(|idx| signals[*idx]).collect();
+            let conf: Vec<f32> = absolute_idx
+                .iter()
+                .map(|idx| gene_confidences.get(*idx).copied().unwrap_or(0.0))
+                .collect();
             let fold_months: Vec<i64> = absolute_idx.iter().map(|idx| months[*idx]).collect();
             let fold_days: Vec<i64> = absolute_idx.iter().map(|idx| days[*idx]).collect();
             let metrics = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
@@ -1439,6 +1451,7 @@ fn evaluate_cpcv_gate(
                 &high,
                 &low,
                 &sig,
+                &conf,
                 &fold_months,
                 &fold_days,
                 &[],
@@ -1508,11 +1521,20 @@ fn build_discovery_validation_artifacts(
         let settings = discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
         let strategy_hash = stable_json_hash(gene)?;
         let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
+        // Regenerate per-bar confidence for risk-based, confidence-scaled
+        // sizing. We reuse the precomputed `signals` for the signal vector
+        // (identity-preserving) and only take the fresh confidence slice —
+        // both are produced from the SAME gene + evaluation config, so they
+        // are aligned by construction.
+        let eval_config = config.evaluation_config(ohlcv.close.last().copied());
+        let (_regen_signals, confidences) =
+            signals_and_confidence_for_gene_full(features, ohlcv, gene, &eval_config);
         let metrics = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
             &ohlcv.close,
             &ohlcv.high,
             &ohlcv.low,
             signals,
+            &confidences,
             &months,
             &days,
             timestamps,
@@ -1559,7 +1581,7 @@ fn build_discovery_validation_artifacts(
     }
 
     let (cpcv_passed, cpcv_fold_count, cpcv_profitable_fold_ratio) =
-        evaluate_cpcv_gate(portfolio, portfolio_signals, ohlcv, config, &months, &days)?;
+        evaluate_cpcv_gate(portfolio, portfolio_signals, features, ohlcv, config, &months, &days)?;
 
     let validation_gates = DiscoveryValidationGates {
         walkforward_passed,

@@ -47,8 +47,9 @@ pub use runtime_overrides::{
 };
 pub use search_engine::{
     evaluate_genes, evolve_search, evolve_search_with_progress,
-    evolve_search_with_progress_and_limits, month_day_indices, random_search, signals_for_gene,
-    signals_for_gene_full,
+    evolve_search_with_progress_and_limits, month_day_indices, random_search,
+    signals_and_confidence_for_gene_full, signals_and_confidence_for_gene_with_config,
+    signals_for_gene, signals_for_gene_full,
 };
 pub use seed_templates::seed_professional_templates;
 pub use smc_indicators::{
