@@ -611,9 +611,19 @@ impl DiscoveryConfig {
         // `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` env overrides.)
         let cfg = &self.prop_firm_gate_params;
         let mut rules = PropFirmRiskRules::default();
-        rules.min_profit_target_pct =
-            PropFirmConstraints::FTMO_STANDARD.challenge_profit_target_pct as f64;
-        rules.require_profit_target = true;
+        // Operator architecture (2026-06-06): the discovery finds a robust EDGE
+        // (positive across windows + LOW DRAWDOWN), NOT a full FTMO challenge pass.
+        // The aggressive 10%/window profit target REJECTS exactly the steady
+        // low-DD strategies the operator wants — a candidate making ~1%/60-day
+        // window with 7.4% DD and 9/9 positive months failed ONLY on this target,
+        // not on DD/overfit. Account GROWTH to the target is the LIVE models' job
+        // (partial profits + smart exits keep DD low). So the discovery gate keeps
+        // strategies on consistency + low DD, NOT the profit target.
+        // `prop_firm_gate.profit_target_pct > 0` re-enables the target if wanted;
+        // `prop_firm_gate.max_overall_drawdown_pct` overrides the low-DD bar below.
+        rules.min_profit_target_pct = 0.0;
+        rules.require_profit_target = false;
+        rules.max_overall_drawdown_pct = 0.10;
         if let Some(v) = cfg.max_daily_loss_pct {
             rules.max_daily_loss_pct = v;
         }
