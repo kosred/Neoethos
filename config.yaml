@@ -34,11 +34,10 @@ system:
   deep_purge_on_train: true
   # Hardware is detected automatically (CPU/GPU/RAM)
   # Set preference to "auto", "true" (force GPU), or "false" (force CPU)        
-  enable_gpu_preference: auto
-  # Discovery data handling (full data + avoid auto row caps)
-  discovery_auto_cap: false
-  discovery_max_rows: 0
-  discovery_stream: true
+  enable_gpu_preference: cpu  # agent 2026-06-04: iGPU wgpu OOM on this laptop -> CPU-only for a stable 7-day run
+  # agent 2026-06-05 overfitting fix: removed dead `discovery_auto_cap` /
+  # `discovery_max_rows` / `discovery_stream` keys — never consumed by code.
+  # The REAL discovery row cap is `models.prop_search_max_rows` (see below).
 
 risk:
   initial_balance: 10000  # Fallback used when broker balance is unavailable
@@ -169,11 +168,12 @@ models:
   prop_search_enabled: true  # CRITICAL: Enable strategy discovery!
   prop_search_population: 100  # Per-island population (100 × 8 islands = 800 total)
   prop_search_generations: 1000  # operator 2026-06-01: deep Python-class search (was 20); time-bounded by max_hours
-  prop_search_max_hours: 24  # operator 2026-06-01: up to 24h budget per symbol,TF run (was 2.0)
-  prop_search_max_rows: 0  # 0 = USE FULL DATASET for strategy discovery (2.2M rows)
+  prop_search_max_hours: 0.5  # agent 2026-06-05 golden-mean: 30min GA per combo (was 1h) so ALL ~150 combos + training fit 7 days; cmd_discover re-reads config per combo so this applies from the next combo
+  prop_search_max_rows: 400000  # agent 2026-06-05 ROOT-CAUSE fix: was 0 (=FULL dataset) → M5 ran GA+walkforward+CPCV on 1.05M rows serially (~46min/combo; M1's 5.27M never finished). THIS is the real row-cap (DiscoveryConfig.max_rows, discovery.rs:424); `system.discovery_max_rows` is a DEAD field. 400k = last ~3.8yr M5; trims ONLY M5 (M15=350k & smaller untouched). trim_recent_history keeps the most-recent rows. cmd_discover re-reads config per combo → applies next combo, no restart.
   prop_search_portfolio_size: 4  # Cap discovered strategies per pair
-  # 0 = allow full indicator set (no hard cap)
-  prop_search_max_indicators: 0
+  # agent 2026-06-05 overfitting fix: 0 meant unlimited (usize::MAX) -> genes used
+  # up to 58 indicators = severe overfitting; 16 caps degrees of freedom (regularization).
+  prop_search_max_indicators: 16
   prop_search_async: true
   prop_search_async_wait: false
   tree_device_preference: gpu
@@ -286,8 +286,20 @@ models:
   prop_accuracy_weight: 0.1
   prop_min_trades: 0
   prop_conf_threshold: 0.55
-  walkforward_splits: 20  # time-based walk-forward splits for OOS validation
+  walkforward_splits: 10  # agent 2026-06-05: was 20 → halves the serial post-gate walkforward cost (20→10 backtests × survivors × rows). 10 splits is the robust OOS sweet spot. Speeds every combo. NOTE: with require_walkforward_for_export=true (below) walk-forward is now an EXPORT GATE in PropFirm mode, not just informational.
   embargo_minutes: 120
+  # agent 2026-06-05 overfitting fix: walk-forward as an EXPORT GATE. When true
+  # (default), a discovered portfolio is export-ready in PropFirm mode ONLY if it
+  # also passes walk-forward (out-of-sample) — not just the prop-firm window gate.
+  # This stops in-sample-overfit strategies (IS Sharpe 3-11 / PF up to 62) that
+  # fail walk-forward from exporting. Set false to restore window-gate-only.
+  require_walkforward_for_export: true
+  # agent 2026-06-05 overfitting fix: hard floor for the prop-firm window
+  # pass-rate (combined as max with discovery_runtime.prop_firm_gate.pass_rate,
+  # which defaults to 0.0 = ranking-only). 0.65 = a candidate must pass FTMO
+  # rules on ≥65% of random evaluation windows to survive. Raise toward 1.0 for
+  # stricter selection; lower (e.g. 0.0) to restore the old ranking-only behaviour.
+  prop_firm_min_pass_rate: 0.65
   # CPCV (Combinatorial Purged Cross-Validation) settings
   enable_cpcv: true
   cpcv_n_splits: 5
@@ -295,7 +307,7 @@ models:
   cpcv_embargo_pct: 0.01
   cpcv_purge_pct: 0.02
   cpcv_min_phi: 0.80
-  cpcv_max_rows: 0
+  cpcv_max_rows: 200000  # agent 2026-06-05: was 0 (=full rows) → CPCV (combinatorial purged CV, the single heaviest serial validation) ran on 1.05M rows. 200k bounds it on every TF; CPCV stays enabled (López de Prado overfitting check, kept per "stats are the authority") but capped. Informational in PropFirm mode.
 
 news:
   news_decay_minutes: 120

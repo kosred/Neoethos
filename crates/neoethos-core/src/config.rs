@@ -108,9 +108,12 @@ pub struct SystemConfig {
     pub deep_purge_on_train: bool,
     pub n_jobs: usize,
     pub enable_gpu_preference: String,
-    pub discovery_auto_cap: bool,
-    pub discovery_max_rows: usize,
-    pub discovery_stream: bool,
+    // agent 2026-06-05 overfitting fix: removed three dead `discovery_*` fields
+    // (`discovery_auto_cap` / `discovery_max_rows` / `discovery_stream`). They
+    // were never read anywhere in the workspace — the REAL discovery row cap is
+    // `models.prop_search_max_rows` (→ DiscoveryConfig.max_rows, discovery.rs).
+    // SystemConfig does NOT derive `#[serde(deny_unknown_fields)]`, so any stale
+    // copies of these keys still in a user's config.yaml are ignored, not errors.
     pub enable_gpu: bool,
     pub num_gpus: usize,
     pub device: String,
@@ -225,9 +228,8 @@ impl Default for SystemConfig {
             deep_purge_on_train: true,
             n_jobs,
             enable_gpu_preference: "auto".to_string(),
-            discovery_auto_cap: true,
-            discovery_max_rows: 0,
-            discovery_stream: false,
+            // agent 2026-06-05 overfitting fix: dead `discovery_*` fields removed
+            // (see struct decl). The real row cap is `models.prop_search_max_rows`.
             enable_gpu: false,
             num_gpus: 0,
             device: "cpu".to_string(),
@@ -695,6 +697,23 @@ pub struct ModelsConfig {
     /// `NEOETHOS_BOT_DISCOVERY_MODE`; now a first-class config knob the
     /// operator sets from the UI / TUI — never the environment.
     pub discovery_mode: String,
+    /// agent 2026-06-05 overfitting fix: when `true` (default), a discovered
+    /// portfolio is only export-ready in PropFirm mode if it ALSO passes the
+    /// walk-forward gate (not just the prop-firm window gate). Previously the
+    /// walk-forward result was purely informational in PropFirm mode, so
+    /// overfit strategies (in-sample Sharpe 3-11 / PF up to 62) that failed
+    /// out-of-sample still exported. Set `false` to restore the old behaviour
+    /// (prop-firm-window gate only). `#[serde(default)]` on `ModelsConfig`
+    /// makes a missing key fall back to the `Default` impl below (= `true`).
+    pub require_walkforward_for_export: bool,
+    /// agent 2026-06-05 overfitting fix: hard floor for the prop-firm
+    /// window-pass rate, applied on top of `discovery_runtime.prop_firm_gate
+    /// .pass_rate` (effective floor = max of the two). Default 0.65 — a
+    /// candidate must pass FTMO-style rules on at least 65% of the random
+    /// evaluation windows to survive. The previous effective floor was 0.0
+    /// (ranking-only), which let strategies that passed barely over half the
+    /// windows through. Raise toward 1.0 for stricter selection.
+    pub prop_firm_min_pass_rate: f64,
     /// Genetic-search runtime knobs (config-driven replacement for the
     /// `NEOETHOS_BOT_*` search env vars). See [`SearchRuntimeConfig`].
     pub search_runtime: SearchRuntimeConfig,
@@ -1384,6 +1403,10 @@ impl Default for ModelsConfig {
             walkforward_splits: 20,
             embargo_minutes: 120,
             discovery_mode: "prop_firm".to_string(),
+            // agent 2026-06-05 overfitting fix: default-on walk-forward export
+            // gate + 0.65 prop-firm pass-rate floor (see field docs above).
+            require_walkforward_for_export: true,
+            prop_firm_min_pass_rate: 0.65,
             search_runtime: SearchRuntimeConfig::default(),
             discovery_runtime: DiscoveryRuntimeConfig::default(),
             eval_runtime: EvalRuntimeConfig::default(),

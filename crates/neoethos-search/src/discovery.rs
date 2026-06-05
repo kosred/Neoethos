@@ -284,6 +284,18 @@ pub struct DiscoveryConfig {
     pub risky_start_balance: f64,
     pub risky_target_balance: f64,
     pub risky_horizon_days: f64,
+    /// agent 2026-06-05 overfitting fix: when `true` (default), PropFirm-mode
+    /// export-readiness ALSO requires the walk-forward gate to pass — not just
+    /// the prop-firm window gate. Previously walk-forward was informational in
+    /// PropFirm mode, so overfit strategies that failed out-of-sample still
+    /// exported. Wired from `models.require_walkforward_for_export`. When
+    /// `false`, behaviour is identical to before (window gate only).
+    pub require_walkforward_for_export: bool,
+    /// agent 2026-06-05 overfitting fix: hard floor for the prop-firm
+    /// window-pass rate, combined (max) with `prop_firm_gate.pass_rate`. Wired
+    /// from `models.prop_firm_min_pass_rate` (default 0.65). A value of 0.0
+    /// reproduces the old ranking-only behaviour.
+    pub prop_firm_min_pass_rate: f64,
 }
 
 /// Configuration for the prop-firm window-pass gate.
@@ -351,6 +363,11 @@ impl Default for DiscoveryConfig {
             risky_start_balance: 100.0,
             risky_target_balance: 50000.0,
             risky_horizon_days: 180.0,
+            // agent 2026-06-05 overfitting fix: default-on walk-forward export
+            // gate + 0.65 prop-firm pass-rate floor (from_settings overrides
+            // from typed config; these defaults match ModelsConfig::default).
+            require_walkforward_for_export: true,
+            prop_firm_min_pass_rate: 0.65,
         }
     }
 }
@@ -467,6 +484,10 @@ impl DiscoveryConfig {
             risky_start_balance: settings.system.risky_start_balance_usd,
             risky_target_balance: settings.system.risky_target_balance_usd,
             risky_horizon_days: settings.system.risky_horizon_days as f64,
+            // agent 2026-06-05 overfitting fix: walk-forward export gate +
+            // prop-firm pass-rate floor, both from typed config (Settings.models).
+            require_walkforward_for_export: model_settings.require_walkforward_for_export,
+            prop_firm_min_pass_rate: model_settings.prop_firm_min_pass_rate.clamp(0.0, 1.0),
         }
     }
 
@@ -3078,6 +3099,13 @@ where
         if pf.n_windows == 0 {
             pf.n_windows = auto_tune_n_windows(&features.timestamps, pf.window_days);
         }
+        // agent 2026-06-05 overfitting fix: enforce a hard pass-rate floor
+        // (default 0.65) ON TOP of the gate's own `pass_rate`. The effective
+        // floor is the max of the two, so a candidate must clear FTMO-style
+        // rules on at least 65% of the random windows. Raising `pf.pass_rate`
+        // here means BOTH the diagnostic bucket below and the survival filter
+        // (`*rate >= pf.pass_rate`) use the floored threshold consistently.
+        pf.pass_rate = pf.pass_rate.max(config.prop_firm_min_pass_rate);
         let candidates_in: Vec<((usize, Gene), Vec<i8>)> =
             filtered.into_iter().zip(signals_map.into_iter()).collect();
         let timestamps_owned = features.timestamps.clone();
@@ -3276,7 +3304,19 @@ where
             config,
         )?;
     if let Some(pf) = config.prop_firm_gate.as_ref() {
-        validation_gates.prop_firm_window_passed = !portfolio.is_empty();
+        // agent 2026-06-05 overfitting fix: the prop-firm window gate alone let
+        // in-sample-overfit portfolios export (walk-forward was informational).
+        // When `require_walkforward_for_export` is set (default), the portfolio
+        // must ALSO clear the walk-forward gate to be window-passed — so
+        // `is_portfolio_export_ready()` (which keys off `prop_firm_window_passed`)
+        // now demands genuine out-of-sample robustness. When the flag is false
+        // the AND collapses to the previous `!portfolio.is_empty()` behaviour.
+        let window_passed = !portfolio.is_empty();
+        validation_gates.prop_firm_window_passed = if config.require_walkforward_for_export {
+            window_passed && validation_gates.walkforward_passed
+        } else {
+            window_passed
+        };
         validation_gates.prop_firm_window_count = pf.n_windows;
         validation_gates.prop_firm_window_pass_rate = if portfolio_pass_rates.is_empty() {
             0.0
