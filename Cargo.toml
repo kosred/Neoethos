@@ -70,8 +70,14 @@ thiserror   = "2.0.16"
 #       happy path + ~10 MB binary growth — acceptable trade for not
 #       killing the process on a recoverable indicator panic.
 [profile.release]
-lto = "fat"
-codegen-units = 1
+# agent 2026-06-05 (operator decision): dropped `lto = "fat"` + `codegen-units = 1`.
+# They cost ~3-4x compile/link time (full-program LTO of the 100MB+ binary) for a
+# marginal runtime gain — the GA hot loop lives inside ONE crate (neoethos-search)
+# and is already optimised at opt-level=3 regardless of cross-crate LTO. A
+# ~120-150MB binary is fine for GitHub + the shipped installer, and iteration
+# (incl. the VPS rebuild) becomes dramatically faster.
+lto = false
+codegen-units = 16
 strip = "symbols"
 panic = "unwind"
 

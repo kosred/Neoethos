@@ -34,3 +34,12 @@ BINDGEN_EXTRA_CLANG_ARGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 # than locking to the exact build machine.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "link-arg=/FORCE:MULTIPLE", "-C", "link-arg=/IGNORE:4006"]
+
+# agent 2026-06-05: AVX2/BMI2/FMA SIMD on Linux too (local WSL2 build + the L40
+# VPS). The Windows section above already requested `target-cpu=x86-64-v3`, but
+# Linux builds (x86_64-unknown-linux-gnu) were silently getting the SSE2 baseline
+# — no AVX2 vectorisation in the GA/TA/numeric hot paths, i.e. a slower binary.
+# Same microarch level (Intel Haswell 2013+ / AMD Zen 2017+), portable across all
+# post-2013 CPUs. CPU-instruction-level only; no effect on the Vulkan/CUDA GPU lane.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
