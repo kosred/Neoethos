@@ -1279,7 +1279,7 @@ impl Default for ModelsConfig {
             prop_search_enabled: false,
             prop_search_population: 100,
             prop_search_generations: 50,
-            prop_search_max_hours: 8.0,
+            prop_search_max_hours: 0.5, // 2026-06-05: sane default (was 8.0=absurd 8h/combo); config-overridable (VPS budget run uses 0.25)
             prop_search_max_rows: 0,
             prop_search_max_rows_by_tf: HashMap::new(),
             prop_search_portfolio_size: 3000,
@@ -1400,7 +1400,7 @@ impl Default for ModelsConfig {
             label_neutral_band_atr_fraction: 0.25,
             label_stop_atr_multiplier: 0.0,
             label_take_profit_rr: 0.0,
-            walkforward_splits: 20,
+            walkforward_splits: 10, // 2026-06-05: robust OOS default (was 20, slow); config-overridable
             embargo_minutes: 120,
             discovery_mode: "prop_firm".to_string(),
             // agent 2026-06-05 overfitting fix: default-on walk-forward export
@@ -1426,7 +1426,7 @@ impl Default for ModelsConfig {
             cpcv_embargo_pct: 0.01,
             cpcv_purge_pct: 0.02,
             cpcv_min_phi: 0.80,
-            cpcv_max_rows: 0,
+            cpcv_max_rows: 200000, // 2026-06-05: cap informational CPCV (was 0=full=heavy on full-data); config-overridable
             enable_ddp: false,
             enable_fsdp: false,
             ddp_world_size: 1,

@@ -169,7 +169,7 @@ models:
   prop_search_population: 100  # Per-island population (100 × 8 islands = 800 total)
   prop_search_generations: 1000  # operator 2026-06-01: deep Python-class search (was 20); time-bounded by max_hours
   prop_search_max_hours: 0.5  # agent 2026-06-05 golden-mean: 30min GA per combo (was 1h) so ALL ~150 combos + training fit 7 days; cmd_discover re-reads config per combo so this applies from the next combo
-  prop_search_max_rows: 400000  # agent 2026-06-05 ROOT-CAUSE fix: was 0 (=FULL dataset) → M5 ran GA+walkforward+CPCV on 1.05M rows serially (~46min/combo; M1's 5.27M never finished). THIS is the real row-cap (DiscoveryConfig.max_rows, discovery.rs:424); `system.discovery_max_rows` is a DEAD field. 400k = last ~3.8yr M5; trims ONLY M5 (M15=350k & smaller untouched). trim_recent_history keeps the most-recent rows. cmd_discover re-reads config per combo → applies next combo, no restart.
+  prop_search_max_rows: 0  # operator 2026-06-05: NO cap — use ALL data per file (400k cut M1 to ~9mo -> "not enough history" + capped depth). 0=full history. Per-TF override via prop_search_max_rows_by_tf (not hardcoded).
   prop_search_portfolio_size: 4  # Cap discovered strategies per pair
   # agent 2026-06-05 overfitting fix: 0 meant unlimited (usize::MAX) -> genes used
   # up to 58 indicators = severe overfitting; 16 caps degrees of freedom (regularization).
