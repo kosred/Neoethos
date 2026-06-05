@@ -166,6 +166,7 @@ models:
   evo_islands: 8  # MORE ISLANDS = MORE DIVERSITY (was 4, now 8)
   evo_sigma: 0.25
   prop_search_enabled: true  # CRITICAL: Enable strategy discovery!
+  discovery_mode: prop_firm  # FTMO-style robust discovery (default)
   prop_search_population: 100  # Per-island population (100 × 8 islands = 800 total)
   prop_search_generations: 1000  # operator 2026-06-01: deep Python-class search (was 20); time-bounded by max_hours
   prop_search_max_hours: 0.5  # agent 2026-06-05 golden-mean: 30min GA per combo (was 1h) so ALL ~150 combos + training fit 7 days; cmd_discover re-reads config per combo so this applies from the next combo
@@ -293,13 +294,13 @@ models:
   # also passes walk-forward (out-of-sample) — not just the prop-firm window gate.
   # This stops in-sample-overfit strategies (IS Sharpe 3-11 / PF up to 62) that
   # fail walk-forward from exporting. Set false to restore window-gate-only.
-  require_walkforward_for_export: true
+  require_walkforward_for_export: true  # 2026-06-06 REVERTED: walk-forward export gate is a robustness/anti-overfit filter — keep it ON.
   # agent 2026-06-05 overfitting fix: hard floor for the prop-firm window
   # pass-rate (combined as max with discovery_runtime.prop_firm_gate.pass_rate,
   # which defaults to 0.0 = ranking-only). 0.65 = a candidate must pass FTMO
   # rules on ≥65% of random evaluation windows to survive. Raise toward 1.0 for
   # stricter selection; lower (e.g. 0.0) to restore the old ranking-only behaviour.
-  prop_firm_min_pass_rate: 0.65
+  prop_firm_min_pass_rate: 0.65  # 2026-06-06 REVERTED: this is the OVERFITTING guard (rejects in-sample-Sharpe-7 strategies that fail OOS windows). Do NOT relax — operator wants robust, not overfit.
   # CPCV (Combinatorial Purged Cross-Validation) settings
   enable_cpcv: true
   cpcv_n_splits: 5

@@ -3547,6 +3547,36 @@ pub fn save_portfolio_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> 
 }
 
 pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
+    // Operator observability (2026-06-06): surface the rich per-candidate metrics
+    // that were previously written ONLY to <stem>.quality.json (invisible at
+    // runtime — "we don't see how many trades / how often each strategy does").
+    // Flags likely-overfit candidates (in-sample Sharpe > 3.0) at a glance — the
+    // operator's "Sharpe 3 = wrong / overfit" rule.
+    if !result.quality_metrics.is_empty() {
+        tracing::info!(
+            target: "neoethos_search::discovery",
+            count = result.quality_metrics.len(),
+            "CANDIDATE METRICS — id | trades(/mo,/day) | hold | WR | PF | Sharpe | maxDD | verdict"
+        );
+        for q in &result.quality_metrics {
+            let flag = if q.sharpe_ratio > 3.0 { " [!] OVERFIT?" } else { "" };
+            tracing::info!(
+                target: "neoethos_search::discovery",
+                "  {} | {} trades ({:.1}/mo, {:.2}/day) | {:.1}h hold | WR {:.0}% | PF {:.2} | Sharpe {:.2}{} | maxDD {:.1}% | {}",
+                q.strategy_id,
+                q.total_trades,
+                q.trades_per_month,
+                q.trades_per_month / 21.0,
+                q.avg_trade_duration_hours,
+                q.win_rate * 100.0,
+                q.profit_factor,
+                q.sharpe_ratio,
+                flag,
+                q.max_drawdown_pct * 100.0,
+                q.recommendation,
+            );
+        }
+    }
     write_json_atomic(path, &result.quality_metrics)
 }
 
