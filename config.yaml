@@ -10,7 +10,7 @@ system:
   account_currency: USD
   data_dir: data
   base_timeframe: M1  # 1-minute base for multi-timeframe analysis
-  multi_resolution_enabled: true
+  multi_resolution_enabled: false  # agent 2026-06-05: top-down MTF (base + strictly-HIGHER TFs only). When true, resolve_higher_timeframes returned ALL canonical TFs except the base (incl M1's 5.27M rows) as "higher" → every combo serially reloaded M1 (the pre-GA wall that stopped combos completing on laptop AND VPS) AND fed M1 noise into coarse-TF strategies. false = base+higher only → the cmd_discover base+higher load-fix actually helps + cleaner features.
   multi_resolution_timeframes: [M1, M3, M5, M15, M30, H1, H2, H4, D1, W1, MN1]
   multi_resolution_prefix_base: false
   use_volume_features: true
@@ -34,7 +34,7 @@ system:
   deep_purge_on_train: true
   # Hardware is detected automatically (CPU/GPU/RAM)
   # Set preference to "auto", "true" (force GPU), or "false" (force CPU)        
-  enable_gpu_preference: cpu  # agent 2026-06-04: iGPU wgpu OOM on this laptop -> CPU-only for a stable 7-day run
+  enable_gpu_preference: auto  # agent 2026-06-05: auto-detect (was "cpu", a laptop iGPU-OOM workaround). The search GA hybrid is compile-gated regardless of this knob; on a real GPU (L40 VPS) the gpu-vulkan build uses it, and a CPU-only build ignores it. Per-machine override stays possible.
   # agent 2026-06-05 overfitting fix: removed dead `discovery_auto_cap` /
   # `discovery_max_rows` / `discovery_stream` keys — never consumed by code.
   # The REAL discovery row cap is `models.prop_search_max_rows` (see below).
