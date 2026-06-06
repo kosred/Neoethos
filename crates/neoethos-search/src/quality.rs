@@ -895,6 +895,44 @@ mod overrides_tests {
     use super::*;
 
     #[test]
+    fn money_view_and_equity_curve_are_correct() {
+        // Deterministic check of the pro money-view (2026-06-06): a Sharpe number
+        // alone hides "how much EUR in how long, with what curve" — verify those.
+        let analyzer = StrategyQualityAnalyzer::default();
+        let day = 86_400_000_i64;
+        // Real timestamps are never 0 (analyze_strategy filters entry_time>0 to
+        // ignore unset times), so start at day 1.
+        let mk = |i: i64, pnl: f64| Trade {
+            entry_time: (i + 1) * day,
+            exit_time: Some((i + 2) * day),
+            pnl,
+            pnl_pct: Some(pnl / 100_000.0),
+            duration_hours: Some(24.0),
+        };
+        // +600, -350, +600, -350 over 4 days on EUR 100,000.
+        let trades = vec![mk(0, 600.0), mk(1, -350.0), mk(2, 600.0), mk(3, -350.0)];
+        let m = analyzer.analyze_strategy("demo", &trades, 100_000.0);
+
+        assert_eq!(m.initial_capital, 100_000.0);
+        assert!((m.net_profit - 500.0).abs() < 1e-6, "net {}", m.net_profit);
+        assert!((m.final_balance - 100_500.0).abs() < 1e-6);
+        // equity path: 100000 -> 100600 -> 100250 -> 100850 -> 100500
+        assert_eq!(m.equity_curve.len(), 5);
+        assert_eq!(m.equity_curve[0], 100_000.0);
+        assert!((m.equity_curve[4] - 100_500.0).abs() < 1e-6);
+        // worst peak-to-trough in EUR = 350
+        assert!(
+            (m.max_drawdown_money - 350.0).abs() < 1e-6,
+            "ddmoney {}",
+            m.max_drawdown_money
+        );
+        // recovery = net / maxDD = 500 / 350
+        assert!((m.recovery_factor - (500.0 / 350.0)).abs() < 0.01);
+        // period spans 4 days
+        assert!((m.period_days - 4.0).abs() < 1e-6, "days {}", m.period_days);
+    }
+
+    #[test]
     fn quality_runtime_overrides_defaults_match_legacy_env_defaults() {
         let defaults = QualityRuntimeOverrides::default();
         assert_eq!(defaults.min_trades_per_month, 4);
