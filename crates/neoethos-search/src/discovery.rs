@@ -3582,6 +3582,25 @@ pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult
                 q.max_drawdown_pct * 100.0,
                 q.recommendation,
             );
+            // Pro money-view (2026-06-06): "how much € in how long, with what curve" —
+            // ratios alone (Sharpe 7) hide that a strategy made ~5% over 9 months (useless).
+            let curve_min = q
+                .equity_curve
+                .iter()
+                .cloned()
+                .fold(f64::INFINITY, f64::min);
+            tracing::info!(
+                target: "neoethos_search::discovery",
+                "      money: EUR {:.0} -> {:.0} (net {:+.0}, {:.1} months, {:.2}%/mo) | recovery {:.2} | curve min EUR {:.0} | maxDD EUR {:.0}",
+                q.initial_capital,
+                q.final_balance,
+                q.net_profit,
+                q.period_days / 30.44,
+                if q.period_days > 0.0 { q.total_return_pct * 100.0 / (q.period_days / 30.44) } else { 0.0 },
+                q.recovery_factor,
+                if curve_min.is_finite() { curve_min } else { q.initial_capital },
+                q.max_drawdown_money,
+            );
         }
     }
     write_json_atomic(path, &result.quality_metrics)
