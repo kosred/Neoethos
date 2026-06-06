@@ -1702,7 +1702,12 @@ pub fn evaluate_population_core(
     // risk-based, confidence-scaled sizing.
     #[cfg(feature = "gpu")]
     {
-        const PHASE1_GPU_SIZING_PORTED: bool = false;
+        // Phase 2 (2026-06-06): GPU lane ENABLED — the cubecl kernel now ports
+        // confidence-scaled risk-based sizing + slot-7 monthly_target_hit_rate,
+        // verified CPU==GPU within tolerance by `gpu_population_eval_matches_cpu`
+        // on a real RTX A6000 (Vulkan). Was `false` while the kernel was
+        // fixed-1-lot (would have corrupted fitness).
+        const PHASE1_GPU_SIZING_PORTED: bool = true;
         if PHASE1_GPU_SIZING_PORTED
             && cuda_eval_signal_kernel_enabled()
             && cuda_eval_backtest_kernel_enabled()
@@ -2086,7 +2091,6 @@ mod gpu_cpu_parity_tests {
     use ndarray::Array2;
 
     #[test]
-    #[ignore = "Phase 1: GPU sizing not yet ported (kernel still fixed-1-lot; CPU now risk-based)"]
     fn gpu_population_eval_matches_cpu() {
         let n_samples = 800usize;
         let n_features = 6usize;
@@ -2119,17 +2123,33 @@ mod gpu_cpu_parity_tests {
         let smc_weights = [0.0f32; 11];
         let gate_threshold = 0.0f32;
 
-        // 1-minute bars; coarse month/day buckets.
+        // 1-minute bars; fine month/day buckets so slot-7 monthly_target_hit_rate
+        // is non-trivial (800 bars → 8 months, ~27 days; crosses real boundaries).
         let timestamps: Vec<i64> = (0..n_samples as i64).map(|i| i * 60_000).collect();
-        let month_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 43_200).collect();
-        let day_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 1_440).collect();
+        let month_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 100).collect();
+        let day_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 30).collect();
 
-        let settings = BacktestSettings::default();
+        // Finite cost model + explicit risk-sizing knobs (default settings are
+        // all-NaN for pip_value/spread/commission → would zero pos_lots and pass
+        // vacuously). Mirrors run_single_sl_trade's setup.
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = true;
+        settings.risk_per_trade_min = 0.005;
+        settings.risk_per_trade_max = 0.03;
+        settings.high_quality_confidence = 0.65;
 
         // CPU reference — the path the shipped binary actually runs.
         let cpu: Vec<[f64; 11]> = (0..n_genes)
             .map(|g| {
-                let (signals, _conf) = synthesize_signals_and_confidence_cpu(
+                let (signals, conf) = synthesize_signals_and_confidence_cpu(
                     indicators.view(),
                     &gene_offsets,
                     &gene_indices,
@@ -2146,11 +2166,11 @@ mod gpu_cpu_parity_tests {
                 let mut s = settings.clone();
                 s.sl_pips = sl_pips[g];
                 s.tp_pips = tp_pips[g];
-                // Phase 1: legacy fixed-1-lot (`&[]`) to match the unchanged
-                // GPU kernel; this test is `#[ignore]`d until the kernel
-                // ports risk-based sizing (Phase 2).
+                // Phase 2: real per-bar confidence feeds the CPU risk-based
+                // sizing; the GPU kernel recomputes confidence on-device, so this
+                // asserts both lanes agree on sizing AND slot-7.
                 fast_evaluate_strategy_core(
-                    &close, &high, &low, &signals, &[], &month_idx, &day_idx, &timestamps, &s,
+                    &close, &high, &low, &signals, &conf, &month_idx, &day_idx, &timestamps, &s,
                 )
             })
             .collect();
@@ -2179,6 +2199,11 @@ mod gpu_cpu_parity_tests {
         ) {
             Ok(g) => g,
             Err(e) => {
+                // On a real GPU box set NEOETHOS_REQUIRE_GPU=1 so a device/driver
+                // misconfig fails LOUD instead of vacuously skipping.
+                if std::env::var("NEOETHOS_REQUIRE_GPU").is_ok() {
+                    panic!("NEOETHOS_REQUIRE_GPU set but GPU eval failed: {e}");
+                }
                 eprintln!("GPU parity test SKIPPED (no usable GPU device): {e}");
                 return;
             }
@@ -2186,15 +2211,15 @@ mod gpu_cpu_parity_tests {
 
         assert_eq!(gpu.len(), n_genes, "gpu returned wrong gene count");
 
-        // Metric layout (see try_evaluate_population_cuda): index 7 is a
-        // reserved 0.0 slot; index 8 is the integer trade count.
+        // Metric layout (see try_evaluate_population_cuda): index 7 is
+        // monthly_target_hit_rate; index 8 is the integer trade count.
         for g in 0..n_genes {
             let (ct, gt) = (cpu[g][8], gpu[g][8]);
             assert!(
                 (ct - gt).abs() <= 1.0,
                 "gene {g} trade-count mismatch: cpu={ct} gpu={gt} (GPU kernel logic bug)"
             );
-            for m in [0usize, 1, 2, 3, 4, 5, 6, 9, 10] {
+            for m in [0usize, 1, 2, 3, 4, 5, 6, 7, 9, 10] {
                 let (c, v) = (cpu[g][m], gpu[g][m]);
                 // f32 GPU vs f64 CPU: tolerate accumulation rounding, catch
                 // gross logic divergence.
@@ -2240,7 +2265,7 @@ mod gpu_cpu_parity_tests {
                 cpu[g][8],
                 hybrid[g][8]
             );
-            for m in [0usize, 1, 2, 3, 4, 5, 6, 9, 10] {
+            for m in [0usize, 1, 2, 3, 4, 5, 6, 7, 9, 10] {
                 let (c, v) = (cpu[g][m], hybrid[g][m]);
                 let tol = 1e-2 * c.abs().max(1.0) + 1e-3;
                 assert!(

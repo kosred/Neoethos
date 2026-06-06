@@ -165,12 +165,22 @@ fn create_gpu_client() -> Result<ComputeClient<CudaRuntime>> {
 
 /// wgpu/Vulkan twin of the `gpu-cuda` client factory above. Uses cubecl's
 /// `wgpu` (naga → SPIR-V) path, NOT `wgpu-spirv`: the direct SPIR-V passthrough
-/// crashes AMD's Vulkan driver, so naga emits validated SPIR-V. `DefaultDevice`
-/// selects the best adapter (the integrated AMD GPU here; the first discrete
-/// GPU on a workstation). Multi-adapter selection is a later (Stage c) step.
+/// crashes AMD's Vulkan driver, so naga emits validated SPIR-V.
+///
+/// MULTI-GPU (2026-06-06): `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE=<n>` pins this
+/// process to discrete GPU `n` (`WgpuDevice::DiscreteGpu(n)`) — combo-level
+/// parallelism: launch one discovery process per A6000 (env=0 and env=1) and
+/// both cards run concurrently. Unset ⇒ `DefaultDevice` (the best adapter; the
+/// first discrete GPU on a multi-GPU box).
 #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
 fn create_gpu_client() -> Result<ComputeClient<WgpuRuntime>> {
-    let device = WgpuDevice::DefaultDevice;
+    let device = match std::env::var("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        Some(n) => WgpuDevice::DiscreteGpu(n),
+        None => WgpuDevice::DefaultDevice,
+    };
     Ok(WgpuRuntime::client(&device))
 }
 
@@ -186,6 +196,11 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
     gene_smc_flags: &Array<i32>,
     smc_weights: &Array<F>,
     output: &mut Array<i32>,
+    // Phase 2 (2026-06-06): per-bar confidence of the raw threshold crossing,
+    // mirrors `synthesize_signals_and_confidence_cpu` (eval.rs:1543-1544).
+    // f32 regardless of `F` so the backtest kernel's risk-sizing reads the same
+    // precision the CPU uses; written only where the final signal survives.
+    confidences_out: &mut Array<f32>,
     n_samples: u32,
     gate_threshold: F,
 ) {
@@ -226,8 +241,39 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
         let sig_val = sig.read();
         if sig_val == 0 {
             output[pos] = 0;
+            confidences_out[pos] = 0.0;
             terminate!();
         }
+
+        // Confidence of the raw threshold crossing (pre-gate); computed in `F`
+        // (cast to f32 only at the store) to match the CPU
+        // `synthesize_signals_and_confidence_cpu` (eval.rs:1507/1543-1544):
+        // gap = |lt - st| guarded >= 1e-6; margin = (combined-lt) long / (st-combined) short;
+        // conf = (margin/gap).clamp(0,1). Written only where the final signal survives.
+        let gap_raw = lt - st;
+        let gap_abs = if gap_raw >= F::new(0.0) {
+            gap_raw
+        } else {
+            F::new(0.0) - gap_raw
+        };
+        let gap = if gap_abs < F::new(1e-6) {
+            F::new(1e-6)
+        } else {
+            gap_abs
+        };
+        let margin = if sig_val == 1 {
+            combined_val - lt
+        } else {
+            st - combined_val
+        };
+        let conf_f = margin / gap;
+        let conf = if conf_f < F::new(0.0) {
+            F::new(0.0)
+        } else if conf_f > F::new(1.0) {
+            F::new(1.0)
+        } else {
+            conf_f
+        };
 
         let flag_base = gene * SMC_WIDTH;
         let smc_base = sample * SMC_WIDTH;
@@ -241,6 +287,7 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
         let active_sum_val = active_sum.read();
         if active_sum_val <= F::new(0.0) {
             output[pos] = sig_val;
+            confidences_out[pos] = f32::cast_from(conf);
             terminate!();
         }
 
@@ -265,8 +312,10 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
 
         if score.read() >= gate {
             output[pos] = sig_val;
+            confidences_out[pos] = f32::cast_from(conf);
         } else {
             output[pos] = 0;
+            confidences_out[pos] = 0.0;
         }
     }
 }
@@ -310,6 +359,20 @@ fn backtest_population_kernel(
     swap_long_pips_per_day: f32,
     swap_short_pips_per_day: f32,
     pnl_conversion_fee_rate: f32,
+    // Phase 2 (2026-06-06): risk-based, confidence-scaled position sizing —
+    // mirrors `risk_based_pos_lots` + the pos_lots multiply sites on the CPU
+    // (eval.rs:657-685, 1049-1054, 809/865-880/979/627). `confidences_flat` is
+    // per-gene-per-bar (same layout as `signals_flat`). When `risk_based_sizing`
+    // is 0 the kernel forces pos_lots = 1.0 (legacy fixed-1-lot parity).
+    confidences_flat: &Array<f32>,
+    risk_based_sizing: i32,
+    risk_per_trade_min: f32,
+    risk_per_trade_max: f32,
+    high_quality_confidence: f32,
+    // Per-month STARTING equity (sibling of monthly_pnls_out); the host divides
+    // monthly_pnls_out / month_start_equities_out to get monthly_target_hit_rate
+    // (metric slot 7), matching eval.rs:1110-1131.
+    month_start_equities_out: &mut Array<f32>,
 ) {
     // cubecl 0.9: index arithmetic is usize; coerce u32 params at the top.
     // Every scalar accumulator that gets reassigned must use RuntimeCell —
@@ -328,6 +391,7 @@ fn backtest_population_kernel(
 
         for zero_idx in 0..month_capacity {
             monthly_pnls_out[month_base + zero_idx] = 0.0;
+            month_start_equities_out[month_base + zero_idx] = initial_equity;
         }
         month_counts_out[gene] = 0;
         trade_counts_out[gene] = 0;
@@ -353,6 +417,12 @@ fn backtest_population_kernel(
         let last_month = RuntimeCell::<i32>::new(-1);
         let current_month_pnl = RuntimeCell::<f32>::new(0.0);
         let month_ptr = RuntimeCell::<i32>::new(-1);
+        // Per-month starting equity (slot-7 monthly_target_hit_rate). Mirrors the
+        // CPU `current_month_start_equity` carried at each month boundary (eval.rs:732/778).
+        let current_month_start_equity = RuntimeCell::<f32>::new(initial_equity);
+        // Confidence-scaled lot size, captured ONCE at entry, held for the trade
+        // (eval.rs:1049-1054). 1.0 = legacy fixed-1-lot.
+        let pos_lots = RuntimeCell::<f32>::new(1.0);
 
         let last_day = RuntimeCell::<i32>::new(-1);
         let day_peak = RuntimeCell::<f32>::new(initial_equity);
@@ -390,9 +460,14 @@ fn backtest_population_kernel(
                     month_ptr.store(next_ptr);
                     if next_ptr >= 0 && next_ptr < month_capacity as i32 {
                         monthly_pnls_out[month_base + next_ptr as usize] = current_month_pnl.read();
+                        month_start_equities_out[month_base + next_ptr as usize] =
+                            current_month_start_equity.read();
                     }
                 }
                 current_month_pnl.store(0.0);
+                // New month starts at the equity carried in (eval.rs:778). Runs
+                // BEFORE this bar's exits mutate equity — preserve the ordering.
+                current_month_start_equity.store(equity.read());
                 last_month.store(m_val);
             }
 
@@ -429,13 +504,17 @@ fn backtest_population_kernel(
                         - commission_per_trade
                         - (spread_pips * 0.5 * pip_value_per_lot),
                 );
+                // Phase 2: scale (gross - commission - half_spread) by pos_lots
+                // BEFORE swap (swap scaled in its own term). Matches eval.rs:809.
+                pnl_cell.store(pnl_cell.read() * pos_lots.read());
                 // Phase C.3: broker swap (signed: + = credit, − = charge).
                 let swap_per_day_gap = if in_pos_v == 1 {
                     swap_long_pips_per_day
                 } else {
                     swap_short_pips_per_day
                 };
-                let swap_credit_gap = swap_per_day_gap * position_days.read() * pip_value_per_lot;
+                let swap_credit_gap =
+                    swap_per_day_gap * position_days.read() * pip_value_per_lot * pos_lots.read();
                 pnl_cell.store(pnl_cell.read() + swap_credit_gap);
                 // PnL conversion fee applied last; skip if out-of-range.
                 if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
@@ -475,21 +554,25 @@ fn backtest_population_kernel(
                 let hi = high_pips[i];
                 let entry_px_v = entry_px.read();
 
-                let worst_float_pnl = if in_pos_v2 == 1 {
+                // Phase 2: float PnL scaled by pos_lots (eval.rs:865-880) so the
+                // equity-based DD tracks the sized position.
+                let worst_base = if in_pos_v2 == 1 {
                     (lo - entry_px_v) * pip_value_per_lot
                 } else {
                     (entry_px_v - hi) * pip_value_per_lot
                 };
+                let worst_float_pnl = worst_base * pos_lots.read();
                 let eq = equity.read();
                 if (eq + worst_float_pnl) < day_low.read() {
                     day_low.store(eq + worst_float_pnl);
                 }
 
-                let best_float_pnl = if in_pos_v2 == 1 {
+                let best_base = if in_pos_v2 == 1 {
                     (hi - entry_px_v) * pip_value_per_lot
                 } else {
                     (entry_px_v - lo) * pip_value_per_lot
                 };
+                let best_float_pnl = best_base * pos_lots.read();
                 if (eq + best_float_pnl) > peak_equity.read() {
                     peak_equity.store(eq + best_float_pnl);
                 }
@@ -580,13 +663,17 @@ fn backtest_population_kernel(
                             - commission_per_trade
                             - (spread_pips * 0.5 * pip_value_per_lot),
                     );
+                    // Phase 2: scale (gross - commission - half_spread) by pos_lots
+                    // BEFORE swap. Matches eval.rs:979.
+                    pnl_cell.store(pnl_cell.read() * pos_lots.read());
                     // Phase C.3: broker swap (signed: + = credit, − = charge).
                     let swap_per_day = if in_pos_v2 == 1 {
                         swap_long_pips_per_day
                     } else {
                         swap_short_pips_per_day
                     };
-                    let swap_credit = swap_per_day * position_days.read() * pip_value_per_lot;
+                    let swap_credit =
+                        swap_per_day * position_days.read() * pip_value_per_lot * pos_lots.read();
                     pnl_cell.store(pnl_cell.read() + swap_credit);
                     if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
                         pnl_cell.store(pnl_cell.read() * (1.0 - pnl_conversion_fee_rate));
@@ -631,6 +718,52 @@ fn backtest_population_kernel(
                         trail_px.store(0.0);
                         // Phase C.3: reset carry accumulator at new entry.
                         position_days.store(0.0);
+                        // Phase 2: risk-based, confidence-scaled lot size, captured
+                        // at entry from running equity + the prior-bar confidence
+                        // (causal i-1, same shift as the signal read). Mirrors
+                        // risk_based_pos_lots (eval.rs:657-685) term-for-term.
+                        if risk_based_sizing != 0 {
+                            // RuntimeCell idiom (cubecl rejects if-as-value that mixes
+                            // array-read cube values with bare literals).
+                            let conf_c = RuntimeCell::<f32>::new(confidences_flat[signal_base + i - 1]);
+                            if conf_c.read() < 0.0 {
+                                conf_c.store(0.0);
+                            }
+                            if conf_c.read() > 1.0 {
+                                conf_c.store(1.0);
+                            }
+                            // conf_scale = (conf/hq).min(1.0), guarded for hq<=0 (=> 1.0).
+                            let conf_scale = RuntimeCell::<f32>::new(1.0);
+                            if high_quality_confidence > 0.0 {
+                                let r = conf_c.read() / high_quality_confidence;
+                                if r < 1.0 {
+                                    conf_scale.store(r);
+                                }
+                            }
+                            let risk_pct = risk_per_trade_min
+                                + (risk_per_trade_max - risk_per_trade_min) * conf_scale.read();
+                            // eff_sl = sl_distance.max(1.0)
+                            let eff_sl = RuntimeCell::<f32>::new(1.0);
+                            if sl_distance > 1.0 {
+                                eff_sl.store(sl_distance);
+                            }
+                            let denom = eff_sl.read() * pip_value_per_lot;
+                            let eq_now = equity.read();
+                            // lots = (risk_pct*equity)/denom if valid, else 0; clamp [0,100].
+                            let lots = RuntimeCell::<f32>::new(0.0);
+                            if eq_now > 0.0 && denom > 1e-12 {
+                                lots.store((risk_pct * eq_now) / denom);
+                            }
+                            if lots.read() > 100.0 {
+                                lots.store(100.0);
+                            }
+                            if lots.read() < 0.0 {
+                                lots.store(0.0);
+                            }
+                            pos_lots.store(lots.read());
+                        } else {
+                            pos_lots.store(1.0);
+                        }
                         day_trade_count.store(day_trade_count.read() + 1);
                     }
                 }
@@ -921,13 +1054,13 @@ fn launch_signal_kernel<F, R: Runtime>(
     n_genes: usize,
     n_samples: usize,
     gate_threshold: F,
-) -> Result<Vec<i32>>
+) -> Result<(Vec<i32>, Vec<f32>)>
 where
     F: Float + CubeElement,
 {
     let total = n_genes.saturating_mul(n_samples);
     if total == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     // **CRITICAL for real-money trading**: validate every kernel input
@@ -960,6 +1093,7 @@ where
     let gene_smc_flags_handle = client.create_from_slice(i32::as_bytes(gene_smc_flags));
     let smc_weights_handle = client.create_from_slice(F::as_bytes(smc_weights));
     let output_handle = client.empty(total.saturating_mul(std::mem::size_of::<i32>()));
+    let conf_handle = client.empty(total.saturating_mul(std::mem::size_of::<f32>()));
 
     let units = signal_kernel_units(client);
     let cubes = (total as u32).div_ceil(units);
@@ -982,12 +1116,17 @@ where
         unsafe { ArrayArg::from_raw_parts(gene_smc_flags_handle.clone(), gene_smc_flags.len()) },
         unsafe { ArrayArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
         unsafe { ArrayArg::from_raw_parts(output_handle.clone(), total) },
+        unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
         n_samples as u32,
         gate_threshold,
     );
 
     let bytes = client.read_one_unchecked(output_handle);
-    Ok(i32::from_bytes(&bytes).to_vec())
+    let conf_bytes = client.read_one_unchecked(conf_handle);
+    Ok((
+        i32::from_bytes(&bytes).to_vec(),
+        f32::from_bytes(&conf_bytes).to_vec(),
+    ))
 }
 
 // Signal-only GPU path: kept for a future "GPU signals + CPU backtest" hybrid
@@ -1015,11 +1154,11 @@ fn try_generate_signal_flat_cuda(
     gene_smc_flags: &[SmcRow],
     gate_threshold: f32,
     smc_weights: &[f32; SMC_WIDTH],
-) -> Result<Vec<i32>> {
+) -> Result<(Vec<i32>, Vec<f32>)> {
     let n_genes = long_thr.len();
     let n_samples = indicators.ncols();
     if n_genes == 0 || n_samples == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     if gene_offsets.len() != n_genes + 1 {
         bail!(
@@ -1080,7 +1219,7 @@ fn try_generate_signal_flat_cuda(
             n_samples,
             bf16::from_f32(gate_threshold),
         ) {
-            Ok(flat) => return Ok(flat),
+            Ok(pair) => return Ok(pair),
             Err(err) => {
                 tracing::debug!(
                     "cuda evaluator bf16 signal kernel unavailable, falling back to fp32: {err}"
@@ -1122,7 +1261,7 @@ pub(crate) fn try_generate_signal_rows_cuda(
 ) -> Result<Vec<Vec<i8>>> {
     let n_genes = long_thr.len();
     let n_samples = indicators.ncols();
-    let flat = try_generate_signal_flat_cuda(
+    let (flat, _conf) = try_generate_signal_flat_cuda(
         indicators,
         gene_offsets,
         gene_indices,
@@ -1188,6 +1327,7 @@ fn launch_backtest_kernel<R: Runtime>(
     high_pips: &[f32],
     low_pips: &[f32],
     signals_flat: &[i32],
+    confidences_flat: &[f32],
     timestamp_deltas_ms: &[i32],
     use_timestamps: bool,
     month_idx: &[i32],
@@ -1196,11 +1336,11 @@ fn launch_backtest_kernel<R: Runtime>(
     tp_pips: &[f32],
     settings: &BacktestSettings,
     month_capacity: usize,
-) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>)> {
+) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>)> {
     let n_samples = close_pips.len();
     let n_genes = sl_pips.len();
     if n_samples == 0 || n_genes == 0 {
-        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
     }
     if high_pips.len() != n_samples
         || low_pips.len() != n_samples
@@ -1209,6 +1349,7 @@ fn launch_backtest_kernel<R: Runtime>(
         || day_idx.len() != n_samples
         || tp_pips.len() != n_genes
         || signals_flat.len() != n_genes.saturating_mul(n_samples)
+        || confidences_flat.len() != n_genes.saturating_mul(n_samples)
     {
         bail!("cuda evaluator backtest kernel received inconsistent dimensions");
     }
@@ -1217,6 +1358,7 @@ fn launch_backtest_kernel<R: Runtime>(
     let high_handle = client.create_from_slice(f32::as_bytes(high_pips));
     let low_handle = client.create_from_slice(f32::as_bytes(low_pips));
     let signals_handle = client.create_from_slice(i32::as_bytes(signals_flat));
+    let conf_handle = client.create_from_slice(f32::as_bytes(confidences_flat));
     let timestamp_delta_handle = client.create_from_slice(i32::as_bytes(timestamp_deltas_ms));
     let month_handle = client.create_from_slice(i32::as_bytes(month_idx));
     let day_handle = client.create_from_slice(i32::as_bytes(day_idx));
@@ -1228,6 +1370,8 @@ fn launch_backtest_kernel<R: Runtime>(
     let metrics_handle = client.empty(metrics_len.saturating_mul(std::mem::size_of::<f32>()));
     let trade_counts_handle = client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>()));
     let monthly_handle = client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>()));
+    let month_start_eq_handle =
+        client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>()));
     let month_counts_handle = client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>()));
 
     let units = backtest_kernel_units(client);
@@ -1270,18 +1414,29 @@ fn launch_backtest_kernel<R: Runtime>(
         settings.swap_long_pips_per_day as f32,
         settings.swap_short_pips_per_day as f32,
         settings.pnl_conversion_fee_rate as f32,
+        // Phase 2 (2026-06-06) — confidence-scaled risk-based sizing knobs +
+        // per-month start-equity output for slot-7. ORDER MUST MATCH the kernel
+        // signature appended after pnl_conversion_fee_rate.
+        unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), confidences_flat.len()) },
+        if settings.risk_based_sizing { 1i32 } else { 0i32 },
+        settings.risk_per_trade_min as f32,
+        settings.risk_per_trade_max as f32,
+        settings.high_quality_confidence as f32,
+        unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
     );
 
     let metrics_bytes = client.read_one_unchecked(metrics_handle);
     let trade_counts_bytes = client.read_one_unchecked(trade_counts_handle);
     let monthly_bytes = client.read_one_unchecked(monthly_handle);
     let month_counts_bytes = client.read_one_unchecked(month_counts_handle);
+    let month_start_eq_bytes = client.read_one_unchecked(month_start_eq_handle);
 
     Ok((
         f32::from_bytes(&metrics_bytes).to_vec(),
         i32::from_bytes(&trade_counts_bytes).to_vec(),
         f32::from_bytes(&monthly_bytes).to_vec(),
         i32::from_bytes(&month_counts_bytes).to_vec(),
+        f32::from_bytes(&month_start_eq_bytes).to_vec(),
     ))
 }
 
@@ -1322,7 +1477,7 @@ pub(crate) fn try_evaluate_population_cuda(
         bail!("cuda population evaluate path received inconsistent dimensions");
     }
 
-    let signals_flat = try_generate_signal_flat_cuda(
+    let (signals_flat, confidences_flat) = try_generate_signal_flat_cuda(
         indicators,
         gene_offsets,
         gene_indices,
@@ -1358,21 +1513,23 @@ pub(crate) fn try_evaluate_population_cuda(
         .collect::<Vec<_>>();
     let month_capacity = settings.month_capacity();
 
-    let (metrics_flat, trade_counts, monthly_flat, month_counts) = launch_backtest_kernel(
-        &client,
-        &close_pips,
-        &high_pips,
-        &low_pips,
-        &signals_flat,
-        &timestamp_deltas_ms,
-        use_timestamps,
-        &month_idx,
-        &day_idx,
-        &sl_pips,
-        &tp_pips,
-        settings,
-        month_capacity,
-    )?;
+    let (metrics_flat, trade_counts, monthly_flat, month_counts, month_start_eq_flat) =
+        launch_backtest_kernel(
+            &client,
+            &close_pips,
+            &high_pips,
+            &low_pips,
+            &signals_flat,
+            &confidences_flat,
+            &timestamp_deltas_ms,
+            use_timestamps,
+            &month_idx,
+            &day_idx,
+            &sl_pips,
+            &tp_pips,
+            settings,
+            month_capacity,
+        )?;
 
     let mut results = Vec::with_capacity(n_genes);
     for g in 0..n_genes {
@@ -1398,6 +1555,28 @@ pub(crate) fn try_evaluate_population_cuda(
             0.0
         };
 
+        // Slot 7: monthly_target_hit_rate — fraction of COMPLETE months whose
+        // return >= 4% of that month's STARTING equity. Computed host-side in f64
+        // from the kernel's per-month PnL + start-equity buffers, byte-for-byte
+        // matching the CPU (eval.rs:1110-1131): base>0 counts, no-trade months miss.
+        const MONTHLY_RETURN_TARGET: f64 = 0.04;
+        let mut hit = 0usize;
+        let mut counted = 0usize;
+        for idx in 0..month_limit {
+            let base = month_start_eq_flat[month_base + idx] as f64;
+            if base > 0.0 {
+                counted += 1;
+                if (monthly_flat[month_base + idx] as f64) / base >= MONTHLY_RETURN_TARGET {
+                    hit += 1;
+                }
+            }
+        }
+        let monthly_hit = if counted > 0 {
+            hit as f64 / counted as f64
+        } else {
+            0.0
+        };
+
         results.push([
             metrics_flat[metric_base] as f64,
             sharpe,
@@ -1406,7 +1585,7 @@ pub(crate) fn try_evaluate_population_cuda(
             metrics_flat[metric_base + 3] as f64,
             metrics_flat[metric_base + 4] as f64,
             metrics_flat[metric_base + 5] as f64,
-            0.0,
+            monthly_hit,
             trade_counts.get(g).copied().unwrap_or_default() as f64,
             consistency,
             metrics_flat[metric_base + 6] as f64,
