@@ -1,6 +1,5 @@
 system:
   symbol: EURUSD
-  symbols: [EURUSD]
   # F-304 (2026-05-28): account currency for the backtest cost model.
   # Cost model uses this for commission/swap/pnl_conversion_fee FX
   # conversions and the risk gate uses it for position-sizing pip-value
@@ -15,23 +14,9 @@ system:
   multi_resolution_prefix_base: false
   use_volume_features: true
   higher_timeframes: [M3, M5, M15, M30, H1, H2, H4, D1, W1, MN1]
-  history_years: 10
-  trading_session_start: "00:05"
-  trading_session_end: "23:55"
-  session_timezone: UTC
-  broker_backend: ctrader
   poll_interval_seconds: 60
-  metrics_logging_enabled: true
   metrics_db_path: metrics.sqlite
-  risk_ledger_enabled: true
-  risk_ledger_max_events: 1000
-  strategy_ledger_path: strategy_ledger.sqlite
-  enable_dashboard: true
-  cache_enabled: true
   cache_dir: cache
-  cache_max_age_minutes: 0
-  deep_purge_mode: "all"  # Enable full purge for institutional training
-  deep_purge_on_train: true
   # Hardware is detected automatically (CPU/GPU/RAM)
   # Set preference to "auto", "true" (force GPU), or "false" (force CPU)        
   enable_gpu_preference: auto  # agent 2026-06-05: auto-detect (was "cpu", a laptop iGPU-OOM workaround). The search GA hybrid is compile-gated regardless of this knob; on a real GPU (L40 VPS) the gpu-vulkan build uses it, and a CPU-only build ignores it. Per-machine override stays possible.
@@ -47,69 +32,35 @@ risk:
   daily_drawdown_limit: 0.04
   total_drawdown_limit: 0.07
   min_risk_reward: 2.0
-  spread_guard_multiplier: 2.5
-  slippage_guard_multiplier: 2.0
   challenge_mode: true
   challenge_phase: phase_1
   prop_firm_rules: true
-  max_daily_risk_pct: 0.04
-  base_risk_per_trade: 0.03
-  daily_risk_budget: 0.040
-  consistency_tracking: true
-  min_confidence_threshold: 0.55
   kill_zones_enabled: true
-  enhanced_features: true
-  uncertainty_quantification: true
   max_trades_per_day: 8
-  daily_profit_stop_pct: 0.0
   high_quality_confidence: 0.65
-  high_quality_risk_pct: 0.030
-  high_quality_rr: 2.0
   atr_period: 14
   atr_stop_multiplier: 1.5
   triple_barrier_max_bars: 35
   trailing_enabled: true
   trailing_atr_multiplier: 1.0
   trailing_be_trigger_r: 1.0
-  kelly_lambda: 1.0
   slippage_pips: 0.5
   commission_per_lot: 7.0
   backtest_spread_pips: 1.5
-  cost_penalty_r: 0.0
-  gate_trade_prob: 0.55
-  daily_hard_stop_pct: 0.04
   conformal_enabled: true
   conformal_alpha: 0.10
   conformal_abstain_min_set_size: 3
-  volatility_stop_sigma: 0.02
-  volatility_lookback: 50
   meta_label_tp_pips: null
   meta_label_sl_pips: null
   meta_label_max_hold_bars: 100
-  meta_label_min_prob_threshold: 0.55
   meta_label_min_dist: 0.0005
   meta_label_fixed_sl: 0.0020
   meta_label_fixed_tp: 0.0040
   # Stop/target engine (unsupervised blend of volatility + tail risk)
   stop_target_mode: blend
   vol_estimator: ensemble  # ensemble | yang_zhang | garman_klass | parkinson | rogers_satchell | ewma
-  vol_ensemble_weights:
-    yang_zhang: 1.0
-    garman_klass: 1.0
-    rogers_satchell: 1.0
-    parkinson: 1.0
   vol_window: 50
   ewma_lambda: 0.94
-  ewma_lambda_by_timeframe:
-    M1: 0.90
-    M5: 0.92
-    M15: 0.94
-    M30: 0.95
-    H1: 0.96
-    H4: 0.97
-    D1: 0.98
-    W1: 0.985
-    MN1: 0.99
   vol_horizon_bars: 5
   tail_window: 100
   tail_alpha: 0.975

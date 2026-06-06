@@ -12,7 +12,6 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct SystemConfig {
     pub symbol: String,
-    pub symbols: Vec<String>,
     /// Market Watch live-tick subscription set (F-338). Empty → the spot
     /// streamer falls back to `DEFAULT_STREAMED_SYMBOLS` (the 8 majors).
     /// The operator edits this from Market Watch; it takes effect on the
@@ -82,30 +81,16 @@ pub struct SystemConfig {
     pub required_timeframes: Vec<String>,
     pub enable_level2: bool,
     pub level2_depth_levels: usize,
-    pub history_years: usize,
-    pub trading_session_start: String,
-    pub trading_session_end: String,
-    pub session_timezone: String,
     /// Broker time zone used for prop-firm calendar-day boundaries (e.g.
     /// daily-DD reset). Most cTrader prop firms run on EET ("Europe/Athens",
     /// UTC+2/+3); some run pure UTC. When set, the trading runtime computes
     /// `day_id` against this offset instead of the local clock. Empty string
-    /// falls back to `session_timezone` (default "UTC"). M12 in the audit.
+    /// falls back to UTC. M12 in the audit.
     #[serde(default)]
     pub broker_timezone: String,
-    pub broker_backend: String,
     pub poll_interval_seconds: u64,
-    pub metrics_logging_enabled: bool,
     pub metrics_db_path: PathBuf,
-    pub risk_ledger_enabled: bool,
-    pub risk_ledger_max_events: usize,
-    pub strategy_ledger_path: PathBuf,
-    pub enable_dashboard: bool,
-    pub cache_enabled: bool,
     pub cache_dir: PathBuf,
-    pub cache_max_age_minutes: u64,
-    pub deep_purge_mode: String,
-    pub deep_purge_on_train: bool,
     pub n_jobs: usize,
     pub enable_gpu_preference: String,
     // agent 2026-06-05 overfitting fix: removed three dead `discovery_*` fields
@@ -173,7 +158,6 @@ impl Default for SystemConfig {
             // downstream guard that rejects empty-symbol orders
             // (see `risk_gate::prop_firm_pre_trade_check` Batch B Pass 3).
             symbol: String::new(),
-            symbols: Vec::new(),
             watchlist: Vec::new(),
             // F-304 fix (2026-05-28): empty default forces operator/
             // broker-session population, matching `symbol`. The
@@ -208,24 +192,10 @@ impl Default for SystemConfig {
                 .collect(),
             enable_level2: false,
             level2_depth_levels: 10,
-            history_years: 10,
-            trading_session_start: "00:05".to_string(),
-            trading_session_end: "23:55".to_string(),
-            session_timezone: "UTC".to_string(),
-            broker_timezone: String::new(), // empty = fall back to session_timezone
-            broker_backend: "ctrader".to_string(),
+            broker_timezone: String::new(), // empty = fall back to UTC
             poll_interval_seconds: 60,
-            metrics_logging_enabled: true,
             metrics_db_path: PathBuf::from("metrics.sqlite"),
-            risk_ledger_enabled: true,
-            risk_ledger_max_events: 1000,
-            strategy_ledger_path: PathBuf::from("strategy_ledger.sqlite"),
-            enable_dashboard: true,
-            cache_enabled: true,
             cache_dir: PathBuf::from("cache"),
-            cache_max_age_minutes: 60,
-            deep_purge_mode: "off".to_string(),
-            deep_purge_on_train: true,
             n_jobs,
             enable_gpu_preference: "auto".to_string(),
             // agent 2026-06-05 overfitting fix: dead `discovery_*` fields removed
@@ -315,62 +285,41 @@ pub struct RiskConfig {
     pub daily_drawdown_limit: f64,
     pub total_drawdown_limit: f64,
     pub min_risk_reward: f64,
-    pub spread_guard_multiplier: f64,
-    pub slippage_guard_multiplier: f64,
     pub max_lot_size: f64,
     pub require_stop_loss: bool,
     pub challenge_mode: bool,
     pub challenge_phase: String,
     pub prop_firm_rules: bool,
-    pub max_daily_risk_pct: f64,
-    pub base_risk_per_trade: f64,
-    pub daily_risk_budget: f64,
-    pub consistency_tracking: bool,
-    pub min_confidence_threshold: f64,
     pub kill_zones_enabled: bool,
-    pub enhanced_features: bool,
-    pub uncertainty_quantification: bool,
     pub max_trades_per_day: usize,
-    pub daily_profit_stop_pct: f64,
     pub recovery_mode_enabled: bool,
     pub feature_drift_threshold: f64,
     pub high_quality_confidence: f64,
-    pub high_quality_risk_pct: f64,
-    pub high_quality_rr: f64,
     pub atr_period: usize,
     pub atr_stop_multiplier: f64,
     pub triple_barrier_max_bars: usize,
     pub trailing_enabled: bool,
     pub trailing_atr_multiplier: f64,
     pub trailing_be_trigger_r: f64,
-    pub kelly_lambda: f64,
     pub slippage_pips: f64,
     pub commission_per_lot: f64,
     pub backtest_spread_pips: f64,
-    pub cost_penalty_r: f64,
-    pub gate_trade_prob: f64,
-    pub daily_hard_stop_pct: f64,
     pub conformal_enabled: bool,
     pub conformal_alpha: f64,
     pub conformal_abstain_min_set_size: usize,
-    pub volatility_stop_sigma: f64,
-    pub volatility_lookback: usize,
     pub meta_label_tp_pips: Option<f64>,
     pub meta_label_sl_pips: Option<f64>,
     pub meta_label_max_hold_bars: usize,
-    pub meta_label_min_prob_threshold: f64,
     pub meta_label_min_dist: f64,
     pub meta_label_fixed_sl: f64,
     pub meta_label_fixed_tp: f64,
     pub stop_target_mode: String,
     pub vol_estimator: String,
-    pub vol_ensemble_weights: HashMap<String, f64>,
     pub vol_ensemble_weights_trend: Option<HashMap<String, f64>>,
     pub vol_ensemble_weights_range: Option<HashMap<String, f64>>,
     pub vol_ensemble_weights_neutral: Option<HashMap<String, f64>>,
     pub vol_window: usize,
     pub ewma_lambda: f64,
-    pub ewma_lambda_by_timeframe: HashMap<String, f64>,
     pub vol_horizon_bars: usize,
     pub tail_window: usize,
     pub tail_alpha: f64,
@@ -390,38 +339,6 @@ pub struct RiskConfig {
 
 impl Default for RiskConfig {
     fn default() -> Self {
-        let mut vol_ensemble_weights = HashMap::new();
-        vol_ensemble_weights.insert("yang_zhang".to_string(), 1.0);
-        vol_ensemble_weights.insert("garman_klass".to_string(), 1.0);
-        vol_ensemble_weights.insert("rogers_satchell".to_string(), 1.0);
-        vol_ensemble_weights.insert("parkinson".to_string(), 1.0);
-
-        // EWMA lambdas keyed by canonical timeframe. The list MUST match
-        // `CANONICAL_TIMEFRAMES` exactly — every supported timeframe gets
-        // its own decay coefficient, and unknown timeframes must fall
-        // back to a default rather than be hard-coded here.
-        let mut ewma_lambda_by_timeframe = HashMap::new();
-        for (tf, lambda) in [
-            ("M1", 0.90),
-            ("M3", 0.91),
-            ("M5", 0.92),
-            ("M15", 0.94),
-            ("M30", 0.95),
-            ("H1", 0.96),
-            ("H4", 0.97),
-            ("H12", 0.98),
-            ("D1", 0.985),
-            ("W1", 0.99),
-            ("MN1", 0.995),
-        ] {
-            debug_assert!(
-                CANONICAL_TIMEFRAMES.contains(&tf),
-                "ewma_lambda_by_timeframe key {} must be a canonical timeframe",
-                tf
-            );
-            ewma_lambda_by_timeframe.insert(tf.to_string(), lambda);
-        }
-
         // Config is the single source: `config.yaml`'s `risk.preset` key drives
         // the preset (serde fills it post-construction). The legacy
         // `NEOETHOS_PROP_FIRM_PRESET` env override was retired in v0.4.36 —
@@ -452,8 +369,6 @@ impl Default for RiskConfig {
             // overall-drawdown ceiling for the same buffer reason.
             total_drawdown_limit: (constraints.max_overall_drawdown_pct as f64) * 0.7,
             min_risk_reward: 2.0,
-            spread_guard_multiplier: 2.5,
-            slippage_guard_multiplier: 2.0,
             max_lot_size: runtime.max_lot_size,
             require_stop_loss: true,
             challenge_mode: false,
@@ -463,58 +378,39 @@ impl Default for RiskConfig {
             // money; we still respect per-trade risk limits but skip
             // the challenge accounting.
             prop_firm_rules: preset != PropFirmPreset::None,
-            max_daily_risk_pct: runtime.daily_dd_stop_trading_pct,
-            base_risk_per_trade: 0.03,
-            daily_risk_budget: runtime.daily_dd_stop_trading_pct,
-            consistency_tracking: true,
-            min_confidence_threshold: 0.55,
             kill_zones_enabled: true,
-            enhanced_features: true,
-            uncertainty_quantification: true,
             // Cap is preset-driven. FTMO defaults to 15; The5%ers is
             // tighter; "own money" raises it. Operators can override
             // via YAML when their style demands a different cap.
             max_trades_per_day: runtime.max_trades_per_day,
-            daily_profit_stop_pct: runtime.daily_profit_lock_pct,
             recovery_mode_enabled: true,
             feature_drift_threshold: 0.30,
             high_quality_confidence: 0.65,
-            high_quality_risk_pct: 0.030,
-            high_quality_rr: 2.0,
             atr_period: 14,
             atr_stop_multiplier: 1.5,
             triple_barrier_max_bars: 35,
             trailing_enabled: true,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
-            kelly_lambda: 1.0,
             slippage_pips: 0.5,
             commission_per_lot: 7.0,
             backtest_spread_pips: 1.5,
-            cost_penalty_r: 0.0,
-            gate_trade_prob: 0.55,
-            daily_hard_stop_pct: runtime.daily_dd_stop_trading_pct,
             conformal_enabled: true,
             conformal_alpha: 0.10,
             conformal_abstain_min_set_size: 3,
-            volatility_stop_sigma: 0.02,
-            volatility_lookback: 50,
             meta_label_tp_pips: None,
             meta_label_sl_pips: None,
             meta_label_max_hold_bars: 100,
-            meta_label_min_prob_threshold: 0.55,
             meta_label_min_dist: 0.0005,
             meta_label_fixed_sl: 0.0020,
             meta_label_fixed_tp: 0.0040,
             stop_target_mode: "blend".to_string(),
             vol_estimator: "ensemble".to_string(),
-            vol_ensemble_weights,
             vol_ensemble_weights_trend: None,
             vol_ensemble_weights_range: None,
             vol_ensemble_weights_neutral: None,
             vol_window: 50,
             ewma_lambda: 0.94,
-            ewma_lambda_by_timeframe,
             vol_horizon_bars: 5,
             tail_window: 100,
             tail_alpha: 0.975,
