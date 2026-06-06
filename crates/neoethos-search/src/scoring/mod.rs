@@ -133,10 +133,11 @@ mod tests {
     }
 
     #[test]
-    fn scoring_version_is_two_after_return_oriented_ga() {
-        // 2026-06-06: bumped 1→2 when `ga_fitness` became RETURN-oriented
-        // (net-return reward added, Sharpe demoted 0.40→0.20). Artifacts from
-        // v1 runs are tagged accordingly and are NOT directly comparable.
-        assert_eq!(SCORING_VERSION_CURRENT.0, 2);
+    fn scoring_version_is_three_after_consistency_oriented_ga() {
+        // 2026-06-06: bumped 2→3 when `ga_fitness` became CONSISTENT-monthly-return
+        // oriented (dominant reward = monthly_target_hit_rate in metrics[7]; total-net
+        // demoted). v2 (total-net) genes were lumpy and failed the window gate.
+        // Artifacts from v1/v2 runs are tagged accordingly and NOT directly comparable.
+        assert_eq!(SCORING_VERSION_CURRENT.0, 3);
     }
 }

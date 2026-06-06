@@ -295,7 +295,10 @@ fn prop_firm_gate_auto_enables_with_default_config() {
     // rules on us" semantics and survives the f32 round-trip.
     assert!((pf.rules.max_daily_loss_pct - 0.05).abs() < 1e-6);
     assert!((pf.rules.max_overall_drawdown_pct - 0.10).abs() < 1e-6);
-    assert!((pf.rules.min_profit_target_pct - 0.10).abs() < 1e-6);
+    // 2026-06-06 RE-CALIBRATED: the discovery default per-window profit target is now the
+    // operator's bar (8%/60-day window = >=4%/month), NOT the full FTMO 10% — see
+    // derive_prop_firm_gate. (max_daily_loss / max_dd stay at the FTMO 5%/10% guards.)
+    assert!((pf.rules.min_profit_target_pct - 0.08).abs() < 1e-6);
     assert!(pf.rules.require_profit_target);
     // Permissive filter floors should be applied automatically.
     assert!(!cfg.filtering.anomaly_guard);

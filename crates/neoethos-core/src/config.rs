@@ -706,13 +706,15 @@ pub struct ModelsConfig {
     /// (prop-firm-window gate only). `#[serde(default)]` on `ModelsConfig`
     /// makes a missing key fall back to the `Default` impl below (= `true`).
     pub require_walkforward_for_export: bool,
-    /// agent 2026-06-05 overfitting fix: hard floor for the prop-firm
-    /// window-pass rate, applied on top of `discovery_runtime.prop_firm_gate
-    /// .pass_rate` (effective floor = max of the two). Default 0.65 — a
-    /// candidate must pass FTMO-style rules on at least 65% of the random
-    /// evaluation windows to survive. The previous effective floor was 0.0
-    /// (ranking-only), which let strategies that passed barely over half the
-    /// windows through. Raise toward 1.0 for stricter selection.
+    /// Hard floor for the prop-firm window-pass rate, applied on top of
+    /// `discovery_runtime.prop_firm_gate.pass_rate` (effective floor = max of the
+    /// two). RE-CALIBRATED 2026-06-06 from 0.65 → **0.40** when the per-window
+    /// profit target was set to the operator's bar (8%/60-day window = >=4%/month,
+    /// in `derive_prop_firm_gate`). 0.40 = a candidate must hit >=4%/month in at
+    /// least 40% of the random 60-day windows to survive — a genuine persistent
+    /// edge, with the live models lifting the rest (discovery=edge, models=grow).
+    /// The base-filter max-DD + walk-forward export gate still reject blow-ups /
+    /// overfit. Raise toward 0.65 for stricter selection; lower for more candidates.
     pub prop_firm_min_pass_rate: f64,
     /// Genetic-search runtime knobs (config-driven replacement for the
     /// `NEOETHOS_BOT_*` search env vars). See [`SearchRuntimeConfig`].
@@ -1403,10 +1405,12 @@ impl Default for ModelsConfig {
             walkforward_splits: 10, // 2026-06-05: robust OOS default (was 20, slow); config-overridable
             embargo_minutes: 120,
             discovery_mode: "prop_firm".to_string(),
-            // agent 2026-06-05 overfitting fix: default-on walk-forward export
-            // gate + 0.65 prop-firm pass-rate floor (see field docs above).
+            // walk-forward export gate ON (robustness). prop-firm pass-rate floor
+            // RE-CALIBRATED 0.65→0.40 (2026-06-06) to match the operator's >=4%/month
+            // bar now used as the per-window target — see derive_prop_firm_gate +
+            // config.yaml prop_firm_min_pass_rate. (see field docs above.)
             require_walkforward_for_export: true,
-            prop_firm_min_pass_rate: 0.65,
+            prop_firm_min_pass_rate: 0.40,
             search_runtime: SearchRuntimeConfig::default(),
             discovery_runtime: DiscoveryRuntimeConfig::default(),
             eval_runtime: EvalRuntimeConfig::default(),

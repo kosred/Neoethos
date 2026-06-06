@@ -213,20 +213,27 @@ pub struct BacktestMetrics {
     pub max_daily_drawdown: f64,
 }
 
-/// **F-001 documentation (2026-05-25)** — index-7 slot is *deliberately
-/// reserved* and MUST be passed through as 0.0 on the round-trip.
+/// **Index-7 slot — F-001 (2026-05-25) + repurposed by scoring_version 3 (2026-06-06).**
 ///
-/// History: an earlier revision used index 7 for `average_trade_pnl`
-/// (computed inline in the kernel). That metric was dropped from the
-/// struct but the `[f64; 11]` array shape was kept to avoid breaking
-/// the GPU kernel's per-gene output stride (which writes 11 floats per
-/// gene). Any caller that hand-rolls a `[f64; 11]` MUST write `0.0` at
-/// index 7 or the round-trip via [`BacktestMetrics::from_metric_array`]
-/// will silently misinterpret subsequent fields.
+/// Originally (F-001) a *deliberately reserved* slot kept at 0.0: an earlier revision
+/// used it for `average_trade_pnl`; that was dropped but the `[f64; 11]` shape was kept
+/// so the GPU kernel's per-gene output stride (11 floats/gene) stayed intact.
 ///
-/// Callers should prefer the named-field constructor + `to_metric_array`
-/// rather than hand-rolling the array. The constant below documents the
-/// reserved slot for grep-discoverability.
+/// **scoring_version 3:** the RAW output of [`fast_evaluate_strategy_core`] now carries
+/// `monthly_target_hit_rate` (fraction of months hitting the operator's >=4% bar) in
+/// slot 7 — the consistency signal [`crate::scoring::ga_fitness`] optimises toward.
+/// This is SAFE because the GA fitness reads the raw eval array directly (see
+/// `genetic::evolution_math::apply_metrics`), and the CPU eval is the only producer
+/// (the GPU lane is disabled: `PHASE1_GPU_SIZING_PORTED = false`). When the GPU kernel
+/// is re-enabled it MUST also write this rate into slot 7 (parity), alongside porting
+/// risk-based sizing.
+///
+/// The [`BacktestMetrics`] STRUCT does not model this field, so [`BacktestMetrics::
+/// from_metric_array`] ignores slot 7 and [`BacktestMetrics::to_metric_array`] writes
+/// 0.0. That round-trip is for the struct view (display / persistence) and never feeds
+/// the GA fitness, so the divergence is intentional and contained. Code that hand-rolls
+/// a `[f64; 11]` to feed `ga_fitness` must set slot 7 to the hit-rate (0.0 disables the
+/// dominant consistency reward).
 pub const BACKTEST_METRICS_RESERVED_INDEX_7: usize = 7;
 
 impl BacktestMetrics {
@@ -717,6 +724,12 @@ pub fn fast_evaluate_strategy_core(
     let mut current_month_pnl = 0.0;
     let mut monthly_pnls = vec![0.0; month_capacity];
     let mut month_ptr = -1i64;
+    // Parallel to `monthly_pnls`: equity at the START of each completed month, so we
+    // can compute each month's RETURN % (pnl / month-start-equity) for the
+    // monthly_target_hit_rate metric (reserved slot 7). Compounding makes total net a
+    // poor consistency signal; per-month return % is scale-invariant.
+    let mut month_start_equities = vec![initial_equity; month_capacity];
+    let mut current_month_start_equity = initial_equity;
 
     let mut last_day = -1i64;
     let mut day_peak = equity;
@@ -758,9 +771,11 @@ pub fn fast_evaluate_strategy_core(
                 month_ptr += 1;
                 if month_ptr < month_capacity as i64 {
                     monthly_pnls[month_ptr as usize] = current_month_pnl;
+                    month_start_equities[month_ptr as usize] = current_month_start_equity;
                 }
             }
             current_month_pnl = 0.0;
+            current_month_start_equity = equity; // equity carried in = start of the new month
             last_month = m_val;
         }
 
@@ -1074,6 +1089,40 @@ pub fn fast_evaluate_strategy_core(
         0.0
     };
 
+    // monthly_target_hit_rate (reserved slot 7, scoring_version 3, 2026-06-06):
+    // the fraction of COMPLETE months whose return >= MONTHLY_RETURN_TARGET of that
+    // month's STARTING equity. This is the CONSISTENT-monthly-return signal the GA
+    // now optimises toward (ga_fitness reads metrics[7]) — it matches the prop-firm
+    // window-consistency gate, unlike total net (compounding makes it lumpy) or
+    // `consistency`/`sharpe` (= monthly mean/std, which a few big months inflate).
+    // 0.04 = the operator's >=4%/month bar. Months with no trades count as misses
+    // (a strategy that sits out a month did NOT hit the bar) — same spirit as the gate.
+    // GPU PARITY (Phase 2): when the cubecl kernel ports risk-based sizing it MUST
+    // also fill slot 7 with this rate, else GPU-evaluated genes score fitness with
+    // monthly_hit=0. The GPU lane is currently disabled (PHASE1_GPU_SIZING_PORTED).
+    const MONTHLY_RETURN_TARGET: f64 = 0.04;
+    let monthly_target_hit_rate = if month_ptr >= 0 {
+        let limit = month_ptr.min(month_capacity.saturating_sub(1) as i64) as usize;
+        let mut hit = 0usize;
+        let mut counted = 0usize;
+        for idx in 0..=limit {
+            let base = month_start_equities[idx];
+            if base > 0.0 {
+                counted += 1;
+                if monthly_pnls[idx] / base >= MONTHLY_RETURN_TARGET {
+                    hit += 1;
+                }
+            }
+        }
+        if counted > 0 {
+            hit as f64 / counted as f64
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
     // Final NaN/inf scrub. A single non-finite slot would poison sorting in
     // the GA (any comparison with NaN returns Equal via partial_cmp fallback).
     //
@@ -1122,7 +1171,7 @@ pub fn fast_evaluate_strategy_core(
         sanitize(win_rate),
         sanitize(pf),
         sanitize(expectancy),
-        0.0,
+        sanitize(monthly_target_hit_rate), // slot 7: was reserved 0.0 — now the consistent-monthly-return signal (scoring_version 3)
         trade_count as f64,
         sanitize(consistency),
         sanitize(max_daily_dd),
