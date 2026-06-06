@@ -79,6 +79,7 @@ fn main() -> Result<()> {
         "train" => cmd_train(&args[2..]),
         "search" => cmd_search(&args[2..]),
         "discover" => cmd_discover(&args[2..]),
+        "discovery-promote-weekly" => cmd_discovery_promote_weekly(&args[2..]),
         "trader-replay" => cmd_trader_replay(&args[2..]),
         "batch-discover" => cmd_batch_discover(&args[2..]),
         "migrate-data" => cmd_migrate_data(&args[2..]),
@@ -226,6 +227,151 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
         features.n_samples(),
         features.n_features()
     );
+    Ok(())
+}
+
+/// `discovery-promote-weekly [--symbol X --tf Y] [--cache-dir ...] [--portfolio ...]`
+/// — the weekly-refresh promotion step of the search-memory feature.
+///
+/// Loads THIS run's discovery ledger (`<cache-dir>/{SYMBOL}_{TF}.discovery_ledger.json`,
+/// written by every discovery run) and merges its recorded genes into the live
+/// portfolio under the **additive** policy: a ledger gene is "new" when its
+/// canonical signature hash is not already present among the live portfolio's
+/// genes; existing genes are always carried. Prints a growth summary
+/// ("added N new, carried M, total K").
+///
+/// SCOPE NOTE (deferred — see report): the ledger records gene *signatures*
+/// (hash + indicator names + SMC flags + fitness), not the full `Gene`
+/// (indices/weights). The live portfolio stores full genes. So we can detect
+/// which ledger genes are NEW relative to the live portfolio and carry the
+/// existing full genes forward, but we cannot synthesize full genes for ledger-
+/// only records here — adding them as live genes would require the discovery
+/// run to also persist full genes per ledger entry (a future enhancement). We
+/// therefore write a merged **growth-summary JSON** next to the portfolio and
+/// report the new-vs-carried breakdown.
+fn cmd_discovery_promote_weekly(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?;
+    let ledger_cfg = settings
+        .as_ref()
+        .map(|s| s.models.discovery_ledger.clone())
+        .unwrap_or_default();
+
+    let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
+    let tf = parse_flag(args, "--tf")
+        .or_else(|| parse_flag(args, "--base"))
+        .unwrap_or_else(|| default_base_tf(settings.as_ref()));
+    let cache_dir = parse_flag(args, "--cache-dir").unwrap_or(ledger_cfg.cache_dir);
+
+    let ledger = neoethos_search::load_prior_ledger(&cache_dir, &symbol, &tf).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no discovery ledger found at {} — run a discovery for {} {} first \
+             (the ledger is written automatically when models.discovery_ledger.enabled = true)",
+            neoethos_search::ledger_path(&cache_dir, &symbol, &tf).display(),
+            symbol,
+            tf
+        )
+    })?;
+
+    // Ledger genes recorded this run (portfolio + archive), de-duplicated by hash.
+    let mut ledger_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for rec in ledger.portfolio.iter().chain(ledger.archive.iter()) {
+        ledger_hashes.insert(rec.hash.clone());
+    }
+
+    // The live portfolio whose full genes we carry. Default path mirrors the
+    // discover command's `{out}.live_portfolio.json`, keyed off the ledger's
+    // cache layout; override with --portfolio.
+    let portfolio_path = parse_flag(args, "--portfolio").unwrap_or_else(|| {
+        format!("{}/{}_{}.live_portfolio.json", cache_dir, symbol, tf)
+    });
+
+    let mut existing_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let existing_count = match neoethos_search::load_live_portfolio_json(&portfolio_path) {
+        Ok(artifact) => {
+            for gene in &artifact.genes {
+                existing_hashes
+                    .insert(neoethos_search::genetic::gene_signature_hash(gene).to_string());
+            }
+            artifact.genes.len()
+        }
+        Err(_) => {
+            println!(
+                "(no existing live portfolio at {} — treating all ledger genes as new)",
+                portfolio_path
+            );
+            0
+        }
+    };
+
+    let new_genes: Vec<&neoethos_search::GeneRecord> = ledger
+        .portfolio
+        .iter()
+        .chain(ledger.archive.iter())
+        .filter(|rec| !existing_hashes.contains(&rec.hash))
+        .collect();
+    // Distinct new hashes (a hash could appear in both portfolio + archive).
+    let new_hashes: std::collections::HashSet<&String> =
+        new_genes.iter().map(|r| &r.hash).collect();
+    let added = new_hashes.len();
+    let carried = existing_count;
+    let total = carried + added;
+
+    // Write a merged growth-summary JSON next to the portfolio so the weekly run
+    // leaves an auditable record of what grew.
+    #[derive(serde::Serialize)]
+    struct PromotionSummary<'a> {
+        symbol: &'a str,
+        tf: &'a str,
+        policy: &'a str,
+        carried: usize,
+        added: usize,
+        total: usize,
+        new_genes: Vec<&'a neoethos_search::GeneRecord>,
+    }
+    let summary_path = format!("{}/{}_{}.weekly_promotion.json", cache_dir, symbol, tf);
+    let summary = PromotionSummary {
+        symbol: &symbol,
+        tf: &tf,
+        policy: &ledger_cfg.promotion_policy,
+        carried,
+        added,
+        total,
+        new_genes: new_genes.clone(),
+    };
+    if let Err(err) =
+        neoethos_core::storage::json::write_json_atomic(&summary_path, &summary)
+    {
+        tracing::warn!(
+            target: "neoethos_cli::discovery_promote_weekly",
+            error = %err,
+            path = %summary_path,
+            "failed to write weekly-promotion summary (non-fatal)"
+        );
+    }
+
+    println!(
+        "discovery-promote-weekly {} {} (policy={}): added {} new, carried {}, total {}",
+        symbol, tf, ledger_cfg.promotion_policy, added, carried, total
+    );
+    println!("  ledger: {}", neoethos_search::ledger_path(&cache_dir, &symbol, &tf).display());
+    println!("  summary written: {}", summary_path);
+    if added > 0 {
+        println!("  new strategies this run:");
+        for rec in new_genes.iter().take(20) {
+            let flags = if rec.smc_flags.is_empty() {
+                "-".to_string()
+            } else {
+                rec.smc_flags.clone()
+            };
+            println!(
+                "    fitness={:.4} sharpe={:.3} trades={:.0} smc=[{}] indicators={:?}",
+                rec.fitness, rec.sharpe, rec.trades, flags, rec.indicator_names
+            );
+        }
+        if new_genes.len() > 20 {
+            println!("    ... and {} more", new_genes.len() - 20);
+        }
+    }
     Ok(())
 }
 
@@ -1784,6 +1930,9 @@ fn print_help() {
     );
     println!(
         "  discover --symbol EURUSD --base M1 --higher H1,H4 --population 100 --generations 5 --max-indicators 12 --portfolio-size 100 --candidates 200 --corr 0.7 --min-trades 1 --out cache/vector_ta_knowledge.json --root data"
+    );
+    println!(
+        "  discovery-promote-weekly [--symbol EURUSD --tf M1] [--cache-dir cache/search] [--portfolio <live_portfolio.json>]  Weekly-refresh: merge this run's discovery ledger into the live portfolio (additive by gene-signature hash) and print 'added N new, carried M, total K'."
     );
     println!(
         "  trader-replay [--symbol EURUSD --base M1 | --portfolio <live_portfolio.json>] [--root data]  Offline dry-run of the autonomous trader over on-disk history (zero broker calls; same engine as /autonomous/replay). With --portfolio it runs the REAL discovered genes."

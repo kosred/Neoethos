@@ -296,6 +296,18 @@ pub struct DiscoveryConfig {
     /// from `models.prop_firm_min_pass_rate` (default 0.65). A value of 0.0
     /// reproduces the old ranking-only behaviour.
     pub prop_firm_min_pass_rate: f64,
+    /// Search-memory + weekly-refresh ledger (2026-06-06): when `true`, this run
+    /// loads the prior per-symbol/TF ledger and seeds the GA's seen-signature
+    /// memory before search, then writes an updated ledger after finalize. When
+    /// `false`, behaviour is byte-identical to a build without the feature.
+    /// Wired from `models.discovery_ledger.enabled`.
+    pub discovery_ledger_enabled: bool,
+    /// Directory the discovery ledger JSON files live in. Wired from
+    /// `models.discovery_ledger.cache_dir`.
+    pub discovery_ledger_cache_dir: String,
+    /// How many top archive (non-portfolio) genes to also record in the ledger.
+    /// Wired from `models.discovery_ledger.archive_top_n`.
+    pub discovery_ledger_archive_top_n: usize,
 }
 
 /// Configuration for the prop-firm window-pass gate.
@@ -372,6 +384,12 @@ impl Default for DiscoveryConfig {
             // config; these defaults match ModelsConfig::default.)
             require_walkforward_for_export: true,
             prop_firm_min_pass_rate: 0.40,
+            // Search-memory ledger defaults mirror DiscoveryLedgerConfig::default
+            // (enabled, cache/search, top-20 archive). from_settings overrides
+            // from typed config.
+            discovery_ledger_enabled: true,
+            discovery_ledger_cache_dir: "cache/search".to_string(),
+            discovery_ledger_archive_top_n: 20,
         }
     }
 }
@@ -492,6 +510,11 @@ impl DiscoveryConfig {
             // prop-firm pass-rate floor, both from typed config (Settings.models).
             require_walkforward_for_export: model_settings.require_walkforward_for_export,
             prop_firm_min_pass_rate: model_settings.prop_firm_min_pass_rate.clamp(0.0, 1.0),
+            // Search-memory + weekly-refresh ledger (2026-06-06): wired from
+            // models.discovery_ledger so discovery.rs can read it.
+            discovery_ledger_enabled: model_settings.discovery_ledger.enabled,
+            discovery_ledger_cache_dir: model_settings.discovery_ledger.cache_dir.clone(),
+            discovery_ledger_archive_top_n: model_settings.discovery_ledger.archive_top_n,
         }
     }
 
@@ -2135,6 +2158,56 @@ where
     // Capture names after prefilter — gene indices refer to this list.
     let effective_feature_names = features.names.clone();
 
+    // Search-memory + weekly-refresh (2026-06-06): BEFORE the GA starts, seed the
+    // seen-signature memory with the hashes recorded in the prior run's ledger so
+    // the engine SKIPS re-discovering strategies it already found — each weekly
+    // run then ADDS new diverse strategies to a growing library. Config-gated:
+    // when `discovery_ledger_enabled` is false this whole block is skipped and
+    // behaviour is byte-identical to a build without the feature.
+    //
+    // The GA builds its OWN `SeenSignatureMemory::from_env()` (search_engine.rs,
+    // not modified here). We seed into a memory built from the same env/config so
+    // — when an on-disk seen-file is configured via
+    // `models.seen_signature_runtime.file_path` — the seeded hashes are persisted
+    // and the engine's `from_env()` reads them at construction. When no seen-file
+    // is configured (the in-memory default) we still run the seed step but log
+    // that cross-run dedup needs a seen-file path to reach the engine.
+    if config.discovery_ledger_enabled {
+        if let Some(prior) = crate::discovery_ledger::load_prior_ledger(
+            &config.discovery_ledger_cache_dir,
+            &config.evaluation_symbol,
+            &config.timeframe_label,
+        ) {
+            let mut seen = crate::genetic::SeenSignatureMemory::from_env();
+            let seen_has_file = seen.file_path.is_some();
+            let prior_total = prior.portfolio.len() + prior.archive.len();
+            let inserted = crate::discovery_ledger::seed_seen_from_ledger(&prior, &mut seen);
+            seen.flush();
+            if seen_has_file {
+                tracing::info!(
+                    target: "neoethos_search::discovery_ledger",
+                    symbol = %config.evaluation_symbol,
+                    tf = %config.timeframe_label,
+                    prior_total,
+                    seeded = inserted,
+                    "seeded GA seen-set from prior discovery ledger (persisted to seen-file)"
+                );
+            } else {
+                tracing::warn!(
+                    target: "neoethos_search::discovery_ledger",
+                    symbol = %config.evaluation_symbol,
+                    tf = %config.timeframe_label,
+                    prior_total,
+                    seeded = inserted,
+                    "loaded prior discovery ledger but no on-disk seen-file is configured \
+                     (models.seen_signature_runtime.file_path) — the seeded hashes will NOT \
+                     reach the engine's fresh in-memory seen-set. Set a file_path for true \
+                     cross-run dedup."
+                );
+            }
+        }
+    }
+
     // Multi-stage Funnel: Stage 1 (Fast Evaluation)
     let stage1_pct = config.runtime_overrides.resolved_funnel_stage1_pct();
     let stage1_window = config.runtime_overrides.stage1_window;
@@ -2203,7 +2276,7 @@ where
     let profitable_count = search.genes.iter().filter(|g| g.fitness > 0.0).count();
     funnel.record_stage("profitable_archive_size", stage1_count, profitable_count);
 
-    finalize_candidates_with_progress(
+    let result = finalize_candidates_with_progress(
         search.genes,
         &features,
         &ohlcv,
@@ -2211,7 +2284,43 @@ where
         effective_feature_names,
         &mut funnel,
         progress_fn,
-    )
+    )?;
+
+    // Search-memory + weekly-refresh (2026-06-06): AFTER finalize, on the
+    // SUCCESS path, write this run's ledger (portfolio + top archive genes, each
+    // with its canonical gene-signature hash) so the NEXT run can seed from it.
+    // Config-gated; non-fatal (a ledger write failure must not fail an otherwise
+    // successful discovery). Timestamp uses the same chrono::Utc clock the crate
+    // stamps its other artifacts with — passed in so the ledger module stays pure.
+    if config.discovery_ledger_enabled {
+        let timestamp_ms = Utc::now().timestamp_millis();
+        if let Err(err) = crate::discovery_ledger::save_discovery_ledger(
+            &config.discovery_ledger_cache_dir,
+            &config.evaluation_symbol,
+            &config.timeframe_label,
+            &result,
+            config,
+            timestamp_ms,
+        ) {
+            tracing::warn!(
+                target: "neoethos_search::discovery_ledger",
+                symbol = %config.evaluation_symbol,
+                tf = %config.timeframe_label,
+                error = %err,
+                "save_discovery_ledger failed (non-fatal — discovery result is unaffected)"
+            );
+        } else {
+            tracing::info!(
+                target: "neoethos_search::discovery_ledger",
+                symbol = %config.evaluation_symbol,
+                tf = %config.timeframe_label,
+                portfolio = result.portfolio.len(),
+                "wrote discovery ledger for next-run search-memory seeding"
+            );
+        }
+    }
+
+    Ok(result)
 }
 
 fn pearson_correlation(x: &[f32], y: &[f32]) -> f32 {

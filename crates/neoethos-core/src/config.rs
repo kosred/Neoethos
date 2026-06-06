@@ -599,6 +599,11 @@ pub struct ModelsConfig {
     /// the `NEOETHOS_BOT_PROP_SEEN_*` env vars). See
     /// [`SeenSignatureRuntimeConfig`].
     pub seen_signature_runtime: SeenSignatureRuntimeConfig,
+    /// Search-memory + weekly-refresh ledger knobs (2026-06-06): persist what
+    /// each discovery run found and seed the next run's seen-set so weekly runs
+    /// add NEW strategies instead of re-discovering old ones. See
+    /// [`DiscoveryLedgerConfig`].
+    pub discovery_ledger: DiscoveryLedgerConfig,
     /// SMC search-injection knobs (config-driven replacement for the
     /// `NEOETHOS_BOT_PROP_SMC_*` env vars). See [`SmcSearchRuntimeConfig`].
     pub smc_search_runtime: SmcSearchRuntimeConfig,
@@ -941,6 +946,51 @@ impl Default for SeenSignatureRuntimeConfig {
     }
 }
 
+/// Search-memory + weekly-refresh knobs (2026-06-06). When `enabled`, each
+/// discovery run reads a per-symbol/TF on-disk **ledger** of previously found
+/// strategies (indicator + SMC-flag combos + fitness) and seeds the GA's
+/// seen-signature memory with their hashes so the next run AVOIDS
+/// re-discovering them — every weekly run ADDS new diverse strategies to a
+/// growing library. Mirrors the nested-config pattern of
+/// [`DiscoveryRuntimeConfig`]; consumed via
+/// `neoethos_search::DiscoveryConfig::from_settings`.
+///
+/// Cross-run dedup of the seeded hashes only takes effect for the GA when an
+/// on-disk seen-signature file is configured (`seen_signature_runtime.file_path`):
+/// the genetic engine builds its own `SeenSignatureMemory::from_env()` and reads
+/// previously-persisted hashes from that file. When `file_path` is unset
+/// (in-memory only, the default), the ledger is still recorded + the seed step
+/// runs, but the seeded hashes are not visible to the engine's fresh in-memory
+/// set — set a `file_path` to get true cross-run dedup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DiscoveryLedgerConfig {
+    /// Master switch. When `false`, discovery behaves byte-identically to a
+    /// build without this feature (no ledger read, no seed, no ledger write).
+    pub enabled: bool,
+    /// Directory the per-symbol/TF ledger JSON files live in. Relative paths
+    /// resolve against the process CWD (same convention as `cache/features`).
+    pub cache_dir: String,
+    /// How many top archive (non-portfolio) genes to also record per run, so
+    /// the seen-set grows beyond just the promoted portfolio.
+    pub archive_top_n: usize,
+    /// Promotion policy for `discovery-promote-weekly`. `"additive"` (the
+    /// default + only implemented policy) merges new genes by hash and keeps
+    /// existing ones; unknown values fall back to additive.
+    pub promotion_policy: String,
+}
+
+impl Default for DiscoveryLedgerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cache_dir: "cache/search".to_string(),
+            archive_top_n: 20,
+            promotion_policy: "additive".to_string(),
+        }
+    }
+}
+
 /// SMC (smart-money-concept) search-injection knobs — config-driven
 /// replacement for the `NEOETHOS_BOT_PROP_SMC_*` env vars (the per-flag
 /// enable probabilities, the force-ratio + min-flags that seed each GA
@@ -1277,6 +1327,7 @@ impl Default for ModelsConfig {
             quality_runtime: QualityRuntimeConfig::default(),
             backtest_runtime: BacktestRuntimeConfig::default(),
             seen_signature_runtime: SeenSignatureRuntimeConfig::default(),
+            discovery_ledger: DiscoveryLedgerConfig::default(),
             smc_search_runtime: SmcSearchRuntimeConfig::default(),
             data_runtime: DataRuntimeConfig::default(),
             tree_runtime: TreeRuntimeConfig::default(),

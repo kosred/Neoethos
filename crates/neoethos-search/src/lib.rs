@@ -17,6 +17,7 @@ pub mod checkpoint;
 #[cfg(feature = "gpu")]
 mod cubecl_eval;
 pub mod discovery;
+pub mod discovery_ledger;
 // `mod scheduler_assignment;` — DELETED 2026-05-25 (verbose-build pass):
 // the file was a 19-LOC orphan with zero callers. The scheduler-driven
 // GPU routing it scaffolded is dispatched directly via `BackendKind`
@@ -99,6 +100,10 @@ pub use genetic::{
     install_strategy_evaluation_runtime_overrides_from_env,
     install_strategy_evaluation_runtime_overrides_from_settings, month_day_indices, random_search,
     signals_for_gene, signals_for_gene_full,
+};
+pub use discovery_ledger::{
+    DiscoverySearchLedger, GeneRecord, SearchMetadata, ledger_path, load_prior_ledger,
+    save_discovery_ledger, seed_seen_from_ledger,
 };
 pub use live_portfolio::{
     LIVE_PORTFOLIO_SCHEMA_VERSION, LivePortfolioArtifact, load_live_portfolio_json,
