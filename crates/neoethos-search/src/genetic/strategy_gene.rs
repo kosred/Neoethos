@@ -761,6 +761,20 @@ impl EvaluationConfig {
             pip_value_per_lot: profile.pip_value_per_lot,
             spread_pips: profile.spread_pips,
             commission_per_trade: profile.commission_per_trade,
+            // 2026-06-06 operator mandate: break-even + trailing is ALWAYS ON in
+            // discovery (HARDCODED here — the production EvaluationConfig builder).
+            // Both the GA eval (search_engine `b_settings`) and the funnel/prop-firm
+            // window gate (`discovery_backtest_settings`) read these fields, so a single
+            // hardcode makes the risk model consistent everywhere. RATIONALE: with
+            // trailing OFF (the old default), a losing trade ran to the full SL, so
+            // drawdown was higher than necessary and candidates failed the prop-firm
+            // DD/consistency gate. With BE ON, once a trade reaches +1R the stop moves to
+            // ~entry (then trails the extreme), so after 1R the trade can no longer become
+            // a loss → lower DD → more strategies clear the prop-firm gate. `Default`
+            // keeps these at false/1.0/1.0 for test fixtures; production = always on.
+            trailing_enabled: true,
+            trailing_be_trigger_r: 1.0, // move to break-even once +1R in profit
+            trailing_atr_multiplier: 1.0, // then trail 1×SL behind the running extreme
             ..Self::default()
         }
     }
