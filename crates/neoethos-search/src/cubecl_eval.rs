@@ -511,17 +511,11 @@ fn backtest_population_kernel(
                 if past_min_hold && in_pos_v2 == 1 {
                     let sl_cell = RuntimeCell::<f32>::new(entry_px_v - sl_distance);
                     let tp = entry_px_v + tp_distance;
-                    if trailing_enabled != 0 {
-                        let mv = hi - entry_px_v;
-                        if mv >= (trailing_be_trigger_r * sl_distance) {
-                            let candidate = hi - (trailing_atr_multiplier * sl_distance);
-                            if trail_px.read() == 0.0 || candidate > trail_px.read() {
-                                trail_px.store(candidate);
-                            }
-                            if trail_px.read() > sl_cell.read() {
-                                sl_cell.store(trail_px.read());
-                            }
-                        }
+                    // Apply only the trail from PRIOR bars (no intra-bar look-ahead — must
+                    // match the CPU eval: this bar's high can't move the stop its own low is
+                    // checked against). `trail_px == 0.0` is the unset sentinel.
+                    if trailing_enabled != 0 && trail_px.read() > 0.0 && trail_px.read() > sl_cell.read() {
+                        sl_cell.store(trail_px.read());
                     }
                     let sl_v = sl_cell.read();
                     if lo <= sl_v {
@@ -531,20 +525,21 @@ fn backtest_population_kernel(
                         pnl_cell.store((tp - entry_px_v) * pip_value_per_lot);
                         exit_cell.store(1);
                     }
+                    // AFTER the exit check: ratchet the trail up from THIS bar's high.
+                    if exit_cell.read() == 0 && trailing_enabled != 0 {
+                        let mv = hi - entry_px_v;
+                        if mv >= (trailing_be_trigger_r * sl_distance) {
+                            let candidate = hi - (trailing_atr_multiplier * sl_distance);
+                            if trail_px.read() == 0.0 || candidate > trail_px.read() {
+                                trail_px.store(candidate);
+                            }
+                        }
+                    }
                 } else if past_min_hold {
                     let sl_cell = RuntimeCell::<f32>::new(entry_px_v + sl_distance);
                     let tp = entry_px_v - tp_distance;
-                    if trailing_enabled != 0 {
-                        let mv = entry_px_v - lo;
-                        if mv >= (trailing_be_trigger_r * sl_distance) {
-                            let candidate = lo + (trailing_atr_multiplier * sl_distance);
-                            if trail_px.read() == 0.0 || candidate < trail_px.read() {
-                                trail_px.store(candidate);
-                            }
-                            if trail_px.read() < sl_cell.read() {
-                                sl_cell.store(trail_px.read());
-                            }
-                        }
+                    if trailing_enabled != 0 && trail_px.read() > 0.0 && trail_px.read() < sl_cell.read() {
+                        sl_cell.store(trail_px.read());
                     }
                     let sl_v = sl_cell.read();
                     if hi >= sl_v {
@@ -553,6 +548,16 @@ fn backtest_population_kernel(
                     } else if lo <= tp {
                         pnl_cell.store((entry_px_v - tp) * pip_value_per_lot);
                         exit_cell.store(1);
+                    }
+                    // AFTER the exit check: ratchet the trail down from THIS bar's low.
+                    if exit_cell.read() == 0 && trailing_enabled != 0 {
+                        let mv = entry_px_v - lo;
+                        if mv >= (trailing_be_trigger_r * sl_distance) {
+                            let candidate = lo + (trailing_atr_multiplier * sl_distance);
+                            if trail_px.read() == 0.0 || candidate < trail_px.read() {
+                                trail_px.store(candidate);
+                            }
+                        }
                     }
                 }
 

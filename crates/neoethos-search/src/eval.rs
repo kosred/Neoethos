@@ -903,18 +903,13 @@ pub fn fast_evaluate_strategy_core(
                 if in_pos == 1 {
                     let mut sl = entry_px - (settings.sl_pips * pip);
                     let tp = entry_px + (settings.tp_pips * pip);
-                    if settings.trailing_enabled {
-                        let mv = hi - entry_px;
-                        if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
-                            let candidate =
-                                hi - (settings.trailing_atr_multiplier * settings.sl_pips * pip);
-                            if trail_px == 0.0 || candidate > trail_px {
-                                trail_px = candidate;
-                            }
-                            if trail_px > sl {
-                                sl = trail_px;
-                            }
-                        }
+                    // Apply the trail locked in by PRIOR bars. NO intra-bar look-ahead:
+                    // this bar's high must NOT move the stop that this bar's low is then
+                    // checked against (the old order optimistically avoided losses → the
+                    // GA reward-hacked it into fake never-lose genes, PF~100 / ~0% DD).
+                    // `trail_px == 0.0` is the unset sentinel — only apply once set.
+                    if settings.trailing_enabled && trail_px > 0.0 && trail_px > sl {
+                        sl = trail_px;
                     }
                     if lo <= sl {
                         pnl = (sl - entry_px) / pip * settings.pip_value_per_lot;
@@ -923,25 +918,26 @@ pub fn fast_evaluate_strategy_core(
                         pnl = (tp - entry_px) / pip * settings.pip_value_per_lot;
                         exit = true;
                     }
+                    // Only AFTER the exit check: ratchet the trail up from THIS bar's high
+                    // so it protects FUTURE bars (a bar's own high can't save its own low).
+                    if !exit && settings.trailing_enabled {
+                        let mv = hi - entry_px;
+                        if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
+                            let candidate =
+                                hi - (settings.trailing_atr_multiplier * settings.sl_pips * pip);
+                            if trail_px == 0.0 || candidate > trail_px {
+                                trail_px = candidate;
+                            }
+                        }
+                    }
                 } else {
                     let mut sl = entry_px + (settings.sl_pips * pip);
                     let tp = entry_px - (settings.tp_pips * pip);
-                    // L2: trailing stop on a short position only activates once
-                    // the price has moved at least `trailing_be_trigger_r * sl_pips`
-                    // in the trader's favour. Until then `trail_px` stays at 0.0
-                    // and the original `entry_px - sl_pips` stop holds.
-                    if settings.trailing_enabled {
-                        let mv = entry_px - lo;
-                        if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
-                            let candidate =
-                                lo + (settings.trailing_atr_multiplier * settings.sl_pips * pip);
-                            if trail_px == 0.0 || candidate < trail_px {
-                                trail_px = candidate;
-                            }
-                            if trail_px < sl {
-                                sl = trail_px;
-                            }
-                        }
+                    // Short: apply the trail from PRIOR bars only (no intra-bar look-ahead,
+                    // see the long branch). Until +trigger `trail_px` is 0.0 (unset) and the
+                    // original `entry_px + sl_pips` stop holds.
+                    if settings.trailing_enabled && trail_px > 0.0 && trail_px < sl {
+                        sl = trail_px;
                     }
                     if hi >= sl {
                         pnl = (entry_px - sl) / pip * settings.pip_value_per_lot;
@@ -949,6 +945,17 @@ pub fn fast_evaluate_strategy_core(
                     } else if lo <= tp {
                         pnl = (entry_px - tp) / pip * settings.pip_value_per_lot;
                         exit = true;
+                    }
+                    // Only AFTER the exit check: ratchet the trail down from THIS bar's low.
+                    if !exit && settings.trailing_enabled {
+                        let mv = entry_px - lo;
+                        if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
+                            let candidate =
+                                lo + (settings.trailing_atr_multiplier * settings.sl_pips * pip);
+                            if trail_px == 0.0 || candidate < trail_px {
+                                trail_px = candidate;
+                            }
+                        }
                     }
                 }
 
@@ -1321,18 +1328,10 @@ pub fn simulate_trades_core(
             if in_pos == 1 && !exit && past_min_hold {
                 let mut sl = entry_px - (settings.sl_pips * pip);
                 let tp = entry_px + (settings.tp_pips * pip);
-                if settings.trailing_enabled {
-                    let mv = hi - entry_px;
-                    if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
-                        let candidate =
-                            hi - (settings.trailing_atr_multiplier * settings.sl_pips * pip);
-                        if trail_px == 0.0 || candidate > trail_px {
-                            trail_px = candidate;
-                        }
-                        if trail_px > sl {
-                            sl = trail_px;
-                        }
-                    }
+                // Apply only the trail locked in by PRIOR bars — NO intra-bar look-ahead
+                // (this bar's high must not move the stop its own low is checked against).
+                if settings.trailing_enabled && trail_px > 0.0 && trail_px > sl {
+                    sl = trail_px;
                 }
                 if lo <= sl {
                     pnl = (sl - entry_px) / pip * settings.pip_value_per_lot;
@@ -1341,21 +1340,22 @@ pub fn simulate_trades_core(
                     pnl = (tp - entry_px) / pip * settings.pip_value_per_lot;
                     exit = true;
                 }
+                // AFTER the exit check: ratchet the trail up from THIS bar's high (next bar).
+                if !exit && settings.trailing_enabled {
+                    let mv = hi - entry_px;
+                    if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
+                        let candidate =
+                            hi - (settings.trailing_atr_multiplier * settings.sl_pips * pip);
+                        if trail_px == 0.0 || candidate > trail_px {
+                            trail_px = candidate;
+                        }
+                    }
+                }
             } else if in_pos == -1 && !exit && past_min_hold {
                 let mut sl = entry_px + (settings.sl_pips * pip);
                 let tp = entry_px - (settings.tp_pips * pip);
-                if settings.trailing_enabled {
-                    let mv = entry_px - lo;
-                    if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
-                        let candidate =
-                            lo + (settings.trailing_atr_multiplier * settings.sl_pips * pip);
-                        if trail_px == 0.0 || candidate < trail_px {
-                            trail_px = candidate;
-                        }
-                        if trail_px < sl {
-                            sl = trail_px;
-                        }
-                    }
+                if settings.trailing_enabled && trail_px > 0.0 && trail_px < sl {
+                    sl = trail_px;
                 }
                 if hi >= sl {
                     pnl = (entry_px - sl) / pip * settings.pip_value_per_lot;
@@ -1363,6 +1363,17 @@ pub fn simulate_trades_core(
                 } else if lo <= tp {
                     pnl = (entry_px - tp) / pip * settings.pip_value_per_lot;
                     exit = true;
+                }
+                // AFTER the exit check: ratchet the trail down from THIS bar's low (next bar).
+                if !exit && settings.trailing_enabled {
+                    let mv = entry_px - lo;
+                    if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
+                        let candidate =
+                            lo + (settings.trailing_atr_multiplier * settings.sl_pips * pip);
+                        if trail_px == 0.0 || candidate < trail_px {
+                            trail_px = candidate;
+                        }
+                    }
                 }
             }
 
