@@ -3553,6 +3553,28 @@ pub fn save_portfolio_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> 
     write_json_atomic(path, &exports)
 }
 
+/// Unicode sparkline of an equity curve (operator 2026-06-06): see the shape
+/// (start → trough → end) at a glance in the log, not just numbers.
+fn equity_sparkline(curve: &[f64], width: usize) -> String {
+    if curve.len() < 2 {
+        return String::new();
+    }
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let lo = curve.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = curve.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let range = (hi - lo).max(1e-9);
+    let n = curve.len();
+    let cols = width.max(1).min(n);
+    let mut s = String::with_capacity(cols);
+    for c in 0..cols {
+        let idx = (c * (n - 1)) / cols;
+        let v = curve[idx];
+        let b = (((v - lo) / range) * (BLOCKS.len() - 1) as f64).round() as usize;
+        s.push(BLOCKS[b.min(BLOCKS.len() - 1)]);
+    }
+    s
+}
+
 pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
     // Operator observability (2026-06-06): surface the rich per-candidate metrics
     // that were previously written ONLY to <stem>.quality.json (invisible at
@@ -3600,6 +3622,21 @@ pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult
                 q.recovery_factor,
                 if curve_min.is_finite() { curve_min } else { q.initial_capital },
                 q.max_drawdown_money,
+            );
+            if q.equity_curve.len() >= 2 {
+                tracing::info!(
+                    target: "neoethos_search::discovery",
+                    "      curve: {}",
+                    equity_sparkline(&q.equity_curve, 50)
+                );
+            }
+            tracing::info!(
+                target: "neoethos_search::discovery",
+                "      per-trade: MFE EUR {:.0} | MAE EUR {:.0} | avg R {:+.2} | MFE-capture {:.0}%",
+                q.avg_mfe,
+                q.avg_mae,
+                q.avg_r_multiple,
+                q.mfe_capture_ratio * 100.0,
             );
         }
     }

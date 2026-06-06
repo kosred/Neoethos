@@ -106,13 +106,22 @@ pub fn current_quality_runtime_overrides() -> QualityRuntimeOverrides {
     QUALITY_RUNTIME_OVERRIDES.get().copied().unwrap_or_default()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Trade {
     pub entry_time: i64,
     pub exit_time: Option<i64>,
     pub pnl: f64,
     pub pnl_pct: Option<f64>,
     pub duration_hours: Option<f64>,
+    /// Max Favorable Excursion — best unrealized profit reached during the trade ($).
+    #[serde(default)]
+    pub mfe: f64,
+    /// Max Adverse Excursion — worst unrealized loss reached during the trade ($, positive).
+    #[serde(default)]
+    pub mae: f64,
+    /// R-multiple — net P&L / initial $ risk (sl_pips × pip_value_per_lot).
+    #[serde(default)]
+    pub r_multiple: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +180,15 @@ pub struct StrategyMetrics {
     /// start → trough → end curve the operator wants to graph.
     #[serde(default)]
     pub equity_curve: Vec<f64>,
+    // Per-trade excursion aggregates (operator 2026-06-06): "ανά συναλλαγή" pro stats.
+    #[serde(default)]
+    pub avg_mfe: f64,
+    #[serde(default)]
+    pub avg_mae: f64,
+    #[serde(default)]
+    pub avg_r_multiple: f64,
+    #[serde(default)]
+    pub mfe_capture_ratio: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -446,6 +464,30 @@ impl StrategyQualityAnalyzer {
             0.0
         };
 
+        // Per-trade excursion aggregates (operator 2026-06-06): MFE/MAE/R-multiple
+        // averaged + MFE-capture-ratio (realized / potential; <40% = noise-driven exits).
+        let avg_mfe = if !trades.is_empty() {
+            trades.iter().map(|t| t.mfe).sum::<f64>() / trades.len() as f64
+        } else {
+            0.0
+        };
+        let avg_mae = if !trades.is_empty() {
+            trades.iter().map(|t| t.mae).sum::<f64>() / trades.len() as f64
+        } else {
+            0.0
+        };
+        let avg_r_multiple = if !trades.is_empty() {
+            trades.iter().map(|t| t.r_multiple).sum::<f64>() / trades.len() as f64
+        } else {
+            0.0
+        };
+        let sum_mfe: f64 = trades.iter().map(|t| t.mfe).sum();
+        let mfe_capture_ratio = if sum_mfe > 1e-9 {
+            total_return / sum_mfe
+        } else {
+            0.0
+        };
+
         let mut metrics = StrategyMetrics {
             strategy_id: strategy_id.to_string(),
             total_trades,
@@ -487,6 +529,10 @@ impl StrategyQualityAnalyzer {
             period_end_ms,
             period_days,
             equity_curve,
+            avg_mfe,
+            avg_mae,
+            avg_r_multiple,
+            mfe_capture_ratio,
         };
 
         score_strategy(self, &mut metrics);
@@ -823,6 +869,10 @@ fn empty_metrics(strategy_id: &str) -> StrategyMetrics {
         period_end_ms: 0,
         period_days: 0.0,
         equity_curve: Vec::new(),
+        avg_mfe: 0.0,
+        avg_mae: 0.0,
+        avg_r_multiple: 0.0,
+        mfe_capture_ratio: 0.0,
     }
 }
 
@@ -908,6 +958,7 @@ mod overrides_tests {
             pnl,
             pnl_pct: Some(pnl / 100_000.0),
             duration_hours: Some(24.0),
+            ..Default::default()
         };
         // +600, -350, +600, -350 over 4 days on EUR 100,000.
         let trades = vec![mk(0, 600.0), mk(1, -350.0), mk(2, 600.0), mk(3, -350.0)];

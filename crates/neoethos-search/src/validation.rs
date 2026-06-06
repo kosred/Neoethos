@@ -1771,6 +1771,7 @@ mod tests {
                 pnl: 800.0,
                 pnl_pct: None,
                 duration_hours: None,
+                ..Default::default()
             },
             crate::quality::Trade {
                 entry_time: 1_700_086_400_000,
@@ -1778,6 +1779,7 @@ mod tests {
                 pnl: -400.0,
                 pnl_pct: None,
                 duration_hours: None,
+                ..Default::default()
             },
             crate::quality::Trade {
                 entry_time: 1_700_172_800_000,
@@ -1785,6 +1787,7 @@ mod tests {
                 pnl: 600.0,
                 pnl_pct: None,
                 duration_hours: None,
+                ..Default::default()
             },
         ]
     }
@@ -1832,6 +1835,7 @@ mod tests {
             pnl: -7_000.0,
             pnl_pct: None,
             duration_hours: None,
+            ..Default::default()
         }];
         let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
             trades: &trades,

@@ -1162,6 +1162,10 @@ pub fn simulate_trades_core(
     let mut entry_px = 0.0;
     let mut entry_idx = 0usize;
     let mut trail_px = 0.0;
+    // Per-trade excursions (operator 2026-06-06): MFE/MAE tracked while a position
+    // is open, reset at entry, emitted in each Trade record.
+    let mut mfe_money = 0.0_f64;
+    let mut mae_money = 0.0_f64;
     let mut last_day_key = -1i64;
     let mut day_trade_count = 0usize;
 
@@ -1187,6 +1191,23 @@ pub fn simulate_trades_core(
         }
 
         if in_pos != 0 {
+            // Per-trade MFE/MAE tracking (operator 2026-06-06): update from this
+            // bar's high/low BEFORE any exit, so we capture the full excursion.
+            {
+                let (fav, adv) = if in_pos == 1 {
+                    (high[i] - entry_px, entry_px - low[i])
+                } else {
+                    (entry_px - low[i], high[i] - entry_px)
+                };
+                let fav_money = (fav / pip) * settings.pip_value_per_lot;
+                let adv_money = (adv / pip) * settings.pip_value_per_lot;
+                if fav_money > mfe_money {
+                    mfe_money = fav_money;
+                }
+                if adv_money > mae_money {
+                    mae_money = adv_money;
+                }
+            }
             // Gap detection: force-exit on large market gap
             if settings.gap_threshold_ms > 0 && i > 0 {
                 let ts_prev = timestamps[i - 1];
@@ -1212,6 +1233,10 @@ pub fn simulate_trades_core(
                         pnl,
                         pnl_pct: Some(pnl / initial_balance),
                         duration_hours,
+                        mfe: mfe_money,
+                        mae: mae_money,
+                        r_multiple: pnl
+                            / (settings.sl_pips * settings.pip_value_per_lot).max(1e-9),
                     });
                     in_pos = 0;
                     continue;
@@ -1322,6 +1347,10 @@ pub fn simulate_trades_core(
                     pnl,
                     pnl_pct: Some(pnl / initial_balance),
                     duration_hours,
+                    mfe: mfe_money,
+                    mae: mae_money,
+                    r_multiple: pnl
+                        / (settings.sl_pips * settings.pip_value_per_lot).max(1e-9),
                 });
                 in_pos = 0;
             }
@@ -1356,6 +1385,8 @@ pub fn simulate_trades_core(
                 entry_px = close[i] + (s as f64) * half_spread_px;
                 entry_idx = i;
                 trail_px = 0.0;
+                mfe_money = 0.0;
+                mae_money = 0.0;
                 day_trade_count += 1;
             }
         }
