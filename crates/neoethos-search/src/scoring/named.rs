@@ -14,7 +14,7 @@
 //!
 //! | Function | Sharpe | Consistency | DD penalty | PF | Win-rate | Net | Expectancy |
 //! |----------|--------|-------------|-----------|----|----|----|--|
-//! | `ga_fitness` | 0.40 × conf₁₀ | 0.25 | subtract `dd*15→5` | 0.20 (GA shape) | 0.10 | — | — |
+//! | `ga_fitness` (v2) | 0.20 × conf₁₀ | 0.15 | subtract `dd*15→5` | 0.20 (GA shape) | 0.10 | 0.35 (net÷12k) | — |
 //! | `quality_score` | 0.25 × conf₁₀ | 0.15 | subtract `dd*8→3` | 0.20 (smooth shape) | 0.10 | 0.20 | 0.10 |
 //! | `window_score` | 0.25 × conf₈ | 0.15 | subtract `dd*8→3` | 0.20 (smooth shape) | 0.10 | 0.20 | 0.10 |
 //! | `archive_score` | 0.25 × conf₁₀ | 0.15 | subtract `dd*8→3` | 0.20 (smooth shape) | 0.10 | 0.20 | 0.10 |
@@ -47,10 +47,12 @@ pub struct ScoringVersion(pub u32);
 
 /// Current scoring-formula version.
 ///
-/// Phase A (this commit) keeps the legacy four-weight-table behaviour
-/// → version stays at `1`. When Phase C unifies the tables, this bumps
-/// to `2` + a changelog entry documenting the delta.
-pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(1);
+/// 2026-06-06: bumped to `2` — `ga_fitness` is now RETURN-oriented (added a
+/// net-return reward, demoted Sharpe 0.40→0.20) per the operator's ≥4%/month
+/// directive, now safe because risk-based sizing caps leverage (F-028). Runs
+/// before this carry `scoring_version=1` and are NOT directly comparable
+/// (different fitness landscape); old artifacts still deserialize.
+pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(2);
 
 // ---------------------------------------------------------------------------
 // ga_fitness — was `genetic::evolution_math::score_from_metrics`
@@ -76,6 +78,7 @@ pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(1);
 /// trade_count < 1 → caller (the GA selection step) treats this as a
 /// "do not propagate" marker.
 pub fn ga_fitness(metrics: &[f64; 11]) -> f64 {
+    let net = metrics[0];
     let sharpe = metrics[1];
     let max_dd = metrics[3];
     let win_rate = metrics[4];
@@ -128,18 +131,28 @@ pub fn ga_fitness(metrics: &[f64; 11]) -> f64 {
     let activity_mult = 0.3 + 0.7 * activity;
 
     let conf = trades_confidence(trades);
-    let sh = sharpe_component(sharpe, conf) * 0.40;
-    let cons = consistency_component(consistency) * 0.25;
+    // **2026-06-06 (scoring_version 2 — return-oriented GA, operator directive)**:
+    // the GA previously optimised Sharpe ONLY (net deliberately excluded to avoid
+    // an over-leverage bias, F-028) and so converged on high-Sharpe-but-tiny-return
+    // genes — Sharpe 7 at ~0.5%/month, useless when the operator needs ≥4%/month.
+    // Risk-based confidence-scaled position sizing now CAPS per-trade risk, so the
+    // over-leverage concern is gone; rewarding net return is safe AND the unscaled
+    // DD penalty below still rejects blow-ups. `net` (metrics[0], on a fixed initial)
+    // is divided by 12_000 → differentiates net up to ~€36k (≈4%/month over 9 months
+    // on a 100k account) before the ±3 clamp; weight 0.35 makes RETURN the dominant
+    // reward, Sharpe demoted 0.40→0.20 (still rewards smoothness, no longer dominates).
+    let ret = (net / 12_000.0).clamp(-3.0, 3.0) * 0.35;
+    let sh = sharpe_component(sharpe, conf) * 0.20;
+    let cons = consistency_component(consistency) * 0.15;
     let pf = ga_pf_component(profit_factor)
         * if profit_factor >= 1.0 { 0.20 } else { 0.30 };
     let wr = win_rate_component(win_rate) * 0.10;
     let dd = drawdown_penalty(max_dd);
 
-    // Positive components scaled by activity so low-trade candidates
-    // (1–5 trades over the whole window) cannot win on Sharpe noise +
-    // tiny drawdown. The DD penalty is NOT scaled — it stays at full
-    // weight so blow-up candidates are still rejected.
-    (sh + cons + pf + wr) * activity_mult - dd
+    // Positive components scaled by activity so low-trade candidates (1–5 trades
+    // over the whole window) cannot win on noise; the DD penalty is NOT scaled —
+    // full weight, rejects blow-ups even when return is high.
+    (ret + sh + cons + pf + wr) * activity_mult - dd
 }
 
 // ---------------------------------------------------------------------------
@@ -280,11 +293,18 @@ mod tests {
 
     #[test]
     fn ga_fitness_finite_for_healthy_genome() {
-        // sharpe=2.0, dd=0.05, wr=0.60, pf=1.8, trades=100, consistency=0.70
-        let m = metrics(1000.0, 2.0, 0.05, 0.60, 1.8, 12.0, 100.0, 0.70);
+        // scoring_version 2: "healthy" now requires real RETURN, not just Sharpe.
+        // A 1%-return / 5%-DD genome now scores NEGATIVE (correctly — poor recovery);
+        // a genuinely healthy genome makes real money: net=20000 (~20% on 100k),
+        // sharpe=2.0, dd=0.05, wr=0.60, pf=1.8, trades=100, consistency=0.70.
+        let m = metrics(20_000.0, 2.0, 0.05, 0.60, 1.8, 12.0, 100.0, 0.70);
         let s = ga_fitness(&m);
         assert!(s.is_finite());
-        assert!(s > 0.0, "healthy genome must score positive, got {}", s);
+        assert!(
+            s > 0.0,
+            "healthy (high-return, low-DD) genome must score positive, got {}",
+            s
+        );
     }
 
     #[test]
@@ -340,23 +360,25 @@ mod tests {
         // The 0.335 pin therefore SURVIVES the graduated-fitness fix
         // because the healthy-genome case sits in the saturated region.
         //
+        // scoring_version 2 (2026-06-06, return-oriented GA): added a return reward
+        // (net/12000 *0.35), demoted Sharpe 0.40→0.20 and consistency 0.25→0.15.
         // Healthy genome: net=1000, sharpe=2, dd=0.05, wr=0.60, pf=1.8,
         // expectancy=12, trades=100, consistency=0.70.
-        //   activity = (100 / 30).clamp(0,1) = 1.0
-        //   activity_mult = 0.3 + 0.7 * 1.0 = 1.0
-        //   conf = sqrt(100)/10 = 1.0
-        //   sharpe_component = 2.0 (clamped) * 1.0 = 2.0 → * 0.40 = 0.80
-        //   consistency_component = 0.70 → * 0.25 = 0.175
-        //   pf above 1.0: (1.8 - 1.0) * 0.5 = 0.40 (cap @ 1.5, ok) → * 0.20 = 0.08
-        //   wr: (0.60 - 0.45) * 2.0 = 0.30 (cap @ 0.5, ok) → * 0.10 = 0.03
-        //   dd penalty: 0.05 * 15.0 = 0.75 (cap @ 5, ok)
-        //   positives_sum = 0.80 + 0.175 + 0.08 + 0.03 = 1.085
-        //   total = 1.085 * 1.0 - 0.75 = 0.335
+        //   activity_mult = 1.0 ; conf = 1.0
+        //   ret  = (1000/12000).clamp(±3) = 0.083333 → * 0.35 = 0.029167
+        //   sh   = 2.0 (clamped) * 1.0 = 2.0 → * 0.20 = 0.40
+        //   cons = 0.70 → * 0.15 = 0.105
+        //   pf   = (1.8 - 1.0) * 0.5 = 0.40 → * 0.20 = 0.08
+        //   wr   = (0.60 - 0.45) * 2.0 = 0.30 → * 0.10 = 0.03
+        //   dd   = 0.05 * 15.0 = 0.75
+        //   total = (0.029167 + 0.40 + 0.105 + 0.08 + 0.03) * 1.0 - 0.75 = -0.105833
+        // NOTE the genome now scores NEGATIVE: 1% return at 5% DD is poor, and the
+        // return-oriented fitness correctly penalises it (this is the intended change).
         let m = metrics(1000.0, 2.0, 0.05, 0.60, 1.8, 12.0, 100.0, 0.70);
         let s = ga_fitness(&m);
         assert!(
-            (s - 0.335).abs() < 1e-9,
-            "Phase-A GA fitness pin broken: expected 0.335, got {}",
+            (s - (-0.105833)).abs() < 1e-5,
+            "GA fitness pin (scoring_version 2) broken: expected -0.105833, got {}",
             s
         );
     }

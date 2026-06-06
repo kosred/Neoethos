@@ -133,10 +133,10 @@ mod tests {
     }
 
     #[test]
-    fn scoring_version_constant_starts_at_one() {
-        // The pre-unification behaviour these named functions
-        // replicate is version 1. Persisted DiscoveryRunProfile
-        // artifacts will default to this until Phase C bumps to 2.
-        assert_eq!(SCORING_VERSION_CURRENT.0, 1);
+    fn scoring_version_is_two_after_return_oriented_ga() {
+        // 2026-06-06: bumped 1→2 when `ga_fitness` became RETURN-oriented
+        // (net-return reward added, Sharpe demoted 0.40→0.20). Artifacts from
+        // v1 runs are tagged accordingly and are NOT directly comparable.
+        assert_eq!(SCORING_VERSION_CURRENT.0, 2);
     }
 }
