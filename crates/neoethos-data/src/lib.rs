@@ -78,7 +78,7 @@ pub use crate::core::quant_features::*;
 pub use crate::core::regime_detection::*;
 pub use crate::core::resample::*;
 pub use crate::core::session_features::*;
-pub use crate::core::slicing::slice_ohlcv;
+pub use crate::core::slicing::{slice_ohlcv, slice_ohlcv_by_date_range_ms};
 pub use crate::core::smc::*;
 pub use crate::core::timestamps::*;
 pub use crate::core::vortex_io::*;

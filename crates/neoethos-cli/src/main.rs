@@ -83,6 +83,7 @@ fn main() -> Result<()> {
         "trader-replay" => cmd_trader_replay(&args[2..]),
         "batch-discover" => cmd_batch_discover(&args[2..]),
         "migrate-data" => cmd_migrate_data(&args[2..]),
+        "slice-dataset" => cmd_slice_dataset(&args[2..]),
         "import" => cmd_import(&args[2..]),
         "config" => cmd_config(&args[2..]),
         "auto-loop" => cmd_auto_loop(&args[2..]),
@@ -156,6 +157,136 @@ fn cmd_load(args: &[String]) -> Result<()> {
     let ohlcv = neoethos_data::load_symbol_timeframe(&root, &symbol, &timeframe)?;
     println!("Loaded {} {} rows: {}", symbol, timeframe, ohlcv.len());
     Ok(())
+}
+
+/// `slice-dataset --symbol EURUSD --base M1 --root <SRC> --out-root <DST>
+///                --from-date 2018-01-01 --to-date 2021-01-01`
+///
+/// Additive, NON-destructive: reads the source `(symbol, base)` Vortex
+/// dataset from `<SRC>`, keeps only the bars whose timestamp falls in the
+/// half-open range `[from-date, to-date)` (UTC), and writes the filtered
+/// subset to `<DST>/symbol=<SYM>/timeframe=<TF>/data.vortex` in the SAME
+/// canonical Vortex layout the loader reads — so a subsequent
+/// `discover --root <DST> --symbol <SYM> --base <TF>` runs on the slice.
+///
+/// Purpose: OOM-safe walk-forward. A multi-year M1 dataset that overflows
+/// RAM on a weak machine can be chopped into e.g. 3-year windows that each
+/// fit, discovered independently, and stitched by the operator.
+///
+/// Reuses the exact discovery IO path:
+///   - reader: `neoethos_data::load_symbol_timeframe` (same as `discover`)
+///   - date→row mapping + filter: `neoethos_data::slice_ohlcv_by_date_range_ms`
+///   - writer: `neoethos_data::write_symbol_timeframe_vortex`
+///     (canonical `write_ohlcv_vortex` under the hood)
+///
+/// Fails loud when the source is missing/empty or the range yields 0 rows.
+fn cmd_slice_dataset(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?;
+    let root = parse_root(args, settings.as_ref());
+
+    let out_root = parse_flag(args, "--out-root")
+        .or_else(|| parse_flag(args, "--out"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "slice-dataset requires --out-root <DST> (the new root dir to write the slice into)"
+            )
+        })?;
+
+    let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
+    if symbol.is_empty() {
+        anyhow::bail!(
+            "slice-dataset: no --symbol supplied and config.yaml could not provide one — \
+             pass --symbol explicitly (e.g. --symbol EURUSD)"
+        );
+    }
+    // `--base` is the primary name (matches discover/prepare); `--timeframe`
+    // is accepted as an alias for parity with `load`.
+    let base = parse_flag(args, "--base")
+        .or_else(|| parse_flag(args, "--timeframe"))
+        .unwrap_or_else(|| default_base_tf(settings.as_ref()));
+    if base.is_empty() {
+        anyhow::bail!(
+            "slice-dataset: no --base supplied and config.yaml could not provide one — \
+             pass --base explicitly (e.g. --base M1)"
+        );
+    }
+
+    let from_date = parse_flag(args, "--from-date").ok_or_else(|| {
+        anyhow::anyhow!("slice-dataset requires --from-date YYYY-MM-DD (inclusive lower bound, UTC)")
+    })?;
+    let to_date = parse_flag(args, "--to-date").ok_or_else(|| {
+        anyhow::anyhow!("slice-dataset requires --to-date YYYY-MM-DD (exclusive upper bound, UTC)")
+    })?;
+
+    let from_ms = parse_ymd_to_epoch_ms(&from_date, "--from-date")?;
+    let to_ms = parse_ymd_to_epoch_ms(&to_date, "--to-date")?;
+    if to_ms <= from_ms {
+        anyhow::bail!(
+            "slice-dataset: --to-date ({to_date}) must be strictly after --from-date ({from_date}) \
+             (the range is half-open [from, to))"
+        );
+    }
+
+    // Reader — identical to the `discover` command's load path.
+    let source = neoethos_data::load_symbol_timeframe(&root, &symbol, &base).map_err(|err| {
+        anyhow::anyhow!("slice-dataset: failed to load source {symbol} {base} from {root}: {err}")
+    })?;
+    let source_rows = source.len();
+    if source_rows == 0 {
+        anyhow::bail!(
+            "slice-dataset: source {symbol} {base} at {root} is empty — nothing to slice"
+        );
+    }
+
+    // Date→row mapping + half-open filter (shared data-crate helper).
+    let (slice, span) = neoethos_data::slice_ohlcv_by_date_range_ms(&source, from_ms, to_ms)
+        .map_err(|err| anyhow::anyhow!("slice-dataset: {err}"))?;
+    let kept_rows = slice.len();
+    if kept_rows == 0 {
+        anyhow::bail!(
+            "slice-dataset: 0 rows of {symbol} {base} fall in [{from_date}, {to_date}) — \
+             the requested window does not overlap the source data \
+             (source has {source_rows} rows). Widen the date range or check the dataset."
+        );
+    }
+
+    // Writer — canonical Vortex layout, byte-compatible with the loader.
+    let written = neoethos_data::write_symbol_timeframe_vortex(&out_root, &symbol, &base, &slice)
+        .map_err(|err| {
+            anyhow::anyhow!("slice-dataset: failed to write slice to {out_root}: {err}")
+        })?;
+
+    let (first_ms, last_ms) = span.expect("span is Some when kept_rows > 0");
+    println!(
+        "slice-dataset {symbol} {base}: [{from_date}, {to_date})  source rows={source_rows}  kept rows={kept_rows}"
+    );
+    println!(
+        "  kept span: {} .. {}",
+        format_epoch_ms_date(first_ms),
+        format_epoch_ms_date(last_ms)
+    );
+    println!("  written: {}", written.display());
+    Ok(())
+}
+
+/// Parse a `YYYY-MM-DD` date as midnight UTC and return epoch milliseconds.
+/// Fails loud with the offending flag name when the string isn't a valid date.
+fn parse_ymd_to_epoch_ms(date: &str, flag: &str) -> Result<i64> {
+    let naive = chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d").map_err(|err| {
+        anyhow::anyhow!("slice-dataset: {flag} '{date}' is not a valid YYYY-MM-DD date: {err}")
+    })?;
+    let dt = naive.and_hms_opt(0, 0, 0).ok_or_else(|| {
+        anyhow::anyhow!("slice-dataset: {flag} '{date}' could not be set to midnight")
+    })?;
+    Ok(dt.and_utc().timestamp_millis())
+}
+
+/// Render an epoch-ms timestamp as a `YYYY-MM-DD` UTC date for the kept-span
+/// summary line.
+fn format_epoch_ms_date(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| format!("ms:{ms}"))
 }
 
 fn cmd_symbols(args: &[String]) -> Result<()> {
@@ -1938,6 +2069,15 @@ fn print_help() {
         "  trader-replay [--symbol EURUSD --base M1 | --portfolio <live_portfolio.json>] [--root data]  Offline dry-run of the autonomous trader over on-disk history (zero broker calls; same engine as /autonomous/replay). With --portfolio it runs the REAL discovered genes."
     );
     println!("  migrate-data --root data [--force] [--delete-source]");
+    println!(
+        "  slice-dataset --symbol EURUSD --base M1 --root <SRC> --out-root <DST> --from-date 2018-01-01 --to-date 2021-01-01"
+    );
+    println!(
+        "                               Write the [from,to) UTC date-range subset of a Vortex dataset to a NEW root"
+    );
+    println!(
+        "                               (discover --root <DST> runs on the slice). Enables OOM-safe walk-forward chunking."
+    );
     println!("  stop-target --symbol EURUSD --timeframe M1 --pip 0.0001 --signal 1 --root data");
     println!("  wizard                       Launch the interactive first-run wizard (TUI).");
     println!("  setup [show|paths|ctrader|news]  Headless credentials helper (Task #61).");
