@@ -171,7 +171,7 @@ models:
   prop_search_generations: 1000  # operator 2026-06-01: deep Python-class search (was 20); time-bounded by max_hours
   prop_search_max_hours: 0.5  # agent 2026-06-05 golden-mean: 30min GA per combo (was 1h) so ALL ~150 combos + training fit 7 days; cmd_discover re-reads config per combo so this applies from the next combo
   prop_search_max_rows: 0  # operator 2026-06-05: NO cap — use ALL data per file (400k cut M1 to ~9mo -> "not enough history" + capped depth). 0=full history. Per-TF override via prop_search_max_rows_by_tf (not hardcoded).
-  prop_search_portfolio_size: 4  # Cap discovered strategies per pair
+  prop_search_portfolio_size: 50  # 2026-06-06 operator regime-diversity mandate: keep MANY diverse regime-specialist strategies per pair (was 4). The goal is a LARGE library, each capturing a different market condition; the live ensemble + regime-detection deploys each when its edge is active. Correlation-diversification still picks the most-diverse top-N.
   # agent 2026-06-05 overfitting fix: 0 meant unlimited (usize::MAX) -> genes used
   # up to 58 indicators = severe overfitting; 16 caps degrees of freedom (regularization).
   prop_search_max_indicators: 16
@@ -294,13 +294,13 @@ models:
   # also passes walk-forward (out-of-sample) — not just the prop-firm window gate.
   # This stops in-sample-overfit strategies (IS Sharpe 3-11 / PF up to 62) that
   # fail walk-forward from exporting. Set false to restore window-gate-only.
-  require_walkforward_for_export: true  # 2026-06-06 REVERTED: walk-forward export gate is a robustness/anti-overfit filter — keep it ON.
+  require_walkforward_for_export: false  # 2026-06-06 operator regime-diversity mandate: walk-forward tests ALL-PERIOD generalization → as a HARD gate it kills regime-specialists (genes good in SOME market conditions, not all years), which is exactly what we WANT to keep. Now INFORMATIONAL: walk-forward still RUNS and is recorded per strategy (so the live system knows each strategy's OOS character), but it no longer blocks export. Robustness comes from portfolio DIVERSITY + live regime-detection, not per-strategy all-period generalization. Set true to restore the hard OOS export gate.
   # agent 2026-06-05 overfitting fix: hard floor for the prop-firm window
   # pass-rate (combined as max with discovery_runtime.prop_firm_gate.pass_rate,
   # which defaults to 0.0 = ranking-only). 0.65 = a candidate must pass FTMO
   # rules on ≥65% of random evaluation windows to survive. Raise toward 1.0 for
   # stricter selection; lower (e.g. 0.0) to restore the old ranking-only behaviour.
-  prop_firm_min_pass_rate: 0.40  # 2026-06-06 RE-CALIBRATED 0.65→0.40 (operator, after validation cut every gene here). With the per-window target now at the operator's bar (8%/60d = >=4%/month, in derive_prop_firm_gate), 0.40 = "hits >=4%/month in >=40% of 60-day windows" = a genuine persistent edge; the live models lift the rest (discovery=edge, models=grow). Walk-forward export gate + base-filter max_dd still reject overfit/blow-ups. Raise toward 0.65 for stricter, lower for more candidates.
+  prop_firm_min_pass_rate: 0.0  # 2026-06-06 operator regime-diversity mandate: 0.65→0.40→0.0. A hard all-window consistency floor KILLS regime-specialists (genes active in only SOME market conditions) — exactly the strategies we WANT for a diverse library. 0.0 = RANKING-ONLY: the prop-firm window-pass-rate still RANKS candidates (more-consistent first) but no longer kills any. The LOW-DD base filter (max_dd) + quality screen (MC/spread/regime) + min-trades still reject blow-ups and noise. Raise (e.g. 0.40-0.65) to demand all-window consistency again.
   # CPCV (Combinatorial Purged Cross-Validation) settings
   enable_cpcv: true
   cpcv_n_splits: 5
