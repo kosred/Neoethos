@@ -1629,24 +1629,17 @@ fn spawn_discover_combo(
         .arg(resolved.search.portfolio_size.to_string())
         .arg("--out")
         .arg(format!("cache/schedule/{symbol}_{timeframe}.json"));
-    if a.card_ids.len() > 1 {
-        // Multi-card heavy combo: shard the GA population across ALL its cards
-        // (Stage 2). The plural env list + per-card gene cap drive the multi-
-        // device path in evaluate_population_core.
-        let ids = a
-            .card_ids
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        cmd.env("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES", &ids);
-        cmd.env("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICES", &ids);
-        cmd.env(
-            "NEOETHOS_BOT_SEARCH_EVAL_GENES_PER_CARD",
-            a.genes_per_card.to_string(),
-        );
-    } else if let Some(&card) = a.card_ids.first() {
-        // Single card: pin on whichever GPU backend the binary was built with.
+    // NOTE: intra-combo GPU sharding (Stage 2, the plural *_DEVICES env) is
+    // DISABLED at the dispatch layer — the cubecl wgpu multi-device path panics
+    // at runtime ("Memory page 0 doesn't exist" in cubecl-runtime client.rs) and
+    // falls back to slow CPU recompute. Validated 2026-06-07 on the 2×A6000 VPS:
+    // M1 ran 58 min on CPU (gen 305/20000, 0 results) before we caught it. Until
+    // that cubecl multi-device issue is fixed, every combo runs on the PROVEN
+    // single-device path, pinned to its first assigned card (H4 validated: card
+    // at 120 MiB, clean run). Combo-level throughput (one combo per card,
+    // concurrent) is preserved; the multi-device code in eval.rs stays in place,
+    // gated behind the plural env which we simply no longer set.
+    if let Some(&card) = a.card_ids.first() {
         cmd.env("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE", card.to_string());
         cmd.env("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE", card.to_string());
     }
