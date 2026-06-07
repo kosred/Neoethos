@@ -121,6 +121,33 @@ fn drop_nonfinite_rows_dataframe(
     Ok((clean_frame, clean_labels, dropped))
 }
 
+/// Prune feature COLUMNS that are entirely non-finite (NaN/Inf in every row).
+/// Such a column carries zero information, and — left in — would make the
+/// row-wise [`drop_nonfinite_rows`] discard EVERY row. Mutates `features` +
+/// `names` in lock-step and returns the number of columns removed. A column
+/// that has at least one finite value is kept (its warmup NaNs are handled by
+/// the row drop). See `train_symbol_with_progress`.
+fn prune_all_nonfinite_columns(
+    features: &mut ndarray::Array2<f32>,
+    names: &mut Vec<String>,
+) -> usize {
+    let ncols = features.ncols();
+    if ncols == 0 || features.nrows() == 0 {
+        return 0;
+    }
+    let keep: Vec<usize> = (0..ncols)
+        .filter(|&c| features.column(c).iter().any(|v| v.is_finite()))
+        .collect();
+    let pruned = ncols - keep.len();
+    if pruned > 0 {
+        *features = features.select(ndarray::Axis(1), &keep);
+        if names.len() == ncols {
+            *names = keep.iter().map(|&c| names[c].clone()).collect();
+        }
+    }
+    pruned
+}
+
 fn drop_nonfinite_rows(
     features: ndarray::Array2<f32>,
     labels: Vec<i32>,
@@ -263,6 +290,21 @@ impl TrainingOrchestrator {
         // rows are 1:1 with `base_ohlcv` (and `labels`) here, so we slice the dense
         // matrix + labels to the leading in-sample block.
         let mut dense = frame.to_dense_samples_major();
+        let mut feature_names = frame.names.clone();
+        // Prune feature columns that are PERMANENTLY non-finite (e.g. a
+        // long-lookback indicator on a sparse higher TF — MN1 ~156 bars — that
+        // never warms up). Such a column carries zero information yet, left in,
+        // makes the row-wise NaN drop below discard EVERY row ("kept 0 rows").
+        // Discovery dodges this by projecting to the genes' effective features;
+        // training keeps all columns, so we prune the dead ones here instead.
+        let pruned_cols = prune_all_nonfinite_columns(&mut dense, &mut feature_names);
+        if pruned_cols > 0 {
+            info!(
+                "Pruned {} all-NaN feature column(s) before training ({} columns remain)",
+                pruned_cols,
+                feature_names.len()
+            );
+        }
         let mut labels = labels;
         if let Some(cutoff) = self.oos_lock_from_ms {
             let timestamps = base_ohlcv
@@ -309,19 +351,22 @@ impl TrainingOrchestrator {
             );
         }
         // Fail loud with an actionable message instead of the downstream
-        // "expert requires a non-empty feature matrix": an empty cube here almost
-        // always means a feature column was all-NaN (e.g. a higher-TF selection
-        // that doesn't exist on disk or cannot align to this base TF).
+        // "expert requires a non-empty feature matrix": after pruning all-NaN
+        // columns, an empty cube means every REMAINING row had a non-finite
+        // value (e.g. the entire series is shorter than the indicator warmup).
         if clean_data.nrows() == 0 {
             anyhow::bail!(
-                "training feature cube for {symbol}/{base_tf} is EMPTY after dropping {dropped} \
-                 non-finite rows — a feature column is entirely NaN. Most likely the higher-TF \
-                 selection ({:?}) contains a timeframe that is missing on disk or cannot align to \
-                 base {base_tf}. Check system.higher_timeframes / multi_resolution_timeframes.",
+                "training feature cube for {symbol}/{base_tf} is EMPTY after pruning {pruned_cols} \
+                 all-NaN column(s) and dropping {dropped} non-finite rows ({} columns remained). \
+                 The remaining features never produce a finite row — likely the series is too short \
+                 for the indicator warmup, or the higher-TF selection ({:?}) cannot align to base \
+                 {base_tf}. Check system.higher_timeframes / multi_resolution_timeframes.",
+                feature_names.len(),
                 self.selected_feature_timeframes(base_tf)
             );
         }
-        let raw_payload = TrainingPayload::from_named_dense(clean_data, clean_labels, frame.names)?;
+        let raw_payload =
+            TrainingPayload::from_named_dense(clean_data, clean_labels, feature_names)?;
         let filtered_payload = if self.settings.models.filter_to_base_signal {
             let (filtered_frame, filtered_labels) = self.apply_base_signal_filter(
                 raw_payload.frame.as_ref(),
@@ -798,32 +843,24 @@ impl TrainingOrchestrator {
             &self.settings.system.higher_timeframes
         };
 
-        // Only timeframes STRICTLY HIGHER than the base are valid multi-TF
-        // features. A lower TF cannot be aligned onto a coarser base bar — the
-        // multi-TF cube emits it as an all-NaN column, which drops EVERY row at
-        // training time (observed: D1/H1 base with the config's base-M1-oriented
-        // flat list -> "kept 0 rows" -> "elasticnet requires a non-empty feature
-        // matrix"). This mirrors discovery's `canonical_higher_timeframes`
-        // contract; the config's flat list is authored for a base-M1 run, so a
-        // coarser base must filter the lower TFs out. (Base M1 keeps all of
-        // them — every listed TF is above M1 — so M1 training is unchanged.)
-        let above = neoethos_core::canonical_higher_timeframes(base_tf);
+        // Mirror discovery's selection (the flat config list minus the base) for
+        // UI/CLI↔discovery parity — discovery trains genes on these same TFs and
+        // works. Any feature column that ends up permanently non-finite (e.g. a
+        // long-lookback indicator on a sparse higher TF that never warms up) is
+        // PRUNED in `train_symbol_with_progress` before the row-wise NaN drop, so
+        // a single dead column no longer nukes the whole dataset.
         let mut selected = Vec::new();
         for timeframe in source {
-            let tf = timeframe.trim();
-            if tf.is_empty() || tf.eq_ignore_ascii_case(base_tf) {
+            if timeframe.eq_ignore_ascii_case(base_tf) {
                 continue;
-            }
-            if !above.iter().any(|a| a.eq_ignore_ascii_case(tf)) {
-                continue; // lower-than-base or non-canonical — would be all-NaN
             }
             if selected
                 .iter()
-                .any(|existing: &String| existing.eq_ignore_ascii_case(tf))
+                .any(|existing: &String| existing.eq_ignore_ascii_case(timeframe))
             {
                 continue;
             }
-            selected.push(tf.to_string());
+            selected.push(timeframe.clone());
         }
 
         selected
