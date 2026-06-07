@@ -16,6 +16,10 @@ pub mod checkpoint;
 // 0.0002 cost violation.
 #[cfg(feature = "gpu")]
 mod cubecl_eval;
+// Pure CSR population partitioning for multi-GPU sharding (Stage 2). Not GPU-
+// gated: it is plain slice math, so it compiles + unit-tests on any build. The
+// device-execution glue that consumes it lives in `eval.rs` behind `gpu`.
+mod lane_partition;
 pub mod discovery;
 pub mod discovery_ledger;
 // `mod scheduler_assignment;` — DELETED 2026-05-25 (verbose-build pass):
