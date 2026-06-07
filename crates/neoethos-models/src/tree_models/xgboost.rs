@@ -652,6 +652,13 @@ impl XGBoostExpert {
                 ),
             };
 
+            // v0.5 ML-integration Stage 1(a): plumb the L1/L2/min-child/gamma
+            // regularizers into the booster. Previously these were never set,
+            // so any `reg_lambda` / `reg_alpha` / `gamma` / `min_child_weight`
+            // in `config.params` was silently dropped. Fallbacks are XGBoost's
+            // own neutral defaults (gamma 0, min_child_weight 1, lambda 1,
+            // alpha 0) so that with the regularized seed map OFF (keys absent)
+            // the booster behaves exactly as before.
             let tree_params =
                 TreeBoosterParametersBuilder::default()
                     .eta(param_float(&self.config.params, "learning_rate", 0.05) as f32)
@@ -662,6 +669,12 @@ impl XGBoostExpert {
                         param_float(&self.config.params, "colsample_bylevel", 1.0) as f32
                     )
                     .colsample_bynode(self.tree_colsample_bynode())
+                    .min_child_weight(
+                        param_float(&self.config.params, "min_child_weight", 1.0) as f32,
+                    )
+                    .gamma(param_float(&self.config.params, "gamma", 0.0) as f32)
+                    .lambda(param_float(&self.config.params, "reg_lambda", 1.0) as f32)
+                    .alpha(param_float(&self.config.params, "reg_alpha", 0.0) as f32)
                     .num_parallel_tree(self.tree_num_parallel())
                     .tree_method(effective_tree_method)
                     .predictor(self.predictor())

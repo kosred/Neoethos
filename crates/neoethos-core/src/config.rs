@@ -458,6 +458,31 @@ pub struct ModelsConfig {
     pub prop_search_async: bool,
     pub prop_search_async_wait: bool,
     pub tree_device_preference: String,
+    /// ML overfit-reduction (v0.5 ML-integration Stage 1). When `true`
+    /// (default), the gradient boosters (xgboost/lightgbm/catboost + variants)
+    /// train with regularized, bar-scaled defaults (shallower trees, column +
+    /// row subsampling, L1/L2, leaf-size floors, bar-scaled tree counts) instead
+    /// of the legacy full-depth / full-data / no-shrinkage defaults that
+    /// memorize thin-TF (D1/W1/MN) targets. Set `false` to restore the legacy
+    /// unregularized defaults for a controlled before/after OOS comparison.
+    /// `#[serde(default)]` on `ModelsConfig` makes a missing key fall back to
+    /// the `Default` impl below (= `true`).
+    pub regularized_model_defaults: bool,
+    /// ML overfit-reduction: minimum per-(symbol,TF) bar count below which the
+    /// heavy gradient boosters are forced onto a shrunk preset (shallow depth,
+    /// few trees, strong L2) and per-bar HPO is disabled (a thin holdout cannot
+    /// select 5+ hyperparameters). Default 4000 — D1 (~2700 bars) and coarser
+    /// TFs fall below it. Below an absolute floor (800) an even tinier preset is
+    /// used. Set to 0 to disable the gate entirely.
+    pub heavy_booster_min_bars: usize,
+    /// ML overfit-reduction: when `true` (default) ML hyperparameter selection
+    /// uses CombinatorialPurgedCV (purge+embargo, 15 paths) scored by
+    /// mean-minus-stdev of the objective across folds — penalizing params that
+    /// only generalize to one lucky window — instead of a single time-series
+    /// holdout. Gated to `bars >= heavy_booster_min_bars` and `trials > 1` to
+    /// bound the 15×-fold fit cost; below that it falls back to the single
+    /// holdout. Set `false` to restore the single-holdout HPO.
+    pub ml_cpcv_enabled: bool,
     pub prop_search_parent_selection: String,
     pub prop_search_survivor_selection: String,
     pub prop_search_survivor_fraction: f64,
@@ -1210,6 +1235,9 @@ impl Default for ModelsConfig {
             prop_search_async: false,
             prop_search_async_wait: false,
             tree_device_preference: "auto".to_string(),
+            regularized_model_defaults: true,
+            heavy_booster_min_bars: 4000,
+            ml_cpcv_enabled: true,
             prop_search_parent_selection: "rank".to_string(),
             prop_search_survivor_selection: "rank".to_string(),
             prop_search_survivor_fraction: 0.10,

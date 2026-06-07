@@ -21,7 +21,7 @@ use crate::runtime::exports::{
     ONNX_EXPORT_STATUS_FILE_NAME, OnnxExportStatus, write_onnx_export_status,
 };
 use crate::runtime::hpo::{
-    OPTIMIZATION_REPORT_FILE_NAME, OptimizationReport, OptimizationTrialRecord,
+    OPTIMIZATION_REPORT_FILE_NAME, OptimizationReport, OptimizationTrialRecord, ValidationMetrics,
     evaluate_prediction_quality, time_series_holdout_split, write_optimization_report,
 };
 use crate::runtime::profile::{
@@ -1005,59 +1005,137 @@ impl TrainingOrchestrator {
 
     fn default_model_params(&self, name: &str) -> HashMap<String, String> {
         let canonical = canonical_model_name(name);
+        // v0.5 ML-integration Stage 1(a): the gradient boosters seed from
+        // REGULARIZED, bar-scalable defaults (shallow depth, column + row
+        // subsampling, L1/L2, leaf-size floors) instead of the legacy
+        // full-depth / full-data / no-shrinkage values that memorize thin-TF
+        // (D1/W1/MN) triple-barrier targets. The per-(symbol,TF) bar-count
+        // scaling of `n_estimators` / `num_iterations` / `iterations` /
+        // `min_data_in_leaf` happens later in `train_model_dispatch` where
+        // `payload.frame.height()` is known. Set
+        // `models.regularized_model_defaults = false` to restore the legacy
+        // unregularized seeds for a controlled before/after OOS comparison.
+        //
+        // CRITICAL (verified): this seed map is the REAL production source for
+        // the named boosters — `parse_tree_params` forwards every key here into
+        // the expert's `config.params`. Editing only each booster's
+        // `default_params()` would be a silent no-op because the orchestrator
+        // always passes `Some(parse_tree_params(...))`.
+        let reg = self.settings.models.regularized_model_defaults;
+        let device = self.settings.models.tree_device_preference.clone();
         match canonical {
+            "xgboost_rf" if reg => HashMap::from([
+                ("variant".to_string(), "rf".to_string()),
+                ("num_parallel_tree".to_string(), "64".to_string()),
+                // rf is bagging — keep slightly deeper than the boosters for
+                // member diversity, but still subsample rows + columns + L2.
+                ("max_depth".to_string(), "5".to_string()),
+                ("subsample".to_string(), "0.8".to_string()),
+                ("colsample_bytree".to_string(), "0.8".to_string()),
+                ("colsample_bynode".to_string(), "0.8".to_string()),
+                ("min_child_weight".to_string(), "10".to_string()),
+                ("reg_lambda".to_string(), "5.0".to_string()),
+                ("reg_alpha".to_string(), "0.5".to_string()),
+                ("gamma".to_string(), "0.5".to_string()),
+                ("device".to_string(), device),
+            ]),
             "xgboost_rf" => HashMap::from([
                 ("variant".to_string(), "rf".to_string()),
                 ("num_parallel_tree".to_string(), "64".to_string()),
                 ("subsample".to_string(), "0.8".to_string()),
                 ("colsample_bynode".to_string(), "0.8".to_string()),
-                (
-                    "device".to_string(),
-                    self.settings.models.tree_device_preference.clone(),
-                ),
+                ("device".to_string(), device),
+            ]),
+            "xgboost_dart" if reg => HashMap::from([
+                ("variant".to_string(), "dart".to_string()),
+                ("rate_drop".to_string(), "0.1".to_string()),
+                ("skip_drop".to_string(), "0.5".to_string()),
+                ("max_depth".to_string(), "4".to_string()),
+                ("learning_rate".to_string(), "0.03".to_string()),
+                ("subsample".to_string(), "0.8".to_string()),
+                ("colsample_bytree".to_string(), "0.8".to_string()),
+                ("colsample_bylevel".to_string(), "0.8".to_string()),
+                ("colsample_bynode".to_string(), "0.8".to_string()),
+                ("min_child_weight".to_string(), "10".to_string()),
+                ("reg_lambda".to_string(), "5.0".to_string()),
+                ("reg_alpha".to_string(), "0.5".to_string()),
+                ("gamma".to_string(), "0.5".to_string()),
+                ("device".to_string(), device),
             ]),
             "xgboost_dart" => HashMap::from([
                 ("variant".to_string(), "dart".to_string()),
                 ("rate_drop".to_string(), "0.1".to_string()),
                 ("skip_drop".to_string(), "0.5".to_string()),
-                (
-                    "device".to_string(),
-                    self.settings.models.tree_device_preference.clone(),
-                ),
+                ("device".to_string(), device),
+            ]),
+            "catboost_alt" if reg => HashMap::from([
+                ("variant".to_string(), "alt".to_string()),
+                // "alt" variant — keep a touch more depth for ensemble
+                // diversity than the primary catboost, still strongly L2'd.
+                ("depth".to_string(), "6".to_string()),
+                ("l2_leaf_reg".to_string(), "6.0".to_string()),
+                ("device".to_string(), device),
             ]),
             "catboost_alt" => HashMap::from([
                 ("variant".to_string(), "alt".to_string()),
                 ("depth".to_string(), "10".to_string()),
                 ("l2_leaf_reg".to_string(), "5.0".to_string()),
-                (
-                    "device".to_string(),
-                    self.settings.models.tree_device_preference.clone(),
-                ),
+                ("device".to_string(), device),
+            ]),
+            "lightgbm" if reg => HashMap::from([
+                ("device".to_string(), device),
+                ("num_iterations".to_string(), "400".to_string()),
+                ("learning_rate".to_string(), "0.03".to_string()),
+                ("max_depth".to_string(), "4".to_string()),
+                ("num_leaves".to_string(), "15".to_string()),
+                ("min_data_in_bin".to_string(), "3".to_string()),
+                // baseline; bar-scaled to max(20, bars/200) in train_model_dispatch
+                ("min_data_in_leaf".to_string(), "50".to_string()),
+                ("feature_fraction".to_string(), "0.8".to_string()),
+                ("bagging_fraction".to_string(), "0.8".to_string()),
+                ("bagging_freq".to_string(), "1".to_string()),
+                ("min_gain_to_split".to_string(), "0.01".to_string()),
+                ("lambda_l1".to_string(), "0.5".to_string()),
+                ("lambda_l2".to_string(), "5.0".to_string()),
             ]),
             "lightgbm" => HashMap::from([
-                (
-                    "device".to_string(),
-                    self.settings.models.tree_device_preference.clone(),
-                ),
+                ("device".to_string(), device),
                 ("num_iterations".to_string(), "400".to_string()),
                 ("learning_rate".to_string(), "0.05".to_string()),
                 ("max_depth".to_string(), "8".to_string()),
                 ("num_leaves".to_string(), "31".to_string()),
             ]),
+            "xgboost" if reg => HashMap::from([
+                ("device".to_string(), device),
+                // baseline; bar-scaled to 200/400/800 in train_model_dispatch
+                ("n_estimators".to_string(), "400".to_string()),
+                ("max_depth".to_string(), "4".to_string()),
+                ("learning_rate".to_string(), "0.03".to_string()),
+                ("subsample".to_string(), "0.8".to_string()),
+                ("colsample_bytree".to_string(), "0.8".to_string()),
+                ("colsample_bylevel".to_string(), "0.8".to_string()),
+                ("colsample_bynode".to_string(), "0.8".to_string()),
+                ("min_child_weight".to_string(), "10".to_string()),
+                ("reg_lambda".to_string(), "5.0".to_string()),
+                ("reg_alpha".to_string(), "0.5".to_string()),
+                ("gamma".to_string(), "0.5".to_string()),
+            ]),
             "xgboost" => HashMap::from([
-                (
-                    "device".to_string(),
-                    self.settings.models.tree_device_preference.clone(),
-                ),
+                ("device".to_string(), device),
                 ("n_estimators".to_string(), "800".to_string()),
                 ("max_depth".to_string(), "8".to_string()),
                 ("learning_rate".to_string(), "0.05".to_string()),
             ]),
+            "catboost" if reg => HashMap::from([
+                ("device".to_string(), device),
+                // baseline; bar-scaled to 200/400/800 in train_model_dispatch
+                ("iterations".to_string(), "400".to_string()),
+                ("depth".to_string(), "4".to_string()),
+                ("learning_rate".to_string(), "0.03".to_string()),
+                ("l2_leaf_reg".to_string(), "6.0".to_string()),
+            ]),
             "catboost" => HashMap::from([
-                (
-                    "device".to_string(),
-                    self.settings.models.tree_device_preference.clone(),
-                ),
+                ("device".to_string(), device),
                 ("iterations".to_string(), "500".to_string()),
                 ("depth".to_string(), "8".to_string()),
                 ("learning_rate".to_string(), "0.05".to_string()),
@@ -3166,6 +3244,199 @@ fn select_hpo_dataset(
     Ok((frame, labels, Some(max_rows)))
 }
 
+/// Row-gather helper for the non-contiguous CombinatorialPurgedCV index sets
+/// (the purged train fold is a union of groups with holes from purge/embargo,
+/// so a contiguous `slice` cannot express it).
+fn take_frame_rows(frame: &DataFrame, idx: &[usize]) -> Result<DataFrame> {
+    let indices: Vec<u32> = idx.iter().map(|&i| i as u32).collect();
+    let ca = Series::new("__cpcv_idx".into(), indices).u32()?.clone();
+    Ok(frame.take(&ca)?)
+}
+
+/// Stage 1(c): score each HPO candidate with CombinatorialPurgedCV instead of a
+/// single time-series holdout. Each candidate is fit + evaluated on every purged
+/// path; the candidate score is `mean - stdev` of the per-path objective, so a
+/// candidate that only generalizes to one lucky window is penalized — the direct
+/// overfit signal. Reuses `neoethos_search::CombinatorialPurgedCV` (the SAME
+/// purge+embargo machinery the gene side uses) rather than reinventing it.
+/// Returns `Ok(None)` when no valid purged paths can be formed or every
+/// candidate fails, so the caller falls back to the single-holdout path.
+#[allow(clippy::too_many_arguments)]
+fn optimize_model_config_cpcv(
+    config: &ModelConfig,
+    hpo_frame: &DataFrame,
+    hpo_labels: &[i32],
+    backend: &str,
+    trials_requested: usize,
+    base_params: &HashMap<String, String>,
+    confidence_threshold: f32,
+    metric_weight: f64,
+    accuracy_weight: f64,
+    row_budget_applied: Option<usize>,
+    hpo_rows_applied: Option<usize>,
+) -> Result<Option<(HashMap<String, String>, OptimizationReport)>> {
+    const N_SPLITS: usize = 6;
+    const N_TEST_GROUPS: usize = 2;
+    const EMBARGO_PCT: f64 = 0.02;
+    const PURGE_PCT: f64 = 0.01;
+
+    let n = hpo_frame.height();
+    let cv = neoethos_search::CombinatorialPurgedCV::new(
+        N_SPLITS,
+        N_TEST_GROUPS,
+        EMBARGO_PCT,
+        PURGE_PCT,
+    );
+    let splits = cv.split(n);
+    if splits.is_empty() {
+        return Ok(None);
+    }
+    let n_paths = splits.len();
+
+    let mut best_params = base_params.clone();
+    let mut best_score = f64::NEG_INFINITY; // mean-minus-stdev aggregate
+    let mut best_metrics: Option<ValidationMetrics> = None;
+    let mut best_trial_index = 0usize;
+    let mut trials: Vec<OptimizationTrialRecord> = Vec::new();
+
+    for trial_idx in 0..trials_requested {
+        let candidate_params = if trial_idx == 0 {
+            base_params.clone()
+        } else {
+            generate_hpo_candidate_params(config, base_params, trial_idx, trials_requested, backend)
+        };
+
+        let mut fold_scores: Vec<f64> = Vec::with_capacity(n_paths);
+        let mut repr_metrics: Option<ValidationMetrics> = None;
+        let mut fold_error: Option<String> = None;
+
+        for (train_idx, test_idx) in &splits {
+            let train_frame = match take_frame_rows(hpo_frame, train_idx) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    fold_error = Some(error.to_string());
+                    break;
+                }
+            };
+            let test_frame = match take_frame_rows(hpo_frame, test_idx) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    fold_error = Some(error.to_string());
+                    break;
+                }
+            };
+            let train_labels: Vec<i32> = train_idx.iter().map(|&i| hpo_labels[i]).collect();
+            let test_labels: Vec<i32> = test_idx.iter().map(|&i| hpo_labels[i]).collect();
+
+            let mut model = match build_expert_model(config, hpo_frame.width(), &candidate_params) {
+                Ok(model) => model,
+                Err(error) => {
+                    fold_error = Some(error.to_string());
+                    break;
+                }
+            };
+            let train_labels_series = labels_to_series(&train_labels);
+            let test_labels_series = labels_to_series(&test_labels);
+            match model
+                .fit_with_validation(
+                    &train_frame,
+                    &train_labels_series,
+                    Some(&test_frame),
+                    Some(&test_labels_series),
+                )
+                .and_then(|_| model.predict_proba(&test_frame))
+            {
+                Ok(probabilities) => {
+                    let metrics = evaluate_prediction_quality(
+                        &probabilities,
+                        &test_labels,
+                        confidence_threshold,
+                        metric_weight,
+                        accuracy_weight,
+                    )?;
+                    fold_scores.push(metrics.objective_score);
+                    if repr_metrics.is_none() {
+                        repr_metrics = Some(metrics);
+                    }
+                }
+                Err(error) => {
+                    fold_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+
+        if fold_scores.is_empty() {
+            trials.push(OptimizationTrialRecord {
+                index: trial_idx,
+                backend: backend.to_string(),
+                params: candidate_params,
+                metrics: None,
+                error: fold_error.or_else(|| Some("no CPCV folds completed".to_string())),
+                selected: false,
+            });
+            continue;
+        }
+
+        let mean = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
+        let variance =
+            fold_scores.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / fold_scores.len() as f64;
+        let aggregate = mean - variance.sqrt();
+
+        if aggregate > best_score {
+            best_score = aggregate;
+            best_params = candidate_params.clone();
+            best_metrics = repr_metrics.clone();
+            best_trial_index = trial_idx;
+        }
+        trials.push(OptimizationTrialRecord {
+            index: trial_idx,
+            backend: backend.to_string(),
+            params: candidate_params,
+            metrics: repr_metrics,
+            error: None,
+            // Marked authoritatively after the loop so exactly one is selected.
+            selected: false,
+        });
+    }
+
+    let trials_completed = trials.iter().filter(|trial| trial.metrics.is_some()).count();
+    if trials_completed == 0 {
+        // Every candidate failed under CPCV — let the caller fall back to the
+        // single-holdout path instead of returning an unusable report.
+        return Ok(None);
+    }
+    if let Some(selected_trial) = trials.get_mut(best_trial_index) {
+        selected_trial.selected = true;
+    }
+
+    let report = OptimizationReport {
+        model_name: config.name.clone(),
+        capability_family: config.capability_family,
+        capability_state: config.capability_state,
+        backend: backend.to_string(),
+        trials_requested,
+        trials_completed,
+        // CPCV does not use a single holdout fraction; 0.0 is valid ([0,1)).
+        holdout_pct: 0.0,
+        train_rows: n,
+        // Approximate per-path test size for the report (n/S * test groups).
+        val_rows: (n / N_SPLITS) * N_TEST_GROUPS,
+        selected_trial_index: best_trial_index,
+        selected_params: best_params.clone(),
+        selected_metrics: best_metrics,
+        row_budget_applied,
+        hpo_rows_applied,
+        notes: vec![format!(
+            "CombinatorialPurgedCV HPO: {N_SPLITS} splits, {N_TEST_GROUPS} test groups, \
+             {n_paths} purged paths; candidate score = mean-minus-stdev of objective across paths"
+        )],
+        trials,
+    };
+
+    Ok(Some((best_params, report)))
+}
+
 fn optimize_model_config(
     config: &ModelConfig,
     payload: &TrainingPayload,
@@ -3187,6 +3458,30 @@ fn optimize_model_config(
         embargo_rows_for_timeframe(base_tf, embargo_minutes_from_params(&config.params));
     let (hpo_frame, hpo_labels, hpo_rows_applied) =
         select_hpo_dataset(payload, hpo_max_rows_from_params(&config.params))?;
+
+    // Stage 1(c): CombinatorialPurgedCV HPO scoring for the heavy boosters.
+    // `apply_overfit_overrides` sets `__ml_cpcv` only for thick-enough heavy
+    // boosters; we additionally require trials > 1 (a single trial cannot
+    // benefit from cross-path variance penalization).
+    if parse_bool_param(&config.params, "__ml_cpcv", false) && trials_requested > 1 {
+        if let Some(result) = optimize_model_config_cpcv(
+            config,
+            &hpo_frame,
+            &hpo_labels,
+            &backend,
+            trials_requested,
+            &base_params,
+            confidence_threshold,
+            metric_weight,
+            accuracy_weight,
+            row_budget_applied,
+            hpo_rows_applied,
+        )? {
+            return Ok(result);
+        }
+        // Fall through to the single-holdout path when CPCV could not form
+        // valid purged paths (e.g. dataset still too small after gating).
+    }
 
     let Some((train_frame, train_labels, val_frame, val_labels)) =
         time_series_holdout_split(&hpo_frame, &hpo_labels, holdout_pct, embargo_rows, 256, 64)?
@@ -3367,6 +3662,120 @@ fn write_onnx_status_sidecar(
     write_onnx_export_status(&artifact_dir.join(ONNX_EXPORT_STATUS_FILE_NAME), &status)
 }
 
+/// v0.5 ML-integration Stage 1(b): per-(symbol,TF) overfit gate + tree-budget
+/// scaling for the heavy gradient boosters, applied at train time where the
+/// real bar count (`payload.frame.height()`) is known. No-op when
+/// `regularized_model_defaults` is off or the model is not one of the heavy
+/// boosters (xgboost/xgboost_rf/xgboost_dart/lightgbm/catboost/catboost_alt).
+///
+/// - Tree budget scales with bars: <3000 -> 200, 3000-10000 -> 400, >10000 -> 800.
+/// - Below `heavy_booster_min_bars` (default 4000; D1 ~2700 falls below) the
+///   booster is forced onto a shrunk preset (shallow depth, few trees, few
+///   leaves) AND per-bar HPO is disabled (`__hpo_trials=1`) — a thin holdout
+///   cannot reliably select 5+ hyperparameters. Below an absolute floor (800)
+///   an even tinier preset is used. The model still trains and votes (we do not
+///   silently drop a voter); it is simply low-variance.
+fn apply_overfit_overrides(
+    settings: &neoethos_core::Settings,
+    config: &ModelConfig,
+    bars: usize,
+) -> ModelConfig {
+    let canonical = canonical_model_name(&config.name);
+    let is_heavy = matches!(
+        canonical,
+        "xgboost" | "xgboost_rf" | "xgboost_dart" | "lightgbm" | "catboost" | "catboost_alt"
+    );
+    if !is_heavy {
+        return config.clone();
+    }
+
+    let mut params = config.params.clone();
+    let min_bars = settings.models.heavy_booster_min_bars;
+    let thin = min_bars > 0 && bars < min_bars;
+    let very_thin = thin && bars < 800;
+
+    if settings.models.regularized_model_defaults {
+        // Bar-scaled tree budget (early stopping on the val frame still caps it).
+        let trees = if thin {
+            if very_thin { 80 } else { 150 }
+        } else if bars < 3000 {
+            200
+        } else if bars <= 10_000 {
+            400
+        } else {
+            800
+        };
+        let depth: Option<i64> = if thin {
+            Some(if very_thin { 2 } else { 3 })
+        } else {
+            None
+        };
+        let leaves: Option<i64> = if thin {
+            Some(if very_thin { 4 } else { 7 })
+        } else {
+            None
+        };
+
+        match canonical {
+            "xgboost" | "xgboost_rf" | "xgboost_dart" => {
+                params.insert("n_estimators".into(), trees.to_string());
+                if let Some(d) = depth {
+                    params.insert("max_depth".into(), d.to_string());
+                }
+            }
+            "lightgbm" => {
+                params.insert("num_iterations".into(), trees.to_string());
+                // Leaf-size floor scales with data (min 20) — single-row leaves
+                // are the classic LightGBM overfit on thin TFs.
+                let min_leaf = (bars / 200).max(20);
+                params.insert("min_data_in_leaf".into(), min_leaf.to_string());
+                if let Some(d) = depth {
+                    params.insert("max_depth".into(), d.to_string());
+                }
+                if let Some(l) = leaves {
+                    params.insert("num_leaves".into(), l.to_string());
+                }
+            }
+            "catboost" | "catboost_alt" => {
+                params.insert("iterations".into(), trees.to_string());
+                if let Some(d) = depth {
+                    params.insert("depth".into(), d.to_string());
+                }
+            }
+            _ => {}
+        }
+
+        if thin {
+            // A thin holdout cannot select 5+ hyperparameters — disable per-bar HPO.
+            params.insert("__hpo_trials".into(), "1".into());
+            tracing::info!(
+                target: "neoethos_models::training",
+                model = %config.name,
+                bars,
+                heavy_booster_min_bars = min_bars,
+                trees,
+                "thin-data overfit gate: shrunk booster preset + HPO disabled"
+            );
+        }
+    }
+
+    // Stage 1(c): enable CombinatorialPurgedCV HPO scoring for the heavy
+    // boosters when the data is thick enough (purged 15-path CV is wasteful and
+    // unstable on thin data, which is also forced to trials=1 above). The
+    // `optimize_model_config` reader additionally requires trials > 1.
+    if settings.models.ml_cpcv_enabled && !thin {
+        params.insert("__ml_cpcv".into(), "1".into());
+    }
+
+    ModelConfig {
+        name: config.name.clone(),
+        model_type: config.model_type,
+        capability_family: config.capability_family,
+        capability_state: config.capability_state,
+        params,
+    }
+}
+
 fn train_model_dispatch(
     models_dir: &std::path::Path,
     settings: &neoethos_core::Settings,
@@ -3379,6 +3788,10 @@ fn train_model_dispatch(
     let artifact_dir = model_artifact_dir(models_dir, symbol, base_tf, &config.name);
 
     if uses_shared_expert_dispatch(config.model_type) {
+        // Stage 1(b): apply the bar-count overfit gate BEFORE HPO so the
+        // selection respects the gated budget.
+        let gated = apply_overfit_overrides(settings, config, payload.frame.height());
+        let config = &gated;
         let (selected_params, optimization_report) =
             optimize_model_config(config, payload, base_tf, row_budget_applied)?;
         let effective_config = ModelConfig {
@@ -3723,6 +4136,83 @@ mod tests {
             .create_dispatch_plan()
             .expect_err("expected empty-config error");
         assert!(err.to_string().contains("no model names"));
+    }
+
+    // v0.5 ML-integration Stage 1(a) guard: the regularized seed map is the
+    // REAL production source for the named boosters (verdict #3). If these keys
+    // ever regress out of `default_model_params`, the booster silently trains
+    // with the legacy unregularized values and a before/after OOS shows no
+    // effect — this test fails loudly instead.
+    #[test]
+    fn regularized_seed_maps_contain_reg_keys() {
+        let orch = orchestrator_with_models(&["xgboost"]);
+        assert!(orch.settings.models.regularized_model_defaults);
+
+        let xgb = orch.default_model_params("xgboost");
+        assert_eq!(xgb.get("max_depth").map(String::as_str), Some("4"));
+        assert_eq!(xgb.get("subsample").map(String::as_str), Some("0.8"));
+        assert_eq!(xgb.get("colsample_bytree").map(String::as_str), Some("0.8"));
+        assert_eq!(xgb.get("min_child_weight").map(String::as_str), Some("10"));
+        assert_eq!(xgb.get("reg_lambda").map(String::as_str), Some("5.0"));
+        assert_eq!(xgb.get("reg_alpha").map(String::as_str), Some("0.5"));
+        assert_eq!(xgb.get("gamma").map(String::as_str), Some("0.5"));
+
+        let lgbm = orch.default_model_params("lightgbm");
+        assert_eq!(lgbm.get("num_leaves").map(String::as_str), Some("15"));
+        assert_eq!(lgbm.get("max_depth").map(String::as_str), Some("4"));
+        assert_eq!(lgbm.get("feature_fraction").map(String::as_str), Some("0.8"));
+        assert_eq!(lgbm.get("bagging_fraction").map(String::as_str), Some("0.8"));
+        assert_eq!(lgbm.get("lambda_l2").map(String::as_str), Some("5.0"));
+        assert!(lgbm.contains_key("min_data_in_leaf"));
+
+        let cat = orch.default_model_params("catboost");
+        assert_eq!(cat.get("depth").map(String::as_str), Some("4"));
+        assert_eq!(cat.get("l2_leaf_reg").map(String::as_str), Some("6.0"));
+    }
+
+    #[test]
+    fn legacy_seed_maps_restore_unregularized_defaults() {
+        let mut orch = orchestrator_with_models(&["xgboost"]);
+        orch.settings.models.regularized_model_defaults = false;
+
+        let xgb = orch.default_model_params("xgboost");
+        assert_eq!(xgb.get("max_depth").map(String::as_str), Some("8"));
+        assert_eq!(xgb.get("n_estimators").map(String::as_str), Some("800"));
+        // Regularizers are NOT seeded in legacy mode (the booster's neutral
+        // inline fallbacks then apply == legacy behaviour).
+        assert!(!xgb.contains_key("subsample"));
+        assert!(!xgb.contains_key("reg_lambda"));
+
+        let lgbm = orch.default_model_params("lightgbm");
+        assert_eq!(lgbm.get("num_leaves").map(String::as_str), Some("31"));
+        assert!(!lgbm.contains_key("feature_fraction"));
+    }
+
+    #[test]
+    fn overfit_gate_shrinks_and_disables_hpo_on_thin_data() {
+        let orch = orchestrator_with_models(&["xgboost"]);
+        let base = ModelConfig {
+            name: "xgboost".to_string(),
+            model_type: ModelType::XGBoost,
+            capability_family: crate::runtime::capabilities::ModelFamily::Tree,
+            capability_state: CapabilityState::Verified,
+            params: orch.default_model_params("xgboost"),
+        };
+
+        // Thin (D1-like): below the 4000-bar gate -> shrunk preset + HPO off,
+        // and NO CPCV meta flag (15-path CV is wasteful on thin data).
+        let thin = apply_overfit_overrides(&orch.settings, &base, 2700);
+        assert_eq!(thin.params.get("max_depth").map(String::as_str), Some("3"));
+        assert_eq!(thin.params.get("n_estimators").map(String::as_str), Some("150"));
+        assert_eq!(thin.params.get("__hpo_trials").map(String::as_str), Some("1"));
+        assert!(!thin.params.contains_key("__ml_cpcv"));
+
+        // Thick: bar-scaled budget, no shrink, CPCV enabled.
+        let thick = apply_overfit_overrides(&orch.settings, &base, 50_000);
+        assert_eq!(thick.params.get("n_estimators").map(String::as_str), Some("800"));
+        assert_eq!(thick.params.get("max_depth").map(String::as_str), Some("4"));
+        assert!(!thick.params.contains_key("__hpo_trials"));
+        assert_eq!(thick.params.get("__ml_cpcv").map(String::as_str), Some("1"));
     }
 
     #[test]
