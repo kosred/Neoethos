@@ -150,7 +150,10 @@ gpu-cuda = [
     "dep:cubecl",
     "statistical-models",
     "lightgbm",
-    "lightgbm3/gpu",
+    # `lightgbm3/gpu` (OpenCL) intentionally NOT pulled: on NVIDIA we want the
+    # CUDA learner, and the OpenCL path fails to link (`undefined symbol:
+    # clReleaseProgram` — `-lOpenCL` is never emitted). Keep CUDA only.
+    # See docs/gpu-build.md.
     "lightgbm3/cuda",
     "reinforcement-learning",
     "rlkit/cuda",
