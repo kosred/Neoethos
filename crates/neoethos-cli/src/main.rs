@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use neoethos_core::logging::{setup_logging, write_subsystem_record};
 use neoethos_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use std::path::Path;
@@ -89,6 +89,7 @@ fn main() -> Result<()> {
         "import" => cmd_import(&args[2..]),
         "config" => cmd_config(&args[2..]),
         "auto-loop" => cmd_auto_loop(&args[2..]),
+        "schedule" => cmd_schedule(&args[2..]),
         "stop-target" => cmd_stop_target(&args[2..]),
         "wizard" => cmd_wizard(&args[2..]),
         "setup" => cmd_setup(&args[2..]),
@@ -1343,6 +1344,322 @@ fn cmd_config(args: &[String]) -> Result<()> {
 ///
 /// Persists checkpoint to cache/auto_loop_checkpoint.json — on crash,
 /// re-run with --resume to continue.
+/// Multi-GPU / hybrid scheduler driver (Stage 1).
+///
+/// Enumerates symbol×TF combos, asks `scheduler::plan_combo` how each should be
+/// admitted, then runs the schedulable (single-card / CPU) combos across all
+/// cards concurrently — each as a subprocess `discover` pinned to a card via
+/// `NEOETHOS_BOT_SEARCH_EVAL_{WGPU,CUDA}_DEVICE`. Combos that need the GA
+/// population SHARDED across >1 card are DEFERRED to Stage 2 (intra-combo
+/// multi-GPU) and reported, never silently dropped. Training co-scheduling on
+/// separate cards is Stage 3.
+///
+/// `--dry-run` prints the full admission plan WITHOUT spawning — the way to
+/// validate the decisions against a real hardware probe + real on-disk data
+/// sizes (works on any machine, no GPU needed).
+fn cmd_schedule(args: &[String]) -> Result<()> {
+    use neoethos_core::scheduler::{
+        plan_combo, AdmissionPolicy, ComboAdmissionPlan, ComboItem, ComboShape, WorkScheduler,
+    };
+
+    let settings = resolve_cli_settings(args)?.unwrap_or_else(neoethos_core::Settings::default);
+    let resolved = neoethos_core::resolved_config::ResolvedConfig::from_settings(&settings);
+    let root = parse_root(args, Some(&settings));
+    let dry_run = has_flag(args, "--dry-run");
+    // Stage 1 schedules DISCOVERY only; training co-scheduling on separate
+    // cards is Stage 3, so there is no `--skip-training` knob here yet.
+    let resume = has_flag(args, "--resume");
+    let stop_flag =
+        parse_flag(args, "--stop-flag").unwrap_or_else(|| "cache/schedule_stop.flag".to_string());
+    // feature-cube column count is hard to know without building the cube; a
+    // conservative estimate is fine because the planner's safety margins
+    // (0.75 RAM / 0.80 VRAM / 2× overhead) absorb the error. Overridable.
+    let feature_count: usize = parse_flag(args, "--features")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1500);
+    // bytes-per-bar for the load-free row estimate (vortex-compressed OHLCV).
+    let bytes_per_bar: f64 = parse_flag(args, "--bytes-per-bar")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12.0);
+    let population = resolved.search.population;
+
+    // Set the data root for any child orchestrator BEFORE any thread spawns.
+    unsafe {
+        std::env::set_var("NEOETHOS_BOT_DATA_ROOT", &root);
+    }
+
+    let symbols: Vec<String> = match parse_flag(args, "--symbols") {
+        Some(s) if !s.trim().is_empty() => {
+            s.split(',').map(|x| x.trim().to_uppercase()).collect()
+        }
+        _ => neoethos_data::discover_symbols(&root)?,
+    };
+    let tfs: Vec<String> = parse_flag(args, "--timeframes")
+        .unwrap_or_else(|| resolved.timeframes.canonical_default.join(","))
+        .split(',')
+        .map(|x| x.trim().to_uppercase())
+        .collect();
+
+    let mut probe = neoethos_core::system::HardwareProbe::new();
+    let hw = probe.detect();
+    let policy = AdmissionPolicy::default();
+    println!(
+        "Hardware: {} cores, {:.0}GB RAM avail, {} usable GPU(s) VRAM={:?}GB",
+        hw.cpu_cores,
+        hw.available_ram_gb,
+        hw.gpu_mem_gb.iter().filter(|m| **m > 0.0).count(),
+        hw.gpu_mem_gb
+    );
+
+    // Build admission plans, partitioning schedulable (<=1 card) from the
+    // sharding-heavy combos deferred to Stage 2.
+    let mut id_combo: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    let mut schedulable: Vec<ComboItem> = Vec::new();
+    let mut deferred: Vec<(String, ComboAdmissionPlan)> = Vec::new();
+    for sym in &symbols {
+        for tf in &tfs {
+            let id = format!("{sym}/{tf}");
+            let rows = estimate_series_rows(&root, sym, tf, bytes_per_bar);
+            if rows == 0 {
+                println!("  skip {id}: no vortex data found on disk");
+                continue;
+            }
+            let shape = ComboShape::new(rows, population, feature_count);
+            let plan = plan_combo(shape, &hw, &policy);
+            id_combo.insert(id.clone(), (sym.clone(), tf.clone()));
+            if plan.cards_per_combo > 1 {
+                deferred.push((id, plan));
+            } else {
+                schedulable.push(ComboItem::new(id, shape, plan));
+            }
+        }
+    }
+
+    println!(
+        "\n=== Admission plan: {} schedulable, {} deferred-to-Stage2 ===",
+        schedulable.len(),
+        deferred.len()
+    );
+    for it in &schedulable {
+        let tag = if it.plan.cards_per_combo == 0 {
+            "  [CPU lane]"
+        } else if !it.plan.fits_on_gpu {
+            "  [does NOT fit on one card — chunk]"
+        } else {
+            ""
+        };
+        println!(
+            "  [{:?}] {:<14} rows≈{:>9}  cards={} genes/card={} cpu={} RAM≈{:.1}GB VRAM/card≈{:.1}GB{}",
+            it.plan.class,
+            it.id,
+            it.shape.series_rows,
+            it.plan.cards_per_combo,
+            it.plan.genes_per_card,
+            it.plan.cpu_threads_per_worker,
+            it.plan.est_ram_per_combo_gb,
+            it.plan.est_vram_per_card_gb,
+            tag
+        );
+    }
+    for (id, plan) in &deferred {
+        println!(
+            "  [DEFER] {:<14} needs {} cards (population sharding) — Stage 2; RAM≈{:.1}GB",
+            id, plan.cards_per_combo, plan.est_ram_per_combo_gb
+        );
+    }
+
+    if dry_run {
+        println!("\n--dry-run: plan only, no processes spawned.");
+        return Ok(());
+    }
+    if !deferred.is_empty() {
+        println!(
+            "\nNOTE: {} heavy combo(s) need multi-GPU sharding (Stage 2) and are NOT run now.",
+            deferred.len()
+        );
+    }
+
+    let checkpoint_path = std::path::PathBuf::from("cache").join("schedule_checkpoint.json");
+    let mut completed: Vec<String> = Vec::new();
+    if resume && checkpoint_path.exists() {
+        if let Ok(text) = std::fs::read_to_string(&checkpoint_path) {
+            if let Ok(prev) = serde_json::from_str::<ScheduleCheckpoint>(&text) {
+                completed = prev.completed.clone();
+                schedulable.retain(|it| !completed.contains(&it.id));
+                println!(
+                    "Resuming: {} already done; {} remaining",
+                    completed.len(),
+                    schedulable.len()
+                );
+            }
+        }
+    }
+
+    let mut sched = WorkScheduler::new(schedulable, &hw, &policy);
+    let mut children: std::collections::HashMap<String, std::process::Child> =
+        std::collections::HashMap::new();
+    let mut failed: Vec<String> = Vec::new();
+    let total = sched.pending_len();
+    println!(
+        "\nScheduling {} combos across {} card(s)...",
+        total,
+        sched.total_cards()
+    );
+
+    loop {
+        let stopping = std::path::Path::new(&stop_flag).exists();
+        if stopping && children.is_empty() {
+            println!("Stop-flag found and no in-flight work — exiting.");
+            break;
+        }
+        if !stopping {
+            for a in sched.poll() {
+                let (sym, tf) = id_combo.get(&a.id).cloned().unwrap_or_default();
+                match spawn_discover_combo(&a, &sym, &tf, &root, &resolved) {
+                    Ok(child) => {
+                        println!(
+                            "  ▶ {} on cards {:?} ({} genes/card, {} cpu threads)",
+                            a.id, a.card_ids, a.genes_per_card, a.cpu_threads
+                        );
+                        children.insert(a.id.clone(), child);
+                    }
+                    Err(e) => {
+                        eprintln!("  spawn {} failed: {e:#}", a.id);
+                        sched.complete(&a.id);
+                        failed.push(a.id.clone());
+                    }
+                }
+            }
+        }
+        if children.is_empty() {
+            if sched.is_done() || stopping {
+                break;
+            }
+            // Nothing running and nothing dispatchable — avoid a spin loop.
+            eprintln!("scheduler stalled with {} pending and no free capacity — stopping", sched.pending_len());
+            break;
+        }
+
+        let ids: Vec<String> = children.keys().cloned().collect();
+        let mut any_done = false;
+        for id in ids {
+            let finished = match children.get_mut(&id).map(|c| c.try_wait()) {
+                Some(Ok(Some(status))) => Some(status),
+                Some(Err(e)) => {
+                    eprintln!("  wait {id}: {e}");
+                    None
+                }
+                _ => None,
+            };
+            if let Some(status) = finished {
+                any_done = true;
+                children.remove(&id);
+                sched.complete(&id);
+                if status.success() {
+                    completed.push(id.clone());
+                    println!("  ✔ {id} done ({}/{})", completed.len(), total);
+                    write_schedule_checkpoint(&checkpoint_path, &completed);
+                } else {
+                    // Stage 1 has no CPU lane yet (that is Stage 3), so a GPU
+                    // failure is logged and resources freed — NOT retried in a
+                    // loop. The OOM->CPU requeue path is exercised once Stage 3
+                    // lands a real fast-CPU fallback.
+                    failed.push(id.clone());
+                    eprintln!(
+                        "  ✗ {id} FAILED (exit {:?}) — freed; not retried (CPU lane is Stage 3)",
+                        status.code()
+                    );
+                }
+            }
+        }
+        if !any_done {
+            std::thread::sleep(std::time::Duration::from_millis(750));
+        }
+    }
+
+    println!(
+        "\nSchedule done: {} completed, {} failed, {} deferred-to-Stage2.",
+        completed.len(),
+        failed.len(),
+        deferred.len()
+    );
+    if !failed.is_empty() {
+        println!("  failed: {failed:?}");
+    }
+    Ok(())
+}
+
+/// Cheap, load-free estimate of the bar count for a symbol/timeframe from the
+/// on-disk vortex file size. The orchestrator must NOT materialise data (M1 is
+/// ~80GB expanded), so we estimate from bytes. Feeds the admission planner,
+/// whose conservative margins + the subprocess's exact load make the estimate
+/// non-critical to correctness.
+fn estimate_series_rows(root: &str, symbol: &str, tf: &str, bytes_per_bar: f64) -> usize {
+    let path = neoethos_data::symbol_timeframe_vortex_path(root, symbol, tf);
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64;
+    if bytes <= 0.0 {
+        return 0;
+    }
+    (bytes / bytes_per_bar.max(1.0)).ceil() as usize
+}
+
+/// Spawn one `discover` subprocess pinned to its assigned card. Stage 1 pins to
+/// a single card (`card_ids[0]`); multi-card sharding is Stage 2.
+fn spawn_discover_combo(
+    a: &neoethos_core::scheduler::Assignment,
+    symbol: &str,
+    timeframe: &str,
+    root: &str,
+    resolved: &neoethos_core::resolved_config::ResolvedConfig,
+) -> Result<std::process::Child> {
+    let exe = std::env::current_exe().context("locating current executable")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("discover")
+        .arg("--symbol")
+        .arg(symbol)
+        .arg("--base")
+        .arg(timeframe)
+        .arg("--root")
+        .arg(root)
+        .arg("--population")
+        .arg(resolved.search.population.to_string())
+        .arg("--generations")
+        .arg(resolved.search.generations.to_string())
+        .arg("--portfolio-size")
+        .arg(resolved.search.portfolio_size.to_string())
+        .arg("--out")
+        .arg(format!("cache/schedule/{symbol}_{timeframe}.json"));
+    if let Some(&card) = a.card_ids.first() {
+        // Pin to one card on whichever GPU backend the binary was built with.
+        cmd.env("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE", card.to_string());
+        cmd.env("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE", card.to_string());
+    }
+    cmd.env("NEOETHOS_BOT_CPU_BUDGET", a.cpu_threads.to_string());
+    cmd.env("NEOETHOS_BOT_DATA_ROOT", root);
+    cmd.spawn()
+        .with_context(|| format!("spawning discover for {symbol}/{timeframe}"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct ScheduleCheckpoint {
+    updated_at: String,
+    completed: Vec<String>,
+}
+
+fn write_schedule_checkpoint(path: &std::path::Path, completed: &[String]) {
+    let ck = ScheduleCheckpoint {
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        completed: completed.to_vec(),
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&ck) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 fn cmd_auto_loop(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?.unwrap_or_else(neoethos_core::Settings::default);
     let resolved = neoethos_core::resolved_config::ResolvedConfig::from_settings(&settings);
