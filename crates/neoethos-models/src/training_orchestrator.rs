@@ -3684,8 +3684,7 @@ fn optimize_model_config(
                     metric_weight,
                     accuracy_weight,
                 )?;
-                let selected = metrics.objective_score > best_score;
-                if selected {
+                if metrics.objective_score > best_score {
                     best_score = metrics.objective_score;
                     best_metrics = Some(metrics.clone());
                     best_params = candidate_params.clone();
@@ -3697,7 +3696,12 @@ fn optimize_model_config(
                     params: candidate_params,
                     metrics: Some(metrics),
                     error: None,
-                    selected,
+                    // Marked authoritatively after the loop so EXACTLY ONE trial
+                    // is selected (validate_optimization_report requires it).
+                    // Previously every improving trial was marked, so a
+                    // monotonically-improving HPO run failed validation and the
+                    // model (e.g. nbeats) was lost.
+                    selected: false,
                 });
             }
             Err(error) => {
