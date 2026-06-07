@@ -308,6 +308,19 @@ impl TrainingOrchestrator {
                 clean_data.nrows()
             );
         }
+        // Fail loud with an actionable message instead of the downstream
+        // "expert requires a non-empty feature matrix": an empty cube here almost
+        // always means a feature column was all-NaN (e.g. a higher-TF selection
+        // that doesn't exist on disk or cannot align to this base TF).
+        if clean_data.nrows() == 0 {
+            anyhow::bail!(
+                "training feature cube for {symbol}/{base_tf} is EMPTY after dropping {dropped} \
+                 non-finite rows — a feature column is entirely NaN. Most likely the higher-TF \
+                 selection ({:?}) contains a timeframe that is missing on disk or cannot align to \
+                 base {base_tf}. Check system.higher_timeframes / multi_resolution_timeframes.",
+                self.selected_feature_timeframes(base_tf)
+            );
+        }
         let raw_payload = TrainingPayload::from_named_dense(clean_data, clean_labels, frame.names)?;
         let filtered_payload = if self.settings.models.filter_to_base_signal {
             let (filtered_frame, filtered_labels) = self.apply_base_signal_filter(
@@ -785,18 +798,32 @@ impl TrainingOrchestrator {
             &self.settings.system.higher_timeframes
         };
 
+        // Only timeframes STRICTLY HIGHER than the base are valid multi-TF
+        // features. A lower TF cannot be aligned onto a coarser base bar — the
+        // multi-TF cube emits it as an all-NaN column, which drops EVERY row at
+        // training time (observed: D1/H1 base with the config's base-M1-oriented
+        // flat list -> "kept 0 rows" -> "elasticnet requires a non-empty feature
+        // matrix"). This mirrors discovery's `canonical_higher_timeframes`
+        // contract; the config's flat list is authored for a base-M1 run, so a
+        // coarser base must filter the lower TFs out. (Base M1 keeps all of
+        // them — every listed TF is above M1 — so M1 training is unchanged.)
+        let above = neoethos_core::canonical_higher_timeframes(base_tf);
         let mut selected = Vec::new();
         for timeframe in source {
-            if timeframe.eq_ignore_ascii_case(base_tf) {
+            let tf = timeframe.trim();
+            if tf.is_empty() || tf.eq_ignore_ascii_case(base_tf) {
                 continue;
+            }
+            if !above.iter().any(|a| a.eq_ignore_ascii_case(tf)) {
+                continue; // lower-than-base or non-canonical — would be all-NaN
             }
             if selected
                 .iter()
-                .any(|existing: &String| existing.eq_ignore_ascii_case(timeframe))
+                .any(|existing: &String| existing.eq_ignore_ascii_case(tf))
             {
                 continue;
             }
-            selected.push(timeframe.clone());
+            selected.push(tf.to_string());
         }
 
         selected
