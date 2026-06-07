@@ -1627,6 +1627,34 @@ mod hybrid_split {
     }
 }
 
+/// GPU device ids the scheduler pinned for THIS process, from the plural
+/// `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES` (or CUDA twin), e.g. "0,1,2,3".
+/// Empty when unset (single-device behaviour is preserved). The Stage-1
+/// scheduler sets this for a heavy combo so the GA shards across all its cards.
+#[cfg(feature = "gpu")]
+fn eval_gpu_devices() -> Vec<usize> {
+    std::env::var("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES")
+        .or_else(|_| std::env::var("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICES"))
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Per-card gene cap from the scheduler's VRAM math
+/// (`NEOETHOS_BOT_SEARCH_EVAL_GENES_PER_CARD`). Unset => no cap (even split).
+#[cfg(feature = "gpu")]
+fn eval_genes_per_card_cap() -> usize {
+    std::env::var("NEOETHOS_BOT_SEARCH_EVAL_GENES_PER_CARD")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(usize::MAX)
+}
+
 pub fn evaluate_population_core(
     inputs: PopulationEvalInputs<'_>,
 ) -> Result<Vec<[f64; 11]>, String> {
@@ -1713,8 +1741,123 @@ pub fn evaluate_population_core(
             && cuda_eval_backtest_kernel_enabled()
             && n_genes >= 4
         {
+            let devices = eval_gpu_devices();
             let gpu_count = hybrid_split::gpu_count(n_genes);
             if gpu_count > 0 && gpu_count < n_genes {
+                // ── Multi-GPU sharding (Stage 2) ─────────────────────────
+                // When the scheduler pins >1 card (NEOETHOS_BOT_SEARCH_EVAL_
+                // WGPU_DEVICES=0,1,..), shard the GPU-assigned prefix across the
+                // cards: one thread + one device client per lane, the CPU lane
+                // takes the remainder, gathered back in gene order. Genes beyond
+                // the per-card VRAM cap stay on the CPU lane (never dropped —
+                // see lane_partition::placed_genes).
+                if devices.len() > 1 {
+                    let cap = eval_genes_per_card_cap();
+                    let lanes = crate::lane_partition::partition_gpu_lanes(
+                        gene_offsets,
+                        gpu_count,
+                        &devices,
+                        cap,
+                    );
+                    let placed = crate::lane_partition::placed_genes(&lanes);
+                    if placed > 0 {
+                        let (gpu_joined, cpu_lane, cpu_dt) = std::thread::scope(|scope| {
+                            let handles: Vec<_> = lanes
+                                .iter()
+                                .map(|lane| {
+                                    scope.spawn(move || {
+                                        let gs = lane.gene_start;
+                                        let ge = lane.gene_end;
+                                        let t = std::time::Instant::now();
+                                        let r = try_evaluate_population_cuda(
+                                            close,
+                                            high,
+                                            low,
+                                            indicators,
+                                            &lane.rebased_offsets,
+                                            &gene_indices[lane.idx_start..lane.idx_end],
+                                            &gene_weights[lane.idx_start..lane.idx_end],
+                                            &long_thr[gs..ge],
+                                            &short_thr[gs..ge],
+                                            month_idx,
+                                            day_idx,
+                                            timestamps,
+                                            &sl_pips[gs..ge],
+                                            &tp_pips[gs..ge],
+                                            smc_data,
+                                            &gene_smc_flags[gs..ge],
+                                            gate_threshold,
+                                            weights,
+                                            settings,
+                                            Some(lane.device_id),
+                                        );
+                                        (r, t.elapsed())
+                                    })
+                                })
+                                .collect();
+                            let t = std::time::Instant::now();
+                            let cpu_lane: Vec<[f64; 11]> = (placed..n_genes)
+                                .into_par_iter()
+                                .map(&eval_gene_cpu)
+                                .collect();
+                            let cpu_dt = t.elapsed();
+                            let joined: Vec<_> =
+                                handles.into_iter().map(|h| h.join()).collect();
+                            (joined, cpu_lane, cpu_dt)
+                        });
+
+                        let mut gpu_out: Vec<[f64; 11]> = Vec::with_capacity(placed);
+                        let mut max_gpu_dt = std::time::Duration::ZERO;
+                        let mut all_ok = true;
+                        for (lane, joined) in lanes.iter().zip(gpu_joined.into_iter()) {
+                            match joined {
+                                Ok((Ok(part), dt)) if part.len() == lane.gene_count() => {
+                                    gpu_out.extend_from_slice(&part);
+                                    if dt > max_gpu_dt {
+                                        max_gpu_dt = dt;
+                                    }
+                                }
+                                Ok((Ok(_), _)) => {
+                                    tracing::warn!(
+                                        "multi-GPU lane returned the wrong gene count — CPU recompute"
+                                    );
+                                    all_ok = false;
+                                    break;
+                                }
+                                Ok((Err(e), _)) => {
+                                    tracing::warn!("multi-GPU lane failed ({e}) — CPU recompute");
+                                    all_ok = false;
+                                    break;
+                                }
+                                Err(_) => {
+                                    tracing::warn!("multi-GPU lane panicked — CPU recompute");
+                                    all_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if all_ok && gpu_out.len() == placed {
+                            hybrid_split::update(placed, max_gpu_dt, n_genes - placed, cpu_dt);
+                            let mut out = Vec::with_capacity(n_genes);
+                            out.extend_from_slice(&gpu_out);
+                            out.extend_from_slice(&cpu_lane);
+                            return Ok(out);
+                        }
+                        // Any lane unusable: recompute the GPU portion on the CPU,
+                        // keep the CPU lane we already have.
+                        let mut out: Vec<[f64; 11]> =
+                            (0..placed).into_par_iter().map(&eval_gene_cpu).collect();
+                        out.extend_from_slice(&cpu_lane);
+                        return Ok(out);
+                    }
+                }
+
+                // ── Single-device hybrid (default, or 0–1 pinned card) ────
+                let device_override = if devices.len() == 1 {
+                    devices.first().copied()
+                } else {
+                    None
+                };
                 let gpu_entry_end = gene_offsets[gpu_count] as usize;
                 let (gpu_outcome, cpu_lane, cpu_dt) = std::thread::scope(|scope| {
                     let gpu_thread = scope.spawn(|| {
@@ -1739,6 +1882,7 @@ pub fn evaluate_population_core(
                             gate_threshold,
                             weights,
                             settings,
+                            device_override,
                         );
                         (r, t.elapsed())
                     });
@@ -2196,6 +2340,7 @@ mod gpu_cpu_parity_tests {
             gate_threshold,
             &smc_weights,
             &settings,
+            None,
         ) {
             Ok(g) => g,
             Err(e) => {

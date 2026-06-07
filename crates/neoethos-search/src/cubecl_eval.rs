@@ -149,8 +149,8 @@ fn read_cuda_device_id_from_env() -> usize {
 /// generic over `R: Runtime` and runs unchanged on whichever backend was built.
 /// (When both features are on, CUDA wins.)
 #[cfg(feature = "gpu-cuda")]
-fn create_gpu_client() -> Result<ComputeClient<CudaRuntime>> {
-    let device_id = cuda_device_id();
+fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<CudaRuntime>> {
+    let device_id = device_override.unwrap_or_else(cuda_device_id);
     let device_count = tch::Cuda::device_count();
     if device_count <= device_id as i64 {
         bail!(
@@ -173,11 +173,13 @@ fn create_gpu_client() -> Result<ComputeClient<CudaRuntime>> {
 /// both cards run concurrently. Unset ⇒ `DefaultDevice` (the best adapter; the
 /// first discrete GPU on a multi-GPU box).
 #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
-fn create_gpu_client() -> Result<ComputeClient<WgpuRuntime>> {
-    let device = match std::env::var("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE")
+fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<WgpuRuntime>> {
+    // Multi-GPU sharding (Stage 2): an explicit `device_override` (one per lane)
+    // wins; otherwise the legacy singular env var; otherwise the best adapter.
+    let env_device = std::env::var("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE")
         .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-    {
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    let device = match device_override.or(env_device) {
         Some(n) => WgpuDevice::DiscreteGpu(n),
         None => WgpuDevice::DefaultDevice,
     };
@@ -1154,6 +1156,7 @@ fn try_generate_signal_flat_cuda(
     gene_smc_flags: &[SmcRow],
     gate_threshold: f32,
     smc_weights: &[f32; SMC_WIDTH],
+    device_override: Option<usize>,
 ) -> Result<(Vec<i32>, Vec<f32>)> {
     let n_genes = long_thr.len();
     let n_samples = indicators.ncols();
@@ -1175,7 +1178,7 @@ fn try_generate_signal_flat_cuda(
         bail!("cuda evaluator signal kernel received inconsistent dimensions");
     }
 
-    let client = create_gpu_client()?;
+    let client = create_gpu_client(device_override)?;
 
     let indicators_flat = indicators.iter().copied().collect::<Vec<_>>();
     let smc_data_flat = flatten_i32_rows(smc_data);
@@ -1272,6 +1275,7 @@ pub(crate) fn try_generate_signal_rows_cuda(
         gene_smc_flags,
         gate_threshold,
         smc_weights,
+        None,
     )?;
     Ok(materialize_i8_rows(&flat, n_genes, n_samples))
 }
@@ -1460,6 +1464,7 @@ pub(crate) fn try_evaluate_population_cuda(
     gate_threshold: f32,
     smc_weights: &[f32; SMC_WIDTH],
     settings: &BacktestSettings,
+    device_override: Option<usize>,
 ) -> Result<Vec<[f64; 11]>> {
     let n_genes = long_thr.len();
     let n_samples = close.len();
@@ -1488,9 +1493,10 @@ pub(crate) fn try_evaluate_population_cuda(
         gene_smc_flags,
         gate_threshold,
         smc_weights,
+        device_override,
     )?;
 
-    let client = create_gpu_client()?;
+    let client = create_gpu_client(device_override)?;
     let close_pips = normalize_prices_to_pips(close, settings.pip_value);
     let high_pips = normalize_prices_to_pips(high, settings.pip_value);
     let low_pips = normalize_prices_to_pips(low, settings.pip_value);
