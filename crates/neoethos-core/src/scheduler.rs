@@ -330,16 +330,21 @@ struct RunningItem {
     item: ComboItem,
     card_ids: Vec<usize>,
     ram_gb: f64,
-    was_heavy: bool,
 }
 
 /// Greedy, FIFO, hardware-aware scheduler.
 ///
-/// Invariants it guarantees:
-///   - a **Heavy** combo runs alone (exclusive box) and only when idle;
-///   - the sum of in-flight committed RAM never exceeds usable RAM (except a
-///     single combo that legitimately needs more than the whole budget, which
-///     runs alone);
+/// Multi-card scaling is **combo-level**: each combo runs on ONE card and many
+/// combos run concurrently, one per card, bounded by free cards + usable RAM.
+/// (Intra-combo GPU sharding — splitting one combo across several cards — is
+/// disabled because cubecl wgpu cannot drive multiple device contexts
+/// concurrently in one process; the per-combo sharding math in `plan_combo`
+/// stays for a future cubecl fix but the scheduler dispatches one card each.)
+/// On a many-card, big-RAM box this fills every card with a different combo.
+///
+/// Invariants:
+///   - in-flight committed RAM never exceeds usable RAM (except a single combo
+///     that alone needs more than the whole budget, which runs by itself);
 ///   - logical card slots are never double-assigned.
 #[derive(Debug)]
 pub struct WorkScheduler {
@@ -350,13 +355,11 @@ pub struct WorkScheduler {
     usable_ram_gb: f64,
     committed_ram_gb: f64,
     cpu_cores: usize,
-    heavy_running: bool,
 }
 
 impl WorkScheduler {
-    /// Build a scheduler. Combos are ordered **heavy-first** so the heaviest
-    /// timeframes (which run alone across all cards) finish earliest — the
-    /// operator's "early feedback" goal.
+    /// Build a scheduler. Combos are ordered **heavy-first** (biggest RAM
+    /// footprint first) so the deepest timeframes start earliest.
     pub fn new(mut combos: Vec<ComboItem>, hw: &HardwareProfile, policy: &AdmissionPolicy) -> Self {
         combos.sort_by_key(|c| match c.plan.class {
             ComboClass::Heavy => 0u8,
@@ -371,7 +374,6 @@ impl WorkScheduler {
             usable_ram_gb: (hw.available_ram_gb * policy.ram_usable_fraction).max(0.0),
             committed_ram_gb: 0.0,
             cpu_cores: hw.cpu_cores.max(1),
-            heavy_running: false,
         }
     }
 
@@ -397,53 +399,55 @@ impl WorkScheduler {
     pub fn poll(&mut self) -> Vec<Assignment> {
         let mut out = Vec::new();
         while let Some(front) = self.pending.front() {
-            let class = front.plan.class;
-            let need_cards = front.plan.cards_per_combo;
             let ram = front.plan.est_ram_per_combo_gb;
-
-            // A running heavy combo monopolises the whole box.
-            if self.heavy_running {
-                break;
-            }
-            // A heavy combo needs an idle box and is dispatched on its own.
-            if class == ComboClass::Heavy && (!self.running.is_empty() || !out.is_empty()) {
-                break;
-            }
-            // Card budget.
+            // One card per GPU combo (sharding disabled). A combo whose plan
+            // requests 0 cards — no GPU present, or requeued to CPU after a
+            // failure — runs on the CPU lane. So GPU concurrency is bounded by
+            // free cards, CPU-lane concurrency purely by RAM.
+            let need_cards = if self.total_cards > 0 && front.plan.cards_per_combo > 0 {
+                1
+            } else {
+                0
+            };
+            // Card budget: stop once every card is busy.
             if need_cards > self.free_cards.len() {
                 break;
             }
-            // RAM budget: a single combo may exceed the whole budget and run
-            // alone; otherwise the in-flight sum must stay under usable RAM.
-            let ram_ok = self.running.is_empty() || self.committed_ram_gb + ram <= self.usable_ram_gb + 1e-9;
+            // RAM budget: the first in-flight combo may exceed the whole budget
+            // (it runs by itself); otherwise the in-flight sum must stay under
+            // usable RAM. FIFO-strict: stop at the first combo that doesn't fit.
+            let ram_ok =
+                self.running.is_empty() || self.committed_ram_gb + ram <= self.usable_ram_gb + 1e-9;
             if !ram_ok {
                 break;
             }
 
             // Commit it.
-            let mut item = self.pending.pop_front().expect("front exists");
-            let card_ids: Vec<usize> = self.free_cards.drain(0..need_cards).collect();
+            let item = self.pending.pop_front().expect("front exists");
+            let card_ids: Vec<usize> = if need_cards > 0 {
+                self.free_cards.drain(0..need_cards).collect()
+            } else {
+                Vec::new()
+            };
             self.committed_ram_gb += ram;
-            let was_heavy = class == ComboClass::Heavy;
-            if was_heavy {
-                self.heavy_running = true;
-            }
-            // Cores split across the active workers (current + this one).
-            let active = self.running.len() + out.len() + 1;
-            let cpu_threads = (self.cpu_cores / active.max(1)).max(1);
-            item.plan.cpu_threads_per_worker = cpu_threads;
-
+            let class = item.plan.class;
+            let genes = item.plan.genes_per_card;
             out.push(Assignment {
                 id: item.id.clone(),
                 card_ids: card_ids.clone(),
-                genes_per_card: item.plan.genes_per_card,
-                cpu_threads,
+                genes_per_card: genes,
+                cpu_threads: 0, // set fairly below
                 class,
             });
-            self.running.push(RunningItem { item, card_ids, ram_gb: ram, was_heavy });
-
-            if was_heavy {
-                break; // exclusive: nothing else this poll
+            self.running.push(RunningItem { item, card_ids, ram_gb: ram });
+        }
+        // Fairly split CPU cores across ALL in-flight workers (advisory budget;
+        // avoids over-subscribing the cores when several combos run concurrently).
+        if !out.is_empty() {
+            let active = self.running.len().max(1);
+            let cpu = (self.cpu_cores / active).max(1);
+            for a in out.iter_mut() {
+                a.cpu_threads = cpu;
             }
         }
         out
@@ -456,9 +460,6 @@ impl WorkScheduler {
             self.free_cards.extend(done.card_ids);
             self.free_cards.sort_unstable();
             self.committed_ram_gb = (self.committed_ram_gb - done.ram_gb).max(0.0);
-            if done.was_heavy {
-                self.heavy_running = false;
-            }
         }
     }
 
@@ -471,9 +472,6 @@ impl WorkScheduler {
             self.free_cards.extend(done.card_ids);
             self.free_cards.sort_unstable();
             self.committed_ram_gb = (self.committed_ram_gb - done.ram_gb).max(0.0);
-            if done.was_heavy {
-                self.heavy_running = false;
-            }
             let mut item = done.item;
             item.plan.cards_per_combo = 0;
             item.plan.genes_per_card = 0;
@@ -636,26 +634,22 @@ mod tests {
     }
 
     #[test]
-    fn heavy_runs_alone_first_then_lights_flood() {
+    fn heavy_does_not_block_lights_combo_level_concurrency() {
         let combos = vec![
             mk_item("Llate", ComboClass::Light, 1, 1.0),
             mk_item("H", ComboClass::Heavy, 8, 70.0),
             mk_item("Lother", ComboClass::Light, 1, 1.0),
         ];
         let mut sched = WorkScheduler::new(combos, &hw(60, 116.0, &[48.0; 8]), &AdmissionPolicy::default());
-        // Heavy is sorted first and dispatched alone across all cards.
-        let first = sched.poll();
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].id, "H");
-        assert_eq!(first[0].card_ids.len(), 8);
-        assert_eq!(first[0].cpu_threads, 60, "heavy gets all cores");
-        // Nothing else starts while the heavy runs.
-        assert!(sched.poll().is_empty());
-        // After it completes, the two lights flood in.
-        sched.complete("H");
-        let next = sched.poll();
-        assert_eq!(next.len(), 2);
-        assert!(sched.is_done() == false && sched.running_len() == 2);
+        // No heavy-exclusivity: the heavy (sorted first) runs on ONE card while
+        // the two lights run concurrently on other cards (70+1+1 = 72 <= 87 usable).
+        let started = sched.poll();
+        assert_eq!(started.len(), 3, "heavy + 2 lights run concurrently");
+        assert_eq!(started[0].id, "H", "heavy-first ordering");
+        assert!(started.iter().all(|a| a.card_ids.len() == 1), "one card per combo");
+        assert_eq!(started[0].cpu_threads, 20, "60 cores / 3 in-flight workers");
+        assert_eq!(sched.free_cards(), 5);
+        assert_eq!(sched.running_len(), 3);
     }
 
     #[test]
@@ -679,16 +673,17 @@ mod tests {
         let mut sched = WorkScheduler::new(combos, &hw(32, 128.0, &[48.0; 4]), &AdmissionPolicy::default());
         let started = sched.poll();
         assert_eq!(started.len(), 2);
-        assert_eq!(sched.free_cards(), 0);
-        sched.complete("A");
+        // One card per combo now (sharding disabled): 2 of 4 cards used.
         assert_eq!(sched.free_cards(), 2);
+        sched.complete("A");
+        assert_eq!(sched.free_cards(), 3);
         sched.complete("B");
         assert_eq!(sched.free_cards(), 4);
         assert!(sched.is_done());
     }
 
     #[test]
-    fn cpu_only_box_serializes_a_heavy_combo() {
+    fn cpu_only_box_runs_combo_on_cpu_lane() {
         let combos = vec![mk_item("H", ComboClass::Heavy, 0, 200.0)];
         let mut sched = WorkScheduler::new(combos, &hw(96, 256.0, &[]), &AdmissionPolicy::default());
         assert_eq!(sched.total_cards(), 0);
@@ -704,13 +699,13 @@ mod tests {
         let mut sched = WorkScheduler::new(combos, &hw(32, 128.0, &[48.0; 4]), &AdmissionPolicy::default());
         let started = sched.poll();
         assert_eq!(started.len(), 1);
-        assert_eq!(started[0].card_ids.len(), 2);
-        // Simulate a GPU OOM: requeue to the CPU lane.
+        assert_eq!(started[0].card_ids.len(), 1, "one card per combo");
+        // Simulate a GPU failure: requeue to the CPU lane (plan cards -> 0).
         sched.fail_and_requeue_cpu("G");
-        assert_eq!(sched.free_cards(), 4, "cards freed after failure");
+        assert_eq!(sched.free_cards(), 4, "card freed after failure");
         let retry = sched.poll();
         assert_eq!(retry.len(), 1);
-        assert!(retry[0].card_ids.is_empty(), "retried on CPU, no cards");
+        assert!(retry[0].card_ids.is_empty(), "retried on CPU lane, no cards");
         assert_eq!(sched.pending_len(), 0);
     }
 }
