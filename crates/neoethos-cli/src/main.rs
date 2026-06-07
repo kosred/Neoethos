@@ -82,6 +82,7 @@ fn main() -> Result<()> {
         "discovery-promote-weekly" => cmd_discovery_promote_weekly(&args[2..]),
         "trader-replay" => cmd_trader_replay(&args[2..]),
         "forward-test" => cmd_forward_test(&args[2..]),
+        "blend-test" => cmd_blend_test(&args[2..]),
         "batch-discover" => cmd_batch_discover(&args[2..]),
         "migrate-data" => cmd_migrate_data(&args[2..]),
         "slice-dataset" => cmd_slice_dataset(&args[2..]),
@@ -678,6 +679,98 @@ fn cmd_forward_test(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `blend-test --portfolio <live_portfolio.json> --models-root <models_oos_locked>
+/// [--root data] [--gate-floor 0.34] [--veto-below 0.15]`
+///
+/// Stage 4 — re-validate the gene↔ML blend on the NETTED portfolio the live
+/// engine actually trades (verdict #1: the trader nets the genes via
+/// combine_gene_signals, so we compare on the netted signal, not per-gene). Runs
+/// the SAME trader engine three ways — GenesOnly (baseline) vs MlConfirm vs
+/// MlScale — over identical bars, and prints a paired EngineStats table + a
+/// non-degradation verdict. The blend ships ON only if it does NOT degrade
+/// genes-only.
+///
+/// IMPORTANT: point `--models-root` at a LEAK-FREE root (`cli train --oos-from
+/// <date> --models-dir models_oos_locked`), else the ensemble has seen the
+/// evaluation window and the comparison is contaminated. Note the trader engine
+/// uses a uniform SL/TP model (decision.rs), so the absolute P&L is a simplified
+/// figure — but a GenesOnly-vs-blend comparison on the SAME engine is a valid
+/// apples-to-apples accept/reject (only the gated signal differs). The rigorous
+/// per-gene faithful number remains `forward-test`.
+fn cmd_blend_test(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?;
+    let root = parse_root(args, settings.as_ref());
+    let portfolio = parse_flag(args, "--portfolio").ok_or_else(|| {
+        anyhow::anyhow!("blend-test requires --portfolio <live_portfolio.json>")
+    })?;
+    let models_root =
+        parse_flag(args, "--models-root").unwrap_or_else(|| "models_oos_locked".to_string());
+    let gate_floor = parse_flag(args, "--gate-floor")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.34)
+        .clamp(0.0, 1.0);
+    let veto_below = parse_flag(args, "--veto-below")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.15)
+        .clamp(0.0, 1.0);
+
+    let run = |mode| -> Result<neoethos_trader::EngineStats> {
+        neoethos_trader::replay_blend_from_dir(
+            &root,
+            &portfolio,
+            &models_root,
+            neoethos_trader::EngineConfig::default(),
+            neoethos_trader::BlendConfig {
+                mode,
+                gate_floor,
+                veto_below,
+            },
+        )
+    };
+    let genes = run(neoethos_trader::BlendMode::GenesOnly)?;
+    let confirm = run(neoethos_trader::BlendMode::MlConfirm)?;
+    let scale = run(neoethos_trader::BlendMode::MlScale)?;
+
+    println!(
+        "blend-test (NETTED trader engine, models_root={models_root}, gate_floor={gate_floor:.2}, veto_below={veto_below:.2}):"
+    );
+    let row = |name: &str, s: &neoethos_trader::EngineStats| {
+        println!(
+            "  {name:<8} pnl={:>12.5} equity={:>12.2} opened={:>5} closed={:>5} blocked={:>5} signals={:>6}",
+            s.realized_pnl,
+            s.equity,
+            s.positions_opened,
+            s.positions_closed,
+            s.intents_blocked,
+            s.signals_evaluated
+        );
+    };
+    row("genes", &genes);
+    row("confirm", &confirm);
+    row("scale", &scale);
+
+    // Non-degradation accept gate vs the genes-only baseline (same engine/bars).
+    let verdict = |name: &str, s: &neoethos_trader::EngineStats| {
+        let pnl_ok = s.realized_pnl >= genes.realized_pnl - 1e-9;
+        let eq_ok = s.equity >= genes.equity - 1e-9;
+        let traded = s.positions_opened >= 1;
+        if pnl_ok && eq_ok && traded {
+            println!("  -> {name}: ACCEPT (>= genes-only on realized_pnl AND equity, still trades)");
+        } else if !traded {
+            println!("  -> {name}: REJECT (blend vetoed every trade)");
+        } else {
+            println!("  -> {name}: REJECT (degrades vs genes-only)");
+        }
+    };
+    verdict("confirm", &confirm);
+    verdict("scale", &scale);
+    println!(
+        "NOTE: relative comparison on the trader's uniform-SL/TP engine; ensure --models-root is \
+         leak-free (train --oos-from). Per-gene faithful numbers: `forward-test`."
+    );
+    Ok(())
+}
+
 fn cmd_resample(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?;
     let root = parse_root(args, settings.as_ref());
@@ -721,11 +814,39 @@ fn cmd_train(args: &[String]) -> Result<()> {
         let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| settings.system.symbol.clone());
         let base =
             parse_flag(args, "--base").unwrap_or_else(|| settings.system.base_timeframe.clone());
-        let models_dir = parse_flag(args, "--models-dir").unwrap_or_else(|| "models".to_string());
-        let orchestrator = neoethos_models::TrainingOrchestrator::new(
+        // Stage 4 leak-free OOS-locked retrain: `--oos-from YYYY-MM-DD` truncates
+        // each symbol's training to rows strictly before the cutoff (minus the
+        // triple-barrier purge), so the experts can be used in an OOS blend
+        // validation on [cutoff, end) without look-ahead. The locked experts MUST
+        // go to a SEPARATE root so production `models/` is never overwritten.
+        let oos_ms = match parse_flag(args, "--oos-from") {
+            Some(d) => Some(parse_ymd_to_epoch_ms(&d, "--oos-from")?),
+            None => None,
+        };
+        let default_models_dir = if oos_ms.is_some() {
+            "models_oos_locked"
+        } else {
+            "models"
+        };
+        let models_dir =
+            parse_flag(args, "--models-dir").unwrap_or_else(|| default_models_dir.to_string());
+        if oos_ms.is_some() {
+            let norm = models_dir.replace('\\', "/");
+            if models_dir == "models" || norm.ends_with("/models") {
+                anyhow::bail!(
+                    "--oos-from trains LEAK-LOCKED experts; refusing to write them to the \
+                     production '{models_dir}' root. Use a distinct --models-dir \
+                     (e.g. models_oos_locked)."
+                );
+            }
+        }
+        let mut orchestrator = neoethos_models::TrainingOrchestrator::new(
             settings,
             std::path::PathBuf::from(models_dir),
         );
+        if let Some(ms) = oos_ms {
+            orchestrator = orchestrator.with_oos_lock_from_ms(ms);
+        }
 
         orchestrator.train_symbol(&symbol, &base)?;
 
@@ -2182,8 +2303,12 @@ fn print_help() {
         "  discovery-promote-weekly [--symbol EURUSD --tf M1] [--cache-dir cache/search] [--portfolio <live_portfolio.json>]  Weekly-refresh: merge this run's discovery ledger into the live portfolio (additive by gene-signature hash) and print 'added N new, carried M, total K'."
     );
     println!(
-        "  trader-replay [--symbol EURUSD --base M1 | --portfolio <live_portfolio.json>] [--root data]  Offline dry-run of the autonomous trader over on-disk history (zero broker calls; same engine as /autonomous/replay). With --portfolio it runs the REAL discovered genes."
+        "  trader-replay [--symbol EURUSD --base M1 | --portfolio <live_portfolio.json>] [--root data] [--blend off|confirm|scale] [--models-root models]  Offline dry-run of the autonomous trader (zero broker calls; same engine as /autonomous/replay). With --portfolio runs the REAL genes; --blend gates their size by the ML ensemble (gene-dominant)."
     );
+    println!(
+        "  blend-test --portfolio <live_portfolio.json> --models-root models_oos_locked [--root data] [--gate-floor 0.34] [--veto-below 0.15]  Re-validate the gene<->ML blend on the NETTED portfolio: GenesOnly vs MlConfirm vs MlScale on the same engine + non-degradation verdict. Point --models-root at a LEAK-FREE root (train --oos-from)."
+    );
+    println!("  train --symbol EURUSD --base H1 [--models-dir models] [--oos-from 2023-01-01]  Train the ML ensemble. --oos-from trains LEAK-LOCKED experts (rows < cutoff, purged) to a SEPARATE root for OOS blend validation.");
     println!("  migrate-data --root data [--force] [--delete-source]");
     println!(
         "  slice-dataset --symbol EURUSD --base M1 --root <SRC> --out-root <DST> --from-date 2018-01-01 --to-date 2021-01-01"

@@ -57,6 +57,15 @@ pub struct TrainingRunSummary {
 pub struct TrainingOrchestrator {
     pub settings: neoethos_core::Settings,
     pub models_dir: PathBuf,
+    /// v0.5 ML-integration Stage 4 — leak-free OOS-locked retrain. When `Some(ms)`,
+    /// each symbol's training frame + labels are truncated to rows with
+    /// `timestamp < ms`, minus a `label_horizon_bars` purge (the triple-barrier
+    /// label looks forward), BEFORE the warmup drop + train/val split. The
+    /// resulting experts have seen ZERO bars at/after the cutoff, so a blend that
+    /// uses them can be validated on `[ms, end)` without look-ahead. Callers MUST
+    /// point `models_dir` at a SEPARATE root (e.g. `models_oos_locked/`) so the
+    /// production `models/` artifacts are never overwritten with leak-locked ones.
+    pub oos_lock_from_ms: Option<i64>,
 }
 
 fn is_supported_orchestrator_burn_device_policy(policy: &str) -> bool {
@@ -159,7 +168,16 @@ impl TrainingOrchestrator {
         Self {
             settings,
             models_dir,
+            oos_lock_from_ms: None,
         }
+    }
+
+    /// Builder: lock training to the in-sample window `timestamp < oos_from_ms`
+    /// (minus the triple-barrier purge) so the trained experts are leak-free for
+    /// an OOS blend validation on `[oos_from_ms, end)`. See [`Self::oos_lock_from_ms`].
+    pub fn with_oos_lock_from_ms(mut self, oos_from_ms: i64) -> Self {
+        self.oos_lock_from_ms = Some(oos_from_ms);
+        self
     }
 
     fn preferred_burn_device_policy(&self) -> String {
@@ -239,13 +257,50 @@ impl TrainingOrchestrator {
         let frame = prepare_multitimeframe_features_with_options(&dataset, base_tf, &opts, None)?;
         let base_ohlcv = dataset.frames.get(base_tf).context("base tf missing")?;
         let labels = self.derive_labels(base_ohlcv)?;
+
+        // Stage 4 leak-free OOS lock: truncate to rows STRICTLY before the cutoff,
+        // minus a triple-barrier purge, BEFORE the warmup drop + split. The frame
+        // rows are 1:1 with `base_ohlcv` (and `labels`) here, so we slice the dense
+        // matrix + labels to the leading in-sample block.
+        let mut dense = frame.to_dense_samples_major();
+        let mut labels = labels;
+        if let Some(cutoff) = self.oos_lock_from_ms {
+            let timestamps = base_ohlcv
+                .timestamp
+                .as_ref()
+                .context("OOS-lock requires base-tf timestamps")?;
+            if timestamps.len() != dense.nrows() {
+                anyhow::bail!(
+                    "OOS-lock: timestamp/feature row mismatch ({} ts vs {} rows)",
+                    timestamps.len(),
+                    dense.nrows()
+                );
+            }
+            let in_sample = timestamps.iter().take_while(|&&t| t < cutoff).count();
+            // Purge the last `label_horizon_bars` IS rows whose triple-barrier
+            // label looks forward across the cutoff.
+            let purge = self.settings.models.label_horizon_bars;
+            let keep = in_sample.saturating_sub(purge);
+            if keep < 256 {
+                anyhow::bail!(
+                    "OOS-lock: only {keep} in-sample rows before {cutoff} (after a {purge}-bar \
+                     purge) for {symbol}/{base_tf} — too few to train leak-free; pick a later cutoff"
+                );
+            }
+            info!(
+                "OOS-lock: {symbol}/{base_tf} truncated to {keep} in-sample rows (< {cutoff}, \
+                 purged {purge} look-ahead rows of {in_sample}); experts will not see >= cutoff"
+            );
+            dense = dense.slice(ndarray::s![0..keep, ..]).to_owned();
+            labels.truncate(keep);
+        }
+
         // Drop any rows whose features are non-finite (NaN/Inf). This is
         // the warmup period for indicators like rsi_7 — the first N rows
         // will have NaN until the lookback window fills. The downstream
         // `dataframe_to_float32_array` strict-rejects any non-finite, so
         // we sanitise here. Labels are sliced in lock-step.
-        let (clean_data, clean_labels, dropped) =
-            drop_nonfinite_rows(frame.to_dense_samples_major(), labels);
+        let (clean_data, clean_labels, dropped) = drop_nonfinite_rows(dense, labels);
         if dropped > 0 {
             info!(
                 "Dropped {} warmup/non-finite feature rows before training (kept {} rows)",
