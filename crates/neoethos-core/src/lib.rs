@@ -9,6 +9,7 @@ pub mod domain;
 pub mod env_overrides;
 pub mod logging;
 pub mod resolved_config;
+pub mod scheduler;
 pub mod schema_version;
 pub mod sectioned_log;
 pub mod storage;
