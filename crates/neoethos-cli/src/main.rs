@@ -81,6 +81,7 @@ fn main() -> Result<()> {
         "discover" => cmd_discover(&args[2..]),
         "discovery-promote-weekly" => cmd_discovery_promote_weekly(&args[2..]),
         "trader-replay" => cmd_trader_replay(&args[2..]),
+        "forward-test" => cmd_forward_test(&args[2..]),
         "batch-discover" => cmd_batch_discover(&args[2..]),
         "migrate-data" => cmd_migrate_data(&args[2..]),
         "slice-dataset" => cmd_slice_dataset(&args[2..]),
@@ -558,6 +559,82 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
     println!(
         "  realized_pnl={:.5} equity={:.2}",
         stats.realized_pnl, stats.equity
+    );
+    Ok(())
+}
+
+/// `forward-test --portfolio <live_portfolio.json> [--root data] [--oos-from 2023-01-01]`
+/// — FAITHFUL out-of-sample test: runs each gene's REAL strategy (its own SL/TP +
+/// risk-based confidence-scaled sizing + full costs) via the discovery backtest
+/// engine on the holdout window, features computed warm over the FULL series then
+/// sliced to [oos-from, end). Reports per-gene IS-vs-OOS + Walk-Forward Efficiency.
+fn cmd_forward_test(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?;
+    let root = parse_root(args, settings.as_ref());
+    let config = settings
+        .as_ref()
+        .map(neoethos_search::DiscoveryConfig::from_settings)
+        .unwrap_or_default();
+    let portfolio = parse_flag(args, "--portfolio").ok_or_else(|| {
+        anyhow::anyhow!("forward-test requires --portfolio <live_portfolio.json>")
+    })?;
+    let oos_from = parse_flag(args, "--oos-from").unwrap_or_else(|| "2023-01-01".to_string());
+    let oos_ms = parse_ymd_to_epoch_ms(&oos_from, "--oos-from")?;
+
+    let results = neoethos_search::faithful_oos_eval(
+        &config,
+        std::path::Path::new(&root),
+        std::path::Path::new(&portfolio),
+        oos_ms,
+    )?;
+
+    println!(
+        "FAITHFUL OOS forward-test (gene real SL/TP + risk sizing; holdout from {oos_from}):"
+    );
+    println!(
+        "{:<16}{:>5}{:>5}{:>8}{:>8}{:>8}{:>8}{:>10}{:>7}{:>8}  verdict",
+        "gene", "#ind", "#smc", "IS_PF", "IS_DD%", "OOS_PF", "OOS_DD%", "OOS_net", "OOS_tr", "WFE_shp"
+    );
+    let mut survives = 0usize;
+    for r in &results {
+        let net = r.oos.net_profit;
+        let oos_dd = r.oos.max_drawdown * 100.0;
+        let is_survivor = r.oos.trade_count >= 30
+            && r.wfe_sharpe >= 0.5
+            && r.oos.profit_factor >= 1.3
+            && oos_dd <= 10.0
+            && net > 0.0;
+        let verdict = if r.oos.trade_count < 30 {
+            "DEAD (<30 tr)"
+        } else if is_survivor {
+            "SURVIVES"
+        } else if net > 0.0 && r.oos.profit_factor >= 1.0 {
+            "weak+"
+        } else {
+            "FAILS-OOS"
+        };
+        if is_survivor {
+            survives += 1;
+        }
+        println!(
+            "{:<16}{:>5}{:>5}{:>8.2}{:>8.1}{:>8.2}{:>8.1}{:>10.0}{:>7}{:>8.2}  {}",
+            r.strategy_id,
+            r.n_indicators,
+            r.n_smc,
+            r.is_profit_factor,
+            r.is_max_drawdown * 100.0,
+            r.oos.profit_factor,
+            oos_dd,
+            net,
+            r.oos.trade_count,
+            r.wfe_sharpe,
+            verdict
+        );
+    }
+    println!(
+        "SURVIVES={}/{} (WFE_sharpe>=0.5, OOS PF>=1.3, OOS DD<=10%, >=30 trades, net>0)",
+        survives,
+        results.len()
     );
     Ok(())
 }

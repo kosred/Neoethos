@@ -1139,6 +1139,129 @@ fn discovery_backtest_settings(
     }
 }
 
+/// Faithful out-of-sample result for ONE gene: its in-sample (discovery) metrics
+/// + its REAL out-of-sample metrics (same engine, gene's own SL/TP + risk sizing)
+/// + Walk-Forward Efficiency (Pardo) = OOS/IS retention.
+#[derive(Debug, Clone)]
+pub struct GeneOosResult {
+    pub strategy_id: String,
+    pub n_indicators: usize,
+    pub n_smc: usize,
+    pub is_profit_factor: f64,
+    pub is_sharpe: f64,
+    pub is_max_drawdown: f64,
+    pub is_trades: usize,
+    pub oos: crate::eval::BacktestMetrics,
+    pub oos_monthly_hit_rate: f64,
+    pub wfe_sharpe: f64,
+    pub wfe_pf: f64,
+}
+
+/// FAITHFUL forward/OOS test (research-backed methodology). For each gene in a
+/// `*.live_portfolio.json`, runs the gene's REAL strategy (its indicators+SMC
+/// signals, its own SL/TP, risk-based confidence-scaled sizing, full costs) via
+/// the SAME discovery backtest engine on the holdout window — NOT the Phase-1
+/// trader stub. Features are computed on the FULL series (warm, no cold-start
+/// contamination) then the evaluation is sliced to `[oos_start_ts, end)`, so the
+/// holdout features are bit-identical to what discovery saw. Compares to the
+/// gene's in-sample discovery metrics to get Walk-Forward Efficiency.
+pub fn faithful_oos_eval(
+    config: &DiscoveryConfig,
+    data_dir: &std::path::Path,
+    portfolio_path: &std::path::Path,
+    oos_start_ts_ms: i64,
+) -> anyhow::Result<Vec<GeneOosResult>> {
+    let artifact = crate::load_live_portfolio_json(portfolio_path)?;
+    if artifact.genes.is_empty() {
+        anyhow::bail!("portfolio {} has no genes", portfolio_path.display());
+    }
+    let symbol = artifact.symbol.clone();
+    let base_tf = artifact.base_tf.clone();
+    let base_ohlcv = neoethos_data::load_symbol_timeframe(data_dir, &symbol, &base_tf)?;
+    if base_ohlcv.is_empty() {
+        anyhow::bail!("no base bars for {symbol} {base_tf}");
+    }
+    // Rebuild the SAME multi-TF cube discovery used (warm over the FULL series),
+    // then project onto the genes' effective feature set (fail-loud on drift).
+    let dataset = neoethos_data::load_symbol_dataset(data_dir, &symbol)?;
+    let higher_refs: Vec<&str> = artifact.higher_tfs.iter().map(|s| s.as_str()).collect();
+    let raw_features =
+        neoethos_data::prepare_multitimeframe_features(&dataset, &base_tf, &higher_refs, None)?;
+    let features = crate::project_features_to_effective(&raw_features, &artifact.effective_feature_names)?;
+    if features.n_samples() != base_ohlcv.len() {
+        anyhow::bail!(
+            "feature/bar length mismatch {symbol} {base_tf}: {} vs {}",
+            features.n_samples(),
+            base_ohlcv.len()
+        );
+    }
+    let timestamps = features.timestamps.clone();
+    let (months, days) = month_day_indices(&timestamps);
+    // OOS window = first bar whose timestamp >= the cutoff (warm features behind it).
+    let oos_start = timestamps
+        .iter()
+        .position(|&t| t >= oos_start_ts_ms)
+        .unwrap_or(timestamps.len());
+    if oos_start >= timestamps.len().saturating_sub(2) {
+        anyhow::bail!(
+            "no OOS bars after {oos_start_ts_ms} for {symbol} {base_tf} (last ts {})",
+            timestamps.last().copied().unwrap_or(0)
+        );
+    }
+    let eval_config = config.evaluation_config(base_ohlcv.close.last().copied());
+    const MONTHLY_RETURN_TARGET_IDX: usize = 7; // slot-7 monthly_target_hit_rate
+
+    let mut out = Vec::with_capacity(artifact.genes.len());
+    for gene in &artifact.genes {
+        let settings = discovery_backtest_settings(config, gene, base_ohlcv.close.last().copied());
+        let (signals, confidences) =
+            signals_and_confidence_for_gene_full(&features, &base_ohlcv, gene, &eval_config);
+        // Slice everything to the OOS window (features already warm).
+        let close = &base_ohlcv.close[oos_start..];
+        let high = &base_ohlcv.high[oos_start..];
+        let low = &base_ohlcv.low[oos_start..];
+        let sig = &signals[oos_start..];
+        let conf = &confidences[oos_start..];
+        let mo = &months[oos_start..];
+        let dy = &days[oos_start..];
+        let ts = &timestamps[oos_start..];
+        let raw = fast_evaluate_strategy_core(close, high, low, sig, conf, mo, dy, ts, &settings);
+        let oos_monthly_hit_rate = raw.get(MONTHLY_RETURN_TARGET_IDX).copied().unwrap_or(0.0);
+        let oos = crate::eval::BacktestMetrics::from_metric_array(raw);
+        let is_sharpe = gene.sharpe_ratio;
+        let is_pf = gene.profit_factor;
+        out.push(GeneOosResult {
+            strategy_id: gene.strategy_id.clone(),
+            n_indicators: gene.indices.len(),
+            n_smc: [
+                gene.use_ob,
+                gene.use_fvg,
+                gene.use_liq_sweep,
+                gene.mtf_confirmation,
+                gene.use_premium_discount,
+                gene.use_inducement,
+                gene.use_bos,
+                gene.use_choch,
+                gene.use_eqh,
+                gene.use_eql,
+                gene.use_displacement,
+            ]
+            .iter()
+            .filter(|b| **b)
+            .count(),
+            is_profit_factor: is_pf,
+            is_sharpe,
+            is_max_drawdown: gene.max_drawdown,
+            is_trades: gene.trades_count,
+            oos_monthly_hit_rate,
+            wfe_sharpe: if is_sharpe.abs() > 1e-9 { oos.sharpe / is_sharpe } else { 0.0 },
+            wfe_pf: if is_pf.abs() > 1e-9 { oos.profit_factor / is_pf } else { 0.0 },
+            oos,
+        });
+    }
+    Ok(out)
+}
+
 /// F-305 (2026-05-28): scale `min_trades_per_month` proportionally to
 /// timeframe bar density so the operator's `config.yaml` value
 /// (typically 15 trades/month, tuned for M1/M5/M15 intra-day flow)

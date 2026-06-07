@@ -63,7 +63,8 @@ pub mod validation;
 pub use discovery::{
     DiscoveryConfig, DiscoveryPerKindEvidenceHashes, DiscoveryProgress, DiscoveryResult,
     DiscoveryRunProfile, DiscoveryRuntimeOverrides, DiscoveryValidationGates, LoggedStrategyTrades,
-    Stage1Window, build_discovery_profile, compute_discovery_forward_test_artifacts,
+    GeneOosResult, Stage1Window, build_discovery_profile, compute_discovery_forward_test_artifacts,
+    faithful_oos_eval,
     compute_discovery_prop_firm_artifacts, discovery_per_kind_evidence_hashes,
     discovery_validation_evidence_manifest,
     discovery_validation_evidence_manifest_excluding_live_sim, ensure_non_empty_portfolio,
