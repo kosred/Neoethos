@@ -6649,6 +6649,7 @@ dependencies = [
  "chrono",
  "ndarray 0.17.2",
  "neoethos-data",
+ "neoethos-models",
  "neoethos-search",
  "serde",
  "serde_json",
