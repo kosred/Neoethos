@@ -203,6 +203,77 @@ pub fn load_experts_for_symbol(
     Ok(registry.load_with_partial(&artifact_root, DEFAULT_BOOTSTRAP_EXPERT_NAMES))
 }
 
+/// v0.5 ML-integration Stage 3 — produce the per-row role-aware
+/// [`EnsembleDecision`]s for a symbol from a `FeatureFrame`, centralizing the
+/// feature-column CONTRACT so the trader never feeds mis-columned data to the
+/// experts.
+///
+/// Builds the symbol's ensemble, reads the experts' shared `feature_columns()`
+/// (asserting all loaded experts agree), selects the FeatureFrame columns to
+/// EXACTLY that set BY NAME (the experts bail unless the DataFrame columns equal
+/// their trained set), runs [`SoftVotingEnsemble::predict_with_roles`], and
+/// returns one decision per row. FAILS LOUD on any column mismatch / missing
+/// feature — the caller (the trader) then falls back to gene-only rather than
+/// trading on a wrong-columned ensemble.
+pub fn role_decisions_from_feature_frame(
+    models_root: &Path,
+    symbol: &str,
+    timeframe: &str,
+    features: &neoethos_data::FeatureFrame,
+) -> Result<Vec<super::EnsembleDecision>> {
+    use anyhow::{anyhow, bail};
+    use polars::prelude::{Column, DataFrame, NamedFrom, Series};
+
+    // `load_outcome` is an `EnsemblePredictor` trait method.
+    use super::EnsemblePredictor;
+
+    let ensemble = build_ensemble_for_symbol(models_root, symbol, timeframe)?;
+
+    // Determine the experts' shared feature-column set; assert all loaded
+    // experts that expose columns agree on them.
+    let mut expected: Option<Vec<String>> = None;
+    for expert in &ensemble.load_outcome().loaded {
+        let cols = expert.feature_columns();
+        if cols.is_empty() {
+            continue;
+        }
+        match &expected {
+            None => expected = Some(cols.to_vec()),
+            Some(prev) => {
+                if prev.as_slice() != cols {
+                    bail!(
+                        "ensemble experts disagree on feature columns for {symbol}/{timeframe}; \
+                         refusing to feed mis-columned data"
+                    );
+                }
+            }
+        }
+    }
+    let expected = expected.ok_or_else(|| {
+        anyhow!("no loaded expert exposes feature_columns for {symbol}/{timeframe}")
+    })?;
+
+    // Build a DataFrame with EXACTLY `expected` columns, by name, from the cube.
+    let mut columns = Vec::with_capacity(expected.len());
+    for name in &expected {
+        let idx = features
+            .names
+            .iter()
+            .position(|n| n == name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "feature '{name}' required by the {symbol}/{timeframe} ensemble is absent \
+                     from the trader feature cube; refusing to trade on incomplete features"
+                )
+            })?;
+        let col: Vec<f32> = features.feature_column(idx).to_vec();
+        columns.push(Column::from(Series::new(name.as_str().into(), col)));
+    }
+    let df = DataFrame::new(columns).context("build ensemble feature DataFrame")?;
+
+    ensemble.predict_with_roles(&df)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

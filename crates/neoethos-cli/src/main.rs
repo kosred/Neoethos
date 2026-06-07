@@ -520,11 +520,50 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
     // (symbol/base come from the artifact). Without it, run the momentum stub on
     // --symbol/--base. Both drive the SAME engine (parity with /autonomous/replay).
     let stats = if let Some(portfolio) = parse_flag(args, "--portfolio") {
-        neoethos_trader::replay_portfolio_from_dir(
-            &root,
-            &portfolio,
-            neoethos_trader::EngineConfig::default(),
-        )?
+        // `--blend off|confirm|scale` (default off). With confirm/scale the
+        // discovered genes' size is gated by the per-(symbol,base_tf)
+        // SoftVotingEnsemble loaded from `--models-root` (default `models`) —
+        // gene-dominant meta-labeling; ML never flips direction. `off` is
+        // byte-identical to the gene-only path.
+        let blend_arg = parse_flag(args, "--blend").unwrap_or_else(|| "off".to_string());
+        let mode = match blend_arg.trim().to_ascii_lowercase().as_str() {
+            "off" | "genes" | "genes_only" | "genesonly" => neoethos_trader::BlendMode::GenesOnly,
+            "confirm" | "mlconfirm" => neoethos_trader::BlendMode::MlConfirm,
+            "scale" | "mlscale" => neoethos_trader::BlendMode::MlScale,
+            other => anyhow::bail!(
+                "--blend must be off|confirm|scale (got '{other}')"
+            ),
+        };
+        if matches!(mode, neoethos_trader::BlendMode::GenesOnly) {
+            neoethos_trader::replay_portfolio_from_dir(
+                &root,
+                &portfolio,
+                neoethos_trader::EngineConfig::default(),
+            )?
+        } else {
+            let models_root = parse_flag(args, "--models-root").unwrap_or_else(|| "models".to_string());
+            let mut blend = neoethos_trader::BlendConfig {
+                mode,
+                ..Default::default()
+            };
+            if let Some(f) = parse_flag(args, "--gate-floor").and_then(|v| v.parse::<f64>().ok()) {
+                blend.gate_floor = f.clamp(0.0, 1.0);
+            }
+            if let Some(v) = parse_flag(args, "--veto-below").and_then(|v| v.parse::<f64>().ok()) {
+                blend.veto_below = v.clamp(0.0, 1.0);
+            }
+            println!(
+                "  blend mode={blend_arg} models_root={models_root} gate_floor={:.2} veto_below={:.2}",
+                blend.gate_floor, blend.veto_below
+            );
+            neoethos_trader::replay_blend_from_dir(
+                &root,
+                &portfolio,
+                &models_root,
+                neoethos_trader::EngineConfig::default(),
+                blend,
+            )?
+        }
     } else {
         let symbol =
             parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));

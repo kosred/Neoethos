@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use neoethos_data::{FeatureFrame, Ohlcv};
+use neoethos_search::genetic::signals_and_confidence_for_gene_full;
 use neoethos_search::{EvaluationConfig, Gene, signals_for_gene, signals_for_gene_full};
 
 use crate::contracts::{Direction, LiveBar, PortfolioEntry, Signal, SignalEngine, SignalSource};
@@ -64,6 +65,64 @@ pub fn combine_gene_signals(
         }
     }
     net.into_iter().map(dir_from_net).collect()
+}
+
+/// Like [`combine_gene_signals`] but ALSO returns the netted per-bar gene
+/// confidence (Stage 3/4 prerequisite). Uses the GA's
+/// `signals_and_confidence_for_gene_full` (the same per-bar confidence the
+/// faithful OOS eval consumes) for every gene, then per bar nets the signed
+/// signals into a direction and averages the confidence of the genes that AGREE
+/// with the net side. A Flat net ⇒ confidence 0.0. This gives the blend (and the
+/// netted OOS re-validation) a REAL gene confidence to scale, instead of the
+/// 1.0/0.0 placeholder.
+pub fn combine_gene_signals_with_confidence(
+    genes: &[Gene],
+    aligned_features: &FeatureFrame,
+    base_ohlcv: &Ohlcv,
+) -> (Vec<Direction>, Vec<f64>) {
+    let n = aligned_features.n_samples();
+    let cfg = EvaluationConfig::default();
+    let mut net = vec![0i32; n];
+    // Per-bar accumulators of confidence on each side.
+    let mut conf_long = vec![0.0f64; n];
+    let mut cnt_long = vec![0u32; n];
+    let mut conf_short = vec![0.0f64; n];
+    let mut cnt_short = vec![0u32; n];
+
+    for gene in genes {
+        let (sigs, confs) =
+            signals_and_confidence_for_gene_full(aligned_features, base_ohlcv, gene, &cfg);
+        for i in 0..n {
+            let s = sigs.get(i).copied().unwrap_or(0);
+            let c = confs.get(i).copied().unwrap_or(0.0) as f64;
+            net[i] += s as i32;
+            if s > 0 {
+                conf_long[i] += c;
+                cnt_long[i] += 1;
+            } else if s < 0 {
+                conf_short[i] += c;
+                cnt_short[i] += 1;
+            }
+        }
+    }
+
+    let mut dirs = Vec::with_capacity(n);
+    let mut out_conf = Vec::with_capacity(n);
+    for i in 0..n {
+        let dir = dir_from_net(net[i]);
+        let conf = match dir {
+            Direction::Long if cnt_long[i] > 0 => {
+                (conf_long[i] / cnt_long[i] as f64).clamp(0.0, 1.0)
+            }
+            Direction::Short if cnt_short[i] > 0 => {
+                (conf_short[i] / cnt_short[i] as f64).clamp(0.0, 1.0)
+            }
+            _ => 0.0,
+        };
+        dirs.push(dir);
+        out_conf.push(conf);
+    }
+    (dirs, out_conf)
 }
 
 /// A `SignalEngine` that serves a precomputed per-bar direction vector by cursor.

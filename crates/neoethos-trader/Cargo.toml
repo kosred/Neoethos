@@ -26,12 +26,24 @@ neoethos-data = { path = "../neoethos-data" }
 # `LivePortfolioArtifact` loader — reused, never re-implemented, so live signals
 # match backtest signals.
 neoethos-search = { path = "../neoethos-search" }
+# v0.5 ML-integration Stage 3: the SoftVotingEnsemble role-aware combiner that
+# gates gene size in the blend. OPTIONAL + behind the `ml-blend` feature so the
+# default (gene-only) build stays dependency-light and does not pull in the
+# heavy native ML stack (lightgbm/xgboost/catboost). The blend CORE (blend math
+# + BlendedSignalEngine + invariants) compiles WITHOUT this dep; only
+# `replay_blend_from_dir` (which loads + runs the ensemble) needs it.
+neoethos-models = { path = "../neoethos-models", optional = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+
+[features]
+# Enable the ML-gated blend replay path (genes × SoftVotingEnsemble). Off by
+# default — gene-only replay needs none of the ML stack.
+ml-blend = ["dep:neoethos-models"]
 
 [dev-dependencies]
 # Tests construct `FeatureData::InMemory(Array2)` fixtures for the gene-signal
