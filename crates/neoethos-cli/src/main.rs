@@ -1416,7 +1416,10 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
     let mut id_combo: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     let mut schedulable: Vec<ComboItem> = Vec::new();
-    let mut deferred: Vec<(String, ComboAdmissionPlan)> = Vec::new();
+    // With Stage 2 (population sharding) landed, multi-card heavy combos are no
+    // longer deferred — the GA shards across all their cards. `deferred` is kept
+    // (empty) so the reporting/--resume shape is unchanged.
+    let deferred: Vec<(String, ComboAdmissionPlan)> = Vec::new();
     for sym in &symbols {
         for tf in &tfs {
             let id = format!("{sym}/{tf}");
@@ -1428,11 +1431,7 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
             let shape = ComboShape::new(rows, population, feature_count);
             let plan = plan_combo(shape, &hw, &policy);
             id_combo.insert(id.clone(), (sym.clone(), tf.clone()));
-            if plan.cards_per_combo > 1 {
-                deferred.push((id, plan));
-            } else {
-                schedulable.push(ComboItem::new(id, shape, plan));
-            }
+            schedulable.push(ComboItem::new(id, shape, plan));
         }
     }
 
@@ -1630,8 +1629,24 @@ fn spawn_discover_combo(
         .arg(resolved.search.portfolio_size.to_string())
         .arg("--out")
         .arg(format!("cache/schedule/{symbol}_{timeframe}.json"));
-    if let Some(&card) = a.card_ids.first() {
-        // Pin to one card on whichever GPU backend the binary was built with.
+    if a.card_ids.len() > 1 {
+        // Multi-card heavy combo: shard the GA population across ALL its cards
+        // (Stage 2). The plural env list + per-card gene cap drive the multi-
+        // device path in evaluate_population_core.
+        let ids = a
+            .card_ids
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        cmd.env("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES", &ids);
+        cmd.env("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICES", &ids);
+        cmd.env(
+            "NEOETHOS_BOT_SEARCH_EVAL_GENES_PER_CARD",
+            a.genes_per_card.to_string(),
+        );
+    } else if let Some(&card) = a.card_ids.first() {
+        // Single card: pin on whichever GPU backend the binary was built with.
         cmd.env("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE", card.to_string());
         cmd.env("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE", card.to_string());
     }
