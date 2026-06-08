@@ -1095,10 +1095,14 @@ pub fn auto_tune_memory_budgets() {
         .filter(|v| v.is_finite() && *v > 0.0)
         .fold(f64::INFINITY, f64::min);
 
-    // Host: spend ~40% of AVAILABLE RAM on the signal-assembly buffer, clamped so
-    // even a 1GB box runs (256MB floor → tiny chunks, slow but never OOM) and a
-    // big box doesn't over-reserve (8GB ceiling).
-    let host_budget_mb = ((avail_ram_gb * 1024.0 * 0.40) as u64).clamp(256, 8192);
+    // Host: cap the RESIDENT RAM for signal handling at ~25% of available RAM
+    // (the gene_chunk_size 5× overhead factor already accounts for the transient
+    // GPU upload/readback copies, so this budget is real RSS). Clamped [256MB,
+    // 4GB]: a 1GB box still runs (tiny chunks, slow but never OOM); a big box is
+    // capped at 4GB of signal handling — fixed data costs (the indicator matrix,
+    // ~rows×cols×4B) live on top, so leaving 4GB headroom keeps even M1 (6M rows)
+    // inside a 16GB box.
+    let host_budget_mb = ((avail_ram_gb * 1024.0 * 0.25) as u64).clamp(256, 4096);
     // VRAM: trim the pool above ~60% of the smallest card; if VRAM is unknown,
     // use a conservative 2GB so the trim still keeps the footprint modest.
     let (vram_budget_mb, gpu_buffer_mb) = if min_vram_gb.is_finite() {
@@ -1186,7 +1190,16 @@ fn gpu_pool_budget_bytes() -> u64 {
 /// override `NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB`; the startup auto-tuner lowers
 /// it on low-RAM boxes.
 fn gene_chunk_size(n_genes: usize, n_samples: usize) -> usize {
-    const DEFAULT_MB: u64 = 2048;
+    const DEFAULT_MB: u64 = 1024;
+    // The signal+confidence assembly is 8 B/gene/sample, but during GPU
+    // upload+readback cubecl/wgpu transiently holds several COPIES of that data
+    // (host staging on the way to the device, plus the device→host readback),
+    // so the resident peak is empirically ~4-5× the logical buffer. Measured on
+    // an A4000: a full-population (200-gene) M1 pass with no copy margin hit 38GB
+    // RSS (~4.5× the 8.4GB buffer) and SIGSEGV'd, while a 12-gene chunk ran
+    // clean. We bake a 5× factor in so the budget means real RESIDENT RAM, not
+    // just the logical buffer — the user/auto-tuner can reason in true GB.
+    const HOST_OVERHEAD_FACTOR: u64 = 5;
     let budget = std::env::var("NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -1194,7 +1207,10 @@ fn gene_chunk_size(n_genes: usize, n_samples: usize) -> usize {
         .or_else(|| installed_memory_budgets().map(|b| b.host_budget_mb))
         .unwrap_or(DEFAULT_MB)
         .saturating_mul(1024 * 1024);
-    let per_gene = (n_samples as u64).saturating_mul(8).max(1); // i32 signal + f32 conf
+    let per_gene = (n_samples as u64)
+        .saturating_mul(8)
+        .saturating_mul(HOST_OVERHEAD_FACTOR)
+        .max(1);
     ((budget / per_gene) as usize).clamp(1, n_genes.max(1))
 }
 
@@ -1313,13 +1329,14 @@ mod window_tests {
 
     #[test]
     fn gene_chunk_size_bounds_host_buffer_and_never_zero() {
-        // Default budget (2048MB, no env override in the test environment).
+        // Default budget (1024MB, no env override in the test environment).
         // Tiny rows -> whole population fits one chunk.
         assert_eq!(gene_chunk_size(200, 1), 200);
-        // M1-like 6M rows: 8B/gene/sample -> ~42 genes/chunk, so the host
-        // signal+conf buffer stays ~2GB regardless of how big the population is.
+        // M1-like 6M rows: 8B/gene/sample × 5× copy-overhead factor -> a few
+        // genes/chunk, so the resident signal RAM (incl. transient GPU copies)
+        // stays inside the budget regardless of how big the population is.
         let c = gene_chunk_size(200, 6_000_000);
-        assert!((30..=60).contains(&c), "M1 chunk = {c}");
+        assert!((2..=10).contains(&c), "M1 chunk = {c}");
         // Absurd rows -> clamps to >=1 (never 0 -> no div-by-zero and the
         // caller's `while c0 < n_genes` always advances). The never-OOM floor.
         assert_eq!(gene_chunk_size(1_000_000, 2_000_000_000), 1);
