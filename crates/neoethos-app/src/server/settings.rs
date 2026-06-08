@@ -46,6 +46,10 @@ pub struct SettingsDto {
     /// Top-level trading mode (`"risky"` | `"prop_firm"`) — see
     /// `SystemConfig::trading_mode`. Drives discovery + risk orientation.
     pub trading_mode: String,
+    /// Compute device preference (`"auto"` | `"cpu"` | `"gpu"`) — see
+    /// `SystemConfig::enable_gpu_preference`. `auto` picks the best device and,
+    /// with the never-OOM auto-tuner, fits any card; `cpu` forces the CPU lane.
+    pub compute_mode: String,
     /// Risky-Mode goal — see `SystemConfig::risky_*`. Start/target balances
     /// (account ccy) + horizon (days). The operator sets these and they
     /// pressure the Risky discovery search toward strategies that can hit the
@@ -85,6 +89,8 @@ pub struct SettingsUpdateDto {
     pub ui_locale: Option<String>,
     /// `"risky"` | `"prop_firm"`. Unknown values are rejected (400).
     pub trading_mode: Option<String>,
+    /// `"auto"` | `"cpu"` | `"gpu"`. Unknown values are rejected (400).
+    pub compute_mode: Option<String>,
     pub risky_start_balance: Option<f64>,
     pub risky_target_balance: Option<f64>,
     pub risky_horizon_days: Option<u32>,
@@ -392,6 +398,23 @@ pub async fn update_settings(
         }
         settings.system.trading_mode = mode;
     }
+    if let Some(raw) = payload.compute_mode {
+        let mode = raw.trim().to_ascii_lowercase();
+        if mode != "auto" && mode != "cpu" && mode != "gpu" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "unknown compute_mode `{}`. Expected one of: auto, cpu, gpu.",
+                        raw
+                    ),
+                    "code": "invalid_compute_mode",
+                })),
+            )
+                .into_response();
+        }
+        settings.system.enable_gpu_preference = mode;
+    }
     // Risky-Mode goal (positive values only; the search + projection read these).
     if let Some(v) = payload.risky_start_balance {
         if v > 0.0 {
@@ -503,6 +526,7 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         data_dir: settings.system.data_dir.display().to_string(),
         ui_locale: settings.system.ui_locale.clone(),
         trading_mode: settings.system.trading_mode.clone(),
+        compute_mode: settings.system.enable_gpu_preference.clone(),
         risky_start_balance: settings.system.risky_start_balance_usd,
         risky_target_balance: settings.system.risky_target_balance_usd,
         risky_horizon_days: settings.system.risky_horizon_days,

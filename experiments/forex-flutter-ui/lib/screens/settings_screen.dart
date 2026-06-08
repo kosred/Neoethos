@@ -388,6 +388,7 @@ class _AppSettingsScreenState extends ConsumerState<AppSettingsScreen> {
             subtitle: l10n.settingsHeaderSubtitle,
           ),
           const _LanguageCard(),
+          const _ComputeModeCard(),
           _credentialsCard(context),
           asyncSettings.when(
             data: (s) => _configCard(s),
@@ -599,6 +600,58 @@ class _LanguageCard extends ConsumerWidget {
               } catch (_) {
                 // Non-fatal: the in-memory switch already applied; the
                 // choice just isn't persisted until the next successful save.
+              }
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Compute-device selector (`auto` | `cpu` | `gpu`) — parity with the CLI/TUI
+/// and `SystemConfig.enable_gpu_preference`. Labels stay English (technical
+/// jargon per the i18n convention). Saves immediately to config.yaml; the
+/// never-OOM auto-tuner makes `auto` safe on any card, so this is mostly for
+/// power users forcing the CPU lane.
+class _ComputeModeCard extends ConsumerWidget {
+  const _ComputeModeCard();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final raw = ref.watch(settingsProvider).maybeWhen(
+          data: (s) => s.computeMode,
+          orElse: () => 'auto',
+        );
+    const valid = {'auto', 'cpu', 'gpu'};
+    final current = valid.contains(raw) ? raw : 'auto';
+    return SectionCard(
+      title: 'Compute Mode',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'auto = best device, never OOMs · cpu = force CPU lane · gpu = force GPU',
+            style: TextStyle(fontSize: 11, color: NeoethosTokens.textMuted),
+          ),
+          const SizedBox(height: 10),
+          SegmentedButton<String>(
+            segments: const [
+              ButtonSegment(value: 'auto', label: Text('Auto')),
+              ButtonSegment(value: 'cpu', label: Text('CPU')),
+              ButtonSegment(value: 'gpu', label: Text('GPU')),
+            ],
+            selected: {current},
+            showSelectedIcon: false,
+            onSelectionChanged: (sel) async {
+              final mode = sel.first;
+              try {
+                await ref
+                    .read(backendClientProvider)
+                    .saveSettings(computeMode: mode);
+                ref.invalidate(settingsProvider);
+              } catch (_) {
+                // Non-fatal: leave the previous value; next save retries.
               }
             },
           ),

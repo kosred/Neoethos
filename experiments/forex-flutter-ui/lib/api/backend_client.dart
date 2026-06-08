@@ -387,6 +387,7 @@ class BackendClient {
     String? dataDir,
     String? uiLocale,
     String? tradingMode,
+    String? computeMode,
     double? riskyStartBalance,
     double? riskyTargetBalance,
     int? riskyHorizonDays,
@@ -405,6 +406,7 @@ class BackendClient {
     if (dataDir != null) body['dataDir'] = dataDir;
     if (uiLocale != null) body['uiLocale'] = uiLocale;
     if (tradingMode != null) body['tradingMode'] = tradingMode;
+    if (computeMode != null) body['computeMode'] = computeMode;
     if (riskyStartBalance != null) {
       body['riskyStartBalance'] = riskyStartBalance;
     }
@@ -1330,6 +1332,12 @@ class SettingsSnapshot {
   /// selector + the Risky-Mode card.
   final String tradingMode;
 
+  /// Compute device preference (`'auto'` | `'cpu'` | `'gpu'`) from
+  /// `SystemConfig.enable_gpu_preference`. `auto` picks the best device (and,
+  /// with the never-OOM auto-tuner, fits any card); `cpu` forces the CPU lane.
+  /// Defaults to `'auto'` for back-compat with a backend that predates it.
+  final String computeMode;
+
   /// Risky-Mode goal from `SystemConfig::risky_*` — start/target balance
   /// (account ccy) + horizon (days). The operator edits these; they pressure
   /// the Risky discovery search. Defaults mirror the backend (100/50000/180).
@@ -1360,6 +1368,7 @@ class SettingsSnapshot {
     required this.dataDir,
     this.localeCode = 'en',
     this.tradingMode = 'prop_firm',
+    this.computeMode = 'auto',
     this.riskyStartBalance = 100.0,
     this.riskyTargetBalance = 50000.0,
     this.riskyHorizonDays = 180,
@@ -1380,6 +1389,7 @@ class SettingsSnapshot {
         dataDir: j['dataDir'] as String,
         localeCode: (j['uiLocale'] as String?) ?? 'en',
         tradingMode: (j['tradingMode'] as String?) ?? 'prop_firm',
+        computeMode: (j['computeMode'] as String?) ?? 'auto',
         riskyStartBalance:
             (j['riskyStartBalance'] as num?)?.toDouble() ?? 100.0,
         riskyTargetBalance:
