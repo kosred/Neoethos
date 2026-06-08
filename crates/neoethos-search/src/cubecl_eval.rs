@@ -1107,9 +1107,19 @@ pub fn auto_tune_memory_budgets() {
     // use a conservative 2GB so the trim still keeps the footprint modest.
     let (vram_budget_mb, gpu_buffer_mb) = if min_vram_gb.is_finite() {
         let v = ((min_vram_gb * 1024.0 * 0.60) as u64).clamp(384, 24576);
-        // Raise the per-buffer cap on roomy cards (fewer windows → faster).
-        let buf = if min_vram_gb >= 20.0 { 384 } else { 120 };
-        (v, buf)
+        // The per-storage-buffer cap MUST stay under wgpu's
+        // `max_storage_buffer_binding_size` — 128MB under cubecl's DEFAULT device
+        // limits (`WgpuRuntime::client` does not request the adapter's real max),
+        // which is INDEPENDENT of total VRAM: a 48GB card still rejects a single
+        // >128MB storage buffer. This was previously raised to 384 on >=20GB cards
+        // "for speed", but that made the M1 backtest buffer (batch×rows×4 =
+        // 16×5.9M×4 ≈ 377MB) exceed the binding limit → `wgpu error: Out of
+        // Memory` → GPU-lane panic → silent CPU fallback for EVERY heavy-TF
+        // generation (M1/M3/M5 never actually ran on the GPU). Hold it at 120MB on
+        // ALL cards so the heavy TFs run on the GPU; the pool-trim budget (`v`)
+        // still scales with the card. (Future: raise this once create_gpu_client
+        // requests the adapter's real per-buffer limit instead of the default.)
+        (v, 120)
     } else {
         (2048, 120)
     };
