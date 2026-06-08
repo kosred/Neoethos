@@ -747,6 +747,17 @@ pub struct DiscoveryRuntimeConfig {
     /// Fraction of rows treated as in-sample when ranking features; must be
     /// in `(0, 1]`. (was `NEOETHOS_BOT_PREFILTER_INSAMPLE`)
     pub prefilter_insample_frac: f64,
+    /// Minimum number of features to force-keep from EACH present higher
+    /// timeframe group during the prefilter, in addition to the global
+    /// `prefilter_top_k`. The prefilter ranks by correlation with the BASE
+    /// timeframe's 1-bar forward return; a slow higher-TF indicator is
+    /// near-constant across many base bars so that correlation is ~0 by
+    /// construction, and the global top-K therefore discards EVERY multi-TF
+    /// feature — wasting the entire multi-resolution cube and starving the
+    /// GA's multi-TF seed templates. This quota guarantees each higher TF
+    /// (`H1_`, `H4_`, `M15_`, …) reaches the GA. `0` reproduces the legacy
+    /// base-only behaviour. (new 2026-06-08)
+    pub prefilter_min_per_timeframe: usize,
     /// Fraction of rows fed to the multi-stage funnel's first stage; clamped
     /// to `[0.01, 1.0]`. (was `NEOETHOS_BOT_FUNNEL_STAGE1_PCT`)
     pub funnel_stage1_pct: f64,
@@ -774,6 +785,7 @@ impl Default for DiscoveryRuntimeConfig {
         Self {
             prefilter_top_k: 50,
             prefilter_insample_frac: 0.70,
+            prefilter_min_per_timeframe: 6,
             funnel_stage1_pct: 0.25,
             stage1_window: "earliest".to_string(),
             min_history_years: 0,

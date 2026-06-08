@@ -66,6 +66,14 @@ pub struct DiscoveryRuntimeOverrides {
     /// Fraction of rows treated as in-sample when ranking features. Must be
     /// strictly positive and at most `1.0`.
     pub prefilter_insample_frac: f64,
+    /// Minimum number of features to force-keep from EACH present higher
+    /// timeframe group during the prefilter, on top of the global
+    /// `prefilter_top_k`. The correlation ranking is against the BASE
+    /// timeframe's 1-bar forward return, against which a near-constant
+    /// higher-TF indicator scores ~0 — so without this quota the global
+    /// top-K discards every multi-TF feature and the GA's multi-TF seed
+    /// templates find no `H1_`/`H4_`/… prefixes. `0` = legacy behaviour.
+    pub prefilter_min_per_timeframe: usize,
     /// Fraction of rows fed to the multi-stage funnel's first stage.
     /// Clamped to `[0.01, 1.0]` at use time.
     pub funnel_stage1_pct: f64,
@@ -87,6 +95,7 @@ impl Default for DiscoveryRuntimeOverrides {
         Self {
             prefilter_top_k: 50,
             prefilter_insample_frac: 0.70,
+            prefilter_min_per_timeframe: 6,
             funnel_stage1_pct: 0.25,
             stage1_window: Stage1Window::Earliest,
             // **2026-05-26 operator directive (Κωνσταντίνος)**: the design
@@ -132,6 +141,12 @@ impl DiscoveryRuntimeOverrides {
         {
             overrides.prefilter_insample_frac = insample;
         }
+        if let Some(min_per_tf) = std::env::var("NEOETHOS_BOT_PREFILTER_MIN_PER_TF")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            overrides.prefilter_min_per_timeframe = min_per_tf;
+        }
         if let Some(stage1) = std::env::var("NEOETHOS_BOT_FUNNEL_STAGE1_PCT")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -172,6 +187,7 @@ impl DiscoveryRuntimeOverrides {
         {
             overrides.prefilter_insample_frac = cfg.prefilter_insample_frac;
         }
+        overrides.prefilter_min_per_timeframe = cfg.prefilter_min_per_timeframe;
         if cfg.funnel_stage1_pct.is_finite() {
             overrides.funnel_stage1_pct = cfg.funnel_stage1_pct.clamp(0.01, 1.0);
         }
@@ -835,6 +851,7 @@ pub struct DiscoveryRunProfile {
     pub validation_temporal_contract_hash: Option<String>,
     pub prefilter_top_k: usize,
     pub prefilter_insample_frac: f64,
+    pub prefilter_min_per_timeframe: usize,
     pub funnel_stage1_pct: f64,
     /// Per-kind validation-evidence hashes ready for the typed
     /// [`neoethos_core::contracts::ValidationEvidenceManifest`]. `None`
@@ -2269,9 +2286,16 @@ where
     let prefilter_top_k = config.runtime_overrides.prefilter_top_k;
     let prefilter_insample_frac = config.runtime_overrides.resolved_prefilter_insample_frac();
 
+    let prefilter_min_per_tf = config.runtime_overrides.prefilter_min_per_timeframe;
     let n_features_before_prefilter = features.names.len();
     if prefilter_top_k > 0 && features.names.len() > prefilter_top_k {
-        features = prefilter_features(&features, &ohlcv, prefilter_top_k, prefilter_insample_frac);
+        features = prefilter_features(
+            &features,
+            &ohlcv,
+            prefilter_top_k,
+            prefilter_insample_frac,
+            prefilter_min_per_tf,
+        );
     }
     funnel.record_stage(
         "features_after_prefilter",
@@ -2473,11 +2497,41 @@ fn pearson_correlation(x: &[f32], y: &[f32]) -> f32 {
     }
 }
 
+/// Identify the higher-timeframe prefix group of a multi-TF feature name.
+///
+/// Multi-resolution features are emitted as `"{TF}_{indicator}"` (e.g.
+/// `"H1_rsi_14"`, `"M15_ema_20"`) by
+/// `prepare_multitimeframe_features_with_options`. Base-TF features are
+/// unprefixed and `regime_*` columns are handled separately, so this returns
+/// `None` for both. A timeframe label is one or two leading uppercase letters
+/// (`M`, `H`, `D`, `W`, or `MN`) followed by digits, terminated by `_` — which
+/// distinguishes it from lowercase/longer base indicator heads (`rsi`, `macd`,
+/// `ema`, `bb`) without needing the live higher-TF list.
+fn timeframe_group(name: &str) -> Option<&str> {
+    let head = name.split('_').next()?;
+    // Canonical TF labels are 2-3 chars: M1/H1/D1/W1 (2) or M15/MN1 (3).
+    if head.len() < 2 || head.len() > 3 {
+        return None;
+    }
+    let digits = if let Some(rest) = head.strip_prefix("MN") {
+        rest
+    } else if head.starts_with(['M', 'H', 'D', 'W']) {
+        &head[1..]
+    } else {
+        return None;
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(head)
+}
+
 fn prefilter_features(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     top_k: usize,
     insample_frac: f64,
+    min_per_tf: usize,
 ) -> FeatureFrame {
     let n_rows = features.n_samples();
     let n_cols = features.n_features();
@@ -2544,10 +2598,48 @@ fn prefilter_features(
         .take(actual_top_k)
         .map(|(idx, _)| *idx)
         .collect();
-    keep_indices.sort(); // Maintain original order
 
-    let mut new_names = Vec::with_capacity(actual_top_k);
-    let mut new_data = ndarray::Array2::zeros((n_rows, actual_top_k));
+    // Per-higher-timeframe quota (2026-06-08). The ranking above is against
+    // the BASE timeframe's 1-bar forward return. A higher-TF indicator is
+    // near-constant across many base bars, so its 1-bar-forward correlation is
+    // ~0 by construction — the global top-K therefore systematically discards
+    // EVERY multi-TF feature (confirmed live: the surviving set was 100%
+    // base-TF and the GA's multi-TF seed templates found no `H1_`/`H4_`/…
+    // prefixes → 0 seeds → random cold start), wasting the whole
+    // multi-resolution cube. Force-keep each present higher-TF group's top
+    // `min_per_tf` features by |corr|, ADDITIVELY (mirrors the regime_
+    // force-keep). `correlations` is already sorted by descending |corr| so
+    // each group is topped up with its strongest features first.
+    if min_per_tf > 0 {
+        let mut kept: std::collections::HashSet<usize> = keep_indices.iter().copied().collect();
+        let mut per_group: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for &idx in &keep_indices {
+            if let Some(group) = timeframe_group(&features.names[idx]) {
+                *per_group.entry(group).or_insert(0) += 1;
+            }
+        }
+        for &(idx, _) in &correlations {
+            let Some(group) = timeframe_group(&features.names[idx]) else {
+                continue;
+            };
+            let count = per_group.entry(group).or_insert(0);
+            if *count >= min_per_tf {
+                continue;
+            }
+            if kept.insert(idx) {
+                *count += 1;
+            }
+        }
+        keep_indices = kept.into_iter().collect();
+    }
+
+    keep_indices.sort(); // Maintain original order
+    keep_indices.dedup();
+    let n_keep = keep_indices.len();
+
+    let mut new_names = Vec::with_capacity(n_keep);
+    let mut new_data = ndarray::Array2::zeros((n_rows, n_keep));
 
     for (new_col_idx, &orig_col_idx) in keep_indices.iter().enumerate() {
         new_names.push(features.names[orig_col_idx].clone());
@@ -4325,6 +4417,7 @@ pub fn build_discovery_profile(
         validation_temporal_contract_hash: result.validation_gates.temporal_contract_hash.clone(),
         prefilter_top_k: config.runtime_overrides.prefilter_top_k,
         prefilter_insample_frac: config.runtime_overrides.resolved_prefilter_insample_frac(),
+        prefilter_min_per_timeframe: config.runtime_overrides.prefilter_min_per_timeframe,
         funnel_stage1_pct: config.runtime_overrides.resolved_funnel_stage1_pct(),
         validation_evidence_hashes: validation_evidence_hashes.clone(),
         validation_evidence_complete: validation_evidence_hashes.all_present(),

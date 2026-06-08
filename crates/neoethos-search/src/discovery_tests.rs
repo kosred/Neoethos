@@ -556,6 +556,7 @@ fn discovery_runtime_overrides_defaults_match_legacy_env_defaults() {
     let defaults = DiscoveryRuntimeOverrides::default();
     assert_eq!(defaults.prefilter_top_k, 50);
     assert!((defaults.prefilter_insample_frac - 0.70).abs() < 1e-9);
+    assert_eq!(defaults.prefilter_min_per_timeframe, 6);
     assert!((defaults.funnel_stage1_pct - 0.25).abs() < 1e-9);
 }
 
@@ -564,6 +565,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
     let overrides = DiscoveryRuntimeOverrides {
         prefilter_top_k: 0,
         prefilter_insample_frac: f64::NAN,
+        prefilter_min_per_timeframe: 6,
         funnel_stage1_pct: 5.0,
         stage1_window: Stage1Window::Earliest,
         // Tests opt-out of the 10y minimum: synthetic fixtures don't carry
@@ -577,6 +579,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
     let too_small = DiscoveryRuntimeOverrides {
         prefilter_top_k: 0,
         prefilter_insample_frac: 0.0,
+        prefilter_min_per_timeframe: 6,
         funnel_stage1_pct: 0.0001,
         stage1_window: Stage1Window::Earliest,
         min_history_years: 0,
@@ -603,6 +606,7 @@ fn discovery_profile_exports_runtime_override_resolution() {
     config.runtime_overrides = DiscoveryRuntimeOverrides {
         prefilter_top_k: 17,
         prefilter_insample_frac: 0.6,
+        prefilter_min_per_timeframe: 6,
         funnel_stage1_pct: 0.5,
         stage1_window: Stage1Window::Earliest,
         // Tests opt-out of the 10y minimum (synthetic fixtures, no real data).
@@ -625,7 +629,97 @@ fn discovery_profile_exports_runtime_override_resolution() {
     let profile = build_discovery_profile(&config, &result);
     assert_eq!(profile.prefilter_top_k, 17);
     assert!((profile.prefilter_insample_frac - 0.6).abs() < 1e-9);
+    assert_eq!(profile.prefilter_min_per_timeframe, 6);
     assert!((profile.funnel_stage1_pct - 0.5).abs() < 1e-9);
+}
+
+#[test]
+fn timeframe_group_classifies_multitimeframe_prefixes() {
+    // Higher-TF columns are emitted as "{TF}_{indicator}" by
+    // prepare_multitimeframe_features_with_options.
+    assert_eq!(timeframe_group("H1_rsi_14"), Some("H1"));
+    assert_eq!(timeframe_group("H4_ema_20"), Some("H4"));
+    assert_eq!(timeframe_group("M15_macd_signal"), Some("M15"));
+    assert_eq!(timeframe_group("D1_atr"), Some("D1"));
+    assert_eq!(timeframe_group("MN1_close"), Some("MN1"));
+    // Base-TF + regime columns are unprefixed → no group.
+    assert_eq!(timeframe_group("rsi_14"), None);
+    assert_eq!(timeframe_group("macd_signal"), None);
+    assert_eq!(timeframe_group("ema_20"), None);
+    assert_eq!(timeframe_group("regime_trend_strength"), None);
+    // Uppercase base heads that are NOT timeframe labels must not match.
+    assert_eq!(timeframe_group("MA_20"), None); // letters then non-digit
+    assert_eq!(timeframe_group("MACD_x"), None); // 4 chars, too long
+}
+
+#[test]
+fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
+    // The correlation prefilter ranks by |corr| with the BASE TF's 1-bar
+    // forward return. Higher-TF columns are near-constant across base bars →
+    // ~0 correlation → the global top-K discards them ALL. This test proves
+    // the per-TF quota (min_per_tf > 0) force-keeps each higher-TF group, while
+    // min_per_tf == 0 reproduces the legacy base-only behaviour.
+    let n = 60usize;
+    // Close series whose 1-bar returns alternate sign deterministically.
+    let mut close = vec![100.0f64; n];
+    for i in 1..n {
+        let dir = if (i - 1) % 2 == 0 { 1.0 } else { -1.0 };
+        close[i] = close[i - 1] * (1.0 + 0.01 * dir);
+    }
+    let ohlcv = Ohlcv {
+        timestamp: Some((0..n as i64).collect()),
+        open: close.clone(),
+        high: close.clone(),
+        low: close.clone(),
+        close: close.clone(),
+        volume: Some(vec![1.0; n]),
+    };
+
+    let names = vec![
+        "base_a".to_string(),
+        "base_b".to_string(),
+        "base_c".to_string(),
+        "H1_x".to_string(),
+        "H1_y".to_string(),
+        "H4_z".to_string(),
+    ];
+    // base_* track the alternating return sign (high |corr|); H*_* are slowly
+    // rising near-constant columns (~0 |corr| vs the zero-mean alternation).
+    let data = ndarray::Array2::from_shape_fn((n, names.len()), |(i, j)| {
+        let sign = if i % 2 == 0 { 1.0f32 } else { -1.0f32 };
+        match j {
+            0 | 1 | 2 => sign,
+            _ => 1000.0 + (i as f32) * 0.001,
+        }
+    });
+    let frame = FeatureFrame {
+        timestamps: (0..n as i64).collect(),
+        names,
+        data: neoethos_data::FeatureData::InMemory(data),
+    };
+
+    // Legacy (no quota): top-3 by |corr| are the 3 base columns; no HTF.
+    let legacy = prefilter_features(&frame, &ohlcv, 3, 1.0, 0);
+    assert!(
+        !legacy.names.iter().any(|n| timeframe_group(n).is_some()),
+        "legacy prefilter should keep only base features, got {:?}",
+        legacy.names
+    );
+
+    // With quota: each present higher-TF group gets at least 1 representative.
+    let quota = prefilter_features(&frame, &ohlcv, 3, 1.0, 1);
+    assert!(
+        quota.names.iter().any(|n| n.starts_with("H1_")),
+        "quota prefilter must keep an H1_ feature, got {:?}",
+        quota.names
+    );
+    assert!(
+        quota.names.iter().any(|n| n.starts_with("H4_")),
+        "quota prefilter must keep an H4_ feature, got {:?}",
+        quota.names
+    );
+    // The base top-K survivors are preserved (additive, no regression).
+    assert!(quota.names.iter().filter(|n| n.starts_with("base_")).count() >= 3);
 }
 
 #[test]
