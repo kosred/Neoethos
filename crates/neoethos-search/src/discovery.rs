@@ -2193,6 +2193,9 @@ where
     // (OnceLock) and override-respecting (explicit NEOETHOS_BOT_SEARCH_* env
     // wins). The average user gets a hardware-fit config with zero tuning; huge
     // population/gene requests stream through in chunks instead of OOMing.
+    // Gated on the `gpu` feature: cubecl_eval (and the budgets it installs) only
+    // exists in GPU builds; a CPU-only build has no GPU eval to tune.
+    #[cfg(feature = "gpu")]
     crate::cubecl_eval::auto_tune_memory_budgets();
 
     // 2026-05-26 operator directive (dual-mode product): instrument the

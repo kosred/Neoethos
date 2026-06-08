@@ -378,6 +378,22 @@ pub fn launch_now(shared: &mut AppShared) {
         args.push("--symbols".to_string());
         args.push(symbols);
     }
+    // Forward the numeric form fields as explicit overrides so they actually
+    // take effect (parity fix: these were silently dropped before, making the
+    // form fields dead). Each is passed only when the user entered a value.
+    for (field, flag) in [
+        ("Population", "--population"),
+        ("Generations", "--generations"),
+        ("Portfolio size", "--portfolio-size"),
+    ] {
+        if let Some(v) = form.value_for(field) {
+            let v = v.trim();
+            if !v.is_empty() && v.parse::<usize>().is_ok() {
+                args.push(flag.to_string());
+                args.push(v.to_string());
+            }
+        }
+    }
 
     shared.jobs.spawn("discover", args);
     shared.status = "Spawned batch-discover".to_string();

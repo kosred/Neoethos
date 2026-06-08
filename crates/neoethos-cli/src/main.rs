@@ -1236,10 +1236,32 @@ fn cmd_batch_discover(args: &[String]) -> Result<()> {
             .map(|s| s.trim().to_uppercase())
             .collect();
 
-        let config = settings
+        let mut config = settings
             .as_ref()
             .map(neoethos_search::DiscoveryConfig::from_settings)
             .unwrap_or_default();
+        // Explicit overrides win over the config-derived values (same
+        // precedence as env > config elsewhere). These let the TUI Discover
+        // form's Population/Generations/Portfolio-size fields actually take
+        // effect instead of being silently dropped (parity fix 2026-06-08).
+        if let Some(p) = parse_flag(args, "--population")
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+        {
+            config.population = p;
+        }
+        if let Some(g) = parse_flag(args, "--generations")
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+        {
+            config.generations = g;
+        }
+        if let Some(ps) = parse_flag(args, "--portfolio-size")
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+        {
+            config.portfolio_size = ps;
+        }
         let orchestrator = neoethos_search::DiscoveryOrchestrator::new(&root, &out_dir, config);
 
         let summary = orchestrator.run_batch(&symbols, &tfs)?;
