@@ -20,7 +20,14 @@ tracing = "0.1"
 # which has always shown 0.2.9). Bumping the literal makes the intent obvious
 # to anyone reading this file and prevents a future patch removal from silently
 # downgrading the binary.
-vector-ta = { version = "0.2.9" }
+# `nightly-avx`: vector-ta's runtime-selected AVX2/AVX512 TA kernels (the repo
+# pins a NIGHTLY toolchain in rust-toolchain.toml, so this is always available).
+# Without it `Kernel::Auto` falls back to the SCALAR baseline — i.e. the whole
+# feature build runs on SSE2-class scalar code instead of AVX2/AVX512. This is
+# the single biggest CPU win for `hpc_ta::compute_classic_ta_columns` and needs
+# no GPU. (vector-ta's separate `cuda`/`cuda-build-ptx` GPU path is wired
+# separately once `hpc_ta` dispatches to `vector_ta::cuda::*` — task #22.)
+vector-ta = { version = "0.2.9", features = ["nightly-avx"] }
 memmap2 = "0.9.5"
 # Recursive filesystem walk used by core::discover. Latest stable
 # (verified on crates.io 2026-05-14): 2.5.0.
