@@ -93,7 +93,14 @@ impl Page {
             ],
             Page::Funnel => &[("Tab", "page"), ("R", "refresh"), ("Q", "quit")],
             Page::AutoLoop => &[("Tab", "page"), ("L", "launch"), ("Q", "quit")],
-            Page::Config => &[("Tab", "page"), ("Q", "quit")],
+            Page::Config => &[
+                ("↑↓", "field"),
+                ("Enter", "edit"),
+                ("S", "save"),
+                ("R", "reload"),
+                ("Tab", "page"),
+                ("Q", "quit"),
+            ],
             Page::Logs => &[("Tab", "page"), ("Q", "quit")],
             Page::Chart => &[
                 ("←→", "symbol"),
@@ -127,6 +134,7 @@ impl Page {
             Page::Train => train::handle_key(code, shared),
             Page::AutoLoop => auto_loop::handle_key(code, shared),
             Page::Chart => chart::handle_key(code, shared),
+            Page::Config => config_view::handle_key(code, shared),
             _ => false,
         }
     }

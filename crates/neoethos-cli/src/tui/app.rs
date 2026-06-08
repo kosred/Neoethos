@@ -77,6 +77,9 @@ pub struct AppShared {
     pub train_form: FormState,
     /// Chart page state — selected symbol/timeframe + cached candles.
     pub chart_state: crate::tui::pages::chart::ChartState,
+    /// Editable Config page form — loaded from the on-disk Settings, saved
+    /// back to config.yaml so the user can change core settings from the TUI.
+    pub config_form: FormState,
 }
 
 impl AppShared {
@@ -94,6 +97,7 @@ impl AppShared {
             discover_form: make_discover_form(&root_str),
             train_form: make_train_form(&root_str),
             chart_state,
+            config_form: crate::tui::pages::config_view::make_config_form(),
         }
     }
 
@@ -196,7 +200,9 @@ impl App {
         // mid-symbol-name. Esc breaks out of edit mode (handled by the
         // page); Tab still cycles fields (handled by the page);
         // outside edit mode the global shortcuts apply.
-        let editing = self.shared.discover_form.editing || self.shared.train_form.editing;
+        let editing = self.shared.discover_form.editing
+            || self.shared.train_form.editing
+            || self.shared.config_form.editing;
         if editing {
             let _ = self.current.handle_key(code, &mut self.shared);
             return;
@@ -222,8 +228,12 @@ impl App {
             // page already promises this key works.
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.shared.last_refresh = Instant::now();
+                // Re-read the editable config from disk too, so external edits
+                // to config.yaml show up on the Config page after a refresh.
+                self.shared.config_form =
+                    crate::tui::pages::config_view::make_config_form();
                 self.shared.status =
-                    "Refreshed dataset inventory.".to_string();
+                    "Refreshed dataset inventory + config.".to_string();
             }
             other => {
                 // Page-local: Up/Down focus, Enter to edit/launch, etc.
