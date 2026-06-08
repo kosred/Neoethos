@@ -171,8 +171,9 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
 }
 
 struct StratMetrics {
+    net_profit: f64,
+    return_pct: f64,
     sharpe: f64,
-    pf: f64,
     max_dd: f64,
     win: f64,
 }
@@ -183,19 +184,40 @@ fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
     }
     let mut sidecar = p.path.clone().into_os_string();
     sidecar.push(".quality.json");
-    let metrics = std::fs::read_to_string(std::path::PathBuf::from(sidecar))
-        .ok()
-        .map(|t| extract_strategy_metrics(&t))
-        .unwrap_or_default();
+    let text = std::fs::read_to_string(std::path::PathBuf::from(sidecar)).unwrap_or_default();
+    let metrics = extract_strategy_metrics(&text);
+    let initial = scan_numbers(&text, "initial_capital")
+        .first()
+        .copied()
+        .unwrap_or(0.0);
+    let total_net: f64 = metrics.iter().map(|m| m.net_profit).sum();
 
-    let mut lines: Vec<Line> = vec![Line::from(vec![
+    // Header carries the money view: starting capital + Σ net € across the
+    // portfolio (the €-view the operator wanted, not just ratios).
+    let mut header = vec![
         Span::styled(
             format!(" {} ", p.name),
             theme::accent_style().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("· {} strategies   ", p.strategies), theme::muted_style()),
-        Span::styled("[↑↓] select  [V] validate (trader-replay)", theme::caption_style()),
-    ])];
+        Span::styled(format!("· {} strat  ", p.strategies), theme::muted_style()),
+    ];
+    if initial > 0.0 {
+        header.push(Span::styled(
+            format!("start €{}  ", fmt_eur(initial)),
+            theme::caption_style(),
+        ));
+        let net_style = if total_net >= 0.0 {
+            theme::buy_style()
+        } else {
+            Style::default().fg(theme::SELL)
+        };
+        header.push(Span::styled(
+            format!("Σnet €{}  ", fmt_eur(total_net)),
+            net_style.add_modifier(Modifier::BOLD),
+        ));
+    }
+    header.push(Span::styled("[↑↓] [V]alidate", theme::caption_style()));
+    let mut lines: Vec<Line> = vec![Line::from(header)];
 
     if metrics.is_empty() {
         lines.push(Line::styled(
@@ -205,8 +227,8 @@ fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
     } else {
         lines.push(Line::from(vec![Span::styled(
             format!(
-                "  {:<4}{:>9}{:>8}{:>9}{:>8}",
-                "#", "Sharpe", "PF", "MaxDD%", "Win%"
+                "  {:<4}{:>10}{:>8}{:>8}{:>7}{:>7}",
+                "#", "Net €", "Ret%", "Sharpe", "DD%", "Win%"
             ),
             theme::caption_style().add_modifier(Modifier::BOLD),
         )]));
@@ -221,12 +243,18 @@ fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
             } else {
                 Style::default().fg(theme::SELL)
             };
+            let net_style = if m.net_profit >= 0.0 {
+                theme::buy_style()
+            } else {
+                Style::default().fg(theme::SELL)
+            };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {:<4}", i + 1), theme::muted_style()),
-                Span::styled(format!("{:>9.2}", m.sharpe), theme::primary_style()),
-                Span::styled(format!("{:>8.2}", m.pf), theme::primary_style()),
-                Span::styled(format!("{:>8.2}%", dd_pct), dd_style),
-                Span::styled(format!("{:>7.1}%", m.win * 100.0), theme::muted_style()),
+                Span::styled(format!("{:>10}", fmt_eur(m.net_profit)), net_style),
+                Span::styled(format!("{:>7.1}%", m.return_pct), theme::primary_style()),
+                Span::styled(format!("{:>8.2}", m.sharpe), theme::primary_style()),
+                Span::styled(format!("{:>6.1}%", dd_pct), dd_style),
+                Span::styled(format!("{:>6.0}%", m.win * 100.0), theme::muted_style()),
             ]));
         }
     }
@@ -243,19 +271,39 @@ fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
 /// for field tokens (no schema dependency — works across writer shapes). Zips
 /// the parallel sharpe/PF/DD/win arrays in document order.
 fn extract_strategy_metrics(text: &str) -> Vec<StratMetrics> {
+    let net = scan_numbers(text, "net_profit");
+    let ret = scan_numbers(text, "total_return_pct");
     let sharpe = scan_numbers(text, "sharpe_ratio");
-    let pf = scan_numbers(text, "profit_factor");
     let dd = scan_numbers(text, "max_drawdown_pct");
     let win = scan_numbers(text, "win_rate");
-    let n = sharpe.len().min(pf.len()).min(dd.len()).min(win.len());
+    let n = net
+        .len()
+        .min(ret.len())
+        .min(sharpe.len())
+        .min(dd.len())
+        .min(win.len());
     (0..n)
         .map(|i| StratMetrics {
+            net_profit: net[i],
+            return_pct: ret[i],
             sharpe: sharpe[i],
-            pf: pf[i],
             max_dd: dd[i],
             win: win[i],
         })
         .collect()
+}
+
+/// Compact money formatting for the narrow details panel: thousands as `k`,
+/// millions as `M`, with sign preserved.
+fn fmt_eur(v: f64) -> String {
+    let a = v.abs();
+    if a >= 1_000_000.0 {
+        format!("{:.2}M", v / 1_000_000.0)
+    } else if a >= 1_000.0 {
+        format!("{:.1}k", v / 1_000.0)
+    } else {
+        format!("{:.0}", v)
+    }
 }
 
 fn scan_numbers(text: &str, key: &str) -> Vec<f64> {
