@@ -83,6 +83,9 @@ pub struct AppShared {
     /// Single-field form on the Symbols page: a source path to import data from
     /// (CSV/Parquet/Vortex/… → canonical data/ layout) without leaving the TUI.
     pub import_form: FormState,
+    /// Selected row on the Strategies page (index into the scanned portfolio
+    /// list), so the user can browse a portfolio's per-strategy metrics.
+    pub strategies_selected: usize,
 }
 
 impl AppShared {
@@ -106,6 +109,7 @@ impl AppShared {
                 "",
                 "Folder/file to import (CSV/TSV/JSON/Parquet/Vortex) → data/ layout",
             )]),
+            strategies_selected: 0,
         }
     }
 

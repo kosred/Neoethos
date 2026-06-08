@@ -76,10 +76,8 @@ impl Page {
                 ("Q", "quit"),
             ],
             Page::Strategies => &[
-                ("Tab", "next page"),
-                ("↑↓", "select"),
-                ("/", "filter"),
-                ("Enter", "details"),
+                ("↑↓", "select / details"),
+                ("Tab", "page"),
                 ("Q", "quit"),
             ],
             Page::Symbols => &[
@@ -141,6 +139,7 @@ impl Page {
             Page::Chart => chart::handle_key(code, shared),
             Page::Config => config_view::handle_key(code, shared),
             Page::Symbols => symbols::handle_key(code, shared),
+            Page::Strategies => strategies::handle_key(code, shared),
             _ => false,
         }
     }

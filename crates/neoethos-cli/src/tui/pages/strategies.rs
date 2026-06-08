@@ -3,16 +3,38 @@
 
 use std::path::PathBuf;
 
+use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, Widget};
+use ratatui::widgets::{
+    Block, Borders, Cell, Padding, Paragraph, Row, StatefulWidget, Table, TableState, Widget,
+};
 
 use crate::tui::app::AppShared;
 use crate::tui::theme;
 
-pub fn draw(area: Rect, buf: &mut Buffer, _shared: &AppShared) {
+/// Move the Strategies selection. Returns whether the key was consumed.
+pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
+    let count = scan_portfolios().len();
+    if count == 0 {
+        return false;
+    }
+    match code {
+        KeyCode::Up => {
+            shared.strategies_selected = shared.strategies_selected.saturating_sub(1);
+            true
+        }
+        KeyCode::Down => {
+            shared.strategies_selected = (shared.strategies_selected + 1).min(count - 1);
+            true
+        }
+        _ => false,
+    }
+}
+
+pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::BORDER))
@@ -53,6 +75,23 @@ pub fn draw(area: Rect, buf: &mut Buffer, _shared: &AppShared) {
         return;
     }
 
+    let sel = shared
+        .strategies_selected
+        .min(portfolios.len().saturating_sub(1));
+
+    // Split: portfolio table on top, the selected portfolio's per-strategy
+    // metrics below — so the user can actually SEE what a discovery found.
+    let detail_h = (inner.height / 2).clamp(0, 14).min(inner.height.saturating_sub(4));
+    let table_area = Rect {
+        height: inner.height.saturating_sub(detail_h),
+        ..inner
+    };
+    let detail_area = Rect {
+        y: inner.y + table_area.height,
+        height: detail_h,
+        ..inner
+    };
+
     let header = Row::new(vec![
         Cell::from("PORTFOLIO").style(theme::caption_style()),
         Cell::from("STRATEGIES").style(theme::caption_style()),
@@ -62,13 +101,13 @@ pub fn draw(area: Rect, buf: &mut Buffer, _shared: &AppShared) {
     .height(1);
 
     let rows: Vec<Row> = portfolios
-        .into_iter()
+        .iter()
         .map(|p| {
             Row::new(vec![
-                Cell::from(p.name).style(theme::accent_style()),
+                Cell::from(p.name.clone()).style(theme::accent_style()),
                 Cell::from(p.strategies.to_string()).style(theme::primary_style()),
                 Cell::from(format_size(p.bytes)).style(theme::muted_style()),
-                Cell::from(p.modified).style(theme::muted_style()),
+                Cell::from(p.modified.clone()).style(theme::muted_style()),
             ])
             .height(1)
         })
@@ -87,8 +126,120 @@ pub fn draw(area: Rect, buf: &mut Buffer, _shared: &AppShared) {
             Style::default()
                 .bg(theme::SURFACE_ALT)
                 .add_modifier(Modifier::BOLD),
-        );
-    Widget::render(table, inner, buf);
+        )
+        .highlight_symbol("▸ ");
+    let mut state = TableState::default();
+    state.select(Some(sel));
+    StatefulWidget::render(table, table_area, buf, &mut state);
+
+    draw_details(detail_area, buf, &portfolios[sel]);
+}
+
+struct StratMetrics {
+    sharpe: f64,
+    pf: f64,
+    max_dd: f64,
+    win: f64,
+}
+
+fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
+    if area.height == 0 {
+        return;
+    }
+    let mut sidecar = p.path.clone().into_os_string();
+    sidecar.push(".quality.json");
+    let metrics = std::fs::read_to_string(std::path::PathBuf::from(sidecar))
+        .ok()
+        .map(|t| extract_strategy_metrics(&t))
+        .unwrap_or_default();
+
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled(
+            format!(" {} ", p.name),
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("· {} strategies   ", p.strategies), theme::muted_style()),
+        Span::styled("[↑↓] select", theme::caption_style()),
+    ])];
+
+    if metrics.is_empty() {
+        lines.push(Line::styled(
+            "  No .quality.json sidecar — re-run discovery to regenerate per-strategy metrics.",
+            theme::caption_style(),
+        ));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  {:<4}{:>9}{:>8}{:>9}{:>8}",
+                "#", "Sharpe", "PF", "MaxDD%", "Win%"
+            ),
+            theme::caption_style().add_modifier(Modifier::BOLD),
+        )]));
+        let max_rows = area.height.saturating_sub(3) as usize;
+        for (i, m) in metrics.iter().take(max_rows).enumerate() {
+            let dd_pct = m.max_dd * 100.0;
+            // Operator's low-DD lens: green ≤6%, amber ≤10%, red above.
+            let dd_style = if dd_pct <= 6.0 {
+                theme::primary_style()
+            } else if dd_pct <= 10.0 {
+                theme::warn_style()
+            } else {
+                Style::default().fg(theme::SELL)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<4}", i + 1), theme::muted_style()),
+                Span::styled(format!("{:>9.2}", m.sharpe), theme::primary_style()),
+                Span::styled(format!("{:>8.2}", m.pf), theme::primary_style()),
+                Span::styled(format!("{:>8.2}%", dd_pct), dd_style),
+                Span::styled(format!("{:>7.1}%", m.win * 100.0), theme::muted_style()),
+            ]));
+        }
+    }
+    Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(theme::BORDER)),
+        )
+        .render(area, buf);
+}
+
+/// Robustly pull per-strategy metrics from a quality.json sidecar by scanning
+/// for field tokens (no schema dependency — works across writer shapes). Zips
+/// the parallel sharpe/PF/DD/win arrays in document order.
+fn extract_strategy_metrics(text: &str) -> Vec<StratMetrics> {
+    let sharpe = scan_numbers(text, "sharpe_ratio");
+    let pf = scan_numbers(text, "profit_factor");
+    let dd = scan_numbers(text, "max_drawdown_pct");
+    let win = scan_numbers(text, "win_rate");
+    let n = sharpe.len().min(pf.len()).min(dd.len()).min(win.len());
+    (0..n)
+        .map(|i| StratMetrics {
+            sharpe: sharpe[i],
+            pf: pf[i],
+            max_dd: dd[i],
+            win: win[i],
+        })
+        .collect()
+}
+
+fn scan_numbers(text: &str, key: &str) -> Vec<f64> {
+    let pat = format!("\"{key}\"");
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while let Some(p) = text[idx..].find(&pat) {
+        let after = idx + p + pat.len();
+        let rest = text[after..].trim_start_matches([':', ' ', '\t', '\n', '\r']);
+        let num: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))
+            .collect();
+        if let Ok(v) = num.parse::<f64>() {
+            out.push(v);
+        }
+        idx = after;
+    }
+    out
 }
 
 struct PortfolioSummary {
@@ -96,6 +247,7 @@ struct PortfolioSummary {
     strategies: usize,
     bytes: u64,
     modified: String,
+    path: PathBuf,
 }
 
 fn scan_portfolios() -> Vec<PortfolioSummary> {
@@ -140,6 +292,7 @@ fn scan_portfolios() -> Vec<PortfolioSummary> {
                 strategies,
                 bytes,
                 modified,
+                path,
             });
         }
     }
