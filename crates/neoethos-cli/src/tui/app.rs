@@ -86,6 +86,9 @@ pub struct AppShared {
     /// Selected row on the Strategies page (index into the scanned portfolio
     /// list), so the user can browse a portfolio's per-strategy metrics.
     pub strategies_selected: usize,
+    /// Logs page scroll offset measured in lines UP from the tail (0 = follow
+    /// the newest lines, the default).
+    pub logs_scroll: usize,
 }
 
 impl AppShared {
@@ -110,6 +113,7 @@ impl AppShared {
                 "Folder/file to import (CSV/TSV/JSON/Parquet/Vortex) → data/ layout",
             )]),
             strategies_selected: 0,
+            logs_scroll: 0,
         }
     }
 

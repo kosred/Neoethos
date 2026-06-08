@@ -105,7 +105,12 @@ impl Page {
                 ("Tab", "page"),
                 ("Q", "quit"),
             ],
-            Page::Logs => &[("Tab", "page"), ("Q", "quit")],
+            Page::Logs => &[
+                ("↑↓", "scroll"),
+                ("F", "follow tail"),
+                ("Tab", "page"),
+                ("Q", "quit"),
+            ],
             Page::Chart => &[
                 ("←→", "symbol"),
                 ("↑↓", "timeframe"),
@@ -141,6 +146,7 @@ impl Page {
             Page::Config => config_view::handle_key(code, shared),
             Page::Symbols => symbols::handle_key(code, shared),
             Page::Strategies => strategies::handle_key(code, shared),
+            Page::Logs => logs::handle_key(code, shared),
             _ => false,
         }
     }
