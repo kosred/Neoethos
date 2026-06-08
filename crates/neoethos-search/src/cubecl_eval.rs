@@ -253,29 +253,33 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
         // gap = |lt - st| guarded >= 1e-6; margin = (combined-lt) long / (st-combined) short;
         // conf = (margin/gap).clamp(0,1). Written only where the final signal survives.
         let gap_raw = lt - st;
-        let gap_abs = if gap_raw >= F::new(0.0) {
-            gap_raw
-        } else {
-            F::new(0.0) - gap_raw
-        };
-        let gap = if gap_abs < F::new(1e-6) {
-            F::new(1e-6)
-        } else {
-            gap_abs
-        };
-        let margin = if sig_val == 1 {
-            combined_val - lt
-        } else {
-            st - combined_val
-        };
-        let conf_f = margin / gap;
-        let conf = if conf_f < F::new(0.0) {
-            F::new(0.0)
+        // #1375 WORKAROUND (tracel-ai/cubecl#1375, open): an expression-position
+        // `let x = if <runtime cond> { a } else { b }` returns the ELSE branch
+        // UNCONDITIONALLY on the wgpu/Vulkan backend (CPU & CUDA are correct).
+        // Statement-if + RuntimeCell is correct on ALL backends, so this both
+        // preserves CPU/CUDA behaviour and FIXES the Vulkan eval — and matches the
+        // RuntimeCell idiom used throughout this kernel. gap = |lt - st|, floored 1e-6.
+        let gap_abs = RuntimeCell::<F>::new(gap_raw);
+        if gap_raw < F::new(0.0) {
+            gap_abs.store(F::new(0.0) - gap_raw);
+        }
+        let gap = RuntimeCell::<F>::new(gap_abs.read());
+        if gap_abs.read() < F::new(1e-6) {
+            gap.store(F::new(1e-6));
+        }
+        // margin: long = combined - lt, short = st - combined.
+        let margin = RuntimeCell::<F>::new(st - combined_val);
+        if sig_val == 1 {
+            margin.store(combined_val - lt);
+        }
+        let conf_f = margin.read() / gap.read();
+        // conf = conf_f.clamp(0, 1)  (statement-if else-if chain — #1375-safe).
+        let conf = RuntimeCell::<F>::new(conf_f);
+        if conf_f < F::new(0.0) {
+            conf.store(F::new(0.0));
         } else if conf_f > F::new(1.0) {
-            F::new(1.0)
-        } else {
-            conf_f
-        };
+            conf.store(F::new(1.0));
+        }
 
         let flag_base = gene * SMC_WIDTH;
         let smc_base = sample * SMC_WIDTH;
@@ -289,15 +293,18 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
         let active_sum_val = active_sum.read();
         if active_sum_val <= F::new(0.0) {
             output[pos] = sig_val;
-            confidences_out[pos] = f32::cast_from(conf);
+            confidences_out[pos] = f32::cast_from(conf.read());
             terminate!();
         }
 
-        let gate = if active_sum_val < gate_threshold {
-            active_sum_val
-        } else {
-            gate_threshold
-        };
+        // #1375 workaround: gate = min(active_sum_val, gate_threshold). On Vulkan the
+        // expression form returned gate_threshold unconditionally, making the SMC
+        // gate at `score >= gate` HARDER for low-SMC-weight genes → signals wrongly
+        // suppressed vs CPU/CUDA. Statement-if restores parity.
+        let gate = RuntimeCell::<F>::new(gate_threshold);
+        if active_sum_val < gate_threshold {
+            gate.store(active_sum_val);
+        }
         let score = RuntimeCell::<F>::new(F::new(0.0));
         for k in 0..SMC_WIDTH {
             if gene_smc_flags[flag_base + k] != 0 {
@@ -312,9 +319,9 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
             }
         }
 
-        if score.read() >= gate {
+        if score.read() >= gate.read() {
             output[pos] = sig_val;
-            confidences_out[pos] = f32::cast_from(conf);
+            confidences_out[pos] = f32::cast_from(conf.read());
         } else {
             output[pos] = 0;
             confidences_out[pos] = 0.0;
@@ -510,13 +517,13 @@ fn backtest_population_kernel(
                 // BEFORE swap (swap scaled in its own term). Matches eval.rs:809.
                 pnl_cell.store(pnl_cell.read() * pos_lots.read());
                 // Phase C.3: broker swap (signed: + = credit, − = charge).
-                let swap_per_day_gap = if in_pos_v == 1 {
-                    swap_long_pips_per_day
-                } else {
-                    swap_short_pips_per_day
-                };
+                // #1375 workaround: long => swap_long, short => swap_short.
+                let swap_per_day_gap = RuntimeCell::<f32>::new(swap_short_pips_per_day);
+                if in_pos_v == 1 {
+                    swap_per_day_gap.store(swap_long_pips_per_day);
+                }
                 let swap_credit_gap =
-                    swap_per_day_gap * position_days.read() * pip_value_per_lot * pos_lots.read();
+                    swap_per_day_gap.read() * position_days.read() * pip_value_per_lot * pos_lots.read();
                 pnl_cell.store(pnl_cell.read() + swap_credit_gap);
                 // PnL conversion fee applied last; skip if out-of-range.
                 if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
@@ -558,23 +565,24 @@ fn backtest_population_kernel(
 
                 // Phase 2: float PnL scaled by pos_lots (eval.rs:865-880) so the
                 // equity-based DD tracks the sized position.
-                let worst_base = if in_pos_v2 == 1 {
-                    (lo - entry_px_v) * pip_value_per_lot
-                } else {
-                    (entry_px_v - hi) * pip_value_per_lot
-                };
-                let worst_float_pnl = worst_base * pos_lots.read();
+                // #1375 workaround: long worst-case intrabar = low-entry, short = entry-high.
+                // The expr form gave longs the SHORT formula on Vulkan → wrong max_dd.
+                let worst_base = RuntimeCell::<f32>::new((entry_px_v - hi) * pip_value_per_lot);
+                if in_pos_v2 == 1 {
+                    worst_base.store((lo - entry_px_v) * pip_value_per_lot);
+                }
+                let worst_float_pnl = worst_base.read() * pos_lots.read();
                 let eq = equity.read();
                 if (eq + worst_float_pnl) < day_low.read() {
                     day_low.store(eq + worst_float_pnl);
                 }
 
-                let best_base = if in_pos_v2 == 1 {
-                    (hi - entry_px_v) * pip_value_per_lot
-                } else {
-                    (entry_px_v - lo) * pip_value_per_lot
-                };
-                let best_float_pnl = best_base * pos_lots.read();
+                // #1375 workaround: long best-case intrabar = high-entry, short = entry-low.
+                let best_base = RuntimeCell::<f32>::new((entry_px_v - lo) * pip_value_per_lot);
+                if in_pos_v2 == 1 {
+                    best_base.store((hi - entry_px_v) * pip_value_per_lot);
+                }
+                let best_float_pnl = best_base.read() * pos_lots.read();
                 if (eq + best_float_pnl) > peak_equity.read() {
                     peak_equity.store(eq + best_float_pnl);
                 }
@@ -669,13 +677,13 @@ fn backtest_population_kernel(
                     // BEFORE swap. Matches eval.rs:979.
                     pnl_cell.store(pnl_cell.read() * pos_lots.read());
                     // Phase C.3: broker swap (signed: + = credit, − = charge).
-                    let swap_per_day = if in_pos_v2 == 1 {
-                        swap_long_pips_per_day
-                    } else {
-                        swap_short_pips_per_day
-                    };
+                    // #1375 workaround: long => swap_long, short => swap_short.
+                    let swap_per_day = RuntimeCell::<f32>::new(swap_short_pips_per_day);
+                    if in_pos_v2 == 1 {
+                        swap_per_day.store(swap_long_pips_per_day);
+                    }
                     let swap_credit =
-                        swap_per_day * position_days.read() * pip_value_per_lot * pos_lots.read();
+                        swap_per_day.read() * position_days.read() * pip_value_per_lot * pos_lots.read();
                     pnl_cell.store(pnl_cell.read() + swap_credit);
                     if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
                         pnl_cell.store(pnl_cell.read() * (1.0 - pnl_conversion_fee_rate));
