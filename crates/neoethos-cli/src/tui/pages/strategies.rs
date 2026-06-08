@@ -15,12 +15,14 @@ use ratatui::widgets::{
 use crate::tui::app::AppShared;
 use crate::tui::theme;
 
-/// Move the Strategies selection. Returns whether the key was consumed.
+/// Move the Strategies selection / validate the selected portfolio. Returns
+/// whether the key was consumed.
 pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
-    let count = scan_portfolios().len();
-    if count == 0 {
+    let portfolios = scan_portfolios();
+    if portfolios.is_empty() {
         return false;
     }
+    let count = portfolios.len();
     match code {
         KeyCode::Up => {
             shared.strategies_selected = shared.strategies_selected.saturating_sub(1);
@@ -30,8 +32,41 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
             shared.strategies_selected = (shared.strategies_selected + 1).min(count - 1);
             true
         }
+        KeyCode::Char('V') => {
+            let sel = shared.strategies_selected.min(count - 1);
+            launch_validate(shared, &portfolios[sel].path);
+            true
+        }
         _ => false,
     }
+}
+
+/// Validate the selected portfolio on real data via `trader-replay`, which
+/// replays the discovery's own genes (the `.live_portfolio.json` artifact) so
+/// the user can confirm a portfolio out-of-sample without leaving the TUI.
+fn launch_validate(shared: &mut AppShared, portfolio_path: &std::path::Path) {
+    let mut sidecar = portfolio_path.to_path_buf().into_os_string();
+    sidecar.push(".live_portfolio.json");
+    let sidecar = PathBuf::from(sidecar);
+    if !sidecar.exists() {
+        shared.status =
+            "No .live_portfolio.json next to this portfolio — re-run discovery (it emits one) to validate"
+                .to_string();
+        return;
+    }
+    if shared.jobs.has_running("validate") {
+        shared.status = "validation already running".to_string();
+        return;
+    }
+    shared.jobs.spawn(
+        "validate",
+        vec![
+            "trader-replay".to_string(),
+            "--portfolio".to_string(),
+            sidecar.display().to_string(),
+        ],
+    );
+    shared.status = "Spawned trader-replay validation — see Logs / status".to_string();
 }
 
 pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
@@ -159,7 +194,7 @@ fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
             theme::accent_style().add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("· {} strategies   ", p.strategies), theme::muted_style()),
-        Span::styled("[↑↓] select", theme::caption_style()),
+        Span::styled("[↑↓] select  [V] validate (trader-replay)", theme::caption_style()),
     ])];
 
     if metrics.is_empty() {

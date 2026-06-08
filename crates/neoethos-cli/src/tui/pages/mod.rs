@@ -76,7 +76,8 @@ impl Page {
                 ("Q", "quit"),
             ],
             Page::Strategies => &[
-                ("↑↓", "select / details"),
+                ("↑↓", "select"),
+                ("V", "validate"),
                 ("Tab", "page"),
                 ("Q", "quit"),
             ],
