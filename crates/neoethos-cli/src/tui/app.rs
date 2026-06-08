@@ -22,7 +22,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Widget};
 
 use crate::tui::form::{FormState, make_discover_form, make_train_form};
 use crate::tui::jobs::JobManager;
@@ -139,6 +139,9 @@ pub struct App {
     pub current: Page,
     pub shared: AppShared,
     pub quit: bool,
+    /// When true, a help overlay listing every page + its keys is shown over
+    /// the current page. Toggled with `?`; any key dismisses it.
+    pub show_help: bool,
 }
 
 impl App {
@@ -147,6 +150,7 @@ impl App {
             current: Page::Dashboard,
             shared: AppShared::new(data_root),
             quit: false,
+            show_help: false,
         }
     }
 
@@ -211,6 +215,12 @@ impl App {
             return;
         }
 
+        // Help overlay: while it's open, ANY key dismisses it.
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+
         // When ANY form is currently in edit mode, the page swallows
         // every key — otherwise typing 'q' would quit the app
         // mid-symbol-name. Esc breaks out of edit mode (handled by the
@@ -227,6 +237,7 @@ impl App {
 
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('?') => self.show_help = true,
             KeyCode::Tab => self.next_page(),
             KeyCode::BackTab => self.prev_page(),
             KeyCode::Char('1') => self.current = Page::Dashboard,
@@ -359,6 +370,65 @@ fn render(area: Rect, buf: &mut ratatui::buffer::Buffer, app: &mut App) {
     render_top_bar(rows[0], buf, app);
     app.current.draw(rows[1], buf, &mut app.shared);
     render_status_bar(rows[2], buf, app);
+    if app.show_help {
+        render_help_overlay(rows[1], buf);
+    }
+}
+
+/// Centered keyboard-help overlay: every page's keys at a glance, so the user
+/// never has to guess. Toggled with `?`, dismissed by any key.
+fn render_help_overlay(area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    let w = ((area.width as f32 * 0.72) as u16).clamp(40, area.width);
+    let h = (Page::ALL.len() as u16 + 6).min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    Clear.render(popup, buf);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(Span::styled(
+            " KEYBOARD HELP — press any key to close ",
+            theme::caption_style().add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme::SURFACE_ALT))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(
+                "Global  ",
+                theme::accent_style().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Tab/Shift-Tab pages · 1-0 jump · R refresh · ? help · Q / Ctrl-C quit",
+                theme::muted_style(),
+            ),
+        ]),
+        Line::raw(""),
+    ];
+    for p in Page::ALL {
+        let hints: Vec<String> = p
+            .key_hints()
+            .iter()
+            .map(|(k, a)| format!("{k} {a}"))
+            .collect();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<10}", p.label()),
+                theme::accent_style().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(hints.join("  ·  "), theme::muted_style()),
+        ]));
+    }
+    Paragraph::new(lines).render(inner, buf);
 }
 
 fn render_top_bar(area: Rect, buf: &mut ratatui::buffer::Buffer, app: &mut App) {

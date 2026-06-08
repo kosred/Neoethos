@@ -66,7 +66,12 @@ impl Page {
     /// Bottom-of-screen keyboard hints, contextual to the page.
     pub fn key_hints(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Page::Dashboard => &[("Tab", "next page"), ("R", "refresh"), ("Q", "quit")],
+            Page::Dashboard => &[
+                ("?", "help"),
+                ("Tab", "next page"),
+                ("R", "refresh"),
+                ("Q", "quit"),
+            ],
             Page::Discover => &[
                 ("↑↓", "focus field"),
                 ("Enter", "edit"),
