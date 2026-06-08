@@ -147,8 +147,19 @@ pub struct GeneticSearchRuntimeOverrides {
     /// disables novelty scoring (default).
     pub novelty_weight: f64,
     /// Number of stagnant generations the search tolerates before
-    /// triggering early-stop or gate-relaxation. Always at least `1`.
+    /// triggering the SOFT diversity kick / gate-relaxation. Always at
+    /// least `1`. (The HARD early-stop is the separate, larger
+    /// `convergence_patience`.)
     pub stagnation_patience: usize,
+    /// Generations of no meaningful improvement before the GA HARD
+    /// early-stops the combo (returns the archive so the auto-loop advances
+    /// to the next symbol×timeframe). `0` disables. Distinct from — and
+    /// larger than — `stagnation_patience`, which only triggers the soft
+    /// diversity kick.
+    pub convergence_patience: usize,
+    /// Minimum top-fitness increase counted as an improvement when tracking
+    /// stagnation (replaces the legacy hard-coded `1e-12`).
+    pub min_improvement: f64,
     /// Optional explicit tournament size for tournament-based selection.
     /// `None` means "derive from population" (`max(population/12, 3)`).
     pub tournament_size_override: Option<usize>,
@@ -169,6 +180,8 @@ impl Default for GeneticSearchRuntimeOverrides {
             seed: None,
             novelty_weight: 0.0,
             stagnation_patience: 2,
+            convergence_patience: 250,
+            min_improvement: 1e-12,
             tournament_size_override: None,
             archive_cap_override: None,
             seen_retry_attempts: 16,
@@ -194,6 +207,13 @@ impl GeneticSearchRuntimeOverrides {
         }
         if let Some(patience) = env_usize_positive("NEOETHOS_BOT_PROP_STAGNATION_GENS") {
             overrides.stagnation_patience = patience;
+        }
+        // `env_u64` (not `_positive`) so `0` is honored as "disable early-stop".
+        if let Some(conv) = env_u64("NEOETHOS_BOT_PROP_CONVERGENCE_GENS") {
+            overrides.convergence_patience = conv as usize;
+        }
+        if let Some(min_imp) = env_f64_finite("NEOETHOS_BOT_PROP_MIN_IMPROVEMENT") {
+            overrides.min_improvement = min_imp;
         }
         if let Some(tournament) = env_usize_positive("NEOETHOS_BOT_PROP_TOURNAMENT_SIZE") {
             overrides.tournament_size_override = Some(tournament);
@@ -281,6 +301,8 @@ impl GeneticSearchRuntimeOverrides {
             seed: c.seed,
             novelty_weight: c.novelty_weight,
             stagnation_patience: c.stagnation_patience,
+            convergence_patience: c.convergence_patience,
+            min_improvement: c.min_improvement,
             tournament_size_override: c.tournament_size_override,
             archive_cap_override: c.archive_cap_override,
             seen_retry_attempts: c.seen_retry_attempts,
@@ -372,6 +394,25 @@ impl GeneticSearchRuntimeOverrides {
     /// of `1` so callers do not need to clamp themselves.
     pub fn effective_stagnation_patience(&self) -> usize {
         self.stagnation_patience.max(1)
+    }
+
+    /// Resolve the convergence early-stop patience. `0` means "disabled"
+    /// (the GA runs to the time / generation cap as before); any positive
+    /// value is the number of flat generations after which the combo is
+    /// hard-stopped.
+    pub fn effective_convergence_patience(&self) -> usize {
+        self.convergence_patience
+    }
+
+    /// Resolve the stagnation improvement epsilon, guarding against
+    /// non-finite / negative configured values (falls back to the legacy
+    /// `1e-12`).
+    pub fn effective_min_improvement(&self) -> f64 {
+        if self.min_improvement.is_finite() && self.min_improvement >= 0.0 {
+            self.min_improvement
+        } else {
+            1e-12
+        }
     }
 
     /// Resolve the legacy `seed: Option<u64>` field into the canonical
@@ -750,6 +791,8 @@ mod tests {
         assert_eq!(defaults.seed, None);
         assert!((defaults.novelty_weight - 0.0).abs() < 1e-9);
         assert_eq!(defaults.stagnation_patience, 2);
+        assert_eq!(defaults.convergence_patience, 250);
+        assert!((defaults.min_improvement - 1e-12).abs() < 1e-18);
         assert_eq!(defaults.tournament_size_override, None);
         assert_eq!(defaults.archive_cap_override, None);
         assert_eq!(defaults.seen_retry_attempts, 16);
@@ -828,6 +871,34 @@ mod tests {
             ..GeneticSearchRuntimeOverrides::default()
         };
         assert_eq!(zero.effective_stagnation_patience(), 1);
+    }
+
+    #[test]
+    fn effective_convergence_patience_and_min_improvement_resolve() {
+        let d = GeneticSearchRuntimeOverrides::default();
+        // Default-ON early-stop; legacy improvement epsilon preserved.
+        assert_eq!(d.effective_convergence_patience(), 250);
+        assert!((d.effective_min_improvement() - 1e-12).abs() < 1e-18);
+        // `0` disables the early-stop (unlike stagnation_patience, NOT floored to 1).
+        let off = GeneticSearchRuntimeOverrides {
+            convergence_patience: 0,
+            ..GeneticSearchRuntimeOverrides::default()
+        };
+        assert_eq!(off.effective_convergence_patience(), 0);
+        // Non-finite / negative min_improvement falls back to 1e-12 (fail-safe).
+        for bad in [-1.0_f64, f64::NAN, f64::INFINITY] {
+            let o = GeneticSearchRuntimeOverrides {
+                min_improvement: bad,
+                ..GeneticSearchRuntimeOverrides::default()
+            };
+            assert!((o.effective_min_improvement() - 1e-12).abs() < 1e-18);
+        }
+        // A valid positive epsilon is honored.
+        let custom = GeneticSearchRuntimeOverrides {
+            min_improvement: 1e-6,
+            ..GeneticSearchRuntimeOverrides::default()
+        };
+        assert!((custom.effective_min_improvement() - 1e-6).abs() < 1e-15);
     }
 
     #[test]

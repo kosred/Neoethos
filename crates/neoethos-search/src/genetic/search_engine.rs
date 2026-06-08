@@ -849,6 +849,11 @@ where
         tournament_size,
     );
     let stagnation_patience = genetic_runtime_overrides.effective_stagnation_patience();
+    // HARD convergence early-stop (separate from the soft `stagnation_patience`
+    // kick). `0` disables. `min_improvement` is the epsilon defining a
+    // "meaningful" top-fitness gain when counting stagnant generations.
+    let convergence_patience = genetic_runtime_overrides.effective_convergence_patience();
+    let min_improvement = genetic_runtime_overrides.effective_min_improvement();
 
     // Default OFF to avoid O(n²) cost; set > 0 only for large populations.
     let novelty_weight = genetic_runtime_overrides.novelty_weight;
@@ -859,6 +864,10 @@ where
     let started_at = Instant::now();
     let mut best_score_seen = f64::NEG_INFINITY;
     let mut stagnant_gens = 0usize;
+    // Fires the "gate fully relaxed" notice at most ONCE per search. The
+    // realized smc_gate_threshold is clamped to [gate_lo, gate_hi] regardless,
+    // so the previous per-generation warn was pure log flood (audit 2026-06-08).
+    let mut warned_gate_floor = false;
 
     if generations == 0 {
         let metrics = evaluate_genes_cached(features, ohlcv, &genes, &eval_cfg, &eval_cache)?;
@@ -873,27 +882,29 @@ where
         if stagnant_gens >= stagnation_patience {
             // F-036 fix (2026-05-25): the stagnation decrement subtracts
             // `gate_stagnation_step * stagnant_gens`. With a default
-            // step of 0.02 and `stagnant_gens` reaching e.g. 100, the
-            // gate would be driven to -2.0 — well below any sensible
-            // floor, effectively disabling the SMC gate. The downstream
-            // `.clamp(gate_lo, gate_hi)` clamps to `gate_lo` BUT that
-            // hides the runaway from the operator. We now apply an
-            // additional explicit clamp here so the visible value
-            // never goes below `gate_lo - 1.0` (one full step below
-            // the floor). Anything below that surfaces as a warning.
+            // step of 0.03 and `stagnant_gens` reaching the thousands the
+            // raw value balloons (e.g. -54), but the downstream
+            // `.clamp(gate_lo, gate_hi)` at line ~900 pins the REALIZED
+            // threshold to `gate_lo` regardless — so the runaway raw value
+            // has zero effect on which signals pass the gate. The previous
+            // code re-emitted a WARN every generation once past the floor,
+            // flooding the log on any stagnating combo (audit 2026-06-08).
+            // We now (a) bottom the raw value at `gate_lo - 1.0` so it never
+            // diverges, and (b) emit the diagnostic at most ONCE per search.
             gate_now -= gate_stagnation_step * (stagnant_gens as f32);
             let absolute_floor = gate_lo - 1.0;
             if gate_now < absolute_floor {
-                tracing::warn!(
-                    target: "neoethos_search::search_engine",
-                    generation,
-                    stagnant_gens,
-                    gate_lo,
-                    raw_gate = gate_now,
-                    "SMC stagnation decrement drove gate below absolute floor; \
-                     clamping to gate_lo - 1.0. Consider reducing \
-                     gate_stagnation_step or increasing stagnation_patience."
-                );
+                if !warned_gate_floor {
+                    warned_gate_floor = true;
+                    tracing::info!(
+                        target: "neoethos_search::search_engine",
+                        generation,
+                        stagnant_gens,
+                        gate_lo,
+                        "SMC gate fully relaxed under stagnation; realized \
+                         threshold stays clamped at gate_lo. Logged once per search."
+                    );
+                }
                 gate_now = absolute_floor;
             }
         }
@@ -983,7 +994,7 @@ where
         });
 
         let top_score = scored.first().map(|x| x.0).unwrap_or(f64::NEG_INFINITY);
-        if top_score > best_score_seen + 1e-12 {
+        if top_score > best_score_seen + min_improvement {
             best_score_seen = top_score;
             stagnant_gens = 0;
         } else {
@@ -1027,6 +1038,67 @@ where
             stagnant_gens,
             profitable_archive.len(),
         );
+
+        // Convergence early-stop (2026-06-09): once the search has been flat for
+        // `convergence_patience` generations the soft diversity kick (gate
+        // relaxation + raised immigrants + heavy hypermutation) has already had
+        // its chance to escape — further generations are wasted wall-clock.
+        // Returning the archive NOW lets the auto-loop advance to the next
+        // symbol×timeframe (coverage beats depth — search-depth-economics
+        // analysis: heavy TFs stagnate early and burn ~90% of the budget for
+        // nothing). `convergence_patience == 0` disables. Fail-loud: the reason
+        // is logged at INFO so this is never mistaken for a crash / silent
+        // truncation. Returns via the SAME archive-or-top_candidates logic as
+        // the wall-clock cap below so downstream finalize is byte-identical.
+        // Intentionally placed BEFORE the max_runtime check: if a generation is
+        // both converged and over-budget, both paths yield identical output and
+        // "converged" is the more informative reason — do not reorder.
+        if convergence_patience > 0 && stagnant_gens >= convergence_patience {
+            tracing::info!(
+                target: "neoethos_search::search_engine",
+                generation = generation + 1,
+                total_generations = generations,
+                best_score = best_score_seen,
+                stagnant_gens,
+                convergence_patience,
+                archive_len = profitable_archive.len(),
+                "GA converged: early-stopping this combo after no improvement for \
+                 convergence_patience generations; advancing to the next."
+            );
+            let best_return_count = population
+                .clamp(2, (population / 2).clamp(100, 500))
+                .min(scored.len());
+            let top_candidates: Vec<Gene> = scored
+                .iter()
+                .take(best_return_count)
+                .map(|(_, _, g, _)| g.clone())
+                .collect();
+            let top_metrics: Vec<[f64; 11]> = scored
+                .iter()
+                .take(best_return_count)
+                .map(|(_, _, _, m)| *m)
+                .collect();
+            seen_memory.flush();
+            if !profitable_archive.is_empty() {
+                profitable_archive.sort_by(|a, b| {
+                    b.1[0]
+                        .partial_cmp(&a.1[0])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.2.cmp(&b.2))
+                });
+                return Ok(SearchResult {
+                    genes: profitable_archive
+                        .iter()
+                        .map(|(g, _, _)| g.clone())
+                        .collect(),
+                    metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
+                });
+            }
+            return Ok(SearchResult {
+                genes: top_candidates,
+                metrics: top_metrics,
+            });
+        }
 
         if let Some(max_runtime) = max_runtime
             && started_at.elapsed() >= max_runtime

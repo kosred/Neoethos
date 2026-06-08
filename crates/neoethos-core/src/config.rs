@@ -701,6 +701,19 @@ pub struct SearchRuntimeConfig {
     pub immigrant_ratio: f64,
     pub survivor_fraction: f64,
     pub selection_temperature: f64,
+    /// Generations of no meaningful improvement before the GA hard
+    /// early-stops THIS combo and returns its archive, freeing the
+    /// wall-clock budget for the next symbol×timeframe. `0` disables the
+    /// early-stop (run to the time / generation cap as before). This is a
+    /// SEPARATE, larger threshold than `stagnation_patience`: the soft
+    /// diversity kick (gate relaxation + immigrants + hypermutation) is
+    /// attempted first; the hard stop fires only if the search is STILL
+    /// flat after `convergence_patience` generations.
+    pub convergence_patience: usize,
+    /// Minimum increase in top fitness counted as "improvement" when
+    /// tracking stagnation; a generation gaining less than this is
+    /// stagnant. Replaces the legacy hard-coded `1e-12`.
+    pub min_improvement: f64,
 }
 
 impl Default for SearchRuntimeConfig {
@@ -726,6 +739,8 @@ impl Default for SearchRuntimeConfig {
             immigrant_ratio: 0.25,
             survivor_fraction: 0.10,
             selection_temperature: 0.75,
+            convergence_patience: 250,
+            min_improvement: 1e-12,
         }
     }
 }
