@@ -149,19 +149,40 @@ pub fn genes_per_card(device_vram_gb: f64, shape: ComboShape, policy: &Admission
     (usable / per_gene).floor().max(0.0) as usize
 }
 
-/// Per-GPU usable VRAM in GB. Cards reporting `0` VRAM (e.g. some Vulkan
-/// adapters) are excluded — we cannot size a shard for them, so they are
-/// conservatively treated as absent rather than risking an OOM.
+/// Conservative VRAM (GB) assumed for a GPU that exists but doesn't report its
+/// memory (common on consumer Vulkan/wgpu adapters, which surface 0). The
+/// per-combo never-OOM auto-tuner (pool trim + gene-chunking) makes every combo
+/// fit any card regardless of size, so the scheduler only needs the card COUNT
+/// to dispatch one combo per card — the value here just has to be non-zero so
+/// `plan_combo` admits the combo instead of bailing.
+const ASSUMED_VRAM_GB: f64 = 8.0;
+
+/// Per-GPU usable VRAM in GB, one entry per detected card.
+///
+/// Prefer real reported VRAM (NVIDIA via nvidia-smi). When NO card reports its
+/// VRAM (consumer wgpu/Vulkan adapters surface 0) but GPUs DO exist, fall back
+/// to counting the devices with [`ASSUMED_VRAM_GB`] each — otherwise a consumer
+/// multi-GPU box would be seen as "0 cards" and run everything sequentially.
+/// Since the never-OOM work bounds every combo to fit any card, the scheduler
+/// only needs the count, not the exact size.
 fn gpu_device_vrams(hw: &HardwareProfile) -> Vec<f64> {
     let from_list: Vec<f64> = hw.gpu_mem_gb.iter().copied().filter(|m| *m > 0.0).collect();
     if !from_list.is_empty() {
         return from_list;
     }
-    hw.accelerator_devices
+    let from_accel: Vec<f64> = hw
+        .accelerator_devices
         .iter()
         .filter(|d| d.memory_gb > 0.0)
         .map(|d| d.memory_gb)
-        .collect()
+        .collect();
+    if !from_accel.is_empty() {
+        return from_accel;
+    }
+    // No card reports VRAM. Count the devices that exist (by accelerator list or
+    // num_gpus) and assume a conservative size — never-OOM handles the fitting.
+    let device_count = hw.accelerator_devices.len().max(hw.num_gpus);
+    vec![ASSUMED_VRAM_GB; device_count]
 }
 
 fn ceil_div(a: usize, b: usize) -> usize {
@@ -630,6 +651,27 @@ mod tests {
         let mut cards: Vec<usize> = started.iter().flat_map(|a| a.card_ids.clone()).collect();
         cards.sort_unstable();
         assert_eq!(cards, (0..8).collect::<Vec<_>>());
+        assert_eq!(sched.free_cards(), 0);
+    }
+
+    #[test]
+    fn consumer_wgpu_zero_vram_box_counts_cards_not_serialize() {
+        // Consumer Vulkan/wgpu adapters report 0 VRAM but the GPUs exist
+        // (num_gpus). never-OOM makes every combo fit any card, so the scheduler
+        // must COUNT them — otherwise a 2-GPU consumer box would run everything
+        // on "0 cards" sequentially (the bug this fixes).
+        let combos = vec![
+            mk_item("A", ComboClass::Light, 1, 1.0),
+            mk_item("B", ComboClass::Light, 1, 1.0),
+        ];
+        let mut sched = WorkScheduler::new(
+            combos,
+            &hw(8, 32.0, &[0.0, 0.0]),
+            &AdmissionPolicy::default(),
+        );
+        assert_eq!(sched.total_cards(), 2, "two 0-VRAM GPUs must count as 2 cards");
+        let started = sched.poll();
+        assert_eq!(started.len(), 2, "both combos dispatched across the 2 cards");
         assert_eq!(sched.free_cards(), 0);
     }
 
