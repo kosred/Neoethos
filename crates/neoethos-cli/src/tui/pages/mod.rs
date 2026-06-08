@@ -82,7 +82,12 @@ impl Page {
                 ("Enter", "details"),
                 ("Q", "quit"),
             ],
-            Page::Symbols => &[("Tab", "next page"), ("↑↓", "select"), ("Q", "quit")],
+            Page::Symbols => &[
+                ("E", "edit source"),
+                ("I", "import data"),
+                ("Tab", "page"),
+                ("Q", "quit"),
+            ],
             Page::Train => &[
                 ("↑↓", "focus field"),
                 ("Enter", "edit"),
@@ -135,6 +140,7 @@ impl Page {
             Page::AutoLoop => auto_loop::handle_key(code, shared),
             Page::Chart => chart::handle_key(code, shared),
             Page::Config => config_view::handle_key(code, shared),
+            Page::Symbols => symbols::handle_key(code, shared),
             _ => false,
         }
     }

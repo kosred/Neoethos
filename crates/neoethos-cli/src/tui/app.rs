@@ -80,6 +80,9 @@ pub struct AppShared {
     /// Editable Config page form — loaded from the on-disk Settings, saved
     /// back to config.yaml so the user can change core settings from the TUI.
     pub config_form: FormState,
+    /// Single-field form on the Symbols page: a source path to import data from
+    /// (CSV/Parquet/Vortex/… → canonical data/ layout) without leaving the TUI.
+    pub import_form: FormState,
 }
 
 impl AppShared {
@@ -98,6 +101,11 @@ impl AppShared {
             train_form: make_train_form(&root_str),
             chart_state,
             config_form: crate::tui::pages::config_view::make_config_form(),
+            import_form: FormState::new(vec![crate::tui::form::Field::new(
+                "Import source",
+                "",
+                "Folder/file to import (CSV/TSV/JSON/Parquet/Vortex) → data/ layout",
+            )]),
         }
     }
 
@@ -202,7 +210,8 @@ impl App {
         // outside edit mode the global shortcuts apply.
         let editing = self.shared.discover_form.editing
             || self.shared.train_form.editing
-            || self.shared.config_form.editing;
+            || self.shared.config_form.editing
+            || self.shared.import_form.editing;
         if editing {
             let _ = self.current.handle_key(code, &mut self.shared);
             return;
