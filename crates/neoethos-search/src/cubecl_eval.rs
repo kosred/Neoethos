@@ -1073,6 +1073,55 @@ fn backtest_gene_batch(n_genes: usize, n_samples: usize) -> usize {
     (gpu_buffer_elem_cap() / n_samples.max(1)).clamp(1, n_genes.max(1))
 }
 
+/// Conservative cap (bytes) on the cubecl GPU memory pool's RESERVED footprint.
+/// cubecl's wgpu pool is grow-only: it recycles freed buffers for reuse and does
+/// NOT return them to the driver, so across thousands of kernel launches (many
+/// windows × batches × generations) the reserved high-water mark climbs until it
+/// fills the card — this is why a 60k-row H1 run peaked at ~15GB on a 16GB card
+/// even though the live working set is only ~250MB. We probe the pool with
+/// `ComputeClient::memory_usage()` and, when `bytes_reserved` exceeds this cap,
+/// ask cubecl to release what it can via `memory_cleanup()`. The default is
+/// deliberately small so the engine NEVER OOMs on a modest discrete GPU
+/// regardless of how large a population/generations the user requests; the
+/// startup auto-tuner raises it on cards with more headroom. Override via
+/// `NEOETHOS_BOT_SEARCH_VRAM_BUDGET_MB`.
+fn gpu_pool_budget_bytes() -> u64 {
+    const DEFAULT_MB: u64 = 3072;
+    std::env::var("NEOETHOS_BOT_SEARCH_VRAM_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|m| *m > 0)
+        .unwrap_or(DEFAULT_MB)
+        .saturating_mul(1024 * 1024)
+}
+
+/// Probe the cubecl memory pool and, if its RESERVED footprint exceeds the
+/// budget, ask cubecl to trim it (`memory_cleanup()` →
+/// `pool.cleanup(explicit=true)` + `storage.flush()`). This bounds the otherwise
+/// grow-only wgpu pool high-water mark so peak VRAM tracks the live working set,
+/// not the run length. Cheap when under budget (just a usage probe) and never
+/// fails the run — a probe error is ignored (CPU/GPU correctness is unaffected).
+/// Set `NEOETHOS_BOT_SEARCH_VRAM_LOG=1` to log the pool footprint at each check.
+fn trim_gpu_pool_if_over_budget<R: Runtime>(client: &ComputeClient<R>) {
+    let usage = match client.memory_usage() {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    let budget = gpu_pool_budget_bytes();
+    if std::env::var("NEOETHOS_BOT_SEARCH_VRAM_LOG").is_ok() {
+        tracing::info!(
+            target: "neoethos_search::cubecl_eval",
+            reserved_mb = usage.bytes_reserved / (1024 * 1024),
+            in_use_mb = usage.bytes_in_use / (1024 * 1024),
+            budget_mb = budget / (1024 * 1024),
+            "gpu pool footprint"
+        );
+    }
+    if usage.bytes_reserved > budget {
+        client.memory_cleanup();
+    }
+}
+
 /// Gather indicator columns `[s0, s1)` out of the indicator-major flat matrix
 /// (`[n_indicators × n_samples]`, indexed `idx*n_samples+s`) into a contiguous
 /// `[n_indicators × (s1-s0)]` window the kernel indexes as `idx*W + (s-s0)`.
@@ -1147,6 +1196,10 @@ where
             conf[dst..dst + wlen].copy_from_slice(&conf_w[src..src + wlen]);
         }
         s0 = s1;
+        // Bound the pool across the (potentially thousands of) sample-windows a
+        // huge-row TF sweeps — without this the reserved high-water climbs
+        // through the whole signal-synth before the backtest even starts.
+        trim_gpu_pool_if_over_budget(client);
     }
     Ok((signals, conf))
 }
@@ -1644,6 +1697,9 @@ pub(crate) fn try_evaluate_population_cuda(
     )?;
 
     let client = create_gpu_client(device_override)?;
+    // Release the device buffers the (windowed) signal-synth phase reserved
+    // before the backtest allocates its own — bounds the grow-only pool.
+    trim_gpu_pool_if_over_budget(&client);
     let close_pips = normalize_prices_to_pips(close, settings.pip_value);
     let high_pips = normalize_prices_to_pips(high, settings.pip_value);
     let low_pips = normalize_prices_to_pips(low, settings.pip_value);
@@ -1701,6 +1757,9 @@ pub(crate) fn try_evaluate_population_cuda(
         month_counts.extend_from_slice(&mc);
         month_start_eq_flat.extend_from_slice(&mse);
         g0 = g1;
+        // Trim the pool between gene-batches so a huge-row TF (many batches per
+        // generation) can't let the reserved high-water mark climb mid-eval.
+        trim_gpu_pool_if_over_budget(&client);
     }
 
     let mut results = Vec::with_capacity(n_genes);
