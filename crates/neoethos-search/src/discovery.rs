@@ -2305,6 +2305,27 @@ where
     // Capture names after prefilter — gene indices refer to this list.
     let effective_feature_names = features.names.clone();
 
+    // Diagnostic (2026-06-08): surface the per-timeframe coverage of the
+    // prefiltered cube so a "multi-TF features never reached the GA"
+    // regression is visible at a glance instead of hiding behind a flat
+    // `cols=N`. base = unprefixed/regime; each higher TF shows its survivor
+    // count. A higher TF reading 0 here means the warm-start can't use it.
+    {
+        let mut by_tf: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for name in &effective_feature_names {
+            let key = timeframe_group(name)
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "base".to_string());
+            *by_tf.entry(key).or_insert(0) += 1;
+        }
+        tracing::info!(
+            target: "neoethos_search::discovery",
+            total = effective_feature_names.len(),
+            coverage = ?by_tf,
+            "prefilter timeframe coverage (base = unprefixed/regime)"
+        );
+    }
+
     // Search-memory + weekly-refresh (2026-06-06): BEFORE the GA starts, seed the
     // seen-signature memory with the hashes recorded in the prior run's ledger so
     // the engine SKIPS re-discovering strategies it already found — each weekly
@@ -2630,6 +2651,17 @@ fn prefilter_features(
             if kept.insert(idx) {
                 *count += 1;
             }
+        }
+        // Force-keep the EXACT features the multi-TF seed templates reference,
+        // resolved by the templates' own role logic against the full
+        // pre-prefilter names. The per-TF correlation quota above guarantees
+        // general multi-TF REPRESENTATION, but the warm-start templates need
+        // SPECIFIC slow families (ema/rsi/macd/atr) per TF that rarely top the
+        // 1-bar-forward correlation ranking — without this the templates still
+        // resolve <2 roles and the GA cold-starts random. Single source of
+        // truth: the templates themselves (no duplicated family list).
+        for idx in crate::genetic::seed_templates::template_feature_indices(&features.names) {
+            kept.insert(idx);
         }
         keep_indices = kept.into_iter().collect();
     }

@@ -304,6 +304,33 @@ fn build_variant(
 /// - Indices are always `< n_features`; no out-of-bounds access.
 /// - Templates with fewer than 2 resolvable roles are skipped (returns
 ///   fewer than `count` rather than producing nonsense).
+/// Collect the feature indices the professional seed templates would
+/// reference against `feature_names`, resolved by the SAME role logic the
+/// templates use ([`resolve_role`] = primary keyword, then family fallback,
+/// matched case-insensitively together with the TF prefix), deduplicated.
+///
+/// The feature prefilter calls this to FORCE-KEEP exactly the multi-TF
+/// indicators the warm-start needs. Otherwise the correlation top-K drops
+/// every slow higher-TF `ema`/`rsi`/`macd`/`atr` (their 1-bar-forward corr is
+/// ~0 by construction), the templates resolve fewer than 2 roles, and the GA
+/// falls back to a pure-random cold start — wasting the entire multi-TF cube.
+/// Resolving here against the FULL pre-prefilter names keeps the prefilter and
+/// the warm-start in lockstep without duplicating the template family list.
+pub fn template_feature_indices(feature_names: &[String]) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for template in TEMPLATES.iter() {
+        for role in template.roles.iter() {
+            if let Some(idx) = resolve_role(feature_names, role) {
+                if seen.insert(idx) {
+                    out.push(idx);
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn seed_professional_templates(
     count: usize,
     feature_names: &[String],
@@ -406,5 +433,49 @@ mod tests {
                 assert!(*idx < names.len());
             }
         }
+    }
+
+    #[test]
+    fn template_feature_indices_resolves_referenced_features() {
+        // The prefilter force-keeps these so the warm-start can resolve.
+        let names: Vec<String> = vec![
+            "ema_50", "rsi", "atr",
+            "h4_ema_21", "h4_macd",
+            "h1_rsi", "h1_macd",
+            "m15_rsi", "m15_adx",
+            // A column the templates never reference — must NOT be returned.
+            "h4_returns_zscore",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let idxs = template_feature_indices(&names);
+        assert!(!idxs.is_empty(), "templates should resolve some features");
+        // Deduplicated.
+        let mut sorted = idxs.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), idxs.len(), "indices must be deduplicated");
+        // The unreferenced column is excluded.
+        let zscore_idx = names.iter().position(|n| n == "h4_returns_zscore").unwrap();
+        assert!(
+            !idxs.contains(&zscore_idx),
+            "unreferenced feature must not be force-kept"
+        );
+        // A higher-TF family the templates DO reference is included.
+        let h4_macd_idx = names.iter().position(|n| n == "h4_macd").unwrap();
+        assert!(
+            idxs.contains(&h4_macd_idx),
+            "h4_macd is referenced by the momentum template and must be kept"
+        );
+    }
+
+    #[test]
+    fn template_feature_indices_empty_for_unrelated_names() {
+        let names: Vec<String> = vec!["foo", "bar", "baz_qux"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(template_feature_indices(&names).is_empty());
     }
 }
