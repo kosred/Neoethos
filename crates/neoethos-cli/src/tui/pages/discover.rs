@@ -176,7 +176,7 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         let (text, fg, bg) = if job_alive {
             (
                 format!(
-                    "  ⏳ Running for {}s — see LIVE LOG on the right  ",
+                    "  ⏳ Running for {}s — press [K] to Stop · LIVE LOG →  ",
                     shared
                         .jobs
                         .latest_for(JOB_LABEL_PREFIX)
@@ -228,6 +228,7 @@ fn render_status(area: Rect, buf: &mut Buffer, shared: &AppShared) {
                 JobStatus::Running => "RUNNING",
                 JobStatus::Completed => "COMPLETED",
                 JobStatus::Failed => "FAILED",
+                JobStatus::Stopped => "STOPPED",
             },
             j.elapsed_seconds()
         ),
@@ -342,6 +343,14 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
         }
         KeyCode::Char('l') | KeyCode::Char('L') => {
             launch_now(shared);
+            true
+        }
+        KeyCode::Char('K') => {
+            shared.status = if shared.jobs.stop_latest(JOB_LABEL_PREFIX) {
+                "Stopping discovery…".to_string()
+            } else {
+                "No running discovery to stop".to_string()
+            };
             true
         }
         _ => false,

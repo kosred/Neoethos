@@ -137,7 +137,7 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         let (text, fg, bg) = if job_alive {
             (
                 format!(
-                    "  ⏳ Training for {}s — see live log on the right  ",
+                    "  ⏳ Training for {}s — press [K] to Stop · live log →  ",
                     shared
                         .jobs
                         .latest_for(JOB_LABEL_PREFIX)
@@ -189,6 +189,7 @@ fn render_live_log(area: Rect, buf: &mut Buffer, shared: &AppShared) {
                 JobStatus::Running => "RUNNING",
                 JobStatus::Completed => "COMPLETED",
                 JobStatus::Failed => "FAILED",
+                JobStatus::Stopped => "STOPPED",
             },
             j.elapsed_seconds()
         ),
@@ -331,6 +332,14 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
         }
         KeyCode::Char('l') | KeyCode::Char('L') => {
             launch_now(shared);
+            true
+        }
+        KeyCode::Char('K') => {
+            shared.status = if shared.jobs.stop_latest(JOB_LABEL_PREFIX) {
+                "Stopping training…".to_string()
+            } else {
+                "No running training to stop".to_string()
+            };
             true
         }
         _ => false,

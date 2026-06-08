@@ -167,6 +167,7 @@ fn render_state(area: Rect, buf: &mut Buffer, shared: &AppShared) {
                     JobStatus::Running => "RUNNING",
                     JobStatus::Completed => "COMPLETED",
                     JobStatus::Failed => "FAILED",
+                    JobStatus::Stopped => "STOPPED",
                 },
                 job.elapsed_seconds()
             ),
