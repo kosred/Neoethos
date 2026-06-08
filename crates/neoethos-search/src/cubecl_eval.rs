@@ -1095,6 +1095,28 @@ fn gpu_pool_budget_bytes() -> u64 {
         .saturating_mul(1024 * 1024)
 }
 
+/// How many genes to evaluate per chunk so the host-side signal + confidence
+/// assembly (`chunk × n_samples × 8B`) stays within a budget. This buffer is
+/// the ONLY population-dependent host allocation in the GPU path (the indicator
+/// matrix is data-sized, not population-sized), so chunking it makes peak host
+/// RAM a function of (budget, rows) and NOT of the requested population: a user
+/// can ask for an enormous population and it streams through in chunks instead
+/// of OOMing. Genes are evaluated independently, so a chunk split is numerically
+/// identical to one pass (CPU↔GPU parity preserved). Default budget 2048MB;
+/// override `NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB`; the startup auto-tuner lowers
+/// it on low-RAM boxes.
+fn gene_chunk_size(n_genes: usize, n_samples: usize) -> usize {
+    const DEFAULT_MB: u64 = 2048;
+    let budget = std::env::var("NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|m| *m > 0)
+        .unwrap_or(DEFAULT_MB)
+        .saturating_mul(1024 * 1024);
+    let per_gene = (n_samples as u64).saturating_mul(8).max(1); // i32 signal + f32 conf
+    ((budget / per_gene) as usize).clamp(1, n_genes.max(1))
+}
+
 /// Probe the cubecl memory pool and, if its RESERVED footprint exceeds the
 /// budget, ask cubecl to trim it (`memory_cleanup()` →
 /// `pool.cleanup(explicit=true)` + `storage.flush()`). This bounds the otherwise
@@ -1206,7 +1228,23 @@ where
 
 #[cfg(test)]
 mod window_tests {
-    use super::{backtest_gene_batch, gather_indicator_window, signal_window_size};
+    use super::{backtest_gene_batch, gather_indicator_window, gene_chunk_size, signal_window_size};
+
+    #[test]
+    fn gene_chunk_size_bounds_host_buffer_and_never_zero() {
+        // Default budget (2048MB, no env override in the test environment).
+        // Tiny rows -> whole population fits one chunk.
+        assert_eq!(gene_chunk_size(200, 1), 200);
+        // M1-like 6M rows: 8B/gene/sample -> ~42 genes/chunk, so the host
+        // signal+conf buffer stays ~2GB regardless of how big the population is.
+        let c = gene_chunk_size(200, 6_000_000);
+        assert!((30..=60).contains(&c), "M1 chunk = {c}");
+        // Absurd rows -> clamps to >=1 (never 0 -> no div-by-zero and the
+        // caller's `while c0 < n_genes` always advances). The never-OOM floor.
+        assert_eq!(gene_chunk_size(1_000_000, 2_000_000_000), 1);
+        // Chunk never exceeds the population.
+        assert_eq!(gene_chunk_size(50, 1), 50);
+    }
 
     #[test]
     fn gather_indicator_window_extracts_strided_columns() {
@@ -1682,24 +1720,9 @@ pub(crate) fn try_evaluate_population_cuda(
         bail!("cuda population evaluate path received inconsistent dimensions");
     }
 
-    let (signals_flat, confidences_flat) = try_generate_signal_flat_cuda(
-        indicators,
-        gene_offsets,
-        gene_indices,
-        gene_weights,
-        long_thr,
-        short_thr,
-        smc_data,
-        gene_smc_flags,
-        gate_threshold,
-        smc_weights,
-        device_override,
-    )?;
-
     let client = create_gpu_client(device_override)?;
-    // Release the device buffers the (windowed) signal-synth phase reserved
-    // before the backtest allocates its own — bounds the grow-only pool.
-    trim_gpu_pool_if_over_budget(&client);
+    // Per-SAMPLE host vecs — shared across every gene, so compute once outside
+    // the gene-chunk loop (they are data-sized, not population-sized).
     let close_pips = normalize_prices_to_pips(close, settings.pip_value);
     let high_pips = normalize_prices_to_pips(high, settings.pip_value);
     let low_pips = normalize_prices_to_pips(low, settings.pip_value);
@@ -1712,54 +1735,88 @@ pub(crate) fn try_evaluate_population_cuda(
         .iter()
         .map(|value| saturating_i32(*value))
         .collect::<Vec<_>>();
-    let sl_pips = sl_pips
+    let sl_pips_all = sl_pips
         .iter()
         .map(|value| *value as f32)
         .collect::<Vec<_>>();
-    let tp_pips = tp_pips
+    let tp_pips_all = tp_pips
         .iter()
         .map(|value| *value as f32)
         .collect::<Vec<_>>();
     let month_capacity = settings.month_capacity();
 
-    // Gene-batch the backtest so each per-gene signal buffer (`B × n_samples`)
-    // stays under the wgpu storage-buffer cap — huge-row TFs (M1/M3) no longer
-    // OOM. Each gene is evaluated WHOLE-SERIES (the kernel is unchanged), so the
-    // concatenated result is identical to a single launch — CPU↔GPU parity holds.
     let mut metrics_flat: Vec<f32> = Vec::with_capacity(n_genes * BACKTEST_CORE_METRIC_WIDTH);
     let mut trade_counts: Vec<i32> = Vec::with_capacity(n_genes);
     let mut monthly_flat: Vec<f32> = Vec::with_capacity(n_genes * month_capacity);
     let mut month_counts: Vec<i32> = Vec::with_capacity(n_genes);
     let mut month_start_eq_flat: Vec<f32> = Vec::with_capacity(n_genes * month_capacity);
-    let batch = backtest_gene_batch(n_genes, n_samples);
-    let mut g0 = 0usize;
-    while g0 < n_genes {
-        let g1 = (g0 + batch).min(n_genes);
-        let (m, tc, mo, mc, mse) = launch_backtest_kernel(
-            &client,
-            &close_pips,
-            &high_pips,
-            &low_pips,
-            &signals_flat[g0 * n_samples..g1 * n_samples],
-            &confidences_flat[g0 * n_samples..g1 * n_samples],
-            &timestamp_deltas_ms,
-            use_timestamps,
-            &month_idx,
-            &day_idx,
-            &sl_pips[g0..g1],
-            &tp_pips[g0..g1],
-            settings,
-            month_capacity,
+
+    // Outer GENE-CHUNK loop: the per-gene signal + confidence host buffers
+    // (`chunk × n_samples × 8B`) are the only POPULATION-dependent host
+    // allocation, so synthesising signals one gene-chunk at a time bounds peak
+    // host RAM to ~`gene_chunk_size × n_samples × 8B` regardless of how large a
+    // population the user requested (never-OOM invariant: memory = f(hardware),
+    // not f(params)). Inside each chunk the backtest gene-batches so each device
+    // signal buffer (`B × n_samples`) stays under the wgpu storage-buffer cap.
+    // Genes are independent + concatenated in gene order, so this is numerically
+    // identical to a single pass — CPU↔GPU parity holds.
+    let g_chunk = gene_chunk_size(n_genes, n_samples);
+    let mut c0 = 0usize;
+    while c0 < n_genes {
+        let c1 = (c0 + g_chunk).min(n_genes);
+        // Slice + rebase the CSR gene arrays for the chunk [c0, c1).
+        let idx0 = gene_offsets[c0] as usize;
+        let idx1 = gene_offsets[c1] as usize;
+        let base = gene_offsets[c0];
+        let chunk_offsets: Vec<i32> = gene_offsets[c0..=c1].iter().map(|o| *o - base).collect();
+        let (signals_flat, confidences_flat) = try_generate_signal_flat_cuda(
+            indicators,
+            &chunk_offsets,
+            &gene_indices[idx0..idx1],
+            &gene_weights[idx0..idx1],
+            &long_thr[c0..c1],
+            &short_thr[c0..c1],
+            smc_data,
+            &gene_smc_flags[c0..c1],
+            gate_threshold,
+            smc_weights,
+            device_override,
         )?;
-        metrics_flat.extend_from_slice(&m);
-        trade_counts.extend_from_slice(&tc);
-        monthly_flat.extend_from_slice(&mo);
-        month_counts.extend_from_slice(&mc);
-        month_start_eq_flat.extend_from_slice(&mse);
-        g0 = g1;
-        // Trim the pool between gene-batches so a huge-row TF (many batches per
-        // generation) can't let the reserved high-water mark climb mid-eval.
+        // Release the signal-synth device buffers before the backtest allocates.
         trim_gpu_pool_if_over_budget(&client);
+
+        let chunk_n = c1 - c0;
+        let batch = backtest_gene_batch(chunk_n, n_samples);
+        let mut g0 = 0usize;
+        while g0 < chunk_n {
+            let g1 = (g0 + batch).min(chunk_n);
+            let (m, tc, mo, mc, mse) = launch_backtest_kernel(
+                &client,
+                &close_pips,
+                &high_pips,
+                &low_pips,
+                &signals_flat[g0 * n_samples..g1 * n_samples],
+                &confidences_flat[g0 * n_samples..g1 * n_samples],
+                &timestamp_deltas_ms,
+                use_timestamps,
+                &month_idx,
+                &day_idx,
+                &sl_pips_all[c0 + g0..c0 + g1],
+                &tp_pips_all[c0 + g0..c0 + g1],
+                settings,
+                month_capacity,
+            )?;
+            metrics_flat.extend_from_slice(&m);
+            trade_counts.extend_from_slice(&tc);
+            monthly_flat.extend_from_slice(&mo);
+            month_counts.extend_from_slice(&mc);
+            month_start_eq_flat.extend_from_slice(&mse);
+            g0 = g1;
+            // Trim the pool between gene-batches so a huge-row TF (many batches
+            // per chunk) can't let the reserved high-water mark climb mid-eval.
+            trim_gpu_pool_if_over_budget(&client);
+        }
+        c0 = c1;
     }
 
     let mut results = Vec::with_capacity(n_genes);
