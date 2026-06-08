@@ -1042,6 +1042,150 @@ fn validate_signal_kernel_inputs<F>(
 // `F` first so callers can `launch_signal_kernel::<f32>(&client, ...)` and have
 // `R` inferred from the client (turbofish is positional; the runtime is never
 // named at the call sites).
+/// Conservative max ELEMENTS per single GPU storage buffer. wgpu caps a storage
+/// buffer at `max_storage_buffer_binding_size` (WebGPU default 128MB); exceeding
+/// it raises "wgpu error: Out of Memory". We stay under it and window/batch the
+/// GA's big buffers (the indicators matrix and the per-gene signal series) so
+/// even huge-row timeframes (M1: ~5.3M rows) run on the GPU instead of falling
+/// back to CPU. Overridable per box via `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB`
+/// (raise it where the device's real limit is higher than the 128MB default).
+fn gpu_buffer_elem_cap() -> usize {
+    const DEFAULT_MB: usize = 120;
+    let mb = std::env::var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|m| *m > 0)
+        .unwrap_or(DEFAULT_MB);
+    (mb.saturating_mul(1024 * 1024) / 4).max(1) // 4 bytes/element (i32/f32)
+}
+
+/// SAMPLE columns the signal-synth kernel can process in one launch so no buffer
+/// exceeds the cap. Per-window buffers: indicators window (`n_indicators × W`),
+/// signal/confidence outputs (`n_genes × W`), SMC window (`W × SMC_WIDTH`).
+fn signal_window_size(n_indicators: usize, n_genes: usize, n_samples: usize) -> usize {
+    let per_sample = n_indicators.max(n_genes).max(SMC_WIDTH).max(1);
+    (gpu_buffer_elem_cap() / per_sample).clamp(1, n_samples.max(1))
+}
+
+/// GENES the backtest kernel can process in one launch — its signal buffer is
+/// `B × n_samples`, so `B = cap / n_samples`.
+fn backtest_gene_batch(n_genes: usize, n_samples: usize) -> usize {
+    (gpu_buffer_elem_cap() / n_samples.max(1)).clamp(1, n_genes.max(1))
+}
+
+/// Gather indicator columns `[s0, s1)` out of the indicator-major flat matrix
+/// (`[n_indicators × n_samples]`, indexed `idx*n_samples+s`) into a contiguous
+/// `[n_indicators × (s1-s0)]` window the kernel indexes as `idx*W + (s-s0)`.
+fn gather_indicator_window<F: Copy>(
+    indicators_flat: &[F],
+    n_indicators: usize,
+    n_samples: usize,
+    s0: usize,
+    s1: usize,
+) -> Vec<F> {
+    let wlen = s1 - s0;
+    let mut out = Vec::with_capacity(n_indicators.saturating_mul(wlen));
+    for idx in 0..n_indicators {
+        let base = idx * n_samples;
+        out.extend_from_slice(&indicators_flat[base + s0..base + s1]);
+    }
+    out
+}
+
+/// Run the (stateless, per-sample) signal-synth kernel over SAMPLE-windows so the
+/// indicators/signal buffers stay under the wgpu cap, assembling the full
+/// `[n_genes × n_samples]` signal + confidence series on the host. Windowing is
+/// exact (each sample is independent of the others) so the result is identical
+/// to a single whole-series launch — CPU↔GPU parity is preserved.
+fn windowed_signal_synth<F, R: Runtime>(
+    client: &ComputeClient<R>,
+    indicators_flat: &[F],
+    n_indicators: usize,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[F],
+    long_thr: &[F],
+    short_thr: &[F],
+    smc_data_flat: &[i32],
+    gene_smc_flags_flat: &[i32],
+    smc_weights: &[F],
+    n_genes: usize,
+    n_samples: usize,
+    gate_threshold: F,
+) -> Result<(Vec<i32>, Vec<f32>)>
+where
+    F: Float + CubeElement,
+{
+    let w = signal_window_size(n_indicators, n_genes, n_samples);
+    let mut signals = vec![0i32; n_genes.saturating_mul(n_samples)];
+    let mut conf = vec![0f32; n_genes.saturating_mul(n_samples)];
+    let mut s0 = 0;
+    while s0 < n_samples {
+        let s1 = (s0 + w).min(n_samples);
+        let wlen = s1 - s0;
+        let ind_window = gather_indicator_window(indicators_flat, n_indicators, n_samples, s0, s1);
+        let smc_window = &smc_data_flat[s0 * SMC_WIDTH..s1 * SMC_WIDTH];
+        let (sig_w, conf_w) = launch_signal_kernel::<F, R>(
+            client,
+            &ind_window,
+            gene_offsets,
+            gene_indices,
+            gene_weights,
+            long_thr,
+            short_thr,
+            smc_window,
+            gene_smc_flags_flat,
+            smc_weights,
+            n_genes,
+            wlen,
+            gate_threshold,
+        )?;
+        for gene in 0..n_genes {
+            let dst = gene * n_samples + s0;
+            let src = gene * wlen;
+            signals[dst..dst + wlen].copy_from_slice(&sig_w[src..src + wlen]);
+            conf[dst..dst + wlen].copy_from_slice(&conf_w[src..src + wlen]);
+        }
+        s0 = s1;
+    }
+    Ok((signals, conf))
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::{backtest_gene_batch, gather_indicator_window, signal_window_size};
+
+    #[test]
+    fn gather_indicator_window_extracts_strided_columns() {
+        // 3 indicators × 5 samples, indicator-major flat: idx*5 + s.
+        let flat: Vec<i32> = (0..15).collect(); // ind0=[0..5] ind1=[5..10] ind2=[10..15]
+        // Window samples [1, 4) -> each indicator's [1,2,3] offset.
+        let w = gather_indicator_window(&flat, 3, 5, 1, 4);
+        assert_eq!(w, vec![1, 2, 3, 6, 7, 8, 11, 12, 13]);
+        // Full window == original.
+        assert_eq!(gather_indicator_window(&flat, 3, 5, 0, 5), flat);
+    }
+
+    #[test]
+    fn small_combo_is_one_window_and_one_batch() {
+        // n_samples small => the whole series fits one window / one batch.
+        assert_eq!(signal_window_size(64, 50, 10), 10);
+        assert_eq!(backtest_gene_batch(200, 100), 200);
+    }
+
+    #[test]
+    fn huge_combo_splits_into_multiple_windows_and_batches() {
+        // M1-like: 5.27M samples => sub-series windows + small gene batches.
+        let w = signal_window_size(64, 50, 5_270_000);
+        assert!(w >= 1 && w < 5_270_000, "got {w}");
+        let b = backtest_gene_batch(200, 5_270_000);
+        assert!(b >= 1 && b < 200, "got {b}");
+        // The full series is covered by an integer number of windows.
+        let windows = 5_270_000usize.div_ceil(w);
+        assert!(windows >= 2);
+    }
+}
+
 fn launch_signal_kernel<F, R: Runtime>(
     client: &ComputeClient<R>,
     indicators_flat: &[F],
@@ -1183,6 +1327,7 @@ fn try_generate_signal_flat_cuda(
     let indicators_flat = indicators.iter().copied().collect::<Vec<_>>();
     let smc_data_flat = flatten_i32_rows(smc_data);
     let gene_smc_flags_flat = flatten_i32_flags(gene_smc_flags);
+    let n_indicators = indicators.nrows();
     let precision = requested_eval_precision();
 
     if prefers_bf16(precision) {
@@ -1207,9 +1352,10 @@ fn try_generate_signal_flat_cuda(
             .map(|value| bf16::from_f32(*value))
             .collect::<Vec<_>>();
 
-        match launch_signal_kernel::<bf16, _>(
+        match windowed_signal_synth::<bf16, _>(
             &client,
             &indicators_bf16,
+            n_indicators,
             gene_offsets,
             gene_indices,
             &gene_weights_bf16,
@@ -1231,9 +1377,10 @@ fn try_generate_signal_flat_cuda(
         }
     }
 
-    launch_signal_kernel::<f32, _>(
+    windowed_signal_synth::<f32, _>(
         &client,
         &indicators_flat,
+        n_indicators,
         gene_offsets,
         gene_indices,
         gene_weights,
@@ -1519,23 +1666,42 @@ pub(crate) fn try_evaluate_population_cuda(
         .collect::<Vec<_>>();
     let month_capacity = settings.month_capacity();
 
-    let (metrics_flat, trade_counts, monthly_flat, month_counts, month_start_eq_flat) =
-        launch_backtest_kernel(
+    // Gene-batch the backtest so each per-gene signal buffer (`B × n_samples`)
+    // stays under the wgpu storage-buffer cap — huge-row TFs (M1/M3) no longer
+    // OOM. Each gene is evaluated WHOLE-SERIES (the kernel is unchanged), so the
+    // concatenated result is identical to a single launch — CPU↔GPU parity holds.
+    let mut metrics_flat: Vec<f32> = Vec::with_capacity(n_genes * BACKTEST_CORE_METRIC_WIDTH);
+    let mut trade_counts: Vec<i32> = Vec::with_capacity(n_genes);
+    let mut monthly_flat: Vec<f32> = Vec::with_capacity(n_genes * month_capacity);
+    let mut month_counts: Vec<i32> = Vec::with_capacity(n_genes);
+    let mut month_start_eq_flat: Vec<f32> = Vec::with_capacity(n_genes * month_capacity);
+    let batch = backtest_gene_batch(n_genes, n_samples);
+    let mut g0 = 0usize;
+    while g0 < n_genes {
+        let g1 = (g0 + batch).min(n_genes);
+        let (m, tc, mo, mc, mse) = launch_backtest_kernel(
             &client,
             &close_pips,
             &high_pips,
             &low_pips,
-            &signals_flat,
-            &confidences_flat,
+            &signals_flat[g0 * n_samples..g1 * n_samples],
+            &confidences_flat[g0 * n_samples..g1 * n_samples],
             &timestamp_deltas_ms,
             use_timestamps,
             &month_idx,
             &day_idx,
-            &sl_pips,
-            &tp_pips,
+            &sl_pips[g0..g1],
+            &tp_pips[g0..g1],
             settings,
             month_capacity,
         )?;
+        metrics_flat.extend_from_slice(&m);
+        trade_counts.extend_from_slice(&tc);
+        monthly_flat.extend_from_slice(&mo);
+        month_counts.extend_from_slice(&mc);
+        month_start_eq_flat.extend_from_slice(&mse);
+        g0 = g1;
+    }
 
     let mut results = Vec::with_capacity(n_genes);
     for g in 0..n_genes {
