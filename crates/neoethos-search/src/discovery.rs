@@ -2187,6 +2187,14 @@ where
         );
     }
 
+    // Never-OOM auto-tune (2026-06-08): probe host RAM + GPU VRAM ONCE and
+    // install memory budgets sized to the detected hardware, so peak memory
+    // tracks the box and NOT the requested population/generations. Idempotent
+    // (OnceLock) and override-respecting (explicit NEOETHOS_BOT_SEARCH_* env
+    // wins). The average user gets a hardware-fit config with zero tuning; huge
+    // population/gene requests stream through in chunks instead of OOMing.
+    crate::cubecl_eval::auto_tune_memory_budgets();
+
     // 2026-05-26 operator directive (dual-mode product): instrument the
     // 16-stage rejection funnel before any pipeline work so a panic /
     // preflight failure still leaves a partially-populated funnel for the

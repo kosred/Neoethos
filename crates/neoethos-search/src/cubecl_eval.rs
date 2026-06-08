@@ -1049,12 +1049,91 @@ fn validate_signal_kernel_inputs<F>(
 /// even huge-row timeframes (M1: ~5.3M rows) run on the GPU instead of falling
 /// back to CPU. Overridable per box via `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB`
 /// (raise it where the device's real limit is higher than the 128MB default).
+/// Hardware-derived memory budgets installed once at discovery start by
+/// [`auto_tune_memory_budgets`]. They make the engine fit whatever card + RAM it
+/// finds with ZERO user config: the cap helpers below resolve their value as
+/// `explicit env override > auto-tuned budget > conservative default`. A user
+/// can therefore (a) do nothing and get a hardware-fit config, (b) set an env
+/// var to force a specific value. Either way the engine never OOMs regardless of
+/// requested population/generations (the budgets bound the windowing, the pool
+/// trim, and the host gene-chunk).
+#[derive(Clone, Copy, Debug)]
+struct MemoryBudgets {
+    /// Host budget (MB) for the per-gene signal+confidence assembly → gene chunk.
+    host_budget_mb: u64,
+    /// VRAM pool reserved budget (MB) above which the pool is trimmed.
+    vram_budget_mb: u64,
+    /// Per-storage-buffer cap (MB) for the windowing/batching.
+    gpu_buffer_mb: usize,
+}
+
+static MEMORY_BUDGETS: std::sync::OnceLock<MemoryBudgets> = std::sync::OnceLock::new();
+
+fn installed_memory_budgets() -> Option<MemoryBudgets> {
+    MEMORY_BUDGETS.get().copied()
+}
+
+/// Probe the host RAM + GPU VRAM and install memory budgets sized to fit, so the
+/// average user needs no manual tuning. Idempotent (first install wins) and
+/// safe: explicit `NEOETHOS_BOT_SEARCH_*` env vars still override per-knob. On a
+/// box where VRAM can't be read (wgpu/ROCm report 0), a conservative VRAM budget
+/// is used so the pool trim still bounds usage. Called once at discovery start.
+pub fn auto_tune_memory_budgets() {
+    if MEMORY_BUDGETS.get().is_some() {
+        return;
+    }
+    let profile = neoethos_core::system::HardwareProbe::new().detect();
+    let avail_ram_gb = if profile.available_ram_gb.is_finite() && profile.available_ram_gb > 0.0 {
+        profile.available_ram_gb
+    } else {
+        4.0 // conservative fallback
+    };
+    let min_vram_gb = profile
+        .gpu_mem_gb
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .fold(f64::INFINITY, f64::min);
+
+    // Host: spend ~40% of AVAILABLE RAM on the signal-assembly buffer, clamped so
+    // even a 1GB box runs (256MB floor → tiny chunks, slow but never OOM) and a
+    // big box doesn't over-reserve (8GB ceiling).
+    let host_budget_mb = ((avail_ram_gb * 1024.0 * 0.40) as u64).clamp(256, 8192);
+    // VRAM: trim the pool above ~60% of the smallest card; if VRAM is unknown,
+    // use a conservative 2GB so the trim still keeps the footprint modest.
+    let (vram_budget_mb, gpu_buffer_mb) = if min_vram_gb.is_finite() {
+        let v = ((min_vram_gb * 1024.0 * 0.60) as u64).clamp(384, 24576);
+        // Raise the per-buffer cap on roomy cards (fewer windows → faster).
+        let buf = if min_vram_gb >= 20.0 { 384 } else { 120 };
+        (v, buf)
+    } else {
+        (2048, 120)
+    };
+
+    let budgets = MemoryBudgets {
+        host_budget_mb,
+        vram_budget_mb,
+        gpu_buffer_mb,
+    };
+    let _ = MEMORY_BUDGETS.set(budgets);
+    tracing::info!(
+        target: "neoethos_search::cubecl_eval",
+        avail_ram_gb = format!("{avail_ram_gb:.1}"),
+        min_vram_gb = if min_vram_gb.is_finite() { format!("{min_vram_gb:.1}") } else { "unknown".to_string() },
+        host_budget_mb,
+        vram_budget_mb,
+        gpu_buffer_mb,
+        "auto-tuned memory budgets (memory tracks hardware, not user params)"
+    );
+}
+
 fn gpu_buffer_elem_cap() -> usize {
     const DEFAULT_MB: usize = 120;
     let mb = std::env::var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|m| *m > 0)
+        .or_else(|| installed_memory_budgets().map(|b| b.gpu_buffer_mb))
         .unwrap_or(DEFAULT_MB);
     (mb.saturating_mul(1024 * 1024) / 4).max(1) // 4 bytes/element (i32/f32)
 }
@@ -1091,6 +1170,7 @@ fn gpu_pool_budget_bytes() -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|m| *m > 0)
+        .or_else(|| installed_memory_budgets().map(|b| b.vram_budget_mb))
         .unwrap_or(DEFAULT_MB)
         .saturating_mul(1024 * 1024)
 }
@@ -1111,6 +1191,7 @@ fn gene_chunk_size(n_genes: usize, n_samples: usize) -> usize {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|m| *m > 0)
+        .or_else(|| installed_memory_budgets().map(|b| b.host_budget_mb))
         .unwrap_or(DEFAULT_MB)
         .saturating_mul(1024 * 1024);
     let per_gene = (n_samples as u64).saturating_mul(8).max(1); // i32 signal + f32 conf
