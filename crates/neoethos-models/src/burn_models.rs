@@ -844,20 +844,38 @@ impl<B: Backend> BurnNBeatsx<B> {
 }
 
 // ============================================================================
-// BURN TiDE — residual dense encoder-decoder for tabular time-series
+// BURN TiDE — faithful dense-residual MLP encoder-decoder (Das et al. 2023,
+// "Long-term Forecasting with TiDE", TMLR), applied as a per-row 3-class head
+// over FLAT features. Canonical pieces realized here: two-dense residual
+// blocks w/ LayerNorm+dropout, input feature projection, dense encoder
+// (enc1/enc2), dense decoder (dec1/dec2), and the global LINEAR residual
+// (raw_skip → head). The paper's temporal decoder + multi-horizon decode are
+// N/A: this pipeline has no lookback/horizon axis (input is [batch, features],
+// output is 3 classes), so manufacturing one would be meaningless.
 // ============================================================================
 
+/// Canonical TiDE residual block (Das, Kong, Sen, Zhou — "Long-term
+/// Forecasting with TiDE", TMLR 2023): two dense layers
+/// (`fc1 → ReLU → Dropout → fc2`) plus a **linear-projection skip**, followed
+/// by LayerNorm. The previous implementation had a single dense layer and an
+/// identity skip — a simplification of the paper's block. The second dense
+/// layer and the projected skip are the real faithfulness fix (the skip is
+/// square here since every block is `hidden → hidden`, but the projection is
+/// the canonical form and lets the block also serve as a feature projection).
 #[derive(Module, Debug)]
 pub struct ResidualBlock<B: Backend> {
-    fc: nn::Linear<B>,
+    fc1: nn::Linear<B>,
+    fc2: nn::Linear<B>,
+    skip: nn::Linear<B>,
     norm: nn::LayerNorm<B>,
     dropout: nn::Dropout,
 }
 
 impl<B: Backend> ResidualBlock<B> {
     fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let out = burn::tensor::activation::relu(self.fc.forward(x.clone()));
-        self.norm.forward(x + self.dropout.forward(out))
+        let h = burn::tensor::activation::relu(self.fc1.forward(x.clone()));
+        let h = self.dropout.forward(self.fc2.forward(h));
+        self.norm.forward(self.skip.forward(x) + h)
     }
 }
 
@@ -887,7 +905,9 @@ pub struct BurnTiDEConfig {
 impl BurnTiDEConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> BurnTiDE<B> {
         let mk_res = || ResidualBlock {
-            fc: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc1: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            skip: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
             norm: nn::LayerNormConfig::new(self.hidden_dim).init(device),
             dropout: nn::DropoutConfig::new(self.dropout).init(),
         };
@@ -918,7 +938,11 @@ impl<B: Backend> BurnTiDE<B> {
 }
 
 // ============================================================================
-// BURN TiDE-NF — dedicated TiDE variant with seasonal/frequency gating
+// BURN TiDE-NF — the TiDE dense-residual backbone PLUS a learned context/
+// seasonal/horizon GATE (a neoethos variant, analogous to N-BEATSx's
+// exogenous gate). This is NOT a published "TiDE-NF" algorithm — it is
+// TiDE-flavoured + gating. It inherits the canonical two-dense ResidualBlock
+// fix for free via the shared `mk_res`.
 // ============================================================================
 
 #[derive(Module, Debug)]
@@ -951,7 +975,9 @@ pub struct BurnTiDENfConfig {
 impl BurnTiDENfConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> BurnTiDENf<B> {
         let mk_res = || ResidualBlock {
-            fc: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc1: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            skip: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
             norm: nn::LayerNormConfig::new(self.hidden_dim).init(device),
             dropout: nn::DropoutConfig::new(self.dropout).init(),
         };
@@ -2675,6 +2701,59 @@ mod tests {
         );
         let y = model.forward(x);
         assert_eq!(y.dims(), [2, 3]);
+        assert!(
+            y.into_data()
+                .to_vec::<f32>()
+                .expect("v")
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn tide_two_dense_block_forward_shape_and_finite() {
+        // The upgraded two-dense ResidualBlock (fc1→ReLU→Dropout→fc2 + linear
+        // skip → LayerNorm) must run end-to-end and emit a 3-class row.
+        let device = Default::default();
+        let model = BurnTiDEConfig::new(8)
+            .with_hidden_dim(16)
+            .with_dropout(0.0)
+            .init::<InferBackend>(&device);
+        let x = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(
+                (0..32).map(|v| (v % 8) as f32 * 0.15 - 0.6).collect::<Vec<f32>>(),
+                [4, 8],
+            ),
+            &device,
+        );
+        let y = model.forward(x);
+        assert_eq!(y.dims(), [4, 3]);
+        assert!(
+            y.into_data()
+                .to_vec::<f32>()
+                .expect("v")
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn tide_nf_forward_shape_and_finite() {
+        // TiDE-NF (two-dense backbone + seasonal/context/horizon gates).
+        let device = Default::default();
+        let model = BurnTiDENfConfig::new(8)
+            .with_hidden_dim(16)
+            .with_dropout(0.0)
+            .init::<InferBackend>(&device);
+        let x = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(
+                (0..32).map(|v| (v % 8) as f32 * 0.1 - 0.4).collect::<Vec<f32>>(),
+                [4, 8],
+            ),
+            &device,
+        );
+        let y = model.forward(x);
+        assert_eq!(y.dims(), [4, 3]);
         assert!(
             y.into_data()
                 .to_vec::<f32>()

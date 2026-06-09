@@ -1090,6 +1090,35 @@ mod tests {
     }
 
     #[test]
+    fn elasticnet_l1_drives_weights_to_exact_zero() -> Result<()> {
+        // End-to-end proof that ElasticNet is genuinely real for l1>0: pure-L1
+        // (l1_ratio=1.0) is routed to the CPU ISTA proximal path, which must
+        // pin at least one coefficient to EXACTLY 0.0 (the sparsity a
+        // subgradient cannot produce), while predictions stay a valid simplex.
+        // This locks in the `already_real` audit verdict for linear_gpu (l1>0
+        // never touches the subgradient CUDA kernel — see the gate above).
+        let df = sample_dataframe();
+        let y = sample_labels();
+        let mut model = ElasticNetExpert::new(0.5, 1.0);
+        model.fit(&df, &y)?;
+        let artifact = model.model.as_ref().expect("trained ElasticNet artifact");
+        assert!(
+            artifact.weights.iter().any(|w| *w == 0.0),
+            "pure-L1 ElasticNet must zero at least one coefficient exactly: {:?}",
+            artifact.weights
+        );
+        let probabilities = model.predict_proba(&df)?;
+        for row in probabilities.outer_iter() {
+            let sum: f32 = row.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-4,
+                "probability row must sum to 1, got {sum}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn runtime_predictions_use_shared_three_class_confidence_gate() -> Result<()> {
         let probabilities = Array2::from_shape_vec((1, 3), vec![0.58_f32, 0.20, 0.22])?;
         let predictions = runtime_predictions(
