@@ -6626,6 +6626,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "cubecl",
+ "cubecl-runtime",
  "duckdb",
  "half",
  "itertools 0.14.0",

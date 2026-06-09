@@ -10,6 +10,14 @@ chrono = "0.4.44"
 # See neoethos-models/Cargo.toml for the full reasoning (AMD Vulkan
 # SPIR-V driver crash avoidance).
 cubecl = { version = "0.10.0", optional = true }
+# AREA 1 (2026-06-09): direct handle on the cubecl memory-management types
+# (`MemoryConfiguration::Custom` / `MemoryPoolOptions` / `PoolType`) used to inject
+# a BOUNDED wgpu pool in `create_gpu_client`. cubecl/cubecl-wgpu only re-export
+# `MemoryConfiguration` (cubecl-wgpu runtime.rs:15) — the pool-option structs are
+# NOT re-exported, so we name `cubecl_runtime` directly. Version pinned to the same
+# 0.10.0 the cubecl umbrella resolves (Cargo.lock) so there is one copy in the graph.
+# Optional + gated to `gpu` so the non-GPU build never pulls it.
+cubecl-runtime = { version = "0.10.0", optional = true }
 ndarray = { version = "0.17.2", features = ["rayon"] }
 half = { version = "2.5", optional = true, default-features = true, features = ["alloc", "num-traits"] }
 itertools = "0.14.0"
@@ -35,7 +43,7 @@ default = []
 # `tch::Cuda::device_count()`. The concrete runtime is now selected by the
 # vendor aliases below; `gpu` itself binds NO runtime (so a Vulkan build never
 # compiles cubecl-cuda), and `tch` (CUDA device enumeration) moved to `gpu-cuda`.
-gpu = ["dep:cubecl", "dep:half"]
+gpu = ["dep:cubecl", "dep:half", "dep:cubecl-runtime"]
 # #205: vendor-aware aliases so the top-level binary can pick a backend
 # without knowing the internals. The `cubecl_eval.rs` GA kernels are generic
 # over `R: Runtime`, so each alias just selects the cubecl runtime:

@@ -2420,4 +2420,230 @@ mod gpu_cpu_parity_tests {
             }
         }
     }
+
+    /// AREA 1 (2026-06-09) regression lock for the raised per-buffer cap. The
+    /// 800-row case above fits one window/one batch, so it never exercised the
+    /// windowing/batching machinery the cap-raise relies on as its safety net.
+    /// This drives ~2M samples with a DELIBERATELY tiny per-buffer cap (set via
+    /// `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB`, which `gpu_buffer_elem_cap` now treats
+    /// as a ceiling) so the signal-synth splits into MANY windows AND the backtest
+    /// splits into MANY gene-batches — and asserts the concatenated GPU result
+    /// still matches the whole-series CPU reference within the SAME tolerance. This
+    /// is the lock proving the cap change did not break windowing. Runs only on a
+    /// real GPU box (skips cleanly otherwise; set NEOETHOS_REQUIRE_GPU=1 to fail
+    /// loud on a device misconfig).
+    ///
+    /// Note: the env-var read by `gpu_buffer_elem_cap` is process-global, but
+    /// windowing/batching are EXACT by construction (each window splits on
+    /// independent samples, each batch on independent genes, both concatenated in
+    /// order), so even if this races the sibling test's window sizing the result
+    /// is still correct — only the split COUNT differs, never the math.
+    #[test]
+    fn gpu_population_eval_matches_cpu_heavy_rows() {
+        // 600k bars × 8 genes: large enough that an 8MB buffer cap forces SEVERAL
+        // sample-windows in the signal synth (600k×8B = 4.8MB/gene > the 8MB/4=2M-elem
+        // window) AND several gene-batches in the backtest (8MB/4/600k ≈ 3 genes per
+        // batch → 8 genes = 3 batches). 600k (not 2M) keeps every buffer small enough
+        // that even the larger comparison cap can't OOM a shared-RAM iGPU — windowing
+        // exists precisely to avoid the big single buffer that would.
+        let n_samples = 600_000usize;
+        let n_features = 6usize;
+        let n_genes = 8usize;
+
+        // Price: a flat close with a WIDE per-bar high/low band (±300 pips, far
+        // beyond SL=25 / TP=50) so EVERY trade resolves on its first bar by a huge
+        // margin. This is deliberate: with a grazing price path, f32-on-GPU vs
+        // f64-on-CPU sub-pip rounding flips TP-hit-vs-SL-hit for thousands of
+        // borderline trades over 2M bars → divergent win-rate/profit-factor that has
+        // nothing to do with windowing. Overshooting both levels by 250+ pips makes
+        // the per-trade OUTCOME f32/f64-agnostic, leaving windowing/batching as the
+        // only GPU-vs-CPU variable.
+        let close: Vec<f64> = vec![1.10; n_samples];
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0300).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0300).collect();
+
+        // SLOW SQUARE wave (period ~5000 bars), each feature decisively ±0.8 — NOT a
+        // smooth sine. This is deliberate: the 800-bar test keeps values "well clear
+        // of the ±0.3 thresholds" so CPU(f64) and GPU(f32) agree on the SIGN at every
+        // bar; a sine grazes the threshold and, over 2M bars, f32-vs-f64 epsilon flips
+        // thousands of boundary signals → wildly different trade SETS (not just a
+        // count drift), which would mask the thing we're actually testing. With a
+        // square wave each gene's 2-feature sum is ±1.6 (5× the threshold) except on
+        // the rare single-bar transitions, so the SIGNAL is identical on both lanes
+        // and the ONLY variable left is the windowing/batching the cap-raise relies
+        // on. Per-feature phase offset gives the genes distinct (but still clear)
+        // signals.
+        let period = 5_000i64;
+        let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
+            let phase = (i as i64 + (f as i64) * 911) % period;
+            if phase < period / 2 { 0.8f32 } else { -0.8f32 }
+        });
+
+        // 8 CSR genes, each summing 2 distinct features (unit weight). Feature pairs
+        // are rotated so genes get different (but still threshold-clear) signals.
+        let mut gene_offsets: Vec<i32> = vec![0];
+        let mut gene_indices: Vec<i32> = Vec::new();
+        for g in 0..n_genes {
+            let a = (g % n_features) as i32;
+            let b = ((g + 2) % n_features) as i32;
+            gene_indices.push(a);
+            gene_indices.push(b);
+            gene_offsets.push(gene_indices.len() as i32);
+        }
+        let gene_weights: Vec<f32> = vec![1.0; gene_indices.len()];
+        let long_thr: Vec<f32> = vec![0.3; n_genes];
+        let short_thr: Vec<f32> = vec![-0.3; n_genes];
+        let sl_pips: Vec<f64> = vec![25.0; n_genes];
+        let tp_pips: Vec<f64> = vec![50.0; n_genes];
+
+        let smc_data: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
+        let gene_smc_flags: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
+        let smc_weights = [0.0f32; 11];
+        let gate_threshold = 0.0f32;
+
+        // 1-minute bars; ~7 months / ~417 days so the monthly/slot-7 buckets are
+        // exercised across many month boundaries.
+        let timestamps: Vec<i64> = (0..n_samples as i64).map(|i| i * 60_000).collect();
+        let month_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 86_400).collect();
+        let day_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 1_440).collect();
+
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = true;
+        settings.risk_per_trade_min = 0.005;
+        settings.risk_per_trade_max = 0.03;
+        settings.high_quality_confidence = 0.65;
+
+        // CPU reference — whole series in one pass (no windowing).
+        let cpu: Vec<[f64; 11]> = (0..n_genes)
+            .map(|g| {
+                let (signals, conf) = synthesize_signals_and_confidence_cpu(
+                    indicators.view(),
+                    &gene_offsets,
+                    &gene_indices,
+                    &gene_weights,
+                    &long_thr,
+                    &short_thr,
+                    &smc_data,
+                    &gene_smc_flags,
+                    gate_threshold,
+                    &smc_weights,
+                    g,
+                    n_samples,
+                );
+                let mut s = settings.clone();
+                s.sl_pips = sl_pips[g];
+                s.tp_pips = tp_pips[g];
+                fast_evaluate_strategy_core(
+                    &close, &high, &low, &signals, &conf, &month_idx, &day_idx, &timestamps, &s,
+                )
+            })
+            .collect();
+
+        // Run the GPU eval under an explicit per-buffer cap (MB), restoring the env
+        // afterwards. `gpu_buffer_elem_cap` now treats this env as a CEILING.
+        let run_gpu_with_cap = |cap_mb: &str| -> anyhow::Result<Vec<[f64; 11]>> {
+            let prev = std::env::var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB").ok();
+            // SAFETY: test-only env toggle; restored below. Windowing/batching is
+            // exact-by-construction, so a concurrent race with the sibling test only
+            // changes the split COUNT, never the result.
+            unsafe {
+                std::env::set_var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB", cap_mb);
+            }
+            let out = crate::cubecl_eval::try_evaluate_population_cuda(
+                &close,
+                &high,
+                &low,
+                indicators.view(),
+                &gene_offsets,
+                &gene_indices,
+                &gene_weights,
+                &long_thr,
+                &short_thr,
+                &month_idx,
+                &day_idx,
+                &timestamps,
+                &sl_pips,
+                &tp_pips,
+                &smc_data,
+                &gene_smc_flags,
+                gate_threshold,
+                &smc_weights,
+                &settings,
+                None,
+            );
+            unsafe {
+                match &prev {
+                    Some(v) => std::env::set_var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB", v),
+                    None => std::env::remove_var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB"),
+                }
+            }
+            out
+        };
+
+        // Two DIFFERENT small caps, both forcing MANY windows / gene-batches over
+        // the 2M-row buffers but with DIFFERENT split granularities. Both stay tiny
+        // so they never approach the device's memory limit (a single huge-cap launch
+        // would OOM a shared-RAM iGPU — exactly what windowing exists to avoid).
+        let gpu_a = match run_gpu_with_cap("8") {
+            Ok(g) => g,
+            Err(e) => {
+                if std::env::var("NEOETHOS_REQUIRE_GPU").is_ok() {
+                    panic!("NEOETHOS_REQUIRE_GPU set but heavy-row GPU eval failed: {e}");
+                }
+                eprintln!("GPU heavy-row parity test SKIPPED (no usable GPU device): {e}");
+                return;
+            }
+        };
+        let gpu_b = run_gpu_with_cap("16")
+            .expect("second-granularity GPU eval after the first succeeded");
+
+        assert_eq!(gpu_a.len(), n_genes, "gpu(cap=8) wrong gene count");
+        assert_eq!(gpu_b.len(), n_genes, "gpu(cap=16) wrong gene count");
+
+        // ── PRIMARY LOCK: windowing/batching is EXACT (split-invariant) ───────
+        // Both runs are f32-on-GPU but split the 2M rows into DIFFERENT numbers of
+        // windows + gene-batches. If the split is numerically faithful they must be
+        // BIT-IDENTICAL. This isolates the cap-raise's windowing from ALL f32-vs-f64
+        // noise — a gather/concatenation bug shows up here as an exact-equality
+        // failure regardless of the CPU reference.
+        let gpu_multi = &gpu_a;
+        for g in 0..n_genes {
+            for m in 0..11 {
+                let (a, b) = (gpu_a[g][m], gpu_b[g][m]);
+                assert!(
+                    (a - b).abs() <= 1e-9 * a.abs().max(1.0),
+                    "heavy gene {g} metric[{m}]: GPU cap=8 ({a}) != cap=16 ({b}) \
+                     (windowing/batching is NOT split-invariant — the cap-raise corrupted results)"
+                );
+            }
+        }
+
+        // ── SECONDARY: GPU multi-window matches the CPU reference ─────────────
+        // The square-wave signal is clear of the ±0.3 threshold and every trade
+        // overshoots SL/TP by 250+ pips, so f32-vs-f64 cannot flip a signal or a
+        // trade outcome → the GPU result matches CPU within the EXISTING tolerance.
+        for g in 0..n_genes {
+            let (ct, gt) = (cpu[g][8], gpu_multi[g][8]);
+            assert!(
+                (ct - gt).abs() <= 1.0,
+                "heavy gene {g} trade-count mismatch: cpu={ct} gpu={gt}"
+            );
+            for m in [0usize, 1, 2, 3, 4, 5, 6, 7, 9, 10] {
+                let (c, v) = (cpu[g][m], gpu_multi[g][m]);
+                let tol = 1e-2 * c.abs().max(1.0) + 1e-3;
+                assert!(
+                    (c - v).abs() <= tol,
+                    "heavy gene {g} metric[{m}] mismatch: cpu={c} gpu={v} tol={tol}"
+                );
+            }
+        }
+    }
 }

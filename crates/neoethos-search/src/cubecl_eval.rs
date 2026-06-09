@@ -160,7 +160,14 @@ fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<Cud
         );
     }
     let device = CudaDevice::new(device_id);
-    Ok(CudaRuntime::client(&device))
+    let client = CudaRuntime::client(&device);
+    // AREA 1 (2026-06-09): probe the device's REAL per-buffer cap (VRAM/4 on CUDA)
+    // and install it ONCE. CUDA canNOT inject a `MemoryConfiguration` (CudaServer
+    // hardcodes its pool), so unlike the wgpu branch we do NOT call `init_setup`;
+    // the existing reactive `trim_gpu_pool_if_over_budget` bounds the pool. We only
+    // raise the per-buffer cap so heavy TFs stop being windowed to 120MB.
+    install_gpu_buffer_cap(probe_gpu_buffer_cap_bytes(&client));
+    Ok(client)
 }
 
 /// wgpu/Vulkan twin of the `gpu-cuda` client factory above. Uses cubecl's
@@ -174,16 +181,156 @@ fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<Cud
 /// first discrete GPU on a multi-GPU box).
 #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
 fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<WgpuRuntime>> {
+    // `WgpuDevice`/`WgpuRuntime` come from the module-level import (line ~7).
+    // The pool-option structs (`MemoryPoolOptions`/`PoolType`) are used inside
+    // `bounded_wgpu_pools` below, which imports them itself.
+    use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, Vulkan, init_setup};
+
     // Multi-GPU sharding (Stage 2): an explicit `device_override` (one per lane)
     // wins; otherwise the legacy singular env var; otherwise the best adapter.
     let env_device = std::env::var("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok());
-    let device = match device_override.or(env_device) {
+    let base_device = match device_override.or(env_device) {
         Some(n) => WgpuDevice::DiscreteGpu(n),
         None => WgpuDevice::DefaultDevice,
     };
-    Ok(WgpuRuntime::client(&device))
+
+    // AREA 1 (2026-06-09): initialize the wgpu server for this device EXACTLY ONCE,
+    // with the adapter's REAL limits + a BOUNDED memory pool, then reuse it.
+    //
+    // `init_setup::<Vulkan>(&base_device, opts)` builds the wgpu adapter/device with
+    // the adapter's NATIVE limits (cubecl requests `adapter.limits()` on the wgsl
+    // path, NOT the 128MB defaults) AND registers a `ComputeClient` server under
+    // `base_device` using our `opts` — see cubecl-wgpu runtime.rs:264-273. After one
+    // `init_setup`, `WgpuRuntime::client(&base_device)` (which calls
+    // `ComputeClient::load`) just looks the bounded server back up.
+    //
+    // CRITICAL — it must run AT MOST ONCE per device key: `ComputeClient::init`
+    // PANICS ("already registered server") on a duplicate, and `init_setup` reads
+    // the limits ONLY as a side effect of registering, so we cannot pre-read them to
+    // size the pool. We therefore build the bounded pool from the SAME first
+    // principles cubecl's default `SubSlices` uses (a graduated set sized off
+    // `max_page` + alignment), passing the device's real `max_storage_buffer_binding_size`
+    // as `max_page`. A single giant page would be WRONG — `SlicedPool::accept`
+    // requires a slice to fill >=80% of its page, so small buffers would be rejected
+    // → `BufferTooBig`. The graduated pools handle every buffer size; the only
+    // difference from the default is a finite `dealloc_period` so freed pages RETURN
+    // to the driver (cubecl's default is `None` = grow-only, the documented
+    // 60k-row-H1 → 15GB peak). The reactive `trim_gpu_pool_if_over_budget` stays as
+    // the backstop. The registry below guarantees the once-per-key invariant.
+    static INITIALIZED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<isize>>> =
+        std::sync::OnceLock::new();
+    // Key the cache on the resolved override (or -1 for "default adapter"). All
+    // callers in one process with the same override share the one bounded device.
+    let key: isize = device_override
+        .or(env_device)
+        .map(|n| n as isize)
+        .unwrap_or(-1);
+
+    let initialized =
+        INITIALIZED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut seen = initialized
+        .lock()
+        .map_err(|_| anyhow::anyhow!("wgpu device-init registry mutex poisoned"))?;
+    if seen.insert(key) {
+        // We can't read the device limits without registering, so the bounded pool
+        // is built from a CONSERVATIVE `max_page` = the cap ceiling (2GiB), which is
+        // >= the largest single buffer the windowing machinery ever builds
+        // (`gpu_buffer_elem_cap` is clamped to <=2GiB). The graduated pools cover
+        // every smaller size. wgpu's `min_uniform_buffer_offset_alignment` is 256 on
+        // every desktop adapter; use it as the alignment unit (over-aligning is
+        // harmless — it only rounds page sizes up).
+        const POOL_MAX_PAGE: u64 = GPU_BUFFER_CAP_CEIL; // 2 GiB
+        const POOL_ALIGNMENT: u64 = 256;
+        let runtime_options = RuntimeOptions {
+            tasks_max: 32,
+            memory_config: MemoryConfiguration::Custom {
+                pool_options: bounded_wgpu_pools(POOL_MAX_PAGE, POOL_ALIGNMENT),
+            },
+        };
+        let setup = init_setup::<Vulkan>(&base_device, runtime_options);
+        let binding_limit = setup.device.limits().max_storage_buffer_binding_size as u64;
+        let buffer_limit = setup.adapter.limits().max_buffer_size;
+        let real_cap = binding_limit.min(buffer_limit);
+        install_gpu_buffer_cap(
+            ((real_cap as f64 * 0.8) as u64).clamp(GPU_BUFFER_CAP_FLOOR, GPU_BUFFER_CAP_CEIL),
+        );
+        tracing::info!(
+            target: "neoethos_search::cubecl_eval",
+            max_storage_buffer_binding_size = binding_limit,
+            max_buffer_size = buffer_limit,
+            "wgpu adapter limits probed at init_setup (bounded pool installed)"
+        );
+    }
+    drop(seen); // release the registry lock before building the (cheap) client
+
+    Ok(WgpuRuntime::client(&base_device))
+}
+
+/// Build a GRADUATED set of sliced memory pools (mirroring cubecl's default
+/// `SubSlices` construction: cubecl-runtime memory_manage.rs:202-258) but with a
+/// finite `dealloc_period` so freed pages RETURN to the driver instead of growing
+/// forever. `max_page` is the largest single buffer to accommodate; `alignment`
+/// rounds page sizes. The structure: a tiny exclusive pool for sub-alignment
+/// allocations, a descending ladder of `max_page/4, /16, /64, …` sliced pools
+/// (each `max_slice_size = page/2^i` to curb fragmentation), and a final full
+/// `max_page` pool. Every buffer size therefore lands in a right-sized pool — a
+/// single giant page would reject small allocations (`SlicedPool::accept` needs a
+/// slice to fill >=80% of its page).
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+fn bounded_wgpu_pools(
+    max_page: u64,
+    alignment: u64,
+) -> Vec<cubecl_runtime::memory_management::MemoryPoolOptions> {
+    use cubecl_runtime::memory_management::{MemoryPoolOptions, PoolType};
+    const MB: u64 = 1024 * 1024;
+    // Reclaim a page after it has gone unused across ~64 parent allocations. Bounds
+    // the otherwise grow-only high-water mark while keeping enough reuse that the
+    // hot window/gene-batch loop doesn't thrash the driver allocator.
+    const DEALLOC_PERIOD: u64 = 64;
+    let alignment = alignment.max(1);
+
+    let mut pools: Vec<MemoryPoolOptions> = Vec::new();
+    // Sub-alignment allocations can't use offsets (wgpu) — give them an exclusive
+    // pool. (dealloc_period None: these are tiny + reused constantly.)
+    pools.push(MemoryPoolOptions {
+        pool_type: PoolType::ExclusivePages { max_alloc_size: 0 },
+        dealloc_period: None,
+    });
+
+    let mut current = max_page;
+    let mut max_sizes: Vec<u64> = Vec::new();
+    let mut page_sizes: Vec<u64> = Vec::new();
+    let mut base: u32 = pools.len() as u32;
+    while current >= 32 * MB {
+        current /= 4;
+        current = current.next_multiple_of(alignment);
+        max_sizes.push(current / 2u64.pow(base));
+        page_sizes.push(current);
+        base += 1;
+    }
+    max_sizes.reverse();
+    page_sizes.reverse();
+    for i in 0..max_sizes.len() {
+        pools.push(MemoryPoolOptions {
+            pool_type: PoolType::SlicedPages {
+                page_size: page_sizes[i],
+                max_slice_size: max_sizes[i].max(alignment),
+            },
+            dealloc_period: Some(DEALLOC_PERIOD),
+        });
+    }
+    // Final big pool for the largest buffers.
+    let big = (max_page / alignment) * alignment;
+    pools.push(MemoryPoolOptions {
+        pool_type: PoolType::SlicedPages {
+            page_size: big.max(alignment),
+            max_slice_size: big.max(alignment),
+        },
+        dealloc_period: Some(DEALLOC_PERIOD),
+    });
+    pools
 }
 
 #[cube(launch)]
@@ -1081,6 +1228,63 @@ fn installed_memory_budgets() -> Option<MemoryBudgets> {
     MEMORY_BUDGETS.get().copied()
 }
 
+/// The device's REAL per-storage-buffer cap (bytes), probed ONCE from the active
+/// GPU client the first time one is built (in `create_gpu_client`). Replaces the
+/// historical hardcoded 120MB literal that was a workaround for cubecl using the
+/// DEFAULT (128MB) wgpu limits instead of the adapter's true
+/// `max_storage_buffer_binding_size` — on Vulkan that real limit is far higher
+/// (often `u64::MAX`), and on CUDA it is VRAM/4 (cubecl-cuda runtime.rs). With the
+/// real cap the windowing/batching machinery (still the safety net) produces a few
+/// big launches instead of many tiny ones, so heavy TFs (M1/M3/M5) actually run on
+/// the GPU. Populated on BOTH backends; `gpu_buffer_elem_cap` reads it.
+static GPU_BUFFER_CAP_BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Floor for the probed per-buffer cap: never drop below the historical 120MB so a
+/// bogus tiny `max_page_size` report can't starve the GPU lane into many micro
+/// launches.
+const GPU_BUFFER_CAP_FLOOR: u64 = 120 * 1024 * 1024;
+/// Ceiling for the probed per-buffer cap: keep a single window at <=2GiB so its
+/// host element count (fed into u32 cube math) stays addressable and a single
+/// allocation can't blow a small card before the pool-trim/catch_unwind safety
+/// nets engage.
+const GPU_BUFFER_CAP_CEIL: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Probe the active client for the device's REAL per-storage-buffer byte limit.
+/// `client.properties().memory.max_page_size` is populated on BOTH backends:
+/// cubecl-wgpu sets it to `device.limits().max_storage_buffer_binding_size`
+/// (runtime.rs:291), cubecl-cuda to VRAM/4. We keep 0.8 headroom and clamp to
+/// `[120MB, 2GiB]`. Generic over `R: Runtime` exactly like `signal_kernel_units`.
+///
+/// Used by the CUDA `create_gpu_client` (which has only a `ComputeClient`, never a
+/// raw `WgpuSetup`). The wgpu branch reads the equivalent value directly from
+/// `setup.device.limits()`/`setup.adapter.limits()` at `init_setup` time, so this
+/// helper is dead on a vulkan-only build — hence the `#[cfg]` gate.
+#[cfg(feature = "gpu-cuda")]
+fn probe_gpu_buffer_cap_bytes<R: Runtime>(client: &ComputeClient<R>) -> u64 {
+    let max_page = client.properties().memory.max_page_size;
+    ((max_page as f64 * 0.8) as u64).clamp(GPU_BUFFER_CAP_FLOOR, GPU_BUFFER_CAP_CEIL)
+}
+
+/// Install the probed per-buffer cap (first install wins) and log it ONCE. Called
+/// from `create_gpu_client` on first client build (both backends). On the wgpu
+/// path the cap may already have been installed from the raw adapter/device limits
+/// at `init_setup` time; this is then a no-op (the `OnceLock` keeps the first
+/// value), so we only log when WE are the installer.
+fn install_gpu_buffer_cap(probed: u64) {
+    let mut newly_installed = false;
+    let cap = *GPU_BUFFER_CAP_BYTES.get_or_init(|| {
+        newly_installed = true;
+        probed
+    });
+    if newly_installed {
+        tracing::info!(
+            target: "neoethos_search::cubecl_eval",
+            probed_cap_mb = cap / (1024 * 1024),
+            "probed GPU per-buffer cap (replaces the old hardcoded 120MB)"
+        );
+    }
+}
+
 /// Probe the host RAM + GPU VRAM and install memory budgets sized to fit, so the
 /// average user needs no manual tuning. Idempotent (first install wins) and
 /// safe: explicit `NEOETHOS_BOT_SEARCH_*` env vars still override per-knob. On a
@@ -1113,24 +1317,23 @@ pub fn auto_tune_memory_budgets() {
     let host_budget_mb = ((avail_ram_gb * 1024.0 * 0.25) as u64).clamp(256, 4096);
     // VRAM: trim the pool above ~60% of the smallest card; if VRAM is unknown,
     // use a conservative 2GB so the trim still keeps the footprint modest.
-    let (vram_budget_mb, gpu_buffer_mb) = if min_vram_gb.is_finite() {
-        let v = ((min_vram_gb * 1024.0 * 0.60) as u64).clamp(384, 24576);
-        // The per-storage-buffer cap MUST stay under wgpu's
-        // `max_storage_buffer_binding_size` — 128MB under cubecl's DEFAULT device
-        // limits (`WgpuRuntime::client` does not request the adapter's real max),
-        // which is INDEPENDENT of total VRAM: a 48GB card still rejects a single
-        // >128MB storage buffer. This was previously raised to 384 on >=20GB cards
-        // "for speed", but that made the M1 backtest buffer (batch×rows×4 =
-        // 16×5.9M×4 ≈ 377MB) exceed the binding limit → `wgpu error: Out of
-        // Memory` → GPU-lane panic → silent CPU fallback for EVERY heavy-TF
-        // generation (M1/M3/M5 never actually ran on the GPU). Hold it at 120MB on
-        // ALL cards so the heavy TFs run on the GPU; the pool-trim budget (`v`)
-        // still scales with the card. (Future: raise this once create_gpu_client
-        // requests the adapter's real per-buffer limit instead of the default.)
-        (v, 120)
+    // AREA 1 (2026-06-09): the per-storage-buffer cap is NO LONGER guessed here.
+    // It used to be hardcoded to 120MB because cubecl built clients with the
+    // DEFAULT (128MB) wgpu limits instead of the adapter's real
+    // `max_storage_buffer_binding_size`, so a single >128MB buffer → `wgpu error:
+    // Out of Memory` → GPU-lane panic → silent CPU fallback for every heavy-TF
+    // generation (M1/M3/M5 never actually ran on the GPU). `create_gpu_client` now
+    // (a) on wgpu builds the device via `init_setup` reading the adapter's TRUE
+    // limits, and (b) on BOTH backends probes `client.properties().memory
+    // .max_page_size` to install `GPU_BUFFER_CAP_BYTES`. So we set `gpu_buffer_mb`
+    // to 0 here = "probe at client build"; `gpu_buffer_elem_cap` ignores a 0 budget
+    // and reads the probed cap. The pool-trim budget (`v`) still scales with VRAM.
+    let vram_budget_mb = if min_vram_gb.is_finite() {
+        ((min_vram_gb * 1024.0 * 0.60) as u64).clamp(384, 24576)
     } else {
-        (2048, 120)
+        2048
     };
+    let gpu_buffer_mb = 0usize; // 0 ⇒ probe the device's real cap at client build
 
     let budgets = MemoryBudgets {
         host_budget_mb,
@@ -1149,15 +1352,43 @@ pub fn auto_tune_memory_budgets() {
     );
 }
 
+/// Maximum elements (i32/f32 = 4 B) a single storage buffer may hold so it stays
+/// under the device's real per-buffer limit.
+///
+/// Resolution order (bytes):
+///   1. `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB` env override — a manual CEILING,
+///      `min`'d with the probed cap so a user can only ever LOWER it, never blow
+///      past the device's true limit.
+///   2. The device-probed cap installed at first client build
+///      (`GPU_BUFFER_CAP_BYTES`, set by `create_gpu_client`).
+///   3. A startup-budget value (only if the budget still carries a non-zero
+///      `gpu_buffer_mb`; today the auto-tuner sets it to 0 = "probe at build").
+///   4. The 120MB floor — used only before any client exists (e.g. unit code that
+///      computes a window size without a GPU).
 fn gpu_buffer_elem_cap() -> usize {
-    const DEFAULT_MB: usize = 120;
-    let mb = std::env::var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB")
+    let env_bytes = std::env::var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB")
         .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|m| *m > 0)
-        .or_else(|| installed_memory_budgets().map(|b| b.gpu_buffer_mb))
-        .unwrap_or(DEFAULT_MB);
-    (mb.saturating_mul(1024 * 1024) / 4).max(1) // 4 bytes/element (i32/f32)
+        .map(|mb| mb.saturating_mul(1024 * 1024));
+    let probed = GPU_BUFFER_CAP_BYTES.get().copied();
+    let budget_bytes = installed_memory_budgets()
+        .map(|b| b.gpu_buffer_mb)
+        .filter(|mb| *mb > 0)
+        .map(|mb| (mb as u64).saturating_mul(1024 * 1024));
+
+    let bytes = match (env_bytes, probed) {
+        // Env override present AND a probed cap: env is a ceiling, never exceed
+        // the device's true limit.
+        (Some(env), Some(p)) => env.min(p),
+        // Env override only (no client built yet): honor it verbatim.
+        (Some(env), None) => env,
+        // No env override: prefer the probed cap, else the (non-zero) budget,
+        // else the floor.
+        (None, Some(p)) => p,
+        (None, None) => budget_bytes.unwrap_or(GPU_BUFFER_CAP_FLOOR),
+    };
+    (bytes.saturating_div(4)).max(1) as usize // 4 bytes/element (i32/f32)
 }
 
 /// SAMPLE columns the signal-synth kernel can process in one launch so no buffer
@@ -1880,58 +2111,88 @@ pub(crate) fn try_evaluate_population_cuda(
     let mut c0 = 0usize;
     while c0 < n_genes {
         let c1 = (c0 + g_chunk).min(n_genes);
-        // Slice + rebase the CSR gene arrays for the chunk [c0, c1).
-        let idx0 = gene_offsets[c0] as usize;
-        let idx1 = gene_offsets[c1] as usize;
-        let base = gene_offsets[c0];
-        let chunk_offsets: Vec<i32> = gene_offsets[c0..=c1].iter().map(|o| *o - base).collect();
-        let (signals_flat, confidences_flat) = try_generate_signal_flat_cuda(
-            indicators,
-            &chunk_offsets,
-            &gene_indices[idx0..idx1],
-            &gene_weights[idx0..idx1],
-            &long_thr[c0..c1],
-            &short_thr[c0..c1],
-            smc_data,
-            &gene_smc_flags[c0..c1],
-            gate_threshold,
-            smc_weights,
-            device_override,
-        )?;
-        // Release the signal-synth device buffers before the backtest allocates.
-        trim_gpu_pool_if_over_budget(&client);
 
-        let chunk_n = c1 - c0;
-        let batch = backtest_gene_batch(chunk_n, n_samples);
-        let mut g0 = 0usize;
-        while g0 < chunk_n {
-            let g1 = (g0 + batch).min(chunk_n);
-            let (m, tc, mo, mc, mse) = launch_backtest_kernel(
-                &client,
-                &close_pips,
-                &high_pips,
-                &low_pips,
-                &signals_flat[g0 * n_samples..g1 * n_samples],
-                &confidences_flat[g0 * n_samples..g1 * n_samples],
-                &timestamp_deltas_ms,
-                use_timestamps,
-                &month_idx,
-                &day_idx,
-                &sl_pips_all[c0 + g0..c0 + g1],
-                &tp_pips_all[c0 + g0..c0 + g1],
-                settings,
-                month_capacity,
-            )?;
-            metrics_flat.extend_from_slice(&m);
-            trade_counts.extend_from_slice(&tc);
-            monthly_flat.extend_from_slice(&mo);
-            month_counts.extend_from_slice(&mc);
-            month_start_eq_flat.extend_from_slice(&mse);
-            g0 = g1;
-            // Trim the pool between gene-batches so a huge-row TF (many batches
-            // per chunk) can't let the reserved high-water mark climb mid-eval.
-            trim_gpu_pool_if_over_budget(&client);
-        }
+        // AREA 1 (2026-06-09): wrap the per-chunk GPU work in `catch_unwind`.
+        // cubecl 0.10 has NO Result-returning launch — a pool exhaustion or the
+        // cubecl#243 class of failure surfaces as a PANIC, not an `Err`. Without
+        // this the panic would unwind across `try_evaluate_population_cuda`,
+        // poison the worker thread, and only reach the eval.rs hybrid match as an
+        // opaque thread-join error. Catching it HERE lets a single bad chunk fail
+        // LOUD (a tracing::warn upstream carries the message) and convert to an
+        // `Err` → the existing eval.rs:1896-1917 fallback recomputes on CPU. The
+        // build is `panic = "unwind"` (workspace Cargo.toml) so this is sound; the
+        // SUCCESS path is byte-identical (the closure just runs the same launches).
+        let chunk_res: Result<()> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<()> {
+                // Slice + rebase the CSR gene arrays for the chunk [c0, c1).
+                let idx0 = gene_offsets[c0] as usize;
+                let idx1 = gene_offsets[c1] as usize;
+                let base = gene_offsets[c0];
+                let chunk_offsets: Vec<i32> =
+                    gene_offsets[c0..=c1].iter().map(|o| *o - base).collect();
+                let (signals_flat, confidences_flat) = try_generate_signal_flat_cuda(
+                    indicators,
+                    &chunk_offsets,
+                    &gene_indices[idx0..idx1],
+                    &gene_weights[idx0..idx1],
+                    &long_thr[c0..c1],
+                    &short_thr[c0..c1],
+                    smc_data,
+                    &gene_smc_flags[c0..c1],
+                    gate_threshold,
+                    smc_weights,
+                    device_override,
+                )?;
+                // Release the signal-synth device buffers before the backtest allocates.
+                trim_gpu_pool_if_over_budget(&client);
+
+                let chunk_n = c1 - c0;
+                let batch = backtest_gene_batch(chunk_n, n_samples);
+                let mut g0 = 0usize;
+                while g0 < chunk_n {
+                    let g1 = (g0 + batch).min(chunk_n);
+                    let (m, tc, mo, mc, mse) = launch_backtest_kernel(
+                        &client,
+                        &close_pips,
+                        &high_pips,
+                        &low_pips,
+                        &signals_flat[g0 * n_samples..g1 * n_samples],
+                        &confidences_flat[g0 * n_samples..g1 * n_samples],
+                        &timestamp_deltas_ms,
+                        use_timestamps,
+                        &month_idx,
+                        &day_idx,
+                        &sl_pips_all[c0 + g0..c0 + g1],
+                        &tp_pips_all[c0 + g0..c0 + g1],
+                        settings,
+                        month_capacity,
+                    )?;
+                    metrics_flat.extend_from_slice(&m);
+                    trade_counts.extend_from_slice(&tc);
+                    monthly_flat.extend_from_slice(&mo);
+                    month_counts.extend_from_slice(&mc);
+                    month_start_eq_flat.extend_from_slice(&mse);
+                    g0 = g1;
+                    // Trim the pool between gene-batches so a huge-row TF (many
+                    // batches per chunk) can't let the reserved high-water mark
+                    // climb mid-eval.
+                    trim_gpu_pool_if_over_budget(&client);
+                }
+                Ok(())
+            },
+        ))
+        .map_err(|payload| {
+            // Best-effort extraction of the panic message for a fail-loud Err.
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic>".to_string());
+            anyhow::anyhow!("GPU gene-chunk [{c0},{c1}) panicked (cubecl pool/#243): {msg}")
+        })
+        .and_then(|inner| inner);
+        chunk_res?; // → propagates to the eval.rs hybrid match → CPU recompute
+
         c0 = c1;
     }
 
