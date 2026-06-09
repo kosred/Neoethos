@@ -39,3 +39,24 @@ vortex-io = "0.67.0"
 vortex-layout = "0.67.0"
 vortex-session = "0.67.0"
 
+# Task #22 — GPU (CUDA) feature build. `gpu-cuda` ADDITIVELY turns on
+# vector-ta's `cuda-build-ptx` sub-feature, which (a) compiles the CUDA
+# indicator-kernel PTX at build time via nvcc AND (b) transitively enables
+# vector-ta's `cuda` feature (`cuda-build-ptx = ["cuda"]` in
+# vendor/vector-ta-0.2.9-patched/Cargo.toml), which is what gates the runtime
+# API we call: the `vector_ta::cuda::*` module (CudaRuntime, cuda_available)
+# and `vector_ta::indicators::dispatch::compute_cuda_device` + its
+# `IndicatorCuda*` request/output types (all `#[cfg(feature = "cuda")]` in the
+# vendor crate). So enabling `cuda-build-ptx` alone brings BOTH the PTX build
+# and the host-side `cuda` API into scope — no separate `vector-ta/cuda` line
+# needed.
+#
+# This does NOT change the default build: with `gpu-cuda` OFF the `vector-ta`
+# dep above stays exactly `["nightly-avx"]` and every GPU code path in
+# `hpc_ta.rs` is `#[cfg(feature = "gpu-cuda")]`-gated, so the non-GPU object
+# code is byte-identical. Built ONLY on a machine with the CUDA toolkit (the
+# A6000 VPS) — `cargo check --features gpu-cuda` fails on a non-CUDA host
+# because vector-ta's build.rs needs nvcc to emit the kernel PTX.
+[features]
+gpu-cuda = ["vector-ta/cuda-build-ptx"]
+
