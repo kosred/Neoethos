@@ -1583,27 +1583,64 @@ impl<B: Backend> BurnPatchTST<B> {
 // BURN TimesNet — dedicated multi-period mixer
 // ============================================================================
 
+/// Real DFT period detection (TimesNet `FFT_for_Period`). Returns the top-k
+/// dominant PERIODS (round(L/f), DC excluded) of a length-L signal plus their
+/// amplitudes (the aggregation weights). Plain O(L²) Rust — L is the small
+/// feature count and this runs OFF the autograd graph (burn 0.21 `rfft` is not
+/// autodiff-able: `todo!()`), exactly as in real TimesNet where period selection
+/// is discrete/non-differentiable.
+fn fft_top_periods(signal: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
+    let l = signal.len();
+    if l < 2 || k == 0 {
+        return (vec![l.max(1)], vec![1.0]);
+    }
+    let half = (l / 2).max(1);
+    let mut spectrum: Vec<(usize, f32)> = (1..=half)
+        .map(|f| {
+            let (mut re, mut im) = (0.0f32, 0.0f32);
+            for (t, &v) in signal.iter().enumerate() {
+                let ang = -2.0 * std::f32::consts::PI * f as f32 * t as f32 / l as f32;
+                re += v * ang.cos();
+                im += v * ang.sin();
+            }
+            (f, (re * re + im * im).sqrt())
+        })
+        .collect();
+    spectrum.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut periods = Vec::with_capacity(k);
+    let mut amps = Vec::with_capacity(k);
+    for &(f, amp) in spectrum.iter().take(k) {
+        periods.push(((l as f32 / f as f32).round() as usize).clamp(1, l));
+        amps.push(amp);
+    }
+    if periods.is_empty() {
+        periods.push(l);
+        amps.push(1.0);
+    }
+    (periods, amps)
+}
+
 #[derive(Module, Debug)]
 pub struct BurnTimesNet<B: Backend> {
-    input_proj: nn::Linear<B>,
-    raw_period_projs: Vec<nn::Linear<B>>,
-    period_mixers: Vec<nn::Linear<B>>,
-    period_norms: Vec<nn::LayerNorm<B>>,
-    period_weight_proj: nn::Linear<B>,
-    gate_proj: nn::Linear<B>,
-    fusion_norm: nn::LayerNorm<B>,
-    decoder: Vec<ResidualBlock<B>>,
-    output: nn::Linear<B>,
-    hidden_dim: usize,
+    input_embed: nn::conv::Conv1d<B>, // lift scalar feature-series -> C channels
+    inception: Vec<nn::conv::Conv2d<B>>, // multi-kernel 2D inception (Same padding)
+    period_norm: nn::LayerNorm<B>,
+    out_head: nn::Linear<B>,
+    n_periods: usize,
+    channels: usize,
+    input_dim: usize,
 }
 
 #[derive(Config, Debug)]
 pub struct BurnTimesNetConfig {
     pub input_dim: usize,
     #[config(default = 192)]
-    pub hidden_dim: usize,
+    pub hidden_dim: usize, // kept for config compat (unused by the real TimesBlock)
     #[config(default = 4)]
     pub n_periods: usize,
+    /// Embedding channels C for the 2D inter/intra-period convolution.
+    #[config(default = 16)]
+    pub channels: usize,
     #[config(default = 3)]
     pub n_classes: usize,
     #[config(default = 0.05)]
@@ -1612,71 +1649,81 @@ pub struct BurnTimesNetConfig {
 
 impl BurnTimesNetConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> BurnTimesNet<B> {
-        let hidden_dim = self.hidden_dim.max(16);
+        let channels = self.channels.max(4);
         let n_periods = self.n_periods.max(2);
-        let raw_period_projs = (0..n_periods)
-            .map(|_| nn::LinearConfig::new(self.input_dim, hidden_dim).init(device))
-            .collect();
-        let period_mixers = (0..n_periods)
-            .map(|_| nn::LinearConfig::new(hidden_dim, hidden_dim).init(device))
-            .collect();
-        let period_norms = (0..n_periods)
-            .map(|_| nn::LayerNormConfig::new(hidden_dim).init(device))
-            .collect();
-        let decoder = (0..2)
-            .map(|_| ResidualBlock {
-                fc: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
-                norm: nn::LayerNormConfig::new(hidden_dim).init(device),
-                dropout: nn::DropoutConfig::new(self.dropout).init(),
+        let input_embed = nn::conv::Conv1dConfig::new(1, channels, 1).init(device);
+        let inception = [1usize, 3, 5]
+            .iter()
+            .map(|&ks| {
+                nn::conv::Conv2dConfig::new([channels, channels], [ks, ks])
+                    .with_padding(nn::PaddingConfig2d::Same)
+                    .init(device)
             })
             .collect();
-
         BurnTimesNet {
-            input_proj: nn::LinearConfig::new(self.input_dim, hidden_dim).init(device),
-            raw_period_projs,
-            period_mixers,
-            period_norms,
-            period_weight_proj: nn::LinearConfig::new(hidden_dim, n_periods).init(device),
-            gate_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
-            fusion_norm: nn::LayerNormConfig::new(hidden_dim).init(device),
-            decoder,
-            output: nn::LinearConfig::new(hidden_dim, self.n_classes).init(device),
-            hidden_dim,
+            input_embed,
+            inception,
+            period_norm: nn::LayerNormConfig::new(channels).init(device),
+            out_head: nn::LinearConfig::new(channels, self.n_classes).init(device),
+            n_periods,
+            channels,
+            input_dim: self.input_dim,
         }
     }
 }
 
 impl<B: Backend> BurnTimesNet<B> {
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let batch = x.dims()[0];
-        let base = burn::tensor::activation::gelu(self.input_proj.forward(x.clone()));
-        let period_weights =
-            burn::tensor::activation::softmax(self.period_weight_proj.forward(base.clone()), 1);
-        let mut periodic: Tensor<B, 2> = Tensor::zeros([batch, self.hidden_dim], &base.device());
+        let [batch, l] = x.dims();
+        // Channel embedding: [B, L] -> [B, 1, L] -> Conv1d -> [B, C, L].
+        let emb = self.input_embed.forward(x.clone().reshape([batch, 1, l]));
 
-        for (period_idx, ((raw_proj, mixer), norm)) in self
-            .raw_period_projs
-            .iter()
-            .zip(self.period_mixers.iter())
-            .zip(self.period_norms.iter())
-            .enumerate()
-        {
-            let raw_period = raw_proj.forward(x.clone());
-            let mixed = mixer.forward(base.clone());
-            let branch = norm.forward(burn::tensor::activation::gelu(raw_period + mixed));
-            let weight = period_weights
-                .clone()
-                .slice([0..batch, period_idx..(period_idx + 1)])
-                .repeat_dim(1, self.hidden_dim);
-            periodic = periodic + branch * weight;
-        }
+        // --- Period detection OFF the autograd graph (host DFT on the mean signal) ---
+        let mean_signal: Vec<f32> = x
+            .clone()
+            .mean_dim(0)
+            .reshape([l])
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap_or_else(|_| vec![0.0; l]);
+        let (periods, amps) = fft_top_periods(&mean_signal, self.n_periods);
+        // Amplitude softmax -> aggregation weights (host constants).
+        let max_a = amps.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = amps.iter().map(|a| (a - max_a).exp()).collect();
+        let sum_e: f32 = exps.iter().sum::<f32>().max(1e-9);
+        let weights: Vec<f32> = exps.iter().map(|e| e / sum_e).collect();
 
-        let gate = burn::tensor::activation::sigmoid(self.gate_proj.forward(base.clone()));
-        let mut h = self.fusion_norm.forward(base + periodic * gate);
-        for block in &self.decoder {
-            h = block.forward(h);
+        // --- Per-period 1D->2D inception path (DIFFERENTIABLE) ---
+        let mut agg: Tensor<B, 3> = Tensor::zeros([batch, self.channels, l], &emb.device());
+        for (p, w) in periods.iter().zip(weights.iter()) {
+            let p = (*p).clamp(1, l);
+            let rows = l.div_ceil(p);
+            let l_pad = rows * p;
+            let padded = if l_pad > l {
+                Tensor::cat(
+                    vec![
+                        emb.clone(),
+                        Tensor::zeros([batch, self.channels, l_pad - l], &emb.device()),
+                    ],
+                    2,
+                )
+            } else {
+                emb.clone()
+            };
+            let img = padded.reshape([batch, self.channels, rows, p]); // [B,C,rows,p]
+            let mut acc = Tensor::zeros([batch, self.channels, rows, p], &img.device());
+            for conv in &self.inception {
+                acc = acc + conv.forward(img.clone());
+            }
+            let out2d = burn::tensor::activation::gelu(acc);
+            let back = out2d.reshape([batch, self.channels, l_pad]).narrow(2, 0, l);
+            agg = agg + back.mul_scalar(*w);
         }
-        self.output.forward(h)
+        let agg = agg + emb; // residual (one TimesBlock)
+
+        // Head: global average pool over L -> [B, C] -> LayerNorm -> classes.
+        let pooled = self.period_norm.forward(agg.mean_dim(2).reshape([batch, self.channels]));
+        self.out_head.forward(pooled)
     }
 }
 
@@ -2585,6 +2632,43 @@ mod tests {
         let x = Tensor::<InferBackend, 2>::from_data(
             TensorData::new(
                 (0..32).map(|v| (v % 16) as f32 * 0.1 - 0.8).collect::<Vec<f32>>(),
+                [2, 16],
+            ),
+            &device,
+        );
+        let y = model.forward(x);
+        assert_eq!(y.dims(), [2, 3]);
+        assert!(
+            y.into_data()
+                .to_vec::<f32>()
+                .expect("v")
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn fft_detects_dominant_period() {
+        // A length-16 signal with period 4 (freq f=L/p=4) — the DFT must pick it.
+        let sig: Vec<f32> = (0..16)
+            .map(|t| (2.0 * std::f32::consts::PI * t as f32 / 4.0).sin())
+            .collect();
+        let (periods, _amps) = fft_top_periods(&sig, 2);
+        assert!(
+            periods.iter().any(|&p| p == 4),
+            "DFT must detect period 4, got {periods:?}"
+        );
+    }
+
+    #[test]
+    fn timesnet_forward_is_finite() {
+        let device = Default::default();
+        let model = BurnTimesNetConfig::new(16).init::<InferBackend>(&device);
+        let x = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(
+                (0..32)
+                    .map(|t| (2.0 * std::f32::consts::PI * (t % 16) as f32 / 4.0).sin())
+                    .collect::<Vec<f32>>(),
                 [2, 16],
             ),
             &device,
