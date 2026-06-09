@@ -617,26 +617,6 @@ impl<B: Backend> BurnMLP<B> {
 // BURN N-BEATS — matches legacy NBeatsExpert (deep.py)
 // ============================================================================
 
-#[derive(Module, Debug)]
-pub struct NBeatsBlock<B: Backend> {
-    fc1: nn::Linear<B>,
-    fc2: nn::Linear<B>,
-    fc3: nn::Linear<B>,
-    fc4: nn::Linear<B>,
-    theta_b: nn::Linear<B>,
-    theta_f: nn::Linear<B>,
-}
-
-impl<B: Backend> NBeatsBlock<B> {
-    fn forward(&self, x: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 2>) {
-        let h = burn::tensor::activation::relu(self.fc1.forward(x));
-        let h = burn::tensor::activation::relu(self.fc2.forward(h));
-        let h = burn::tensor::activation::relu(self.fc3.forward(h));
-        let h = burn::tensor::activation::relu(self.fc4.forward(h));
-        (self.theta_b.forward(h.clone()), self.theta_f.forward(h))
-    }
-}
-
 /// FIXED N-BEATS basis matrix `[basis_dim, signal_len]` (Oreshkin et al. 2019).
 /// `is_trend`: rows are the polynomial basis t^j (t = i/len). Otherwise: row 0 =
 /// ones, then `cos(2π k t)` and `sin(2π k t)` harmonics — the Fourier seasonality
@@ -788,11 +768,8 @@ impl<B: Backend> BurnNBeats<B> {
 #[derive(Module, Debug)]
 pub struct BurnNBeatsx<B: Backend> {
     input_norm: nn::LayerNorm<B>,
-    embed: nn::Linear<B>,
-    blocks: Vec<NBeatsBlock<B>>,
+    blocks: Vec<NBeatsBasisBlock<B>>,
     exogenous_gate: nn::Linear<B>,
-    skip_proj: nn::Linear<B>,
-    fusion_norm: nn::LayerNorm<B>,
     output: nn::Linear<B>,
 }
 
@@ -805,55 +782,64 @@ pub struct BurnNBeatsxConfig {
     pub n_blocks: usize,
     #[config(default = 3)]
     pub n_classes: usize,
+    #[config(default = 3)]
+    pub trend_degree: usize,
+    #[config(default = 4)]
+    pub n_harmonics: usize,
 }
 
 impl BurnNBeatsxConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> BurnNBeatsx<B> {
-        let embed = nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device);
-        let blocks = (0..self.n_blocks)
-            .map(|_| NBeatsBlock {
-                fc1: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                fc3: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                fc4: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                theta_b: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim)
-                    .with_bias(false)
-                    .init(device),
-                theta_f: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim)
-                    .with_bias(false)
-                    .init(device),
-            })
-            .collect();
-
+        let len = self.input_dim.max(1);
+        let trend_dim = (self.trend_degree + 1).clamp(1, len);
+        let k = self.n_harmonics.min(len.saturating_sub(1) / 2);
+        let seasonal_dim = (1 + 2 * k).clamp(1, len);
+        let make = |is_trend: bool, basis_dim: usize| NBeatsBasisBlock {
+            fc1: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
+            fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc3: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc4: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            theta_b: nn::LinearConfig::new(self.hidden_dim, basis_dim)
+                .with_bias(false)
+                .init(device),
+            theta_f: nn::LinearConfig::new(self.hidden_dim, basis_dim)
+                .with_bias(false)
+                .init(device),
+            is_trend,
+            basis_dim,
+            signal_len: len,
+        };
+        let mut blocks = Vec::with_capacity(self.n_blocks * 2);
+        for _ in 0..self.n_blocks {
+            blocks.push(make(true, trend_dim));
+        }
+        for _ in 0..self.n_blocks {
+            blocks.push(make(false, seasonal_dim));
+        }
         BurnNBeatsx {
             input_norm: nn::LayerNormConfig::new(self.input_dim).init(device),
-            embed,
             blocks,
-            exogenous_gate: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
-            skip_proj: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
-            fusion_norm: nn::LayerNormConfig::new(self.hidden_dim).init(device),
-            output: nn::LinearConfig::new(self.hidden_dim, self.n_classes).init(device),
+            exogenous_gate: nn::LinearConfig::new(self.input_dim, self.input_dim).init(device),
+            output: nn::LinearConfig::new(len, self.n_classes).init(device),
         }
     }
 }
 
 impl<B: Backend> BurnNBeatsx<B> {
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let normalized = self.input_norm.forward(x.clone());
-        let skip = burn::tensor::activation::gelu(self.skip_proj.forward(normalized.clone()));
+        let normalized = self.input_norm.forward(x);
+        // Exogenous gate (learned from the input) modulates how much each
+        // feature's backcast is consumed at each block — the N-BEATSx routing.
         let gate =
             burn::tensor::activation::sigmoid(self.exogenous_gate.forward(normalized.clone()));
-
-        let mut residual = self.embed.forward(normalized) * gate.clone() + skip.clone();
+        let mut residual = normalized;
         let mut forecast = Tensor::zeros(residual.dims(), &residual.device());
         for block in &self.blocks {
             let (backcast, fore) = block.forward(residual.clone());
             residual = residual - backcast * gate.clone();
             forecast = forecast + fore;
         }
-
-        let fused = self.fusion_norm.forward(forecast + skip);
-        self.output.forward(fused)
+        self.output.forward(forecast)
     }
 }
 
@@ -2590,6 +2576,28 @@ mod tests {
         let v2 = model.forward(x2).into_data().to_vec::<f32>().expect("v");
         let diff: f32 = v1.iter().zip(&v2).map(|(a, b)| (a - b).abs()).sum();
         assert!(diff > 1e-5, "KAN must be input-sensitive (learnable edges), diff={diff}");
+    }
+
+    #[test]
+    fn nbeatsx_basis_forward_is_finite() {
+        let device = Default::default();
+        let model = BurnNBeatsxConfig::new(16).init::<InferBackend>(&device);
+        let x = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(
+                (0..32).map(|v| (v % 16) as f32 * 0.1 - 0.8).collect::<Vec<f32>>(),
+                [2, 16],
+            ),
+            &device,
+        );
+        let y = model.forward(x);
+        assert_eq!(y.dims(), [2, 3]);
+        assert!(
+            y.into_data()
+                .to_vec::<f32>()
+                .expect("v")
+                .iter()
+                .all(|v| v.is_finite())
+        );
     }
 
     #[test]
