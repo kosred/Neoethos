@@ -1134,54 +1134,78 @@ impl<B: Backend> BurnTabNet<B> {
 const KAN_GRID_MIN: f32 = -3.0;
 const KAN_GRID_MAX: f32 = 3.0;
 
+/// B-spline basis via the Cox–de Boor recursion (PyKAN / efficient-kan) — the
+/// REAL KAN edge basis (the previous code used a FIXED, non-learnable Gaussian
+/// RBF, which is not a KAN at all). `x: [batch, in_f] -> [batch, in_f, grid_size
+/// + spline_order]`. Uniform knots over `[grid_min, grid_max]`; the per-step
+/// denominators are the constant knot spacing `p*h`, so no division guards needed.
+fn b_spline_basis<B: Backend>(
+    x: Tensor<B, 2>,
+    grid_min: f32,
+    grid_max: f32,
+    grid_size: usize,
+    spline_order: usize,
+) -> Tensor<B, 3> {
+    let [batch, in_f] = x.dims();
+    let dev = x.device();
+    let h = (grid_max - grid_min) / grid_size.max(1) as f32;
+    let n_knots = grid_size + 2 * spline_order + 1;
+    let knots: Vec<f32> = (0..n_knots)
+        .map(|t| (t as f32 - spline_order as f32) * h + grid_min)
+        .collect();
+    let m = n_knots - 1; // number of order-0 intervals
+    let g = Tensor::<B, 1>::from_data(TensorData::new(knots, [n_knots]), &dev)
+        .reshape([1, 1, n_knots]);
+    let xc = x.clamp(grid_min, grid_max).unsqueeze_dim::<3>(2); // [batch, in_f, 1]
+    let left = g.clone().slice([0..1, 0..1, 0..m]);
+    let right = g.clone().slice([0..1, 0..1, 1..m + 1]);
+    // order-0 indicator: (x >= grid[t]) AND (x < grid[t+1]); product == logical-and.
+    let mut bases =
+        xc.clone().greater_equal(left).float() * xc.clone().lower(right).float(); // [batch,in_f,m]
+    let mut width = m;
+    for p in 1..=spline_order {
+        width -= 1; // basis width shrinks by one each recursion step
+        let denom = (p as f32 * h).max(1e-6);
+        let gt = g.clone().slice([0..1, 0..1, 0..width]); // grid[t]
+        let gtp1 = g.clone().slice([0..1, 0..1, p + 1..p + 1 + width]); // grid[t+p+1]
+        let b_lo = bases.clone().slice([0..batch, 0..in_f, 0..width]); // B_{p-1}[t]
+        let b_hi = bases.clone().slice([0..batch, 0..in_f, 1..1 + width]); // B_{p-1}[t+1]
+        bases = (xc.clone() - gt) / denom * b_lo + (gtp1 - xc.clone()) / denom * b_hi;
+    }
+    bases // [batch, in_f, grid_size + spline_order]
+}
+
+/// A real KAN layer: every edge (i -> j) is a LEARNABLE univariate function
+/// `phi_ij(x_i) = sum_t spline_weight[j,i,t] * B_t(x_i)` plus a SiLU residual
+/// base path. Node `j = sum_i phi_ij(x_i) + base_j`. The learnable splines ARE
+/// the nonlinearity (no GELU/ReLU on top).
 #[derive(Module, Debug)]
 pub struct KANLayer<B: Backend> {
-    base: nn::Linear<B>,
-    spline: nn::Linear<B>,
-    gate: nn::Linear<B>,
+    base_weight: Param<Tensor<B, 2>>, // [out_f, in_f] — SiLU residual path
+    spline_weight: Param<Tensor<B, 3>>, // [out_f, in_f, grid_size + spline_order]
     norm: nn::LayerNorm<B>,
     dropout: nn::Dropout,
+    in_f: usize,
+    out_f: usize,
     grid_size: usize,
-}
-
-fn kan_grid_center(index: usize, grid_size: usize) -> f32 {
-    if grid_size <= 1 {
-        0.0
-    } else {
-        let fraction = index as f32 / (grid_size - 1) as f32;
-        KAN_GRID_MIN + (KAN_GRID_MAX - KAN_GRID_MIN) * fraction
-    }
-}
-
-fn kan_grid_gamma(grid_size: usize) -> f32 {
-    if grid_size <= 1 {
-        1.0
-    } else {
-        let width = (KAN_GRID_MAX - KAN_GRID_MIN) / (grid_size - 1) as f32;
-        1.0 / (width * width).max(1e-6)
-    }
+    spline_order: usize,
 }
 
 impl<B: Backend> KANLayer<B> {
-    fn basis_expand(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let bounded = x.clamp(KAN_GRID_MIN, KAN_GRID_MAX);
-        let gamma = kan_grid_gamma(self.grid_size);
-        let mut basis = Vec::with_capacity(self.grid_size);
-        for grid_idx in 0..self.grid_size {
-            let center = kan_grid_center(grid_idx, self.grid_size);
-            let radial = ((bounded.clone() - center).powi_scalar(2) * -gamma).exp();
-            basis.push(radial);
-        }
-        Tensor::cat(basis, 1)
-    }
-
     fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let basis = self.basis_expand(x.clone());
-        let base = burn::tensor::activation::silu(self.base.forward(x.clone()));
-        let spline = self.spline.forward(basis);
-        let gate = burn::tensor::activation::sigmoid(self.gate.forward(x));
-        let h = base + spline * gate;
-        burn::tensor::activation::gelu(self.dropout.forward(self.norm.forward(h)))
+        let batch = x.dims()[0];
+        let coeffs = self.grid_size + self.spline_order;
+        // residual base path b(x) = silu(x), projected by the per-edge base weights.
+        let base = burn::tensor::activation::silu(x.clone())
+            .matmul(self.base_weight.val().swap_dims(0, 1)); // [batch, out_f]
+        // spline path: flatten (in_f, coeffs) and contract with the per-edge coeffs.
+        let bsp =
+            b_spline_basis::<B>(x, KAN_GRID_MIN, KAN_GRID_MAX, self.grid_size, self.spline_order)
+                .reshape([batch, self.in_f * coeffs]);
+        let w = self.spline_weight.val().reshape([self.out_f, self.in_f * coeffs]);
+        let spline = bsp.matmul(w.swap_dims(0, 1)); // [batch, out_f]
+        // LayerNorm + dropout for stability/regularisation only (NOT a nonlinearity).
+        self.dropout.forward(self.norm.forward(base + spline))
     }
 }
 
@@ -1198,8 +1222,12 @@ pub struct BurnKANConfig {
     pub hidden_dim: usize,
     #[config(default = 3)]
     pub n_layers: usize,
+    /// Number of grid intervals G (spline coefficients per edge = G + spline_order).
     #[config(default = 9)]
     pub grid_size: usize,
+    /// B-spline order k (3 = cubic).
+    #[config(default = 3)]
+    pub spline_order: usize,
     #[config(default = 3)]
     pub n_classes: usize,
     #[config(default = 0.05)]
@@ -1211,16 +1239,32 @@ impl BurnKANConfig {
         let hidden_dim = self.hidden_dim.max(4);
         let n_layers = self.n_layers.max(1);
         let grid_size = self.grid_size.clamp(3, 33);
+        let spline_order = self.spline_order.clamp(1, 5);
+        let coeffs = grid_size + spline_order;
         let mut layers = Vec::with_capacity(n_layers);
-        let mut dim = self.input_dim;
+        let mut dim = self.input_dim.max(1);
         for _ in 0..n_layers {
+            // base_weight: Kaiming-style N(0, 1/sqrt(in_f)); spline_weight: small noise
+            // N(0, 0.1/coeffs) so the splines start near-flat (efficient-kan init).
+            let base_weight = Param::from_tensor(Tensor::<B, 2>::random(
+                [hidden_dim, dim],
+                burn::tensor::Distribution::Normal(0.0, (1.0 / dim as f64).sqrt()),
+                device,
+            ));
+            let spline_weight = Param::from_tensor(Tensor::<B, 3>::random(
+                [hidden_dim, dim, coeffs],
+                burn::tensor::Distribution::Normal(0.0, 0.1 / coeffs as f64),
+                device,
+            ));
             layers.push(KANLayer {
-                base: nn::LinearConfig::new(dim, hidden_dim).init(device),
-                spline: nn::LinearConfig::new(dim * grid_size, hidden_dim).init(device),
-                gate: nn::LinearConfig::new(dim, hidden_dim).init(device),
+                base_weight,
+                spline_weight,
                 norm: nn::LayerNormConfig::new(hidden_dim).init(device),
                 dropout: nn::DropoutConfig::new(self.dropout).init(),
+                in_f: dim,
+                out_f: hidden_dim,
                 grid_size,
+                spline_order,
             });
             dim = hidden_dim;
         }
@@ -2508,6 +2552,44 @@ mod tests {
             .iter()
             .all(|v| v.is_finite());
         assert!(finite, "N-BEATS output must be finite");
+    }
+
+    #[test]
+    fn b_spline_basis_is_partition_of_unity() {
+        // Correct Cox-de Boor B-splines form a partition of unity: the basis sums
+        // to 1 over the coefficient axis for any interior input. This validates
+        // the recurrence (a wrong recurrence breaks this).
+        let device = Default::default();
+        let x = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(vec![-1.0f32, 0.0, 0.7, 2.0], [1, 4]),
+            &device,
+        );
+        let sums = b_spline_basis::<InferBackend>(x, -3.0, 3.0, 9, 3)
+            .sum_dim(2) // [1, 4, 1]
+            .into_data()
+            .to_vec::<f32>()
+            .expect("to_vec");
+        for s in sums {
+            assert!((s - 1.0).abs() < 1e-3, "B-spline basis must sum to 1, got {s}");
+        }
+    }
+
+    #[test]
+    fn kan_forward_is_finite_and_input_sensitive() {
+        let device = Default::default();
+        let model = BurnKANConfig::new(8).init::<InferBackend>(&device);
+        let x1 = Tensor::<InferBackend, 2>::from_data(TensorData::new(vec![0.5f32; 8], [1, 8]), &device);
+        let x2 = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new((0..8).map(|v| v as f32 * 0.3 - 1.0).collect::<Vec<f32>>(), [1, 8]),
+            &device,
+        );
+        let y1 = model.forward(x1);
+        assert_eq!(y1.dims(), [1, 3]);
+        let v1 = y1.into_data().to_vec::<f32>().expect("v");
+        assert!(v1.iter().all(|v| v.is_finite()), "KAN output must be finite");
+        let v2 = model.forward(x2).into_data().to_vec::<f32>().expect("v");
+        let diff: f32 = v1.iter().zip(&v2).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-5, "KAN must be input-sensitive (learnable edges), diff={diff}");
     }
 
     #[test]
