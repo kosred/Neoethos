@@ -2922,6 +2922,22 @@ fn compute_prop_firm_pass_rate(
     (passes as f64 / counted as f64, counted)
 }
 
+/// AREA 2 / Stage A (2026-06-09) — serializes GPU launches across the
+/// quality-screen's candidate `rayon::par_iter`. The Monte-Carlo screen now
+/// fires ONE batched GPU population launch per candidate (mc_runs perturbed
+/// genes), but that launch happens from inside the outer candidate par_iter:
+/// without this lock, N rayon threads would each build a cubecl GPU client
+/// concurrently → VRAM × N → OOM on a single device. Holding this lock around
+/// the launch lets candidates SHARE one client one-at-a-time (the GPU is one
+/// device anyway); the CPU-bound screen work (regime robustness, spread
+/// sensitivity, metrics analysis) still parallelizes freely across threads.
+///
+/// On the non-GPU build `validation_genes_population` is pure CPU (rayon
+/// internally), so the lock would needlessly serialize CPU work — it is only
+/// taken under `cfg(feature = "gpu")`.
+#[cfg(feature = "gpu")]
+static GPU_LAUNCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn finalize_candidates_with_progress<F>(
     candidates: Vec<Gene>,
     features: &FeatureFrame,
@@ -3295,13 +3311,37 @@ where
         let analyzer = quality_analyzer_for_config(config);
         let initial_balance = config.initial_balance;
 
+        // AREA 2 / Stage A (2026-06-09): deterministic per-combo seed for the
+        // Monte-Carlo perturbation RNG. Derived ONLY from combo-stable material
+        // (symbol + timeframe label + sample count) so the seed is identical on
+        // every run of the same combo+window and reproduces CPU↔GPU bit-for-bit.
+        // It is XOR-combined per (candidate_idx, run_idx) inside the loop so each
+        // (candidate, run) draws an independent-but-reproducible perturbation.
+        let combo_seed: u64 = {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+            let mut mix = |bytes: &[u8]| {
+                for &b in bytes {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x0000_0100_0000_01B3);
+                }
+            };
+            mix(config.evaluation_symbol.as_bytes());
+            mix(config.timeframe_label.as_bytes());
+            mix(&(ohlcv.close.len() as u64).to_le_bytes());
+            h
+        };
+
         // Outer-parallel quality screen: each candidate runs simulate_trades +
         // 100 MC perturbations + spread sensitivity independently. Previously
         // the outer loop was serial and only the 100-run MC was parallel,
         // which under-utilised cores when the candidate set was large. Move
         // parallelism to the outer level and keep the MC loop serial — this
         // avoids rayon nested-parallel oversubscription and gives ~Ncores×
-        // throughput on the per-candidate work.
+        // throughput on the per-candidate work. AREA 2 / Stage A: the inner MC
+        // loop now builds `mc_runs` perturbed genes deterministically and fires
+        // ONE batched GPU population launch (CPU fallback) per candidate via
+        // `validation_genes_population`, replacing the per-run serial
+        // `signals_for_gene_full` + `simulate_trades_core`.
         let pairs: Vec<((usize, Gene), Vec<i8>)> = filtered.into_iter().zip(signals_map).collect();
         let screened: Vec<Option<QualityCandidate>> = pairs
             .into_par_iter()
@@ -3336,16 +3376,31 @@ where
                 }
 
                 // Monte Carlo Parameter Perturbation Test.
-                // Serial here because we are already inside a par_iter on
-                // candidates — nesting rayon would oversubscribe cores.
                 // 2026-05-26 operator directive (dual-mode product): runs +
                 // min_profitable threshold sourced from typed Settings,
                 // previously hardcoded 100/70.
+                //
+                // AREA 2 / Stage A (2026-06-09): GPU-routed. The serial
+                // per-run `signals_for_gene_full` + `simulate_trades_core` is
+                // replaced by ONE batched population launch over `mc_runs`
+                // perturbed gene clones via `validation_genes_population`
+                // (GPU-try, CPU-fallback). The perturbations are applied with a
+                // DETERMINISTIC ChaCha8 RNG seeded per (combo, candidate, run),
+                // in the EXACT same draw order the serial loop used
+                // (long_threshold → short_threshold → each weight → sl_pips? →
+                // tp_pips?), so the batched run reproduces the old serial run
+                // bit-for-bit and is reproducible CPU↔GPU. The pass test
+                // `metrics[run][0] > 0.0` (net_profit) is the trade-pnl sum
+                // (fixed-1-lot, `risk_based_sizing == false`), semantically
+                // identical to the old `p_trades.iter().map(|t| t.pnl).sum() > 0.0`.
                 let mc_runs = config.mc_runs as usize;
-                let mut profitable_runs = 0usize;
-                let mut rng = rand::rng();
-                use rand::Rng;
-                for _ in 0..mc_runs {
+                let mut perturbed_genes: Vec<Gene> = Vec::with_capacity(mc_runs);
+                for run_idx in 0..mc_runs as u64 {
+                    use rand::Rng;
+                    use rand::SeedableRng;
+                    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
+                        combo_seed ^ ((candidate_idx as u64) << 20) ^ run_idx,
+                    );
                     let mut perturbed = gene.clone();
                     perturbed.long_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
                     perturbed.short_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
@@ -3358,31 +3413,49 @@ where
                     if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
                         perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
                     }
-                    // Item 6: SMC-gated signal so the MC perturbation reward is
-                    // measured against the same execution rule the search used.
-                    let p_sig = crate::genetic::signals_for_gene_full(
+                    perturbed_genes.push(perturbed);
+                }
+
+                // Template settings = the SAME `discovery_backtest_settings`
+                // the serial loop fed `simulate_trades_core` (kill-zones on,
+                // gene-resolved SL/TP with 20/40 fallback). The price hint uses
+                // the BASE gene only to source the shared cost/pip config; the
+                // per-gene SL/TP is re-resolved inside `validation_genes_population`
+                // from each perturbed gene, matching the serial per-run settings.
+                // `risk_based_sizing` is forced false in the helper so sizing is
+                // fixed-1-lot — identical to `simulate_trades_core`.
+                let mc_settings =
+                    discovery_backtest_settings(config, &gene, ohlcv.close.last().copied());
+                let mc_metrics = {
+                    // Serialize the GPU launch across the candidate par_iter so
+                    // N rayon threads don't each spin up a GPU client → VRAM × N
+                    // → OOM. The CPU-bound screen work above/below still runs in
+                    // parallel; only the device launch is one-at-a-time.
+                    #[cfg(feature = "gpu")]
+                    let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                    crate::genetic::validation_genes_population(
                         features,
                         ohlcv,
-                        &perturbed,
+                        &perturbed_genes,
                         &eval_config_for_signals,
-                    );
-                    let p_trades = crate::eval::simulate_trades_core(
-                        &ohlcv.close,
-                        &ohlcv.high,
-                        &ohlcv.low,
-                        &features.timestamps,
-                        &p_sig,
-                        &discovery_backtest_settings(
-                            config,
-                            &perturbed,
-                            ohlcv.close.last().copied(),
-                        ),
-                    );
-                    let pnl: f64 = p_trades.iter().map(|t| t.pnl).sum();
-                    if pnl > 0.0 {
-                        profitable_runs += 1;
+                        &mc_settings,
+                    )
+                };
+                let profitable_runs = match mc_metrics {
+                    Ok(metrics) => metrics.iter().filter(|m| m[0] > 0.0).count(),
+                    Err(e) => {
+                        // Fail-loud: a malformed population (empty features /
+                        // length mismatch) is a real bug, not a "0 profitable"
+                        // result. Reject the candidate but log the cause.
+                        tracing::warn!(
+                            target: "neoethos_search::discovery",
+                            error = %e,
+                            strategy_id = %gene.strategy_id,
+                            "Monte-Carlo batched eval failed — rejecting candidate"
+                        );
+                        return None;
                     }
-                }
+                };
 
                 if (profitable_runs as u32) < config.mc_min_profitable {
                     return None;

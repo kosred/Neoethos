@@ -448,6 +448,141 @@ pub fn evaluate_genes_cached(
     .map_err(|e| anyhow!(e))
 }
 
+/// AREA 2 / Stage A (2026-06-09) — GPU-routed **validation** population eval.
+///
+/// Mirrors [`evaluate_genes`] (same CSR/SMC array packing via the SHARED
+/// `build_gene_arrays` / `build_smc_arrays`, the single source of truth used by
+/// the GA), but with two deliberate differences so it reproduces the post-search
+/// validation screens (Monte-Carlo / re-eval) bit-for-bit:
+///
+/// 1. It routes through [`crate::eval::validation_backtest_population`] (whole
+///    population → ONE GPU launch, CPU fallback) instead of the GA's CPU+GPU
+///    *split* [`crate::eval::evaluate_population_core`].
+/// 2. The caller supplies the **exact** [`BacktestSettings`] template the serial
+///    validation path used (e.g. `discovery_backtest_settings`): kill-zones on,
+///    and — critically — `risk_based_sizing == false`, so the kernel uses
+///    fixed-1-lot sizing identical to `simulate_trades_core`. Per-gene `sl_pips`
+///    / `tp_pips` are taken from the gene with the SAME 20/40 fallback
+///    `discovery_backtest_settings` applies (NOT the OHLCV-inferred
+///    `resolve_stop_target_arrays` defaults the GA uses), so the SL/TP exits
+///    match the serial Monte-Carlo run exactly.
+///
+/// With `risk_based_sizing == false` the returned `metrics[0]` (net_profit) is
+/// the fixed-1-lot trade-pnl sum, so a consumer testing `metrics[g][0] > 0.0`
+/// gets the SAME profitable/not verdict as the serial
+/// `simulate_trades_core(...).iter().map(|t| t.pnl).sum() > 0.0`.
+pub fn validation_genes_population(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    genes: &[Gene],
+    config: &EvaluationConfig,
+    settings_template: &BacktestSettings,
+) -> Result<Vec<[f64; 11]>> {
+    if genes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if features.n_samples() == 0 || features.n_features() == 0 {
+        bail!("empty feature matrix");
+    }
+    let n_samples = features.n_samples();
+    if ohlcv.close.len() != n_samples {
+        bail!("ohlcv length does not match feature rows");
+    }
+
+    let indicators = transpose_features(features);
+    let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
+    // Per-gene SL/TP resolved the SAME way `discovery_backtest_settings` does:
+    // the gene's own finite-positive value, else the 20/40-pip fallback. This is
+    // what the serial validation path injected into `simulate_trades_core`, so
+    // the SL/TP exits stay identical.
+    let mut sl_pips = Vec::with_capacity(genes.len());
+    let mut tp_pips = Vec::with_capacity(genes.len());
+    for g in genes {
+        sl_pips.push(if g.sl_pips.is_finite() && g.sl_pips > 0.0 {
+            g.sl_pips
+        } else {
+            20.0
+        });
+        tp_pips.push(if g.tp_pips.is_finite() && g.tp_pips > 0.0 {
+            g.tp_pips
+        } else {
+            40.0
+        });
+    }
+    let (months, days) = month_day_indices(&features.timestamps);
+
+    let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
+        build_smc_arrays(features, ohlcv);
+    let mut smc_data = Vec::with_capacity(n_samples);
+    for i in 0..n_samples {
+        smc_data.push([
+            ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i], eql[i],
+            disp[i],
+        ]);
+    }
+    let mut gene_smc_flags = Vec::with_capacity(genes.len());
+    for g in genes {
+        gene_smc_flags.push([
+            g.use_ob as i8,
+            g.use_fvg as i8,
+            g.use_liq_sweep as i8,
+            g.mtf_confirmation as i8,
+            g.use_premium_discount as i8,
+            g.use_inducement as i8,
+            g.use_bos as i8,
+            g.use_choch as i8,
+            g.use_eqh as i8,
+            g.use_eql as i8,
+            g.use_displacement as i8,
+        ]);
+    }
+
+    let smc_weights = [
+        config.smc_weight_ob,
+        config.smc_weight_fvg,
+        config.smc_weight_liq,
+        config.smc_weight_mtf,
+        config.smc_weight_premium,
+        config.smc_weight_inducement,
+        config.smc_weight_bos,
+        config.smc_weight_choch,
+        config.smc_weight_eqh,
+        config.smc_weight_eql,
+        config.smc_weight_displacement,
+    ];
+
+    // Use the caller's settings verbatim, but FORCE fixed-1-lot sizing so the
+    // metrics[0] sign matches the serial `simulate_trades_core` reference. The
+    // caller is expected to pass `risk_based_sizing == false` already; this is
+    // belt-and-suspenders so a stray template can never silently change sizing.
+    let mut settings = settings_template.clone();
+    settings.risk_based_sizing = false;
+
+    Ok(crate::eval::validation_backtest_population(
+        crate::eval::PopulationEvalInputs {
+            close: &ohlcv.close,
+            high: &ohlcv.high,
+            low: &ohlcv.low,
+            indicators: indicators.view(),
+            gene_offsets: &offsets,
+            gene_indices: &indices,
+            gene_weights: &weights,
+            long_thr: &long_thr,
+            short_thr: &short_thr,
+            month_idx: &months,
+            day_idx: &days,
+            timestamps: &features.timestamps,
+            sl_pips: &sl_pips,
+            tp_pips: &tp_pips,
+            smc_data: &smc_data,
+            gene_smc_flags: &gene_smc_flags,
+            gate_threshold: config.smc_gate_threshold,
+            weights: &smc_weights,
+            settings: &settings,
+        },
+    ))
+}
+
 pub fn evaluate_genes(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,

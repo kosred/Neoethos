@@ -1924,6 +1924,207 @@ pub fn evaluate_population_core(
     Ok(results)
 }
 
+/// AREA 2 / Stage A (2026-06-09) — shared GPU-try + CPU-fallback entry for the
+/// **validation tail** (the post-search Monte-Carlo / re-evaluation screens that
+/// today run 100% on CPU). It takes the EXACT same [`PopulationEvalInputs`] shape
+/// the GA search builds (CSR gene arrays + per-gene sl/tp/smc_flags + shared
+/// per-sample close/high/low/indicators/month/day/timestamps + settings) and
+/// returns the SAME `Vec<[f64; 11]>` per-gene metric layout as
+/// [`evaluate_population_core`].
+///
+/// Unlike `evaluate_population_core` (which CPU+GPU *splits* a single population),
+/// this routes the WHOLE population through the GPU kernel in one launch, then
+/// falls back to a full-CPU re-evaluation on any failure. It is the first
+/// validation consumer of the GPU population kernel: a Monte-Carlo screen builds
+/// `mc_runs` perturbed genes and asks "how many are profitable?", which is a
+/// population eval — identical shape to a GA generation, no kernel change.
+///
+/// Fallback semantics MIRROR the GA hybrid's own fallback
+/// (`evaluate_population_core`, the `match gpu_outcome` arms): a wrong gene count,
+/// an `Err`, or a cubecl pool panic (#243 — cubecl 0.10 has no Result-returning
+/// launch, so a pool exhaustion *panics*; the release profile is `panic="unwind"`,
+/// Cargo.toml, so `catch_unwind` is meaningful) all `tracing::warn!` and fall
+/// through to the exact `eval_gene_cpu` closure used by `evaluate_population_core`.
+/// This keeps the never-OOM invariant: a GPU failure becomes a slow-but-correct
+/// CPU recompute, never a crash.
+///
+/// Determinism note: the GPU lane is f32, the CPU lane f64. Callers that consume
+/// only the SIGN of a metric (e.g. the MC profitable-run COUNT, which tests
+/// `metrics[0] > 0.0`) get CPU==GPU agreement except for a strategy whose
+/// `net_profit` sits within f32 epsilon of zero — the parity test
+/// `gpu_montecarlo_batch_matches_cpu` pins this to within ±1 run.
+#[cfg(feature = "gpu")]
+pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+    let PopulationEvalInputs {
+        close,
+        high,
+        low,
+        indicators,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        month_idx,
+        day_idx,
+        timestamps,
+        sl_pips,
+        tp_pips,
+        smc_data,
+        gene_smc_flags,
+        gate_threshold,
+        weights,
+        settings,
+    } = inputs;
+    init_rayon();
+    let n_genes = long_thr.len();
+    let n_samples = close.len();
+    if n_genes == 0 {
+        return Vec::new();
+    }
+
+    // Per-gene CPU fallback — lifted VERBATIM from `evaluate_population_core` so
+    // the CSR signal-synth + SL/TP backtest is the SINGLE source of truth shared
+    // with the GA. (Kept as a local closure rather than a free fn because it
+    // closes over the borrowed input slices.)
+    let eval_gene_cpu = |g: usize| -> [f64; 11] {
+        let (signals, confidences) = synthesize_signals_and_confidence_cpu(
+            indicators,
+            gene_offsets,
+            gene_indices,
+            gene_weights,
+            long_thr,
+            short_thr,
+            smc_data,
+            gene_smc_flags,
+            gate_threshold,
+            weights,
+            g,
+            n_samples,
+        );
+        let mut gene_settings = settings.clone();
+        gene_settings.sl_pips = sl_pips[g];
+        gene_settings.tp_pips = tp_pips[g];
+        fast_evaluate_strategy_core(
+            close, high, low, &signals, &confidences, month_idx, day_idx, timestamps,
+            &gene_settings,
+        )
+    };
+
+    // Respect the same env kill-switches the GA hybrid honours: if a kernel is
+    // disabled, go straight to CPU (no point building a GPU launch that the
+    // kernel-enabled guard would reject).
+    if cuda_eval_signal_kernel_enabled() && cuda_eval_backtest_kernel_enabled() {
+        let device_override = eval_gpu_devices().first().copied();
+        // catch_unwind is the ONLY mitigation for cubecl #243 pool-panics
+        // (no Result-returning launch in cubecl 0.10). `AssertUnwindSafe` is
+        // sound here: on a panic we discard every partial GPU result and
+        // recompute the WHOLE population on the CPU, so no observer sees a
+        // torn intermediate.
+        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            try_evaluate_population_cuda(
+                close,
+                high,
+                low,
+                indicators,
+                gene_offsets,
+                gene_indices,
+                gene_weights,
+                long_thr,
+                short_thr,
+                month_idx,
+                day_idx,
+                timestamps,
+                sl_pips,
+                tp_pips,
+                smc_data,
+                gene_smc_flags,
+                gate_threshold,
+                weights,
+                settings,
+                device_override,
+            )
+        }));
+        match gpu {
+            Ok(Ok(v)) if v.len() == n_genes => return v,
+            Ok(Ok(_)) => tracing::warn!(
+                target: "neoethos_search::eval",
+                "validation GPU lane returned the wrong gene count — recomputing on CPU"
+            ),
+            Ok(Err(e)) => tracing::warn!(
+                target: "neoethos_search::eval",
+                "validation GPU lane failed ({e}) — recomputing on CPU"
+            ),
+            Err(_) => tracing::warn!(
+                target: "neoethos_search::eval",
+                "validation GPU lane panicked (cubecl pool/#243?) — recomputing on CPU"
+            ),
+        }
+    }
+
+    // CPU fallback — full-population re-evaluation (fail-loud already logged).
+    (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect()
+}
+
+/// CPU-only twin of [`validation_backtest_population`] for the non-GPU build, so
+/// `discovery.rs` (and any other validation consumer) compiles and runs the SAME
+/// code path with or without the `gpu` feature. Behaviour is identical to the
+/// GPU twin's fallback arm: a full-population CPU re-evaluation.
+#[cfg(not(feature = "gpu"))]
+pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+    let PopulationEvalInputs {
+        close,
+        high,
+        low,
+        indicators,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        month_idx,
+        day_idx,
+        timestamps,
+        sl_pips,
+        tp_pips,
+        smc_data,
+        gene_smc_flags,
+        gate_threshold,
+        weights,
+        settings,
+    } = inputs;
+    init_rayon();
+    let n_genes = long_thr.len();
+    let n_samples = close.len();
+    if n_genes == 0 {
+        return Vec::new();
+    }
+    let eval_gene_cpu = |g: usize| -> [f64; 11] {
+        let (signals, confidences) = synthesize_signals_and_confidence_cpu(
+            indicators,
+            gene_offsets,
+            gene_indices,
+            gene_weights,
+            long_thr,
+            short_thr,
+            smc_data,
+            gene_smc_flags,
+            gate_threshold,
+            weights,
+            g,
+            n_samples,
+        );
+        let mut gene_settings = settings.clone();
+        gene_settings.sl_pips = sl_pips[g];
+        gene_settings.tp_pips = tp_pips[g];
+        fast_evaluate_strategy_core(
+            close, high, low, &signals, &confidences, month_idx, day_idx, timestamps,
+            &gene_settings,
+        )
+    };
+    (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect()
+}
+
 #[cfg(test)]
 mod overrides_tests {
     use super::*;
@@ -2645,5 +2846,217 @@ mod gpu_cpu_parity_tests {
                 );
             }
         }
+    }
+
+    /// AREA 2 / Stage A (2026-06-09) — Monte-Carlo batched-population parity.
+    ///
+    /// The discovery quality screen used to run, per surviving candidate, a
+    /// SERIAL loop of `mc_runs` perturbations: each perturbed gene → SMC-gated
+    /// signal → `simulate_trades_core` (fixed-1-lot) → count `pnl_sum > 0`. Stage A
+    /// replaces that with ONE batched `validation_backtest_population` launch over
+    /// the `mc_runs` perturbed genes and counts `metrics[run][0] > 0.0`. The two
+    /// must report the SAME profitable-run COUNT.
+    ///
+    /// This test pins BOTH halves of that equivalence:
+    ///  1. RNG determinism — the perturbed genes are built with a `ChaCha8Rng`
+    ///     seeded per `(combo, candidate, run)` (exactly as the discovery loop now
+    ///     does), so the batched run is reproducible and CPU==GPU on the same seeds.
+    ///  2. Pass-test equivalence — `metrics[0] > 0.0` (net_profit, fixed-1-lot)
+    ///     equals `simulate_trades_core(...).iter().map(|t| t.pnl).sum() > 0.0`
+    ///     because with `risk_based_sizing == false` net_profit IS the fixed-1-lot
+    ///     trade-pnl sum.
+    ///
+    /// The only consumed signal is the SIGN of net_profit, so the COUNT is asserted
+    /// EXACT-equal with a ±1 tolerance for the sole edge case (a run whose net sits
+    /// within f32 epsilon of zero); any near-zero sign flip is logged. The
+    /// per-metric tolerance band of the sibling tests is NOT loosened. Runs only on
+    /// a real GPU box (skips cleanly otherwise; `NEOETHOS_REQUIRE_GPU=1` fails loud
+    /// on a device misconfig), and falls back to a CPU==CPU check on a GPU-less box
+    /// (since `validation_backtest_population` CPU-falls-back there).
+    #[test]
+    fn gpu_montecarlo_batch_matches_cpu() {
+        use rand::Rng;
+        use rand::SeedableRng;
+
+        let n_samples = 800usize;
+        let n_features = 6usize;
+        let mc_runs = 64usize;
+
+        // Same deterministic price wave + indicators as the population parity test,
+        // so SL/TP exits actually fire across the perturbed thresholds.
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| 1.10 + ((i as f64) * 0.02).sin() * 0.01)
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0008).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0008).collect();
+        let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
+            (((i + f * 11) as f32) * 0.05).sin() * 0.8
+        });
+
+        let timestamps: Vec<i64> = (0..n_samples as i64).map(|i| i * 60_000).collect();
+        let month_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 100).collect();
+        let day_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 30).collect();
+
+        // SMC gating OFF (zero flags + zero gate) so signals are pure
+        // indicator-threshold crossings — keeps the test's signal path identical
+        // CPU↔GPU, isolating the MC batching as the thing under test.
+        let smc_data: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
+        let smc_weights = [0.0f32; 11];
+        let gate_threshold = 0.0f32;
+
+        // Fixed-1-lot cost model (mirrors `discovery_backtest_settings` after the
+        // helper forces `risk_based_sizing = false`).
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = false; // fixed-1-lot, matching the helper
+
+        // A "base gene": sums features 0+1 (weight 1.0), modest thresholds, finite
+        // SL/TP. Each MC run perturbs a clone of this, exactly like the discovery
+        // loop perturbs `gene`.
+        let base_long_thr = 0.30f32;
+        let base_short_thr = -0.30f32;
+        let base_weights = [1.0f32, 1.0f32];
+        let base_indices = [0i32, 1i32];
+        let base_sl = 25.0f64;
+        let base_tp = 50.0f64;
+
+        // Deterministic per-(combo, candidate, run) perturbation — IDENTICAL draw
+        // order to `finalize_candidates_with_progress`'s MC loop
+        // (long_threshold → short_threshold → each weight → sl? → tp?).
+        let combo_seed: u64 = 0x1234_5678_9abc_def0;
+        let candidate_idx: u64 = 7;
+
+        // Per-run perturbed gene parameters (CSR-flat for the population call).
+        let mut gene_offsets: Vec<i32> = Vec::with_capacity(mc_runs + 1);
+        let mut gene_indices: Vec<i32> = Vec::with_capacity(mc_runs * 2);
+        let mut gene_weights: Vec<f32> = Vec::with_capacity(mc_runs * 2);
+        let mut long_thr: Vec<f32> = Vec::with_capacity(mc_runs);
+        let mut short_thr: Vec<f32> = Vec::with_capacity(mc_runs);
+        let mut sl_pips: Vec<f64> = Vec::with_capacity(mc_runs);
+        let mut tp_pips: Vec<f64> = Vec::with_capacity(mc_runs);
+        gene_offsets.push(0);
+        for run_idx in 0..mc_runs as u64 {
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
+                combo_seed ^ ((candidate_idx) << 20) ^ run_idx,
+            );
+            let lt = base_long_thr * (1.0 + rng.random_range(-0.15f32..=0.15));
+            let st = base_short_thr * (1.0 + rng.random_range(-0.15f32..=0.15));
+            let w0 = base_weights[0] * (1.0 + rng.random_range(-0.20f32..=0.20));
+            let w1 = base_weights[1] * (1.0 + rng.random_range(-0.20f32..=0.20));
+            // sl/tp are finite>0, so the conditional draws ALWAYS happen (same as
+            // the discovery loop, whose base gene has finite SL/TP).
+            let sl = base_sl * (1.0 + rng.random_range(-0.25f64..=0.25));
+            let tp = base_tp * (1.0 + rng.random_range(-0.25f64..=0.25));
+            long_thr.push(lt);
+            short_thr.push(st);
+            gene_indices.extend_from_slice(&base_indices);
+            gene_weights.push(w0);
+            gene_weights.push(w1);
+            gene_offsets.push(gene_indices.len() as i32);
+            sl_pips.push(sl);
+            tp_pips.push(tp);
+        }
+        let gene_smc_flags: Vec<SmcRow> = vec![[0i8; 11]; mc_runs];
+
+        // ── SERIAL CPU REFERENCE — the exact old MC path ────────────────────────
+        // Per run: synthesize the SMC-gated signal (the same synth the helper uses
+        // internally), then `simulate_trades_core` (fixed-1-lot) and count pnl>0.
+        let mut cpu_profitable = 0usize;
+        let mut cpu_net: Vec<f64> = Vec::with_capacity(mc_runs);
+        for run in 0..mc_runs {
+            let (signals, _conf) = synthesize_signals_and_confidence_cpu(
+                indicators.view(),
+                &gene_offsets,
+                &gene_indices,
+                &gene_weights,
+                &long_thr,
+                &short_thr,
+                &smc_data,
+                &gene_smc_flags,
+                gate_threshold,
+                &smc_weights,
+                run,
+                n_samples,
+            );
+            let mut s = settings.clone();
+            s.sl_pips = sl_pips[run];
+            s.tp_pips = tp_pips[run];
+            let trades =
+                simulate_trades_core(&close, &high, &low, &timestamps, &signals, &s);
+            let net: f64 = trades.iter().map(|t| t.pnl).sum();
+            cpu_net.push(net);
+            if net > 0.0 {
+                cpu_profitable += 1;
+            }
+        }
+
+        // ── BATCHED POPULATION (GPU-try, CPU-fallback) ──────────────────────────
+        // On a GPU box this exercises the real kernel; on a GPU-less box the helper
+        // CPU-falls-back, so this still validates the pass-test equivalence and RNG
+        // determinism (the CPU vs CPU comparison is then EXACT).
+        let metrics = validation_backtest_population(PopulationEvalInputs {
+            close: &close,
+            high: &high,
+            low: &low,
+            indicators: indicators.view(),
+            gene_offsets: &gene_offsets,
+            gene_indices: &gene_indices,
+            gene_weights: &gene_weights,
+            long_thr: &long_thr,
+            short_thr: &short_thr,
+            month_idx: &month_idx,
+            day_idx: &day_idx,
+            timestamps: &timestamps,
+            sl_pips: &sl_pips,
+            tp_pips: &tp_pips,
+            smc_data: &smc_data,
+            gene_smc_flags: &gene_smc_flags,
+            gate_threshold,
+            weights: &smc_weights,
+            settings: &settings,
+        });
+        assert_eq!(
+            metrics.len(),
+            mc_runs,
+            "batched MC returned the wrong run count"
+        );
+        let batch_profitable = metrics.iter().filter(|m| m[0] > 0.0).count();
+
+        // Log + tolerate near-zero sign flips (the f32-vs-f64 edge case the ±1
+        // tolerance covers). A flip far from zero is a real divergence and fails.
+        let mut near_zero_flips = 0usize;
+        for run in 0..mc_runs {
+            let (cpu_sign, gpu_sign) = (cpu_net[run] > 0.0, metrics[run][0] > 0.0);
+            if cpu_sign != gpu_sign {
+                let cn = cpu_net[run];
+                let gn = metrics[run][0];
+                // "Near zero" = within a few cents of break-even relative to the
+                // run's magnitude; anything larger is a genuine logic divergence.
+                let scale = cn.abs().max(gn.abs()).max(1.0);
+                let near_zero = cn.abs() <= 1e-2 * scale && gn.abs() <= 1e-2 * scale;
+                eprintln!(
+                    "MC run {run}: sign flip cpu_net={cn} gpu_net={gn} (near_zero={near_zero})"
+                );
+                assert!(
+                    near_zero,
+                    "MC run {run}: profitable-sign flip FAR from zero (cpu_net={cn} gpu_net={gn}) \
+                     — GPU batched MC diverges from the serial CPU reference"
+                );
+                near_zero_flips += 1;
+            }
+        }
+
+        assert!(
+            (batch_profitable as i64 - cpu_profitable as i64).abs() <= 1,
+            "MC profitable-run COUNT mismatch: cpu={cpu_profitable} batched={batch_profitable} \
+             (near-zero sign flips={near_zero_flips}) — only ±1 is tolerated (single break-even run)"
+        );
     }
 }
