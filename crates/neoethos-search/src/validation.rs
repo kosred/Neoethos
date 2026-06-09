@@ -4,6 +4,7 @@ use crate::eval::{
 };
 use anyhow::{Result, bail};
 use itertools::Itertools;
+use rayon::prelude::*;
 use neoethos_core::contracts::{TemporalFeatureContract, TemporalScopeHashes};
 use neoethos_core::domain::prop_firm::{PropFirmChallengeDefaults, PropFirmConstraints};
 use serde::{Deserialize, Serialize};
@@ -1068,113 +1069,116 @@ pub fn embargoed_walkforward_backtest(
     }
 
     let window = (n / n_splits).max(1);
-    let mut split_results = Vec::new();
 
-    for i in 0..n_splits {
-        let start = i * window;
-        let end = ((i + 1) * window).min(n);
-        // **F-020 + F-021 documentation (2026-05-25)** — minimum window
-        // of 80 bars is timeframe-AGNOSTIC by design. The audit flagged
-        // this because 80 M1-bars = 80 minutes (trivially small), while
-        // 80 D1-bars = 80 days (substantial). The fix is to compute the
-        // minimum *in calendar days* from the timestamps array rather
-        // than as a raw bar count.
-        //
-        // Phase A (this commit): we DOCUMENT the limitation + log a
-        // structured warning when the cutoff triggers, so operators
-        // see split-drop events in the run profile. The 80-bar floor
-        // stays because the existing test fixtures + persisted
-        // run-profiles assume it; raising it would break the calibration.
-        //
-        // Phase B (deferred): replace `< 80` with
-        // `(timestamps[end-1] - timestamps[start]) < min_window_days
-        // * 86_400_000` using the operator-tunable `min_window_days`
-        // knob (default 14 days for M1/M5, 30 for H1, 90 for D1).
-        // This unifies the timeframe-aware minimum across the splits.
-        if end - start < 80 {
-            tracing::warn!(
-                target: "neoethos_search::validation",
-                split_index = i,
-                bars_in_window = end - start,
-                "walkforward split below 80-bar floor; dropping split. \
-                 Consider reducing n_splits or expanding the input window."
-            );
-            break;
-        }
-
-        let train_end = start + ((window as f64) * train_ratio) as usize;
-        let test_start = train_end + embargo_bars;
-
-        if test_start >= end || (train_end - start) < 40 || (end - test_start) < 40 {
-            continue;
-        }
-
-        let slice_close = &close[test_start..end];
-        let slice_high = &high[test_start..end];
-        let slice_low = &low[test_start..end];
-        let slice_sig = &signals[test_start..end];
-        let slice_months = &months[test_start..end];
-        let slice_days = &days[test_start..end];
-        let slice_ts = if timestamps.len() == n {
-            &timestamps[test_start..end]
-        } else {
-            slice_days
-        };
-
-        let metrics = fast_evaluate_strategy_core(
-            slice_close,
-            slice_high,
-            slice_low,
-            slice_sig,
-            // Phase 1: legacy fixed-1-lot for the walk-forward slice eval.
-            &[],
-            slice_months,
-            slice_days,
-            &[],
-            settings,
+    // `window` is constant across splits: with floor division
+    // n_splits*window <= n, so `end` == (i+1)*window for every split (the
+    // `.min(n)` clamp never bites) and `end - start` == window for ALL splits.
+    // The 80-bar floor and the train/embargo validity checks below are
+    // therefore split-INDEPENDENT — either every split qualifies or none does.
+    // Each split's backtest reads disjoint slices with NO RNG, so the
+    // qualifying splits evaluate in parallel bit-identically to the old serial
+    // loop. This saturates idle cores when the outer candidate axis has shrunk
+    // below the core count (the validation-tail idle-core leak).
+    //
+    // F-020 + F-021: the 80-bar floor is timeframe-AGNOSTIC by design (80
+    // M1-bars = 80 min, 80 D1-bars = 80 days). Phase B (deferred): replace
+    // `< 80` with a calendar-day minimum from the timestamps array via an
+    // operator-tunable `min_window_days` knob.
+    if window < 80 {
+        tracing::warn!(
+            target: "neoethos_search::validation",
+            bars_in_window = window,
+            n_splits,
+            "walkforward window below 80-bar floor; dropping all splits. \
+             Consider reducing n_splits or expanding the input window."
         );
-
-        // Map metrics [net_profit, 0.0, peak_equity, max_dd, win_rate, pf, expectancy, 0.0, trade_count, consistency, max_daily_dd]
-        let net_profit = metrics[0];
-        let max_dd = metrics[3];
-        let win_rate = metrics[4];
-        let trade_count = metrics[8] as usize;
-        let max_daily_dd = metrics[10];
-        let risk = walkforward_risk_diagnostics(
-            slice_close,
-            slice_high,
-            slice_low,
-            slice_sig,
-            slice_days,
-            slice_ts,
-            settings,
-            max_daily_dd,
-            max_daily_loss_pct,
-            max_daily_profit_pct,
-            min_trading_days,
-            max_trades_per_day,
-            initial_balance,
-        );
-
-        let res = WalkforwardSplitResult {
-            split: i + 1,
-            trades: trade_count,
-            pnl: net_profit,
-            win_rate,
-            max_dd,
-            max_consec_losses: risk.max_consec_losses,
-            daily_min_dd: risk.daily_min_dd,
-            max_daily_loss: risk.max_daily_loss,
-            daily_loss_breach: risk.daily_loss_breach,
-            consistency_violation: risk.consistency_violation,
-            trade_limit_violation: risk.trade_limit_violation,
-            min_trading_days_ok: risk.min_trading_days_ok,
-            daily_returns: risk.daily_returns,
-            max_daily_dd_pct: risk.max_daily_dd_pct,
-            prop_compliant: risk.prop_compliant,
-        };
-        split_results.push(res);
     }
+    let mut split_results: Vec<WalkforwardSplitResult> = if window < 80 {
+        Vec::new()
+    } else {
+        (0..n_splits)
+            .into_par_iter()
+            .filter_map(|i| {
+                let start = i * window;
+                let end = ((i + 1) * window).min(n);
+
+                let train_end = start + ((window as f64) * train_ratio) as usize;
+                let test_start = train_end + embargo_bars;
+
+                if test_start >= end || (train_end - start) < 40 || (end - test_start) < 40 {
+                    return None;
+                }
+
+                let slice_close = &close[test_start..end];
+                let slice_high = &high[test_start..end];
+                let slice_low = &low[test_start..end];
+                let slice_sig = &signals[test_start..end];
+                let slice_months = &months[test_start..end];
+                let slice_days = &days[test_start..end];
+                let slice_ts = if timestamps.len() == n {
+                    &timestamps[test_start..end]
+                } else {
+                    slice_days
+                };
+
+                let metrics = fast_evaluate_strategy_core(
+                    slice_close,
+                    slice_high,
+                    slice_low,
+                    slice_sig,
+                    // Phase 1: legacy fixed-1-lot for the walk-forward slice eval.
+                    &[],
+                    slice_months,
+                    slice_days,
+                    &[],
+                    settings,
+                );
+
+                // Map metrics [net_profit, 0.0, peak_equity, max_dd, win_rate, pf, expectancy, 0.0, trade_count, consistency, max_daily_dd]
+                let net_profit = metrics[0];
+                let max_dd = metrics[3];
+                let win_rate = metrics[4];
+                let trade_count = metrics[8] as usize;
+                let max_daily_dd = metrics[10];
+                let risk = walkforward_risk_diagnostics(
+                    slice_close,
+                    slice_high,
+                    slice_low,
+                    slice_sig,
+                    slice_days,
+                    slice_ts,
+                    settings,
+                    max_daily_dd,
+                    max_daily_loss_pct,
+                    max_daily_profit_pct,
+                    min_trading_days,
+                    max_trades_per_day,
+                    initial_balance,
+                );
+
+                Some(WalkforwardSplitResult {
+                    split: i + 1,
+                    trades: trade_count,
+                    pnl: net_profit,
+                    win_rate,
+                    max_dd,
+                    max_consec_losses: risk.max_consec_losses,
+                    daily_min_dd: risk.daily_min_dd,
+                    max_daily_loss: risk.max_daily_loss,
+                    daily_loss_breach: risk.daily_loss_breach,
+                    consistency_violation: risk.consistency_violation,
+                    trade_limit_violation: risk.trade_limit_violation,
+                    min_trading_days_ok: risk.min_trading_days_ok,
+                    daily_returns: risk.daily_returns,
+                    max_daily_dd_pct: risk.max_daily_dd_pct,
+                    prop_compliant: risk.prop_compliant,
+                })
+            })
+            .collect()
+    };
+    // par collect preserves range order, but make the ascending-split
+    // invariant explicit for downstream consumers.
+    split_results.sort_by_key(|r| r.split);
 
     if split_results.is_empty() {
         return Ok(WalkforwardSummary {
