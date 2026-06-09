@@ -976,6 +976,29 @@ fn glu<B: Backend>(x: Tensor<B, 2>, half: usize) -> Tensor<B, 2> {
     a * burn::tensor::activation::sigmoid(b)
 }
 
+/// sparsemax (Martins & Astudillo 2016) over the last dim of a `[batch, dim]`
+/// tensor: a sparse softmax alternative that yields EXACT zeros. For each row z,
+/// returns max(z - tau, 0) where tau is the threshold making the row sum to 1.
+/// This is TabNet's defining feature-selection activation — the previous code
+/// used plain softmax (never sparse).
+fn sparsemax<B: Backend>(z: Tensor<B, 2>) -> Tensor<B, 2> {
+    let d = z.dims()[1];
+    let z_sorted = z.clone().sort_descending(1);
+    let z_cumsum = z_sorted.clone().cumsum(1);
+    // k = [1, 2, ..., d], broadcast over the batch.
+    let k = Tensor::<B, 1, Int>::arange(1..(d as i64 + 1), &z.device())
+        .float()
+        .reshape([1, d]);
+    // support indicator: 1 + k*z_sorted[k] > cumsum[k] (true for the top k_z; monotone on sorted z).
+    let support = (z_sorted.clone() * k + 1.0 - z_cumsum)
+        .greater_elem(0.0)
+        .float();
+    let k_z = support.clone().sum_dim(1); // [batch, 1] — size of the support (>= 1)
+    let top_sum = (z_sorted * support).sum_dim(1); // sum of the top-k_z sorted values
+    let tau = (top_sum - 1.0) / k_z; // [batch, 1]
+    burn::tensor::activation::relu(z - tau)
+}
+
 impl<B: Backend> BurnTabNet<B> {
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
         let batch = x.dims()[0];
@@ -991,12 +1014,17 @@ impl<B: Backend> BurnTabNet<B> {
             // Attention mask
             let attn = self.attn_fc.forward(feat.clone());
             let attn = self.attn_norm.forward(attn * prior.clone());
-            let mask = burn::tensor::activation::softmax(attn, 1);
+            // sparsemax → enforces SPARSE feature selection (exact zeros), the
+            // defining TabNet property the previous softmax lacked.
+            let mask = sparsemax(attn);
 
-            // Update prior (decay attention)
-            let threshold =
+            // TabNet prior update P_i = P_{i-1} * (gamma - M_i). gamma>1 and the
+            // sparsemax mask is in [0,1] so the factor is always positive. The
+            // previous code clamped it to [0,1], capping the >1 growth that makes
+            // successive steps attend DIFFERENT features (cross-step diversity).
+            let prior_decay =
                 Tensor::<B, 2>::ones_like(&mask) * self.relaxation_factor - mask.clone();
-            prior = prior * threshold.clamp(0.0, 1.0);
+            prior = prior * prior_decay;
 
             // Masked feature → transform → accumulate
             let masked = x_norm.clone() * mask;
@@ -2344,6 +2372,22 @@ pub fn predict_proba_checked_on_device_with_selection<B: Backend, M: BurnForward
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparsemax_is_normalized_and_sparse() {
+        // sparsemax must (a) sum to 1 per row and (b) produce EXACT zeros for the
+        // dominated entries — unlike softmax which is always fully dense.
+        let device = Default::default();
+        let z = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(vec![3.0f32, 0.1, 0.1, 0.1, 0.1], [1, 5]),
+            &device,
+        );
+        let p = sparsemax(z).into_data().to_vec::<f32>().expect("to_vec");
+        let sum: f32 = p.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4, "sparsemax must sum to 1, got {sum}");
+        let zeros = p.iter().filter(|&&x| x.abs() < 1e-6).count();
+        assert!(zeros >= 1, "sparsemax must produce exact zeros, got {p:?}");
+    }
 
     #[test]
     fn transformer_positional_encoding_makes_token_order_matter() {
