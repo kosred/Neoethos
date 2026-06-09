@@ -160,6 +160,11 @@ pub struct GeneticSearchRuntimeOverrides {
     /// Minimum top-fitness increase counted as an improvement when tracking
     /// stagnation (replaces the legacy hard-coded `1e-12`).
     pub min_improvement: f64,
+    /// Wall-clock floor for the convergence early-stop, as a fraction of the
+    /// per-combo time budget. The early-stop fires only after this fraction
+    /// of `max_runtime` has elapsed — makes it throughput-robust so fast
+    /// timeframes (where 250 gens ≈ 1 s) are not killed before they search.
+    pub convergence_min_elapsed_fraction: f64,
     /// Optional explicit tournament size for tournament-based selection.
     /// `None` means "derive from population" (`max(population/12, 3)`).
     pub tournament_size_override: Option<usize>,
@@ -182,6 +187,7 @@ impl Default for GeneticSearchRuntimeOverrides {
             stagnation_patience: 2,
             convergence_patience: 250,
             min_improvement: 1e-12,
+            convergence_min_elapsed_fraction: 0.5,
             tournament_size_override: None,
             archive_cap_override: None,
             seen_retry_attempts: 16,
@@ -214,6 +220,9 @@ impl GeneticSearchRuntimeOverrides {
         }
         if let Some(min_imp) = env_f64_finite("NEOETHOS_BOT_PROP_MIN_IMPROVEMENT") {
             overrides.min_improvement = min_imp;
+        }
+        if let Some(frac) = env_f64_finite("NEOETHOS_BOT_PROP_CONVERGENCE_MIN_ELAPSED_FRAC") {
+            overrides.convergence_min_elapsed_fraction = frac;
         }
         if let Some(tournament) = env_usize_positive("NEOETHOS_BOT_PROP_TOURNAMENT_SIZE") {
             overrides.tournament_size_override = Some(tournament);
@@ -303,6 +312,7 @@ impl GeneticSearchRuntimeOverrides {
             stagnation_patience: c.stagnation_patience,
             convergence_patience: c.convergence_patience,
             min_improvement: c.min_improvement,
+            convergence_min_elapsed_fraction: c.convergence_min_elapsed_fraction,
             tournament_size_override: c.tournament_size_override,
             archive_cap_override: c.archive_cap_override,
             seen_retry_attempts: c.seen_retry_attempts,
@@ -412,6 +422,19 @@ impl GeneticSearchRuntimeOverrides {
             self.min_improvement
         } else {
             1e-12
+        }
+    }
+
+    /// Resolve the convergence wall-clock floor fraction, clamped to
+    /// `[0.0, 1.0]`. Non-finite / out-of-range values fall back to the safe
+    /// default of `0.5` (every combo gets at least half its time budget
+    /// before the early-stop can fire).
+    pub fn effective_convergence_min_elapsed_fraction(&self) -> f64 {
+        let f = self.convergence_min_elapsed_fraction;
+        if f.is_finite() && (0.0..=1.0).contains(&f) {
+            f
+        } else {
+            0.5
         }
     }
 
@@ -793,6 +816,7 @@ mod tests {
         assert_eq!(defaults.stagnation_patience, 2);
         assert_eq!(defaults.convergence_patience, 250);
         assert!((defaults.min_improvement - 1e-12).abs() < 1e-18);
+        assert!((defaults.convergence_min_elapsed_fraction - 0.5).abs() < 1e-9);
         assert_eq!(defaults.tournament_size_override, None);
         assert_eq!(defaults.archive_cap_override, None);
         assert_eq!(defaults.seen_retry_attempts, 16);
@@ -899,6 +923,28 @@ mod tests {
             ..GeneticSearchRuntimeOverrides::default()
         };
         assert!((custom.effective_min_improvement() - 1e-6).abs() < 1e-15);
+    }
+
+    #[test]
+    fn effective_convergence_min_elapsed_fraction_clamps() {
+        let d = GeneticSearchRuntimeOverrides::default();
+        assert!((d.effective_convergence_min_elapsed_fraction() - 0.5).abs() < 1e-9);
+        // In-range values honored.
+        for (val, exp) in [(0.0, 0.0), (0.25, 0.25), (1.0, 1.0)] {
+            let o = GeneticSearchRuntimeOverrides {
+                convergence_min_elapsed_fraction: val,
+                ..GeneticSearchRuntimeOverrides::default()
+            };
+            assert!((o.effective_convergence_min_elapsed_fraction() - exp).abs() < 1e-9);
+        }
+        // Out-of-range / non-finite fall back to 0.5 (safe).
+        for bad in [-0.1_f64, 1.5, f64::NAN, f64::INFINITY] {
+            let o = GeneticSearchRuntimeOverrides {
+                convergence_min_elapsed_fraction: bad,
+                ..GeneticSearchRuntimeOverrides::default()
+            };
+            assert!((o.effective_convergence_min_elapsed_fraction() - 0.5).abs() < 1e-9);
+        }
     }
 
     #[test]

@@ -714,6 +714,17 @@ pub struct SearchRuntimeConfig {
     /// tracking stagnation; a generation gaining less than this is
     /// stagnant. Replaces the legacy hard-coded `1e-12`.
     pub min_improvement: f64,
+    /// Wall-clock floor for the convergence early-stop, as a fraction of
+    /// the per-combo time budget (`prop_search_max_hours`). The early-stop
+    /// (see `convergence_patience`) may fire ONLY after this fraction of
+    /// the budget has elapsed. This makes the early-stop throughput-robust:
+    /// generation rate varies ~300× across timeframes, so a pure
+    /// generation count (e.g. 250 gens ≈ 1 s on a fast TF, ≈ 21 min on M1)
+    /// would otherwise kill fast timeframes before they ever search. `0.5`
+    /// = every combo gets at least half its budget; `0` = no floor (pure
+    /// generation count, NOT recommended); `1.0` = effectively disables the
+    /// early-stop (only the time cap stops the combo).
+    pub convergence_min_elapsed_fraction: f64,
 }
 
 impl Default for SearchRuntimeConfig {
@@ -741,6 +752,7 @@ impl Default for SearchRuntimeConfig {
             selection_temperature: 0.75,
             convergence_patience: 250,
             min_improvement: 1e-12,
+            convergence_min_elapsed_fraction: 0.5,
         }
     }
 }

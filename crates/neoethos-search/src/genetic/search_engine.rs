@@ -854,6 +854,13 @@ where
     // "meaningful" top-fitness gain when counting stagnant generations.
     let convergence_patience = genetic_runtime_overrides.effective_convergence_patience();
     let min_improvement = genetic_runtime_overrides.effective_min_improvement();
+    // Wall-clock floor: the early-stop may fire only after this fraction of the
+    // time budget has elapsed. Generation throughput varies ~300× across
+    // timeframes (a fast TF does 250 gens in ~1 s, M1 in ~21 min), so a pure
+    // generation count would kill fast TFs before they ever search. The floor
+    // guarantees every combo gets real search time regardless of its gen rate.
+    let convergence_min_elapsed_fraction =
+        genetic_runtime_overrides.effective_convergence_min_elapsed_fraction();
 
     // Default OFF to avoid O(n²) cost; set > 0 only for large populations.
     let novelty_weight = genetic_runtime_overrides.novelty_weight;
@@ -1053,7 +1060,24 @@ where
         // Intentionally placed BEFORE the max_runtime check: if a generation is
         // both converged and over-budget, both paths yield identical output and
         // "converged" is the more informative reason — do not reorder.
-        if convergence_patience > 0 && stagnant_gens >= convergence_patience {
+        //
+        // WALL-CLOCK FLOOR (fix 2026-06-09): the generation count alone is NOT a
+        // safe stop signal — a fast TF reaches 250 stagnant gens in ~1 s, far
+        // too little real search to find the rare low-DD prop-firm genes (live
+        // regression: AUDUSD H4 early-stopped at gen 291 in 1 s → 0 strategies
+        // vs 7 on a full run). So the early-stop additionally requires that at
+        // least `convergence_min_elapsed_fraction` of the time budget has
+        // elapsed. With no time budget (`max_runtime == None`) the wall-clock
+        // floor cannot be evaluated, so the early-stop is suppressed and the
+        // combo runs to the generation ceiling.
+        let convergence_floor_reached = match max_runtime {
+            Some(mr) => started_at.elapsed() >= mr.mul_f64(convergence_min_elapsed_fraction),
+            None => false,
+        };
+        if convergence_patience > 0
+            && stagnant_gens >= convergence_patience
+            && convergence_floor_reached
+        {
             tracing::info!(
                 target: "neoethos_search::search_engine",
                 generation = generation + 1,
@@ -1061,9 +1085,11 @@ where
                 best_score = best_score_seen,
                 stagnant_gens,
                 convergence_patience,
+                elapsed_s = started_at.elapsed().as_secs(),
+                min_elapsed_fraction = convergence_min_elapsed_fraction,
                 archive_len = profitable_archive.len(),
-                "GA converged: early-stopping this combo after no improvement for \
-                 convergence_patience generations; advancing to the next."
+                "GA converged: early-stopping this combo (flat for convergence_patience \
+                 gens past the wall-clock floor); advancing to the next."
             );
             let best_return_count = population
                 .clamp(2, (population / 2).clamp(100, 500))
