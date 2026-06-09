@@ -1130,9 +1130,34 @@ impl<B: Backend> BurnKAN<B> {
 // BURN TRANSFORMER — feature-token transformer for tabular time-series features
 // ============================================================================
 
+/// Sinusoidal positional encoding (Vaswani 2017), kept as a LEARNABLE `Param`
+/// initialised to the canonical sin/cos pattern. Self-attention is otherwise
+/// permutation-invariant, so without this the feature-token / patch ORDER is
+/// invisible to the model (the previous defect). `[seq, dim]`, broadcast over batch.
+fn sinusoidal_pos_encoding<B: Backend>(
+    seq: usize,
+    dim: usize,
+    device: &B::Device,
+) -> Param<Tensor<B, 2>> {
+    let mut data = vec![0.0f32; seq * dim];
+    for pos in 0..seq {
+        for i in 0..dim {
+            let denom = 10000.0f32.powf((2 * (i / 2)) as f32 / dim as f32);
+            let angle = pos as f32 / denom;
+            data[pos * dim + i] = if i % 2 == 0 { angle.sin() } else { angle.cos() };
+        }
+    }
+    Param::from_tensor(Tensor::<B, 2>::from_data(
+        TensorData::new(data, [seq, dim]),
+        device,
+    ))
+}
+
 #[derive(Module, Debug)]
 pub struct BurnTransformer<B: Backend> {
     token_proj: nn::Linear<B>,
+    /// Learnable positional encoding `[token_count, hidden_dim]` (sinusoidal init).
+    pos_encoding: Param<Tensor<B, 2>>,
     encoder: Vec<SequenceTransformerBlock<B>>,
     final_norm: nn::LayerNorm<B>,
     output: nn::Linear<B>,
@@ -1187,6 +1212,7 @@ impl BurnTransformerConfig {
             .collect();
         BurnTransformer {
             token_proj: nn::LinearConfig::new(token_size, hidden_dim).init(device),
+            pos_encoding: sinusoidal_pos_encoding::<B>(token_count, hidden_dim, device),
             encoder,
             final_norm: nn::LayerNormConfig::new(hidden_dim).init(device),
             output: nn::LinearConfig::new(hidden_dim, self.n_classes).init(device),
@@ -1218,6 +1244,8 @@ impl<B: Backend> BurnTransformer<B> {
         }
 
         let mut h = Tensor::cat(tokens, 1);
+        // Inject token-order info before the permutation-invariant attention stack.
+        h = h + self.pos_encoding.val().unsqueeze_dim::<3>(0);
         for block in &self.encoder {
             h = block.forward(h);
         }
@@ -1298,6 +1326,8 @@ impl<B: Backend> SequenceTransformerBlock<B> {
 #[derive(Module, Debug)]
 pub struct BurnPatchTST<B: Backend> {
     patch_proj: nn::Linear<B>,
+    /// Learnable per-patch positional encoding `[patch_count, hidden_dim]` (PatchTST).
+    pos_encoding: Param<Tensor<B, 2>>,
     patch_encoder: Vec<SequenceTransformerBlock<B>>,
     merge_proj: nn::Linear<B>,
     skip_proj: nn::Linear<B>,
@@ -1356,6 +1386,7 @@ impl BurnPatchTSTConfig {
 
         BurnPatchTST {
             patch_proj: nn::LinearConfig::new(patch_size, hidden_dim).init(device),
+            pos_encoding: sinusoidal_pos_encoding::<B>(patch_count, hidden_dim, device),
             patch_encoder,
             merge_proj: nn::LinearConfig::new(hidden_dim * patch_count, hidden_dim).init(device),
             skip_proj: nn::LinearConfig::new(self.input_dim, hidden_dim).init(device),
@@ -1390,6 +1421,7 @@ impl<B: Backend> BurnPatchTST<B> {
         }
 
         let mut sequence = Tensor::cat(tokens, 1);
+        sequence = sequence + self.pos_encoding.val().unsqueeze_dim::<3>(0);
         for block in &self.patch_encoder {
             sequence = block.forward(sequence);
         }
@@ -2312,6 +2344,32 @@ pub fn predict_proba_checked_on_device_with_selection<B: Backend, M: BurnForward
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transformer_positional_encoding_makes_token_order_matter() {
+        // Self-attention is permutation-invariant; the sinusoidal positional
+        // encoding must make two inputs that differ ONLY in token order produce
+        // different logits. (This would fail on the pre-fix code.)
+        let device = Default::default();
+        let model = BurnTransformerConfig::new(16)
+            .with_token_count(8)
+            .with_hidden_dim(32)
+            .init::<InferBackend>(&device);
+        let base: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let mut swapped = base.clone();
+        swapped.swap(0, 14); // token 0 <-> token 7 (each token = 2 features); multiset preserved
+        swapped.swap(1, 15);
+        let x1 = Tensor::<InferBackend, 2>::from_data(TensorData::new(base, [1, 16]), &device);
+        let x2 = Tensor::<InferBackend, 2>::from_data(TensorData::new(swapped, [1, 16]), &device);
+        let diff: f32 = (model.forward(x1) - model.forward(x2))
+            .abs()
+            .max()
+            .into_scalar();
+        assert!(
+            diff > 1e-5,
+            "positional encoding must make token order matter (diff={diff})"
+        );
+    }
 
     #[test]
     fn predict_proba_checked_returns_empty_array_for_empty_input() -> anyhow::Result<()> {
