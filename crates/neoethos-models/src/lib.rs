@@ -53,6 +53,9 @@ pub mod genetic;
 // Exit agent (RL-based trade exit decisions)
 pub mod exit_agent;
 
+// Soft Actor-Critic (discrete) — RL entry/direction policy
+pub mod soft_actor_critic;
+
 // Pure Rust ML Modular Modules
 pub mod anomaly;
 pub mod evolution;
@@ -71,6 +74,7 @@ pub use rl::{
     TradingAction, TradingEpisode, TradingReinforcementLearner, TradingStateEncoding,
     TradingTransition,
 };
+pub use soft_actor_critic::{SoftActorCritic, SoftActorCriticArtifact};
 pub use statistical::{BayesianLogitExpert, ElasticNetExpert, LogisticExpert};
 pub use streaming::{
     AdaptiveGradientBooster, OnlineHoeffdingExpert, OnlinePassiveAggressiveExpert,

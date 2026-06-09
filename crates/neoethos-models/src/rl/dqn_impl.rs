@@ -702,6 +702,19 @@ fn build_reward_triplet(labels: &[usize], idx: usize, horizon: usize) -> [f32; 3
     ]
 }
 
+/// Public wrapper over [`build_training_episodes`] so sibling RL agents
+/// (e.g. [`crate::soft_actor_critic::SoftActorCritic`]) can reuse the
+/// SAME episode/transition construction the DQN trainer uses — keeping
+/// the reward-triplet and windowing logic a single source of truth.
+pub fn build_training_episodes_public(
+    features: &Array2<f32>,
+    labels: &[usize],
+    episode_len: usize,
+    horizon: usize,
+) -> Result<Vec<TradingEpisode>> {
+    build_training_episodes(features, labels, episode_len, horizon)
+}
+
 fn build_training_episodes(
     features: &Array2<f32>,
     labels: &[usize],

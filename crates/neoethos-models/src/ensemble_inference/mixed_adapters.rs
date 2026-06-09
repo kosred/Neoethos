@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn full_27_loaders_coexist() {
+    fn full_28_loaders_coexist() {
         let mut reg = ExpertRegistry::new();
         super::super::tree_adapters::register_tree_loaders(&mut reg).expect("trees");
         super::super::deep_classification_adapters::register_deep_classification_loaders(&mut reg)
@@ -319,7 +319,9 @@ mod tests {
             .expect("deep-ts");
         super::super::meta_adapters::register_meta_loaders(&mut reg).expect("meta");
         register_mixed_loaders(&mut reg).expect("mixed");
-        // 7 tree + 3 deep-cls + 7 deep-ts + 7 meta + 3 mixed = 27
-        assert_eq!(reg.registered_names().len(), 27);
+        // 7 tree + 3 deep-cls + 7 deep-ts + 8 meta (incl. hmm_regime) +
+        // 3 mixed = 28. (rl loaders dqn/sac are registered separately;
+        // this test covers only the tree/deep/meta/mixed families.)
+        assert_eq!(reg.registered_names().len(), 28);
     }
 }

@@ -84,8 +84,8 @@ use super::{
 ///     legitimate algorithms because they run inside the search
 ///     crate, but they have no role in the soft-voting ensemble.
 ///
-/// **29 names total** (34 KNOWN_MODEL_NAMES − swarm − 3 evolutionary
-/// search algorithms − exit_agent).
+/// **30 names total** (KNOWN_MODEL_NAMES − swarm − 3 evolutionary
+/// search algorithms − exit_agent, + the `sac` entry voter).
 ///
 /// `exit_agent` was removed in F-318 (2026-05-29): the model trains
 /// successfully and emits `ExitDecision3` probabilities, but
@@ -130,8 +130,11 @@ pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     "online_pa",
     "online_hoeffding",
     "isolation_forest",
-    // RL (1) — exit_agent removed in F-318 (consumers never wired)
+    // RL (2) — exit_agent removed in F-318 (consumers never wired).
+    // `sac` (discrete Soft Actor-Critic) is an entry/direction voter
+    // that emits Classification3 probs and soft-votes like `dqn`.
     "dqn",
+    "sac",
 ];
 
 /// Build a fully populated [`ExpertRegistry`] with every default
@@ -149,7 +152,7 @@ pub fn build_default_registry() -> Result<ExpertRegistry> {
     debug_assert_eq!(
         registry.registered_names().len(),
         DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(),
-        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 29 canonical names"
+        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 30 canonical names"
     );
     Ok(registry)
 }
@@ -302,8 +305,9 @@ mod tests {
 
     #[test]
     fn default_bootstrap_names_match_known_model_names_minus_swarm() {
-        // 33 names = 34 KNOWN_MODEL_NAMES minus swarm_forecaster.
-        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 29);
+        // 30 voters = KNOWN_MODEL_NAMES minus swarm_forecaster,
+        // 3 evolutionary discoverers, and exit_agent; plus sac.
+        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 30);
         let names: std::collections::HashSet<&str> =
             DEFAULT_BOOTSTRAP_EXPERT_NAMES.iter().copied().collect();
         assert!(
@@ -341,10 +345,10 @@ mod tests {
     }
 
     #[test]
-    fn build_default_registry_installs_all_29_loaders() {
+    fn build_default_registry_installs_all_30_loaders() {
         let registry = build_default_registry().expect("build default registry");
         let registered = registry.registered_names();
-        assert_eq!(registered.len(), 29);
+        assert_eq!(registered.len(), 30);
         for required in DEFAULT_BOOTSTRAP_EXPERT_NAMES {
             assert!(
                 registry.has_loader(required),
@@ -361,7 +365,7 @@ mod tests {
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
         assert_eq!(outcome.loaded_count(), 0);
         assert_eq!(outcome.degraded_count(), 0);
-        assert_eq!(outcome.missing_count(), 29);
+        assert_eq!(outcome.missing_count(), 30);
         assert!(!outcome.has_any_loaded());
     }
 
@@ -389,6 +393,6 @@ mod tests {
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
         // Still 30 missing because the dir is empty, but the
         // function didn't error out → path resolution worked.
-        assert_eq!(outcome.missing_count(), 29);
+        assert_eq!(outcome.missing_count(), 30);
     }
 }

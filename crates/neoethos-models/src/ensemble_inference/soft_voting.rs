@@ -568,6 +568,7 @@ mod tests {
         assert_eq!(expert_role("hmm_regime"), Some(ExpertRole::RegimeGate));
         assert_eq!(expert_role("isolation_forest"), Some(ExpertRole::AnomalyScale));
         assert_eq!(expert_role("dqn"), Some(ExpertRole::DirectionalConfirm));
+        assert_eq!(expert_role("sac"), Some(ExpertRole::DirectionalConfirm));
         assert_eq!(expert_role("xgboost"), Some(ExpertRole::Direction));
         assert_eq!(expert_role("not_a_real_model"), None);
     }
@@ -804,19 +805,27 @@ mod tests {
 
     #[test]
     fn default_config_excludes_strategy_discoverers() {
-        // genetic + neuro_evo are excluded by default.
+        // F-319 (2026-05-29): the strategy-discoverer adapters
+        // (genetic / neuro_evo / neat) were removed from the inference
+        // layer entirely, so the default exclusion set is now EMPTY —
+        // there are no built-in non-voters left to skip. Operators can
+        // still populate `excluded_names` manually to drop a specific
+        // expert from voting (see the explicit-exclusion tests below).
         let cfg = SoftVotingEnsembleConfig::default();
-        assert!(cfg.excluded_names.contains("genetic"));
-        assert!(cfg.excluded_names.contains("neuro_evo"));
-        assert_eq!(cfg.excluded_names.len(), 2);
+        assert!(cfg.excluded_names.is_empty());
     }
 
     #[test]
     fn genetic_expert_is_skipped_at_voting_layer() {
         // Construct an outcome with a regular voter + a "genetic"
-        // expert. With the default exclusion list, the genetic
-        // expert must not contribute to the average even though
-        // its output_kind is Classification3.
+        // expert. When the operator excludes "genetic" by name, that
+        // expert must not contribute to the average even though its
+        // output_kind is Classification3.
+        //
+        // F-319: the default exclusion set is now empty (genetic /
+        // neuro_evo adapters were removed from inference), so the
+        // exclusion is driven explicitly via config here — this pins
+        // that the name-based exclusion MECHANISM still works.
         let outcome = outcome_with(vec![
             Box::new(ConstantClassifier {
                 name: "regular".into(),
@@ -827,7 +836,9 @@ mod tests {
                 probs: [0.8, 0.1, 0.1],
             }),
         ]);
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        let mut cfg = SoftVotingEnsembleConfig::default();
+        cfg.excluded_names.insert("genetic".to_string());
+        let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
         // 2 loaded but only 1 votes — genetic excluded.
         assert_eq!(ens.voting_expert_count(), 1);
         assert!(ens.experts_unused_for_voting().contains(&"genetic"));
@@ -841,7 +852,10 @@ mod tests {
     }
 
     #[test]
-    fn neuro_evo_expert_is_also_skipped_by_default() {
+    fn neuro_evo_expert_is_also_skipped_when_excluded() {
+        // As with `genetic`, an operator-supplied exclusion of
+        // "neuro_evo" must drop it from the vote. (F-319: not excluded
+        // by default any more — the adapter was removed from inference.)
         let outcome = outcome_with(vec![
             Box::new(ConstantClassifier {
                 name: "voter".into(),
@@ -852,7 +866,9 @@ mod tests {
                 probs: [0.9, 0.05, 0.05],
             }),
         ]);
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        let mut cfg = SoftVotingEnsembleConfig::default();
+        cfg.excluded_names.insert("neuro_evo".to_string());
+        let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
         assert_eq!(ens.voting_expert_count(), 1);
         let probs = ens.predict(&small_df(1)).expect("predict");
         let row = probs.row(0);

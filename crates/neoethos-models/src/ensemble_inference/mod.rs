@@ -137,7 +137,8 @@ pub use mixed_adapters::{
     OnlinePaAdapter, OnlinePaLoader, register_mixed_loaders,
 };
 pub use rl_exit_adapters::{
-    DqnAdapter, DqnLoader, ExitAgentAdapter, ExitAgentLoader, register_rl_exit_loaders,
+    DqnAdapter, DqnLoader, ExitAgentAdapter, ExitAgentLoader, SacAgentAdapter, SacAgentLoader,
+    register_rl_exit_loaders,
 };
 pub use soft_voting::{SoftVotingEnsemble, SoftVotingEnsembleConfig};
 pub use tree_adapters::{
@@ -269,8 +270,11 @@ pub fn expert_role(name: &str) -> Option<ExpertRole> {
         "hmm_regime" => Some(ExpertRole::RegimeGate),
         // Anomaly scale/veto — outlier score scales size, does not vote.
         "isolation_forest" => Some(ExpertRole::AnomalyScale),
-        // Confirm-only directional contributor (RL Q-values, softmaxed).
-        "dqn" => Some(ExpertRole::DirectionalConfirm),
+        // Confirm-only directional contributors (RL policies). `dqn`
+        // softmaxes its Q-values; `sac` emits a softmax policy directly.
+        // Both are entry/direction RL voters that confirm — never
+        // originate/override — the genes' direction (Stage 3 invariant).
+        "dqn" | "sac" => Some(ExpertRole::DirectionalConfirm),
         // Genuine directional classifiers.
         "lightgbm" | "xgboost" | "xgboost_rf" | "xgboost_dart" | "catboost" | "catboost_alt"
         | "sklears_tree" | "mlp" | "kan" | "tabnet" | "nbeats" | "nbeatsx_nf" | "tide"

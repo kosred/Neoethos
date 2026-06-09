@@ -11,6 +11,7 @@ use crate::ensemble::{
     ProbabilityCalibrationExpert,
 };
 use crate::exit_agent::ExitAgent;
+use crate::soft_actor_critic::SoftActorCritic;
 use crate::parallel_trainer::{
     ModelConfig, ModelTrainingFailure, ModelTrainingProgress, ModelType, TrainingPayload,
     train_models_parallel_with_progress,
@@ -471,6 +472,20 @@ impl TrainingOrchestrator {
             }
         }
         if self.settings.models.use_sac_agent {
+            // `use_sac_agent` now drives the REAL discrete Soft
+            // Actor-Critic entry/direction policy (see
+            // `crate::soft_actor_critic`), which participates in the
+            // soft-voting ensemble like the DQN entry voter. It used to
+            // silently alias to the DQN-backed `exit_agent`; that alias
+            // is gone.
+            requested_models.push("sac".to_string());
+            // The exit-side `exit_agent` was previously the ONLY model
+            // this flag produced. To avoid silently dropping its
+            // training, keep it auto-requested under the same flag so
+            // existing configs still train both the SAC entry policy and
+            // the exit-decision agent. (The exit agent's ExitDecision3
+            // outputs are not soft-voted — F-318 — but the artifact
+            // stays available for the exit-side pipeline.)
             requested_models.push("exit_agent".to_string());
         }
         if self.settings.models.use_rl_agent || self.settings.models.use_rllib_agent {
@@ -1554,6 +1569,68 @@ impl TrainingOrchestrator {
                     },
                 ),
             ]),
+            // Soft Actor-Critic (discrete) — RL entry/direction policy.
+            // Reuses the shared RL hyperparameter knobs (gamma / learning
+            // rate / horizon / batch / epochs). `tau` and
+            // `target_entropy_scale` are SAC-specific and use faithful
+            // defaults from Christodoulou (2019).
+            "sac" => HashMap::from([
+                ("device".to_string(), self.preferred_burn_device_policy()),
+                (
+                    "hidden_dim".to_string(),
+                    self.settings
+                        .models
+                        .rl_network_arch
+                        .first()
+                        .copied()
+                        .unwrap_or(256)
+                        .max(8)
+                        .to_string(),
+                ),
+                (
+                    "gamma".to_string(),
+                    format!("{:.6}", self.settings.models.rl_gamma),
+                ),
+                ("tau".to_string(), "0.010000".to_string()),
+                (
+                    "learning_rate".to_string(),
+                    format!("{:.6}", self.settings.models.rl_learning_rate),
+                ),
+                ("target_entropy_scale".to_string(), "0.980000".to_string()),
+                (
+                    "epochs".to_string(),
+                    Self::epochs_from_seconds(self.settings.models.rl_train_seconds, 32)
+                        .to_string(),
+                ),
+                (
+                    "batch_size".to_string(),
+                    self.settings.models.train_batch_size.max(32).to_string(),
+                ),
+                (
+                    "reward_horizon".to_string(),
+                    if self.settings.models.rl_reward_horizon == 0 {
+                        self.settings
+                            .risk
+                            .triple_barrier_max_bars
+                            .clamp(6, 64)
+                            .to_string()
+                    } else {
+                        self.settings.models.rl_reward_horizon.to_string()
+                    },
+                ),
+                (
+                    "episode_len".to_string(),
+                    if self.settings.models.rl_episode_len == 0 {
+                        self.settings
+                            .models
+                            .transformer_seq_len
+                            .clamp(24, 256)
+                            .to_string()
+                    } else {
+                        self.settings.models.rl_episode_len.to_string()
+                    },
+                ),
+            ]),
             "online_pa" => HashMap::from([
                 ("c".to_string(), "1.0".to_string()),
                 (
@@ -1976,6 +2053,7 @@ impl TrainingOrchestrator {
             "conformal_gate" => Ok(ModelType::ConformalGate),
             "meta_stack" => Ok(ModelType::MetaStack),
             "exit_agent" => Ok(ModelType::ExitAgent),
+            "sac" => Ok(ModelType::SacAgent),
             "online_pa" => Ok(ModelType::OnlinePassiveAggressive),
             "online_hoeffding" => Ok(ModelType::OnlineHoeffding),
             "isolation_forest" => Ok(ModelType::IsolationForest),
@@ -3992,6 +4070,41 @@ fn train_model_dispatch(
             .with_reward_horizon(parse_usize_param(&config.params, "reward_horizon", 0))
             .with_warmup_steps(parse_usize_param(&config.params, "warmup_steps", 0));
             model.fit_from_frame(payload.frame.as_ref(), &labels)?;
+            persist_training_artifacts(
+                &artifact_dir,
+                settings,
+                config,
+                symbol,
+                base_tf,
+                payload,
+                row_budget_applied,
+                None,
+                |staged_dir| model.save(staged_dir),
+            )?;
+            Ok(())
+        }
+        ModelType::SacAgent => {
+            let mut model = SoftActorCritic::with_hidden_dim(
+                payload.frame.width().max(1),
+                parse_usize_param(&config.params, "hidden_dim", 256),
+            )
+            .with_gamma(parse_f32_param(&config.params, "gamma", 0.99))
+            .with_tau(parse_f32_param(&config.params, "tau", 0.01))
+            .with_learning_rate(parse_f64_param(&config.params, "learning_rate", 3e-4))
+            .with_target_entropy_scale(parse_f32_param(
+                &config.params,
+                "target_entropy_scale",
+                0.98,
+            ))
+            .with_train_schedule(
+                parse_usize_param(&config.params, "epochs", 32),
+                parse_usize_param(&config.params, "batch_size", 64),
+            )
+            .with_episode_layout(
+                parse_usize_param(&config.params, "reward_horizon", 0),
+                parse_usize_param(&config.params, "episode_len", 0),
+            );
+            model.train_on_frame(payload.frame.as_ref(), &labels)?;
             persist_training_artifacts(
                 &artifact_dir,
                 settings,

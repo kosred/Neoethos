@@ -313,6 +313,7 @@ pub enum ModelType {
     ConformalGate,
     MetaStack,
     ExitAgent,
+    SacAgent,
     OnlinePassiveAggressive,
     OnlineHoeffding,
     IsolationForest,
