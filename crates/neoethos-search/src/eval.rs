@@ -3059,4 +3059,251 @@ mod gpu_cpu_parity_tests {
              (near-zero sign flips={near_zero_flips}) — only ±1 is tolerated (single break-even run)"
         );
     }
+
+    /// AREA 2 / Stage B (2026-06-09) — THE CPCV gate parity test.
+    ///
+    /// A CPCV fold is a NON-CONTIGUOUS gathered index set. The serial CPU gate
+    /// (`discovery::evaluate_cpcv_gate`) gathers the per-bar arrays HOST-SIDE into
+    /// fresh contiguous Vecs and runs `fast_evaluate_strategy_core` on them; the
+    /// GPU path (`validation_genes_population_gathered` →
+    /// `validation_backtest_population`) feeds the SAME host-gathered contiguous
+    /// buffer to the population kernel, which re-synthesizes signals/confidence
+    /// pointwise from the gathered indicators + gathered FULL-SERIES SMC. This test
+    /// is the GATE that proves the gather→contiguous-buffer→kernel path is bit-
+    /// faithful: a gather-indexing bug (wrong column, off-by-one, SMC recomputed on
+    /// the gathered slice rather than gathered from the full series) would silently
+    /// corrupt the in-sample CPCV phi, promoting bad strategies to live.
+    ///
+    /// The fixture deliberately mirrors CPCV reality:
+    ///  - a non-contiguous fold (every-3rd-bar stride PLUS a disjoint tail block,
+    ///    like two CPCV test groups),
+    ///  - REAL per-bar confidence with `risk_based_sizing == true` (CPCV inherits
+    ///    `discovery_backtest_settings`, which keeps risk sizing on — unlike the MC
+    ///    path's forced fixed-1-lot),
+    ///  - ACTIVE SMC gating (non-zero flags + a non-trivial full-series SMC pattern)
+    ///    so the gather of SMC rows is exercised, not bypassed.
+    ///
+    /// CPU reference: synthesize each gene's signals/confidence on the FULL series
+    /// (with the full-series SMC), GATHER them at `absolute_idx`, then
+    /// `fast_evaluate_strategy_core` on the gathered Vecs (timestamps = &[],
+    /// exactly as the gate does). GPU: gather the indicators + full-series SMC at
+    /// `absolute_idx` and run the population kernel. Assert per-gene metric parity
+    /// within the EXISTING tolerance (`1e-2*|c|.max(1)+1e-3`, trade-count ±1) — NOT
+    /// loosened. Skips cleanly without a device; `NEOETHOS_REQUIRE_GPU=1` fails
+    /// loud on a misconfig (the helper CPU-falls-back on a GPU-less box, so the
+    /// comparison is then CPU==CPU and EXACT).
+    #[test]
+    fn gpu_cpcv_gathered_fold_matches_cpu() {
+        let n_samples = 1_200usize;
+        let n_features = 6usize;
+        let n_genes = 6usize;
+
+        // Deterministic price wave large enough to trigger SL/TP exits across the
+        // gathered (non-contiguous) bars.
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| 1.10 + ((i as f64) * 0.02).sin() * 0.01)
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0008).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0008).collect();
+
+        // [features × samples], values well clear of the ±0.3 thresholds so the
+        // SIGN is f32/f64-agnostic and the gather is the only variable.
+        let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
+            (((i + f * 11) as f32) * 0.05).sin() * 0.8
+        });
+
+        // CSR genes: each sums 2 features (weight 1.0).
+        let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8, 10, 12];
+        let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 0];
+        let gene_weights: Vec<f32> = vec![1.0; 12];
+        let long_thr: Vec<f32> = vec![0.3; n_genes];
+        let short_thr: Vec<f32> = vec![-0.3; n_genes];
+        let sl_pips: Vec<f64> = vec![25.0; n_genes];
+        let tp_pips: Vec<f64> = vec![50.0; n_genes];
+
+        // ACTIVE SMC gating. A non-trivial FULL-SERIES SMC pattern (alternating
+        // ±1 with period-7 zeros) so the gathered SMC rows actually influence the
+        // gate — this is the path most likely to corrupt under a gather bug.
+        let full_smc: Vec<SmcRow> = (0..n_samples)
+            .map(|i| {
+                let dir = if (i / 5) % 2 == 0 { 1i8 } else { -1i8 };
+                let mut row = [0i8; 11];
+                if i % 7 != 0 {
+                    // Populate a few channels (trend/bos/premium-ish) with the
+                    // direction; leave others zero so the score is partial.
+                    row[3] = dir; // mtf/trend channel
+                    row[6] = dir; // bos
+                    row[4] = dir; // premium
+                }
+                row
+            })
+            .collect();
+        // Enable a subset of flags per gene (rotating) with a modest gate so SOME
+        // bars pass and SOME are suppressed — exercising the gate both ways.
+        let gene_smc_flags: Vec<SmcRow> = (0..n_genes)
+            .map(|g| {
+                let mut row = [0i8; 11];
+                row[3] = 1;
+                if g % 2 == 0 {
+                    row[6] = 1;
+                }
+                if g % 3 == 0 {
+                    row[4] = 1;
+                }
+                row
+            })
+            .collect();
+        let smc_weights = [
+            0.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let gate_threshold = 1.0f32;
+
+        // Full-series month/day buckets (gathered per fold below).
+        let full_month_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 150).collect();
+        let full_day_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 30).collect();
+
+        // Finite cost model + REAL risk-based sizing (CPCV keeps it on).
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = true; // CPCV uses real confidence
+        settings.risk_per_trade_min = 0.005;
+        settings.risk_per_trade_max = 0.03;
+        settings.high_quality_confidence = 0.65;
+
+        // NON-CONTIGUOUS gathered fold: every-3rd bar over the first ~60% PLUS a
+        // disjoint tail block — exactly the shape a CPCV split (two disjoint test
+        // groups) produces.
+        let mut absolute_idx: Vec<usize> = (0..(n_samples * 6 / 10)).step_by(3).collect();
+        absolute_idx.extend((n_samples * 8 / 10)..(n_samples * 9 / 10));
+        let fold_n = absolute_idx.len();
+        assert!(fold_n > 50, "fold must be non-trivial");
+
+        // Gather the per-bar arrays HOST-SIDE (exactly as evaluate_cpcv_gate does).
+        let g_close: Vec<f64> = absolute_idx.iter().map(|&i| close[i]).collect();
+        let g_high: Vec<f64> = absolute_idx.iter().map(|&i| high[i]).collect();
+        let g_low: Vec<f64> = absolute_idx.iter().map(|&i| low[i]).collect();
+        let g_month: Vec<i64> = absolute_idx.iter().map(|&i| full_month_idx[i]).collect();
+        let g_day: Vec<i64> = absolute_idx.iter().map(|&i| full_day_idx[i]).collect();
+
+        // ── CPU REFERENCE — the exact serial CPCV path ──────────────────────────
+        // Synthesize each gene's signals/confidence on the FULL series with the
+        // FULL-SERIES SMC, GATHER them at absolute_idx, then backtest the gathered
+        // Vecs (timestamps = &[], risk-based sizing on).
+        let cpu: Vec<[f64; 11]> = (0..n_genes)
+            .map(|g| {
+                let (full_signals, full_conf) = synthesize_signals_and_confidence_cpu(
+                    indicators.view(),
+                    &gene_offsets,
+                    &gene_indices,
+                    &gene_weights,
+                    &long_thr,
+                    &short_thr,
+                    &full_smc,
+                    &gene_smc_flags,
+                    gate_threshold,
+                    &smc_weights,
+                    g,
+                    n_samples,
+                );
+                let g_sig: Vec<i8> = absolute_idx.iter().map(|&i| full_signals[i]).collect();
+                let g_conf: Vec<f32> = absolute_idx.iter().map(|&i| full_conf[i]).collect();
+                let mut s = settings.clone();
+                s.sl_pips = sl_pips[g];
+                s.tp_pips = tp_pips[g];
+                fast_evaluate_strategy_core(
+                    &g_close, &g_high, &g_low, &g_sig, &g_conf, &g_month, &g_day, &[], &s,
+                )
+            })
+            .collect();
+
+        // ── GPU PATH — gather indicators + full-series SMC at absolute_idx, then
+        // run the population kernel (or CPU-fallback on a GPU-less box) ──────────
+        // Build the gathered indicators matrix [features × fold_n].
+        let mut g_ind = Array2::<f32>::zeros((n_features, fold_n));
+        for f in 0..n_features {
+            for (k, &abs) in absolute_idx.iter().enumerate() {
+                g_ind[(f, k)] = indicators[(f, abs)];
+            }
+        }
+        let g_smc: Vec<SmcRow> = absolute_idx.iter().map(|&i| full_smc[i]).collect();
+
+        // NEOETHOS_REQUIRE_GPU fail-loud: probe a device the same way the sibling
+        // tests do; on failure either panic (REQUIRE_GPU) or skip.
+        if let Err(e) = crate::cubecl_eval::try_evaluate_population_cuda(
+            &g_close,
+            &g_high,
+            &g_low,
+            g_ind.view(),
+            &gene_offsets,
+            &gene_indices,
+            &gene_weights,
+            &long_thr,
+            &short_thr,
+            &g_month,
+            &g_day,
+            &[],
+            &sl_pips,
+            &tp_pips,
+            &g_smc,
+            &gene_smc_flags,
+            gate_threshold,
+            &smc_weights,
+            &settings,
+            None,
+        ) {
+            if std::env::var("NEOETHOS_REQUIRE_GPU").is_ok() {
+                panic!("NEOETHOS_REQUIRE_GPU set but GPU CPCV eval failed: {e}");
+            }
+            eprintln!("GPU CPCV parity test SKIPPED (no usable GPU device): {e}");
+            return;
+        }
+
+        let gpu = validation_backtest_population(PopulationEvalInputs {
+            close: &g_close,
+            high: &g_high,
+            low: &g_low,
+            indicators: g_ind.view(),
+            gene_offsets: &gene_offsets,
+            gene_indices: &gene_indices,
+            gene_weights: &gene_weights,
+            long_thr: &long_thr,
+            short_thr: &short_thr,
+            month_idx: &g_month,
+            day_idx: &g_day,
+            timestamps: &[],
+            sl_pips: &sl_pips,
+            tp_pips: &tp_pips,
+            smc_data: &g_smc,
+            gene_smc_flags: &gene_smc_flags,
+            gate_threshold,
+            weights: &smc_weights,
+            settings: &settings,
+        });
+        assert_eq!(gpu.len(), n_genes, "gpu CPCV returned wrong gene count");
+
+        for g in 0..n_genes {
+            let (ct, gt) = (cpu[g][8], gpu[g][8]);
+            assert!(
+                (ct - gt).abs() <= 1.0,
+                "CPCV gene {g} trade-count mismatch: cpu={ct} gpu={gt} \
+                 (gather indexing bug?)"
+            );
+            for m in [0usize, 1, 2, 3, 4, 5, 6, 7, 9, 10] {
+                let (c, v) = (cpu[g][m], gpu[g][m]);
+                let tol = 1e-2 * c.abs().max(1.0) + 1e-3;
+                assert!(
+                    (c - v).abs() <= tol,
+                    "CPCV gene {g} metric[{m}] mismatch: cpu={c} gpu={v} tol={tol} \
+                     (gathered host-buffer not bit-faithful to the kernel)"
+                );
+            }
+        }
+    }
 }

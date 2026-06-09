@@ -583,6 +583,190 @@ pub fn validation_genes_population(
     ))
 }
 
+/// AREA 2 / Stage B (2026-06-09) — GPU-routed **CPCV fold** population eval over a
+/// NON-CONTIGUOUS gathered index set.
+///
+/// This is the CPCV twin of [`validation_genes_population`]. The CPCV gate
+/// (`discovery::evaluate_cpcv_gate`) backtests every portfolio gene on each
+/// Combinatorial-Purged-CV fold, where a fold is a set of *gathered*
+/// (re-indexed, non-monotonic) absolute bar indices `absolute_idx`. The serial
+/// CPU path gathers the per-bar arrays HOST-SIDE into fresh contiguous Vecs and
+/// runs `fast_evaluate_strategy_core` on them — the backtest never sees the gaps
+/// because the gather already happened. This helper feeds the GPU population
+/// kernel the SAME host-gathered contiguous buffers, so the kernel is byte-
+/// identical to the CPU's gathered-Vec path WITHOUT any kernel change.
+///
+/// ## Why this can't reuse [`validation_genes_population`]
+/// Two deliberate differences:
+///  1. **SMC is gathered, NOT recomputed.** `validation_genes_population` calls
+///     `build_smc_arrays` on the *passed* OHLCV. The SMC primitives in
+///     `derive_smc_arrays` carry heavy cross-bar LOOKBACK (trend uses
+///     `close[i-12]`, BoS/EQH/EQL use 12–20-bar windows, FVG/liq use 2–3-bar
+///     windows). Recomputing SMC on a gathered (non-contiguous) OHLCV slice would
+///     read the WRONG neighbours and silently corrupt the fold. The CPU CPCV path
+///     avoids this by gathering the *full-series* precomputed signals/confidence;
+///     this helper mirrors it by computing the full-series SMC arrays ONCE and
+///     GATHERING them at `absolute_idx`. Signal synthesis is fully pointwise
+///     (`combined[i]` = weighted sum of indicator[i]; the gate reads only
+///     `smc_row[i]`), so the on-device synth at gathered position `k` reads the
+///     SAME indicator+SMC values the full-series synth read at `absolute_idx[k]`
+///     → identical signals/confidence → identical fold metrics.
+///  2. **`risk_based_sizing` is PRESERVED from the caller's template**, not forced
+///     to `false`. CPCV uses `discovery_backtest_settings` which inherits
+///     `BacktestSettings::default().risk_based_sizing == true` and feeds the gene's
+///     REAL per-bar confidence into the risk sizer. The kernel recomputes the
+///     identical confidence on-device (pointwise), so risk-based sizing matches.
+///
+/// `timestamps` is passed empty (`&[]`) so the backtest uses index-delta carry —
+/// EXACTLY as the serial CPCV path does (`fast_evaluate_strategy_core(..., &[], ...)`).
+///
+/// Per-gene `sl_pips`/`tp_pips` use the SAME finite-positive-else-20/40 fallback
+/// `discovery_backtest_settings` applies, so SL/TP exits match the serial run.
+///
+/// Returns one `[f64; 11]` metric row per gene (same layout as
+/// [`crate::eval::evaluate_population_core`]).
+#[allow(clippy::too_many_arguments)]
+pub fn validation_genes_population_gathered(
+    full_indicators: ndarray::ArrayView2<'_, f32>,
+    full_smc: &[crate::eval::SmcRow],
+    genes: &[Gene],
+    config: &EvaluationConfig,
+    settings_template: &BacktestSettings,
+    absolute_idx: &[usize],
+    gathered_close: &[f64],
+    gathered_high: &[f64],
+    gathered_low: &[f64],
+    gathered_months: &[i64],
+    gathered_days: &[i64],
+) -> Result<Vec<[f64; 11]>> {
+    if genes.is_empty() || absolute_idx.is_empty() {
+        return Ok(Vec::new());
+    }
+    let full_samples = full_indicators.ncols();
+    let n_features = full_indicators.nrows();
+    if full_smc.len() != full_samples {
+        bail!(
+            "full SMC length {} != full sample count {}",
+            full_smc.len(),
+            full_samples
+        );
+    }
+    let fold_n = absolute_idx.len();
+    if gathered_close.len() != fold_n
+        || gathered_high.len() != fold_n
+        || gathered_low.len() != fold_n
+        || gathered_months.len() != fold_n
+        || gathered_days.len() != fold_n
+    {
+        bail!(
+            "gathered per-bar arrays must all have length {} (the fold index count)",
+            fold_n
+        );
+    }
+    if let Some(&bad) = absolute_idx.iter().find(|&&i| i >= full_samples) {
+        bail!(
+            "CPCV gather index {} out of range (full series has {} samples)",
+            bad,
+            full_samples
+        );
+    }
+
+    // Gather the indicator columns at `absolute_idx` into a fresh
+    // `[n_features × fold_n]` matrix — the kernel's `indicators` layout. The
+    // pointwise synth then reads `gathered_ind[f][k]` = full-series indicator[f]
+    // at `absolute_idx[k]`, reproducing `combined` exactly.
+    let mut gathered_ind = Array2::<f32>::zeros((n_features, fold_n));
+    for f in 0..n_features {
+        let src = full_indicators.row(f);
+        let mut dst = gathered_ind.row_mut(f);
+        for (k, &abs) in absolute_idx.iter().enumerate() {
+            dst[k] = src[abs];
+        }
+    }
+
+    // Gather the FULL-SERIES SMC rows (NOT recomputed on the gathered slice).
+    let mut gathered_smc: Vec<crate::eval::SmcRow> = Vec::with_capacity(fold_n);
+    for &abs in absolute_idx {
+        gathered_smc.push(full_smc[abs]);
+    }
+
+    let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
+    // Per-gene SL/TP resolved the SAME way `discovery_backtest_settings` does.
+    let mut sl_pips = Vec::with_capacity(genes.len());
+    let mut tp_pips = Vec::with_capacity(genes.len());
+    for g in genes {
+        sl_pips.push(if g.sl_pips.is_finite() && g.sl_pips > 0.0 {
+            g.sl_pips
+        } else {
+            20.0
+        });
+        tp_pips.push(if g.tp_pips.is_finite() && g.tp_pips > 0.0 {
+            g.tp_pips
+        } else {
+            40.0
+        });
+    }
+
+    let mut gene_smc_flags = Vec::with_capacity(genes.len());
+    for g in genes {
+        gene_smc_flags.push([
+            g.use_ob as i8,
+            g.use_fvg as i8,
+            g.use_liq_sweep as i8,
+            g.mtf_confirmation as i8,
+            g.use_premium_discount as i8,
+            g.use_inducement as i8,
+            g.use_bos as i8,
+            g.use_choch as i8,
+            g.use_eqh as i8,
+            g.use_eql as i8,
+            g.use_displacement as i8,
+        ]);
+    }
+
+    let smc_weights = [
+        config.smc_weight_ob,
+        config.smc_weight_fvg,
+        config.smc_weight_liq,
+        config.smc_weight_mtf,
+        config.smc_weight_premium,
+        config.smc_weight_inducement,
+        config.smc_weight_bos,
+        config.smc_weight_choch,
+        config.smc_weight_eqh,
+        config.smc_weight_eql,
+        config.smc_weight_displacement,
+    ];
+
+    // Use the caller's settings VERBATIM — including `risk_based_sizing` (CPCV
+    // keeps it true so the gene's real per-bar confidence drives sizing, matching
+    // the serial `fast_evaluate_strategy_core` call). Empty `timestamps` ⇒ the
+    // kernel/CPU backtest uses index-delta carry, identical to the serial path.
+    Ok(crate::eval::validation_backtest_population(
+        crate::eval::PopulationEvalInputs {
+            close: gathered_close,
+            high: gathered_high,
+            low: gathered_low,
+            indicators: gathered_ind.view(),
+            gene_offsets: &offsets,
+            gene_indices: &indices,
+            gene_weights: &weights,
+            long_thr: &long_thr,
+            short_thr: &short_thr,
+            month_idx: gathered_months,
+            day_idx: gathered_days,
+            timestamps: &[],
+            sl_pips: &sl_pips,
+            tp_pips: &tp_pips,
+            smc_data: &gathered_smc,
+            gene_smc_flags: &gene_smc_flags,
+            gate_threshold: config.smc_gate_threshold,
+            weights: &smc_weights,
+            settings: settings_template,
+        },
+    ))
+}
+
 pub fn evaluate_genes(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,

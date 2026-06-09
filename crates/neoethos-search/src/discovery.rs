@@ -2,8 +2,9 @@ use crate::artifact_io::{stable_json_hash, write_json_atomic};
 use crate::eval::{BacktestMetrics, fast_evaluate_strategy_core, simulate_trades_core};
 use crate::genetic::strategy_gene::EvaluationConfig;
 use crate::genetic::{
-    Gene, evolve_search_with_progress_and_limits, month_day_indices,
+    Gene, build_smc_arrays, evolve_search_with_progress_and_limits, month_day_indices,
     signals_and_confidence_for_gene_full, signals_for_gene_full,
+    validation_genes_population_gathered,
 };
 use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use crate::validation::{
@@ -1549,6 +1550,11 @@ fn walkforward_summary_passed(summary: &WalkforwardSummary) -> bool {
 
 fn evaluate_cpcv_gate(
     portfolio: &[Gene],
+    // AREA 2 / Stage B (2026-06-09): the GPU population path re-synthesizes each
+    // gene's signals on-device from the GATHERED indicators + GATHERED full-series
+    // SMC (pointwise, so it reproduces the full-series signals at `absolute_idx`),
+    // so the precomputed `portfolio_signals` are no longer gathered here. Kept in
+    // the signature for the caller's alignment sanity check below.
     portfolio_signals: &[Vec<i8>],
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
@@ -1597,42 +1603,128 @@ fn evaluate_cpcv_gate(
         return Ok((false, 0, 0.0));
     }
 
+    // Alignment sanity check: the GPU path re-synthesizes signals on-device from
+    // the gathered full-series indicators/SMC, which is only equivalent to the
+    // precomputed `portfolio_signals` when those were computed on the SAME full
+    // series. A length mismatch means the caller built signals on a different
+    // window — fail loud rather than silently validating against a stale series.
+    if portfolio_signals.len() != portfolio.len() {
+        anyhow::bail!(
+            "CPCV gate: {} portfolio signals for {} genes — internal bug",
+            portfolio_signals.len(),
+            portfolio.len()
+        );
+    }
+    if let Some((i, s)) = portfolio_signals
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.len() != ohlcv.close.len())
+    {
+        anyhow::bail!(
+            "CPCV gate: signals[{}].len()={} != full series len {} — signals must be \
+             full-series aligned for the gathered GPU re-synthesis to match",
+            i,
+            s.len(),
+            ohlcv.close.len()
+        );
+    }
+
     let mut fold_count = 0usize;
     let mut profitable_folds = 0usize;
     let eval_config = config.evaluation_config(ohlcv.close.last().copied());
-    for (gene, signals) in portfolio.iter().zip(portfolio_signals) {
-        let settings = discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
-        // Per-bar confidence for risk-based sizing — regenerated from the
-        // SAME gene + evaluation config that produced `signals` (and sliced
-        // per fold below, aligned to the price/signal slices).
-        let (_regen_signals, gene_confidences) =
-            signals_and_confidence_for_gene_full(features, ohlcv, gene, &eval_config);
-        for (_, test_idx) in &splits {
-            if test_idx.is_empty() {
-                continue;
-            }
-            let absolute_idx: Vec<usize> = test_idx.iter().map(|idx| offset + *idx).collect();
-            let close: Vec<f64> = absolute_idx.iter().map(|idx| ohlcv.close[*idx]).collect();
-            let high: Vec<f64> = absolute_idx.iter().map(|idx| ohlcv.high[*idx]).collect();
-            let low: Vec<f64> = absolute_idx.iter().map(|idx| ohlcv.low[*idx]).collect();
-            let sig: Vec<i8> = absolute_idx.iter().map(|idx| signals[*idx]).collect();
-            let conf: Vec<f32> = absolute_idx
-                .iter()
-                .map(|idx| gene_confidences.get(*idx).copied().unwrap_or(0.0))
-                .collect();
-            let fold_months: Vec<i64> = absolute_idx.iter().map(|idx| months[*idx]).collect();
-            let fold_days: Vec<i64> = absolute_idx.iter().map(|idx| days[*idx]).collect();
-            let metrics = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
+
+    // AREA 2 / Stage B (2026-06-09) — GPU-route the CPCV gate.
+    //
+    // TRANSPOSE: was a nested loop over genes × folds, each (gene, fold) gathering
+    // a non-contiguous index set and running a SINGLE-gene
+    // `fast_evaluate_strategy_core`. Now batches ACROSS GENES PER FOLD: for each
+    // fold we gather the per-sample arrays ONCE and fire ONE
+    // `validation_genes_population_gathered` launch over the WHOLE portfolio
+    // (GPU-try, CPU-fallback). portfolio×folds backtests → folds launches.
+    //
+    // PARITY: the gather happens HOST-SIDE (exactly as the old serial loop did),
+    // so the population kernel consumes the SAME contiguous re-indexed buffer the
+    // CPU built — byte-identical input, no kernel change. SMC is GATHERED from the
+    // FULL-SERIES arrays at `absolute_idx` (NOT recomputed on the gathered slice,
+    // which would break the cross-bar SMC lookback); see
+    // `validation_genes_population_gathered`. Confidence/sizing match the serial
+    // path: `discovery_backtest_settings` keeps `risk_based_sizing == true`, the
+    // gene's REAL per-bar confidence is recomputed on-device pointwise, and
+    // `timestamps = &[]` is honoured exactly as before. The fold-pass test below is
+    // the EXACT condition the serial loop used (via `BacktestMetrics`, so trade-
+    // count rounding is identical).
+    //
+    // Settings template: every field of `discovery_backtest_settings` except the
+    // per-gene `sl_pips`/`tp_pips` is gene-INDEPENDENT (sourced from
+    // `evaluation_config`), and the helper re-resolves per-gene SL/TP with the same
+    // 20/40 fallback, so one template + the helper's per-gene SL/TP arrays
+    // reproduce the per-gene settings the serial loop built.
+    let settings_template = if let Some(gene) = portfolio.first() {
+        discovery_backtest_settings(config, gene, ohlcv.close.last().copied())
+    } else {
+        return Ok((false, 0, 0.0));
+    };
+
+    // Full-series indicators + SMC, computed ONCE and gathered per fold. The SMC
+    // arrays carry cross-bar lookback, so they MUST be derived on the full
+    // contiguous series and then gathered — never recomputed on a gathered slice.
+    let full_indicators = features.as_indicators_view();
+    let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
+        build_smc_arrays(features, ohlcv);
+    let full_n = ohlcv.close.len();
+    let mut full_smc: Vec<crate::eval::SmcRow> = Vec::with_capacity(full_n);
+    for i in 0..full_n {
+        full_smc.push([
+            ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i], eql[i],
+            disp[i],
+        ]);
+    }
+
+    for (_, test_idx) in &splits {
+        if test_idx.is_empty() {
+            continue;
+        }
+        let absolute_idx: Vec<usize> = test_idx.iter().map(|idx| offset + *idx).collect();
+        let close: Vec<f64> = absolute_idx.iter().map(|idx| ohlcv.close[*idx]).collect();
+        let high: Vec<f64> = absolute_idx.iter().map(|idx| ohlcv.high[*idx]).collect();
+        let low: Vec<f64> = absolute_idx.iter().map(|idx| ohlcv.low[*idx]).collect();
+        let fold_months: Vec<i64> = absolute_idx.iter().map(|idx| months[*idx]).collect();
+        let fold_days: Vec<i64> = absolute_idx.iter().map(|idx| days[*idx]).collect();
+
+        // ONE GPU launch over the whole portfolio on this gathered fold. Serialize
+        // the device launch behind GPU_LAUNCH_LOCK so the (possible) outer
+        // parallelism never spins up N GPU clients → VRAM × N → OOM. The
+        // CPU-fallback inside the helper still parallelises across genes.
+        let metrics_per_gene = {
+            #[cfg(feature = "gpu")]
+            let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            validation_genes_population_gathered(
+                full_indicators,
+                &full_smc,
+                portfolio,
+                &eval_config,
+                &settings_template,
+                &absolute_idx,
                 &close,
                 &high,
                 &low,
-                &sig,
-                &conf,
                 &fold_months,
                 &fold_days,
-                &[],
-                &settings,
-            ));
+            )?
+        };
+        if metrics_per_gene.len() != portfolio.len() {
+            anyhow::bail!(
+                "CPCV fold eval returned {} metric rows for {} genes — internal bug",
+                metrics_per_gene.len(),
+                portfolio.len()
+            );
+        }
+
+        for m in metrics_per_gene {
+            // EXACT fold-pass criteria of the original serial loop — routed through
+            // `BacktestMetrics` so net_profit/max_drawdown/trade_count (incl. the
+            // trade-count rounding) are read identically.
+            let metrics = BacktestMetrics::from_metric_array(m);
             fold_count += 1;
             let drawdown_ok =
                 config.filtering.max_dd <= 0.0 || metrics.max_drawdown <= config.filtering.max_dd;

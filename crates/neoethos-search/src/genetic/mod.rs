@@ -50,6 +50,7 @@ pub use search_engine::{
     evolve_search_with_progress_and_limits, month_day_indices, random_search,
     signals_and_confidence_for_gene_full, signals_and_confidence_for_gene_with_config,
     signals_for_gene, signals_for_gene_full, validation_genes_population,
+    validation_genes_population_gathered,
 };
 pub use seed_templates::seed_professional_templates;
 pub use smc_indicators::{
