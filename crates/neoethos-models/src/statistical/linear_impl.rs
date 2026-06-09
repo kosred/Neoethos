@@ -59,6 +59,13 @@ fn sign(value: f32) -> f32 {
     }
 }
 
+/// Soft-threshold proximal operator for the L1 penalty:
+/// `prox_{t|·|}(w) = sign(w)·max(|w|−t, 0)`. Drives small coefficients to EXACT
+/// zero — the defining ElasticNet/Lasso sparsity that a subgradient cannot give.
+fn soft_threshold(w: f32, t: f32) -> f32 {
+    sign(w) * (w.abs() - t).max(0.0)
+}
+
 fn split_train_val_indices(rows: usize) -> (Vec<usize>, Vec<usize>) {
     if rows <= 6 {
         return ((0..rows).collect(), Vec::new());
@@ -491,8 +498,12 @@ fn fit_linear_softmax(
     #[cfg(feature = "statistical-gpu")]
     let mut runtime_degraded_reason = runtime_degraded_reason;
 
+    // The CUDA softmax kernel uses subgradient-L1 SGD; when an L1 penalty is
+    // active we MUST use the CPU proximal/ISTA path (exact zeros), or the two
+    // backends would optimise different objectives. Pure-L2 (l1_ratio==0) is
+    // identical on both, so it may still use the kernel.
     #[cfg(feature = "statistical-gpu")]
-    if statistical_cuda_kernel_enabled(model_name) {
+    if statistical_cuda_kernel_enabled(model_name) && l1_ratio <= 0.0 {
         match try_fit_linear_softmax_cuda(
             model_name,
             &train_features,
@@ -564,13 +575,17 @@ fn fit_linear_softmax(
         let mut grad_w = train_features.t().dot(&error) / train_features.nrows() as f32;
         let grad_b = error.sum_axis(Axis(0)) / train_features.nrows() as f32;
 
+        // ElasticNet via PROXIMAL gradient (ISTA): the SMOOTH L2 (ridge) term goes
+        // in the gradient; the NON-smooth L1 (lasso) term is applied by the
+        // soft-threshold proximal operator AFTER the gradient step (below), which
+        // drives coefficients to EXACT zero — the sparsity the previous
+        // subgradient-L1 (`grad += sign(w)`) could never produce.
+        let l1r = l1_ratio.clamp(0.0, 1.0);
         if regularization > 0.0 {
             for feature_idx in 0..cols {
                 for class_idx in 0..n_classes {
-                    let weight = weights[(feature_idx, class_idx)];
-                    let l2 = (1.0 - l1_ratio.clamp(0.0, 1.0)) * weight;
-                    let l1 = l1_ratio.clamp(0.0, 1.0) * sign(weight);
-                    grad_w[(feature_idx, class_idx)] += regularization * (l2 + l1);
+                    let l2 = (1.0 - l1r) * weights[(feature_idx, class_idx)];
+                    grad_w[(feature_idx, class_idx)] += regularization * l2;
                 }
             }
         }
@@ -582,6 +597,18 @@ fn fit_linear_softmax(
         }
         for class_idx in 0..n_classes {
             bias[class_idx] -= lr * grad_b[class_idx];
+        }
+
+        // Proximal soft-threshold for L1 (the ISTA prox step). Threshold
+        // t = lr·alpha·l1_ratio; the bias is NOT regularised (standard).
+        let threshold = lr * regularization * l1r;
+        if threshold > 0.0 {
+            for feature_idx in 0..cols {
+                for class_idx in 0..n_classes {
+                    weights[(feature_idx, class_idx)] =
+                        soft_threshold(weights[(feature_idx, class_idx)], threshold);
+                }
+            }
         }
 
         if let Some(val_features) = val_features.as_ref() {
@@ -962,6 +989,17 @@ impl LogisticExpert {
 mod tests {
     use super::*;
     use crate::base::three_class_runtime_confidence;
+
+    #[test]
+    fn soft_threshold_produces_exact_zeros_and_shrinks() {
+        // The L1 proximal operator: |w| <= t -> EXACTLY 0 (the ElasticNet sparsity
+        // a subgradient cannot produce); |w| > t -> shrunk toward 0 by t.
+        assert_eq!(soft_threshold(0.2, 0.3), 0.0);
+        assert_eq!(soft_threshold(-0.2, 0.3), 0.0);
+        assert_eq!(soft_threshold(0.0, 0.3), 0.0);
+        assert!((soft_threshold(0.5, 0.3) - 0.2).abs() < 1e-6);
+        assert!((soft_threshold(-0.5, 0.3) + 0.2).abs() < 1e-6);
+    }
 
     fn sample_dataframe() -> DataFrame {
         DataFrame::new(vec![
