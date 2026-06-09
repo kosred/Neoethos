@@ -767,6 +767,213 @@ pub fn validation_genes_population_gathered(
     ))
 }
 
+/// Window-INDEPENDENT, gene-derived population arrays for the walk-forward
+/// population path. Built ONCE per portfolio and reused for every split window
+/// so the per-window cost is just the contiguous slice + the GPU launch.
+///
+/// This is the gene axis of the walk-forward transpose: the CSR genome arrays,
+/// the per-gene SL/TP (same finite-positive-else-20/40 fallback the rest of the
+/// validation tail uses), the per-gene SMC flags, the SMC weights, and the
+/// fixed-1-lot settings template. None of these depend on which split window is
+/// being evaluated.
+pub struct WalkforwardPopulationGenePack {
+    offsets: Vec<i32>,
+    indices: Vec<i32>,
+    weights: Vec<f32>,
+    long_thr: Vec<f32>,
+    short_thr: Vec<f32>,
+    sl_pips: Vec<f64>,
+    tp_pips: Vec<f64>,
+    gene_smc_flags: Vec<crate::eval::SmcRow>,
+    smc_weights: [f32; 11],
+    gate_threshold: f32,
+    /// Settings template with `risk_based_sizing` FORCED to `false` — the
+    /// fixed-1-lot semantics the single-gene walk-forward uses (`&[]` confidence
+    /// at validation.rs:1129-1130).
+    settings: BacktestSettings,
+    n_genes: usize,
+}
+
+impl WalkforwardPopulationGenePack {
+    /// Build the gene-derived arrays ONCE for the walk-forward population.
+    ///
+    /// `settings_template` is cloned and FORCED to fixed-1-lot
+    /// (`risk_based_sizing = false`) so the GPU metrics match the single-gene
+    /// walk-forward's legacy fixed-1-lot backtest, regardless of what the caller
+    /// passes (belt-and-suspenders, mirroring [`validation_genes_population`]).
+    pub fn new(genes: &[Gene], config: &EvaluationConfig, settings_template: &BacktestSettings) -> Self {
+        let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
+        let mut sl_pips = Vec::with_capacity(genes.len());
+        let mut tp_pips = Vec::with_capacity(genes.len());
+        for g in genes {
+            sl_pips.push(if g.sl_pips.is_finite() && g.sl_pips > 0.0 {
+                g.sl_pips
+            } else {
+                20.0
+            });
+            tp_pips.push(if g.tp_pips.is_finite() && g.tp_pips > 0.0 {
+                g.tp_pips
+            } else {
+                40.0
+            });
+        }
+        let mut gene_smc_flags = Vec::with_capacity(genes.len());
+        for g in genes {
+            gene_smc_flags.push([
+                g.use_ob as i8,
+                g.use_fvg as i8,
+                g.use_liq_sweep as i8,
+                g.mtf_confirmation as i8,
+                g.use_premium_discount as i8,
+                g.use_inducement as i8,
+                g.use_bos as i8,
+                g.use_choch as i8,
+                g.use_eqh as i8,
+                g.use_eql as i8,
+                g.use_displacement as i8,
+            ]);
+        }
+        let smc_weights = [
+            config.smc_weight_ob,
+            config.smc_weight_fvg,
+            config.smc_weight_liq,
+            config.smc_weight_mtf,
+            config.smc_weight_premium,
+            config.smc_weight_inducement,
+            config.smc_weight_bos,
+            config.smc_weight_choch,
+            config.smc_weight_eqh,
+            config.smc_weight_eql,
+            config.smc_weight_displacement,
+        ];
+        let mut settings = settings_template.clone();
+        settings.risk_based_sizing = false;
+        Self {
+            offsets,
+            indices,
+            weights,
+            long_thr,
+            short_thr,
+            sl_pips,
+            tp_pips,
+            gene_smc_flags,
+            smc_weights,
+            gate_threshold: config.smc_gate_threshold,
+            settings,
+            n_genes: genes.len(),
+        }
+    }
+
+    pub fn n_genes(&self) -> usize {
+        self.n_genes
+    }
+}
+
+/// AREA 2 / Stage C (2026-06-09) — GPU-routed population backtest on a single
+/// CONTIGUOUS walk-forward split window `[a, b)`.
+///
+/// The walk-forward population path ([`crate::validation::embargoed_walkforward_population`])
+/// calls this once per qualifying split. It slices the FULL-SERIES indicators +
+/// SMC + OHLCV + calendar arrays contiguously at `[a, b)` (NO gather — the WF
+/// test slice is contiguous by construction) and runs ONE GPU population launch
+/// over all genes in `pack` via [`crate::eval::validation_backtest_population`]
+/// (GPU-try → CPU fallback, fail-loud).
+///
+/// ## Parity with the single-gene walk-forward
+/// The single-gene path slices the PRECOMPUTED full-series `signals[a..b]` and
+/// backtests them with `&[]` confidence (fixed-1-lot). Here the kernel
+/// RE-SYNTHESIZES the signal from `indicators[.., a..b]` + `smc[a..b]`. Signal
+/// synthesis is fully POINTWISE (the SMC arrays carry lookback but are
+/// precomputed on the full series and then sliced, never recomputed on the
+/// slice), so the on-device synth at slice position `k` reads the SAME
+/// indicator + SMC values the full-series synth read at bar `a + k` → identical
+/// per-bar signal → identical metrics. `risk_based_sizing` is forced `false`
+/// (in [`WalkforwardPopulationGenePack::new`]) so sizing is fixed-1-lot, and
+/// `timestamps[a..b]` is passed through so gap/session logic matches the slice.
+///
+/// Returns one `[f64; 11]` metric row per gene (same order as the pack's genes).
+#[allow(clippy::too_many_arguments)]
+pub fn validation_genes_population_window(
+    pack: &WalkforwardPopulationGenePack,
+    full_indicators: ndarray::ArrayView2<'_, f32>,
+    full_smc: &[crate::eval::SmcRow],
+    full_close: &[f64],
+    full_high: &[f64],
+    full_low: &[f64],
+    full_months: &[i64],
+    full_days: &[i64],
+    full_timestamps: &[i64],
+    a: usize,
+    b: usize,
+) -> Result<Vec<[f64; 11]>> {
+    if pack.n_genes == 0 {
+        return Ok(Vec::new());
+    }
+    let full_samples = full_indicators.ncols();
+    if full_smc.len() != full_samples {
+        bail!(
+            "full SMC length {} != full sample count {}",
+            full_smc.len(),
+            full_samples
+        );
+    }
+    if !(a < b && b <= full_samples) {
+        bail!(
+            "walk-forward window [{a}, {b}) out of range (full series has {full_samples} samples)"
+        );
+    }
+    if full_close.len() != full_samples
+        || full_high.len() != full_samples
+        || full_low.len() != full_samples
+        || full_months.len() != full_samples
+        || full_days.len() != full_samples
+    {
+        bail!("walk-forward full-series per-bar arrays must all equal the sample count");
+    }
+
+    // Contiguous slice of the indicator matrix at the split columns. A column
+    // slice of an `ArrayView2` is a cheap view (no copy), so the kernel's
+    // `indicators` is exactly the full-series indicators restricted to `[a, b)`.
+    let win_ind = full_indicators.slice(ndarray::s![.., a..b]);
+    let win_smc = &full_smc[a..b];
+    let win_close = &full_close[a..b];
+    let win_high = &full_high[a..b];
+    let win_low = &full_low[a..b];
+    let win_months = &full_months[a..b];
+    let win_days = &full_days[a..b];
+    // Pass timestamps only when full-length (same guard as the single-gene path
+    // at validation.rs:1118-1122); otherwise empty ⇒ index-delta carry.
+    let win_ts: &[i64] = if full_timestamps.len() == full_samples {
+        &full_timestamps[a..b]
+    } else {
+        &[]
+    };
+
+    Ok(crate::eval::validation_backtest_population(
+        crate::eval::PopulationEvalInputs {
+            close: win_close,
+            high: win_high,
+            low: win_low,
+            indicators: win_ind,
+            gene_offsets: &pack.offsets,
+            gene_indices: &pack.indices,
+            gene_weights: &pack.weights,
+            long_thr: &pack.long_thr,
+            short_thr: &pack.short_thr,
+            month_idx: win_months,
+            day_idx: win_days,
+            timestamps: win_ts,
+            sl_pips: &pack.sl_pips,
+            tp_pips: &pack.tp_pips,
+            smc_data: win_smc,
+            gene_smc_flags: &pack.gene_smc_flags,
+            gate_threshold: pack.gate_threshold,
+            weights: &pack.smc_weights,
+            settings: &pack.settings,
+        },
+    ))
+}
+
 pub fn evaluate_genes(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,

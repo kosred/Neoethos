@@ -3306,4 +3306,290 @@ mod gpu_cpu_parity_tests {
             }
         }
     }
+
+    /// AREA 2 / Stage C (2026-06-09) — GPU-routed **walk-forward** split parity.
+    ///
+    /// The walk-forward population path
+    /// ([`crate::validation::embargoed_walkforward_population`]) replaces the
+    /// per-gene `embargoed_walkforward_backtest` with, per CONTIGUOUS split window
+    /// `[test_start..end]`, ONE population launch over all survivor genes
+    /// (`validation_genes_population_window` → `validation_backtest_population`),
+    /// keeping the risk diagnostics on the CPU. This test is the easiest parity
+    /// case: the test slice is contiguous (no gather), and the launch is fixed-1-lot
+    /// (`risk_based_sizing == false`, matching the single-gene WF's `&[]` confidence
+    /// at validation.rs:1129-1130).
+    ///
+    /// It asserts BOTH halves of the WF parity claim:
+    ///  1. the kernel's RE-SYNTHESIZED signal on `indicators[test_start..end]`
+    ///     equals the PRECOMPUTED full-series signal sliced `[test_start..end]`
+    ///     (the pointwise-synth-on-a-contiguous-slice insight), and
+    ///  2. the population metrics[0/3/4/8] match the per-gene CPU
+    ///     `fast_evaluate_strategy_core` reference (fixed-1-lot, `&[]` confidence)
+    ///     within the EXISTING tolerance (`1e-2*|c|.max(1)+1e-3`, trade-count ±1) —
+    ///     NOT loosened.
+    ///
+    /// ACTIVE SMC gating is used so the SMC slice actually influences the gate.
+    /// Modest fixture (1 200 rows × 6 genes) to avoid the iGPU async-OOM. Skips
+    /// cleanly without a device; `NEOETHOS_REQUIRE_GPU=1` fails loud on a misconfig
+    /// (the helper CPU-falls-back on a GPU-less box, so the comparison is then
+    /// CPU==CPU and EXACT).
+    #[test]
+    fn gpu_walkforward_split_matches_cpu() {
+        let n_samples = 1_200usize;
+        let n_features = 6usize;
+        let n_genes = 6usize;
+
+        // Deterministic price wave large enough to trigger SL/TP exits.
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| 1.10 + ((i as f64) * 0.02).sin() * 0.01)
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0008).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0008).collect();
+
+        // [features × samples], values well clear of the ±0.3 thresholds.
+        let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
+            (((i + f * 11) as f32) * 0.05).sin() * 0.8
+        });
+
+        // CSR genes: each sums 2 features (weight 1.0).
+        let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8, 10, 12];
+        let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 0];
+        let gene_weights: Vec<f32> = vec![1.0; 12];
+        let long_thr: Vec<f32> = vec![0.3; n_genes];
+        let short_thr: Vec<f32> = vec![-0.3; n_genes];
+        let sl_pips: Vec<f64> = vec![25.0; n_genes];
+        let tp_pips: Vec<f64> = vec![50.0; n_genes];
+
+        // ACTIVE SMC gating with a non-trivial full-series SMC pattern, so the
+        // contiguous SMC slice influences the gate (not bypassed).
+        let full_smc: Vec<SmcRow> = (0..n_samples)
+            .map(|i| {
+                let dir = if (i / 5) % 2 == 0 { 1i8 } else { -1i8 };
+                let mut row = [0i8; 11];
+                if i % 7 != 0 {
+                    row[3] = dir; // mtf/trend channel
+                    row[6] = dir; // bos
+                    row[4] = dir; // premium
+                }
+                row
+            })
+            .collect();
+        let gene_smc_flags: Vec<SmcRow> = (0..n_genes)
+            .map(|g| {
+                let mut row = [0i8; 11];
+                row[3] = 1;
+                if g % 2 == 0 {
+                    row[6] = 1;
+                }
+                if g % 3 == 0 {
+                    row[4] = 1;
+                }
+                row
+            })
+            .collect();
+        let smc_weights = [0.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let gate_threshold = 1.0f32;
+
+        // Full-series calendar buckets (sliced contiguously per window).
+        let full_month_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 150).collect();
+        let full_day_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 30).collect();
+        // 1-minute bars for the timestamp slice (full-length ⇒ passed through).
+        let full_timestamps: Vec<i64> = (0..n_samples as i64).map(|i| i * 60_000).collect();
+
+        // Finite cost model. FIXED-1-LOT: risk_based_sizing OFF — the walk-forward's
+        // legacy fixed-1-lot (the single-gene path passes `&[]` confidence so
+        // pos_lots stays 1.0 regardless; the population pack FORCES this flag off).
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = false; // fixed-1-lot, matching WF `&[]` confidence
+
+        // Reproduce one walk-forward split's contiguous test window EXACTLY as
+        // `embargoed_walkforward_backtest` computes it (train_ratio=0.70, the same
+        // window/train/embargo arithmetic), for n_splits=4.
+        let n_splits = 4usize;
+        let train_ratio = 0.70f64;
+        let embargo_bars = 5usize;
+        let window = (n_samples / n_splits).max(1);
+        // Pick split index 1 (a mid-series window) and derive its test slice.
+        let split_i = 1usize;
+        let start = split_i * window;
+        let end = ((split_i + 1) * window).min(n_samples);
+        let train_end = start + ((window as f64) * train_ratio) as usize;
+        let test_start = train_end + embargo_bars;
+        assert!(
+            test_start < end && (train_end - start) >= 40 && (end - test_start) >= 40,
+            "fixture must yield a qualifying split window"
+        );
+        let win_len = end - test_start;
+        assert!(win_len > 80, "window must clear the 80-bar floor");
+
+        // ── Precompute full-series signals per gene, then SLICE [test_start..end].
+        // This is what the single-gene WF path feeds (it slices the precomputed
+        // `signals`). The population path RE-SYNTHESIZES from the sliced indicators;
+        // both must agree because synth is pointwise.
+        let full_signals_per_gene: Vec<Vec<i8>> = (0..n_genes)
+            .map(|g| {
+                synthesize_signals_and_confidence_cpu(
+                    indicators.view(),
+                    &gene_offsets,
+                    &gene_indices,
+                    &gene_weights,
+                    &long_thr,
+                    &short_thr,
+                    &full_smc,
+                    &gene_smc_flags,
+                    gate_threshold,
+                    &smc_weights,
+                    g,
+                    n_samples,
+                )
+                .0
+            })
+            .collect();
+
+        // ── CPU REFERENCE — the single-gene WF slice eval: precomputed signals
+        // sliced contiguously + `&[]` confidence (fixed-1-lot) on the window. ──────
+        let slice_close = &close[test_start..end];
+        let slice_high = &high[test_start..end];
+        let slice_low = &low[test_start..end];
+        let slice_month = &full_month_idx[test_start..end];
+        let slice_day = &full_day_idx[test_start..end];
+        let slice_ts = &full_timestamps[test_start..end];
+        let cpu: Vec<[f64; 11]> = (0..n_genes)
+            .map(|g| {
+                let slice_sig = &full_signals_per_gene[g][test_start..end];
+                let mut s = settings.clone();
+                s.sl_pips = sl_pips[g];
+                s.tp_pips = tp_pips[g];
+                fast_evaluate_strategy_core(
+                    slice_close,
+                    slice_high,
+                    slice_low,
+                    slice_sig,
+                    // Phase 1 walk-forward: legacy fixed-1-lot `&[]` confidence.
+                    &[],
+                    slice_month,
+                    slice_day,
+                    slice_ts,
+                    &s,
+                )
+            })
+            .collect();
+
+        // ── GPU PATH — contiguous slice of the indicators/SMC; the kernel
+        // re-synthesizes signals on the slice and backtests (or CPU-falls-back). ──
+        let win_ind = indicators.slice(ndarray::s![.., test_start..end]).to_owned();
+        let win_smc: Vec<SmcRow> = full_smc[test_start..end].to_vec();
+
+        // Half (1): the re-synthesized window signals must equal the precomputed
+        // full-series signals sliced — the core WF parity insight. (CPU synth, so
+        // this is device-independent and always runs.)
+        for g in 0..n_genes {
+            let (resynth, _conf) = synthesize_signals_and_confidence_cpu(
+                win_ind.view(),
+                &gene_offsets,
+                &gene_indices,
+                &gene_weights,
+                &long_thr,
+                &short_thr,
+                &win_smc,
+                &gene_smc_flags,
+                gate_threshold,
+                &smc_weights,
+                g,
+                win_len,
+            );
+            let sliced = &full_signals_per_gene[g][test_start..end];
+            assert_eq!(
+                resynth.as_slice(),
+                sliced,
+                "gene {g}: re-synth on the contiguous window != precomputed-signal slice \
+                 (walk-forward window-synth not bit-faithful)"
+            );
+        }
+
+        // NEOETHOS_REQUIRE_GPU fail-loud probe (same pattern as the siblings).
+        if let Err(e) = crate::cubecl_eval::try_evaluate_population_cuda(
+            slice_close,
+            slice_high,
+            slice_low,
+            win_ind.view(),
+            &gene_offsets,
+            &gene_indices,
+            &gene_weights,
+            &long_thr,
+            &short_thr,
+            slice_month,
+            slice_day,
+            slice_ts,
+            &sl_pips,
+            &tp_pips,
+            &win_smc,
+            &gene_smc_flags,
+            gate_threshold,
+            &smc_weights,
+            &settings,
+            None,
+        ) {
+            if std::env::var("NEOETHOS_REQUIRE_GPU").is_ok() {
+                panic!("NEOETHOS_REQUIRE_GPU set but GPU walk-forward eval failed: {e}");
+            }
+            eprintln!("GPU walk-forward parity test SKIPPED (no usable GPU device): {e}");
+            return;
+        }
+
+        // Half (2): population metrics half via the SAME entry the WF window path
+        // uses (`validation_backtest_population`), fixed-1-lot, on the contiguous
+        // slice.
+        let gpu = validation_backtest_population(PopulationEvalInputs {
+            close: slice_close,
+            high: slice_high,
+            low: slice_low,
+            indicators: win_ind.view(),
+            gene_offsets: &gene_offsets,
+            gene_indices: &gene_indices,
+            gene_weights: &gene_weights,
+            long_thr: &long_thr,
+            short_thr: &short_thr,
+            month_idx: slice_month,
+            day_idx: slice_day,
+            timestamps: slice_ts,
+            sl_pips: &sl_pips,
+            tp_pips: &tp_pips,
+            smc_data: &win_smc,
+            gene_smc_flags: &gene_smc_flags,
+            gate_threshold,
+            weights: &smc_weights,
+            settings: &settings,
+        });
+        assert_eq!(gpu.len(), n_genes, "gpu walk-forward returned wrong gene count");
+
+        // The WF path consumes metric slots 0 (net_profit), 3 (max_dd), 4
+        // (win_rate), 8 (trade_count); slot 10 (max_daily_dd) feeds the risk
+        // diagnostics. Assert all of them (incl. the others, for safety) within
+        // the EXISTING tolerance.
+        for g in 0..n_genes {
+            let (ct, gt) = (cpu[g][8], gpu[g][8]);
+            assert!(
+                (ct - gt).abs() <= 1.0,
+                "WF gene {g} trade-count mismatch: cpu={ct} gpu={gt} (window-synth bug?)"
+            );
+            for m in [0usize, 1, 2, 3, 4, 5, 6, 7, 9, 10] {
+                let (c, v) = (cpu[g][m], gpu[g][m]);
+                let tol = 1e-2 * c.abs().max(1.0) + 1e-3;
+                assert!(
+                    (c - v).abs() <= tol,
+                    "WF gene {g} metric[{m}] mismatch: cpu={c} gpu={v} tol={tol} \
+                     (contiguous window not bit-faithful to the kernel)"
+                );
+            }
+        }
+    }
 }

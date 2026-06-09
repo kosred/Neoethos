@@ -11,11 +11,10 @@ use crate::validation::{
     CanonicalBacktestArtifactFile, CanonicalBacktestScope, CombinatorialPurgedCV, ForwardTestInput,
     ForwardTestValidationArtifactFile, ForwardTestValidationScope, PropFirmRiskInput,
     PropFirmRiskRules, PropFirmRiskValidationArtifactFile, PropFirmRiskValidationScope,
-    WalkforwardBacktestInput, WalkforwardSummary, WalkforwardValidationArtifactFile,
-    WalkforwardValidationScope, compute_forward_test_summary, compute_prop_firm_risk_summary,
-    embargoed_walkforward_backtest, write_canonical_backtest_artifact_atomic,
-    write_forward_test_validation_artifact_atomic, write_prop_firm_risk_validation_artifact_atomic,
-    write_walkforward_validation_artifact_atomic,
+    WalkforwardSummary, WalkforwardValidationArtifactFile, WalkforwardValidationScope,
+    compute_forward_test_summary, compute_prop_firm_risk_summary,
+    write_canonical_backtest_artifact_atomic, write_forward_test_validation_artifact_atomic,
+    write_prop_firm_risk_validation_artifact_atomic, write_walkforward_validation_artifact_atomic,
 };
 use anyhow::{Context, Result};
 use chrono::{Datelike, TimeZone, Utc};
@@ -1785,7 +1784,104 @@ fn build_discovery_validation_artifacts(
     let mut walkforward_validation_artifacts = Vec::with_capacity(portfolio.len());
     let mut walkforward_passed = true;
 
-    for (gene, signals) in portfolio.iter().zip(portfolio_signals) {
+    // ── AREA 2 / Stage C (2026-06-09): GPU-routed POPULATION walk-forward ─────
+    //
+    // The single-gene `embargoed_walkforward_backtest` ran `n_genes × n_splits`
+    // tiny CPU backtests. Transpose it: build the full-series indicators + SMC
+    // ONCE, build the window-independent gene pack ONCE, then per qualifying
+    // split do ONE GPU population launch (`validation_genes_population_window`)
+    // over all survivor genes — `n_splits` launches instead of `n_genes ×
+    // n_splits` CPU backtests. The kernel emits only the metric half; the risk
+    // diagnostics stay on the CPU inside `embargoed_walkforward_population`,
+    // which builds a byte-identical `WalkforwardSummary` per gene.
+    //
+    // The GPU metrics half is gene-independent except SL/TP (handled by the
+    // pack's per-gene SL/TP arrays with the SAME finite-positive-else-20/40
+    // fallback `discovery_backtest_settings` applies), so one template built
+    // from `portfolio[0]` + the pack reproduces every gene's WF metrics.
+    let wf_settings_template =
+        discovery_backtest_settings(config, &portfolio[0], ohlcv.close.last().copied());
+    // The CPU risk-diagnostic half needs each gene's OWN settings (its SL/TP
+    // drives `simulate_trades_core`'s exits), exactly as the single-gene path's
+    // per-gene `discovery_backtest_settings` did — so build the full per-gene
+    // settings vector.
+    let wf_gene_settings: Vec<crate::eval::BacktestSettings> = portfolio
+        .iter()
+        .map(|gene| discovery_backtest_settings(config, gene, ohlcv.close.last().copied()))
+        .collect();
+    let wf_eval_config = config.evaluation_config(ohlcv.close.last().copied());
+    let wf_full_indicators = features.as_indicators_view();
+    let (wob, wfvg, wliq, wtrend, wprem, wind, wbos, wchoch, weqh, weql, wdisp) =
+        build_smc_arrays(features, ohlcv);
+    let wf_full_n = ohlcv.close.len();
+    let mut wf_full_smc: Vec<crate::eval::SmcRow> = Vec::with_capacity(wf_full_n);
+    for i in 0..wf_full_n {
+        wf_full_smc.push([
+            wob[i], wfvg[i], wliq[i], wtrend[i], wprem[i], wind[i], wbos[i], wchoch[i], weqh[i],
+            weql[i], wdisp[i],
+        ]);
+    }
+    let wf_gene_pack = crate::genetic::WalkforwardPopulationGenePack::new(
+        portfolio,
+        &wf_eval_config,
+        &wf_settings_template,
+    );
+
+    let walkforward_summaries = crate::validation::embargoed_walkforward_population(
+        crate::validation::WalkforwardPopulationInput {
+            close: &ohlcv.close,
+            high: &ohlcv.high,
+            low: &ohlcv.low,
+            months: &months,
+            days: &days,
+            timestamps,
+            train_ratio: 0.70,
+            n_splits: config.walkforward_splits.max(1),
+            embargo_bars,
+            gene_settings: &wf_gene_settings,
+            max_daily_loss_pct: config.max_regime_loss_pct,
+            max_daily_profit_pct: 0.0,
+            min_trading_days: 0,
+            max_trades_per_day: 0,
+            initial_balance: config.initial_balance,
+        },
+        portfolio_signals,
+        |test_start, end| {
+            // ONE GPU population launch over the whole portfolio on this
+            // contiguous split window. Serialize the device launch behind
+            // GPU_LAUNCH_LOCK so any outer parallelism never spins up N GPU
+            // clients → VRAM × N → OOM. The CPU fallback inside the helper still
+            // parallelises across genes.
+            #[cfg(feature = "gpu")]
+            let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            crate::genetic::validation_genes_population_window(
+                &wf_gene_pack,
+                wf_full_indicators,
+                &wf_full_smc,
+                &ohlcv.close,
+                &ohlcv.high,
+                &ohlcv.low,
+                &months,
+                &days,
+                timestamps,
+                test_start,
+                end,
+            )
+        },
+    )?;
+    if walkforward_summaries.len() != portfolio.len() {
+        anyhow::bail!(
+            "walk-forward population returned {} summaries for {} genes — internal bug",
+            walkforward_summaries.len(),
+            portfolio.len()
+        );
+    }
+
+    for ((gene, signals), walkforward_summary) in portfolio
+        .iter()
+        .zip(portfolio_signals)
+        .zip(walkforward_summaries)
+    {
         let settings = discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
         let strategy_hash = stable_json_hash(gene)?;
         let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
@@ -1794,9 +1890,8 @@ fn build_discovery_validation_artifacts(
         // (identity-preserving) and only take the fresh confidence slice —
         // both are produced from the SAME gene + evaluation config, so they
         // are aligned by construction.
-        let eval_config = config.evaluation_config(ohlcv.close.last().copied());
         let (_regen_signals, confidences) =
-            signals_and_confidence_for_gene_full(features, ohlcv, gene, &eval_config);
+            signals_and_confidence_for_gene_full(features, ohlcv, gene, &wf_eval_config);
         let metrics = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
             &ohlcv.close,
             &ohlcv.high,
@@ -1818,24 +1913,6 @@ fn build_discovery_validation_artifacts(
             metrics,
         ));
 
-        let walkforward_summary = embargoed_walkforward_backtest(WalkforwardBacktestInput {
-            close: &ohlcv.close,
-            high: &ohlcv.high,
-            low: &ohlcv.low,
-            signals,
-            months: &months,
-            days: &days,
-            timestamps,
-            train_ratio: 0.70,
-            n_splits: config.walkforward_splits.max(1),
-            embargo_bars,
-            settings: &settings,
-            max_daily_loss_pct: config.max_regime_loss_pct,
-            max_daily_profit_pct: 0.0,
-            min_trading_days: 0,
-            max_trades_per_day: 0,
-            initial_balance: config.initial_balance,
-        })?;
         walkforward_passed &= walkforward_summary_passed(&walkforward_summary);
         walkforward_validation_artifacts.push(WalkforwardValidationArtifactFile::new(
             WalkforwardValidationScope::for_strategy(
