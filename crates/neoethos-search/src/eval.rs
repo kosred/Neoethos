@@ -1583,6 +1583,11 @@ mod hybrid_split {
         cpu_genes_per_s: f64,
         gpu_genes_per_s: f64,
         samples: u32,
+        /// Generations seen by `gpu_count` — drives the periodic GPU re-probe.
+        calls: u64,
+        /// Whether the "GPU share decayed to 0" notice has already fired, so the
+        /// fail-loud warning is emitted on the TRANSITION, not every generation.
+        zero_logged: bool,
     }
     static RATES: OnceLock<Mutex<Rates>> = OnceLock::new();
     fn rates() -> &'static Mutex<Rates> {
@@ -1591,20 +1596,72 @@ mod hybrid_split {
                 cpu_genes_per_s: 0.0,
                 gpu_genes_per_s: 0.0,
                 samples: 0,
+                calls: 0,
+                zero_logged: false,
             })
         })
     }
 
+    /// Re-probe cadence. Even after the throughput EMA drives the GPU share to 0
+    /// (GPU measured slower than the CPU lane for some workload), force a small
+    /// GPU lane every this-many generations so a GPU that has since become
+    /// competitive — lighter generation, warmed kernels, the next combo, or a
+    /// kernel that was just made faster — gets RE-MEASURED and can recover.
+    /// Without this, `update()` runs only on the success arm, so once `gpu_count`
+    /// returns 0 the GPU lane is never entered again, no fresh measurement is ever
+    /// taken, and the GPU stays abandoned for the whole run (the death-spiral bug,
+    /// fixed 2026-06-09).
+    const REPROBE_EVERY: u64 = 32;
+
+    /// Minimum genes handed to the GPU while (re-)probing.
+    fn probe_floor(n_genes: usize) -> usize {
+        (n_genes / 20).clamp(1, n_genes.saturating_sub(1))
+    }
+
     /// Genes to route to the GPU lane for a population of `n_genes`. Before any
     /// measurement, give the GPU a conservative 25 % so we learn its speed
-    /// without a big slowdown if it turns out weak.
+    /// without a big slowdown if it turns out weak. Once measured, the share is
+    /// proportional to the GPU's fraction of total genes/sec — but it is NEVER
+    /// left at an absorbing 0 (periodic re-probe above) and a much-faster GPU is
+    /// clamped to `n_genes - 1` rather than `n_genes` so the caller's
+    /// `gpu_count < n_genes` guard can't paradoxically disable a winning GPU.
     pub fn gpu_count(n_genes: usize) -> usize {
-        let r = rates().lock().unwrap_or_else(|p| p.into_inner());
+        let mut r = rates().lock().unwrap_or_else(|p| p.into_inner());
+        r.calls = r.calls.wrapping_add(1);
+        let due_reprobe = r.calls % REPROBE_EVERY == 0;
         if r.samples == 0 || r.cpu_genes_per_s <= 0.0 || r.gpu_genes_per_s <= 0.0 {
             return (n_genes / 4).clamp(1, n_genes.saturating_sub(1));
         }
         let frac = r.gpu_genes_per_s / (r.cpu_genes_per_s + r.gpu_genes_per_s);
-        ((n_genes as f64) * frac).round() as usize
+        let measured = ((n_genes as f64) * frac).round() as usize;
+        if measured == 0 {
+            if !r.zero_logged {
+                r.zero_logged = true;
+                tracing::warn!(
+                    target: "neoethos_search::eval",
+                    gpu_genes_per_s = r.gpu_genes_per_s,
+                    cpu_genes_per_s = r.cpu_genes_per_s,
+                    reprobe_every = REPROBE_EVERY,
+                    "hybrid GPU lane share decayed to 0 — GPU measured slower than \
+                     the CPU lane for this workload. Routing genes to CPU; will \
+                     re-probe the GPU periodically so it can recover (fail-loud)."
+                );
+            }
+            if due_reprobe {
+                return probe_floor(n_genes);
+            }
+            return 0;
+        }
+        if r.zero_logged {
+            r.zero_logged = false;
+            tracing::info!(
+                target: "neoethos_search::eval",
+                gpu_genes_per_s = r.gpu_genes_per_s,
+                cpu_genes_per_s = r.cpu_genes_per_s,
+                "hybrid GPU lane recovered — re-probe found the GPU competitive again."
+            );
+        }
+        measured.clamp(1, n_genes.saturating_sub(1))
     }
 
     /// Fold this generation's measured lane throughputs into the EMA.

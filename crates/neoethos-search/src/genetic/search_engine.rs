@@ -1397,6 +1397,12 @@ where
     let started_at = Instant::now();
     let mut best_score_seen = f64::NEG_INFINITY;
     let mut stagnant_gens = 0usize;
+    // Wall-clock timestamp of the last *meaningful* top-fitness improvement.
+    // Drives the time-based convergence early-stop (slow-TF fix 2026-06-09):
+    // `convergence_patience` is a GENERATION count and a heavy TF can never
+    // accumulate that many slow generations inside its time budget, so we ALSO
+    // stop when the search has been flat in wall-clock for the floor window.
+    let mut last_improvement_at = started_at;
     // Fires the "gate fully relaxed" notice at most ONCE per search. The
     // realized smc_gate_threshold is clamped to [gate_lo, gate_hi] regardless,
     // so the previous per-generation warn was pure log flood (audit 2026-06-08).
@@ -1530,6 +1536,7 @@ where
         if top_score > best_score_seen + min_improvement {
             best_score_seen = top_score;
             stagnant_gens = 0;
+            last_improvement_at = Instant::now();
         } else {
             stagnant_gens += 1;
         }
@@ -1600,9 +1607,26 @@ where
             Some(mr) => started_at.elapsed() >= mr.mul_f64(convergence_min_elapsed_fraction),
             None => false,
         };
+        // Slow-TF fix (2026-06-09): `convergence_patience` counts GENERATIONS, but
+        // a heavy TF (M3 ≈ 0.4 gen/s) needs ~10+ min to accumulate 250 slow gens —
+        // longer than its whole time budget — so the gen-count trigger can NEVER
+        // fire and the combo burns its full cap even when flat since gen ~3
+        // (observed live: AUDUSD M3 ran the entire 15-min stage-1 cap stagnant the
+        // whole time, then a 15-min validation tail, then got killed). So ALSO stop
+        // when the search has been flat in WALL-CLOCK for the same floor fraction of
+        // the budget. Both triggers share the `convergence_floor_reached` gate, so a
+        // fast TF still gets its guaranteed minimum search time before either can
+        // fire (preserves the AUDUSD-H4 "gen-291-in-1s → 0 strategies" guard).
+        let stagnation_time_trigger = match max_runtime {
+            Some(mr) => {
+                last_improvement_at.elapsed() >= mr.mul_f64(convergence_min_elapsed_fraction)
+            }
+            None => false,
+        };
+        let gen_count_trigger = stagnant_gens >= convergence_patience;
         if convergence_patience > 0
-            && stagnant_gens >= convergence_patience
             && convergence_floor_reached
+            && (gen_count_trigger || stagnation_time_trigger)
         {
             tracing::info!(
                 target: "neoethos_search::search_engine",
@@ -1610,12 +1634,18 @@ where
                 total_generations = generations,
                 best_score = best_score_seen,
                 stagnant_gens,
+                stagnant_secs = last_improvement_at.elapsed().as_secs(),
                 convergence_patience,
                 elapsed_s = started_at.elapsed().as_secs(),
                 min_elapsed_fraction = convergence_min_elapsed_fraction,
                 archive_len = profitable_archive.len(),
-                "GA converged: early-stopping this combo (flat for convergence_patience \
-                 gens past the wall-clock floor); advancing to the next."
+                trigger = if gen_count_trigger {
+                    "gen_count"
+                } else {
+                    "wall_clock_stagnation"
+                },
+                "GA converged: early-stopping this combo (flat past the wall-clock \
+                 floor); advancing to the next."
             );
             let best_return_count = population
                 .clamp(2, (population / 2).clamp(100, 500))
