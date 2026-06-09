@@ -1582,3 +1582,182 @@ fn sanitize_downgrades_stale_external_runtime_to_local_fallback_reason() {
     assert!(repaired.last_result.is_some());
     assert!(!repaired.candidate_reports.is_empty());
 }
+
+// === Particle Swarm Optimization (PSO) over the ensemble weights ===
+//
+// These are pure-fn tests on the always-compiled local PSO path. They use small
+// deterministic fixtures: the optimizer correctness/determinism/simplex
+// invariants are asserted on the math, not on broker realism (see file header).
+
+/// A tiny 3-candidate / 2-window fixture where the SECOND candidate is exactly
+/// the actuals (perfect forecaster), so the optimal weight vector concentrates
+/// on candidate 1 and drives ensemble MAE toward zero.
+fn pso_fixture() -> Vec<PsoWindow> {
+    vec![
+        PsoWindow {
+            forecasts: vec![
+                vec![1.00, 1.00, 1.00], // flat / poor
+                vec![1.05, 1.12, 1.20], // == actuals (perfect)
+                vec![0.80, 0.70, 0.60], // far off
+            ],
+            actuals: vec![1.05, 1.12, 1.20],
+            baseline: 1.0,
+        },
+        PsoWindow {
+            forecasts: vec![
+                vec![2.00, 2.00, 2.00],
+                vec![2.10, 2.05, 1.95], // == actuals (perfect)
+                vec![3.00, 3.20, 3.40],
+            ],
+            actuals: vec![2.10, 2.05, 1.95],
+            baseline: 2.0,
+        },
+    ]
+}
+
+#[test]
+fn pso_weights_beat_or_match_uniform_and_warm_start_in_sample() {
+    let windows = pso_fixture();
+    let uniform = vec![1.0 / 3.0; 3];
+    // Warm start = a softmax-ish blend that under-weights the perfect candidate.
+    let warm_start = vec![0.5_f32, 0.3, 0.2];
+
+    let uniform_mae = ensemble_window_mae(&uniform, &windows);
+    let warm_mae = ensemble_window_mae(&warm_start, &windows);
+
+    let pso = pso_optimize_weights(&windows, &warm_start, PSO_SEED);
+    let pso_mae = ensemble_window_mae(&pso, &windows);
+
+    assert!(
+        pso_mae <= uniform_mae + 1e-6,
+        "PSO MAE {pso_mae} should be <= uniform MAE {uniform_mae}"
+    );
+    assert!(
+        pso_mae <= warm_mae + 1e-6,
+        "PSO MAE {pso_mae} should be <= warm-start MAE {warm_mae}"
+    );
+    // The perfect candidate (index 1) should dominate the learned weights.
+    assert!(
+        pso[1] > pso[0] && pso[1] > pso[2],
+        "PSO should concentrate weight on the perfect candidate, got {pso:?}"
+    );
+}
+
+#[test]
+fn pso_weights_are_reproducible_same_seed() {
+    let windows = pso_fixture();
+    let init = vec![0.4_f32, 0.4, 0.2];
+
+    let first = pso_optimize_weights(&windows, &init, PSO_SEED);
+    let second = pso_optimize_weights(&windows, &init, PSO_SEED);
+
+    assert_eq!(
+        first.len(),
+        second.len(),
+        "PSO weight vectors must have equal length"
+    );
+    for (a, b) in first.iter().zip(second.iter()) {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "same (windows, init, seed) must yield bit-identical PSO weights"
+        );
+    }
+}
+
+#[test]
+fn pso_weights_on_simplex() {
+    let windows = pso_fixture();
+    let init = vec![0.2_f32, 0.5, 0.3];
+    let pso = pso_optimize_weights(&windows, &init, PSO_SEED);
+
+    assert!(
+        pso.iter().all(|w| w.is_finite()),
+        "PSO weights must be finite: {pso:?}"
+    );
+    assert!(
+        pso.iter().all(|w| *w >= 0.0),
+        "PSO weights must be non-negative: {pso:?}"
+    );
+    let sum: f32 = pso.iter().sum();
+    assert!(
+        (sum - 1.0).abs() < 1e-5,
+        "PSO weights must sum to 1, got {sum}"
+    );
+}
+
+#[test]
+fn pso_different_seed_still_valid_simplex_and_non_regressive() {
+    let windows = pso_fixture();
+    let init = vec![0.5_f32, 0.3, 0.2];
+    let base_fit = ensemble_window_mae(&init, &windows);
+
+    // A different seed must still return a valid simplex point and, because the
+    // warm start (particle 0) seeds the swarm, fitness can never beat-then-regress
+    // past the incumbent global best — gbest <= base_fit.
+    let pso = pso_optimize_weights(&windows, &init, PSO_SEED ^ 0xDEAD_BEEF);
+    let sum: f32 = pso.iter().sum();
+    assert!((sum - 1.0).abs() < 1e-5, "weights must sum to 1, got {sum}");
+    assert!(pso.iter().all(|w| *w >= 0.0 && w.is_finite()));
+    let pso_fit = ensemble_window_mae(&pso, &windows);
+    assert!(
+        pso_fit <= base_fit + 1e-6,
+        "warm-started PSO must not regress past the incumbent: pso {pso_fit} vs base {base_fit}"
+    );
+}
+
+#[test]
+fn ensemble_window_mae_mirrors_aggregate_weighted_baseline_fallback() {
+    // When NO candidate contributes finite weight at a step (all weights zero),
+    // ensemble_window_mae must fall back to the window baseline, EXACTLY like
+    // production's aggregate_weighted.
+    let windows = vec![PsoWindow {
+        forecasts: vec![vec![5.0_f32], vec![6.0_f32]],
+        actuals: vec![10.0_f32],
+        baseline: 9.0_f32,
+    }];
+    // All-zero weights → total contributing weight <= EPS → baseline (9.0) used.
+    let zero_weights = vec![0.0_f32, 0.0];
+    let mae_from_baseline = ensemble_window_mae(&zero_weights, &windows);
+    // Expected: |baseline - actual| = |9 - 10| = 1.0
+    assert!(
+        (mae_from_baseline - 1.0).abs() < 1e-6,
+        "zero-weight step must fall back to baseline like aggregate_weighted, got {mae_from_baseline}"
+    );
+
+    // Cross-check the renormalize-by-contributing-weight rule against a direct
+    // aggregate_weighted call on the same data.
+    let candidates = vec![
+        ("a".to_string(), vec![5.0_f32]),
+        ("b".to_string(), vec![6.0_f32]),
+    ];
+    let weights = HashMap::from([("a".to_string(), 0.25_f32), ("b".to_string(), 0.75_f32)]);
+    let aggregated = aggregate_weighted(&candidates, &weights, 1, 9.0);
+    // ensemble_window_mae uses index alignment; mirror with the same weights.
+    let windows2 = vec![PsoWindow {
+        forecasts: vec![vec![5.0_f32], vec![6.0_f32]],
+        actuals: aggregated.clone(),
+        baseline: 9.0_f32,
+    }];
+    let idx_weights = vec![0.25_f32, 0.75];
+    // With actuals == the aggregated output, MAE must be ~0 (same combination math).
+    let parity_mae = ensemble_window_mae(&idx_weights, &windows2);
+    assert!(
+        parity_mae < 1e-5,
+        "ensemble_window_mae combination must match aggregate_weighted (renormalize-by-contributing-weight); MAE {parity_mae}"
+    );
+}
+
+#[test]
+fn project_to_simplex_clips_and_renormalizes() {
+    let mut weights = vec![-0.5_f32, 2.0, 0.5];
+    project_to_simplex(&mut weights);
+    assert!((weights[0] - 0.0).abs() < 1e-6, "negatives clipped to 0");
+    let sum: f32 = weights.iter().sum();
+    assert!((sum - 1.0).abs() < 1e-6, "renormalized to sum 1");
+
+    // All-zero (or all-negative) collapses to uniform.
+    let mut zeros = vec![0.0_f32, 0.0, 0.0, 0.0];
+    project_to_simplex(&mut zeros);
+    assert!(zeros.iter().all(|w| (*w - 0.25).abs() < 1e-6), "all-zero -> uniform");
+}

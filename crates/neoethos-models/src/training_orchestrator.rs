@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::base::ExpertModel;
 use crate::burn_models::{active_burn_backend_name, normalize_burn_device_policy};
@@ -1765,18 +1765,35 @@ impl TrainingOrchestrator {
                     },
                 ),
             ]),
-            "dqn" => HashMap::from([
+            "dqn" => {
+                // RLlib/Ray honesty: Ray's RLlib is a Python framework and there is
+                // NO Ray runtime in this pure-Rust build. The `use_rllib_agent` /
+                // `auto_enable_rllib` config flags are kept for compatibility, but
+                // their EFFECT must be truthful — a request for "rllib" can only ever
+                // execute on the real native `rlkit` backend. So we resolve the
+                // `backend` param to the honest `rlkit` label (never a bare "rllib"
+                // that implies a Ray backend that does not exist) and carry the
+                // original request in `__rllib_requested` so the runtime profile /
+                // artifact records the honest requested-vs-effective degradation.
+                let rllib_auto = self.settings.models.auto_enable_rllib
+                    && self.settings.system.enable_gpu
+                    && self.settings.models.ray_tune_max_concurrency > 0;
+                let rllib_requested = self.settings.models.use_rllib_agent || rllib_auto;
+                if rllib_requested {
+                    rllib_unavailable_warn_once();
+                }
+                HashMap::from([
                 (
+                    // Honest backend: rlkit is the only RL backend that exists here.
                     "backend".to_string(),
-                    if self.settings.models.use_rllib_agent
-                        || (self.settings.models.auto_enable_rllib
-                            && self.settings.system.enable_gpu
-                            && self.settings.models.ray_tune_max_concurrency > 0)
-                    {
-                        "rllib".to_string()
-                    } else {
-                        "native".to_string()
-                    },
+                    "rlkit".to_string(),
+                ),
+                (
+                    // Records that rllib/Ray was requested but is unavailable, so the
+                    // training runtime profile can attach an honest degradation note
+                    // WITHOUT a misleading bare "rllib" backend label.
+                    "__rllib_requested".to_string(),
+                    rllib_requested.to_string(),
                 ),
                 (
                     "auto_rllib".to_string(),
@@ -1914,7 +1931,8 @@ impl TrainingOrchestrator {
                         .collect::<Vec<_>>()
                         .join(","),
                 ),
-            ]),
+            ])
+            }
             "swarm_forecaster" => HashMap::from([
                 (
                     "memory_limit_mb".to_string(),
@@ -2397,6 +2415,19 @@ fn parse_survivor_selection_policy(params: &HashMap<String, String>) -> Survivor
     )
 }
 
+/// Emit a single process-wide warning the first time an RLlib/Ray-backed DQN run
+/// is requested. Ray's RLlib is a Python framework with no Rust runtime in this
+/// build; a request can only execute on the native `rlkit` backend. The warning
+/// makes the honest degradation visible without spamming the log per model run.
+fn rllib_unavailable_warn_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        warn!(
+            "rllib/Ray requested for DQN but is unavailable in the pure-Rust build; using rlkit (native) backend instead"
+        );
+    });
+}
+
 fn training_runtime_profile(
     settings: &neoethos_core::Settings,
     config: &ModelConfig,
@@ -2416,17 +2447,23 @@ fn training_runtime_profile(
     let planned_backend = parse_string_param(&config.params, "__planned_backend");
     let planned_device = parse_string_param(&config.params, "__planned_device");
     let planned_precision = parse_string_param(&config.params, "__planned_precision");
-    let rllib_requested = requested_backend
-        .as_deref()
-        .is_some_and(|backend| backend.eq_ignore_ascii_case("rllib"));
+    // RLlib honesty: the `backend` param is now ALWAYS the truthful effective
+    // backend (`rlkit`), never a bare "rllib". The original rllib/Ray REQUEST is
+    // carried in `__rllib_requested` (the back-compat fallback `backend == "rllib"`
+    // only matters for older persisted configs). This records the honest
+    // requested-vs-effective degradation in the runtime profile/artifact.
+    let rllib_requested = parse_bool_param(&config.params, "__rllib_requested", false)
+        || requested_backend
+            .as_deref()
+            .is_some_and(|backend| backend.eq_ignore_ascii_case("rllib"));
     let mut notes = Vec::new();
     if rllib_requested {
         notes.push(
-            "rllib backend is recorded as a requested runtime hint; current DQN training path remains native rlkit".to_string(),
+            "rllib/Ray was requested for DQN but is unavailable in this pure-Rust build; training executed on the native rlkit backend".to_string(),
         );
         if parse_bool_param(&config.params, "auto_rllib", false) {
             notes.push(
-                "rllib backend was auto-requested from config because GPU preference and RLlib auto-enable were both active".to_string(),
+                "rllib was auto-requested from config because GPU preference and RLlib auto-enable were both active; the effective backend remains native rlkit".to_string(),
             );
         }
     }
@@ -4671,6 +4708,79 @@ mod tests {
         assert_eq!(profile.effective_label_horizon_bars, 3);
         assert_eq!(profile.meta_label_max_hold_bars, 3);
         assert!(!profile.label_use_triple_barrier);
+    }
+
+    #[test]
+    fn dqn_backend_param_is_honest_rlkit_not_bare_rllib_when_rllib_requested() {
+        let mut orchestrator = orchestrator_with_models(&["dqn"]);
+        // Operator explicitly asks for the (non-existent in Rust) RLlib/Ray agent.
+        orchestrator.settings.models.use_rllib_agent = true;
+
+        let params = orchestrator.default_model_params("dqn");
+
+        // The effective backend must be the truthful native `rlkit`, NEVER a bare
+        // "rllib" label that implies a Ray backend that does not exist here.
+        assert_eq!(
+            params.get("backend").map(String::as_str),
+            Some("rlkit"),
+            "dqn backend must resolve to the honest rlkit backend, not a bare rllib claim"
+        );
+        assert_ne!(
+            params.get("backend").map(String::as_str),
+            Some("rllib"),
+            "a bare rllib backend label is misleading (no Ray runtime exists in this build)"
+        );
+        // The honest request-vs-effective degradation signal must be carried so the
+        // runtime profile/artifact can record it.
+        assert_eq!(
+            params.get("__rllib_requested").map(String::as_str),
+            Some("true"),
+            "rllib request must be recorded as a degradation marker"
+        );
+    }
+
+    #[test]
+    fn training_runtime_profile_records_rllib_degradation_reason() {
+        let orchestrator = orchestrator_with_models(&["dqn"]);
+        let config = ModelConfig {
+            name: "dqn".to_string(),
+            model_type: ModelType::Dqn,
+            capability_family: crate::runtime::capabilities::ModelFamily::Rl,
+            capability_state: CapabilityState::Implemented,
+            params: HashMap::from([
+                ("backend".to_string(), "rlkit".to_string()),
+                ("__rllib_requested".to_string(), "true".to_string()),
+            ]),
+        };
+        let payload =
+            TrainingPayload::from_dense(ndarray::Array2::<f32>::zeros((4, 1)), vec![0, 0, 0, 0])
+                .expect("build payload");
+
+        let profile = training_runtime_profile(
+            &orchestrator.settings,
+            &config,
+            "EURUSD",
+            "M1",
+            &payload,
+            Some(4),
+            Vec::new(),
+        );
+
+        // The effective/requested backend recorded is the honest rlkit, not rllib.
+        assert_eq!(profile.requested_backend.as_deref(), Some("rlkit"));
+        assert!(
+            profile.rllib_requested,
+            "rllib request must still be flagged on the profile via the __rllib_requested marker"
+        );
+        // An honest degradation note must be recorded; it must NOT claim rllib ran.
+        assert!(
+            profile
+                .notes
+                .iter()
+                .any(|note| note.contains("rllib") && note.contains("unavailable")),
+            "profile must record the honest rllib-unavailable degradation reason; notes were: {:?}",
+            profile.notes
+        );
     }
 
     #[test]
