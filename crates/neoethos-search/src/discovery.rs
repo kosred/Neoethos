@@ -789,6 +789,19 @@ pub struct DiscoveryValidationGates {
     pub prop_firm_window_passed: bool,
     pub prop_firm_window_pass_rate: f64,
     pub prop_firm_window_count: usize,
+    /// NEVER-ZERO (2026-06-09, operator non-negotiable): set when the strict
+    /// funnel rejected EVERY candidate and discovery promoted the best-found
+    /// genes as a best-effort portfolio instead of dying empty. These genes did
+    /// NOT pass the prop bar — `prop_firm_window_passed`/`walkforward_passed`/
+    /// `cpcv_passed` are all forced false so `is_portfolio_export_ready()` stays
+    /// honest. Downstream consumers (the autonomous trader) MUST treat a
+    /// fallback portfolio cautiously (e.g. demo-only / heavily down-sized).
+    #[serde(default)]
+    pub fallback_mode: bool,
+    /// Which strict stage was the bottleneck that emptied the portfolio (e.g.
+    /// `"passed_prop_firm_window"`). Empty unless `fallback_mode`.
+    #[serde(default)]
+    pub fallback_reason: String,
 }
 
 impl DiscoveryValidationGates {
@@ -804,6 +817,8 @@ impl DiscoveryValidationGates {
             prop_firm_window_passed: false,
             prop_firm_window_pass_rate: 0.0,
             prop_firm_window_count: 0,
+            fallback_mode: false,
+            fallback_reason: String::new(),
         }
     }
 
@@ -1939,6 +1954,8 @@ fn build_discovery_validation_artifacts(
         prop_firm_window_passed: false,
         prop_firm_window_pass_rate: 0.0,
         prop_firm_window_count: 0,
+        fallback_mode: false,
+        fallback_reason: String::new(),
     };
 
     Ok((
@@ -3466,6 +3483,29 @@ where
         filtered.push((idx, gene));
         signals_map.push(sig);
     }
+    // ── NEVER-ZERO best-effort snapshot (2026-06-09, operator non-negotiable) ──
+    // Capture the top-by-fitness base-filtered survivors WITH their signals here,
+    // at the richest point before the strict quality / prop-firm / correlation
+    // gates can empty the portfolio. If those gates reject EVERY candidate, we
+    // promote this set (correlation-pruned, honestly labeled "did not pass the
+    // prop bar") so a hard combo (e.g. AUDUSD M3) emits its best-found genes
+    // instead of dying with zero output. Cloning only the top N keeps it cheap.
+    const FALLBACK_PORTFOLIO_MAX: usize = 8;
+    let best_effort_fallback: Vec<((usize, Gene), Vec<i8>)> = {
+        let mut order: Vec<usize> = (0..filtered.len()).collect();
+        order.sort_by(|&a, &b| {
+            filtered[b]
+                .1
+                .fitness
+                .partial_cmp(&filtered[a].1.fitness)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        order
+            .into_iter()
+            .take(FALLBACK_PORTFOLIO_MAX)
+            .map(|i| (filtered[i].clone(), signals_map[i].clone()))
+            .collect()
+    };
     progress_fn(DiscoveryProgress::CandidatesFiltered {
         passed_filters: filtered.len(),
         evaluated_candidates: ranked_candidates.len(),
@@ -3939,14 +3979,78 @@ where
         portfolio_size = portfolio.len(),
         "candidate funnel — how many genes survived each gate"
     );
+    // ── NEVER-ZERO rescue (2026-06-09, operator non-negotiable) ─────────────
+    // If the strict funnel (quality + prop-firm + correlation) rejected EVERY
+    // candidate, promote the best-found base-filtered genes instead of dying
+    // empty. They are correlation-pruned like a real portfolio and their metrics
+    // recomputed so portfolio/quality_metrics/signals stay consistent — but the
+    // heavy CPCV/walk-forward validation is SKIPPED (running it on genes that
+    // already failed the bar would just burn the validation tail). They are
+    // emitted honestly flagged `fallback_mode` and forced not-export-ready.
+    let mut fallback_mode = false;
     let (mut validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts) =
-        build_discovery_validation_artifacts(
-            &portfolio,
-            &portfolio_signals,
-            features,
-            ohlcv,
-            config,
-        )?;
+        if portfolio.is_empty() && !best_effort_fallback.is_empty() {
+            fallback_mode = true;
+            let fallback_reason = funnel
+                .stages
+                .iter()
+                .filter(|s| s.count_in > 0)
+                .max_by_key(|s| s.rejected)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| "strict_gates".to_string());
+            let analyzer = quality_analyzer_for_config(config);
+            for ((_, gene), sig) in best_effort_fallback {
+                if portfolio.len() >= FALLBACK_PORTFOLIO_MAX {
+                    break;
+                }
+                let mut ok = true;
+                for existing in &portfolio_signals {
+                    if pearson_corr_i8(&sig, existing).abs() >= config.corr_threshold {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let trades = crate::eval::simulate_trades_core(
+                    &ohlcv.close,
+                    &ohlcv.high,
+                    &ohlcv.low,
+                    &features.timestamps,
+                    &sig,
+                    &discovery_backtest_settings(config, &gene, ohlcv.close.last().copied()),
+                );
+                quality_metrics.push(analyzer.analyze_strategy(
+                    &gene.strategy_id,
+                    &trades,
+                    config.initial_balance,
+                ));
+                portfolio_signals.push(sig);
+                portfolio.push(gene);
+            }
+            funnel.record_stage("fallback_best_effort", 0, portfolio.len());
+            tracing::warn!(
+                target: "neoethos_search::discovery",
+                promoted = portfolio.len(),
+                reason = %fallback_reason,
+                "NEVER-ZERO: the strict funnel emptied the portfolio — promoting the \
+                 best-found genes (did NOT pass the prop bar) so the run is not empty. \
+                 Flagged fallback_mode + not-export-ready."
+            );
+            let mut gates = DiscoveryValidationGates::pending();
+            gates.fallback_mode = true;
+            gates.fallback_reason = fallback_reason;
+            (gates, Vec::new(), Vec::new())
+        } else {
+            build_discovery_validation_artifacts(
+                &portfolio,
+                &portfolio_signals,
+                features,
+                ohlcv,
+                config,
+            )?
+        };
     if let Some(pf) = config.prop_firm_gate.as_ref() {
         // agent 2026-06-05 overfitting fix: the prop-firm window gate alone let
         // in-sample-overfit portfolios export (walk-forward was informational).
@@ -3973,6 +4077,12 @@ where
     // pass/fail so the operator can see whether a non-empty portfolio later
     // got dropped at the walkforward stage. The validation_gates bool fields
     // are the canonical pass/fail signal.
+    if fallback_mode {
+        // Honest: best-effort fallback genes did NOT pass the prop bar, so they
+        // must never read as export-ready downstream (the autonomous trader keys
+        // off `is_portfolio_export_ready()` / `prop_firm_window_passed`).
+        validation_gates.prop_firm_window_passed = false;
+    }
     let portfolio_size = portfolio.len();
     let walkforward_pass = if validation_gates.walkforward_passed {
         portfolio_size
@@ -4006,7 +4116,9 @@ where
     // 2026-05-26: finalize funnel with outcome label. The caller saves the
     // file next to the portfolio JSON — that's where the file lives in the
     // production layout.
-    let outcome = if portfolio.is_empty() {
+    let outcome = if fallback_mode {
+        "fallback_best_effort"
+    } else if portfolio.is_empty() {
         "no_candidates"
     } else if export_ready > 0 {
         "exported"
