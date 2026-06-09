@@ -2679,6 +2679,181 @@ mod gpu_cpu_parity_tests {
         }
     }
 
+    /// PARITY GATE (2026-06-09) for the GPU FTMO prop-firm observables emitted by
+    /// `backtest_population_kernel` into the new `ftmo_out` array. The GPU computes
+    /// the 6 FTMO observables on-device; this asserts they match the CPU ground
+    /// truth = `simulate_trades_core` → `compute_prop_firm_risk_summary`
+    /// (validation.rs:746) bit-for-bit within f32 tolerance. A subtle bug here would
+    /// corrupt which strategies the prop-firm gate keeps, so this is the safety net.
+    /// Skips cleanly without a GPU device (set NEOETHOS_REQUIRE_GPU=1 to fail loud).
+    #[test]
+    fn gpu_cpu_prop_firm_ftmo_matches() {
+        use crate::validation::{
+            PropFirmRiskInput, PropFirmRiskRules, compute_prop_firm_risk_summary,
+        };
+
+        // ~2400 bars at 1h spacing → spans ~100 calendar days, several trades/day on
+        // some days, dry stretches on others → exercises every FTMO observable
+        // (multi-day buckets, positive + negative days, end-of-day DD, trade-day count).
+        let n_samples = 2400usize;
+        let n_features = 6usize;
+        let n_genes = 6usize;
+
+        // Deterministic price wave large enough to trigger SL/TP exits regularly.
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| 1.10 + ((i as f64) * 0.05).sin() * 0.012)
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0010).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0010).collect();
+
+        // [features × samples], values well clear of the ±0.3 thresholds.
+        let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
+            (((i + f * 7) as f32) * 0.06).sin() * 0.85
+        });
+
+        // CSR genes: each sums 2 features (weight 1.0).
+        let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8, 10, 12];
+        let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 0];
+        let gene_weights: Vec<f32> = vec![1.0; 12];
+        let long_thr: Vec<f32> = vec![0.3; n_genes];
+        let short_thr: Vec<f32> = vec![-0.3; n_genes];
+        let sl_pips: Vec<f64> = vec![20.0; n_genes];
+        let tp_pips: Vec<f64> = vec![40.0; n_genes];
+
+        // SMC gating OFF: zero flags + zero gate → signals pass through ungated.
+        let smc_data: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
+        let gene_smc_flags: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
+        let smc_weights = [0.0f32; 11];
+        let gate_threshold = 0.0f32;
+
+        // 1-hour bars; day_idx = timestamp/86_400_000 (the SAME key both the CPU
+        // bucketing in compute_prop_firm_risk_summary and the GPU kernel use).
+        let timestamps: Vec<i64> = (0..n_samples as i64).map(|i| i * 3_600_000).collect();
+        let month_idx: Vec<i64> = timestamps.iter().map(|ts| ts / (30 * 86_400_000)).collect();
+        let day_idx: Vec<i64> = timestamps.iter().map(|ts| ts / 86_400_000).collect();
+
+        // Finite cost model + explicit risk-sizing knobs (default settings are
+        // all-NaN for pip_value/spread/commission).
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.kill_zones_enabled = false;
+        // The PRODUCTION prop-firm gate (discovery.rs compute_prop_firm_pass_rate)
+        // calls simulate_trades_core WITHOUT a confidences slice, so risk-based
+        // sizing is inert there (use_risk_sizing = risk_based_sizing && !conf.is_empty()
+        // == false) → fixed-1-lot. To match that exact behavior, the GPU FTMO path
+        // is exercised here with risk_based_sizing = false (pos_lots forced to 1.0
+        // in the kernel), so CPU and GPU run the identical fixed-1-lot backtest.
+        settings.risk_based_sizing = false;
+        settings.risk_per_trade_min = 0.005;
+        settings.risk_per_trade_max = 0.03;
+        settings.high_quality_confidence = 0.65;
+
+        let initial_balance = settings.initial_equity();
+
+        // CPU ground truth: per gene, simulate trades then aggregate FTMO observables
+        // via the SAME function the production prop-firm gate uses.
+        let cpu: Vec<[f64; 6]> = (0..n_genes)
+            .map(|g| {
+                let (signals, _conf) = synthesize_signals_and_confidence_cpu(
+                    indicators.view(),
+                    &gene_offsets,
+                    &gene_indices,
+                    &gene_weights,
+                    &long_thr,
+                    &short_thr,
+                    &smc_data,
+                    &gene_smc_flags,
+                    gate_threshold,
+                    &smc_weights,
+                    g,
+                    n_samples,
+                );
+                let mut s = settings.clone();
+                s.sl_pips = sl_pips[g];
+                s.tp_pips = tp_pips[g];
+                let trades =
+                    simulate_trades_core(&close, &high, &low, &timestamps, &signals, &s);
+                let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
+                    trades: &trades,
+                    initial_balance,
+                    rules: PropFirmRiskRules::default(),
+                });
+                [
+                    summary.net_return_pct,
+                    summary.max_daily_loss_pct_observed,
+                    summary.max_overall_drawdown_pct_observed,
+                    summary.largest_profit_share_observed,
+                    summary.max_trades_per_day_observed as f64,
+                    summary.trading_days_observed as f64,
+                ]
+            })
+            .collect();
+
+        // GPU path — skip (don't fail) when no usable device is present.
+        let gpu = match crate::cubecl_eval::try_evaluate_ftmo_population_cuda(
+            &close,
+            &high,
+            &low,
+            indicators.view(),
+            &gene_offsets,
+            &gene_indices,
+            &gene_weights,
+            &long_thr,
+            &short_thr,
+            &month_idx,
+            &day_idx,
+            &timestamps,
+            &sl_pips,
+            &tp_pips,
+            &smc_data,
+            &gene_smc_flags,
+            gate_threshold,
+            &smc_weights,
+            &settings,
+            None,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                if std::env::var("NEOETHOS_REQUIRE_GPU").is_ok() {
+                    panic!("NEOETHOS_REQUIRE_GPU set but GPU FTMO eval failed: {e}");
+                }
+                eprintln!("GPU FTMO parity test SKIPPED (no usable GPU device): {e}");
+                return;
+            }
+        };
+
+        assert_eq!(gpu.len(), n_genes, "gpu returned wrong gene count");
+
+        for g in 0..n_genes {
+            let c = cpu[g];
+            let v = gpu[g];
+            // [0] net_return_pct, [1] max_daily_loss_pct, [2] max_overall_drawdown_pct,
+            // [3] largest_profit_share — float (f32 vs f64): abs tol ~1e-3.
+            for m in [0usize, 1, 2, 3] {
+                let (cm, vm) = (c[m], v[m] as f64);
+                let tol = 1e-3 * cm.abs().max(1.0) + 1e-3;
+                assert!(
+                    (cm - vm).abs() <= tol,
+                    "gene {g} FTMO[{m}] mismatch: cpu={cm} gpu={vm} tol={tol}"
+                );
+            }
+            // [4] max_trades_per_day, [5] trading_days — integer-valued, exact.
+            for m in [4usize, 5] {
+                let (cm, vm) = (c[m], v[m] as f64);
+                assert!(
+                    (cm - vm).abs() <= 0.5,
+                    "gene {g} FTMO[{m}] (integer) mismatch: cpu={cm} gpu={vm}"
+                );
+            }
+        }
+    }
+
     /// AREA 1 (2026-06-09) regression lock for the raised per-buffer cap. The
     /// 800-row case above fits one window/one batch, so it never exercised the
     /// windowing/batching machinery the cap-raise relies on as its safety net.

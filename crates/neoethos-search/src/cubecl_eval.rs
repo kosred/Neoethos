@@ -14,6 +14,17 @@ use crate::eval::{BacktestSettings, SmcRow};
 
 const SMC_WIDTH: usize = 11;
 const BACKTEST_CORE_METRIC_WIDTH: usize = 7;
+// FTMO prop-firm observables emitted per gene by `backtest_population_kernel`
+// into the `ftmo_out` array, so the host can apply FTMO rules on the GPU result
+// instead of re-running a CPU `simulate_trades_core` + `compute_prop_firm_risk_summary`.
+// Layout per gene (matches validation.rs::compute_prop_firm_risk_summary):
+//   [0] net_return_pct          = net_profit / initial_equity
+//   [1] max_daily_loss_pct      = max_day(|day_pnl| if day_pnl<0) / initial_equity
+//   [2] max_overall_drawdown_pct = peak-to-trough DD of the END-OF-DAY equity curve
+//   [3] largest_profit_share    = largest_positive_day / sum_of_positive_days (0 if none)
+//   [4] max_trades_per_day      = max day trade count (as f32)
+//   [5] trading_days            = count of days with >=1 trade (as f32)
+const FTMO_WIDTH: usize = 6;
 
 // ─── F-CORE3 consolidation — CUDA env-var registry ──────────────────
 //
@@ -529,6 +540,10 @@ fn backtest_population_kernel(
     // monthly_pnls_out / month_start_equities_out to get monthly_target_hit_rate
     // (metric slot 7), matching eval.rs:1110-1131.
     month_start_equities_out: &mut Array<f32>,
+    // FTMO prop-firm observables, `n_genes * FTMO_WIDTH` laid out per gene
+    // (see `FTMO_WIDTH`). MUST be the LAST kernel parameter so `launch_backtest_kernel`
+    // appends its `ArrayArg` after all the existing args.
+    ftmo_out: &mut Array<f32>,
 ) {
     // cubecl 0.9: index arithmetic is usize; coerce u32 params at the top.
     // Every scalar accumulator that gets reassigned must use RuntimeCell —
@@ -544,6 +559,7 @@ fn backtest_population_kernel(
         let signal_base = gene * n_samples;
         let month_base = gene * month_capacity;
         let metric_base = gene * BACKTEST_CORE_METRIC_WIDTH;
+        let ftmo_base = gene * FTMO_WIDTH;
 
         for zero_idx in 0..month_capacity {
             monthly_pnls_out[month_base + zero_idx] = 0.0;
@@ -551,6 +567,9 @@ fn backtest_population_kernel(
         }
         month_counts_out[gene] = 0;
         trade_counts_out[gene] = 0;
+        for fj in 0..FTMO_WIDTH {
+            ftmo_out[ftmo_base + fj] = 0.0;
+        }
 
         if n_samples == 0 {
             for j in 0..BACKTEST_CORE_METRIC_WIDTH {
@@ -585,6 +604,29 @@ fn backtest_population_kernel(
         let day_low = RuntimeCell::<f32>::new(initial_equity);
         let max_daily_dd = RuntimeCell::<f32>::new(0.0);
         let day_trade_count = RuntimeCell::<u32>::new(0);
+
+        // ── FTMO prop-firm observables (mirror validation.rs::compute_prop_firm_risk_summary) ──
+        // Trades bucket by integer DAY == day_idx[i] (same key the CPU derives from
+        // trade.exit_time / 86_400_000). `current_day_pnl` accumulates realized pnl of
+        // the day in progress; finalized at each day boundary and once more after the loop.
+        let current_day_pnl = RuntimeCell::<f32>::new(0.0);
+        let max_daily_loss = RuntimeCell::<f32>::new(0.0);
+        // END-OF-DAY equity curve drawdown: equity at a day boundary already equals
+        // initial + sum(all prior days' realized pnl), i.e. exactly the CPU's per-day
+        // equity point (equity += day_pnl iterated in day order). No-trade boundary days
+        // repeat the prior point → never create a new peak or a larger DD → harmless.
+        let eod_peak = RuntimeCell::<f32>::new(initial_equity);
+        let max_eod_dd = RuntimeCell::<f32>::new(0.0);
+        let positive_day_sum = RuntimeCell::<f32>::new(0.0);
+        let largest_positive_day = RuntimeCell::<f32>::new(0.0);
+        let max_trades_day = RuntimeCell::<u32>::new(0);
+        let trading_days = RuntimeCell::<i32>::new(0);
+        // FTMO trade-DAY counting must bucket by the CLOSE day (= trade.exit_time/day),
+        // because the CPU `compute_prop_firm_risk_summary` keys `day_trade_count` on
+        // `trade.exit_time/86_400_000`. The existing `day_trade_count` increments at
+        // ENTRY (it gates `max_trades_per_day` on the entry side) and would diverge for
+        // overnight holds, so we keep a SEPARATE close-bucketed counter here.
+        let current_day_closes = RuntimeCell::<u32>::new(0);
 
         let in_pos = RuntimeCell::<i32>::new(0);
         let entry_px = RuntimeCell::<f32>::new(0.0);
@@ -636,6 +678,52 @@ fn backtest_population_kernel(
                         max_daily_dd.store(dd);
                     }
                 }
+                // ── FTMO: finalize the PREVIOUS day before resetting day state ──
+                // Runs AFTER the prior day's exits have already mutated `equity`
+                // (the entry for THIS bar happens later in the loop), so `equity`
+                // and `current_day_pnl` here hold the just-finished day's totals.
+                if last_day_v != -1 {
+                    let dp = current_day_pnl.read();
+                    // max_daily_loss = max over days of |negative day pnl|.
+                    if dp < 0.0 {
+                        let neg = -dp;
+                        if neg > max_daily_loss.read() {
+                            max_daily_loss.store(neg);
+                        }
+                    }
+                    // largest_profit_share inputs: sum + max of POSITIVE day pnls.
+                    if dp > 0.0 {
+                        positive_day_sum.store(positive_day_sum.read() + dp);
+                        if dp > largest_positive_day.read() {
+                            largest_positive_day.store(dp);
+                        }
+                    }
+                    // END-OF-DAY equity drawdown: `equity` == initial + sum(all prior
+                    // days' pnl) == the CPU's per-day equity point.
+                    let eod_eq = equity.read();
+                    if eod_eq > eod_peak.read() {
+                        eod_peak.store(eod_eq);
+                    }
+                    let ep = eod_peak.read();
+                    let eod_dd = RuntimeCell::<f32>::new(0.0);
+                    if ep > 0.0 {
+                        eod_dd.store((ep - eod_eq) / ep);
+                    }
+                    if eod_dd.read() > max_eod_dd.read() {
+                        max_eod_dd.store(eod_dd.read());
+                    }
+                    // trading_days + max_trades_per_day from the finished day —
+                    // counted by CLOSES (exit-day bucketed) to match the CPU.
+                    let dtc = current_day_closes.read();
+                    if dtc > 0 {
+                        trading_days.store(trading_days.read() + 1);
+                    }
+                    if dtc > max_trades_day.read() {
+                        max_trades_day.store(dtc);
+                    }
+                    current_day_pnl.store(0.0);
+                    current_day_closes.store(0);
+                }
                 last_day.store(d_val);
                 day_peak.store(equity.read());
                 day_low.store(equity.read());
@@ -679,6 +767,10 @@ fn backtest_population_kernel(
                 let pnl = pnl_cell.read();
                 equity.store(equity.read() + pnl);
                 current_month_pnl.store(current_month_pnl.read() + pnl);
+                // FTMO: attribute this realized pnl + closed-trade to the CURRENT
+                // (close) day's bucket — matches the CPU's exit-day bucketing.
+                current_day_pnl.store(current_day_pnl.read() + pnl);
+                current_day_closes.store(current_day_closes.read() + 1);
                 trade_count.store(trade_count.read() + 1);
                 if pnl > 0.0 {
                     wins.store(wins.read() + 1);
@@ -838,6 +930,10 @@ fn backtest_population_kernel(
                     let pnl = pnl_cell.read();
                     equity.store(equity.read() + pnl);
                     current_month_pnl.store(current_month_pnl.read() + pnl);
+                    // FTMO: attribute this realized pnl + closed-trade to the CURRENT
+                    // (close) day's bucket — matches the CPU's exit-day bucketing.
+                    current_day_pnl.store(current_day_pnl.read() + pnl);
+                    current_day_closes.store(current_day_closes.read() + 1);
                     trade_count.store(trade_count.read() + 1);
                     if pnl > 0.0 {
                         wins.store(wins.read() + 1);
@@ -927,6 +1023,48 @@ fn backtest_population_kernel(
             }
         }
 
+        // ── FTMO: FLUSH THE FINAL DAY ──────────────────────────────────────
+        // The boundary block only fires on a CHANGE of day_idx, so the LAST day
+        // in the series is never finalized there. Repeat the same finalize using
+        // the final `current_day_pnl` / `equity` / `day_trade_count`, but only if
+        // at least one bar was processed (last_day != -1). This exactly mirrors
+        // the CPU iterating its last BTreeMap day.
+        if last_day.read() != -1 {
+            let dp = current_day_pnl.read();
+            if dp < 0.0 {
+                let neg = -dp;
+                if neg > max_daily_loss.read() {
+                    max_daily_loss.store(neg);
+                }
+            }
+            if dp > 0.0 {
+                positive_day_sum.store(positive_day_sum.read() + dp);
+                if dp > largest_positive_day.read() {
+                    largest_positive_day.store(dp);
+                }
+            }
+            let eod_eq = equity.read();
+            if eod_eq > eod_peak.read() {
+                eod_peak.store(eod_eq);
+            }
+            let ep = eod_peak.read();
+            let eod_dd = RuntimeCell::<f32>::new(0.0);
+            if ep > 0.0 {
+                eod_dd.store((ep - eod_eq) / ep);
+            }
+            if eod_dd.read() > max_eod_dd.read() {
+                max_eod_dd.store(eod_dd.read());
+            }
+            // Count by CLOSES (exit-day bucketed) to match the CPU.
+            let dtc = current_day_closes.read();
+            if dtc > 0 {
+                trading_days.store(trading_days.read() + 1);
+            }
+            if dtc > max_trades_day.read() {
+                max_trades_day.store(dtc);
+            }
+        }
+
         let final_equity = equity.read();
         let final_peak = peak_equity.read();
         let final_max_dd = max_dd.read();
@@ -971,6 +1109,31 @@ fn backtest_population_kernel(
         metrics_out[metric_base + 6] = final_max_daily_dd;
         trade_counts_out[gene] = final_trade_count;
         month_counts_out[gene] = filled_months_cell.read();
+
+        // ── FTMO observables emit (mirrors validation.rs::compute_prop_firm_risk_summary) ──
+        // net_return_pct = net_profit / initial_equity (guard initial_equity>0).
+        let net_return_pct = RuntimeCell::<f32>::new(0.0);
+        if initial_equity > 0.0 {
+            net_return_pct.store(net_profit / initial_equity);
+        }
+        // max_daily_loss_pct = max|neg day pnl| / initial_equity.
+        let max_daily_loss_pct = RuntimeCell::<f32>::new(0.0);
+        if initial_equity > 0.0 {
+            max_daily_loss_pct.store(max_daily_loss.read() / initial_equity);
+        }
+        // largest_profit_share = largest_positive_day / sum_positive_days (0 if none).
+        // Statement-if guard (cubecl#1375: NEVER expression-if mixing runtime values).
+        let largest_profit_share = RuntimeCell::<f32>::new(0.0);
+        if positive_day_sum.read() > 1e-9 {
+            largest_profit_share.store(largest_positive_day.read() / positive_day_sum.read());
+        }
+
+        ftmo_out[ftmo_base] = net_return_pct.read();
+        ftmo_out[ftmo_base + 1] = max_daily_loss_pct.read();
+        ftmo_out[ftmo_base + 2] = max_eod_dd.read();
+        ftmo_out[ftmo_base + 3] = largest_profit_share.read();
+        ftmo_out[ftmo_base + 4] = max_trades_day.read() as f32;
+        ftmo_out[ftmo_base + 5] = trading_days.read() as f32;
     }
 }
 
@@ -1925,11 +2088,18 @@ fn launch_backtest_kernel<R: Runtime>(
     tp_pips: &[f32],
     settings: &BacktestSettings,
     month_capacity: usize,
-) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>)> {
+) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>)> {
     let n_samples = close_pips.len();
     let n_genes = sl_pips.len();
     if n_samples == 0 || n_genes == 0 {
-        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        return Ok((
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
     }
     if high_pips.len() != n_samples
         || low_pips.len() != n_samples
@@ -1962,6 +2132,8 @@ fn launch_backtest_kernel<R: Runtime>(
     let month_start_eq_handle =
         client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>()));
     let month_counts_handle = client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>()));
+    let ftmo_len = n_genes.saturating_mul(FTMO_WIDTH);
+    let ftmo_handle = client.empty(ftmo_len.saturating_mul(std::mem::size_of::<f32>()));
 
     let units = backtest_kernel_units(client);
     let cubes = (n_genes as u32).div_ceil(units);
@@ -2012,6 +2184,9 @@ fn launch_backtest_kernel<R: Runtime>(
         settings.risk_per_trade_max as f32,
         settings.high_quality_confidence as f32,
         unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
+        // FTMO prop-firm observables — LAST kernel argument (matches the kernel
+        // signature). `n_genes * FTMO_WIDTH` f32s laid out per gene.
+        unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
     );
 
     let metrics_bytes = client.read_one_unchecked(metrics_handle);
@@ -2019,6 +2194,7 @@ fn launch_backtest_kernel<R: Runtime>(
     let monthly_bytes = client.read_one_unchecked(monthly_handle);
     let month_counts_bytes = client.read_one_unchecked(month_counts_handle);
     let month_start_eq_bytes = client.read_one_unchecked(month_start_eq_handle);
+    let ftmo_bytes = client.read_one_unchecked(ftmo_handle);
 
     Ok((
         f32::from_bytes(&metrics_bytes).to_vec(),
@@ -2026,6 +2202,7 @@ fn launch_backtest_kernel<R: Runtime>(
         f32::from_bytes(&monthly_bytes).to_vec(),
         i32::from_bytes(&month_counts_bytes).to_vec(),
         f32::from_bytes(&month_start_eq_bytes).to_vec(),
+        f32::from_bytes(&ftmo_bytes).to_vec(),
     ))
 }
 
@@ -2151,7 +2328,9 @@ pub(crate) fn try_evaluate_population_cuda(
                 let mut g0 = 0usize;
                 while g0 < chunk_n {
                     let g1 = (g0 + batch).min(chunk_n);
-                    let (m, tc, mo, mc, mse) = launch_backtest_kernel(
+                    // The metrics path ignores the new FTMO vec (last tuple slot);
+                    // FTMO observables are surfaced via `try_evaluate_ftmo_population_cuda`.
+                    let (m, tc, mo, mc, mse, _ftmo) = launch_backtest_kernel(
                         &client,
                         &close_pips,
                         &high_pips,
@@ -2255,6 +2434,176 @@ pub(crate) fn try_evaluate_population_cuda(
             consistency,
             metrics_flat[metric_base + 6] as f64,
         ]);
+    }
+
+    Ok(results)
+}
+
+/// GPU FTMO prop-firm observables path — sibling of [`try_evaluate_population_cuda`]
+/// that returns the per-gene `[f32; FTMO_WIDTH]` FTMO observables instead of the
+/// `[f64; 11]` ranking metrics. Reuses the EXACT same signal-synth
+/// (`try_generate_signal_flat_cuda`) + backtest (`launch_backtest_kernel`) path, so
+/// the trades the kernel realizes are identical to the metrics path — only the slot
+/// of the launch tuple that we keep differs. Layout per gene matches `FTMO_WIDTH`
+/// (see the const doc) and `validation.rs::compute_prop_firm_risk_summary`:
+///   [0] net_return_pct  [1] max_daily_loss_pct  [2] max_overall_drawdown_pct
+///   [3] largest_profit_share  [4] max_trades_per_day  [5] trading_days
+///
+/// Isolating this in its own function keeps the proven `[f64;11]` metrics path
+/// untouched (its signature is unchanged); callers that need FTMO observables on the
+/// GPU call this instead of re-running a CPU `simulate_trades_core`.
+pub(crate) fn try_evaluate_ftmo_population_cuda(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    indicators: ArrayView2<'_, f32>,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f32],
+    long_thr: &[f32],
+    short_thr: &[f32],
+    month_idx: &[i64],
+    day_idx: &[i64],
+    timestamps: &[i64],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
+    smc_data: &[SmcRow],
+    gene_smc_flags: &[SmcRow],
+    gate_threshold: f32,
+    smc_weights: &[f32; SMC_WIDTH],
+    settings: &BacktestSettings,
+    device_override: Option<usize>,
+) -> Result<Vec<[f32; FTMO_WIDTH]>> {
+    let n_genes = long_thr.len();
+    let n_samples = close.len();
+    if n_genes == 0 || n_samples == 0 {
+        return Ok(vec![[0.0f32; FTMO_WIDTH]; n_genes]);
+    }
+    if high.len() != n_samples
+        || low.len() != n_samples
+        || month_idx.len() != n_samples
+        || day_idx.len() != n_samples
+        || indicators.ncols() != n_samples
+        || sl_pips.len() != n_genes
+        || tp_pips.len() != n_genes
+    {
+        bail!("cuda ftmo population evaluate path received inconsistent dimensions");
+    }
+
+    let client = create_gpu_client(device_override)?;
+    // Per-SAMPLE host vecs — shared across every gene (data-sized, not population-sized).
+    let close_pips = normalize_prices_to_pips(close, settings.pip_value);
+    let high_pips = normalize_prices_to_pips(high, settings.pip_value);
+    let low_pips = normalize_prices_to_pips(low, settings.pip_value);
+    let (timestamp_deltas_ms, use_timestamps) = timestamp_delta_ms(timestamps, n_samples);
+    let month_idx = month_idx
+        .iter()
+        .map(|value| saturating_i32(*value))
+        .collect::<Vec<_>>();
+    let day_idx = day_idx
+        .iter()
+        .map(|value| saturating_i32(*value))
+        .collect::<Vec<_>>();
+    let sl_pips_all = sl_pips
+        .iter()
+        .map(|value| *value as f32)
+        .collect::<Vec<_>>();
+    let tp_pips_all = tp_pips
+        .iter()
+        .map(|value| *value as f32)
+        .collect::<Vec<_>>();
+    let month_capacity = settings.month_capacity();
+
+    let mut ftmo_flat: Vec<f32> = Vec::with_capacity(n_genes * FTMO_WIDTH);
+
+    // Same bounded GENE-CHUNK + gene-BATCH loop as the metrics path (never-OOM
+    // invariant); genes are independent + concatenated in order so this is
+    // numerically identical to a single pass.
+    let g_chunk = gene_chunk_size(n_genes, n_samples);
+    let mut c0 = 0usize;
+    while c0 < n_genes {
+        let c1 = (c0 + g_chunk).min(n_genes);
+
+        let chunk_res: Result<()> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<()> {
+                let idx0 = gene_offsets[c0] as usize;
+                let idx1 = gene_offsets[c1] as usize;
+                let base = gene_offsets[c0];
+                let chunk_offsets: Vec<i32> =
+                    gene_offsets[c0..=c1].iter().map(|o| *o - base).collect();
+                let (signals_flat, confidences_flat) = try_generate_signal_flat_cuda(
+                    indicators,
+                    &chunk_offsets,
+                    &gene_indices[idx0..idx1],
+                    &gene_weights[idx0..idx1],
+                    &long_thr[c0..c1],
+                    &short_thr[c0..c1],
+                    smc_data,
+                    &gene_smc_flags[c0..c1],
+                    gate_threshold,
+                    smc_weights,
+                    device_override,
+                )?;
+                trim_gpu_pool_if_over_budget(&client);
+
+                let chunk_n = c1 - c0;
+                let batch = backtest_gene_batch(chunk_n, n_samples);
+                let mut g0 = 0usize;
+                while g0 < chunk_n {
+                    let g1 = (g0 + batch).min(chunk_n);
+                    // We keep ONLY the FTMO vec (last tuple slot); the metrics
+                    // outputs are recomputed identically but discarded here.
+                    let (_m, _tc, _mo, _mc, _mse, ftmo) = launch_backtest_kernel(
+                        &client,
+                        &close_pips,
+                        &high_pips,
+                        &low_pips,
+                        &signals_flat[g0 * n_samples..g1 * n_samples],
+                        &confidences_flat[g0 * n_samples..g1 * n_samples],
+                        &timestamp_deltas_ms,
+                        use_timestamps,
+                        &month_idx,
+                        &day_idx,
+                        &sl_pips_all[c0 + g0..c0 + g1],
+                        &tp_pips_all[c0 + g0..c0 + g1],
+                        settings,
+                        month_capacity,
+                    )?;
+                    ftmo_flat.extend_from_slice(&ftmo);
+                    g0 = g1;
+                    trim_gpu_pool_if_over_budget(&client);
+                }
+                Ok(())
+            },
+        ))
+        .map_err(|payload| {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic>".to_string());
+            anyhow::anyhow!("GPU ftmo gene-chunk [{c0},{c1}) panicked (cubecl pool/#243): {msg}")
+        })
+        .and_then(|inner| inner);
+        chunk_res?;
+
+        c0 = c1;
+    }
+
+    if ftmo_flat.len() != n_genes * FTMO_WIDTH {
+        bail!(
+            "cuda ftmo evaluate produced {} values, expected {}",
+            ftmo_flat.len(),
+            n_genes * FTMO_WIDTH
+        );
+    }
+
+    let mut results = Vec::with_capacity(n_genes);
+    for g in 0..n_genes {
+        let base = g * FTMO_WIDTH;
+        let mut row = [0.0f32; FTMO_WIDTH];
+        row.copy_from_slice(&ftmo_flat[base..base + FTMO_WIDTH]);
+        results.push(row);
     }
 
     Ok(results)
