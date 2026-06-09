@@ -637,10 +637,79 @@ impl<B: Backend> NBeatsBlock<B> {
     }
 }
 
+/// FIXED N-BEATS basis matrix `[basis_dim, signal_len]` (Oreshkin et al. 2019).
+/// `is_trend`: rows are the polynomial basis t^j (t = i/len). Otherwise: row 0 =
+/// ones, then `cos(2π k t)` and `sin(2π k t)` harmonics — the Fourier seasonality
+/// basis. NOT a learnable Param — recomputed deterministically so autodiff never
+/// updates it (interpretability invariant).
+fn nbeats_basis<B: Backend>(
+    is_trend: bool,
+    basis_dim: usize,
+    len: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let mut data = vec![0.0f32; basis_dim * len];
+    for i in 0..len {
+        let t = i as f32 / len.max(1) as f32;
+        if is_trend {
+            for j in 0..basis_dim {
+                data[j * len + i] = t.powi(j as i32);
+            }
+        } else {
+            if basis_dim > 0 {
+                data[i] = 1.0; // row 0: constant
+            }
+            let k_max = basis_dim.saturating_sub(1) / 2; // harmonics that fit
+            for k in 1..=k_max {
+                let ang = 2.0 * std::f32::consts::PI * k as f32 * t;
+                data[k * len + i] = ang.cos(); // rows 1..=k_max
+                data[(k_max + k) * len + i] = ang.sin(); // rows k_max+1..=2*k_max
+            }
+        }
+    }
+    Tensor::<B, 2>::from_data(TensorData::new(data, [basis_dim, len]), device)
+}
+
+/// Real N-BEATS basis-expansion block: a 4-layer FC tower produces low-rank
+/// expansion coefficients θ_b, θ_f which are projected onto a FIXED basis to
+/// form the backcast/forecast over the (synthetic) window — the defining
+/// N-BEATS structure the previous generic-FC block lacked.
+#[derive(Module, Debug)]
+pub struct NBeatsBasisBlock<B: Backend> {
+    fc1: nn::Linear<B>,
+    fc2: nn::Linear<B>,
+    fc3: nn::Linear<B>,
+    fc4: nn::Linear<B>,
+    theta_b: nn::Linear<B>,
+    theta_f: nn::Linear<B>,
+    is_trend: bool,
+    basis_dim: usize,
+    signal_len: usize,
+}
+
+impl<B: Backend> NBeatsBasisBlock<B> {
+    fn forward(&self, x: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 2>) {
+        let h = burn::tensor::activation::relu(self.fc1.forward(x));
+        let h = burn::tensor::activation::relu(self.fc2.forward(h));
+        let h = burn::tensor::activation::relu(self.fc3.forward(h));
+        let h = burn::tensor::activation::relu(self.fc4.forward(h));
+        let theta_b = self.theta_b.forward(h.clone()); // [batch, basis_dim]
+        let theta_f = self.theta_f.forward(h); // [batch, basis_dim]
+        let basis = nbeats_basis::<B>(
+            self.is_trend,
+            self.basis_dim,
+            self.signal_len,
+            &theta_b.device(),
+        ); // [basis_dim, signal_len]
+        let backcast = theta_b.matmul(basis.clone()); // [batch, signal_len]
+        let forecast = theta_f.matmul(basis); // [batch, signal_len]
+        (backcast, forecast)
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct BurnNBeats<B: Backend> {
-    embed: nn::Linear<B>,
-    blocks: Vec<NBeatsBlock<B>>,
+    blocks: Vec<NBeatsBasisBlock<B>>,
     output: nn::Linear<B>,
 }
 
@@ -653,37 +722,55 @@ pub struct BurnNBeatsConfig {
     pub n_blocks: usize,
     #[config(default = 3)]
     pub n_classes: usize,
+    /// Polynomial degree of the trend stack (basis_dim = degree + 1).
+    #[config(default = 3)]
+    pub trend_degree: usize,
+    /// Number of Fourier harmonics in the seasonality stack (basis_dim = 1 + 2K).
+    #[config(default = 4)]
+    pub n_harmonics: usize,
 }
 
 impl BurnNBeatsConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> BurnNBeats<B> {
-        let embed = nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device);
-        let blocks = (0..self.n_blocks)
-            .map(|_| NBeatsBlock {
-                fc1: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                fc3: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                fc4: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                theta_b: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim)
-                    .with_bias(false)
-                    .init(device),
-                theta_f: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim)
-                    .with_bias(false)
-                    .init(device),
-            })
-            .collect();
-        let output = nn::LinearConfig::new(self.hidden_dim, self.n_classes).init(device);
+        let len = self.input_dim.max(1);
+        // Guard the basis ranks so they never exceed the (synthetic) window.
+        let trend_dim = (self.trend_degree + 1).clamp(1, len);
+        let k = self.n_harmonics.min(len.saturating_sub(1) / 2);
+        let seasonal_dim = (1 + 2 * k).clamp(1, len);
+        let make = |is_trend: bool, basis_dim: usize| NBeatsBasisBlock {
+            fc1: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
+            fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc3: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc4: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            theta_b: nn::LinearConfig::new(self.hidden_dim, basis_dim)
+                .with_bias(false)
+                .init(device),
+            theta_f: nn::LinearConfig::new(self.hidden_dim, basis_dim)
+                .with_bias(false)
+                .init(device),
+            is_trend,
+            basis_dim,
+            signal_len: len,
+        };
+        // Interpretable config: a trend stack followed by a seasonality stack.
+        let mut blocks = Vec::with_capacity(self.n_blocks * 2);
+        for _ in 0..self.n_blocks {
+            blocks.push(make(true, trend_dim));
+        }
+        for _ in 0..self.n_blocks {
+            blocks.push(make(false, seasonal_dim));
+        }
         BurnNBeats {
-            embed,
             blocks,
-            output,
+            output: nn::LinearConfig::new(len, self.n_classes).init(device),
         }
     }
 }
 
 impl<B: Backend> BurnNBeats<B> {
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let mut residual = self.embed.forward(x);
+        // Doubly-residual stacking over the (synthetic) input window.
+        let mut residual = x;
         let mut forecast = Tensor::zeros(residual.dims(), &residual.device());
         for block in &self.blocks {
             let (backcast, fore) = block.forward(residual.clone());
@@ -2387,6 +2474,40 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-4, "sparsemax must sum to 1, got {sum}");
         let zeros = p.iter().filter(|&&x| x.abs() < 1e-6).count();
         assert!(zeros >= 1, "sparsemax must produce exact zeros, got {p:?}");
+    }
+
+    #[test]
+    fn nbeats_trend_basis_is_polynomial_and_forward_shapes() {
+        let device = Default::default();
+        // trend basis [3, 8] row-major: row0 = ones, row1 = t, row2 = t^2.
+        let b = nbeats_basis::<InferBackend>(true, 3, 8, &device)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("to_vec");
+        for i in 0..8 {
+            let t = i as f32 / 8.0;
+            assert!((b[i] - 1.0).abs() < 1e-6, "trend row0 must be ones");
+            assert!((b[8 + i] - t).abs() < 1e-6, "trend row1 must be t");
+            assert!((b[16 + i] - t * t).abs() < 1e-6, "trend row2 must be t^2");
+        }
+        // forward: real interpretable N-BEATS produces finite [batch, n_classes].
+        let model = BurnNBeatsConfig::new(16).init::<InferBackend>(&device);
+        let x = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(
+                (0..64).map(|v| (v % 16) as f32 * 0.1).collect::<Vec<f32>>(),
+                [4, 16],
+            ),
+            &device,
+        );
+        let y = model.forward(x);
+        assert_eq!(y.dims(), [4, 3]);
+        let finite = y
+            .into_data()
+            .to_vec::<f32>()
+            .expect("to_vec")
+            .iter()
+            .all(|v| v.is_finite());
+        assert!(finite, "N-BEATS output must be finite");
     }
 
     #[test]
