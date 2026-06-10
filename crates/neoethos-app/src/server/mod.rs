@@ -181,6 +181,10 @@ pub fn router(state: AppApiState) -> Router {
         .route("/orders", post(orders::place))
         .route("/orders/cancel", post(orders::cancel_order))
         .route("/positions/close", post(orders::close_position))
+        .route(
+            "/positions/protection",
+            post(orders::amend_position_protection),
+        )
         // #204 ChatGPT subscription via Codex CLI OAuth flow.
         // Replaces the previous local-Gemma path. Status renders the
         // UI badge, start kicks off PKCE, logout wipes the token,

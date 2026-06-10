@@ -27,8 +27,8 @@ use crate::app_services::ctrader_execution::{
     CTraderExecutionRuntimeRequest, ProductionCTraderExecutionBackend,
 };
 use crate::app_services::ctrader_messages::{
-    CTraderCancelOrderRequest, CTraderClosePositionRequest, CTraderNewOrderRequest,
-    CTraderOrderType, CTraderTradeSide,
+    CTraderAmendPositionSltpRequest, CTraderCancelOrderRequest, CTraderClosePositionRequest,
+    CTraderNewOrderRequest, CTraderOrderType, CTraderTradeSide,
 };
 use crate::app_services::ctrader_messages::{
     CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, build_account_auth_request,
@@ -863,6 +863,49 @@ pub fn cancel_order_blocking(order_id: i64) -> Result<CTraderExecutionOutcome> {
         request: CTraderExecutionRequest::CancelOrder(CTraderCancelOrderRequest {
             account_id,
             order_id,
+        }),
+    };
+    ProductionCTraderExecutionBackend::default().execute(&runtime_request)
+}
+
+/// Modify the stop-loss / take-profit of an ALREADY-OPEN position
+/// (`ProtoOAAmendPositionSLTPReq`, 2026-06-10). `stop_loss` / `take_profit`
+/// are ABSOLUTE prices (cTrader's position-amend proto is price-based, unlike
+/// the pip-relative new-order path); `None` leaves that bracket untouched. At
+/// least one of the two must be provided, or there is nothing to amend.
+///
+/// This is the capability that lets the bot trail a winner or pull a stop to
+/// breakeven without closing and re-opening the position.
+pub fn amend_position_sltp_blocking(
+    position_id: i64,
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+    trailing_stop_loss: Option<bool>,
+) -> Result<CTraderExecutionOutcome> {
+    if stop_loss.is_none() && take_profit.is_none() {
+        return Err(anyhow!(
+            "amend_position_sltp requires at least one of stopLoss / takeProfit"
+        ));
+    }
+    let creds = resolve_creds()?;
+    let account_id: i64 = creds
+        .account_id_str
+        .parse()
+        .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
+    let runtime_request = CTraderExecutionRuntimeRequest {
+        client_id: creds.client_id,
+        client_secret: creds.client_secret,
+        access_token: creds.access_token,
+        environment: creds.environment,
+        account_id: creds.account_id_str,
+        request: CTraderExecutionRequest::AmendPositionSltp(CTraderAmendPositionSltpRequest {
+            account_id,
+            position_id,
+            stop_loss,
+            take_profit,
+            guaranteed_stop_loss: None,
+            trailing_stop_loss,
+            stop_loss_trigger_method: None,
         }),
     };
     ProductionCTraderExecutionBackend::default().execute(&runtime_request)

@@ -3,11 +3,12 @@ use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE, CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE,
-    CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderCancelOrderRequest, CTraderNewOrderRequest,
-    CTraderOpenApiJsonMessage, CTraderOpenApiTransport, build_account_auth_request,
-    build_application_auth_request, build_cancel_order_request, build_close_position_request,
-    build_new_order_request, expected_response_payload_type, is_ctrader_auth_token_error,
-    is_matching_open_api_response, parse_ctrader_error_payload_parts, parse_open_api_envelope,
+    CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderAmendPositionSltpRequest, CTraderCancelOrderRequest,
+    CTraderNewOrderRequest, CTraderOpenApiJsonMessage, CTraderOpenApiTransport,
+    build_account_auth_request, build_amend_position_sltp_request, build_application_auth_request,
+    build_cancel_order_request, build_close_position_request, build_new_order_request,
+    expected_response_payload_type, is_ctrader_auth_token_error, is_matching_open_api_response,
+    parse_ctrader_error_payload_parts, parse_open_api_envelope,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -26,6 +27,10 @@ pub enum CTraderExecutionRequest {
     NewOrder(Box<CTraderNewOrderRequest>),
     CancelOrder(CTraderCancelOrderRequest),
     ClosePosition(crate::app_services::ctrader_messages::CTraderClosePositionRequest),
+    /// Modify an open position's SL/TP (2026-06-10). Like the others the broker
+    /// answers with a `ProtoOAExecutionEvent`, so it rides the same retry +
+    /// idempotency path.
+    AmendPositionSltp(CTraderAmendPositionSltpRequest),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +231,7 @@ impl CTraderExecutionRequest {
             Self::NewOrder(request) => request.account_id,
             Self::CancelOrder(request) => request.account_id,
             Self::ClosePosition(request) => request.account_id,
+            Self::AmendPositionSltp(request) => request.account_id,
         }
     }
 
@@ -234,6 +240,9 @@ impl CTraderExecutionRequest {
             Self::NewOrder(request) => build_new_order_request(request, client_msg_id),
             Self::CancelOrder(request) => build_cancel_order_request(request, client_msg_id),
             Self::ClosePosition(request) => build_close_position_request(request, client_msg_id),
+            Self::AmendPositionSltp(request) => {
+                build_amend_position_sltp_request(request, client_msg_id)
+            }
         }
     }
 
@@ -271,6 +280,16 @@ impl CTraderExecutionRequest {
             Self::ClosePosition(request) => format!(
                 "close|acct={}|position_id={}|volume={}",
                 request.account_id, request.position_id, request.volume
+            ),
+            Self::AmendPositionSltp(request) => format!(
+                "amend_pos|acct={}|position_id={}|sl={:?}|tp={:?}|gsl={:?}|tsl={:?}|trigger={:?}",
+                request.account_id,
+                request.position_id,
+                request.stop_loss,
+                request.take_profit,
+                request.guaranteed_stop_loss,
+                request.trailing_stop_loss,
+                request.stop_loss_trigger_method.map(|v| v.label())
             ),
         }
     }
@@ -705,6 +724,7 @@ fn request_action_label(request: &CTraderExecutionRequest) -> &'static str {
         CTraderExecutionRequest::NewOrder(_) => "new_order",
         CTraderExecutionRequest::CancelOrder(_) => "cancel_order",
         CTraderExecutionRequest::ClosePosition(_) => "close_position",
+        CTraderExecutionRequest::AmendPositionSltp(_) => "amend_position_sltp",
     }
 }
 
@@ -1103,6 +1123,15 @@ fn validate_execution_outcome(
             if outcome.position_id != Some(inner.position_id) {
                 anyhow::bail!(
                     "cTrader close-position response position mismatch: expected {}, got {:?}",
+                    inner.position_id,
+                    outcome.position_id
+                );
+            }
+        }
+        CTraderExecutionRequest::AmendPositionSltp(inner) => {
+            if outcome.position_id != Some(inner.position_id) {
+                anyhow::bail!(
+                    "cTrader amend-position-SLTP response position mismatch: expected {}, got {:?}",
                     inner.position_id,
                     outcome.position_id
                 );
