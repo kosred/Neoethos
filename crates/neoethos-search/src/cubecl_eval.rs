@@ -2388,6 +2388,399 @@ fn launch_backtest_kernel<R: Runtime>(
     ))
 }
 
+/// Opt-in (default OFF) GPU signal→backtest FUSION. When set, the eval keeps
+/// each gene-batch's synthesized signals RESIDENT in VRAM and feeds them
+/// straight to the backtest kernel — eliminating the genes×samples signal
+/// readback (measured 688ms on the A6000, vs a 0.09ms kernel) and the matching
+/// re-upload. Default-off until A6000 byte-parity is proven, because this is
+/// the hottest real-money path. **2026-06-10, task #39.**
+fn cuda_eval_fused_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEOETHOS_GPU_FUSED_EVAL")
+            .ok()
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Fusion applies only when a gene-batch's signal series fits ONE signal
+/// window (`window >= n_samples`). The windowed host-assembly exists precisely
+/// because the full genes×samples matrix can exceed the per-buffer cap on heavy
+/// TFs (M1 = 6M rows) — there the signals MUST be assembled in host RAM, so the
+/// fused VRAM-resident path declines and the proven windowed path runs. Holds
+/// for the TFs the GPU actually uses today (M30/M15/H1/H4).
+fn fused_single_window_applies(n_indicators: usize, n_genes: usize, n_samples: usize) -> bool {
+    if n_genes == 0 || n_samples == 0 {
+        return false;
+    }
+    let batch = backtest_gene_batch(n_genes, n_samples);
+    signal_window_size(n_indicators, batch, n_samples) >= n_samples
+}
+
+/// FUSED single-window signal-synth + backtest for ONE gene-batch. The signal
+/// kernel writes signals(i32)/conf(f32) into VRAM handles that the backtest
+/// kernel reads DIRECTLY — no readback of the matrix, no re-upload. Only the
+/// per-gene metric scalars are read back. Both handles stay local (inferred
+/// type), so no `Handle` type crosses a signature. Numerically identical to the
+/// windowed host path: same kernels, same inputs, same f32/bf16 precision — the
+/// bytes are simply not round-tripped through host RAM.
+#[allow(clippy::too_many_arguments)]
+fn fused_signal_backtest_batch<F, R: Runtime>(
+    client: &ComputeClient<R>,
+    indicators_flat: &[F],
+    // The signal kernel derives the indicator count from `indicators_flat.len() /
+    // n_samples` internally; kept in the signature for call-site symmetry.
+    _n_indicators: usize,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[F],
+    long_thr: &[F],
+    short_thr: &[F],
+    smc_data_flat: &[i32],
+    gene_smc_flags_flat: &[i32],
+    smc_weights: &[F],
+    gate_threshold: F,
+    close_pips: &[f32],
+    high_pips: &[f32],
+    low_pips: &[f32],
+    timestamp_deltas_ms: &[i32],
+    use_timestamps: bool,
+    month_idx: &[i32],
+    day_idx: &[i32],
+    sl_pips: &[f32],
+    tp_pips: &[f32],
+    settings: &BacktestSettings,
+    month_capacity: usize,
+    n_genes: usize,
+    n_samples: usize,
+) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>)>
+where
+    F: Float + CubeElement,
+{
+    let total = n_genes.saturating_mul(n_samples);
+    if total == 0 {
+        return Ok((
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+    // Same input validation the non-fused signal kernel runs — a bad GA gene
+    // index must fail LOUD, not read garbage VRAM (real-money path).
+    validate_signal_kernel_inputs(
+        indicators_flat,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        smc_data_flat,
+        gene_smc_flags_flat,
+        smc_weights,
+        n_genes,
+        n_samples,
+    )
+    .context("fused signal kernel input validation failed")?;
+
+    // ── Signal kernel: upload inputs + allocate the sig/conf VRAM outputs that
+    //    the backtest will read directly (kept local — never read back). ──
+    let (
+        indicators_handle,
+        gene_offsets_handle,
+        gene_indices_handle,
+        gene_weights_handle,
+        long_thr_handle,
+        short_thr_handle,
+        smc_data_handle,
+        gene_smc_flags_handle,
+        smc_weights_handle,
+        signals_handle,
+        conf_handle,
+    ) = gpu_timing::upload(|| {
+        (
+            client.create_from_slice(F::as_bytes(indicators_flat)),
+            client.create_from_slice(i32::as_bytes(gene_offsets)),
+            client.create_from_slice(i32::as_bytes(gene_indices)),
+            client.create_from_slice(F::as_bytes(gene_weights)),
+            client.create_from_slice(F::as_bytes(long_thr)),
+            client.create_from_slice(F::as_bytes(short_thr)),
+            client.create_from_slice(i32::as_bytes(smc_data_flat)),
+            client.create_from_slice(i32::as_bytes(gene_smc_flags_flat)),
+            client.create_from_slice(F::as_bytes(smc_weights)),
+            client.empty(total.saturating_mul(std::mem::size_of::<i32>())),
+            client.empty(total.saturating_mul(std::mem::size_of::<f32>())),
+        )
+    });
+    let sig_units = signal_kernel_units(client);
+    let sig_cubes = (total as u32).div_ceil(sig_units);
+    gpu_timing::kernel(|| {
+        synthesize_signals_kernel::launch::<F, R>(
+            client,
+            CubeCount::Static(sig_cubes, 1, 1),
+            CubeDim::new_1d(sig_units),
+            unsafe { ArrayArg::from_raw_parts(indicators_handle.clone(), indicators_flat.len()) },
+            unsafe { ArrayArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len()) },
+            unsafe { ArrayArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len()) },
+            unsafe { ArrayArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len()) },
+            unsafe { ArrayArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
+            unsafe { ArrayArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
+            unsafe { ArrayArg::from_raw_parts(smc_data_handle.clone(), smc_data_flat.len()) },
+            unsafe {
+                ArrayArg::from_raw_parts(gene_smc_flags_handle.clone(), gene_smc_flags_flat.len())
+            },
+            unsafe { ArrayArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
+            unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), total) },
+            unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
+            n_samples as u32,
+            gate_threshold,
+        );
+    });
+
+    // BARRIER (parity-critical): wait for the signal kernel to FINISH writing
+    // signals_handle/conf_handle before the backtest reads them. The cubecl-cuda
+    // backend can place the two kernels on DIFFERENT streams, so without this the
+    // backtest races partially-written signals and the metrics diverge from the
+    // windowed path (whose readback synced here implicitly). A sync is a stream
+    // barrier — it waits for the ~0.09ms signal kernel but copies NOTHING, so the
+    // 22MB signal-matrix readback the windowed path paid is still eliminated.
+    cubecl::future::block_on(client.sync())
+        .map_err(|e| anyhow::anyhow!("fused signal-kernel sync failed: {e:?}"))?;
+
+    // ── Backtest kernel: upload the per-sample arrays + allocate metric
+    //    outputs, but READ the signal/conf handles above directly (no
+    //    re-upload). The barrier above guarantees the signal writes are visible;
+    //    the metrics readback below syncs the backtest. ──
+    let metrics_len = n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+    let monthly_len = n_genes.saturating_mul(month_capacity);
+    let ftmo_len = n_genes.saturating_mul(FTMO_WIDTH);
+    let (
+        close_handle,
+        high_handle,
+        low_handle,
+        timestamp_delta_handle,
+        month_handle,
+        day_handle,
+        sl_handle,
+        tp_handle,
+        metrics_handle,
+        trade_counts_handle,
+        monthly_handle,
+        month_start_eq_handle,
+        month_counts_handle,
+        ftmo_handle,
+    ) = gpu_timing::upload(|| {
+        (
+            client.create_from_slice(f32::as_bytes(close_pips)),
+            client.create_from_slice(f32::as_bytes(high_pips)),
+            client.create_from_slice(f32::as_bytes(low_pips)),
+            client.create_from_slice(i32::as_bytes(timestamp_deltas_ms)),
+            client.create_from_slice(i32::as_bytes(month_idx)),
+            client.create_from_slice(i32::as_bytes(day_idx)),
+            client.create_from_slice(f32::as_bytes(sl_pips)),
+            client.create_from_slice(f32::as_bytes(tp_pips)),
+            client.empty(metrics_len.saturating_mul(std::mem::size_of::<f32>())),
+            client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+            client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>())),
+            client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>())),
+            client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+            client.empty(ftmo_len.saturating_mul(std::mem::size_of::<f32>())),
+        )
+    });
+    let bt_units = backtest_kernel_units(client);
+    let bt_cubes = (n_genes as u32).div_ceil(bt_units);
+    gpu_timing::kernel(|| {
+        backtest_population_kernel::launch::<R>(
+            client,
+            CubeCount::Static(bt_cubes, 1, 1),
+            CubeDim::new_1d(bt_units),
+            unsafe { ArrayArg::from_raw_parts(close_handle.clone(), n_samples) },
+            unsafe { ArrayArg::from_raw_parts(high_handle.clone(), n_samples) },
+            unsafe { ArrayArg::from_raw_parts(low_handle.clone(), n_samples) },
+            unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), total) },
+            unsafe { ArrayArg::from_raw_parts(timestamp_delta_handle.clone(), n_samples) },
+            unsafe { ArrayArg::from_raw_parts(month_handle.clone(), month_idx.len()) },
+            unsafe { ArrayArg::from_raw_parts(day_handle.clone(), day_idx.len()) },
+            unsafe { ArrayArg::from_raw_parts(sl_handle.clone(), sl_pips.len()) },
+            unsafe { ArrayArg::from_raw_parts(tp_handle.clone(), tp_pips.len()) },
+            unsafe { ArrayArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
+            unsafe { ArrayArg::from_raw_parts(trade_counts_handle.clone(), n_genes) },
+            unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
+            unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
+            n_samples as u32,
+            month_capacity as u32,
+            settings.initial_equity() as f32,
+            settings.max_hold_bars as u32,
+            settings.min_hold_bars as u32,
+            settings.max_trades_per_day as u32,
+            saturating_i32(settings.gap_threshold_ms),
+            if use_timestamps { 1i32 } else { 0i32 },
+            if settings.trailing_enabled { 1i32 } else { 0i32 },
+            settings.trailing_atr_multiplier as f32,
+            settings.trailing_be_trigger_r as f32,
+            settings.spread_pips as f32,
+            settings.commission_per_trade as f32,
+            settings.pip_value_per_lot as f32,
+            settings.swap_long_pips_per_day as f32,
+            settings.swap_short_pips_per_day as f32,
+            settings.pnl_conversion_fee_rate as f32,
+            unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
+            if settings.risk_based_sizing { 1i32 } else { 0i32 },
+            settings.risk_per_trade_min as f32,
+            settings.risk_per_trade_max as f32,
+            settings.high_quality_confidence as f32,
+            unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
+            unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
+        );
+    });
+
+    // READBACK: only the per-gene metric scalars (NOT the genes×samples matrix).
+    let (
+        metrics_bytes,
+        trade_counts_bytes,
+        monthly_bytes,
+        month_counts_bytes,
+        month_start_eq_bytes,
+        ftmo_bytes,
+    ) = gpu_timing::readback(|| {
+        (
+            client.read_one_unchecked(metrics_handle),
+            client.read_one_unchecked(trade_counts_handle),
+            client.read_one_unchecked(monthly_handle),
+            client.read_one_unchecked(month_counts_handle),
+            client.read_one_unchecked(month_start_eq_handle),
+            client.read_one_unchecked(ftmo_handle),
+        )
+    });
+    Ok((
+        f32::from_bytes(&metrics_bytes).to_vec(),
+        i32::from_bytes(&trade_counts_bytes).to_vec(),
+        f32::from_bytes(&monthly_bytes).to_vec(),
+        i32::from_bytes(&month_counts_bytes).to_vec(),
+        f32::from_bytes(&month_start_eq_bytes).to_vec(),
+        f32::from_bytes(&ftmo_bytes).to_vec(),
+    ))
+}
+
+/// Precision-dispatching wrapper for [`fused_signal_backtest_batch`] mirroring
+/// [`try_generate_signal_flat_cuda`]'s bf16→f32 choice, so the fused path uses
+/// the SAME precision as the windowed path (byte-parity). `indicators_f32` is
+/// the full gene-independent flat matrix (converted to F here, once per batch).
+#[allow(clippy::too_many_arguments)]
+fn fused_eval_batch_dispatch<R: Runtime>(
+    client: &ComputeClient<R>,
+    indicators_f32: &[f32],
+    n_indicators: usize,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f32],
+    long_thr: &[f32],
+    short_thr: &[f32],
+    smc_data_flat: &[i32],
+    gene_smc_flags_flat: &[i32],
+    smc_weights: &[f32; SMC_WIDTH],
+    gate_threshold: f32,
+    close_pips: &[f32],
+    high_pips: &[f32],
+    low_pips: &[f32],
+    timestamp_deltas_ms: &[i32],
+    use_timestamps: bool,
+    month_idx: &[i32],
+    day_idx: &[i32],
+    sl_pips: &[f32],
+    tp_pips: &[f32],
+    settings: &BacktestSettings,
+    month_capacity: usize,
+    n_genes: usize,
+    n_samples: usize,
+) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>)> {
+    let precision = requested_eval_precision();
+    if prefers_bf16(precision) {
+        let indicators_bf16 = indicators_f32
+            .iter()
+            .map(|v| bf16::from_f32(*v))
+            .collect::<Vec<_>>();
+        let gene_weights_bf16 = gene_weights
+            .iter()
+            .map(|v| bf16::from_f32(*v))
+            .collect::<Vec<_>>();
+        let long_thr_bf16 = long_thr.iter().map(|v| bf16::from_f32(*v)).collect::<Vec<_>>();
+        let short_thr_bf16 = short_thr
+            .iter()
+            .map(|v| bf16::from_f32(*v))
+            .collect::<Vec<_>>();
+        let smc_weights_bf16 = smc_weights
+            .iter()
+            .map(|v| bf16::from_f32(*v))
+            .collect::<Vec<_>>();
+        match fused_signal_backtest_batch::<bf16, R>(
+            client,
+            &indicators_bf16,
+            n_indicators,
+            gene_offsets,
+            gene_indices,
+            &gene_weights_bf16,
+            &long_thr_bf16,
+            &short_thr_bf16,
+            smc_data_flat,
+            gene_smc_flags_flat,
+            &smc_weights_bf16,
+            bf16::from_f32(gate_threshold),
+            close_pips,
+            high_pips,
+            low_pips,
+            timestamp_deltas_ms,
+            use_timestamps,
+            month_idx,
+            day_idx,
+            sl_pips,
+            tp_pips,
+            settings,
+            month_capacity,
+            n_genes,
+            n_samples,
+        ) {
+            Ok(out) => return Ok(out),
+            Err(err) => {
+                tracing::debug!("fused bf16 path unavailable, falling back to fp32: {err}");
+            }
+        }
+    }
+    fused_signal_backtest_batch::<f32, R>(
+        client,
+        indicators_f32,
+        n_indicators,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        smc_data_flat,
+        gene_smc_flags_flat,
+        smc_weights,
+        gate_threshold,
+        close_pips,
+        high_pips,
+        low_pips,
+        timestamp_deltas_ms,
+        use_timestamps,
+        month_idx,
+        day_idx,
+        sl_pips,
+        tp_pips,
+        settings,
+        month_capacity,
+        n_genes,
+        n_samples,
+    )
+}
+
 pub(crate) fn try_evaluate_population_cuda(
     close: &[f64],
     high: &[f64],
@@ -2483,6 +2876,81 @@ pub(crate) fn try_evaluate_population_cuda(
     // signal buffer (`B × n_samples`) stays under the wgpu storage-buffer cap.
     // Genes are independent + concatenated in gene order, so this is numerically
     // identical to a single pass — CPU↔GPU parity holds.
+    let n_indicators = indicators.nrows();
+    // **task #39 (2026-06-10):** when fusion is enabled AND the batch's signal
+    // series fits ONE window, run the VRAM-resident fused path — the signal
+    // matrix never leaves the GPU (no 688ms readback, no re-upload). It fills the
+    // SAME metric vecs as the windowed path, so the assembly below — and thus the
+    // result — is byte-identical. Otherwise the proven windowed host path runs.
+    let use_fused = cuda_eval_fused_enabled()
+        && fused_single_window_applies(n_indicators, n_genes, n_samples);
+    if use_fused {
+        let indicators_f32: Vec<f32> = indicators.iter().copied().collect();
+        let smc_data_flat = flatten_i32_rows(smc_data);
+        let gene_smc_flags_flat_all = flatten_i32_flags(gene_smc_flags);
+        let batch = backtest_gene_batch(n_genes, n_samples);
+        let mut b0 = 0usize;
+        while b0 < n_genes {
+            let b1 = (b0 + batch).min(n_genes);
+            let bn = b1 - b0;
+            // Same catch_unwind guard as the windowed path: a cubecl pool/#243
+            // panic becomes a fail-loud Err → eval.rs recomputes on CPU.
+            let res: Result<()> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Result<()> {
+                    let idx0 = gene_offsets[b0] as usize;
+                    let idx1 = gene_offsets[b1] as usize;
+                    let base = gene_offsets[b0];
+                    let chunk_offsets: Vec<i32> =
+                        gene_offsets[b0..=b1].iter().map(|o| *o - base).collect();
+                    let (m, tc, mo, mc, mse, _ftmo) = fused_eval_batch_dispatch(
+                        &client,
+                        &indicators_f32,
+                        n_indicators,
+                        &chunk_offsets,
+                        &gene_indices[idx0..idx1],
+                        &gene_weights[idx0..idx1],
+                        &long_thr[b0..b1],
+                        &short_thr[b0..b1],
+                        &smc_data_flat,
+                        &gene_smc_flags_flat_all[b0 * SMC_WIDTH..b1 * SMC_WIDTH],
+                        smc_weights,
+                        gate_threshold,
+                        &close_pips,
+                        &high_pips,
+                        &low_pips,
+                        &timestamp_deltas_ms,
+                        use_timestamps,
+                        &month_idx,
+                        &day_idx,
+                        &sl_pips_all[b0..b1],
+                        &tp_pips_all[b0..b1],
+                        settings,
+                        month_capacity,
+                        bn,
+                        n_samples,
+                    )?;
+                    metrics_flat.extend_from_slice(&m);
+                    trade_counts.extend_from_slice(&tc);
+                    monthly_flat.extend_from_slice(&mo);
+                    month_counts.extend_from_slice(&mc);
+                    month_start_eq_flat.extend_from_slice(&mse);
+                    Ok(())
+                },
+            ))
+            .map_err(|payload| {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic>".to_string());
+                anyhow::anyhow!("GPU fused batch [{b0},{b1}) panicked (cubecl pool/#243): {msg}")
+            })
+            .and_then(|inner| inner);
+            res?;
+            trim_gpu_pool_if_over_budget(&client);
+            b0 = b1;
+        }
+    } else {
     let g_chunk = gene_chunk_size(n_genes, n_samples);
     let mut c0 = 0usize;
     while c0 < n_genes {
@@ -2573,6 +3041,8 @@ pub(crate) fn try_evaluate_population_cuda(
 
         c0 = c1;
     }
+    } // end `else` (windowed host path); the `if use_fused` branch filled the
+      // same metric vecs above.
 
     let mut results = Vec::with_capacity(n_genes);
     for g in 0..n_genes {
@@ -2837,3 +3307,180 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
 }
 
 const ZERO_METRICS: [f64; 11] = [0.0; 11];
+
+// ── task #39 parity: the fused VRAM-resident path MUST be byte-identical to the
+//    proven windowed host path. Runs only where a GPU client builds (A6000 via
+//    `cargo test --features gpu-nvidia`; no-ops on a GPU-less CI box). ──
+#[cfg(test)]
+mod fused_parity_tests {
+    use super::*;
+    use ndarray::Array2;
+
+    #[test]
+    fn fused_path_is_byte_identical_to_windowed_path() {
+        // Skip cleanly if no GPU is present (keeps GPU-less CI green).
+        let client = match create_gpu_client(None) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        // Deterministic synthetic combo that actually produces trades: a sine
+        // close (±50 pips) with oscillating indicators driving the signals.
+        let n_samples = 300usize;
+        let n_genes = 3usize;
+        let n_indicators = 2usize;
+
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| 1.10 + 0.005 * (i as f64 * 0.1).sin())
+            .collect();
+        // WIDE intrabar range (±60 pips) so a fixed SL(15-30)/TP(30-60) is hit
+        // intrabar and the position actually CLOSES (trade_count increments on
+        // close) — narrow bars would let it enter but never close.
+        let high: Vec<f64> = close.iter().map(|c| c + 0.006).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.006).collect();
+
+        // STRONG ±5 square-wave indicators (indicator-major flat). Combined with
+        // the ±0.5 thresholds these give |margin/gap| ≫ 1 → confidence clamps to
+        // 1.0 (full lot sizing under risk-based sizing) and a clean alternating
+        // +1/-1 signal with transitions every 30/45 bars, so the backtest opens
+        // and closes real trades (the meaningful-reduction guard below).
+        let mut ind_flat = Vec::with_capacity(n_indicators * n_samples);
+        ind_flat.extend((0..n_samples).map(|i| if (i / 30) % 2 == 0 { 5.0f32 } else { -5.0 }));
+        ind_flat.extend((0..n_samples).map(|i| if (i / 45) % 2 == 0 { 5.0f32 } else { -5.0 }));
+        let indicators = Array2::from_shape_vec((n_indicators, n_samples), ind_flat).unwrap();
+
+        // CSR genes: g0→ind0, g1→ind1, g2→0.5·ind0+0.5·ind1.
+        let gene_offsets: Vec<i32> = vec![0, 1, 2, 4];
+        let gene_indices: Vec<i32> = vec![0, 1, 0, 1];
+        let gene_weights: Vec<f32> = vec![1.0, 1.0, 0.5, 0.5];
+        let long_thr: Vec<f32> = vec![0.5, 0.5, 0.5];
+        let short_thr: Vec<f32> = vec![-0.5, -0.5, -0.5];
+
+        let timestamps: Vec<i64> = (0..n_samples).map(|i| 1_600_000_000_000 + i as i64 * 3_600_000).collect();
+        let month_idx: Vec<i64> = (0..n_samples).map(|i| (i / 720) as i64).collect();
+        let day_idx: Vec<i64> = (0..n_samples).map(|i| (i / 24) as i64).collect();
+        // Per-gene SL/TP varied so the genes produce DIFFERENT trade outcomes
+        // (varied metrics), not a trivially-identical set.
+        let sl_pips: Vec<f64> = vec![20.0, 15.0, 30.0];
+        let tp_pips: Vec<f64> = vec![40.0, 30.0, 60.0];
+        let smc_data: Vec<SmcRow> = vec![[0i8; SMC_WIDTH]; n_samples];
+        let gene_smc_flags: Vec<SmcRow> = vec![[0i8; SMC_WIDTH]; n_genes];
+        let gate_threshold = 0.0f32;
+        let smc_weights = [0.0f32; SMC_WIDTH];
+        // Fixed 1-lot sizing — matches the PRODUCTION gate (simulate_trades_core
+        // gets no confidences) and the FTMO parity test. With risk-based sizing on,
+        // the synthetic combo's lots round below the min and no trade opens.
+        let mut settings = BacktestSettings::default();
+        settings.risk_based_sizing = false;
+        // Force a short hold so every opened position CLOSES (trade_count
+        // increments on close) regardless of whether SL/TP triggers first —
+        // guarantees the backtest reduction is exercised with real trades.
+        settings.min_hold_bars = 0;
+        settings.max_hold_bars = 3;
+        let month_capacity = settings.month_capacity();
+
+        // ── WINDOWED path: synth signals to host, then backtest (re-upload). ──
+        let (sig, conf) = try_generate_signal_flat_cuda(
+            indicators.view(),
+            &gene_offsets,
+            &gene_indices,
+            &gene_weights,
+            &long_thr,
+            &short_thr,
+            &smc_data,
+            &gene_smc_flags,
+            gate_threshold,
+            &smc_weights,
+            None,
+        )
+        .expect("windowed signal synth");
+
+        let close_pips = normalize_prices_to_pips(&close, settings.pip_value);
+        let high_pips = normalize_prices_to_pips(&high, settings.pip_value);
+        let low_pips = normalize_prices_to_pips(&low, settings.pip_value);
+        let (ts_deltas, use_ts) = timestamp_delta_ms(&timestamps, n_samples);
+        let month_i32: Vec<i32> = month_idx.iter().map(|v| saturating_i32(*v)).collect();
+        let day_i32: Vec<i32> = day_idx.iter().map(|v| saturating_i32(*v)).collect();
+        let sl_f32: Vec<f32> = sl_pips.iter().map(|v| *v as f32).collect();
+        let tp_f32: Vec<f32> = tp_pips.iter().map(|v| *v as f32).collect();
+
+        let (mw, tcw, mow, mcw, msew, _ftmo_w) = launch_backtest_kernel(
+            &client,
+            &close_pips,
+            &high_pips,
+            &low_pips,
+            &sig,
+            &conf,
+            &ts_deltas,
+            use_ts,
+            &month_i32,
+            &day_i32,
+            &sl_f32,
+            &tp_f32,
+            &settings,
+            month_capacity,
+        )
+        .expect("windowed backtest");
+
+        // ── FUSED path: signals stay in VRAM, fed straight to the backtest. ──
+        let indicators_f32: Vec<f32> = indicators.iter().copied().collect();
+        let smc_flat = flatten_i32_rows(&smc_data);
+        let flags_flat = flatten_i32_flags(&gene_smc_flags);
+        let (mf, tcf, mof, mcf, msef, _ftmo_f) = fused_eval_batch_dispatch(
+            &client,
+            &indicators_f32,
+            n_indicators,
+            &gene_offsets,
+            &gene_indices,
+            &gene_weights,
+            &long_thr,
+            &short_thr,
+            &smc_flat,
+            &flags_flat,
+            &smc_weights,
+            gate_threshold,
+            &close_pips,
+            &high_pips,
+            &low_pips,
+            &ts_deltas,
+            use_ts,
+            &month_i32,
+            &day_i32,
+            &sl_f32,
+            &tp_f32,
+            &settings,
+            month_capacity,
+            n_genes,
+            n_samples,
+        )
+        .expect("fused eval");
+
+        // BIT-for-bit equality across every per-gene output buffer. We compare
+        // raw bit patterns (not `==`) so a legitimately-equal NaN (same bit
+        // pattern, produced identically by both paths) counts as equal — `f32 ==`
+        // makes NaN != NaN. This is the strict byte-parity check we actually want.
+        fn bits_eq(a: &[f32], b: &[f32]) -> bool {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+        }
+        let sig_nonzero = sig.iter().filter(|s| **s != 0).count();
+        eprintln!(
+            "PARITY DIAG: signals_nonzero={sig_nonzero}/{} trade_counts={tcw:?} metrics0={:?}",
+            sig.len(),
+            &mw[..mw.len().min(7)]
+        );
+        assert!(bits_eq(&mw, &mf), "metrics_flat mismatch (fused vs windowed)");
+        assert_eq!(tcw, tcf, "trade_counts mismatch");
+        assert!(bits_eq(&mow, &mof), "monthly_flat mismatch");
+        assert_eq!(mcw, mcf, "month_counts mismatch");
+        assert!(bits_eq(&msew, &msef), "month_start_eq_flat mismatch");
+
+        // Meaningfulness guard: the signal kernel produced real non-trivial
+        // output that BOTH paths fed into the backtest. This is what makes the
+        // parity non-trivial — and it is what caught the original signal-transport
+        // RACE (before the client.sync() barrier the two paths diverged here).
+        assert!(
+            sig_nonzero > 0,
+            "expected the synthetic combo to generate signals; got {sig_nonzero}"
+        );
+    }
+}
