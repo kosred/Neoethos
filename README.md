@@ -70,7 +70,7 @@ Prefer a packaged install? Grab the Windows or Linux installer from the [latest 
 
 ## Status
 
-**v0.4.40** — the engine works end to end: discovery, both trading modes, risk-aware sizing, a bilingual desktop app, a live TUI. The road ahead: broker-agnostic adapters → a mobile monitor → a multi-node deployment. *v0.5 is "everything works."* We're close.
+**v0.4.99** — the engine works end to end: discovery, both trading modes, risk-aware sizing, a bilingual desktop app, a live TUI. The road ahead: broker-agnostic adapters → a mobile monitor → a multi-node deployment. *v0.5 is "everything works."* We're close.
 
 ## License
 

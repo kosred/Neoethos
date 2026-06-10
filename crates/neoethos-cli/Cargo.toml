@@ -1,6 +1,6 @@
 [package]
 name = "neoethos-cli"
-version = "0.4.43"
+version = "0.4.99"
 edition.workspace = true
 # SPDX dual-license matches the repo-root LICENSE file. Required by both
 # cargo-deb (writes Debian `control` License:) and cargo-generate-rpm.
