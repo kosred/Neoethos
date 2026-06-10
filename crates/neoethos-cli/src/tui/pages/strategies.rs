@@ -37,6 +37,11 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
             launch_validate(shared, &portfolios[sel].path);
             true
         }
+        KeyCode::Char('P') => {
+            let sel = shared.strategies_selected.min(count - 1);
+            launch_promote(shared, &portfolios[sel]);
+            true
+        }
         _ => false,
     }
 }
@@ -67,6 +72,71 @@ fn launch_validate(shared: &mut AppShared, portfolio_path: &std::path::Path) {
         ],
     );
     shared.status = "Spawned trader-replay validation — see Logs / status".to_string();
+}
+
+/// Promote the selected portfolio to the live set via `discovery-promote-weekly`
+/// (B3/#4 parity). That CLI command merges this run's discovery ledger for a
+/// given (symbol, tf) into the live portfolio additively (by gene-signature
+/// hash) and prints the promotion verdict ("added N new, carried M, total K").
+/// We derive `--symbol`/`--tf` from the portfolio's `<SYMBOL>_<TF>.json` name
+/// and point `--cache-dir` at the portfolio's own directory so the matching
+/// ledger is found; the verdict streams into the live log like `V` does.
+fn launch_promote(shared: &mut AppShared, p: &PortfolioSummary) {
+    let Some((symbol, tf)) = parse_symbol_tf(&p.name) else {
+        shared.status = format!(
+            "Cannot derive SYMBOL/TF from '{}' — promote needs a <SYMBOL>_<TF>.json portfolio",
+            p.name
+        );
+        return;
+    };
+    if shared.jobs.has_running("promote") {
+        shared.status = "promotion already running".to_string();
+        return;
+    }
+    let cache_dir = p
+        .path
+        .parent()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|| "cache/discovery".to_string());
+
+    let mut args = vec![
+        "discovery-promote-weekly".to_string(),
+        "--symbol".to_string(),
+        symbol.clone(),
+        "--tf".to_string(),
+        tf.clone(),
+        "--cache-dir".to_string(),
+        cache_dir,
+    ];
+    // If the portfolio has a live_portfolio sidecar, point the command at it so
+    // the carried/added accounting is against the real live set (otherwise the
+    // command falls back to its default cache-dir-relative path).
+    let mut sidecar = p.path.clone().into_os_string();
+    sidecar.push(".live_portfolio.json");
+    let sidecar = PathBuf::from(sidecar);
+    if sidecar.exists() {
+        args.push("--portfolio".to_string());
+        args.push(sidecar.display().to_string());
+    }
+
+    shared.jobs.spawn("promote", args);
+    shared.status = format!(
+        "Spawned discovery-promote-weekly {symbol} {tf} — see live log for the promotion verdict"
+    );
+}
+
+/// Parse `<SYMBOL>_<TF>.json` (e.g. `EURUSD_M30.json`) into `(symbol, tf)`. The
+/// timeframe is the trailing `_`-delimited token before `.json`; everything
+/// before it is the symbol (symbols don't contain `_`, timeframes don't either,
+/// so the last underscore is the split point). Returns `None` for names that
+/// don't match the convention so the caller can surface a clear message.
+fn parse_symbol_tf(name: &str) -> Option<(String, String)> {
+    let stem = name.strip_suffix(".json")?;
+    let (sym, tf) = stem.rsplit_once('_')?;
+    if sym.is_empty() || tf.is_empty() {
+        return None;
+    }
+    Some((sym.to_string(), tf.to_string()))
 }
 
 pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
@@ -216,7 +286,10 @@ fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
             net_style.add_modifier(Modifier::BOLD),
         ));
     }
-    header.push(Span::styled("[↑↓] [V]alidate", theme::caption_style()));
+    header.push(Span::styled(
+        "[↑↓] [V]alidate [P]romote",
+        theme::caption_style(),
+    ));
     let mut lines: Vec<Line> = vec![Line::from(header)];
 
     if metrics.is_empty() {

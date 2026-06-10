@@ -83,6 +83,7 @@ impl Page {
             Page::Strategies => &[
                 ("↑↓", "select"),
                 ("V", "validate"),
+                ("P", "promote"),
                 ("Tab", "page"),
                 ("Q", "quit"),
             ],
@@ -101,7 +102,12 @@ impl Page {
                 ("Q", "quit"),
             ],
             Page::Funnel => &[("Tab", "page"), ("R", "refresh"), ("Q", "quit")],
-            Page::AutoLoop => &[("Tab", "page"), ("L", "launch"), ("Q", "quit")],
+            Page::AutoLoop => &[
+                ("Tab", "page"),
+                ("L", "launch"),
+                ("K", "stop"),
+                ("Q", "quit"),
+            ],
             Page::Config => &[
                 ("↑↓", "field"),
                 ("Enter", "edit"),

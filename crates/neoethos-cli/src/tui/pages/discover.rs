@@ -346,15 +346,29 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
             true
         }
         KeyCode::Char('K') => {
-            shared.status = if shared.jobs.stop_latest(JOB_LABEL_PREFIX) {
-                "Stopping discovery…".to_string()
+            // Stopping a discovery kills the subprocess — stage a Y/N
+            // confirmation rather than killing immediately (FIX A). Only prompt
+            // if there's actually a running job to stop.
+            if shared.jobs.has_running(JOB_LABEL_PREFIX) {
+                shared.pending_confirmation =
+                    Some(crate::tui::app::PendingAction::DiscoverStop);
+                shared.status = "Confirm stop discovery? [Y]es / [N]o".to_string();
             } else {
-                "No running discovery to stop".to_string()
-            };
+                shared.status = "No running discovery to stop".to_string();
+            }
             true
         }
         _ => false,
     }
+}
+
+/// Stop the running discovery (called once the user confirms — FIX A).
+pub fn do_stop(shared: &mut AppShared) {
+    shared.status = if shared.jobs.stop_latest(JOB_LABEL_PREFIX) {
+        "Stopping discovery…".to_string()
+    } else {
+        "No running discovery to stop".to_string()
+    };
 }
 
 pub fn launch_now(shared: &mut AppShared) {

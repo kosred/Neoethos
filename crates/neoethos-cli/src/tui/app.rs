@@ -54,6 +54,45 @@ pub enum HitAction {
     FocusField { page: Page, index: usize },
 }
 
+/// A high-impact action staged behind a Y/N confirmation prompt. When
+/// `AppShared::pending_confirmation` is `Some`, the next keypress is routed by
+/// `app.rs`: `Y` runs the stored action, `N`/`Esc` cancels. Each page asks for
+/// confirmation by setting this rather than acting immediately, so destructive
+/// keys (save / import / stop) can't fire on a fat-finger.
+#[derive(Debug, Clone)]
+pub enum PendingAction {
+    /// Save the Config form back to config.yaml (`config_view::S`).
+    ConfigSave,
+    /// Import data into the data/ layout (`symbols::I`).
+    SymbolsImport,
+    /// Stop the running discovery job (`discover::K`).
+    DiscoverStop,
+    /// Create the auto-loop stop flag (`auto_loop::K`).
+    AutoLoopStop,
+}
+
+impl PendingAction {
+    /// Human label shown in the "Confirm <label>?" prompt.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PendingAction::ConfigSave => "save config to config.yaml",
+            PendingAction::SymbolsImport => "import data into data/",
+            PendingAction::DiscoverStop => "stop the running discovery",
+            PendingAction::AutoLoopStop => "create the auto-loop stop flag",
+        }
+    }
+
+    /// Run the confirmed action against shared state.
+    pub fn execute(self, shared: &mut AppShared) {
+        match self {
+            PendingAction::ConfigSave => crate::tui::pages::config_view::do_save(shared),
+            PendingAction::SymbolsImport => crate::tui::pages::symbols::launch_import(shared),
+            PendingAction::DiscoverStop => crate::tui::pages::discover::do_stop(shared),
+            PendingAction::AutoLoopStop => crate::tui::pages::auto_loop::do_create_stop_flag(shared),
+        }
+    }
+}
+
 pub struct AppShared {
     pub data_root: PathBuf,
     pub build_version: &'static str,
@@ -89,6 +128,10 @@ pub struct AppShared {
     /// Logs page scroll offset measured in lines UP from the tail (0 = follow
     /// the newest lines, the default).
     pub logs_scroll: usize,
+    /// A high-impact action staged behind a Y/N confirmation prompt. When
+    /// `Some`, the next keypress is routed to confirm/cancel (see
+    /// `App::handle_key`) and a centered prompt is rendered over the page.
+    pub pending_confirmation: Option<PendingAction>,
 }
 
 impl AppShared {
@@ -114,6 +157,7 @@ impl AppShared {
             )]),
             strategies_selected: 0,
             logs_scroll: 0,
+            pending_confirmation: None,
         }
     }
 
@@ -218,6 +262,31 @@ impl App {
         // Help overlay: while it's open, ANY key dismisses it.
         if self.show_help {
             self.show_help = false;
+            return;
+        }
+
+        // Confirmation prompt: while one is staged, only Y/N/Esc are honored —
+        // Y runs the action, N/Esc cancels. Every other key is swallowed so a
+        // stray keystroke can't both dismiss the prompt AND do something else.
+        if let Some(action) = self.shared.pending_confirmation.take() {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let label = action.label();
+                    action.execute(&mut self.shared);
+                    // `execute` sets its own status; only override if it didn't.
+                    if self.shared.status.is_empty() {
+                        self.shared.status = format!("Confirmed: {label}");
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.shared.status = "Cancelled".to_string();
+                }
+                _ => {
+                    // Unknown key: re-arm the prompt so it stays up until the
+                    // user explicitly answers.
+                    self.shared.pending_confirmation = Some(action);
+                }
+            }
             return;
         }
 
@@ -373,6 +442,51 @@ fn render(area: Rect, buf: &mut ratatui::buffer::Buffer, app: &mut App) {
     if app.show_help {
         render_help_overlay(rows[1], buf);
     }
+    if let Some(action) = &app.shared.pending_confirmation {
+        render_confirm_overlay(rows[1], buf, action.label());
+    }
+}
+
+/// Centered Y/N confirmation prompt rendered over the current page — reuses the
+/// help-overlay's bordered, accent-titled style so it reads as a modal. The
+/// next keypress is routed by `App::handle_key` (Y runs, N/Esc cancels).
+fn render_confirm_overlay(area: Rect, buf: &mut ratatui::buffer::Buffer, label: &str) {
+    let title = format!("Confirm {label}?");
+    let w = ((title.chars().count() as u16) + 8)
+        .max(34)
+        .min(area.width);
+    let h = 5u16.min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    Clear.render(popup, buf);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(Span::styled(
+            " CONFIRM ",
+            theme::caption_style().add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme::SURFACE_ALT))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    let lines = vec![
+        Line::from(vec![Span::styled(
+            title,
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![Span::styled(
+            "[Y]es   ·   [N]o / Esc",
+            theme::muted_style(),
+        )]),
+    ];
+    Paragraph::new(lines).render(inner, buf);
 }
 
 /// Centered keyboard-help overlay: every page's keys at a glance, so the user

@@ -157,7 +157,24 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
             true
         }
         KeyCode::Char('I') => {
-            launch_import(shared);
+            // Import writes into the data/ layout — stage a Y/N confirmation
+            // rather than launching immediately (FIX A). Guard against a blank
+            // source up front so the prompt only appears for a real action.
+            let src = shared
+                .import_form
+                .value_for("Import source")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if src.is_empty() {
+                shared.status = "Set an import source first (press E)".to_string();
+            } else if shared.jobs.has_running("import") {
+                shared.status = "import already running".to_string();
+            } else {
+                shared.pending_confirmation =
+                    Some(crate::tui::app::PendingAction::SymbolsImport);
+                shared.status = "Confirm data import? [Y]es / [N]o".to_string();
+            }
             true
         }
         _ => false,

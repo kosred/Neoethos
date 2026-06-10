@@ -144,6 +144,23 @@ fn render_quick_start(area: Rect, buf: &mut Buffer) {
                 .add_modifier(Modifier::BOLD),
         ),
         Line::styled("    train models on a portfolio", theme::muted_style()),
+        Line::raw(""),
+        Line::styled(
+            "5.  Promote ([P] in Strategies)",
+            Style::default()
+                .fg(theme::TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled("    merge into the live portfolio", theme::muted_style()),
+        Line::raw(""),
+        // This TUI is the discovery / training / config console. Live trading,
+        // positions and orders live in the NeoEthos desktop app (which owns the
+        // broker connection) — by design, not a gap.
+        Line::styled(
+            "Live trading & positions",
+            theme::caption_style().add_modifier(Modifier::BOLD),
+        ),
+        Line::styled("    → NeoEthos desktop app", theme::muted_style()),
     ];
     Paragraph::new(lines).render(inner, buf);
 }

@@ -69,6 +69,24 @@ pub fn make_config_form() -> FormState {
             format!("{}", s.models.prop_firm_min_pass_rate),
             "0 = ranking-only; 0.40–0.65 = stricter all-window consistency",
         ),
+        // Risky-mode capital-growth goal (FIX B). Only meaningful when
+        // trading_mode = risky, but exposed unconditionally for parity with
+        // the GUI Risk screen.
+        Field::new(
+            "Risky start balance",
+            format!("{}", s.system.risky_start_balance_usd),
+            "Risky-mode starting capital (USD). Default 100; e.g. 100–5000",
+        ),
+        Field::new(
+            "Risky target balance",
+            format!("{}", s.system.risky_target_balance_usd),
+            "Risky-mode target capital (USD), must exceed start. e.g. 1000–100000",
+        ),
+        Field::new(
+            "Risky horizon days",
+            s.system.risky_horizon_days.to_string(),
+            "Days to reach target in Risky mode. Default 180; e.g. 30–365",
+        ),
     ])
 }
 
@@ -145,6 +163,12 @@ pub fn save_config_form(form: &FormState) -> String {
     apply_f64(form, "Max hours/combo", &mut s.models.prop_search_max_hours, 0.0, f64::MAX, &mut changed, &mut rejected);
     apply_f64(form, "Prop-firm pass rate", &mut s.models.prop_firm_min_pass_rate, 0.0, 1.0, &mut changed, &mut rejected);
 
+    // Risky-mode goal params (FIX B). Balances are positive USD; horizon is a
+    // positive day count. These persist under `system.risky_*`.
+    apply_f64(form, "Risky start balance", &mut s.system.risky_start_balance_usd, 0.0, f64::MAX, &mut changed, &mut rejected);
+    apply_f64(form, "Risky target balance", &mut s.system.risky_target_balance_usd, 0.0, f64::MAX, &mut changed, &mut rejected);
+    apply_u32(form, "Risky horizon days", &mut s.system.risky_horizon_days, &mut changed, &mut rejected);
+
     if !rejected.is_empty() {
         return format!("Not saved — invalid: {}", rejected.join(", "));
     }
@@ -182,6 +206,29 @@ fn apply_usize(
     }
 }
 
+fn apply_u32(
+    form: &FormState,
+    label: &'static str,
+    dst: &mut u32,
+    changed: &mut usize,
+    rejected: &mut Vec<&'static str>,
+) {
+    if let Some(raw) = form.value_for(label) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return;
+        }
+        match raw.parse::<u32>() {
+            Ok(v) if v != *dst => {
+                *dst = v;
+                *changed += 1;
+            }
+            Ok(_) => {}
+            Err(_) => rejected.push(label),
+        }
+    }
+}
+
 fn apply_f64(
     form: &FormState,
     label: &'static str,
@@ -206,6 +253,15 @@ fn apply_f64(
             _ => rejected.push(label),
         }
     }
+}
+
+/// Perform the actual config save (called once the user confirms — FIX A).
+/// Writes the form back to config.yaml, then reloads the form from disk so it
+/// reflects exactly what's now persisted.
+pub fn do_save(shared: &mut AppShared) {
+    let msg = save_config_form(&shared.config_form);
+    shared.config_form = make_config_form();
+    shared.status = msg;
 }
 
 pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
@@ -236,10 +292,10 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
             true
         }
         KeyCode::Char('S') => {
-            let msg = save_config_form(&shared.config_form);
-            // Reload so the form reflects exactly what's now on disk.
-            shared.config_form = make_config_form();
-            shared.status = msg;
+            // Saving overwrites config.yaml — stage a Y/N confirmation rather
+            // than writing immediately (FIX A). `do_save` runs on confirm.
+            shared.pending_confirmation = Some(crate::tui::app::PendingAction::ConfigSave);
+            shared.status = "Confirm config save? [Y]es / [N]o".to_string();
             true
         }
         // 'R' (reload) is handled by the global refresh key in app.rs, which
