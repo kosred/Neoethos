@@ -82,6 +82,22 @@ pub async fn place(State(_state): State<AppApiState>, Json(body): Json<NewOrderB
             .into_response();
     }
 
+    // 2026-06-10: risky:true is a deliberate operator override (a naked
+    // position is a valid manual choice), but it is also the single most
+    // dangerous order shape — one adverse tick has no bracket to stop it.
+    // Leave a loud, money-tagged audit-trail entry whenever one actually
+    // goes out so it is never silent in the logs.
+    if body.risky && body.stop_loss_pips.is_none() && body.take_profit_pips.is_none() {
+        tracing::warn!(
+            target: "neoethos_app::orders",
+            %symbol,
+            volume_lots = body.volume_lots,
+            side = ?body.side,
+            "placing a NAKED order (risky=true, no stop-loss and no take-profit) — \
+             this position has no bracket protection"
+        );
+    }
+
     let side = body.side;
     let volume_lots = body.volume_lots;
     let sl = body.stop_loss_pips;

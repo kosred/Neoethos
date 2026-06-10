@@ -252,6 +252,31 @@ pub async fn serve(state: AppApiState) -> anyhow::Result<()> {
         "NeoEthos HTTP server listening — Flutter client should connect here"
     );
 
+    // 2026-06-10: the trading endpoints (/orders, /positions/close,
+    // /broker/credentials, …) carry NO authentication — the security model
+    // is "loopback-only", enforced solely by the bind address. Make that
+    // assumption explicit in the logs, and SHOUT if the operator ever points
+    // the bind at a non-loopback interface, where those endpoints would become
+    // reachable (and trade-capable) from the network with no auth in front.
+    if addr.ip().is_loopback() {
+        tracing::info!(
+            target: "neoethos_app::server",
+            bind_addr = %addr,
+            "server is loopback-only (no endpoint authentication by design — \
+             do not expose this port on a public interface)"
+        );
+    } else {
+        tracing::warn!(
+            target: "neoethos_app::server",
+            bind_addr = %addr,
+            "SECURITY: HTTP server bound to a NON-loopback address — the trading \
+             endpoints have NO authentication and are now reachable from the \
+             network. Anyone who can reach this port can place/close live trades \
+             and change broker credentials. Bind to 127.0.0.1 unless you have put \
+             your own auth/firewall in front."
+        );
+    }
+
     axum::serve(listener, app)
         .await
         .context("axum::serve returned with an unrecoverable error")

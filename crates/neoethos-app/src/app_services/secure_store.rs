@@ -196,6 +196,28 @@ fn decode_token_bundle(secret: &str) -> Result<CTraderTokenBundle> {
     }) {
         return Err(anyhow!("incomplete cTrader token bundle in secure storage"));
     }
+    // 2026-06-10: validate the shape beyond non-emptiness. An OAuth bearer
+    // bundle must carry token_type=="bearer" and a positive expires_in; a
+    // malformed/zero lifetime would make the refresh-ahead window misfire
+    // (treat a live token as perpetually expired, or never refresh). Reject
+    // early with a clear message instead of trusting a junk bundle.
+    if let Some(token_type) = value.get("token_type").and_then(serde_json::Value::as_str)
+        && !token_type.trim().eq_ignore_ascii_case("bearer")
+    {
+        return Err(anyhow!(
+            "unexpected cTrader token_type {token_type:?} in secure storage (expected \"bearer\")"
+        ));
+    }
+    if value
+        .get("expires_in")
+        .and_then(serde_json::Value::as_i64)
+        .map(|secs| secs <= 0)
+        .unwrap_or(true)
+    {
+        return Err(anyhow!(
+            "cTrader token bundle has a missing or non-positive expires_in in secure storage"
+        ));
+    }
     serde_json::from_value(value).context("failed to decode stored cTrader token bundle")
 }
 
