@@ -2388,6 +2388,32 @@ fn launch_backtest_kernel<R: Runtime>(
     ))
 }
 
+/// Device-side copy of one sample-WINDOW of synthesized signals/conf into the
+/// correct slice of the full-series PERSISTENT VRAM buffer — the mechanism that
+/// lets the fused path keep signals VRAM-resident even when the signal synth
+/// must window the sample axis (heavy TFs like M1, 6M rows). `src` is the
+/// window buffer (genes×wlen, gene-contiguous); `dst` is the persistent buffer
+/// (genes×full_samples). Generic over T so the SAME kernel copies i32 signals
+/// and f32 confidences. **2026-06-10 — M1/general fused path.**
+#[cube(launch)]
+fn copy_window_into_persistent<T: CubePrimitive>(
+    src: &Array<T>,
+    dst: &mut Array<T>,
+    wlen: u32,
+    full_samples: u32,
+    s0: u32,
+    valid_len: u32,
+) {
+    let pos = ABSOLUTE_POS;
+    if pos < valid_len as usize {
+        let wlen = wlen as usize;
+        let gene = pos / wlen;
+        let sample = pos % wlen;
+        let dpos = gene * (full_samples as usize) + (s0 as usize) + sample;
+        dst[dpos] = src[pos];
+    }
+}
+
 /// Opt-in (default OFF) GPU signal→backtest FUSION. When set, the eval keeps
 /// each gene-batch's synthesized signals RESIDENT in VRAM and feeds them
 /// straight to the backtest kernel — eliminating the genes×samples signal
@@ -2407,24 +2433,12 @@ fn cuda_eval_fused_enabled() -> bool {
     })
 }
 
-/// Fusion applies only when a gene-batch's signal series fits ONE signal
-/// window (`window >= n_samples`). The windowed host-assembly exists precisely
-/// because the full genes×samples matrix can exceed the per-buffer cap on heavy
-/// TFs (M1 = 6M rows) — there the signals MUST be assembled in host RAM, so the
-/// fused VRAM-resident path declines and the proven windowed path runs. Holds
-/// for the TFs the GPU actually uses today (M30/M15/H1/H4).
-fn fused_single_window_applies(n_indicators: usize, n_genes: usize, n_samples: usize) -> bool {
-    if n_genes == 0 || n_samples == 0 {
-        return false;
-    }
-    let batch = backtest_gene_batch(n_genes, n_samples);
-    signal_window_size(n_indicators, batch, n_samples) >= n_samples
-}
-
-/// FUSED single-window signal-synth + backtest for ONE gene-batch. The signal
-/// kernel writes signals(i32)/conf(f32) into VRAM handles that the backtest
-/// kernel reads DIRECTLY — no readback of the matrix, no re-upload. Only the
-/// per-gene metric scalars are read back. Both handles stay local (inferred
+/// FUSED windowed signal-synth + backtest for ONE gene-batch. The signal kernel
+/// writes each sample-window's signals(i32)/conf(f32) into a PERSISTENT VRAM
+/// buffer (via a GPU-side copy — no host roundtrip) that the backtest kernel
+/// then reads DIRECTLY — no readback of the genes×samples matrix, no re-upload.
+/// Only the per-gene metric scalars are read back. Handles all timeframes
+/// (1 window for light TFs, many for M1). Both handles stay local (inferred
 /// type), so no `Handle` type crosses a signature. Numerically identical to the
 /// windowed host path: same kernels, same inputs, same f32/bf16 precision — the
 /// bytes are simply not round-tripped through host RAM.
@@ -2489,67 +2503,121 @@ where
     )
     .context("fused signal kernel input validation failed")?;
 
-    // ── Signal kernel: upload inputs + allocate the sig/conf VRAM outputs that
-    //    the backtest will read directly (kept local — never read back). ──
+    // ── WINDOWED signal synthesis into PERSISTENT VRAM (general / M1-capable). ──
+    // The signal synth windows the SAMPLE axis to bound the per-window INDICATOR
+    // upload — the heaviest TFs (M1, 6M rows × ~76 indicators ≈ 1.8GB) can't
+    // upload all indicators in one buffer. But instead of reading each window
+    // back to host (the windowed host path's 688ms-and-up readback), each
+    // window's signals/conf are copied ON THE GPU into the full-series persistent
+    // buffers below, which the backtest then reads directly. So the signals stay
+    // VRAM-resident for ANY timeframe — solve M1 ⇒ solved everywhere.
+    let n_indicators = indicators_flat.len() / n_samples;
+    let signals_handle = client.empty(total.saturating_mul(std::mem::size_of::<i32>()));
+    let conf_handle = client.empty(total.saturating_mul(std::mem::size_of::<f32>()));
+    // Gene-independent inputs are identical every window — upload ONCE.
     let (
-        indicators_handle,
         gene_offsets_handle,
         gene_indices_handle,
         gene_weights_handle,
         long_thr_handle,
         short_thr_handle,
-        smc_data_handle,
         gene_smc_flags_handle,
         smc_weights_handle,
-        signals_handle,
-        conf_handle,
     ) = gpu_timing::upload(|| {
         (
-            client.create_from_slice(F::as_bytes(indicators_flat)),
             client.create_from_slice(i32::as_bytes(gene_offsets)),
             client.create_from_slice(i32::as_bytes(gene_indices)),
             client.create_from_slice(F::as_bytes(gene_weights)),
             client.create_from_slice(F::as_bytes(long_thr)),
             client.create_from_slice(F::as_bytes(short_thr)),
-            client.create_from_slice(i32::as_bytes(smc_data_flat)),
             client.create_from_slice(i32::as_bytes(gene_smc_flags_flat)),
             client.create_from_slice(F::as_bytes(smc_weights)),
-            client.empty(total.saturating_mul(std::mem::size_of::<i32>())),
-            client.empty(total.saturating_mul(std::mem::size_of::<f32>())),
         )
     });
     let sig_units = signal_kernel_units(client);
-    let sig_cubes = (total as u32).div_ceil(sig_units);
-    gpu_timing::kernel(|| {
-        synthesize_signals_kernel::launch::<F, R>(
-            client,
-            CubeCount::Static(sig_cubes, 1, 1),
-            CubeDim::new_1d(sig_units),
-            unsafe { ArrayArg::from_raw_parts(indicators_handle.clone(), indicators_flat.len()) },
-            unsafe { ArrayArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len()) },
-            unsafe { ArrayArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len()) },
-            unsafe { ArrayArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len()) },
-            unsafe { ArrayArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
-            unsafe { ArrayArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
-            unsafe { ArrayArg::from_raw_parts(smc_data_handle.clone(), smc_data_flat.len()) },
-            unsafe {
-                ArrayArg::from_raw_parts(gene_smc_flags_handle.clone(), gene_smc_flags_flat.len())
-            },
-            unsafe { ArrayArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
-            unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), total) },
-            unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
-            n_samples as u32,
-            gate_threshold,
-        );
-    });
+    let w = signal_window_size(n_indicators, n_genes, n_samples);
+    let mut s0 = 0usize;
+    while s0 < n_samples {
+        let s1 = (s0 + w).min(n_samples);
+        let wlen = s1 - s0;
+        let win_total = n_genes.saturating_mul(wlen);
+        let ind_window =
+            gather_indicator_window(indicators_flat, n_indicators, n_samples, s0, s1);
+        let smc_window = &smc_data_flat[s0 * SMC_WIDTH..s1 * SMC_WIDTH];
+        // Per-window inputs + transient window output buffers (freed each pass).
+        let (indicators_handle, smc_data_handle, sig_w, conf_w) = gpu_timing::upload(|| {
+            (
+                client.create_from_slice(F::as_bytes(&ind_window)),
+                client.create_from_slice(i32::as_bytes(smc_window)),
+                client.empty(win_total.saturating_mul(std::mem::size_of::<i32>())),
+                client.empty(win_total.saturating_mul(std::mem::size_of::<f32>())),
+            )
+        });
+        let sig_cubes = (win_total as u32).div_ceil(sig_units);
+        gpu_timing::kernel(|| {
+            synthesize_signals_kernel::launch::<F, R>(
+                client,
+                CubeCount::Static(sig_cubes, 1, 1),
+                CubeDim::new_1d(sig_units),
+                unsafe { ArrayArg::from_raw_parts(indicators_handle.clone(), ind_window.len()) },
+                unsafe { ArrayArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len()) },
+                unsafe { ArrayArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len()) },
+                unsafe { ArrayArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len()) },
+                unsafe { ArrayArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
+                unsafe { ArrayArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
+                unsafe { ArrayArg::from_raw_parts(smc_data_handle.clone(), smc_window.len()) },
+                unsafe {
+                    ArrayArg::from_raw_parts(gene_smc_flags_handle.clone(), gene_smc_flags_flat.len())
+                },
+                unsafe { ArrayArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
+                unsafe { ArrayArg::from_raw_parts(sig_w.clone(), win_total) },
+                unsafe { ArrayArg::from_raw_parts(conf_w.clone(), win_total) },
+                wlen as u32,
+                gate_threshold,
+            );
+        });
+        // BARRIER: the copy below reads what the signal kernel just wrote; on a
+        // multi-stream backend that is a cross-kernel dependency, so sync first.
+        cubecl::future::block_on(client.sync())
+            .map_err(|e| anyhow::anyhow!("fused signal-window sync failed: {e:?}"))?;
+        // GPU-side copy of this window into the persistent full-series buffers
+        // (no host roundtrip). i32 signals + f32 conf share the generic kernel.
+        let copy_cubes = (win_total as u32).div_ceil(sig_units);
+        gpu_timing::kernel(|| {
+            copy_window_into_persistent::launch::<i32, R>(
+                client,
+                CubeCount::Static(copy_cubes, 1, 1),
+                CubeDim::new_1d(sig_units),
+                unsafe { ArrayArg::from_raw_parts(sig_w.clone(), win_total) },
+                unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), total) },
+                wlen as u32,
+                n_samples as u32,
+                s0 as u32,
+                win_total as u32,
+            );
+            copy_window_into_persistent::launch::<f32, R>(
+                client,
+                CubeCount::Static(copy_cubes, 1, 1),
+                CubeDim::new_1d(sig_units),
+                unsafe { ArrayArg::from_raw_parts(conf_w.clone(), win_total) },
+                unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
+                wlen as u32,
+                n_samples as u32,
+                s0 as u32,
+                win_total as u32,
+            );
+        });
+        s0 = s1;
+        // Free this window's transient buffers before the next pass so peak VRAM
+        // stays ~one window, not the whole series (never-OOM on heavy TFs).
+        trim_gpu_pool_if_over_budget(client);
+    }
 
-    // BARRIER (parity-critical): wait for the signal kernel to FINISH writing
-    // signals_handle/conf_handle before the backtest reads them. The cubecl-cuda
-    // backend can place the two kernels on DIFFERENT streams, so without this the
-    // backtest races partially-written signals and the metrics diverge from the
-    // windowed path (whose readback synced here implicitly). A sync is a stream
-    // barrier — it waits for the ~0.09ms signal kernel but copies NOTHING, so the
-    // 22MB signal-matrix readback the windowed path paid is still eliminated.
+    // BARRIER (parity-critical): wait for every window's copy to FINISH writing
+    // the persistent signals/conf before the backtest reads them. Without it the
+    // backtest races partially-written signals (the cubecl-cuda backend may use
+    // multiple streams) and the metrics diverge from the windowed path. A sync is
+    // a stream barrier — it copies NOTHING, so the readback-elimination win stands.
     cubecl::future::block_on(client.sync())
         .map_err(|e| anyhow::anyhow!("fused signal-kernel sync failed: {e:?}"))?;
 
@@ -2877,13 +2945,14 @@ pub(crate) fn try_evaluate_population_cuda(
     // Genes are independent + concatenated in gene order, so this is numerically
     // identical to a single pass — CPU↔GPU parity holds.
     let n_indicators = indicators.nrows();
-    // **task #39 (2026-06-10):** when fusion is enabled AND the batch's signal
-    // series fits ONE window, run the VRAM-resident fused path — the signal
-    // matrix never leaves the GPU (no 688ms readback, no re-upload). It fills the
-    // SAME metric vecs as the windowed path, so the assembly below — and thus the
-    // result — is byte-identical. Otherwise the proven windowed host path runs.
-    let use_fused = cuda_eval_fused_enabled()
-        && fused_single_window_applies(n_indicators, n_genes, n_samples);
+    // **task #39 (2026-06-10):** when fusion is enabled, run the VRAM-resident
+    // fused path for EVERY timeframe — the signal matrix never leaves the GPU
+    // (no 688ms+ readback, no re-upload). The fused batch windows the signal
+    // synth internally (persistent-VRAM accumulator), so it handles the heaviest
+    // TFs (M1, 6M rows) too; the gene-batch already bounds genes×samples to fit
+    // VRAM (never-OOM). It fills the SAME metric vecs as the windowed path, so
+    // the assembly below — and the result — is byte-identical (A6000-proven).
+    let use_fused = cuda_eval_fused_enabled();
     if use_fused {
         let indicators_f32: Vec<f32> = indicators.iter().copied().collect();
         let smc_data_flat = flatten_i32_rows(smc_data);
@@ -3326,7 +3395,15 @@ mod fused_parity_tests {
 
         // Deterministic synthetic combo that actually produces trades: a sine
         // close (±50 pips) with oscillating indicators driving the signals.
-        let n_samples = 300usize;
+        // `n_samples` is env-tunable so the A6000 run can force the MULTI-window
+        // accumulator path (FUSED_TEST_NSAMPLES=200000 + a tiny
+        // NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB=1 cap → many signal windows); the
+        // default 300 is one window. Both must be byte-identical to windowed.
+        let n_samples: usize = std::env::var("FUSED_TEST_NSAMPLES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(300);
         let n_genes = 3usize;
         let n_indicators = 2usize;
 
@@ -3357,8 +3434,13 @@ mod fused_parity_tests {
         let short_thr: Vec<f32> = vec![-0.5, -0.5, -0.5];
 
         let timestamps: Vec<i64> = (0..n_samples).map(|i| 1_600_000_000_000 + i as i64 * 3_600_000).collect();
-        let month_idx: Vec<i64> = (0..n_samples).map(|i| (i / 720) as i64).collect();
-        let day_idx: Vec<i64> = (0..n_samples).map(|i| (i / 24) as i64).collect();
+        // Bucket day/month proportionally to n_samples so the counts stay bounded
+        // (~4 months, ~60 days) regardless of how big n_samples gets — keeps the
+        // month buffer within month_capacity for the large multi-window run.
+        let month_div = (n_samples / 4).max(1) as i64;
+        let day_div = (n_samples / 60).max(1) as i64;
+        let month_idx: Vec<i64> = (0..n_samples).map(|i| i as i64 / month_div).collect();
+        let day_idx: Vec<i64> = (0..n_samples).map(|i| i as i64 / day_div).collect();
         // Per-gene SL/TP varied so the genes produce DIFFERENT trade outcomes
         // (varied metrics), not a trivially-identical set.
         let sl_pips: Vec<f64> = vec![20.0, 15.0, 30.0];
