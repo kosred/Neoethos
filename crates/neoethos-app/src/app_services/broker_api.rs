@@ -30,10 +30,24 @@ use crate::app_services::ctrader_messages::{
     CTraderAmendPositionSltpRequest, CTraderCancelOrderRequest, CTraderClosePositionRequest,
     CTraderNewOrderRequest, CTraderOrderType, CTraderTradeSide,
 };
+use crate::app_services::ctrader_account::{
+    CTraderCashFlowBundle, CTraderCtidProfileSnapshot, CTraderExpectedMarginBundle,
+    CTraderOrderHistoryBundle, CTraderServerVersionSnapshot, ensure_success_payload_type,
+    parse_cash_flow_history_response, parse_ctid_profile_response, parse_expected_margin_response,
+    parse_order_list_response, parse_version_response,
+};
 use crate::app_services::ctrader_messages::{
+    CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_CASH_FLOW_HISTORY_LIST_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE,
     CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, build_account_auth_request,
     build_application_auth_request, build_asset_class_list_request,
-    build_symbol_category_list_request, build_symbols_list_request,
+    build_cash_flow_history_list_request, build_expected_margin_request,
+    build_get_ctid_profile_by_token_request, build_order_list_request,
+    build_symbol_category_list_request, build_symbols_list_request, build_version_request,
 };
 use crate::app_services::secure_store::production_ctrader_token_store;
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
@@ -909,6 +923,166 @@ pub fn amend_position_sltp_blocking(
         }),
     };
     ProductionCTraderExecutionBackend::default().execute(&runtime_request)
+}
+
+/// Maximum cTrader history window for the order-list / cash-flow RPCs.
+/// The broker rejects windows wider than one week; we fail loud before the
+/// round-trip instead of letting the broker bounce it (operator's
+/// defensive-code rule).
+const CTRADER_HISTORY_MAX_WINDOW_MS: i64 = 604_800_000; // 7 days
+
+fn validate_history_window(from_ms: i64, to_ms: i64) -> Result<()> {
+    if to_ms < from_ms {
+        return Err(anyhow!(
+            "history window is inverted: from={from_ms} > to={to_ms}"
+        ));
+    }
+    if to_ms - from_ms > CTRADER_HISTORY_MAX_WINDOW_MS {
+        return Err(anyhow!(
+            "history window {} ms exceeds the cTrader maximum of {} ms (1 week) — narrow the range",
+            to_ms - from_ms,
+            CTRADER_HISTORY_MAX_WINDOW_MS
+        ));
+    }
+    Ok(())
+}
+
+/// Account-wide historical orders over `[from_ms, to_ms]` (ms).
+/// `ProtoOAOrderListReq`. Blocking (sync WSS) — wrap in `spawn_blocking`.
+pub fn fetch_broker_order_history_blocking(
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<CTraderOrderHistoryBundle> {
+    validate_history_window(from_ms, to_ms)?;
+    let creds = resolve_creds()?;
+    let account_id: i64 = creds
+        .account_id_str
+        .parse()
+        .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
+    let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
+    let responses = transport.send_sequence(&[
+        build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
+        build_account_auth_request(account_id, &creds.access_token, "account-auth-1"),
+        build_order_list_request(account_id, from_ms, to_ms, "order-list-1"),
+    ])?;
+    if responses.len() != 3 {
+        return Err(anyhow!(
+            "expected 3 cTrader order-history responses, received {}",
+            responses.len()
+        ));
+    }
+    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(&responses[2], CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE)?;
+    parse_order_list_response(&responses[2])
+}
+
+/// Cash-flow history (deposits / withdrawals / swaps / fees) over
+/// `[from_ms, to_ms]` (ms). `ProtoOACashFlowHistoryListReq`. Blocking.
+pub fn fetch_broker_cash_flow_history_blocking(
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<CTraderCashFlowBundle> {
+    validate_history_window(from_ms, to_ms)?;
+    let creds = resolve_creds()?;
+    let account_id: i64 = creds
+        .account_id_str
+        .parse()
+        .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
+    let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
+    let responses = transport.send_sequence(&[
+        build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
+        build_account_auth_request(account_id, &creds.access_token, "account-auth-1"),
+        build_cash_flow_history_list_request(account_id, from_ms, to_ms, "cashflow-1"),
+    ])?;
+    if responses.len() != 3 {
+        return Err(anyhow!(
+            "expected 3 cTrader cash-flow responses, received {}",
+            responses.len()
+        ));
+    }
+    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[2],
+        CTRADER_OA_CASH_FLOW_HISTORY_LIST_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    parse_cash_flow_history_response(&responses[2])
+}
+
+/// Pre-trade margin estimate for each of `volumes` (0.01-unit wire volume) on
+/// `symbol_id`. `ProtoOAExpectedMarginReq`. Blocking.
+pub fn fetch_broker_expected_margin_blocking(
+    symbol_id: i64,
+    volumes: Vec<i64>,
+) -> Result<CTraderExpectedMarginBundle> {
+    if volumes.is_empty() {
+        return Err(anyhow!("expected-margin requires at least one volume"));
+    }
+    let creds = resolve_creds()?;
+    let account_id: i64 = creds
+        .account_id_str
+        .parse()
+        .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
+    let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
+    let responses = transport.send_sequence(&[
+        build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
+        build_account_auth_request(account_id, &creds.access_token, "account-auth-1"),
+        build_expected_margin_request(account_id, symbol_id, &volumes, "exp-margin-1"),
+    ])?;
+    if responses.len() != 3 {
+        return Err(anyhow!(
+            "expected 3 cTrader expected-margin responses, received {}",
+            responses.len()
+        ));
+    }
+    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(&responses[2], CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE)?;
+    parse_expected_margin_response(&responses[2])
+}
+
+/// The cTID profile (user id) behind the saved access token.
+/// `ProtoOAGetCtidProfileByTokenReq` — token-scoped, no account-auth. Blocking.
+pub fn fetch_broker_ctid_profile_blocking() -> Result<CTraderCtidProfileSnapshot> {
+    let creds = resolve_creds()?;
+    let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
+    let responses = transport.send_sequence(&[
+        build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
+        build_get_ctid_profile_by_token_request(&creds.access_token, "ctid-profile-1"),
+    ])?;
+    if responses.len() != 2 {
+        return Err(anyhow!(
+            "expected 2 cTrader cTID-profile responses, received {}",
+            responses.len()
+        ));
+    }
+    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[1],
+        CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    parse_ctid_profile_response(&responses[1])
+}
+
+/// The broker's Open API proto version. `ProtoOAVersionReq` — app-level,
+/// no account, no token. Blocking; useful as a connectivity probe.
+pub fn fetch_broker_version_blocking() -> Result<CTraderServerVersionSnapshot> {
+    let creds = resolve_creds()?;
+    let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
+    let responses = transport.send_sequence(&[
+        build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
+        build_version_request("version-1"),
+    ])?;
+    if responses.len() != 2 {
+        return Err(anyhow!(
+            "expected 2 cTrader version responses, received {}",
+            responses.len()
+        ));
+    }
+    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(&responses[1], CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE)?;
+    parse_version_response(&responses[1])
 }
 
 fn bars_to_normalized(bars: &[HistoricalBar]) -> Vec<NormalizedBar> {

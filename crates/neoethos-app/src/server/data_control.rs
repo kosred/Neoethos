@@ -8,13 +8,16 @@
 //! are thin wrappers around `spawn_blocking`.
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
 
 use crate::app_services::broker_api::{
-    download_history_blocking, fetch_broker_accounts_blocking, fetch_broker_symbols_blocking,
+    download_history_blocking, fetch_broker_accounts_blocking,
+    fetch_broker_cash_flow_history_blocking, fetch_broker_ctid_profile_blocking,
+    fetch_broker_expected_margin_blocking, fetch_broker_order_history_blocking,
+    fetch_broker_symbols_blocking, fetch_broker_version_blocking,
 };
 use crate::app_services::ctrader_errors::translate_anyhow;
 
@@ -396,5 +399,117 @@ pub async fn import_file(
             )
         }
         Err(join_err) => internal_panic("Importing the file", join_err),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2026-06-10 — cTrader Open API history / margin / profile endpoints.
+// Thin three-arm `spawn_blocking` wrappers over the broker_api fetch fns,
+// exactly like `symbols` above. The bundle structs are Serialize + camelCase,
+// so the handlers return them directly.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const DEFAULT_HISTORY_WINDOW_MS: i64 = 604_800_000; // 7 days (the broker cap)
+
+/// `?from=<ms>&to=<ms>`; both optional. Default = the last 7 days (the broker's
+/// maximum window), which is the most useful default for a journal view.
+#[derive(Debug, serde::Deserialize)]
+pub struct HistoryWindowQuery {
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+}
+
+fn resolve_history_window(q: &HistoryWindowQuery) -> (i64, i64) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let to = q.to.unwrap_or(now_ms);
+    let from = q.from.unwrap_or(to - DEFAULT_HISTORY_WINDOW_MS);
+    (from, to)
+}
+
+// ─── GET /broker/orders/history ───────────────────────────────────────────
+
+pub async fn order_history(
+    State(_state): State<AppApiState>,
+    Query(q): Query<HistoryWindowQuery>,
+) -> Response {
+    let (from, to) = resolve_history_window(&q);
+    match tokio::task::spawn_blocking(move || fetch_broker_order_history_blocking(from, to)).await {
+        Ok(Ok(bundle)) => Json(bundle).into_response(),
+        Ok(Err(err)) => broker_gateway_error(err),
+        Err(join_err) => internal_panic("Loading broker order history", join_err),
+    }
+}
+
+// ─── GET /broker/cashflow ─────────────────────────────────────────────────
+
+pub async fn cash_flow_history(
+    State(_state): State<AppApiState>,
+    Query(q): Query<HistoryWindowQuery>,
+) -> Response {
+    let (from, to) = resolve_history_window(&q);
+    match tokio::task::spawn_blocking(move || fetch_broker_cash_flow_history_blocking(from, to))
+        .await
+    {
+        Ok(Ok(bundle)) => Json(bundle).into_response(),
+        Ok(Err(err)) => broker_gateway_error(err),
+        Err(join_err) => internal_panic("Loading broker cash-flow history", join_err),
+    }
+}
+
+// ─── GET /broker/margin/expected?symbolId=..&volume=.. ────────────────────
+
+/// `symbolId` is required; `volume` is the wire volume (0.01-unit cents) to
+/// price the margin for — defaults to one standard lot (10_000_000 cents).
+#[derive(Debug, serde::Deserialize)]
+pub struct ExpectedMarginQuery {
+    #[serde(rename = "symbolId")]
+    pub symbol_id: i64,
+    pub volume: Option<i64>,
+}
+
+pub async fn expected_margin(
+    State(_state): State<AppApiState>,
+    Query(q): Query<ExpectedMarginQuery>,
+) -> Response {
+    let symbol_id = q.symbol_id;
+    let volume = q.volume.unwrap_or(10_000_000); // 1.0 lot default
+    if symbol_id <= 0 || volume <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "symbolId and volume must both be positive"})),
+        )
+            .into_response();
+    }
+    match tokio::task::spawn_blocking(move || {
+        fetch_broker_expected_margin_blocking(symbol_id, vec![volume])
+    })
+    .await
+    {
+        Ok(Ok(bundle)) => Json(bundle).into_response(),
+        Ok(Err(err)) => broker_gateway_error(err),
+        Err(join_err) => internal_panic("Computing expected margin", join_err),
+    }
+}
+
+// ─── GET /broker/profile ──────────────────────────────────────────────────
+
+pub async fn ctid_profile(State(_state): State<AppApiState>) -> Response {
+    match tokio::task::spawn_blocking(fetch_broker_ctid_profile_blocking).await {
+        Ok(Ok(snapshot)) => Json(snapshot).into_response(),
+        Ok(Err(err)) => broker_gateway_error(err),
+        Err(join_err) => internal_panic("Loading cTID profile", join_err),
+    }
+}
+
+// ─── GET /broker/version ──────────────────────────────────────────────────
+
+pub async fn server_version(State(_state): State<AppApiState>) -> Response {
+    match tokio::task::spawn_blocking(fetch_broker_version_blocking).await {
+        Ok(Ok(snapshot)) => Json(snapshot).into_response(),
+        Ok(Err(err)) => broker_gateway_error(err),
+        Err(join_err) => internal_panic("Loading broker version", join_err),
     }
 }

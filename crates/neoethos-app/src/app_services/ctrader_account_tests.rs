@@ -465,3 +465,84 @@ impl crate::app_services::ctrader_messages::CTraderOpenApiTransport for StubTran
         Ok(output)
     }
 }
+
+// ─── 2026-06-10 API-completeness response parsers ──────────────────────────
+// TODO(real-data): replace these hand-built fixtures with captured broker
+// responses once a demo account is available (see file header).
+
+#[test]
+fn parses_order_list_response() {
+    let json = r#"{"payloadType":2176,"payload":{"ctidTraderAccountId":1,"hasMore":true,
+      "order":[{"orderId":5,"orderType":2,"orderStatus":2,"executedVolume":1000,
+        "executionPrice":1.2345,"utcLastUpdateTimestamp":1700000000000,"timeInForce":2,
+        "tradeData":{"symbolId":1,"volume":1000,"tradeSide":1,"openTimestamp":1699999999000,
+          "closeTimestamp":1700000001000}}]}}"#;
+    let b = parse_order_list_response(json).unwrap();
+    assert_eq!(b.account_id, 1);
+    assert!(b.has_more);
+    let o = &b.orders[0];
+    assert_eq!(o.side, "BUY");
+    assert_eq!(o.order_status, "FILLED");
+    assert_eq!(o.order_type, "LIMIT");
+    assert_eq!(o.time_in_force.as_deref(), Some("GOOD_TILL_CANCEL"));
+    assert_eq!(o.volume_lots, 10.0); // 1000 cents / 100
+    assert_eq!(o.executed_volume_lots, Some(10.0));
+    assert_eq!(o.close_timestamp_ms, Some(1700000001000));
+    assert!(!o.is_stop_out);
+}
+
+#[test]
+fn order_list_rejects_wrong_payload_type() {
+    // 2138 is GET_TRENDBARS_RES — the discriminator-bug guard.
+    let json = r#"{"payloadType":2138,"payload":{"ctidTraderAccountId":1,"order":[]}}"#;
+    assert!(parse_order_list_response(json).is_err());
+}
+
+#[test]
+fn parses_cash_flow_history_with_money_digits() {
+    let json = r#"{"payloadType":2144,"payload":{"ctidTraderAccountId":1,"depositWithdraw":[
+      {"operationType":0,"balanceHistoryId":7,"balance":10053099944,"delta":10000000000,
+       "changeBalanceTimestamp":1700000000000,"equity":10053099944,"moneyDigits":8}]}}"#;
+    let b = parse_cash_flow_history_response(json).unwrap();
+    let e = &b.entries[0];
+    assert_eq!(e.operation_type, "BALANCE_DEPOSIT");
+    assert_eq!(e.operation_type_code, 0);
+    assert!((e.balance - 100.53099944).abs() < 1e-6); // / 10^8
+    assert!((e.delta - 100.0).abs() < 1e-6);
+    assert_eq!(e.change_balance_timestamp_ms, 1700000000000);
+}
+
+#[test]
+fn cash_flow_unknown_operation_type_is_labelled_not_guessed() {
+    // We only hardcode 0/1/39; anything else stays unmapped (no invented names).
+    let json = r#"{"payloadType":2144,"payload":{"ctidTraderAccountId":1,"depositWithdraw":[
+      {"operationType":17,"balanceHistoryId":1,"balance":0,"delta":-500,
+       "changeBalanceTimestamp":1,"moneyDigits":2}]}}"#;
+    let e = &parse_cash_flow_history_response(json).unwrap().entries[0];
+    assert_eq!(e.operation_type, "CHANGE_BALANCE_TYPE(17)");
+    assert_eq!(e.operation_type_code, 17);
+    assert!((e.delta - (-5.0)).abs() < 1e-6); // signed delta is authoritative
+}
+
+#[test]
+fn parses_expected_margin() {
+    let json = r#"{"payloadType":2140,"payload":{"ctidTraderAccountId":1,"moneyDigits":2,
+      "margin":[{"volume":10000000,"buyMargin":33333,"sellMargin":33333}]}}"#;
+    let b = parse_expected_margin_response(json).unwrap();
+    let e = &b.entries[0];
+    assert_eq!(e.volume_lots, 100000.0); // 10_000_000 cents / 100
+    assert!((e.buy_margin - 333.33).abs() < 1e-6); // / 10^2
+    assert!((e.sell_margin - 333.33).abs() < 1e-6);
+}
+
+#[test]
+fn parses_ctid_profile_only_user_id() {
+    let json = r#"{"payloadType":2152,"payload":{"profile":{"userId":123456}}}"#;
+    assert_eq!(parse_ctid_profile_response(json).unwrap().user_id, 123456);
+}
+
+#[test]
+fn parses_version() {
+    let json = r#"{"payloadType":2105,"payload":{"version":"4.2.1"}}"#;
+    assert_eq!(parse_version_response(json).unwrap().version, "4.2.1");
+}

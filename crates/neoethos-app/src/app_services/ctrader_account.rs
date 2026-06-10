@@ -2,18 +2,22 @@ use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_CASH_FLOW_HISTORY_LIST_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_DEAL_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_ORDER_DETAILS_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_ORDER_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE, CTraderDealListRequest, CTraderOpenApiTransport,
+    CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE, CTraderDealListRequest, CTraderOpenApiTransport,
     ProductionCTraderOpenApiTransport, build_account_auth_request, build_application_auth_request,
     build_deal_list_request, build_reconcile_request, build_trader_request,
     parse_ctrader_error_payload, parse_open_api_envelope,
 };
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -807,7 +811,415 @@ impl CTraderAccountRuntimeBackend for StubCTraderAccountRuntimeBackend {
     }
 }
 
-fn ensure_success_payload_type(response_json: &str, expected_payload_type: u32) -> Result<()> {
+// ═══════════════════════════════════════════════════════════════════════════
+// 2026-06-10 — cTrader Open API response consumers (operator: "make the whole
+// API part of the bot"). Field names + scaling rules verified against the
+// Spotware proto (OpenApiMessages.proto / OpenApiModelMessages.proto). The
+// request builders + req→res map already exist in ctrader_messages.rs; this
+// block adds the response parsers. Public structs derive Serialize + camelCase
+// so the server handlers can return them directly.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── ProtoOAOrderListRes (2176) — account-wide order history ───────────────
+
+#[derive(Debug, Deserialize)]
+struct OrderListEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: OrderListPayload,
+}
+#[derive(Debug, Deserialize)]
+struct OrderListPayload {
+    #[serde(rename = "ctidTraderAccountId")]
+    ctid_trader_account_id: i64,
+    #[serde(default)]
+    order: Vec<HistoricalOrderPayload>,
+    #[serde(rename = "hasMore", default)]
+    has_more: bool,
+}
+#[derive(Debug, Deserialize)]
+struct HistoricalOrderPayload {
+    #[serde(rename = "orderId")]
+    order_id: i64,
+    #[serde(rename = "tradeData")]
+    trade_data: HistoricalTradeDataPayload,
+    #[serde(rename = "orderType")]
+    order_type: i32,
+    #[serde(rename = "orderStatus")]
+    order_status: i32,
+    #[serde(rename = "expirationTimestamp")]
+    expiration_timestamp: Option<i64>,
+    #[serde(rename = "executionPrice")]
+    execution_price: Option<f64>,
+    #[serde(rename = "executedVolume")]
+    executed_volume: Option<i64>,
+    #[serde(rename = "utcLastUpdateTimestamp")]
+    utc_last_update_timestamp: Option<i64>,
+    #[serde(rename = "limitPrice")]
+    limit_price: Option<f64>,
+    #[serde(rename = "stopPrice")]
+    stop_price: Option<f64>,
+    #[serde(rename = "stopLoss")]
+    stop_loss: Option<f64>,
+    #[serde(rename = "takeProfit")]
+    take_profit: Option<f64>,
+    #[serde(rename = "clientOrderId")]
+    client_order_id: Option<String>,
+    #[serde(rename = "timeInForce")]
+    time_in_force: Option<i32>,
+    #[serde(rename = "positionId")]
+    position_id: Option<i64>,
+    #[serde(rename = "closingOrder")]
+    closing_order: Option<bool>,
+    #[serde(rename = "isStopOut")]
+    is_stop_out: Option<bool>,
+    #[serde(rename = "trailingStopLoss")]
+    trailing_stop_loss: Option<bool>,
+}
+#[derive(Debug, Deserialize)]
+struct HistoricalTradeDataPayload {
+    #[serde(rename = "symbolId")]
+    symbol_id: i64,
+    volume: i64,
+    #[serde(rename = "tradeSide")]
+    trade_side: i32,
+    #[serde(rename = "openTimestamp")]
+    open_timestamp: Option<i64>,
+    label: Option<String>,
+    comment: Option<String>,
+    #[serde(rename = "closeTimestamp")]
+    close_timestamp: Option<u64>,
+}
+
+/// One historical order. `volume`/`executedVolume` are cents → lots via
+/// `volume_to_units` (NOT moneyDigits-scaled — `ProtoOAOrder` carries no
+/// moneyDigits). Prices pass through raw; all timestamps are ms.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CTraderHistoricalOrderSnapshot {
+    pub order_id: i64,
+    pub position_id: Option<i64>,
+    pub symbol_id: i64,
+    pub side: String,
+    pub order_type: String,
+    pub order_status: String,
+    pub volume_lots: f64,
+    pub executed_volume_lots: Option<f64>,
+    pub execution_price: Option<f64>,
+    pub limit_price: Option<f64>,
+    pub stop_price: Option<f64>,
+    pub stop_loss: Option<f64>,
+    pub take_profit: Option<f64>,
+    pub time_in_force: Option<String>,
+    pub label: Option<String>,
+    pub comment: Option<String>,
+    pub client_order_id: Option<String>,
+    pub closing_order: bool,
+    pub is_stop_out: bool,
+    pub trailing_stop_loss: bool,
+    pub open_timestamp_ms: Option<i64>,
+    pub close_timestamp_ms: Option<i64>,
+    pub expiration_timestamp_ms: Option<i64>,
+    pub utc_last_update_timestamp_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CTraderOrderHistoryBundle {
+    pub account_id: i64,
+    pub orders: Vec<CTraderHistoricalOrderSnapshot>,
+    pub has_more: bool,
+}
+
+fn historical_order_payload_to_snapshot(p: HistoricalOrderPayload) -> CTraderHistoricalOrderSnapshot {
+    CTraderHistoricalOrderSnapshot {
+        order_id: p.order_id,
+        position_id: p.position_id,
+        symbol_id: p.trade_data.symbol_id,
+        side: trade_side_label(p.trade_data.trade_side),
+        order_type: order_type_label(p.order_type),
+        order_status: order_status_label(p.order_status),
+        volume_lots: volume_to_units(p.trade_data.volume),
+        executed_volume_lots: p.executed_volume.map(volume_to_units),
+        execution_price: p.execution_price,
+        limit_price: p.limit_price,
+        stop_price: p.stop_price,
+        stop_loss: p.stop_loss,
+        take_profit: p.take_profit,
+        time_in_force: p.time_in_force.map(time_in_force_label),
+        label: p.trade_data.label,
+        comment: p.trade_data.comment,
+        client_order_id: p.client_order_id,
+        closing_order: p.closing_order.unwrap_or(false),
+        is_stop_out: p.is_stop_out.unwrap_or(false),
+        trailing_stop_loss: p.trailing_stop_loss.unwrap_or(false),
+        open_timestamp_ms: p.trade_data.open_timestamp,
+        close_timestamp_ms: p.trade_data.close_timestamp.map(|t| t as i64),
+        expiration_timestamp_ms: p.expiration_timestamp,
+        utc_last_update_timestamp_ms: p.utc_last_update_timestamp,
+    }
+}
+
+pub fn parse_order_list_response(response_json: &str) -> Result<CTraderOrderHistoryBundle> {
+    let envelope: OrderListEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader order list response")?;
+    if envelope.payload_type != CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader order list payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    Ok(CTraderOrderHistoryBundle {
+        account_id: envelope.payload.ctid_trader_account_id,
+        has_more: envelope.payload.has_more,
+        orders: envelope
+            .payload
+            .order
+            .into_iter()
+            .map(historical_order_payload_to_snapshot)
+            .collect(),
+    })
+}
+
+// ─── ProtoOACashFlowHistoryListRes (2144) — deposits / withdrawals / fees ──
+
+#[derive(Debug, Deserialize)]
+struct CashFlowListEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: CashFlowListPayload,
+}
+#[derive(Debug, Deserialize)]
+struct CashFlowListPayload {
+    #[serde(rename = "ctidTraderAccountId")]
+    ctid_trader_account_id: i64,
+    #[serde(rename = "depositWithdraw", default)]
+    deposit_withdraw: Vec<DepositWithdrawPayload>,
+}
+#[derive(Debug, Deserialize)]
+struct DepositWithdrawPayload {
+    #[serde(rename = "operationType")]
+    operation_type: i32,
+    #[serde(rename = "balanceHistoryId")]
+    balance_history_id: i64,
+    balance: i64,
+    delta: i64,
+    #[serde(rename = "changeBalanceTimestamp")]
+    change_balance_timestamp: i64,
+    #[serde(rename = "externalNote")]
+    external_note: Option<String>,
+    #[serde(rename = "balanceVersion")]
+    balance_version: Option<i64>,
+    equity: Option<i64>,
+    #[serde(rename = "moneyDigits")]
+    money_digits: Option<u32>,
+}
+
+/// One cash-flow record. `balance`/`delta`/`equity` ARE moneyDigits-scaled
+/// (per-item field) — use `scaled_money`, never a hardcoded /100. The signed
+/// `delta` is the authoritative deposit(+)/withdraw(-) direction; the raw
+/// `operation_type_code` is preserved for downstream classification.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CTraderCashFlowSnapshot {
+    pub balance_history_id: i64,
+    pub operation_type: String,
+    pub operation_type_code: i32,
+    pub balance: f64,
+    pub delta: f64,
+    pub equity: Option<f64>,
+    pub change_balance_timestamp_ms: i64,
+    pub external_note: Option<String>,
+    pub balance_version: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CTraderCashFlowBundle {
+    pub account_id: i64,
+    pub entries: Vec<CTraderCashFlowSnapshot>,
+}
+
+fn cash_flow_payload_to_snapshot(p: DepositWithdrawPayload) -> CTraderCashFlowSnapshot {
+    let digits = required_money_digits(p.money_digits, "cashFlow.moneyDigits");
+    CTraderCashFlowSnapshot {
+        balance_history_id: p.balance_history_id,
+        operation_type: change_balance_type_label(p.operation_type),
+        operation_type_code: p.operation_type,
+        balance: scaled_money(p.balance, digits),
+        delta: scaled_money(p.delta, digits),
+        equity: p.equity.map(|e| scaled_money(e, digits)),
+        change_balance_timestamp_ms: p.change_balance_timestamp,
+        external_note: p.external_note,
+        balance_version: p.balance_version,
+    }
+}
+
+pub fn parse_cash_flow_history_response(response_json: &str) -> Result<CTraderCashFlowBundle> {
+    let envelope: CashFlowListEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader cash flow history response")?;
+    if envelope.payload_type != CTRADER_OA_CASH_FLOW_HISTORY_LIST_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader cash flow payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    Ok(CTraderCashFlowBundle {
+        account_id: envelope.payload.ctid_trader_account_id,
+        entries: envelope
+            .payload
+            .deposit_withdraw
+            .into_iter()
+            .map(cash_flow_payload_to_snapshot)
+            .collect(),
+    })
+}
+
+// ─── ProtoOAExpectedMarginRes (2140) — pre-trade margin ────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ExpectedMarginEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: ExpectedMarginPayload,
+}
+#[derive(Debug, Deserialize)]
+struct ExpectedMarginPayload {
+    #[serde(rename = "ctidTraderAccountId")]
+    ctid_trader_account_id: i64,
+    #[serde(default)]
+    margin: Vec<ExpectedMarginEntryPayload>,
+    #[serde(rename = "moneyDigits")]
+    money_digits: Option<u32>,
+}
+#[derive(Debug, Deserialize)]
+struct ExpectedMarginEntryPayload {
+    volume: i64,
+    #[serde(rename = "buyMargin")]
+    buy_margin: i64,
+    #[serde(rename = "sellMargin")]
+    sell_margin: i64,
+}
+
+/// One (volume → buy/sell margin) entry. `moneyDigits` is on the PARENT Res,
+/// scaling buy/sellMargin; `volume` is cents → lots.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CTraderExpectedMarginEntry {
+    pub volume_lots: f64,
+    pub buy_margin: f64,
+    pub sell_margin: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CTraderExpectedMarginBundle {
+    pub account_id: i64,
+    pub entries: Vec<CTraderExpectedMarginEntry>,
+}
+
+pub fn parse_expected_margin_response(response_json: &str) -> Result<CTraderExpectedMarginBundle> {
+    let envelope: ExpectedMarginEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader expected margin response")?;
+    if envelope.payload_type != CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader expected margin payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    let digits = required_money_digits(envelope.payload.money_digits, "expectedMargin.moneyDigits");
+    Ok(CTraderExpectedMarginBundle {
+        account_id: envelope.payload.ctid_trader_account_id,
+        entries: envelope
+            .payload
+            .margin
+            .into_iter()
+            .map(|m| CTraderExpectedMarginEntry {
+                volume_lots: volume_to_units(m.volume),
+                buy_margin: scaled_money(m.buy_margin, digits),
+                sell_margin: scaled_money(m.sell_margin, digits),
+            })
+            .collect(),
+    })
+}
+
+// ─── ProtoOAGetCtidProfileByTokenRes (2152) — who is logged in ─────────────
+// Verified proto: ProtoOACtidProfile carries EXACTLY one field, userId.
+// (The builder docstring's "nickname" is wrong; do NOT add a nickname field.)
+
+#[derive(Debug, Deserialize)]
+struct CtidProfileEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: CtidProfilePayload,
+}
+#[derive(Debug, Deserialize)]
+struct CtidProfilePayload {
+    profile: CtidProfileInner,
+}
+#[derive(Debug, Deserialize)]
+struct CtidProfileInner {
+    #[serde(rename = "userId")]
+    user_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CTraderCtidProfileSnapshot {
+    pub user_id: i64,
+}
+
+pub fn parse_ctid_profile_response(response_json: &str) -> Result<CTraderCtidProfileSnapshot> {
+    let envelope: CtidProfileEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader cTID profile response")?;
+    if envelope.payload_type != CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader cTID profile payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    Ok(CTraderCtidProfileSnapshot {
+        user_id: envelope.payload.profile.user_id,
+    })
+}
+
+// ─── ProtoOAVersionRes (2105) — broker Open API version ────────────────────
+
+#[derive(Debug, Deserialize)]
+struct VersionEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: VersionPayload,
+}
+#[derive(Debug, Deserialize)]
+struct VersionPayload {
+    version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CTraderServerVersionSnapshot {
+    pub version: String,
+}
+
+pub fn parse_version_response(response_json: &str) -> Result<CTraderServerVersionSnapshot> {
+    let envelope: VersionEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader version response")?;
+    if envelope.payload_type != CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader version payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    Ok(CTraderServerVersionSnapshot {
+        version: envelope.payload.version,
+    })
+}
+
+pub(crate) fn ensure_success_payload_type(
+    response_json: &str,
+    expected_payload_type: u32,
+) -> Result<()> {
     let envelope = parse_open_api_envelope(response_json)?;
     if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
         return Err(anyhow!(
@@ -927,6 +1339,52 @@ fn deal_status_label(value: i32) -> String {
         6 => "ERROR",
         7 => "MISSED",
         other => return format!("UNKNOWN({other})"),
+    }
+    .to_string()
+}
+
+/// `ProtoOAOrderStatus` enum (2026-06-10). Order-history audit view.
+fn order_status_label(value: i32) -> String {
+    match value {
+        1 => "ACCEPTED",
+        2 => "FILLED",
+        3 => "REJECTED",
+        4 => "EXPIRED",
+        5 => "CANCELLED",
+        other => return format!("UNKNOWN({other})"),
+    }
+    .to_string()
+}
+
+/// `ProtoOATimeInForce` enum (2026-06-10).
+fn time_in_force_label(value: i32) -> String {
+    match value {
+        1 => "GOOD_TILL_DATE",
+        2 => "GOOD_TILL_CANCEL",
+        3 => "IMMEDIATE_OR_CANCEL",
+        4 => "FILL_OR_KILL",
+        5 => "MARKET_ON_OPEN",
+        other => return format!("UNKNOWN({other})"),
+    }
+    .to_string()
+}
+
+/// `ProtoOAChangeBalanceType` (cash-flow operation) — COSMETIC label only.
+///
+/// The enum has ~35 members; their exact numeric mapping was NOT fully
+/// verified against the proto in this pass, and mislabelling a withdrawal as
+/// a deposit would corrupt the operator's money view. So we deliberately map
+/// ONLY the two values we are certain of (0 = deposit, 1 = withdraw) plus the
+/// known 39, and return `CHANGE_BALANCE_TYPE(n)` for the rest — the SIGNED
+/// `delta` is the authoritative direction for any money math, and the raw
+/// `operation_type_code` is preserved on the snapshot for later precise
+/// labelling once the full enum is transcribed from the proto.
+fn change_balance_type_label(value: i32) -> String {
+    match value {
+        0 => "BALANCE_DEPOSIT",
+        1 => "BALANCE_WITHDRAW",
+        39 => "BALANCE_DEPOSIT_NEGATIVE_BALANCE_PROTECTION",
+        other => return format!("CHANGE_BALANCE_TYPE({other})"),
     }
     .to_string()
 }

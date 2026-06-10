@@ -165,6 +165,12 @@ pub fn router(state: AppApiState) -> Router {
         .route("/broker/symbols", get(data_control::symbols))
         .route("/broker/timeframes", get(data_control::timeframes))
         .route("/broker/accounts", get(data_control::accounts))
+        // 2026-06-10 cTrader Open API history / margin / profile consumers.
+        .route("/broker/orders/history", get(data_control::order_history))
+        .route("/broker/cashflow", get(data_control::cash_flow_history))
+        .route("/broker/margin/expected", get(data_control::expected_margin))
+        .route("/broker/profile", get(data_control::ctid_profile))
+        .route("/broker/version", get(data_control::server_version))
         // F-333: set the *active* cTrader account by promoting it to the
         // front of broker_credentials.toml's accounts list (resolve_creds
         // reads accounts.first()). MVP — takes effect on next start.
