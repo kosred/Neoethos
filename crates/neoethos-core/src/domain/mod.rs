@@ -1,4 +1,5 @@
 pub mod consistency;
+pub mod demo_gate;
 pub mod errors;
 pub mod events;
 pub mod meta_controller;
@@ -12,6 +13,7 @@ pub mod prop_firm;
 pub mod risk;
 pub mod risky_mode;
 
+pub use demo_gate::{DemoForwardDecision, DemoForwardGateConfig, evaluate_demo_forward_gate};
 pub use promotion_gate::{
     CriterionResult, PromotionDecision, PromotionGateConfig, PromotionMetrics,
     aggregate_portfolio, evaluate_promotion,
