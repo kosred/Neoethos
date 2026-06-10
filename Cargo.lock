@@ -6503,7 +6503,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-app"
-version = "0.4.43"
+version = "0.4.99"
 dependencies = [
  "anyhow",
  "axum",
@@ -6556,7 +6556,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-cli"
-version = "0.4.43"
+version = "0.4.99"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6575,7 +6575,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-codex"
-version = "0.4.43"
+version = "0.4.99"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6594,7 +6594,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-core"
-version = "0.4.43"
+version = "0.4.99"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6619,7 +6619,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-data"
-version = "0.4.43"
+version = "0.4.99"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6644,10 +6644,11 @@ dependencies = [
 
 [[package]]
 name = "neoethos-models"
-version = "0.4.43"
+version = "0.4.99"
 dependencies = [
  "anyhow",
  "burn",
+ "burn-cuda",
  "burn-ndarray",
  "burn-wgpu",
  "candle-core 0.9.2",
@@ -6691,7 +6692,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-search"
-version = "0.4.43"
+version = "0.4.99"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6715,7 +6716,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-trader"
-version = "0.4.43"
+version = "0.4.99"
 dependencies = [
  "anyhow",
  "chrono",

@@ -19,10 +19,15 @@ use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::backend::{Backend, BackendTypes};
 use burn::tensor::{DType, FloatDType, TensorData};
-#[cfg(not(feature = "burn-wgpu-backend"))]
+#[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
 use burn_ndarray::NdArray;
-#[cfg(feature = "burn-wgpu-backend")]
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
 use burn_wgpu::{Wgpu, WgpuDevice, graphics, init_setup};
+// Native CUDA backend takes priority over wgpu when both are enabled (the
+// `gpu-cuda` build pulls in burn-cuda); neural training then runs on the card
+// in f32, which Ampere supports natively (no BF16 matmul hazard).
+#[cfg(feature = "burn-cuda-backend")]
+use burn_cuda::{Cuda, CudaDevice};
 
 use crate::hardware::HardwareInfo;
 use crate::runtime::capabilities::{
@@ -38,16 +43,20 @@ use std::sync::{Mutex, OnceLock};
 use tracing::info;
 
 /// Backend types
-#[cfg(feature = "burn-wgpu-backend")]
+#[cfg(feature = "burn-cuda-backend")]
+pub type TrainBackend = Autodiff<Cuda<f32, i32>>;
+#[cfg(feature = "burn-cuda-backend")]
+pub type InferBackend = Cuda<f32, i32>;
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
 pub type TrainBackend = Autodiff<Wgpu>;
-#[cfg(feature = "burn-wgpu-backend")]
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
 pub type InferBackend = Wgpu;
-#[cfg(not(feature = "burn-wgpu-backend"))]
+#[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
 pub type TrainBackend = Autodiff<NdArray>;
-#[cfg(not(feature = "burn-wgpu-backend"))]
+#[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
 pub type InferBackend = NdArray;
 
-#[cfg(feature = "burn-wgpu-backend")]
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
 fn initialize_wgpu_runtime(device: &<InferBackend as BackendTypes>::Device, policy_key: &str) {
     static INIT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let initialized = INIT.get_or_init(|| Mutex::new(HashSet::new()));
@@ -67,11 +76,15 @@ fn initialize_wgpu_runtime(device: &<InferBackend as BackendTypes>::Device, poli
 }
 
 pub fn active_burn_backend_name() -> &'static str {
-    #[cfg(feature = "burn-wgpu-backend")]
+    #[cfg(feature = "burn-cuda-backend")]
+    {
+        "cuda"
+    }
+    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
     {
         "wgpu"
     }
-    #[cfg(not(feature = "burn-wgpu-backend"))]
+    #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
     {
         "ndarray_cpu"
     }
@@ -220,6 +233,15 @@ pub(crate) fn validate_burn_device_selection(
                 ));
             }
         }
+        "cuda" | "cuda_default" | "cuda_discrete_gpu" => {
+            // Native Burn CUDA backend (gpu-cuda build): the A6000 is exposed as
+            // the canonical gpu:0 effective policy.
+            if effective != "gpu" && effective != "default" && !effective.starts_with("gpu:") {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime CUDA backend {execution_backend} is incompatible with effective policy {effective}"
+                ));
+            }
+        }
         other if other.starts_with("external:") => {
             if effective != "external_device" {
                 return Err(anyhow::anyhow!(
@@ -237,7 +259,27 @@ pub(crate) fn validate_burn_device_selection(
     Ok(())
 }
 
-#[cfg(feature = "burn-wgpu-backend")]
+// CUDA device resolution for the Burn neural models. The VPS has a single
+// A6000 and the discovery stack already pins CUDA device 0, so every
+// accelerator request maps to the default CUDA device; a `cpu` request is
+// surfaced honestly in the effective policy (the Burn CUDA backend has no CPU
+// device — the genuinely-CPU build is the `burn-ndarray` fallback).
+#[cfg(feature = "burn-cuda-backend")]
+fn resolve_cuda_device_policy(_normalized: &str) -> (CudaDevice, String, String) {
+    // Single A6000: map every accelerator request to CUDA device 0 (discovery
+    // already pins device 0). The effective policy uses the canonical `gpu:0`
+    // form so it passes BOTH `validate_burn_device_selection` (effective must be
+    // gpu/gpu:N) AND the deep-model param validator (`is_supported_device_policy`
+    // accepts the `gpu:` prefix). Execution backend "cuda" is whitelisted in
+    // both validators.
+    (
+        CudaDevice::default(),
+        "gpu:0".to_string(),
+        "cuda".to_string(),
+    )
+}
+
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
 fn parse_wgpu_gpu_index(normalized: &str) -> Option<usize> {
     normalized
         .strip_prefix("cuda:")
@@ -249,7 +291,7 @@ fn parse_wgpu_gpu_index(normalized: &str) -> Option<usize> {
         .and_then(|value| value.parse::<usize>().ok())
 }
 
-#[cfg(feature = "burn-wgpu-backend")]
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
 fn resolve_wgpu_device_policy(normalized: &str) -> (WgpuDevice, String, String) {
     match normalized {
         "cpu" => (WgpuDevice::Cpu, "cpu".to_string(), "wgpu_cpu".to_string()),
@@ -280,7 +322,20 @@ pub fn resolve_infer_device(
     policy: &str,
 ) -> (<InferBackend as BackendTypes>::Device, BurnDeviceSelection) {
     let requested_policy = normalize_burn_device_policy(policy);
-    #[cfg(feature = "burn-wgpu-backend")]
+    #[cfg(feature = "burn-cuda-backend")]
+    {
+        let (device, effective_policy, execution_backend) =
+            resolve_cuda_device_policy(&requested_policy);
+        return (
+            device,
+            BurnDeviceSelection {
+                requested_policy,
+                effective_policy,
+                execution_backend,
+            },
+        );
+    }
+    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
     {
         let (device, effective_policy, execution_backend) =
             resolve_wgpu_device_policy(&requested_policy);
@@ -294,7 +349,7 @@ pub fn resolve_infer_device(
             },
         );
     }
-    #[cfg(not(feature = "burn-wgpu-backend"))]
+    #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
     {
         (
             <InferBackend as BackendTypes>::Device::default(),
@@ -311,7 +366,20 @@ pub fn resolve_train_device(
     policy: &str,
 ) -> (<TrainBackend as BackendTypes>::Device, BurnDeviceSelection) {
     let requested_policy = normalize_burn_device_policy(policy);
-    #[cfg(feature = "burn-wgpu-backend")]
+    #[cfg(feature = "burn-cuda-backend")]
+    {
+        let (device, effective_policy, execution_backend) =
+            resolve_cuda_device_policy(&requested_policy);
+        return (
+            device,
+            BurnDeviceSelection {
+                requested_policy,
+                effective_policy,
+                execution_backend,
+            },
+        );
+    }
+    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
     {
         let (device, effective_policy, execution_backend) =
             resolve_wgpu_device_policy(&requested_policy);
@@ -325,7 +393,7 @@ pub fn resolve_train_device(
             },
         );
     }
-    #[cfg(not(feature = "burn-wgpu-backend"))]
+    #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
     {
         (
             <TrainBackend as BackendTypes>::Device::default(),
@@ -2332,8 +2400,16 @@ where
 
                 let logits = BurnForward::forward_pass(&model, x_batch);
                 let loss = cross_entropy_loss(logits, y_batch, &class_weights, device);
-                let loss_val =
-                    scalar_loss_value(loss.clone().into_data(), "extract Burn training loss")?;
+                // Cast the loss to f32 BEFORE reading it back: on the CUDA
+                // backend `training_dtype` resolves to bf16 (Ampere supports it),
+                // so the loss tensor is bf16 and `to_vec::<f32>()` would fail with
+                // a dtype mismatch ("extract Burn training loss"). The cast is a
+                // no-op when already f32. bf16 training (forward/backward) is
+                // unaffected — only the scalar readback is normalized.
+                let loss_val = scalar_loss_value(
+                    cast_tensor_to_dtype(loss.clone(), DType::F32).into_data(),
+                    "extract Burn training loss",
+                )?;
 
                 let grads = loss.backward();
                 let grads_params = GradientsParams::from_grads(grads, &model);
@@ -2382,7 +2458,10 @@ where
             let y_val = labels_to_tensor::<B>(y_val, device);
             let val_logits = BurnForward::forward_pass(&model, x_val);
             let val_loss = cross_entropy_loss(val_logits, y_val, &class_weights, device);
-            let vl = scalar_loss_value(val_loss.into_data(), "extract Burn validation loss")?;
+            let vl = scalar_loss_value(
+                cast_tensor_to_dtype(val_loss, DType::F32).into_data(),
+                "extract Burn validation loss",
+            )?;
 
             if vl < best_loss {
                 best_loss = vl;

@@ -320,13 +320,16 @@ fn resolve_rl_training_precision_with_capability(
         && (effective_device_policy.starts_with("cuda:")
             || effective_device_policy.starts_with("gpu:"));
     let rlkit_cpu_runtime = effective_backend == "rlkit_cpu" && effective_device_policy == "cpu";
-    let bf16_available = if rlkit_cpu_runtime {
-        true
-    } else if rlkit_cuda_runtime {
-        bf16_supported.unwrap_or(true)
-    } else {
-        false
-    };
+    // rlkit 0.0.3's candle backend has NO BF16 matmul kernel on either the CPU
+    // or the CUDA device — empirically every BF16 run dies with
+    // "unsupported dtype BF16 for op matmul" (the A6000 supports BF16 in
+    // hardware, but the candle *kernel* doesn't implement it). So BF16 is never
+    // actually runnable for the DQN: force fp32 regardless of the nominal
+    // device capability. fp32 is perfectly fine for a small Q-network. The
+    // `bf16_supported` probe + runtime flags are still consulted below to build
+    // an honest degraded-reason string.
+    let bf16_available = false;
+    let _ = bf16_supported;
 
     match requested.as_str() {
         "auto" if bf16_available => return ("bf16".to_string(), None),
@@ -1458,7 +1461,6 @@ impl TradingReinforcementLearner {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let mut env = TradingEpisodeEnv::new(encoded_episodes, first_state, self.state_bins)?;
         let (device, effective_policy, effective_backend) =
             resolve_rl_training_device(&self.train_args.device_policy)?;
         let requested_precision = requested_training_precision_policy("dqn");
@@ -1479,42 +1481,79 @@ impl TradingReinforcementLearner {
         self.train_args
             .requested_device_policy
             .get_or_insert_with(|| self.train_args.device_policy.clone());
-        let mut model = DQN::new_with_dtype(
-            &env,
-            self.buffer_capacity,
-            &self.hidden_dims,
-            self.state_encoding.as_rlkit(),
-            model_dtype,
-            &device,
-        )
-        .map_err(|err| anyhow::anyhow!("create DQN model: {err}"))?;
-        let mut policy = EpsilonGreedy::new(
-            self.train_args
-                .epsilon_start
-                .max(self.train_args.epsilon_end),
-            self.train_args.epsilon_end,
-            self.train_args.epsilon_decay,
-        );
 
-        let train_args = TrainArgs {
-            epochs: self.train_args.epochs,
-            max_steps: self.train_args.max_steps,
-            update_interval: self.train_args.update_interval,
-            update_freq: self.train_args.update_freq,
-            batch_size: self.train_args.batch_size,
-            learning_rate: self.train_args.learning_rate,
-            gamma: self.train_args.gamma,
+        // Build → train → snapshot for a given (device, dtype). We attempt the
+        // resolved accelerator first; if rlkit's CUDA backend rejects the run
+        // (e.g. candle's CUDA matmul has no BF16 kernel — the A6000 supports
+        // BF16 in hardware, the *kernel* doesn't), fall back to CPU fp32 so the
+        // DQN still trains. Fail-loud WARN, never a silently-skipped model. The
+        // `self` borrow is confined to this block so the runtime fields below
+        // stay mutable.
+        let (network, effective_backend, effective_policy, effective_precision) = {
+            let build_and_train = |device: &Device, dtype: DType| -> Result<NeuralNetwork> {
+                let mut env =
+                    TradingEpisodeEnv::new(encoded_episodes.clone(), first_state, self.state_bins)?;
+                let mut model = DQN::new_with_dtype(
+                    &env,
+                    self.buffer_capacity,
+                    &self.hidden_dims,
+                    self.state_encoding.as_rlkit(),
+                    dtype,
+                    device,
+                )
+                .map_err(|err| anyhow::anyhow!("create DQN model: {err}"))?;
+                let mut policy = EpsilonGreedy::new(
+                    self.train_args
+                        .epsilon_start
+                        .max(self.train_args.epsilon_end),
+                    self.train_args.epsilon_end,
+                    self.train_args.epsilon_decay,
+                );
+                let train_args = TrainArgs {
+                    epochs: self.train_args.epochs,
+                    max_steps: self.train_args.max_steps,
+                    update_interval: self.train_args.update_interval,
+                    update_freq: self.train_args.update_freq,
+                    batch_size: self.train_args.batch_size,
+                    learning_rate: self.train_args.learning_rate,
+                    gamma: self.train_args.gamma,
+                };
+                model
+                    .train(&mut env, &mut policy, train_args)
+                    .map_err(|err| anyhow::anyhow!("train DQN policy: {err}"))?;
+                let network =
+                    <DQN<u16, u16> as Algorithm<TradingEpisodeEnv, u16, u16>>::vars_any(&model)
+                        .downcast::<NeuralNetwork>()
+                        .map_err(|_| anyhow::anyhow!("extract DQN network snapshot"))?;
+                Ok(*network)
+            };
+
+            match build_and_train(&device, model_dtype) {
+                Ok(network) => (
+                    network,
+                    effective_backend,
+                    effective_policy,
+                    effective_precision,
+                ),
+                Err(gpu_err) if effective_backend != "rlkit_cpu" => {
+                    tracing::warn!(
+                        target: "neoethos_models::rl::dqn",
+                        error = %gpu_err,
+                        "DQN accelerator training failed; retrying on CPU (fp32)"
+                    );
+                    let network = build_and_train(&Device::Cpu, DType::F32)?;
+                    (
+                        network,
+                        "rlkit_cpu".to_string(),
+                        "cpu".to_string(),
+                        "fp32".to_string(),
+                    )
+                }
+                Err(err) => return Err(err),
+            }
         };
 
-        model
-            .train(&mut env, &mut policy, train_args)
-            .map_err(|err| anyhow::anyhow!("train DQN policy: {err}"))?;
-
-        let network = <DQN<u16, u16> as Algorithm<TradingEpisodeEnv, u16, u16>>::vars_any(&model)
-            .downcast::<NeuralNetwork>()
-            .map_err(|_| anyhow::anyhow!("extract DQN network snapshot"))?;
-
-        self.inference_network = Some(*network);
+        self.inference_network = Some(network);
         self.train_args.effective_backend = Some(effective_backend.clone());
         self.train_args.effective_device_policy = Some(effective_policy.clone());
         self.train_args.network_precision = Some(effective_precision);

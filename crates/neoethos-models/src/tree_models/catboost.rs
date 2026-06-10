@@ -662,8 +662,6 @@ impl CatBoostExpert {
             .arg(train_dir)
             .arg("--delimiter")
             .arg("\t")
-            .arg("--has-header")
-            .arg("false")
             .arg("--loss-function")
             .arg(param_string(
                 &self.config.params,
@@ -672,6 +670,15 @@ impl CatBoostExpert {
             ))
             .arg("--classes-count")
             .arg("3")
+            // Pin the full label space explicitly. `--classes-count 3` alone is
+            // not enough when a training fold happens to contain only 2 of the 3
+            // classes (e.g. no -1/sell bars) — CatBoost then trains a 2-class
+            // model and our runtime validator rejects the dimension mismatch
+            // ("expected 3 classes, got 2"). `--class-names 0,1,2` forces all
+            // three classes (our remapped labels) so the model always emits a
+            // 3-class probability vector, the absent class simply ~0.
+            .arg("--class-names")
+            .arg("0,1,2")
             .arg("--iterations")
             .arg(
                 param_int(&self.config.params, "iterations", 500)
@@ -696,18 +703,19 @@ impl CatBoostExpert {
                     .max(1)
                     .to_string(),
             )
-            .arg("--use-best-model")
-            .arg(
-                if param_bool(&self.config.params, "use_best_model", false) {
-                    "true"
-                } else {
-                    "false"
-                },
-            )
             .arg("--verbose")
             .arg("0")
             .arg("--random-seed")
             .arg(self.idx.to_string());
+
+        // CatBoost CLI booleans are PRESENCE-only flags: passing an explicit
+        // "true"/"false" value makes the parser treat it as a misplaced freearg
+        // ("freearg 'false' is misplaced"). So `--has-header` is omitted (our
+        // learn-set is written WITHOUT a header row) and `--use-best-model` is
+        // added only when enabled (and only meaningful with an eval set).
+        if param_bool(&self.config.params, "use_best_model", false) {
+            command.arg("--use-best-model");
+        }
 
         command
             .arg("--task-type")

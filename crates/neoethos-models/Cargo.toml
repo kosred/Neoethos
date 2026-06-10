@@ -1,6 +1,6 @@
 [package]
 name = "neoethos-models"
-version = "0.4.43"
+version = "0.4.99"
 edition.workspace = true
 
 [dependencies]
@@ -78,6 +78,12 @@ extended-isolation-forest = { version = "0.2.0", optional = true, features = ["s
 burn = { version = "0.21", features = ["autodiff"] }
 burn-ndarray = { version = "0.21" }
 burn-wgpu = { version = "0.21", optional = true }
+# Native CUDA backend for the Burn neural models (TabNet/KAN/N-BEATS/TiDE/
+# TimesNet/transformer). Reuses the SAME cubecl 0.10.0 + cubecl-cuda stack the
+# discovery kernels already build, so there is no version split. Enabled by the
+# `gpu-cuda` aggregate so the NVIDIA build trains neural nets on the card in f32
+# (Ampere-native) instead of falling back to burn-ndarray (CPU).
+burn-cuda = { version = "0.21", optional = true }
 
 num_cpus = "1.17.0"
 rand = "0.9.2"
@@ -123,6 +129,7 @@ anomaly-detection = ["dep:extended-isolation-forest"]
 
 # Burn pure-Rust deep learning (production backend)
 burn-wgpu-backend = ["dep:burn-wgpu"]
+burn-cuda-backend = ["dep:burn-cuda"]
 burn-backend = []
 pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", "swarm-forecasting", "burn-backend", "statistical-models", "anomaly-detection"]
 
@@ -148,13 +155,23 @@ pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", 
 gpu-cuda = [
     "neuro-evolution",
     "dep:cubecl",
+    # NOTE: `burn-cuda-backend` is deliberately NOT enabled here. Empirically
+    # (2026-06-10, A6000) burn-cuda 0.21 is pathological for our TINY neural
+    # models: cubecl re-autotunes every distinct matmul shape (338 autotune
+    # passes vs 14 real epochs in 74 min on one combo) and hits burn-tensor
+    # dtype panics. These models train in ~17 min TOTAL on burn-ndarray (CPU)
+    # and are stable. The GPU's job in this system is DISCOVERY (large batched
+    # backtests); the tiny per-model matmuls are launch/autotune-bound and
+    # belong on the CPU. The dep + `burn-cuda-backend` feature are kept so a
+    # future build with genuinely large models can opt in via
+    # `--features gpu-cuda,burn-cuda-backend`.
     "statistical-models",
+    # LightGBM is CPU-only by design: `lightgbm3/cuda` does NOT actually build a
+    # GPU tree learner (runtime dies with "[LightGBM] [Fatal] GPU Tree Learner
+    # was not enabled in this build") and the OpenCL path fails to link. Gradient
+    # boosting on our 10^4-10^5 row folds is seconds on CPU, so the GPU buys
+    # nothing here — see effective_device_type() in tree_models/lightgbm.rs.
     "lightgbm",
-    # `lightgbm3/gpu` (OpenCL) intentionally NOT pulled: on NVIDIA we want the
-    # CUDA learner, and the OpenCL path fails to link (`undefined symbol:
-    # clReleaseProgram` — `-lOpenCL` is never emitted). Keep CUDA only.
-    # See docs/gpu-build.md.
-    "lightgbm3/cuda",
     "reinforcement-learning",
     "rlkit/cuda",
     "candle-core/cuda",

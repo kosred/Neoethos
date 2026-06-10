@@ -91,13 +91,42 @@ pub fn write_json_with_backup<T: Serialize + ?Sized>(
         })?;
     }
     {
-        let mut temp = File::create(&temp_path).with_context(|| {
-            format!(
-                "create staged {} {}",
-                config.artifact_label,
-                temp_path.display()
-            )
-        })?;
+        let mut temp = match File::create(&temp_path) {
+            Ok(file) => file,
+            // Defensive: under heavy parallel training, a concurrent
+            // stage/cleanup of the SAME artifact dir can remove our parent dir
+            // between the create_dir_all above and this File::create (ENOENT) —
+            // this surfaced as `online_pa`/`online_hoeffding` "No such file or
+            // directory" failures. Re-create the parent and retry once before
+            // giving up, so a transient race doesn't sink the model.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!(
+                            "re-create {} artifact directory {}",
+                            config.artifact_label,
+                            parent.display()
+                        )
+                    })?;
+                }
+                File::create(&temp_path).with_context(|| {
+                    format!(
+                        "create staged {} {} (after parent re-create)",
+                        config.artifact_label,
+                        temp_path.display()
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "create staged {} {}",
+                        config.artifact_label,
+                        temp_path.display()
+                    )
+                });
+            }
+        };
         temp.write_all(&payload).with_context(|| {
             format!(
                 "write staged {} to {}",

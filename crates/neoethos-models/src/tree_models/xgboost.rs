@@ -47,6 +47,76 @@ use xgb::{PredictConfig, PredictType};
 const XGBOOST_RUNTIME_FILE_NAME: &str = "xgboost_runtime.json";
 const XGBOOST_LOCAL_RUNTIME_FILE_NAME: &str = "xgboost_local_runtime.json";
 
+/// One-time runtime probe: does the *linked* libxgboost actually support the
+/// CUDA (`gpu_hist`) updater? A present GPU (`gpu_count() > 0`) is NOT enough —
+/// the `xgb` crate's bundled libxgboost is built CPU-only by default, so a
+/// `gpu_hist` booster fails at `update()` ("update XGBoost booster at iteration
+/// 0"). That single failure used to sink SIX models at once (xgboost,
+/// xgboost_dart, meta_stack, meta_blender, probability_calibrator,
+/// conformal_gate) because they all route through this expert. We detect the
+/// capability ONCE by training a tiny GPU booster; on failure every
+/// XGBoost-family model degrades to CPU `hist` (fast at our row counts) instead
+/// of dying. Dropping a CUDA-enabled libxgboost on the box makes the probe pass
+/// and the GPU path lights up automatically — no code change required.
+#[cfg(feature = "xgboost")]
+fn xgboost_cuda_runtime_available() -> bool {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if gpu_count() == 0 {
+            return false;
+        }
+        let probe = || -> Result<()> {
+            // 3 rows × 2 features, one row per class so MultiSoftprob(3) is valid.
+            let flat = [0.0f32, 0.0, 1.0, 1.0, 0.5, 0.5];
+            let mut dtrain =
+                xgb::DMatrix::from_dense(&flat, 3).context("xgboost gpu probe: DMatrix")?;
+            dtrain
+                .set_labels(&[0.0f32, 1.0, 2.0])
+                .context("xgboost gpu probe: labels")?;
+            let tree_params = TreeBoosterParametersBuilder::default()
+                .tree_method(TreeMethod::GpuHist)
+                .predictor(Predictor::Gpu)
+                .build()
+                .context("xgboost gpu probe: tree params")?;
+            let learning_params = LearningTaskParametersBuilder::default()
+                .objective(Objective::MultiSoftprob(3))
+                .build()
+                .context("xgboost gpu probe: learning params")?;
+            let booster_params = BoosterParametersBuilder::default()
+                .booster_type(BoosterType::Tree(tree_params))
+                .learning_params(learning_params)
+                .verbose(false)
+                .build()
+                .context("xgboost gpu probe: booster params")?;
+            let mut booster = xgb::Booster::new_with_cached_dmats(&booster_params, &[&dtrain])
+                .context("xgboost gpu probe: create booster")?;
+            booster
+                .update(&dtrain, 0)
+                .context("xgboost gpu probe: update booster")?;
+            Ok(())
+        };
+        match probe() {
+            Ok(()) => {
+                tracing::info!(
+                    target: "neoethos_models::tree_models::xgboost",
+                    "XGBoost CUDA runtime probe succeeded — XGBoost-family models train on GPU (gpu_hist)"
+                );
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "neoethos_models::tree_models::xgboost",
+                    %error,
+                    "XGBoost CUDA runtime probe failed (linked libxgboost is CPU-only) — \
+                     XGBoost-family models will train on CPU `hist`"
+                );
+                false
+            }
+        }
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct XGBoostRuntimeArtifact {
     configured_params: HashMap<String, ParamValue>,
@@ -146,7 +216,7 @@ impl XGBoostExpert {
 
     #[cfg(feature = "xgboost")]
     fn effective_tree_method(&self) -> TreeMethod {
-        let gpu_available = gpu_count() > 0;
+        let gpu_available = xgboost_cuda_runtime_available();
         match self.config.device_pref {
             DevicePreference::Gpu if gpu_available => match self.configured_tree_method() {
                 TreeMethod::Auto | TreeMethod::Hist => TreeMethod::GpuHist,
@@ -164,7 +234,7 @@ impl XGBoostExpert {
 
     #[cfg(feature = "xgboost")]
     fn predictor(&self) -> Predictor {
-        let gpu_available = gpu_count() > 0;
+        let gpu_available = xgboost_cuda_runtime_available();
         match self.config.device_pref {
             DevicePreference::Gpu if gpu_available => Predictor::Gpu,
             DevicePreference::Gpu => Predictor::Cpu,
