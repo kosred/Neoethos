@@ -405,6 +405,9 @@ impl SymbolFinancials {
 
     /// True if the symbol allows opening NEW positions right now.
     /// `CloseOnlyMode` and the two `Disabled*` variants return false.
+    /// `dead_code` until the live risk gate consults symbol trading-mode
+    /// before opening (Phase 2-5).
+    #[allow(dead_code)]
     pub fn can_open_new_position(&self) -> bool {
         matches!(self.trading_mode, Some(TradingModeProto::Enabled))
     }
@@ -412,6 +415,8 @@ impl SymbolFinancials {
     /// True if SHORT (sell-to-open) is permitted on this symbol.
     /// Defaults to true when the broker omitted the field — matches
     /// cTrader's default behavior.
+    /// `dead_code` until the live risk gate consults it (Phase 2-5).
+    #[allow(dead_code)]
     pub fn short_selling_allowed(&self) -> bool {
         self.enable_short_selling.unwrap_or(true)
     }
@@ -506,6 +511,11 @@ pub struct CTraderChartHistoryRequest {
     pub count: Option<u32>,
 }
 
+// The full chart-history result + its live-subscription plan are produced by
+// `load_chart_history` (below), the live charting path that isn't wired into the
+// production server yet (it uses the bars-only fetch). `dead_code` until Phase
+// 2-5 wires live charting; the bars-only result above stays live.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct CTraderChartHistoryResult {
     pub symbol: CTraderSymbolInfo,
@@ -523,6 +533,7 @@ pub struct CTraderHistoricalBarsFetchResult {
     pub has_more: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CTraderLiveSubscriptionPlan {
     pub subscribe_spots: CTraderOpenApiJsonMessage,
@@ -1154,6 +1165,10 @@ pub fn parse_tick_data_response(
     })
 }
 
+// Full chart-history loader (bars + bid/ask ticks + a live-subscription plan).
+// `dead_code` until the live charting path is wired (Phase 2-5); production data
+// fetch uses `load_historical_bars_only` today.
+#[allow(dead_code)]
 pub fn load_chart_history_with_transport<T: CTraderOpenApiTransport>(
     transport: &T,
     request: &CTraderChartHistoryRequest,
@@ -1247,6 +1262,7 @@ pub fn load_chart_history_with_transport<T: CTraderOpenApiTransport>(
     })
 }
 
+#[allow(dead_code)]
 pub fn load_chart_history(
     request: &CTraderChartHistoryRequest,
 ) -> Result<CTraderChartHistoryResult> {

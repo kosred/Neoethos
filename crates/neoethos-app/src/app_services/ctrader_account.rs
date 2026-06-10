@@ -137,6 +137,11 @@ pub struct CTraderAccountRuntimeSnapshot {
     pub recent_deals: Vec<CTraderDealSnapshot>,
 }
 
+// The account-runtime backend (trait + production impl) loads trader balance /
+// reconcile / recent-deals for the live account panel. `dead_code` because the
+// production server doesn't yet poll account runtime through this seam — the
+// live engine wires it in Phase 2-5. Exercised today only by the stub in tests.
+#[allow(dead_code)]
 pub trait CTraderAccountRuntimeBackend: Send + Sync {
     fn load_account_runtime(
         &self,
@@ -144,6 +149,7 @@ pub trait CTraderAccountRuntimeBackend: Send + Sync {
     ) -> Result<CTraderAccountRuntimeSnapshot>;
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub struct ProductionCTraderAccountRuntimeBackend;
 

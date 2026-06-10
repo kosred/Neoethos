@@ -295,6 +295,10 @@ pub fn save_risky_mode_state(state: &RiskyModeStateFile) -> Result<()> {
 /// `auto_rearm_ready` every 5 s; once the 24 h cooldown elapses it
 /// calls `auto_re_arm_if_ready` (below) to flip `armed = true` and
 /// clear `last_killed_at_utc_ms` automatically.
+// `dead_code` because it's called only by the autonomous risk gate
+// (`RiskyModeManager::check_trade_allowed` on the live auto-trade path), which is
+// Phase 2-5 pending. The 24h auto-rearm reader (`auto_re_arm_if_ready`) is live.
+#[allow(dead_code)]
 pub fn record_kill_switch_trip() -> Result<()> {
     let mut state = load_risky_mode_state()
         .context("load risky mode state before kill-switch trip")?

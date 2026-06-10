@@ -69,6 +69,19 @@ thiserror   = "2.0.16"
 #       contradiction. Cost of unwind: ~3-5% perf overhead on the
 #       happy path + ~10 MB binary growth — acceptable trade for not
 #       killing the process on a recoverable indicator panic.
+# ── Dev profile — local debug builds + tests ─────────────────────────────────
+# `debug = "line-tables-only"` instead of the default full DWARF. The workspace
+# binary is enormous (neoethos-app links ~260 object files across the whole
+# crate graph: polars, burn/cubecl, candle, the tree-model FFI, arrow, etc.).
+# Full type info pushes the monolithic Windows PDB past the MSVC linker's
+# internal cap and the link dies with `LNK1318: Unexpected PDB error; LIMIT (12)`
+# — so `cargo build` / `cargo test` could not link locally at all. Line-tables
+# keep panic backtraces (file:line) working while dropping the type-record
+# streams that overflow the PDB, so debug builds link again. The shipped
+# artifact is unaffected — `[profile.release]` strips symbols entirely (no PDB).
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 # agent 2026-06-05 (operator decision): dropped `lto = "fat"` + `codegen-units = 1`.
 # They cost ~3-4x compile/link time (full-program LTO of the 100MB+ binary) for a
