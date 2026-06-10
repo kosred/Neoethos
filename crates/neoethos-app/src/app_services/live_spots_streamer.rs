@@ -59,10 +59,15 @@ use tungstenite::{Message, WebSocket, connect};
 static STREAM_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 use crate::app_services::ctrader_messages::{
-    CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_HEARTBEAT_PAYLOAD_TYPE, CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE,
-    build_account_auth_request, build_application_auth_request, build_subscribe_spots_request,
-    parse_ctrader_error_payload, parse_open_api_envelope,
+    CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE,
+    CTRADER_OA_ACCOUNTS_TOKEN_INVALIDATED_EVENT_PAYLOAD_TYPE,
+    CTRADER_OA_CLIENT_DISCONNECT_EVENT_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_HEARTBEAT_PAYLOAD_TYPE, CTRADER_OA_MARGIN_CALL_TRIGGER_EVENT_PAYLOAD_TYPE,
+    CTRADER_OA_MARGIN_CALL_UPDATE_EVENT_PAYLOAD_TYPE, CTRADER_OA_MARGIN_CHANGED_EVENT_PAYLOAD_TYPE,
+    CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE, CTRADER_OA_TRADER_UPDATE_EVENT_PAYLOAD_TYPE,
+    CTRADER_OA_TRAILING_SL_CHANGED_EVENT_PAYLOAD_TYPE, build_account_auth_request,
+    build_application_auth_request, build_subscribe_spots_request, parse_ctrader_error_payload,
+    parse_open_api_envelope,
 };
 use crate::app_services::live_spots;
 
@@ -546,10 +551,65 @@ fn run_blocking(config: LiveSpotsStreamerConfig, my_gen: u64) -> Result<()> {
                     .unwrap_or_else(|_| "unparseable error payload".to_string());
                 return Err(anyhow!("cTrader error on spot stream: {detail}"));
             }
+            // **2026-06-10 API-completeness pass.** The Open API multiplexes
+            // ALL account push events onto this one authed socket, not just
+            // spots. Surface the high-value ones instead of dropping them in
+            // the `_` arm — silence here is why an invalidated token or a
+            // margin call used to go unnoticed until the next failed request.
+            CTRADER_OA_ACCOUNTS_TOKEN_INVALIDATED_EVENT_PAYLOAD_TYPE => {
+                // Token revoked broker-side: the whole session is now invalid.
+                // Tear down so the reconnect re-auths; if the token is truly
+                // dead the re-auth surfaces it loudly. This is an auth
+                // emergency, not a routine reconnect.
+                tracing::error!(
+                    target: "neoethos_app::live_spots_streamer",
+                    "cTrader ACCOUNTS_TOKEN_INVALIDATED event — the access token was revoked; \
+                     a manual re-authentication is required"
+                );
+                return Err(anyhow!(
+                    "cTrader access token invalidated (token-invalidated event on spot stream)"
+                ));
+            }
+            CTRADER_OA_CLIENT_DISCONNECT_EVENT_PAYLOAD_TYPE => {
+                tracing::warn!(
+                    target: "neoethos_app::live_spots_streamer",
+                    payload = %payload_text,
+                    "cTrader CLIENT_DISCONNECT event — broker dropped the application session"
+                );
+                return Err(anyhow!("cTrader client disconnect event on spot stream"));
+            }
+            CTRADER_OA_MARGIN_CALL_TRIGGER_EVENT_PAYLOAD_TYPE => {
+                // A live-money risk event — never bury this.
+                tracing::warn!(
+                    target: "neoethos_app::live_spots_streamer",
+                    payload = %payload_text,
+                    "cTrader MARGIN_CALL_TRIGGER event — a margin-call threshold was breached"
+                );
+                continue;
+            }
+            CTRADER_OA_MARGIN_CALL_UPDATE_EVENT_PAYLOAD_TYPE => {
+                tracing::info!(
+                    target: "neoethos_app::live_spots_streamer",
+                    "cTrader MARGIN_CALL_UPDATE event — a margin-call threshold changed"
+                );
+                continue;
+            }
+            CTRADER_OA_MARGIN_CHANGED_EVENT_PAYLOAD_TYPE
+            | CTRADER_OA_TRADER_UPDATE_EVENT_PAYLOAD_TYPE
+            | CTRADER_OA_TRAILING_SL_CHANGED_EVENT_PAYLOAD_TYPE => {
+                // Informational account-state pushes the bridge's periodic
+                // snapshot will also pick up. Trace at debug so they are
+                // observable without spamming the default log level.
+                tracing::debug!(
+                    target: "neoethos_app::live_spots_streamer",
+                    payload_type = envelope.payload_type,
+                    "cTrader account push event (margin/trader/trailing-SL changed)"
+                );
+                continue;
+            }
             _ => {
-                // Heartbeat, account-changed, execution events, etc.
-                // We don't care about them here — the regular bridge
-                // owns those. Just keep reading.
+                // Heartbeat, symbol-changed, execution events, etc. — the
+                // regular bridge owns those. Just keep reading.
                 continue;
             }
         }

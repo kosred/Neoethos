@@ -124,6 +124,97 @@ pub const CTRADER_OA_ORDER_DETAILS_RESPONSE_PAYLOAD_TYPE: u32 = 2182;
 /// that hit a single `positionId` over a time window.
 pub const CTRADER_OA_ORDER_LIST_BY_POSITION_ID_REQUEST_PAYLOAD_TYPE: u32 = 2183;
 pub const CTRADER_OA_ORDER_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE: u32 = 2184;
+
+// ─────────────────────────────────────────────────────────────────────────
+// **2026-06-10 — full ProtoOAPayloadType catalog (operator directive
+// "read the whole cTrader API and make it part of the bot").** Every
+// remaining `ProtoOAPayloadType` from Spotware's `OpenApiModelMessages.proto`
+// that the bot did not yet name. Numeric values verified against the upstream
+// proto enum. Naming every variant means `classify_open_api_payload` can
+// recognise — and the read loops can deliberately handle — every frame the
+// broker can send, instead of treating unknown types as opaque.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `ProtoOAVersionReq/Res` — query the broker's Open API proto version.
+pub const CTRADER_OA_VERSION_REQUEST_PAYLOAD_TYPE: u32 = 2104;
+pub const CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE: u32 = 2105;
+/// `ProtoOATrailingSLChangedEvent` — pushed when the broker moves a
+/// position's trailing stop-loss to a new trigger price.
+pub const CTRADER_OA_TRAILING_SL_CHANGED_EVENT_PAYLOAD_TYPE: u32 = 2107;
+/// `ProtoOAAmendPositionSLTPReq` — modify the stop-loss / take-profit (and
+/// trailing / guaranteed flags) of an ALREADY-OPEN position. The response is
+/// a `ProtoOAExecutionEvent` (2126), like the other trade actions. This is the
+/// capability that lets the bot move a stop to breakeven or trail a winner.
+pub const CTRADER_OA_AMEND_POSITION_SLTP_REQUEST_PAYLOAD_TYPE: u32 = 2110;
+/// `ProtoOASymbolsForConversionReq/Res` — the symbol chain used to convert a
+/// P&L expressed in one asset into the account's deposit currency.
+pub const CTRADER_OA_SYMBOLS_FOR_CONVERSION_REQUEST_PAYLOAD_TYPE: u32 = 2118;
+pub const CTRADER_OA_SYMBOLS_FOR_CONVERSION_RESPONSE_PAYLOAD_TYPE: u32 = 2119;
+/// `ProtoOASymbolChangedEvent` — pushed when a symbol's specification (digits,
+/// trading hours, swap, etc.) changes broker-side; consumers should refetch.
+pub const CTRADER_OA_SYMBOL_CHANGED_EVENT_PAYLOAD_TYPE: u32 = 2120;
+/// `ProtoOATraderUpdatedEvent` — pushed when the trader/account record changes
+/// (balance, leverage, bonus, …) WITHOUT us polling `ProtoOATraderReq`. Lets
+/// the live account view stay fresh between reconcile ticks.
+pub const CTRADER_OA_TRADER_UPDATE_EVENT_PAYLOAD_TYPE: u32 = 2123;
+/// `ProtoOAExpectedMarginReq/Res` — ask the broker how much margin a given
+/// volume on a symbol would lock up, BEFORE placing the order (pre-trade risk).
+pub const CTRADER_OA_EXPECTED_MARGIN_REQUEST_PAYLOAD_TYPE: u32 = 2139;
+pub const CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE: u32 = 2140;
+/// `ProtoOAMarginChangedEvent` — pushed when the used margin on the account
+/// changes (a fill, a partial close, a price move on a marked position).
+pub const CTRADER_OA_MARGIN_CHANGED_EVENT_PAYLOAD_TYPE: u32 = 2141;
+/// `ProtoOACashFlowHistoryListReq/Res` — deposits, withdrawals, swap and
+/// commission charges over a time window. Backs the money-view / equity-curve.
+pub const CTRADER_OA_CASH_FLOW_HISTORY_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2143;
+pub const CTRADER_OA_CASH_FLOW_HISTORY_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2144;
+/// `ProtoOAAccountsTokenInvalidatedEvent` — pushed when the access token tied
+/// to the streamed accounts is revoked/expired broker-side. The single most
+/// important auth event: it tells us to force an OAuth re-auth NOW.
+pub const CTRADER_OA_ACCOUNTS_TOKEN_INVALIDATED_EVENT_PAYLOAD_TYPE: u32 = 2147;
+/// `ProtoOAClientDisconnectEvent` — pushed when the broker disconnects the
+/// whole application session (not just one account).
+pub const CTRADER_OA_CLIENT_DISCONNECT_EVENT_PAYLOAD_TYPE: u32 = 2148;
+/// `ProtoOAGetCtidProfileByTokenReq/Res` — the cTID profile (user id, nickname)
+/// behind an access token.
+pub const CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_REQUEST_PAYLOAD_TYPE: u32 = 2151;
+pub const CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE: u32 = 2152;
+/// `ProtoOADepthEvent` + subscribe/unsubscribe — Level-2 depth-of-market.
+pub const CTRADER_OA_DEPTH_EVENT_PAYLOAD_TYPE: u32 = 2155;
+pub const CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE: u32 = 2156;
+pub const CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_RESPONSE_PAYLOAD_TYPE: u32 = 2157;
+pub const CTRADER_OA_UNSUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE: u32 = 2158;
+pub const CTRADER_OA_UNSUBSCRIBE_DEPTH_QUOTES_RESPONSE_PAYLOAD_TYPE: u32 = 2159;
+/// `ProtoOAAccountLogoutReq/Res` — cleanly release an account session
+/// (counterpart to account-auth) so the broker frees server-side state.
+pub const CTRADER_OA_ACCOUNT_LOGOUT_REQUEST_PAYLOAD_TYPE: u32 = 2162;
+pub const CTRADER_OA_ACCOUNT_LOGOUT_RESPONSE_PAYLOAD_TYPE: u32 = 2163;
+/// `ProtoOAMarginCallListReq/Res`, `…UpdateReq/Res`, `…UpdateEvent`,
+/// `…TriggerEvent` — the broker's margin-call thresholds and the pushed
+/// alert when one is hit (a critical risk signal for a live bot).
+pub const CTRADER_OA_MARGIN_CALL_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2167;
+pub const CTRADER_OA_MARGIN_CALL_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2168;
+pub const CTRADER_OA_MARGIN_CALL_UPDATE_REQUEST_PAYLOAD_TYPE: u32 = 2169;
+pub const CTRADER_OA_MARGIN_CALL_UPDATE_RESPONSE_PAYLOAD_TYPE: u32 = 2170;
+pub const CTRADER_OA_MARGIN_CALL_UPDATE_EVENT_PAYLOAD_TYPE: u32 = 2171;
+pub const CTRADER_OA_MARGIN_CALL_TRIGGER_EVENT_PAYLOAD_TYPE: u32 = 2172;
+/// `ProtoOARefreshTokenReq/Res` — refresh the OAuth access token over the
+/// Open API socket itself (alternative to the HTTPS token endpoint).
+pub const CTRADER_OA_REFRESH_TOKEN_REQUEST_PAYLOAD_TYPE: u32 = 2173;
+pub const CTRADER_OA_REFRESH_TOKEN_RESPONSE_PAYLOAD_TYPE: u32 = 2174;
+/// `ProtoOAOrderListReq/Res` — historical orders over a time window (the
+/// account-wide order history that backs the trade journal / analytics).
+pub const CTRADER_OA_ORDER_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2175;
+pub const CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2176;
+/// `ProtoOAGetDynamicLeverageByIDReq/Res` — the broker's dynamic-leverage
+/// tiers (volume-banded leverage) referenced by a symbol's `leverageId`.
+pub const CTRADER_OA_GET_DYNAMIC_LEVERAGE_REQUEST_PAYLOAD_TYPE: u32 = 2177;
+pub const CTRADER_OA_GET_DYNAMIC_LEVERAGE_RESPONSE_PAYLOAD_TYPE: u32 = 2178;
+/// `ProtoOADealOffsetListReq/Res` — for a closing deal, the opening deals it
+/// offset (FIFO matching) and the realised gross/net per offset.
+pub const CTRADER_OA_DEAL_OFFSET_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2185;
+pub const CTRADER_OA_DEAL_OFFSET_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2186;
+
 pub const CTRADER_QUOTE_TYPE_BID: i32 = 1;
 pub const CTRADER_QUOTE_TYPE_ASK: i32 = 2;
 pub const CTRADER_TRADE_SIDE_BUY: i32 = 1;
@@ -377,6 +468,21 @@ pub struct CTraderClosePositionRequest {
     pub account_id: i64,
     pub position_id: i64,
     pub volume: i64,
+}
+
+/// `ProtoOAAmendPositionSLTPReq` (2110) — change the stop-loss / take-profit
+/// of an ALREADY-OPEN position. Both prices are ABSOLUTE (unlike the
+/// new-order relative pips). Any `None` field is left untouched by the broker.
+/// The response is a `ProtoOAExecutionEvent` (2126). **2026-06-10.**
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderAmendPositionSltpRequest {
+    pub account_id: i64,
+    pub position_id: i64,
+    pub stop_loss: Option<f64>,
+    pub take_profit: Option<f64>,
+    pub guaranteed_stop_loss: Option<bool>,
+    pub trailing_stop_loss: Option<bool>,
+    pub stop_loss_trigger_method: Option<CTraderOrderTriggerMethod>,
 }
 
 pub trait CTraderOpenApiTransport {
@@ -663,6 +769,254 @@ pub fn build_get_position_unrealized_pnl_request(
         payload_type: CTRADER_OA_GET_POSITION_UNREALIZED_PNL_REQUEST_PAYLOAD_TYPE,
         payload: serde_json::json!({
             "ctidTraderAccountId": ctid_trader_account_id,
+        }),
+    }
+}
+
+/// `ProtoOAAmendPositionSLTPReq` (2110) — move an open position's stops.
+/// Flagship of the 2026-06-10 API-completeness pass: this is what lets the
+/// bot trail a winner or pull a stop to breakeven. Only the provided fields
+/// are sent; omitted ones are left as-is on the broker.
+pub fn build_amend_position_sltp_request(
+    request: &CTraderAmendPositionSltpRequest,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    let mut payload = serde_json::json!({
+        "ctidTraderAccountId": request.account_id,
+        "positionId": request.position_id,
+    });
+    if let Some(stop_loss) = request.stop_loss {
+        payload["stopLoss"] = serde_json::json!(stop_loss);
+    }
+    if let Some(take_profit) = request.take_profit {
+        payload["takeProfit"] = serde_json::json!(take_profit);
+    }
+    if let Some(guaranteed_stop_loss) = request.guaranteed_stop_loss {
+        payload["guaranteedStopLoss"] = serde_json::json!(guaranteed_stop_loss);
+    }
+    if let Some(trailing_stop_loss) = request.trailing_stop_loss {
+        payload["trailingStopLoss"] = serde_json::json!(trailing_stop_loss);
+    }
+    if let Some(stop_loss_trigger_method) = request.stop_loss_trigger_method {
+        payload["stopLossTriggerMethod"] = serde_json::json!(stop_loss_trigger_method.as_i32());
+    }
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_AMEND_POSITION_SLTP_REQUEST_PAYLOAD_TYPE,
+        payload,
+    }
+}
+
+/// `ProtoOAVersionReq` (2104) — ask the broker which Open API proto version
+/// it speaks. Carries no account; useful as a connectivity/handshake probe.
+pub fn build_version_request(client_msg_id: impl Into<String>) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_VERSION_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({}),
+    }
+}
+
+/// `ProtoOAExpectedMarginReq` (2139) — pre-trade margin: how much margin would
+/// each of `volumes` (in 0.01-unit wire volume) lock up on `symbol_id`.
+pub fn build_expected_margin_request(
+    ctid_trader_account_id: i64,
+    symbol_id: i64,
+    volumes: &[i64],
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_EXPECTED_MARGIN_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "symbolId": symbol_id,
+            "volume": volumes,
+        }),
+    }
+}
+
+/// `ProtoOAOrderListReq` (2175) — account-wide historical orders over a time
+/// window. Backs the trade journal / analytics (the order history that the
+/// per-position lookups can't give in one call).
+pub fn build_order_list_request(
+    ctid_trader_account_id: i64,
+    from_timestamp_ms: i64,
+    to_timestamp_ms: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_ORDER_LIST_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "fromTimestamp": from_timestamp_ms,
+            "toTimestamp": to_timestamp_ms,
+        }),
+    }
+}
+
+/// `ProtoOACashFlowHistoryListReq` (2143) — deposits, withdrawals, swap and
+/// commission over a time window. Backs the €-money view / equity curve.
+pub fn build_cash_flow_history_list_request(
+    ctid_trader_account_id: i64,
+    from_timestamp_ms: i64,
+    to_timestamp_ms: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_CASH_FLOW_HISTORY_LIST_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "fromTimestamp": from_timestamp_ms,
+            "toTimestamp": to_timestamp_ms,
+        }),
+    }
+}
+
+/// `ProtoOARefreshTokenReq` (2173) — refresh the OAuth access token over the
+/// Open API socket itself (the alternative to the HTTPS token endpoint).
+pub fn build_refresh_token_request(
+    refresh_token: impl Into<String>,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_REFRESH_TOKEN_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "refreshToken": refresh_token.into(),
+        }),
+    }
+}
+
+/// `ProtoOAGetCtidProfileByTokenReq` (2151) — the cTID profile behind an
+/// access token (user id, nickname).
+pub fn build_get_ctid_profile_by_token_request(
+    access_token: impl Into<String>,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "accessToken": access_token.into(),
+        }),
+    }
+}
+
+/// `ProtoOAAccountLogoutReq` (2162) — cleanly release an account session so the
+/// broker frees server-side state (counterpart to account-auth).
+pub fn build_account_logout_request(
+    ctid_trader_account_id: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_ACCOUNT_LOGOUT_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+        }),
+    }
+}
+
+/// `ProtoOAGetDynamicLeverageByIDReq` (2177) — the broker's dynamic-leverage
+/// tier table referenced by a symbol's `leverageId`.
+pub fn build_get_dynamic_leverage_request(
+    ctid_trader_account_id: i64,
+    leverage_id: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_GET_DYNAMIC_LEVERAGE_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "leverageId": leverage_id,
+        }),
+    }
+}
+
+/// `ProtoOASymbolsForConversionReq` (2118) — the symbol chain to convert a P&L
+/// expressed in `first_asset_id` into `last_asset_id` (the deposit currency).
+pub fn build_symbols_for_conversion_request(
+    ctid_trader_account_id: i64,
+    first_asset_id: i64,
+    last_asset_id: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_SYMBOLS_FOR_CONVERSION_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "firstAssetId": first_asset_id,
+            "lastAssetId": last_asset_id,
+        }),
+    }
+}
+
+/// `ProtoOADealOffsetListReq` (2185) — for a closing deal, the opening deals it
+/// offset (FIFO) and the realised gross/net per offset.
+pub fn build_deal_offset_list_request(
+    ctid_trader_account_id: i64,
+    deal_id: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_DEAL_OFFSET_LIST_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "dealId": deal_id,
+        }),
+    }
+}
+
+/// `ProtoOAMarginCallListReq` (2167) — the account's configured margin-call
+/// thresholds (the levels whose breach fires a `…TriggerEvent`).
+pub fn build_margin_call_list_request(
+    ctid_trader_account_id: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_MARGIN_CALL_LIST_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+        }),
+    }
+}
+
+/// `ProtoOASubscribeDepthQuotesReq` (2156) — subscribe to Level-2 depth-of-
+/// market for the given symbols (pushes `ProtoOADepthEvent`s).
+pub fn build_subscribe_depth_quotes_request(
+    ctid_trader_account_id: i64,
+    symbol_ids: &[i64],
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "symbolId": symbol_ids,
+        }),
+    }
+}
+
+/// `ProtoOAUnsubscribeDepthQuotesReq` (2158) — stop Level-2 depth for symbols.
+pub fn build_unsubscribe_depth_quotes_request(
+    ctid_trader_account_id: i64,
+    symbol_ids: &[i64],
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_UNSUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "symbolId": symbol_ids,
         }),
     }
 }
@@ -1015,6 +1369,7 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         CTRADER_OA_NEW_ORDER_REQUEST_PAYLOAD_TYPE
         | CTRADER_OA_CANCEL_ORDER_REQUEST_PAYLOAD_TYPE
         | CTRADER_OA_AMEND_ORDER_REQUEST_PAYLOAD_TYPE
+        | CTRADER_OA_AMEND_POSITION_SLTP_REQUEST_PAYLOAD_TYPE
         | CTRADER_OA_CLOSE_POSITION_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE)
         }
@@ -1076,6 +1431,46 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         CTRADER_OA_ORDER_DETAILS_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_ORDER_DETAILS_RESPONSE_PAYLOAD_TYPE)
         }
+        // 2026-06-10 API-completeness pass — the remaining request/response
+        // pairs from the full ProtoOAPayloadType catalog.
+        CTRADER_OA_VERSION_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE),
+        CTRADER_OA_EXPECTED_MARGIN_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_ORDER_LIST_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE),
+        CTRADER_OA_CASH_FLOW_HISTORY_LIST_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_CASH_FLOW_HISTORY_LIST_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_REFRESH_TOKEN_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_REFRESH_TOKEN_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_ACCOUNT_LOGOUT_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_ACCOUNT_LOGOUT_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_GET_DYNAMIC_LEVERAGE_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_GET_DYNAMIC_LEVERAGE_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_SYMBOLS_FOR_CONVERSION_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_SYMBOLS_FOR_CONVERSION_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_DEAL_OFFSET_LIST_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_DEAL_OFFSET_LIST_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_MARGIN_CALL_LIST_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_MARGIN_CALL_LIST_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_MARGIN_CALL_UPDATE_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_MARGIN_CALL_UPDATE_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_UNSUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_UNSUBSCRIBE_DEPTH_QUOTES_RESPONSE_PAYLOAD_TYPE)
+        }
         CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE => Err(anyhow!(
             "cTrader spot events are push-only payloads and are not valid request messages"
         )),
@@ -1099,6 +1494,7 @@ pub fn is_matching_open_api_response(
         CTRADER_OA_NEW_ORDER_REQUEST_PAYLOAD_TYPE
             | CTRADER_OA_CANCEL_ORDER_REQUEST_PAYLOAD_TYPE
             | CTRADER_OA_AMEND_ORDER_REQUEST_PAYLOAD_TYPE
+            | CTRADER_OA_AMEND_POSITION_SLTP_REQUEST_PAYLOAD_TYPE
             | CTRADER_OA_CLOSE_POSITION_REQUEST_PAYLOAD_TYPE
     ) {
         return envelope.client_msg_id == request.client_msg_id
