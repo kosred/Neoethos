@@ -1613,9 +1613,22 @@ mod hybrid_split {
     /// fixed 2026-06-09).
     const REPROBE_EVERY: u64 = 32;
 
-    /// Minimum genes handed to the GPU while (re-)probing.
+    /// Genes handed to the GPU while (re-)probing.
+    ///
+    /// 2026-06-10: measure the GPU at SCALE — ~half the population. The old
+    /// `n_genes / 20` floor (~25 genes for pop 512) is a self-reinforcing trap:
+    /// per-LAUNCH overhead (client-get, the constant per-sample data upload, kernel
+    /// enqueue, readback sync) is FIXED per call and dominates a tiny chunk, so the
+    /// GPU's measured genes/s is crushed (~74/s observed on the A6000), the EMA
+    /// drives the GPU share to 0, and every re-probe re-measures the SAME tiny
+    /// overhead-dominated chunk → the GPU never recovers. Per-launch overhead only
+    /// amortizes over a LARGE batch (VectorAlpha's 350k pairs/s comes from big
+    /// batches, not small ones), so the re-probe must run the GPU on a big chunk —
+    /// the regime where the GPU/CPU genes/s comparison is actually fair. Half the
+    /// population is a large, representative batch while still leaving real work on
+    /// the CPU lane so the generation still completes if the GPU is genuinely slow.
     fn probe_floor(n_genes: usize) -> usize {
-        (n_genes / 20).clamp(1, n_genes.saturating_sub(1))
+        (n_genes / 2).clamp(1, n_genes.saturating_sub(1))
     }
 
     /// Genes to route to the GPU lane for a population of `n_genes`. Before any

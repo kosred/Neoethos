@@ -102,6 +102,123 @@ fn cuda_env_knobs() -> CudaEnvKnobs {
     *CUDA_ENV_KNOBS.get_or_init(CudaEnvKnobs::from_env)
 }
 
+// ─── GPU per-call timing instrumentation (NEOETHOS_GPU_TIMING) ───────
+//
+// 2026-06-10: the hybrid splitter measured the A6000 at ~74 genes/s vs the CPU
+// lane's ~77 000 genes/s — a ~1000× gap that is per-LAUNCH overhead, NOT inherent
+// GPU slowness (the kernel itself is correct + parity-proven). To SEE where the
+// milliseconds go inside one `try_evaluate_population_cuda` call, set
+// `NEOETHOS_GPU_TIMING=1` and this module emits a `tracing::info!` breakdown:
+// n_genes, n_samples, total elapsed, and the split between client-get, host
+// data-prep, device UPLOAD (`create_from_slice` / `empty`), KERNEL launch, and
+// READBACK (`read_one_unchecked`).
+//
+// PARITY: this module is a pure side-effect. It only accumulates `Duration`s into
+// a thread-local; it never touches a kernel input, an output buffer, or a launch
+// dimension. When `NEOETHOS_GPU_TIMING` is unset, the cached `enabled()` flag is
+// `false` and every phase closure runs the wrapped work WITHOUT even reading the
+// clock, so the production path is byte-identical and ~free.
+mod gpu_timing {
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    /// Cached once: is `NEOETHOS_GPU_TIMING` set? Checked at most once per process.
+    fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("NEOETHOS_GPU_TIMING").is_ok())
+    }
+
+    /// The phases a population eval splits into. `upload` / `kernel` / `readback`
+    /// accumulate across EVERY gene-chunk + gene-batch inside the call (the inner
+    /// `launch_signal_kernel` / `launch_backtest_kernel` add into the live frame).
+    #[derive(Default, Clone, Copy)]
+    pub struct Phases {
+        pub client_get: Duration,
+        pub host_prep: Duration,
+        pub upload: Duration,
+        pub kernel: Duration,
+        pub readback: Duration,
+    }
+
+    thread_local! {
+        /// The live accumulation frame for the current `try_evaluate_population_cuda`
+        /// call on this thread. `None` outside a measured call (also the always-state
+        /// when timing is disabled, so the inner adders are no-ops).
+        static FRAME: RefCell<Option<Phases>> = const { RefCell::new(None) };
+    }
+
+    /// Begin a measurement frame for the current call. No-op when timing is off.
+    pub fn begin() {
+        if !enabled() {
+            return;
+        }
+        FRAME.with(|f| *f.borrow_mut() = Some(Phases::default()));
+    }
+
+    /// End the frame and return the accumulated phases (the residual top-level time
+    /// the caller can attribute to "other"). `None` when timing is off.
+    pub fn end() -> Option<Phases> {
+        if !enabled() {
+            return None;
+        }
+        FRAME.with(|f| f.borrow_mut().take())
+    }
+
+    /// Add `d` to one phase of the live frame. Cheap no-op when no frame is active.
+    fn add(select: impl Fn(&mut Phases) -> &mut Duration, d: Duration) {
+        FRAME.with(|f| {
+            if let Some(frame) = f.borrow_mut().as_mut() {
+                *select(frame) += d;
+            }
+        });
+    }
+
+    /// Run `body`, attributing its elapsed time to the UPLOAD phase. When timing is
+    /// off, runs `body` WITHOUT reading the clock (the closure is fully inlined and
+    /// the result is byte-identical).
+    pub fn upload<T>(body: impl FnOnce() -> T) -> T {
+        time(|p| &mut p.upload, body)
+    }
+
+    /// Run `body`, attributing its elapsed time to the KERNEL phase.
+    pub fn kernel<T>(body: impl FnOnce() -> T) -> T {
+        time(|p| &mut p.kernel, body)
+    }
+
+    /// Run `body`, attributing its elapsed time to the READBACK phase.
+    pub fn readback<T>(body: impl FnOnce() -> T) -> T {
+        time(|p| &mut p.readback, body)
+    }
+
+    /// Run `body`, attributing its elapsed time to the CLIENT-GET phase.
+    pub fn client_get<T>(body: impl FnOnce() -> T) -> T {
+        time(|p| &mut p.client_get, body)
+    }
+
+    /// Directly fold an already-measured `Duration` into the HOST-PREP phase. Used
+    /// for the constant per-sample conversions, which are measured with a plain
+    /// `Instant` window at the call site rather than a closure. No-op when off.
+    pub fn add_host_prep(d: Duration) {
+        if !enabled() {
+            return;
+        }
+        add(|p| &mut p.host_prep, d);
+    }
+
+    /// Common timing core. The `enabled()` branch is the only check on the hot path
+    /// when timing is off — no `Instant::now()`, no thread-local borrow.
+    fn time<T>(select: impl Fn(&mut Phases) -> &mut Duration, body: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return body();
+        }
+        let start = Instant::now();
+        let out = body();
+        add(select, start.elapsed());
+        out
+    }
+}
+
 fn read_requested_precision_from_env() -> TrainingPrecision {
     [
         "NEOETHOS_BOT_SEARCH_EVAL_PRECISION",
@@ -1830,17 +1947,34 @@ where
     )
     .context("signal kernel input validation failed")?;
 
-    let indicators_handle = client.create_from_slice(F::as_bytes(indicators_flat));
-    let gene_offsets_handle = client.create_from_slice(i32::as_bytes(gene_offsets));
-    let gene_indices_handle = client.create_from_slice(i32::as_bytes(gene_indices));
-    let gene_weights_handle = client.create_from_slice(F::as_bytes(gene_weights));
-    let long_thr_handle = client.create_from_slice(F::as_bytes(long_thr));
-    let short_thr_handle = client.create_from_slice(F::as_bytes(short_thr));
-    let smc_data_handle = client.create_from_slice(i32::as_bytes(smc_data));
-    let gene_smc_flags_handle = client.create_from_slice(i32::as_bytes(gene_smc_flags));
-    let smc_weights_handle = client.create_from_slice(F::as_bytes(smc_weights));
-    let output_handle = client.empty(total.saturating_mul(std::mem::size_of::<i32>()));
-    let conf_handle = client.empty(total.saturating_mul(std::mem::size_of::<f32>()));
+    // Device UPLOAD phase (timed under NEOETHOS_GPU_TIMING; unchanged otherwise).
+    let (
+        indicators_handle,
+        gene_offsets_handle,
+        gene_indices_handle,
+        gene_weights_handle,
+        long_thr_handle,
+        short_thr_handle,
+        smc_data_handle,
+        gene_smc_flags_handle,
+        smc_weights_handle,
+        output_handle,
+        conf_handle,
+    ) = gpu_timing::upload(|| {
+        (
+            client.create_from_slice(F::as_bytes(indicators_flat)),
+            client.create_from_slice(i32::as_bytes(gene_offsets)),
+            client.create_from_slice(i32::as_bytes(gene_indices)),
+            client.create_from_slice(F::as_bytes(gene_weights)),
+            client.create_from_slice(F::as_bytes(long_thr)),
+            client.create_from_slice(F::as_bytes(short_thr)),
+            client.create_from_slice(i32::as_bytes(smc_data)),
+            client.create_from_slice(i32::as_bytes(gene_smc_flags)),
+            client.create_from_slice(F::as_bytes(smc_weights)),
+            client.empty(total.saturating_mul(std::mem::size_of::<i32>())),
+            client.empty(total.saturating_mul(std::mem::size_of::<f32>())),
+        )
+    });
 
     let units = signal_kernel_units(client);
     let cubes = (total as u32).div_ceil(units);
@@ -1849,6 +1983,8 @@ where
     // the originals alive for the read-back. Scalars are passed as raw values
     // (the 0.10 `LaunchArg for T` impl, replacing 0.9's `ScalarArg::new`). The
     // generated `launch` is infallible (returns `()`), so no `.context()?`.
+    // KERNEL phase (timed).
+    gpu_timing::kernel(|| {
     synthesize_signals_kernel::launch::<F, R>(
         client,
         CubeCount::Static(cubes, 1, 1),
@@ -1867,9 +2003,15 @@ where
         n_samples as u32,
         gate_threshold,
     );
+    }); // end gpu_timing::kernel
 
-    let bytes = client.read_one_unchecked(output_handle);
-    let conf_bytes = client.read_one_unchecked(conf_handle);
+    // READBACK phase (timed): blocking VRAM→host copy that syncs the kernel.
+    let (bytes, conf_bytes) = gpu_timing::readback(|| {
+        (
+            client.read_one_unchecked(output_handle),
+            client.read_one_unchecked(conf_handle),
+        )
+    });
     Ok((
         i32::from_bytes(&bytes).to_vec(),
         f32::from_bytes(&conf_bytes).to_vec(),
@@ -2113,33 +2255,59 @@ fn launch_backtest_kernel<R: Runtime>(
         bail!("cuda evaluator backtest kernel received inconsistent dimensions");
     }
 
-    let close_handle = client.create_from_slice(f32::as_bytes(close_pips));
-    let high_handle = client.create_from_slice(f32::as_bytes(high_pips));
-    let low_handle = client.create_from_slice(f32::as_bytes(low_pips));
-    let signals_handle = client.create_from_slice(i32::as_bytes(signals_flat));
-    let conf_handle = client.create_from_slice(f32::as_bytes(confidences_flat));
-    let timestamp_delta_handle = client.create_from_slice(i32::as_bytes(timestamp_deltas_ms));
-    let month_handle = client.create_from_slice(i32::as_bytes(month_idx));
-    let day_handle = client.create_from_slice(i32::as_bytes(day_idx));
-    let sl_handle = client.create_from_slice(f32::as_bytes(sl_pips));
-    let tp_handle = client.create_from_slice(f32::as_bytes(tp_pips));
-
+    // Device UPLOAD phase (timed under NEOETHOS_GPU_TIMING; runs unchanged
+    // otherwise). All `create_from_slice` (host→VRAM copies) + `empty` (output
+    // allocations) are the per-launch device-buffer setup the breakdown isolates.
     let metrics_len = n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
     let monthly_len = n_genes.saturating_mul(month_capacity);
-    let metrics_handle = client.empty(metrics_len.saturating_mul(std::mem::size_of::<f32>()));
-    let trade_counts_handle = client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>()));
-    let monthly_handle = client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>()));
-    let month_start_eq_handle =
-        client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>()));
-    let month_counts_handle = client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>()));
     let ftmo_len = n_genes.saturating_mul(FTMO_WIDTH);
-    let ftmo_handle = client.empty(ftmo_len.saturating_mul(std::mem::size_of::<f32>()));
+    let (
+        close_handle,
+        high_handle,
+        low_handle,
+        signals_handle,
+        conf_handle,
+        timestamp_delta_handle,
+        month_handle,
+        day_handle,
+        sl_handle,
+        tp_handle,
+        metrics_handle,
+        trade_counts_handle,
+        monthly_handle,
+        month_start_eq_handle,
+        month_counts_handle,
+        ftmo_handle,
+    ) = gpu_timing::upload(|| {
+        (
+            client.create_from_slice(f32::as_bytes(close_pips)),
+            client.create_from_slice(f32::as_bytes(high_pips)),
+            client.create_from_slice(f32::as_bytes(low_pips)),
+            client.create_from_slice(i32::as_bytes(signals_flat)),
+            client.create_from_slice(f32::as_bytes(confidences_flat)),
+            client.create_from_slice(i32::as_bytes(timestamp_deltas_ms)),
+            client.create_from_slice(i32::as_bytes(month_idx)),
+            client.create_from_slice(i32::as_bytes(day_idx)),
+            client.create_from_slice(f32::as_bytes(sl_pips)),
+            client.create_from_slice(f32::as_bytes(tp_pips)),
+            client.empty(metrics_len.saturating_mul(std::mem::size_of::<f32>())),
+            client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+            client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>())),
+            client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>())),
+            client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+            client.empty(ftmo_len.saturating_mul(std::mem::size_of::<f32>())),
+        )
+    });
 
     let units = backtest_kernel_units(client);
     let cubes = (n_genes as u32).div_ceil(units);
     // cubecl 0.10 migration: Handle-by-value `from_raw_parts(handle, len)`
     // (clone to keep originals for read-back), raw-value scalars (no
     // `ScalarArg::new`), infallible `launch` (no `.context()?`).
+    // KERNEL phase (timed). Note: cubecl launches are ASYNC enqueues, so most of
+    // the real GPU time is realized at the readback sync below — the split still
+    // tells the operator whether launch-enqueue itself is a bottleneck.
+    gpu_timing::kernel(|| {
     backtest_population_kernel::launch::<R>(
         client,
         CubeCount::Static(cubes, 1, 1),
@@ -2188,13 +2356,27 @@ fn launch_backtest_kernel<R: Runtime>(
         // signature). `n_genes * FTMO_WIDTH` f32s laid out per gene.
         unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
     );
+    }); // end gpu_timing::kernel
 
-    let metrics_bytes = client.read_one_unchecked(metrics_handle);
-    let trade_counts_bytes = client.read_one_unchecked(trade_counts_handle);
-    let monthly_bytes = client.read_one_unchecked(monthly_handle);
-    let month_counts_bytes = client.read_one_unchecked(month_counts_handle);
-    let month_start_eq_bytes = client.read_one_unchecked(month_start_eq_handle);
-    let ftmo_bytes = client.read_one_unchecked(ftmo_handle);
+    // READBACK phase (timed). `read_one_unchecked` is the blocking VRAM→host copy
+    // that also SYNCS the queued kernel, so this is where async GPU time is realized.
+    let (
+        metrics_bytes,
+        trade_counts_bytes,
+        monthly_bytes,
+        month_counts_bytes,
+        month_start_eq_bytes,
+        ftmo_bytes,
+    ) = gpu_timing::readback(|| {
+        (
+            client.read_one_unchecked(metrics_handle),
+            client.read_one_unchecked(trade_counts_handle),
+            client.read_one_unchecked(monthly_handle),
+            client.read_one_unchecked(month_counts_handle),
+            client.read_one_unchecked(month_start_eq_handle),
+            client.read_one_unchecked(ftmo_handle),
+        )
+    });
 
     Ok((
         f32::from_bytes(&metrics_bytes).to_vec(),
@@ -2244,9 +2426,23 @@ pub(crate) fn try_evaluate_population_cuda(
         bail!("cuda population evaluate path received inconsistent dimensions");
     }
 
-    let client = create_gpu_client(device_override)?;
+    // NEOETHOS_GPU_TIMING: open a per-call measurement frame (no-op when unset).
+    // The total is timed from here; the inner phases (client-get/host-prep/upload/
+    // kernel/readback) are attributed below. PARITY: pure side-effect — `begin()`
+    // only touches a thread-local Duration accumulator, never a kernel byte.
+    gpu_timing::begin();
+    let call_start = std::time::Instant::now();
+
+    // `create_gpu_client` is CHEAP: cubecl 0.10 memoizes one ComputeClient/server
+    // per device id in a global registry (cubecl-common channel.rs `CHANNELS`), so
+    // this is a HashMap lookup + Arc-handle clone, NOT a fresh CUDA context. We
+    // still time it so the operator can CONFIRM it is not the overhead.
+    let client = gpu_timing::client_get(|| create_gpu_client(device_override))?;
     // Per-SAMPLE host vecs — shared across every gene, so compute once outside
-    // the gene-chunk loop (they are data-sized, not population-sized).
+    // the gene-chunk loop (they are data-sized, not population-sized). These are
+    // the constant per-sample conversions (normalize_prices_to_pips ×3 +
+    // timestamp/month/day) the timing breakdown attributes to "host-prep".
+    let prep_start = std::time::Instant::now();
     let close_pips = normalize_prices_to_pips(close, settings.pip_value);
     let high_pips = normalize_prices_to_pips(high, settings.pip_value);
     let low_pips = normalize_prices_to_pips(low, settings.pip_value);
@@ -2268,6 +2464,9 @@ pub(crate) fn try_evaluate_population_cuda(
         .map(|value| *value as f32)
         .collect::<Vec<_>>();
     let month_capacity = settings.month_capacity();
+    // Attribute the constant per-sample conversions above to the host-prep phase
+    // (no-op when timing is off).
+    gpu_timing::add_host_prep(prep_start.elapsed());
 
     let mut metrics_flat: Vec<f32> = Vec::with_capacity(n_genes * BACKTEST_CORE_METRIC_WIDTH);
     let mut trade_counts: Vec<i32> = Vec::with_capacity(n_genes);
@@ -2434,6 +2633,34 @@ pub(crate) fn try_evaluate_population_cuda(
             consistency,
             metrics_flat[metric_base + 6] as f64,
         ]);
+    }
+
+    // NEOETHOS_GPU_TIMING breakdown. `end()` returns None (and skips the whole log)
+    // when the env var is unset, so production pays nothing here.
+    if let Some(phases) = gpu_timing::end() {
+        let total = call_start.elapsed();
+        // "other" = total minus the attributed phases (host result-assembly above,
+        // pool trims, the catch_unwind plumbing). A large `kernel` or `upload`
+        // share at a SMALL n_genes is the per-launch-overhead signature.
+        let attributed = phases.client_get
+            + phases.host_prep
+            + phases.upload
+            + phases.kernel
+            + phases.readback;
+        let other = total.saturating_sub(attributed);
+        tracing::info!(
+            target: "neoethos_search::gpu",
+            n_genes,
+            n_samples,
+            total_ms = total.as_secs_f64() * 1e3,
+            client_get_ms = phases.client_get.as_secs_f64() * 1e3,
+            host_prep_ms = phases.host_prep.as_secs_f64() * 1e3,
+            upload_ms = phases.upload.as_secs_f64() * 1e3,
+            kernel_ms = phases.kernel.as_secs_f64() * 1e3,
+            readback_ms = phases.readback.as_secs_f64() * 1e3,
+            other_ms = other.as_secs_f64() * 1e3,
+            "NEOETHOS_GPU_TIMING: population eval per-call breakdown"
+        );
     }
 
     Ok(results)
