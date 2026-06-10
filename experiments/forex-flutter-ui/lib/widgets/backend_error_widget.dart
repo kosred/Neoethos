@@ -15,6 +15,7 @@ import '../api/error_translation.dart';
 import '../l10n/app_localizations.dart';
 import '../startup/backend_watchdog.dart';
 import '../theme/theme.dart';
+import 'report_issue.dart';
 
 class BackendErrorWidget extends ConsumerWidget {
   final Object error;
@@ -40,7 +41,29 @@ class BackendErrorWidget extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final l10n = AppLocalizations.of(context)!;
     final detail = describeError(error);
-    final resolvedTitle = title ?? l10n.backendErrorDefaultTitle;
+
+    // Distinguish "backend up but broke" (5xx) from "backend
+    // unreachable" (connection refused / timeout). Previously both
+    // rendered the same generic banner, so the operator couldn't tell
+    // a backend bug from the engine not running.
+    final kind = classifyBackendFailure(error);
+    final isServerError = kind == BackendFailureKind.serverError;
+
+    final resolvedTitle = title ??
+        (isServerError
+            ? l10n.backendErrorServerTitle
+            : l10n.backendErrorDefaultTitle);
+
+    // For a 5xx the "is the indicator red?" hint is misleading (the
+    // engine IS running) — replace it with the report-this-bug line.
+    final hint = isServerError
+        ? l10n.backendErrorServerDetail
+        : l10n.backendErrorCheckIndicator;
+
+    // A restart rarely fixes a 5xx bug, so we don't offer it there;
+    // unreachable errors keep the restart button.
+    final showRestartButton = showRestart && !isServerError;
+
     return Padding(
       padding: const EdgeInsets.all(NeoethosTokens.spMd),
       child: Column(
@@ -81,14 +104,14 @@ class BackendErrorWidget extends ConsumerWidget {
           ],
           const SizedBox(height: 4),
           Text(
-            l10n.backendErrorCheckIndicator,
+            hint,
             style: const TextStyle(
               fontSize: NeoethosTokens.fsCaption,
               height: 1.45,
               color: NeoethosTokens.textFaint,
             ),
           ),
-          if (showRestart) ...[
+          if (showRestartButton) ...[
             const SizedBox(height: 10),
             OutlinedButton.icon(
               onPressed: () {
@@ -102,6 +125,18 @@ class BackendErrorWidget extends ConsumerWidget {
               },
               icon: const Icon(Icons.refresh, size: 16),
               label: Text(l10n.backendErrorRestartEngine),
+            ),
+          ],
+          if (isServerError) ...[
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: () => showReportIssueDialog(
+                context,
+                prefillDescription: '$resolvedTitle\n$detail',
+                category: 'backend_5xx',
+              ),
+              icon: const Icon(Icons.bug_report_outlined, size: 16),
+              label: Text(l10n.backendErrorReportIssue),
             ),
           ],
         ],

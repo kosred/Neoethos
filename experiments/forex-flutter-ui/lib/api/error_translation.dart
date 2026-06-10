@@ -72,6 +72,55 @@ class TranslatedError {
   }
 }
 
+/// Coarse failure class, derived from the HTTP status code (when there
+/// is a response) or the Dio error type (when there isn't). Lets the UI
+/// tell "the backend is up but broke" (5xx — operator should report it)
+/// apart from "can't reach the backend at all" (connection error —
+/// operator should restart / check it's running). Before this, both
+/// looked identical: a generic red banner with a raw Dio string.
+enum BackendFailureKind {
+  /// Server responded 5xx — backend reachable but it errored. Critical:
+  /// surface the Report Issue CTA, a restart usually won't fix it.
+  serverError,
+
+  /// No response — connection refused / timed out / DNS / socket. The
+  /// backend is unreachable (not started, crashed, wrong port).
+  unreachable,
+
+  /// 4xx or anything else (bad input, validation, not-found). The
+  /// caller usually has a more specific message for these.
+  other,
+}
+
+/// Classify a failure. Non-Dio errors are treated as [other].
+BackendFailureKind classifyBackendFailure(Object error) {
+  if (error is! DioException) return BackendFailureKind.other;
+  final status = error.response?.statusCode;
+  if (status != null) {
+    if (status >= 500) return BackendFailureKind.serverError;
+    return BackendFailureKind.other;
+  }
+  // No response object at all → transport-level failure.
+  switch (error.type) {
+    case DioExceptionType.connectionError:
+    case DioExceptionType.connectionTimeout:
+    case DioExceptionType.sendTimeout:
+    case DioExceptionType.receiveTimeout:
+      return BackendFailureKind.unreachable;
+    case DioExceptionType.unknown:
+      // Dio buckets socket exceptions (connection refused) under
+      // `unknown` with no response — treat as unreachable.
+      return BackendFailureKind.unreachable;
+    default:
+      return BackendFailureKind.other;
+  }
+}
+
+/// True when the backend responded with a 5xx — it's up but broke, so
+/// the operator should report it (a restart rarely helps).
+bool isBackendServerError(Object error) =>
+    classifyBackendFailure(error) == BackendFailureKind.serverError;
+
 /// Pull a translation block out of a DioException body, if present.
 /// Returns null when (a) it's not a DioException with a structured
 /// body, or (b) the body has no `translation` field (i.e. the server

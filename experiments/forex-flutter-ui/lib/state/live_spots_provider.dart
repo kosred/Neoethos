@@ -83,9 +83,23 @@ class LiveSpotsNotifier extends AsyncNotifier<LiveSpotsSnapshot> {
         completer.complete(LiveSpotsSnapshot.empty().mergeTick(tick));
       }
     });
+    // 10 s timeout so the UI doesn't hang forever if the SSE is
+    // unreachable. After timeout we THROW (mirrors account_provider) —
+    // this puts the provider into AsyncError so the consuming screens
+    // render an explicit "prices unavailable / reconnecting" state.
+    //
+    // Returning LiveSpotsSnapshot.empty() here (the old behaviour) was
+    // a silent-blank-prices bug: a stalled backend looked identical to
+    // a closed market — Chart / Market Watch / PnL showed ZERO prices
+    // with no error surfaced. Every consumer is safe with the throw:
+    // _WatchlistPanel has an error: branch (marketWatchPricesUnavailable),
+    // and the .valueOrNull readers (chart overlay, inline buy/sell,
+    // summary strip) already treat the absence of a value as "no tick
+    // yet" and fall back / render nothing rather than crash.
     final result = await completer.future.timeout(
       const Duration(seconds: 10),
-      onTimeout: () => LiveSpotsSnapshot.empty(),
+      onTimeout: () => throw const BrokerNotReadyException(
+          'live spots stream did not deliver an initial event within 10 s'),
     );
     await subscription.cancel();
     return result;

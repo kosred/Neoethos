@@ -764,7 +764,11 @@ class _PendingOrdersTable extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _PanelTitle(title: l10n.positionsPendingTitle, count: 0),
+          _PanelTitle(
+            title: l10n.positionsPendingTitle,
+            count: 0,
+            comingSoon: true,
+          ),
           Expanded(
             child: _EmptyLine(
               message: l10n.positionsPendingEmpty,
@@ -784,10 +788,16 @@ class _PanelTitle extends StatelessWidget {
   final String title;
   final int count;
   final Widget? trailing;
+
+  /// When true the count badge is replaced by a muted "SOON" pill — for
+  /// unwired panels (e.g. Pending Orders, no backend yet) so an empty
+  /// table doesn't masquerade as a real, working empty list.
+  final bool comingSoon;
   const _PanelTitle({
     required this.title,
     required this.count,
     this.trailing,
+    this.comingSoon = false,
   });
 
   @override
@@ -812,21 +822,39 @@ class _PanelTitle extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 6),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-            decoration: BoxDecoration(
-              color: NeoethosTokens.accentMuted,
-              borderRadius: BorderRadius.circular(3),
-            ),
-            child: Text(
-              '$count',
-              style: const TextStyle(
-                fontSize: NeoethosTokens.fsCaption - 1,
-                fontWeight: FontWeight.w800,
-                color: NeoethosTokens.accent,
+          if (comingSoon)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+              decoration: BoxDecoration(
+                color: NeoethosTokens.border.withValues(alpha: 0.4),
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: Text(
+                AppLocalizations.of(context)!.commonComingSoon.toUpperCase(),
+                style: const TextStyle(
+                  fontSize: NeoethosTokens.fsCaption - 1,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.5,
+                  color: NeoethosTokens.textFaint,
+                ),
+              ),
+            )
+          else
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+              decoration: BoxDecoration(
+                color: NeoethosTokens.accentMuted,
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: Text(
+                '$count',
+                style: const TextStyle(
+                  fontSize: NeoethosTokens.fsCaption - 1,
+                  fontWeight: FontWeight.w800,
+                  color: NeoethosTokens.accent,
+                ),
               ),
             ),
-          ),
           const Spacer(),
           if (trailing != null) trailing!,
         ],

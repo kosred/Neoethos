@@ -73,7 +73,9 @@ class _StrategyLabScreenState extends ConsumerState<StrategyLabScreen>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const _PipelineStrip(),
+        _PipelineStrip(onSelectStage: _goToStage),
+        const SizedBox(height: NeoethosTokens.spSm),
+        const _LabTargetSelector(),
         const SizedBox(height: NeoethosTokens.spSm),
         _StageTabs(controller: _controller, stages: stageLabels),
         const SizedBox(height: NeoethosTokens.spSm),
@@ -92,6 +94,118 @@ class _StrategyLabScreenState extends ConsumerState<StrategyLabScreen>
       ],
     );
   }
+
+  /// Drive the sub-tab controller from a pipeline chip. Stage cells are
+  /// 1-indexed (Data Ready = 1); the tabs below start at Discovery, so
+  /// stage N maps to tab N-2 (Discovery=tab0). The Data Ready stage has
+  /// no dedicated tab — it lands on Discovery (the first actionable
+  /// stage).
+  void _goToStage(int stageIndex) {
+    final tabIndex = (stageIndex - 2).clamp(0, _stageCount - 1);
+    _controller.animateTo(tabIndex);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Symbol + base-timeframe selector (drives the shared
+// selectedSymbolProvider / selectedBaseTfProvider that the promotion
+// gate + any discovery/training launched here read).
+// ---------------------------------------------------------------------------
+
+class _LabTargetSelector extends ConsumerWidget {
+  const _LabTargetSelector();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
+    final symbol = ref.watch(selectedSymbolProvider);
+    final baseTf = ref.watch(selectedBaseTfProvider);
+    return Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: NeoethosTokens.spMd,
+        vertical: 8,
+      ),
+      decoration: BoxDecoration(
+        color: NeoethosTokens.panelBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
+      ),
+      child: Row(
+        children: [
+          Text(
+            l10n.strategyLabTargetLabel.toUpperCase(),
+            style: const TextStyle(
+              fontSize: NeoethosTokens.fsCaption,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0.8,
+              color: NeoethosTokens.textMuted,
+            ),
+          ),
+          const SizedBox(width: NeoethosTokens.spMd),
+          _LabDropdown(
+            value: symbol,
+            items: strategyLabSymbols,
+            onChanged: (v) =>
+                ref.read(selectedSymbolProvider.notifier).state = v,
+          ),
+          const SizedBox(width: NeoethosTokens.spSm),
+          _LabDropdown(
+            value: baseTf,
+            items: strategyLabBaseTimeframes,
+            onChanged: (v) =>
+                ref.read(selectedBaseTfProvider.notifier).state = v,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _LabDropdown extends StatelessWidget {
+  final String value;
+  final List<String> items;
+  final ValueChanged<String> onChanged;
+  const _LabDropdown({
+    required this.value,
+    required this.items,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    // Guard against a value that isn't in the list (defensive — keeps
+    // DropdownButton from asserting if defaults ever drift).
+    final safeValue = items.contains(value) ? value : items.first;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      decoration: BoxDecoration(
+        color: NeoethosTokens.appBg,
+        border: Border.all(color: NeoethosTokens.border),
+        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          value: safeValue,
+          isDense: true,
+          dropdownColor: NeoethosTokens.panelBg,
+          style: const TextStyle(
+            fontSize: NeoethosTokens.fsBody,
+            fontWeight: FontWeight.w700,
+            color: NeoethosTokens.textPrimary,
+          ),
+          icon: const Icon(Icons.arrow_drop_down,
+              size: 18, color: NeoethosTokens.textMuted),
+          items: [
+            for (final item in items)
+              DropdownMenuItem<String>(value: item, child: Text(item)),
+          ],
+          onChanged: (v) {
+            if (v != null) onChanged(v);
+          },
+        ),
+      ),
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +213,10 @@ class _StrategyLabScreenState extends ConsumerState<StrategyLabScreen>
 // ---------------------------------------------------------------------------
 
 class _PipelineStrip extends ConsumerWidget {
-  const _PipelineStrip();
+  /// Called with the 1-based stage index when a chip is tapped, so the
+  /// parent can switch the sub-tab controller to that stage.
+  final ValueChanged<int> onSelectStage;
+  const _PipelineStrip({required this.onSelectStage});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -116,6 +233,7 @@ class _PipelineStrip extends ConsumerWidget {
         // to bootstrap historical data if it's missing on disk.
         subtitle: l10n.strategyLabDataReadySubtitle,
         status: _StageStatus.done,
+        onTap: () => onSelectStage(1),
       ),
       _StageCell(
         index: 2,
@@ -124,6 +242,7 @@ class _PipelineStrip extends ConsumerWidget {
             ? l10n.statusIdle
             : _enginePhrase(l10n, engines.discovery, l10n.strategyLabGaSearch),
         status: _statusFor(engines?.discovery),
+        onTap: () => onSelectStage(2),
       ),
       _StageCell(
         index: 3,
@@ -133,6 +252,7 @@ class _PipelineStrip extends ConsumerWidget {
             : _enginePhrase(
                 l10n, engines.training, l10n.strategyLabEnsembleFit),
         status: _statusFor(engines?.training),
+        onTap: () => onSelectStage(3),
       ),
       _StageCell(
         index: 4,
@@ -147,6 +267,7 @@ class _PipelineStrip extends ConsumerWidget {
                         ? '—'
                         : '${(intel.walkforwardAvgAccuracy! * 100).toStringAsFixed(1)}% acc'}',
         status: _validationStatus(intel),
+        onTap: () => onSelectStage(4),
       ),
       _StageCell(
         index: 5,
@@ -155,6 +276,7 @@ class _PipelineStrip extends ConsumerWidget {
             ? l10n.strategyLabAwaitingValidation
             : l10n.strategyLabPromotionManualReview,
         status: _promotionStatus(intel),
+        onTap: () => onSelectStage(5),
       ),
     ];
 
@@ -241,11 +363,16 @@ class _StageCell extends StatelessWidget {
   final String title;
   final String subtitle;
   final _StageStatus status;
+
+  /// Tapping the chip switches the sub-tab below to this stage. The
+  /// chips looked interactive but used to be inert; this wires them.
+  final VoidCallback? onTap;
   const _StageCell({
     required this.index,
     required this.title,
     required this.subtitle,
     required this.status,
+    this.onTap,
   });
 
   @override
@@ -258,14 +385,27 @@ class _StageCell extends StatelessWidget {
       _StageStatus.error => (l10n.strategyLabBadgeError, NeoethosTokens.sell),
       _StageStatus.idle => (l10n.strategyLabBadgeIdle, NeoethosTokens.textFaint),
     };
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-      decoration: BoxDecoration(
-        color: NeoethosTokens.appBg,
-        border: Border.all(color: NeoethosTokens.border),
-        borderRadius: BorderRadius.circular(NeoethosTokens.rSm),
+    final radius = BorderRadius.circular(NeoethosTokens.rSm);
+    return Material(
+      color: NeoethosTokens.appBg,
+      borderRadius: radius,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: radius,
+        child: Ink(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          decoration: BoxDecoration(
+            border: Border.all(color: NeoethosTokens.border),
+            borderRadius: radius,
+          ),
+          child: _cellBody(statusLabel, statusColor),
+        ),
       ),
-      child: Column(
+    );
+  }
+
+  Widget _cellBody(String statusLabel, Color statusColor) {
+    return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -336,7 +476,6 @@ class _StageCell extends StatelessWidget {
             ),
           ),
         ],
-      ),
     );
   }
 }
@@ -417,12 +556,13 @@ class _PromotionGateView extends ConsumerStatefulWidget {
 }
 
 class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
-  // No symbol/timeframe selection state exists on the Strategy Lab
-  // screen yet (Discovery uses a per-card queue, Training its own
-  // fields). F-330 backend defaults the gate to the primary pair, so
-  // we mirror that here until a shared selection provider lands.
-  static const _symbol = 'EURUSD';
-  static const _baseTf = 'M5';
+  // The pair/timeframe the gate evaluates now comes from the shared
+  // Strategy Lab selection providers (driven by the header dropdowns),
+  // NOT a hard-coded constant. This fixed the wrong-pair promotion bug:
+  // the gate used to always check EURUSD/M5 regardless of what the
+  // operator was discovering/training.
+  String get _symbol => ref.read(selectedSymbolProvider);
+  String get _baseTf => ref.read(selectedBaseTfProvider);
 
   PromotionStatus? _status;
   String? _error;
@@ -511,6 +651,10 @@ class _PromotionGateViewState extends ConsumerState<_PromotionGateView> {
 
   @override
   Widget build(BuildContext context) {
+    // Re-evaluate the gate whenever the operator picks a different
+    // pair / base TF in the Strategy Lab header.
+    ref.listen<String>(selectedSymbolProvider, (_, __) => _load());
+    ref.listen<String>(selectedBaseTfProvider, (_, __) => _load());
     return Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 640),
