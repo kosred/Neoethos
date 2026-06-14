@@ -66,7 +66,12 @@ impl Page {
     /// Bottom-of-screen keyboard hints, contextual to the page.
     pub fn key_hints(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Page::Dashboard => &[("Tab", "next page"), ("R", "refresh"), ("Q", "quit")],
+            Page::Dashboard => &[
+                ("?", "help"),
+                ("Tab", "next page"),
+                ("R", "refresh"),
+                ("Q", "quit"),
+            ],
             Page::Discover => &[
                 ("↑↓", "focus field"),
                 ("Enter", "edit"),
@@ -76,13 +81,18 @@ impl Page {
                 ("Q", "quit"),
             ],
             Page::Strategies => &[
-                ("Tab", "next page"),
                 ("↑↓", "select"),
-                ("/", "filter"),
-                ("Enter", "details"),
+                ("V", "validate"),
+                ("P", "promote"),
+                ("Tab", "page"),
                 ("Q", "quit"),
             ],
-            Page::Symbols => &[("Tab", "next page"), ("↑↓", "select"), ("Q", "quit")],
+            Page::Symbols => &[
+                ("E", "edit source"),
+                ("I", "import data"),
+                ("Tab", "page"),
+                ("Q", "quit"),
+            ],
             Page::Train => &[
                 ("↑↓", "focus field"),
                 ("Enter", "edit"),
@@ -92,9 +102,26 @@ impl Page {
                 ("Q", "quit"),
             ],
             Page::Funnel => &[("Tab", "page"), ("R", "refresh"), ("Q", "quit")],
-            Page::AutoLoop => &[("Tab", "page"), ("L", "launch"), ("Q", "quit")],
-            Page::Config => &[("Tab", "page"), ("Q", "quit")],
-            Page::Logs => &[("Tab", "page"), ("Q", "quit")],
+            Page::AutoLoop => &[
+                ("Tab", "page"),
+                ("L", "launch"),
+                ("K", "stop"),
+                ("Q", "quit"),
+            ],
+            Page::Config => &[
+                ("↑↓", "field"),
+                ("Enter", "edit"),
+                ("S", "save"),
+                ("R", "reload"),
+                ("Tab", "page"),
+                ("Q", "quit"),
+            ],
+            Page::Logs => &[
+                ("↑↓", "scroll"),
+                ("F", "follow tail"),
+                ("Tab", "page"),
+                ("Q", "quit"),
+            ],
             Page::Chart => &[
                 ("←→", "symbol"),
                 ("↑↓", "timeframe"),
@@ -127,6 +154,10 @@ impl Page {
             Page::Train => train::handle_key(code, shared),
             Page::AutoLoop => auto_loop::handle_key(code, shared),
             Page::Chart => chart::handle_key(code, shared),
+            Page::Config => config_view::handle_key(code, shared),
+            Page::Symbols => symbols::handle_key(code, shared),
+            Page::Strategies => strategies::handle_key(code, shared),
+            Page::Logs => logs::handle_key(code, shared),
             _ => false,
         }
     }

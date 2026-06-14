@@ -387,6 +387,7 @@ class BackendClient {
     String? dataDir,
     String? uiLocale,
     String? tradingMode,
+    String? computeMode,
     double? riskyStartBalance,
     double? riskyTargetBalance,
     int? riskyHorizonDays,
@@ -405,6 +406,7 @@ class BackendClient {
     if (dataDir != null) body['dataDir'] = dataDir;
     if (uiLocale != null) body['uiLocale'] = uiLocale;
     if (tradingMode != null) body['tradingMode'] = tradingMode;
+    if (computeMode != null) body['computeMode'] = computeMode;
     if (riskyStartBalance != null) {
       body['riskyStartBalance'] = riskyStartBalance;
     }
@@ -514,14 +516,16 @@ class BackendClient {
   /// value here lets the operator tune that knob from the Advanced
   /// expander without editing YAML.
   ///
-  /// #264 (2026-05-29): [higherTfs] threads the multi-TF UI chip
-  /// selection through to the backend's `StartJobBody.higher_tfs`
-  /// (`engines_control.rs:48`). When `null` or empty, the server
-  /// uses `DEFAULT_HIGHER_TFS = ["M5", "M15", "H1"]`. Passing
-  /// e.g. `["M15", "H1", "H4"]` overrides only the higher-TF context
-  /// for this run; everything else (symbol/base_tf/GA knobs) is
-  /// unaffected. The list is sent as a JSON array of canonical
-  /// timeframe labels; the server uppercases + trims defensively.
+  /// #264 (2026-05-29) · PARITY 2026-06-04: [higherTfs] threads the
+  /// multi-TF UI chip selection through to the backend's
+  /// `StartJobBody.higher_tfs`. When `null` or empty, the server resolves
+  /// the operator's config default ladder via
+  /// `SystemConfig::resolve_higher_timeframes` (honouring
+  /// `multi_resolution_timeframes` / `higher_timeframes`) — IDENTICAL to a
+  /// CLI `discover` with no `--higher`. Passing e.g. `["M15", "H1", "H4"]`
+  /// overrides only the higher-TF context for this run; everything else
+  /// (symbol/base_tf/GA knobs) is unaffected. The list is sent as a JSON
+  /// array of canonical timeframe labels; the server uppercases + trims.
   Future<Map<String, dynamic>> startDiscovery({
     String? symbol,
     String? baseTf,
@@ -537,10 +541,9 @@ class BackendClient {
     if (baseTf != null && baseTf.trim().isNotEmpty) body['base_tf'] = baseTf;
     if (higherTfs != null && higherTfs.isNotEmpty) {
       // De-dup + trim before sending so the server doesn't have to.
-      // Skip the body field entirely when the cleaned set is empty so
-      // the backend falls back to DEFAULT_HIGHER_TFS instead of
-      // receiving an empty array (which it would also fall back on,
-      // but the cleaner wire is easier to reason about in logs).
+      // Skip the body field entirely when the cleaned set is empty so the
+      // backend resolves the config default ladder (parity with the CLI)
+      // instead of receiving an empty array.
       final cleaned = higherTfs
           .map((tf) => tf.trim())
           .where((tf) => tf.isNotEmpty)
@@ -1329,6 +1332,12 @@ class SettingsSnapshot {
   /// selector + the Risky-Mode card.
   final String tradingMode;
 
+  /// Compute device preference (`'auto'` | `'cpu'` | `'gpu'`) from
+  /// `SystemConfig.enable_gpu_preference`. `auto` picks the best device (and,
+  /// with the never-OOM auto-tuner, fits any card); `cpu` forces the CPU lane.
+  /// Defaults to `'auto'` for back-compat with a backend that predates it.
+  final String computeMode;
+
   /// Risky-Mode goal from `SystemConfig::risky_*` — start/target balance
   /// (account ccy) + horizon (days). The operator edits these; they pressure
   /// the Risky discovery search. Defaults mirror the backend (100/50000/180).
@@ -1359,6 +1368,7 @@ class SettingsSnapshot {
     required this.dataDir,
     this.localeCode = 'en',
     this.tradingMode = 'prop_firm',
+    this.computeMode = 'auto',
     this.riskyStartBalance = 100.0,
     this.riskyTargetBalance = 50000.0,
     this.riskyHorizonDays = 180,
@@ -1379,6 +1389,7 @@ class SettingsSnapshot {
         dataDir: j['dataDir'] as String,
         localeCode: (j['uiLocale'] as String?) ?? 'en',
         tradingMode: (j['tradingMode'] as String?) ?? 'prop_firm',
+        computeMode: (j['computeMode'] as String?) ?? 'auto',
         riskyStartBalance:
             (j['riskyStartBalance'] as num?)?.toDouble() ?? 100.0,
         riskyTargetBalance:

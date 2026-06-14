@@ -750,3 +750,267 @@ fn transport_selector_picks_protobuf_when_env_set() {
     assert_eq!(selected, CTraderTransportKind::Protobuf);
     assert_eq!(selected.label(), "protobuf");
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// 2026-06-10 — full ProtoOAPayloadType API-completeness pass. Each builder
+// is pinned to its documented payloadType and field names so a future wire-
+// format drift fails loudly here instead of silently at the broker.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn amend_position_sltp_request_uses_documented_payload_and_fields() {
+    let request = CTraderAmendPositionSltpRequest {
+        account_id: 7001,
+        position_id: 42,
+        stop_loss: Some(1.0850),
+        take_profit: Some(1.0950),
+        guaranteed_stop_loss: Some(true),
+        trailing_stop_loss: Some(false),
+        stop_loss_trigger_method: Some(CTraderOrderTriggerMethod::Opposite),
+    };
+    let message = build_amend_position_sltp_request(&request, "amend-pos-1");
+    assert_eq!(
+        message.payload_type,
+        CTRADER_OA_AMEND_POSITION_SLTP_REQUEST_PAYLOAD_TYPE
+    );
+    assert_eq!(message.payload_type, 2110);
+    assert_eq!(
+        message.payload.get("positionId").and_then(Value::as_i64),
+        Some(42)
+    );
+    assert_eq!(
+        message.payload.get("stopLoss").and_then(Value::as_f64),
+        Some(1.0850)
+    );
+    assert_eq!(
+        message.payload.get("takeProfit").and_then(Value::as_f64),
+        Some(1.0950)
+    );
+    assert_eq!(
+        message
+            .payload
+            .get("guaranteedStopLoss")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        message
+            .payload
+            .get("stopLossTriggerMethod")
+            .and_then(Value::as_i64),
+        Some(CTRADER_ORDER_TRIGGER_METHOD_OPPOSITE as i64)
+    );
+}
+
+#[test]
+fn amend_position_sltp_omits_untouched_fields() {
+    // Only the SL is being moved (e.g. trail) — TP and the flags must NOT be
+    // sent so the broker leaves them as-is.
+    let request = CTraderAmendPositionSltpRequest {
+        account_id: 1,
+        position_id: 2,
+        stop_loss: Some(1.2345),
+        take_profit: None,
+        guaranteed_stop_loss: None,
+        trailing_stop_loss: None,
+        stop_loss_trigger_method: None,
+    };
+    let message = build_amend_position_sltp_request(&request, "amend-pos-2");
+    assert!(message.payload.get("stopLoss").is_some());
+    assert!(message.payload.get("takeProfit").is_none());
+    assert!(message.payload.get("trailingStopLoss").is_none());
+    assert!(message.payload.get("stopLossTriggerMethod").is_none());
+}
+
+#[test]
+fn amend_position_sltp_response_is_an_execution_event() {
+    // Like the other trade actions, the broker answers a 2110 with a
+    // ProtoOAExecutionEvent (2126) — the matcher and the expected-response
+    // map must both agree, or the execution backend hangs waiting for a 2111.
+    assert_eq!(
+        expected_response_payload_type(CTRADER_OA_AMEND_POSITION_SLTP_REQUEST_PAYLOAD_TYPE)
+            .unwrap(),
+        CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE
+    );
+    let request = build_amend_position_sltp_request(
+        &CTraderAmendPositionSltpRequest {
+            account_id: 1,
+            position_id: 2,
+            stop_loss: Some(1.0),
+            take_profit: None,
+            guaranteed_stop_loss: None,
+            trailing_stop_loss: None,
+            stop_loss_trigger_method: None,
+        },
+        "amend-pos-3",
+    );
+    let exec_event = CTraderOpenApiJsonMessage {
+        client_msg_id: "amend-pos-3".to_string(),
+        payload_type: CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE,
+        payload: Value::Null,
+    };
+    assert!(is_matching_open_api_response(
+        &exec_event,
+        &request,
+        CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE
+    ));
+}
+
+#[test]
+fn version_request_carries_no_account() {
+    let message = build_version_request("ver-1");
+    assert_eq!(message.payload_type, CTRADER_OA_VERSION_REQUEST_PAYLOAD_TYPE);
+    assert_eq!(message.payload_type, 2104);
+    assert_eq!(
+        expected_response_payload_type(CTRADER_OA_VERSION_REQUEST_PAYLOAD_TYPE).unwrap(),
+        CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE
+    );
+}
+
+#[test]
+fn expected_margin_request_uses_documented_payload_and_fields() {
+    let message = build_expected_margin_request(7001, 1, &[10_000_000, 20_000_000], "em-1");
+    assert_eq!(
+        message.payload_type,
+        CTRADER_OA_EXPECTED_MARGIN_REQUEST_PAYLOAD_TYPE
+    );
+    assert_eq!(message.payload_type, 2139);
+    assert_eq!(
+        message.payload.get("symbolId").and_then(Value::as_i64),
+        Some(1)
+    );
+    let volumes = message
+        .payload
+        .get("volume")
+        .and_then(Value::as_array)
+        .expect("volume array");
+    assert_eq!(volumes.len(), 2);
+    assert_eq!(volumes[0].as_i64(), Some(10_000_000));
+    assert_eq!(
+        expected_response_payload_type(CTRADER_OA_EXPECTED_MARGIN_REQUEST_PAYLOAD_TYPE).unwrap(),
+        CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE
+    );
+}
+
+#[test]
+fn order_list_and_cash_flow_history_carry_time_window() {
+    let orders = build_order_list_request(7001, 1_000, 2_000, "ol-1");
+    assert_eq!(orders.payload_type, CTRADER_OA_ORDER_LIST_REQUEST_PAYLOAD_TYPE);
+    assert_eq!(orders.payload_type, 2175);
+    assert_eq!(
+        orders.payload.get("fromTimestamp").and_then(Value::as_i64),
+        Some(1_000)
+    );
+    assert_eq!(
+        orders.payload.get("toTimestamp").and_then(Value::as_i64),
+        Some(2_000)
+    );
+    assert_eq!(
+        expected_response_payload_type(CTRADER_OA_ORDER_LIST_REQUEST_PAYLOAD_TYPE).unwrap(),
+        CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE
+    );
+
+    let cash = build_cash_flow_history_list_request(7001, 3_000, 4_000, "cf-1");
+    assert_eq!(
+        cash.payload_type,
+        CTRADER_OA_CASH_FLOW_HISTORY_LIST_REQUEST_PAYLOAD_TYPE
+    );
+    assert_eq!(cash.payload_type, 2143);
+    assert_eq!(
+        cash.payload.get("toTimestamp").and_then(Value::as_i64),
+        Some(4_000)
+    );
+}
+
+#[test]
+fn refresh_token_and_ctid_profile_requests_carry_tokens() {
+    let refresh = build_refresh_token_request("refresh-abc", "rt-1");
+    assert_eq!(
+        refresh.payload_type,
+        CTRADER_OA_REFRESH_TOKEN_REQUEST_PAYLOAD_TYPE
+    );
+    assert_eq!(
+        refresh.payload.get("refreshToken").and_then(Value::as_str),
+        Some("refresh-abc")
+    );
+
+    let profile = build_get_ctid_profile_by_token_request("access-xyz", "pr-1");
+    assert_eq!(
+        profile.payload_type,
+        CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_REQUEST_PAYLOAD_TYPE
+    );
+    assert_eq!(
+        profile.payload.get("accessToken").and_then(Value::as_str),
+        Some("access-xyz")
+    );
+}
+
+#[test]
+fn account_logout_and_dynamic_leverage_and_conversion_and_offset_requests() {
+    let logout = build_account_logout_request(7001, "lo-1");
+    assert_eq!(
+        logout.payload_type,
+        CTRADER_OA_ACCOUNT_LOGOUT_REQUEST_PAYLOAD_TYPE
+    );
+    assert_eq!(
+        logout
+            .payload
+            .get("ctidTraderAccountId")
+            .and_then(Value::as_i64),
+        Some(7001)
+    );
+
+    let lev = build_get_dynamic_leverage_request(7001, 88, "dl-1");
+    assert_eq!(
+        lev.payload_type,
+        CTRADER_OA_GET_DYNAMIC_LEVERAGE_REQUEST_PAYLOAD_TYPE
+    );
+    assert_eq!(lev.payload.get("leverageId").and_then(Value::as_i64), Some(88));
+
+    let conv = build_symbols_for_conversion_request(7001, 3, 5, "sc-1");
+    assert_eq!(
+        conv.payload_type,
+        CTRADER_OA_SYMBOLS_FOR_CONVERSION_REQUEST_PAYLOAD_TYPE
+    );
+    assert_eq!(conv.payload.get("firstAssetId").and_then(Value::as_i64), Some(3));
+    assert_eq!(conv.payload.get("lastAssetId").and_then(Value::as_i64), Some(5));
+
+    let offset = build_deal_offset_list_request(7001, 999, "do-1");
+    assert_eq!(
+        offset.payload_type,
+        CTRADER_OA_DEAL_OFFSET_LIST_REQUEST_PAYLOAD_TYPE
+    );
+    assert_eq!(offset.payload.get("dealId").and_then(Value::as_i64), Some(999));
+}
+
+#[test]
+fn margin_call_and_depth_quote_requests_use_documented_payloads() {
+    let mc = build_margin_call_list_request(7001, "mc-1");
+    assert_eq!(
+        mc.payload_type,
+        CTRADER_OA_MARGIN_CALL_LIST_REQUEST_PAYLOAD_TYPE
+    );
+
+    let sub = build_subscribe_depth_quotes_request(7001, &[1, 2, 3], "dq-1");
+    assert_eq!(
+        sub.payload_type,
+        CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE
+    );
+    let ids = sub
+        .payload
+        .get("symbolId")
+        .and_then(Value::as_array)
+        .expect("symbolId array");
+    assert_eq!(ids.len(), 3);
+    assert_eq!(
+        expected_response_payload_type(CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE)
+            .unwrap(),
+        CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_RESPONSE_PAYLOAD_TYPE
+    );
+
+    let unsub = build_unsubscribe_depth_quotes_request(7001, &[1], "dq-2");
+    assert_eq!(
+        unsub.payload_type,
+        CTRADER_OA_UNSUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE
+    );
+}

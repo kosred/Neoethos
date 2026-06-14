@@ -729,7 +729,7 @@ class _NumberCell extends StatelessWidget {
 // Open Positions panel (right top)
 // ---------------------------------------------------------------------------
 
-class _OpenPositionsPanel extends StatelessWidget {
+class _OpenPositionsPanel extends ConsumerWidget {
   final AsyncValue<AccountSnapshot> accountAsync;
   final AsyncValue<LiveSpotsSnapshot> spotsAsync;
   const _OpenPositionsPanel({
@@ -738,7 +738,7 @@ class _OpenPositionsPanel extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final acc = accountAsync.valueOrNull;
     final positions = acc?.positions ?? const <Position>[];
     final currencySymbol = currencyGlyph(acc?.currency ?? 'USD');
@@ -775,6 +775,14 @@ class _OpenPositionsPanel extends StatelessWidget {
                     itemBuilder: (context, i) => _PositionRow(
                       position: positions[i],
                       currencySymbol: currencySymbol,
+                      // F-334: tap a position row → open that symbol's
+                      // chart (with the inline buy/sell overlay), same
+                      // affordance as the watchlist rows.
+                      onTap: () => _openSymbolChart(
+                        context,
+                        ref,
+                        positions[i].symbol,
+                      ),
                     ),
                   ),
                 );
@@ -790,9 +798,11 @@ class _OpenPositionsPanel extends StatelessWidget {
 class _PositionRow extends StatelessWidget {
   final Position position;
   final String currencySymbol;
+  final VoidCallback? onTap;
   const _PositionRow({
     required this.position,
     required this.currencySymbol,
+    this.onTap,
   });
 
   @override
@@ -816,7 +826,9 @@ class _PositionRow extends StatelessWidget {
         position.pnlPips == 0 ? '0.0' : position.pnlPips.toStringAsFixed(1);
     final pnlUsd =
         position.pnlUsd == 0 ? '0.00' : position.pnlUsd.toStringAsFixed(2);
-    return Container(
+    return InkWell(
+      onTap: onTap,
+      child: Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: const BoxDecoration(
         border: Border(
@@ -898,6 +910,7 @@ class _PositionRow extends StatelessWidget {
           ),
         ],
       ),
+      ),
     );
   }
 }
@@ -923,6 +936,7 @@ class _PendingOrdersPanel extends StatelessWidget {
           _PanelTitle(
             title: AppLocalizations.of(context)!.marketWatchPendingOrders,
             count: 0,
+            comingSoon: true,
           ),
           Expanded(
             child: _EmptyLine(
@@ -942,7 +956,16 @@ class _PendingOrdersPanel extends StatelessWidget {
 class _PanelTitle extends StatelessWidget {
   final String title;
   final int count;
-  const _PanelTitle({required this.title, required this.count});
+
+  /// When true the count badge is replaced by a muted "SOON" pill —
+  /// for unwired panels (e.g. Pending Orders, no backend yet) so an
+  /// empty table doesn't masquerade as a real, working empty list.
+  final bool comingSoon;
+  const _PanelTitle({
+    required this.title,
+    required this.count,
+    this.comingSoon = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -966,21 +989,39 @@ class _PanelTitle extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 6),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-            decoration: BoxDecoration(
-              color: NeoethosTokens.accentMuted,
-              borderRadius: BorderRadius.circular(3),
-            ),
-            child: Text(
-              '$count',
-              style: const TextStyle(
-                fontSize: NeoethosTokens.fsCaption - 1,
-                fontWeight: FontWeight.w800,
-                color: NeoethosTokens.accent,
+          if (comingSoon)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+              decoration: BoxDecoration(
+                color: NeoethosTokens.border.withValues(alpha: 0.4),
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: Text(
+                AppLocalizations.of(context)!.commonComingSoon.toUpperCase(),
+                style: const TextStyle(
+                  fontSize: NeoethosTokens.fsCaption - 1,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.5,
+                  color: NeoethosTokens.textFaint,
+                ),
+              ),
+            )
+          else
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+              decoration: BoxDecoration(
+                color: NeoethosTokens.accentMuted,
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: Text(
+                '$count',
+                style: const TextStyle(
+                  fontSize: NeoethosTokens.fsCaption - 1,
+                  fontWeight: FontWeight.w800,
+                  color: NeoethosTokens.accent,
+                ),
               ),
             ),
-          ),
         ],
       ),
     );

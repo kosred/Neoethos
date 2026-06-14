@@ -40,48 +40,67 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 // ---------------------------------------------------------------------------
 // Env-var names — canonical string constants
 // ---------------------------------------------------------------------------
+//
+// The cTrader-retry / streaming / PnL-audit name + default constants in this
+// section are part of the env-override *catalog*: kept exported so the registry
+// stays grep-able and the test drift-guard can assert every knob is documented.
+// They read as `dead_code` only because their consumers live on the live
+// cTrader execution + PnL circuit-breaker path, which is built but not yet
+// wired into the production HTTP server (Phase 2-5 live-engine wiring — see
+// `app_services/discovery.rs` + the autonomous-trader design). The
+// `#[allow(dead_code)]` comes off when the live supervisor reads these getters.
 
 /// HTTP server bind address (`host:port`). When unset, falls back to
 /// `127.0.0.1:7423`. Read by `server::serve` at startup.
+#[allow(dead_code)]
 pub const ENV_SERVER_BIND: &str = "NEOETHOS_SERVER_BIND";
 
 /// Maximum TCP read time (seconds) for `execute_via_session`. 0 disables
 /// the timeout. Clamped to `[0, 3600]`; default 30s.
+#[allow(dead_code)]
 pub const ENV_CTRADER_READ_TIMEOUT_SECS: &str = "NEOETHOS_BOT_CTRADER_READ_TIMEOUT_SECS";
 
 /// Maximum attempts (initial + retries) per cTrader execution call.
 /// Clamped to `[1, 5]`; default 3. Retry safety relies on the broker
 /// deduping by `clientOrderId`.
+#[allow(dead_code)]
 pub const ENV_CTRADER_MAX_ATTEMPTS: &str = "NEOETHOS_BOT_CTRADER_MAX_ATTEMPTS";
 
 /// Base backoff (ms) for cTrader retries; doubles per attempt with
 /// 0-99ms jitter, capped at 5s total. Clamped to `[10, 2000]`; default 200.
+#[allow(dead_code)]
 pub const ENV_CTRADER_BACKOFF_BASE_MS: &str = "NEOETHOS_BOT_CTRADER_BACKOFF_BASE_MS";
 
 /// Whether partial fills are accepted as final (`1`/`true`/`yes` → on).
 /// Default off — partial fills error out so the risk-per-trade math
 /// stays consistent.
+#[allow(dead_code)]
 pub const ENV_CTRADER_ALLOW_PARTIAL_FILL: &str = "NEOETHOS_BOT_CTRADER_ALLOW_PARTIAL_FILL";
 
 /// Maximum attempts for the streaming chart-update poll. Clamped
 /// `[1, 5]`; default 3. Stateless polls are safe to retry.
+#[allow(dead_code)]
 pub const ENV_CTRADER_STREAM_MAX_ATTEMPTS: &str = "NEOETHOS_BOT_CTRADER_STREAM_MAX_ATTEMPTS";
 
 /// Base backoff (ms) for the streaming layer. Clamped `[10, 2000]`;
 /// default 200.
+#[allow(dead_code)]
 pub const ENV_CTRADER_STREAM_BACKOFF_BASE_MS: &str = "NEOETHOS_BOT_CTRADER_STREAM_BACKOFF_BASE_MS";
 
 /// Quote side (`mid` / `bid` / `ask`) used for chart-merge when a
 /// single price is required (e.g. latest-close display). Default `mid`.
+#[allow(dead_code)]
 pub const ENV_CHART_MERGE_SIDE: &str = "NEOETHOS_BOT_CHART_MERGE_SIDE";
 
 /// PnL drift threshold (fraction of notional) above which an audit
 /// warning is logged. Clamped `[1e-5, 0.05]`; default 0.001 (10bp).
+#[allow(dead_code)]
 pub const ENV_PNL_AUDIT_DRIFT_FRACTION: &str = "NEOETHOS_BOT_PNL_AUDIT_DRIFT_FRACTION";
 
 /// PnL drift threshold (fraction of notional) that halts the auto-trader.
 /// Clamped `[1e-4, 0.20]` so the breaker cannot be silenced by a typo.
 /// Default 0.01 (1%).
+#[allow(dead_code)]
 pub const ENV_PNL_CIRCUIT_BREAKER_FRACTION: &str = "NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION";
 
 /// Override path for the live trading journal. Test/CI use; production
@@ -114,10 +133,17 @@ pub const ENV_CAPTURE_FIXTURES_DIR: &str = "NEOETHOS_CAPTURE_FIXTURES_DIR";
 
 pub const DEFAULT_BIND_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 7423);
+// `dead_code` only until the live cTrader-exec + PnL path reads these — see the
+// catalog note above the ENV_* block.
+#[allow(dead_code)]
 pub const DEFAULT_CTRADER_READ_TIMEOUT_SECS: u64 = 30;
+#[allow(dead_code)]
 pub const DEFAULT_CTRADER_MAX_ATTEMPTS: u32 = 3;
+#[allow(dead_code)]
 pub const DEFAULT_CTRADER_BACKOFF_BASE_MS: u64 = 200;
+#[allow(dead_code)]
 pub const DEFAULT_PNL_AUDIT_DRIFT_FRACTION: f64 = 0.001;
+#[allow(dead_code)]
 pub const DEFAULT_PNL_CIRCUIT_BREAKER_FRACTION: f64 = 0.01;
 
 // ---------------------------------------------------------------------------
@@ -191,17 +217,23 @@ pub fn ctrader_allow_partial_fill() -> bool {
 }
 
 /// Maximum streaming poll attempts. Clamped `[1, 5]`.
+/// `dead_code` until the live streaming layer is wired (Phase 2-5).
+#[allow(dead_code)]
 pub fn ctrader_stream_max_attempts() -> u32 {
     app_runtime().ctrader_stream_max_attempts.clamp(1, 5)
 }
 
 /// Streaming retry backoff base (ms). Clamped `[10, 2000]`.
+/// `dead_code` until the live streaming layer is wired (Phase 2-5).
+#[allow(dead_code)]
 pub fn ctrader_stream_backoff_base_ms() -> u64 {
     app_runtime().ctrader_stream_backoff_base_ms.clamp(10, 2_000)
 }
 
 /// Chart-merge quote side (`mid`/`bid`/`ask`); `None` when the configured
 /// value is empty (the caller then uses its own default).
+/// `dead_code` until the live chart-merge display path is wired.
+#[allow(dead_code)]
 pub fn chart_merge_side_raw() -> Option<String> {
     let v = app_runtime().chart_merge_side.trim().to_ascii_lowercase();
     if v.is_empty() { None } else { Some(v) }

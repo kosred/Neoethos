@@ -84,8 +84,8 @@ use super::{
 ///     legitimate algorithms because they run inside the search
 ///     crate, but they have no role in the soft-voting ensemble.
 ///
-/// **29 names total** (34 KNOWN_MODEL_NAMES − swarm − 3 evolutionary
-/// search algorithms − exit_agent).
+/// **30 names total** (KNOWN_MODEL_NAMES − swarm − 3 evolutionary
+/// search algorithms − exit_agent, + the `sac` entry voter).
 ///
 /// `exit_agent` was removed in F-318 (2026-05-29): the model trains
 /// successfully and emits `ExitDecision3` probabilities, but
@@ -130,8 +130,11 @@ pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     "online_pa",
     "online_hoeffding",
     "isolation_forest",
-    // RL (1) — exit_agent removed in F-318 (consumers never wired)
+    // RL (2) — exit_agent removed in F-318 (consumers never wired).
+    // `sac` (discrete Soft Actor-Critic) is an entry/direction voter
+    // that emits Classification3 probs and soft-votes like `dqn`.
     "dqn",
+    "sac",
 ];
 
 /// Build a fully populated [`ExpertRegistry`] with every default
@@ -149,7 +152,7 @@ pub fn build_default_registry() -> Result<ExpertRegistry> {
     debug_assert_eq!(
         registry.registered_names().len(),
         DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(),
-        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 29 canonical names"
+        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 30 canonical names"
     );
     Ok(registry)
 }
@@ -203,6 +206,77 @@ pub fn load_experts_for_symbol(
     Ok(registry.load_with_partial(&artifact_root, DEFAULT_BOOTSTRAP_EXPERT_NAMES))
 }
 
+/// v0.5 ML-integration Stage 3 — produce the per-row role-aware
+/// [`EnsembleDecision`]s for a symbol from a `FeatureFrame`, centralizing the
+/// feature-column CONTRACT so the trader never feeds mis-columned data to the
+/// experts.
+///
+/// Builds the symbol's ensemble, reads the experts' shared `feature_columns()`
+/// (asserting all loaded experts agree), selects the FeatureFrame columns to
+/// EXACTLY that set BY NAME (the experts bail unless the DataFrame columns equal
+/// their trained set), runs [`SoftVotingEnsemble::predict_with_roles`], and
+/// returns one decision per row. FAILS LOUD on any column mismatch / missing
+/// feature — the caller (the trader) then falls back to gene-only rather than
+/// trading on a wrong-columned ensemble.
+pub fn role_decisions_from_feature_frame(
+    models_root: &Path,
+    symbol: &str,
+    timeframe: &str,
+    features: &neoethos_data::FeatureFrame,
+) -> Result<Vec<super::EnsembleDecision>> {
+    use anyhow::{anyhow, bail};
+    use polars::prelude::{Column, DataFrame, NamedFrom, Series};
+
+    // `load_outcome` is an `EnsemblePredictor` trait method.
+    use super::EnsemblePredictor;
+
+    let ensemble = build_ensemble_for_symbol(models_root, symbol, timeframe)?;
+
+    // Determine the experts' shared feature-column set; assert all loaded
+    // experts that expose columns agree on them.
+    let mut expected: Option<Vec<String>> = None;
+    for expert in &ensemble.load_outcome().loaded {
+        let cols = expert.feature_columns();
+        if cols.is_empty() {
+            continue;
+        }
+        match &expected {
+            None => expected = Some(cols.to_vec()),
+            Some(prev) => {
+                if prev.as_slice() != cols {
+                    bail!(
+                        "ensemble experts disagree on feature columns for {symbol}/{timeframe}; \
+                         refusing to feed mis-columned data"
+                    );
+                }
+            }
+        }
+    }
+    let expected = expected.ok_or_else(|| {
+        anyhow!("no loaded expert exposes feature_columns for {symbol}/{timeframe}")
+    })?;
+
+    // Build a DataFrame with EXACTLY `expected` columns, by name, from the cube.
+    let mut columns = Vec::with_capacity(expected.len());
+    for name in &expected {
+        let idx = features
+            .names
+            .iter()
+            .position(|n| n == name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "feature '{name}' required by the {symbol}/{timeframe} ensemble is absent \
+                     from the trader feature cube; refusing to trade on incomplete features"
+                )
+            })?;
+        let col: Vec<f32> = features.feature_column(idx).to_vec();
+        columns.push(Column::from(Series::new(name.as_str().into(), col)));
+    }
+    let df = DataFrame::new(columns).context("build ensemble feature DataFrame")?;
+
+    ensemble.predict_with_roles(&df)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -231,8 +305,9 @@ mod tests {
 
     #[test]
     fn default_bootstrap_names_match_known_model_names_minus_swarm() {
-        // 33 names = 34 KNOWN_MODEL_NAMES minus swarm_forecaster.
-        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 29);
+        // 30 voters = KNOWN_MODEL_NAMES minus swarm_forecaster,
+        // 3 evolutionary discoverers, and exit_agent; plus sac.
+        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 30);
         let names: std::collections::HashSet<&str> =
             DEFAULT_BOOTSTRAP_EXPERT_NAMES.iter().copied().collect();
         assert!(
@@ -270,10 +345,10 @@ mod tests {
     }
 
     #[test]
-    fn build_default_registry_installs_all_29_loaders() {
+    fn build_default_registry_installs_all_30_loaders() {
         let registry = build_default_registry().expect("build default registry");
         let registered = registry.registered_names();
-        assert_eq!(registered.len(), 29);
+        assert_eq!(registered.len(), 30);
         for required in DEFAULT_BOOTSTRAP_EXPERT_NAMES {
             assert!(
                 registry.has_loader(required),
@@ -290,7 +365,7 @@ mod tests {
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
         assert_eq!(outcome.loaded_count(), 0);
         assert_eq!(outcome.degraded_count(), 0);
-        assert_eq!(outcome.missing_count(), 29);
+        assert_eq!(outcome.missing_count(), 30);
         assert!(!outcome.has_any_loaded());
     }
 
@@ -318,6 +393,6 @@ mod tests {
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
         // Still 30 missing because the dir is empty, but the
         // function didn't error out → path resolution worked.
-        assert_eq!(outcome.missing_count(), 29);
+        assert_eq!(outcome.missing_count(), 30);
     }
 }

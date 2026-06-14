@@ -258,6 +258,11 @@ class BackendSupervisor {
         [
           '--server',
           '--launched-by-flutter',
+          // Tie the backend's lifetime to this GUI: it self-terminates within
+          // ~2s of us exiting, so it never orphans port 7423 and blocks the
+          // next launch. `pid` (dart:io) is THIS Flutter process's PID.
+          '--parent-pid',
+          '$pid',
           '--config',
           '${_userDataDir().path}${Platform.pathSeparator}config.yaml',
         ],

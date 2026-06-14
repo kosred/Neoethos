@@ -1,6 +1,5 @@
 system:
   symbol: EURUSD
-  symbols: [EURUSD]
   # F-304 (2026-05-28): account currency for the backtest cost model.
   # Cost model uses this for commission/swap/pnl_conversion_fee FX
   # conversions and the risk gate uses it for position-sizing pip-value
@@ -10,35 +9,20 @@ system:
   account_currency: USD
   data_dir: data
   base_timeframe: M1  # 1-minute base for multi-timeframe analysis
-  multi_resolution_enabled: true
+  multi_resolution_enabled: false  # agent 2026-06-05: top-down MTF (base + strictly-HIGHER TFs only). When true, resolve_higher_timeframes returned ALL canonical TFs except the base (incl M1's 5.27M rows) as "higher" → every combo serially reloaded M1 (the pre-GA wall that stopped combos completing on laptop AND VPS) AND fed M1 noise into coarse-TF strategies. false = base+higher only → the cmd_discover base+higher load-fix actually helps + cleaner features.
   multi_resolution_timeframes: [M1, M3, M5, M15, M30, H1, H2, H4, D1, W1, MN1]
   multi_resolution_prefix_base: false
   use_volume_features: true
   higher_timeframes: [M3, M5, M15, M30, H1, H2, H4, D1, W1, MN1]
-  history_years: 10
-  trading_session_start: "00:05"
-  trading_session_end: "23:55"
-  session_timezone: UTC
-  broker_backend: ctrader
   poll_interval_seconds: 60
-  metrics_logging_enabled: true
   metrics_db_path: metrics.sqlite
-  risk_ledger_enabled: true
-  risk_ledger_max_events: 1000
-  strategy_ledger_path: strategy_ledger.sqlite
-  enable_dashboard: true
-  cache_enabled: true
   cache_dir: cache
-  cache_max_age_minutes: 0
-  deep_purge_mode: "all"  # Enable full purge for institutional training
-  deep_purge_on_train: true
   # Hardware is detected automatically (CPU/GPU/RAM)
   # Set preference to "auto", "true" (force GPU), or "false" (force CPU)        
-  enable_gpu_preference: auto
-  # Discovery data handling (full data + avoid auto row caps)
-  discovery_auto_cap: false
-  discovery_max_rows: 0
-  discovery_stream: true
+  enable_gpu_preference: auto  # agent 2026-06-05: auto-detect (was "cpu", a laptop iGPU-OOM workaround). The search GA hybrid is compile-gated regardless of this knob; on a real GPU (L40 VPS) the gpu-vulkan build uses it, and a CPU-only build ignores it. Per-machine override stays possible.
+  # agent 2026-06-05 overfitting fix: removed dead `discovery_auto_cap` /
+  # `discovery_max_rows` / `discovery_stream` keys — never consumed by code.
+  # The REAL discovery row cap is `models.prop_search_max_rows` (see below).
 
 risk:
   initial_balance: 10000  # Fallback used when broker balance is unavailable
@@ -48,84 +32,31 @@ risk:
   daily_drawdown_limit: 0.04
   total_drawdown_limit: 0.07
   min_risk_reward: 2.0
-  spread_guard_multiplier: 2.5
-  slippage_guard_multiplier: 2.0
   challenge_mode: true
   challenge_phase: phase_1
   prop_firm_rules: true
-  max_daily_risk_pct: 0.04
-  base_risk_per_trade: 0.03
-  daily_risk_budget: 0.040
-  consistency_tracking: true
-  min_confidence_threshold: 0.55
   kill_zones_enabled: true
-  enhanced_features: true
-  uncertainty_quantification: true
   max_trades_per_day: 8
-  daily_profit_stop_pct: 0.0
   high_quality_confidence: 0.65
-  high_quality_risk_pct: 0.030
-  high_quality_rr: 2.0
   atr_period: 14
   atr_stop_multiplier: 1.5
   triple_barrier_max_bars: 35
   trailing_enabled: true
   trailing_atr_multiplier: 1.0
   trailing_be_trigger_r: 1.0
-  kelly_lambda: 1.0
   slippage_pips: 0.5
   commission_per_lot: 7.0
   backtest_spread_pips: 1.5
-  cost_penalty_r: 0.0
-  gate_trade_prob: 0.55
-  daily_hard_stop_pct: 0.04
   conformal_enabled: true
   conformal_alpha: 0.10
   conformal_abstain_min_set_size: 3
-  volatility_stop_sigma: 0.02
-  volatility_lookback: 50
   meta_label_tp_pips: null
   meta_label_sl_pips: null
   meta_label_max_hold_bars: 100
-  meta_label_min_prob_threshold: 0.55
   meta_label_min_dist: 0.0005
   meta_label_fixed_sl: 0.0020
   meta_label_fixed_tp: 0.0040
-  # Stop/target engine (unsupervised blend of volatility + tail risk)
-  stop_target_mode: blend
-  vol_estimator: ensemble  # ensemble | yang_zhang | garman_klass | parkinson | rogers_satchell | ewma
-  vol_ensemble_weights:
-    yang_zhang: 1.0
-    garman_klass: 1.0
-    rogers_satchell: 1.0
-    parkinson: 1.0
-  vol_window: 50
-  ewma_lambda: 0.94
-  ewma_lambda_by_timeframe:
-    M1: 0.90
-    M5: 0.92
-    M15: 0.94
-    M30: 0.95
-    H1: 0.96
-    H4: 0.97
-    D1: 0.98
-    W1: 0.985
-    MN1: 0.99
   vol_horizon_bars: 5
-  tail_window: 100
-  tail_alpha: 0.975
-  tail_step: 5
-  tail_max_bars: 300000
-  stop_k_vol: 1.0
-  stop_k_tail: 1.25
-  rr_trend: 2.5
-  rr_range: 1.5
-  rr_neutral: 2.0
-  regime_adx_trend: 25.0
-  regime_adx_range: 20.0
-  hurst_window: 100
-  hurst_trend: 0.55
-  hurst_range: 0.45
 
 models:
   ml_models: [lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, sklears_tree, mlp, neat, elasticnet, bayes_logit, online_pa, online_hoeffding, swarm_forecaster, isolation_forest]
@@ -167,13 +98,29 @@ models:
   evo_islands: 8  # MORE ISLANDS = MORE DIVERSITY (was 4, now 8)
   evo_sigma: 0.25
   prop_search_enabled: true  # CRITICAL: Enable strategy discovery!
-  prop_search_population: 100  # Per-island population (100 × 8 islands = 800 total)
-  prop_search_generations: 1000  # operator 2026-06-01: deep Python-class search (was 20); time-bounded by max_hours
-  prop_search_max_hours: 24  # operator 2026-06-01: up to 24h budget per symbol,TF run (was 2.0)
-  prop_search_max_rows: 0  # 0 = USE FULL DATASET for strategy discovery (2.2M rows)
-  prop_search_portfolio_size: 4  # Cap discovered strategies per pair
-  # 0 = allow full indicator set (no hard cap)
-  prop_search_max_indicators: 0
+  discovery_mode: prop_firm  # FTMO-style robust discovery (default)
+  # Feature prefilter (in-sample correlation ranking). The prefilter ranks the
+  # multi-resolution feature cube by |corr| with the BASE TF's 1-bar forward
+  # return and keeps the top-K. A slow higher-TF indicator is near-constant
+  # across many base bars, so its 1-bar-forward corr is ~0 by construction —
+  # the top-K alone therefore discards EVERY multi-TF (H1_/H4_/M15_/...) feature
+  # and the GA's multi-TF seed templates find no prefixes (→ "0 genes" → random
+  # cold start), wasting the whole multi-resolution cube. prefilter_min_per_timeframe
+  # force-keeps each present higher-TF group's best-N features ADDITIVELY (like
+  # the regime_* force-keep) so multi-TF context actually reaches the GA.
+  # 0 = legacy base-only behaviour. (root-caused + fixed 2026-06-08)
+  discovery_runtime:
+    prefilter_top_k: 50
+    prefilter_insample_frac: 0.70
+    prefilter_min_per_timeframe: 6
+  prop_search_population: 200  # 2026-06-06 operator: 100->200 per-island (200 × 8 islands = 1600 total) — MORE breadth/diversity per generation → finds more of the rare low-DD regime-specialist genes (the deep experiment found maxDD 2.7-4.5% vs 7-9.5% shallow).
+  prop_search_generations: 20000  # 2026-06-06 operator: 1000->20000 — deep GA. Time-bounded by max_hours (binds first on big TFs); on small/fast TFs lets the GA search far deeper than the old 1000 cap.
+  prop_search_max_hours: 1.0  # 2026-06-06 operator: 0.5->1.0 — a full hour of deep search per combo (the experiment used 1h and found notably better genes). NOTE: a full 126-combo library run at 1h/combo exceeds current VPS credit — for the full library, add credit or lower this. Re-read per combo.
+  prop_search_max_rows: 0  # operator 2026-06-05: NO cap — use ALL data per file (400k cut M1 to ~9mo -> "not enough history" + capped depth). 0=full history. Per-TF override via prop_search_max_rows_by_tf (not hardcoded).
+  prop_search_portfolio_size: 50  # 2026-06-06 operator regime-diversity mandate: keep MANY diverse regime-specialist strategies per pair (was 4). The goal is a LARGE library, each capturing a different market condition; the live ensemble + regime-detection deploys each when its edge is active. Correlation-diversification still picks the most-diverse top-N.
+  # agent 2026-06-05 overfitting fix: 0 meant unlimited (usize::MAX) -> genes used
+  # up to 58 indicators = severe overfitting; 16 caps degrees of freedom (regularization).
+  prop_search_max_indicators: 16
   prop_search_async: true
   prop_search_async_wait: false
   tree_device_preference: gpu
@@ -190,7 +137,7 @@ models:
   prop_search_val_candidates: 0
   prop_search_val_min_positive_months: 0
   prop_search_val_min_trades_per_month: 15
-  prop_search_val_min_trades_per_day: 0.5
+  prop_search_val_min_trades_per_day: 1.0  # operator 2026-06-05: >=1 trade per working day so we can actually observe what a strategy does
   prop_search_val_min_monthly_profit_pct: 0.0
   prop_search_val_log_trades: true
   prop_search_val_trade_log_max: 50
@@ -286,8 +233,20 @@ models:
   prop_accuracy_weight: 0.1
   prop_min_trades: 0
   prop_conf_threshold: 0.55
-  walkforward_splits: 20  # time-based walk-forward splits for OOS validation
+  walkforward_splits: 10  # agent 2026-06-05: was 20 → halves the serial post-gate walkforward cost (20→10 backtests × survivors × rows). 10 splits is the robust OOS sweet spot. Speeds every combo. NOTE: with require_walkforward_for_export=true (below) walk-forward is now an EXPORT GATE in PropFirm mode, not just informational.
   embargo_minutes: 120
+  # agent 2026-06-05 overfitting fix: walk-forward as an EXPORT GATE. When true
+  # (default), a discovered portfolio is export-ready in PropFirm mode ONLY if it
+  # also passes walk-forward (out-of-sample) — not just the prop-firm window gate.
+  # This stops in-sample-overfit strategies (IS Sharpe 3-11 / PF up to 62) that
+  # fail walk-forward from exporting. Set false to restore window-gate-only.
+  require_walkforward_for_export: false  # 2026-06-06 operator regime-diversity mandate: walk-forward tests ALL-PERIOD generalization → as a HARD gate it kills regime-specialists (genes good in SOME market conditions, not all years), which is exactly what we WANT to keep. Now INFORMATIONAL: walk-forward still RUNS and is recorded per strategy (so the live system knows each strategy's OOS character), but it no longer blocks export. Robustness comes from portfolio DIVERSITY + live regime-detection, not per-strategy all-period generalization. Set true to restore the hard OOS export gate.
+  # agent 2026-06-05 overfitting fix: hard floor for the prop-firm window
+  # pass-rate (combined as max with discovery_runtime.prop_firm_gate.pass_rate,
+  # which defaults to 0.0 = ranking-only). 0.65 = a candidate must pass FTMO
+  # rules on ≥65% of random evaluation windows to survive. Raise toward 1.0 for
+  # stricter selection; lower (e.g. 0.0) to restore the old ranking-only behaviour.
+  prop_firm_min_pass_rate: 0.0  # 2026-06-06 operator regime-diversity mandate: 0.65→0.40→0.0. A hard all-window consistency floor KILLS regime-specialists (genes active in only SOME market conditions) — exactly the strategies we WANT for a diverse library. 0.0 = RANKING-ONLY: the prop-firm window-pass-rate still RANKS candidates (more-consistent first) but no longer kills any. The LOW-DD base filter (max_dd) + quality screen (MC/spread/regime) + min-trades still reject blow-ups and noise. Raise (e.g. 0.40-0.65) to demand all-window consistency again.
   # CPCV (Combinatorial Purged Cross-Validation) settings
   enable_cpcv: true
   cpcv_n_splits: 5
@@ -295,7 +254,7 @@ models:
   cpcv_embargo_pct: 0.01
   cpcv_purge_pct: 0.02
   cpcv_min_phi: 0.80
-  cpcv_max_rows: 0
+  cpcv_max_rows: 200000  # agent 2026-06-05: was 0 (=full rows) → CPCV (combinatorial purged CV, the single heaviest serial validation) ran on 1.05M rows. 200k bounds it on every TF; CPCV stays enabled (López de Prado overfitting check, kept per "stats are the authority") but capped. Informational in PropFirm mode.
 
 news:
   news_decay_minutes: 120

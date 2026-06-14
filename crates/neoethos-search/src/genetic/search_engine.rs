@@ -50,7 +50,7 @@ impl EvalDataCache {
     pub fn build(features: &FeatureFrame, ohlcv: &Ohlcv) -> Self {
         let indicators = transpose_features(features);
         let (months, days) = month_day_indices(&features.timestamps);
-        let n_samples = features.data.nrows();
+        let n_samples = features.n_samples();
         let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
             build_smc_arrays(features, ohlcv);
         let mut smc_data = Vec::with_capacity(n_samples);
@@ -106,7 +106,11 @@ fn build_gene_arrays(genes: &[Gene]) -> GeneArrays {
 }
 
 fn transpose_features(frame: &FeatureFrame) -> Array2<f32> {
-    frame.data.t().to_owned()
+    // `as_indicators_view` is already `[features × samples]` for both backings
+    // (a transposed view of the in-RAM matrix, or the native mmap layout), so
+    // this is the GA's `indicators` exactly. Callers only ever pass the small
+    // prefiltered/windowed frame here, so the `to_owned` copy stays bounded.
+    frame.as_indicators_view().to_owned()
 }
 
 /// Compute the signal series for a `Gene` using the SAME SMC-gated logic as
@@ -139,18 +143,38 @@ pub fn signals_for_gene_with_config(
     gene: &Gene,
     config: &EvaluationConfig,
 ) -> Vec<i8> {
-    let n_samples = features.data.nrows();
+    // Behaviour-identical thin wrapper: drop the confidence vector.
+    signals_and_confidence_for_gene_with_config(features, gene, config).0
+}
+
+/// Confidence-emitting variant of [`signals_for_gene_with_config`]. Returns
+/// the SAME signals plus a per-bar confidence in `[0,1]` used by the
+/// risk-based position sizer.
+///
+/// Confidence per bar: `0.0` when the signal is `0`; otherwise
+///   gap    = (long_threshold - short_threshold).abs().max(1e-6)
+///   long:  margin = combined[i] - long_threshold
+///   short: margin = short_threshold - combined[i]
+///   conf   = (margin / gap).clamp(0.0, 1.0)
+pub fn signals_and_confidence_for_gene_with_config(
+    features: &FeatureFrame,
+    gene: &Gene,
+    config: &EvaluationConfig,
+) -> (Vec<i8>, Vec<f32>) {
+    let n_samples = features.n_samples();
     let mut combined = vec![0.0_f32; n_samples];
     for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
-        if *idx >= features.data.ncols() {
+        if *idx >= features.n_features() {
             continue;
         }
-        let col = features.data.column(*idx);
+        let col = features.feature_column(*idx);
         for (i, v) in col.iter().enumerate() {
             combined[i] += *weight * *v;
         }
     }
     let mut signals = vec![0_i8; n_samples];
+    let mut confidences = vec![0.0_f32; n_samples];
+    let gap = (gene.long_threshold - gene.short_threshold).abs().max(1e-6);
 
     // Resolve gene SMC flags + per-flag weights identical to the in-search
     // evaluator. If no flag is enabled we short-circuit to the simple
@@ -169,38 +193,36 @@ pub fn signals_for_gene_with_config(
         gene.use_eql as i8,
         gene.use_displacement as i8,
     ];
-    let any_flag = flags.iter().any(|f| *f != 0);
-    if !any_flag {
-        for (i, slot) in signals.iter_mut().enumerate() {
-            let v = combined[i];
-            *slot = if v >= gene.long_threshold {
-                1
-            } else if v <= gene.short_threshold {
-                -1
-            } else {
-                0
-            };
-        }
-        return signals;
-    }
+    let _any_flag = flags.iter().any(|f| *f != 0);
 
     // Need OHLCV-derived SMC indicator series — compute the same way the
     // evaluator does. Without OHLCV we fall back to the un-gated path so
     // single-arg callers (no Ohlcv handy) keep working; gated callers
-    // should use `signals_for_gene_full`.
+    // should use `signals_for_gene_full`. (Both branches of the original
+    // code applied the identical un-gated threshold loop, so this is
+    // behaviour-preserving.)
     let _ = config; // reserved: future per-config gate threshold override
 
-    for (i, slot) in signals.iter_mut().enumerate() {
+    for i in 0..n_samples {
         let v = combined[i];
-        *slot = if v >= gene.long_threshold {
+        let sig = if v >= gene.long_threshold {
             1
         } else if v <= gene.short_threshold {
             -1
         } else {
             0
         };
+        signals[i] = sig;
+        if sig != 0 {
+            let margin = if sig == 1 {
+                v - gene.long_threshold
+            } else {
+                gene.short_threshold - v
+            };
+            confidences[i] = (margin / gap).clamp(0.0, 1.0);
+        }
     }
-    signals
+    (signals, confidences)
 }
 
 /// SMC-gated variant that mirrors `eval::synthesize_signals_cpu` exactly.
@@ -212,13 +234,34 @@ pub fn signals_for_gene_full(
     gene: &Gene,
     config: &EvaluationConfig,
 ) -> Vec<i8> {
-    let n_samples = features.data.nrows();
+    // Behaviour-identical thin wrapper: drop the confidence vector.
+    signals_and_confidence_for_gene_full(features, ohlcv, gene, config).0
+}
+
+/// Confidence-emitting variant of [`signals_for_gene_full`]. Returns the
+/// SAME SMC-gated signals plus a per-bar confidence in `[0,1]` used by the
+/// risk-based position sizer. Confidence is computed from the RAW threshold
+/// crossing (pre-gate) and stored only for bars whose final (post-gate)
+/// signal is non-zero, so it aligns exactly with the signals slice.
+///
+/// Confidence per bar: `0.0` when the signal is `0`; otherwise
+///   gap    = (long_threshold - short_threshold).abs().max(1e-6)
+///   long:  margin = combined[i] - long_threshold
+///   short: margin = short_threshold - combined[i]
+///   conf   = (margin / gap).clamp(0.0, 1.0)
+pub fn signals_and_confidence_for_gene_full(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    gene: &Gene,
+    config: &EvaluationConfig,
+) -> (Vec<i8>, Vec<f32>) {
+    let n_samples = features.n_samples();
     let mut combined = vec![0.0_f32; n_samples];
     for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
-        if *idx >= features.data.ncols() {
+        if *idx >= features.n_features() {
             continue;
         }
-        let col = features.data.column(*idx);
+        let col = features.feature_column(*idx);
         for (i, v) in col.iter().enumerate() {
             combined[i] += *weight * *v;
         }
@@ -275,6 +318,8 @@ pub fn signals_for_gene_full(
         super::smc_indicators::build_smc_arrays(features, ohlcv);
 
     let mut signals = vec![0_i8; n_samples];
+    let mut confidences = vec![0.0_f32; n_samples];
+    let gap = (gene.long_threshold - gene.short_threshold).abs().max(1e-6);
     for i in 0..n_samples {
         let v = combined[i];
         let raw = if v >= gene.long_threshold {
@@ -287,8 +332,16 @@ pub fn signals_for_gene_full(
         if raw == 0 {
             continue;
         }
+        // Confidence of the raw threshold crossing (pre-gate).
+        let margin = if raw == 1 {
+            v - gene.long_threshold
+        } else {
+            gene.short_threshold - v
+        };
+        let conf = (margin / gap).clamp(0.0, 1.0);
         if active_sum <= 0.0 {
             signals[i] = raw;
+            confidences[i] = conf;
             continue;
         }
         let smc_row = [
@@ -309,9 +362,10 @@ pub fn signals_for_gene_full(
         }
         if score >= gate {
             signals[i] = raw;
+            confidences[i] = conf;
         }
     }
-    signals
+    (signals, confidences)
 }
 
 /// Evaluate genes using a pre-built EvalDataCache (avoids recomputing stable arrays each generation).
@@ -394,16 +448,542 @@ pub fn evaluate_genes_cached(
     .map_err(|e| anyhow!(e))
 }
 
+/// AREA 2 / Stage A (2026-06-09) — GPU-routed **validation** population eval.
+///
+/// Mirrors [`evaluate_genes`] (same CSR/SMC array packing via the SHARED
+/// `build_gene_arrays` / `build_smc_arrays`, the single source of truth used by
+/// the GA), but with two deliberate differences so it reproduces the post-search
+/// validation screens (Monte-Carlo / re-eval) bit-for-bit:
+///
+/// 1. It routes through [`crate::eval::validation_backtest_population`] (whole
+///    population → ONE GPU launch, CPU fallback) instead of the GA's CPU+GPU
+///    *split* [`crate::eval::evaluate_population_core`].
+/// 2. The caller supplies the **exact** [`BacktestSettings`] template the serial
+///    validation path used (e.g. `discovery_backtest_settings`): kill-zones on,
+///    and — critically — `risk_based_sizing == false`, so the kernel uses
+///    fixed-1-lot sizing identical to `simulate_trades_core`. Per-gene `sl_pips`
+///    / `tp_pips` are taken from the gene with the SAME 20/40 fallback
+///    `discovery_backtest_settings` applies (NOT the OHLCV-inferred
+///    `resolve_stop_target_arrays` defaults the GA uses), so the SL/TP exits
+///    match the serial Monte-Carlo run exactly.
+///
+/// With `risk_based_sizing == false` the returned `metrics[0]` (net_profit) is
+/// the fixed-1-lot trade-pnl sum, so a consumer testing `metrics[g][0] > 0.0`
+/// gets the SAME profitable/not verdict as the serial
+/// `simulate_trades_core(...).iter().map(|t| t.pnl).sum() > 0.0`.
+pub fn validation_genes_population(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    genes: &[Gene],
+    config: &EvaluationConfig,
+    settings_template: &BacktestSettings,
+) -> Result<Vec<[f64; 11]>> {
+    if genes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if features.n_samples() == 0 || features.n_features() == 0 {
+        bail!("empty feature matrix");
+    }
+    let n_samples = features.n_samples();
+    if ohlcv.close.len() != n_samples {
+        bail!("ohlcv length does not match feature rows");
+    }
+
+    let indicators = transpose_features(features);
+    let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
+    // Per-gene SL/TP resolved the SAME way `discovery_backtest_settings` does:
+    // the gene's own finite-positive value, else the 20/40-pip fallback. This is
+    // what the serial validation path injected into `simulate_trades_core`, so
+    // the SL/TP exits stay identical.
+    let mut sl_pips = Vec::with_capacity(genes.len());
+    let mut tp_pips = Vec::with_capacity(genes.len());
+    for g in genes {
+        sl_pips.push(if g.sl_pips.is_finite() && g.sl_pips > 0.0 {
+            g.sl_pips
+        } else {
+            20.0
+        });
+        tp_pips.push(if g.tp_pips.is_finite() && g.tp_pips > 0.0 {
+            g.tp_pips
+        } else {
+            40.0
+        });
+    }
+    let (months, days) = month_day_indices(&features.timestamps);
+
+    let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
+        build_smc_arrays(features, ohlcv);
+    let mut smc_data = Vec::with_capacity(n_samples);
+    for i in 0..n_samples {
+        smc_data.push([
+            ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i], eql[i],
+            disp[i],
+        ]);
+    }
+    let mut gene_smc_flags = Vec::with_capacity(genes.len());
+    for g in genes {
+        gene_smc_flags.push([
+            g.use_ob as i8,
+            g.use_fvg as i8,
+            g.use_liq_sweep as i8,
+            g.mtf_confirmation as i8,
+            g.use_premium_discount as i8,
+            g.use_inducement as i8,
+            g.use_bos as i8,
+            g.use_choch as i8,
+            g.use_eqh as i8,
+            g.use_eql as i8,
+            g.use_displacement as i8,
+        ]);
+    }
+
+    let smc_weights = [
+        config.smc_weight_ob,
+        config.smc_weight_fvg,
+        config.smc_weight_liq,
+        config.smc_weight_mtf,
+        config.smc_weight_premium,
+        config.smc_weight_inducement,
+        config.smc_weight_bos,
+        config.smc_weight_choch,
+        config.smc_weight_eqh,
+        config.smc_weight_eql,
+        config.smc_weight_displacement,
+    ];
+
+    // Use the caller's settings verbatim, but FORCE fixed-1-lot sizing so the
+    // metrics[0] sign matches the serial `simulate_trades_core` reference. The
+    // caller is expected to pass `risk_based_sizing == false` already; this is
+    // belt-and-suspenders so a stray template can never silently change sizing.
+    let mut settings = settings_template.clone();
+    settings.risk_based_sizing = false;
+
+    Ok(crate::eval::validation_backtest_population(
+        crate::eval::PopulationEvalInputs {
+            close: &ohlcv.close,
+            high: &ohlcv.high,
+            low: &ohlcv.low,
+            indicators: indicators.view(),
+            gene_offsets: &offsets,
+            gene_indices: &indices,
+            gene_weights: &weights,
+            long_thr: &long_thr,
+            short_thr: &short_thr,
+            month_idx: &months,
+            day_idx: &days,
+            timestamps: &features.timestamps,
+            sl_pips: &sl_pips,
+            tp_pips: &tp_pips,
+            smc_data: &smc_data,
+            gene_smc_flags: &gene_smc_flags,
+            gate_threshold: config.smc_gate_threshold,
+            weights: &smc_weights,
+            settings: &settings,
+        },
+    ))
+}
+
+/// AREA 2 / Stage B (2026-06-09) — GPU-routed **CPCV fold** population eval over a
+/// NON-CONTIGUOUS gathered index set.
+///
+/// This is the CPCV twin of [`validation_genes_population`]. The CPCV gate
+/// (`discovery::evaluate_cpcv_gate`) backtests every portfolio gene on each
+/// Combinatorial-Purged-CV fold, where a fold is a set of *gathered*
+/// (re-indexed, non-monotonic) absolute bar indices `absolute_idx`. The serial
+/// CPU path gathers the per-bar arrays HOST-SIDE into fresh contiguous Vecs and
+/// runs `fast_evaluate_strategy_core` on them — the backtest never sees the gaps
+/// because the gather already happened. This helper feeds the GPU population
+/// kernel the SAME host-gathered contiguous buffers, so the kernel is byte-
+/// identical to the CPU's gathered-Vec path WITHOUT any kernel change.
+///
+/// ## Why this can't reuse [`validation_genes_population`]
+/// Two deliberate differences:
+///  1. **SMC is gathered, NOT recomputed.** `validation_genes_population` calls
+///     `build_smc_arrays` on the *passed* OHLCV. The SMC primitives in
+///     `derive_smc_arrays` carry heavy cross-bar LOOKBACK (trend uses
+///     `close[i-12]`, BoS/EQH/EQL use 12–20-bar windows, FVG/liq use 2–3-bar
+///     windows). Recomputing SMC on a gathered (non-contiguous) OHLCV slice would
+///     read the WRONG neighbours and silently corrupt the fold. The CPU CPCV path
+///     avoids this by gathering the *full-series* precomputed signals/confidence;
+///     this helper mirrors it by computing the full-series SMC arrays ONCE and
+///     GATHERING them at `absolute_idx`. Signal synthesis is fully pointwise
+///     (`combined[i]` = weighted sum of indicator[i]; the gate reads only
+///     `smc_row[i]`), so the on-device synth at gathered position `k` reads the
+///     SAME indicator+SMC values the full-series synth read at `absolute_idx[k]`
+///     → identical signals/confidence → identical fold metrics.
+///  2. **`risk_based_sizing` is PRESERVED from the caller's template**, not forced
+///     to `false`. CPCV uses `discovery_backtest_settings` which inherits
+///     `BacktestSettings::default().risk_based_sizing == true` and feeds the gene's
+///     REAL per-bar confidence into the risk sizer. The kernel recomputes the
+///     identical confidence on-device (pointwise), so risk-based sizing matches.
+///
+/// `timestamps` is passed empty (`&[]`) so the backtest uses index-delta carry —
+/// EXACTLY as the serial CPCV path does (`fast_evaluate_strategy_core(..., &[], ...)`).
+///
+/// Per-gene `sl_pips`/`tp_pips` use the SAME finite-positive-else-20/40 fallback
+/// `discovery_backtest_settings` applies, so SL/TP exits match the serial run.
+///
+/// Returns one `[f64; 11]` metric row per gene (same layout as
+/// [`crate::eval::evaluate_population_core`]).
+#[allow(clippy::too_many_arguments)]
+pub fn validation_genes_population_gathered(
+    full_indicators: ndarray::ArrayView2<'_, f32>,
+    full_smc: &[crate::eval::SmcRow],
+    genes: &[Gene],
+    config: &EvaluationConfig,
+    settings_template: &BacktestSettings,
+    absolute_idx: &[usize],
+    gathered_close: &[f64],
+    gathered_high: &[f64],
+    gathered_low: &[f64],
+    gathered_months: &[i64],
+    gathered_days: &[i64],
+) -> Result<Vec<[f64; 11]>> {
+    if genes.is_empty() || absolute_idx.is_empty() {
+        return Ok(Vec::new());
+    }
+    let full_samples = full_indicators.ncols();
+    let n_features = full_indicators.nrows();
+    if full_smc.len() != full_samples {
+        bail!(
+            "full SMC length {} != full sample count {}",
+            full_smc.len(),
+            full_samples
+        );
+    }
+    let fold_n = absolute_idx.len();
+    if gathered_close.len() != fold_n
+        || gathered_high.len() != fold_n
+        || gathered_low.len() != fold_n
+        || gathered_months.len() != fold_n
+        || gathered_days.len() != fold_n
+    {
+        bail!(
+            "gathered per-bar arrays must all have length {} (the fold index count)",
+            fold_n
+        );
+    }
+    if let Some(&bad) = absolute_idx.iter().find(|&&i| i >= full_samples) {
+        bail!(
+            "CPCV gather index {} out of range (full series has {} samples)",
+            bad,
+            full_samples
+        );
+    }
+
+    // Gather the indicator columns at `absolute_idx` into a fresh
+    // `[n_features × fold_n]` matrix — the kernel's `indicators` layout. The
+    // pointwise synth then reads `gathered_ind[f][k]` = full-series indicator[f]
+    // at `absolute_idx[k]`, reproducing `combined` exactly.
+    let mut gathered_ind = Array2::<f32>::zeros((n_features, fold_n));
+    for f in 0..n_features {
+        let src = full_indicators.row(f);
+        let mut dst = gathered_ind.row_mut(f);
+        for (k, &abs) in absolute_idx.iter().enumerate() {
+            dst[k] = src[abs];
+        }
+    }
+
+    // Gather the FULL-SERIES SMC rows (NOT recomputed on the gathered slice).
+    let mut gathered_smc: Vec<crate::eval::SmcRow> = Vec::with_capacity(fold_n);
+    for &abs in absolute_idx {
+        gathered_smc.push(full_smc[abs]);
+    }
+
+    let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
+    // Per-gene SL/TP resolved the SAME way `discovery_backtest_settings` does.
+    let mut sl_pips = Vec::with_capacity(genes.len());
+    let mut tp_pips = Vec::with_capacity(genes.len());
+    for g in genes {
+        sl_pips.push(if g.sl_pips.is_finite() && g.sl_pips > 0.0 {
+            g.sl_pips
+        } else {
+            20.0
+        });
+        tp_pips.push(if g.tp_pips.is_finite() && g.tp_pips > 0.0 {
+            g.tp_pips
+        } else {
+            40.0
+        });
+    }
+
+    let mut gene_smc_flags = Vec::with_capacity(genes.len());
+    for g in genes {
+        gene_smc_flags.push([
+            g.use_ob as i8,
+            g.use_fvg as i8,
+            g.use_liq_sweep as i8,
+            g.mtf_confirmation as i8,
+            g.use_premium_discount as i8,
+            g.use_inducement as i8,
+            g.use_bos as i8,
+            g.use_choch as i8,
+            g.use_eqh as i8,
+            g.use_eql as i8,
+            g.use_displacement as i8,
+        ]);
+    }
+
+    let smc_weights = [
+        config.smc_weight_ob,
+        config.smc_weight_fvg,
+        config.smc_weight_liq,
+        config.smc_weight_mtf,
+        config.smc_weight_premium,
+        config.smc_weight_inducement,
+        config.smc_weight_bos,
+        config.smc_weight_choch,
+        config.smc_weight_eqh,
+        config.smc_weight_eql,
+        config.smc_weight_displacement,
+    ];
+
+    // Use the caller's settings VERBATIM — including `risk_based_sizing` (CPCV
+    // keeps it true so the gene's real per-bar confidence drives sizing, matching
+    // the serial `fast_evaluate_strategy_core` call). Empty `timestamps` ⇒ the
+    // kernel/CPU backtest uses index-delta carry, identical to the serial path.
+    Ok(crate::eval::validation_backtest_population(
+        crate::eval::PopulationEvalInputs {
+            close: gathered_close,
+            high: gathered_high,
+            low: gathered_low,
+            indicators: gathered_ind.view(),
+            gene_offsets: &offsets,
+            gene_indices: &indices,
+            gene_weights: &weights,
+            long_thr: &long_thr,
+            short_thr: &short_thr,
+            month_idx: gathered_months,
+            day_idx: gathered_days,
+            timestamps: &[],
+            sl_pips: &sl_pips,
+            tp_pips: &tp_pips,
+            smc_data: &gathered_smc,
+            gene_smc_flags: &gene_smc_flags,
+            gate_threshold: config.smc_gate_threshold,
+            weights: &smc_weights,
+            settings: settings_template,
+        },
+    ))
+}
+
+/// Window-INDEPENDENT, gene-derived population arrays for the walk-forward
+/// population path. Built ONCE per portfolio and reused for every split window
+/// so the per-window cost is just the contiguous slice + the GPU launch.
+///
+/// This is the gene axis of the walk-forward transpose: the CSR genome arrays,
+/// the per-gene SL/TP (same finite-positive-else-20/40 fallback the rest of the
+/// validation tail uses), the per-gene SMC flags, the SMC weights, and the
+/// fixed-1-lot settings template. None of these depend on which split window is
+/// being evaluated.
+pub struct WalkforwardPopulationGenePack {
+    offsets: Vec<i32>,
+    indices: Vec<i32>,
+    weights: Vec<f32>,
+    long_thr: Vec<f32>,
+    short_thr: Vec<f32>,
+    sl_pips: Vec<f64>,
+    tp_pips: Vec<f64>,
+    gene_smc_flags: Vec<crate::eval::SmcRow>,
+    smc_weights: [f32; 11],
+    gate_threshold: f32,
+    /// Settings template with `risk_based_sizing` FORCED to `false` — the
+    /// fixed-1-lot semantics the single-gene walk-forward uses (`&[]` confidence
+    /// at validation.rs:1129-1130).
+    settings: BacktestSettings,
+    n_genes: usize,
+}
+
+impl WalkforwardPopulationGenePack {
+    /// Build the gene-derived arrays ONCE for the walk-forward population.
+    ///
+    /// `settings_template` is cloned and FORCED to fixed-1-lot
+    /// (`risk_based_sizing = false`) so the GPU metrics match the single-gene
+    /// walk-forward's legacy fixed-1-lot backtest, regardless of what the caller
+    /// passes (belt-and-suspenders, mirroring [`validation_genes_population`]).
+    pub fn new(genes: &[Gene], config: &EvaluationConfig, settings_template: &BacktestSettings) -> Self {
+        let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
+        let mut sl_pips = Vec::with_capacity(genes.len());
+        let mut tp_pips = Vec::with_capacity(genes.len());
+        for g in genes {
+            sl_pips.push(if g.sl_pips.is_finite() && g.sl_pips > 0.0 {
+                g.sl_pips
+            } else {
+                20.0
+            });
+            tp_pips.push(if g.tp_pips.is_finite() && g.tp_pips > 0.0 {
+                g.tp_pips
+            } else {
+                40.0
+            });
+        }
+        let mut gene_smc_flags = Vec::with_capacity(genes.len());
+        for g in genes {
+            gene_smc_flags.push([
+                g.use_ob as i8,
+                g.use_fvg as i8,
+                g.use_liq_sweep as i8,
+                g.mtf_confirmation as i8,
+                g.use_premium_discount as i8,
+                g.use_inducement as i8,
+                g.use_bos as i8,
+                g.use_choch as i8,
+                g.use_eqh as i8,
+                g.use_eql as i8,
+                g.use_displacement as i8,
+            ]);
+        }
+        let smc_weights = [
+            config.smc_weight_ob,
+            config.smc_weight_fvg,
+            config.smc_weight_liq,
+            config.smc_weight_mtf,
+            config.smc_weight_premium,
+            config.smc_weight_inducement,
+            config.smc_weight_bos,
+            config.smc_weight_choch,
+            config.smc_weight_eqh,
+            config.smc_weight_eql,
+            config.smc_weight_displacement,
+        ];
+        let mut settings = settings_template.clone();
+        settings.risk_based_sizing = false;
+        Self {
+            offsets,
+            indices,
+            weights,
+            long_thr,
+            short_thr,
+            sl_pips,
+            tp_pips,
+            gene_smc_flags,
+            smc_weights,
+            gate_threshold: config.smc_gate_threshold,
+            settings,
+            n_genes: genes.len(),
+        }
+    }
+
+    pub fn n_genes(&self) -> usize {
+        self.n_genes
+    }
+}
+
+/// AREA 2 / Stage C (2026-06-09) — GPU-routed population backtest on a single
+/// CONTIGUOUS walk-forward split window `[a, b)`.
+///
+/// The walk-forward population path ([`crate::validation::embargoed_walkforward_population`])
+/// calls this once per qualifying split. It slices the FULL-SERIES indicators +
+/// SMC + OHLCV + calendar arrays contiguously at `[a, b)` (NO gather — the WF
+/// test slice is contiguous by construction) and runs ONE GPU population launch
+/// over all genes in `pack` via [`crate::eval::validation_backtest_population`]
+/// (GPU-try → CPU fallback, fail-loud).
+///
+/// ## Parity with the single-gene walk-forward
+/// The single-gene path slices the PRECOMPUTED full-series `signals[a..b]` and
+/// backtests them with `&[]` confidence (fixed-1-lot). Here the kernel
+/// RE-SYNTHESIZES the signal from `indicators[.., a..b]` + `smc[a..b]`. Signal
+/// synthesis is fully POINTWISE (the SMC arrays carry lookback but are
+/// precomputed on the full series and then sliced, never recomputed on the
+/// slice), so the on-device synth at slice position `k` reads the SAME
+/// indicator + SMC values the full-series synth read at bar `a + k` → identical
+/// per-bar signal → identical metrics. `risk_based_sizing` is forced `false`
+/// (in [`WalkforwardPopulationGenePack::new`]) so sizing is fixed-1-lot, and
+/// `timestamps[a..b]` is passed through so gap/session logic matches the slice.
+///
+/// Returns one `[f64; 11]` metric row per gene (same order as the pack's genes).
+#[allow(clippy::too_many_arguments)]
+pub fn validation_genes_population_window(
+    pack: &WalkforwardPopulationGenePack,
+    full_indicators: ndarray::ArrayView2<'_, f32>,
+    full_smc: &[crate::eval::SmcRow],
+    full_close: &[f64],
+    full_high: &[f64],
+    full_low: &[f64],
+    full_months: &[i64],
+    full_days: &[i64],
+    full_timestamps: &[i64],
+    a: usize,
+    b: usize,
+) -> Result<Vec<[f64; 11]>> {
+    if pack.n_genes == 0 {
+        return Ok(Vec::new());
+    }
+    let full_samples = full_indicators.ncols();
+    if full_smc.len() != full_samples {
+        bail!(
+            "full SMC length {} != full sample count {}",
+            full_smc.len(),
+            full_samples
+        );
+    }
+    if !(a < b && b <= full_samples) {
+        bail!(
+            "walk-forward window [{a}, {b}) out of range (full series has {full_samples} samples)"
+        );
+    }
+    if full_close.len() != full_samples
+        || full_high.len() != full_samples
+        || full_low.len() != full_samples
+        || full_months.len() != full_samples
+        || full_days.len() != full_samples
+    {
+        bail!("walk-forward full-series per-bar arrays must all equal the sample count");
+    }
+
+    // Contiguous slice of the indicator matrix at the split columns. A column
+    // slice of an `ArrayView2` is a cheap view (no copy), so the kernel's
+    // `indicators` is exactly the full-series indicators restricted to `[a, b)`.
+    let win_ind = full_indicators.slice(ndarray::s![.., a..b]);
+    let win_smc = &full_smc[a..b];
+    let win_close = &full_close[a..b];
+    let win_high = &full_high[a..b];
+    let win_low = &full_low[a..b];
+    let win_months = &full_months[a..b];
+    let win_days = &full_days[a..b];
+    // Pass timestamps only when full-length (same guard as the single-gene path
+    // at validation.rs:1118-1122); otherwise empty ⇒ index-delta carry.
+    let win_ts: &[i64] = if full_timestamps.len() == full_samples {
+        &full_timestamps[a..b]
+    } else {
+        &[]
+    };
+
+    Ok(crate::eval::validation_backtest_population(
+        crate::eval::PopulationEvalInputs {
+            close: win_close,
+            high: win_high,
+            low: win_low,
+            indicators: win_ind,
+            gene_offsets: &pack.offsets,
+            gene_indices: &pack.indices,
+            gene_weights: &pack.weights,
+            long_thr: &pack.long_thr,
+            short_thr: &pack.short_thr,
+            month_idx: win_months,
+            day_idx: win_days,
+            timestamps: win_ts,
+            sl_pips: &pack.sl_pips,
+            tp_pips: &pack.tp_pips,
+            smc_data: win_smc,
+            gene_smc_flags: &pack.gene_smc_flags,
+            gate_threshold: pack.gate_threshold,
+            weights: &pack.smc_weights,
+            settings: &pack.settings,
+        },
+    ))
+}
+
 pub fn evaluate_genes(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     genes: &[Gene],
     config: &EvaluationConfig,
 ) -> Result<Vec<[f64; 11]>> {
-    if features.data.nrows() == 0 || features.data.ncols() == 0 {
+    if features.n_samples() == 0 || features.n_features() == 0 {
         bail!("empty feature matrix");
     }
-    let n_samples = features.data.nrows();
+    let n_samples = features.n_samples();
     if ohlcv.close.len() != n_samples {
         bail!("ohlcv length does not match feature rows");
     }
@@ -547,7 +1127,7 @@ pub fn random_search(
     n_genes: usize,
     max_indicators: usize,
 ) -> Result<SearchResult> {
-    let n_indicators = features.data.ncols();
+    let n_indicators = features.n_features();
     let smc_cfg = SmcSearchConfig::from_env();
     let mut rng = build_search_rng();
     let mut genes =
@@ -645,7 +1225,7 @@ where
     if population == 0 {
         bail!("population must be > 0");
     }
-    let n_indicators = features.data.ncols();
+    let n_indicators = features.n_features();
     let smc_cfg = SmcSearchConfig::from_env();
 
     // All `NEOETHOS_BOT_*` search-engine knobs are resolved through the typed
@@ -795,6 +1375,18 @@ where
         tournament_size,
     );
     let stagnation_patience = genetic_runtime_overrides.effective_stagnation_patience();
+    // HARD convergence early-stop (separate from the soft `stagnation_patience`
+    // kick). `0` disables. `min_improvement` is the epsilon defining a
+    // "meaningful" top-fitness gain when counting stagnant generations.
+    let convergence_patience = genetic_runtime_overrides.effective_convergence_patience();
+    let min_improvement = genetic_runtime_overrides.effective_min_improvement();
+    // Wall-clock floor: the early-stop may fire only after this fraction of the
+    // time budget has elapsed. Generation throughput varies ~300× across
+    // timeframes (a fast TF does 250 gens in ~1 s, M1 in ~21 min), so a pure
+    // generation count would kill fast TFs before they ever search. The floor
+    // guarantees every combo gets real search time regardless of its gen rate.
+    let convergence_min_elapsed_fraction =
+        genetic_runtime_overrides.effective_convergence_min_elapsed_fraction();
 
     // Default OFF to avoid O(n²) cost; set > 0 only for large populations.
     let novelty_weight = genetic_runtime_overrides.novelty_weight;
@@ -805,6 +1397,16 @@ where
     let started_at = Instant::now();
     let mut best_score_seen = f64::NEG_INFINITY;
     let mut stagnant_gens = 0usize;
+    // Wall-clock timestamp of the last *meaningful* top-fitness improvement.
+    // Drives the time-based convergence early-stop (slow-TF fix 2026-06-09):
+    // `convergence_patience` is a GENERATION count and a heavy TF can never
+    // accumulate that many slow generations inside its time budget, so we ALSO
+    // stop when the search has been flat in wall-clock for the floor window.
+    let mut last_improvement_at = started_at;
+    // Fires the "gate fully relaxed" notice at most ONCE per search. The
+    // realized smc_gate_threshold is clamped to [gate_lo, gate_hi] regardless,
+    // so the previous per-generation warn was pure log flood (audit 2026-06-08).
+    let mut warned_gate_floor = false;
 
     if generations == 0 {
         let metrics = evaluate_genes_cached(features, ohlcv, &genes, &eval_cfg, &eval_cache)?;
@@ -819,27 +1421,29 @@ where
         if stagnant_gens >= stagnation_patience {
             // F-036 fix (2026-05-25): the stagnation decrement subtracts
             // `gate_stagnation_step * stagnant_gens`. With a default
-            // step of 0.02 and `stagnant_gens` reaching e.g. 100, the
-            // gate would be driven to -2.0 — well below any sensible
-            // floor, effectively disabling the SMC gate. The downstream
-            // `.clamp(gate_lo, gate_hi)` clamps to `gate_lo` BUT that
-            // hides the runaway from the operator. We now apply an
-            // additional explicit clamp here so the visible value
-            // never goes below `gate_lo - 1.0` (one full step below
-            // the floor). Anything below that surfaces as a warning.
+            // step of 0.03 and `stagnant_gens` reaching the thousands the
+            // raw value balloons (e.g. -54), but the downstream
+            // `.clamp(gate_lo, gate_hi)` at line ~900 pins the REALIZED
+            // threshold to `gate_lo` regardless — so the runaway raw value
+            // has zero effect on which signals pass the gate. The previous
+            // code re-emitted a WARN every generation once past the floor,
+            // flooding the log on any stagnating combo (audit 2026-06-08).
+            // We now (a) bottom the raw value at `gate_lo - 1.0` so it never
+            // diverges, and (b) emit the diagnostic at most ONCE per search.
             gate_now -= gate_stagnation_step * (stagnant_gens as f32);
             let absolute_floor = gate_lo - 1.0;
             if gate_now < absolute_floor {
-                tracing::warn!(
-                    target: "neoethos_search::search_engine",
-                    generation,
-                    stagnant_gens,
-                    gate_lo,
-                    raw_gate = gate_now,
-                    "SMC stagnation decrement drove gate below absolute floor; \
-                     clamping to gate_lo - 1.0. Consider reducing \
-                     gate_stagnation_step or increasing stagnation_patience."
-                );
+                if !warned_gate_floor {
+                    warned_gate_floor = true;
+                    tracing::info!(
+                        target: "neoethos_search::search_engine",
+                        generation,
+                        stagnant_gens,
+                        gate_lo,
+                        "SMC gate fully relaxed under stagnation; realized \
+                         threshold stays clamped at gate_lo. Logged once per search."
+                    );
+                }
                 gate_now = absolute_floor;
             }
         }
@@ -929,9 +1533,10 @@ where
         });
 
         let top_score = scored.first().map(|x| x.0).unwrap_or(f64::NEG_INFINITY);
-        if top_score > best_score_seen + 1e-12 {
+        if top_score > best_score_seen + min_improvement {
             best_score_seen = top_score;
             stagnant_gens = 0;
+            last_improvement_at = Instant::now();
         } else {
             stagnant_gens += 1;
         }
@@ -957,7 +1562,7 @@ where
             // mutated copies that produce the SAME signal collapse to one
             // archive entry regardless of their randomly-assigned strategy_id.
             let mut canonical = gene.clone();
-            canonical.normalize(features.data.ncols(), 1);
+            canonical.normalize(features.n_features(), 1);
             let hash = gene_signature_hash(&canonical);
             if !seen_gene_hashes.insert(hash) {
                 continue;
@@ -973,6 +1578,109 @@ where
             stagnant_gens,
             profitable_archive.len(),
         );
+
+        // Convergence early-stop (2026-06-09): once the search has been flat for
+        // `convergence_patience` generations the soft diversity kick (gate
+        // relaxation + raised immigrants + heavy hypermutation) has already had
+        // its chance to escape — further generations are wasted wall-clock.
+        // Returning the archive NOW lets the auto-loop advance to the next
+        // symbol×timeframe (coverage beats depth — search-depth-economics
+        // analysis: heavy TFs stagnate early and burn ~90% of the budget for
+        // nothing). `convergence_patience == 0` disables. Fail-loud: the reason
+        // is logged at INFO so this is never mistaken for a crash / silent
+        // truncation. Returns via the SAME archive-or-top_candidates logic as
+        // the wall-clock cap below so downstream finalize is byte-identical.
+        // Intentionally placed BEFORE the max_runtime check: if a generation is
+        // both converged and over-budget, both paths yield identical output and
+        // "converged" is the more informative reason — do not reorder.
+        //
+        // WALL-CLOCK FLOOR (fix 2026-06-09): the generation count alone is NOT a
+        // safe stop signal — a fast TF reaches 250 stagnant gens in ~1 s, far
+        // too little real search to find the rare low-DD prop-firm genes (live
+        // regression: AUDUSD H4 early-stopped at gen 291 in 1 s → 0 strategies
+        // vs 7 on a full run). So the early-stop additionally requires that at
+        // least `convergence_min_elapsed_fraction` of the time budget has
+        // elapsed. With no time budget (`max_runtime == None`) the wall-clock
+        // floor cannot be evaluated, so the early-stop is suppressed and the
+        // combo runs to the generation ceiling.
+        let convergence_floor_reached = match max_runtime {
+            Some(mr) => started_at.elapsed() >= mr.mul_f64(convergence_min_elapsed_fraction),
+            None => false,
+        };
+        // Slow-TF fix (2026-06-09): `convergence_patience` counts GENERATIONS, but
+        // a heavy TF (M3 ≈ 0.4 gen/s) needs ~10+ min to accumulate 250 slow gens —
+        // longer than its whole time budget — so the gen-count trigger can NEVER
+        // fire and the combo burns its full cap even when flat since gen ~3
+        // (observed live: AUDUSD M3 ran the entire 15-min stage-1 cap stagnant the
+        // whole time, then a 15-min validation tail, then got killed). So ALSO stop
+        // when the search has been flat in WALL-CLOCK for the same floor fraction of
+        // the budget. Both triggers share the `convergence_floor_reached` gate, so a
+        // fast TF still gets its guaranteed minimum search time before either can
+        // fire (preserves the AUDUSD-H4 "gen-291-in-1s → 0 strategies" guard).
+        let stagnation_time_trigger = match max_runtime {
+            Some(mr) => {
+                last_improvement_at.elapsed() >= mr.mul_f64(convergence_min_elapsed_fraction)
+            }
+            None => false,
+        };
+        let gen_count_trigger = stagnant_gens >= convergence_patience;
+        if convergence_patience > 0
+            && convergence_floor_reached
+            && (gen_count_trigger || stagnation_time_trigger)
+        {
+            tracing::info!(
+                target: "neoethos_search::search_engine",
+                generation = generation + 1,
+                total_generations = generations,
+                best_score = best_score_seen,
+                stagnant_gens,
+                stagnant_secs = last_improvement_at.elapsed().as_secs(),
+                convergence_patience,
+                elapsed_s = started_at.elapsed().as_secs(),
+                min_elapsed_fraction = convergence_min_elapsed_fraction,
+                archive_len = profitable_archive.len(),
+                trigger = if gen_count_trigger {
+                    "gen_count"
+                } else {
+                    "wall_clock_stagnation"
+                },
+                "GA converged: early-stopping this combo (flat past the wall-clock \
+                 floor); advancing to the next."
+            );
+            let best_return_count = population
+                .clamp(2, (population / 2).clamp(100, 500))
+                .min(scored.len());
+            let top_candidates: Vec<Gene> = scored
+                .iter()
+                .take(best_return_count)
+                .map(|(_, _, g, _)| g.clone())
+                .collect();
+            let top_metrics: Vec<[f64; 11]> = scored
+                .iter()
+                .take(best_return_count)
+                .map(|(_, _, _, m)| *m)
+                .collect();
+            seen_memory.flush();
+            if !profitable_archive.is_empty() {
+                profitable_archive.sort_by(|a, b| {
+                    b.1[0]
+                        .partial_cmp(&a.1[0])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.2.cmp(&b.2))
+                });
+                return Ok(SearchResult {
+                    genes: profitable_archive
+                        .iter()
+                        .map(|(g, _, _)| g.clone())
+                        .collect(),
+                    metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
+                });
+            }
+            return Ok(SearchResult {
+                genes: top_candidates,
+                metrics: top_metrics,
+            });
+        }
 
         if let Some(max_runtime) = max_runtime
             && started_at.elapsed() >= max_runtime

@@ -356,7 +356,15 @@ impl BurnDeepExpert {
     fn is_supported_execution_backend(backend: &str) -> bool {
         matches!(
             backend.trim(),
-            "ndarray_cpu" | "wgpu_cpu" | "wgpu_default" | "wgpu_discrete_gpu"
+            "ndarray_cpu"
+                | "wgpu_cpu"
+                | "wgpu_default"
+                | "wgpu_discrete_gpu"
+                // Native Burn CUDA backend (gpu-cuda build): neural models train
+                // on the card. `resolve_cuda_device_policy` reports "cuda".
+                | "cuda"
+                | "cuda_default"
+                | "cuda_discrete_gpu"
         )
     }
 

@@ -139,15 +139,15 @@ pub struct DiscoveryFormState {
 
 impl Default for DiscoveryFormState {
     fn default() -> Self {
-        // F-257 documentation (2026-05-25): the higher_tfs default
-        // "M5, M15, H1" mirrors `engines_control::DEFAULT_HIGHER_TFS`
-        // — the single source of truth for the discovery default
-        // multi-timeframe ladder. Operator can override via the
-        // wizard's discovery form; the const lives in engines_control
-        // for the headless `auto_discovery` path. Both stay in sync
-        // because the comma-joined form here is the human-readable
-        // mirror of the const slice. Phase C task: introduce a typed
-        // `TimeframeSet` and have both sites point at it.
+        // F-257 (2026-05-25) · PARITY 2026-06-04: this whole struct is
+        // test-only scaffolding (`impl` block below is `#[allow(dead_code)]`).
+        // The LIVE discovery default ladder is resolved by
+        // `SystemConfig::resolve_higher_timeframes` — the single source of
+        // truth shared by the CLI and the `/engines/discovery/start` endpoint.
+        // The "M5, M15, H1" seed below does NOT drive any production run; it is
+        // just a fixture value for the wizard-form tests. (The old
+        // `engines_control::DEFAULT_HIGHER_TFS` const it used to mirror was
+        // deleted when the resolution was unified.)
         Self {
             base_tf: "M1".to_string(),
             higher_tfs: "M5, M15, H1".to_string(),

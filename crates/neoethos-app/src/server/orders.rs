@@ -17,7 +17,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::app_services::broker_api::{
-    OrderSide, cancel_order_blocking, close_position_blocking, submit_market_order_blocking,
+    OrderSide, amend_position_sltp_blocking, cancel_order_blocking, close_position_blocking,
+    submit_market_order_blocking,
 };
 use crate::app_services::ctrader_errors::translate_anyhow;
 
@@ -80,6 +81,22 @@ pub async fn place(State(_state): State<AppApiState>, Json(body): Json<NewOrderB
             Json(serde_json::json!({"error": "symbol must be non-empty"})),
         )
             .into_response();
+    }
+
+    // 2026-06-10: risky:true is a deliberate operator override (a naked
+    // position is a valid manual choice), but it is also the single most
+    // dangerous order shape — one adverse tick has no bracket to stop it.
+    // Leave a loud, money-tagged audit-trail entry whenever one actually
+    // goes out so it is never silent in the logs.
+    if body.risky && body.stop_loss_pips.is_none() && body.take_profit_pips.is_none() {
+        tracing::warn!(
+            target: "neoethos_app::orders",
+            %symbol,
+            volume_lots = body.volume_lots,
+            side = ?body.side,
+            "placing a NAKED order (risky=true, no stop-loss and no take-profit) — \
+             this position has no bracket protection"
+        );
     }
 
     let side = body.side;
@@ -152,7 +169,74 @@ pub async fn cancel_order(
     outcome_to_response(result)
 }
 
-/// Shared response shaper for place/close/cancel — they all come back
+// ─── POST /positions/protection (modify an open position's SL/TP) ──────────
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AmendPositionProtectionBody {
+    #[serde(rename = "positionId")]
+    pub position_id: i64,
+    /// New ABSOLUTE stop-loss price. cTrader's position-amend is price-based
+    /// (not pip-relative); omit to leave the existing stop untouched.
+    #[serde(rename = "stopLossPrice")]
+    pub stop_loss_price: Option<f64>,
+    #[serde(rename = "takeProfitPrice")]
+    pub take_profit_price: Option<f64>,
+    /// Toggle the broker-side trailing-stop flag on the position's SL.
+    #[serde(rename = "trailingStopLoss")]
+    pub trailing_stop_loss: Option<bool>,
+}
+
+/// Modify an open position's stop-loss / take-profit (move to breakeven, trail
+/// a winner, widen/tighten). Money-critical: at least one bracket must be
+/// supplied and every supplied price must be finite and positive.
+pub async fn amend_position_protection(
+    State(_state): State<AppApiState>,
+    Json(body): Json<AmendPositionProtectionBody>,
+) -> Response {
+    if body.position_id <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "positionId must be positive"})),
+        )
+            .into_response();
+    }
+    if body.stop_loss_price.is_none() && body.take_profit_price.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "supply at least one of stopLossPrice / takeProfitPrice to amend",
+            })),
+        )
+            .into_response();
+    }
+    for (label, price) in [
+        ("stopLossPrice", body.stop_loss_price),
+        ("takeProfitPrice", body.take_profit_price),
+    ] {
+        if let Some(p) = price
+            && (!p.is_finite() || p <= 0.0)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("{label} must be a finite, positive price"),
+                })),
+            )
+                .into_response();
+        }
+    }
+    let position_id = body.position_id;
+    let sl = body.stop_loss_price;
+    let tp = body.take_profit_price;
+    let trailing = body.trailing_stop_loss;
+    let result = tokio::task::spawn_blocking(move || {
+        amend_position_sltp_blocking(position_id, sl, tp, trailing)
+    })
+    .await;
+    outcome_to_response(result)
+}
+
+/// Shared response shaper for place/close/cancel/amend — they all come back
 /// as `CTraderExecutionOutcome`.
 fn outcome_to_response(
     result: Result<

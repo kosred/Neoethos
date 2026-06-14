@@ -27,6 +27,7 @@
 //! Tighten before exposing on non-loopback interfaces.
 
 pub mod account;
+pub mod autonomous;
 pub mod bridge;
 pub mod broker_control;
 pub mod chart;
@@ -151,6 +152,10 @@ pub fn router(state: AppApiState) -> Router {
             get(strategy_lab::promotion_status),
         )
         .route("/strategy_lab/promote", post(strategy_lab::promote))
+        // Autonomous trader (Phase 1.5): offline dry-run over on-disk history,
+        // the SAME engine + helper the CLI `trader-replay` drives → identical
+        // EngineStats from both front-ends.
+        .route("/autonomous/replay", post(autonomous::replay))
         .route("/broker/status", get(system_status::broker_status))
         .route("/broker/reauth", post(broker_control::reauth))
         .route(
@@ -160,6 +165,12 @@ pub fn router(state: AppApiState) -> Router {
         .route("/broker/symbols", get(data_control::symbols))
         .route("/broker/timeframes", get(data_control::timeframes))
         .route("/broker/accounts", get(data_control::accounts))
+        // 2026-06-10 cTrader Open API history / margin / profile consumers.
+        .route("/broker/orders/history", get(data_control::order_history))
+        .route("/broker/cashflow", get(data_control::cash_flow_history))
+        .route("/broker/margin/expected", get(data_control::expected_margin))
+        .route("/broker/profile", get(data_control::ctid_profile))
+        .route("/broker/version", get(data_control::server_version))
         // F-333: set the *active* cTrader account by promoting it to the
         // front of broker_credentials.toml's accounts list (resolve_creds
         // reads accounts.first()). MVP — takes effect on next start.
@@ -176,6 +187,10 @@ pub fn router(state: AppApiState) -> Router {
         .route("/orders", post(orders::place))
         .route("/orders/cancel", post(orders::cancel_order))
         .route("/positions/close", post(orders::close_position))
+        .route(
+            "/positions/protection",
+            post(orders::amend_position_protection),
+        )
         // #204 ChatGPT subscription via Codex CLI OAuth flow.
         // Replaces the previous local-Gemma path. Status renders the
         // UI badge, start kicks off PKCE, logout wipes the token,
@@ -246,6 +261,31 @@ pub async fn serve(state: AppApiState) -> anyhow::Result<()> {
         bind_addr = %addr,
         "NeoEthos HTTP server listening — Flutter client should connect here"
     );
+
+    // 2026-06-10: the trading endpoints (/orders, /positions/close,
+    // /broker/credentials, …) carry NO authentication — the security model
+    // is "loopback-only", enforced solely by the bind address. Make that
+    // assumption explicit in the logs, and SHOUT if the operator ever points
+    // the bind at a non-loopback interface, where those endpoints would become
+    // reachable (and trade-capable) from the network with no auth in front.
+    if addr.ip().is_loopback() {
+        tracing::info!(
+            target: "neoethos_app::server",
+            bind_addr = %addr,
+            "server is loopback-only (no endpoint authentication by design — \
+             do not expose this port on a public interface)"
+        );
+    } else {
+        tracing::warn!(
+            target: "neoethos_app::server",
+            bind_addr = %addr,
+            "SECURITY: HTTP server bound to a NON-loopback address — the trading \
+             endpoints have NO authentication and are now reachable from the \
+             network. Anyone who can reach this port can place/close live trades \
+             and change broker credentials. Bind to 127.0.0.1 unless you have put \
+             your own auth/firewall in front."
+        );
+    }
 
     axum::serve(listener, app)
         .await

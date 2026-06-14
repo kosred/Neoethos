@@ -3,16 +3,143 @@
 
 use std::path::PathBuf;
 
+use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, Widget};
+use ratatui::widgets::{
+    Block, Borders, Cell, Padding, Paragraph, Row, StatefulWidget, Table, TableState, Widget,
+};
 
 use crate::tui::app::AppShared;
 use crate::tui::theme;
 
-pub fn draw(area: Rect, buf: &mut Buffer, _shared: &AppShared) {
+/// Move the Strategies selection / validate the selected portfolio. Returns
+/// whether the key was consumed.
+pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
+    let portfolios = scan_portfolios();
+    if portfolios.is_empty() {
+        return false;
+    }
+    let count = portfolios.len();
+    match code {
+        KeyCode::Up => {
+            shared.strategies_selected = shared.strategies_selected.saturating_sub(1);
+            true
+        }
+        KeyCode::Down => {
+            shared.strategies_selected = (shared.strategies_selected + 1).min(count - 1);
+            true
+        }
+        KeyCode::Char('V') => {
+            let sel = shared.strategies_selected.min(count - 1);
+            launch_validate(shared, &portfolios[sel].path);
+            true
+        }
+        KeyCode::Char('P') => {
+            let sel = shared.strategies_selected.min(count - 1);
+            launch_promote(shared, &portfolios[sel]);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Validate the selected portfolio on real data via `trader-replay`, which
+/// replays the discovery's own genes (the `.live_portfolio.json` artifact) so
+/// the user can confirm a portfolio out-of-sample without leaving the TUI.
+fn launch_validate(shared: &mut AppShared, portfolio_path: &std::path::Path) {
+    let mut sidecar = portfolio_path.to_path_buf().into_os_string();
+    sidecar.push(".live_portfolio.json");
+    let sidecar = PathBuf::from(sidecar);
+    if !sidecar.exists() {
+        shared.status =
+            "No .live_portfolio.json next to this portfolio — re-run discovery (it emits one) to validate"
+                .to_string();
+        return;
+    }
+    if shared.jobs.has_running("validate") {
+        shared.status = "validation already running".to_string();
+        return;
+    }
+    shared.jobs.spawn(
+        "validate",
+        vec![
+            "trader-replay".to_string(),
+            "--portfolio".to_string(),
+            sidecar.display().to_string(),
+        ],
+    );
+    shared.status = "Spawned trader-replay validation — see Logs / status".to_string();
+}
+
+/// Promote the selected portfolio to the live set via `discovery-promote-weekly`
+/// (B3/#4 parity). That CLI command merges this run's discovery ledger for a
+/// given (symbol, tf) into the live portfolio additively (by gene-signature
+/// hash) and prints the promotion verdict ("added N new, carried M, total K").
+/// We derive `--symbol`/`--tf` from the portfolio's `<SYMBOL>_<TF>.json` name
+/// and point `--cache-dir` at the portfolio's own directory so the matching
+/// ledger is found; the verdict streams into the live log like `V` does.
+fn launch_promote(shared: &mut AppShared, p: &PortfolioSummary) {
+    let Some((symbol, tf)) = parse_symbol_tf(&p.name) else {
+        shared.status = format!(
+            "Cannot derive SYMBOL/TF from '{}' — promote needs a <SYMBOL>_<TF>.json portfolio",
+            p.name
+        );
+        return;
+    };
+    if shared.jobs.has_running("promote") {
+        shared.status = "promotion already running".to_string();
+        return;
+    }
+    let cache_dir = p
+        .path
+        .parent()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|| "cache/discovery".to_string());
+
+    let mut args = vec![
+        "discovery-promote-weekly".to_string(),
+        "--symbol".to_string(),
+        symbol.clone(),
+        "--tf".to_string(),
+        tf.clone(),
+        "--cache-dir".to_string(),
+        cache_dir,
+    ];
+    // If the portfolio has a live_portfolio sidecar, point the command at it so
+    // the carried/added accounting is against the real live set (otherwise the
+    // command falls back to its default cache-dir-relative path).
+    let mut sidecar = p.path.clone().into_os_string();
+    sidecar.push(".live_portfolio.json");
+    let sidecar = PathBuf::from(sidecar);
+    if sidecar.exists() {
+        args.push("--portfolio".to_string());
+        args.push(sidecar.display().to_string());
+    }
+
+    shared.jobs.spawn("promote", args);
+    shared.status = format!(
+        "Spawned discovery-promote-weekly {symbol} {tf} — see live log for the promotion verdict"
+    );
+}
+
+/// Parse `<SYMBOL>_<TF>.json` (e.g. `EURUSD_M30.json`) into `(symbol, tf)`. The
+/// timeframe is the trailing `_`-delimited token before `.json`; everything
+/// before it is the symbol (symbols don't contain `_`, timeframes don't either,
+/// so the last underscore is the split point). Returns `None` for names that
+/// don't match the convention so the caller can surface a clear message.
+fn parse_symbol_tf(name: &str) -> Option<(String, String)> {
+    let stem = name.strip_suffix(".json")?;
+    let (sym, tf) = stem.rsplit_once('_')?;
+    if sym.is_empty() || tf.is_empty() {
+        return None;
+    }
+    Some((sym.to_string(), tf.to_string()))
+}
+
+pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::BORDER))
@@ -53,6 +180,23 @@ pub fn draw(area: Rect, buf: &mut Buffer, _shared: &AppShared) {
         return;
     }
 
+    let sel = shared
+        .strategies_selected
+        .min(portfolios.len().saturating_sub(1));
+
+    // Split: portfolio table on top, the selected portfolio's per-strategy
+    // metrics below — so the user can actually SEE what a discovery found.
+    let detail_h = (inner.height / 2).clamp(0, 14).min(inner.height.saturating_sub(4));
+    let table_area = Rect {
+        height: inner.height.saturating_sub(detail_h),
+        ..inner
+    };
+    let detail_area = Rect {
+        y: inner.y + table_area.height,
+        height: detail_h,
+        ..inner
+    };
+
     let header = Row::new(vec![
         Cell::from("PORTFOLIO").style(theme::caption_style()),
         Cell::from("STRATEGIES").style(theme::caption_style()),
@@ -62,13 +206,13 @@ pub fn draw(area: Rect, buf: &mut Buffer, _shared: &AppShared) {
     .height(1);
 
     let rows: Vec<Row> = portfolios
-        .into_iter()
+        .iter()
         .map(|p| {
             Row::new(vec![
-                Cell::from(p.name).style(theme::accent_style()),
+                Cell::from(p.name.clone()).style(theme::accent_style()),
                 Cell::from(p.strategies.to_string()).style(theme::primary_style()),
                 Cell::from(format_size(p.bytes)).style(theme::muted_style()),
-                Cell::from(p.modified).style(theme::muted_style()),
+                Cell::from(p.modified.clone()).style(theme::muted_style()),
             ])
             .height(1)
         })
@@ -87,8 +231,171 @@ pub fn draw(area: Rect, buf: &mut Buffer, _shared: &AppShared) {
             Style::default()
                 .bg(theme::SURFACE_ALT)
                 .add_modifier(Modifier::BOLD),
-        );
-    Widget::render(table, inner, buf);
+        )
+        .highlight_symbol("▸ ");
+    let mut state = TableState::default();
+    state.select(Some(sel));
+    StatefulWidget::render(table, table_area, buf, &mut state);
+
+    draw_details(detail_area, buf, &portfolios[sel]);
+}
+
+struct StratMetrics {
+    net_profit: f64,
+    return_pct: f64,
+    sharpe: f64,
+    max_dd: f64,
+    win: f64,
+}
+
+fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
+    if area.height == 0 {
+        return;
+    }
+    let mut sidecar = p.path.clone().into_os_string();
+    sidecar.push(".quality.json");
+    let text = std::fs::read_to_string(std::path::PathBuf::from(sidecar)).unwrap_or_default();
+    let metrics = extract_strategy_metrics(&text);
+    let initial = scan_numbers(&text, "initial_capital")
+        .first()
+        .copied()
+        .unwrap_or(0.0);
+    let total_net: f64 = metrics.iter().map(|m| m.net_profit).sum();
+
+    // Header carries the money view: starting capital + Σ net € across the
+    // portfolio (the €-view the operator wanted, not just ratios).
+    let mut header = vec![
+        Span::styled(
+            format!(" {} ", p.name),
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("· {} strat  ", p.strategies), theme::muted_style()),
+    ];
+    if initial > 0.0 {
+        header.push(Span::styled(
+            format!("start €{}  ", fmt_eur(initial)),
+            theme::caption_style(),
+        ));
+        let net_style = if total_net >= 0.0 {
+            theme::buy_style()
+        } else {
+            Style::default().fg(theme::SELL)
+        };
+        header.push(Span::styled(
+            format!("Σnet €{}  ", fmt_eur(total_net)),
+            net_style.add_modifier(Modifier::BOLD),
+        ));
+    }
+    header.push(Span::styled(
+        "[↑↓] [V]alidate [P]romote",
+        theme::caption_style(),
+    ));
+    let mut lines: Vec<Line> = vec![Line::from(header)];
+
+    if metrics.is_empty() {
+        lines.push(Line::styled(
+            "  No .quality.json sidecar — re-run discovery to regenerate per-strategy metrics.",
+            theme::caption_style(),
+        ));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  {:<4}{:>10}{:>8}{:>8}{:>7}{:>7}",
+                "#", "Net €", "Ret%", "Sharpe", "DD%", "Win%"
+            ),
+            theme::caption_style().add_modifier(Modifier::BOLD),
+        )]));
+        let max_rows = area.height.saturating_sub(3) as usize;
+        for (i, m) in metrics.iter().take(max_rows).enumerate() {
+            let dd_pct = m.max_dd * 100.0;
+            // Operator's low-DD lens: green ≤6%, amber ≤10%, red above.
+            let dd_style = if dd_pct <= 6.0 {
+                theme::primary_style()
+            } else if dd_pct <= 10.0 {
+                theme::warn_style()
+            } else {
+                Style::default().fg(theme::SELL)
+            };
+            let net_style = if m.net_profit >= 0.0 {
+                theme::buy_style()
+            } else {
+                Style::default().fg(theme::SELL)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<4}", i + 1), theme::muted_style()),
+                Span::styled(format!("{:>10}", fmt_eur(m.net_profit)), net_style),
+                Span::styled(format!("{:>7.1}%", m.return_pct), theme::primary_style()),
+                Span::styled(format!("{:>8.2}", m.sharpe), theme::primary_style()),
+                Span::styled(format!("{:>6.1}%", dd_pct), dd_style),
+                Span::styled(format!("{:>6.0}%", m.win * 100.0), theme::muted_style()),
+            ]));
+        }
+    }
+    Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(theme::BORDER)),
+        )
+        .render(area, buf);
+}
+
+/// Robustly pull per-strategy metrics from a quality.json sidecar by scanning
+/// for field tokens (no schema dependency — works across writer shapes). Zips
+/// the parallel sharpe/PF/DD/win arrays in document order.
+fn extract_strategy_metrics(text: &str) -> Vec<StratMetrics> {
+    let net = scan_numbers(text, "net_profit");
+    let ret = scan_numbers(text, "total_return_pct");
+    let sharpe = scan_numbers(text, "sharpe_ratio");
+    let dd = scan_numbers(text, "max_drawdown_pct");
+    let win = scan_numbers(text, "win_rate");
+    let n = net
+        .len()
+        .min(ret.len())
+        .min(sharpe.len())
+        .min(dd.len())
+        .min(win.len());
+    (0..n)
+        .map(|i| StratMetrics {
+            net_profit: net[i],
+            return_pct: ret[i],
+            sharpe: sharpe[i],
+            max_dd: dd[i],
+            win: win[i],
+        })
+        .collect()
+}
+
+/// Compact money formatting for the narrow details panel: thousands as `k`,
+/// millions as `M`, with sign preserved.
+fn fmt_eur(v: f64) -> String {
+    let a = v.abs();
+    if a >= 1_000_000.0 {
+        format!("{:.2}M", v / 1_000_000.0)
+    } else if a >= 1_000.0 {
+        format!("{:.1}k", v / 1_000.0)
+    } else {
+        format!("{:.0}", v)
+    }
+}
+
+fn scan_numbers(text: &str, key: &str) -> Vec<f64> {
+    let pat = format!("\"{key}\"");
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while let Some(p) = text[idx..].find(&pat) {
+        let after = idx + p + pat.len();
+        let rest = text[after..].trim_start_matches([':', ' ', '\t', '\n', '\r']);
+        let num: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))
+            .collect();
+        if let Ok(v) = num.parse::<f64>() {
+            out.push(v);
+        }
+        idx = after;
+    }
+    out
 }
 
 struct PortfolioSummary {
@@ -96,6 +403,7 @@ struct PortfolioSummary {
     strategies: usize,
     bytes: u64,
     modified: String,
+    path: PathBuf,
 }
 
 fn scan_portfolios() -> Vec<PortfolioSummary> {
@@ -140,6 +448,7 @@ fn scan_portfolios() -> Vec<PortfolioSummary> {
                 strategies,
                 bytes,
                 modified,
+                path,
             });
         }
     }

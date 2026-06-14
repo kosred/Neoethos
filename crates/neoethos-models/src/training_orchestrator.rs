@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::base::ExpertModel;
 use crate::burn_models::{active_burn_backend_name, normalize_burn_device_policy};
@@ -11,6 +11,7 @@ use crate::ensemble::{
     ProbabilityCalibrationExpert,
 };
 use crate::exit_agent::ExitAgent;
+use crate::soft_actor_critic::SoftActorCritic;
 use crate::parallel_trainer::{
     ModelConfig, ModelTrainingFailure, ModelTrainingProgress, ModelType, TrainingPayload,
     train_models_parallel_with_progress,
@@ -21,7 +22,7 @@ use crate::runtime::exports::{
     ONNX_EXPORT_STATUS_FILE_NAME, OnnxExportStatus, write_onnx_export_status,
 };
 use crate::runtime::hpo::{
-    OPTIMIZATION_REPORT_FILE_NAME, OptimizationReport, OptimizationTrialRecord,
+    OPTIMIZATION_REPORT_FILE_NAME, OptimizationReport, OptimizationTrialRecord, ValidationMetrics,
     evaluate_prediction_quality, time_series_holdout_split, write_optimization_report,
 };
 use crate::runtime::profile::{
@@ -57,6 +58,15 @@ pub struct TrainingRunSummary {
 pub struct TrainingOrchestrator {
     pub settings: neoethos_core::Settings,
     pub models_dir: PathBuf,
+    /// v0.5 ML-integration Stage 4 — leak-free OOS-locked retrain. When `Some(ms)`,
+    /// each symbol's training frame + labels are truncated to rows with
+    /// `timestamp < ms`, minus a `label_horizon_bars` purge (the triple-barrier
+    /// label looks forward), BEFORE the warmup drop + train/val split. The
+    /// resulting experts have seen ZERO bars at/after the cutoff, so a blend that
+    /// uses them can be validated on `[ms, end)` without look-ahead. Callers MUST
+    /// point `models_dir` at a SEPARATE root (e.g. `models_oos_locked/`) so the
+    /// production `models/` artifacts are never overwritten with leak-locked ones.
+    pub oos_lock_from_ms: Option<i64>,
 }
 
 fn is_supported_orchestrator_burn_device_policy(policy: &str) -> bool {
@@ -112,6 +122,33 @@ fn drop_nonfinite_rows_dataframe(
     Ok((clean_frame, clean_labels, dropped))
 }
 
+/// Prune feature COLUMNS that are entirely non-finite (NaN/Inf in every row).
+/// Such a column carries zero information, and — left in — would make the
+/// row-wise [`drop_nonfinite_rows`] discard EVERY row. Mutates `features` +
+/// `names` in lock-step and returns the number of columns removed. A column
+/// that has at least one finite value is kept (its warmup NaNs are handled by
+/// the row drop). See `train_symbol_with_progress`.
+fn prune_all_nonfinite_columns(
+    features: &mut ndarray::Array2<f32>,
+    names: &mut Vec<String>,
+) -> usize {
+    let ncols = features.ncols();
+    if ncols == 0 || features.nrows() == 0 {
+        return 0;
+    }
+    let keep: Vec<usize> = (0..ncols)
+        .filter(|&c| features.column(c).iter().any(|v| v.is_finite()))
+        .collect();
+    let pruned = ncols - keep.len();
+    if pruned > 0 {
+        *features = features.select(ndarray::Axis(1), &keep);
+        if names.len() == ncols {
+            *names = keep.iter().map(|&c| names[c].clone()).collect();
+        }
+    }
+    pruned
+}
+
 fn drop_nonfinite_rows(
     features: ndarray::Array2<f32>,
     labels: Vec<i32>,
@@ -159,7 +196,16 @@ impl TrainingOrchestrator {
         Self {
             settings,
             models_dir,
+            oos_lock_from_ms: None,
         }
+    }
+
+    /// Builder: lock training to the in-sample window `timestamp < oos_from_ms`
+    /// (minus the triple-barrier purge) so the trained experts are leak-free for
+    /// an OOS blend validation on `[oos_from_ms, end)`. See [`Self::oos_lock_from_ms`].
+    pub fn with_oos_lock_from_ms(mut self, oos_from_ms: i64) -> Self {
+        self.oos_lock_from_ms = Some(oos_from_ms);
+        self
     }
 
     fn preferred_burn_device_policy(&self) -> String {
@@ -239,12 +285,65 @@ impl TrainingOrchestrator {
         let frame = prepare_multitimeframe_features_with_options(&dataset, base_tf, &opts, None)?;
         let base_ohlcv = dataset.frames.get(base_tf).context("base tf missing")?;
         let labels = self.derive_labels(base_ohlcv)?;
+
+        // Stage 4 leak-free OOS lock: truncate to rows STRICTLY before the cutoff,
+        // minus a triple-barrier purge, BEFORE the warmup drop + split. The frame
+        // rows are 1:1 with `base_ohlcv` (and `labels`) here, so we slice the dense
+        // matrix + labels to the leading in-sample block.
+        let mut dense = frame.to_dense_samples_major();
+        let mut feature_names = frame.names.clone();
+        // Prune feature columns that are PERMANENTLY non-finite (e.g. a
+        // long-lookback indicator on a sparse higher TF — MN1 ~156 bars — that
+        // never warms up). Such a column carries zero information yet, left in,
+        // makes the row-wise NaN drop below discard EVERY row ("kept 0 rows").
+        // Discovery dodges this by projecting to the genes' effective features;
+        // training keeps all columns, so we prune the dead ones here instead.
+        let pruned_cols = prune_all_nonfinite_columns(&mut dense, &mut feature_names);
+        if pruned_cols > 0 {
+            info!(
+                "Pruned {} all-NaN feature column(s) before training ({} columns remain)",
+                pruned_cols,
+                feature_names.len()
+            );
+        }
+        let mut labels = labels;
+        if let Some(cutoff) = self.oos_lock_from_ms {
+            let timestamps = base_ohlcv
+                .timestamp
+                .as_ref()
+                .context("OOS-lock requires base-tf timestamps")?;
+            if timestamps.len() != dense.nrows() {
+                anyhow::bail!(
+                    "OOS-lock: timestamp/feature row mismatch ({} ts vs {} rows)",
+                    timestamps.len(),
+                    dense.nrows()
+                );
+            }
+            let in_sample = timestamps.iter().take_while(|&&t| t < cutoff).count();
+            // Purge the last `label_horizon_bars` IS rows whose triple-barrier
+            // label looks forward across the cutoff.
+            let purge = self.settings.models.label_horizon_bars;
+            let keep = in_sample.saturating_sub(purge);
+            if keep < 256 {
+                anyhow::bail!(
+                    "OOS-lock: only {keep} in-sample rows before {cutoff} (after a {purge}-bar \
+                     purge) for {symbol}/{base_tf} — too few to train leak-free; pick a later cutoff"
+                );
+            }
+            info!(
+                "OOS-lock: {symbol}/{base_tf} truncated to {keep} in-sample rows (< {cutoff}, \
+                 purged {purge} look-ahead rows of {in_sample}); experts will not see >= cutoff"
+            );
+            dense = dense.slice(ndarray::s![0..keep, ..]).to_owned();
+            labels.truncate(keep);
+        }
+
         // Drop any rows whose features are non-finite (NaN/Inf). This is
         // the warmup period for indicators like rsi_7 — the first N rows
         // will have NaN until the lookback window fills. The downstream
         // `dataframe_to_float32_array` strict-rejects any non-finite, so
         // we sanitise here. Labels are sliced in lock-step.
-        let (clean_data, clean_labels, dropped) = drop_nonfinite_rows(frame.data, labels);
+        let (clean_data, clean_labels, dropped) = drop_nonfinite_rows(dense, labels);
         if dropped > 0 {
             info!(
                 "Dropped {} warmup/non-finite feature rows before training (kept {} rows)",
@@ -252,7 +351,23 @@ impl TrainingOrchestrator {
                 clean_data.nrows()
             );
         }
-        let raw_payload = TrainingPayload::from_named_dense(clean_data, clean_labels, frame.names)?;
+        // Fail loud with an actionable message instead of the downstream
+        // "expert requires a non-empty feature matrix": after pruning all-NaN
+        // columns, an empty cube means every REMAINING row had a non-finite
+        // value (e.g. the entire series is shorter than the indicator warmup).
+        if clean_data.nrows() == 0 {
+            anyhow::bail!(
+                "training feature cube for {symbol}/{base_tf} is EMPTY after pruning {pruned_cols} \
+                 all-NaN column(s) and dropping {dropped} non-finite rows ({} columns remained). \
+                 The remaining features never produce a finite row — likely the series is too short \
+                 for the indicator warmup, or the higher-TF selection ({:?}) cannot align to base \
+                 {base_tf}. Check system.higher_timeframes / multi_resolution_timeframes.",
+                feature_names.len(),
+                self.selected_feature_timeframes(base_tf)
+            );
+        }
+        let raw_payload =
+            TrainingPayload::from_named_dense(clean_data, clean_labels, feature_names)?;
         let filtered_payload = if self.settings.models.filter_to_base_signal {
             let (filtered_frame, filtered_labels) = self.apply_base_signal_filter(
                 raw_payload.frame.as_ref(),
@@ -357,6 +472,20 @@ impl TrainingOrchestrator {
             }
         }
         if self.settings.models.use_sac_agent {
+            // `use_sac_agent` now drives the REAL discrete Soft
+            // Actor-Critic entry/direction policy (see
+            // `crate::soft_actor_critic`), which participates in the
+            // soft-voting ensemble like the DQN entry voter. It used to
+            // silently alias to the DQN-backed `exit_agent`; that alias
+            // is gone.
+            requested_models.push("sac".to_string());
+            // The exit-side `exit_agent` was previously the ONLY model
+            // this flag produced. To avoid silently dropping its
+            // training, keep it auto-requested under the same flag so
+            // existing configs still train both the SAC entry policy and
+            // the exit-decision agent. (The exit agent's ExitDecision3
+            // outputs are not soft-voted — F-318 — but the artifact
+            // stays available for the exit-side pipeline.)
             requested_models.push("exit_agent".to_string());
         }
         if self.settings.models.use_rl_agent || self.settings.models.use_rllib_agent {
@@ -729,6 +858,12 @@ impl TrainingOrchestrator {
             &self.settings.system.higher_timeframes
         };
 
+        // Mirror discovery's selection (the flat config list minus the base) for
+        // UI/CLI↔discovery parity — discovery trains genes on these same TFs and
+        // works. Any feature column that ends up permanently non-finite (e.g. a
+        // long-lookback indicator on a sparse higher TF that never warms up) is
+        // PRUNED in `train_symbol_with_progress` before the row-wise NaN drop, so
+        // a single dead column no longer nukes the whole dataset.
         let mut selected = Vec::new();
         for timeframe in source {
             if timeframe.eq_ignore_ascii_case(base_tf) {
@@ -1004,59 +1139,137 @@ impl TrainingOrchestrator {
 
     fn default_model_params(&self, name: &str) -> HashMap<String, String> {
         let canonical = canonical_model_name(name);
+        // v0.5 ML-integration Stage 1(a): the gradient boosters seed from
+        // REGULARIZED, bar-scalable defaults (shallow depth, column + row
+        // subsampling, L1/L2, leaf-size floors) instead of the legacy
+        // full-depth / full-data / no-shrinkage values that memorize thin-TF
+        // (D1/W1/MN) triple-barrier targets. The per-(symbol,TF) bar-count
+        // scaling of `n_estimators` / `num_iterations` / `iterations` /
+        // `min_data_in_leaf` happens later in `train_model_dispatch` where
+        // `payload.frame.height()` is known. Set
+        // `models.regularized_model_defaults = false` to restore the legacy
+        // unregularized seeds for a controlled before/after OOS comparison.
+        //
+        // CRITICAL (verified): this seed map is the REAL production source for
+        // the named boosters — `parse_tree_params` forwards every key here into
+        // the expert's `config.params`. Editing only each booster's
+        // `default_params()` would be a silent no-op because the orchestrator
+        // always passes `Some(parse_tree_params(...))`.
+        let reg = self.settings.models.regularized_model_defaults;
+        let device = self.settings.models.tree_device_preference.clone();
         match canonical {
+            "xgboost_rf" if reg => HashMap::from([
+                ("variant".to_string(), "rf".to_string()),
+                ("num_parallel_tree".to_string(), "64".to_string()),
+                // rf is bagging — keep slightly deeper than the boosters for
+                // member diversity, but still subsample rows + columns + L2.
+                ("max_depth".to_string(), "5".to_string()),
+                ("subsample".to_string(), "0.8".to_string()),
+                ("colsample_bytree".to_string(), "0.8".to_string()),
+                ("colsample_bynode".to_string(), "0.8".to_string()),
+                ("min_child_weight".to_string(), "10".to_string()),
+                ("reg_lambda".to_string(), "5.0".to_string()),
+                ("reg_alpha".to_string(), "0.5".to_string()),
+                ("gamma".to_string(), "0.5".to_string()),
+                ("device".to_string(), device),
+            ]),
             "xgboost_rf" => HashMap::from([
                 ("variant".to_string(), "rf".to_string()),
                 ("num_parallel_tree".to_string(), "64".to_string()),
                 ("subsample".to_string(), "0.8".to_string()),
                 ("colsample_bynode".to_string(), "0.8".to_string()),
-                (
-                    "device".to_string(),
-                    self.settings.models.tree_device_preference.clone(),
-                ),
+                ("device".to_string(), device),
+            ]),
+            "xgboost_dart" if reg => HashMap::from([
+                ("variant".to_string(), "dart".to_string()),
+                ("rate_drop".to_string(), "0.1".to_string()),
+                ("skip_drop".to_string(), "0.5".to_string()),
+                ("max_depth".to_string(), "4".to_string()),
+                ("learning_rate".to_string(), "0.03".to_string()),
+                ("subsample".to_string(), "0.8".to_string()),
+                ("colsample_bytree".to_string(), "0.8".to_string()),
+                ("colsample_bylevel".to_string(), "0.8".to_string()),
+                ("colsample_bynode".to_string(), "0.8".to_string()),
+                ("min_child_weight".to_string(), "10".to_string()),
+                ("reg_lambda".to_string(), "5.0".to_string()),
+                ("reg_alpha".to_string(), "0.5".to_string()),
+                ("gamma".to_string(), "0.5".to_string()),
+                ("device".to_string(), device),
             ]),
             "xgboost_dart" => HashMap::from([
                 ("variant".to_string(), "dart".to_string()),
                 ("rate_drop".to_string(), "0.1".to_string()),
                 ("skip_drop".to_string(), "0.5".to_string()),
-                (
-                    "device".to_string(),
-                    self.settings.models.tree_device_preference.clone(),
-                ),
+                ("device".to_string(), device),
+            ]),
+            "catboost_alt" if reg => HashMap::from([
+                ("variant".to_string(), "alt".to_string()),
+                // "alt" variant — keep a touch more depth for ensemble
+                // diversity than the primary catboost, still strongly L2'd.
+                ("depth".to_string(), "6".to_string()),
+                ("l2_leaf_reg".to_string(), "6.0".to_string()),
+                ("device".to_string(), device),
             ]),
             "catboost_alt" => HashMap::from([
                 ("variant".to_string(), "alt".to_string()),
                 ("depth".to_string(), "10".to_string()),
                 ("l2_leaf_reg".to_string(), "5.0".to_string()),
-                (
-                    "device".to_string(),
-                    self.settings.models.tree_device_preference.clone(),
-                ),
+                ("device".to_string(), device),
+            ]),
+            "lightgbm" if reg => HashMap::from([
+                ("device".to_string(), device),
+                ("num_iterations".to_string(), "400".to_string()),
+                ("learning_rate".to_string(), "0.03".to_string()),
+                ("max_depth".to_string(), "4".to_string()),
+                ("num_leaves".to_string(), "15".to_string()),
+                ("min_data_in_bin".to_string(), "3".to_string()),
+                // baseline; bar-scaled to max(20, bars/200) in train_model_dispatch
+                ("min_data_in_leaf".to_string(), "50".to_string()),
+                ("feature_fraction".to_string(), "0.8".to_string()),
+                ("bagging_fraction".to_string(), "0.8".to_string()),
+                ("bagging_freq".to_string(), "1".to_string()),
+                ("min_gain_to_split".to_string(), "0.01".to_string()),
+                ("lambda_l1".to_string(), "0.5".to_string()),
+                ("lambda_l2".to_string(), "5.0".to_string()),
             ]),
             "lightgbm" => HashMap::from([
-                (
-                    "device".to_string(),
-                    self.settings.models.tree_device_preference.clone(),
-                ),
+                ("device".to_string(), device),
                 ("num_iterations".to_string(), "400".to_string()),
                 ("learning_rate".to_string(), "0.05".to_string()),
                 ("max_depth".to_string(), "8".to_string()),
                 ("num_leaves".to_string(), "31".to_string()),
             ]),
+            "xgboost" if reg => HashMap::from([
+                ("device".to_string(), device),
+                // baseline; bar-scaled to 200/400/800 in train_model_dispatch
+                ("n_estimators".to_string(), "400".to_string()),
+                ("max_depth".to_string(), "4".to_string()),
+                ("learning_rate".to_string(), "0.03".to_string()),
+                ("subsample".to_string(), "0.8".to_string()),
+                ("colsample_bytree".to_string(), "0.8".to_string()),
+                ("colsample_bylevel".to_string(), "0.8".to_string()),
+                ("colsample_bynode".to_string(), "0.8".to_string()),
+                ("min_child_weight".to_string(), "10".to_string()),
+                ("reg_lambda".to_string(), "5.0".to_string()),
+                ("reg_alpha".to_string(), "0.5".to_string()),
+                ("gamma".to_string(), "0.5".to_string()),
+            ]),
             "xgboost" => HashMap::from([
-                (
-                    "device".to_string(),
-                    self.settings.models.tree_device_preference.clone(),
-                ),
+                ("device".to_string(), device),
                 ("n_estimators".to_string(), "800".to_string()),
                 ("max_depth".to_string(), "8".to_string()),
                 ("learning_rate".to_string(), "0.05".to_string()),
             ]),
+            "catboost" if reg => HashMap::from([
+                ("device".to_string(), device),
+                // baseline; bar-scaled to 200/400/800 in train_model_dispatch
+                ("iterations".to_string(), "400".to_string()),
+                ("depth".to_string(), "4".to_string()),
+                ("learning_rate".to_string(), "0.03".to_string()),
+                ("l2_leaf_reg".to_string(), "6.0".to_string()),
+            ]),
             "catboost" => HashMap::from([
-                (
-                    "device".to_string(),
-                    self.settings.models.tree_device_preference.clone(),
-                ),
+                ("device".to_string(), device),
                 ("iterations".to_string(), "500".to_string()),
                 ("depth".to_string(), "8".to_string()),
                 ("learning_rate".to_string(), "0.05".to_string()),
@@ -1356,6 +1569,68 @@ impl TrainingOrchestrator {
                     },
                 ),
             ]),
+            // Soft Actor-Critic (discrete) — RL entry/direction policy.
+            // Reuses the shared RL hyperparameter knobs (gamma / learning
+            // rate / horizon / batch / epochs). `tau` and
+            // `target_entropy_scale` are SAC-specific and use faithful
+            // defaults from Christodoulou (2019).
+            "sac" => HashMap::from([
+                ("device".to_string(), self.preferred_burn_device_policy()),
+                (
+                    "hidden_dim".to_string(),
+                    self.settings
+                        .models
+                        .rl_network_arch
+                        .first()
+                        .copied()
+                        .unwrap_or(256)
+                        .max(8)
+                        .to_string(),
+                ),
+                (
+                    "gamma".to_string(),
+                    format!("{:.6}", self.settings.models.rl_gamma),
+                ),
+                ("tau".to_string(), "0.010000".to_string()),
+                (
+                    "learning_rate".to_string(),
+                    format!("{:.6}", self.settings.models.rl_learning_rate),
+                ),
+                ("target_entropy_scale".to_string(), "0.980000".to_string()),
+                (
+                    "epochs".to_string(),
+                    Self::epochs_from_seconds(self.settings.models.rl_train_seconds, 32)
+                        .to_string(),
+                ),
+                (
+                    "batch_size".to_string(),
+                    self.settings.models.train_batch_size.max(32).to_string(),
+                ),
+                (
+                    "reward_horizon".to_string(),
+                    if self.settings.models.rl_reward_horizon == 0 {
+                        self.settings
+                            .risk
+                            .triple_barrier_max_bars
+                            .clamp(6, 64)
+                            .to_string()
+                    } else {
+                        self.settings.models.rl_reward_horizon.to_string()
+                    },
+                ),
+                (
+                    "episode_len".to_string(),
+                    if self.settings.models.rl_episode_len == 0 {
+                        self.settings
+                            .models
+                            .transformer_seq_len
+                            .clamp(24, 256)
+                            .to_string()
+                    } else {
+                        self.settings.models.rl_episode_len.to_string()
+                    },
+                ),
+            ]),
             "online_pa" => HashMap::from([
                 ("c".to_string(), "1.0".to_string()),
                 (
@@ -1490,18 +1765,35 @@ impl TrainingOrchestrator {
                     },
                 ),
             ]),
-            "dqn" => HashMap::from([
+            "dqn" => {
+                // RLlib/Ray honesty: Ray's RLlib is a Python framework and there is
+                // NO Ray runtime in this pure-Rust build. The `use_rllib_agent` /
+                // `auto_enable_rllib` config flags are kept for compatibility, but
+                // their EFFECT must be truthful — a request for "rllib" can only ever
+                // execute on the real native `rlkit` backend. So we resolve the
+                // `backend` param to the honest `rlkit` label (never a bare "rllib"
+                // that implies a Ray backend that does not exist) and carry the
+                // original request in `__rllib_requested` so the runtime profile /
+                // artifact records the honest requested-vs-effective degradation.
+                let rllib_auto = self.settings.models.auto_enable_rllib
+                    && self.settings.system.enable_gpu
+                    && self.settings.models.ray_tune_max_concurrency > 0;
+                let rllib_requested = self.settings.models.use_rllib_agent || rllib_auto;
+                if rllib_requested {
+                    rllib_unavailable_warn_once();
+                }
+                HashMap::from([
                 (
+                    // Honest backend: rlkit is the only RL backend that exists here.
                     "backend".to_string(),
-                    if self.settings.models.use_rllib_agent
-                        || (self.settings.models.auto_enable_rllib
-                            && self.settings.system.enable_gpu
-                            && self.settings.models.ray_tune_max_concurrency > 0)
-                    {
-                        "rllib".to_string()
-                    } else {
-                        "native".to_string()
-                    },
+                    "rlkit".to_string(),
+                ),
+                (
+                    // Records that rllib/Ray was requested but is unavailable, so the
+                    // training runtime profile can attach an honest degradation note
+                    // WITHOUT a misleading bare "rllib" backend label.
+                    "__rllib_requested".to_string(),
+                    rllib_requested.to_string(),
                 ),
                 (
                     "auto_rllib".to_string(),
@@ -1639,7 +1931,8 @@ impl TrainingOrchestrator {
                         .collect::<Vec<_>>()
                         .join(","),
                 ),
-            ]),
+            ])
+            }
             "swarm_forecaster" => HashMap::from([
                 (
                     "memory_limit_mb".to_string(),
@@ -1778,6 +2071,7 @@ impl TrainingOrchestrator {
             "conformal_gate" => Ok(ModelType::ConformalGate),
             "meta_stack" => Ok(ModelType::MetaStack),
             "exit_agent" => Ok(ModelType::ExitAgent),
+            "sac" => Ok(ModelType::SacAgent),
             "online_pa" => Ok(ModelType::OnlinePassiveAggressive),
             "online_hoeffding" => Ok(ModelType::OnlineHoeffding),
             "isolation_forest" => Ok(ModelType::IsolationForest),
@@ -2121,6 +2415,19 @@ fn parse_survivor_selection_policy(params: &HashMap<String, String>) -> Survivor
     )
 }
 
+/// Emit a single process-wide warning the first time an RLlib/Ray-backed DQN run
+/// is requested. Ray's RLlib is a Python framework with no Rust runtime in this
+/// build; a request can only execute on the native `rlkit` backend. The warning
+/// makes the honest degradation visible without spamming the log per model run.
+fn rllib_unavailable_warn_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        warn!(
+            "rllib/Ray requested for DQN but is unavailable in the pure-Rust build; using rlkit (native) backend instead"
+        );
+    });
+}
+
 fn training_runtime_profile(
     settings: &neoethos_core::Settings,
     config: &ModelConfig,
@@ -2140,17 +2447,23 @@ fn training_runtime_profile(
     let planned_backend = parse_string_param(&config.params, "__planned_backend");
     let planned_device = parse_string_param(&config.params, "__planned_device");
     let planned_precision = parse_string_param(&config.params, "__planned_precision");
-    let rllib_requested = requested_backend
-        .as_deref()
-        .is_some_and(|backend| backend.eq_ignore_ascii_case("rllib"));
+    // RLlib honesty: the `backend` param is now ALWAYS the truthful effective
+    // backend (`rlkit`), never a bare "rllib". The original rllib/Ray REQUEST is
+    // carried in `__rllib_requested` (the back-compat fallback `backend == "rllib"`
+    // only matters for older persisted configs). This records the honest
+    // requested-vs-effective degradation in the runtime profile/artifact.
+    let rllib_requested = parse_bool_param(&config.params, "__rllib_requested", false)
+        || requested_backend
+            .as_deref()
+            .is_some_and(|backend| backend.eq_ignore_ascii_case("rllib"));
     let mut notes = Vec::new();
     if rllib_requested {
         notes.push(
-            "rllib backend is recorded as a requested runtime hint; current DQN training path remains native rlkit".to_string(),
+            "rllib/Ray was requested for DQN but is unavailable in this pure-Rust build; training executed on the native rlkit backend".to_string(),
         );
         if parse_bool_param(&config.params, "auto_rllib", false) {
             notes.push(
-                "rllib backend was auto-requested from config because GPU preference and RLlib auto-enable were both active".to_string(),
+                "rllib was auto-requested from config because GPU preference and RLlib auto-enable were both active; the effective backend remains native rlkit".to_string(),
             );
         }
     }
@@ -3165,6 +3478,199 @@ fn select_hpo_dataset(
     Ok((frame, labels, Some(max_rows)))
 }
 
+/// Row-gather helper for the non-contiguous CombinatorialPurgedCV index sets
+/// (the purged train fold is a union of groups with holes from purge/embargo,
+/// so a contiguous `slice` cannot express it).
+fn take_frame_rows(frame: &DataFrame, idx: &[usize]) -> Result<DataFrame> {
+    let indices: Vec<u32> = idx.iter().map(|&i| i as u32).collect();
+    let ca = Series::new("__cpcv_idx".into(), indices).u32()?.clone();
+    Ok(frame.take(&ca)?)
+}
+
+/// Stage 1(c): score each HPO candidate with CombinatorialPurgedCV instead of a
+/// single time-series holdout. Each candidate is fit + evaluated on every purged
+/// path; the candidate score is `mean - stdev` of the per-path objective, so a
+/// candidate that only generalizes to one lucky window is penalized — the direct
+/// overfit signal. Reuses `neoethos_search::CombinatorialPurgedCV` (the SAME
+/// purge+embargo machinery the gene side uses) rather than reinventing it.
+/// Returns `Ok(None)` when no valid purged paths can be formed or every
+/// candidate fails, so the caller falls back to the single-holdout path.
+#[allow(clippy::too_many_arguments)]
+fn optimize_model_config_cpcv(
+    config: &ModelConfig,
+    hpo_frame: &DataFrame,
+    hpo_labels: &[i32],
+    backend: &str,
+    trials_requested: usize,
+    base_params: &HashMap<String, String>,
+    confidence_threshold: f32,
+    metric_weight: f64,
+    accuracy_weight: f64,
+    row_budget_applied: Option<usize>,
+    hpo_rows_applied: Option<usize>,
+) -> Result<Option<(HashMap<String, String>, OptimizationReport)>> {
+    const N_SPLITS: usize = 6;
+    const N_TEST_GROUPS: usize = 2;
+    const EMBARGO_PCT: f64 = 0.02;
+    const PURGE_PCT: f64 = 0.01;
+
+    let n = hpo_frame.height();
+    let cv = neoethos_search::CombinatorialPurgedCV::new(
+        N_SPLITS,
+        N_TEST_GROUPS,
+        EMBARGO_PCT,
+        PURGE_PCT,
+    );
+    let splits = cv.split(n);
+    if splits.is_empty() {
+        return Ok(None);
+    }
+    let n_paths = splits.len();
+
+    let mut best_params = base_params.clone();
+    let mut best_score = f64::NEG_INFINITY; // mean-minus-stdev aggregate
+    let mut best_metrics: Option<ValidationMetrics> = None;
+    let mut best_trial_index = 0usize;
+    let mut trials: Vec<OptimizationTrialRecord> = Vec::new();
+
+    for trial_idx in 0..trials_requested {
+        let candidate_params = if trial_idx == 0 {
+            base_params.clone()
+        } else {
+            generate_hpo_candidate_params(config, base_params, trial_idx, trials_requested, backend)
+        };
+
+        let mut fold_scores: Vec<f64> = Vec::with_capacity(n_paths);
+        let mut repr_metrics: Option<ValidationMetrics> = None;
+        let mut fold_error: Option<String> = None;
+
+        for (train_idx, test_idx) in &splits {
+            let train_frame = match take_frame_rows(hpo_frame, train_idx) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    fold_error = Some(error.to_string());
+                    break;
+                }
+            };
+            let test_frame = match take_frame_rows(hpo_frame, test_idx) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    fold_error = Some(error.to_string());
+                    break;
+                }
+            };
+            let train_labels: Vec<i32> = train_idx.iter().map(|&i| hpo_labels[i]).collect();
+            let test_labels: Vec<i32> = test_idx.iter().map(|&i| hpo_labels[i]).collect();
+
+            let mut model = match build_expert_model(config, hpo_frame.width(), &candidate_params) {
+                Ok(model) => model,
+                Err(error) => {
+                    fold_error = Some(error.to_string());
+                    break;
+                }
+            };
+            let train_labels_series = labels_to_series(&train_labels);
+            let test_labels_series = labels_to_series(&test_labels);
+            match model
+                .fit_with_validation(
+                    &train_frame,
+                    &train_labels_series,
+                    Some(&test_frame),
+                    Some(&test_labels_series),
+                )
+                .and_then(|_| model.predict_proba(&test_frame))
+            {
+                Ok(probabilities) => {
+                    let metrics = evaluate_prediction_quality(
+                        &probabilities,
+                        &test_labels,
+                        confidence_threshold,
+                        metric_weight,
+                        accuracy_weight,
+                    )?;
+                    fold_scores.push(metrics.objective_score);
+                    if repr_metrics.is_none() {
+                        repr_metrics = Some(metrics);
+                    }
+                }
+                Err(error) => {
+                    fold_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+
+        if fold_scores.is_empty() {
+            trials.push(OptimizationTrialRecord {
+                index: trial_idx,
+                backend: backend.to_string(),
+                params: candidate_params,
+                metrics: None,
+                error: fold_error.or_else(|| Some("no CPCV folds completed".to_string())),
+                selected: false,
+            });
+            continue;
+        }
+
+        let mean = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
+        let variance =
+            fold_scores.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / fold_scores.len() as f64;
+        let aggregate = mean - variance.sqrt();
+
+        if aggregate > best_score {
+            best_score = aggregate;
+            best_params = candidate_params.clone();
+            best_metrics = repr_metrics.clone();
+            best_trial_index = trial_idx;
+        }
+        trials.push(OptimizationTrialRecord {
+            index: trial_idx,
+            backend: backend.to_string(),
+            params: candidate_params,
+            metrics: repr_metrics,
+            error: None,
+            // Marked authoritatively after the loop so exactly one is selected.
+            selected: false,
+        });
+    }
+
+    let trials_completed = trials.iter().filter(|trial| trial.metrics.is_some()).count();
+    if trials_completed == 0 {
+        // Every candidate failed under CPCV — let the caller fall back to the
+        // single-holdout path instead of returning an unusable report.
+        return Ok(None);
+    }
+    if let Some(selected_trial) = trials.get_mut(best_trial_index) {
+        selected_trial.selected = true;
+    }
+
+    let report = OptimizationReport {
+        model_name: config.name.clone(),
+        capability_family: config.capability_family,
+        capability_state: config.capability_state,
+        backend: backend.to_string(),
+        trials_requested,
+        trials_completed,
+        // CPCV does not use a single holdout fraction; 0.0 is valid ([0,1)).
+        holdout_pct: 0.0,
+        train_rows: n,
+        // Approximate per-path test size for the report (n/S * test groups).
+        val_rows: (n / N_SPLITS) * N_TEST_GROUPS,
+        selected_trial_index: best_trial_index,
+        selected_params: best_params.clone(),
+        selected_metrics: best_metrics,
+        row_budget_applied,
+        hpo_rows_applied,
+        notes: vec![format!(
+            "CombinatorialPurgedCV HPO: {N_SPLITS} splits, {N_TEST_GROUPS} test groups, \
+             {n_paths} purged paths; candidate score = mean-minus-stdev of objective across paths"
+        )],
+        trials,
+    };
+
+    Ok(Some((best_params, report)))
+}
+
 fn optimize_model_config(
     config: &ModelConfig,
     payload: &TrainingPayload,
@@ -3186,6 +3692,30 @@ fn optimize_model_config(
         embargo_rows_for_timeframe(base_tf, embargo_minutes_from_params(&config.params));
     let (hpo_frame, hpo_labels, hpo_rows_applied) =
         select_hpo_dataset(payload, hpo_max_rows_from_params(&config.params))?;
+
+    // Stage 1(c): CombinatorialPurgedCV HPO scoring for the heavy boosters.
+    // `apply_overfit_overrides` sets `__ml_cpcv` only for thick-enough heavy
+    // boosters; we additionally require trials > 1 (a single trial cannot
+    // benefit from cross-path variance penalization).
+    if parse_bool_param(&config.params, "__ml_cpcv", false) && trials_requested > 1 {
+        if let Some(result) = optimize_model_config_cpcv(
+            config,
+            &hpo_frame,
+            &hpo_labels,
+            &backend,
+            trials_requested,
+            &base_params,
+            confidence_threshold,
+            metric_weight,
+            accuracy_weight,
+            row_budget_applied,
+            hpo_rows_applied,
+        )? {
+            return Ok(result);
+        }
+        // Fall through to the single-holdout path when CPCV could not form
+        // valid purged paths (e.g. dataset still too small after gating).
+    }
 
     let Some((train_frame, train_labels, val_frame, val_labels)) =
         time_series_holdout_split(&hpo_frame, &hpo_labels, holdout_pct, embargo_rows, 256, 64)?
@@ -3269,8 +3799,7 @@ fn optimize_model_config(
                     metric_weight,
                     accuracy_weight,
                 )?;
-                let selected = metrics.objective_score > best_score;
-                if selected {
+                if metrics.objective_score > best_score {
                     best_score = metrics.objective_score;
                     best_metrics = Some(metrics.clone());
                     best_params = candidate_params.clone();
@@ -3282,7 +3811,12 @@ fn optimize_model_config(
                     params: candidate_params,
                     metrics: Some(metrics),
                     error: None,
-                    selected,
+                    // Marked authoritatively after the loop so EXACTLY ONE trial
+                    // is selected (validate_optimization_report requires it).
+                    // Previously every improving trial was marked, so a
+                    // monotonically-improving HPO run failed validation and the
+                    // model (e.g. nbeats) was lost.
+                    selected: false,
                 });
             }
             Err(error) => {
@@ -3366,6 +3900,120 @@ fn write_onnx_status_sidecar(
     write_onnx_export_status(&artifact_dir.join(ONNX_EXPORT_STATUS_FILE_NAME), &status)
 }
 
+/// v0.5 ML-integration Stage 1(b): per-(symbol,TF) overfit gate + tree-budget
+/// scaling for the heavy gradient boosters, applied at train time where the
+/// real bar count (`payload.frame.height()`) is known. No-op when
+/// `regularized_model_defaults` is off or the model is not one of the heavy
+/// boosters (xgboost/xgboost_rf/xgboost_dart/lightgbm/catboost/catboost_alt).
+///
+/// - Tree budget scales with bars: <3000 -> 200, 3000-10000 -> 400, >10000 -> 800.
+/// - Below `heavy_booster_min_bars` (default 4000; D1 ~2700 falls below) the
+///   booster is forced onto a shrunk preset (shallow depth, few trees, few
+///   leaves) AND per-bar HPO is disabled (`__hpo_trials=1`) — a thin holdout
+///   cannot reliably select 5+ hyperparameters. Below an absolute floor (800)
+///   an even tinier preset is used. The model still trains and votes (we do not
+///   silently drop a voter); it is simply low-variance.
+fn apply_overfit_overrides(
+    settings: &neoethos_core::Settings,
+    config: &ModelConfig,
+    bars: usize,
+) -> ModelConfig {
+    let canonical = canonical_model_name(&config.name);
+    let is_heavy = matches!(
+        canonical,
+        "xgboost" | "xgboost_rf" | "xgboost_dart" | "lightgbm" | "catboost" | "catboost_alt"
+    );
+    if !is_heavy {
+        return config.clone();
+    }
+
+    let mut params = config.params.clone();
+    let min_bars = settings.models.heavy_booster_min_bars;
+    let thin = min_bars > 0 && bars < min_bars;
+    let very_thin = thin && bars < 800;
+
+    if settings.models.regularized_model_defaults {
+        // Bar-scaled tree budget (early stopping on the val frame still caps it).
+        let trees = if thin {
+            if very_thin { 80 } else { 150 }
+        } else if bars < 3000 {
+            200
+        } else if bars <= 10_000 {
+            400
+        } else {
+            800
+        };
+        let depth: Option<i64> = if thin {
+            Some(if very_thin { 2 } else { 3 })
+        } else {
+            None
+        };
+        let leaves: Option<i64> = if thin {
+            Some(if very_thin { 4 } else { 7 })
+        } else {
+            None
+        };
+
+        match canonical {
+            "xgboost" | "xgboost_rf" | "xgboost_dart" => {
+                params.insert("n_estimators".into(), trees.to_string());
+                if let Some(d) = depth {
+                    params.insert("max_depth".into(), d.to_string());
+                }
+            }
+            "lightgbm" => {
+                params.insert("num_iterations".into(), trees.to_string());
+                // Leaf-size floor scales with data (min 20) — single-row leaves
+                // are the classic LightGBM overfit on thin TFs.
+                let min_leaf = (bars / 200).max(20);
+                params.insert("min_data_in_leaf".into(), min_leaf.to_string());
+                if let Some(d) = depth {
+                    params.insert("max_depth".into(), d.to_string());
+                }
+                if let Some(l) = leaves {
+                    params.insert("num_leaves".into(), l.to_string());
+                }
+            }
+            "catboost" | "catboost_alt" => {
+                params.insert("iterations".into(), trees.to_string());
+                if let Some(d) = depth {
+                    params.insert("depth".into(), d.to_string());
+                }
+            }
+            _ => {}
+        }
+
+        if thin {
+            // A thin holdout cannot select 5+ hyperparameters — disable per-bar HPO.
+            params.insert("__hpo_trials".into(), "1".into());
+            tracing::info!(
+                target: "neoethos_models::training",
+                model = %config.name,
+                bars,
+                heavy_booster_min_bars = min_bars,
+                trees,
+                "thin-data overfit gate: shrunk booster preset + HPO disabled"
+            );
+        }
+    }
+
+    // Stage 1(c): enable CombinatorialPurgedCV HPO scoring for the heavy
+    // boosters when the data is thick enough (purged 15-path CV is wasteful and
+    // unstable on thin data, which is also forced to trials=1 above). The
+    // `optimize_model_config` reader additionally requires trials > 1.
+    if settings.models.ml_cpcv_enabled && !thin {
+        params.insert("__ml_cpcv".into(), "1".into());
+    }
+
+    ModelConfig {
+        name: config.name.clone(),
+        model_type: config.model_type,
+        capability_family: config.capability_family,
+        capability_state: config.capability_state,
+        params,
+    }
+}
+
 fn train_model_dispatch(
     models_dir: &std::path::Path,
     settings: &neoethos_core::Settings,
@@ -3378,6 +4026,10 @@ fn train_model_dispatch(
     let artifact_dir = model_artifact_dir(models_dir, symbol, base_tf, &config.name);
 
     if uses_shared_expert_dispatch(config.model_type) {
+        // Stage 1(b): apply the bar-count overfit gate BEFORE HPO so the
+        // selection respects the gated budget.
+        let gated = apply_overfit_overrides(settings, config, payload.frame.height());
+        let config = &gated;
         let (selected_params, optimization_report) =
             optimize_model_config(config, payload, base_tf, row_budget_applied)?;
         let effective_config = ModelConfig {
@@ -3455,6 +4107,41 @@ fn train_model_dispatch(
             .with_reward_horizon(parse_usize_param(&config.params, "reward_horizon", 0))
             .with_warmup_steps(parse_usize_param(&config.params, "warmup_steps", 0));
             model.fit_from_frame(payload.frame.as_ref(), &labels)?;
+            persist_training_artifacts(
+                &artifact_dir,
+                settings,
+                config,
+                symbol,
+                base_tf,
+                payload,
+                row_budget_applied,
+                None,
+                |staged_dir| model.save(staged_dir),
+            )?;
+            Ok(())
+        }
+        ModelType::SacAgent => {
+            let mut model = SoftActorCritic::with_hidden_dim(
+                payload.frame.width().max(1),
+                parse_usize_param(&config.params, "hidden_dim", 256),
+            )
+            .with_gamma(parse_f32_param(&config.params, "gamma", 0.99))
+            .with_tau(parse_f32_param(&config.params, "tau", 0.01))
+            .with_learning_rate(parse_f64_param(&config.params, "learning_rate", 3e-4))
+            .with_target_entropy_scale(parse_f32_param(
+                &config.params,
+                "target_entropy_scale",
+                0.98,
+            ))
+            .with_train_schedule(
+                parse_usize_param(&config.params, "epochs", 32),
+                parse_usize_param(&config.params, "batch_size", 64),
+            )
+            .with_episode_layout(
+                parse_usize_param(&config.params, "reward_horizon", 0),
+                parse_usize_param(&config.params, "episode_len", 0),
+            );
+            model.train_on_frame(payload.frame.as_ref(), &labels)?;
             persist_training_artifacts(
                 &artifact_dir,
                 settings,
@@ -3724,6 +4411,83 @@ mod tests {
         assert!(err.to_string().contains("no model names"));
     }
 
+    // v0.5 ML-integration Stage 1(a) guard: the regularized seed map is the
+    // REAL production source for the named boosters (verdict #3). If these keys
+    // ever regress out of `default_model_params`, the booster silently trains
+    // with the legacy unregularized values and a before/after OOS shows no
+    // effect — this test fails loudly instead.
+    #[test]
+    fn regularized_seed_maps_contain_reg_keys() {
+        let orch = orchestrator_with_models(&["xgboost"]);
+        assert!(orch.settings.models.regularized_model_defaults);
+
+        let xgb = orch.default_model_params("xgboost");
+        assert_eq!(xgb.get("max_depth").map(String::as_str), Some("4"));
+        assert_eq!(xgb.get("subsample").map(String::as_str), Some("0.8"));
+        assert_eq!(xgb.get("colsample_bytree").map(String::as_str), Some("0.8"));
+        assert_eq!(xgb.get("min_child_weight").map(String::as_str), Some("10"));
+        assert_eq!(xgb.get("reg_lambda").map(String::as_str), Some("5.0"));
+        assert_eq!(xgb.get("reg_alpha").map(String::as_str), Some("0.5"));
+        assert_eq!(xgb.get("gamma").map(String::as_str), Some("0.5"));
+
+        let lgbm = orch.default_model_params("lightgbm");
+        assert_eq!(lgbm.get("num_leaves").map(String::as_str), Some("15"));
+        assert_eq!(lgbm.get("max_depth").map(String::as_str), Some("4"));
+        assert_eq!(lgbm.get("feature_fraction").map(String::as_str), Some("0.8"));
+        assert_eq!(lgbm.get("bagging_fraction").map(String::as_str), Some("0.8"));
+        assert_eq!(lgbm.get("lambda_l2").map(String::as_str), Some("5.0"));
+        assert!(lgbm.contains_key("min_data_in_leaf"));
+
+        let cat = orch.default_model_params("catboost");
+        assert_eq!(cat.get("depth").map(String::as_str), Some("4"));
+        assert_eq!(cat.get("l2_leaf_reg").map(String::as_str), Some("6.0"));
+    }
+
+    #[test]
+    fn legacy_seed_maps_restore_unregularized_defaults() {
+        let mut orch = orchestrator_with_models(&["xgboost"]);
+        orch.settings.models.regularized_model_defaults = false;
+
+        let xgb = orch.default_model_params("xgboost");
+        assert_eq!(xgb.get("max_depth").map(String::as_str), Some("8"));
+        assert_eq!(xgb.get("n_estimators").map(String::as_str), Some("800"));
+        // Regularizers are NOT seeded in legacy mode (the booster's neutral
+        // inline fallbacks then apply == legacy behaviour).
+        assert!(!xgb.contains_key("subsample"));
+        assert!(!xgb.contains_key("reg_lambda"));
+
+        let lgbm = orch.default_model_params("lightgbm");
+        assert_eq!(lgbm.get("num_leaves").map(String::as_str), Some("31"));
+        assert!(!lgbm.contains_key("feature_fraction"));
+    }
+
+    #[test]
+    fn overfit_gate_shrinks_and_disables_hpo_on_thin_data() {
+        let orch = orchestrator_with_models(&["xgboost"]);
+        let base = ModelConfig {
+            name: "xgboost".to_string(),
+            model_type: ModelType::XGBoost,
+            capability_family: crate::runtime::capabilities::ModelFamily::Tree,
+            capability_state: CapabilityState::Verified,
+            params: orch.default_model_params("xgboost"),
+        };
+
+        // Thin (D1-like): below the 4000-bar gate -> shrunk preset + HPO off,
+        // and NO CPCV meta flag (15-path CV is wasteful on thin data).
+        let thin = apply_overfit_overrides(&orch.settings, &base, 2700);
+        assert_eq!(thin.params.get("max_depth").map(String::as_str), Some("3"));
+        assert_eq!(thin.params.get("n_estimators").map(String::as_str), Some("150"));
+        assert_eq!(thin.params.get("__hpo_trials").map(String::as_str), Some("1"));
+        assert!(!thin.params.contains_key("__ml_cpcv"));
+
+        // Thick: bar-scaled budget, no shrink, CPCV enabled.
+        let thick = apply_overfit_overrides(&orch.settings, &base, 50_000);
+        assert_eq!(thick.params.get("n_estimators").map(String::as_str), Some("800"));
+        assert_eq!(thick.params.get("max_depth").map(String::as_str), Some("4"));
+        assert!(!thick.params.contains_key("__hpo_trials"));
+        assert_eq!(thick.params.get("__ml_cpcv").map(String::as_str), Some("1"));
+    }
+
     #[test]
     fn build_dispatch_plan_orders_and_deduplicates_enabled_models() {
         let orchestrator = orchestrator_with_models(&["mlp", "lightgbm", "patchtst", "lightgbm"]);
@@ -3944,6 +4708,79 @@ mod tests {
         assert_eq!(profile.effective_label_horizon_bars, 3);
         assert_eq!(profile.meta_label_max_hold_bars, 3);
         assert!(!profile.label_use_triple_barrier);
+    }
+
+    #[test]
+    fn dqn_backend_param_is_honest_rlkit_not_bare_rllib_when_rllib_requested() {
+        let mut orchestrator = orchestrator_with_models(&["dqn"]);
+        // Operator explicitly asks for the (non-existent in Rust) RLlib/Ray agent.
+        orchestrator.settings.models.use_rllib_agent = true;
+
+        let params = orchestrator.default_model_params("dqn");
+
+        // The effective backend must be the truthful native `rlkit`, NEVER a bare
+        // "rllib" label that implies a Ray backend that does not exist here.
+        assert_eq!(
+            params.get("backend").map(String::as_str),
+            Some("rlkit"),
+            "dqn backend must resolve to the honest rlkit backend, not a bare rllib claim"
+        );
+        assert_ne!(
+            params.get("backend").map(String::as_str),
+            Some("rllib"),
+            "a bare rllib backend label is misleading (no Ray runtime exists in this build)"
+        );
+        // The honest request-vs-effective degradation signal must be carried so the
+        // runtime profile/artifact can record it.
+        assert_eq!(
+            params.get("__rllib_requested").map(String::as_str),
+            Some("true"),
+            "rllib request must be recorded as a degradation marker"
+        );
+    }
+
+    #[test]
+    fn training_runtime_profile_records_rllib_degradation_reason() {
+        let orchestrator = orchestrator_with_models(&["dqn"]);
+        let config = ModelConfig {
+            name: "dqn".to_string(),
+            model_type: ModelType::Dqn,
+            capability_family: crate::runtime::capabilities::ModelFamily::Rl,
+            capability_state: CapabilityState::Implemented,
+            params: HashMap::from([
+                ("backend".to_string(), "rlkit".to_string()),
+                ("__rllib_requested".to_string(), "true".to_string()),
+            ]),
+        };
+        let payload =
+            TrainingPayload::from_dense(ndarray::Array2::<f32>::zeros((4, 1)), vec![0, 0, 0, 0])
+                .expect("build payload");
+
+        let profile = training_runtime_profile(
+            &orchestrator.settings,
+            &config,
+            "EURUSD",
+            "M1",
+            &payload,
+            Some(4),
+            Vec::new(),
+        );
+
+        // The effective/requested backend recorded is the honest rlkit, not rllib.
+        assert_eq!(profile.requested_backend.as_deref(), Some("rlkit"));
+        assert!(
+            profile.rllib_requested,
+            "rllib request must still be flagged on the profile via the __rllib_requested marker"
+        );
+        // An honest degradation note must be recorded; it must NOT claim rllib ran.
+        assert!(
+            profile
+                .notes
+                .iter()
+                .any(|note| note.contains("rllib") && note.contains("unavailable")),
+            "profile must record the honest rllib-unavailable degradation reason; notes were: {:?}",
+            profile.notes
+        );
     }
 
     #[test]

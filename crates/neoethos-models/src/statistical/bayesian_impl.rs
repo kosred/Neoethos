@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use nalgebra::DMatrix;
 use ndarray::{Array1, Array2, Axis};
 use neoethos_core::storage::json::{DirBackupWriteConfig, write_dir_with_backup};
 use polars::prelude::*;
@@ -23,8 +24,13 @@ use super::common::{
 struct BayesianClassPosterior {
     weights: Array1<f32>,
     bias: f32,
-    variance_diag: Array1<f32>,
-    bias_variance: f32,
+    /// FULL Laplace posterior covariance over the augmented parameter vector
+    /// `[w_0..w_{d-1}, bias]`, shape `(d+1, d+1)`. Bishop PRML §4.5:
+    /// `Σ = (XᵀSX + αI)⁻¹`. The off-diagonal terms capture feature
+    /// correlation (TA features are highly collinear), unlike the previous
+    /// diagonal-only `variance_diag`/`bias_variance` approximation that
+    /// assumed feature independence.
+    covariance: Array2<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,8 +235,20 @@ fn fit_binary_posterior(
         bias = best_bias;
     }
 
-    let mut variance_diag = Array1::<f32>::zeros(cols);
-    let mut bias_hessian = 0.0_f32;
+    // FULL Laplace posterior covariance (Bishop PRML §4.5.1). Build the
+    // augmented Hessian over Z = [X | 1] (bias = last column):
+    //     H = ZᵀSZ + αI ,  S = diag(p_i(1-p_i)) ,  α = N · prior_precision
+    // We use the UN-averaged data term `ZᵀSZ` with the prior scaled by N
+    // (`α = N·prior`). This yields the SAME w_MAP the (1/N)-averaged fit
+    // gradient minimised (its stationarity ⇔ ΣᵢXᵀ(p−y) + N·prior·w = 0),
+    // while giving a genuinely Bayesian posterior precision that GROWS with N
+    // — so Σ = H⁻¹ contracts as ~1/N (the defining posterior-contraction
+    // property). The previous (1/N)-scaled diagonal Hessian neither
+    // contracted with N nor carried off-diagonal feature covariance.
+    // f64 for the linear algebra (mirrors the HMM f64 covariance math),
+    // stored back as f32.
+    let aug = cols + 1;
+    let mut hessian = DMatrix::<f64>::zeros(aug, aug);
     for row in 0..rows {
         let x_row = train_features.row(row);
         let logit = weights
@@ -239,25 +257,54 @@ fn fit_binary_posterior(
             .map(|(weight, value)| weight * value)
             .sum::<f32>()
             + bias;
-        let probability = sigmoid(logit);
+        let probability = sigmoid(logit) as f64;
         let curvature = (probability * (1.0 - probability)).max(1e-6);
-        bias_hessian += curvature;
-        for col in 0..cols {
-            variance_diag[col] += curvature * x_row[col] * x_row[col];
+        for a in 0..aug {
+            let za = if a < cols { x_row[a] as f64 } else { 1.0 };
+            if za == 0.0 {
+                continue;
+            }
+            for b in 0..aug {
+                let zb = if b < cols { x_row[b] as f64 } else { 1.0 };
+                hessian[(a, b)] += curvature * za * zb;
+            }
         }
     }
-
-    for col in 0..cols {
-        let diagonal = prior + variance_diag[col] / rows as f32;
-        variance_diag[col] = 1.0 / diagonal.max(1e-6);
+    // Gaussian prior precision α = N·prior on the weight diagonal only (the
+    // intercept is left unpenalised, matching the fit objective); a tiny
+    // jitter on the bias diagonal keeps the unpenalised bias strictly SPD.
+    let prior_alpha = prior as f64 * rows as f64;
+    for d in 0..cols {
+        hessian[(d, d)] += prior_alpha;
     }
-    let bias_variance = 1.0 / (bias_hessian / rows as f32 + 1e-6);
+    hessian[(cols, cols)] += 1e-6;
+
+    // Σ = H⁻¹ via Cholesky (SPD by construction). Escalate a ridge jitter on
+    // numerical non-positive-definiteness; bail loud if it never resolves.
+    let mut jitter = 0.0_f64;
+    let sigma = loop {
+        let mut candidate = hessian.clone();
+        for d in 0..aug {
+            candidate[(d, d)] += jitter;
+        }
+        match candidate.cholesky() {
+            Some(chol) => break chol.inverse(),
+            None => {
+                jitter = if jitter == 0.0 { 1e-8 } else { jitter * 10.0 };
+                if jitter > 1.0 {
+                    bail!(
+                        "bayesian Laplace Hessian is not positive-definite (jitter escalation exhausted)"
+                    );
+                }
+            }
+        }
+    };
+    let covariance = Array2::from_shape_fn((aug, aug), |(a, b)| sigma[(a, b)] as f32);
 
     Ok(BayesianClassPosterior {
         weights,
         bias,
-        variance_diag,
-        bias_variance,
+        covariance,
     })
 }
 
@@ -269,16 +316,35 @@ fn predictive_logit(class_model: &BayesianClassPosterior, features: &[f32]) -> R
         .map(|(weight, value)| weight * value)
         .sum::<f32>()
         + class_model.bias;
-    let variance = class_model
-        .variance_diag
+    // Predictive logit variance σ_a² = zᵀ Σ z with z = [x | 1] (augmented
+    // bias slot). The FULL quadratic form picks up off-diagonal posterior
+    // covariance (Bishop PRML eq. 4.151), unlike the old diagonal sum.
+    let aug = class_model.covariance.nrows();
+    if aug != features.len() + 1 {
+        bail!(
+            "bayesian predictive covariance dimension mismatch: covariance {} vs features+bias {}",
+            aug,
+            features.len() + 1
+        );
+    }
+    let z: Vec<f32> = features
         .iter()
-        .zip(features.iter())
-        .map(|(variance, value)| variance * value * value)
-        .sum::<f32>()
-        + class_model.bias_variance;
+        .copied()
+        .chain(std::iter::once(1.0))
+        .collect();
+    let mut variance = 0.0_f32;
+    for a in 0..aug {
+        let mut row_acc = 0.0_f32;
+        for b in 0..aug {
+            row_acc += class_model.covariance[(a, b)] * z[b];
+        }
+        variance += z[a] * row_acc;
+    }
     if !mean.is_finite() || !variance.is_finite() {
         bail!("bayesian logistic regression produced non-finite posterior moments");
     }
+    // Probit/κ correction (Bishop eq. 4.153, MacKay 1992) — UNCHANGED; only
+    // its variance input now comes from the full quadratic form.
     let correction = (1.0 + std::f32::consts::PI * variance.max(0.0) / 8.0).sqrt();
     Ok(mean / correction.max(1e-6))
 }
@@ -492,16 +558,21 @@ fn validate_bayesian_artifact(artifact: &BayesianOneVsRestArtifact) -> Result<()
         || artifact.scaler.stds.iter().any(|value| !value.is_finite())
         || artifact.scaler.stds.iter().any(|value| *value <= 0.0)
         || artifact.classes.iter().any(|class_model| {
+            let aug = artifact.feature_columns.len() + 1;
             class_model.weights.len() != artifact.feature_columns.len()
-                || class_model.variance_diag.len() != artifact.feature_columns.len()
+                || class_model.covariance.dim() != (aug, aug)
                 || class_model.weights.iter().any(|value| !value.is_finite())
                 || !class_model.bias.is_finite()
-                || class_model
-                    .variance_diag
-                    .iter()
-                    .any(|value| !value.is_finite() || *value <= 0.0)
-                || !class_model.bias_variance.is_finite()
-                || class_model.bias_variance <= 0.0
+                || class_model.covariance.iter().any(|value| !value.is_finite())
+                // a covariance must have strictly positive variances on the diagonal
+                || (0..aug).any(|d| class_model.covariance[(d, d)] <= 0.0)
+                // and must be (numerically) symmetric
+                || (0..aug).any(|a| {
+                    (a + 1..aug).any(|b| {
+                        (class_model.covariance[(a, b)] - class_model.covariance[(b, a)]).abs()
+                            > 1e-3
+                    })
+                })
         })
     {
         bail!("bayesian artifact contains invalid posterior parameters");
@@ -721,6 +792,99 @@ mod tests {
     use super::*;
     use crate::base::three_class_runtime_confidence;
 
+    // Deterministic, rule-derived fixture (NOT random noise): two spread-out
+    // features and a fixed linear decision boundary. Used to verify the
+    // defining Bayesian properties of the full-covariance Laplace posterior.
+    fn laplace_feature(i: usize, j: usize) -> f32 {
+        if j == 0 {
+            ((i % 11) as f32 - 5.0) * 0.3
+        } else {
+            ((i * 7 % 13) as f32 - 6.0) * 0.25
+        }
+    }
+    fn make_features(n: usize) -> Array2<f32> {
+        Array2::from_shape_fn((n, 2), |(i, j)| laplace_feature(i, j))
+    }
+    fn make_labels(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let x0 = laplace_feature(i, 0);
+                let x1 = laplace_feature(i, 1);
+                if 1.5 * x0 - x1 > 0.0 { 1.0 } else { 0.0 }
+            })
+            .collect()
+    }
+    fn predictive_variance(cm: &BayesianClassPosterior, x: &[f32]) -> f32 {
+        let aug = cm.covariance.nrows();
+        let z: Vec<f32> = x.iter().copied().chain(std::iter::once(1.0)).collect();
+        let mut v = 0.0_f32;
+        for a in 0..aug {
+            let mut acc = 0.0_f32;
+            for b in 0..aug {
+                acc += cm.covariance[(a, b)] * z[b];
+            }
+            v += z[a] * acc;
+        }
+        v
+    }
+
+    #[test]
+    fn full_laplace_predictive_variance_contracts_with_data() -> Result<()> {
+        // The defining Bayesian property: more data ⇒ tighter posterior ⇒
+        // smaller predictive logit variance zᵀΣz for a fixed probe point.
+        let probe = [0.6_f32, -0.4];
+        let cm_small = fit_binary_posterior(
+            &make_features(24),
+            &make_labels(24),
+            None,
+            None,
+            0.05,
+            0.1,
+            400,
+        )?;
+        let cm_large = fit_binary_posterior(
+            &make_features(400),
+            &make_labels(400),
+            None,
+            None,
+            0.05,
+            0.1,
+            400,
+        )?;
+        let v_small = predictive_variance(&cm_small, &probe);
+        let v_large = predictive_variance(&cm_large, &probe);
+        assert!(v_small.is_finite() && v_large.is_finite() && v_small > 0.0 && v_large > 0.0);
+        assert!(
+            v_large < v_small,
+            "posterior predictive variance must contract with more data: N=24 -> {v_small}, N=400 -> {v_large}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn probit_correction_shrinks_logit_toward_half() -> Result<()> {
+        // With a positive predictive variance the κ/probit correction
+        // (Bishop 4.153) must shrink |logit| below the plug-in mean, pulling
+        // σ strictly closer to 0.5.
+        let cm = BayesianClassPosterior {
+            weights: Array1::from(vec![0.8_f32, -0.5]),
+            bias: 0.2,
+            covariance: Array2::<f32>::eye(3) * 0.5_f32,
+        };
+        let x = [1.0_f32, 1.0];
+        let raw_mean = 0.8 * 1.0 - 0.5 * 1.0 + 0.2_f32; // 0.5
+        let corrected = predictive_logit(&cm, &x)?;
+        assert!(
+            corrected.abs() < raw_mean.abs(),
+            "probit correction must shrink the logit toward 0: raw={raw_mean}, corrected={corrected}"
+        );
+        assert!(
+            (sigmoid(corrected) - 0.5).abs() < (sigmoid(raw_mean) - 0.5).abs(),
+            "probit-corrected probability must be closer to 0.5 than the plug-in"
+        );
+        Ok(())
+    }
+
     fn sample_dataframe() -> DataFrame {
         DataFrame::new(vec![
             Series::new("open".into(), vec![1.0_f64, 1.1, 1.2, 1.3, 1.4, 1.5]).into(),
@@ -807,8 +971,7 @@ mod tests {
                 BayesianClassPosterior {
                     weights: Array1::zeros(2),
                     bias: 0.0,
-                    variance_diag: Array1::ones(2),
-                    bias_variance: 1.0,
+                    covariance: Array2::eye(3),
                 };
                 3
             ],
@@ -846,8 +1009,7 @@ mod tests {
                 BayesianClassPosterior {
                     weights: Array1::zeros(2),
                     bias: 0.0,
-                    variance_diag: Array1::ones(2),
-                    bias_variance: 1.0,
+                    covariance: Array2::eye(3),
                 };
                 3
             ],

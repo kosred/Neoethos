@@ -8,6 +8,7 @@ members = [
   "crates/neoethos-core",
   "crates/neoethos-app",
   "crates/neoethos-codex",
+  "crates/neoethos-trader",
 ]
 default-members = [
   "crates/neoethos-search",
@@ -17,6 +18,7 @@ default-members = [
   "crates/neoethos-core",
   "crates/neoethos-app",
   "crates/neoethos-codex",
+  "crates/neoethos-trader",
 ]
 
 [workspace.package]
@@ -67,9 +69,30 @@ thiserror   = "2.0.16"
 #       contradiction. Cost of unwind: ~3-5% perf overhead on the
 #       happy path + ~10 MB binary growth — acceptable trade for not
 #       killing the process on a recoverable indicator panic.
+# ── Dev profile — local debug builds + tests ─────────────────────────────────
+# `debug = "line-tables-only"` instead of the default full DWARF. The workspace
+# binary is enormous (neoethos-app links ~260 object files across the whole
+# crate graph: polars, burn/cubecl, candle, the tree-model FFI, arrow, etc.).
+# Full type info pushes the monolithic Windows PDB past the MSVC linker's
+# internal cap and the link dies with `LNK1318: Unexpected PDB error; LIMIT (12)`
+# — so `cargo build` / `cargo test` could not link locally at all. Line-tables
+# keep panic backtraces (file:line) working while dropping the type-record
+# streams that overflow the PDB, so debug builds link again. The shipped
+# artifact is unaffected — `[profile.release]` strips symbols entirely (no PDB).
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
-lto = "fat"
-codegen-units = 1
+# agent 2026-06-05 (operator decision): dropped `lto = "fat"` + `codegen-units = 1`.
+# They cost ~3-4x compile/link time (full-program LTO of the 100MB+ binary) for a
+# marginal runtime gain — the GA hot loop lives inside ONE crate (neoethos-search)
+# and is already optimised at opt-level=3 regardless of cross-crate LTO. A
+# ~120-150MB binary is fine for GitHub + the shipped installer, and iteration
+# (incl. the VPS rebuild) becomes dramatically faster.
+lto = "thin"          # operator 2026-06-05: thin LTO (not fat) — cross-crate
+                      # inlining for faster code, but a fraction of fat's
+                      # compile cost (and mold + -Zthreads below offset it).
+codegen-units = 16
 strip = "symbols"
 panic = "unwind"
 

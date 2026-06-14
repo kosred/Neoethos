@@ -53,6 +53,7 @@ use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
 use crate::exit_agent::ExitAgent;
 use crate::rl::TradingReinforcementLearner;
 use crate::runtime::capabilities::ModelFamily;
+use crate::soft_actor_critic::SoftActorCritic;
 
 // ---------------------------------------------------------------------------
 // dqn
@@ -257,19 +258,99 @@ impl ExpertLoader for ExitAgentLoader {
 }
 
 // ---------------------------------------------------------------------------
+// sac (Soft Actor-Critic, discrete) — ENTRY voter (like dqn)
+// ---------------------------------------------------------------------------
+
+/// [`ExpertModel`] adapter for [`SoftActorCritic`] (sac).
+///
+/// SAC is an **entry / direction** policy. Its softmax policy emits a
+/// canonical 3-class `[neutral, buy, sell]` distribution tagged
+/// [`super::ExpertOutputKind::Classification3`] so the trade-direction
+/// aggregators (SoftVoting / MoE classifier head) treat it as a regular
+/// soft voter — exactly like [`DqnAdapter`], and unlike the exit agent
+/// whose `ExitDecision3` outputs are filtered out.
+pub struct SacAgentAdapter {
+    inner: SoftActorCritic,
+}
+
+// SAFETY: see DqnAdapter — same Burn OnceCell contract. `predict` is the
+// only entry point and does not mutate the inner agent.
+unsafe impl Sync for SacAgentAdapter {}
+
+impl SacAgentAdapter {
+    pub fn new(inner: SoftActorCritic) -> Self {
+        Self { inner }
+    }
+    pub fn inner(&self) -> &SoftActorCritic {
+        &self.inner
+    }
+}
+
+impl ExpertModel for SacAgentAdapter {
+    fn name(&self) -> &str {
+        "sac"
+    }
+    fn family(&self) -> ModelFamily {
+        ModelFamily::Rl
+    }
+    fn output_kind(&self) -> ExpertOutputKind {
+        // SAC's softmax policy IS a Classification3 distribution — it
+        // votes on trade direction like the DQN entry agent.
+        ExpertOutputKind::Classification3
+    }
+    fn feature_columns(&self) -> &[String] {
+        self.inner.feature_columns()
+    }
+    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+        let runtime_preds = self
+            .inner
+            .predict_runtime(df)
+            .with_context(|| "sac predict_runtime failed")?;
+        let mut out = Vec::with_capacity(runtime_preds.len());
+        for rp in runtime_preds {
+            let pred = ExpertPrediction {
+                kind: ExpertOutputKind::Classification3,
+                values: rp.class_probabilities().to_vec(),
+            };
+            pred.validate()?;
+            out.push(pred);
+        }
+        Ok(out)
+    }
+}
+
+/// Loader for [`SacAgentAdapter`].
+pub struct SacAgentLoader;
+
+impl ExpertLoader for SacAgentLoader {
+    fn name(&self) -> &str {
+        "sac"
+    }
+    fn load(&self, artifact_dir: &Path) -> Result<Box<dyn ExpertModel>> {
+        let inner = SoftActorCritic::load(artifact_dir)
+            .with_context(|| format!("SoftActorCritic::load({}) failed", artifact_dir.display()))?;
+        Ok(Box::new(SacAgentAdapter::new(inner)))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Convenience: register-all-rl-exit-loaders
 // ---------------------------------------------------------------------------
 
-/// Register the dqn loader (1 canonical name).
+/// Register the RL entry-voter loaders: `dqn` + `sac` (2 names).
 ///
-/// **F-318 (2026-05-29)**: was a 2-name function (dqn + exit_agent),
-/// but ExitAgent's `ExitDecision3` outputs are filtered out by
-/// `SoftVotingEnsemble` (Classification3 only) and no production
-/// exit-side pipeline reads them. `ExitAgentLoader` is kept in the
-/// module for future revival when an exit-side decision loop ships;
-/// the bootstrap simply doesn't wire it in until then.
+/// **F-318 (2026-05-29)**: the exit-side `exit_agent` is NOT wired in —
+/// its `ExitDecision3` outputs are filtered out by `SoftVotingEnsemble`
+/// (Classification3 only) and no production exit-side pipeline reads
+/// them. `ExitAgentLoader` is kept in the module for future revival.
+///
+/// **SAC (Christodoulou 2019)**: a real discrete Soft Actor-Critic entry
+/// policy. Unlike the exit agent it emits a `Classification3`
+/// `[neutral, buy, sell]` distribution and soft-votes like `dqn`, so it
+/// IS registered here.
 pub fn register_rl_exit_loaders(registry: &mut super::ExpertRegistry) -> Result<()> {
     registry.register(Box::new(DqnLoader))?;
+    registry.register(Box::new(SacAgentLoader))?;
     Ok(())
 }
 
@@ -298,7 +379,8 @@ mod tests {
         register_rl_exit_loaders(&mut reg).expect("register");
         let mut names = reg.registered_names();
         names.sort_unstable();
-        assert_eq!(names, vec!["dqn", "exit_agent"]);
+        // dqn + sac entry voters (exit_agent stays unwired — F-318).
+        assert_eq!(names, vec!["dqn", "sac"]);
     }
 
     #[test]
@@ -322,10 +404,16 @@ mod tests {
         let exit = ExitAgentAdapter::new(inner_exit);
         assert_eq!(exit.output_kind(), ExpertOutputKind::ExitDecision3);
         assert_eq!(exit.family(), ModelFamily::Exit);
+
+        // SAC is an entry voter: Classification3 (like dqn), NOT filtered.
+        let inner_sac = SoftActorCritic::new(8);
+        let sac = SacAgentAdapter::new(inner_sac);
+        assert_eq!(sac.output_kind(), ExpertOutputKind::Classification3);
+        assert_eq!(sac.family(), ModelFamily::Rl);
     }
 
     #[test]
-    fn full_29_loaders_coexist() {
+    fn full_30_loaders_coexist() {
         // **F-319 (2026-05-29)**: genetic/neuro_evo/neat removed — they
         // are strategy discoverers in `neoethos-search`, not voters.
         // **F-318 (2026-05-29)**: exit_agent removed — `ExitDecision3`
@@ -341,10 +429,10 @@ mod tests {
         super::super::mixed_adapters::register_mixed_loaders(&mut reg).expect("mixed");
         register_rl_exit_loaders(&mut reg).expect("rl");
         // 7 tree + 3 deep-cls + 7 deep-ts + 8 meta (incl. hmm_regime) +
-        // 3 mixed + 1 rl (dqn) = 29
-        // (34th = swarm_forecaster, deferred to D1.2.8;
+        // 3 mixed + 2 rl (dqn + sac) = 30
+        // (swarm_forecaster deferred to D1.2.8;
         //  3 evolutionary removed in F-319; exit_agent removed in F-318)
-        assert_eq!(reg.registered_names().len(), 29);
+        assert_eq!(reg.registered_names().len(), 30);
         for required in [
             "lightgbm",
             "xgboost",
@@ -375,6 +463,7 @@ mod tests {
             "online_hoeffding",
             "isolation_forest",
             "dqn",
+            "sac",
         ] {
             assert!(
                 reg.has_loader(required),

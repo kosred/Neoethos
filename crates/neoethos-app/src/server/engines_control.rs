@@ -33,14 +33,16 @@ use super::errors::actionable_error;
 use super::state::AppApiState;
 
 /// Shared request body for `start` endpoints — picks the symbol +
-/// timeframe to operate on. Empty fields fall back to "EURUSD" / "M1"
-/// so the dashboard "Start" button can fire without any params.
+/// timeframe to operate on. Empty fields are resolved from `config.yaml`
+/// via the shared `SystemConfig` resolvers (the SAME ones the CLI uses);
+/// a missing symbol/base fails loud rather than silently defaulting.
 ///
 /// `higher_tfs` is the MTF context discovery considers alongside
-/// `base_tf`. When omitted, falls back to [`DEFAULT_HIGHER_TFS`]. The
-/// dashboard exposes this as a comma-separated text field; the
-/// canonical wire form is a JSON array of canonical timeframe labels
-/// (`["M5", "M15", "H1"]`).
+/// `base_tf`. When omitted, the server resolves the operator's configured
+/// ladder via `SystemConfig::resolve_higher_timeframes` (honouring
+/// `multi_resolution_timeframes` / `higher_timeframes`) — IDENTICAL to a
+/// CLI `discover` with no `--higher`. The wire form is a JSON array of
+/// canonical timeframe labels (`["M5", "M15", "H1"]`).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct StartJobBody {
@@ -58,13 +60,6 @@ pub struct StartJobBody {
     pub target_candidates: Option<usize>,
     pub portfolio_size: Option<usize>,
 }
-
-/// Default MTF context for discovery when the caller does not supply
-/// one. Mirrors the dashboard preset that ships in `DiscoveryFormState`
-/// in `app_state.rs` so the server-driven start and the UI-driven
-/// start operate on the same context unless the caller explicitly
-/// overrides.
-pub const DEFAULT_HIGHER_TFS: &[&str] = &["M5", "M15", "H1"];
 
 #[derive(Debug, serde::Serialize)]
 pub struct StartResponse {
@@ -87,29 +82,69 @@ pub async fn discovery_start(
     body: Option<Json<StartJobBody>>,
 ) -> Response {
     let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    // 2026-06-04 PARITY: resolve symbol / base / higher-TFs through the SAME
+    // shared `SystemConfig` resolvers the CLI uses, seeded from config.yaml,
+    // with the request body as the explicit override. Previously this endpoint
+    // hardcoded "EURUSD" / "M1" and a *pure* canonical higher-TF ladder,
+    // silently ignoring the operator's config.yaml (`symbol`, `base_timeframe`,
+    // `multi_resolution_enabled`, `multi_resolution_timeframes`,
+    // `higher_timeframes`). That was a UI↔CLI divergence — the same config could
+    // produce a different search depending on which entry point launched it.
+    // `settings` is loaded ONCE here and reused for the DiscoveryConfig seed.
+    let settings = match Settings::from_yaml(state.config_path()) {
+        Ok(s) => Some(s),
+        Err(err) => {
+            tracing::warn!(
+                target: "neoethos_app::engines_control",
+                error = %err,
+                config_path = %state.config_path().display(),
+                "failed to load Settings; symbol/base/higher-TF defaults and \
+                 DiscoveryConfig will fall back and the run will fail loud at the \
+                 symbol/cost-model guards until config.yaml is fixed"
+            );
+            None
+        }
+    };
     let symbol = body
         .symbol
-        .unwrap_or_else(|| "EURUSD".to_string())
-        .trim()
-        .to_uppercase();
-    let base_tf = body
-        .base_tf
-        .unwrap_or_else(|| "M1".to_string())
-        .trim()
-        .to_uppercase();
-    let higher_tfs: Vec<String> = body
-        .higher_tfs
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| {
-            DEFAULT_HIGHER_TFS
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect()
-        })
-        .into_iter()
         .map(|s| s.trim().to_uppercase())
         .filter(|s| !s.is_empty())
-        .collect();
+        .or_else(|| settings.as_ref().map(|s| s.system.resolve_symbol()))
+        .unwrap_or_default();
+    let base_tf = body
+        .base_tf
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .or_else(|| settings.as_ref().map(|s| s.system.resolve_base_timeframe()))
+        .unwrap_or_default();
+    let higher_tfs: Vec<String> = match body.higher_tfs.filter(|v| !v.is_empty()) {
+        Some(v) => v
+            .into_iter()
+            .map(|s| s.trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        // Default = the operator-configured ladder above THIS base (the shared
+        // resolver honours multi_resolution_* / higher_timeframes), NOT a raw
+        // canonical sweep — identical to a CLI `discover` with no `--higher`.
+        None => settings
+            .as_ref()
+            .map(|s| s.system.resolve_higher_timeframes(&base_tf))
+            .unwrap_or_default(),
+    };
+
+    // Fail loud (parity with the CLI's F-CORE2 doctrine): no synthetic
+    // symbol/base fallback. Empty here means neither the request nor a
+    // readable config.yaml supplied one.
+    if symbol.is_empty() || base_tf.is_empty() {
+        return actionable_error(
+            StatusCode::BAD_REQUEST,
+            "Discovery can't start — no symbol / base timeframe was supplied and \
+             config.yaml couldn't be read to provide a default. Set them in \
+             Settings (or include them in the request) and try again.",
+            &anyhow::anyhow!("symbol='{symbol}' base_tf='{base_tf}'"),
+        );
+    }
 
     if state.engine_state(JobKind::Discovery).await == EngineRunState::Running {
         return (
@@ -164,19 +199,14 @@ pub async fn discovery_start(
     // account_currency + NaN spread/commission, tripping the cost-model
     // NaN guard and producing zero-trade GA candidates that the
     // sanitizer scrubbed to 0.0 — invisible failure mode.
-    let mut config = match Settings::from_yaml(state.config_path()) {
-        Ok(settings) => neoethos_search::DiscoveryConfig::from_settings(&settings),
-        Err(err) => {
-            tracing::warn!(
-                target: "neoethos_app::engines_control",
-                error = %err,
-                config_path = %state.config_path().display(),
-                "failed to load Settings; falling back to DiscoveryConfig::default() \
-                 (evaluation_symbol/account_currency will be empty — discovery will \
-                 fail at the cost-model NaN guard until config.yaml is fixed)"
-            );
-            neoethos_search::DiscoveryConfig::default()
-        }
+    // Reuse the `settings` already loaded (+ warned) at the top of this handler
+    // — no second read, no second warning. Parity unification 2026-06-04.
+    let mut config = match settings.as_ref() {
+        Some(settings) => neoethos_search::DiscoveryConfig::from_settings(settings),
+        // Settings load already failed + warned above; fall back to the engine
+        // default (evaluation_symbol/account_currency empty → cost-model NaN
+        // guard fails loud until config.yaml is fixed).
+        None => neoethos_search::DiscoveryConfig::default(),
     };
     // Body-supplied symbol always wins (operator picked it on the UI).
     config.evaluation_symbol = symbol.clone();
@@ -280,16 +310,34 @@ pub async fn training_start(
     body: Option<Json<StartJobBody>>,
 ) -> Response {
     let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    // 2026-06-04 PARITY: resolve symbol/base through the shared `SystemConfig`
+    // resolvers (config.yaml seed + request override), matching the CLI and the
+    // discovery endpoint. No more hardcoded "EURUSD"/"M1" that ignored config.
+    let settings = Settings::from_yaml(state.config_path()).ok();
     let symbol = body
         .symbol
-        .unwrap_or_else(|| "EURUSD".to_string())
-        .trim()
-        .to_uppercase();
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .or_else(|| settings.as_ref().map(|s| s.system.resolve_symbol()))
+        .unwrap_or_default();
     let base_tf = body
         .base_tf
-        .unwrap_or_else(|| "M1".to_string())
-        .trim()
-        .to_uppercase();
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .or_else(|| settings.as_ref().map(|s| s.system.resolve_base_timeframe()))
+        .unwrap_or_default();
+
+    // Fail loud (parity with the CLI's F-CORE2 doctrine): no synthetic fallback.
+    if symbol.is_empty() || base_tf.is_empty() {
+        return actionable_error(
+            StatusCode::BAD_REQUEST,
+            "Training can't start — no symbol / base timeframe was supplied and \
+             config.yaml couldn't be read to provide a default. Set them in \
+             Settings (or include them in the request) and try again.",
+            &anyhow::anyhow!("symbol='{symbol}' base_tf='{base_tf}'"),
+        );
+    }
 
     if state.engine_state(JobKind::Training).await == EngineRunState::Running {
         return (

@@ -1,6 +1,6 @@
 [package]
 name = "neoethos-data"
-version = "0.4.40"
+version = "0.4.99"
 edition.workspace = true
 
 [dependencies]
@@ -10,6 +10,7 @@ neoethos-core = { path = "../neoethos-core" }
 csv = "1.3"
 polars = { version = "0.52.0", features = ["lazy", "dtype-full", "temporal", "timezones", "parquet", "ipc"] }
 ndarray = { version = "0.17.2", features = ["rayon"] }
+rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
@@ -19,7 +20,14 @@ tracing = "0.1"
 # which has always shown 0.2.9). Bumping the literal makes the intent obvious
 # to anyone reading this file and prevents a future patch removal from silently
 # downgrading the binary.
-vector-ta = { version = "0.2.9" }
+# `nightly-avx`: vector-ta's runtime-selected AVX2/AVX512 TA kernels (the repo
+# pins a NIGHTLY toolchain in rust-toolchain.toml, so this is always available).
+# Without it `Kernel::Auto` falls back to the SCALAR baseline — i.e. the whole
+# feature build runs on SSE2-class scalar code instead of AVX2/AVX512. This is
+# the single biggest CPU win for `hpc_ta::compute_classic_ta_columns` and needs
+# no GPU. (vector-ta's separate `cuda`/`cuda-build-ptx` GPU path is wired
+# separately once `hpc_ta` dispatches to `vector_ta::cuda::*` — task #22.)
+vector-ta = { version = "0.2.9", features = ["nightly-avx"] }
 memmap2 = "0.9.5"
 # Recursive filesystem walk used by core::discover. Latest stable
 # (verified on crates.io 2026-05-14): 2.5.0.
@@ -30,4 +38,25 @@ vortex-file = "0.67.0"
 vortex-io = "0.67.0"
 vortex-layout = "0.67.0"
 vortex-session = "0.67.0"
+
+# Task #22 — GPU (CUDA) feature build. `gpu-cuda` ADDITIVELY turns on
+# vector-ta's `cuda-build-ptx` sub-feature, which (a) compiles the CUDA
+# indicator-kernel PTX at build time via nvcc AND (b) transitively enables
+# vector-ta's `cuda` feature (`cuda-build-ptx = ["cuda"]` in
+# vendor/vector-ta-0.2.9-patched/Cargo.toml), which is what gates the runtime
+# API we call: the `vector_ta::cuda::*` module (CudaRuntime, cuda_available)
+# and `vector_ta::indicators::dispatch::compute_cuda_device` + its
+# `IndicatorCuda*` request/output types (all `#[cfg(feature = "cuda")]` in the
+# vendor crate). So enabling `cuda-build-ptx` alone brings BOTH the PTX build
+# and the host-side `cuda` API into scope — no separate `vector-ta/cuda` line
+# needed.
+#
+# This does NOT change the default build: with `gpu-cuda` OFF the `vector-ta`
+# dep above stays exactly `["nightly-avx"]` and every GPU code path in
+# `hpc_ta.rs` is `#[cfg(feature = "gpu-cuda")]`-gated, so the non-GPU object
+# code is byte-identical. Built ONLY on a machine with the CUDA toolkit (the
+# A6000 VPS) — `cargo check --features gpu-cuda` fails on a non-CUDA host
+# because vector-ta's build.rs needs nvcc to emit the kernel PTX.
+[features]
+gpu-cuda = ["vector-ta/cuda-build-ptx"]
 

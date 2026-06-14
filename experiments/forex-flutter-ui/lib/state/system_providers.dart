@@ -166,6 +166,41 @@ final brokerTimeframesProvider = FutureProvider<List<String>>((ref) {
 final chartSymbolProvider = StateProvider<String>((ref) => 'EURUSD');
 final chartTimeframeProvider = StateProvider<String>((ref) => 'M1');
 
+/// Symbol + base-timeframe the operator is working on in the Strategy
+/// Lab. Previously the Promotion Gate hard-coded EURUSD/M5, so the
+/// gate (and any discovery/training launched from this screen)
+/// evaluated the wrong pair regardless of what the user cared about.
+/// These StateProviders are the single selection source the Strategy
+/// Lab header dropdowns drive and the gate reads. Defaults mirror the
+/// backend's primary-pair default. Kept non-autoDispose so the choice
+/// survives tab switches within the Strategy Lab.
+final selectedSymbolProvider = StateProvider<String>((ref) => 'EURUSD');
+final selectedBaseTfProvider = StateProvider<String>((ref) => 'M5');
+
+/// The pairs Strategy Lab offers for discovery / training / promotion.
+/// A small project-curated list (the majors NeoEthos ships data for) —
+/// not the full 830-symbol broker catalog, which would overwhelm this
+/// selector and isn't all backed by local history.
+const strategyLabSymbols = <String>[
+  'AUDUSD',
+  'EURGBP',
+  'EURJPY',
+  'EURUSD',
+  'GBPUSD',
+];
+
+/// Base timeframes Strategy Lab offers. Canonical cTrader set, low end
+/// (the higher TFs are derived multi-resolution on the backend).
+const strategyLabBaseTimeframes = <String>[
+  'M1',
+  'M3',
+  'M5',
+  'M15',
+  'M30',
+  'H1',
+  'H4',
+];
+
 /// `/chart` snapshot for panel A. Refetches whenever the slot-A
 /// symbol or timeframe changes.
 final chartProvider =

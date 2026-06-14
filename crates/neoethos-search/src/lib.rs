@@ -16,7 +16,12 @@ pub mod checkpoint;
 // 0.0002 cost violation.
 #[cfg(feature = "gpu")]
 mod cubecl_eval;
+// Pure CSR population partitioning for multi-GPU sharding (Stage 2). Not GPU-
+// gated: it is plain slice math, so it compiles + unit-tests on any build. The
+// device-execution glue that consumes it lives in `eval.rs` behind `gpu`.
+mod lane_partition;
 pub mod discovery;
+pub mod discovery_ledger;
 // `mod scheduler_assignment;` — DELETED 2026-05-25 (verbose-build pass):
 // the file was a 19-LOC orphan with zero callers. The scheduler-driven
 // GPU routing it scaffolded is dispatched directly via `BackendKind`
@@ -33,6 +38,7 @@ pub mod funnel_profile;
 // `FilteringConfig` in `genetic::strategy_gene` + the prop-firm validation
 // gates in `discovery.rs`. 194 LOC removed.
 pub mod genetic;
+pub mod live_portfolio;
 pub mod orchestration;
 pub mod parity;
 pub mod portfolio;
@@ -61,7 +67,8 @@ pub mod validation;
 pub use discovery::{
     DiscoveryConfig, DiscoveryPerKindEvidenceHashes, DiscoveryProgress, DiscoveryResult,
     DiscoveryRunProfile, DiscoveryRuntimeOverrides, DiscoveryValidationGates, LoggedStrategyTrades,
-    Stage1Window, build_discovery_profile, compute_discovery_forward_test_artifacts,
+    GeneOosResult, Stage1Window, build_discovery_profile, compute_discovery_forward_test_artifacts,
+    faithful_oos_eval,
     compute_discovery_prop_firm_artifacts, discovery_per_kind_evidence_hashes,
     discovery_validation_evidence_manifest,
     discovery_validation_evidence_manifest_excluding_live_sim, ensure_non_empty_portfolio,
@@ -97,7 +104,15 @@ pub use genetic::{
     install_strategy_evaluation_runtime_overrides,
     install_strategy_evaluation_runtime_overrides_from_env,
     install_strategy_evaluation_runtime_overrides_from_settings, month_day_indices, random_search,
-    signals_for_gene,
+    signals_for_gene, signals_for_gene_full,
+};
+pub use discovery_ledger::{
+    DiscoverySearchLedger, GeneRecord, SearchMetadata, ledger_path, load_prior_ledger,
+    save_discovery_ledger, seed_seen_from_ledger,
+};
+pub use live_portfolio::{
+    LIVE_PORTFOLIO_SCHEMA_VERSION, LivePortfolioArtifact, load_live_portfolio_json,
+    project_features_to_effective, save_live_portfolio_json,
 };
 pub use neoethos_core::contracts::DeterminismPolicy;
 pub use orchestration::{BatchDiscoverySummary, DiscoveryOrchestrator};

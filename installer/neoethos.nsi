@@ -26,7 +26,7 @@
 ;==============================================================================
 
 !define PRODUCT_NAME      "NeoEthos"
-!define PRODUCT_VERSION   "0.4.40"
+!define PRODUCT_VERSION   "0.4.99"
 !define PRODUCT_PUBLISHER "Konstantinos Red"
 !define PRODUCT_WEB_SITE  "https://github.com/kosred/neoethos"
 !define PRODUCT_REGKEY    "Software\${PRODUCT_NAME}"

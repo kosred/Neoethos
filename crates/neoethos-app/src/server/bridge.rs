@@ -380,12 +380,26 @@ fn refresh_ctrader_token_if_needed(
             fresh
         }
         Err(e) => {
-            tracing::warn!(
-                target: "neoethos_app::ctrader_auth",
-                error = %e,
-                "cTrader OAuth token refresh failed; falling back to the existing token \
-                 (it may be expired — a manual re-auth may be required)"
-            );
+            // 2026-06-10: distinguish "refresh failed but the current token is
+            // still valid for a while" (benign — we'll retry next cycle) from
+            // "refresh failed AND the token is already expired" (the next broker
+            // call WILL 401/403 and the operator must re-auth NOW). The latter
+            // is an operational emergency, not a warning.
+            if bundle.is_expired_at(now) {
+                tracing::error!(
+                    target: "neoethos_app::ctrader_auth",
+                    error = %e,
+                    "cTrader OAuth token is EXPIRED and the refresh failed — account/trading \
+                     calls will fail until you re-authenticate. Manual re-auth required immediately."
+                );
+            } else {
+                tracing::warn!(
+                    target: "neoethos_app::ctrader_auth",
+                    error = %e,
+                    "cTrader OAuth token refresh failed; the current token is still valid, \
+                     will retry on the next refresh cycle"
+                );
+            }
             bundle
         }
     }

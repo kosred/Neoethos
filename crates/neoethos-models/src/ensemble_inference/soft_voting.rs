@@ -58,7 +58,10 @@ use anyhow::Result;
 use ndarray::Array2;
 use polars::prelude::DataFrame;
 
-use super::{EnsemblePredictor, ExpertLoadOutcome, ExpertOutputKind, ExpertPrediction};
+use super::{
+    EnsembleDecision, EnsemblePredictor, ExpertLoadOutcome, ExpertOutputKind, ExpertPrediction,
+    ExpertRole, anomaly_scale_from_score, expert_role, regime_gate_from_posterior,
+};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -97,6 +100,12 @@ pub struct SoftVotingEnsembleConfig {
     /// populate this field manually to drop a specific expert from
     /// voting (e.g., A/B testing whether a deep model contributes).
     pub excluded_names: std::collections::HashSet<String>,
+    /// v0.5 ML-integration Stage 2: anomaly-score lower knee. Raw
+    /// `isolation_forest` scores below this get no size penalty (scale 1.0).
+    pub anomaly_lo: f32,
+    /// Anomaly-score upper knee — at/above this the anomaly scale hard-vetoes
+    /// to 0.0. Default 0.9 (matches the trained ~0.95-quantile threshold).
+    pub anomaly_hi: f32,
 }
 
 impl Default for SoftVotingEnsembleConfig {
@@ -105,6 +114,8 @@ impl Default for SoftVotingEnsembleConfig {
             expert_weights: std::collections::HashMap::new(),
             abstain_below_confidence: None,
             excluded_names: std::collections::HashSet::new(),
+            anomaly_lo: 0.5,
+            anomaly_hi: 0.9,
         }
     }
 }
@@ -179,6 +190,153 @@ impl SoftVotingEnsemble {
     /// Count of experts that actually participate in voting.
     pub fn voting_expert_count(&self) -> usize {
         self.outcome.loaded.len() - self.unused_for_voting.len()
+    }
+
+    /// v0.5 ML-integration Stage 2 — role-aware combiner.
+    ///
+    /// Unlike [`EnsemblePredictor::predict`] (a flat average of EVERY
+    /// Classification3 expert, which lets `hmm_regime`/`isolation_forest`
+    /// pollute the direction vote), this partitions the loaded experts by
+    /// [`ExpertRole`] and returns one [`EnsembleDecision`] per row:
+    /// - direction vote = weighted average of the genuine directional
+    ///   classifiers + `dqn` (confirm), with `hmm_regime` / `isolation_forest`
+    ///   REMOVED from the vote;
+    /// - `regime_gate` ∈ [0,1] from `hmm_regime` (1.0 when absent);
+    /// - `anomaly_scale` ∈ [0,1] from `isolation_forest` (1.0 when absent,
+    ///   0.0 hard-veto at an extreme score).
+    ///
+    /// FAILS LOUD if a loaded, non-excluded expert name is unmapped (a new
+    /// expert must be assigned a role in [`expert_role`]) or if the direction
+    /// pool ends up empty (re-roling must never strip every directional voter).
+    /// The two gate factors are bounded [0,1], so the ensemble can only SHRINK
+    /// conviction or veto — never flip direction or manufacture a trade.
+    pub fn predict_with_roles(&self, df: &DataFrame) -> Result<Vec<EnsembleDecision>> {
+        let n_rows = df.height();
+        if n_rows == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Direction vote accumulator (weighted, per row).
+        let mut dir_sums: Vec<[f32; 3]> = vec![[0.0; 3]; n_rows];
+        let mut dir_weight_totals: Vec<f32> = vec![0.0; n_rows];
+        let mut direction_voters = 0usize;
+        // Optional per-row regime posterior + anomaly score.
+        let mut regime_posterior: Option<Vec<[f32; 3]>> = None;
+        let mut anomaly_scores: Option<Vec<f32>> = None;
+
+        for expert in &self.outcome.loaded {
+            let name = expert.name();
+            if self.config.excluded_names.contains(name) {
+                continue;
+            }
+            // Non-Classification3 kinds (Forecast1, ExitDecision3, …) are not
+            // consumed by this combiner; the role map only covers voting kinds.
+            if expert.output_kind() != ExpertOutputKind::Classification3 {
+                continue;
+            }
+            let Some(role) = expert_role(name) else {
+                anyhow::bail!(
+                    "role-aware combiner: loaded expert '{}' has no role mapping; add it to \
+                     `expert_role` (Direction / DirectionalConfirm / RegimeGate / AnomalyScale)",
+                    name
+                );
+            };
+
+            let preds: Vec<ExpertPrediction> = expert.predict(df)?;
+            if preds.len() != n_rows {
+                anyhow::bail!(
+                    "expert '{}' returned {} predictions for a {}-row DataFrame",
+                    name,
+                    preds.len(),
+                    n_rows
+                );
+            }
+
+            match role {
+                ExpertRole::Direction | ExpertRole::DirectionalConfirm => {
+                    let weight = self
+                        .config
+                        .expert_weights
+                        .get(name)
+                        .copied()
+                        .unwrap_or(1.0);
+                    if weight <= 0.0 {
+                        continue;
+                    }
+                    direction_voters += 1;
+                    for (row_idx, p) in preds.iter().enumerate() {
+                        if p.kind != ExpertOutputKind::Classification3 || p.values.len() != 3 {
+                            continue;
+                        }
+                        dir_sums[row_idx][0] += weight * p.values[0];
+                        dir_sums[row_idx][1] += weight * p.values[1];
+                        dir_sums[row_idx][2] += weight * p.values[2];
+                        dir_weight_totals[row_idx] += weight;
+                    }
+                }
+                ExpertRole::RegimeGate => {
+                    // hmm_regime posterior: col0=P(range), col1=P(buy), col2=P(sell).
+                    let mut post = vec![[1.0 / 3.0_f32; 3]; n_rows];
+                    for (row_idx, p) in preds.iter().enumerate() {
+                        if p.values.len() == 3 {
+                            post[row_idx] = [p.values[0], p.values[1], p.values[2]];
+                        }
+                    }
+                    regime_posterior = Some(post);
+                }
+                ExpertRole::AnomalyScale => {
+                    // isolation_forest emits [anomaly, (1-a)/2, (1-a)/2] -> col0
+                    // is the raw anomaly score (no retrain / new artifact needed).
+                    let mut scores = vec![0.0_f32; n_rows];
+                    for (row_idx, p) in preds.iter().enumerate() {
+                        if !p.values.is_empty() {
+                            scores[row_idx] = p.values[0];
+                        }
+                    }
+                    anomaly_scores = Some(scores);
+                }
+            }
+        }
+
+        if direction_voters == 0 {
+            anyhow::bail!(
+                "role-aware combiner: no directional voters remained after re-roling \
+                 (hmm_regime/isolation_forest are gates, not voters). At least one genuine \
+                 Classification3 directional expert must be loaded."
+            );
+        }
+
+        let mut out = Vec::with_capacity(n_rows);
+        for row_idx in 0..n_rows {
+            let total = dir_weight_totals[row_idx];
+            let dir_probs = if total <= 0.0 {
+                [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
+            } else {
+                [
+                    dir_sums[row_idx][0] / total,
+                    dir_sums[row_idx][1] / total,
+                    dir_sums[row_idx][2] / total,
+                ]
+            };
+            let regime_gate = match &regime_posterior {
+                Some(post) => regime_gate_from_posterior(dir_probs, post[row_idx]),
+                None => 1.0,
+            };
+            let anomaly_scale = match &anomaly_scores {
+                Some(scores) => anomaly_scale_from_score(
+                    scores[row_idx],
+                    self.config.anomaly_lo,
+                    self.config.anomaly_hi,
+                ),
+                None => 1.0,
+            };
+            out.push(EnsembleDecision {
+                dir_probs,
+                regime_gate,
+                anomaly_scale,
+            });
+        }
+        Ok(out)
     }
 
     /// Apply the per-row probability vector through the optional
@@ -396,6 +554,116 @@ mod tests {
         assert_eq!(ens.experts_unused_for_voting(), vec!["forecaster"]);
     }
 
+    // -- Stage 2: role-aware combiner ---------------------------------
+
+    #[test]
+    fn role_map_covers_all_bootstrap_experts() {
+        for name in crate::ensemble_inference::bootstrap::DEFAULT_BOOTSTRAP_EXPERT_NAMES {
+            assert!(
+                expert_role(name).is_some(),
+                "bootstrap expert '{name}' has no role in expert_role(); the role-aware \
+                 combiner would fail loud on it in production"
+            );
+        }
+        assert_eq!(expert_role("hmm_regime"), Some(ExpertRole::RegimeGate));
+        assert_eq!(expert_role("isolation_forest"), Some(ExpertRole::AnomalyScale));
+        assert_eq!(expert_role("dqn"), Some(ExpertRole::DirectionalConfirm));
+        assert_eq!(expert_role("sac"), Some(ExpertRole::DirectionalConfirm));
+        assert_eq!(expert_role("xgboost"), Some(ExpertRole::Direction));
+        assert_eq!(expert_role("not_a_real_model"), None);
+    }
+
+    #[test]
+    fn regime_gate_pure_math() {
+        // Voted long; HMM strong buy-trend -> gate near 1.
+        let g = regime_gate_from_posterior([0.1, 0.8, 0.1], [0.05, 0.9, 0.05]);
+        assert!(g > 0.8, "agreeing trend should keep size, got {g}");
+        // Voted long; HMM says range -> gate near 0.
+        let g = regime_gate_from_posterior([0.1, 0.8, 0.1], [0.95, 0.03, 0.02]);
+        assert!(g < 0.1, "range regime should shrink, got {g}");
+        // Voted long; HMM says sell-trend (disagree) -> small gate.
+        let g = regime_gate_from_posterior([0.1, 0.8, 0.1], [0.05, 0.05, 0.9]);
+        assert!(g < 0.1, "disagreeing trend should shrink, got {g}");
+    }
+
+    #[test]
+    fn anomaly_scale_pure_math() {
+        assert_eq!(anomaly_scale_from_score(0.3, 0.5, 0.9), 1.0); // below lo
+        assert_eq!(anomaly_scale_from_score(0.9, 0.5, 0.9), 0.0); // at hi -> veto
+        assert_eq!(anomaly_scale_from_score(0.95, 0.5, 0.9), 0.0); // above hi
+        let mid = anomaly_scale_from_score(0.7, 0.5, 0.9); // halfway -> 0.5
+        assert!((mid - 0.5).abs() < 1e-6, "mid ramp should be 0.5, got {mid}");
+    }
+
+    #[test]
+    fn predict_with_roles_excludes_gates_from_direction() {
+        // Directional voter votes strong buy; the regime + anomaly experts must
+        // NOT pollute dir_probs — they only set the gate factors.
+        let outcome = outcome_with(vec![
+            Box::new(ConstantClassifier {
+                name: "xgboost".into(),
+                probs: [0.1, 0.8, 0.1],
+            }),
+            Box::new(ConstantClassifier {
+                name: "hmm_regime".into(),
+                probs: [0.05, 0.9, 0.05], // P(range)=.05, P(buy)=.9
+            }),
+            Box::new(ConstantClassifier {
+                name: "isolation_forest".into(),
+                probs: [0.3, 0.35, 0.35], // col0=anomaly score 0.3 (< lo)
+            }),
+        ]);
+        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        let decisions = ens.predict_with_roles(&small_df(2)).expect("roles");
+        assert_eq!(decisions.len(), 2);
+        for d in &decisions {
+            // dir_probs == the SOLE directional voter, gates removed.
+            assert!((d.dir_probs[1] - 0.8).abs() < 1e-6, "dir vote polluted: {d:?}");
+            assert!(d.regime_gate > 0.8, "agreeing regime gate: {d:?}");
+            assert_eq!(d.anomaly_scale, 1.0, "low anomaly -> no penalty: {d:?}");
+        }
+    }
+
+    #[test]
+    fn predict_with_roles_bails_when_no_direction_voter() {
+        // Only gates loaded -> construction succeeds (they are Classification3)
+        // but the role-aware combiner must refuse (no directional voter).
+        let outcome = outcome_with(vec![
+            Box::new(ConstantClassifier {
+                name: "hmm_regime".into(),
+                probs: [0.2, 0.4, 0.4],
+            }),
+            Box::new(ConstantClassifier {
+                name: "isolation_forest".into(),
+                probs: [0.1, 0.45, 0.45],
+            }),
+        ]);
+        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        match ens.predict_with_roles(&small_df(1)) {
+            Ok(_) => panic!("must bail when no directional voter remains"),
+            Err(err) => assert!(err.to_string().contains("no directional voters")),
+        }
+    }
+
+    #[test]
+    fn predict_with_roles_bails_on_unmapped_expert() {
+        let outcome = outcome_with(vec![
+            Box::new(ConstantClassifier {
+                name: "xgboost".into(),
+                probs: [0.2, 0.6, 0.2],
+            }),
+            Box::new(ConstantClassifier {
+                name: "mystery_model".into(),
+                probs: [0.3, 0.4, 0.3],
+            }),
+        ]);
+        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        match ens.predict_with_roles(&small_df(1)) {
+            Ok(_) => panic!("must fail loud on an unmapped expert"),
+            Err(err) => assert!(err.to_string().contains("no role mapping")),
+        }
+    }
+
     // -- Vote arithmetic ----------------------------------------------
 
     #[test]
@@ -537,19 +805,27 @@ mod tests {
 
     #[test]
     fn default_config_excludes_strategy_discoverers() {
-        // genetic + neuro_evo are excluded by default.
+        // F-319 (2026-05-29): the strategy-discoverer adapters
+        // (genetic / neuro_evo / neat) were removed from the inference
+        // layer entirely, so the default exclusion set is now EMPTY —
+        // there are no built-in non-voters left to skip. Operators can
+        // still populate `excluded_names` manually to drop a specific
+        // expert from voting (see the explicit-exclusion tests below).
         let cfg = SoftVotingEnsembleConfig::default();
-        assert!(cfg.excluded_names.contains("genetic"));
-        assert!(cfg.excluded_names.contains("neuro_evo"));
-        assert_eq!(cfg.excluded_names.len(), 2);
+        assert!(cfg.excluded_names.is_empty());
     }
 
     #[test]
     fn genetic_expert_is_skipped_at_voting_layer() {
         // Construct an outcome with a regular voter + a "genetic"
-        // expert. With the default exclusion list, the genetic
-        // expert must not contribute to the average even though
-        // its output_kind is Classification3.
+        // expert. When the operator excludes "genetic" by name, that
+        // expert must not contribute to the average even though its
+        // output_kind is Classification3.
+        //
+        // F-319: the default exclusion set is now empty (genetic /
+        // neuro_evo adapters were removed from inference), so the
+        // exclusion is driven explicitly via config here — this pins
+        // that the name-based exclusion MECHANISM still works.
         let outcome = outcome_with(vec![
             Box::new(ConstantClassifier {
                 name: "regular".into(),
@@ -560,7 +836,9 @@ mod tests {
                 probs: [0.8, 0.1, 0.1],
             }),
         ]);
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        let mut cfg = SoftVotingEnsembleConfig::default();
+        cfg.excluded_names.insert("genetic".to_string());
+        let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
         // 2 loaded but only 1 votes — genetic excluded.
         assert_eq!(ens.voting_expert_count(), 1);
         assert!(ens.experts_unused_for_voting().contains(&"genetic"));
@@ -574,7 +852,10 @@ mod tests {
     }
 
     #[test]
-    fn neuro_evo_expert_is_also_skipped_by_default() {
+    fn neuro_evo_expert_is_also_skipped_when_excluded() {
+        // As with `genetic`, an operator-supplied exclusion of
+        // "neuro_evo" must drop it from the vote. (F-319: not excluded
+        // by default any more — the adapter was removed from inference.)
         let outcome = outcome_with(vec![
             Box::new(ConstantClassifier {
                 name: "voter".into(),
@@ -585,7 +866,9 @@ mod tests {
                 probs: [0.9, 0.05, 0.05],
             }),
         ]);
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        let mut cfg = SoftVotingEnsembleConfig::default();
+        cfg.excluded_names.insert("neuro_evo".to_string());
+        let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
         assert_eq!(ens.voting_expert_count(), 1);
         let probs = ens.predict(&small_df(1)).expect("predict");
         let row = probs.row(0);

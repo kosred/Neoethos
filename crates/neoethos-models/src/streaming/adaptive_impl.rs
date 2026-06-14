@@ -1132,8 +1132,10 @@ impl ExpertModel for OnlineHoeffdingExpert {
             let (features, feature_columns) = feature_matrix_from_dataframe(x)?;
             let labels = remap_three_class_labels(y)?;
             ensure_label_count("online_hoeffding", features.nrows(), labels.len())?;
-            let (scaler, weights, bias) =
-                fit_fallback_online_committee(&features, &labels, &self.params)?;
+            // Establish the fallback basis/blend/classes params BEFORE fitting so
+            // the fitted weight matrix matches the basis the runtime validator
+            // recomputes from these params (otherwise it is built linear (3×F)
+            // but validated against the quadratic expansion (3×2F) → mismatch).
             self.params
                 .entry("fallback_blend_weight".to_string())
                 .or_insert_with(|| "0.3".to_string());
@@ -1143,6 +1145,8 @@ impl ExpertModel for OnlineHoeffdingExpert {
             self.params
                 .entry("classes".to_string())
                 .or_insert_with(|| "3".to_string());
+            let (scaler, weights, bias) =
+                fit_fallback_online_committee(&features, &labels, &self.params)?;
             self.params
                 .insert("artifact_mode".to_string(), "fallback_only".to_string());
             self.feature_columns = feature_columns;
@@ -1190,9 +1194,10 @@ impl ExpertModel for OnlineHoeffdingExpert {
                 committees.push(runtime);
             }
 
-            let (fallback_scaler, fallback_weights, fallback_bias) =
-                fit_fallback_online_committee(&features, &labels, &self.params)?;
-
+            // Establish the fallback basis/blend/classes params BEFORE fitting so
+            // the fitted weight matrix matches the basis the runtime validator
+            // recomputes from these params (otherwise it is built linear (3×F)
+            // but validated against the quadratic expansion (3×2F) → mismatch).
             self.params
                 .entry("fallback_blend_weight".to_string())
                 .or_insert_with(|| "0.3".to_string());
@@ -1202,6 +1207,10 @@ impl ExpertModel for OnlineHoeffdingExpert {
             self.params
                 .entry("classes".to_string())
                 .or_insert_with(|| "3".to_string());
+
+            let (fallback_scaler, fallback_weights, fallback_bias) =
+                fit_fallback_online_committee(&features, &labels, &self.params)?;
+
             self.params
                 .insert("artifact_mode".to_string(), "committee_hybrid".to_string());
             self.feature_columns = feature_columns;

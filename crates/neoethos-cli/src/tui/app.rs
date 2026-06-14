@@ -22,7 +22,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Widget};
 
 use crate::tui::form::{FormState, make_discover_form, make_train_form};
 use crate::tui::jobs::JobManager;
@@ -54,6 +54,45 @@ pub enum HitAction {
     FocusField { page: Page, index: usize },
 }
 
+/// A high-impact action staged behind a Y/N confirmation prompt. When
+/// `AppShared::pending_confirmation` is `Some`, the next keypress is routed by
+/// `app.rs`: `Y` runs the stored action, `N`/`Esc` cancels. Each page asks for
+/// confirmation by setting this rather than acting immediately, so destructive
+/// keys (save / import / stop) can't fire on a fat-finger.
+#[derive(Debug, Clone)]
+pub enum PendingAction {
+    /// Save the Config form back to config.yaml (`config_view::S`).
+    ConfigSave,
+    /// Import data into the data/ layout (`symbols::I`).
+    SymbolsImport,
+    /// Stop the running discovery job (`discover::K`).
+    DiscoverStop,
+    /// Create the auto-loop stop flag (`auto_loop::K`).
+    AutoLoopStop,
+}
+
+impl PendingAction {
+    /// Human label shown in the "Confirm <label>?" prompt.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PendingAction::ConfigSave => "save config to config.yaml",
+            PendingAction::SymbolsImport => "import data into data/",
+            PendingAction::DiscoverStop => "stop the running discovery",
+            PendingAction::AutoLoopStop => "create the auto-loop stop flag",
+        }
+    }
+
+    /// Run the confirmed action against shared state.
+    pub fn execute(self, shared: &mut AppShared) {
+        match self {
+            PendingAction::ConfigSave => crate::tui::pages::config_view::do_save(shared),
+            PendingAction::SymbolsImport => crate::tui::pages::symbols::launch_import(shared),
+            PendingAction::DiscoverStop => crate::tui::pages::discover::do_stop(shared),
+            PendingAction::AutoLoopStop => crate::tui::pages::auto_loop::do_create_stop_flag(shared),
+        }
+    }
+}
+
 pub struct AppShared {
     pub data_root: PathBuf,
     pub build_version: &'static str,
@@ -77,6 +116,22 @@ pub struct AppShared {
     pub train_form: FormState,
     /// Chart page state — selected symbol/timeframe + cached candles.
     pub chart_state: crate::tui::pages::chart::ChartState,
+    /// Editable Config page form — loaded from the on-disk Settings, saved
+    /// back to config.yaml so the user can change core settings from the TUI.
+    pub config_form: FormState,
+    /// Single-field form on the Symbols page: a source path to import data from
+    /// (CSV/Parquet/Vortex/… → canonical data/ layout) without leaving the TUI.
+    pub import_form: FormState,
+    /// Selected row on the Strategies page (index into the scanned portfolio
+    /// list), so the user can browse a portfolio's per-strategy metrics.
+    pub strategies_selected: usize,
+    /// Logs page scroll offset measured in lines UP from the tail (0 = follow
+    /// the newest lines, the default).
+    pub logs_scroll: usize,
+    /// A high-impact action staged behind a Y/N confirmation prompt. When
+    /// `Some`, the next keypress is routed to confirm/cancel (see
+    /// `App::handle_key`) and a centered prompt is rendered over the page.
+    pub pending_confirmation: Option<PendingAction>,
 }
 
 impl AppShared {
@@ -94,6 +149,15 @@ impl AppShared {
             discover_form: make_discover_form(&root_str),
             train_form: make_train_form(&root_str),
             chart_state,
+            config_form: crate::tui::pages::config_view::make_config_form(),
+            import_form: FormState::new(vec![crate::tui::form::Field::new(
+                "Import source",
+                "",
+                "Folder/file to import (CSV/TSV/JSON/Parquet/Vortex) → data/ layout",
+            )]),
+            strategies_selected: 0,
+            logs_scroll: 0,
+            pending_confirmation: None,
         }
     }
 
@@ -119,6 +183,9 @@ pub struct App {
     pub current: Page,
     pub shared: AppShared,
     pub quit: bool,
+    /// When true, a help overlay listing every page + its keys is shown over
+    /// the current page. Toggled with `?`; any key dismisses it.
+    pub show_help: bool,
 }
 
 impl App {
@@ -127,6 +194,7 @@ impl App {
             current: Page::Dashboard,
             shared: AppShared::new(data_root),
             quit: false,
+            show_help: false,
         }
     }
 
@@ -191,12 +259,46 @@ impl App {
             return;
         }
 
+        // Help overlay: while it's open, ANY key dismisses it.
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+
+        // Confirmation prompt: while one is staged, only Y/N/Esc are honored —
+        // Y runs the action, N/Esc cancels. Every other key is swallowed so a
+        // stray keystroke can't both dismiss the prompt AND do something else.
+        if let Some(action) = self.shared.pending_confirmation.take() {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let label = action.label();
+                    action.execute(&mut self.shared);
+                    // `execute` sets its own status; only override if it didn't.
+                    if self.shared.status.is_empty() {
+                        self.shared.status = format!("Confirmed: {label}");
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.shared.status = "Cancelled".to_string();
+                }
+                _ => {
+                    // Unknown key: re-arm the prompt so it stays up until the
+                    // user explicitly answers.
+                    self.shared.pending_confirmation = Some(action);
+                }
+            }
+            return;
+        }
+
         // When ANY form is currently in edit mode, the page swallows
         // every key — otherwise typing 'q' would quit the app
         // mid-symbol-name. Esc breaks out of edit mode (handled by the
         // page); Tab still cycles fields (handled by the page);
         // outside edit mode the global shortcuts apply.
-        let editing = self.shared.discover_form.editing || self.shared.train_form.editing;
+        let editing = self.shared.discover_form.editing
+            || self.shared.train_form.editing
+            || self.shared.config_form.editing
+            || self.shared.import_form.editing;
         if editing {
             let _ = self.current.handle_key(code, &mut self.shared);
             return;
@@ -204,6 +306,7 @@ impl App {
 
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('?') => self.show_help = true,
             KeyCode::Tab => self.next_page(),
             KeyCode::BackTab => self.prev_page(),
             KeyCode::Char('1') => self.current = Page::Dashboard,
@@ -222,8 +325,12 @@ impl App {
             // page already promises this key works.
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.shared.last_refresh = Instant::now();
+                // Re-read the editable config from disk too, so external edits
+                // to config.yaml show up on the Config page after a refresh.
+                self.shared.config_form =
+                    crate::tui::pages::config_view::make_config_form();
                 self.shared.status =
-                    "Refreshed dataset inventory.".to_string();
+                    "Refreshed dataset inventory + config.".to_string();
             }
             other => {
                 // Page-local: Up/Down focus, Enter to edit/launch, etc.
@@ -332,6 +439,110 @@ fn render(area: Rect, buf: &mut ratatui::buffer::Buffer, app: &mut App) {
     render_top_bar(rows[0], buf, app);
     app.current.draw(rows[1], buf, &mut app.shared);
     render_status_bar(rows[2], buf, app);
+    if app.show_help {
+        render_help_overlay(rows[1], buf);
+    }
+    if let Some(action) = &app.shared.pending_confirmation {
+        render_confirm_overlay(rows[1], buf, action.label());
+    }
+}
+
+/// Centered Y/N confirmation prompt rendered over the current page — reuses the
+/// help-overlay's bordered, accent-titled style so it reads as a modal. The
+/// next keypress is routed by `App::handle_key` (Y runs, N/Esc cancels).
+fn render_confirm_overlay(area: Rect, buf: &mut ratatui::buffer::Buffer, label: &str) {
+    let title = format!("Confirm {label}?");
+    let w = ((title.chars().count() as u16) + 8)
+        .max(34)
+        .min(area.width);
+    let h = 5u16.min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    Clear.render(popup, buf);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(Span::styled(
+            " CONFIRM ",
+            theme::caption_style().add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme::SURFACE_ALT))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    let lines = vec![
+        Line::from(vec![Span::styled(
+            title,
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![Span::styled(
+            "[Y]es   ·   [N]o / Esc",
+            theme::muted_style(),
+        )]),
+    ];
+    Paragraph::new(lines).render(inner, buf);
+}
+
+/// Centered keyboard-help overlay: every page's keys at a glance, so the user
+/// never has to guess. Toggled with `?`, dismissed by any key.
+fn render_help_overlay(area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    let w = ((area.width as f32 * 0.72) as u16).clamp(40, area.width);
+    let h = (Page::ALL.len() as u16 + 6).min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    Clear.render(popup, buf);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(Span::styled(
+            " KEYBOARD HELP — press any key to close ",
+            theme::caption_style().add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme::SURFACE_ALT))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(
+                "Global  ",
+                theme::accent_style().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Tab/Shift-Tab pages · 1-0 jump · R refresh · ? help · Q / Ctrl-C quit",
+                theme::muted_style(),
+            ),
+        ]),
+        Line::raw(""),
+    ];
+    for p in Page::ALL {
+        let hints: Vec<String> = p
+            .key_hints()
+            .iter()
+            .map(|(k, a)| format!("{k} {a}"))
+            .collect();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<10}", p.label()),
+                theme::accent_style().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(hints.join("  ·  "), theme::muted_style()),
+        ]));
+    }
+    Paragraph::new(lines).render(inner, buf);
 }
 
 fn render_top_bar(area: Rect, buf: &mut ratatui::buffer::Buffer, app: &mut App) {

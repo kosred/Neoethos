@@ -78,7 +78,7 @@ pub use crate::core::quant_features::*;
 pub use crate::core::regime_detection::*;
 pub use crate::core::resample::*;
 pub use crate::core::session_features::*;
-pub use crate::core::slicing::slice_ohlcv;
+pub use crate::core::slicing::{slice_ohlcv, slice_ohlcv_by_date_range_ms};
 pub use crate::core::smc::*;
 pub use crate::core::timestamps::*;
 pub use crate::core::vortex_io::*;
@@ -924,7 +924,7 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Res
     Ok(FeatureFrame {
         timestamps,
         names,
-        data,
+        data: crate::core::features::FeatureData::InMemory(data),
     })
 }
 
@@ -939,6 +939,47 @@ pub fn prepare_multitimeframe_features(
         ..Default::default()
     };
     prepare_multitimeframe_features_with_options(ds, base_tf, &opts, cache)
+}
+
+/// Temp path for a discovery feature-store, unique per (symbol, base_tf,
+/// process). The store auto-deletes when its `FeatureFrame` drops, so this
+/// path collides only if a prior run crashed mid-build (truncate-on-create
+/// reclaims it).
+fn discovery_feature_store_path(symbol: &str, base_tf: &str) -> std::path::PathBuf {
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect()
+    };
+    let mut dir = std::env::temp_dir();
+    dir.push("neoethos_feature_store");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.push(format!(
+        "{}_{}_{}.fstore",
+        sanitize(symbol),
+        sanitize(base_tf),
+        std::process::id()
+    ));
+    dir
+}
+
+/// Stream one in-RAM `[samples × cols]` feature block to the mmap store, column
+/// by column (each column becomes one feature-major row), normalising each
+/// series in place when enabled, then letting the caller free the block. Keeps
+/// peak RAM at one timeframe's block rather than the whole multi-TF cube.
+fn append_feature_block(
+    writer: &mut crate::core::feature_store::FeatureStoreWriter,
+    block: &Array2<f32>,
+    normalize: bool,
+) -> Result<()> {
+    for c in 0..block.ncols() {
+        let mut series: Vec<f32> = block.column(c).to_vec();
+        if normalize {
+            crate::core::normalization::normalize_feature_series_in_place(&mut series);
+        }
+        writer.append_feature(&series)?;
+    }
+    Ok(())
 }
 
 pub fn prepare_multitimeframe_features_with_options(
@@ -959,9 +1000,27 @@ pub fn prepare_multitimeframe_features_with_options(
         .as_ref()
         .context("base has no timestamps")?;
 
-    let mut all_names = Vec::new();
-    let mut all_data_parts: Vec<Array2<f32>> = Vec::new();
+    let n_samples = base_ns.len();
 
+    // ── Out-of-core feature assembly ──────────────────────────────────────
+    //
+    // The multi-resolution feature matrix for full M1 data is ~13 GB dense
+    // (5.27M samples x ~618 features x 4 B), and the old path held it more than
+    // once (per-TF parts + a concatenated copy) plus the GA's transposed copy
+    // — ~30-40 GB, which overflowed the Windows commit limit and OOM'd.
+    // Instead we stream each timeframe's features straight into a feature-major
+    // mmap store (one contiguous row per feature = exactly the GA's
+    // `indicators.row(idx)` layout). Peak RAM is now ONE timeframe's
+    // `compute_hpc_feature_frame` (~10 GB for base M1), not the whole cube; the
+    // store is paged from disk on demand and auto-deleted when the returned
+    // frame drops.
+    let store_path = discovery_feature_store_path(&ds.symbol, base_tf);
+    let mut writer =
+        crate::core::feature_store::FeatureStoreWriter::create(&store_path, n_samples)?;
+    let mut all_names: Vec<String> = Vec::new();
+    let normalize = current_data_runtime_overrides().normalize_features;
+
+    // Base timeframe — native resolution, no alignment needed.
     let base_feats = compute_hpc_feature_frame(base_ohlcv, opts.profile)?;
     all_names.extend(base_feats.names.iter().map(|n| {
         if opts.prefix_base_features {
@@ -970,7 +1029,14 @@ pub fn prepare_multitimeframe_features_with_options(
             n.clone()
         }
     }));
-    all_data_parts.push(base_feats.data);
+    let base_block = match base_feats.data {
+        crate::core::features::FeatureData::InMemory(a) => a,
+        crate::core::features::FeatureData::Mmap(_) => {
+            anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
+        }
+    };
+    append_feature_block(&mut writer, &base_block, normalize)?;
+    drop(base_block);
 
     for h_tf in &opts.higher_tfs {
         if h_tf == base_tf {
@@ -1021,43 +1087,44 @@ pub fn prepare_multitimeframe_features_with_options(
                     }
                 }
             }
-            let aligned = align_features_by_ns(base_ns, h_ns, &h_feats.data, true, max_age_ns);
-            all_names.extend(h_feats.names.iter().map(|n| format!("{}_{}", h_tf, n)));
-            all_data_parts.push(aligned);
+            let h_names = h_feats.names.clone();
+            let h_block = match h_feats.data {
+                crate::core::features::FeatureData::InMemory(a) => a,
+                crate::core::features::FeatureData::Mmap(_) => {
+                    anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
+                }
+            };
+            let aligned = align_features_by_ns(base_ns, h_ns, &h_block, true, max_age_ns);
+            drop(h_block);
+            all_names.extend(h_names.iter().map(|n| format!("{}_{}", h_tf, n)));
+            append_feature_block(&mut writer, &aligned, normalize)?;
+            drop(aligned);
         }
     }
 
-    let total_cols = all_data_parts.iter().map(|p| p.ncols()).sum();
-    let mut merged = Array2::zeros((base_ns.len(), total_cols));
-    let mut curr_col = 0;
-    for part in all_data_parts {
-        let ncols = part.ncols();
-        merged
-            .slice_mut(ndarray::s![.., curr_col..curr_col + ncols])
-            .assign(&part);
-        curr_col += ncols;
-    }
-
-    // Per-column robust z-score (median + MAD * 1.4826) with NaN→0
-    // and clip to ±10. Opt-in via `NEOETHOS_BOT_NORMALIZE_FEATURES=1`.
-    //
-    // Why opt-in: normalization is correct architecture (puts every
-    // column on the same scale, kills NaN propagation, fixes the
-    // EURJPY/XAUUSD empty-portfolio bug at the root) but the GA's
-    // `random_coarse_threshold = [0.15..0.55]` is calibrated for the
-    // un-normalized magnitude regime. Enabling normalization without
-    // re-calibrating thresholds breaks discovery for symbols that
-    // currently work (EURUSD/GBPUSD/AUDUSD). Threshold re-calibration
-    // is a follow-up; until then operators opt in per-symbol when
-    // they want to attack the JPY/XAU portfolio gap.
-    if current_data_runtime_overrides().normalize_features {
-        let _norm_stats = crate::core::normalization::normalize_feature_matrix(&mut merged);
-    }
+    // Normalisation (opt-in via `NEOETHOS_BOT_NORMALIZE_FEATURES=1`) is applied
+    // per-series during the streaming append above. Robust z-score is
+    // per-column independent, so normalising each series before it is written
+    // to the store is identical to normalising the assembled matrix (see
+    // `normalize_feature_series_in_place`). Why opt-in: it is correct
+    // architecture (puts every column on the same scale, kills NaN
+    // propagation, fixes the EURJPY/XAUUSD empty-portfolio bug at the root) but
+    // the GA's `random_coarse_threshold = [0.15..0.55]` is calibrated for the
+    // un-normalized magnitude regime; enabling it without re-calibrating
+    // thresholds breaks discovery for symbols that currently work
+    // (EURUSD/GBPUSD/AUDUSD). Threshold re-calibration is a follow-up.
+    let n_features = writer.finish()?;
+    let store = crate::core::feature_store::FeatureStore::open(
+        &store_path,
+        n_features,
+        n_samples,
+        /* delete_on_drop */ true,
+    )?;
 
     Ok(FeatureFrame {
         timestamps: base_ns.clone(),
         names: all_names,
-        data: merged,
+        data: crate::core::features::FeatureData::Mmap(std::sync::Arc::new(store)),
     })
 }
 

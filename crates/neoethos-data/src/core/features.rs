@@ -53,11 +53,26 @@ impl Default for FeatureBuildOptions {
     }
 }
 
+/// Backing storage for a [`FeatureFrame`]'s feature matrix.
+///
+/// Small frames (validation-fold windows, prefiltered sub-frames, per-TF
+/// blocks, tests) stay in RAM as a `[samples × features]` `Array2`. The big
+/// multi-resolution discovery frame is held out-of-core in a feature-major
+/// mmap ([`crate::core::feature_store::FeatureStore`]) so the GA reads only
+/// the feature rows it references instead of materialising the full (~100 GB
+/// for M1) `[samples × features]` matrix AND its `[features × samples]`
+/// transpose in RAM.
+#[derive(Debug, Clone)]
+pub enum FeatureData {
+    InMemory(Array2<f32>),
+    Mmap(std::sync::Arc<crate::core::feature_store::FeatureStore>),
+}
+
 #[derive(Debug, Clone)]
 pub struct FeatureFrame {
     pub timestamps: Vec<i64>,
     pub names: Vec<String>,
-    pub data: Array2<f32>,
+    pub data: FeatureData,
 }
 
 impl FeatureFrame {
@@ -67,6 +82,125 @@ impl FeatureFrame {
 
     pub fn validate_registry(&self) -> Result<()> {
         validate_feature_names(&self.names)
+    }
+
+    /// Build an in-RAM frame from a `[samples × features]` matrix.
+    pub fn from_array(timestamps: Vec<i64>, names: Vec<String>, data: Array2<f32>) -> Self {
+        Self {
+            timestamps,
+            names,
+            data: FeatureData::InMemory(data),
+        }
+    }
+
+    // ── Out-of-core access layer ──────────────────────────────────────────
+    //
+    // Accessors abstract over the physical backing so call sites never touch a
+    // dense matrix directly. `InMemory` serves small frames from a
+    // `[samples × features]` `Array2`; `Mmap` serves the big discovery frame
+    // from a feature-major mmap without ever materialising the full matrix.
+
+    /// Number of time samples.
+    #[inline]
+    pub fn n_samples(&self) -> usize {
+        match &self.data {
+            FeatureData::InMemory(a) => a.nrows(),
+            FeatureData::Mmap(s) => s.n_samples(),
+        }
+    }
+
+    /// Number of feature columns.
+    #[inline]
+    pub fn n_features(&self) -> usize {
+        match &self.data {
+            FeatureData::InMemory(a) => a.ncols(),
+            FeatureData::Mmap(s) => s.n_features(),
+        }
+    }
+
+    /// Feature `idx`'s full time series (`[samples]`).
+    #[inline]
+    pub fn feature_column(&self, idx: usize) -> ndarray::ArrayView1<'_, f32> {
+        match &self.data {
+            FeatureData::InMemory(a) => a.column(idx),
+            FeatureData::Mmap(s) => ndarray::ArrayView1::from(s.feature_row(idx)),
+        }
+    }
+
+    /// Owned `[(end-start) × n_features]` sample-window sub-matrix (all
+    /// features over a contiguous time slice) — small, used by folds/regime.
+    pub fn sample_window(&self, start: usize, end: usize) -> Array2<f32> {
+        match &self.data {
+            FeatureData::InMemory(a) => a.slice(ndarray::s![start..end, ..]).to_owned(),
+            FeatureData::Mmap(s) => {
+                let rows = end - start;
+                let ncols = s.n_features();
+                let mut out = Array2::zeros((rows, ncols));
+                for f in 0..ncols {
+                    out.column_mut(f)
+                        .assign(&ndarray::ArrayView1::from(&s.feature_row(f)[start..end]));
+                }
+                out
+            }
+        }
+    }
+
+    /// Single feature value at logical `(sample, feature)`.
+    #[inline]
+    pub fn feature_at(&self, sample: usize, feature: usize) -> f32 {
+        match &self.data {
+            FeatureData::InMemory(a) => a[(sample, feature)],
+            FeatureData::Mmap(s) => s.feature_row(feature)[sample],
+        }
+    }
+
+    /// Total number of feature values (`n_samples * n_features`).
+    #[inline]
+    pub fn n_values(&self) -> usize {
+        self.n_samples() * self.n_features()
+    }
+
+    /// `[features × samples]` view — the GA eval's `indicators` layout. The
+    /// mmap backing yields this natively (contiguous, zero-copy); the in-RAM
+    /// backing yields a (small, strided) transposed view.
+    pub fn as_indicators_view(&self) -> ndarray::ArrayView2<'_, f32> {
+        match &self.data {
+            FeatureData::InMemory(a) => a.t(),
+            FeatureData::Mmap(s) => s.as_view(),
+        }
+    }
+
+    /// Iterate every feature value (order-independent; used by NaN/zero/min/max
+    /// diagnostics that only need aggregate stats).
+    pub fn iter_values(&self) -> Box<dyn Iterator<Item = f32> + '_> {
+        match &self.data {
+            FeatureData::InMemory(a) => Box::new(a.iter().copied()),
+            FeatureData::Mmap(s) => {
+                Box::new((0..s.n_features()).flat_map(move |f| s.feature_row(f).iter().copied()))
+            }
+        }
+    }
+
+    /// Materialise the full `[samples × features]` matrix in RAM. In-memory
+    /// frames clone; mmap frames reconstruct from the feature rows.
+    ///
+    /// WARNING: allocates `n_samples * n_features * 4` bytes — for the full M1
+    /// discovery cube that is ~13-32 GB. Only call where the dense matrix is
+    /// genuinely required (e.g. ML training on a bounded dataset), NEVER on the
+    /// big discovery frame in the GA path (which reads feature rows on demand).
+    pub fn to_dense_samples_major(&self) -> Array2<f32> {
+        match &self.data {
+            FeatureData::InMemory(a) => a.clone(),
+            FeatureData::Mmap(s) => {
+                let (nf, ns) = (s.n_features(), s.n_samples());
+                let mut out = Array2::zeros((ns, nf));
+                for f in 0..nf {
+                    out.column_mut(f)
+                        .assign(&ndarray::ArrayView1::from(s.feature_row(f)));
+                }
+                out
+            }
+        }
     }
 }
 

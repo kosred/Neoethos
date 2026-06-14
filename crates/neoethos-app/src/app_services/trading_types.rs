@@ -30,6 +30,11 @@
 /// capability flags below; the cTrader Open API is the only fully wired
 /// backend today, with DXtrade kept as a draft second adapter so the
 /// capability-flag abstraction stays honest (no `== "cTrader"` checks).
+// The variants are never *constructed* and `as_str` is never *called* in live
+// code today — their only consumers are the broker-readiness banner helpers in
+// `broker_config`, which are themselves Phase 2-5-pending. The type is still
+// referenced in signatures and the capability-flag methods below stay live.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingAdapterKind {
     CTrader,
@@ -37,6 +42,7 @@ pub enum TradingAdapterKind {
 }
 
 impl TradingAdapterKind {
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CTrader => "cTrader",

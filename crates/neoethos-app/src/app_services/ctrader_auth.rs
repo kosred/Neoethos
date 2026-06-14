@@ -11,6 +11,14 @@
 
 use serde::{Deserialize, Serialize};
 
+// The auth-session state machine (state enum, account summary, snapshot, and the
+// `CTraderAuthSession` struct + impl) is the residual session state the
+// account/bridge pipeline was meant to inspect. It reads as `dead_code` because
+// production now drives cTrader through `reauth` + the `CTraderTokenBundle`
+// directly (see the module header) and the live engine that would hold a session
+// is Phase 2-5 pending. `CTraderTokenBundle` below stays live. Allows come off
+// when the live supervisor holds a session.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CTraderAuthState {
     NotConfigured,
@@ -19,6 +27,7 @@ pub enum CTraderAuthState {
     AccountsAvailable,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CTraderAccountSummary {
     pub account_id: String,
@@ -62,6 +71,7 @@ impl CTraderTokenBundle {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CTraderAuthSnapshot {
     pub state: CTraderAuthState,
@@ -73,6 +83,7 @@ pub struct CTraderAuthSnapshot {
     pub discovered_accounts: Vec<CTraderDiscoveredAccount>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CTraderAuthSession {
     state: CTraderAuthState,
@@ -81,6 +92,7 @@ pub struct CTraderAuthSession {
     discovered_accounts: Vec<CTraderDiscoveredAccount>,
 }
 
+#[allow(dead_code)]
 impl CTraderAuthSession {
     pub fn new(client_id: impl Into<String>, redirect_uri: impl Into<String>) -> Self {
         let client_id = client_id.into();

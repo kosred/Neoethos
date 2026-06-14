@@ -153,6 +153,8 @@ fn supports_gpu_for_model(name: &str, family: ModelFamily) -> bool {
         "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
         "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
         "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
+        // SAC runs on the Burn backend (like Deep/Exit), not rlkit/CUDA.
+        "sac" => cfg!(feature = "burn-wgpu-backend"),
         _ => match family {
             ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
             _ => false,
@@ -166,6 +168,8 @@ fn prefers_gpu_for_model(name: &str, family: ModelFamily) -> bool {
         "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
         "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
         "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
+        // SAC runs on the Burn backend (like Deep/Exit), not rlkit/CUDA.
+        "sac" => cfg!(feature = "burn-wgpu-backend"),
         _ => match family {
             ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
             _ => false,

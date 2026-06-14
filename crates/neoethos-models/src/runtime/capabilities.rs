@@ -107,6 +107,12 @@ pub const KNOWN_MODEL_NAMES: &[&str] = &[
     "online_hoeffding",
     "isolation_forest",
     "dqn",
+    // Discrete Soft Actor-Critic entry/direction policy (Christodoulou
+    // 2019). Implemented end-to-end in `crate::soft_actor_critic`; driven
+    // by the `models.use_sac_agent` config flag. Emits Classification3
+    // [neutral, buy, sell] probabilities and soft-votes like the DQN
+    // entry agent.
+    "sac",
     // 34th model added 2026-05-25: 3-state Hidden Markov Model for
     // soft-posterior regime detection (bullish_trend / bearish_trend /
     // range). Output is Classification3 with the canonical
@@ -351,6 +357,14 @@ pub fn model_capability(name: &str) -> Option<ModelCapability> {
 
         // Reinforcement-learning models
         "dqn" => ModelCapability::new(name, ModelFamily::Rl, CapabilityState::Verified),
+        "sac" => ModelCapability::new(name, ModelFamily::Rl, CapabilityState::Implemented),
+
+        // Regime models — 3-state Baum-Welch HMM soft-posterior regime
+        // classifier (`crate::forecasting::hmm_regime`). Sits in the
+        // regime-vote (meta) layer like its `HmmRegimeAdapter`
+        // (`ModelFamily::Meta`); a real EM-trained model so it is
+        // Implemented (matching `genetic`/`neuro_evo`'s state class).
+        "hmm_regime" => ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Implemented),
 
         _ => return None,
     };

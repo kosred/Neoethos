@@ -23,6 +23,9 @@ pub enum JobStatus {
     Running,
     Completed,
     Failed,
+    /// The user asked to stop the job and we killed its process. Distinct from
+    /// Failed so the operator sees an intentional cancel, not a crash.
+    Stopped,
 }
 
 pub struct Job {
@@ -31,7 +34,32 @@ pub struct Job {
     pub status: JobStatus,
     pub started_at: Instant,
     pub log: VecDeque<String>,
+    /// OS process id of the child, so the user can stop a running job. `None`
+    /// when the spawn itself failed (no process to kill).
+    pid: Option<u32>,
+    /// Set when the user requested a stop, so the watcher's exit is reported as
+    /// Stopped (intentional) rather than Failed (crash).
+    stop_requested: bool,
     rx: Receiver<LogLine>,
+}
+
+/// Best-effort cross-platform kill of a process tree by pid. Errors are
+/// swallowed — if the process already exited, the watcher reports it normally.
+fn kill_pid(pid: u32) {
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    #[cfg(unix)]
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 enum LogLine {
@@ -54,13 +82,32 @@ impl Job {
                     self.log.push_back(s);
                 }
                 LogLine::ExitOk => {
-                    self.status = JobStatus::Completed;
+                    self.status = if self.stop_requested {
+                        JobStatus::Stopped
+                    } else {
+                        JobStatus::Completed
+                    };
                     if self.log.len() == RING_BUFFER_LINES {
                         self.log.pop_front();
                     }
-                    self.log.push_back("[exited cleanly]".to_string());
+                    let msg = if self.stop_requested {
+                        "[stopped by user]"
+                    } else {
+                        "[exited cleanly]"
+                    };
+                    self.log.push_back(msg.to_string());
                 }
                 LogLine::ExitFail(code) => {
+                    // A user-requested stop kills the child, which exits
+                    // non-zero — report that as an intentional Stop, not a crash.
+                    if self.stop_requested {
+                        self.status = JobStatus::Stopped;
+                        if self.log.len() == RING_BUFFER_LINES {
+                            self.log.pop_front();
+                        }
+                        self.log.push_back("[stopped by user]".to_string());
+                        continue;
+                    }
                     self.status = JobStatus::Failed;
                     // Surface the actual exit code (#200) — previously
                     // discarded with `_`, leaving the operator with a red
@@ -176,6 +223,9 @@ impl JobManager {
 
         match cmd.spawn() {
             Ok(mut child) => {
+                // Capture the pid BEFORE the child moves into the watcher thread
+                // — this is what lets the user stop the job later.
+                let pid = child.id();
                 let stdout = child.stdout.take();
                 let stderr = child.stderr.take();
                 if let Some(stdout) = stdout {
@@ -225,6 +275,8 @@ impl JobManager {
                     status: JobStatus::Running,
                     started_at: Instant::now(),
                     log: VecDeque::with_capacity(RING_BUFFER_LINES),
+                    pid: Some(pid),
+                    stop_requested: false,
                     rx,
                 };
                 self.jobs.push(job);
@@ -242,10 +294,36 @@ impl JobManager {
                     status: JobStatus::Failed,
                     started_at: Instant::now(),
                     log,
+                    pid: None,
+                    stop_requested: false,
                     rx,
                 });
                 self.jobs.len() - 1
             }
         }
+    }
+
+    /// Stop the most recent RUNNING job whose label starts with `prefix` by
+    /// killing its process tree. Returns true if a job was found + signalled.
+    /// The watcher thread then observes the exit and marks the job Stopped.
+    pub fn stop_latest(&mut self, prefix: &str) -> bool {
+        let prefix = prefix.to_lowercase();
+        if let Some(job) = self
+            .jobs
+            .iter_mut()
+            .rev()
+            .find(|j| j.status == JobStatus::Running && j.label.to_lowercase().starts_with(&prefix))
+        {
+            if let Some(pid) = job.pid {
+                kill_pid(pid);
+                job.stop_requested = true;
+                if job.log.len() == RING_BUFFER_LINES {
+                    job.log.pop_front();
+                }
+                job.log.push_back("[stop requested by user]".to_string());
+                return true;
+            }
+        }
+        false
     }
 }

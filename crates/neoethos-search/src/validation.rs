@@ -4,6 +4,7 @@ use crate::eval::{
 };
 use anyhow::{Result, bail};
 use itertools::Itertools;
+use rayon::prelude::*;
 use neoethos_core::contracts::{TemporalFeatureContract, TemporalScopeHashes};
 use neoethos_core::domain::prop_firm::{PropFirmChallengeDefaults, PropFirmConstraints};
 use serde::{Deserialize, Serialize};
@@ -429,6 +430,9 @@ pub fn compute_forward_test_summary(input: ForwardTestInput<'_>) -> Result<Forwa
         input.high,
         input.low,
         input.signals,
+        // Phase 1: legacy fixed-1-lot for the forward-test summary (no
+        // confidence threaded here yet) — `&[]` forces pos_lots = 1.0.
+        &[],
         input.months,
         input.days,
         input.timestamps,
@@ -1065,114 +1069,130 @@ pub fn embargoed_walkforward_backtest(
     }
 
     let window = (n / n_splits).max(1);
-    let mut split_results = Vec::new();
 
-    for i in 0..n_splits {
-        let start = i * window;
-        let end = ((i + 1) * window).min(n);
-        // **F-020 + F-021 documentation (2026-05-25)** — minimum window
-        // of 80 bars is timeframe-AGNOSTIC by design. The audit flagged
-        // this because 80 M1-bars = 80 minutes (trivially small), while
-        // 80 D1-bars = 80 days (substantial). The fix is to compute the
-        // minimum *in calendar days* from the timestamps array rather
-        // than as a raw bar count.
-        //
-        // Phase A (this commit): we DOCUMENT the limitation + log a
-        // structured warning when the cutoff triggers, so operators
-        // see split-drop events in the run profile. The 80-bar floor
-        // stays because the existing test fixtures + persisted
-        // run-profiles assume it; raising it would break the calibration.
-        //
-        // Phase B (deferred): replace `< 80` with
-        // `(timestamps[end-1] - timestamps[start]) < min_window_days
-        // * 86_400_000` using the operator-tunable `min_window_days`
-        // knob (default 14 days for M1/M5, 30 for H1, 90 for D1).
-        // This unifies the timeframe-aware minimum across the splits.
-        if end - start < 80 {
-            tracing::warn!(
-                target: "neoethos_search::validation",
-                split_index = i,
-                bars_in_window = end - start,
-                "walkforward split below 80-bar floor; dropping split. \
-                 Consider reducing n_splits or expanding the input window."
-            );
-            break;
-        }
-
-        let train_end = start + ((window as f64) * train_ratio) as usize;
-        let test_start = train_end + embargo_bars;
-
-        if test_start >= end || (train_end - start) < 40 || (end - test_start) < 40 {
-            continue;
-        }
-
-        let slice_close = &close[test_start..end];
-        let slice_high = &high[test_start..end];
-        let slice_low = &low[test_start..end];
-        let slice_sig = &signals[test_start..end];
-        let slice_months = &months[test_start..end];
-        let slice_days = &days[test_start..end];
-        let slice_ts = if timestamps.len() == n {
-            &timestamps[test_start..end]
-        } else {
-            slice_days
-        };
-
-        let metrics = fast_evaluate_strategy_core(
-            slice_close,
-            slice_high,
-            slice_low,
-            slice_sig,
-            slice_months,
-            slice_days,
-            &[],
-            settings,
+    // `window` is constant across splits: with floor division
+    // n_splits*window <= n, so `end` == (i+1)*window for every split (the
+    // `.min(n)` clamp never bites) and `end - start` == window for ALL splits.
+    // The 80-bar floor and the train/embargo validity checks below are
+    // therefore split-INDEPENDENT — either every split qualifies or none does.
+    // Each split's backtest reads disjoint slices with NO RNG, so the
+    // qualifying splits evaluate in parallel bit-identically to the old serial
+    // loop. This saturates idle cores when the outer candidate axis has shrunk
+    // below the core count (the validation-tail idle-core leak).
+    //
+    // F-020 + F-021: the 80-bar floor is timeframe-AGNOSTIC by design (80
+    // M1-bars = 80 min, 80 D1-bars = 80 days). Phase B (deferred): replace
+    // `< 80` with a calendar-day minimum from the timestamps array via an
+    // operator-tunable `min_window_days` knob.
+    if window < 80 {
+        tracing::warn!(
+            target: "neoethos_search::validation",
+            bars_in_window = window,
+            n_splits,
+            "walkforward window below 80-bar floor; dropping all splits. \
+             Consider reducing n_splits or expanding the input window."
         );
-
-        // Map metrics [net_profit, 0.0, peak_equity, max_dd, win_rate, pf, expectancy, 0.0, trade_count, consistency, max_daily_dd]
-        let net_profit = metrics[0];
-        let max_dd = metrics[3];
-        let win_rate = metrics[4];
-        let trade_count = metrics[8] as usize;
-        let max_daily_dd = metrics[10];
-        let risk = walkforward_risk_diagnostics(
-            slice_close,
-            slice_high,
-            slice_low,
-            slice_sig,
-            slice_days,
-            slice_ts,
-            settings,
-            max_daily_dd,
-            max_daily_loss_pct,
-            max_daily_profit_pct,
-            min_trading_days,
-            max_trades_per_day,
-            initial_balance,
-        );
-
-        let res = WalkforwardSplitResult {
-            split: i + 1,
-            trades: trade_count,
-            pnl: net_profit,
-            win_rate,
-            max_dd,
-            max_consec_losses: risk.max_consec_losses,
-            daily_min_dd: risk.daily_min_dd,
-            max_daily_loss: risk.max_daily_loss,
-            daily_loss_breach: risk.daily_loss_breach,
-            consistency_violation: risk.consistency_violation,
-            trade_limit_violation: risk.trade_limit_violation,
-            min_trading_days_ok: risk.min_trading_days_ok,
-            daily_returns: risk.daily_returns,
-            max_daily_dd_pct: risk.max_daily_dd_pct,
-            prop_compliant: risk.prop_compliant,
-        };
-        split_results.push(res);
     }
+    let mut split_results: Vec<WalkforwardSplitResult> = if window < 80 {
+        Vec::new()
+    } else {
+        (0..n_splits)
+            .into_par_iter()
+            .filter_map(|i| {
+                let start = i * window;
+                let end = ((i + 1) * window).min(n);
 
+                let train_end = start + ((window as f64) * train_ratio) as usize;
+                let test_start = train_end + embargo_bars;
+
+                if test_start >= end || (train_end - start) < 40 || (end - test_start) < 40 {
+                    return None;
+                }
+
+                let slice_close = &close[test_start..end];
+                let slice_high = &high[test_start..end];
+                let slice_low = &low[test_start..end];
+                let slice_sig = &signals[test_start..end];
+                let slice_months = &months[test_start..end];
+                let slice_days = &days[test_start..end];
+                let slice_ts = if timestamps.len() == n {
+                    &timestamps[test_start..end]
+                } else {
+                    slice_days
+                };
+
+                let metrics = fast_evaluate_strategy_core(
+                    slice_close,
+                    slice_high,
+                    slice_low,
+                    slice_sig,
+                    // Phase 1: legacy fixed-1-lot for the walk-forward slice eval.
+                    &[],
+                    slice_months,
+                    slice_days,
+                    &[],
+                    settings,
+                );
+
+                // Map metrics [net_profit, 0.0, peak_equity, max_dd, win_rate, pf, expectancy, 0.0, trade_count, consistency, max_daily_dd]
+                let net_profit = metrics[0];
+                let max_dd = metrics[3];
+                let win_rate = metrics[4];
+                let trade_count = metrics[8] as usize;
+                let max_daily_dd = metrics[10];
+                let risk = walkforward_risk_diagnostics(
+                    slice_close,
+                    slice_high,
+                    slice_low,
+                    slice_sig,
+                    slice_days,
+                    slice_ts,
+                    settings,
+                    max_daily_dd,
+                    max_daily_loss_pct,
+                    max_daily_profit_pct,
+                    min_trading_days,
+                    max_trades_per_day,
+                    initial_balance,
+                );
+
+                Some(WalkforwardSplitResult {
+                    split: i + 1,
+                    trades: trade_count,
+                    pnl: net_profit,
+                    win_rate,
+                    max_dd,
+                    max_consec_losses: risk.max_consec_losses,
+                    daily_min_dd: risk.daily_min_dd,
+                    max_daily_loss: risk.max_daily_loss,
+                    daily_loss_breach: risk.daily_loss_breach,
+                    consistency_violation: risk.consistency_violation,
+                    trade_limit_violation: risk.trade_limit_violation,
+                    min_trading_days_ok: risk.min_trading_days_ok,
+                    daily_returns: risk.daily_returns,
+                    max_daily_dd_pct: risk.max_daily_dd_pct,
+                    prop_compliant: risk.prop_compliant,
+                })
+            })
+            .collect()
+    };
+    // par collect preserves range order, but make the ascending-split
+    // invariant explicit for downstream consumers.
+    split_results.sort_by_key(|r| r.split);
+
+    Ok(summarize_walkforward_splits(split_results))
+}
+
+/// Reduce a per-gene list of qualifying [`WalkforwardSplitResult`]s into a
+/// [`WalkforwardSummary`]. SINGLE source of truth for the avg/any/all
+/// reductions, shared by the single-gene [`embargoed_walkforward_backtest`] and
+/// the GPU-routed [`embargoed_walkforward_population`] so both produce a
+/// **byte-identical** summary (same averaging divisor, same any/all booleans,
+/// same empty-splits sentinel). Callers MUST pass the splits already sorted by
+/// `split` ascending (both call sites do).
+fn summarize_walkforward_splits(split_results: Vec<WalkforwardSplitResult>) -> WalkforwardSummary {
     if split_results.is_empty() {
-        return Ok(WalkforwardSummary {
+        return WalkforwardSummary {
             walk_forward_splits: 0,
             avg_pnl: 0.0,
             avg_win_rate: 0.0,
@@ -1185,7 +1205,7 @@ pub fn embargoed_walkforward_backtest(
             any_trade_limit_violation: false,
             all_min_trading_days_ok: false,
             splits: Vec::new(),
-        });
+        };
     }
 
     let n_res = split_results.len() as f64;
@@ -1200,7 +1220,7 @@ pub fn embargoed_walkforward_backtest(
     let avg_daily_min_dd = split_results.iter().map(|r| r.daily_min_dd).sum::<f64>() / n_res;
     let avg_max_daily_loss = split_results.iter().map(|r| r.max_daily_loss).sum::<f64>() / n_res;
 
-    Ok(WalkforwardSummary {
+    WalkforwardSummary {
         walk_forward_splits: split_results.len(),
         avg_pnl,
         avg_win_rate: avg_win,
@@ -1213,7 +1233,279 @@ pub fn embargoed_walkforward_backtest(
         any_trade_limit_violation: split_results.iter().any(|r| r.trade_limit_violation),
         all_min_trading_days_ok: split_results.iter().all(|r| r.min_trading_days_ok),
         splits: split_results,
-    })
+    }
+}
+
+/// Shared (gene-INDEPENDENT) inputs for the GPU-routed population walk-forward.
+///
+/// Everything here is identical across the whole survivor portfolio: the
+/// full-series OHLCV / calendar arrays, the split geometry, and the prop-firm
+/// risk knobs. The per-gene axis (precomputed signals + the GPU metrics) is
+/// supplied separately to [`embargoed_walkforward_population`].
+pub struct WalkforwardPopulationInput<'a> {
+    pub close: &'a [f64],
+    pub high: &'a [f64],
+    pub low: &'a [f64],
+    pub months: &'a [i64],
+    pub days: &'a [i64],
+    /// Real bar timestamps (same unit as `simulate_trades_core` expects).
+    pub timestamps: &'a [i64],
+    pub train_ratio: f64,
+    pub n_splits: usize,
+    pub embargo_bars: usize,
+    /// PER-GENE backtest settings (one per gene, aligned to `signals_per_gene`),
+    /// used by the CPU risk-diagnostic half (`walkforward_risk_diagnostics` →
+    /// `simulate_trades_core`). These MUST be the SAME per-gene settings the
+    /// single-gene path built (`discovery_backtest_settings`), in particular the
+    /// gene's own SL/TP, so the risk-diagnostic half is byte-identical to
+    /// `embargoed_walkforward_backtest`. (The GPU **metrics** half gets the
+    /// gene's SL/TP separately via the metrics provider's own per-gene arrays.)
+    pub gene_settings: &'a [BacktestSettings],
+    pub max_daily_loss_pct: f64,
+    pub max_daily_profit_pct: f64,
+    pub min_trading_days: usize,
+    pub max_trades_per_day: usize,
+    pub initial_balance: f64,
+}
+
+/// AREA 2 / Stage C (2026-06-09) — GPU-routed **population** walk-forward.
+///
+/// This is the population twin of [`embargoed_walkforward_backtest`]. The split
+/// loop in the single-gene path runs `fast_evaluate_strategy_core` PER GENE PER
+/// SPLIT on the contiguous test slice `[test_start..end]` (validation.rs ~:1124).
+/// For a portfolio of `n_genes` survivors that is `n_genes × n_splits` tiny CPU
+/// backtests. This helper **transposes** the loop: it walks the qualifying split
+/// windows ONCE and, per window, calls `metrics_fn(test_start, end)` — wired by
+/// the caller to ONE GPU population launch over ALL survivor genes on that
+/// contiguous slice — collapsing the launch count to `n_splits`.
+///
+/// ## HYBRID: GPU for backtest metrics, CPU for risk diagnostics
+/// The GPU population kernel emits ONLY the 11-wide metric array
+/// (net_profit/max_dd/win_rate/trade_count, …). It does NOT produce the
+/// walk-forward risk diagnostics (max_consec_losses, daily_returns,
+/// prop_compliant, …) which need the per-trade list. So per split this helper:
+///  - takes the **metrics half** (slots 0/3/4/8/10) from `metrics_fn`'s GPU rows
+///    (one per gene), and
+///  - computes [`walkforward_risk_diagnostics`] **on the CPU** per gene on the
+///    sliced precomputed `signals` — EXACTLY as the single-gene path does.
+///
+/// The resulting per-gene `WalkforwardSplitResult` is field-for-field identical
+/// to the single-gene path's (the metric slots are read the SAME way; the risk
+/// fields come from the SAME CPU function on the SAME sliced signals), and each
+/// gene's `WalkforwardSummary` is built through the SHARED
+/// [`summarize_walkforward_splits`] reducer — so the avg/any/all aggregation is
+/// byte-identical to `embargoed_walkforward_backtest`.
+///
+/// ## Fixed-1-lot
+/// The metrics half MUST be produced with `risk_based_sizing == false` (fixed
+/// 1-lot) and empty (`&[]`) confidence, matching the single-gene WF call at
+/// validation.rs:1129-1130. The caller wires `metrics_fn` to
+/// `validation_genes_population`, which FORCES `risk_based_sizing = false`.
+///
+/// ## Split-qualification parity
+/// The window size, the 80-bar floor, and the train/embargo validity checks are
+/// COPIED VERBATIM from the single-gene path (which proved them
+/// split-INDEPENDENT): either every split qualifies or none does, and each
+/// qualifying split is the SAME contiguous `[test_start..end]` slice. The set of
+/// qualifying splits is therefore identical to the single-gene loop's.
+///
+/// Returns one [`WalkforwardSummary`] per gene, in `genes` order.
+#[allow(clippy::too_many_arguments)]
+pub fn embargoed_walkforward_population<F>(
+    input: WalkforwardPopulationInput<'_>,
+    // Full-series precomputed signals, one per gene (aligned to the shared
+    // per-bar arrays). Sliced per window for the CPU risk diagnostics — the
+    // single source of truth for the per-gene signal direction, identical to
+    // what the single-gene path slices.
+    signals_per_gene: &[Vec<i8>],
+    // Per-window GPU metrics provider: `metrics_fn(test_start, end)` returns one
+    // `[f64; 11]` row per gene (same order as `signals_per_gene`) for the
+    // contiguous slice `[test_start..end]`. The caller wires this to a single
+    // GPU population launch (fixed-1-lot). Errors propagate (fail-loud).
+    mut metrics_fn: F,
+) -> Result<Vec<WalkforwardSummary>>
+where
+    F: FnMut(usize, usize) -> Result<Vec<[f64; 11]>>,
+{
+    let WalkforwardPopulationInput {
+        close,
+        high,
+        low,
+        months,
+        days,
+        timestamps,
+        train_ratio,
+        n_splits,
+        embargo_bars,
+        gene_settings,
+        max_daily_loss_pct,
+        max_daily_profit_pct,
+        min_trading_days,
+        max_trades_per_day,
+        initial_balance,
+    } = input;
+
+    let n = close.len();
+    let n_genes = signals_per_gene.len();
+    if n == 0 || high.len() != n || low.len() != n || months.len() != n || days.len() != n {
+        bail!("empty data or length mismatch");
+    }
+    if gene_settings.len() != n_genes {
+        bail!(
+            "walk-forward population gene_settings.len()={} != {} genes",
+            gene_settings.len(),
+            n_genes
+        );
+    }
+    if let Some((g, s)) = signals_per_gene
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.len() != n)
+    {
+        bail!(
+            "walk-forward population signals[{}].len()={} != {} bars",
+            g,
+            s.len(),
+            n
+        );
+    }
+    if n_splits == 0 {
+        bail!("n_splits must be greater than zero");
+    }
+    if !train_ratio.is_finite() || !(0.0..1.0).contains(&train_ratio) {
+        bail!("train_ratio must be finite and in the open interval (0, 1)");
+    }
+
+    // Empty portfolio: nothing to evaluate.
+    if n_genes == 0 {
+        return Ok(Vec::new());
+    }
+
+    // ── Window geometry — COPIED VERBATIM from `embargoed_walkforward_backtest`
+    //    so the set of qualifying splits is byte-identical. ───────────────────
+    let window = (n / n_splits).max(1);
+    if window < 80 {
+        tracing::warn!(
+            target: "neoethos_search::validation",
+            bars_in_window = window,
+            n_splits,
+            "walkforward window below 80-bar floor; dropping all splits. \
+             Consider reducing n_splits or expanding the input window."
+        );
+        // No qualifying splits → every gene gets the empty-splits summary, exactly
+        // like the single-gene path returns when `window < 80`.
+        return Ok((0..n_genes)
+            .map(|_| summarize_walkforward_splits(Vec::new()))
+            .collect());
+    }
+
+    // Per-gene accumulator of split results, filled split-by-split.
+    let mut per_gene_splits: Vec<Vec<WalkforwardSplitResult>> =
+        (0..n_genes).map(|_| Vec::new()).collect();
+
+    for i in 0..n_splits {
+        let start = i * window;
+        let end = ((i + 1) * window).min(n);
+
+        let train_end = start + ((window as f64) * train_ratio) as usize;
+        let test_start = train_end + embargo_bars;
+
+        // SAME qualification predicate as the single-gene path.
+        if test_start >= end || (train_end - start) < 40 || (end - test_start) < 40 {
+            continue;
+        }
+
+        // ── GPU half: ONE population launch over all genes on this contiguous
+        //    slice. The caller forces fixed-1-lot / risk_based_sizing=false. ──
+        let gpu_metrics = metrics_fn(test_start, end)?;
+        if gpu_metrics.len() != n_genes {
+            bail!(
+                "walk-forward split {} metrics provider returned {} rows for {} genes",
+                i + 1,
+                gpu_metrics.len(),
+                n_genes
+            );
+        }
+
+        // Contiguous per-bar slices, shared across genes.
+        let slice_close = &close[test_start..end];
+        let slice_high = &high[test_start..end];
+        let slice_low = &low[test_start..end];
+        let slice_days = &days[test_start..end];
+        let slice_ts = if timestamps.len() == n {
+            &timestamps[test_start..end]
+        } else {
+            slice_days
+        };
+
+        // ── CPU half (per gene): risk diagnostics on the sliced precomputed
+        //    signals — IDENTICAL to the single-gene path. ────────────────────
+        let split_results: Vec<WalkforwardSplitResult> = (0..n_genes)
+            .into_par_iter()
+            .map(|g| {
+                let m = gpu_metrics[g];
+                // Metric slots read EXACTLY as the single-gene path
+                // (validation.rs:1138-1142): trade_count via `as usize`, NOT the
+                // `BacktestMetrics::from_metric_array` rounding, so the population
+                // path stays byte-identical to `embargoed_walkforward_backtest`.
+                let net_profit = m[0];
+                let max_dd = m[3];
+                let win_rate = m[4];
+                let trade_count = m[8] as usize;
+                let max_daily_dd = m[10];
+
+                let slice_sig = &signals_per_gene[g][test_start..end];
+                // Per-gene settings (the gene's own SL/TP) so `simulate_trades_core`
+                // inside the diagnostics applies the SAME SL/TP exits the single-gene
+                // path did — byte-identical risk-diagnostic half.
+                let risk = walkforward_risk_diagnostics(
+                    slice_close,
+                    slice_high,
+                    slice_low,
+                    slice_sig,
+                    slice_days,
+                    slice_ts,
+                    &gene_settings[g],
+                    max_daily_dd,
+                    max_daily_loss_pct,
+                    max_daily_profit_pct,
+                    min_trading_days,
+                    max_trades_per_day,
+                    initial_balance,
+                );
+
+                WalkforwardSplitResult {
+                    split: i + 1,
+                    trades: trade_count,
+                    pnl: net_profit,
+                    win_rate,
+                    max_dd,
+                    max_consec_losses: risk.max_consec_losses,
+                    daily_min_dd: risk.daily_min_dd,
+                    max_daily_loss: risk.max_daily_loss,
+                    daily_loss_breach: risk.daily_loss_breach,
+                    consistency_violation: risk.consistency_violation,
+                    trade_limit_violation: risk.trade_limit_violation,
+                    min_trading_days_ok: risk.min_trading_days_ok,
+                    daily_returns: risk.daily_returns,
+                    max_daily_dd_pct: risk.max_daily_dd_pct,
+                    prop_compliant: risk.prop_compliant,
+                }
+            })
+            .collect();
+
+        for (g, r) in split_results.into_iter().enumerate() {
+            per_gene_splits[g].push(r);
+        }
+    }
+
+    // Each gene's splits are pushed in ascending split order (the `for i` loop is
+    // sequential), matching the single-gene path's post-sort invariant. Reduce
+    // through the SHARED summarizer so the aggregation is byte-identical.
+    Ok(per_gene_splits
+        .into_iter()
+        .map(summarize_walkforward_splits)
+        .collect())
 }
 
 pub struct CombinatorialPurgedCV {
@@ -1384,6 +1676,12 @@ mod tests {
             swap_long_pips_per_day: 0.0,
             swap_short_pips_per_day: 0.0,
             pnl_conversion_fee_rate: 0.0,
+            // Risk-based sizing OFF for the flat-test fixture so the existing
+            // PnL assertions (pips × pip_value_per_lot) keep holding.
+            risk_based_sizing: false,
+            risk_per_trade_min: 0.005,
+            risk_per_trade_max: 0.03,
+            high_quality_confidence: 0.65,
         }
     }
 
@@ -1760,6 +2058,7 @@ mod tests {
                 pnl: 800.0,
                 pnl_pct: None,
                 duration_hours: None,
+                ..Default::default()
             },
             crate::quality::Trade {
                 entry_time: 1_700_086_400_000,
@@ -1767,6 +2066,7 @@ mod tests {
                 pnl: -400.0,
                 pnl_pct: None,
                 duration_hours: None,
+                ..Default::default()
             },
             crate::quality::Trade {
                 entry_time: 1_700_172_800_000,
@@ -1774,6 +2074,7 @@ mod tests {
                 pnl: 600.0,
                 pnl_pct: None,
                 duration_hours: None,
+                ..Default::default()
             },
         ]
     }
@@ -1821,6 +2122,7 @@ mod tests {
             pnl: -7_000.0,
             pnl_pct: None,
             duration_hours: None,
+            ..Default::default()
         }];
         let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
             trades: &trades,

@@ -106,13 +106,22 @@ pub fn current_quality_runtime_overrides() -> QualityRuntimeOverrides {
     QUALITY_RUNTIME_OVERRIDES.get().copied().unwrap_or_default()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Trade {
     pub entry_time: i64,
     pub exit_time: Option<i64>,
     pub pnl: f64,
     pub pnl_pct: Option<f64>,
     pub duration_hours: Option<f64>,
+    /// Max Favorable Excursion — best unrealized profit reached during the trade ($).
+    #[serde(default)]
+    pub mfe: f64,
+    /// Max Adverse Excursion — worst unrealized loss reached during the trade ($, positive).
+    #[serde(default)]
+    pub mae: f64,
+    /// R-multiple — net P&L / initial $ risk (sl_pips × pip_value_per_lot).
+    #[serde(default)]
+    pub r_multiple: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +157,38 @@ pub struct StrategyMetrics {
     pub recommendation: String,
     pub mc_worst_drawdown_95_pct: Option<f64>,
     pub mc_risk_of_ruin_pct: Option<f64>,
+    // Pro money-view + equity curve (2026-06-06): the "how much € in how long, with
+    // what path" that ratios alone (Sharpe 7) hide. All #[serde(default)] for
+    // backward-compat with old <stem>.quality.json artifacts.
+    #[serde(default)]
+    pub initial_capital: f64,
+    #[serde(default)]
+    pub net_profit: f64,
+    #[serde(default)]
+    pub final_balance: f64,
+    #[serde(default)]
+    pub max_drawdown_money: f64,
+    #[serde(default)]
+    pub recovery_factor: f64,
+    #[serde(default)]
+    pub period_start_ms: i64,
+    #[serde(default)]
+    pub period_end_ms: i64,
+    #[serde(default)]
+    pub period_days: f64,
+    /// Equity after each closed trade (index 0 = initial_capital) — the
+    /// start → trough → end curve the operator wants to graph.
+    #[serde(default)]
+    pub equity_curve: Vec<f64>,
+    // Per-trade excursion aggregates (operator 2026-06-06): "ανά συναλλαγή" pro stats.
+    #[serde(default)]
+    pub avg_mfe: f64,
+    #[serde(default)]
+    pub avg_mae: f64,
+    #[serde(default)]
+    pub avg_r_multiple: f64,
+    #[serde(default)]
+    pub mfe_capture_ratio: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +306,11 @@ impl StrategyQualityAnalyzer {
         let mut equity = initial_balance;
         let mut peak = initial_balance;
         let mut drawdowns = Vec::with_capacity(total_trades);
+        // Pro equity curve + money drawdown (2026-06-06): collect the equity path
+        // (index 0 = start) and the worst peak-to-trough in account currency.
+        let mut equity_curve = Vec::with_capacity(total_trades + 1);
+        equity_curve.push(initial_balance);
+        let mut max_dd_money = 0.0_f64;
         for pnl in &pnls {
             equity += *pnl;
             if equity > peak {
@@ -276,6 +322,11 @@ impl StrategyQualityAnalyzer {
                 0.0
             };
             drawdowns.push(dd);
+            let dd_money = peak - equity;
+            if dd_money > max_dd_money {
+                max_dd_money = dd_money;
+            }
+            equity_curve.push(equity);
         }
         let max_dd = drawdowns.iter().cloned().fold(0.0, f64::max);
         let avg_dd = if !drawdowns.is_empty() {
@@ -386,6 +437,57 @@ impl StrategyQualityAnalyzer {
         let mc_risk_of_ruin = (ruined_count as f64) / (mc_iterations as f64);
         // -------------------------------------------------------------------
 
+        // Pro money-view + recovery factor + period (2026-06-06).
+        let net_profit = total_return;
+        let final_balance = initial_balance + total_return;
+        let recovery_factor = if max_dd_money > 1e-6 {
+            (net_profit / max_dd_money).clamp(-1000.0, 1000.0)
+        } else if net_profit > 0.0 {
+            1000.0
+        } else {
+            0.0
+        };
+        let period_start_ms = trades
+            .iter()
+            .map(|t| t.entry_time)
+            .filter(|&t| t > 0)
+            .min()
+            .unwrap_or(0);
+        let period_end_ms = trades
+            .iter()
+            .filter_map(|t| t.exit_time)
+            .max()
+            .unwrap_or(period_start_ms);
+        let period_days = if period_end_ms > period_start_ms {
+            (period_end_ms - period_start_ms) as f64 / 86_400_000.0
+        } else {
+            0.0
+        };
+
+        // Per-trade excursion aggregates (operator 2026-06-06): MFE/MAE/R-multiple
+        // averaged + MFE-capture-ratio (realized / potential; <40% = noise-driven exits).
+        let avg_mfe = if !trades.is_empty() {
+            trades.iter().map(|t| t.mfe).sum::<f64>() / trades.len() as f64
+        } else {
+            0.0
+        };
+        let avg_mae = if !trades.is_empty() {
+            trades.iter().map(|t| t.mae).sum::<f64>() / trades.len() as f64
+        } else {
+            0.0
+        };
+        let avg_r_multiple = if !trades.is_empty() {
+            trades.iter().map(|t| t.r_multiple).sum::<f64>() / trades.len() as f64
+        } else {
+            0.0
+        };
+        let sum_mfe: f64 = trades.iter().map(|t| t.mfe).sum();
+        let mfe_capture_ratio = if sum_mfe > 1e-9 {
+            total_return / sum_mfe
+        } else {
+            0.0
+        };
+
         let mut metrics = StrategyMetrics {
             strategy_id: strategy_id.to_string(),
             total_trades,
@@ -418,6 +520,19 @@ impl StrategyQualityAnalyzer {
             recommendation: String::new(),
             mc_worst_drawdown_95_pct: Some(mc_worst_dd_95),
             mc_risk_of_ruin_pct: Some(mc_risk_of_ruin),
+            initial_capital: initial_balance,
+            net_profit,
+            final_balance,
+            max_drawdown_money: max_dd_money,
+            recovery_factor,
+            period_start_ms,
+            period_end_ms,
+            period_days,
+            equity_curve,
+            avg_mfe,
+            avg_mae,
+            avg_r_multiple,
+            mfe_capture_ratio,
         };
 
         score_strategy(self, &mut metrics);
@@ -745,6 +860,19 @@ fn empty_metrics(strategy_id: &str) -> StrategyMetrics {
         recommendation: String::new(),
         mc_worst_drawdown_95_pct: None,
         mc_risk_of_ruin_pct: None,
+        initial_capital: 0.0,
+        net_profit: 0.0,
+        final_balance: 0.0,
+        max_drawdown_money: 0.0,
+        recovery_factor: 0.0,
+        period_start_ms: 0,
+        period_end_ms: 0,
+        period_days: 0.0,
+        equity_curve: Vec::new(),
+        avg_mfe: 0.0,
+        avg_mae: 0.0,
+        avg_r_multiple: 0.0,
+        mfe_capture_ratio: 0.0,
     }
 }
 
@@ -815,6 +943,45 @@ impl StrategyRanker {
 #[cfg(test)]
 mod overrides_tests {
     use super::*;
+
+    #[test]
+    fn money_view_and_equity_curve_are_correct() {
+        // Deterministic check of the pro money-view (2026-06-06): a Sharpe number
+        // alone hides "how much EUR in how long, with what curve" — verify those.
+        let analyzer = StrategyQualityAnalyzer::default();
+        let day = 86_400_000_i64;
+        // Real timestamps are never 0 (analyze_strategy filters entry_time>0 to
+        // ignore unset times), so start at day 1.
+        let mk = |i: i64, pnl: f64| Trade {
+            entry_time: (i + 1) * day,
+            exit_time: Some((i + 2) * day),
+            pnl,
+            pnl_pct: Some(pnl / 100_000.0),
+            duration_hours: Some(24.0),
+            ..Default::default()
+        };
+        // +600, -350, +600, -350 over 4 days on EUR 100,000.
+        let trades = vec![mk(0, 600.0), mk(1, -350.0), mk(2, 600.0), mk(3, -350.0)];
+        let m = analyzer.analyze_strategy("demo", &trades, 100_000.0);
+
+        assert_eq!(m.initial_capital, 100_000.0);
+        assert!((m.net_profit - 500.0).abs() < 1e-6, "net {}", m.net_profit);
+        assert!((m.final_balance - 100_500.0).abs() < 1e-6);
+        // equity path: 100000 -> 100600 -> 100250 -> 100850 -> 100500
+        assert_eq!(m.equity_curve.len(), 5);
+        assert_eq!(m.equity_curve[0], 100_000.0);
+        assert!((m.equity_curve[4] - 100_500.0).abs() < 1e-6);
+        // worst peak-to-trough in EUR = 350
+        assert!(
+            (m.max_drawdown_money - 350.0).abs() < 1e-6,
+            "ddmoney {}",
+            m.max_drawdown_money
+        );
+        // recovery = net / maxDD = 500 / 350
+        assert!((m.recovery_factor - (500.0 / 350.0)).abs() < 0.01);
+        // period spans 4 days
+        assert!((m.period_days - 4.0).abs() < 1e-6, "days {}", m.period_days);
+    }
 
     #[test]
     fn quality_runtime_overrides_defaults_match_legacy_env_defaults() {

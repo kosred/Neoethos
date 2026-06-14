@@ -103,6 +103,14 @@ struct Args {
     #[arg(long, default_value_t = false)]
     launched_by_flutter: bool,
 
+    /// PID of the parent Flutter GUI. When set, the backend self-terminates
+    /// within ~2s of that process exiting, so it never lingers as a windowless
+    /// orphan holding port 7423 (the bug where the next app launch sees a live
+    /// `launched_by_flutter` backend and silently exits → "the app won't
+    /// open"). Set by the Flutter shell's BackendSupervisor detached spawn.
+    #[arg(long)]
+    parent_pid: Option<u32>,
+
     /// **Phase C (2026-05-28)** — capture the real `ProtoOASymbolByIdRes`
     /// payload for each comma-separated symbol from the configured
     /// cTrader account, then exit. Each capture dumps a `.raw.json`
@@ -183,6 +191,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // non-Windows (the helper already handles those internally).
     if !args.launched_by_flutter {
         show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
+    }
+
+    // Tie this backend's lifetime to the GUI that spawned it (#179 follow-up).
+    // The Flutter shell spawns us with `ProcessStartMode.detached`, so on a GUI
+    // close/crash we would otherwise linger as a windowless orphan holding port
+    // 7423 — which makes the NEXT app launch see a live `launched_by_flutter`
+    // backend and silently exit, i.e. "the app won't open". The watchdog
+    // self-terminates this process within ~2s of the parent exiting.
+    if let Some(parent_pid) = args.parent_pid {
+        spawn_parent_watchdog(parent_pid);
     }
 
     let settings = Settings::from_yaml(&args.config)?;
@@ -425,6 +443,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     server::serve(state).await?;
     Ok(())
+}
+
+/// Spawn a background thread that self-terminates this backend within ~2s of
+/// the parent GUI (`parent_pid`) exiting. Without this, the detached spawn
+/// would leave a windowless backend holding port 7423 after the GUI
+/// closes/crashes, which makes the next app launch see a live
+/// `launched_by_flutter` backend and silently exit — the "app won't open" bug.
+/// Captures the parent's start time so OS PID reuse can't masquerade as the
+/// parent still being alive; fail-safe (keeps the backend running) if the
+/// parent can't be located at startup.
+fn spawn_parent_watchdog(parent_pid: u32) {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let _ = std::thread::Builder::new()
+        .name("parent-watchdog".into())
+        .spawn(move || {
+            let target = Pid::from_u32(parent_pid);
+            let mut sys = System::new();
+            // Establish the parent's identity (start time) before enforcing.
+            let mut parent_start: Option<u64> = None;
+            for _ in 0..5 {
+                sys.refresh_processes(ProcessesToUpdate::Some(&[target]), true);
+                if let Some(parent) = sys.process(target) {
+                    parent_start = Some(parent.start_time());
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            if parent_start.is_none() {
+                tracing::warn!(
+                    target: "neoethos_app::watchdog",
+                    parent_pid,
+                    "parent-pid watchdog could not locate the parent GUI at startup; \
+                     leaving the backend running (no self-terminate on a possibly-stale pid)"
+                );
+                return;
+            }
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                sys.refresh_processes(ProcessesToUpdate::Some(&[target]), true);
+                let parent_alive = sys
+                    .process(target)
+                    .map(|parent| Some(parent.start_time()) == parent_start)
+                    .unwrap_or(false);
+                if !parent_alive {
+                    tracing::warn!(
+                        target: "neoethos_app::watchdog",
+                        parent_pid,
+                        "parent GUI exited — backend self-terminating to free port 7423 (no orphan)"
+                    );
+                    std::process::exit(0);
+                }
+            }
+        });
 }
 
 async fn run_headless_loop(runtime: AppRuntimeConfig) {

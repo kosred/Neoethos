@@ -12,7 +12,6 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct SystemConfig {
     pub symbol: String,
-    pub symbols: Vec<String>,
     /// Market Watch live-tick subscription set (F-338). Empty → the spot
     /// streamer falls back to `DEFAULT_STREAMED_SYMBOLS` (the 8 majors).
     /// The operator edits this from Market Watch; it takes effect on the
@@ -82,35 +81,24 @@ pub struct SystemConfig {
     pub required_timeframes: Vec<String>,
     pub enable_level2: bool,
     pub level2_depth_levels: usize,
-    pub history_years: usize,
-    pub trading_session_start: String,
-    pub trading_session_end: String,
-    pub session_timezone: String,
     /// Broker time zone used for prop-firm calendar-day boundaries (e.g.
     /// daily-DD reset). Most cTrader prop firms run on EET ("Europe/Athens",
     /// UTC+2/+3); some run pure UTC. When set, the trading runtime computes
     /// `day_id` against this offset instead of the local clock. Empty string
-    /// falls back to `session_timezone` (default "UTC"). M12 in the audit.
+    /// falls back to UTC. M12 in the audit.
     #[serde(default)]
     pub broker_timezone: String,
-    pub broker_backend: String,
     pub poll_interval_seconds: u64,
-    pub metrics_logging_enabled: bool,
     pub metrics_db_path: PathBuf,
-    pub risk_ledger_enabled: bool,
-    pub risk_ledger_max_events: usize,
-    pub strategy_ledger_path: PathBuf,
-    pub enable_dashboard: bool,
-    pub cache_enabled: bool,
     pub cache_dir: PathBuf,
-    pub cache_max_age_minutes: u64,
-    pub deep_purge_mode: String,
-    pub deep_purge_on_train: bool,
     pub n_jobs: usize,
     pub enable_gpu_preference: String,
-    pub discovery_auto_cap: bool,
-    pub discovery_max_rows: usize,
-    pub discovery_stream: bool,
+    // agent 2026-06-05 overfitting fix: removed three dead `discovery_*` fields
+    // (`discovery_auto_cap` / `discovery_max_rows` / `discovery_stream`). They
+    // were never read anywhere in the workspace — the REAL discovery row cap is
+    // `models.prop_search_max_rows` (→ DiscoveryConfig.max_rows, discovery.rs).
+    // SystemConfig does NOT derive `#[serde(deny_unknown_fields)]`, so any stale
+    // copies of these keys still in a user's config.yaml are ignored, not errors.
     pub enable_gpu: bool,
     pub num_gpus: usize,
     pub device: String,
@@ -170,7 +158,6 @@ impl Default for SystemConfig {
             // downstream guard that rejects empty-symbol orders
             // (see `risk_gate::prop_firm_pre_trade_check` Batch B Pass 3).
             symbol: String::new(),
-            symbols: Vec::new(),
             watchlist: Vec::new(),
             // F-304 fix (2026-05-28): empty default forces operator/
             // broker-session population, matching `symbol`. The
@@ -205,29 +192,14 @@ impl Default for SystemConfig {
                 .collect(),
             enable_level2: false,
             level2_depth_levels: 10,
-            history_years: 10,
-            trading_session_start: "00:05".to_string(),
-            trading_session_end: "23:55".to_string(),
-            session_timezone: "UTC".to_string(),
-            broker_timezone: String::new(), // empty = fall back to session_timezone
-            broker_backend: "ctrader".to_string(),
+            broker_timezone: String::new(), // empty = fall back to UTC
             poll_interval_seconds: 60,
-            metrics_logging_enabled: true,
             metrics_db_path: PathBuf::from("metrics.sqlite"),
-            risk_ledger_enabled: true,
-            risk_ledger_max_events: 1000,
-            strategy_ledger_path: PathBuf::from("strategy_ledger.sqlite"),
-            enable_dashboard: true,
-            cache_enabled: true,
             cache_dir: PathBuf::from("cache"),
-            cache_max_age_minutes: 60,
-            deep_purge_mode: "off".to_string(),
-            deep_purge_on_train: true,
             n_jobs,
             enable_gpu_preference: "auto".to_string(),
-            discovery_auto_cap: true,
-            discovery_max_rows: 0,
-            discovery_stream: false,
+            // agent 2026-06-05 overfitting fix: dead `discovery_*` fields removed
+            // (see struct decl). The real row cap is `models.prop_search_max_rows`.
             enable_gpu: false,
             num_gpus: 0,
             device: "cpu".to_string(),
@@ -242,6 +214,53 @@ impl Default for SystemConfig {
             smc_max_levels: 0,
             smc_use_cuda: false,
             hardware: HardwareConfig::default(),
+        }
+    }
+}
+
+impl SystemConfig {
+    /// Resolve the effective **base timeframe** from config.
+    ///
+    /// THE single source of truth shared by BOTH the CLI (`default_base_tf`)
+    /// and the app server (`/engines/*/start`) so the two never diverge.
+    /// Operator mandate (2026-06-04): the bot must behave identically whether
+    /// driven from the UI or the CLI — no difference anywhere.
+    pub fn resolve_base_timeframe(&self) -> String {
+        self.base_timeframe.trim().to_string()
+    }
+
+    /// Resolve the effective **symbol** from config (shared by CLI + server).
+    pub fn resolve_symbol(&self) -> String {
+        self.symbol.trim().to_string()
+    }
+
+    /// Resolve the effective **higher timeframes** for an already-resolved
+    /// `base`, honouring `multi_resolution_enabled` / `multi_resolution_timeframes`
+    /// / `higher_timeframes` exactly. SHARED by CLI + server.
+    ///
+    /// - When multi-resolution is on and a non-empty explicit list is set, that
+    ///   list wins (minus any entry equal to `base`).
+    /// - Otherwise the configured `higher_timeframes` are filtered to those
+    ///   strictly *above* `base` in canonical order (never a lower/equal TF).
+    ///
+    /// The filter is relative to the **effective** `base` passed in (which may be
+    /// a CLI `--base` / payload override), not necessarily `self.base_timeframe`
+    /// — so an overridden base always gets the correct top-down ladder above it.
+    pub fn resolve_higher_timeframes(&self, base: &str) -> Vec<String> {
+        let base_trim = base.trim();
+        if self.multi_resolution_enabled && !self.multi_resolution_timeframes.is_empty() {
+            self.multi_resolution_timeframes
+                .iter()
+                .map(|tf| tf.trim().to_string())
+                .filter(|tf| !tf.is_empty() && !tf.eq_ignore_ascii_case(base_trim))
+                .collect()
+        } else {
+            let above = crate::contracts::canonical_higher_timeframes(base_trim);
+            self.higher_timeframes
+                .iter()
+                .map(|tf| tf.trim().to_string())
+                .filter(|tf| !tf.is_empty() && above.iter().any(|a| a.eq_ignore_ascii_case(tf)))
+                .collect()
         }
     }
 }
@@ -266,113 +285,42 @@ pub struct RiskConfig {
     pub daily_drawdown_limit: f64,
     pub total_drawdown_limit: f64,
     pub min_risk_reward: f64,
-    pub spread_guard_multiplier: f64,
-    pub slippage_guard_multiplier: f64,
     pub max_lot_size: f64,
     pub require_stop_loss: bool,
     pub challenge_mode: bool,
     pub challenge_phase: String,
     pub prop_firm_rules: bool,
-    pub max_daily_risk_pct: f64,
-    pub base_risk_per_trade: f64,
-    pub daily_risk_budget: f64,
-    pub consistency_tracking: bool,
-    pub min_confidence_threshold: f64,
     pub kill_zones_enabled: bool,
-    pub enhanced_features: bool,
-    pub uncertainty_quantification: bool,
     pub max_trades_per_day: usize,
-    pub daily_profit_stop_pct: f64,
     pub recovery_mode_enabled: bool,
     pub feature_drift_threshold: f64,
     pub high_quality_confidence: f64,
-    pub high_quality_risk_pct: f64,
-    pub high_quality_rr: f64,
     pub atr_period: usize,
     pub atr_stop_multiplier: f64,
     pub triple_barrier_max_bars: usize,
     pub trailing_enabled: bool,
     pub trailing_atr_multiplier: f64,
     pub trailing_be_trigger_r: f64,
-    pub kelly_lambda: f64,
     pub slippage_pips: f64,
     pub commission_per_lot: f64,
     pub backtest_spread_pips: f64,
-    pub cost_penalty_r: f64,
-    pub gate_trade_prob: f64,
-    pub daily_hard_stop_pct: f64,
     pub conformal_enabled: bool,
     pub conformal_alpha: f64,
     pub conformal_abstain_min_set_size: usize,
-    pub volatility_stop_sigma: f64,
-    pub volatility_lookback: usize,
     pub meta_label_tp_pips: Option<f64>,
     pub meta_label_sl_pips: Option<f64>,
     pub meta_label_max_hold_bars: usize,
-    pub meta_label_min_prob_threshold: f64,
     pub meta_label_min_dist: f64,
     pub meta_label_fixed_sl: f64,
     pub meta_label_fixed_tp: f64,
-    pub stop_target_mode: String,
-    pub vol_estimator: String,
-    pub vol_ensemble_weights: HashMap<String, f64>,
     pub vol_ensemble_weights_trend: Option<HashMap<String, f64>>,
     pub vol_ensemble_weights_range: Option<HashMap<String, f64>>,
     pub vol_ensemble_weights_neutral: Option<HashMap<String, f64>>,
-    pub vol_window: usize,
-    pub ewma_lambda: f64,
-    pub ewma_lambda_by_timeframe: HashMap<String, f64>,
     pub vol_horizon_bars: usize,
-    pub tail_window: usize,
-    pub tail_alpha: f64,
-    pub tail_step: usize,
-    pub tail_max_bars: usize,
-    pub stop_k_vol: f64,
-    pub stop_k_tail: f64,
-    pub rr_trend: f64,
-    pub rr_range: f64,
-    pub rr_neutral: f64,
-    pub regime_adx_trend: f64,
-    pub regime_adx_range: f64,
-    pub hurst_window: usize,
-    pub hurst_trend: f64,
-    pub hurst_range: f64,
 }
 
 impl Default for RiskConfig {
     fn default() -> Self {
-        let mut vol_ensemble_weights = HashMap::new();
-        vol_ensemble_weights.insert("yang_zhang".to_string(), 1.0);
-        vol_ensemble_weights.insert("garman_klass".to_string(), 1.0);
-        vol_ensemble_weights.insert("rogers_satchell".to_string(), 1.0);
-        vol_ensemble_weights.insert("parkinson".to_string(), 1.0);
-
-        // EWMA lambdas keyed by canonical timeframe. The list MUST match
-        // `CANONICAL_TIMEFRAMES` exactly — every supported timeframe gets
-        // its own decay coefficient, and unknown timeframes must fall
-        // back to a default rather than be hard-coded here.
-        let mut ewma_lambda_by_timeframe = HashMap::new();
-        for (tf, lambda) in [
-            ("M1", 0.90),
-            ("M3", 0.91),
-            ("M5", 0.92),
-            ("M15", 0.94),
-            ("M30", 0.95),
-            ("H1", 0.96),
-            ("H4", 0.97),
-            ("H12", 0.98),
-            ("D1", 0.985),
-            ("W1", 0.99),
-            ("MN1", 0.995),
-        ] {
-            debug_assert!(
-                CANONICAL_TIMEFRAMES.contains(&tf),
-                "ewma_lambda_by_timeframe key {} must be a canonical timeframe",
-                tf
-            );
-            ewma_lambda_by_timeframe.insert(tf.to_string(), lambda);
-        }
-
         // Config is the single source: `config.yaml`'s `risk.preset` key drives
         // the preset (serde fills it post-construction). The legacy
         // `NEOETHOS_PROP_FIRM_PRESET` env override was retired in v0.4.36 —
@@ -403,8 +351,6 @@ impl Default for RiskConfig {
             // overall-drawdown ceiling for the same buffer reason.
             total_drawdown_limit: (constraints.max_overall_drawdown_pct as f64) * 0.7,
             min_risk_reward: 2.0,
-            spread_guard_multiplier: 2.5,
-            slippage_guard_multiplier: 2.0,
             max_lot_size: runtime.max_lot_size,
             require_stop_loss: true,
             challenge_mode: false,
@@ -414,73 +360,36 @@ impl Default for RiskConfig {
             // money; we still respect per-trade risk limits but skip
             // the challenge accounting.
             prop_firm_rules: preset != PropFirmPreset::None,
-            max_daily_risk_pct: runtime.daily_dd_stop_trading_pct,
-            base_risk_per_trade: 0.03,
-            daily_risk_budget: runtime.daily_dd_stop_trading_pct,
-            consistency_tracking: true,
-            min_confidence_threshold: 0.55,
             kill_zones_enabled: true,
-            enhanced_features: true,
-            uncertainty_quantification: true,
             // Cap is preset-driven. FTMO defaults to 15; The5%ers is
             // tighter; "own money" raises it. Operators can override
             // via YAML when their style demands a different cap.
             max_trades_per_day: runtime.max_trades_per_day,
-            daily_profit_stop_pct: runtime.daily_profit_lock_pct,
             recovery_mode_enabled: true,
             feature_drift_threshold: 0.30,
             high_quality_confidence: 0.65,
-            high_quality_risk_pct: 0.030,
-            high_quality_rr: 2.0,
             atr_period: 14,
             atr_stop_multiplier: 1.5,
             triple_barrier_max_bars: 35,
             trailing_enabled: true,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
-            kelly_lambda: 1.0,
             slippage_pips: 0.5,
             commission_per_lot: 7.0,
             backtest_spread_pips: 1.5,
-            cost_penalty_r: 0.0,
-            gate_trade_prob: 0.55,
-            daily_hard_stop_pct: runtime.daily_dd_stop_trading_pct,
             conformal_enabled: true,
             conformal_alpha: 0.10,
             conformal_abstain_min_set_size: 3,
-            volatility_stop_sigma: 0.02,
-            volatility_lookback: 50,
             meta_label_tp_pips: None,
             meta_label_sl_pips: None,
             meta_label_max_hold_bars: 100,
-            meta_label_min_prob_threshold: 0.55,
             meta_label_min_dist: 0.0005,
             meta_label_fixed_sl: 0.0020,
             meta_label_fixed_tp: 0.0040,
-            stop_target_mode: "blend".to_string(),
-            vol_estimator: "ensemble".to_string(),
-            vol_ensemble_weights,
             vol_ensemble_weights_trend: None,
             vol_ensemble_weights_range: None,
             vol_ensemble_weights_neutral: None,
-            vol_window: 50,
-            ewma_lambda: 0.94,
-            ewma_lambda_by_timeframe,
             vol_horizon_bars: 5,
-            tail_window: 100,
-            tail_alpha: 0.975,
-            tail_step: 5,
-            tail_max_bars: 300_000,
-            stop_k_vol: 1.0,
-            stop_k_tail: 1.25,
-            rr_trend: 2.5,
-            rr_range: 1.5,
-            rr_neutral: 2.0,
-            regime_adx_trend: 25.0,
-            regime_adx_range: 20.0,
-            hurst_window: 100,
-            hurst_trend: 0.55,
-            hurst_range: 0.45,
         }
     }
 }
@@ -549,6 +458,31 @@ pub struct ModelsConfig {
     pub prop_search_async: bool,
     pub prop_search_async_wait: bool,
     pub tree_device_preference: String,
+    /// ML overfit-reduction (v0.5 ML-integration Stage 1). When `true`
+    /// (default), the gradient boosters (xgboost/lightgbm/catboost + variants)
+    /// train with regularized, bar-scaled defaults (shallower trees, column +
+    /// row subsampling, L1/L2, leaf-size floors, bar-scaled tree counts) instead
+    /// of the legacy full-depth / full-data / no-shrinkage defaults that
+    /// memorize thin-TF (D1/W1/MN) targets. Set `false` to restore the legacy
+    /// unregularized defaults for a controlled before/after OOS comparison.
+    /// `#[serde(default)]` on `ModelsConfig` makes a missing key fall back to
+    /// the `Default` impl below (= `true`).
+    pub regularized_model_defaults: bool,
+    /// ML overfit-reduction: minimum per-(symbol,TF) bar count below which the
+    /// heavy gradient boosters are forced onto a shrunk preset (shallow depth,
+    /// few trees, strong L2) and per-bar HPO is disabled (a thin holdout cannot
+    /// select 5+ hyperparameters). Default 4000 — D1 (~2700 bars) and coarser
+    /// TFs fall below it. Below an absolute floor (800) an even tinier preset is
+    /// used. Set to 0 to disable the gate entirely.
+    pub heavy_booster_min_bars: usize,
+    /// ML overfit-reduction: when `true` (default) ML hyperparameter selection
+    /// uses CombinatorialPurgedCV (purge+embargo, 15 paths) scored by
+    /// mean-minus-stdev of the objective across folds — penalizing params that
+    /// only generalize to one lucky window — instead of a single time-series
+    /// holdout. Gated to `bars >= heavy_booster_min_bars` and `trials > 1` to
+    /// bound the 15×-fold fit cost; below that it falls back to the single
+    /// holdout. Set `false` to restore the single-holdout HPO.
+    pub ml_cpcv_enabled: bool,
     pub prop_search_parent_selection: String,
     pub prop_search_survivor_selection: String,
     pub prop_search_survivor_fraction: f64,
@@ -648,6 +582,25 @@ pub struct ModelsConfig {
     /// `NEOETHOS_BOT_DISCOVERY_MODE`; now a first-class config knob the
     /// operator sets from the UI / TUI — never the environment.
     pub discovery_mode: String,
+    /// agent 2026-06-05 overfitting fix: when `true` (default), a discovered
+    /// portfolio is only export-ready in PropFirm mode if it ALSO passes the
+    /// walk-forward gate (not just the prop-firm window gate). Previously the
+    /// walk-forward result was purely informational in PropFirm mode, so
+    /// overfit strategies (in-sample Sharpe 3-11 / PF up to 62) that failed
+    /// out-of-sample still exported. Set `false` to restore the old behaviour
+    /// (prop-firm-window gate only). `#[serde(default)]` on `ModelsConfig`
+    /// makes a missing key fall back to the `Default` impl below (= `true`).
+    pub require_walkforward_for_export: bool,
+    /// Hard floor for the prop-firm window-pass rate, applied on top of
+    /// `discovery_runtime.prop_firm_gate.pass_rate` (effective floor = max of the
+    /// two). RE-CALIBRATED 2026-06-06 from 0.65 → **0.40** when the per-window
+    /// profit target was set to the operator's bar (8%/60-day window = >=4%/month,
+    /// in `derive_prop_firm_gate`). 0.40 = a candidate must hit >=4%/month in at
+    /// least 40% of the random 60-day windows to survive — a genuine persistent
+    /// edge, with the live models lifting the rest (discovery=edge, models=grow).
+    /// The base-filter max-DD + walk-forward export gate still reject blow-ups /
+    /// overfit. Raise toward 0.65 for stricter selection; lower for more candidates.
+    pub prop_firm_min_pass_rate: f64,
     /// Genetic-search runtime knobs (config-driven replacement for the
     /// `NEOETHOS_BOT_*` search env vars). See [`SearchRuntimeConfig`].
     pub search_runtime: SearchRuntimeConfig,
@@ -671,6 +624,11 @@ pub struct ModelsConfig {
     /// the `NEOETHOS_BOT_PROP_SEEN_*` env vars). See
     /// [`SeenSignatureRuntimeConfig`].
     pub seen_signature_runtime: SeenSignatureRuntimeConfig,
+    /// Search-memory + weekly-refresh ledger knobs (2026-06-06): persist what
+    /// each discovery run found and seed the next run's seen-set so weekly runs
+    /// add NEW strategies instead of re-discovering old ones. See
+    /// [`DiscoveryLedgerConfig`].
+    pub discovery_ledger: DiscoveryLedgerConfig,
     /// SMC search-injection knobs (config-driven replacement for the
     /// `NEOETHOS_BOT_PROP_SMC_*` env vars). See [`SmcSearchRuntimeConfig`].
     pub smc_search_runtime: SmcSearchRuntimeConfig,
@@ -743,6 +701,30 @@ pub struct SearchRuntimeConfig {
     pub immigrant_ratio: f64,
     pub survivor_fraction: f64,
     pub selection_temperature: f64,
+    /// Generations of no meaningful improvement before the GA hard
+    /// early-stops THIS combo and returns its archive, freeing the
+    /// wall-clock budget for the next symbol×timeframe. `0` disables the
+    /// early-stop (run to the time / generation cap as before). This is a
+    /// SEPARATE, larger threshold than `stagnation_patience`: the soft
+    /// diversity kick (gate relaxation + immigrants + hypermutation) is
+    /// attempted first; the hard stop fires only if the search is STILL
+    /// flat after `convergence_patience` generations.
+    pub convergence_patience: usize,
+    /// Minimum increase in top fitness counted as "improvement" when
+    /// tracking stagnation; a generation gaining less than this is
+    /// stagnant. Replaces the legacy hard-coded `1e-12`.
+    pub min_improvement: f64,
+    /// Wall-clock floor for the convergence early-stop, as a fraction of
+    /// the per-combo time budget (`prop_search_max_hours`). The early-stop
+    /// (see `convergence_patience`) may fire ONLY after this fraction of
+    /// the budget has elapsed. This makes the early-stop throughput-robust:
+    /// generation rate varies ~300× across timeframes, so a pure
+    /// generation count (e.g. 250 gens ≈ 1 s on a fast TF, ≈ 21 min on M1)
+    /// would otherwise kill fast timeframes before they ever search. `0.5`
+    /// = every combo gets at least half its budget; `0` = no floor (pure
+    /// generation count, NOT recommended); `1.0` = effectively disables the
+    /// early-stop (only the time cap stops the combo).
+    pub convergence_min_elapsed_fraction: f64,
 }
 
 impl Default for SearchRuntimeConfig {
@@ -768,6 +750,9 @@ impl Default for SearchRuntimeConfig {
             immigrant_ratio: 0.25,
             survivor_fraction: 0.10,
             selection_temperature: 0.75,
+            convergence_patience: 250,
+            min_improvement: 1e-12,
+            convergence_min_elapsed_fraction: 0.5,
         }
     }
 }
@@ -789,6 +774,17 @@ pub struct DiscoveryRuntimeConfig {
     /// Fraction of rows treated as in-sample when ranking features; must be
     /// in `(0, 1]`. (was `NEOETHOS_BOT_PREFILTER_INSAMPLE`)
     pub prefilter_insample_frac: f64,
+    /// Minimum number of features to force-keep from EACH present higher
+    /// timeframe group during the prefilter, in addition to the global
+    /// `prefilter_top_k`. The prefilter ranks by correlation with the BASE
+    /// timeframe's 1-bar forward return; a slow higher-TF indicator is
+    /// near-constant across many base bars so that correlation is ~0 by
+    /// construction, and the global top-K therefore discards EVERY multi-TF
+    /// feature — wasting the entire multi-resolution cube and starving the
+    /// GA's multi-TF seed templates. This quota guarantees each higher TF
+    /// (`H1_`, `H4_`, `M15_`, …) reaches the GA. `0` reproduces the legacy
+    /// base-only behaviour. (new 2026-06-08)
+    pub prefilter_min_per_timeframe: usize,
     /// Fraction of rows fed to the multi-stage funnel's first stage; clamped
     /// to `[0.01, 1.0]`. (was `NEOETHOS_BOT_FUNNEL_STAGE1_PCT`)
     pub funnel_stage1_pct: f64,
@@ -816,6 +812,7 @@ impl Default for DiscoveryRuntimeConfig {
         Self {
             prefilter_top_k: 50,
             prefilter_insample_frac: 0.70,
+            prefilter_min_per_timeframe: 6,
             funnel_stage1_pct: 0.25,
             stage1_window: "earliest".to_string(),
             min_history_years: 0,
@@ -1009,6 +1006,51 @@ impl Default for SeenSignatureRuntimeConfig {
             load_max: 3_000_000,
             max_entries: 3_000_000,
             file_path: None,
+        }
+    }
+}
+
+/// Search-memory + weekly-refresh knobs (2026-06-06). When `enabled`, each
+/// discovery run reads a per-symbol/TF on-disk **ledger** of previously found
+/// strategies (indicator + SMC-flag combos + fitness) and seeds the GA's
+/// seen-signature memory with their hashes so the next run AVOIDS
+/// re-discovering them — every weekly run ADDS new diverse strategies to a
+/// growing library. Mirrors the nested-config pattern of
+/// [`DiscoveryRuntimeConfig`]; consumed via
+/// `neoethos_search::DiscoveryConfig::from_settings`.
+///
+/// Cross-run dedup of the seeded hashes only takes effect for the GA when an
+/// on-disk seen-signature file is configured (`seen_signature_runtime.file_path`):
+/// the genetic engine builds its own `SeenSignatureMemory::from_env()` and reads
+/// previously-persisted hashes from that file. When `file_path` is unset
+/// (in-memory only, the default), the ledger is still recorded + the seed step
+/// runs, but the seeded hashes are not visible to the engine's fresh in-memory
+/// set — set a `file_path` to get true cross-run dedup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DiscoveryLedgerConfig {
+    /// Master switch. When `false`, discovery behaves byte-identically to a
+    /// build without this feature (no ledger read, no seed, no ledger write).
+    pub enabled: bool,
+    /// Directory the per-symbol/TF ledger JSON files live in. Relative paths
+    /// resolve against the process CWD (same convention as `cache/features`).
+    pub cache_dir: String,
+    /// How many top archive (non-portfolio) genes to also record per run, so
+    /// the seen-set grows beyond just the promoted portfolio.
+    pub archive_top_n: usize,
+    /// Promotion policy for `discovery-promote-weekly`. `"additive"` (the
+    /// default + only implemented policy) merges new genes by hash and keeps
+    /// existing ones; unknown values fall back to additive.
+    pub promotion_policy: String,
+}
+
+impl Default for DiscoveryLedgerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cache_dir: "cache/search".to_string(),
+            archive_top_n: 20,
+            promotion_policy: "additive".to_string(),
         }
     }
 }
@@ -1213,7 +1255,7 @@ impl Default for ModelsConfig {
             prop_search_enabled: false,
             prop_search_population: 100,
             prop_search_generations: 50,
-            prop_search_max_hours: 8.0,
+            prop_search_max_hours: 0.5, // 2026-06-05: sane default (was 8.0=absurd 8h/combo); config-overridable (VPS budget run uses 0.25)
             prop_search_max_rows: 0,
             prop_search_max_rows_by_tf: HashMap::new(),
             prop_search_portfolio_size: 3000,
@@ -1232,6 +1274,9 @@ impl Default for ModelsConfig {
             prop_search_async: false,
             prop_search_async_wait: false,
             tree_device_preference: "auto".to_string(),
+            regularized_model_defaults: true,
+            heavy_booster_min_bars: 4000,
+            ml_cpcv_enabled: true,
             prop_search_parent_selection: "rank".to_string(),
             prop_search_survivor_selection: "rank".to_string(),
             prop_search_survivor_fraction: 0.10,
@@ -1334,15 +1379,22 @@ impl Default for ModelsConfig {
             label_neutral_band_atr_fraction: 0.25,
             label_stop_atr_multiplier: 0.0,
             label_take_profit_rr: 0.0,
-            walkforward_splits: 20,
+            walkforward_splits: 10, // 2026-06-05: robust OOS default (was 20, slow); config-overridable
             embargo_minutes: 120,
             discovery_mode: "prop_firm".to_string(),
+            // walk-forward export gate ON (robustness). prop-firm pass-rate floor
+            // RE-CALIBRATED 0.65→0.40 (2026-06-06) to match the operator's >=4%/month
+            // bar now used as the per-window target — see derive_prop_firm_gate +
+            // config.yaml prop_firm_min_pass_rate. (see field docs above.)
+            require_walkforward_for_export: true,
+            prop_firm_min_pass_rate: 0.40,
             search_runtime: SearchRuntimeConfig::default(),
             discovery_runtime: DiscoveryRuntimeConfig::default(),
             eval_runtime: EvalRuntimeConfig::default(),
             quality_runtime: QualityRuntimeConfig::default(),
             backtest_runtime: BacktestRuntimeConfig::default(),
             seen_signature_runtime: SeenSignatureRuntimeConfig::default(),
+            discovery_ledger: DiscoveryLedgerConfig::default(),
             smc_search_runtime: SmcSearchRuntimeConfig::default(),
             data_runtime: DataRuntimeConfig::default(),
             tree_runtime: TreeRuntimeConfig::default(),
@@ -1356,7 +1408,7 @@ impl Default for ModelsConfig {
             cpcv_embargo_pct: 0.01,
             cpcv_purge_pct: 0.02,
             cpcv_min_phi: 0.80,
-            cpcv_max_rows: 0,
+            cpcv_max_rows: 200000, // 2026-06-05: cap informational CPCV (was 0=full=heavy on full-data); config-overridable
             enable_ddp: false,
             enable_fsdp: false,
             ddp_world_size: 1,
@@ -1959,6 +2011,73 @@ mod tests {
         );
         assert_eq!(settings.risk.initial_balance, 10_000.0);
         assert!(!settings.models.ml_models.is_empty());
+    }
+
+    // ─── UI↔CLI parity: the shared timeframe/symbol resolvers ───────────────
+    // These lock the behaviour of `SystemConfig::resolve_*`, the SINGLE source
+    // of truth that BOTH `neoethos-cli` and the app server call. If this drifts,
+    // the two entry points would search differently from the same config —
+    // exactly the divergence the 2026-06-04 parity pass removed.
+
+    #[test]
+    fn resolve_higher_timeframes_default_config_multi_resolution() {
+        // Default: multi_resolution_enabled = true and the multi-res list is the
+        // FULL canonical set → "every configured TF except the effective base".
+        let sys = SystemConfig::default();
+
+        let m1 = sys.resolve_higher_timeframes("M1");
+        assert_eq!(
+            m1,
+            vec!["M3", "M5", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1"],
+            "M1 base → all canonical above M1"
+        );
+        assert!(!m1.iter().any(|tf| tf == "M1"), "base itself is excluded");
+
+        // base=H1: multi-resolution keeps LOWER TFs (M1..M30) as extra context
+        // too — only the base is dropped. The Flutter UI cannot replicate this,
+        // which is precisely why an untouched UI sends no override and lets this
+        // resolver decide (parity with the CLI).
+        let h1 = sys.resolve_higher_timeframes("H1");
+        assert!(h1.contains(&"M5".to_string()), "lower TFs retained under multi-res");
+        assert!(h1.contains(&"H4".to_string()), "higher TFs retained");
+        assert!(!h1.iter().any(|tf| tf == "H1"), "base itself is excluded");
+        assert_eq!(h1.len(), 10, "all 11 canonical minus the base");
+
+        // Effective-base relativity: an overridden base trims itself out even
+        // when it differs from `self.base_timeframe`.
+        assert!(!sys.resolve_higher_timeframes("H4").iter().any(|tf| tf == "H4"));
+    }
+
+    #[test]
+    fn resolve_higher_timeframes_multi_resolution_off_filters_strictly_above() {
+        // multi_resolution OFF → higher_timeframes filtered to strictly-above
+        // the base in canonical order (never a lower/equal TF).
+        let mut sys = SystemConfig::default();
+        sys.multi_resolution_enabled = false;
+        assert_eq!(
+            sys.resolve_higher_timeframes("H1"),
+            vec!["H4", "H12", "D1", "W1", "MN1"],
+            "H1 base, multi-res off → only canonical TFs strictly above H1"
+        );
+
+        // An operator exclusion in higher_timeframes is honoured, and entries
+        // not strictly above the base are dropped (D1/H4 kept, M5 below M1? no —
+        // M5 is above M1, so it stays; M1-equal would be dropped).
+        sys.higher_timeframes = vec!["H4".to_string(), "D1".to_string(), "M5".to_string()];
+        assert_eq!(
+            sys.resolve_higher_timeframes("H1"),
+            vec!["H4", "D1"],
+            "restricted higher_timeframes respected; M5 (below H1) excluded"
+        );
+    }
+
+    #[test]
+    fn resolve_base_and_symbol_trim_preserve_config_value() {
+        let mut sys = SystemConfig::default();
+        sys.base_timeframe = "  H4 ".to_string();
+        sys.symbol = " EURUSD ".to_string();
+        assert_eq!(sys.resolve_base_timeframe(), "H4");
+        assert_eq!(sys.resolve_symbol(), "EURUSD");
     }
 
     #[test]

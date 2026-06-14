@@ -26,6 +26,27 @@ pub const CANONICAL_TIMEFRAMES: &[&str] = &[
     "M1", "M3", "M5", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1",
 ];
 
+/// The canonical timeframes strictly *coarser* than `base` (its valid higher-
+/// timeframe / top-down context), in ascending order. Empty when `base` is the
+/// coarsest (MN1) or not canonical.
+///
+/// THE source of truth for "which higher TFs does a base get". Every discovery
+/// default routes through this so a search always sees the **full** top-down
+/// ladder (all canonical TFs above the base) instead of a hardcoded 3-TF subset
+/// — and never a *lower* TF (which a base-agnostic static list would wrongly
+/// include for a coarse base like H1).
+pub fn canonical_higher_timeframes(base: &str) -> Vec<String> {
+    let base_up = base.trim().to_ascii_uppercase();
+    let Some(idx) = CANONICAL_TIMEFRAMES.iter().position(|tf| *tf == base_up) else {
+        return Vec::new();
+    };
+    CANONICAL_TIMEFRAMES
+        .iter()
+        .skip(idx + 1)
+        .map(|tf| (*tf).to_string())
+        .collect()
+}
+
 /// Returns true if `tf` (case-insensitive) is one of the canonical
 /// supported timeframes.
 pub fn is_canonical_timeframe(tf: &str) -> bool {

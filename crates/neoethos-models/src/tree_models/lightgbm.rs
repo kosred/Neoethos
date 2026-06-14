@@ -146,12 +146,13 @@ impl LightGBMExpert {
     }
 
     fn effective_device_type(&self) -> String {
-        let gpu_available = gpu_count() > 0 && !self.gpu_only_disabled;
-        match self.config.device_pref {
-            DevicePreference::Gpu if gpu_available => "gpu".to_string(),
-            DevicePreference::Auto if gpu_available => "gpu".to_string(),
-            _ => "cpu".to_string(),
-        }
+        // LightGBM's GPU/CUDA tree learner is NOT enabled in our built lib —
+        // empirically (2026-06-10, A6000) `device_type=cuda` dies with
+        // "[LightGBM] [Fatal] GPU Tree Learner was not enabled in this build."
+        // (`lightgbm3/cuda` does not actually produce a GPU-capable liblightgbm;
+        // the OpenCL path also fails to link). CPU is correct AND fast at our
+        // row counts (gradient boosting on 10^4-10^5 rows is seconds on CPU).
+        "cpu".to_string()
     }
 
     fn resolved_params(&self) -> HashMap<String, ParamValue> {
@@ -609,7 +610,7 @@ impl LightGBMExpert {
 
 impl ExpertModel for LightGBMExpert {
     fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        self.fit_internal(x, y, None, None)
+        self.fit_with_validation(x, y, None, None)
     }
 
     fn fit_with_validation(
@@ -939,6 +940,38 @@ mod tests {
         .expect("build training dataframe");
         let y = Series::new("label".into(), labels);
         (x, y)
+    }
+
+    /// A training fold where only 2 of the 3 classes appear (no -1/sell). The
+    /// multiclass model is still configured `num_class=3`; this MUST train, not
+    /// fail — some real symbol/TF folds genuinely lack one direction.
+    #[cfg(feature = "lightgbm")]
+    #[test]
+    fn fit_tolerates_two_class_training_fold() {
+        let mut momentum = Vec::new();
+        let mut trend = Vec::new();
+        let mut volatility = Vec::new();
+        let mut labels = Vec::new();
+        for idx in 0..40 {
+            let o = idx as f64 * 0.01;
+            momentum.push(0.78 + o);
+            trend.push(0.7 + o * 0.8);
+            volatility.push(0.35 + o * 0.2);
+            labels.push(1_i32);
+        }
+        for idx in 0..40 {
+            let o = idx as f64 * 0.01;
+            momentum.push(-0.02 + o * 0.05);
+            trend.push(-0.03 + o * 0.04);
+            volatility.push(0.12 + o * 0.03);
+            labels.push(0_i32);
+        }
+        let x = df!["momentum" => momentum, "trend" => trend, "volatility" => volatility]
+            .expect("build 2-class dataframe");
+        let y = Series::new("label".into(), labels);
+        let mut expert = LightGBMExpert::new(7, None);
+        let res = expert.fit(&x, &y);
+        assert!(res.is_ok(), "2-class fold must train, got: {:?}", res.err());
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

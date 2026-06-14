@@ -59,10 +59,15 @@ use tungstenite::{Message, WebSocket, connect};
 static STREAM_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 use crate::app_services::ctrader_messages::{
-    CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_HEARTBEAT_PAYLOAD_TYPE, CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE,
-    build_account_auth_request, build_application_auth_request, build_subscribe_spots_request,
-    parse_ctrader_error_payload, parse_open_api_envelope,
+    CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE,
+    CTRADER_OA_ACCOUNTS_TOKEN_INVALIDATED_EVENT_PAYLOAD_TYPE,
+    CTRADER_OA_CLIENT_DISCONNECT_EVENT_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_HEARTBEAT_PAYLOAD_TYPE, CTRADER_OA_MARGIN_CALL_TRIGGER_EVENT_PAYLOAD_TYPE,
+    CTRADER_OA_MARGIN_CALL_UPDATE_EVENT_PAYLOAD_TYPE, CTRADER_OA_MARGIN_CHANGED_EVENT_PAYLOAD_TYPE,
+    CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE, CTRADER_OA_TRADER_UPDATE_EVENT_PAYLOAD_TYPE,
+    CTRADER_OA_TRAILING_SL_CHANGED_EVENT_PAYLOAD_TYPE, build_account_auth_request,
+    build_application_auth_request, build_subscribe_spots_request, parse_ctrader_error_payload,
+    parse_open_api_envelope,
 };
 use crate::app_services::live_spots;
 
@@ -386,6 +391,15 @@ fn run_blocking(config: LiveSpotsStreamerConfig, my_gen: u64) -> Result<()> {
     // 3. Subscribe to all symbols in one request — cTrader's
     //    subscribe-spots payload takes a list, so we don't need
     //    one round-trip per symbol.
+    //
+    //    No unsubscribe-before-subscribe is needed on reconnect: every
+    //    reconnect runs a FRESH `run_blocking` that opens a brand-new
+    //    `connect()` socket (above) → a new cTrader session. Spot
+    //    subscriptions are per-session, so the dropped connection's
+    //    subscriptions die with it; there is nothing to carry over and
+    //    therefore no duplicate-subscription to guard against. Even if a
+    //    stray duplicate spot event did arrive, `live_spots::update_tick`
+    //    overwrites by `symbol_id`, so the cache stays correct.
     let symbol_ids: Vec<i64> = config.symbols.iter().map(|s| s.symbol_id).collect();
     send_and_await(
         &mut socket,
@@ -498,7 +512,21 @@ fn run_blocking(config: LiveSpotsStreamerConfig, my_gen: u64) -> Result<()> {
             payload_text.as_bytes(),
         );
 
-        let envelope = parse_open_api_envelope(&payload_text)?;
+        // 2026-06-10 defensive parse: a single malformed frame must NOT tear
+        // down the whole stream (a reconnect costs a full re-auth + re-subscribe
+        // round-trip and a Market-Watch price gap). Skip it and keep reading —
+        // a genuinely dead socket still surfaces via the read error / Close arm.
+        let envelope = match parse_open_api_envelope(&payload_text) {
+            Ok(env) => env,
+            Err(err) => {
+                tracing::warn!(
+                    target: "neoethos_app::live_spots_streamer",
+                    error = %err,
+                    "skipping unparseable cTrader spot-stream frame"
+                );
+                continue;
+            }
+        };
         match envelope.payload_type {
             CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE => {
                 if let Some((symbol_id, bid, ask, ts)) =
@@ -523,10 +551,65 @@ fn run_blocking(config: LiveSpotsStreamerConfig, my_gen: u64) -> Result<()> {
                     .unwrap_or_else(|_| "unparseable error payload".to_string());
                 return Err(anyhow!("cTrader error on spot stream: {detail}"));
             }
+            // **2026-06-10 API-completeness pass.** The Open API multiplexes
+            // ALL account push events onto this one authed socket, not just
+            // spots. Surface the high-value ones instead of dropping them in
+            // the `_` arm — silence here is why an invalidated token or a
+            // margin call used to go unnoticed until the next failed request.
+            CTRADER_OA_ACCOUNTS_TOKEN_INVALIDATED_EVENT_PAYLOAD_TYPE => {
+                // Token revoked broker-side: the whole session is now invalid.
+                // Tear down so the reconnect re-auths; if the token is truly
+                // dead the re-auth surfaces it loudly. This is an auth
+                // emergency, not a routine reconnect.
+                tracing::error!(
+                    target: "neoethos_app::live_spots_streamer",
+                    "cTrader ACCOUNTS_TOKEN_INVALIDATED event — the access token was revoked; \
+                     a manual re-authentication is required"
+                );
+                return Err(anyhow!(
+                    "cTrader access token invalidated (token-invalidated event on spot stream)"
+                ));
+            }
+            CTRADER_OA_CLIENT_DISCONNECT_EVENT_PAYLOAD_TYPE => {
+                tracing::warn!(
+                    target: "neoethos_app::live_spots_streamer",
+                    payload = %payload_text,
+                    "cTrader CLIENT_DISCONNECT event — broker dropped the application session"
+                );
+                return Err(anyhow!("cTrader client disconnect event on spot stream"));
+            }
+            CTRADER_OA_MARGIN_CALL_TRIGGER_EVENT_PAYLOAD_TYPE => {
+                // A live-money risk event — never bury this.
+                tracing::warn!(
+                    target: "neoethos_app::live_spots_streamer",
+                    payload = %payload_text,
+                    "cTrader MARGIN_CALL_TRIGGER event — a margin-call threshold was breached"
+                );
+                continue;
+            }
+            CTRADER_OA_MARGIN_CALL_UPDATE_EVENT_PAYLOAD_TYPE => {
+                tracing::info!(
+                    target: "neoethos_app::live_spots_streamer",
+                    "cTrader MARGIN_CALL_UPDATE event — a margin-call threshold changed"
+                );
+                continue;
+            }
+            CTRADER_OA_MARGIN_CHANGED_EVENT_PAYLOAD_TYPE
+            | CTRADER_OA_TRADER_UPDATE_EVENT_PAYLOAD_TYPE
+            | CTRADER_OA_TRAILING_SL_CHANGED_EVENT_PAYLOAD_TYPE => {
+                // Informational account-state pushes the bridge's periodic
+                // snapshot will also pick up. Trace at debug so they are
+                // observable without spamming the default log level.
+                tracing::debug!(
+                    target: "neoethos_app::live_spots_streamer",
+                    payload_type = envelope.payload_type,
+                    "cTrader account push event (margin/trader/trailing-SL changed)"
+                );
+                continue;
+            }
             _ => {
-                // Heartbeat, account-changed, execution events, etc.
-                // We don't care about them here — the regular bridge
-                // owns those. Just keep reading.
+                // Heartbeat, symbol-changed, execution events, etc. — the
+                // regular bridge owns those. Just keep reading.
                 continue;
             }
         }
@@ -587,7 +670,21 @@ fn send_and_await(socket: &mut CTraderSocket, message_json: &str) -> Result<()> 
             }
             Message::Frame(_) => continue,
         };
-        let env = parse_open_api_envelope(&text)?;
+        // 2026-06-10 defensive parse: skip an unparseable frame during the
+        // handshake exactly like an unrelated one (below) — keep awaiting the
+        // matching clientMsgId rather than aborting the connection on one bad
+        // frame.
+        let env = match parse_open_api_envelope(&text) {
+            Ok(env) => env,
+            Err(err) => {
+                tracing::warn!(
+                    target: "neoethos_app::live_spots_streamer",
+                    error = %err,
+                    "skipping unparseable cTrader frame during spot-stream handshake"
+                );
+                continue;
+            }
+        };
         if env.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
             let detail = parse_ctrader_error_payload(&env.payload)
                 .unwrap_or_else(|_| "unparseable error payload".to_string());

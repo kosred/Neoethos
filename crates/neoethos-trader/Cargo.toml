@@ -1,0 +1,51 @@
+[package]
+name = "neoethos-trader"
+version = "0.4.99"
+edition.workspace = true
+
+# ── neoethos-trader ──────────────────────────────────────────────────────────
+# The autonomous live-trading ENGINE — the single library service that both the
+# UI (neoethos-app) and the CLI (neoethos-cli) drive as thin front-ends (see
+# docs/v0.5-autonomous-trader-design.md §1.1). Phase 1 (this crate's first cut)
+# is the SKELETON + OFFLINE REPLAY: the full bar→signal→decision→risk→exec→
+# position loop, provable end-to-end over historical bars with ZERO broker calls.
+#
+# Deliberately depends on NOTHING heavy yet: the real Gene / SoftVotingEnsemble
+# (neoethos-search/-models), the feature cube (neoethos-data), the cTrader
+# broker path (neoethos-app), and the core RiskManager (neoethos-core) plug into
+# the trait seams in `contracts` during Phases 2–6. Keeping Phase 1 dependency-
+# light makes it fast to compile and trivially unit-testable.
+[dependencies]
+# The pure engine (contracts/engine/position/...) needs none of these heavy
+# crates — only `data_replay` does, to load real .vortex history off disk for
+# the offline dry-run that backs the CLI `trader-replay` command and the app
+# `/autonomous/replay` endpoint (same helper → identical EngineStats = parity).
+neoethos-data = { path = "../neoethos-data" }
+# Phase 4: the discovered `Gene` + the EXACT signal/feature-projection code the GA
+# uses (`signals_for_gene_full`, `project_features_to_effective`) + the
+# `LivePortfolioArtifact` loader — reused, never re-implemented, so live signals
+# match backtest signals.
+neoethos-search = { path = "../neoethos-search" }
+# v0.5 ML-integration Stage 3: the SoftVotingEnsemble role-aware combiner that
+# gates gene size in the blend. OPTIONAL + behind the `ml-blend` feature so the
+# default (gene-only) build stays dependency-light and does not pull in the
+# heavy native ML stack (lightgbm/xgboost/catboost). The blend CORE (blend math
+# + BlendedSignalEngine + invariants) compiles WITHOUT this dep; only
+# `replay_blend_from_dir` (which loads + runs the ensemble) needs it.
+neoethos-models = { path = "../neoethos-models", optional = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[features]
+# Enable the ML-gated blend replay path (genes × SoftVotingEnsemble). Off by
+# default — gene-only replay needs none of the ML stack.
+ml-blend = ["dep:neoethos-models"]
+
+[dev-dependencies]
+# Tests construct `FeatureData::InMemory(Array2)` fixtures for the gene-signal
+# parity checks; the non-test engine never touches ndarray directly.
+ndarray = { workspace = true }

@@ -9,6 +9,7 @@ pub mod domain;
 pub mod env_overrides;
 pub mod logging;
 pub mod resolved_config;
+pub mod scheduler;
 pub mod schema_version;
 pub mod sectioned_log;
 pub mod storage;
@@ -36,7 +37,8 @@ pub use contracts::{
     RuntimeSafetyIssue, RuntimeSafetyReport, SearchCheckpointArtifact,
     SearchCheckpointArtifactContract, TimestampPolicy, TimestampUnit, TrainingModelArtifact,
     TrainingModelArtifactContract, TypedArtifactEnvelope, ValidationEvidenceCheck,
-    ValidationEvidenceKind, ValidationEvidenceManifest, is_canonical_timeframe,
+    ValidationEvidenceKind, ValidationEvidenceManifest, canonical_higher_timeframes,
+    is_canonical_timeframe,
 };
 pub use domain::PropFirmConstraints;
 pub use domain::{

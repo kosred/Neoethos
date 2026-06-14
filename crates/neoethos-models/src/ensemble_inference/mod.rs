@@ -137,7 +137,8 @@ pub use mixed_adapters::{
     OnlinePaAdapter, OnlinePaLoader, register_mixed_loaders,
 };
 pub use rl_exit_adapters::{
-    DqnAdapter, DqnLoader, ExitAgentAdapter, ExitAgentLoader, register_rl_exit_loaders,
+    DqnAdapter, DqnLoader, ExitAgentAdapter, ExitAgentLoader, SacAgentAdapter, SacAgentLoader,
+    register_rl_exit_loaders,
 };
 pub use soft_voting::{SoftVotingEnsemble, SoftVotingEnsembleConfig};
 pub use tree_adapters::{
@@ -166,9 +167,14 @@ pub enum ExpertOutputKind {
     /// 3-action Q-values for `[hold, buy, sell]` from an RL agent
     /// (dqn). Not a probability distribution — values are arbitrary
     /// reals; the action with the highest Q is the recommended
-    /// action. Soft-voting treats argmax as a Classification3 vote.
-    /// Matches `dqn_impl.rs::TradingAction::as_index`: Hold=0,
+    /// action. Matches `dqn_impl.rs::TradingAction::as_index`: Hold=0,
     /// Buy=1, Sell=2 (same axis order as Classification3).
+    ///
+    /// NOTE: the live `dqn` ADAPTER (`rl_exit_adapters.rs`) does NOT emit this
+    /// variant — it softmaxes the Q-values into a `Classification3` vector and
+    /// reports `Classification3`, so the soft-voting / role-aware combiners
+    /// treat dqn as a (confirm-only) directional voter. This variant remains
+    /// for any future expert that wants to expose raw Q-values directly.
     ActionValues3,
     /// Single continuous forecast value — e.g. predicted next-bar
     /// close-to-close return. Produced by time-series forecasters
@@ -217,6 +223,127 @@ impl ExpertOutputKind {
             Self::ExitDecision3 => 3,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.5 ML-integration Stage 2 — role-aware ensemble decision.
+// ---------------------------------------------------------------------------
+
+/// The role an expert plays in the role-aware combiner
+/// ([`super::soft_voting::SoftVotingEnsemble::predict_with_roles`]).
+///
+/// CORRECTION TO THE ORIGINAL DESIGN (verified in code 2026-06-07): almost
+/// every expert reports [`ExpertOutputKind::Classification3`] and therefore
+/// ALREADY votes — but several do so with the WRONG semantics, polluting the
+/// flat directional average. The fix is to give each expert its correct ROLE,
+/// not to "resurrect" a discarded one. `hmm_regime` is a regime classifier
+/// (its trend posterior should GATE size, not vote on direction);
+/// `isolation_forest` is an anomaly detector (its score should SCALE/VETO size,
+/// not drag every bar toward neutral); `dqn` is a confirm-only directional
+/// contributor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertRole {
+    /// Genuine directional classifier — contributes to the direction vote.
+    Direction,
+    /// Directional, but confirm-only at the blend (can add weight to a side,
+    /// never originate/override direction). Functionally joins the direction
+    /// pool here; the gene-dominant invariant is enforced downstream (Stage 3).
+    DirectionalConfirm,
+    /// Regime gate (`hmm_regime`): multiplies the final confidence by a
+    /// bounded [0,1] factor; never votes on direction.
+    RegimeGate,
+    /// Anomaly scale/veto (`isolation_forest`): multiplies the final confidence
+    /// by a bounded [0,1] factor (hard veto when extreme); never votes.
+    AnomalyScale,
+}
+
+/// Canonical expert-name -> role map. Declared in ONE place so a future new
+/// expert cannot silently fall into the wrong role — the role-aware combiner
+/// FAILS LOUD on an unmapped loaded expert. (Partitioning on the coarse
+/// [`ModelFamily`] would be wrong: `hmm_regime` is `ModelFamily::Meta`, the same
+/// family as the directional `meta_blender`/`meta_stack`.)
+///
+/// Returns `None` for an unmapped name (the caller decides whether to bail).
+pub fn expert_role(name: &str) -> Option<ExpertRole> {
+    match name {
+        // Regime gate — trend posterior gates size, does not vote.
+        "hmm_regime" => Some(ExpertRole::RegimeGate),
+        // Anomaly scale/veto — outlier score scales size, does not vote.
+        "isolation_forest" => Some(ExpertRole::AnomalyScale),
+        // Confirm-only directional contributors (RL policies). `dqn`
+        // softmaxes its Q-values; `sac` emits a softmax policy directly.
+        // Both are entry/direction RL voters that confirm — never
+        // originate/override — the genes' direction (Stage 3 invariant).
+        "dqn" | "sac" => Some(ExpertRole::DirectionalConfirm),
+        // Genuine directional classifiers.
+        "lightgbm" | "xgboost" | "xgboost_rf" | "xgboost_dart" | "catboost" | "catboost_alt"
+        | "sklears_tree" | "mlp" | "kan" | "tabnet" | "nbeats" | "nbeatsx_nf" | "tide"
+        | "tide_nf" | "transformer" | "patchtst" | "timesnet" | "elasticnet" | "logistic"
+        | "bayes_logit" | "meta_blender" | "probability_calibrator" | "conformal_gate"
+        | "meta_stack" | "online_pa" | "online_hoeffding" => Some(ExpertRole::Direction),
+        _ => None,
+    }
+}
+
+/// Per-row output of the role-aware combiner: a direction vote plus two bounded
+/// [0,1] confidence factors. The blend (Stage 3) and the OOS re-validation
+/// (Stage 4) consume `dir_probs` for the ML agreement on the gene's side and
+/// multiply the confidence by `regime_gate * anomaly_scale`. ML can therefore
+/// only SHRINK conviction or veto — never flip direction or manufacture a trade.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnsembleDecision {
+    /// `[p_neutral, p_buy, p_sell]` from the directional voters only
+    /// (hmm_regime / isolation_forest removed from this vote).
+    pub dir_probs: [f32; 3],
+    /// Regime gate g ∈ [0,1] from `hmm_regime` (1.0 when absent — never a
+    /// veto-by-accident on missing data).
+    pub regime_gate: f32,
+    /// Anomaly scale s ∈ [0,1] from `isolation_forest` (1.0 when absent;
+    /// 0.0 = hard veto on an extreme anomaly).
+    pub anomaly_scale: f32,
+}
+
+impl EnsembleDecision {
+    /// Neutral decision (no directional lean, no gate, no veto) — used for
+    /// warmup/NaN rows where the ensemble abstains.
+    pub fn neutral() -> Self {
+        Self {
+            dir_probs: [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+            regime_gate: 1.0,
+            anomaly_scale: 1.0,
+        }
+    }
+}
+
+/// Pure regime-gate math (testable without a loaded HMM): given the directional
+/// vote and the HMM posterior `[p_range, p_buy, p_sell]`, return
+/// `g = (p_buy + p_sell) * posterior_mass_on_the_voted_side` ∈ [0,1].
+/// A range regime (p_range→1) or a posterior disagreeing with the vote → g→0
+/// (shrink/veto); an agreeing trend → g→1.
+pub fn regime_gate_from_posterior(dir_probs: [f32; 3], posterior: [f32; 3]) -> f32 {
+    // Direction the vote picked: buy (col1) vs sell (col2); neutral lean -> no
+    // gate amplification basis, fall back to (1 - p_range).
+    let trend_mass = (posterior[1] + posterior[2]).clamp(0.0, 1.0);
+    let agreement = if dir_probs[1] >= dir_probs[2] {
+        posterior[1] // voted long -> HMM mass on buy
+    } else {
+        posterior[2] // voted short -> HMM mass on sell
+    };
+    (trend_mass * agreement).clamp(0.0, 1.0)
+}
+
+/// Pure anomaly-scale math: map a raw anomaly score `a` ∈ [0,1] to a confidence
+/// multiplier ∈ [0,1]. Below `lo` → 1.0 (no penalty); ramps down linearly to
+/// `hi`; at/above `hi` → 0.0 (hard veto).
+pub fn anomaly_scale_from_score(a: f32, lo: f32, hi: f32) -> f32 {
+    if !(a.is_finite()) {
+        return 1.0;
+    }
+    if hi <= lo {
+        return if a >= hi { 0.0 } else { 1.0 };
+    }
+    let frac = ((a - lo) / (hi - lo)).clamp(0.0, 1.0);
+    (1.0 - frac).clamp(0.0, 1.0)
 }
 
 /// One prediction (one expert, one input row).

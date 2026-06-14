@@ -3,11 +3,12 @@ use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE, CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE,
-    CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderCancelOrderRequest, CTraderNewOrderRequest,
-    CTraderOpenApiJsonMessage, CTraderOpenApiTransport, build_account_auth_request,
-    build_application_auth_request, build_cancel_order_request, build_close_position_request,
-    build_new_order_request, expected_response_payload_type, is_ctrader_auth_token_error,
-    is_matching_open_api_response, parse_ctrader_error_payload_parts, parse_open_api_envelope,
+    CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderAmendPositionSltpRequest, CTraderCancelOrderRequest,
+    CTraderNewOrderRequest, CTraderOpenApiJsonMessage, CTraderOpenApiTransport,
+    build_account_auth_request, build_amend_position_sltp_request, build_application_auth_request,
+    build_cancel_order_request, build_close_position_request, build_new_order_request,
+    expected_response_payload_type, is_ctrader_auth_token_error, is_matching_open_api_response,
+    parse_ctrader_error_payload_parts, parse_open_api_envelope,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -26,6 +27,10 @@ pub enum CTraderExecutionRequest {
     NewOrder(Box<CTraderNewOrderRequest>),
     CancelOrder(CTraderCancelOrderRequest),
     ClosePosition(crate::app_services::ctrader_messages::CTraderClosePositionRequest),
+    /// Modify an open position's SL/TP (2026-06-10). Like the others the broker
+    /// answers with a `ProtoOAExecutionEvent`, so it rides the same retry +
+    /// idempotency path.
+    AmendPositionSltp(CTraderAmendPositionSltpRequest),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +231,7 @@ impl CTraderExecutionRequest {
             Self::NewOrder(request) => request.account_id,
             Self::CancelOrder(request) => request.account_id,
             Self::ClosePosition(request) => request.account_id,
+            Self::AmendPositionSltp(request) => request.account_id,
         }
     }
 
@@ -234,6 +240,9 @@ impl CTraderExecutionRequest {
             Self::NewOrder(request) => build_new_order_request(request, client_msg_id),
             Self::CancelOrder(request) => build_cancel_order_request(request, client_msg_id),
             Self::ClosePosition(request) => build_close_position_request(request, client_msg_id),
+            Self::AmendPositionSltp(request) => {
+                build_amend_position_sltp_request(request, client_msg_id)
+            }
         }
     }
 
@@ -272,6 +281,16 @@ impl CTraderExecutionRequest {
                 "close|acct={}|position_id={}|volume={}",
                 request.account_id, request.position_id, request.volume
             ),
+            Self::AmendPositionSltp(request) => format!(
+                "amend_pos|acct={}|position_id={}|sl={:?}|tp={:?}|gsl={:?}|tsl={:?}|trigger={:?}",
+                request.account_id,
+                request.position_id,
+                request.stop_loss,
+                request.take_profit,
+                request.guaranteed_stop_loss,
+                request.trailing_stop_loss,
+                request.stop_loss_trigger_method.map(|v| v.label())
+            ),
         }
     }
 }
@@ -305,14 +324,25 @@ impl ProductionCTraderExecutionBackend {
         )
     }
 
-    fn client_msg_id_for(phase: &str, fingerprint: &str, attempt: u32) -> String {
+    /// Derive the wire `clientMsgId` for a request from `(phase, fingerprint)`.
+    ///
+    /// **2026-06-10 idempotency fix:** the attempt number is deliberately NOT
+    /// part of the hash. cTrader (per the Spotware Open API guidance) treats the
+    /// `clientMsgId` as the de-duplication key; if a retry of the SAME order
+    /// carried a different id, a request that actually reached the broker but
+    /// whose response we lost (network timeout → socket reset → retry) would
+    /// execute a SECOND time. A stable id lets the broker collapse the retry
+    /// onto the original. Correlation is still unambiguous because every attempt
+    /// runs on a freshly re-authed socket, so there is only ever one in-flight
+    /// request per socket. The `attempt` counter is retained by the caller for
+    /// backoff/logging only.
+    fn client_msg_id_for(phase: &str, fingerprint: &str) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         phase.hash(&mut hasher);
         fingerprint.hash(&mut hasher);
-        attempt.hash(&mut hasher);
         format!("{phase}-{:016x}", hasher.finish())
     }
 
@@ -338,9 +368,13 @@ impl ProductionCTraderExecutionBackend {
         fingerprint: String,
         outcome: CTraderExecutionOutcome,
     ) {
-        if outcome.status == CTraderExecutionStatus::Failed {
-            return;
-        }
+        // **2026-06-10 idempotency fix:** cache ALL terminal broker outcomes,
+        // including `Failed` (a parsed broker REJECTION — execution_type 7/8).
+        // Previously Failed was dropped, so an accidental immediate re-submit of
+        // the same order (operator double-click) bypassed the 30s dedup window
+        // and hit the broker again. Transient network I/O failures never reach
+        // here — they are returned from the `Err` arm of send_message_and_wait,
+        // not parsed into an outcome — so genuine transient errors stay retryable.
         session.recent_submissions.insert(
             fingerprint,
             CachedExecutionOutcome {
@@ -375,10 +409,20 @@ impl ProductionCTraderExecutionBackend {
                 .context("failed to read cTrader open api response")?
             {
                 Message::Text(text) => {
+                    // 2026-06-10: a frame that is empty or unparseable is NOT a
+                    // reason to abort the whole request. Doing so dropped the
+                    // session and forced a full re-auth + order RETRY (the
+                    // double-submit path). A stray heartbeat / keep-alive / out-
+                    // of-band push between our send and the matching response is
+                    // expected — skip it and keep reading. The 30s socket read
+                    // timeout bounds this loop, so a genuinely silent broker
+                    // still surfaces as a timeout error, not a hang.
                     if text.trim().is_empty() {
-                        return Err(anyhow!("empty cTrader open api response"));
+                        continue;
                     }
-                    let envelope = parse_open_api_envelope(text.as_ref())?;
+                    let Some(envelope) = parse_envelope_or_skip(text.as_ref()) else {
+                        continue;
+                    };
                     if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
                         return Ok(text.to_string());
                     }
@@ -387,12 +431,19 @@ impl ProductionCTraderExecutionBackend {
                     }
                 }
                 Message::Binary(bytes) => {
-                    let text = String::from_utf8(bytes.to_vec())
-                        .context("failed to decode cTrader binary response")?;
+                    let Ok(text) = String::from_utf8(bytes.to_vec()) else {
+                        tracing::warn!(
+                            target: "neoethos_app::ctrader",
+                            "skipping non-UTF8 cTrader binary frame while awaiting response"
+                        );
+                        continue;
+                    };
                     if text.trim().is_empty() {
-                        return Err(anyhow!("empty cTrader open api response"));
+                        continue;
                     }
-                    let envelope = parse_open_api_envelope(&text)?;
+                    let Some(envelope) = parse_envelope_or_skip(&text) else {
+                        continue;
+                    };
                     if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
                         return Ok(text);
                     }
@@ -473,7 +524,7 @@ impl ProductionCTraderExecutionBackend {
         let app_auth = build_application_auth_request(
             &request.client_id,
             &request.client_secret,
-            Self::client_msg_id_for("app-auth", &fingerprint, 0),
+            Self::client_msg_id_for("app-auth", &fingerprint),
         );
         let account_auth = build_account_auth_request(
             request
@@ -481,7 +532,7 @@ impl ProductionCTraderExecutionBackend {
                 .parse::<i64>()
                 .context("cTrader execution account id must be numeric")?,
             &request.access_token,
-            Self::client_msg_id_for("account-auth", &fingerprint, 0),
+            Self::client_msg_id_for("account-auth", &fingerprint),
         );
 
         let socket = session
@@ -544,11 +595,12 @@ impl ProductionCTraderExecutionBackend {
                 continue;
             }
 
-            let order_message = request.request.to_message(&Self::client_msg_id_for(
-                "execute",
-                &fingerprint,
-                attempt,
-            ));
+            // Stable across retries (see client_msg_id_for): a retry of an order
+            // that already reached the broker collapses onto the original by id
+            // instead of executing a second time.
+            let order_message = request
+                .request
+                .to_message(&Self::client_msg_id_for("execute", &fingerprint));
             let socket = session
                 .socket
                 .as_mut()
@@ -623,6 +675,24 @@ impl ProductionCTraderExecutionBackend {
     }
 }
 
+/// Parse a cTrader JSON envelope, returning `None` (with a warning) instead of
+/// an error when the frame is malformed. Used by the response read loop so a
+/// single bad/out-of-band frame is skipped rather than aborting the request and
+/// forcing a session reset + order retry. **2026-06-10 defensive-parse fix.**
+fn parse_envelope_or_skip(frame: &str) -> Option<CTraderOpenApiJsonMessage> {
+    match parse_open_api_envelope(frame) {
+        Ok(envelope) => Some(envelope),
+        Err(err) => {
+            tracing::warn!(
+                target: "neoethos_app::ctrader",
+                error = %err,
+                "skipping unparseable cTrader frame while awaiting a response"
+            );
+            None
+        }
+    }
+}
+
 impl CTraderExecutionBackend for ProductionCTraderExecutionBackend {
     fn execute(&self, request: &CTraderExecutionRuntimeRequest) -> Result<CTraderExecutionOutcome> {
         let outcome = Self::execute_via_session(request)?;
@@ -654,6 +724,7 @@ fn request_action_label(request: &CTraderExecutionRequest) -> &'static str {
         CTraderExecutionRequest::NewOrder(_) => "new_order",
         CTraderExecutionRequest::CancelOrder(_) => "cancel_order",
         CTraderExecutionRequest::ClosePosition(_) => "close_position",
+        CTraderExecutionRequest::AmendPositionSltp(_) => "amend_position_sltp",
     }
 }
 
@@ -1052,6 +1123,15 @@ fn validate_execution_outcome(
             if outcome.position_id != Some(inner.position_id) {
                 anyhow::bail!(
                     "cTrader close-position response position mismatch: expected {}, got {:?}",
+                    inner.position_id,
+                    outcome.position_id
+                );
+            }
+        }
+        CTraderExecutionRequest::AmendPositionSltp(inner) => {
+            if outcome.position_id != Some(inner.position_id) {
+                anyhow::bail!(
+                    "cTrader amend-position-SLTP response position mismatch: expected {}, got {:?}",
                     inner.position_id,
                     outcome.position_id
                 );

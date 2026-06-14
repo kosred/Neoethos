@@ -1,6 +1,6 @@
 [package]
 name = "neoethos-cli"
-version = "0.4.40"
+version = "0.4.99"
 edition.workspace = true
 # SPDX dual-license matches the repo-root LICENSE file. Required by both
 # cargo-deb (writes Debian `control` License:) and cargo-generate-rpm.
@@ -12,13 +12,27 @@ readme = "../../README.md"
 
 [features]
 default = []
-gpu = ["neoethos-search/gpu", "neoethos-models/neuro-evolution-gpu", "neoethos-models/statistical-gpu"]
+# GPU features MIRROR neoethos-app EXACTLY. Discovery/training/eval MUST run
+# identically whether invoked from the UI/backend or the CLI — no capability may
+# differ between front-ends. So `--features gpu-vulkan` (or gpu-nvidia/gpu-rocm)
+# builds the CLI with the SAME cubecl-wgpu / CUDA GPU eval the app uses; the
+# headless/VPS path is no longer silently CPU-only.
+gpu = ["gpu-nvidia"]
+gpu-nvidia = ["neoethos-models/gpu-cuda", "neoethos-search/gpu-cuda"]
+gpu-vulkan = ["neoethos-models/gpu-vulkan", "neoethos-search/gpu-vulkan"]
+gpu-rocm = ["neoethos-models/gpu-rocm", "neoethos-search/gpu-rocm"]
+gpu-apple = ["gpu-vulkan"]
 
 [dependencies]
 neoethos-core = { path = "../neoethos-core" }
 neoethos-data = { path = "../neoethos-data" }
 neoethos-models = { path = "../neoethos-models", features = ["tree-models", "pure-rust-ml"] }
 neoethos-search = { path = "../neoethos-search" }
+# The autonomous-trader engine. The CLI `trader-replay` command drives the SAME
+# engine the app does (parity) over real on-disk history for an offline dry-run.
+# `ml-blend` enables the genes×ensemble blend path (`trader-replay --blend`); the
+# cli already builds neoethos-models so this is only a feature flag, no new cost.
+neoethos-trader = { path = "../neoethos-trader", features = ["ml-blend"] }
 anyhow = "1.0"
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }

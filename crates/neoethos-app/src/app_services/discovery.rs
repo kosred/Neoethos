@@ -916,7 +916,7 @@ pub fn start_discovery_job(
             counters: requested_discovery_counters(&request)
                 .into_iter()
                 .chain([
-                    ("feature_rows".to_string(), features.data.nrows() as u64),
+                    ("feature_rows".to_string(), features.n_samples() as u64),
                     ("feature_columns".to_string(), features.names.len() as u64),
                 ])
                 .collect(),
@@ -926,14 +926,14 @@ pub fn start_discovery_job(
                 JobEventLevel::Info,
                 format!(
                     "prepared feature frame {}x{} for {}",
-                    features.data.nrows(),
+                    features.n_samples(),
                     features.names.len(),
                     request.symbol
                 ),
             ),
             summary: format!(
                 "prepared {} rows x {} columns for discovery",
-                features.data.nrows(),
+                features.n_samples(),
                 features.names.len()
             ),
             log_path: Some(canonical_log_path().display().to_string()),
@@ -977,11 +977,12 @@ pub fn start_discovery_job(
                 vol.truncate(wfv_bound);
             }
 
-            let wfv_feat_bound = wfv_bound.min(features.data.nrows());
+            let wfv_feat_bound = wfv_bound.min(features.n_samples());
             let mut is_features = features.clone();
             is_features.timestamps.truncate(wfv_feat_bound);
-            let rows = features.data.nrows().min(wfv_feat_bound);
-            is_features.data = features.data.slice(ndarray::s![..rows, ..]).to_owned();
+            let rows = features.n_samples().min(wfv_feat_bound);
+            is_features.data =
+                neoethos_data::FeatureData::InMemory(features.sample_window(0, rows));
 
             let resolved_config = search_request.config.clone().apply_mode_overrides();
             let mut result = run_discovery_cycle_with_progress(
@@ -1040,16 +1041,15 @@ pub fn start_discovery_job(
                     close: base_ohlcv.close[wfv_bound..].to_vec(),
                     volume: base_ohlcv.volume.as_ref().map(|v| v[wfv_bound..].to_vec()),
                 };
-                let tail_feat_start = wfv_bound.min(features.data.nrows());
-                let tail_feat_rows = features.data.nrows().saturating_sub(tail_feat_start);
+                let tail_feat_start = wfv_bound.min(features.n_samples());
+                let tail_feat_rows = features.n_samples().saturating_sub(tail_feat_start);
                 if tail_feat_rows > 0 && !tail_ohlcv.close.is_empty() {
                     let tail_features = neoethos_data::FeatureFrame {
                         timestamps: features.timestamps[tail_feat_start..].to_vec(),
                         names: features.names.clone(),
-                        data: features
-                            .data
-                            .slice(ndarray::s![tail_feat_start.., ..])
-                            .to_owned(),
+                        data: neoethos_data::FeatureData::InMemory(
+                            features.sample_window(tail_feat_start, features.n_samples()),
+                        ),
                     };
                     match compute_discovery_forward_test_artifacts(
                         &result.portfolio,
@@ -1107,6 +1107,26 @@ pub fn start_discovery_job(
                 std::fs::create_dir_all(parent)?;
             }
             save_portfolio_json(&out_path, &result)?;
+            // Phase 4 (2026-06-04): self-describing live portfolio artifact for
+            // the autonomous trader (parity with the CLI discover emit).
+            // Additive + non-fatal.
+            {
+                let live_path = out_path.with_extension("live_portfolio.json");
+                if let Err(err) = neoethos_search::save_live_portfolio_json(
+                    &live_path,
+                    &search_request.symbol,
+                    &search_request.base_tf,
+                    &resolved_config.higher_timeframes,
+                    &result,
+                ) {
+                    tracing::warn!(
+                        target: "neoethos_app::discovery",
+                        error = %err,
+                        path = %live_path.display(),
+                        "save_live_portfolio_json failed (non-fatal)"
+                    );
+                }
+            }
             save_discovery_profile_json(
                 out_path.with_extension("profile.json"),
                 &resolved_config,

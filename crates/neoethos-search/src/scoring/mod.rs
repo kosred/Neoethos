@@ -133,10 +133,11 @@ mod tests {
     }
 
     #[test]
-    fn scoring_version_constant_starts_at_one() {
-        // The pre-unification behaviour these named functions
-        // replicate is version 1. Persisted DiscoveryRunProfile
-        // artifacts will default to this until Phase C bumps to 2.
-        assert_eq!(SCORING_VERSION_CURRENT.0, 1);
+    fn scoring_version_is_three_after_consistency_oriented_ga() {
+        // 2026-06-06: bumped 2→3 when `ga_fitness` became CONSISTENT-monthly-return
+        // oriented (dominant reward = monthly_target_hit_rate in metrics[7]; total-net
+        // demoted). v2 (total-net) genes were lumpy and failed the window gate.
+        // Artifacts from v1/v2 runs are tagged accordingly and NOT directly comparable.
+        assert_eq!(SCORING_VERSION_CURRENT.0, 3);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "neoethos-core"
-version = "0.4.40"
+version = "0.4.99"
 edition.workspace = true
 
 [dependencies]

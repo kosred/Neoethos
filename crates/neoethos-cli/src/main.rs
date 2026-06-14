@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use neoethos_core::logging::{setup_logging, write_subsystem_record};
 use neoethos_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use std::path::Path;
@@ -79,11 +79,17 @@ fn main() -> Result<()> {
         "train" => cmd_train(&args[2..]),
         "search" => cmd_search(&args[2..]),
         "discover" => cmd_discover(&args[2..]),
+        "discovery-promote-weekly" => cmd_discovery_promote_weekly(&args[2..]),
+        "trader-replay" => cmd_trader_replay(&args[2..]),
+        "forward-test" => cmd_forward_test(&args[2..]),
+        "blend-test" => cmd_blend_test(&args[2..]),
         "batch-discover" => cmd_batch_discover(&args[2..]),
         "migrate-data" => cmd_migrate_data(&args[2..]),
+        "slice-dataset" => cmd_slice_dataset(&args[2..]),
         "import" => cmd_import(&args[2..]),
         "config" => cmd_config(&args[2..]),
         "auto-loop" => cmd_auto_loop(&args[2..]),
+        "schedule" => cmd_schedule(&args[2..]),
         "stop-target" => cmd_stop_target(&args[2..]),
         "wizard" => cmd_wizard(&args[2..]),
         "setup" => cmd_setup(&args[2..]),
@@ -156,6 +162,136 @@ fn cmd_load(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `slice-dataset --symbol EURUSD --base M1 --root <SRC> --out-root <DST>
+///                --from-date 2018-01-01 --to-date 2021-01-01`
+///
+/// Additive, NON-destructive: reads the source `(symbol, base)` Vortex
+/// dataset from `<SRC>`, keeps only the bars whose timestamp falls in the
+/// half-open range `[from-date, to-date)` (UTC), and writes the filtered
+/// subset to `<DST>/symbol=<SYM>/timeframe=<TF>/data.vortex` in the SAME
+/// canonical Vortex layout the loader reads — so a subsequent
+/// `discover --root <DST> --symbol <SYM> --base <TF>` runs on the slice.
+///
+/// Purpose: OOM-safe walk-forward. A multi-year M1 dataset that overflows
+/// RAM on a weak machine can be chopped into e.g. 3-year windows that each
+/// fit, discovered independently, and stitched by the operator.
+///
+/// Reuses the exact discovery IO path:
+///   - reader: `neoethos_data::load_symbol_timeframe` (same as `discover`)
+///   - date→row mapping + filter: `neoethos_data::slice_ohlcv_by_date_range_ms`
+///   - writer: `neoethos_data::write_symbol_timeframe_vortex`
+///     (canonical `write_ohlcv_vortex` under the hood)
+///
+/// Fails loud when the source is missing/empty or the range yields 0 rows.
+fn cmd_slice_dataset(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?;
+    let root = parse_root(args, settings.as_ref());
+
+    let out_root = parse_flag(args, "--out-root")
+        .or_else(|| parse_flag(args, "--out"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "slice-dataset requires --out-root <DST> (the new root dir to write the slice into)"
+            )
+        })?;
+
+    let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
+    if symbol.is_empty() {
+        anyhow::bail!(
+            "slice-dataset: no --symbol supplied and config.yaml could not provide one — \
+             pass --symbol explicitly (e.g. --symbol EURUSD)"
+        );
+    }
+    // `--base` is the primary name (matches discover/prepare); `--timeframe`
+    // is accepted as an alias for parity with `load`.
+    let base = parse_flag(args, "--base")
+        .or_else(|| parse_flag(args, "--timeframe"))
+        .unwrap_or_else(|| default_base_tf(settings.as_ref()));
+    if base.is_empty() {
+        anyhow::bail!(
+            "slice-dataset: no --base supplied and config.yaml could not provide one — \
+             pass --base explicitly (e.g. --base M1)"
+        );
+    }
+
+    let from_date = parse_flag(args, "--from-date").ok_or_else(|| {
+        anyhow::anyhow!("slice-dataset requires --from-date YYYY-MM-DD (inclusive lower bound, UTC)")
+    })?;
+    let to_date = parse_flag(args, "--to-date").ok_or_else(|| {
+        anyhow::anyhow!("slice-dataset requires --to-date YYYY-MM-DD (exclusive upper bound, UTC)")
+    })?;
+
+    let from_ms = parse_ymd_to_epoch_ms(&from_date, "--from-date")?;
+    let to_ms = parse_ymd_to_epoch_ms(&to_date, "--to-date")?;
+    if to_ms <= from_ms {
+        anyhow::bail!(
+            "slice-dataset: --to-date ({to_date}) must be strictly after --from-date ({from_date}) \
+             (the range is half-open [from, to))"
+        );
+    }
+
+    // Reader — identical to the `discover` command's load path.
+    let source = neoethos_data::load_symbol_timeframe(&root, &symbol, &base).map_err(|err| {
+        anyhow::anyhow!("slice-dataset: failed to load source {symbol} {base} from {root}: {err}")
+    })?;
+    let source_rows = source.len();
+    if source_rows == 0 {
+        anyhow::bail!(
+            "slice-dataset: source {symbol} {base} at {root} is empty — nothing to slice"
+        );
+    }
+
+    // Date→row mapping + half-open filter (shared data-crate helper).
+    let (slice, span) = neoethos_data::slice_ohlcv_by_date_range_ms(&source, from_ms, to_ms)
+        .map_err(|err| anyhow::anyhow!("slice-dataset: {err}"))?;
+    let kept_rows = slice.len();
+    if kept_rows == 0 {
+        anyhow::bail!(
+            "slice-dataset: 0 rows of {symbol} {base} fall in [{from_date}, {to_date}) — \
+             the requested window does not overlap the source data \
+             (source has {source_rows} rows). Widen the date range or check the dataset."
+        );
+    }
+
+    // Writer — canonical Vortex layout, byte-compatible with the loader.
+    let written = neoethos_data::write_symbol_timeframe_vortex(&out_root, &symbol, &base, &slice)
+        .map_err(|err| {
+            anyhow::anyhow!("slice-dataset: failed to write slice to {out_root}: {err}")
+        })?;
+
+    let (first_ms, last_ms) = span.expect("span is Some when kept_rows > 0");
+    println!(
+        "slice-dataset {symbol} {base}: [{from_date}, {to_date})  source rows={source_rows}  kept rows={kept_rows}"
+    );
+    println!(
+        "  kept span: {} .. {}",
+        format_epoch_ms_date(first_ms),
+        format_epoch_ms_date(last_ms)
+    );
+    println!("  written: {}", written.display());
+    Ok(())
+}
+
+/// Parse a `YYYY-MM-DD` date as midnight UTC and return epoch milliseconds.
+/// Fails loud with the offending flag name when the string isn't a valid date.
+fn parse_ymd_to_epoch_ms(date: &str, flag: &str) -> Result<i64> {
+    let naive = chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d").map_err(|err| {
+        anyhow::anyhow!("slice-dataset: {flag} '{date}' is not a valid YYYY-MM-DD date: {err}")
+    })?;
+    let dt = naive.and_hms_opt(0, 0, 0).ok_or_else(|| {
+        anyhow::anyhow!("slice-dataset: {flag} '{date}' could not be set to midnight")
+    })?;
+    Ok(dt.and_utc().timestamp_millis())
+}
+
+/// Render an epoch-ms timestamp as a `YYYY-MM-DD` UTC date for the kept-span
+/// summary line.
+fn format_epoch_ms_date(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| format!("ms:{ms}"))
+}
+
 fn cmd_symbols(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?;
     let root = parse_root(args, settings.as_ref());
@@ -191,8 +327,8 @@ fn cmd_features(args: &[String]) -> Result<()> {
         "Features {} {} -> rows={}, cols={}",
         symbol,
         timeframe,
-        features.data.nrows(),
-        features.data.ncols()
+        features.n_samples(),
+        features.n_features()
     );
     Ok(())
 }
@@ -202,8 +338,8 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
     let root = parse_root(args, settings.as_ref());
     let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
     let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
-    let higher =
-        parse_flag(args, "--higher").unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref()));
+    let higher = parse_flag(args, "--higher")
+        .unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref(), &base));
     let higher_list: Vec<String> = higher
         .split(',')
         .filter(|s| !s.is_empty())
@@ -222,8 +358,416 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
         "Prepared {} base={} rows={} cols={}",
         symbol,
         base,
-        features.data.nrows(),
-        features.data.ncols()
+        features.n_samples(),
+        features.n_features()
+    );
+    Ok(())
+}
+
+/// `discovery-promote-weekly [--symbol X --tf Y] [--cache-dir ...] [--portfolio ...]`
+/// — the weekly-refresh promotion step of the search-memory feature.
+///
+/// Loads THIS run's discovery ledger (`<cache-dir>/{SYMBOL}_{TF}.discovery_ledger.json`,
+/// written by every discovery run) and merges its recorded genes into the live
+/// portfolio under the **additive** policy: a ledger gene is "new" when its
+/// canonical signature hash is not already present among the live portfolio's
+/// genes; existing genes are always carried. Prints a growth summary
+/// ("added N new, carried M, total K").
+///
+/// SCOPE NOTE (deferred — see report): the ledger records gene *signatures*
+/// (hash + indicator names + SMC flags + fitness), not the full `Gene`
+/// (indices/weights). The live portfolio stores full genes. So we can detect
+/// which ledger genes are NEW relative to the live portfolio and carry the
+/// existing full genes forward, but we cannot synthesize full genes for ledger-
+/// only records here — adding them as live genes would require the discovery
+/// run to also persist full genes per ledger entry (a future enhancement). We
+/// therefore write a merged **growth-summary JSON** next to the portfolio and
+/// report the new-vs-carried breakdown.
+fn cmd_discovery_promote_weekly(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?;
+    let ledger_cfg = settings
+        .as_ref()
+        .map(|s| s.models.discovery_ledger.clone())
+        .unwrap_or_default();
+
+    let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
+    let tf = parse_flag(args, "--tf")
+        .or_else(|| parse_flag(args, "--base"))
+        .unwrap_or_else(|| default_base_tf(settings.as_ref()));
+    let cache_dir = parse_flag(args, "--cache-dir").unwrap_or(ledger_cfg.cache_dir);
+
+    let ledger = neoethos_search::load_prior_ledger(&cache_dir, &symbol, &tf).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no discovery ledger found at {} — run a discovery for {} {} first \
+             (the ledger is written automatically when models.discovery_ledger.enabled = true)",
+            neoethos_search::ledger_path(&cache_dir, &symbol, &tf).display(),
+            symbol,
+            tf
+        )
+    })?;
+
+    // Ledger genes recorded this run (portfolio + archive), de-duplicated by hash.
+    let mut ledger_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for rec in ledger.portfolio.iter().chain(ledger.archive.iter()) {
+        ledger_hashes.insert(rec.hash.clone());
+    }
+
+    // The live portfolio whose full genes we carry. Default path mirrors the
+    // discover command's `{out}.live_portfolio.json`, keyed off the ledger's
+    // cache layout; override with --portfolio.
+    let portfolio_path = parse_flag(args, "--portfolio").unwrap_or_else(|| {
+        format!("{}/{}_{}.live_portfolio.json", cache_dir, symbol, tf)
+    });
+
+    let mut existing_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let existing_count = match neoethos_search::load_live_portfolio_json(&portfolio_path) {
+        Ok(artifact) => {
+            for gene in &artifact.genes {
+                existing_hashes
+                    .insert(neoethos_search::genetic::gene_signature_hash(gene).to_string());
+            }
+            artifact.genes.len()
+        }
+        Err(_) => {
+            println!(
+                "(no existing live portfolio at {} — treating all ledger genes as new)",
+                portfolio_path
+            );
+            0
+        }
+    };
+
+    let new_genes: Vec<&neoethos_search::GeneRecord> = ledger
+        .portfolio
+        .iter()
+        .chain(ledger.archive.iter())
+        .filter(|rec| !existing_hashes.contains(&rec.hash))
+        .collect();
+    // Distinct new hashes (a hash could appear in both portfolio + archive).
+    let new_hashes: std::collections::HashSet<&String> =
+        new_genes.iter().map(|r| &r.hash).collect();
+    let added = new_hashes.len();
+    let carried = existing_count;
+    let total = carried + added;
+
+    // Write a merged growth-summary JSON next to the portfolio so the weekly run
+    // leaves an auditable record of what grew.
+    #[derive(serde::Serialize)]
+    struct PromotionSummary<'a> {
+        symbol: &'a str,
+        tf: &'a str,
+        policy: &'a str,
+        carried: usize,
+        added: usize,
+        total: usize,
+        new_genes: Vec<&'a neoethos_search::GeneRecord>,
+    }
+    let summary_path = format!("{}/{}_{}.weekly_promotion.json", cache_dir, symbol, tf);
+    let summary = PromotionSummary {
+        symbol: &symbol,
+        tf: &tf,
+        policy: &ledger_cfg.promotion_policy,
+        carried,
+        added,
+        total,
+        new_genes: new_genes.clone(),
+    };
+    if let Err(err) =
+        neoethos_core::storage::json::write_json_atomic(&summary_path, &summary)
+    {
+        tracing::warn!(
+            target: "neoethos_cli::discovery_promote_weekly",
+            error = %err,
+            path = %summary_path,
+            "failed to write weekly-promotion summary (non-fatal)"
+        );
+    }
+
+    println!(
+        "discovery-promote-weekly {} {} (policy={}): added {} new, carried {}, total {}",
+        symbol, tf, ledger_cfg.promotion_policy, added, carried, total
+    );
+    println!("  ledger: {}", neoethos_search::ledger_path(&cache_dir, &symbol, &tf).display());
+    println!("  summary written: {}", summary_path);
+    if added > 0 {
+        println!("  new strategies this run:");
+        for rec in new_genes.iter().take(20) {
+            let flags = if rec.smc_flags.is_empty() {
+                "-".to_string()
+            } else {
+                rec.smc_flags.clone()
+            };
+            println!(
+                "    fitness={:.4} sharpe={:.3} trades={:.0} smc=[{}] indicators={:?}",
+                rec.fitness, rec.sharpe, rec.trades, flags, rec.indicator_names
+            );
+        }
+        if new_genes.len() > 20 {
+            println!("    ... and {} more", new_genes.len() - 20);
+        }
+    }
+    Ok(())
+}
+
+/// `trader-replay --symbol EURUSD --base M1 [--root data]` — offline dry-run of
+/// the autonomous-trader engine over real on-disk history. Drives the SAME
+/// `neoethos_trader` engine the app's `/autonomous/replay` endpoint does (UI↔CLI
+/// parity) with ZERO broker calls, and prints the resulting EngineStats. Symbol
+/// and base resolve through the shared `SystemConfig` resolvers, same as
+/// `discover`.
+fn cmd_trader_replay(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?;
+    let root = parse_root(args, settings.as_ref());
+    // With --portfolio <live_portfolio.json>, run the REAL discovered genes
+    // (symbol/base come from the artifact). Without it, run the momentum stub on
+    // --symbol/--base. Both drive the SAME engine (parity with /autonomous/replay).
+    let stats = if let Some(portfolio) = parse_flag(args, "--portfolio") {
+        // `--blend off|confirm|scale` (default off). With confirm/scale the
+        // discovered genes' size is gated by the per-(symbol,base_tf)
+        // SoftVotingEnsemble loaded from `--models-root` (default `models`) —
+        // gene-dominant meta-labeling; ML never flips direction. `off` is
+        // byte-identical to the gene-only path.
+        let blend_arg = parse_flag(args, "--blend").unwrap_or_else(|| "off".to_string());
+        let mode = match blend_arg.trim().to_ascii_lowercase().as_str() {
+            "off" | "genes" | "genes_only" | "genesonly" => neoethos_trader::BlendMode::GenesOnly,
+            "confirm" | "mlconfirm" => neoethos_trader::BlendMode::MlConfirm,
+            "scale" | "mlscale" => neoethos_trader::BlendMode::MlScale,
+            other => anyhow::bail!(
+                "--blend must be off|confirm|scale (got '{other}')"
+            ),
+        };
+        if matches!(mode, neoethos_trader::BlendMode::GenesOnly) {
+            neoethos_trader::replay_portfolio_from_dir(
+                &root,
+                &portfolio,
+                neoethos_trader::EngineConfig::default(),
+            )?
+        } else {
+            let models_root = parse_flag(args, "--models-root").unwrap_or_else(|| "models".to_string());
+            let mut blend = neoethos_trader::BlendConfig {
+                mode,
+                ..Default::default()
+            };
+            if let Some(f) = parse_flag(args, "--gate-floor").and_then(|v| v.parse::<f64>().ok()) {
+                blend.gate_floor = f.clamp(0.0, 1.0);
+            }
+            if let Some(v) = parse_flag(args, "--veto-below").and_then(|v| v.parse::<f64>().ok()) {
+                blend.veto_below = v.clamp(0.0, 1.0);
+            }
+            println!(
+                "  blend mode={blend_arg} models_root={models_root} gate_floor={:.2} veto_below={:.2}",
+                blend.gate_floor, blend.veto_below
+            );
+            neoethos_trader::replay_blend_from_dir(
+                &root,
+                &portfolio,
+                &models_root,
+                neoethos_trader::EngineConfig::default(),
+                blend,
+            )?
+        }
+    } else {
+        let symbol =
+            parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
+        let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
+        if symbol.trim().is_empty() || base.trim().is_empty() {
+            anyhow::bail!(
+                "trader-replay needs --symbol and --base (or a reachable config.yaml with \
+                 system.symbol / system.base_timeframe), or pass \
+                 --portfolio <live_portfolio.json> to run the discovered genes"
+            );
+        }
+        neoethos_trader::replay_symbol_from_dir(
+            &root,
+            &symbol,
+            &base,
+            neoethos_trader::EngineConfig::default(),
+        )?
+    };
+    println!("trader-replay (offline dry-run, zero broker calls):");
+    println!(
+        "  bars={} signals={} intents={} executed={} blocked={}",
+        stats.bars_processed,
+        stats.signals_evaluated,
+        stats.intents_emitted,
+        stats.intents_executed,
+        stats.intents_blocked
+    );
+    println!(
+        "  positions: opened={} closed={} open_now={}",
+        stats.positions_opened, stats.positions_closed, stats.open_positions
+    );
+    println!(
+        "  realized_pnl={:.5} equity={:.2}",
+        stats.realized_pnl, stats.equity
+    );
+    Ok(())
+}
+
+/// `forward-test --portfolio <live_portfolio.json> [--root data] [--oos-from 2023-01-01]`
+/// — FAITHFUL out-of-sample test: runs each gene's REAL strategy (its own SL/TP +
+/// risk-based confidence-scaled sizing + full costs) via the discovery backtest
+/// engine on the holdout window, features computed warm over the FULL series then
+/// sliced to [oos-from, end). Reports per-gene IS-vs-OOS + Walk-Forward Efficiency.
+fn cmd_forward_test(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?;
+    let root = parse_root(args, settings.as_ref());
+    let config = settings
+        .as_ref()
+        .map(neoethos_search::DiscoveryConfig::from_settings)
+        .unwrap_or_default();
+    let portfolio = parse_flag(args, "--portfolio").ok_or_else(|| {
+        anyhow::anyhow!("forward-test requires --portfolio <live_portfolio.json>")
+    })?;
+    let oos_from = parse_flag(args, "--oos-from").unwrap_or_else(|| "2023-01-01".to_string());
+    let oos_ms = parse_ymd_to_epoch_ms(&oos_from, "--oos-from")?;
+
+    let results = neoethos_search::faithful_oos_eval(
+        &config,
+        std::path::Path::new(&root),
+        std::path::Path::new(&portfolio),
+        oos_ms,
+    )?;
+
+    println!(
+        "FAITHFUL OOS forward-test (gene real SL/TP + risk sizing; holdout from {oos_from}):"
+    );
+    println!(
+        "{:<16}{:>5}{:>5}{:>8}{:>8}{:>8}{:>8}{:>10}{:>7}{:>8}  verdict",
+        "gene", "#ind", "#smc", "IS_PF", "IS_DD%", "OOS_PF", "OOS_DD%", "OOS_net", "OOS_tr", "WFE_shp"
+    );
+    let mut survives = 0usize;
+    for r in &results {
+        let net = r.oos.net_profit;
+        let oos_dd = r.oos.max_drawdown * 100.0;
+        let is_survivor = r.oos.trade_count >= 30
+            && r.wfe_sharpe >= 0.5
+            && r.oos.profit_factor >= 1.3
+            && oos_dd <= 10.0
+            && net > 0.0;
+        let verdict = if r.oos.trade_count < 30 {
+            "DEAD (<30 tr)"
+        } else if is_survivor {
+            "SURVIVES"
+        } else if net > 0.0 && r.oos.profit_factor >= 1.0 {
+            "weak+"
+        } else {
+            "FAILS-OOS"
+        };
+        if is_survivor {
+            survives += 1;
+        }
+        println!(
+            "{:<16}{:>5}{:>5}{:>8.2}{:>8.1}{:>8.2}{:>8.1}{:>10.0}{:>7}{:>8.2}  {}",
+            r.strategy_id,
+            r.n_indicators,
+            r.n_smc,
+            r.is_profit_factor,
+            r.is_max_drawdown * 100.0,
+            r.oos.profit_factor,
+            oos_dd,
+            net,
+            r.oos.trade_count,
+            r.wfe_sharpe,
+            verdict
+        );
+    }
+    println!(
+        "SURVIVES={}/{} (WFE_sharpe>=0.5, OOS PF>=1.3, OOS DD<=10%, >=30 trades, net>0)",
+        survives,
+        results.len()
+    );
+    Ok(())
+}
+
+/// `blend-test --portfolio <live_portfolio.json> --models-root <models_oos_locked>
+/// [--root data] [--gate-floor 0.34] [--veto-below 0.15]`
+///
+/// Stage 4 — re-validate the gene↔ML blend on the NETTED portfolio the live
+/// engine actually trades (verdict #1: the trader nets the genes via
+/// combine_gene_signals, so we compare on the netted signal, not per-gene). Runs
+/// the SAME trader engine three ways — GenesOnly (baseline) vs MlConfirm vs
+/// MlScale — over identical bars, and prints a paired EngineStats table + a
+/// non-degradation verdict. The blend ships ON only if it does NOT degrade
+/// genes-only.
+///
+/// IMPORTANT: point `--models-root` at a LEAK-FREE root (`cli train --oos-from
+/// <date> --models-dir models_oos_locked`), else the ensemble has seen the
+/// evaluation window and the comparison is contaminated. Note the trader engine
+/// uses a uniform SL/TP model (decision.rs), so the absolute P&L is a simplified
+/// figure — but a GenesOnly-vs-blend comparison on the SAME engine is a valid
+/// apples-to-apples accept/reject (only the gated signal differs). The rigorous
+/// per-gene faithful number remains `forward-test`.
+fn cmd_blend_test(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?;
+    let root = parse_root(args, settings.as_ref());
+    let portfolio = parse_flag(args, "--portfolio").ok_or_else(|| {
+        anyhow::anyhow!("blend-test requires --portfolio <live_portfolio.json>")
+    })?;
+    let models_root =
+        parse_flag(args, "--models-root").unwrap_or_else(|| "models_oos_locked".to_string());
+    let gate_floor = parse_flag(args, "--gate-floor")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.34)
+        .clamp(0.0, 1.0);
+    let veto_below = parse_flag(args, "--veto-below")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.15)
+        .clamp(0.0, 1.0);
+
+    let run = |mode| -> Result<neoethos_trader::EngineStats> {
+        neoethos_trader::replay_blend_from_dir(
+            &root,
+            &portfolio,
+            &models_root,
+            neoethos_trader::EngineConfig::default(),
+            neoethos_trader::BlendConfig {
+                mode,
+                gate_floor,
+                veto_below,
+            },
+        )
+    };
+    let genes = run(neoethos_trader::BlendMode::GenesOnly)?;
+    let confirm = run(neoethos_trader::BlendMode::MlConfirm)?;
+    let scale = run(neoethos_trader::BlendMode::MlScale)?;
+
+    println!(
+        "blend-test (NETTED trader engine, models_root={models_root}, gate_floor={gate_floor:.2}, veto_below={veto_below:.2}):"
+    );
+    let row = |name: &str, s: &neoethos_trader::EngineStats| {
+        println!(
+            "  {name:<8} pnl={:>12.5} equity={:>12.2} opened={:>5} closed={:>5} blocked={:>5} signals={:>6}",
+            s.realized_pnl,
+            s.equity,
+            s.positions_opened,
+            s.positions_closed,
+            s.intents_blocked,
+            s.signals_evaluated
+        );
+    };
+    row("genes", &genes);
+    row("confirm", &confirm);
+    row("scale", &scale);
+
+    // Non-degradation accept gate vs the genes-only baseline (same engine/bars).
+    let verdict = |name: &str, s: &neoethos_trader::EngineStats| {
+        let pnl_ok = s.realized_pnl >= genes.realized_pnl - 1e-9;
+        let eq_ok = s.equity >= genes.equity - 1e-9;
+        let traded = s.positions_opened >= 1;
+        if pnl_ok && eq_ok && traded {
+            println!("  -> {name}: ACCEPT (>= genes-only on realized_pnl AND equity, still trades)");
+        } else if !traded {
+            println!("  -> {name}: REJECT (blend vetoed every trade)");
+        } else {
+            println!("  -> {name}: REJECT (degrades vs genes-only)");
+        }
+    };
+    verdict("confirm", &confirm);
+    verdict("scale", &scale);
+    println!(
+        "NOTE: relative comparison on the trader's uniform-SL/TP engine; ensure --models-root is \
+         leak-free (train --oos-from). Per-gene faithful numbers: `forward-test`."
     );
     Ok(())
 }
@@ -271,11 +815,39 @@ fn cmd_train(args: &[String]) -> Result<()> {
         let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| settings.system.symbol.clone());
         let base =
             parse_flag(args, "--base").unwrap_or_else(|| settings.system.base_timeframe.clone());
-        let models_dir = parse_flag(args, "--models-dir").unwrap_or_else(|| "models".to_string());
-        let orchestrator = neoethos_models::TrainingOrchestrator::new(
+        // Stage 4 leak-free OOS-locked retrain: `--oos-from YYYY-MM-DD` truncates
+        // each symbol's training to rows strictly before the cutoff (minus the
+        // triple-barrier purge), so the experts can be used in an OOS blend
+        // validation on [cutoff, end) without look-ahead. The locked experts MUST
+        // go to a SEPARATE root so production `models/` is never overwritten.
+        let oos_ms = match parse_flag(args, "--oos-from") {
+            Some(d) => Some(parse_ymd_to_epoch_ms(&d, "--oos-from")?),
+            None => None,
+        };
+        let default_models_dir = if oos_ms.is_some() {
+            "models_oos_locked"
+        } else {
+            "models"
+        };
+        let models_dir =
+            parse_flag(args, "--models-dir").unwrap_or_else(|| default_models_dir.to_string());
+        if oos_ms.is_some() {
+            let norm = models_dir.replace('\\', "/");
+            if models_dir == "models" || norm.ends_with("/models") {
+                anyhow::bail!(
+                    "--oos-from trains LEAK-LOCKED experts; refusing to write them to the \
+                     production '{models_dir}' root. Use a distinct --models-dir \
+                     (e.g. models_oos_locked)."
+                );
+            }
+        }
+        let mut orchestrator = neoethos_models::TrainingOrchestrator::new(
             settings,
             std::path::PathBuf::from(models_dir),
         );
+        if let Some(ms) = oos_ms {
+            orchestrator = orchestrator.with_oos_lock_from_ms(ms);
+        }
 
         orchestrator.train_symbol(&symbol, &base)?;
 
@@ -320,8 +892,8 @@ fn cmd_search(args: &[String]) -> Result<()> {
     let root = parse_root(args, settings.as_ref());
     let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
     let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
-    let higher =
-        parse_flag(args, "--higher").unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref()));
+    let higher = parse_flag(args, "--higher")
+        .unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref(), &base));
     let genes: usize = parse_flag(args, "--genes")
         .and_then(|v| v.parse().ok())
         .unwrap_or(defaults.population);
@@ -403,7 +975,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
         let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
         let higher = parse_flag(args, "--higher")
-            .unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref()));
+            .unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref(), &base));
         // F-304 fix (2026-05-28): bind the account currency for the
         // cost model. Resolution order:
         //   1. `--account-currency` CLI flag (operator-explicit)
@@ -454,7 +1026,29 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             .collect();
         let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
 
-        let dataset = neoethos_data::load_symbol_dataset(&root, &symbol)?;
+        // agent 2026-06-05 perf fix: load ONLY base + higher TFs, not every
+        // timeframe. `load_symbol_dataset` loaded EVERY canonical TF (incl M1's
+        // ~5.27M rows) for every combo, then `ensure_timeframes_with_resample`
+        // cloned the whole frame map — the dominant per-combo pre-GA cost
+        // (minutes, GPU idle). `ensure_timeframes_with_resample` skips TFs <= base
+        // and only resamples MISSING higher TFs from the base, so base + higher
+        // (filtered to what exists on disk) is sufficient. M1's 5.27M rows are now
+        // loaded only for the M1-base combo, not for every combo.
+        let mut want_tfs: Vec<String> = vec![base.clone()];
+        for h in &higher_list {
+            if !want_tfs.contains(h) {
+                want_tfs.push(h.clone());
+            }
+        }
+        want_tfs.retain(|tf| {
+            neoethos_data::symbol_timeframe_vortex_path(&root, &symbol, tf).exists()
+        });
+        if !want_tfs.iter().any(|t| t == &base) {
+            want_tfs.push(base.clone());
+        }
+        let want_refs: Vec<&str> = want_tfs.iter().map(|s| s.as_str()).collect();
+        let dataset =
+            neoethos_data::load_symbol_dataset_with_timeframes(&root, &symbol, &want_refs)?;
         let dataset = neoethos_data::ensure_timeframes_with_resample(
             &dataset,
             &base,
@@ -541,6 +1135,27 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         // disk, so the operator can post-mortem even when this fires.
         neoethos_search::ensure_non_empty_portfolio(&result, &format!("{} {}", symbol, base))?;
         neoethos_search::save_portfolio_json(&out, &result)?;
+        // Phase 4 (2026-06-04): also emit the self-describing live portfolio
+        // artifact (full genes + effective_feature_names + base/higher TFs +
+        // normalize flag) the autonomous trader loads to evaluate the discovered
+        // strategies with backtest parity. Additive + non-fatal.
+        {
+            let live_path = format!("{out}.live_portfolio.json");
+            if let Err(err) = neoethos_search::save_live_portfolio_json(
+                &live_path,
+                &symbol,
+                &base,
+                &config.higher_timeframes,
+                &result,
+            ) {
+                tracing::warn!(
+                    target: "neoethos_cli::discover",
+                    error = %err,
+                    path = %live_path,
+                    "save_live_portfolio_json failed (non-fatal)"
+                );
+            }
+        }
         let profile_path = format!("{out}.profile.json");
         neoethos_search::save_discovery_profile_json(&profile_path, &config, &result)?;
         if !result.canonical_backtest_artifacts.is_empty() {
@@ -621,10 +1236,32 @@ fn cmd_batch_discover(args: &[String]) -> Result<()> {
             .map(|s| s.trim().to_uppercase())
             .collect();
 
-        let config = settings
+        let mut config = settings
             .as_ref()
             .map(neoethos_search::DiscoveryConfig::from_settings)
             .unwrap_or_default();
+        // Explicit overrides win over the config-derived values (same
+        // precedence as env > config elsewhere). These let the TUI Discover
+        // form's Population/Generations/Portfolio-size fields actually take
+        // effect instead of being silently dropped (parity fix 2026-06-08).
+        if let Some(p) = parse_flag(args, "--population")
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+        {
+            config.population = p;
+        }
+        if let Some(g) = parse_flag(args, "--generations")
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+        {
+            config.generations = g;
+        }
+        if let Some(ps) = parse_flag(args, "--portfolio-size")
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+        {
+            config.portfolio_size = ps;
+        }
         let orchestrator = neoethos_search::DiscoveryOrchestrator::new(&root, &out_dir, config);
 
         let summary = orchestrator.run_batch(&symbols, &tfs)?;
@@ -729,6 +1366,330 @@ fn cmd_config(args: &[String]) -> Result<()> {
 ///
 /// Persists checkpoint to cache/auto_loop_checkpoint.json — on crash,
 /// re-run with --resume to continue.
+/// Multi-GPU / hybrid scheduler driver (Stage 1).
+///
+/// Enumerates symbol×TF combos, asks `scheduler::plan_combo` how each should be
+/// admitted, then runs the schedulable (single-card / CPU) combos across all
+/// cards concurrently — each as a subprocess `discover` pinned to a card via
+/// `NEOETHOS_BOT_SEARCH_EVAL_{WGPU,CUDA}_DEVICE`. Combos that need the GA
+/// population SHARDED across >1 card are DEFERRED to Stage 2 (intra-combo
+/// multi-GPU) and reported, never silently dropped. Training co-scheduling on
+/// separate cards is Stage 3.
+///
+/// `--dry-run` prints the full admission plan WITHOUT spawning — the way to
+/// validate the decisions against a real hardware probe + real on-disk data
+/// sizes (works on any machine, no GPU needed).
+fn cmd_schedule(args: &[String]) -> Result<()> {
+    use neoethos_core::scheduler::{
+        plan_combo, AdmissionPolicy, ComboAdmissionPlan, ComboItem, ComboShape, WorkScheduler,
+    };
+
+    let settings = resolve_cli_settings(args)?.unwrap_or_else(neoethos_core::Settings::default);
+    let resolved = neoethos_core::resolved_config::ResolvedConfig::from_settings(&settings);
+    let root = parse_root(args, Some(&settings));
+    let dry_run = has_flag(args, "--dry-run");
+    // Stage 1 schedules DISCOVERY only; training co-scheduling on separate
+    // cards is Stage 3, so there is no `--skip-training` knob here yet.
+    let resume = has_flag(args, "--resume");
+    let stop_flag =
+        parse_flag(args, "--stop-flag").unwrap_or_else(|| "cache/schedule_stop.flag".to_string());
+    // feature-cube column count is hard to know without building the cube; a
+    // conservative estimate is fine because the planner's safety margins
+    // (0.75 RAM / 0.80 VRAM / 2× overhead) absorb the error. Overridable.
+    let feature_count: usize = parse_flag(args, "--features")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1500);
+    // bytes-per-bar for the load-free row estimate (vortex-compressed OHLCV).
+    let bytes_per_bar: f64 = parse_flag(args, "--bytes-per-bar")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12.0);
+    let population = resolved.search.population;
+
+    // Set the data root for any child orchestrator BEFORE any thread spawns.
+    unsafe {
+        std::env::set_var("NEOETHOS_BOT_DATA_ROOT", &root);
+    }
+
+    let symbols: Vec<String> = match parse_flag(args, "--symbols") {
+        Some(s) if !s.trim().is_empty() => {
+            s.split(',').map(|x| x.trim().to_uppercase()).collect()
+        }
+        _ => neoethos_data::discover_symbols(&root)?,
+    };
+    let tfs: Vec<String> = parse_flag(args, "--timeframes")
+        .unwrap_or_else(|| resolved.timeframes.canonical_default.join(","))
+        .split(',')
+        .map(|x| x.trim().to_uppercase())
+        .collect();
+
+    let mut probe = neoethos_core::system::HardwareProbe::new();
+    let hw = probe.detect();
+    let policy = AdmissionPolicy::default();
+    println!(
+        "Hardware: {} cores, {:.0}GB RAM avail, {} usable GPU(s) VRAM={:?}GB",
+        hw.cpu_cores,
+        hw.available_ram_gb,
+        hw.gpu_mem_gb.iter().filter(|m| **m > 0.0).count(),
+        hw.gpu_mem_gb
+    );
+
+    // Build admission plans, partitioning schedulable (<=1 card) from the
+    // sharding-heavy combos deferred to Stage 2.
+    let mut id_combo: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    let mut schedulable: Vec<ComboItem> = Vec::new();
+    // With Stage 2 (population sharding) landed, multi-card heavy combos are no
+    // longer deferred — the GA shards across all their cards. `deferred` is kept
+    // (empty) so the reporting/--resume shape is unchanged.
+    let deferred: Vec<(String, ComboAdmissionPlan)> = Vec::new();
+    for sym in &symbols {
+        for tf in &tfs {
+            let id = format!("{sym}/{tf}");
+            let rows = estimate_series_rows(&root, sym, tf, bytes_per_bar);
+            if rows == 0 {
+                println!("  skip {id}: no vortex data found on disk");
+                continue;
+            }
+            let shape = ComboShape::new(rows, population, feature_count);
+            let plan = plan_combo(shape, &hw, &policy);
+            id_combo.insert(id.clone(), (sym.clone(), tf.clone()));
+            schedulable.push(ComboItem::new(id, shape, plan));
+        }
+    }
+
+    println!(
+        "\n=== Admission plan: {} schedulable, {} deferred-to-Stage2 ===",
+        schedulable.len(),
+        deferred.len()
+    );
+    for it in &schedulable {
+        let tag = if it.plan.cards_per_combo == 0 {
+            "  [CPU lane]"
+        } else if !it.plan.fits_on_gpu {
+            "  [does NOT fit on one card — chunk]"
+        } else {
+            ""
+        };
+        println!(
+            "  [{:?}] {:<14} rows≈{:>9}  cards={} genes/card={} cpu={} RAM≈{:.1}GB VRAM/card≈{:.1}GB{}",
+            it.plan.class,
+            it.id,
+            it.shape.series_rows,
+            it.plan.cards_per_combo,
+            it.plan.genes_per_card,
+            it.plan.cpu_threads_per_worker,
+            it.plan.est_ram_per_combo_gb,
+            it.plan.est_vram_per_card_gb,
+            tag
+        );
+    }
+    for (id, plan) in &deferred {
+        println!(
+            "  [DEFER] {:<14} needs {} cards (population sharding) — Stage 2; RAM≈{:.1}GB",
+            id, plan.cards_per_combo, plan.est_ram_per_combo_gb
+        );
+    }
+
+    if dry_run {
+        println!("\n--dry-run: plan only, no processes spawned.");
+        return Ok(());
+    }
+    if !deferred.is_empty() {
+        println!(
+            "\nNOTE: {} heavy combo(s) need multi-GPU sharding (Stage 2) and are NOT run now.",
+            deferred.len()
+        );
+    }
+
+    let checkpoint_path = std::path::PathBuf::from("cache").join("schedule_checkpoint.json");
+    let mut completed: Vec<String> = Vec::new();
+    if resume && checkpoint_path.exists() {
+        if let Ok(text) = std::fs::read_to_string(&checkpoint_path) {
+            if let Ok(prev) = serde_json::from_str::<ScheduleCheckpoint>(&text) {
+                completed = prev.completed.clone();
+                schedulable.retain(|it| !completed.contains(&it.id));
+                println!(
+                    "Resuming: {} already done; {} remaining",
+                    completed.len(),
+                    schedulable.len()
+                );
+            }
+        }
+    }
+
+    let mut sched = WorkScheduler::new(schedulable, &hw, &policy);
+    let mut children: std::collections::HashMap<String, std::process::Child> =
+        std::collections::HashMap::new();
+    let mut failed: Vec<String> = Vec::new();
+    let total = sched.pending_len();
+    println!(
+        "\nScheduling {} combos across {} card(s)...",
+        total,
+        sched.total_cards()
+    );
+
+    loop {
+        let stopping = std::path::Path::new(&stop_flag).exists();
+        if stopping && children.is_empty() {
+            println!("Stop-flag found and no in-flight work — exiting.");
+            break;
+        }
+        if !stopping {
+            for a in sched.poll() {
+                let (sym, tf) = id_combo.get(&a.id).cloned().unwrap_or_default();
+                match spawn_discover_combo(&a, &sym, &tf, &root, &resolved) {
+                    Ok(child) => {
+                        println!(
+                            "  ▶ {} on cards {:?} ({} genes/card, {} cpu threads)",
+                            a.id, a.card_ids, a.genes_per_card, a.cpu_threads
+                        );
+                        children.insert(a.id.clone(), child);
+                    }
+                    Err(e) => {
+                        eprintln!("  spawn {} failed: {e:#}", a.id);
+                        sched.complete(&a.id);
+                        failed.push(a.id.clone());
+                    }
+                }
+            }
+        }
+        if children.is_empty() {
+            if sched.is_done() || stopping {
+                break;
+            }
+            // Nothing running and nothing dispatchable — avoid a spin loop.
+            eprintln!("scheduler stalled with {} pending and no free capacity — stopping", sched.pending_len());
+            break;
+        }
+
+        let ids: Vec<String> = children.keys().cloned().collect();
+        let mut any_done = false;
+        for id in ids {
+            let finished = match children.get_mut(&id).map(|c| c.try_wait()) {
+                Some(Ok(Some(status))) => Some(status),
+                Some(Err(e)) => {
+                    eprintln!("  wait {id}: {e}");
+                    None
+                }
+                _ => None,
+            };
+            if let Some(status) = finished {
+                any_done = true;
+                children.remove(&id);
+                sched.complete(&id);
+                if status.success() {
+                    completed.push(id.clone());
+                    println!("  ✔ {id} done ({}/{})", completed.len(), total);
+                    write_schedule_checkpoint(&checkpoint_path, &completed);
+                } else {
+                    // Stage 1 has no CPU lane yet (that is Stage 3), so a GPU
+                    // failure is logged and resources freed — NOT retried in a
+                    // loop. The OOM->CPU requeue path is exercised once Stage 3
+                    // lands a real fast-CPU fallback.
+                    failed.push(id.clone());
+                    eprintln!(
+                        "  ✗ {id} FAILED (exit {:?}) — freed; not retried (CPU lane is Stage 3)",
+                        status.code()
+                    );
+                }
+            }
+        }
+        if !any_done {
+            std::thread::sleep(std::time::Duration::from_millis(750));
+        }
+    }
+
+    println!(
+        "\nSchedule done: {} completed, {} failed, {} deferred-to-Stage2.",
+        completed.len(),
+        failed.len(),
+        deferred.len()
+    );
+    if !failed.is_empty() {
+        println!("  failed: {failed:?}");
+    }
+    Ok(())
+}
+
+/// Cheap, load-free estimate of the bar count for a symbol/timeframe from the
+/// on-disk vortex file size. The orchestrator must NOT materialise data (M1 is
+/// ~80GB expanded), so we estimate from bytes. Feeds the admission planner,
+/// whose conservative margins + the subprocess's exact load make the estimate
+/// non-critical to correctness.
+fn estimate_series_rows(root: &str, symbol: &str, tf: &str, bytes_per_bar: f64) -> usize {
+    let path = neoethos_data::symbol_timeframe_vortex_path(root, symbol, tf);
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64;
+    if bytes <= 0.0 {
+        return 0;
+    }
+    (bytes / bytes_per_bar.max(1.0)).ceil() as usize
+}
+
+/// Spawn one `discover` subprocess pinned to its assigned card. Stage 1 pins to
+/// a single card (`card_ids[0]`); multi-card sharding is Stage 2.
+fn spawn_discover_combo(
+    a: &neoethos_core::scheduler::Assignment,
+    symbol: &str,
+    timeframe: &str,
+    root: &str,
+    resolved: &neoethos_core::resolved_config::ResolvedConfig,
+) -> Result<std::process::Child> {
+    let exe = std::env::current_exe().context("locating current executable")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("discover")
+        .arg("--symbol")
+        .arg(symbol)
+        .arg("--base")
+        .arg(timeframe)
+        .arg("--root")
+        .arg(root)
+        .arg("--population")
+        .arg(resolved.search.population.to_string())
+        .arg("--generations")
+        .arg(resolved.search.generations.to_string())
+        .arg("--portfolio-size")
+        .arg(resolved.search.portfolio_size.to_string())
+        .arg("--out")
+        .arg(format!("cache/schedule/{symbol}_{timeframe}.json"));
+    // NOTE: intra-combo GPU sharding (Stage 2, the plural *_DEVICES env) is
+    // DISABLED at the dispatch layer — the cubecl wgpu multi-device path panics
+    // at runtime ("Memory page 0 doesn't exist" in cubecl-runtime client.rs) and
+    // falls back to slow CPU recompute. Validated 2026-06-07 on the 2×A6000 VPS:
+    // M1 ran 58 min on CPU (gen 305/20000, 0 results) before we caught it. Until
+    // that cubecl multi-device issue is fixed, every combo runs on the PROVEN
+    // single-device path, pinned to its first assigned card (H4 validated: card
+    // at 120 MiB, clean run). Combo-level throughput (one combo per card,
+    // concurrent) is preserved; the multi-device code in eval.rs stays in place,
+    // gated behind the plural env which we simply no longer set.
+    if let Some(&card) = a.card_ids.first() {
+        cmd.env("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE", card.to_string());
+        cmd.env("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE", card.to_string());
+    }
+    cmd.env("NEOETHOS_BOT_CPU_BUDGET", a.cpu_threads.to_string());
+    cmd.env("NEOETHOS_BOT_DATA_ROOT", root);
+    cmd.spawn()
+        .with_context(|| format!("spawning discover for {symbol}/{timeframe}"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct ScheduleCheckpoint {
+    updated_at: String,
+    completed: Vec<String>,
+}
+
+fn write_schedule_checkpoint(path: &std::path::Path, completed: &[String]) {
+    let ck = ScheduleCheckpoint {
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        completed: completed.to_vec(),
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&ck) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 fn cmd_auto_loop(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?.unwrap_or_else(neoethos_core::Settings::default);
     let resolved = neoethos_core::resolved_config::ResolvedConfig::from_settings(&settings);
@@ -828,8 +1789,11 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
             sym.clone(),
             "--base".to_string(),
             tf.clone(),
-            "--higher".to_string(),
-            "H4".to_string(),
+            // 2026-06-04 parity: no hardcoded `--higher H4`. Omitting `--higher`
+            // lets cmd_discover resolve the higher-TF ladder from config relative
+            // to THIS base (`tf`) via the shared `resolve_higher_timeframes`, so
+            // every base in the sweep gets its correct top-down context — same as
+            // a standalone `discover` run (H4-as-base no longer self-references).
             "--root".to_string(),
             root.clone(),
             "--population".to_string(),
@@ -1383,8 +2347,12 @@ fn default_symbol(settings: Option<&neoethos_core::Settings>) -> String {
     // code rejects empty symbols (see `default_pip_size` returning NaN
     // for empty input → fitness guard rejects) so the operator gets a
     // clear "symbol required" error instead of silent EURUSD execution.
+    // SHARED resolution (2026-06-04 parity unification): the Some branch now
+    // delegates to `SystemConfig::resolve_symbol` in neoethos-core — the SAME
+    // function the app server calls — so UI and CLI can never diverge. Only the
+    // None-path F-CORE2 error logging stays CLI-specific.
     match settings {
-        Some(settings) => settings.system.symbol.clone(),
+        Some(settings) => settings.system.resolve_symbol(),
         None => {
             tracing::error!(
                 target: "neoethos_cli::defaults",
@@ -1400,8 +2368,9 @@ fn default_symbol(settings: Option<&neoethos_core::Settings>) -> String {
 fn default_base_tf(settings: Option<&neoethos_core::Settings>) -> String {
     // **F-648 / F-CORE2 closure (2026-05-25)**: previously fell back to
     // `"M1"` when settings was None. Same fix as `default_symbol`.
+    // 2026-06-04 parity: Some branch delegates to the shared core resolver.
     match settings {
-        Some(settings) => settings.system.base_timeframe.clone(),
+        Some(settings) => settings.system.resolve_base_timeframe(),
         None => {
             tracing::error!(
                 target: "neoethos_cli::defaults",
@@ -1414,26 +2383,13 @@ fn default_base_tf(settings: Option<&neoethos_core::Settings>) -> String {
     }
 }
 
-fn default_higher_tfs_csv(settings: Option<&neoethos_core::Settings>) -> String {
+/// Resolve the higher-TF CSV for the **effective** `base` (which may be a
+/// `--base` override, not the config base). Delegates the actual selection to
+/// the shared `SystemConfig::resolve_higher_timeframes` so the CLI and the app
+/// server always pick the same ladder.
+fn default_higher_tfs_csv(settings: Option<&neoethos_core::Settings>, base: &str) -> String {
     settings
-        .map(|settings| {
-            if settings.system.multi_resolution_enabled
-                && !settings.system.multi_resolution_timeframes.is_empty()
-            {
-                settings
-                    .system
-                    .multi_resolution_timeframes
-                    .iter()
-                    .filter(|timeframe| {
-                        !timeframe.eq_ignore_ascii_case(&settings.system.base_timeframe)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(",")
-            } else {
-                settings.system.higher_timeframes.join(",")
-            }
-        })
+        .map(|settings| settings.system.resolve_higher_timeframes(base).join(","))
         .unwrap_or_default()
 }
 
@@ -1690,7 +2646,26 @@ fn print_help() {
     println!(
         "  discover --symbol EURUSD --base M1 --higher H1,H4 --population 100 --generations 5 --max-indicators 12 --portfolio-size 100 --candidates 200 --corr 0.7 --min-trades 1 --out cache/vector_ta_knowledge.json --root data"
     );
+    println!(
+        "  discovery-promote-weekly [--symbol EURUSD --tf M1] [--cache-dir cache/search] [--portfolio <live_portfolio.json>]  Weekly-refresh: merge this run's discovery ledger into the live portfolio (additive by gene-signature hash) and print 'added N new, carried M, total K'."
+    );
+    println!(
+        "  trader-replay [--symbol EURUSD --base M1 | --portfolio <live_portfolio.json>] [--root data] [--blend off|confirm|scale] [--models-root models]  Offline dry-run of the autonomous trader (zero broker calls; same engine as /autonomous/replay). With --portfolio runs the REAL genes; --blend gates their size by the ML ensemble (gene-dominant)."
+    );
+    println!(
+        "  blend-test --portfolio <live_portfolio.json> --models-root models_oos_locked [--root data] [--gate-floor 0.34] [--veto-below 0.15]  Re-validate the gene<->ML blend on the NETTED portfolio: GenesOnly vs MlConfirm vs MlScale on the same engine + non-degradation verdict. Point --models-root at a LEAK-FREE root (train --oos-from)."
+    );
+    println!("  train --symbol EURUSD --base H1 [--models-dir models] [--oos-from 2023-01-01]  Train the ML ensemble. --oos-from trains LEAK-LOCKED experts (rows < cutoff, purged) to a SEPARATE root for OOS blend validation.");
     println!("  migrate-data --root data [--force] [--delete-source]");
+    println!(
+        "  slice-dataset --symbol EURUSD --base M1 --root <SRC> --out-root <DST> --from-date 2018-01-01 --to-date 2021-01-01"
+    );
+    println!(
+        "                               Write the [from,to) UTC date-range subset of a Vortex dataset to a NEW root"
+    );
+    println!(
+        "                               (discover --root <DST> runs on the slice). Enables OOM-safe walk-forward chunking."
+    );
     println!("  stop-target --symbol EURUSD --timeframe M1 --pip 0.0001 --signal 1 --root data");
     println!("  wizard                       Launch the interactive first-run wizard (TUI).");
     println!("  setup [show|paths|ctrader|news]  Headless credentials helper (Task #61).");

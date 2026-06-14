@@ -25,6 +25,22 @@ use ruv_swarm_ml::time_series::{SeasonalityInfo, TimeSeriesData, TimeSeriesProce
 
 const SWARM_ARTIFACT_FILE_NAME: &str = "swarm_forecaster.json";
 
+/// Deterministic seed for the Particle Swarm Optimization (PSO) that learns the
+/// ensemble combination weights. Fixed so the same `(names, windows, init)` →
+/// bit-identical weights across runs and platforms (`StdRng` is ChaCha-based and
+/// portable). The ASCII bytes spell "SwarmPSO".
+const PSO_SEED: u64 = 0x5377_6172_6D50_534F;
+/// Number of particles in the swarm (Kennedy & Eberhart 1995). ~24 is a standard
+/// small-population choice for a low-dimensional simplex search.
+const PSO_PARTICLES: usize = 24;
+/// PSO iterations. ~60 is ample for the <=6 candidate weight vectors here.
+const PSO_ITERATIONS: usize = 60;
+/// Inertia weight ω (Shi & Eberhart 1998 / Clerc-Kennedy constriction-equivalent).
+const PSO_INERTIA: f32 = 0.7298;
+/// Cognitive/social acceleration coefficients c1 = c2 (Clerc-Kennedy constriction).
+const PSO_COGNITIVE: f32 = 1.49618;
+const PSO_SOCIAL: f32 = 1.49618;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwarmEnsembleStrategy {
     SimpleAverage,
@@ -1863,6 +1879,209 @@ fn derive_validation_candidate_weights(
         .collect()
 }
 
+/// One rolling-validation window seen by the PSO fitness: the candidate
+/// forecasts aligned by `names` (`forecasts[m]` is candidate `names[m]`'s forecast
+/// for this window — an EMPTY vec means that candidate did not produce a forecast
+/// for this window's regime), the realized `actuals`, and the per-window
+/// `baseline` (the snapshot's `last_value`, exactly what production passes to
+/// [`aggregate_weighted`]).
+struct PsoWindow {
+    forecasts: Vec<Vec<f32>>,
+    actuals: Vec<f32>,
+    baseline: f32,
+}
+
+/// Mean ensemble MAE of a weight vector over the rolling-validation windows.
+///
+/// FITNESS PARITY: this MUST combine candidates EXACTLY as production's
+/// [`aggregate_weighted`] does, otherwise the PSO would optimize a different
+/// objective than the one that actually runs at forecast time. Mirrored logic,
+/// per horizon step:
+///   * only FINITE forecast values contribute,
+///   * a candidate's weight is taken from `weights` aligned by index (production
+///     defaults a missing name to `1/n`; here every candidate has an explicit
+///     weight so the alignment is exact),
+///   * the contributing weights are RENORMALIZED per step (`weighted_sum /
+///     total_weight`),
+///   * if the total contributing weight `<= f32::EPSILON`, the step falls back to
+///     the window `baseline` (= `snapshot.last_value`), identical to
+///     `aggregate_weighted`.
+fn ensemble_window_mae(weights: &[f32], windows: &[PsoWindow]) -> f32 {
+    let mut total_mae = 0.0_f32;
+    let mut counted = 0usize;
+    for window in windows {
+        let horizon = window.actuals.len();
+        if horizon == 0 {
+            continue;
+        }
+        let mut combined = Vec::with_capacity(horizon);
+        for step in 0..horizon {
+            let mut weighted_sum = 0.0_f32;
+            let mut total_weight = 0.0_f32;
+            for (idx, forecast) in window.forecasts.iter().enumerate() {
+                if let Some(value) = forecast.get(step).copied()
+                    && value.is_finite()
+                {
+                    let weight = weights.get(idx).copied().unwrap_or(0.0);
+                    weighted_sum += value * weight;
+                    total_weight += weight;
+                }
+            }
+            if total_weight <= f32::EPSILON {
+                combined.push(window.baseline);
+            } else {
+                combined.push(weighted_sum / total_weight);
+            }
+        }
+        total_mae += mae(&combined, &window.actuals);
+        counted += 1;
+    }
+    if counted == 0 {
+        f32::INFINITY
+    } else {
+        total_mae / counted as f32
+    }
+}
+
+/// Project a raw weight vector onto the probability simplex: clip negatives to 0
+/// and renormalize to sum 1; an all-zero vector resets to uniform. Mirrors the
+/// invariant enforced by [`normalize_candidate_weights`].
+fn project_to_simplex(weights: &mut [f32]) {
+    for weight in weights.iter_mut() {
+        if !weight.is_finite() || *weight < 0.0 {
+            *weight = 0.0;
+        }
+    }
+    let sum: f32 = weights.iter().sum();
+    if sum <= f32::EPSILON {
+        let uniform = if weights.is_empty() {
+            1.0
+        } else {
+            1.0 / weights.len() as f32
+        };
+        for weight in weights.iter_mut() {
+            *weight = uniform;
+        }
+    } else {
+        for weight in weights.iter_mut() {
+            *weight /= sum;
+        }
+    }
+}
+
+/// Real Particle Swarm Optimization (Kennedy & Eberhart 1995 + Shi & Eberhart
+/// 1998 inertia) over the ensemble weight simplex, minimizing in-sample ensemble
+/// MAE (`ensemble_window_mae`, which mirrors production's `aggregate_weighted`).
+///
+/// Velocity update per particle/dimension:
+///   `v = ω·v + c1·r1·(pbest − x) + c2·r2·(gbest − x)`, `x += v`, then project to
+/// the simplex. Particle 0 is WARM-STARTED from `init` (the existing
+/// softmax/heuristic weights) so the swarm's global best can never be worse than
+/// the incumbent. Deterministic: a fixed-seed `StdRng` drives all draws and the
+/// particle/dimension iteration order is fixed (no `HashMap` iteration), so the
+/// same `(names, windows, init, seed)` yields a bit-identical `Vec<f32>`.
+fn pso_optimize_weights(windows: &[PsoWindow], init: &[f32], seed: u64) -> Vec<f32> {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    let dims = init.len();
+    if dims < 2 || windows.is_empty() {
+        let mut weights = init.to_vec();
+        project_to_simplex(&mut weights);
+        return weights;
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut positions: Vec<Vec<f32>> = Vec::with_capacity(PSO_PARTICLES);
+    let mut velocities: Vec<Vec<f32>> = Vec::with_capacity(PSO_PARTICLES);
+
+    // Particle 0 is the warm start (the incumbent softmax/heuristic weights).
+    let mut warm = init.to_vec();
+    project_to_simplex(&mut warm);
+    positions.push(warm);
+    velocities.push(vec![0.0_f32; dims]);
+
+    // Remaining particles: random simplex points with small random velocities.
+    for _ in 1..PSO_PARTICLES {
+        let mut position: Vec<f32> = (0..dims).map(|_| rng.random::<f32>()).collect();
+        project_to_simplex(&mut position);
+        let velocity: Vec<f32> = (0..dims).map(|_| rng.random::<f32>() * 0.2 - 0.1).collect();
+        positions.push(position);
+        velocities.push(velocity);
+    }
+
+    let mut personal_best = positions.clone();
+    let mut personal_best_fit: Vec<f32> = positions
+        .iter()
+        .map(|position| ensemble_window_mae(position, windows))
+        .collect();
+
+    let mut global_idx = 0usize;
+    for idx in 1..PSO_PARTICLES {
+        if personal_best_fit[idx] < personal_best_fit[global_idx] {
+            global_idx = idx;
+        }
+    }
+    let mut global_best = personal_best[global_idx].clone();
+    let mut global_best_fit = personal_best_fit[global_idx];
+
+    for _ in 0..PSO_ITERATIONS {
+        for particle in 0..PSO_PARTICLES {
+            for dim in 0..dims {
+                let r1 = rng.random::<f32>();
+                let r2 = rng.random::<f32>();
+                let cognitive =
+                    PSO_COGNITIVE * r1 * (personal_best[particle][dim] - positions[particle][dim]);
+                let social = PSO_SOCIAL * r2 * (global_best[dim] - positions[particle][dim]);
+                let mut velocity = PSO_INERTIA * velocities[particle][dim] + cognitive + social;
+                // Velocity clamp keeps the swarm inside a sane range on the unit
+                // simplex (each dimension is bounded to [0, 1]).
+                velocity = velocity.clamp(-0.5, 0.5);
+                velocities[particle][dim] = velocity;
+                positions[particle][dim] += velocity;
+            }
+            project_to_simplex(&mut positions[particle]);
+
+            let fitness = ensemble_window_mae(&positions[particle], windows);
+            if fitness < personal_best_fit[particle] {
+                personal_best[particle] = positions[particle].clone();
+                personal_best_fit[particle] = fitness;
+                if fitness < global_best_fit {
+                    global_best = positions[particle].clone();
+                    global_best_fit = fitness;
+                }
+            }
+        }
+    }
+
+    global_best
+}
+
+/// Run PSO over the ensemble weights and write the global-best weights back onto
+/// `reports[i].weight`, but ONLY if the PSO's in-sample MAE does not regress past
+/// the warm-start baseline (within a tiny tolerance). This makes the swarm
+/// upgrade strictly non-regressive vs the existing softmax/heuristic weights.
+///
+/// `per_window` is aligned to `reports` by index: `per_window[w].forecasts[i]` is
+/// `reports[i]`'s forecast for window `w` (empty when that candidate produced no
+/// forecast in that window's regime). Must be called BEFORE
+/// `prune_validation_candidates` so weights and the candidate set stay consistent.
+fn apply_pso_candidate_weights(reports: &mut [SwarmCandidateReport], per_window: &[PsoWindow]) {
+    if reports.len() < 2 || per_window.is_empty() {
+        return;
+    }
+    let init: Vec<f32> = reports.iter().map(|report| report.weight).collect();
+    let baseline_fit = ensemble_window_mae(&init, per_window);
+    let optimized = pso_optimize_weights(per_window, &init, PSO_SEED);
+    let optimized_fit = ensemble_window_mae(&optimized, per_window);
+    // Non-regressive guard: only adopt PSO weights when they do not worsen the
+    // (parity-matched) in-sample ensemble MAE.
+    if optimized_fit <= baseline_fit + 1e-6 {
+        for (report, weight) in reports.iter_mut().zip(optimized.iter()) {
+            report.weight = weight.max(1e-6);
+        }
+    }
+}
+
 fn validation_weight_blend_ratio(support: &HashMap<String, f32>, candidate_count: usize) -> f32 {
     if candidate_count == 0 {
         return 0.0;
@@ -2133,8 +2352,48 @@ fn build_weighted_reports_external(
         })
         .collect::<Vec<_>>();
     apply_validation_candidate_weights(&mut reports, &validation_loss_sums, &validation_support);
+    // SWARM: optimize the combination weights with PSO (see build_weighted_reports_local).
+    // Mirror the local hook for the external (ruv-swarm) seed weights so both paths
+    // search the weight simplex rather than relying on the softmax blend alone.
+    let per_window = build_external_pso_windows(windows, frequency, unique_id, &reports)?;
+    apply_pso_candidate_weights(&mut reports, &per_window);
     prune_validation_candidates(&mut reports, &validation_support);
     Ok(reports)
+}
+
+/// External (ruv-swarm) twin of [`build_local_pso_windows`]: rebuilds the
+/// per-candidate forecast matrix from `candidate_predictions` aligned to
+/// `reports` by index, plus the per-window baseline (`snapshot.last_value`).
+#[cfg(feature = "swarm-forecasting")]
+fn build_external_pso_windows(
+    windows: &[(Vec<f32>, Vec<f64>, Vec<f32>)],
+    frequency: &str,
+    unique_id: &str,
+    reports: &[SwarmCandidateReport],
+) -> Result<Vec<PsoWindow>> {
+    let processor = TimeSeriesProcessor::new();
+    let mut per_window = Vec::with_capacity(windows.len());
+    for (train_values, train_timestamps, actuals) in windows {
+        let series = build_training_series(train_values, train_timestamps, frequency, unique_id)?;
+        let snapshot = infer_snapshot(&series, &processor);
+        let candidates = candidate_predictions(train_values, &snapshot, actuals.len().max(1));
+        let forecasts = reports
+            .iter()
+            .map(|report| {
+                candidates
+                    .iter()
+                    .find(|(name, _, _)| name == &report.name)
+                    .map(|(_, _, forecast)| forecast.clone())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        per_window.push(PsoWindow {
+            forecasts,
+            actuals: actuals.clone(),
+            baseline: snapshot.last_value,
+        });
+    }
+    Ok(per_window)
 }
 
 fn build_weighted_reports_local(
@@ -2231,8 +2490,46 @@ fn build_weighted_reports_local(
         })
         .collect::<Vec<_>>();
     apply_validation_candidate_weights(&mut reports, &validation_loss_sums, &validation_support);
+    // SWARM: optimize the COMBINATION weights with a real Particle Swarm over the
+    // weight simplex (minimizing in-sample ensemble MAE that mirrors
+    // `aggregate_weighted`). Run BEFORE pruning so weights & candidate set stay
+    // consistent, and only adopt the result if it does not regress (warm-started
+    // from the softmax/heuristic weights just applied above).
+    let per_window = build_local_pso_windows(windows, &reports)?;
+    apply_pso_candidate_weights(&mut reports, &per_window);
     prune_validation_candidates(&mut reports, &validation_support);
     Ok(reports)
+}
+
+/// Rebuild, for each rolling-validation window, the per-candidate forecast matrix
+/// aligned to `reports` by index (using the SAME local candidate generator the
+/// reports were built from), plus the per-window baseline (`snapshot.last_value`)
+/// that production passes to `aggregate_weighted`. Feeds the PSO fitness.
+fn build_local_pso_windows(
+    windows: &[(Vec<f32>, Vec<f64>, Vec<f32>)],
+    reports: &[SwarmCandidateReport],
+) -> Result<Vec<PsoWindow>> {
+    let mut per_window = Vec::with_capacity(windows.len());
+    for (train_values, train_timestamps, actuals) in windows {
+        let snapshot = build_local_snapshot_with_min(train_values, train_timestamps, 8)?;
+        let candidates = candidate_forecasts_local(train_values, &snapshot, actuals.len().max(1));
+        let forecasts = reports
+            .iter()
+            .map(|report| {
+                candidates
+                    .iter()
+                    .find(|(name, _)| name == &report.name)
+                    .map(|(_, forecast)| forecast.clone())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        per_window.push(PsoWindow {
+            forecasts,
+            actuals: actuals.clone(),
+            baseline: snapshot.last_value,
+        });
+    }
+    Ok(per_window)
 }
 
 fn validation_window_weight(

@@ -1,6 +1,6 @@
 [package]
 name = "neoethos-search"
-version = "0.4.40"
+version = "0.4.99"
 edition.workspace = true
 
 [dependencies]
@@ -10,10 +10,24 @@ chrono = "0.4.44"
 # See neoethos-models/Cargo.toml for the full reasoning (AMD Vulkan
 # SPIR-V driver crash avoidance).
 cubecl = { version = "0.10.0", optional = true }
+# AREA 1 (2026-06-09): direct handle on the cubecl memory-management types
+# (`MemoryConfiguration::Custom` / `MemoryPoolOptions` / `PoolType`) used to inject
+# a BOUNDED wgpu pool in `create_gpu_client`. cubecl/cubecl-wgpu only re-export
+# `MemoryConfiguration` (cubecl-wgpu runtime.rs:15) — the pool-option structs are
+# NOT re-exported, so we name `cubecl_runtime` directly. Version pinned to the same
+# 0.10.0 the cubecl umbrella resolves (Cargo.lock) so there is one copy in the graph.
+# Optional + gated to `gpu` so the non-GPU build never pulls it.
+cubecl-runtime = { version = "0.10.0", optional = true }
 ndarray = { version = "0.17.2", features = ["rayon"] }
 half = { version = "2.5", optional = true, default-features = true, features = ["alloc", "num-traits"] }
 itertools = "0.14.0"
 rand = "0.9.2"
+# AREA 2 / Stage A (2026-06-09): deterministic ChaCha8 RNG for the GPU-batched
+# Monte-Carlo perturbation screen. Seeded per (combo, candidate, run) so the
+# batched population run reproduces the old serial MC bit-for-bit AND is
+# reproducible across CPU/GPU. rand_chacha 0.9 is the companion of rand 0.9
+# (already in Cargo.lock transitively).
+rand_chacha = "0.9.0"
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -32,16 +46,20 @@ default = []
 # `hpc_gpu_discovery` + `hpc` modules were removed (~3132 LOC of orphan
 # code targeting Hyperstack-N3 specifically); generic multi-GPU support
 # now lives inside `cubecl_eval.rs` itself and scales 1→N devices via
-# `tch::Cuda::device_count()`.
-gpu = ["dep:tch", "dep:cubecl", "dep:half"]
-# #205: vendor-aware aliases so the top-level binary can pick a path
-# without knowing the internals. Today cubecl/tch is CUDA-only, so
-# `gpu-cuda` is the only one that actually wires anything; `gpu-vulkan`
-# and `gpu-rocm` are silent no-ops at this layer (Burn-wgpu handles
-# Vulkan downstream in neoethos-models). When cubecl ships a Vulkan
-# kernel or tch ships ROCm, wire them here in the same shape.
-gpu-cuda = ["gpu"]
-gpu-vulkan = []
-gpu-rocm = []
+# `tch::Cuda::device_count()`. The concrete runtime is now selected by the
+# vendor aliases below; `gpu` itself binds NO runtime (so a Vulkan build never
+# compiles cubecl-cuda), and `tch` (CUDA device enumeration) moved to `gpu-cuda`.
+gpu = ["dep:cubecl", "dep:half", "dep:cubecl-runtime"]
+# #205: vendor-aware aliases so the top-level binary can pick a backend
+# without knowing the internals. The `cubecl_eval.rs` GA kernels are generic
+# over `R: Runtime`, so each alias just selects the cubecl runtime:
+# - gpu-cuda   → CUDA (NVIDIA) + `tch` for device enumeration.
+# - gpu-vulkan → cubecl-wgpu via the naga→SPIR-V path (`wgpu`, NOT `wgpu-spirv`:
+#   the direct-SPIR-V passthrough crashes AMD's Vulkan driver). Runs on the
+#   integrated AMD GPU here and on any wgpu adapter (Vulkan/DX12/Metal).
+# - gpu-rocm   → cubecl HIP (AMD discrete, Linux).
+gpu-cuda = ["gpu", "dep:tch", "cubecl/cuda"]
+gpu-vulkan = ["gpu", "cubecl/wgpu"]
+gpu-rocm = ["gpu", "cubecl/hip"]
 strategy-db = ["dep:duckdb"]
 

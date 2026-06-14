@@ -44,6 +44,9 @@ pub struct BootstrapOutcome {
     pub bars_written: usize,
 }
 
+// `dead_code` until the live bootstrap path requests historical chunks through
+// this planner (Phase 2-5). The chunking logic is fully tested below.
+#[allow(dead_code)]
 pub fn plan_bootstrap_chunks(
     now_timestamp_ms: i64,
     timeframe: &str,

@@ -14,7 +14,7 @@
 //!
 //! | Function | Sharpe | Consistency | DD penalty | PF | Win-rate | Net | Expectancy |
 //! |----------|--------|-------------|-----------|----|----|----|--|
-//! | `ga_fitness` | 0.40 × conf₁₀ | 0.25 | subtract `dd*15→5` | 0.20 (GA shape) | 0.10 | — | — |
+//! | `ga_fitness` (v3) | 0.10 × conf₁₀ | 0.10 | subtract `dd*15→5` | 0.15 (GA shape) | 0.10 | 0.15 (net÷20k) | — (+0.45 × monthly-hit-rate, slot 7) |
 //! | `quality_score` | 0.25 × conf₁₀ | 0.15 | subtract `dd*8→3` | 0.20 (smooth shape) | 0.10 | 0.20 | 0.10 |
 //! | `window_score` | 0.25 × conf₈ | 0.15 | subtract `dd*8→3` | 0.20 (smooth shape) | 0.10 | 0.20 | 0.10 |
 //! | `archive_score` | 0.25 × conf₁₀ | 0.15 | subtract `dd*8→3` | 0.20 (smooth shape) | 0.10 | 0.20 | 0.10 |
@@ -47,10 +47,13 @@ pub struct ScoringVersion(pub u32);
 
 /// Current scoring-formula version.
 ///
-/// Phase A (this commit) keeps the legacy four-weight-table behaviour
-/// → version stays at `1`. When Phase C unifies the tables, this bumps
-/// to `2` + a changelog entry documenting the delta.
-pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(1);
+/// 2026-06-06: bumped to `3` — `ga_fitness` is now CONSISTENT-monthly-return
+/// oriented. v2 rewarded total net (compounding → lumpy genes that failed the
+/// prop-firm window-consistency gate); v3's dominant reward is the fraction of
+/// months hitting the operator's ≥4%/month bar (metrics[7], the same consistency
+/// the gate checks). (v1 = Sharpe-only; v2 = total-net.) Runs before this are NOT
+/// directly comparable (different fitness landscape); old artifacts still deserialize.
+pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(3);
 
 // ---------------------------------------------------------------------------
 // ga_fitness — was `genetic::evolution_math::score_from_metrics`
@@ -76,10 +79,14 @@ pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(1);
 /// trade_count < 1 → caller (the GA selection step) treats this as a
 /// "do not propagate" marker.
 pub fn ga_fitness(metrics: &[f64; 11]) -> f64 {
+    let net = metrics[0];
     let sharpe = metrics[1];
     let max_dd = metrics[3];
     let win_rate = metrics[4];
     let profit_factor = metrics[5];
+    // slot 7 (scoring_version 3): monthly_target_hit_rate — fraction of months hitting
+    // the operator's >=4% bar. The CONSISTENT-monthly-return signal (see eval.rs).
+    let monthly_hit = metrics[7];
     let trades = metrics[8];
     let consistency = metrics[9];
 
@@ -128,18 +135,34 @@ pub fn ga_fitness(metrics: &[f64; 11]) -> f64 {
     let activity_mult = 0.3 + 0.7 * activity;
 
     let conf = trades_confidence(trades);
-    let sh = sharpe_component(sharpe, conf) * 0.40;
-    let cons = consistency_component(consistency) * 0.25;
+    // **2026-06-06 (scoring_version 3 — CONSISTENT-monthly-return GA)**:
+    // v2 rewarded TOTAL net (net/12k), but compounding made that reward LUMPY — the GA
+    // converged on genes with huge AGGREGATE return concentrated in a few periods
+    // (in-sample Sharpe 6-13) that ALL failed the prop-firm window-consistency gate
+    // (best gene passed only ~11% of 60-day windows vs the 65% floor). High total net
+    // ≠ a temporally-stable edge.
+    //
+    // The DOMINANT reward is now `monthly_hit` (metrics[7]) = the fraction of months
+    // that hit the operator's >=4%/month bar — the SAME consistency the prop-firm gate
+    // checks, so the GA now searches FOR what survives the gate. `net` is kept as a
+    // smaller magnitude bonus (so among equally-consistent genes the GA still prefers
+    // bigger returns). `sharpe`/`consistency` are demoted: both are monthly mean/std
+    // (consistency = sharpe/3.46 clamped), which a few big months inflate — they do
+    // NOT predict the window pass-rate, which is exactly why v2 over-rewarded lumpy
+    // genes. The DD penalty stays UNSCALED so blow-ups are still rejected.
+    let hit = monthly_hit.clamp(0.0, 1.0) * 0.45;
+    let ret = (net / 20_000.0).clamp(-2.0, 2.0) * 0.15;
+    let sh = sharpe_component(sharpe, conf) * 0.10;
+    let cons = consistency_component(consistency) * 0.10;
     let pf = ga_pf_component(profit_factor)
-        * if profit_factor >= 1.0 { 0.20 } else { 0.30 };
+        * if profit_factor >= 1.0 { 0.15 } else { 0.25 };
     let wr = win_rate_component(win_rate) * 0.10;
     let dd = drawdown_penalty(max_dd);
 
-    // Positive components scaled by activity so low-trade candidates
-    // (1–5 trades over the whole window) cannot win on Sharpe noise +
-    // tiny drawdown. The DD penalty is NOT scaled — it stays at full
-    // weight so blow-up candidates are still rejected.
-    (sh + cons + pf + wr) * activity_mult - dd
+    // Positive components scaled by activity so low-trade candidates (1–5 trades
+    // over the whole window) cannot win on noise; the DD penalty is NOT scaled —
+    // full weight, rejects blow-ups even when return is high.
+    (hit + ret + sh + cons + pf + wr) * activity_mult - dd
 }
 
 // ---------------------------------------------------------------------------
@@ -280,11 +303,22 @@ mod tests {
 
     #[test]
     fn ga_fitness_finite_for_healthy_genome() {
-        // sharpe=2.0, dd=0.05, wr=0.60, pf=1.8, trades=100, consistency=0.70
-        let m = metrics(1000.0, 2.0, 0.05, 0.60, 1.8, 12.0, 100.0, 0.70);
+        // scoring_version 3: "healthy" now requires CONSISTENT monthly return, not just
+        // high total net. The dominant reward is metrics[7] = monthly_target_hit_rate.
+        // A genuinely healthy genome hits the >=4% bar in most months: hit_rate=0.70,
+        // net=20000, sharpe=2.0, dd=0.05, wr=0.60, pf=1.8, trades=100, consistency=0.70.
+        //   hit=0.70*0.45=0.315; ret=(20000/20000)*0.15=0.15; sh=2.0*0.10=0.20;
+        //   cons=0.70*0.10=0.07; pf=0.40*0.15=0.06; wr=0.30*0.10=0.03; dd=0.05*15=0.75
+        //   total = (0.315+0.15+0.20+0.07+0.06+0.03)*1.0 - 0.75 = +0.075 > 0.
+        let mut m = metrics(20_000.0, 2.0, 0.05, 0.60, 1.8, 12.0, 100.0, 0.70);
+        m[7] = 0.70; // monthly_target_hit_rate: hits >=4% in 70% of months
         let s = ga_fitness(&m);
         assert!(s.is_finite());
-        assert!(s > 0.0, "healthy genome must score positive, got {}", s);
+        assert!(
+            s > 0.0,
+            "healthy (consistent-monthly-return, low-DD) genome must score positive, got {}",
+            s
+        );
     }
 
     #[test]
@@ -340,23 +374,27 @@ mod tests {
         // The 0.335 pin therefore SURVIVES the graduated-fitness fix
         // because the healthy-genome case sits in the saturated region.
         //
-        // Healthy genome: net=1000, sharpe=2, dd=0.05, wr=0.60, pf=1.8,
-        // expectancy=12, trades=100, consistency=0.70.
-        //   activity = (100 / 30).clamp(0,1) = 1.0
-        //   activity_mult = 0.3 + 0.7 * 1.0 = 1.0
-        //   conf = sqrt(100)/10 = 1.0
-        //   sharpe_component = 2.0 (clamped) * 1.0 = 2.0 → * 0.40 = 0.80
-        //   consistency_component = 0.70 → * 0.25 = 0.175
-        //   pf above 1.0: (1.8 - 1.0) * 0.5 = 0.40 (cap @ 1.5, ok) → * 0.20 = 0.08
-        //   wr: (0.60 - 0.45) * 2.0 = 0.30 (cap @ 0.5, ok) → * 0.10 = 0.03
-        //   dd penalty: 0.05 * 15.0 = 0.75 (cap @ 5, ok)
-        //   positives_sum = 0.80 + 0.175 + 0.08 + 0.03 = 1.085
-        //   total = 1.085 * 1.0 - 0.75 = 0.335
+        // scoring_version 3 (2026-06-06, consistent-monthly-return GA): dominant reward
+        // is metrics[7]=monthly_target_hit_rate (×0.45); net demoted to ÷20k×0.15;
+        // Sharpe 0.20→0.10, consistency 0.15→0.10, PF 0.20→0.15.
+        // Pin genome has monthly_hit=0 (the `metrics` helper leaves slot 7 = 0):
+        //   net=1000, sharpe=2, dd=0.05, wr=0.60, pf=1.8, trades=100, consistency=0.70.
+        //   activity_mult = 1.0 ; conf = 1.0
+        //   hit  = 0.0 * 0.45 = 0.0
+        //   ret  = (1000/20000).clamp(±2) = 0.05 → * 0.15 = 0.0075
+        //   sh   = 2.0 (clamped) * 1.0 = 2.0 → * 0.10 = 0.20
+        //   cons = 0.70 → * 0.10 = 0.07
+        //   pf   = (1.8 - 1.0) * 0.5 = 0.40 → * 0.15 = 0.06
+        //   wr   = (0.60 - 0.45) * 2.0 = 0.30 → * 0.10 = 0.03
+        //   dd   = 0.05 * 15.0 = 0.75
+        //   total = (0.0 + 0.0075 + 0.20 + 0.07 + 0.06 + 0.03) * 1.0 - 0.75 = -0.3825
+        // NOTE: a genome with ZERO consistency (never hits 4%/month) scores NEGATIVE
+        // even at a positive net — exactly the lumpy case v3 is built to reject.
         let m = metrics(1000.0, 2.0, 0.05, 0.60, 1.8, 12.0, 100.0, 0.70);
         let s = ga_fitness(&m);
         assert!(
-            (s - 0.335).abs() < 1e-9,
-            "Phase-A GA fitness pin broken: expected 0.335, got {}",
+            (s - (-0.3825)).abs() < 1e-5,
+            "GA fitness pin (scoring_version 3) broken: expected -0.3825, got {}",
             s
         );
     }

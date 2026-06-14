@@ -28,6 +28,13 @@ pub use neoethos_core::broker_config::{
 /// Not persisted to disk — recomputed from credentials + live
 /// connection probes. Kept in `neoethos-app` because only the GUI
 /// binary maintains a session.
+// The broker-readiness surface below (session-state enum, readiness snapshot,
+// the `BrokerSettingsReadiness` trait + its helpers) feeds the UI's broker-setup
+// banner. It reads as `dead_code` because the production HTTP server drives
+// cTrader directly through `broker_api` today and the readiness banner isn't
+// wired into the Flutter status panel yet (Phase 2-5 live-engine wiring). The
+// allows come off when the banner consumes `readiness()`.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerSessionState {
     Disconnected,
@@ -40,6 +47,7 @@ pub enum BrokerSessionState {
 /// Read-only readiness snapshot consumed by the UI's broker-setup
 /// banner. Tells the operator what's missing before they can try to
 /// connect.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterReadinessSnapshot {
     pub adapter_name: String,
@@ -53,6 +61,7 @@ pub struct AdapterReadinessSnapshot {
 /// Extension trait so `BrokerSettingsState` (defined in `neoethos-core`)
 /// can still answer the app-side `readiness()` question without
 /// reintroducing the `neoethos-app -> neoethos-app` dependency cycle.
+#[allow(dead_code)]
 pub trait BrokerSettingsReadiness {
     fn readiness(&self, adapter: TradingAdapterKind) -> AdapterReadinessSnapshot;
 }
@@ -95,6 +104,7 @@ impl BrokerSettingsReadiness for BrokerSettingsState {
     }
 }
 
+#[allow(dead_code)]
 fn build_remote_readiness(
     adapter: TradingAdapterKind,
     missing_fields: Vec<String>,
@@ -126,6 +136,7 @@ fn build_remote_readiness(
     }
 }
 
+#[allow(dead_code)]
 fn required_missing_fields(fields: &[(&str, &str)]) -> Vec<String> {
     fields
         .iter()
@@ -134,6 +145,7 @@ fn required_missing_fields(fields: &[(&str, &str)]) -> Vec<String> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn count_enabled_targets(accounts: &[BrokerAccountTarget]) -> usize {
     accounts
         .iter()

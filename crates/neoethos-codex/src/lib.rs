@@ -47,7 +47,7 @@
 //! what we want — the entire point is to give operators a working
 //! AI Helper when the Gemma path is broken.
 
-#![doc(html_root_url = "https://docs.rs/neoethos-codex/0.4.35")]
+#![doc(html_root_url = "https://docs.rs/neoethos-codex/0.4.99")]
 #![deny(unused_must_use)]
 
 pub mod auth_store;

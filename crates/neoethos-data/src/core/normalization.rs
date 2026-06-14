@@ -47,47 +47,60 @@ pub fn normalize_feature_matrix(data: &mut Array2<f32>) -> Vec<(f32, f32)> {
     }
 
     let mut stats = Vec::with_capacity(n_cols);
-
-    // Scratch buffer reused per column to avoid per-column allocs.
-    let mut finite: Vec<f32> = Vec::with_capacity(n_rows);
-
+    // Scratch column buffer reused across columns. Robust z-scoring is
+    // per-column independent, so we delegate each column to the single-series
+    // routine — guaranteeing the out-of-core build path (which normalises each
+    // feature series *before* writing it to the mmap store) is bit-identical
+    // to normalising the assembled in-RAM matrix here.
+    let mut scratch = vec![0.0_f32; n_rows];
     for c in 0..n_cols {
-        finite.clear();
         for r in 0..n_rows {
-            let v = data[(r, c)];
-            if v.is_finite() {
-                finite.push(v);
-            }
+            scratch[r] = data[(r, c)];
         }
-        let (median, scale) = if finite.is_empty() {
-            (0.0_f32, 1.0_f32)
-        } else {
-            // Median (linear partition; small overhead, simpler than
-            // a select-nth implementation, fine for ~3K-200K rows).
-            finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median = finite[finite.len() / 2];
-            // MAD = median(|x - median|).
-            let mut deviations: Vec<f32> = finite.iter().map(|x| (*x - median).abs()).collect();
-            deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let mad = deviations[deviations.len() / 2];
-            let scale = (mad * MAD_TO_SIGMA).max(1e-9);
-            (median, scale)
-        };
+        let (median, scale) = normalize_feature_series_in_place(&mut scratch);
+        for r in 0..n_rows {
+            data[(r, c)] = scratch[r];
+        }
         stats.push((median, scale));
-
-        // Apply z-score in place.
-        for r in 0..n_rows {
-            let v = data[(r, c)];
-            let z = if v.is_finite() {
-                ((v - median) / scale).clamp(-Z_CLIP, Z_CLIP)
-            } else {
-                0.0
-            };
-            data[(r, c)] = z;
-        }
     }
 
     stats
+}
+
+/// Robust z-score one feature's full time series in place — the per-column
+/// kernel of [`normalize_feature_matrix`], exposed so the out-of-core feature
+/// build can normalise each series as it streams it to the mmap store (where
+/// each feature is one contiguous row) without ever materialising the dense
+/// `[samples × features]` matrix.
+///
+/// NaN / Inf cells become `0.0`; finite survivors are `(x - median) / scale`
+/// (`scale = MAD * 1.4826`, floored at `1e-9`) clipped to `±Z_CLIP`. Returns
+/// the `(median, scale)` used.
+pub fn normalize_feature_series_in_place(series: &mut [f32]) -> (f32, f32) {
+    let mut finite: Vec<f32> = series.iter().copied().filter(|v| v.is_finite()).collect();
+    let (median, scale) = if finite.is_empty() {
+        (0.0_f32, 1.0_f32)
+    } else {
+        // Median (linear partition; fine for ~3K-5M rows).
+        finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = finite[finite.len() / 2];
+        // MAD = median(|x - median|).
+        let mut deviations: Vec<f32> = finite.iter().map(|x| (*x - median).abs()).collect();
+        deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mad = deviations[deviations.len() / 2];
+        let scale = (mad * MAD_TO_SIGMA).max(1e-9);
+        (median, scale)
+    };
+
+    for v in series.iter_mut() {
+        *v = if v.is_finite() {
+            ((*v - median) / scale).clamp(-Z_CLIP, Z_CLIP)
+        } else {
+            0.0
+        };
+    }
+
+    (median, scale)
 }
 
 /// Variant that takes an immutable matrix and returns a new normalized

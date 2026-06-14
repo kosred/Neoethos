@@ -45,7 +45,7 @@
 //! the JS / Dart side — same pattern as TradingView.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::chart::ChartDto;
@@ -124,6 +124,19 @@ fn cache() -> &'static Mutex<Cache> {
     CHART_CACHE.get_or_init(|| Mutex::new(Cache::new()))
 }
 
+/// Lock the cache, recovering from a poisoned `Mutex`.
+///
+/// **2026-06-10:** the previous `.lock().ok()?` / `if let Ok(..)` patterns
+/// silently and PERMANENTLY disabled the cache the first time any thread
+/// panicked while holding the lock — every later `get` became a forced miss
+/// and every `put` a no-op, so the chart UI fell back to ~120–500 ms disk
+/// reads forever with no signal. This is just an LRU map: a panic mid-update
+/// leaves no invariant a fresh reader can't tolerate, so recovering the guard
+/// via `into_inner()` is safe and keeps the cache alive across a stray panic.
+fn lock_cache() -> MutexGuard<'static, Cache> {
+    cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Cache-key lookup. `None` = miss; caller loads from disk + calls `put`.
 pub fn get(symbol: &str, timeframe: &str, limit: usize) -> Option<ChartDto> {
     let key = CacheKey {
@@ -131,8 +144,7 @@ pub fn get(symbol: &str, timeframe: &str, limit: usize) -> Option<ChartDto> {
         timeframe: timeframe.to_string(),
         limit,
     };
-    let mut cache = cache().lock().ok()?;
-    cache.get(&key)
+    lock_cache().get(&key)
 }
 
 /// Insert a freshly-loaded `ChartDto`. Overwrites any prior entry for
@@ -143,9 +155,7 @@ pub fn put(symbol: &str, timeframe: &str, limit: usize, dto: ChartDto) {
         timeframe: timeframe.to_string(),
         limit,
     };
-    if let Ok(mut cache) = cache().lock() {
-        cache.put(key, dto);
-    }
+    lock_cache().put(key, dto);
 }
 
 /// Invalidate every cached entry. Currently only used by the
@@ -159,17 +169,13 @@ pub fn put(symbol: &str, timeframe: &str, limit: usize, dto: ChartDto) {
 /// cache" admin endpoint, lift the gate at that commit.
 #[cfg(test)]
 fn clear_all() {
-    if let Ok(mut cache) = cache().lock() {
-        cache.entries.clear();
-    }
+    lock_cache().entries.clear();
 }
 
 /// Invalidate every entry for a given symbol. More targeted than
 /// `clear_all`; called when only one symbol's Vortex file was rewritten.
 pub fn clear_symbol(symbol: &str) {
-    if let Ok(mut cache) = cache().lock() {
-        cache.entries.retain(|k, _| k.symbol != symbol);
-    }
+    lock_cache().entries.retain(|k, _| k.symbol != symbol);
 }
 
 #[cfg(test)]

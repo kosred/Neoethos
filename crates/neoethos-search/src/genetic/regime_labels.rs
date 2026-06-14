@@ -2,7 +2,6 @@ use super::evolution_math::gene_signature_hash;
 use super::search_engine::evaluate_genes;
 use super::strategy_gene::{EvaluationConfig, Gene};
 use anyhow::{Result, bail};
-use ndarray::s;
 use neoethos_data::{FeatureFrame, Ohlcv};
 use serde::{Deserialize, Serialize};
 
@@ -168,10 +167,10 @@ pub fn label_strategies_by_regime_windows(
     if genes.is_empty() {
         return Ok(Vec::new());
     }
-    if features.timestamps.len() != features.data.nrows() {
+    if features.timestamps.len() != features.n_samples() {
         bail!("feature timestamp count does not match feature rows");
     }
-    if ohlcv.close.len() != features.data.nrows() {
+    if ohlcv.close.len() != features.n_samples() {
         bail!("OHLCV rows do not match feature rows");
     }
 
@@ -213,7 +212,7 @@ fn slice_feature_frame(features: &FeatureFrame, start: usize, end: usize) -> Fea
     FeatureFrame {
         timestamps: features.timestamps[start..end].to_vec(),
         names: features.names.clone(),
-        data: features.data.slice(s![start..end, ..]).to_owned(),
+        data: neoethos_data::FeatureData::InMemory(features.sample_window(start, end)),
     }
 }
 

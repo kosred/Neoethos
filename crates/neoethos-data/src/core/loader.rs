@@ -86,7 +86,7 @@ impl FeatureCache {
 }
 
 pub fn feature_frame_to_vortex(frame: &FeatureFrame) -> Result<vortex_array::ArrayRef> {
-    let n_rows = frame.data.nrows();
+    let n_rows = frame.n_samples();
     if frame.timestamps.len() != n_rows {
         bail!(
             "Feature frame timestamp/data row mismatch: timestamps={} data_rows={} — \
@@ -94,7 +94,7 @@ pub fn feature_frame_to_vortex(frame: &FeatureFrame) -> Result<vortex_array::Arr
             frame.timestamps.len(), n_rows
         );
     }
-    if frame.names.len() != frame.data.ncols() {
+    if frame.names.len() != frame.n_features() {
         bail!("feature frame name/data column mismatch");
     }
 
@@ -105,7 +105,7 @@ pub fn feature_frame_to_vortex(frame: &FeatureFrame) -> Result<vortex_array::Arr
     arrays.push(PrimitiveArray::from_iter(frame.timestamps.iter().copied()).into_array());
 
     for (idx, name) in frame.names.iter().enumerate() {
-        let column = frame.data.column(idx).iter().copied().collect::<Vec<_>>();
+        let column = frame.feature_column(idx).iter().copied().collect::<Vec<_>>();
         names.push(name.clone().into());
         arrays.push(PrimitiveArray::from_iter(column).into_array());
     }
@@ -163,7 +163,7 @@ pub fn vortex_to_feature_frame(array: vortex_array::ArrayRef) -> Result<FeatureF
     Ok(FeatureFrame {
         timestamps,
         names,
-        data,
+        data: crate::core::features::FeatureData::InMemory(data),
     })
 }
 

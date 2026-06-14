@@ -1,11 +1,12 @@
 //! Symbols — dataset inventory. Reads `<root>/symbol=*/timeframe=*/`
 //! and shows a grid of available bars per symbol × timeframe.
 
+use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Row, Table, Widget};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Widget};
 
 use crate::tui::app::AppShared;
 use crate::tui::theme;
@@ -22,6 +23,23 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
     let inner = block.inner(area);
     block.render(area, buf);
 
+    // Reserve a bottom import bar so data can be brought in without leaving the
+    // TUI — shown in both the populated and empty-dataset states.
+    let import_h = 4u16.min(inner.height);
+    let content = Rect {
+        height: inner.height.saturating_sub(import_h),
+        ..inner
+    };
+    let bar = Rect {
+        y: inner.y + content.height,
+        height: import_h,
+        ..inner
+    };
+    draw_inventory(content, buf, shared);
+    draw_import_bar(bar, buf, shared);
+}
+
+fn draw_inventory(inner: Rect, buf: &mut Buffer, shared: &AppShared) {
     let rows = collect_inventory(&shared.data_root);
     if rows.is_empty() {
         let empty = ratatui::widgets::Paragraph::new(vec![
@@ -80,6 +98,116 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
                 .add_modifier(Modifier::BOLD),
         );
     Widget::render(table, inner, buf);
+}
+
+fn draw_import_bar(area: Rect, buf: &mut Buffer, shared: &AppShared) {
+    let field = &shared.import_form.fields[0];
+    let editing = shared.import_form.editing;
+    let value = if editing {
+        format!("{}▌", field.value)
+    } else if field.value.trim().is_empty() {
+        "<press E to set a source path>".to_string()
+    } else {
+        field.value.clone()
+    };
+    let vstyle = if editing {
+        Style::default().fg(theme::APP_BG).bg(theme::ACCENT)
+    } else if field.value.trim().is_empty() {
+        theme::muted_style()
+    } else {
+        Style::default().fg(theme::TEXT_PRIMARY)
+    };
+    let running = shared.jobs.has_running("import");
+    let hint = if running {
+        "  importing… see status bar / Logs page".to_string()
+    } else {
+        "  [E] edit source   [I] import → data/   (CSV/TSV/JSON/Parquet/Vortex auto-detected)"
+            .to_string()
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "  IMPORT  ",
+                theme::caption_style().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("source: ", theme::muted_style()),
+            Span::styled(value, vstyle),
+        ]),
+        Line::from(vec![Span::styled(hint, theme::caption_style())]),
+    ];
+    Paragraph::new(lines).render(area, buf);
+}
+
+pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
+    if shared.import_form.editing {
+        let f = &mut shared.import_form;
+        match code {
+            KeyCode::Enter => f.stop_editing(true),
+            KeyCode::Esc => f.stop_editing(false),
+            KeyCode::Backspace => f.backspace(),
+            KeyCode::Char(c) => f.type_char(c),
+            _ => return false,
+        }
+        return true;
+    }
+    match code {
+        KeyCode::Char('E') => {
+            shared.import_form.focus(0);
+            shared.import_form.start_editing();
+            true
+        }
+        KeyCode::Char('I') => {
+            // Import writes into the data/ layout — stage a Y/N confirmation
+            // rather than launching immediately (FIX A). Guard against a blank
+            // source up front so the prompt only appears for a real action.
+            let src = shared
+                .import_form
+                .value_for("Import source")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if src.is_empty() {
+                shared.status = "Set an import source first (press E)".to_string();
+            } else if shared.jobs.has_running("import") {
+                shared.status = "import already running".to_string();
+            } else {
+                shared.pending_confirmation =
+                    Some(crate::tui::app::PendingAction::SymbolsImport);
+                shared.status = "Confirm data import? [Y]es / [N]o".to_string();
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+pub fn launch_import(shared: &mut AppShared) {
+    let src = shared
+        .import_form
+        .value_for("Import source")
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if src.is_empty() {
+        shared.status = "Set an import source first (press E)".to_string();
+        return;
+    }
+    if shared.jobs.has_running("import") {
+        shared.status = "import already running".to_string();
+        return;
+    }
+    let root = shared.data_root.display().to_string();
+    shared.jobs.spawn(
+        "import",
+        vec![
+            "import".to_string(),
+            "--source".to_string(),
+            src,
+            "--root".to_string(),
+            root,
+        ],
+    );
+    shared.status = "Spawned data import — converting to data/ layout".to_string();
 }
 
 fn collect_inventory(root: &std::path::Path) -> Vec<(String, String, usize, u64)> {

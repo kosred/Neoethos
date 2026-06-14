@@ -154,7 +154,7 @@ pub fn ctrader_sample_feature_frame() -> FeatureFrame {
     FeatureFrame {
         timestamps: ohlcv.timestamp.clone().unwrap_or_default(),
         names: vec!["close_minus_open".to_string(), "range_pips".to_string()],
-        data,
+        data: crate::FeatureData::InMemory(data),
     }
 }
 
@@ -245,8 +245,8 @@ mod tests {
     fn feature_frame_shape_matches_ohlcv() {
         let frame = ctrader_sample_feature_frame();
         let ohlcv = ctrader_sample_ohlcv();
-        assert_eq!(frame.data.nrows(), ohlcv.close.len());
-        assert_eq!(frame.data.ncols(), 2);
+        assert_eq!(frame.n_samples(), ohlcv.close.len());
+        assert_eq!(frame.n_features(), 2);
         assert_eq!(frame.names.len(), 2);
         assert_eq!(frame.timestamps.len(), ohlcv.close.len());
     }

@@ -349,6 +349,10 @@
   "@commonLoading": {
     "description": "Generic loading placeholder"
   },
+  "commonComingSoon": "Soon",
+  "@commonComingSoon": {
+    "description": "Generic 'feature not yet wired' pill label"
+  },
   "commonError": "Error",
   "@commonError": {
     "description": "Generic error label"
@@ -461,7 +465,7 @@
   "discoverySliderPortfolioSize": "Portfolio size",
   "discoverySliderPortfolioSizeHint": "Final selected portfolio size — what Training will pick up.",
   "discoveryHigherTfTitle": "Higher timeframes (multi-select)",
-  "discoveryHigherTfExplainer": "Discovery cross-confirms entries against these higher TFs in addition to the base TF. Default mirrors backend DEFAULT_HIGHER_TFS (M5/M15/H1).",
+  "discoveryHigherTfExplainer": "Discovery cross-confirms entries against these higher TFs on top of the base TF. Leave all unselected to use your config's default ladder (identical to a CLI discover run); select specific chips to override it for this run only.",
   "discoveryTimeframesEmpty": "/broker/timeframes returned an empty list — check neoethos_core::CANONICAL_TIMEFRAMES.",
   "discoveryKeepOneTf": "Keep at least one higher TF — empty selection would silently fall back to the server default.",
   "discoveryLoadingTimeframes": "Loading /broker/timeframes…",
@@ -510,6 +514,7 @@
   "discoveryCounterSurvivors": "Survivors",
   "discoveryLoadingEngineState": "Loading engine state…",
   "strategyLabStageDataReady": "Data Ready",
+  "strategyLabTargetLabel": "Target",
   "strategyLabStageValidation": "Validation",
   "strategyLabStagePromotionGate": "Promotion Gate",
   "strategyLabDataReadySubtitle": "Broker symbols subscribed",
@@ -1147,6 +1152,12 @@
   "backendErrorCheckIndicator": "Check the status indicator at the top-right — if it is red, the engine is not running.",
   "backendErrorRestarting": "Restarting the engine…",
   "backendErrorRestartEngine": "Restart engine",
+  "backendErrorServerTitle": "The engine hit an error",
+  "@backendErrorServerTitle": { "description": "Title for a 5xx server-side backend failure (backend up but errored)" },
+  "backendErrorServerDetail": "The engine is running but returned a server error. This is a bug — please report it so we can fix it.",
+  "@backendErrorServerDetail": { "description": "Detail line for a 5xx server-side backend failure" },
+  "backendErrorReportIssue": "Report issue",
+  "@backendErrorReportIssue": { "description": "Button that opens the diagnostic Report Issue dialog" },
   "backendHealthReconnecting": "Backend reconnecting…{suffix}",
   "@backendHealthReconnecting": { "placeholders": { "suffix": {} } },
   "backendHealthRestartProgress": "{count, plural, =1{ (restart #1 in progress)} other{ (restart #{count} in progress)}}",

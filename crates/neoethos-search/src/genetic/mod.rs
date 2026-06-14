@@ -46,9 +46,11 @@ pub use runtime_overrides::{
     install_strategy_evaluation_runtime_overrides_from_settings,
 };
 pub use search_engine::{
-    evaluate_genes, evolve_search, evolve_search_with_progress,
-    evolve_search_with_progress_and_limits, month_day_indices, random_search, signals_for_gene,
-    signals_for_gene_full,
+    WalkforwardPopulationGenePack, evaluate_genes, evolve_search, evolve_search_with_progress,
+    evolve_search_with_progress_and_limits, month_day_indices, random_search,
+    signals_and_confidence_for_gene_full, signals_and_confidence_for_gene_with_config,
+    signals_for_gene, signals_for_gene_full, validation_genes_population,
+    validation_genes_population_gathered, validation_genes_population_window,
 };
 pub use seed_templates::seed_professional_templates;
 pub use smc_indicators::{

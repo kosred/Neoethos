@@ -23,5 +23,27 @@ BINDGEN_EXTRA_CLANG_ARGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 # the linker to keep the first definition and downgrade the duplicate
 # to a warning (LNK4006); both copies implement the same standard
 # OpenMP ABI so picking either is correct.
+# target-cpu=x86-64-v3: emit AVX2/BMI2/FMA SIMD (the microarch level for
+# Intel Haswell 2013+ and AMD Zen 2017+). Operator decision 2026-06-04:
+# NeoEthos only targets post-2013 hardware — requiring AVX2 is intended,
+# and it makes both the local builds and the shipped binary use the CPU's
+# SIMD (vector-ta TA kernels + polars + our numeric code) instead of the
+# SSE2 baseline. This is a CPU-instruction-level flag ONLY: it has no
+# effect on GPU code paths (Vulkan/CUDA run on the GPU regardless). v3
+# (not `native`) keeps the binary portable across all 2013+ CPUs rather
+# than locking to the exact build machine.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-arg=/FORCE:MULTIPLE", "-C", "link-arg=/IGNORE:4006"]
+# + -Zthreads=8 (parallel rustc frontend) for faster local Windows builds too.
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "link-arg=/FORCE:MULTIPLE", "-C", "link-arg=/IGNORE:4006", "-Z", "threads=8"]
+
+# agent 2026-06-05: AVX2/BMI2/FMA SIMD on Linux too (local WSL2 build + the L40
+# VPS). The Windows section above already requested `target-cpu=x86-64-v3`, but
+# Linux builds (x86_64-unknown-linux-gnu) were silently getting the SSE2 baseline
+# — no AVX2 vectorisation in the GA/TA/numeric hot paths, i.e. a slower binary.
+# Same microarch level (Intel Haswell 2013+ / AMD Zen 2017+), portable across all
+# post-2013 CPUs. CPU-instruction-level only; no effect on the Vulkan/CUDA GPU lane.
+[target.x86_64-unknown-linux-gnu]
+# AVX2 + mold linker (parallel, ~5-10x faster link of the 100MB+ binary) +
+# -Zthreads=8 (parallel rustc frontend across cores). mold needs `apt install
+# mold`; -Zthreads needs the nightly toolchain pinned in rust-toolchain.toml.
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "link-arg=-fuse-ld=mold", "-Z", "threads=8"]

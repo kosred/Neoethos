@@ -15,6 +15,9 @@ use crate::tui::jobs::JobStatus;
 use crate::tui::theme;
 
 const JOB_LABEL_PREFIX: &str = "auto-loop";
+/// Graceful-stop flag the auto-loop polls between jobs. Creating it (FIX D's
+/// `K`) tells a running loop to halt after the current job finishes.
+const STOP_FLAG_PATH: &str = "cache/auto_loop_stop.flag";
 
 pub fn draw(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
     let cols = Layout::default()
@@ -42,7 +45,7 @@ fn render_controls(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
     block.render(area, buf);
 
     let job_alive = shared.jobs.has_running(JOB_LABEL_PREFIX);
-    let stop_flag = std::path::Path::new("cache/auto_loop_stop.flag");
+    let stop_flag = std::path::Path::new(STOP_FLAG_PATH);
 
     let mut lines = vec![
         Line::raw(""),
@@ -63,7 +66,7 @@ fn render_controls(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
                 if stop_flag.exists() {
                     "PRESENT — loop will stop after current job"
                 } else {
-                    "absent (touch cache/auto_loop_stop.flag to stop)"
+                    "absent (press K for graceful stop)"
                 },
                 if stop_flag.exists() {
                     theme::sell_style()
@@ -167,6 +170,7 @@ fn render_state(area: Rect, buf: &mut Buffer, shared: &AppShared) {
                     JobStatus::Running => "RUNNING",
                     JobStatus::Completed => "COMPLETED",
                     JobStatus::Failed => "FAILED",
+                    JobStatus::Stopped => "STOPPED",
                 },
                 job.elapsed_seconds()
             ),
@@ -191,7 +195,49 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
             launch_now(shared);
             true
         }
+        KeyCode::Char('K') => {
+            // Graceful-stop: create the stop flag the auto-loop polls between
+            // jobs (FIX D), mirroring how Discover's K stops a run. Behind the
+            // FIX-A Y/N confirmation since it changes a long-running pipeline.
+            if std::path::Path::new(STOP_FLAG_PATH).exists() {
+                shared.status = "Stop flag already present — loop will stop after current job"
+                    .to_string();
+            } else if shared.jobs.has_running(JOB_LABEL_PREFIX) {
+                shared.pending_confirmation =
+                    Some(crate::tui::app::PendingAction::AutoLoopStop);
+                shared.status = "Confirm graceful stop (create stop flag)? [Y]es / [N]o".to_string();
+            } else {
+                // No live job, but still let the operator pre-arm the flag so a
+                // resumed loop stops; confirm anyway for consistency.
+                shared.pending_confirmation =
+                    Some(crate::tui::app::PendingAction::AutoLoopStop);
+                shared.status = "Confirm create stop flag? [Y]es / [N]o".to_string();
+            }
+            true
+        }
         _ => false,
+    }
+}
+
+/// Create the auto-loop stop flag so the loop halts gracefully after the
+/// current job (called once the user confirms — FIX D). The auto-loop polls for
+/// this file between jobs; touching it is the documented graceful-stop path.
+pub fn do_create_stop_flag(shared: &mut AppShared) {
+    let path = std::path::Path::new(STOP_FLAG_PATH);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            shared.status = format!("Could not create {}: {e}", parent.display());
+            return;
+        }
+    }
+    match std::fs::write(path, b"stop\n") {
+        Ok(()) => {
+            shared.status =
+                "Stop flag created — auto-loop will halt after the current job".to_string();
+        }
+        Err(e) => {
+            shared.status = format!("Failed to write {STOP_FLAG_PATH}: {e}");
+        }
     }
 }
 

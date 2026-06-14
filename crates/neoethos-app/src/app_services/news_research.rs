@@ -179,9 +179,11 @@ async fn fetch_all(feeds: Vec<String>) -> (Vec<NewsItem>, usize) {
     // keeps the stricter feeds (some 403 a bare reqwest UA) happy.
     let client = reqwest::Client::builder()
         .timeout(FEED_TIMEOUT)
-        .user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NeoEthos/0.4.35 news-desk",
-        )
+        .user_agent(concat!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NeoEthos/",
+            env!("CARGO_PKG_VERSION"),
+            " news-desk"
+        ))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 

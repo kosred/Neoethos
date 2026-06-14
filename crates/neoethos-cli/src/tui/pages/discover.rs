@@ -176,7 +176,7 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         let (text, fg, bg) = if job_alive {
             (
                 format!(
-                    "  ⏳ Running for {}s — see LIVE LOG on the right  ",
+                    "  ⏳ Running for {}s — press [K] to Stop · LIVE LOG →  ",
                     shared
                         .jobs
                         .latest_for(JOB_LABEL_PREFIX)
@@ -228,6 +228,7 @@ fn render_status(area: Rect, buf: &mut Buffer, shared: &AppShared) {
                 JobStatus::Running => "RUNNING",
                 JobStatus::Completed => "COMPLETED",
                 JobStatus::Failed => "FAILED",
+                JobStatus::Stopped => "STOPPED",
             },
             j.elapsed_seconds()
         ),
@@ -344,8 +345,30 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
             launch_now(shared);
             true
         }
+        KeyCode::Char('K') => {
+            // Stopping a discovery kills the subprocess — stage a Y/N
+            // confirmation rather than killing immediately (FIX A). Only prompt
+            // if there's actually a running job to stop.
+            if shared.jobs.has_running(JOB_LABEL_PREFIX) {
+                shared.pending_confirmation =
+                    Some(crate::tui::app::PendingAction::DiscoverStop);
+                shared.status = "Confirm stop discovery? [Y]es / [N]o".to_string();
+            } else {
+                shared.status = "No running discovery to stop".to_string();
+            }
+            true
+        }
         _ => false,
     }
+}
+
+/// Stop the running discovery (called once the user confirms — FIX A).
+pub fn do_stop(shared: &mut AppShared) {
+    shared.status = if shared.jobs.stop_latest(JOB_LABEL_PREFIX) {
+        "Stopping discovery…".to_string()
+    } else {
+        "No running discovery to stop".to_string()
+    };
 }
 
 pub fn launch_now(shared: &mut AppShared) {
@@ -377,6 +400,22 @@ pub fn launch_now(shared: &mut AppShared) {
     if !symbols.trim().is_empty() {
         args.push("--symbols".to_string());
         args.push(symbols);
+    }
+    // Forward the numeric form fields as explicit overrides so they actually
+    // take effect (parity fix: these were silently dropped before, making the
+    // form fields dead). Each is passed only when the user entered a value.
+    for (field, flag) in [
+        ("Population", "--population"),
+        ("Generations", "--generations"),
+        ("Portfolio size", "--portfolio-size"),
+    ] {
+        if let Some(v) = form.value_for(field) {
+            let v = v.trim();
+            if !v.is_empty() && v.parse::<usize>().is_ok() {
+                args.push(flag.to_string());
+                args.push(v.to_string());
+            }
+        }
     }
 
     shared.jobs.spawn("discover", args);
