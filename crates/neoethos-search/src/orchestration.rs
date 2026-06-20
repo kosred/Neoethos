@@ -125,6 +125,10 @@ impl DiscoveryOrchestrator {
                 };
                 let mut runtime_config = self.config.clone().apply_mode_overrides();
                 runtime_config.timeframe_label = tf.clone();
+                // Bind the current symbol so the cost-model guard doesn't fire.
+                // The base config carries settings.system.symbol as a default,
+                // which is wrong for every symbol except the one in config.yaml.
+                runtime_config.evaluation_symbol = symbol.clone();
                 // Previously this used `?` and aborted the whole batch on a
                 // single discovery failure, while every other error in the
                 // loop counted toward `summary.skipped_*` and continued.
