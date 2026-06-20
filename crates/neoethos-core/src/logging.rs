@@ -292,35 +292,34 @@ pub fn write_subsystem_record_to_path(
     update_section_file(path, section, record)
 }
 
-/// Render a `SectionedRunRecord` as a multi-line visual block. The double
-/// horizontal rule plus the right-arrow header make subsystem checkpoints
-/// trivially greppable (`grep '▶ \['`) and visually obvious in a tail.
+/// Render a `SectionedRunRecord` as a multi-line visual block. The horizontal
+/// rule plus the right-arrow header make subsystem checkpoints trivially
+/// greppable (`grep '> \['`) and visually obvious in a tail.
 ///
-/// We deliberately keep this ASCII-leaning: the box-drawing chars survive
-/// Notepad / `type` / `cat` and the right-arrow is a single UTF-8 codepoint
-/// that renders in every modern terminal. No ANSI colour — the same block
-/// goes to both console and the file layer, and we don't want escape
-/// sequences in the file.
+/// Pure ASCII — no box-drawing Unicode chars. When the block travels through
+/// a pipe (TUI jobs.rs BufReader) on a Windows Greek locale (CP1253 default),
+/// multi-byte UTF-8 codepoints like ═ (E2 95 90) and ▶ (E2 96 B6) render as
+/// mojibake (`âÃÃÃ`). ASCII is always safe regardless of code page.
 fn format_section_block(section: SubsystemSection, record: &SectionedRunRecord) -> String {
     use std::fmt::Write as _;
-    let rule = "═".repeat(78);
+    let rule = "=".repeat(78);
     let mut s = String::with_capacity(512);
     let _ = writeln!(s, "{rule}");
 
-    // Header line: ▶ [SECTION] STATUS operation  •  symbol/timeframe  •  run_id
+    // Header line: > [SECTION] STATUS operation  |  symbol/timeframe  |  run_id
     let _ = write!(
         s,
-        "▶ [{}] {} {}",
+        "> [{}] {} {}",
         section.as_str(),
         record.status,
         record.operation
     );
     if let (Some(sym), Some(tf)) = (record.symbol.as_deref(), record.timeframe.as_deref()) {
-        let _ = write!(s, "  •  {sym} {tf}");
+        let _ = write!(s, "  |  {sym} {tf}");
     } else if let Some(sym) = record.symbol.as_deref() {
-        let _ = write!(s, "  •  {sym}");
+        let _ = write!(s, "  |  {sym}");
     }
-    let _ = writeln!(s, "  •  run_id={}", record.run_id);
+    let _ = writeln!(s, "  |  run_id={}", record.run_id);
 
     if let Some(parent) = record.parent_run_id.as_deref() {
         let _ = writeln!(s, "  parent_run_id: {parent}");
@@ -653,9 +652,9 @@ mod tests {
         let block = format_section_block(SubsystemSection::Training, &record);
 
         // Visual dividers wrap the block (two horizontal rules, one prefix line).
-        assert!(block.contains("══"), "expected box-drawing divider");
+        assert!(block.contains("=="), "expected ASCII divider");
         assert!(
-            block.contains("▶ [TRAINING] SUCCESS train"),
+            block.contains("> [TRAINING] SUCCESS train"),
             "expected greppable header"
         );
         assert!(
@@ -667,15 +666,11 @@ mod tests {
         assert!(block.contains("message: training completed"));
         assert!(block.contains("loss: 0.002"));
         assert!(block.contains("accuracy: 0.94"));
-        // The dividers must appear top and bottom — a stale `assert_contains`
-        // would only catch one. Count instances of the rule string.
-        let rule_count = block.matches("══").count();
-        // We use repeat(78) so a single rule is one big substring — match
-        // count is occurrences of the substring "══" which is the unit, so
-        // each rule line contains 78/2 = 39 occurrences. Two rules → 78.
+        // The dividers must appear top and bottom.
+        let rule_count = block.matches("==").count();
         assert!(
             rule_count >= 2,
-            "expected at least two divider rules, got {rule_count} occurrences of ══"
+            "expected at least two divider rules, got {rule_count} occurrences of =="
         );
     }
 
