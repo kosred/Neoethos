@@ -18,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 
 use neoethos_core::Settings;
 
+use crate::app_services::live_trading::{LiveTradingStatus, StartRequest};
 use super::errors::actionable_error;
 use super::state::AppApiState;
 
@@ -93,4 +94,72 @@ pub async fn replay(State(state): State<AppApiState>, body: Option<Json<ReplayBo
             &anyhow::anyhow!("{join_err}"),
         ),
     }
+}
+
+// ── Live autonomous trading ───────────────────────────────────────────────────
+
+/// `POST /autonomous/start` — begin live trading from a discovered portfolio.
+///
+/// Body: `StartRequest` JSON (portfolio_path required; lot_size, sl/tp optional).
+/// Returns 409 if already running, 200 with the initial status on success.
+pub async fn start_live(State(state): State<AppApiState>, Json(req): Json<StartRequest>) -> Response {
+    let mut slot = match state.live_trading.lock() {
+        Ok(g) => g,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response(),
+    };
+
+    if slot.as_ref().map(|h| h.is_running()).unwrap_or(false) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "live trading is already running — POST /autonomous/stop first"
+            })),
+        )
+            .into_response();
+    }
+
+    match crate::app_services::live_trading::start(req) {
+        Ok(handle) => {
+            let status = handle.snapshot();
+            *slot = Some(handle);
+            (StatusCode::OK, Json(status)).into_response()
+        }
+        Err(e) => actionable_error(
+            StatusCode::BAD_REQUEST,
+            "Failed to start live trading. Check the portfolio_path and broker credentials.",
+            &e,
+        ),
+    }
+}
+
+/// `POST /autonomous/stop` — gracefully stop the live trading loop.
+pub async fn stop_live(State(state): State<AppApiState>) -> Response {
+    let slot = match state.live_trading.lock() {
+        Ok(g) => g,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response(),
+    };
+    match slot.as_ref() {
+        Some(handle) => {
+            handle.stop();
+            (StatusCode::OK, Json(serde_json::json!({"stopped": true}))).into_response()
+        }
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({"stopped": false, "reason": "was not running"})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /autonomous/status` — poll live trading state.
+pub async fn live_status(State(state): State<AppApiState>) -> Response {
+    let slot = match state.live_trading.lock() {
+        Ok(g) => g,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response(),
+    };
+    let status: LiveTradingStatus = slot
+        .as_ref()
+        .map(|h| h.snapshot())
+        .unwrap_or_default();
+    Json(status).into_response()
 }

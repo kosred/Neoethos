@@ -94,6 +94,8 @@ fn main() -> Result<()> {
         "wizard" => cmd_wizard(&args[2..]),
         "setup" => cmd_setup(&args[2..]),
         "credentials" => cmd_credentials(&args[2..]),
+        // Path B: write the last-bar gene signal to a JSON file for MT5 EA
+        "live-signal" => cmd_live_signal(&args[2..]),
         _ => {
             print_help();
             Ok(())
@@ -2680,6 +2682,137 @@ fn print_help() {
     println!("                         (subfolders for symbol/timeframe, Hive-style or flat).");
     println!("                         Supported on: train, discover, import.");
     println!("  --dry-run              With --data-path, print the discovery summary and exit.");
+    println!("  live-signal --portfolio <live_portfolio.json> [--root data] [--output signal.json]");
+    println!("                         Compute the last-bar gene signal from on-disk vortex data");
+    println!("                         and write signal.json for the MT5 Expert Advisor to read.");
+}
+
+// ── Path B: MT5 signal exporter ───────────────────────────────────────────────
+
+/// `live-signal --portfolio <path> [--root data] [--output signal.json]`
+///
+/// Computes the last closed bar's gene signal from on-disk vortex data
+/// and writes it to a JSON file the MT5 EA reads every bar.
+///
+/// Output example (signal.json):
+/// ```json
+/// { "symbol":"EURUSD", "base_tf":"H1", "signal":"Long",
+///   "confidence":0.85, "bar_ts_ms":1750000000000,
+///   "generated_at":"2026-06-20T10:00:00.000Z", "genes":4 }
+/// ```
+fn cmd_live_signal(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?;
+    let root = parse_root(args, settings.as_ref());
+    let portfolio_path = parse_flag(args, "--portfolio")
+        .ok_or_else(|| anyhow::anyhow!("--portfolio <live_portfolio.json> is required"))?;
+    let output_path = parse_flag(args, "--output").unwrap_or_else(|| "signal.json".to_string());
+    let warmup: usize = parse_flag(args, "--warmup")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+
+    // Load portfolio artifact
+    let artifact = neoethos_search::load_live_portfolio_json(&portfolio_path)
+        .with_context(|| format!("load portfolio {portfolio_path}"))?;
+
+    if artifact.genes.is_empty() {
+        anyhow::bail!("portfolio '{}' has no genes", portfolio_path);
+    }
+    if artifact.normalize_features {
+        anyhow::bail!(
+            "portfolio was produced with feature normalisation ON — \
+             normalisation stats are not persisted. Re-run discovery with normalisation OFF."
+        );
+    }
+
+    let symbol = artifact.symbol.clone();
+    let base_tf = artifact.base_tf.clone();
+    let higher_tfs = artifact.higher_tfs.clone();
+    let effective_names = artifact.effective_feature_names.clone();
+    let genes = artifact.genes.clone();
+
+    eprintln!(
+        "live-signal: symbol={symbol} base={base_tf} genes={} higher={higher_tfs:?}",
+        genes.len()
+    );
+
+    // Load multi-TF dataset from vortex files
+    let all_tfs: Vec<&str> = std::iter::once(base_tf.as_str())
+        .chain(higher_tfs.iter().map(|s| s.as_str()))
+        .collect();
+    let dataset = neoethos_data::load_symbol_dataset_with_timeframes(&root, &symbol, &all_tfs)
+        .with_context(|| format!("load dataset for {symbol} in '{root}' — run 'load' first"))?;
+
+    // Load base OHLCV for SMC gates, trimmed to warmup
+    let full_ohlcv = neoethos_data::load_symbol_timeframe(&root, &symbol, &base_tf)
+        .with_context(|| format!("load base OHLCV {symbol} {base_tf}"))?;
+    if full_ohlcv.is_empty() {
+        anyhow::bail!("no bars for {symbol} {base_tf} in '{root}'");
+    }
+    let base_ohlcv = if full_ohlcv.len() > warmup {
+        let skip = full_ohlcv.len() - warmup;
+        neoethos_data::Ohlcv {
+            timestamp: full_ohlcv.timestamp.as_ref().map(|v| v[skip..].to_vec()),
+            open: full_ohlcv.open[skip..].to_vec(),
+            high: full_ohlcv.high[skip..].to_vec(),
+            low: full_ohlcv.low[skip..].to_vec(),
+            close: full_ohlcv.close[skip..].to_vec(),
+            volume: full_ohlcv.volume.as_ref().map(|v| v[skip..].to_vec()),
+        }
+    } else {
+        full_ohlcv
+    };
+
+    // Compute features
+    let higher_refs: Vec<&str> = higher_tfs.iter().map(|s| s.as_str()).collect();
+    let raw_features = neoethos_data::prepare_multitimeframe_features(
+        &dataset, &base_tf, &higher_refs, None,
+    )
+    .context("compute multi-TF features")?;
+
+    let aligned = neoethos_search::project_features_to_effective(&raw_features, &effective_names)
+        .context("project to effective feature set")?;
+
+    if aligned.n_samples() == 0 {
+        anyhow::bail!("empty feature frame after projection");
+    }
+
+    // Gene signals — last bar only (we compute the full vector, take the tail)
+    let (directions, confidences) =
+        neoethos_trader::combine_gene_signals_with_confidence(&genes, &aligned, &base_ohlcv);
+    let last_dir = directions.last().copied().unwrap_or(neoethos_trader::Direction::Flat);
+    let last_conf = confidences.last().copied().unwrap_or(0.0);
+
+    let bar_ts_ms = base_ohlcv
+        .timestamp
+        .as_ref()
+        .and_then(|ts| ts.last().copied())
+        .unwrap_or(0);
+
+    let generated_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let signal_str = match last_dir {
+        neoethos_trader::Direction::Long => "Long",
+        neoethos_trader::Direction::Short => "Short",
+        neoethos_trader::Direction::Flat => "Flat",
+    };
+
+    let output = serde_json::json!({
+        "symbol": symbol,
+        "base_tf": base_tf,
+        "signal": signal_str,
+        "confidence": (last_conf * 1000.0).round() / 1000.0,
+        "bar_ts_ms": bar_ts_ms,
+        "generated_at": generated_at,
+        "genes": genes.len(),
+        "portfolio": portfolio_path,
+    });
+
+    let json_str = serde_json::to_string_pretty(&output)?;
+    std::fs::write(&output_path, &json_str)
+        .with_context(|| format!("write signal to '{output_path}'"))?;
+
+    println!("{json_str}");
+    eprintln!("Signal written to: {output_path}");
+    Ok(())
 }
 
 fn cli_record(operation: &str, status: &str, message: impl Into<String>) -> SectionedRunRecord {

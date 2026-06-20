@@ -156,6 +156,11 @@ pub fn router(state: AppApiState) -> Router {
         // the SAME engine + helper the CLI `trader-replay` drives → identical
         // EngineStats from both front-ends.
         .route("/autonomous/replay", post(autonomous::replay))
+        // Phase A live trading: start/stop/status for the bar-poll → gene
+        // signal → cTrader execution loop.
+        .route("/autonomous/start", post(autonomous::start_live))
+        .route("/autonomous/stop", post(autonomous::stop_live))
+        .route("/autonomous/status", get(autonomous::live_status))
         .route("/broker/status", get(system_status::broker_status))
         .route("/broker/reauth", post(broker_control::reauth))
         .route(

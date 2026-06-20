@@ -211,6 +211,8 @@ pub struct AppApiState {
     /// (deliberate — a second taker is a bug).
     account_refresh_rx:
         Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<()>>>>,
+    /// Live autonomous trading job handle. `None` when idle.
+    pub live_trading: Arc<std::sync::Mutex<Option<crate::app_services::live_trading::Handle>>>,
 }
 
 #[derive(Default)]
@@ -279,6 +281,7 @@ impl AppApiState {
             account_broadcast,
             account_refresh_tx,
             account_refresh_rx: Arc::new(std::sync::Mutex::new(Some(account_refresh_rx))),
+            live_trading: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
