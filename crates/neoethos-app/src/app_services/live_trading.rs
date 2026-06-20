@@ -239,23 +239,37 @@ async fn run(
             break;
         }
 
-        // ── Fetch base-TF bars ────────────────────────────────────────────────
-        let sym = symbol.clone();
-        let tf = base_tf.clone();
-        let base_bars = match tokio::task::spawn_blocking(move || {
-            fetch_recent_chart_bars_blocking(&sym, &tf, warmup)
-        })
-        .await?
-        {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    target: "neoethos_app::live_trading",
-                    error = %e,
-                    "fetch base-TF bars failed, retrying next bar"
-                );
-                continue;
+        // ── Fetch base-TF bars (with configurable retry) ─────────────────────
+        let max_tries = crate::app_services::env_overrides::ctrader_stream_max_attempts();
+        let mut base_bars_opt = None;
+        for attempt in 0..max_tries {
+            let sym = symbol.clone();
+            let tf = base_tf.clone();
+            match tokio::task::spawn_blocking(move || {
+                fetch_recent_chart_bars_blocking(&sym, &tf, warmup)
+            })
+            .await?
+            {
+                Ok(b) => { base_bars_opt = Some(b); break; }
+                Err(e) => {
+                    let last = attempt + 1 == max_tries;
+                    tracing::warn!(
+                        target: "neoethos_app::live_trading",
+                        error = %e, attempt, max_tries, last,
+                        "fetch base-TF bars failed"
+                    );
+                    if !last {
+                        let backoff_ms =
+                            crate::app_services::env_overrides::ctrader_stream_backoff_base_ms()
+                                * (1u64 << attempt.min(4));
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                }
             }
+        }
+        let base_bars = match base_bars_opt {
+            Some(b) => b,
+            None => continue,
         };
 
         // Check if there really is a new bar

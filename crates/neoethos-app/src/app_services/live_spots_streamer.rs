@@ -357,7 +357,12 @@ pub fn spawn(config: LiveSpotsStreamerConfig) {
                 );
                 break;
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Reconnect backoff: operator-configurable via config.yaml
+            // `app_runtime.ctrader_stream_backoff_base_ms`; floored at 1 s
+            // so a misconfigured 0-ms value can't spin-loop.
+            let backoff_ms = crate::app_services::env_overrides::ctrader_stream_backoff_base_ms()
+                .max(1_000);
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         }
     });
 }

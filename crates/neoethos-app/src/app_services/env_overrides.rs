@@ -44,11 +44,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 // The cTrader-retry / streaming / PnL-audit name + default constants in this
 // section are part of the env-override *catalog*: kept exported so the registry
 // stays grep-able and the test drift-guard can assert every knob is documented.
-// They read as `dead_code` only because their consumers live on the live
-// cTrader execution + PnL circuit-breaker path, which is built but not yet
-// wired into the production HTTP server (Phase 2-5 live-engine wiring — see
-// `app_services/discovery.rs` + the autonomous-trader design). The
-// `#[allow(dead_code)]` comes off when the live supervisor reads these getters.
+// The ENV_* string constants read as `dead_code` because the actual runtime
+// values are read through the AppRuntimeConfig OnceLock (not from env directly);
+// the typed getters below (ctrader_read_timeout_secs etc.) are the live call
+// sites. The remaining `#[allow(dead_code)]` items (ENV_* constants,
+// DEFAULT_* constants, chart_merge_side_raw) come off when the PnL
+// circuit-breaker and chart-merge display paths are wired (Phase 2-5).
 
 /// HTTP server bind address (`host:port`). When unset, falls back to
 /// `127.0.0.1:7423`. Read by `server::serve` at startup.
@@ -216,16 +217,13 @@ pub fn ctrader_allow_partial_fill() -> bool {
     app_runtime().ctrader_allow_partial_fill
 }
 
-/// Maximum streaming poll attempts. Clamped `[1, 5]`.
-/// `dead_code` until the live streaming layer is wired (Phase 2-5).
-#[allow(dead_code)]
+/// Maximum bar-fetch attempts in the live trading loop. Clamped `[1, 5]`.
 pub fn ctrader_stream_max_attempts() -> u32 {
     app_runtime().ctrader_stream_max_attempts.clamp(1, 5)
 }
 
-/// Streaming retry backoff base (ms). Clamped `[10, 2000]`.
-/// `dead_code` until the live streaming layer is wired (Phase 2-5).
-#[allow(dead_code)]
+/// Backoff base (ms) for the live trading bar-fetch retries and spot-stream
+/// reconnect. Clamped `[10, 2000]`.
 pub fn ctrader_stream_backoff_base_ms() -> u64 {
     app_runtime().ctrader_stream_backoff_base_ms.clamp(10, 2_000)
 }
