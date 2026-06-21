@@ -1,0 +1,122 @@
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  background: #0f1117;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  background: #11151f;
+  border-bottom: 1px solid #1f2632;
+  flex: 0 0 auto;
+}
+
+.brand {
+  font-weight: 700;
+  font-size: 16px;
+  letter-spacing: 0.3px;
+  color: #e5e7eb;
+}
+
+.pill {
+  font-size: 10px;
+  font-weight: 700;
+  color: #3b82f6;
+  border: 1px solid #3b82f6;
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.pickers {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.pickers label {
+  display: flex;
+  flex-direction: column;
+  font-size: 11px;
+  color: #6b7280;
+  gap: 3px;
+}
+
+.pickers select {
+  background: #0f1117;
+  color: #e5e7eb;
+  border: 1px solid #2a3142;
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 13px;
+  min-width: 96px;
+}
+
+.pickers button {
+  background: #1e3a5f;
+  color: #cfe3ff;
+  border: 1px solid #3b82f6;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.pickers button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.error {
+  background: #3a1620;
+  color: #fca5a5;
+  border-bottom: 1px solid #7f1d1d;
+  padding: 6px 16px;
+  font-size: 12px;
+}
+
+.chart-wrap {
+  flex: 1 1 auto;
+  position: relative;
+  min-height: 0;
+}
+
+.chart {
+  position: absolute;
+  inset: 0;
+}
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 5px 16px;
+  background: #11151f;
+  border-top: 1px solid #1f2632;
+  font-size: 11px;
+  color: #9ca3af;
+  flex: 0 0 auto;
+}
+
+.statusbar .spacer {
+  flex: 1 1 auto;
+}
+
+.statusbar .muted {
+  color: #5b6472;
+  max-width: 50vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.statusbar .ver {
+  color: #3b82f6;
+  font-weight: 600;
+}

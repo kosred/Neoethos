@@ -5,9 +5,9 @@
 // on stdout. Linux/macOS ignore the attribute.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod app_services;
-mod app_state;
-mod server;
+// Modules now live in the library crate (src/lib.rs) so the Tauri desktop
+// shell can reuse them in-process. The bin consumes them via `neoethos_app::`.
+use neoethos_app::{app_services, app_state, server};
 
 use app_state::AppRuntimeConfig;
 use clap::Parser;
@@ -213,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.models.data_runtime.normalize_features,
         settings.models.data_runtime.rebuild_stale_higher_tfs,
     );
-    crate::app_services::env_overrides::install_app_runtime_overrides(settings.app_runtime.clone());
+    app_services::env_overrides::install_app_runtime_overrides(settings.app_runtime.clone());
     let runtime = AppRuntimeConfig::from_settings(
         args.config.clone(),
         args.local,

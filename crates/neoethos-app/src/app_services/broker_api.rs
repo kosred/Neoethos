@@ -31,8 +31,9 @@ use crate::app_services::ctrader_messages::{
     CTraderNewOrderRequest, CTraderOrderType, CTraderTradeSide,
 };
 use crate::app_services::ctrader_account::{
-    CTraderCashFlowBundle, CTraderCtidProfileSnapshot, CTraderExpectedMarginBundle,
-    CTraderOrderHistoryBundle, CTraderServerVersionSnapshot, ensure_success_payload_type,
+    CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot, CTraderCashFlowBundle,
+    CTraderCtidProfileSnapshot, CTraderExpectedMarginBundle, CTraderOrderHistoryBundle,
+    CTraderServerVersionSnapshot, ensure_success_payload_type, load_account_runtime,
     parse_cash_flow_history_response, parse_ctid_profile_response, parse_expected_margin_response,
     parse_order_list_response, parse_version_response,
 };
@@ -50,7 +51,11 @@ use crate::app_services::ctrader_messages::{
     build_symbol_category_list_request, build_symbols_list_request, build_version_request,
 };
 use crate::app_services::secure_store::production_ctrader_token_store;
-use crate::app_services::ctrader_live_auth::CTraderEnvironment;
+use crate::app_services::ctrader_live_auth::{
+    CTraderEnvironment, CTraderLiveAuthBackend, CTraderTokenRefreshRequest,
+    ProductionCTraderLiveAuthBackend,
+};
+use crate::app_services::ctrader_auth::CTraderTokenBundle;
 
 /// What `/broker/symbols` ultimately returns over the wire — kept here
 /// so the server module just shovels it to JSON.
@@ -117,6 +122,92 @@ struct ResolvedCreds {
     env_label: &'static str,
 }
 
+/// Refresh the access token when it is within this many seconds of expiry
+/// (or already expired). cTrader access tokens live ~30 min; 120 s of slack
+/// means a call never goes out on a token about to die mid-request.
+const TOKEN_REFRESH_WINDOW_SECS: i64 = 120;
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Load the stored token bundle and **silently refresh** it via the
+/// `refresh_token` grant when it is expired or about to expire — NO browser,
+/// NO user interaction. The refreshed bundle is persisted back to the keyring.
+///
+/// This is what makes the broker connection automatic: the interactive OAuth
+/// (`run_reauth_flow_blocking`) is only ever needed ONCE to mint the first
+/// refresh_token, or again if the broker revokes the refresh_token. Every
+/// normal launch and every API call after that auto-refreshes here.
+///
+/// Blocking (does a token-endpoint HTTP POST when refreshing); callers already
+/// run broker work inside `spawn_blocking`.
+fn ensure_fresh_token_bundle(client_id: &str, client_secret: &str) -> Result<CTraderTokenBundle> {
+    let store = production_ctrader_token_store();
+    let bundle = store
+        .load_token_bundle_with_legacy_fallback()
+        .map_err(|e| anyhow!("token bundle load failed: {e}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "no cTrader token bundle saved yet — run Re-authenticate \
+                 in Broker Setup once (only needed the first time)"
+            )
+        })?;
+
+    if !bundle.needs_refresh_at(now_unix(), TOKEN_REFRESH_WINDOW_SECS) {
+        return Ok(bundle);
+    }
+    if bundle.refresh_token.trim().is_empty() {
+        // No refresh_token to spend — return the (stale) bundle; the call may
+        // 401 and the operator will be prompted to re-authenticate once.
+        tracing::warn!(
+            target: "neoethos_app::auth",
+            "token expired and no refresh_token present — re-authentication required"
+        );
+        return Ok(bundle);
+    }
+
+    let req = CTraderTokenRefreshRequest {
+        client_id: client_id.to_string(),
+        client_secret: client_secret.to_string(),
+        refresh_token: bundle.refresh_token.clone(),
+        scope: if bundle.scope.trim().is_empty() {
+            "trading".to_string()
+        } else {
+            bundle.scope.clone()
+        },
+    };
+    match ProductionCTraderLiveAuthBackend.refresh_token_bundle(&req) {
+        Ok(fresh) => {
+            if let Err(e) = store.save_token_bundle(&fresh) {
+                tracing::warn!(
+                    target: "neoethos_app::auth",
+                    error = %e,
+                    "access token refreshed but failed to persist; using in-memory copy"
+                );
+            } else {
+                tracing::info!(
+                    target: "neoethos_app::auth",
+                    "cTrader access token silently refreshed (no re-auth needed)"
+                );
+            }
+            Ok(fresh)
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "neoethos_app::auth",
+                error = %e,
+                "silent token refresh failed; falling back to stored token \
+                 (re-authentication may be required if the refresh_token was revoked)"
+            );
+            Ok(bundle)
+        }
+    }
+}
+
 fn resolve_creds() -> Result<ResolvedCreds> {
     let settings = load_broker_settings();
     let ct = &settings.ctrader;
@@ -131,16 +222,7 @@ fn resolve_creds() -> Result<ResolvedCreds> {
         .first()
         .ok_or_else(|| anyhow!("no cTrader account configured"))?;
 
-    let bundle = production_ctrader_token_store()
-        .load_token_bundle_with_legacy_fallback()
-        .map_err(|e| anyhow!("token bundle load failed: {e}"))?
-        .ok_or_else(|| {
-            anyhow!(
-                "no cTrader token bundle saved yet — run \
-                 `neoethos-app --reauth` (or click Re-authenticate \
-                 in Broker Setup) first"
-            )
-        })?;
+    let bundle = ensure_fresh_token_bundle(&ct.client_id, &ct.client_secret)?;
 
     let (env, env_label) = match ct.environment {
         CTraderBrokerEnvironment::Demo => (CTraderEnvironment::Demo, "Demo"),
@@ -182,15 +264,7 @@ pub fn fetch_broker_accounts_blocking() -> Result<BrokerAccountsBundle> {
         ));
     }
 
-    let bundle = production_ctrader_token_store()
-        .load_token_bundle_with_legacy_fallback()
-        .map_err(|e| anyhow!("token bundle load failed: {e}"))?
-        .ok_or_else(|| {
-            anyhow!(
-                "no cTrader token bundle saved yet — open Broker Setup \
-                 and click Re-authenticate first"
-            )
-        })?;
+    let bundle = ensure_fresh_token_bundle(&ct.client_id, &ct.client_secret)?;
 
     let (env, env_label) = match ct.environment {
         CTraderBrokerEnvironment::Demo => (CTraderEnvironment::Demo, "Demo"),
@@ -858,6 +932,23 @@ pub fn close_position_blocking(position_id: i64, volume: i64) -> Result<CTraderE
         }),
     };
     ProductionCTraderExecutionBackend::default().execute(&runtime_request)
+}
+
+/// Load the live account runtime (balance, equity inputs, open positions,
+/// pending orders) from cTrader for the active account. Resolves creds with
+/// the automatic silent-refresh path, so a normal launch never needs re-auth.
+/// Blocking; callers must wrap in `spawn_blocking`.
+pub fn fetch_account_runtime_blocking() -> Result<CTraderAccountRuntimeSnapshot> {
+    let creds = resolve_creds()?;
+    let request = CTraderAccountRuntimeRequest {
+        client_id: creds.client_id,
+        client_secret: creds.client_secret,
+        access_token: creds.access_token,
+        environment: creds.environment,
+        account_id: creds.account_id_str,
+        return_protection_orders: true,
+    };
+    load_account_runtime(&request)
 }
 
 /// Cancel a pending order (not a filled position — use

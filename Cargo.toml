@@ -9,6 +9,12 @@ members = [
   "crates/neoethos-app",
   "crates/neoethos-codex",
   "crates/neoethos-trader",
+  # Tauri desktop shell (single-process replacement for the Flutter+HTTP
+  # split). Shares target/ so it links the already-built neoethos-* rlibs
+  # instead of recompiling the whole dep tree. Deliberately NOT in
+  # default-members: plain `cargo build` stays lean; build via
+  # `cargo tauri dev/build` or `-p neoethos-desktop`.
+  "desktop/src-tauri",
 ]
 default-members = [
   "crates/neoethos-search",
