@@ -1,97 +1,359 @@
-.app {
+/* ── Shell ──────────────────────────────────────────────────────────────── */
+.shell {
   display: flex;
-  flex-direction: column;
   height: 100vh;
   width: 100vw;
   background: #0f1117;
-}
-
-.topbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 16px;
-  background: #11151f;
-  border-bottom: 1px solid #1f2632;
-  flex: 0 0 auto;
-}
-
-.brand {
-  font-weight: 700;
-  font-size: 16px;
-  letter-spacing: 0.3px;
   color: #e5e7eb;
 }
 
+.sidebar {
+  width: 210px;
+  flex: 0 0 210px;
+  background: #11151f;
+  border-right: 1px solid #1f2632;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 10px;
+}
+
+.logo {
+  font-weight: 800;
+  font-size: 16px;
+  padding: 6px 8px 16px;
+}
 .pill {
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 700;
   color: #3b82f6;
   border: 1px solid #3b82f6;
   border-radius: 4px;
-  padding: 1px 6px;
-  margin-left: 6px;
+  padding: 1px 5px;
   vertical-align: middle;
 }
 
-.pickers {
-  display: flex;
-  align-items: flex-end;
-  gap: 12px;
-}
-
-.pickers label {
+nav {
   display: flex;
   flex-direction: column;
-  font-size: 11px;
-  color: #6b7280;
-  gap: 3px;
+  gap: 2px;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: #9ca3af;
+  padding: 9px 10px;
+  border-radius: 7px;
+  font-size: 13.5px;
+  cursor: pointer;
+}
+.nav-item:hover {
+  background: #161c28;
+  color: #e5e7eb;
+}
+.nav-item.active {
+  background: #1a2333;
+  color: #cfe3ff;
+}
+.nav-icon {
+  width: 18px;
+  text-align: center;
+  font-size: 13px;
 }
 
-.pickers select {
+.sidebar-foot {
+  margin-top: auto;
+  font-size: 11px;
+  color: #6b7280;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.dot.ok {
+  background: #22c55e;
+}
+.dot.off {
+  background: #ef4444;
+}
+
+.main {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.content {
+  flex: 1 1 auto;
+  overflow: auto;
+  position: relative;
+}
+
+/* ── Screens ────────────────────────────────────────────────────────────── */
+.screen {
+  padding: 22px 26px;
+}
+.screen h1 {
+  font-size: 20px;
+  margin: 0 0 2px;
+}
+.screen h2 {
+  font-size: 14px;
+  color: #cbd5e1;
+  margin: 22px 0 10px;
+}
+.sub {
+  color: #6b7280;
+  font-size: 12px;
+  margin: 0 0 18px;
+}
+.muted {
+  color: #6b7280;
+}
+.small {
+  font-size: 11px;
+}
+
+/* cards */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+.card {
+  background: #141a26;
+  border: 1px solid #1f2632;
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+.card.accent {
+  border-color: #294063;
+}
+.card-label {
+  font-size: 10.5px;
+  letter-spacing: 0.6px;
+  color: #6b7280;
+}
+.card-value {
+  font-size: 22px;
+  font-weight: 700;
+  margin-top: 8px;
+}
+
+/* tables */
+.tbl {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.tbl th {
+  text-align: left;
+  color: #6b7280;
+  font-weight: 600;
+  padding: 7px 10px;
+  border-bottom: 1px solid #1f2632;
+}
+.tbl td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #161c28;
+}
+.buy {
+  color: #22c55e;
+}
+.sell {
+  color: #ef4444;
+}
+
+/* banners */
+.banner {
+  border-radius: 8px;
+  padding: 9px 13px;
+  font-size: 12.5px;
+  margin: 12px 0;
+}
+.banner.warn {
+  background: #3a1620;
+  color: #fca5a5;
+  border: 1px solid #7f1d1d;
+}
+.banner.info {
+  background: #15202e;
+  color: #9ec5ff;
+  border: 1px solid #294063;
+}
+
+/* controls */
+select,
+input {
   background: #0f1117;
   color: #e5e7eb;
   border: 1px solid #2a3142;
   border-radius: 6px;
-  padding: 5px 8px;
+  padding: 6px 8px;
   font-size: 13px;
-  min-width: 96px;
 }
-
-.pickers button {
-  background: #1e3a5f;
+button {
+  background: #1a2333;
   color: #cfe3ff;
-  border: 1px solid #3b82f6;
+  border: 1px solid #2a3142;
   border-radius: 6px;
-  padding: 6px 14px;
+  padding: 6px 12px;
   font-size: 13px;
   cursor: pointer;
 }
-
-.pickers button:disabled {
+button:hover {
+  border-color: #3b82f6;
+}
+button:disabled {
   opacity: 0.5;
   cursor: default;
 }
-
-.error {
+button.primary {
+  background: #1e3a5f;
+  border-color: #3b82f6;
+}
+button.danger {
   background: #3a1620;
+  border-color: #7f1d1d;
   color: #fca5a5;
-  border-bottom: 1px solid #7f1d1d;
-  padding: 6px 16px;
+}
+
+.seg {
+  display: inline-flex;
+  border: 1px solid #2a3142;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.seg button {
+  border: none;
+  border-radius: 0;
+  background: #0f1117;
+}
+.seg button.on {
+  background: #1e3a5f;
+  color: #cfe3ff;
+}
+.seg button.on.buy {
+  background: #14532d;
+  color: #86efac;
+}
+.seg button.on.sell {
+  background: #7f1d1d;
+  color: #fca5a5;
+}
+
+/* markets */
+.markets {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 16px 18px;
+}
+.markets-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.markets-head h1 {
+  margin: 0;
+}
+.controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.ticker {
+  display: flex;
+  gap: 16px;
+  padding: 8px 2px;
+  overflow-x: auto;
   font-size: 12px;
+  color: #9ca3af;
+  white-space: nowrap;
 }
-
-.chart-wrap {
-  flex: 1 1 auto;
+.tick b {
+  color: #e5e7eb;
+}
+.chart-host {
   position: relative;
+  flex: 1 1 auto;
   min-height: 0;
+  margin-top: 8px;
+  border: 1px solid #1f2632;
+  border-radius: 8px;
+  overflow: hidden;
 }
-
-.chart {
+.empty {
   position: absolute;
   inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #6b7280;
 }
 
+/* ticket */
+.ticket {
+  background: #141a26;
+  border: 1px solid #1f2632;
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+.ticket h2 {
+  margin-top: 0;
+}
+.ticket-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+.ticket-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: #6b7280;
+}
+.ticket-row input {
+  width: 90px;
+}
+
+/* settings */
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin: 8px 0 4px;
+}
+.kv {
+  background: #141a26;
+  border: 1px solid #1f2632;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.kv span {
+  font-size: 10.5px;
+  color: #6b7280;
+}
+.btn-row {
+  display: flex;
+  gap: 10px;
+  margin: 14px 0;
+}
+
+/* statusbar */
 .statusbar {
   display: flex;
   align-items: center;
@@ -103,19 +365,15 @@
   color: #9ca3af;
   flex: 0 0 auto;
 }
-
 .statusbar .spacer {
   flex: 1 1 auto;
 }
-
 .statusbar .muted {
-  color: #5b6472;
-  max-width: 50vw;
+  max-width: 55vw;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
 .statusbar .ver {
   color: #3b82f6;
   font-weight: 600;

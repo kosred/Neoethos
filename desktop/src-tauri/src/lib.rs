@@ -130,6 +130,9 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            // Start the live cTrader spot-price streamer (best-effort; no-op
+            // until the broker is authenticated). The UI polls spot_prices().
+            broker::start_spot_streamer();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -147,6 +150,7 @@ pub fn run() {
             broker::place_order,
             broker::close_position,
             broker::reauth_broker,
+            broker::spot_prices,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

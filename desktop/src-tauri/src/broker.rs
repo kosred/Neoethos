@@ -12,6 +12,7 @@ use tauri::async_runtime::spawn_blocking;
 use neoethos_app::app_services::broker_api;
 use neoethos_app::app_services::broker_persistence::load_broker_settings;
 use neoethos_app::app_services::secure_store::production_ctrader_token_store;
+use neoethos_app::app_services::{live_spots, live_spots_streamer};
 
 // ── DTOs (camelCase for the web UI) ───────────────────────────────────────────
 
@@ -85,6 +86,16 @@ pub struct ExecResult {
     pub side: Option<String>,
     pub fill_price: Option<f64>,
     pub message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotPrice {
+    pub symbol_id: i64,
+    pub name: String,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub mid: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -292,6 +303,40 @@ pub async fn close_position(position_id: i64, volume: i64) -> Result<ExecResult,
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Start the live spot-price streamer (cTrader WebSocket). Idempotent-ish:
+/// safe to call once at startup. Returns whether it spawned (false = creds /
+/// token missing — the UI then shows no live prices until re-auth).
+pub fn start_spot_streamer() {
+    // Run in the tokio context (the streamer does an internal tokio::spawn for
+    // its reconnect loop) but off the UI thread.
+    tauri::async_runtime::spawn(async {
+        let spawned = live_spots_streamer::try_spawn_with_defaults_blocking();
+        log::info!("spot streamer spawned: {spawned}");
+    });
+}
+
+/// Snapshot of the latest live bid/ask per subscribed symbol (the UI polls
+/// this every ~1.5 s — plenty for forex). Populated by the streamer above.
+#[tauri::command]
+pub async fn spot_prices() -> Result<Vec<SpotPrice>, String> {
+    spawn_blocking(|| {
+        live_spots::snapshot_all()
+            .into_iter()
+            .map(|t| {
+                let mid = match (t.bid, t.ask) {
+                    (Some(b), Some(a)) => Some((b + a) / 2.0),
+                    (Some(b), None) => Some(b),
+                    (None, Some(a)) => Some(a),
+                    _ => None,
+                };
+                SpotPrice { symbol_id: t.symbol_id, name: t.symbol_name, bid: t.bid, ask: t.ask, mid }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// One-time interactive OAuth (opens the browser). After this the silent
