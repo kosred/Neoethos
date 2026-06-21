@@ -29,6 +29,14 @@ final riskProvider = FutureProvider.autoDispose<RiskSnapshot>((ref) {
   return client.fetchRisk();
 });
 
+/// Backend compile-time version (from `/healthz`). Surfaced in the status
+/// bar so the UI always shows the version of the binary it is actually
+/// talking to — never a stale hardcoded literal that drifts every release.
+final serverVersionProvider = FutureProvider.autoDispose<String>((ref) {
+  final client = ref.read(backendClientProvider);
+  return client.fetchServerVersion();
+});
+
 /// `/settings` snapshot.
 final settingsProvider = FutureProvider.autoDispose<SettingsSnapshot>((ref) {
   final client = ref.read(backendClientProvider);

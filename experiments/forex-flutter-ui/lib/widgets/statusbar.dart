@@ -82,7 +82,14 @@ class StatusBar extends ConsumerWidget {
           const _StatusSep(),
           _StatusItem(label: l10n.statusNewsBlackout, value: '—'),
           const Spacer(),
-          const _StatusItem(label: 'v0.4.99'),
+          // Version is read live from the backend's /healthz so it never
+          // drifts from the binary actually running (no hardcoded literal).
+          _StatusItem(
+            label: ref.watch(serverVersionProvider).maybeWhen(
+                  data: (v) => 'v$v',
+                  orElse: () => '…',
+                ),
+          ),
         ],
       ),
     );
