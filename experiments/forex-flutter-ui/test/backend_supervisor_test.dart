@@ -114,5 +114,61 @@ void main() {
       expect(result!.added, containsAll(['system.b', 'risk.max_lots']));
       expect(result.added.length, 2);
     });
+
+    test('does NOT splice a 4-space nested field after a list — the bug that '
+        'crash-looped the backend (mapping-values-not-allowed)', () {
+      // Repro of the production break: the bundle has a nested block
+      // `discovery_runtime:` whose child `prefilter_min_per_timeframe` sits at
+      // 4-space indent, and the section also ends with a YAML list
+      // (`phase5_core_models:` / `- kan`). The old merger mis-attributed the
+      // 4-space field to the top-level `models` section and appended it
+      // verbatim after the list → `    prefilter_min_per_timeframe: 6` landing
+      // under `- kan` → invalid YAML → backend exit(1) → supervisor restart
+      // spiral. The field has a backend serde default, so the correct
+      // behaviour is to leave it alone (no splice).
+      final userYaml = 'models:\n'
+          '  phase5_core_models:\n'
+          '  - transformer\n'
+          '  - kan\n';
+      final bundleYaml = 'models:\n'
+          '  phase5_core_models:\n'
+          '  - transformer\n'
+          '  - kan\n'
+          '  discovery_runtime:\n'
+          '    prefilter_top_k: 50\n'
+          '    prefilter_min_per_timeframe: 6\n';
+      final result = BackendSupervisor.mergeMissingScalarFields(
+        userYaml: userYaml,
+        bundleYaml: bundleYaml,
+      );
+      // Nothing splice-safe (the only "missing" bundle keys are 4-space
+      // children of discovery_runtime, which the merger must skip).
+      expect(result, isNull,
+          reason: 'nested-block fields must never be spliced at section level');
+    });
+
+    test('still adds a genuine 2-space field even when the section also '
+        'contains a nested block + a list', () {
+      // Guard the inverse: a real top-level-section scalar IS still added,
+      // and it lands correctly (2-space), not corrupting the list above it.
+      final userYaml = 'models:\n'
+          '  phase5_core_models:\n'
+          '  - kan\n';
+      final bundleYaml = 'models:\n'
+          '  phase5_core_models:\n'
+          '  - kan\n'
+          '  ml_threshold: 0.5\n'
+          '  discovery_runtime:\n'
+          '    prefilter_top_k: 50\n';
+      final result = BackendSupervisor.mergeMissingScalarFields(
+        userYaml: userYaml,
+        bundleYaml: bundleYaml,
+      );
+      expect(result, isNotNull);
+      expect(result!.added, ['models.ml_threshold'],
+          reason: 'the 2-space scalar is added; the 4-space nested one is not');
+      expect(result.yaml, contains('  ml_threshold: 0.5'));
+      expect(result.yaml, isNot(contains('    prefilter_top_k')));
+    });
   });
 }

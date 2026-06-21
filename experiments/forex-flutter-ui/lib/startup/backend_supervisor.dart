@@ -662,6 +662,21 @@ class BackendSupervisor {
         pendingComments = <String>[];
         continue;
       }
+      // ONLY direct children of a top-level section (2-space indent) are
+      // splice-safe. Deeper-nested fields (4+ spaces, e.g. the
+      // `prefilter_min_per_timeframe` under `models.discovery_runtime:`)
+      // must NOT be treated as section-level scalars: the splice logic
+      // appends them at the END of the top-level section, and a 4-space
+      // line landing right after a YAML list (`phase5_core_models:` /
+      // `- kan`) produces "mapping values are not allowed in this
+      // context" — the exact parse error that crash-looped the backend
+      // (restart #1..7). Such nested fields are backfilled by the
+      // backend's own serde defaults, so skipping them here is safe.
+      final indent = m.group(1)!.length;
+      if (indent != 2) {
+        pendingComments = <String>[];
+        continue;
+      }
       final key = m.group(2)!;
       final hasInlineValue = m.group(3) != null;
       final fullBlock = <String>[...pendingComments, line];
