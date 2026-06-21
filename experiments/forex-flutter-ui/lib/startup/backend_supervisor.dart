@@ -51,7 +51,17 @@ class BackendSupervisor {
   static final BackendSupervisor instance = BackendSupervisor._();
 
   static const _baseUrl = 'http://127.0.0.1:7423';
-  static const _maxWaitMs = 10000;
+  // Cold-start budget for the FIRST /healthz. The release backend is a
+  // ~172 MB single exe: on a first-ever launch Windows Defender scans the
+  // whole binary on execute, the process then does a hardware/GPU probe +
+  // config load + cTrader handshake before axum binds port 7423 — measured
+  // at ~9-12 s warm, more on a cold disk. The old 10 s budget timed out
+  // right at that edge, so ensureRunning() declared failure, the watchdog
+  // killed the backend that had *just* come up, and respawns piled into a
+  // port-7423 contention death-spiral (supervisor.log showed restart #1..7+).
+  // 30 s gives the heavy cold start comfortable headroom; a healthy backend
+  // still answers in <50 ms so warm launches are unaffected.
+  static const _maxWaitMs = 30000;
   static const _pollIntervalMs = 250;
 
   Process? _child;
