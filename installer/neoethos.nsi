@@ -45,7 +45,19 @@ RequestExecutionLevel admin
 ; LZMA gives ~30% better compression than the default zlib at the cost
 ; of a slower build (one-time pain for the developer, one-time saving
 ; for every downloader).
-SetCompressor /SOLID lzma
+;
+; NON-solid (no /SOLID): on a large payload (~233 MB → the 172 MB backend
+; exe + Flutter shell) a single solid LZMA stream spanning the whole
+; archive proved fragile — the runtime "Installer integrity check has
+; failed" CRC error fired even on a byte-stable, makensis-success build.
+; Per-file LZMA blocks cost only a few % more size but each block carries
+; its own integrity, so a hiccup can't poison the entire archive.
+SetCompressor lzma
+
+; Be explicit: verify the whole-file CRC at launch and refuse to run a
+; damaged copy (this is the default, but pin it so a future edit can't
+; silently turn it off).
+CRCCheck on
 
 ;==============================================================================
 ; Modern UI 2 — wizard look-and-feel
