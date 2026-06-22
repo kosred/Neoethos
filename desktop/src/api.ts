@@ -19,6 +19,9 @@ export type AccountInfo = {
   brokerTitle: string;
   accountName: string;
   isLive: boolean | null;
+  login: number | null;
+  enabled: boolean;
+  label: string; // e.g. "DEMO · Spotware · login 5789955"
 };
 export type Position = {
   positionId: number;
@@ -80,6 +83,8 @@ export const brokerChart = (symbol: string, timeframe: string, limit = 1000) =>
   invoke<Candle[]>("broker_chart", { symbol, timeframe, limit });
 export const brokerSymbols = () => invoke<SymbolInfo[]>("broker_symbols");
 export const brokerAccounts = () => invoke<AccountInfo[]>("broker_accounts");
+export const selectAccount = (accountId: string, live: boolean, label?: string) =>
+  invoke<BrokerStatus>("select_account", { accountId, live, label: label ?? null });
 export const accountSnapshot = () => invoke<AccountSnapshot>("account_snapshot");
 export const placeOrder = (
   symbol: string,

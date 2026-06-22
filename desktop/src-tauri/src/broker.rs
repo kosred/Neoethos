@@ -50,6 +50,10 @@ pub struct AccountInfo {
     pub broker_title: String,
     pub account_name: String,
     pub is_live: Option<bool>,
+    pub login: Option<i64>,
+    pub enabled: bool,
+    /// e.g. "DEMO · Spotware · login 5789955".
+    pub label: String,
 }
 
 #[derive(Serialize)]
@@ -230,18 +234,102 @@ pub async fn broker_symbols() -> Result<Vec<SymbolInfo>, String> {
 pub async fn broker_accounts() -> Result<Vec<AccountInfo>, String> {
     spawn_blocking(|| {
         let bundle = broker_api::fetch_broker_accounts_blocking().map_err(|e| e.to_string())?;
+        // Which account is currently active for execution (from config)?
+        let enabled_id = load_broker_settings()
+            .ctrader
+            .accounts
+            .iter()
+            .find(|a| a.enabled_for_execution)
+            .map(|a| a.account_id.clone());
         Ok::<Vec<AccountInfo>, String>(
             bundle
                 .accounts
                 .into_iter()
-                .map(|a| AccountInfo {
-                    account_id: a.account_id,
-                    broker_title: a.broker_title,
-                    account_name: a.account_name,
-                    is_live: a.is_live,
+                .map(|a| {
+                    let kind = match a.is_live {
+                        Some(true) => "LIVE",
+                        Some(false) => "DEMO",
+                        None => "?",
+                    };
+                    let label = format!(
+                        "{kind} · {} · login {}",
+                        a.broker_title,
+                        a.trader_login.map(|l| l.to_string()).unwrap_or_else(|| "—".into())
+                    );
+                    let enabled = enabled_id.as_deref() == Some(a.account_id.as_str());
+                    AccountInfo {
+                        account_id: a.account_id,
+                        broker_title: a.broker_title,
+                        account_name: a.account_name,
+                        is_live: a.is_live,
+                        login: a.trader_login,
+                        enabled,
+                        label,
+                    }
                 })
                 .collect(),
         )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Make `account_id` the active execution account, and set the broker
+/// environment to match its type (live ⇒ Live endpoint, demo ⇒ Demo). Writes
+/// broker_credentials.toml. Account-scoped calls pick it up immediately (they
+/// resolve creds fresh); the spot streamer re-subscribes on next launch.
+#[tauri::command]
+pub async fn select_account(
+    account_id: String,
+    live: bool,
+    label: Option<String>,
+) -> Result<BrokerStatus, String> {
+    spawn_blocking(move || {
+        use neoethos_core::broker_config::{
+            BrokerAccountTarget, CTraderBrokerEnvironment, credentials_file_path, load_from_disk,
+            save_to_disk,
+        };
+        let path = credentials_file_path().map_err(|e| e.to_string())?;
+        let mut state = load_from_disk(&path)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "no broker_credentials.toml — authenticate first".to_string())?;
+
+        if !state.ctrader.accounts.iter().any(|a| a.account_id == account_id) {
+            state.ctrader.accounts.push(BrokerAccountTarget {
+                account_id: account_id.clone(),
+                label: label.unwrap_or_else(|| account_id.clone()),
+                enabled_for_execution: false,
+            });
+        }
+        for a in state.ctrader.accounts.iter_mut() {
+            a.enabled_for_execution = a.account_id == account_id;
+        }
+        // chosen account first (stable: keeps the rest in order)
+        state
+            .ctrader
+            .accounts
+            .sort_by_key(|a| u8::from(a.account_id != account_id));
+        state.ctrader.environment = if live {
+            CTraderBrokerEnvironment::Live
+        } else {
+            CTraderBrokerEnvironment::Demo
+        };
+        save_to_disk(&path, &state).map_err(|e| e.to_string())?;
+
+        let configured =
+            !state.ctrader.client_id.is_empty() && !state.ctrader.client_secret.is_empty();
+        let has_token = production_ctrader_token_store()
+            .load_token_bundle_with_legacy_fallback()
+            .ok()
+            .flatten()
+            .map(|b| !b.access_token.is_empty())
+            .unwrap_or(false);
+        Ok::<BrokerStatus, String>(BrokerStatus {
+            configured,
+            has_token,
+            environment: format!("{:?}", state.ctrader.environment),
+            account_id: Some(account_id),
+        })
     })
     .await
     .map_err(|e| e.to_string())?

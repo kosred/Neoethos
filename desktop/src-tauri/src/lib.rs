@@ -146,6 +146,7 @@ pub fn run() {
             broker::broker_chart,
             broker::broker_symbols,
             broker::broker_accounts,
+            broker::select_account,
             broker::account_snapshot,
             broker::place_order,
             broker::close_position,

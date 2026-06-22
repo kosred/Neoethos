@@ -3,6 +3,7 @@ import {
   brokerStatus,
   brokerAccounts,
   reauthBroker,
+  selectAccount,
   type BrokerStatus,
   type AccountInfo,
 } from "../api";
@@ -54,6 +55,24 @@ export default function Settings() {
     }
   };
 
+  const useAccount = async (a: AccountInfo) => {
+    setBusy(true);
+    setMsg(`Switching to ${a.label}…`);
+    try {
+      const s = await selectAccount(a.accountId, a.isLive === true, a.label);
+      setStatus(s);
+      await loadAccounts();
+      setMsg(
+        `✓ Active account: ${a.label} — environment set to ${a.isLive ? "Live" : "Demo"}. ` +
+          `Balance/positions refresh on the Dashboard.`,
+      );
+    } catch (e) {
+      setMsg(`Switch failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="screen">
       <h1>Settings</h1>
@@ -99,19 +118,33 @@ export default function Settings() {
         <table className="tbl">
           <thead>
             <tr>
-              <th>Account ID</th>
-              <th>Broker</th>
-              <th>Name</th>
               <th>Type</th>
+              <th>Account</th>
+              <th>ID</th>
+              <th>Login</th>
+              <th></th>
             </tr>
           </thead>
           <tbody>
             {accounts.map((a) => (
               <tr key={a.accountId}>
+                <td>
+                  <span className={`badge ${a.isLive ? "live" : "demo"}`}>
+                    {a.isLive === null ? "?" : a.isLive ? "LIVE" : "DEMO"}
+                  </span>
+                </td>
+                <td>{a.brokerTitle}{a.accountName ? ` · ${a.accountName}` : ""}</td>
                 <td>{a.accountId}</td>
-                <td>{a.brokerTitle}</td>
-                <td>{a.accountName}</td>
-                <td>{a.isLive === null ? "—" : a.isLive ? "LIVE" : "DEMO"}</td>
+                <td>{a.login ?? "—"}</td>
+                <td>
+                  {a.enabled ? (
+                    <span className="buy small">● Active</span>
+                  ) : (
+                    <button disabled={busy} onClick={() => useAccount(a)}>
+                      Use
+                    </button>
+                  )}
+                </td>
               </tr>
             ))}
           </tbody>
