@@ -217,9 +217,15 @@ fn resolve_creds() -> Result<ResolvedCreds> {
              broker_credentials.toml; the wizard / --reauth must run first"
         ));
     }
+    // Prefer the account explicitly marked for execution (mirrors the spot
+    // streamer's selection). Falling back to `.first()` blindly is how a stale
+    // non-granted account id (e.g. a Live id while the token only grants Demo
+    // accounts) ended up routing every request to CANT_ROUTE_REQUEST.
     let account = ct
         .accounts
-        .first()
+        .iter()
+        .find(|a| a.enabled_for_execution)
+        .or_else(|| ct.accounts.first())
         .ok_or_else(|| anyhow!("no cTrader account configured"))?;
 
     let bundle = ensure_fresh_token_bundle(&ct.client_id, &ct.client_secret)?;

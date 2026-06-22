@@ -138,7 +138,14 @@ pub async fn broker_status() -> Result<BrokerStatus, String> {
             .map(|b| !b.access_token.is_empty())
             .unwrap_or(false);
         let environment = format!("{:?}", ct.environment);
-        let account_id = ct.accounts.first().map(|a| a.account_id.clone());
+        // Report the account the broker calls actually use (enabled-for-execution
+        // first, matching resolve_creds), not just accounts.first().
+        let account_id = ct
+            .accounts
+            .iter()
+            .find(|a| a.enabled_for_execution)
+            .or_else(|| ct.accounts.first())
+            .map(|a| a.account_id.clone());
         BrokerStatus { configured, has_token, environment, account_id }
     })
     .await
