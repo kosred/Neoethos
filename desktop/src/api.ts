@@ -37,6 +37,12 @@ export type AccountSnapshot = {
   currency: string;
   openPositions: number;
   positions: Position[];
+  live: boolean;
+  brokerName: string | null;
+  leverage: number | null;
+  login: number | null;
+  accountType: string | null;
+  label: string; // e.g. "LIVE · FTMO · 200k USD · 1:30"
 };
 export type ExecResult = {
   status: string;

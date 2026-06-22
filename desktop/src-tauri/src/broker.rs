@@ -74,6 +74,32 @@ pub struct AccountSnapshot {
     pub currency: String,
     pub open_positions: usize,
     pub positions: Vec<Position>,
+    // Rich account identity (auto-detected from the broker):
+    pub live: bool,
+    pub broker_name: Option<String>,
+    pub leverage: Option<f64>,
+    pub login: Option<i64>,
+    pub account_type: Option<String>,
+    /// Friendly one-line descriptor, e.g. "LIVE · FTMO · 200k USD · 1:30".
+    pub label: String,
+}
+
+/// "200000" → "200k", "1000" → "1k", "1234567" → "1.2M", "950" → "950".
+fn human_size(balance: f64, currency: &str) -> String {
+    let v = balance.abs();
+    let num = if v >= 1_000_000.0 {
+        format!("{:.1}M", v / 1_000_000.0)
+    } else if v >= 1_000.0 {
+        let k = v / 1_000.0;
+        if (k - k.round()).abs() < 0.05 {
+            format!("{}k", k.round() as i64)
+        } else {
+            format!("{:.1}k", k)
+        }
+    } else {
+        format!("{:.0}", v)
+    };
+    format!("{num} {currency}")
 }
 
 #[derive(Serialize)]
@@ -225,6 +251,9 @@ pub async fn broker_accounts() -> Result<Vec<AccountInfo>, String> {
 #[tauri::command]
 pub async fn account_snapshot() -> Result<AccountSnapshot, String> {
     spawn_blocking(|| {
+        // Live/Demo is determined by the connected environment.
+        let live = format!("{:?}", load_broker_settings().ctrader.environment)
+            .eq_ignore_ascii_case("live");
         let snap = broker_api::fetch_account_runtime_blocking().map_err(|e| e.to_string())?;
         let positions: Vec<Position> = snap
             .reconcile
@@ -240,14 +269,34 @@ pub async fn account_snapshot() -> Result<AccountSnapshot, String> {
                 take_profit: p.take_profit,
             })
             .collect();
+        let currency = asset_currency(snap.trader.deposit_asset_id);
+        let broker = snap.trader.broker_name.clone().unwrap_or_else(|| "cTrader".to_string());
+        // Auto-built descriptor, e.g. "LIVE · FTMO · 200k USD · 1:30".
+        let mut label = format!(
+            "{} · {} · {}",
+            if live { "LIVE" } else { "DEMO" },
+            broker,
+            human_size(snap.trader.balance, &currency)
+        );
+        if let Some(lev) = snap.trader.leverage {
+            if lev > 0.0 {
+                label.push_str(&format!(" · 1:{}", lev.round() as i64));
+            }
+        }
         Ok::<AccountSnapshot, String>(AccountSnapshot {
             account_id: snap.trader.account_id,
             balance: snap.trader.balance,
             equity: snap.trader.balance + snap.trader.unrealized_pnl,
             unrealized_pnl: snap.trader.unrealized_pnl,
-            currency: asset_currency(snap.trader.deposit_asset_id),
+            currency,
             open_positions: positions.len(),
             positions,
+            live,
+            broker_name: snap.trader.broker_name,
+            leverage: snap.trader.leverage,
+            login: snap.trader.trader_login,
+            account_type: snap.trader.account_type,
+            label,
         })
     })
     .await

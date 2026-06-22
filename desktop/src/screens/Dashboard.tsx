@@ -47,6 +47,16 @@ export default function Dashboard() {
       <h1>Dashboard</h1>
       <p className="sub">Account equity · open positions · engine status</p>
 
+      {acct && (
+        <div className="acct-identity">
+          <span className={`badge ${acct.live ? "live" : "demo"}`}>{acct.live ? "LIVE" : "DEMO"}</span>
+          <b className="acct-label">{acct.label}</b>
+          <span className="muted small">
+            {acct.brokerName ?? ""} · login {acct.login ?? "—"} · {acct.accountType ?? ""} · #{acct.accountId}
+          </span>
+        </div>
+      )}
+
       {!status?.configured && (
         <div className="banner warn">
           Broker not configured yet — go to <b>Settings</b> and add cTrader credentials, then

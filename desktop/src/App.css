@@ -122,6 +122,38 @@ nav {
   font-size: 11px;
 }
 
+/* account identity */
+.acct-identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  background: #141a26;
+  border: 1px solid #1f2632;
+  border-radius: 10px;
+}
+.acct-label {
+  font-size: 14px;
+}
+.badge {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  padding: 3px 8px;
+  border-radius: 5px;
+}
+.badge.live {
+  background: #7f1d1d;
+  color: #fecaca;
+  border: 1px solid #ef4444;
+}
+.badge.demo {
+  background: #14532d;
+  color: #bbf7d0;
+  border: 1px solid #22c55e;
+}
+
 /* cards */
 .cards {
   display: grid;

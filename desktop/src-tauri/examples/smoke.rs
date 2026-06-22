@@ -91,6 +91,14 @@ fn main() {
                 snap.trader.balance + snap.trader.unrealized_pnl,
                 snap.reconcile.positions.len()
             );
+            println!(
+                "    RICH IDENTITY → broker_name={:?}  leverage={:?}  account_type={:?}  login={:?}  deposit_asset_id={:?}",
+                snap.trader.broker_name,
+                snap.trader.leverage,
+                snap.trader.account_type,
+                snap.trader.trader_login,
+                snap.trader.deposit_asset_id
+            );
             for p in snap.reconcile.positions.iter().take(5) {
                 println!("    position #{} sym#{} {} vol={} @ {:?}", p.position_id, p.symbol_id, p.trade_side, p.volume, p.price);
             }
