@@ -6,9 +6,10 @@ export default function News() {
   const [force, setForce] = useState(false);
   const { data, error, loading, reload } = usePoll(() => newsFeed(force), 0, [force]);
 
-  // The feed shape is flexible: { briefing?, items|headlines: [{title, source, url, summary, published_at}] }
+  // Shape: { items: [{title, source, url, summary, published_at}], aiSummary, aiAvailable, notice }
   const items: any[] = data?.items ?? data?.headlines ?? (Array.isArray(data) ? data : []);
-  const briefing: string | undefined = data?.briefing ?? data?.market_briefing;
+  const briefing: string | undefined = data?.aiSummary || undefined;
+  const notice: string | undefined = data?.notice || undefined;
 
   return (
     <div className="screen">
@@ -19,6 +20,7 @@ export default function News() {
         <button disabled={loading} onClick={() => { setForce(true); reload(); }}>Refresh</button>
       </div>
       {error && <div className="banner warn">{error}</div>}
+      {notice && <div className="banner warn">{notice}</div>}
 
       {briefing && (
         <div className="banner info" style={{ whiteSpace: "pre-wrap" }}>

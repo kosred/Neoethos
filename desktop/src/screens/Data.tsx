@@ -20,7 +20,7 @@ export default function Data() {
     setMsg(`Fetching ${symbol} ${tf} from broker…`);
     try {
       const r: any = await dataFetch({ symbol: symbol.trim().toUpperCase(), timeframe: tf.trim().toUpperCase(), from_ms: fromMs });
-      setMsg(`✓ Fetched ${r?.bar_count ?? "?"} bars → ${r?.written_path ?? ""}${r?.has_more ? " (more available)" : ""}`);
+      setMsg(`✓ Fetched ${r?.barCount ?? "?"} bars → ${r?.writtenPath ?? ""}${r?.hasMore ? " (more available)" : ""}`);
       await reload();
     } catch (e) {
       setMsg(`Fetch failed: ${e}`);
@@ -38,10 +38,10 @@ export default function Data() {
       {data && (
         <div className="cards">
           <div className="card"><div className="card-label">SYMBOLS</div><div className="card-value">{data.symbols.length}</div></div>
-          <div className="card"><div className="card-label">FILES</div><div className="card-value">{data.file_count}</div></div>
+          <div className="card"><div className="card-label">FILES</div><div className="card-value">{data.fileCount}</div></div>
           <div className="card" style={{ gridColumn: "span 2" }}>
             <div className="card-label">DATA DIR</div>
-            <div className="card-value" style={{ fontSize: 12 }}>{data.data_dir} {data.data_dir_exists ? "" : "(missing)"}</div>
+            <div className="card-value" style={{ fontSize: 12 }}>{data.dataDir} {data.dataDirExists ? "" : "(missing)"}</div>
           </div>
         </div>
       )}

@@ -2,7 +2,11 @@ import { journalStats, journalTrades } from "../api";
 import { usePoll } from "../hooks";
 
 const fmt = (v: unknown) =>
-  typeof v === "number" ? (Number.isInteger(v) ? v.toLocaleString() : v.toFixed(2)) : String(v);
+  typeof v === "number" ? (Number.isInteger(v) ? v.toLocaleString() : v.toFixed(2)) : v == null ? "—" : String(v);
+
+// "winRatePct" / "max_drawdown_pct" → "WIN RATE PCT"
+const label = (k: string) =>
+  k.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/_/g, " ").toUpperCase();
 
 export default function Journal() {
   const { data: stats, error: e1 } = usePoll(journalStats, 0);
@@ -25,7 +29,7 @@ export default function Journal() {
         <div className="cards" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
           {statEntries.slice(0, 8).map(([k, v]) => (
             <div className="card" key={k}>
-              <div className="card-label">{k.replace(/_/g, " ").toUpperCase()}</div>
+              <div className="card-label">{label(k)}</div>
               <div className="card-value" style={{ fontSize: 18 }}>{fmt(v)}</div>
             </div>
           ))}

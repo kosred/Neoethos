@@ -38,10 +38,8 @@ export default function StrategyLab() {
   };
 
   const decision = status?.decision;
-  const eligible =
-    decision === "Promote" ||
-    decision?.Promote !== undefined ||
-    (typeof decision === "object" && JSON.stringify(decision).toLowerCase().includes("promote"));
+  const eligible = !!decision?.promoted;
+  const summary: string = decision?.summary ?? "";
 
   return (
     <div className="screen">
@@ -64,10 +62,11 @@ export default function StrategyLab() {
         <>
           <div className="cards" style={{ marginTop: 14 }}>
             <div className="card"><div className="card-label">SYMBOL</div><div className="card-value">{status.symbol}</div></div>
-            <div className="card"><div className="card-label">BASE TF</div><div className="card-value">{status.base_tf}</div></div>
-            <div className="card"><div className="card-label">PORTFOLIO</div><div className="card-value">{status.portfolio_size}</div></div>
-            <div className="card accent"><div className="card-label">DECISION</div><div className="card-value" style={{ color: eligible ? "#22c55e" : "#fca5a5", fontSize: 16 }}>{typeof decision === "string" ? decision : eligible ? "PROMOTE" : "HOLD"}</div></div>
+            <div className="card"><div className="card-label">BASE TF</div><div className="card-value">{status.baseTf}</div></div>
+            <div className="card"><div className="card-label">PORTFOLIO</div><div className="card-value">{status.portfolioSize}</div></div>
+            <div className="card accent"><div className="card-label">DECISION</div><div className="card-value" style={{ color: eligible ? "#22c55e" : "#fca5a5", fontSize: 16 }}>{eligible ? "PROMOTE" : "HOLD"}</div></div>
           </div>
+          {summary && <div className="banner info">{summary}</div>}
           {status.aggregate && (
             <>
               <h2>Aggregate metrics</h2>

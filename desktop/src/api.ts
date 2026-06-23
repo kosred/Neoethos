@@ -197,30 +197,25 @@ export const autonomousReplay = (b?: unknown) => apiPost("/autonomous/replay", b
 // ── Risk ──────────────────────────────────────────────────────────────────
 export type PresetSummary = {
   id: string;
-  displayName?: string;
-  display_name?: string;
-  maxDailyLossPct?: number;
-  max_daily_loss_pct?: number;
-  maxOverallDrawdownPct?: number;
-  max_overall_drawdown_pct?: number;
-  challengeProfitTargetPct?: number;
-  challenge_profit_target_pct?: number;
-  minTradingDays?: number;
-  min_trading_days?: number;
+  displayName: string;
+  maxDailyLossPct: number;
+  maxOverallDrawdownPct: number;
+  challengeProfitTargetPct: number;
+  minTradingDays: number;
 };
 export type RiskInfo = {
-  risk_per_trade: number;
-  min_risk_per_trade: number;
-  max_risk_per_trade: number;
-  daily_drawdown_limit: number;
-  total_drawdown_limit: number;
-  max_lot_size: number;
-  require_stop_loss: boolean;
+  riskPerTrade: number;
+  minRiskPerTrade: number;
+  maxRiskPerTrade: number;
+  dailyDrawdownLimit: number;
+  totalDrawdownLimit: number;
+  maxLotSize: number;
+  requireStopLoss: boolean;
   preset: string;
-  preset_display_name: string;
-  available_presets: PresetSummary[];
-  prop_firm_rules_enabled: boolean;
-  risky_mode_cooldown_remaining_secs: number | null;
+  presetDisplayName: string;
+  availablePresets: PresetSummary[];
+  propFirmRulesEnabled: boolean;
+  riskyModeCooldownRemainingSecs: number | null;
 };
 export const riskInfo = () => apiGet<RiskInfo>("/risk");
 export const setRiskPreset = (preset: string) => apiPost("/risk/preset", { preset });
@@ -228,8 +223,8 @@ export const riskyScenarios = () => apiGet<any>("/risky/scenarios");
 
 // ── Hardware ──────────────────────────────────────────────────────────────
 export type HardwareInfo = {
-  cpu: { model: string; cores_logical: number; cores_physical: number; load_avg: number };
-  ram: { total_mb: number; used_mb: number; available_mb: number };
+  cpu: { model: string; coresLogical: number; coresPhysical: number; loadAvg: number };
+  ram: { totalMb: number; usedMb: number; availableMb: number };
   gpu: { name: string; available: boolean; kind: string };
 };
 export const hardwareInfo = () => apiGet<HardwareInfo>("/hardware");
@@ -237,20 +232,20 @@ export const hardwareInfo = () => apiGet<HardwareInfo>("/hardware");
 // ── Intelligence ──────────────────────────────────────────────────────────
 export type DiscoveryTarget = {
   symbol: string;
-  base_tf: string;
-  strategy_id: string;
+  baseTf: string;
+  strategyId: string;
   sharpe: number | null;
-  win_rate: number | null;
+  winRate: number | null;
 };
 export type IntelligenceInfo = {
-  models_dir: string;
-  models_dir_exists: boolean;
-  artifact_count: number;
+  modelsDir: string;
+  modelsDirExists: boolean;
+  artifactCount: number;
   artifacts: string[];
-  last_touched_unix_ms: number | null;
-  discovery_targets: DiscoveryTarget[];
-  walkforward_splits: number | null;
-  walkforward_avg_accuracy: number | null;
+  lastTouchedUnixMs: number | null;
+  discoveryTargets: DiscoveryTarget[];
+  walkforwardSplits: number | null;
+  walkforwardAvgAccuracy: number | null;
 };
 export const intelligence = () => apiGet<IntelligenceInfo>("/intelligence");
 
@@ -263,11 +258,11 @@ export const newsFeed = (force = false) => apiGet<any>(`/news/feed${force ? "?fo
 
 // ── Data ──────────────────────────────────────────────────────────────────
 export type DataBootstrap = {
-  data_dir: string;
-  data_dir_exists: boolean;
+  dataDir: string;
+  dataDirExists: boolean;
   symbols: string[];
-  file_count: number;
-  last_touched_unix_ms: number | null;
+  fileCount: number;
+  lastTouchedUnixMs: number | null;
 };
 export const dataBootstrap = () => apiGet<DataBootstrap>("/data/bootstrap");
 export const dataFetch = (b: unknown) => apiPost("/data/fetch", b);

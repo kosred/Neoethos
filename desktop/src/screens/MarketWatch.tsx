@@ -58,10 +58,10 @@ export default function MarketWatch() {
           <tbody>
             {rows.map((r, i) => (
               <tr key={i}>
-                <td>{r.name ?? r.symbol ?? r.symbol_name ?? r.symbol_id}</td>
+                <td>{r.symbolName ?? r.symbolId}</td>
                 <td>{r.bid ?? "—"}</td>
                 <td>{r.ask ?? "—"}</td>
-                <td>{r.mid ?? "—"}</td>
+                <td>{r.midPrice ?? "—"}</td>
               </tr>
             ))}
           </tbody>

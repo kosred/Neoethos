@@ -16,14 +16,14 @@ export default function Hardware() {
           <h2>CPU</h2>
           <div className="settings-grid">
             <div className="kv"><span>Model</span><b style={{ fontSize: 12 }}>{data.cpu.model}</b></div>
-            <div className="kv"><span>Cores</span><b>{data.cpu.cores_physical} phys · {data.cpu.cores_logical} logical</b></div>
-            <div className="kv"><span>Load</span><b>{(data.cpu.load_avg * 100).toFixed(0)}%</b></div>
+            <div className="kv"><span>Cores</span><b>{data.cpu.coresPhysical} phys · {data.cpu.coresLogical} logical</b></div>
+            <div className="kv"><span>Load</span><b>{(data.cpu.loadAvg * 100).toFixed(0)}%</b></div>
           </div>
           <h2>Memory</h2>
           <div className="settings-grid">
-            <div className="kv"><span>Total</span><b>{gb(data.ram.total_mb)}</b></div>
-            <div className="kv"><span>Used</span><b>{gb(data.ram.used_mb)}</b></div>
-            <div className="kv"><span>Available</span><b>{gb(data.ram.available_mb)}</b></div>
+            <div className="kv"><span>Total</span><b>{gb(data.ram.totalMb)}</b></div>
+            <div className="kv"><span>Used</span><b>{gb(data.ram.usedMb)}</b></div>
+            <div className="kv"><span>Available</span><b>{gb(data.ram.availableMb)}</b></div>
           </div>
           <h2>GPU</h2>
           <div className="settings-grid">

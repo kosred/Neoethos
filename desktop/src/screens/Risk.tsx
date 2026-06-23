@@ -1,9 +1,8 @@
 import { useState } from "react";
-import { riskInfo, setRiskPreset, type PresetSummary } from "../api";
+import { riskInfo, setRiskPreset } from "../api";
 import { usePoll } from "../hooks";
 
 const pct = (v: number) => `${(v * 100).toFixed(2)}%`;
-const pp = <T,>(...vals: (T | undefined)[]) => vals.find((v) => v !== undefined);
 
 export default function Risk() {
   const { data, error, reload } = usePoll(riskInfo, 0);
@@ -24,8 +23,6 @@ export default function Risk() {
     }
   };
 
-  const presetName = (p: PresetSummary) => pp(p.displayName, p.display_name) ?? p.id;
-
   return (
     <div className="screen">
       <h1>Risk</h1>
@@ -36,34 +33,34 @@ export default function Risk() {
       {data && (
         <>
           <div className="cards">
-            <div className="card"><div className="card-label">RISK / TRADE</div><div className="card-value">{pct(data.risk_per_trade)}</div></div>
-            <div className="card"><div className="card-label">DAILY DD LIMIT</div><div className="card-value">{pct(data.daily_drawdown_limit)}</div></div>
-            <div className="card"><div className="card-label">TOTAL DD LIMIT</div><div className="card-value">{pct(data.total_drawdown_limit)}</div></div>
-            <div className="card"><div className="card-label">MAX LOT</div><div className="card-value">{data.max_lot_size}</div></div>
+            <div className="card"><div className="card-label">RISK / TRADE</div><div className="card-value">{pct(data.riskPerTrade)}</div></div>
+            <div className="card"><div className="card-label">DAILY DD LIMIT</div><div className="card-value">{pct(data.dailyDrawdownLimit)}</div></div>
+            <div className="card"><div className="card-label">TOTAL DD LIMIT</div><div className="card-value">{pct(data.totalDrawdownLimit)}</div></div>
+            <div className="card"><div className="card-label">MAX LOT</div><div className="card-value">{data.maxLotSize}</div></div>
           </div>
 
           <div className="settings-grid" style={{ marginTop: 14 }}>
-            <div className="kv"><span>Risk/trade range</span><b>{pct(data.min_risk_per_trade)} – {pct(data.max_risk_per_trade)}</b></div>
-            <div className="kv"><span>Require stop-loss</span><b className={data.require_stop_loss ? "buy" : "sell"}>{data.require_stop_loss ? "yes" : "no"}</b></div>
-            <div className="kv"><span>Prop-firm rules</span><b className={data.prop_firm_rules_enabled ? "buy" : ""}>{data.prop_firm_rules_enabled ? "enabled" : "off"}</b></div>
-            <div className="kv"><span>Risky cooldown</span><b>{data.risky_mode_cooldown_remaining_secs != null ? `${data.risky_mode_cooldown_remaining_secs}s` : "—"}</b></div>
+            <div className="kv"><span>Risk/trade range</span><b>{pct(data.minRiskPerTrade)} – {pct(data.maxRiskPerTrade)}</b></div>
+            <div className="kv"><span>Require stop-loss</span><b className={data.requireStopLoss ? "buy" : "sell"}>{data.requireStopLoss ? "yes" : "no"}</b></div>
+            <div className="kv"><span>Prop-firm rules</span><b className={data.propFirmRulesEnabled ? "buy" : ""}>{data.propFirmRulesEnabled ? "enabled" : "off"}</b></div>
+            <div className="kv"><span>Risky cooldown</span><b>{data.riskyModeCooldownRemainingSecs != null ? `${data.riskyModeCooldownRemainingSecs}s` : "—"}</b></div>
           </div>
 
-          <h2>Active preset: {data.preset_display_name || data.preset}</h2>
+          <h2>Active preset: {data.presetDisplayName || data.preset}</h2>
           <table className="tbl">
             <thead>
               <tr><th>Preset</th><th>Daily loss</th><th>Max DD</th><th>Profit target</th><th>Min days</th><th></th></tr>
             </thead>
             <tbody>
-              {data.available_presets.map((p) => {
+              {data.availablePresets.map((p) => {
                 const active = p.id === data.preset;
                 return (
                   <tr key={p.id}>
-                    <td>{presetName(p)}</td>
-                    <td>{(pp(p.maxDailyLossPct, p.max_daily_loss_pct) ?? 0).toFixed(1)}%</td>
-                    <td>{(pp(p.maxOverallDrawdownPct, p.max_overall_drawdown_pct) ?? 0).toFixed(1)}%</td>
-                    <td>{(pp(p.challengeProfitTargetPct, p.challenge_profit_target_pct) ?? 0).toFixed(1)}%</td>
-                    <td>{pp(p.minTradingDays, p.min_trading_days) ?? 0}</td>
+                    <td>{p.displayName || p.id}</td>
+                    <td>{(p.maxDailyLossPct ?? 0).toFixed(1)}%</td>
+                    <td>{(p.maxOverallDrawdownPct ?? 0).toFixed(1)}%</td>
+                    <td>{(p.challengeProfitTargetPct ?? 0).toFixed(1)}%</td>
+                    <td>{p.minTradingDays ?? 0}</td>
                     <td>
                       {active ? (
                         <span className="buy small">● Active</span>
