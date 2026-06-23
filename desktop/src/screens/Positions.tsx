@@ -140,7 +140,7 @@ export default function Positions() {
                 <td>{p.stopLoss ?? "—"}</td>
                 <td>{p.takeProfit ?? "—"}</td>
                 <td>
-                  <button className="danger" disabled={busy} onClick={() => onClose(p.positionId, p.volume)}>
+                  <button className="danger" disabled={busy} onClick={() => onClose(p.positionId, p.volumeUnits)}>
                     Close
                   </button>
                 </td>

@@ -112,6 +112,7 @@ export type Position = {
   symbolId: number;
   side: string;
   volume: number;
+  volumeUnits: number; // raw wire volume — pass THIS to closePosition
   price: number | null;
   stopLoss: number | null;
   takeProfit: number | null;

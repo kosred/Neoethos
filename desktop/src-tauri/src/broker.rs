@@ -62,7 +62,14 @@ pub struct Position {
     pub position_id: i64,
     pub symbol_id: i64,
     pub side: String,
+    /// Human-readable volume (scaled units) for display.
     pub volume: f64,
+    /// Raw cTrader WIRE volume = `volume * 100` — this is what the close
+    /// endpoint wants, and it is guaranteed a multiple of the symbol's
+    /// volumeStep. Mirrors the server bridge's computation (bridge.rs).
+    /// Passing the scaled `volume` to close is what caused TRADING_BAD_VOLUME
+    /// ("closeVolume 1170 not a multiple of volumeStep 117000").
+    pub volume_units: i64,
     pub price: Option<f64>,
     pub stop_loss: Option<f64>,
     pub take_profit: Option<f64>,
@@ -352,6 +359,7 @@ pub async fn account_snapshot() -> Result<AccountSnapshot, String> {
                 symbol_id: p.symbol_id,
                 side: p.trade_side,
                 volume: p.volume,
+                volume_units: (p.volume * 100.0).round() as i64,
                 price: p.price,
                 stop_loss: p.stop_loss,
                 take_profit: p.take_profit,
