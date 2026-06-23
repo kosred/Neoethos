@@ -5,11 +5,13 @@ import {
   type AccountSnapshot,
   type BrokerStatus,
 } from "../api";
+import { useAccountStream } from "../hooks";
 
 export default function Dashboard() {
   const [acct, setAcct] = useState<AccountSnapshot | null>(null);
   const [status, setStatus] = useState<BrokerStatus | null>(null);
   const [err, setErr] = useState<string>("");
+  const { snap, connected } = useAccountStream(); // live balance/equity/PnL (push)
 
   useEffect(() => {
     let alive = true;
@@ -31,20 +33,25 @@ export default function Dashboard() {
       }
     };
     tick();
-    const id = setInterval(tick, 5000);
+    const id = setInterval(tick, 8000); // identity + positions table (slow); numbers stream live
     return () => {
       alive = false;
       clearInterval(id);
     };
   }, []);
 
-  const cur = acct?.currency ?? "";
+  // Live numbers prefer the SSE stream; fall back to the Tauri snapshot.
+  const balance = snap?.balance ?? acct?.balance;
+  const equity = snap?.equity ?? acct?.equity;
+  const pnl = snap ? snap.equity - snap.balance : acct?.unrealizedPnl;
+  const openCount = snap?.positions?.length ?? acct?.openPositions;
+  const cur = snap?.currency ?? acct?.currency ?? "";
   const fmt = (v: number | undefined) =>
     v === undefined ? "—" : `${v.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${cur}`;
 
   return (
     <div className="screen">
-      <h1>Dashboard</h1>
+      <h1>Dashboard <span className={`stream-pill ${connected ? "on" : ""}`}>{connected ? "● LIVE" : "○ polling"}</span></h1>
       <p className="sub">Account equity · open positions · engine status</p>
 
       {acct && (
@@ -71,10 +78,10 @@ export default function Dashboard() {
       )}
 
       <div className="cards">
-        <Card label="BALANCE" value={fmt(acct?.balance)} />
-        <Card label="EQUITY" value={fmt(acct?.equity)} accent />
-        <Card label="UNREALIZED P/L" value={fmt(acct?.unrealizedPnl)} pnl={acct?.unrealizedPnl} />
-        <Card label="OPEN POSITIONS" value={acct ? String(acct.openPositions) : "—"} />
+        <Card label="BALANCE" value={fmt(balance)} />
+        <Card label="EQUITY" value={fmt(equity)} accent />
+        <Card label="UNREALIZED P/L" value={fmt(pnl)} pnl={pnl} />
+        <Card label="OPEN POSITIONS" value={openCount !== undefined ? String(openCount) : "—"} />
       </div>
 
       <h2>Open positions</h2>

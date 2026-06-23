@@ -37,6 +37,55 @@ export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
   return (txt ? JSON.parse(txt) : null) as T;
 }
 
+// ── Server-Sent Events (push) ─────────────────────────────────────────────
+// The backend pushes ticks + account snapshots over SSE. We open an
+// EventSource against the in-process server; the browser auto-reconnects.
+// Returns a disposer that closes the stream.
+export async function openSse(
+  path: string,
+  eventName: string,
+  onData: (data: any) => void,
+  onStatus?: (connected: boolean) => void,
+): Promise<() => void> {
+  const base = await apiBaseUrl();
+  const es = new EventSource(`${base}${path}`);
+  es.addEventListener("open", () => onStatus?.(true));
+  es.addEventListener("error", () => onStatus?.(false));
+  es.addEventListener(eventName, (e) => {
+    try {
+      onData(JSON.parse((e as MessageEvent).data));
+    } catch {
+      /* ignore malformed frame */
+    }
+  });
+  return () => es.close();
+}
+
+export type Tick = {
+  symbolId: number;
+  symbolName: string;
+  bid: number;
+  ask: number;
+  midPrice: number;
+  brokerTimestampMs: number;
+  receivedAtUnixMs: number;
+  freshnessSeconds: number;
+};
+export type AccountStreamSnap = {
+  balance: number;
+  equity: number;
+  freeMargin: number;
+  usedMargin: number;
+  currency: string;
+  fetchedAtUnixMs: number;
+  positions: any[];
+};
+export const streamSpots = (onTick: (t: Tick) => void, onStatus?: (c: boolean) => void) =>
+  openSse("/live/spots/stream", "tick", onTick, onStatus);
+export const streamAccount = (onSnap: (s: AccountStreamSnap) => void, onStatus?: (c: boolean) => void) =>
+  openSse("/account/snapshot/stream", "account", onSnap, onStatus);
+export const refreshAccount = () => apiPost("/account/snapshot/refresh");
+
 // ── Types (mirror the Rust serde DTOs, camelCase) ─────────────────────────────
 export type AppInfo = { version: string; data_root: string; data_root_exists: boolean };
 export type Candle = { time: number; open: number; high: number; low: number; close: number };

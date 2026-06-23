@@ -3,6 +3,7 @@ import {
   accountSnapshot,
   closePosition,
   placeOrder,
+  refreshAccount,
   type AccountSnapshot,
   type ExecResult,
 } from "../api";
@@ -27,6 +28,9 @@ export default function Positions() {
     } catch (e) {
       setErr(String(e));
     }
+    // also nudge the backend's account bridge so the SSE stream (Dashboard)
+    // reflects the new state within ~1s instead of waiting for the safety poll.
+    refreshAccount().catch(() => {});
   };
 
   useEffect(() => {

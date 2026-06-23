@@ -9,7 +9,7 @@ import {
 } from "lightweight-charts";
 import type { Candle } from "../api";
 
-export default function Chart({ candles }: { candles: Candle[] }) {
+export default function Chart({ candles, liveBar }: { candles: Candle[]; liveBar?: Candle | null }) {
   const elRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
@@ -58,6 +58,18 @@ export default function Chart({ candles }: { candles: Candle[] }) {
     );
     chartRef.current?.timeScale().fitContent();
   }, [candles]);
+
+  // live forming candle — single-bar update (cheap; the TradingView model)
+  useEffect(() => {
+    if (!seriesRef.current || !liveBar) return;
+    seriesRef.current.update({
+      time: liveBar.time as UTCTimestamp,
+      open: liveBar.open,
+      high: liveBar.high,
+      low: liveBar.low,
+      close: liveBar.close,
+    });
+  }, [liveBar]);
 
   return <div ref={elRef} style={{ position: "absolute", inset: 0 }} />;
 }

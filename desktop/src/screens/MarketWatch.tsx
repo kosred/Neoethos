@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
-import { getWatchlist, setWatchlist, liveSpots } from "../api";
-import { usePoll } from "../hooks";
+import { getWatchlist, setWatchlist } from "../api";
+import { useSpotStream } from "../hooks";
 
 export default function MarketWatch() {
   const [edit, setEdit] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
-  const { data: spots } = usePoll(liveSpots, 2000);
+  const { ticks, connected } = useSpotStream();
 
   useEffect(() => {
     getWatchlist()
@@ -31,12 +31,12 @@ export default function MarketWatch() {
     }
   };
 
-  const rows: any[] = Array.isArray(spots) ? spots : (spots?.spots ?? []);
+  const rows = Object.values(ticks).sort((a, b) => a.symbolName.localeCompare(b.symbolName));
 
   return (
     <div className="screen">
-      <h1>Market Watch</h1>
-      <p className="sub">Editable watchlist with live bid/ask</p>
+      <h1>Market Watch <span className={`stream-pill ${connected ? "on" : ""}`}>{connected ? "● LIVE" : "○ offline"}</span></h1>
+      <p className="sub">Editable watchlist with live bid/ask (push)</p>
 
       <div className="ticket">
         <label style={{ display: "block", fontSize: 11, color: "#6b7280" }}>

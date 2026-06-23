@@ -1,4 +1,54 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  streamSpots,
+  streamAccount,
+  type Tick,
+  type AccountStreamSnap,
+} from "./api";
+
+/** Live tick stream → a map keyed by symbol name, plus a connected flag. */
+export function useSpotStream() {
+  const [ticks, setTicks] = useState<Record<string, Tick>>({});
+  const [connected, setConnected] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    let close = () => {};
+    streamSpots(
+      (t) => alive && setTicks((m) => ({ ...m, [t.symbolName]: t })),
+      (c) => alive && setConnected(c),
+    ).then((c) => {
+      if (alive) close = c;
+      else c();
+    });
+    return () => {
+      alive = false;
+      close();
+    };
+  }, []);
+  return { ticks, connected };
+}
+
+/** Live account snapshot stream (balance/equity/positions), plus connected flag. */
+export function useAccountStream() {
+  const [snap, setSnap] = useState<AccountStreamSnap | null>(null);
+  const [connected, setConnected] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    let close = () => {};
+    streamAccount(
+      (s) => alive && setSnap(s),
+      (c) => alive && setConnected(c),
+    ).then((c) => {
+      if (alive) close = c;
+      else c();
+    });
+    return () => {
+      alive = false;
+      close();
+    };
+  }, []);
+  return { snap, connected };
+}
 
 /**
  * Fetch once on mount (and re-fetch every `intervalMs` if > 0). Returns the

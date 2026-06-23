@@ -399,6 +399,25 @@ button.danger {
   margin: 14px 0;
 }
 
+/* live stream indicator */
+.stream-pill {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  vertical-align: middle;
+  margin-left: 8px;
+  background: #2a1620;
+  color: #9ca3af;
+  border: 1px solid #3a2630;
+}
+.stream-pill.on {
+  background: #0f2a1a;
+  color: #86efac;
+  border-color: #22c55e;
+}
+
 /* engines: status + progress */
 .engine-status {
   display: flex;
