@@ -12,6 +12,58 @@ use serde::Serialize;
 
 mod broker;
 
+/// In-process backend: the full neoethos-app axum API, served on an ephemeral
+/// loopback port inside THIS process (a tokio task, not a separate exe). It
+/// starts with the app and dies with it — no supervisor, no spawn, no fixed
+/// port. The web UI reads the port via the `api_base` command and calls the
+/// same ~50 handlers the old Flutter client used. One binary, one process.
+mod backend {
+    use std::net::TcpListener;
+    use std::sync::OnceLock;
+
+    use neoethos_app::server;
+
+    static API_PORT: OnceLock<u16> = OnceLock::new();
+
+    /// Bind an ephemeral loopback port *synchronously* (so the port is known
+    /// before the window loads), then serve the full API on it.
+    pub fn start() {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("FATAL: could not bind the in-process backend: {e}");
+                return;
+            }
+        };
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        let _ = API_PORT.set(port);
+        eprintln!("in-process backend bound on 127.0.0.1:{port}");
+
+        tauri::async_runtime::spawn(async move {
+            // Mirror main.rs bootstrap, minus the Flutter-supervisor bits.
+            // Same default config path the CLI/main.rs use when no override.
+            server::state::install_config_path("config.yaml");
+            let state = server::state::AppApiState::new();
+            server::state::install_account_refresh_trigger(state.account_refresh_tx_clone());
+            server::bridge::spawn(state.clone());
+            if let Err(e) = server::serve_on(listener, state).await {
+                eprintln!("in-process backend exited: {e:#}");
+            }
+        });
+    }
+
+    pub fn base_url() -> String {
+        format!("http://127.0.0.1:{}", API_PORT.get().copied().unwrap_or(0))
+    }
+}
+
+/// Base URL of the in-process backend (e.g. `http://127.0.0.1:54321`). The web
+/// UI fetches this once at startup and uses it for every backend call.
+#[tauri::command]
+fn api_base() -> String {
+    backend::base_url()
+}
+
 /// Resolve the data root the same way the engine does: the operator's
 /// `config.yaml` `system.data_dir`. Falls back to the dev repo path if the
 /// configured dir is missing (PoC convenience).
@@ -130,12 +182,18 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            // Start the full neoethos-app API in-process (Discovery, Training,
+            // Risk, Journal, News, Intelligence, Data, Hardware, Autonomous,
+            // Codex, …) — every old Flutter feature, reachable from the new UI.
+            backend::start();
             // Start the live cTrader spot-price streamer (best-effort; no-op
             // until the broker is authenticated). The UI polls spot_prices().
             broker::start_spot_streamer();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // in-process backend base URL
+            api_base,
             // local vortex data
             app_info,
             list_symbols,

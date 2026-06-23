@@ -296,3 +296,31 @@ pub async fn serve(state: AppApiState) -> anyhow::Result<()> {
         .await
         .context("axum::serve returned with an unrecoverable error")
 }
+
+/// Serve the full API on a caller-supplied, already-bound listener. Used by
+/// the in-process desktop shell (Tauri), which binds an ephemeral loopback
+/// port itself — so it knows the port *before* the window loads — and hands
+/// the listener here. Same router, same handlers, same loopback-only security
+/// model as [`serve`]; the only difference is who owns the socket.
+pub async fn serve_on(
+    listener: std::net::TcpListener,
+    state: AppApiState,
+) -> anyhow::Result<()> {
+    let addr = listener.local_addr().ok();
+    listener
+        .set_nonblocking(true)
+        .context("failed to set the backend listener non-blocking")?;
+    let listener = tokio::net::TcpListener::from_std(listener)
+        .context("failed to adopt the pre-bound backend listener into tokio")?;
+    let app = router(state);
+
+    tracing::info!(
+        target: "neoethos_app::server",
+        ?addr,
+        "NeoEthos in-process API listening (Tauri shell) — loopback-only"
+    );
+
+    axum::serve(listener, app)
+        .await
+        .context("in-process axum::serve returned with an unrecoverable error")
+}

@@ -64,6 +64,20 @@ nav {
   font-size: 13px;
 }
 
+.nav-divider {
+  font-size: 9.5px;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: #4b5563;
+  padding: 12px 10px 4px;
+}
+
+nav {
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 .sidebar-foot {
   margin-top: auto;
   font-size: 11px;
@@ -383,6 +397,109 @@ button.danger {
   display: flex;
   gap: 10px;
   margin: 14px 0;
+}
+
+/* engines: status + progress */
+.engine-status {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 6px 0 12px;
+}
+.progress {
+  position: relative;
+  flex: 1 1 auto;
+  height: 16px;
+  background: #11151f;
+  border: 1px solid #1f2632;
+  border-radius: 8px;
+  overflow: hidden;
+  max-width: 420px;
+}
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #1e3a5f, #3b82f6);
+  transition: width 0.4s ease;
+}
+.progress-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: #cfe3ff;
+}
+
+/* file list */
+.file-list {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+  font-family: monospace;
+  font-size: 11.5px;
+  color: #9ca3af;
+  max-height: 280px;
+  overflow: auto;
+}
+.file-list li {
+  padding: 2px 0;
+  border-bottom: 1px solid #161c28;
+}
+
+/* chat (AI Desk) */
+.chat {
+  margin: 14px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 46vh;
+  overflow: auto;
+}
+.chat-turn {
+  background: #141a26;
+  border: 1px solid #1f2632;
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-size: 13px;
+  white-space: pre-wrap;
+}
+.chat-turn.you {
+  border-color: #294063;
+}
+.chat-turn b {
+  display: block;
+  font-size: 10px;
+  color: #6b7280;
+  margin-bottom: 4px;
+}
+.chat-input {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+/* news */
+.news-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+.news-item {
+  background: #141a26;
+  border: 1px solid #1f2632;
+  border-radius: 8px;
+  padding: 9px 12px;
+}
+.news-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.news-summary {
+  font-size: 12px;
+  color: #9ca3af;
+  margin-top: 4px;
 }
 
 /* statusbar */
