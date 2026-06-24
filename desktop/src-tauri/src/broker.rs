@@ -454,3 +454,30 @@ pub async fn reauth_broker() -> Result<ReauthResult, String> {
     .await
     .map_err(|e| e.to_string())?
 }
+
+/// #1 Realistic costs: pull the broker's real per-symbol financials (commission,
+/// swap, spread, lot size) from cTrader and rebuild `data/symbol_metadata.json`,
+/// so the discovery/backtest cost model uses THIS account's actual per-lot costs
+/// instead of a stale static table. Reuses the tested capture→rebuild flow
+/// (no new cost math → no unit-mapping risk). Heavy (fetches the full catalog).
+#[tauri::command]
+pub async fn refresh_broker_costs() -> Result<String, String> {
+    spawn_blocking(|| {
+        use neoethos_app::app_services::capture_symbols as cs;
+        let root = cs::default_bootstrap_root();
+        let env_label = cs::env_label_from_settings();
+        // 1. fetch the broker catalog (raw ProtoOASymbolById incl. commission/swap)
+        cs::run_bootstrap(env_label, &root).map_err(|e| format!("broker fetch: {e}"))?;
+        // 2. convert the raw catalog → SymbolMetadataTable (real per-lot costs)
+        let env_dir = root.join(env_label);
+        let table = cs::build_symbol_metadata_table_from_catalog(&env_dir)
+            .map_err(|e| format!("rebuild: {e}"))?;
+        // 3. write the canonical metadata the cost model reads
+        let path = std::path::PathBuf::from("data").join("symbol_metadata.json");
+        let n = table.entries.len();
+        table.save_to_disk(&path).map_err(|e| format!("write: {e}"))?;
+        Ok::<String, String>(format!("Refreshed real costs for {n} symbols → {}", path.display()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}

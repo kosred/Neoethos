@@ -439,6 +439,8 @@ export type StorageEntry = {
 };
 export const storagePaths = () => apiGet<{ entries: StorageEntry[] }>("/storage/paths");
 export const openPath = (path: string) => invoke("open_path", { path });
+// Refresh real per-symbol costs (commission/swap/spread) from cTrader → cost model.
+export const refreshBrokerCosts = () => invoke<string>("refresh_broker_costs");
 
 // ── Autopilot: existing strategy portfolios ───────────────────────────────
 export type PortfolioEntry = {

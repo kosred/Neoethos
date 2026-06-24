@@ -226,6 +226,7 @@ pub fn run() {
             broker::place_order,
             broker::close_position,
             broker::reauth_broker,
+            broker::refresh_broker_costs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

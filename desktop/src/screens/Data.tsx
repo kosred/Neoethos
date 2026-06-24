@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { dataBootstrap, dataFetch } from "../api";
+import { dataBootstrap, dataFetch, refreshBrokerCosts } from "../api";
 import { usePoll } from "../hooks";
 
 export default function Data() {
@@ -9,6 +9,20 @@ export default function Data() {
   const [from, setFrom] = useState("2020-01-01");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const [costBusy, setCostBusy] = useState(false);
+  const [costMsg, setCostMsg] = useState("");
+
+  const refreshCosts = async () => {
+    setCostBusy(true);
+    setCostMsg("Fetching real per-symbol costs from the broker… (can take a minute)");
+    try {
+      setCostMsg(`✓ ${await refreshBrokerCosts()}`);
+    } catch (e) {
+      setCostMsg(`Failed: ${e}`);
+    } finally {
+      setCostBusy(false);
+    }
+  };
 
   const fetchData = async () => {
     const fromMs = Date.parse(from);
@@ -57,6 +71,21 @@ export default function Data() {
           <button className="primary" disabled={busy} onClick={fetchData}>Fetch from broker</button>
         </div>
         {msg && <div className="banner info">{msg}</div>}
+      </div>
+
+      <h2>Broker costs (for accurate backtests)</h2>
+      <div className="ticket">
+        <p className="muted small">
+          Pull this account's real per-lot commission, swap and spread from cTrader and rebuild the
+          cost model. Without it, discovery uses a static table that may not match your broker — making
+          backtests over-optimistic vs live.
+        </p>
+        <div className="btn-row">
+          <button className="primary" disabled={costBusy} onClick={refreshCosts}>
+            {costBusy ? "Refreshing…" : "Refresh broker costs"}
+          </button>
+        </div>
+        {costMsg && <div className="banner info">{costMsg}</div>}
       </div>
 
       {data && data.symbols.length > 0 && (
