@@ -299,9 +299,9 @@ export type RiskyScenario = {
   winRate: number;
   rewardToRisk: number;
   tradesPerDay: number;
-  bestCaseDays: number;
-  expectedDays: number;
-  conservativeDays: number;
+  bestCaseDays: number | null;
+  expectedDays: number | null;
+  conservativeDays: number | null;
   ruinProbability: number;
   riskFractionMin: number;
   riskFractionMax: number;

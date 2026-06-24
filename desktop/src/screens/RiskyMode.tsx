@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { riskyScenarios, type RiskyParams, type RiskyScenario } from "../api";
 
 const pctOf = (v: number) => `${(v * 100).toFixed(0)}%`;
-const days = (n: number) => (n >= 365 ? `${(n / 365).toFixed(1)}y` : n >= 30 ? `${(n / 30).toFixed(1)}mo` : `${Math.round(n)}d`);
+const days = (n: number | null) =>
+  n == null || Number.isNaN(n) ? "never" : n >= 365 ? `${(n / 365).toFixed(1)}y` : n >= 30 ? `${(n / 30).toFixed(1)}mo` : `${Math.round(n)}d`;
 
 export default function RiskyMode() {
   const [d, setD] = useState<RiskyScenario | null>(null);
