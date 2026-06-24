@@ -28,7 +28,7 @@ export default function StrategyLab() {
     setMsg("Promoting to live…");
     try {
       const r = await promoteStrategy(symbol, baseTf);
-      setMsg(`${r?.promoted ? "✓" : "✗"} ${r?.message ?? ""} ${r?.files_copied ? `(${r.files_copied} files)` : ""}`);
+      setMsg(`${r?.promoted ? "✓" : "✗"} ${r?.message ?? ""} ${r?.filesCopied ? `(${r.filesCopied} files)` : ""}`);
       await check();
     } catch (e) {
       setMsg(`Promote failed: ${e}`);

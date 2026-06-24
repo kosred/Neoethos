@@ -18,7 +18,7 @@ export default function AiDesk() {
     setMsg("Starting ChatGPT (Codex) login — approve in the browser that opens…");
     try {
       const r = await codexStart();
-      if (r?.authorize_url) setMsg(`Open this URL to authorize: ${r.authorize_url}`);
+      if (r?.authorizeUrl) setMsg(`Open this URL to authorize: ${r.authorizeUrl}`);
       await reload();
     } catch (e) {
       setMsg(`Login failed: ${e}`);
