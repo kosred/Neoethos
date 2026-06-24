@@ -203,7 +203,8 @@ pub fn run() {
             // Codex, …) — every old Flutter feature, reachable from the new UI.
             backend::start();
             // Start the live cTrader spot-price streamer (best-effort; no-op
-            // until the broker is authenticated). The UI polls spot_prices().
+            // until the broker is authenticated). Feeds the in-process server's
+            // /live/spots/stream (SSE) that the UI subscribes to.
             broker::start_spot_streamer();
             Ok(())
         })
@@ -219,14 +220,12 @@ pub fn run() {
             // live cTrader broker (in-process, auto-auth)
             broker::broker_status,
             broker::broker_chart,
-            broker::broker_symbols,
             broker::broker_accounts,
             broker::select_account,
             broker::account_snapshot,
             broker::place_order,
             broker::close_position,
             broker::reauth_broker,
-            broker::spot_prices,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -111,7 +111,6 @@ export type BrokerStatus = {
   accountId: string | null;
 };
 
-export type SymbolInfo = { symbolId: number; name: string; enabled: boolean };
 export type AccountInfo = {
   accountId: string;
   brokerTitle: string;
@@ -161,13 +160,6 @@ export type ReauthResult = {
   accessTokenLen: number;
   message: string;
 };
-export type SpotPrice = {
-  symbolId: number;
-  name: string;
-  bid: number | null;
-  ask: number | null;
-  mid: number | null;
-};
 
 // ── Local vortex data (works offline, no broker) ──────────────────────────────
 export const appInfo = () => invoke<AppInfo>("app_info");
@@ -180,7 +172,6 @@ export const localChart = (symbol: string, timeframe: string, limit = 1500) =>
 export const brokerStatus = () => invoke<BrokerStatus>("broker_status");
 export const brokerChart = (symbol: string, timeframe: string, limit = 1000) =>
   invoke<Candle[]>("broker_chart", { symbol, timeframe, limit });
-export const brokerSymbols = () => invoke<SymbolInfo[]>("broker_symbols");
 export const brokerAccounts = () => invoke<AccountInfo[]>("broker_accounts");
 // Full broker symbol universe (dozens — forex/metals/indices) WITH asset class,
 // straight from the server. Use this for selection/watchlist, not the 7 defaults.
@@ -213,7 +204,6 @@ export const placeOrder = (
 export const closePosition = (positionId: number, volume: number) =>
   invoke<ExecResult>("close_position", { positionId, volume });
 export const reauthBroker = () => invoke<ReauthResult>("reauth_broker");
-export const spotPrices = () => invoke<SpotPrice[]>("spot_prices");
 
 // ══════════════════════════════════════════════════════════════════════════
 // Full backend API (in-process axum server) — every old Flutter feature.
@@ -345,7 +335,6 @@ export const dataFetch = (b: unknown) => apiPost("/data/fetch", b);
 // ── Market Watch / watchlist ──────────────────────────────────────────────
 export const getWatchlist = () => apiGet<any>("/watchlist");
 export const setWatchlist = (symbols: string[]) => apiPost("/watchlist", { symbols });
-export const liveSpots = () => apiGet<any>("/live/spots");
 
 // ── AI Desk (Codex / ChatGPT subscription) ────────────────────────────────
 export const codexStatus = () => apiGet<any>("/auth/codex/status");
@@ -375,7 +364,6 @@ export const amendProtection = (
     take_profit_price: takeProfitPrice ?? null,
     trailing_stop_loss: trailingStopLoss ?? null,
   });
-export const cancelOrder = (orderId: number) => apiPost("/orders/cancel", { order_id: orderId });
 
 // ── Advanced settings / diagnostics / data import ─────────────────────────
 // ── Indicators + chart scroll-back ────────────────────────────────────────
