@@ -555,7 +555,7 @@ fn artifact_filename_strips_invalid_characters() {
 fn discovery_runtime_overrides_defaults_match_legacy_env_defaults() {
     let defaults = DiscoveryRuntimeOverrides::default();
     assert_eq!(defaults.prefilter_top_k, 50);
-    assert!((defaults.prefilter_insample_frac - 0.70).abs() < 1e-9);
+    assert!((defaults.prefilter_insample_frac - 0.80).abs() < 1e-9);
     assert_eq!(defaults.prefilter_min_per_timeframe, 6);
     assert!((defaults.funnel_stage1_pct - 0.25).abs() < 1e-9);
 }
@@ -573,7 +573,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
         // as the explicit "skip" sentinel (see ensure_sufficient_history).
         min_history_years: 0,
     };
-    assert!((overrides.resolved_prefilter_insample_frac() - 0.70).abs() < 1e-9);
+    assert!((overrides.resolved_prefilter_insample_frac() - 0.80).abs() < 1e-9);
     assert!((overrides.resolved_funnel_stage1_pct() - 1.0).abs() < 1e-9);
 
     let too_small = DiscoveryRuntimeOverrides {
@@ -584,7 +584,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
         stage1_window: Stage1Window::Earliest,
         min_history_years: 0,
     };
-    assert!((too_small.resolved_prefilter_insample_frac() - 0.70).abs() < 1e-9);
+    assert!((too_small.resolved_prefilter_insample_frac() - 0.80).abs() < 1e-9);
     assert!((too_small.resolved_funnel_stage1_pct() - 0.01).abs() < 1e-9);
 }
 

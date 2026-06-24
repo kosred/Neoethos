@@ -811,7 +811,7 @@ impl Default for DiscoveryRuntimeConfig {
     fn default() -> Self {
         Self {
             prefilter_top_k: 50,
-            prefilter_insample_frac: 0.70,
+            prefilter_insample_frac: 0.80,
             prefilter_min_per_timeframe: 6,
             funnel_stage1_pct: 0.25,
             stage1_window: "earliest".to_string(),
