@@ -8,6 +8,7 @@ import Positions from "./screens/Positions";
 import Account from "./screens/Account";
 import Actions from "./screens/Actions";
 import Autopilot from "./screens/Autopilot";
+import RiskyMode from "./screens/RiskyMode";
 import Risk from "./screens/Risk";
 import Discovery from "./screens/Discovery";
 import Training from "./screens/Training";
@@ -25,7 +26,7 @@ import "./App.css";
 
 type View =
   | "cockpit" | "dashboard" | "markets" | "marketwatch" | "positions" | "account" | "actions"
-  | "autopilot" | "risk" | "discovery" | "training" | "strategylab" | "intelligence"
+  | "autopilot" | "riskymode" | "risk" | "discovery" | "training" | "strategylab" | "intelligence"
   | "files" | "data" | "journal" | "news" | "aidesk" | "hardware" | "advanced" | "settings";
 
 type NavEntry = { id: View; label: string; icon: string } | { divider: string };
@@ -41,6 +42,7 @@ const NAV: NavEntry[] = [
   { id: "actions", label: "Actions", icon: "✓" },
   { divider: "Autopilot" },
   { id: "autopilot", label: "Autopilot", icon: "🤖" },
+  { id: "riskymode", label: "Risky Mode", icon: "🚀" },
   { id: "risk", label: "Risk", icon: "🛡" },
   { divider: "Research" },
   { id: "discovery", label: "Discovery", icon: "🧬" },
@@ -69,6 +71,7 @@ const SCREENS: Record<View, ReactNode> = {
   account: <Account />,
   actions: <Actions />,
   autopilot: <Autopilot />,
+  riskymode: <RiskyMode />,
   risk: <Risk />,
   discovery: <Discovery />,
   training: <Training />,

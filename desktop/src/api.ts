@@ -284,7 +284,35 @@ export type RiskInfo = {
 };
 export const riskInfo = () => apiGet<RiskInfo>("/risk");
 export const setRiskPreset = (preset: string) => apiPost("/risk/preset", { preset });
-export const riskyScenarios = () => apiGet<any>("/risky/scenarios");
+export type RiskyParams = {
+  startingUsd?: number;
+  targetUsd?: number;
+  riskFraction?: number;
+  winRate?: number;
+  rewardToRisk?: number;
+  tradesPerDay?: number;
+};
+export type RiskyScenario = {
+  startingUsd: number;
+  targetUsd: number;
+  riskFraction: number;
+  winRate: number;
+  rewardToRisk: number;
+  tradesPerDay: number;
+  bestCaseDays: number;
+  expectedDays: number;
+  conservativeDays: number;
+  ruinProbability: number;
+  riskFractionMin: number;
+  riskFractionMax: number;
+};
+export const riskyScenarios = (p: RiskyParams = {}) => {
+  const q = Object.entries(p)
+    .filter(([, v]) => v !== undefined && v !== null && !Number.isNaN(v))
+    .map(([k, v]) => `${k}=${v}`)
+    .join("&");
+  return apiGet<RiskyScenario>(`/risky/scenarios${q ? `?${q}` : ""}`);
+};
 
 // ── Hardware ──────────────────────────────────────────────────────────────
 export type HardwareInfo = {

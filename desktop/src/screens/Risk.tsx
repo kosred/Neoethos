@@ -1,12 +1,11 @@
 import { useState } from "react";
-import { riskInfo, setRiskPreset, riskyScenarios } from "../api";
+import { riskInfo, setRiskPreset } from "../api";
 import { usePoll } from "../hooks";
 
 const pct = (v: number) => `${(v * 100).toFixed(2)}%`;
 
 export default function Risk() {
   const { data, error, reload } = usePoll(riskInfo, 0);
-  const { data: growth } = usePoll(riskyScenarios, 0);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
 
@@ -77,22 +76,9 @@ export default function Risk() {
           {msg && <div className="banner info">{msg}</div>}
         </>
       )}
-
-      {growth && (
-        <>
-          <h2>Growth projection (Risky mode)</h2>
-          <p className="muted small">
-            From {growth.startingUsd} → {growth.targetUsd?.toLocaleString()} at {pct(growth.riskFraction)}/trade,
-            {" "}{(growth.winRate * 100).toFixed(0)}% win, {growth.rewardToRisk}R, {growth.tradesPerDay}/day
-          </p>
-          <div className="cards">
-            <div className="card"><div className="card-label">BEST CASE</div><div className="card-value">{growth.bestCaseDays}d</div></div>
-            <div className="card accent"><div className="card-label">EXPECTED</div><div className="card-value">{growth.expectedDays}d</div></div>
-            <div className="card"><div className="card-label">CONSERVATIVE</div><div className="card-value">{growth.conservativeDays}d</div></div>
-            <div className="card"><div className="card-label">RUIN PROB.</div><div className="card-value" style={{ color: "#fca5a5" }}>{(growth.ruinProbability * 100).toFixed(1)}%</div></div>
-          </div>
-        </>
-      )}
+      <p className="muted small" style={{ marginTop: 12 }}>
+        Aggressive account-multiplication lives in its own <b>Risky Mode</b> screen.
+      </p>
     </div>
   );
 }
