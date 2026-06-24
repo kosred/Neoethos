@@ -64,6 +64,22 @@ fn api_base() -> String {
     backend::base_url()
 }
 
+/// Reveal a file or folder in the OS file manager (Windows Explorer). Files are
+/// highlighted via `/select,`; folders open directly. Lets the user find any
+/// data/model/log the app stores with one click.
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    let mut cmd = std::process::Command::new("explorer");
+    if p.is_file() {
+        cmd.arg("/select,").arg(&path);
+    } else {
+        cmd.arg(&path);
+    }
+    // explorer.exe returns non-zero exit codes even on success; ignore status.
+    cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
 /// Resolve the data root the same way the engine does: the operator's
 /// `config.yaml` `system.data_dir`. Falls back to the dev repo path if the
 /// configured dir is missing (PoC convenience).
@@ -192,8 +208,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            // in-process backend base URL
+            // in-process backend base URL + file manager
             api_base,
+            open_path,
             // local vortex data
             app_info,
             list_symbols,

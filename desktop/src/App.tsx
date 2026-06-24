@@ -2,51 +2,57 @@ import { useEffect, useState, type ReactNode } from "react";
 import { appInfo, brokerStatus, type AppInfo, type BrokerStatus } from "./api";
 import Dashboard from "./screens/Dashboard";
 import Markets from "./screens/Markets";
+import MarketWatch from "./screens/MarketWatch";
 import Positions from "./screens/Positions";
 import Account from "./screens/Account";
-import Advanced from "./screens/Advanced";
+import Actions from "./screens/Actions";
+import Autopilot from "./screens/Autopilot";
+import Risk from "./screens/Risk";
 import Discovery from "./screens/Discovery";
 import Training from "./screens/Training";
 import StrategyLab from "./screens/StrategyLab";
-import Autonomous from "./screens/Autonomous";
-import Risk from "./screens/Risk";
 import Intelligence from "./screens/Intelligence";
-import Journal from "./screens/Journal";
-import MarketWatch from "./screens/MarketWatch";
-import News from "./screens/News";
+import Files from "./screens/Files";
 import Data from "./screens/Data";
-import Hardware from "./screens/Hardware";
+import Journal from "./screens/Journal";
+import News from "./screens/News";
 import AiDesk from "./screens/AiDesk";
+import Hardware from "./screens/Hardware";
+import Advanced from "./screens/Advanced";
 import Settings from "./screens/Settings";
 import "./App.css";
 
 type View =
-  | "dashboard" | "markets" | "marketwatch" | "positions" | "account" | "discovery" | "training"
-  | "strategylab" | "autonomous" | "risk" | "intelligence" | "journal" | "news"
-  | "data" | "hardware" | "advanced" | "aidesk" | "settings";
+  | "dashboard" | "markets" | "marketwatch" | "positions" | "account" | "actions"
+  | "autopilot" | "risk" | "discovery" | "training" | "strategylab" | "intelligence"
+  | "files" | "data" | "journal" | "news" | "aidesk" | "hardware" | "advanced" | "settings";
 
 type NavEntry = { id: View; label: string; icon: string } | { divider: string };
 
 const NAV: NavEntry[] = [
-  { divider: "Trading" },
+  { divider: "Trade" },
   { id: "dashboard", label: "Dashboard", icon: "▦" },
   { id: "markets", label: "Markets", icon: "📈" },
   { id: "marketwatch", label: "Market Watch", icon: "👁" },
   { id: "positions", label: "Positions", icon: "≡" },
   { id: "account", label: "Account", icon: "💳" },
-  { id: "autonomous", label: "Autonomous", icon: "🤖" },
+  { id: "actions", label: "Actions", icon: "✓" },
+  { divider: "Autopilot" },
+  { id: "autopilot", label: "Autopilot", icon: "🤖" },
+  { id: "risk", label: "Risk", icon: "🛡" },
   { divider: "Research" },
   { id: "discovery", label: "Discovery", icon: "🧬" },
   { id: "training", label: "Training", icon: "🎓" },
   { id: "strategylab", label: "Strategy Lab", icon: "⚗" },
   { id: "intelligence", label: "Intelligence", icon: "🧠" },
-  { divider: "Insight" },
+  { divider: "Data & Files" },
+  { id: "files", label: "Files & Storage", icon: "🗂" },
+  { id: "data", label: "Data", icon: "🗄" },
+  { divider: "Desk" },
   { id: "journal", label: "Journal", icon: "📒" },
   { id: "news", label: "News", icon: "📰" },
   { id: "aidesk", label: "AI Desk", icon: "💬" },
-  { id: "risk", label: "Risk", icon: "🛡" },
   { divider: "System" },
-  { id: "data", label: "Data", icon: "🗄" },
   { id: "hardware", label: "Hardware", icon: "🖥" },
   { id: "advanced", label: "Advanced", icon: "🔧" },
   { id: "settings", label: "Settings", icon: "⚙" },
@@ -58,16 +64,18 @@ const SCREENS: Record<View, ReactNode> = {
   marketwatch: <MarketWatch />,
   positions: <Positions />,
   account: <Account />,
-  autonomous: <Autonomous />,
+  actions: <Actions />,
+  autopilot: <Autopilot />,
+  risk: <Risk />,
   discovery: <Discovery />,
   training: <Training />,
   strategylab: <StrategyLab />,
   intelligence: <Intelligence />,
+  files: <Files />,
+  data: <Data />,
   journal: <Journal />,
   news: <News />,
   aidesk: <AiDesk />,
-  risk: <Risk />,
-  data: <Data />,
   hardware: <Hardware />,
   advanced: <Advanced />,
   settings: <Settings />,

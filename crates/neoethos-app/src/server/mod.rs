@@ -52,6 +52,8 @@ pub mod live_spots;
 pub mod news;
 pub mod orders;
 pub mod pending_actions;
+pub mod portfolios;
+pub mod storage;
 pub mod risk;
 pub mod risky;
 pub mod settings;
@@ -130,6 +132,9 @@ pub fn router(state: AppApiState) -> Router {
         )
         .route("/settings/presets", get(knob_catalog::get_presets))
         .route("/engines/status", get(system_status::engines))
+        // Storage transparency + autopilot artifact picker.
+        .route("/storage/paths", get(storage::paths))
+        .route("/portfolios/list", get(portfolios::list))
         .route(
             "/engines/discovery/start",
             post(engines_control::discovery_start),

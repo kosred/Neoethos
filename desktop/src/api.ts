@@ -386,3 +386,35 @@ export const saveSettingsRaw = (yaml: string) => apiPost("/settings/raw", { yaml
 export const diagnosticsReport = () => apiPost<any>("/diagnostics/report");
 export const dataImport = (sourcePath: string, symbol: string, timeframe: string) =>
   apiPost<any>("/data/import", { source_path: sourcePath, symbol, timeframe });
+
+// ── Storage transparency (where every file lives) ─────────────────────────
+export type StorageEntry = {
+  key: string;
+  label: string;
+  path: string;
+  exists: boolean;
+  isDir: boolean;
+  sizeBytes: number;
+  itemCount: number;
+  lastModifiedMs: number | null;
+  kind: string;
+};
+export const storagePaths = () => apiGet<{ entries: StorageEntry[] }>("/storage/paths");
+export const openPath = (path: string) => invoke("open_path", { path });
+
+// ── Autopilot: existing strategy portfolios ───────────────────────────────
+export type PortfolioEntry = {
+  path: string;
+  fileName: string;
+  symbol: string | null;
+  baseTf: string | null;
+  geneCount: number | null;
+  sizeBytes: number;
+  modifiedMs: number | null;
+};
+export const portfoliosList = () => apiGet<{ count: number; portfolios: PortfolioEntry[] }>("/portfolios/list");
+
+// ── Trade-confirmation / actions queue ────────────────────────────────────
+export const pendingActions = () => apiGet<any>("/actions/pending");
+export const confirmAction = (id: string) => apiPost(`/actions/${id}/confirm`);
+export const rejectAction = (id: string) => apiPost(`/actions/${id}/reject`);
