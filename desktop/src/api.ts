@@ -414,6 +414,8 @@ export const chartHistory = (symbol: string, timeframe: string, beforeMs: number
     `/chart/history?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&beforeMs=${beforeMs}&limit=${limit}`,
   );
 
+export const settings = () => apiGet<any>("/settings");
+
 export const brokerTimeframes = () => apiGet<{ count: number; timeframes: string[] }>("/broker/timeframes");
 export const settingsPresets = () => apiGet<{ presets: { id: string; label: string; description: string }[] }>("/settings/presets");
 export const knobCatalog = () => apiGet<any>("/settings/knob-catalog");
