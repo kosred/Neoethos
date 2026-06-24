@@ -211,6 +211,7 @@ export default function Cockpit() {
             <div className="ck-label">Account</div>
             <div className="ck-kv"><span>Balance</span><b className="mono">{fmt(snap?.balance)} {cur}</b></div>
             <div className="ck-kv"><span>Equity</span><b className="mono">{fmt(snap?.equity)} {cur}</b></div>
+            <div className="ck-kv"><span>Used margin</span><b className="mono">{fmt(snap?.usedMargin)} {cur}</b></div>
             <div className="ck-kv"><span>Free margin</span><b className="mono">{fmt(snap?.freeMargin)} {cur}</b></div>
             <div className="ck-kv"><span>P/L</span><b className={`mono ${pnl !== undefined && pnl < 0 ? "sell" : "buy"}`}>{fmt(pnl)} {cur}</b></div>
           </div>

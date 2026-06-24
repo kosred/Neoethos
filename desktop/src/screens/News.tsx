@@ -35,11 +35,11 @@ export default function News() {
         <div className="news-list">
           {items.slice(0, 60).map((it, i) => (
             <div className="news-item" key={i}>
-              <div className="news-title">{it.title ?? it.headline ?? "(untitled)"}</div>
+              <div className="news-title">{it.title ?? "(untitled)"}</div>
               <div className="muted small">
-                {(it.source ?? it.feed ?? "")}{it.published_at ? ` · ${it.published_at}` : ""}
+                {it.source ?? ""}{it.publishedMs ? ` · ${new Date(it.publishedMs).toLocaleString()}` : ""}
               </div>
-              {it.summary && <div className="news-summary">{it.summary}</div>}
+              {it.blurb && <div className="news-summary">{it.blurb}</div>}
             </div>
           ))}
         </div>

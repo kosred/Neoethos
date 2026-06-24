@@ -1,5 +1,14 @@
 import type { StreamPosition } from "../api";
 
+const ago = (ms: number | null) => {
+  if (!ms) return "—";
+  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+};
+
 /**
  * The ONE open-positions table used everywhere (Dashboard, Positions, …).
  * EVERY field — symbol, volume, entry, SL, TP, live P/L, pips — comes straight
@@ -30,6 +39,7 @@ export default function PositionsTable({
           <th>Entry</th>
           <th>SL</th>
           <th>TP</th>
+          <th>Opened</th>
           <th>P/L{currency ? ` (${currency})` : ""}</th>
           <th>Pips</th>
           {onClose && <th></th>}
@@ -47,6 +57,7 @@ export default function PositionsTable({
               <td>{p.entryPrice ?? "—"}</td>
               <td>{p.stopLoss ?? "—"}</td>
               <td>{p.takeProfit ?? "—"}</td>
+              <td className="muted">{ago(p.openTimestampMs)}</td>
               <td className={cls}><b>{p.pnlUsd >= 0 ? "+" : ""}{p.pnlUsd.toFixed(2)}</b></td>
               <td className={cls}>{p.pnlPips >= 0 ? "+" : ""}{p.pnlPips.toFixed(1)}</td>
               {onClose && (
@@ -62,7 +73,7 @@ export default function PositionsTable({
       </tbody>
       <tfoot>
         <tr>
-          <td colSpan={6} style={{ textAlign: "right", color: "#6b7280" }}>Total P/L</td>
+          <td colSpan={7} style={{ textAlign: "right", color: "#6b7280" }}>Total P/L</td>
           <td className={total >= 0 ? "buy" : "sell"}><b>{total >= 0 ? "+" : ""}{total.toFixed(2)}</b></td>
           <td colSpan={onClose ? 2 : 1}></td>
         </tr>
