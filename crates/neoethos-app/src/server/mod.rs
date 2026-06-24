@@ -54,6 +54,7 @@ pub mod orders;
 pub mod pending_actions;
 pub mod portfolios;
 pub mod storage;
+pub mod strategy_report;
 pub mod risk;
 pub mod risky;
 pub mod settings;
@@ -135,6 +136,9 @@ pub fn router(state: AppApiState) -> Router {
         // Storage transparency + autopilot artifact picker.
         .route("/storage/paths", get(storage::paths))
         .route("/portfolios/list", get(portfolios::list))
+        // Per-strategy monthly journal + validation verdict + honest flags.
+        .route("/strategy/list", get(strategy_report::list))
+        .route("/strategy/report", get(strategy_report::report))
         .route(
             "/engines/discovery/start",
             post(engines_control::discovery_start),

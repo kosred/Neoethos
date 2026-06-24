@@ -211,6 +211,9 @@ nav {
   padding: 8px 10px;
   border-bottom: 1px solid #161c28;
 }
+.tbl tr.row-sel {
+  background: #15202e;
+}
 .buy {
   color: #22c55e;
 }

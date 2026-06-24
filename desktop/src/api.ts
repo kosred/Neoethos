@@ -450,6 +450,34 @@ export type PortfolioEntry = {
 };
 export const portfoliosList = () => apiGet<{ count: number; portfolios: PortfolioEntry[] }>("/portfolios/list");
 
+// ── Strategy report: monthly journal + validation verdict + flags ─────────
+export type StrategyEntry = {
+  mode: string;
+  dir: string;
+  symbol: string;
+  timeframe: string;
+  base: string;
+  trades: number;
+  winRate: number | null;
+  profitFactor: number | null;
+  sharpe: number | null;
+  cpcvPassed: boolean | null;
+  walkforwardPassed: boolean | null;
+  validationComplete: boolean | null;
+  spanStart: string | null;
+  spanEnd: string | null;
+  years: number;
+  cagrPct: number;
+  finalFrom1000: number;
+  maxDdPct: number;
+  flags: string[];
+};
+export type MonthRow = { month: string; balance: number; returnPct: number; trades: number };
+export type StrategyReport = StrategyEntry & { monthly: MonthRow[]; yearly: MonthRow[] };
+export const strategyList = () => apiGet<{ count: number; strategies: StrategyEntry[] }>("/strategy/list");
+export const strategyReport = (dir: string, base: string) =>
+  apiGet<StrategyReport>(`/strategy/report?dir=${encodeURIComponent(dir)}&base=${encodeURIComponent(base)}`);
+
 // ── Trade-confirmation / actions queue ────────────────────────────────────
 export const pendingActions = () => apiGet<any>("/actions/pending");
 export const confirmAction = (id: string) => apiPost(`/actions/${id}/confirm`);

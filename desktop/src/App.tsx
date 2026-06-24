@@ -13,6 +13,7 @@ import Risk from "./screens/Risk";
 import Discovery from "./screens/Discovery";
 import Training from "./screens/Training";
 import StrategyLab from "./screens/StrategyLab";
+import StrategyReport from "./screens/StrategyReport";
 import Intelligence from "./screens/Intelligence";
 import Files from "./screens/Files";
 import Data from "./screens/Data";
@@ -26,7 +27,7 @@ import "./App.css";
 
 type View =
   | "cockpit" | "dashboard" | "markets" | "marketwatch" | "positions" | "account" | "actions"
-  | "autopilot" | "riskymode" | "risk" | "discovery" | "training" | "strategylab" | "intelligence"
+  | "autopilot" | "riskymode" | "risk" | "discovery" | "training" | "strategylab" | "strategyreport" | "intelligence"
   | "files" | "data" | "journal" | "news" | "aidesk" | "hardware" | "advanced" | "settings";
 
 type NavEntry = { id: View; label: string; icon: string } | { divider: string };
@@ -48,6 +49,7 @@ const NAV: NavEntry[] = [
   { id: "discovery", label: "Discovery", icon: "🧬" },
   { id: "training", label: "Training", icon: "🎓" },
   { id: "strategylab", label: "Strategy Lab", icon: "⚗" },
+  { id: "strategyreport", label: "Strategy Report", icon: "📅" },
   { id: "intelligence", label: "Intelligence", icon: "🧠" },
   { divider: "Data & Files" },
   { id: "files", label: "Files & Storage", icon: "🗂" },
@@ -76,6 +78,7 @@ const SCREENS: Record<View, ReactNode> = {
   discovery: <Discovery />,
   training: <Training />,
   strategylab: <StrategyLab />,
+  strategyreport: <StrategyReport />,
   intelligence: <Intelligence />,
   files: <Files />,
   data: <Data />,
