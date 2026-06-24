@@ -3,6 +3,8 @@ import { appInfo, brokerStatus, type AppInfo, type BrokerStatus } from "./api";
 import Dashboard from "./screens/Dashboard";
 import Markets from "./screens/Markets";
 import Positions from "./screens/Positions";
+import Account from "./screens/Account";
+import Advanced from "./screens/Advanced";
 import Discovery from "./screens/Discovery";
 import Training from "./screens/Training";
 import StrategyLab from "./screens/StrategyLab";
@@ -19,9 +21,9 @@ import Settings from "./screens/Settings";
 import "./App.css";
 
 type View =
-  | "dashboard" | "markets" | "marketwatch" | "positions" | "discovery" | "training"
+  | "dashboard" | "markets" | "marketwatch" | "positions" | "account" | "discovery" | "training"
   | "strategylab" | "autonomous" | "risk" | "intelligence" | "journal" | "news"
-  | "data" | "hardware" | "aidesk" | "settings";
+  | "data" | "hardware" | "advanced" | "aidesk" | "settings";
 
 type NavEntry = { id: View; label: string; icon: string } | { divider: string };
 
@@ -31,6 +33,7 @@ const NAV: NavEntry[] = [
   { id: "markets", label: "Markets", icon: "📈" },
   { id: "marketwatch", label: "Market Watch", icon: "👁" },
   { id: "positions", label: "Positions", icon: "≡" },
+  { id: "account", label: "Account", icon: "💳" },
   { id: "autonomous", label: "Autonomous", icon: "🤖" },
   { divider: "Research" },
   { id: "discovery", label: "Discovery", icon: "🧬" },
@@ -45,6 +48,7 @@ const NAV: NavEntry[] = [
   { divider: "System" },
   { id: "data", label: "Data", icon: "🗄" },
   { id: "hardware", label: "Hardware", icon: "🖥" },
+  { id: "advanced", label: "Advanced", icon: "🔧" },
   { id: "settings", label: "Settings", icon: "⚙" },
 ];
 
@@ -53,6 +57,7 @@ const SCREENS: Record<View, ReactNode> = {
   markets: <Markets />,
   marketwatch: <MarketWatch />,
   positions: <Positions />,
+  account: <Account />,
   autonomous: <Autonomous />,
   discovery: <Discovery />,
   training: <Training />,
@@ -64,6 +69,7 @@ const SCREENS: Record<View, ReactNode> = {
   risk: <Risk />,
   data: <Data />,
   hardware: <Hardware />,
+  advanced: <Advanced />,
   settings: <Settings />,
 };
 

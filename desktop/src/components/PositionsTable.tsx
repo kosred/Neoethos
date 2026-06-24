@@ -1,26 +1,23 @@
-import type { StreamPosition, Position } from "../api";
+import type { StreamPosition } from "../api";
 
 /**
  * The ONE open-positions table used everywhere (Dashboard, Positions, …).
- * Live symbol name + P/L (currency) + pips come from the SSE account stream;
- * entry/SL/TP are merged in from the Tauri snapshot by position id.
+ * EVERY field — symbol, volume, entry, SL, TP, live P/L, pips — comes straight
+ * from the server account stream. The client does NO conversion or merging.
  * Pass `onClose` to show a Close column (trading screens only).
  */
 export default function PositionsTable({
   live,
-  detail,
   currency = "",
   onClose,
   busy,
 }: {
   live: StreamPosition[];
-  detail?: Position[];
   currency?: string;
   onClose?: (positionId: number, volumeUnits: number) => void;
   busy?: boolean;
 }) {
   if (!live || live.length === 0) return <p className="muted">No open positions.</p>;
-  const byId = new Map((detail ?? []).map((p) => [p.positionId, p]));
   let total = 0;
 
   return (
@@ -40,7 +37,6 @@ export default function PositionsTable({
       </thead>
       <tbody>
         {live.map((p) => {
-          const d = byId.get(p.positionId);
           const cls = p.pnlUsd >= 0 ? "buy" : "sell";
           total += p.pnlUsd;
           return (
@@ -48,9 +44,9 @@ export default function PositionsTable({
               <td className={p.side.toLowerCase().includes("buy") ? "buy" : "sell"}>{p.side}</td>
               <td>{p.symbol}</td>
               <td>{p.volume}</td>
-              <td>{d?.price ?? "—"}</td>
-              <td>{d?.stopLoss ?? "—"}</td>
-              <td>{d?.takeProfit ?? "—"}</td>
+              <td>{p.entryPrice ?? "—"}</td>
+              <td>{p.stopLoss ?? "—"}</td>
+              <td>{p.takeProfit ?? "—"}</td>
               <td className={cls}><b>{p.pnlUsd >= 0 ? "+" : ""}{p.pnlUsd.toFixed(2)}</b></td>
               <td className={cls}>{p.pnlPips >= 0 ? "+" : ""}{p.pnlPips.toFixed(1)}</td>
               {onClose && (

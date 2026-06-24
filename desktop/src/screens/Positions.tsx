@@ -4,6 +4,7 @@ import {
   closePosition,
   placeOrder,
   refreshAccount,
+  amendProtection,
   type AccountSnapshot,
   type ExecResult,
 } from "../api";
@@ -23,6 +24,13 @@ export default function Positions() {
   const [sl, setSl] = useState<number | "">(20);
   const [tp, setTp] = useState<number | "">(40);
   const [busy, setBusy] = useState(false);
+
+  // SL/TP protection editor
+  const [protId, setProtId] = useState<number | "">("");
+  const [protSl, setProtSl] = useState<number | "">("");
+  const [protTp, setProtTp] = useState<number | "">("");
+  const [protTrail, setProtTrail] = useState(false);
+  const positions = snap?.positions ?? [];
 
   const refresh = async () => {
     try {
@@ -80,6 +88,29 @@ export default function Positions() {
     }
   };
 
+  const saveProtection = async () => {
+    if (protId === "") {
+      setMsg("Pick a position first.");
+      return;
+    }
+    setBusy(true);
+    setMsg("Updating SL/TP…");
+    try {
+      const r: any = await amendProtection(
+        Number(protId),
+        protSl === "" ? null : Number(protSl),
+        protTp === "" ? null : Number(protTp),
+        protTrail,
+      );
+      setMsg(`✓ Protection updated${r?.message ? ` · ${r.message}` : ""}`);
+      await refresh();
+    } catch (e) {
+      setMsg(`SL/TP update failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="screen">
       <h1>Positions</h1>
@@ -122,11 +153,44 @@ export default function Positions() {
       {err && <div className="banner warn">{err.slice(0, 160)}</div>}
       <PositionsTable
         live={snap?.positions ?? []}
-        detail={acct?.positions}
         currency={snap?.currency ?? acct?.currency ?? ""}
         onClose={onClose}
         busy={busy}
       />
+
+      {positions.length > 0 && (
+        <div className="ticket" style={{ marginTop: 16 }}>
+          <h2>Modify SL / TP (price levels)</h2>
+          <div className="ticket-row">
+            <label>
+              Position
+              <select
+                value={protId}
+                onChange={(e) => {
+                  const id = e.target.value === "" ? "" : Number(e.target.value);
+                  setProtId(id);
+                  const p = positions.find((x) => x.positionId === id);
+                  setProtSl(p?.stopLoss ?? "");
+                  setProtTp(p?.takeProfit ?? "");
+                }}
+              >
+                <option value="">— pick —</option>
+                {positions.map((p) => (
+                  <option key={p.positionId} value={p.positionId}>
+                    {p.symbol} {p.side} #{p.positionId}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>SL price<input type="number" step="0.00001" value={protSl} onChange={(e) => setProtSl(e.target.value === "" ? "" : Number(e.target.value))} /></label>
+            <label>TP price<input type="number" step="0.00001" value={protTp} onChange={(e) => setProtTp(e.target.value === "" ? "" : Number(e.target.value))} /></label>
+            <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <input type="checkbox" checked={protTrail} onChange={(e) => setProtTrail(e.target.checked)} /> Trailing
+            </label>
+            <button className="primary" disabled={busy} onClick={saveProtection}>Update SL/TP</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

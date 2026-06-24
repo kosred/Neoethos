@@ -837,6 +837,9 @@ fn position_to_payload(
         open_timestamp_ms: p.open_timestamp_ms,
         pnl_pips,
         pnl_usd,
+        entry_price: p.price,
+        stop_loss: p.stop_loss,
+        take_profit: p.take_profit,
     }
 }
 

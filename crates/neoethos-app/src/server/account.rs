@@ -77,6 +77,10 @@ pub struct PositionDto {
     pub open_timestamp_ms: Option<i64>,
     pub pnl_pips: f64,
     pub pnl_usd: f64,
+    /// Entry price / SL / TP straight from the broker — no client merge.
+    pub entry_price: Option<f64>,
+    pub stop_loss: Option<f64>,
+    pub take_profit: Option<f64>,
 }
 
 impl From<crate::server::state::PositionPayload> for PositionDto {
@@ -90,6 +94,9 @@ impl From<crate::server::state::PositionPayload> for PositionDto {
             open_timestamp_ms: p.open_timestamp_ms,
             pnl_pips: p.pnl_pips,
             pnl_usd: p.pnl_usd,
+            entry_price: p.entry_price,
+            stop_loss: p.stop_loss,
+            take_profit: p.take_profit,
         }
     }
 }
@@ -215,6 +222,9 @@ mod tests {
                 open_timestamp_ms: None,
                 pnl_pips: 12.5,
                 pnl_usd: 11.30,
+                entry_price: Some(1.0850),
+                stop_loss: None,
+                take_profit: None,
             }],
         })
     }

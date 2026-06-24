@@ -86,7 +86,7 @@ export default function Dashboard() {
       </div>
 
       <h2>Open positions</h2>
-      <PositionsTable live={snap?.positions ?? []} detail={acct?.positions} currency={cur} />
+      <PositionsTable live={snap?.positions ?? []} currency={cur} />
     </div>
   );
 }

@@ -152,6 +152,12 @@ pub struct PositionPayload {
     pub open_timestamp_ms: Option<i64>,
     pub pnl_pips: f64,
     pub pnl_usd: f64,
+    /// Entry (open) price, stop-loss and take-profit as the broker reports
+    /// them. Server-provided so the client renders the full row with ZERO
+    /// conversion or cross-source merging.
+    pub entry_price: Option<f64>,
+    pub stop_loss: Option<f64>,
+    pub take_profit: Option<f64>,
 }
 
 /// Cheap-to-clone handle to whatever the server needs to read.

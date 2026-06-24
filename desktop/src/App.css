@@ -521,6 +521,41 @@ button.danger {
   margin-top: 4px;
 }
 
+/* advanced: yaml editor + knob sections */
+.yaml-editor {
+  width: 100%;
+  height: 320px;
+  background: #0b0e14;
+  color: #cbd5e1;
+  border: 1px solid #2a3142;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+.knob-section {
+  margin: 6px 0;
+  border: 1px solid #1f2632;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.knob-section > summary {
+  cursor: pointer;
+  padding: 9px 12px;
+  background: #141a26;
+  font-size: 13px;
+  font-weight: 600;
+  color: #cbd5e1;
+}
+.knob-section[open] > summary {
+  border-bottom: 1px solid #1f2632;
+}
+.knob-section .tbl {
+  padding: 0 8px;
+}
+
 /* statusbar */
 .statusbar {
   display: flex;

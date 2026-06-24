@@ -80,6 +80,9 @@ export type StreamPosition = {
   openTimestampMs: number | null;
   pnlPips: number;
   pnlUsd: number; // live P/L in the ACCOUNT currency (field name is legacy)
+  entryPrice: number | null; // all server-provided — client does NO conversion
+  stopLoss: number | null;
+  takeProfit: number | null;
 };
 export type AccountStreamSnap = {
   balance: number;
@@ -338,3 +341,34 @@ export const codexStart = () => apiPost<any>("/auth/codex/start");
 export const codexLogout = () => apiPost("/auth/codex/logout");
 export const codexChat = (prompt: string, model?: string) =>
   apiPost<{ model: string; response: string; total_tokens: number }>("/codex/chat", { prompt, model });
+
+// ── Account / broker detail (history, profile, margin, cashflow) ───────────
+export const brokerProfile = () => apiGet<{ userId: number }>("/broker/profile");
+export const brokerVersion = () => apiGet<{ version: string }>("/broker/version");
+export const ordersHistory = () => apiGet<any>("/broker/orders/history");
+export const cashFlow = () => apiGet<any>("/broker/cashflow");
+export const expectedMargin = (symbolId: number, volume: number) =>
+  apiGet<any>(`/broker/margin/expected?symbolId=${symbolId}&volume=${volume}`);
+
+// ── Position protection (move SL/TP, breakeven, trailing) ──────────────────
+export const amendProtection = (
+  positionId: number,
+  stopLossPrice?: number | null,
+  takeProfitPrice?: number | null,
+  trailingStopLoss?: boolean,
+) =>
+  apiPost("/positions/protection", {
+    position_id: positionId,
+    stop_loss_price: stopLossPrice ?? null,
+    take_profit_price: takeProfitPrice ?? null,
+    trailing_stop_loss: trailingStopLoss ?? null,
+  });
+export const cancelOrder = (orderId: number) => apiPost("/orders/cancel", { order_id: orderId });
+
+// ── Advanced settings / diagnostics / data import ─────────────────────────
+export const knobCatalog = () => apiGet<any>("/settings/knob-catalog");
+export const settingsRaw = () => apiGet<any>("/settings/raw");
+export const saveSettingsRaw = (yaml: string) => apiPost("/settings/raw", { yaml });
+export const diagnosticsReport = () => apiPost<any>("/diagnostics/report");
+export const dataImport = (sourcePath: string, symbol: string, timeframe: string) =>
+  apiPost<any>("/data/import", { source_path: sourcePath, symbol, timeframe });
