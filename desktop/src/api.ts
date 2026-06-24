@@ -378,6 +378,26 @@ export const amendProtection = (
 export const cancelOrder = (orderId: number) => apiPost("/orders/cancel", { order_id: orderId });
 
 // ── Advanced settings / diagnostics / data import ─────────────────────────
+// ── Indicators + chart scroll-back ────────────────────────────────────────
+export type IndicatorLine = { name: string; values: number[] };
+export type IndicatorResult = {
+  symbol: string;
+  timeframe: string;
+  indicator: string;
+  candleCount: number;
+  lines: IndicatorLine[];
+};
+export const INDICATORS = ["sma", "ema", "bollinger_bands", "vwap", "rsi", "macd", "atr", "stoch"] as const;
+export const OVERLAY_INDICATORS = ["sma", "ema", "bollinger_bands", "vwap"]; // drawn on the price scale
+export const indicators = (symbol: string, timeframe: string, indicator: string, period?: number) =>
+  apiGet<IndicatorResult>(
+    `/indicators?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&indicator=${indicator}${period ? `&period=${period}` : ""}`,
+  );
+export const chartHistory = (symbol: string, timeframe: string, beforeMs: number, limit = 500) =>
+  apiGet<{ candles: { tsMs: number | null; open: number; high: number; low: number; close: number }[]; hasMore: boolean }>(
+    `/chart/history?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&before_ms=${beforeMs}&limit=${limit}`,
+  );
+
 export const brokerTimeframes = () => apiGet<{ count: number; timeframes: string[] }>("/broker/timeframes");
 export const settingsPresets = () => apiGet<{ presets: { id: string; label: string; description: string }[] }>("/settings/presets");
 export const knobCatalog = () => apiGet<any>("/settings/knob-catalog");

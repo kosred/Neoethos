@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import Chart from "../components/Chart";
+import { useCallback, useEffect, useRef, useState } from "react";
+import Chart, { type Overlay } from "../components/Chart";
 import {
   listSymbols,
   listTimeframes,
@@ -7,12 +7,18 @@ import {
   serverSymbols,
   brokerChart,
   brokerTimeframes,
+  indicators as fetchIndicators,
+  chartHistory,
   getWatchlist,
   setWatchlist,
+  INDICATORS,
+  OVERLAY_INDICATORS,
   type Candle,
   type BrokerSymbol,
 } from "../api";
 import { useSpotStream } from "../hooks";
+
+const IND_COLORS = ["#3b82f6", "#f59e0b", "#a855f7", "#22d3ee", "#ec4899"];
 
 const TF_ORDER = ["M1", "M3", "M5", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1"];
 const BROKER_TFS = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"];
@@ -35,6 +41,10 @@ export default function Markets() {
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(false);
   const [subMsg, setSubMsg] = useState("");
+  const [indicator, setIndicator] = useState("");
+  const [overlays, setOverlays] = useState<Overlay[]>([]);
+  const histLoading = useRef(false);
+  const noMoreHist = useRef(false);
   const { ticks, connected } = useSpotStream();
 
   // symbols when source changes
@@ -106,6 +116,7 @@ export default function Markets() {
     setLoading(true);
     setErr("");
     setLiveBar(null); // reset the forming candle for the new series
+    noMoreHist.current = false; // allow scroll-back again for the new series
     try {
       const c = source === "local" ? await localChart(symbol, tf) : await brokerChart(symbol, tf);
       setCandles(c);
@@ -143,6 +154,68 @@ export default function Markets() {
       return { time: bucket, open: price, high: price, low: price, close: price };
     });
   }, [tick, symbol, tf, source, candles]);
+
+  // Indicator overlays: fetch the chosen indicator, align each line's values to
+  // the tail of the loaded candles, draw on the price scale (sma/ema/bbands/vwap)
+  // or a separate scale (oscillators).
+  useEffect(() => {
+    if (!indicator || !symbol || !tf || candles.length === 0) {
+      setOverlays([]);
+      return;
+    }
+    let alive = true;
+    fetchIndicators(symbol, tf, indicator)
+      .then((res) => {
+        if (!alive) return;
+        const onPrice = OVERLAY_INDICATORS.includes(indicator);
+        const ov: Overlay[] = res.lines.map((line, li) => {
+          const vals = line.values;
+          const start = candles.length - vals.length;
+          const data = vals
+            .map((v, i) => ({ time: candles[start + i]?.time ?? 0, value: v }))
+            .filter((d) => d.time > 0 && Number.isFinite(d.value));
+          return {
+            name: `${indicator}:${line.name}`,
+            color: IND_COLORS[li % IND_COLORS.length],
+            priceScaleId: onPrice ? "right" : "ind",
+            data,
+          };
+        });
+        setOverlays(ov);
+      })
+      .catch(() => setOverlays([]));
+    return () => {
+      alive = false;
+    };
+  }, [indicator, symbol, tf, candles]);
+
+  // Scroll-back: when the chart pans near the left edge, prepend older bars.
+  const loadOlder = useCallback(async () => {
+    if (histLoading.current || noMoreHist.current || candles.length === 0) return;
+    const oldest = candles[0];
+    const beforeMs = oldest.time * 1000;
+    histLoading.current = true;
+    try {
+      const r = await chartHistory(symbol, tf, beforeMs, 500);
+      const older: Candle[] = (r.candles ?? [])
+        .filter((c) => c.tsMs != null)
+        .map((c) => ({ time: (c.tsMs as number) / 1000, open: c.open, high: c.high, low: c.low, close: c.close }))
+        .filter((c) => c.time < oldest.time);
+      if (older.length === 0 || !r.hasMore) noMoreHist.current = true;
+      if (older.length > 0) {
+        setCandles((prev) => {
+          const seen = new Set(prev.map((c) => c.time));
+          const merged = [...older.filter((c) => !seen.has(c.time)), ...prev];
+          merged.sort((a, b) => a.time - b.time);
+          return merged;
+        });
+      }
+    } catch {
+      /* ignore — keep what we have */
+    } finally {
+      histLoading.current = false;
+    }
+  }, [symbol, tf, candles]);
 
   const tickerRows = Object.values(ticks)
     .sort((a, b) => a.symbolName.localeCompare(b.symbolName))
@@ -182,6 +255,10 @@ export default function Markets() {
           <select value={tf} onChange={(e) => setTf(e.target.value)}>
             {timeframes.map((t) => <option key={t}>{t}</option>)}
           </select>
+          <select value={indicator} onChange={(e) => setIndicator(e.target.value)} title="Indicator overlay">
+            <option value="">— indicator —</option>
+            {INDICATORS.map((n) => <option key={n} value={n}>{n}</option>)}
+          </select>
           <button onClick={load} disabled={loading}>{loading ? "…" : "Reload"}</button>
           {source === "broker" && symbol && !ticks[symbol] && (
             <button onClick={streamThis} title="Subscribe this symbol to the live stream">📡 Stream</button>
@@ -206,7 +283,12 @@ export default function Markets() {
         {candles.length === 0 && !loading ? (
           <div className="empty">No candles for {symbol} {tf}.</div>
         ) : (
-          <Chart candles={candles} liveBar={source === "broker" ? liveBar : null} />
+          <Chart
+            candles={candles}
+            liveBar={source === "broker" ? liveBar : null}
+            overlays={overlays}
+            onReachStart={loadOlder}
+          />
         )}
       </div>
       <div className="muted small">
