@@ -233,7 +233,7 @@ models:
   prop_accuracy_weight: 0.1
   prop_min_trades: 0
   prop_conf_threshold: 0.55
-  walkforward_splits: 10  # agent 2026-06-05: was 20 → halves the serial post-gate walkforward cost (20→10 backtests × survivors × rows). 10 splits is the robust OOS sweet spot. Speeds every combo. NOTE: with require_walkforward_for_export=true (below) walk-forward is now an EXPORT GATE in PropFirm mode, not just informational.
+  walkforward_splits: 15  # 2026-06-24 operator "improve success odds": 10→15 more out-of-sample folds = tighter OOS confidence (more unseen windows tested). Still informational (not a hard gate) — see require_walkforward_for_export below.
   embargo_minutes: 120
   # agent 2026-06-05 overfitting fix: walk-forward as an EXPORT GATE. When true
   # (default), a discovered portfolio is export-ready in PropFirm mode ONLY if it
@@ -249,7 +249,7 @@ models:
   prop_firm_min_pass_rate: 0.0  # 2026-06-06 operator regime-diversity mandate: 0.65→0.40→0.0. A hard all-window consistency floor KILLS regime-specialists (genes active in only SOME market conditions) — exactly the strategies we WANT for a diverse library. 0.0 = RANKING-ONLY: the prop-firm window-pass-rate still RANKS candidates (more-consistent first) but no longer kills any. The LOW-DD base filter (max_dd) + quality screen (MC/spread/regime) + min-trades still reject blow-ups and noise. Raise (e.g. 0.40-0.65) to demand all-window consistency again.
   # CPCV (Combinatorial Purged Cross-Validation) settings
   enable_cpcv: true
-  cpcv_n_splits: 5
+  cpcv_n_splits: 8   # 2026-06-24: 5→8 more combinatorial purged folds = stronger overfit detection (more train/test combinations)
   cpcv_n_test_groups: 2
   cpcv_embargo_pct: 0.01
   cpcv_purge_pct: 0.02
