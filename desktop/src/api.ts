@@ -395,7 +395,7 @@ export const indicators = (symbol: string, timeframe: string, indicator: string,
   );
 export const chartHistory = (symbol: string, timeframe: string, beforeMs: number, limit = 500) =>
   apiGet<{ candles: { tsMs: number | null; open: number; high: number; low: number; close: number }[]; hasMore: boolean }>(
-    `/chart/history?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&before_ms=${beforeMs}&limit=${limit}`,
+    `/chart/history?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&beforeMs=${beforeMs}&limit=${limit}`,
   );
 
 export const brokerTimeframes = () => apiGet<{ count: number; timeframes: string[] }>("/broker/timeframes");
