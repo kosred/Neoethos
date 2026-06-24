@@ -181,6 +181,17 @@ export const brokerChart = (symbol: string, timeframe: string, limit = 1000) =>
   invoke<Candle[]>("broker_chart", { symbol, timeframe, limit });
 export const brokerSymbols = () => invoke<SymbolInfo[]>("broker_symbols");
 export const brokerAccounts = () => invoke<AccountInfo[]>("broker_accounts");
+// Full broker symbol universe (dozens — forex/metals/indices) WITH asset class,
+// straight from the server. Use this for selection/watchlist, not the 7 defaults.
+export type BrokerSymbol = {
+  symbolId: number;
+  symbolName: string;
+  enabled: boolean;
+  description: string | null;
+  assetClass: string | null;
+};
+export const serverSymbols = () =>
+  apiGet<{ symbolCount: number; symbols: BrokerSymbol[] }>("/broker/symbols");
 export const selectAccount = (accountId: string, live: boolean, label?: string) =>
   invoke<BrokerStatus>("select_account", { accountId, live, label: label ?? null });
 export const accountSnapshot = () => invoke<AccountSnapshot>("account_snapshot");

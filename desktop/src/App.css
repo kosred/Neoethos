@@ -521,6 +521,35 @@ button.danger {
   margin-top: 4px;
 }
 
+/* market watch symbol grid */
+.sym-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 4px;
+  padding: 8px 10px;
+}
+.sym-cell {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  border: 1px solid #1f2632;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.sym-cell:hover {
+  border-color: #2a3142;
+  background: #141a26;
+}
+.sym-cell.on {
+  border-color: #294063;
+  background: #15202e;
+}
+.sym-cell b {
+  flex: 1;
+}
+
 /* advanced: yaml editor + knob sections */
 .yaml-editor {
   width: 100%;

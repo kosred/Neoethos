@@ -4,9 +4,12 @@ import {
   listSymbols,
   listTimeframes,
   localChart,
-  brokerSymbols,
+  serverSymbols,
   brokerChart,
+  getWatchlist,
+  setWatchlist,
   type Candle,
+  type BrokerSymbol,
 } from "../api";
 import { useSpotStream } from "../hooks";
 
@@ -27,24 +30,48 @@ export default function Markets() {
   const [tf, setTf] = useState("");
   const [candles, setCandles] = useState<Candle[]>([]);
   const [liveBar, setLiveBar] = useState<Candle | null>(null);
+  const [brokerSyms, setBrokerSyms] = useState<BrokerSymbol[]>([]);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(false);
+  const [subMsg, setSubMsg] = useState("");
   const { ticks, connected } = useSpotStream();
 
   // symbols when source changes
   useEffect(() => {
     (async () => {
       try {
-        const s =
-          source === "local" ? await listSymbols() : (await brokerSymbols()).map((x) => x.name);
-        setSymbols(s);
-        setSymbol((p) => (s.includes(p) ? p : s.includes("EURUSD") ? "EURUSD" : s[0] ?? ""));
+        if (source === "local") {
+          const s = await listSymbols();
+          setSymbols(s);
+          setSymbol((p) => (s.includes(p) ? p : s.includes("EURUSD") ? "EURUSD" : s[0] ?? ""));
+        } else {
+          const u = await serverSymbols();
+          setBrokerSyms(u.symbols);
+          const s = u.symbols.map((x) => x.symbolName);
+          setSymbols(s);
+          setSymbol((p) => (s.includes(p) ? p : s.includes("EURUSD") ? "EURUSD" : s[0] ?? ""));
+        }
         setErr("");
       } catch (e) {
         setErr(String(e));
       }
     })();
   }, [source]);
+
+  // Subscribe the selected broker symbol to the live stream (union with the
+  // current watchlist) so its forming candle ticks — for ANY of the dozens.
+  const streamThis = async () => {
+    setSubMsg(`Subscribing ${symbol}…`);
+    try {
+      const w = await getWatchlist();
+      const cur: string[] = Array.isArray(w) ? w : (w?.symbols ?? []);
+      const next = Array.from(new Set([...cur.map((x) => x.toUpperCase()), symbol.toUpperCase()]));
+      await setWatchlist(next);
+      setSubMsg(`✓ ${symbol} subscribed — live candle within ~5s.`);
+    } catch (e) {
+      setSubMsg(`Subscribe failed: ${e}`);
+    }
+  };
 
   // timeframes when symbol/source changes
   useEffect(() => {
@@ -127,14 +154,34 @@ export default function Markets() {
             <button className={source === "broker" ? "on" : ""} onClick={() => setSource("broker")}>Broker</button>
           </div>
           <select value={symbol} onChange={(e) => setSymbol(e.target.value)}>
-            {symbols.map((s) => <option key={s}>{s}</option>)}
+            {source === "broker" && brokerSyms.length > 0
+              ? Object.entries(
+                  brokerSyms.reduce<Record<string, BrokerSymbol[]>>((g, s) => {
+                    (g[s.assetClass || "Other"] ??= []).push(s);
+                    return g;
+                  }, {}),
+                )
+                  .sort()
+                  .map(([cls, syms]) => (
+                    <optgroup key={cls} label={cls}>
+                      {syms
+                        .slice()
+                        .sort((a, b) => a.symbolName.localeCompare(b.symbolName))
+                        .map((s) => <option key={s.symbolId}>{s.symbolName}</option>)}
+                    </optgroup>
+                  ))
+              : symbols.map((s) => <option key={s}>{s}</option>)}
           </select>
           <select value={tf} onChange={(e) => setTf(e.target.value)}>
             {timeframes.map((t) => <option key={t}>{t}</option>)}
           </select>
           <button onClick={load} disabled={loading}>{loading ? "…" : "Reload"}</button>
+          {source === "broker" && symbol && !ticks[symbol] && (
+            <button onClick={streamThis} title="Subscribe this symbol to the live stream">📡 Stream</button>
+          )}
         </div>
       </div>
+      {subMsg && <div className="banner info">{subMsg}</div>}
 
       {tickerRows.length > 0 && (
         <div className="ticker">
