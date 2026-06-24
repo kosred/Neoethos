@@ -6,6 +6,7 @@ import {
   type BrokerStatus,
 } from "../api";
 import { useAccountStream } from "../hooks";
+import PositionsTable from "../components/PositionsTable";
 
 export default function Dashboard() {
   const [acct, setAcct] = useState<AccountSnapshot | null>(null);
@@ -85,34 +86,7 @@ export default function Dashboard() {
       </div>
 
       <h2>Open positions</h2>
-      {acct && acct.positions.length > 0 ? (
-        <table className="tbl">
-          <thead>
-            <tr>
-              <th>Side</th>
-              <th>Symbol</th>
-              <th>Volume</th>
-              <th>Entry</th>
-              <th>SL</th>
-              <th>TP</th>
-            </tr>
-          </thead>
-          <tbody>
-            {acct.positions.map((p) => (
-              <tr key={p.positionId}>
-                <td className={p.side.toLowerCase().includes("buy") ? "buy" : "sell"}>{p.side}</td>
-                <td>#{p.symbolId}</td>
-                <td>{p.volume}</td>
-                <td>{p.price ?? "—"}</td>
-                <td>{p.stopLoss ?? "—"}</td>
-                <td>{p.takeProfit ?? "—"}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      ) : (
-        <p className="muted">No open positions.</p>
-      )}
+      <PositionsTable live={snap?.positions ?? []} detail={acct?.positions} currency={cur} />
     </div>
   );
 }

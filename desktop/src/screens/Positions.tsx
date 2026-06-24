@@ -7,11 +7,14 @@ import {
   type AccountSnapshot,
   type ExecResult,
 } from "../api";
+import { useAccountStream } from "../hooks";
+import PositionsTable from "../components/PositionsTable";
 
 export default function Positions() {
   const [acct, setAcct] = useState<AccountSnapshot | null>(null);
   const [err, setErr] = useState("");
   const [msg, setMsg] = useState("");
+  const { snap } = useAccountStream(); // live positions + P/L (push)
 
   // order ticket
   const [symbol, setSymbol] = useState("EURUSD");
@@ -117,40 +120,13 @@ export default function Positions() {
 
       <h2>Open positions</h2>
       {err && <div className="banner warn">{err.slice(0, 160)}</div>}
-      {acct && acct.positions.length > 0 ? (
-        <table className="tbl">
-          <thead>
-            <tr>
-              <th>Side</th>
-              <th>Symbol</th>
-              <th>Volume</th>
-              <th>Entry</th>
-              <th>SL</th>
-              <th>TP</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {acct.positions.map((p) => (
-              <tr key={p.positionId}>
-                <td className={p.side.toLowerCase().includes("buy") ? "buy" : "sell"}>{p.side}</td>
-                <td>#{p.symbolId}</td>
-                <td>{p.volume}</td>
-                <td>{p.price ?? "—"}</td>
-                <td>{p.stopLoss ?? "—"}</td>
-                <td>{p.takeProfit ?? "—"}</td>
-                <td>
-                  <button className="danger" disabled={busy} onClick={() => onClose(p.positionId, p.volumeUnits)}>
-                    Close
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      ) : (
-        <p className="muted">No open positions.</p>
-      )}
+      <PositionsTable
+        live={snap?.positions ?? []}
+        detail={acct?.positions}
+        currency={snap?.currency ?? acct?.currency ?? ""}
+        onClose={onClose}
+        busy={busy}
+      />
     </div>
   );
 }

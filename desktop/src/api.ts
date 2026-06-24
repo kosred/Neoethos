@@ -71,6 +71,16 @@ export type Tick = {
   receivedAtUnixMs: number;
   freshnessSeconds: number;
 };
+export type StreamPosition = {
+  positionId: number;
+  volumeUnits: number; // wire volume (pass to closePosition)
+  symbol: string; // human name, e.g. "EURUSD"
+  side: string; // BUY / SELL
+  volume: number;
+  openTimestampMs: number | null;
+  pnlPips: number;
+  pnlUsd: number; // live P/L in the ACCOUNT currency (field name is legacy)
+};
 export type AccountStreamSnap = {
   balance: number;
   equity: number;
@@ -78,7 +88,7 @@ export type AccountStreamSnap = {
   usedMargin: number;
   currency: string;
   fetchedAtUnixMs: number;
-  positions: any[];
+  positions: StreamPosition[];
 };
 export const streamSpots = (onTick: (t: Tick) => void, onStatus?: (c: boolean) => void) =>
   openSse("/live/spots/stream", "tick", onTick, onStatus);
