@@ -399,6 +399,56 @@ button.danger {
   margin: 14px 0;
 }
 
+/* ── Trade cockpit ──────────────────────────────────────────────────────── */
+.cockpit { display: flex; flex-direction: column; height: 100%; }
+.ck-grid {
+  display: grid;
+  grid-template-columns: 156px 1fr 196px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.ck-watch, .ck-chart, .ck-side { min-height: 0; display: flex; flex-direction: column; }
+.ck-watch { border-right: 1px solid #1f2632; }
+.ck-chart { border-right: 1px solid #1f2632; }
+.ck-filter { margin: 8px; width: calc(100% - 16px); }
+.ck-watch-list { overflow-y: auto; flex: 1 1 auto; font-size: 12px; }
+.ck-group {
+  padding: 7px 9px 3px; color: #4b5563; font-size: 9.5px;
+  letter-spacing: 0.6px; text-transform: uppercase;
+}
+.ck-sym {
+  display: flex; justify-content: space-between; width: 100%;
+  background: transparent; border: none; border-radius: 0;
+  color: #cbd5e1; padding: 4px 9px; font-size: 12px; cursor: pointer;
+}
+.ck-sym:hover { background: #161c28; border-color: transparent; }
+.ck-sym.on { background: #15202e; color: #cfe3ff; }
+.ck-chart-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border-bottom: 1px solid #1f2632; font-size: 12px;
+}
+.ck-chart-host { position: relative; flex: 1 1 auto; min-height: 0; }
+.ck-side { overflow-y: auto; }
+.ck-order, .ck-account { padding: 8px 10px; }
+.ck-account { border-top: 1px solid #1f2632; margin-top: auto; }
+.ck-label {
+  color: #4b5563; font-size: 9.5px; letter-spacing: 0.6px;
+  text-transform: uppercase; margin-bottom: 6px;
+}
+.ck-field {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 11px; color: #9ca3af; margin: 5px 0;
+}
+.ck-field input { width: 80px; }
+.ck-kv { display: flex; justify-content: space-between; font-size: 12px; padding: 2px 0; }
+.ck-kv span { color: #9ca3af; }
+.ck-msg { margin-top: 6px; font-size: 11px; color: #9ec5ff; }
+.ck-tradewatch {
+  border-top: 1px solid #1f2632; padding: 8px 10px;
+  max-height: 38%; overflow-y: auto; flex: 0 0 auto;
+}
+.mono { font-family: "Cascadia Code", Consolas, monospace; }
+
 /* live stream indicator */
 .stream-pill {
   font-size: 10px;

@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { appInfo, brokerStatus, type AppInfo, type BrokerStatus } from "./api";
+import Cockpit from "./screens/Cockpit";
 import Dashboard from "./screens/Dashboard";
 import Markets from "./screens/Markets";
 import MarketWatch from "./screens/MarketWatch";
@@ -23,7 +24,7 @@ import Settings from "./screens/Settings";
 import "./App.css";
 
 type View =
-  | "dashboard" | "markets" | "marketwatch" | "positions" | "account" | "actions"
+  | "cockpit" | "dashboard" | "markets" | "marketwatch" | "positions" | "account" | "actions"
   | "autopilot" | "risk" | "discovery" | "training" | "strategylab" | "intelligence"
   | "files" | "data" | "journal" | "news" | "aidesk" | "hardware" | "advanced" | "settings";
 
@@ -31,6 +32,7 @@ type NavEntry = { id: View; label: string; icon: string } | { divider: string };
 
 const NAV: NavEntry[] = [
   { divider: "Trade" },
+  { id: "cockpit", label: "Trade", icon: "🎯" },
   { id: "dashboard", label: "Dashboard", icon: "▦" },
   { id: "markets", label: "Markets", icon: "📈" },
   { id: "marketwatch", label: "Market Watch", icon: "👁" },
@@ -59,6 +61,7 @@ const NAV: NavEntry[] = [
 ];
 
 const SCREENS: Record<View, ReactNode> = {
+  cockpit: <Cockpit />,
   dashboard: <Dashboard />,
   markets: <Markets />,
   marketwatch: <MarketWatch />,
@@ -82,7 +85,7 @@ const SCREENS: Record<View, ReactNode> = {
 };
 
 export default function App() {
-  const [view, setView] = useState<View>("dashboard");
+  const [view, setView] = useState<View>("cockpit");
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [status, setStatus] = useState<BrokerStatus | null>(null);
 
