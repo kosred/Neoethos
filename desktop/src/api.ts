@@ -83,6 +83,7 @@ export type StreamPosition = {
   entryPrice: number | null; // all server-provided — client does NO conversion
   stopLoss: number | null;
   takeProfit: number | null;
+  volumeLots: number | null; // cTrader-parity lots (1.17), not raw units
 };
 export type AccountStreamSnap = {
   balance: number;
@@ -377,6 +378,8 @@ export const amendProtection = (
 export const cancelOrder = (orderId: number) => apiPost("/orders/cancel", { order_id: orderId });
 
 // ── Advanced settings / diagnostics / data import ─────────────────────────
+export const brokerTimeframes = () => apiGet<{ count: number; timeframes: string[] }>("/broker/timeframes");
+export const settingsPresets = () => apiGet<{ presets: { id: string; label: string; description: string }[] }>("/settings/presets");
 export const knobCatalog = () => apiGet<any>("/settings/knob-catalog");
 export const settingsRaw = () => apiGet<any>("/settings/raw");
 export const saveSettingsRaw = (yaml: string) => apiPost("/settings/raw", { yaml });

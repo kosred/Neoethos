@@ -817,6 +817,15 @@ fn position_to_payload(
         }
     }
 
+    // Lots = base units / contract_size — SAME metadata the pips calc uses, so
+    // the UI shows cTrader's lots (1.17) not raw units (117000). Computed before
+    // the literal because `symbol:` moves `resolved_name`.
+    let volume_lots = resolved_name
+        .as_deref()
+        .and_then(neoethos_core::symbol_metadata::resolve)
+        .filter(|m| m.contract_size.is_finite() && m.contract_size > 0.0)
+        .map(|m| p.volume / m.contract_size);
+
     PositionPayload {
         position_id: p.position_id,
         volume_units,
@@ -840,6 +849,7 @@ fn position_to_payload(
         entry_price: p.price,
         stop_loss: p.stop_loss,
         take_profit: p.take_profit,
+        volume_lots,
     }
 }
 

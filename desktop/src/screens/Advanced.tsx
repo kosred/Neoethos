@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { settingsRaw, saveSettingsRaw, knobCatalog, diagnosticsReport, dataImport } from "../api";
+import { settingsRaw, saveSettingsRaw, knobCatalog, settingsPresets, diagnosticsReport, dataImport } from "../api";
 import { usePoll } from "../hooks";
 
 export default function Advanced() {
   const { data: catalog } = usePoll(knobCatalog, 0);
+  const { data: presets } = usePoll(settingsPresets, 0);
   const [yaml, setYaml] = useState("");
   const [path, setPath] = useState("");
   const [busy, setBusy] = useState(false);
@@ -82,6 +83,15 @@ export default function Advanced() {
           <button className="primary" disabled={busy || !src} onClick={doImport}>Import</button>
         </div>
       </div>
+
+      <h2>Config presets ({presets?.presets.length ?? 0})</h2>
+      <p className="muted small">Reference profiles — edit config.yaml below to apply one's values.</p>
+      {(presets?.presets ?? []).map((p) => (
+        <div className="kv" key={p.id} style={{ marginBottom: 6 }}>
+          <span><b>{p.label}</b> <span className="muted">({p.id})</span></span>
+          <span className="muted small" style={{ fontWeight: 400 }}>{p.description}</span>
+        </div>
+      ))}
 
       <h2>config.yaml</h2>
       <p className="muted small">{path}</p>

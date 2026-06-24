@@ -26,7 +26,7 @@ export default function PositionsTable({
         <tr>
           <th>Side</th>
           <th>Symbol</th>
-          <th>Volume</th>
+          <th>Lots</th>
           <th>Entry</th>
           <th>SL</th>
           <th>TP</th>
@@ -43,7 +43,7 @@ export default function PositionsTable({
             <tr key={p.positionId}>
               <td className={p.side.toLowerCase().includes("buy") ? "buy" : "sell"}>{p.side}</td>
               <td>{p.symbol}</td>
-              <td>{p.volume}</td>
+              <td>{p.volumeLots != null ? p.volumeLots.toFixed(2) : p.volume}</td>
               <td>{p.entryPrice ?? "—"}</td>
               <td>{p.stopLoss ?? "—"}</td>
               <td>{p.takeProfit ?? "—"}</td>

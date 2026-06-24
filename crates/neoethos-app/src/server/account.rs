@@ -81,6 +81,8 @@ pub struct PositionDto {
     pub entry_price: Option<f64>,
     pub stop_loss: Option<f64>,
     pub take_profit: Option<f64>,
+    /// Volume in lots (cTrader parity); `None` if symbol not in metadata.
+    pub volume_lots: Option<f64>,
 }
 
 impl From<crate::server::state::PositionPayload> for PositionDto {
@@ -97,6 +99,7 @@ impl From<crate::server::state::PositionPayload> for PositionDto {
             entry_price: p.entry_price,
             stop_loss: p.stop_loss,
             take_profit: p.take_profit,
+            volume_lots: p.volume_lots,
         }
     }
 }
@@ -225,6 +228,7 @@ mod tests {
                 entry_price: Some(1.0850),
                 stop_loss: None,
                 take_profit: None,
+                volume_lots: Some(0.10),
             }],
         })
     }

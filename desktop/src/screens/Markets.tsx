@@ -6,6 +6,7 @@ import {
   localChart,
   serverSymbols,
   brokerChart,
+  brokerTimeframes,
   getWatchlist,
   setWatchlist,
   type Candle,
@@ -78,8 +79,14 @@ export default function Markets() {
     if (!symbol) return;
     (async () => {
       if (source === "broker") {
-        setTimeframes(BROKER_TFS);
-        setTf((p) => (BROKER_TFS.includes(p) ? p : "H1"));
+        try {
+          const tfs = (await brokerTimeframes()).timeframes;
+          setTimeframes(tfs.length ? tfs : BROKER_TFS);
+          setTf((p) => (tfs.includes(p) ? p : tfs.includes("H1") ? "H1" : tfs[0] ?? "H1"));
+        } catch {
+          setTimeframes(BROKER_TFS);
+          setTf((p) => (BROKER_TFS.includes(p) ? p : "H1"));
+        }
         return;
       }
       try {

@@ -158,6 +158,10 @@ pub struct PositionPayload {
     pub entry_price: Option<f64>,
     pub stop_loss: Option<f64>,
     pub take_profit: Option<f64>,
+    /// Volume in LOTS (= base units / contract_size), so the UI shows what
+    /// cTrader shows (1.17) instead of raw units (117000). `None` when the
+    /// symbol isn't in the metadata table. Parity-correct, server-computed.
+    pub volume_lots: Option<f64>,
 }
 
 /// Cheap-to-clone handle to whatever the server needs to read.
