@@ -421,7 +421,7 @@ export const settingsPresets = () => apiGet<{ presets: { id: string; label: stri
 export const knobCatalog = () => apiGet<any>("/settings/knob-catalog");
 export const settingsRaw = () => apiGet<any>("/settings/raw");
 export const saveSettingsRaw = (yaml: string) => apiPost("/settings/raw", { yaml });
-export const diagnosticsReport = () => apiPost<any>("/diagnostics/report");
+export const diagnosticsReport = () => apiPost<any>("/diagnostics/report", {});
 export const dataImport = (sourcePath: string, symbol: string, timeframe: string) =>
   apiPost<any>("/data/import", { source_path: sourcePath, symbol, timeframe });
 

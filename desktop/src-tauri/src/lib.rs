@@ -93,6 +93,24 @@ fn resolve_data_root() -> PathBuf {
     PathBuf::from(r"C:\Users\konst\development\forex-ai\data")
 }
 
+/// The engine reads config.yaml + data/ + cache/ + models/ RELATIVE to the
+/// process CWD. Launched from the installer (Start menu / Program Files) the CWD
+/// is NOT the project dir, so every relative path 404s ("config.yaml not
+/// loadable", everything shows "(missing)"). Point the CWD at the project root
+/// (where config.yaml lives) before anything reads it.
+fn ensure_working_dir() {
+    if std::path::Path::new("config.yaml").exists() {
+        return; // already in the project dir (dev launch)
+    }
+    let root = std::path::Path::new(r"C:\Users\konst\development\forex-ai");
+    if root.join("config.yaml").exists() {
+        let _ = std::env::set_current_dir(root);
+        eprintln!("working dir set → {}", root.display());
+    } else {
+        eprintln!("WARNING: config.yaml not found in CWD or project root — paths will 404");
+    }
+}
+
 #[derive(Serialize)]
 struct AppInfo {
     version: String,
@@ -189,6 +207,7 @@ async fn chart(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    ensure_working_dir();
     tauri::Builder::default()
         .setup(|app| {
             if cfg!(debug_assertions) {
