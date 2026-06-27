@@ -170,6 +170,7 @@ pub fn router(state: AppApiState) -> Router {
         .route("/autonomous/start", post(autonomous::start_live))
         .route("/autonomous/stop", post(autonomous::stop_live))
         .route("/autonomous/status", get(autonomous::live_status))
+        .route("/autonomous/gate", get(autonomous::gate))
         .route("/broker/status", get(system_status::broker_status))
         .route("/broker/reauth", post(broker_control::reauth))
         .route(

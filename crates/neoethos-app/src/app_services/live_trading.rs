@@ -106,7 +106,24 @@ impl Handle {
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Spawn the live trading loop and return a [`Handle`].  Returns immediately.
+///
+/// SAFETY GATE: on a REAL-money (Live) broker environment the strategy must
+/// first clear the demo forward-test gate (≥100 demo fills + live metrics within
+/// tolerance of backtest). A Demo environment is unconditionally allowed — that
+/// is exactly how the demo fills accumulate. See [`crate::app_services::live_gate`].
 pub fn start(req: StartRequest) -> Result<Handle> {
+    if crate::app_services::live_gate::active_env_is_live() {
+        let decision = crate::app_services::live_gate::evaluate_for_portfolio(&req.portfolio_path)
+            .context("evaluate demo forward-test gate")?;
+        if !decision.eligible {
+            anyhow::bail!(
+                "LIVE blocked by the demo forward-test gate — {} \
+                 Run this strategy on a DEMO account until it qualifies, then switch to Live.",
+                decision.summary
+            );
+        }
+    }
+
     let stop_flag = Arc::new(AtomicBool::new(false));
     let status = Arc::new(std::sync::Mutex::new(LiveTradingStatus {
         running: true,

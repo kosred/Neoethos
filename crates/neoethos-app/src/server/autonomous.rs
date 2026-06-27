@@ -12,7 +12,7 @@
 //! `config.yaml` identically to the CLI.
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
@@ -148,6 +148,45 @@ pub async fn stop_live(State(state): State<AppApiState>) -> Response {
             Json(serde_json::json!({"stopped": false, "reason": "was not running"})),
         )
             .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct GateQuery {
+    pub portfolio: String,
+}
+
+/// `GET /autonomous/gate?portfolio=...` — demo forward-test eligibility for a
+/// portfolio, so the UI can show WHY live is (not) yet allowed BEFORE the
+/// operator clicks Start. `enforced` is true only on a Live (real-money) env;
+/// on Demo the gate is informational (eligibility still tracked, never blocks).
+pub async fn gate(Query(q): Query<GateQuery>) -> Response {
+    let portfolio = q.portfolio;
+    let env_is_live = crate::app_services::live_gate::active_env_is_live();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::app_services::live_gate::evaluate_for_portfolio(&portfolio)
+    })
+    .await;
+    match result {
+        Ok(Ok(decision)) => Json(serde_json::json!({
+            "envIsLive": env_is_live,
+            "enforced": env_is_live,
+            "eligible": decision.eligible,
+            "summary": decision.summary,
+            "criteria": decision.criteria,
+        }))
+        .into_response(),
+        Ok(Err(e)) => actionable_error(
+            StatusCode::BAD_REQUEST,
+            "Couldn't evaluate the demo forward-test gate — make sure the portfolio path \
+             and its sibling *.quality.json exist.",
+            &e,
+        ),
+        Err(join_err) => actionable_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The gate evaluation task panicked.",
+            &anyhow::anyhow!("{join_err}"),
+        ),
     }
 }
 

@@ -259,6 +259,17 @@ export const autonomousStart = (b?: unknown) => apiPost("/autonomous/start", b ?
 export const autonomousStop = () => apiPost("/autonomous/stop");
 export const autonomousReplay = (b?: unknown) => apiPost("/autonomous/replay", b ?? {});
 
+export type GateCriterion = { name: string; passed: boolean; actual: number; threshold: number; comparison: string };
+export type GateVerdict = {
+  envIsLive: boolean;
+  enforced: boolean;
+  eligible: boolean;
+  summary: string;
+  criteria: GateCriterion[];
+};
+export const autonomousGate = (portfolioPath: string) =>
+  apiGet<GateVerdict>(`/autonomous/gate?portfolio=${encodeURIComponent(portfolioPath)}`);
+
 // ── Risk ──────────────────────────────────────────────────────────────────
 export type PresetSummary = {
   id: string;

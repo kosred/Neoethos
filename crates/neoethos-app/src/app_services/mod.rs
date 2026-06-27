@@ -48,6 +48,7 @@ pub mod journal_reconcile;
 pub mod journal_store;
 pub mod journal_stats;
 pub mod live_journal;
+pub mod live_gate;
 pub mod pnl;
 pub mod reauth;
 pub mod live_spots;
