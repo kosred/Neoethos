@@ -47,7 +47,18 @@ fn backtest_metrics_for(portfolio_path: &str) -> Result<PromotionMetrics> {
         .with_context(|| format!("read backtest quality {}", qpath.display()))?;
     let v: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("parse quality {}", qpath.display()))?;
-    let f = |k: &str| v.get(k).and_then(|x| x.as_f64());
+    // quality.json is an ARRAY of per-gene records; use the most-traded gene as
+    // the representative backtest (matches the Strategy Report's choice).
+    let trades_of = |x: &serde_json::Value| x.get("total_trades").and_then(|t| t.as_f64()).unwrap_or(0.0);
+    let obj = if let Some(arr) = v.as_array() {
+        arr.iter()
+            .max_by(|a, b| trades_of(a).partial_cmp(&trades_of(b)).unwrap_or(std::cmp::Ordering::Equal))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    } else {
+        v
+    };
+    let f = |k: &str| obj.get(k).and_then(|x| x.as_f64());
 
     let mut win_rate = f("win_rate").unwrap_or(0.0);
     if win_rate > 1.0 {
@@ -111,9 +122,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("neo_gate_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let q = dir.join("X_H1.json.quality.json");
+        // Real format: an ARRAY of per-gene records; the most-traded wins.
         std::fs::write(
             &q,
-            r#"{"win_rate":0.45,"profit_factor":1.78,"sharpe_ratio":4.28,"max_drawdown_pct":0.118,"total_trades":300}"#,
+            r#"[{"win_rate":0.30,"profit_factor":1.0,"sharpe_ratio":0.5,"max_drawdown_pct":0.4,"total_trades":12},
+                {"win_rate":0.45,"profit_factor":1.78,"sharpe_ratio":4.28,"max_drawdown_pct":0.118,"total_trades":300}]"#,
         )
         .unwrap();
         let pf = dir.join("X_H1.json.live_portfolio.json");
