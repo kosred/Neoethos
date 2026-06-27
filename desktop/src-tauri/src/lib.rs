@@ -93,22 +93,70 @@ fn resolve_data_root() -> PathBuf {
     PathBuf::from(r"C:\Users\konst\development\forex-ai\data")
 }
 
-/// The engine reads config.yaml + data/ + cache/ + models/ RELATIVE to the
-/// process CWD. Launched from the installer (Start menu / Program Files) the CWD
-/// is NOT the project dir, so every relative path 404s ("config.yaml not
-/// loadable", everything shows "(missing)"). Point the CWD at the project root
-/// (where config.yaml lives) before anything reads it.
-fn ensure_working_dir() {
-    if std::path::Path::new("config.yaml").exists() {
-        return; // already in the project dir (dev launch)
+/// Establish the per-user data root the engine reads (config.yaml + data/ +
+/// cache/ + models/), the cross-platform STANDARD way — no hardcoded paths, so
+/// it works for any user on any machine:
+///   1. `NEOETHOS_USER_DATA_DIR` — explicit override (dev points it at a repo).
+///   2. The current dir IF it already holds config.yaml (dev/portable launch).
+///   3. OS-standard per-user dir: `%LOCALAPPDATA%\neoethos` /
+///      `~/.local/share/neoethos` / `~/Library/Application Support/neoethos`
+///      (via `neoethos_core::config::user_config_path()`).
+/// On first run it SEEDS config.yaml (+ default symbol costs) from the bundled
+/// read-only defaults, then chdirs to the root so every relative read resolves.
+fn prepare_data_root(app: &tauri::App) {
+    use tauri::Manager;
+
+    let overridden = std::env::var("NEOETHOS_USER_DATA_DIR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .is_some();
+
+    // Dev/portable: launched from a dir that already has config.yaml → keep it.
+    if !overridden && std::path::Path::new("config.yaml").exists() {
+        eprintln!("data root → current dir (config.yaml present)");
+        return;
     }
-    let root = std::path::Path::new(r"C:\Users\konst\development\forex-ai");
-    if root.join("config.yaml").exists() {
-        let _ = std::env::set_current_dir(root);
-        eprintln!("working dir set → {}", root.display());
-    } else {
-        eprintln!("WARNING: config.yaml not found in CWD or project root — paths will 404");
+
+    // Override-aware canonical path (user_config_path honours the override).
+    let cfg_path = neoethos_core::config::user_config_path();
+    let root = cfg_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        eprintln!("could not create data root {}: {e}", root.display());
     }
+
+    // First run: seed the editable config + default symbol costs from the
+    // bundled read-only defaults so a fresh install works out of the box.
+    if !cfg_path.exists() {
+        if let Ok(res) = app
+            .path()
+            .resolve("resources/config.yaml", tauri::path::BaseDirectory::Resource)
+        {
+            match std::fs::copy(&res, &cfg_path) {
+                Ok(_) => eprintln!("seeded default config → {}", cfg_path.display()),
+                Err(e) => eprintln!("seed config failed: {e}"),
+            }
+        }
+        let data = root.join("data");
+        let _ = std::fs::create_dir_all(&data);
+        if let Ok(res) = app
+            .path()
+            .resolve("resources/symbol_metadata.json", tauri::path::BaseDirectory::Resource)
+        {
+            let dst = data.join("symbol_metadata.json");
+            if !dst.exists() {
+                let _ = std::fs::copy(&res, &dst);
+            }
+        }
+    }
+
+    if let Err(e) = std::env::set_current_dir(&root) {
+        eprintln!("set working dir {} failed: {e}", root.display());
+    }
+    eprintln!("data root → {}", root.display());
 }
 
 #[derive(Serialize)]
@@ -207,9 +255,10 @@ async fn chart(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    ensure_working_dir();
     tauri::Builder::default()
         .setup(|app| {
+            // STANDARD per-user data root (no hardcoded paths) + first-run seed.
+            prepare_data_root(app);
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()

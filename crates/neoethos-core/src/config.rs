@@ -1673,6 +1673,12 @@ impl Default for Settings {
 /// supply one via the `CONFIG_FILE` env var — `Settings::load` checks
 /// that first.
 pub fn user_config_path() -> PathBuf {
+    // Explicit override (NEOETHOS_USER_DATA_DIR) wins on every platform, so the
+    // desktop shell / power users can point ALL config + data readers at one
+    // chosen root (e.g. a project dir) — keeping every resolver consistent.
+    if let Some(dir) = crate::env_overrides::user_data_dir_override() {
+        return PathBuf::from(dir).join("config.yaml");
+    }
     #[cfg(target_os = "windows")]
     {
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
