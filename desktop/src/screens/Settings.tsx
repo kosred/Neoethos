@@ -56,6 +56,48 @@ export default function Settings() {
     }
   };
 
+  // Editable "search tuning" state, seeded from config whenever it (re)loads.
+  const [tune, setTune] = useState<any>({});
+  const [tuneBusy, setTuneBusy] = useState(false);
+  useEffect(() => {
+    if (!cfg) return;
+    setTune({
+      riskyStartBalance: cfg.riskyStartBalance,
+      riskyTargetBalance: cfg.riskyTargetBalance,
+      riskyHorizonDays: cfg.riskyHorizonDays,
+      prefilterTopK: cfg.prefilterTopK,
+      convergencePatience: cfg.convergencePatience,
+      stagnationPatience: cfg.stagnationPatience,
+      noveltyWeight: cfg.noveltyWeight,
+      disableSmcGate: cfg.disableSmcGate,
+    });
+  }, [cfg]);
+
+  const num = (v: any) => (v === "" || v == null ? undefined : Number(v));
+  const saveTuning = async () => {
+    setTuneBusy(true);
+    setMsg("Saving search tuning to config.yaml…");
+    try {
+      await updateSettings({
+        riskyStartBalance: num(tune.riskyStartBalance),
+        riskyTargetBalance: num(tune.riskyTargetBalance),
+        riskyHorizonDays: num(tune.riskyHorizonDays),
+        prefilterTopK: num(tune.prefilterTopK),
+        convergencePatience: num(tune.convergencePatience),
+        stagnationPatience: num(tune.stagnationPatience),
+        noveltyWeight: num(tune.noveltyWeight),
+        disableSmcGate: !!tune.disableSmcGate,
+      });
+      setCfg(await getSettings());
+      setMsg("✓ Saved to config.yaml — applies to the next Discovery run.");
+    } catch (e) {
+      setMsg(`Save failed: ${e}`);
+    } finally {
+      setTuneBusy(false);
+    }
+  };
+  const setT = (k: string, v: any) => setTune((t: any) => ({ ...t, [k]: v }));
+
   const doReauth = async () => {
     setBusy(true);
     setMsg("Opening browser for cTrader OAuth… approve in the browser, then return here.");
@@ -139,6 +181,46 @@ export default function Settings() {
             )}
           </p>
         )}
+      </div>
+
+      <h2>Risky goal</h2>
+      <p className="muted small">What the Risky search compounds toward. Only used in Risky mode; sizing/win-rate are engine-decided.</p>
+      <div className="ticket">
+        <div className="ticket-row">
+          <label>Start (€)<input type="number" min="1" step="50" value={tune.riskyStartBalance ?? ""} onChange={(e) => setT("riskyStartBalance", e.target.value)} /></label>
+          <label>Target (€)<input type="number" min="1" step="1000" value={tune.riskyTargetBalance ?? ""} onChange={(e) => setT("riskyTargetBalance", e.target.value)} /></label>
+          <label>Horizon (days)<input type="number" min="1" step="30" value={tune.riskyHorizonDays ?? ""} onChange={(e) => setT("riskyHorizonDays", e.target.value)} /></label>
+        </div>
+      </div>
+
+      <h2>Search tuning <span className="muted small">(anti-stagnation — change these if Discovery stalls / finds few strategies)</span></h2>
+      <div className="ticket">
+        <div className="ticket-row" style={{ flexWrap: "wrap", gap: 16 }}>
+          <label style={{ minWidth: 150 }}>Indicator pool
+            <input type="number" min="10" step="10" value={tune.prefilterTopK ?? ""} onChange={(e) => setT("prefilterTopK", e.target.value)} />
+            <span className="muted small">how many indicators the GA may use. Higher = more diverse strategies. <b>Raise if it stalls.</b></span>
+          </label>
+          <label style={{ minWidth: 150 }}>Explore patience
+            <input type="number" min="10" step="50" value={tune.convergencePatience ?? ""} onChange={(e) => setT("convergencePatience", e.target.value)} />
+            <span className="muted small">flat generations before the GA gives up. Raise to search much longer.</span>
+          </label>
+          <label style={{ minWidth: 150 }}>Diversity kick
+            <input type="number" min="1" step="1" value={tune.stagnationPatience ?? ""} onChange={(e) => setT("stagnationPatience", e.target.value)} />
+            <span className="muted small">flat generations before heavier mutation + fresh genes kick in.</span>
+          </label>
+          <label style={{ minWidth: 150 }}>Novelty reward
+            <input type="number" min="0" max="1" step="0.05" value={tune.noveltyWeight ?? ""} onChange={(e) => setT("noveltyWeight", e.target.value)} />
+            <span className="muted small">0 = off. 0.1–0.3 rewards DIFFERENT genes → more regimes.</span>
+          </label>
+          <label style={{ flexDirection: "row", alignItems: "center", gap: 8, minWidth: 200 }}>
+            <input type="checkbox" checked={!!tune.disableSmcGate} onChange={(e) => setT("disableSmcGate", e.target.checked)} />
+            Disable SMC gate
+          </label>
+        </div>
+        <div className="btn-row">
+          <button className="primary" disabled={tuneBusy || !cfg} onClick={saveTuning}>{tuneBusy ? "Saving…" : "Save tuning"}</button>
+          <span className="muted small">Writes to config.yaml · applies to the next Discovery run.</span>
+        </div>
       </div>
 
       <h2>Broker connection</h2>

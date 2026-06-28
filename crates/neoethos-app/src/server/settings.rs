@@ -74,6 +74,13 @@ pub struct SettingsDto {
     pub search_portfolio_size: usize,
     pub search_corr_threshold: f64,
     pub search_max_rows: usize,
+    // ── GA anti-stagnation knobs (models.discovery_runtime / models.search_runtime) ──
+    // Surfaced (2026-06-28) so the operator can un-stick the search from Settings.
+    pub prefilter_top_k: usize,
+    pub convergence_patience: usize,
+    pub stagnation_patience: usize,
+    pub novelty_weight: f64,
+    pub disable_smc_gate: bool,
 }
 
 /// Partial-update payload for `POST /settings`. All fields optional —
@@ -106,6 +113,12 @@ pub struct SettingsUpdateDto {
     pub search_portfolio_size: Option<usize>,
     pub search_corr_threshold: Option<f64>,
     pub search_max_rows: Option<usize>,
+    // GA anti-stagnation knobs (models.discovery_runtime / models.search_runtime).
+    pub prefilter_top_k: Option<usize>,
+    pub convergence_patience: Option<usize>,
+    pub stagnation_patience: Option<usize>,
+    pub novelty_weight: Option<f64>,
+    pub disable_smc_gate: Option<bool>,
 }
 
 pub async fn settings(State(_state): State<AppApiState>) -> Response {
@@ -492,6 +505,22 @@ pub async fn update_settings(
     if let Some(v) = payload.search_max_rows {
         settings.models.prop_search_max_rows = v; // 0 = full dataset
     }
+    // ── GA anti-stagnation knobs (un-stick the search from the UI) ──────
+    if let Some(v) = payload.prefilter_top_k {
+        settings.models.discovery_runtime.prefilter_top_k = v.max(10);
+    }
+    if let Some(v) = payload.convergence_patience {
+        settings.models.search_runtime.convergence_patience = v.max(10);
+    }
+    if let Some(v) = payload.stagnation_patience {
+        settings.models.search_runtime.stagnation_patience = v.max(1);
+    }
+    if let Some(v) = payload.novelty_weight {
+        settings.models.search_runtime.novelty_weight = v.clamp(0.0, 1.0);
+    }
+    if let Some(v) = payload.disable_smc_gate {
+        settings.models.search_runtime.disable_smc_gate = v;
+    }
 
     if let Err(err) = settings.save(config_path()) {
         tracing::error!(
@@ -541,5 +570,10 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         search_portfolio_size: settings.models.prop_search_portfolio_size,
         search_corr_threshold: settings.models.prop_search_corr_threshold,
         search_max_rows: settings.models.prop_search_max_rows,
+        prefilter_top_k: settings.models.discovery_runtime.prefilter_top_k,
+        convergence_patience: settings.models.search_runtime.convergence_patience,
+        stagnation_patience: settings.models.search_runtime.stagnation_patience,
+        novelty_weight: settings.models.search_runtime.novelty_weight,
+        disable_smc_gate: settings.models.search_runtime.disable_smc_gate,
     }
 }

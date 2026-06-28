@@ -432,6 +432,12 @@ export type SettingsUpdate = {
   riskyStartBalance?: number;
   riskyTargetBalance?: number;
   riskyHorizonDays?: number;
+  // GA anti-stagnation tuning (models.discovery_runtime / models.search_runtime)
+  prefilterTopK?: number;
+  convergencePatience?: number;
+  stagnationPatience?: number;
+  noveltyWeight?: number;
+  disableSmcGate?: boolean;
 };
 export const updateSettings = (payload: SettingsUpdate) => apiPost<any>("/settings", payload);
 
