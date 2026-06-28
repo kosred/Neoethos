@@ -101,8 +101,23 @@ const SECTIONS: Sec[] = [
     what: "Power-user tools: diagnostics, data import, config presets and raw YAML editing.",
     how: ["Run diagnostics for a health report.", "Import a CSV/Parquet file.", "Switch presets or hand-edit any setting (affects everything)."] },
   { id: "settings", icon: "⚙", title: "Settings", group: "System",
-    what: "Core preferences and broker setup (re-authenticate, choose the active account).",
-    how: ["Use Broker Setup to re-authenticate or pick a granted account if trading says it can't route."] },
+    what: "The single place to change configuration — discovery mode, risky goal, search tuning, compute, risk, news, broker. Each control writes config.yaml; only Discovery + Training actions live outside.",
+    how: [
+      "Discovery mode: Prop-firm (robust) vs Risky (multiply). Risky goal: start/target/horizon.",
+      "Compute: auto / cpu / gpu. Risk & sizing: pick a preset; limits update.",
+      "News gate: pause / allow / warn around high-impact events.",
+      "Broker Setup: re-authenticate or pick a granted account if trading says it can't route.",
+    ] },
+  { id: "tuning", icon: "🧬", title: "Search tuning (anti-stagnation)", group: "System",
+    what: "If Discovery stalls early or finds few strategies, these knobs (in Settings) widen/deepen the genetic search. The GA can settle on a local optimum — raise these to push it to keep exploring different indicators.",
+    how: [
+      "Indicator pool (prefilter_top_k): how many indicators the GA may use. RAISE first if it stalls — the #1 lever (50→120 gave a ~6× jump in strategies found).",
+      "Explore patience (convergence_patience): flat generations before the GA gives up. Raise (e.g. 500) to search much longer.",
+      "Diversity kick (stagnation_patience): flat generations before heavier mutation + fresh genes kick in. Lower = reacts sooner.",
+      "Novelty reward (novelty_weight): 0 = off; 0.1–0.3 rewards DIFFERENT genes → more market-regime variety.",
+      "Disable SMC gate: turn off the structural gate if it's over-constraining a pair.",
+      "Save writes config.yaml; applies to the next Discovery run.",
+    ] },
 ];
 
 const GROUPS = ["Trade", "Autopilot", "Research", "Data & Files", "Desk", "System"];
