@@ -10,6 +10,8 @@ import {
 } from "../api";
 import { useAccountStream } from "../hooks";
 import PositionsTable from "../components/PositionsTable";
+import { SymbolSelect } from "../components/Select";
+import { HelpPanel, HelpStep } from "../components/Help";
 
 export default function Positions() {
   const [acct, setAcct] = useState<AccountSnapshot | null>(null);
@@ -115,12 +117,19 @@ export default function Positions() {
     <div className="screen">
       <h1>Positions</h1>
 
+      <HelpPanel id="positions">
+        <p>Place and manage <b>manual</b> trades on your connected cTrader account, and watch open positions with live P/L.</p>
+        <HelpStep n={1}><b>New market order:</b> choose a <b>Symbol</b>, <b>BUY</b>/<b>SELL</b>, the <b>Lots</b> size, and optional <b>SL</b>/<b>TP</b> in pips, then send. These are real orders on the active account (Demo or Live — check the header).</HelpStep>
+        <HelpStep n={2}><b>Open positions</b> stream live below with profit/loss and pips. Use <b>Modify SL/TP</b> to move a stop (e.g. to breakeven) and <b>Close</b> to exit.</HelpStep>
+        <p className="muted small">Manual orders here are not risk-gated — you are in control. Automated trading lives in <b>Autopilot</b> and is protected by the demo gate.</p>
+      </HelpPanel>
+
       <div className="ticket">
         <h2>New market order</h2>
         <div className="ticket-row">
           <label>
             Symbol
-            <input value={symbol} onChange={(e) => setSymbol(e.target.value)} />
+            <SymbolSelect value={symbol} onChange={setSymbol} style={{ width: 120 }} />
           </label>
           <div className="seg">
             <button className={side === "buy" ? "on buy" : ""} onClick={() => setSide("buy")}>

@@ -11,6 +11,7 @@ import {
   type GateVerdict,
 } from "../api";
 import { usePoll } from "../hooks";
+import { HelpPanel, HelpStep } from "../components/Help";
 
 function StatGrid({ data }: { data: any }) {
   if (!data || typeof data !== "object") return null;
@@ -118,6 +119,14 @@ export default function Autopilot() {
     <div className="screen">
       <h1>Autopilot <span className={`badge ${running ? "live" : "demo"}`}>{running ? "LIVE RUNNING" : "STOPPED"}</span></h1>
       <p className="sub">Run an EXISTING discovered strategy — dry-run on history or live — with clear file provenance</p>
+
+      <HelpPanel id="autopilot">
+        <p>Autopilot runs a discovered strategy <b>for you</b> — first safely on history, then on the broker.</p>
+        <HelpStep n={1}>Pick a portfolio from the list (each row is a discovered strategy with its file path).</HelpStep>
+        <HelpStep n={2}><b>Replay (dry-run)</b> tests it on stored history with zero broker calls — safe to run anytime.</HelpStep>
+        <HelpStep n={3}>The <b>demo forward-test gate</b> below shows if the strategy has earned real money: ≥100 demo trades whose live results stay within 20% of the backtest.</HelpStep>
+        <HelpStep n={4}><b>Start live</b> runs the loop. On a <b>Demo</b> account it always runs (building the track record); on a <b>Live</b> account it's blocked until the gate passes. <b>Stop</b> halts it.</HelpStep>
+      </HelpPanel>
 
       <div className="btn-row">
         <button onClick={reload} disabled={busy}>Refresh strategies</button>

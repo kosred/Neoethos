@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { enginesStatus, trainingStart, trainingStop, type StartJob } from "../api";
 import { usePoll } from "../hooks";
+import { SymbolSelect, TimeframeSelect } from "../components/Select";
+import { HelpPanel, HelpStep } from "../components/Help";
 
 const pick = <T,>(...vals: (T | undefined)[]) => vals.find((v) => v !== undefined);
 
@@ -50,6 +52,13 @@ export default function Training() {
       <h1>Training</h1>
       <p className="sub">Train the model ensemble on discovered features · symbol/base from config when blank</p>
 
+      <HelpPanel id="training">
+        <p>Training fits the <b>machine-learning ensemble</b> (the models that act as a regime filter on top of the discovered rules). It learns from the same features discovery used and is validated on an 80/20 hold-out so it can't just memorise the past.</p>
+        <HelpStep n={1}>Pick a <b>Symbol</b> and <b>Base TF</b> (or leave <i>(from config)</i>). Use the same pair/timeframe you ran discovery on.</HelpStep>
+        <HelpStep n={2}>Press <b>Start training</b>. Progress shows here; trained models are saved to the model store (see <b>Files &amp; Storage</b> / <b>Intelligence</b>).</HelpStep>
+        <p className="muted small">Models never decide direction on their own — the discovered rules do. The ensemble only down-weights trades in unfavourable regimes.</p>
+      </HelpPanel>
+
       <div className="engine-status">
         <span className={`badge ${running ? "live" : "demo"}`}>{running ? "RUNNING" : state.toUpperCase()}</span>
       </div>
@@ -61,11 +70,11 @@ export default function Training() {
         <div className="ticket-row">
           <label>
             Symbol
-            <input value={symbol} placeholder="(config)" onChange={(e) => setSymbol(e.target.value)} style={{ width: 110 }} />
+            <SymbolSelect value={symbol} onChange={setSymbol} allowConfig style={{ width: 120 }} />
           </label>
           <label>
             Base TF
-            <input value={baseTf} placeholder="(config)" onChange={(e) => setBaseTf(e.target.value)} style={{ width: 80 }} />
+            <TimeframeSelect value={baseTf} onChange={setBaseTf} allowConfig style={{ width: 90 }} />
           </label>
         </div>
         <div className="btn-row">

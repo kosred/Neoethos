@@ -23,9 +23,11 @@ import AiDesk from "./screens/AiDesk";
 import Hardware from "./screens/Hardware";
 import Advanced from "./screens/Advanced";
 import Settings from "./screens/Settings";
+import Help from "./screens/Help";
 import "./App.css";
 
 type View =
+  | "help"
   | "cockpit" | "dashboard" | "markets" | "marketwatch" | "positions" | "account" | "actions"
   | "autopilot" | "riskymode" | "risk" | "discovery" | "training" | "strategylab" | "strategyreport" | "intelligence"
   | "files" | "data" | "journal" | "news" | "aidesk" | "hardware" | "advanced" | "settings";
@@ -33,6 +35,7 @@ type View =
 type NavEntry = { id: View; label: string; icon: string } | { divider: string };
 
 const NAV: NavEntry[] = [
+  { id: "help", label: "Help & Guide", icon: "❓" },
   { divider: "Trade" },
   { id: "cockpit", label: "Trade", icon: "🎯" },
   { id: "dashboard", label: "Dashboard", icon: "▦" },
@@ -65,6 +68,7 @@ const NAV: NavEntry[] = [
 ];
 
 const SCREENS: Record<View, ReactNode> = {
+  help: <Help />,
   cockpit: <Cockpit />,
   dashboard: <Dashboard />,
   markets: <Markets />,

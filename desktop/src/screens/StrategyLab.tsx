@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { promotionStatus, promoteStrategy } from "../api";
+import { SymbolSelect, TimeframeSelect } from "../components/Select";
+import { HelpPanel, HelpStep } from "../components/Help";
 
 export default function StrategyLab() {
   const [symbol, setSymbol] = useState("");
@@ -46,10 +48,17 @@ export default function StrategyLab() {
       <h1>Strategy Lab</h1>
       <p className="sub">Promotion gate — validate a discovered portfolio and promote it to live</p>
 
+      <HelpPanel id="strategylab">
+        <p>Strategy Lab is the <b>quality checkpoint</b> between discovery and trading. It re-checks a discovered portfolio against the promotion criteria (profit factor, Sharpe, drawdown, trade count) and, if it passes, copies it into the live set.</p>
+        <HelpStep n={1}>Pick the <b>Symbol</b> + <b>Base TF</b> of a portfolio you discovered, then press <b>Check gate</b>. You'll see each criterion and a <b>PROMOTE</b> / <b>HOLD</b> verdict.</HelpStep>
+        <HelpStep n={2}>If it says PROMOTE, press <b>Promote to live</b> to copy it into the live portfolio set. <b>HOLD</b> means the strategy isn't good enough yet — run a deeper discovery.</HelpStep>
+        <p className="muted small">This is the backtest gate. Before risking real money there's a second, stricter <b>demo forward-test</b> gate in Autopilot.</p>
+      </HelpPanel>
+
       <div className="ticket">
         <div className="ticket-row">
-          <label>Symbol<input value={symbol} placeholder="(config)" onChange={(e) => setSymbol(e.target.value)} style={{ width: 110 }} /></label>
-          <label>Base TF<input value={baseTf} placeholder="(config)" onChange={(e) => setBaseTf(e.target.value)} style={{ width: 80 }} /></label>
+          <label>Symbol<SymbolSelect value={symbol} onChange={setSymbol} allowConfig style={{ width: 120 }} /></label>
+          <label>Base TF<TimeframeSelect value={baseTf} onChange={setBaseTf} allowConfig style={{ width: 90 }} /></label>
         </div>
         <div className="btn-row">
           <button disabled={busy} onClick={check}>Check gate</button>

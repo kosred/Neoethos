@@ -1,5 +1,6 @@
 import { riskyScenarios, settings, strategyList, riskInfo } from "../api";
 import { usePoll } from "../hooks";
+import { HelpPanel } from "../components/Help";
 
 const days = (n: number | null) =>
   n == null || Number.isNaN(n) ? "never" : n >= 365 ? `${(n / 365).toFixed(1)}y` : n >= 30 ? `${(n / 30).toFixed(1)}mo` : `${Math.round(n)}d`;
@@ -24,6 +25,12 @@ export default function RiskyMode() {
     <div className="screen">
       <h1>Risky Mode <span className="badge live">AUTOMATIC · AGGRESSIVE</span></h1>
       <p className="sub">The bot hunts for strategies to reach the goal — sizing, win-rate, R:R and costs are all engine-decided</p>
+
+      <HelpPanel id="riskymode">
+        <p>A separate, aggressive mode whose job is to <b>multiply a small account</b> toward a target (e.g. €100 → €100k). It is deliberately <b>read-only</b>: you cannot tune it, because over-tuning is how accounts blow up.</p>
+        <p>Everything you see — position sizing (half-Kelly of the measured edge), required win-rate, reward:risk and the time-to-target projection — is computed by the engine from your goal and real broker costs. The list shows the strategies discovered specifically for this mode.</p>
+        <p className="muted small">Aggressive = high risk of ruin. The projection is a best-case compounding model, not a promise. Prove strategies on Demo (Autopilot) before any real money.</p>
+      </HelpPanel>
 
       <div className="banner warn">
         Fully automatic — you don't set any parameters. The engine searches for strategies that can hit the goal,

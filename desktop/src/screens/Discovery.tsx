@@ -6,6 +6,8 @@ import {
   type StartJob,
 } from "../api";
 import { usePoll } from "../hooks";
+import { SymbolSelect, TimeframeSelect } from "../components/Select";
+import { HelpPanel, HelpStep } from "../components/Help";
 
 const pick = <T,>(...vals: (T | undefined)[]) => vals.find((v) => v !== undefined);
 
@@ -70,6 +72,14 @@ export default function Discovery() {
       <h1>Discovery</h1>
       <p className="sub">Genetic strategy search · symbol/base resolved from config when blank</p>
 
+      <HelpPanel id="discovery">
+        <p>Discovery is the <b>strategy factory</b>. It runs a genetic algorithm that breeds and tests thousands of trading rules on your downloaded history, keeps only the ones that survive out-of-sample validation, and saves them as a portfolio you can later replay or trade.</p>
+        <HelpStep n={1}>Pick a <b>Symbol</b> and <b>Base TF</b> (or leave them on <i>(from config)</i> to use your defaults). The base timeframe is the bar size the rules trade on; higher timeframes are added automatically for context.</HelpStep>
+        <HelpStep n={2}>Optional <b>Advanced</b> knobs: <b>Population</b>/<b>Generations</b> = how wide/deep the search goes (bigger = slower, more thorough). <b>Target candidates</b> = how many survivors to aim for. <b>Portfolio size</b> = how many to keep in the final set. Leave blank for sensible defaults.</HelpStep>
+        <HelpStep n={3}>Press <b>Start discovery</b> and watch the progress bar + live counters. It can run for minutes to hours depending on data + settings. Results land in the cache and show up in <b>Strategy Lab</b> / <b>Autopilot</b>.</HelpStep>
+        <p className="muted small">Validation is automatic (80/20 in-sample split + walk-forward + CPCV). Only strategies that hold up out-of-sample are exported.</p>
+      </HelpPanel>
+
       <div className="engine-status">
         <span className={`badge ${running ? "live" : "demo"}`}>{running ? "RUNNING" : state.toUpperCase()}</span>
         {stage && <span className="muted">{stage}</span>}
@@ -99,11 +109,11 @@ export default function Discovery() {
         <div className="ticket-row">
           <label>
             Symbol
-            <input value={symbol} placeholder="(config)" onChange={(e) => setSymbol(e.target.value)} style={{ width: 110 }} />
+            <SymbolSelect value={symbol} onChange={setSymbol} allowConfig style={{ width: 120 }} />
           </label>
           <label>
             Base TF
-            <input value={baseTf} placeholder="(config)" onChange={(e) => setBaseTf(e.target.value)} style={{ width: 80 }} />
+            <TimeframeSelect value={baseTf} onChange={setBaseTf} allowConfig style={{ width: 90 }} />
           </label>
           <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
             <input type="checkbox" checked={adv} onChange={(e) => setAdv(e.target.checked)} /> Advanced
@@ -111,10 +121,10 @@ export default function Discovery() {
         </div>
         {adv && (
           <div className="ticket-row" style={{ marginTop: 10 }}>
-            <label>Population<input value={population} placeholder="default" onChange={(e) => setPopulation(e.target.value)} /></label>
-            <label>Generations<input value={generations} placeholder="default" onChange={(e) => setGenerations(e.target.value)} /></label>
-            <label>Target candidates<input value={targets} placeholder="default" onChange={(e) => setTargets(e.target.value)} /></label>
-            <label>Portfolio size<input value={portfolio} placeholder="default" onChange={(e) => setPortfolio(e.target.value)} /></label>
+            <label>Population<input type="number" min="0" step="50" value={population} placeholder="default" onChange={(e) => setPopulation(e.target.value)} /></label>
+            <label>Generations<input type="number" min="0" step="10" value={generations} placeholder="default" onChange={(e) => setGenerations(e.target.value)} /></label>
+            <label>Target candidates<input type="number" min="0" step="10" value={targets} placeholder="default" onChange={(e) => setTargets(e.target.value)} /></label>
+            <label>Portfolio size<input type="number" min="0" step="1" value={portfolio} placeholder="default" onChange={(e) => setPortfolio(e.target.value)} /></label>
           </div>
         )}
         <div className="btn-row">

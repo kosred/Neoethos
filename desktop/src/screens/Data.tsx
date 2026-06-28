@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { dataBootstrap, dataFetch, refreshBrokerCosts } from "../api";
 import { usePoll } from "../hooks";
+import { SymbolSelect, TimeframeSelect, invalidateSymbolCache } from "../components/Select";
+import { HelpPanel, HelpStep } from "../components/Help";
 
 export default function Data() {
   const { data, error, reload } = usePoll(dataBootstrap, 0);
@@ -35,6 +37,7 @@ export default function Data() {
     try {
       const r: any = await dataFetch({ symbol: symbol.trim().toUpperCase(), timeframe: tf.trim().toUpperCase(), from_ms: fromMs });
       setMsg(`✓ Fetched ${r?.barCount ?? "?"} bars → ${r?.writtenPath ?? ""}${r?.hasMore ? " (more available)" : ""}`);
+      invalidateSymbolCache();
       await reload();
     } catch (e) {
       setMsg(`Fetch failed: ${e}`);
@@ -47,6 +50,15 @@ export default function Data() {
     <div className="screen">
       <h1>Data</h1>
       <p className="sub">Local dataset status &amp; download historical bars from the broker</p>
+
+      <HelpPanel id="data">
+        <p>This screen manages the <b>price history</b> the engine trains and backtests on. Everything is stored locally under your data folder (see <b>Files &amp; Storage</b>).</p>
+        <HelpStep n={1}><b>Download bars:</b> pick a <b>Symbol</b> and <b>Timeframe</b> from the lists, choose a <b>From</b> date, and press <b>Fetch from broker</b>. The deeper the date, the longer it takes (a 10-year M1 pull is millions of bars). It replaces that symbol+timeframe file with the fetched range.</HelpStep>
+        <HelpStep n={2}><b>Broker costs:</b> press <b>Refresh broker costs</b> once so backtests use your account's real commission/swap/spread instead of a generic table — this keeps results honest vs live.</HelpStep>
+        <HelpStep n={3}><b>Local symbols:</b> the chips at the bottom show what data you already have. These are the symbols available in every dropdown across the app.</HelpStep>
+        <p className="muted small">Tip: discovery uses a base timeframe plus higher ones, so download the same date range for each timeframe you plan to search.</p>
+      </HelpPanel>
+
       {error && <div className="banner warn">{error}</div>}
 
       {data && (
@@ -63,9 +75,9 @@ export default function Data() {
       <h2>Download bars</h2>
       <div className="ticket">
         <div className="ticket-row">
-          <label>Symbol<input value={symbol} onChange={(e) => setSymbol(e.target.value)} style={{ width: 110 }} /></label>
-          <label>Timeframe<input value={tf} onChange={(e) => setTf(e.target.value)} style={{ width: 80 }} /></label>
-          <label>From<input value={from} onChange={(e) => setFrom(e.target.value)} style={{ width: 120 }} placeholder="YYYY-MM-DD" /></label>
+          <label>Symbol<SymbolSelect value={symbol} onChange={setSymbol} style={{ width: 120 }} /></label>
+          <label>Timeframe<TimeframeSelect value={tf} onChange={setTf} style={{ width: 90 }} /></label>
+          <label>From<input type="date" value={from} onChange={(e) => setFrom(e.target.value)} style={{ width: 150 }} /></label>
         </div>
         <div className="btn-row">
           <button className="primary" disabled={busy} onClick={fetchData}>Fetch from broker</button>

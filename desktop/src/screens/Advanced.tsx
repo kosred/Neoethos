@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { settingsRaw, saveSettingsRaw, knobCatalog, settingsPresets, diagnosticsReport, dataImport } from "../api";
 import { usePoll } from "../hooks";
+import { TimeframeSelect } from "../components/Select";
+import { HelpPanel, HelpStep } from "../components/Help";
 
 export default function Advanced() {
   const { data: catalog } = usePoll(knobCatalog, 0);
@@ -68,6 +70,14 @@ export default function Advanced() {
     <div className="screen">
       <h1>Advanced</h1>
       <p className="sub">Raw config · knob catalog · diagnostics · data import</p>
+
+      <HelpPanel id="advanced">
+        <p>Power-user tools. Most people never need this screen — the normal controls live on each feature's own screen.</p>
+        <HelpStep n={1}><b>Diagnostics:</b> a one-click health report (paths, data, broker, config) — handy when something looks wrong.</HelpStep>
+        <HelpStep n={2}><b>Import data file:</b> bring in a CSV/Parquet you already have. Give the <b>Source path</b>, the destination <b>Symbol</b> (can be a new pair) and <b>Timeframe</b>; it's converted into the engine's format.</HelpStep>
+        <HelpStep n={3}><b>Config presets</b> + <b>raw YAML</b>: switch the whole engine profile or hand-edit any setting. The knob catalog documents every option. Edits here affect everything — change with care.</HelpStep>
+      </HelpPanel>
+
       {msg && <div className="banner info">{msg}</div>}
 
       <div className="btn-row">
@@ -78,8 +88,8 @@ export default function Advanced() {
       <div className="ticket">
         <div className="ticket-row">
           <label style={{ flex: 1 }}>Source path<input value={src} onChange={(e) => setSrc(e.target.value)} placeholder="C:\path\to\EURUSD.csv" style={{ width: "100%" }} /></label>
-          <label>Symbol<input value={iSym} onChange={(e) => setISym(e.target.value)} style={{ width: 90 }} /></label>
-          <label>TF<input value={iTf} onChange={(e) => setITf(e.target.value)} style={{ width: 70 }} /></label>
+          <label>Symbol<input value={iSym} onChange={(e) => setISym(e.target.value)} style={{ width: 90 }} placeholder="EURUSD" /></label>
+          <label>TF<TimeframeSelect value={iTf} onChange={setITf} style={{ width: 80 }} /></label>
           <button className="primary" disabled={busy || !src} onClick={doImport}>Import</button>
         </div>
       </div>

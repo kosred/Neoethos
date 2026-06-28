@@ -1,5 +1,6 @@
 import { storagePaths, openPath, type StorageEntry } from "../api";
 import { usePoll } from "../hooks";
+import { HelpPanel } from "../components/Help";
 
 const human = (b: number) => {
   if (b <= 0) return "—";
@@ -22,6 +23,11 @@ export default function Files() {
     <div className="screen">
       <h1>Files &amp; Storage</h1>
       <p className="sub">Exactly where everything the app downloads, trains, or logs is kept — click to open</p>
+
+      <HelpPanel id="files">
+        <p>Full transparency on where your data lives — nothing is hidden. Each row is a folder the app uses, with its real path, size and last-modified time.</p>
+        <p>Press <b>Open</b> on any row to reveal it in Windows Explorer: <b>data</b> = downloaded price history, <b>models</b> = trained AI, <b>cache</b> = discovered strategies, <b>journal</b> = closed trades, <b>logs</b> = diagnostics, <b>config</b> = your settings file. Secrets (broker credentials) show the path only — never the contents.</p>
+      </HelpPanel>
 
       <div className="btn-row">
         <button onClick={reload}>Refresh</button>

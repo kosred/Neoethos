@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { riskInfo, setRiskPreset } from "../api";
 import { usePoll } from "../hooks";
+import { HelpPanel, HelpStep } from "../components/Help";
 
 const pct = (v: number) => `${(v * 100).toFixed(2)}%`;
 
@@ -27,6 +28,13 @@ export default function Risk() {
     <div className="screen">
       <h1>Risk</h1>
       <p className="sub">Position sizing limits, drawdown guards, and prop-firm presets</p>
+
+      <HelpPanel id="risk">
+        <p>These are the guardrails every <b>automated</b> trade must respect — how much to risk per trade and when to stop after losses.</p>
+        <HelpStep n={1}>Pick a <b>preset</b> (e.g. an FTMO-style prop-firm profile) to load a sensible, tested set of limits in one click.</HelpStep>
+        <HelpStep n={2}>Review the values: <b>risk per trade</b>, <b>daily</b> and <b>total drawdown</b> caps, and <b>max lot size</b>. If a daily/total loss limit is hit, the engine stops trading to protect the account.</HelpStep>
+        <p className="muted small">Manual orders in Positions are not gated by these — they apply to autopilot / risky mode.</p>
+      </HelpPanel>
 
       {error && <div className="banner warn">{error}</div>}
 
