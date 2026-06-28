@@ -145,6 +145,22 @@ impl FeatureFrame {
         }
     }
 
+    /// A new owned `FeatureFrame` over the contiguous row range `[start, end)`
+    /// (a temporal slice). Because the multi-timeframe features are already
+    /// flattened — each row is one base bar carrying all its higher-TF context —
+    /// a plain row split is a clean temporal cut with NO re-alignment needed.
+    /// Used by the sealed-lockbox split (train on the early rows, judge on the
+    /// untouched recent rows). Always materialises in-memory (slices are small).
+    pub fn row_slice(&self, start: usize, end: usize) -> FeatureFrame {
+        let start = start.min(self.n_samples());
+        let end = end.min(self.n_samples()).max(start);
+        FeatureFrame {
+            timestamps: self.timestamps[start..end].to_vec(),
+            names: self.names.clone(),
+            data: FeatureData::InMemory(self.sample_window(start, end)),
+        }
+    }
+
     /// Single feature value at logical `(sample, feature)`.
     #[inline]
     pub fn feature_at(&self, sample: usize, feature: usize) -> f32 {
