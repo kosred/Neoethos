@@ -6,6 +6,7 @@ import {
   type StartJob,
 } from "../api";
 import { usePoll } from "../hooks";
+import { settings } from "../api";
 import { SymbolSelect, TimeframeSelect } from "../components/Select";
 import { HelpPanel, HelpStep } from "../components/Help";
 
@@ -13,6 +14,7 @@ const pick = <T,>(...vals: (T | undefined)[]) => vals.find((v) => v !== undefine
 
 export default function Discovery() {
   const { data: st, error, reload } = usePoll(enginesStatus, 2000);
+  const { data: cfg } = usePoll(settings, 0);
   const [symbol, setSymbol] = useState("");
   const [baseTf, setBaseTf] = useState("");
   const [adv, setAdv] = useState(false);
@@ -69,8 +71,8 @@ export default function Discovery() {
 
   return (
     <div className="screen">
-      <h1>Discovery</h1>
-      <p className="sub">Genetic strategy search · symbol/base resolved from config when blank</p>
+      <h1>Discovery {cfg?.tradingMode && <span className={`badge ${cfg.tradingMode === "risky" ? "live" : "demo"}`}>{cfg.tradingMode === "risky" ? "🚀 RISKY MODE" : "🛡 PROP-FIRM MODE"}</span>}</h1>
+      <p className="sub">Genetic strategy search · symbol/base resolved from config when blank · <b>mode + tuning in Settings</b></p>
 
       <HelpPanel id="discovery">
         <p>Discovery is the <b>strategy factory</b>. It runs a genetic algorithm that breeds and tests thousands of trading rules on your downloaded history, keeps only the ones that survive out-of-sample validation, and saves them as a portfolio you can later replay or trade.</p>

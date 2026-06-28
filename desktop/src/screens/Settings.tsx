@@ -6,6 +6,9 @@ import {
   selectAccount,
   settings as getSettings,
   updateSettings,
+  settingsPresets,
+  setRiskPreset,
+  riskInfo,
   type BrokerStatus,
   type AccountInfo,
 } from "../api";
@@ -15,6 +18,8 @@ export default function Settings() {
   const [status, setStatus] = useState<BrokerStatus | null>(null);
   const [accounts, setAccounts] = useState<AccountInfo[]>([]);
   const [cfg, setCfg] = useState<any>(null);
+  const [presets, setPresets] = useState<{ id: string; label: string; description: string }[]>([]);
+  const [risk, setRisk] = useState<any>(null);
   const [busy, setBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
   const [msg, setMsg] = useState("");
@@ -29,6 +34,38 @@ export default function Settings() {
       setCfg(await getSettings());
     } catch {
       /* settings optional */
+    }
+    try {
+      setPresets((await settingsPresets()).presets);
+    } catch {
+      /* presets optional */
+    }
+    try {
+      setRisk(await riskInfo());
+    } catch {
+      /* risk optional */
+    }
+  };
+
+  const setCompute = async (mode: "auto" | "cpu" | "gpu") => {
+    setMsg(`Compute mode → ${mode}…`);
+    try {
+      await updateSettings({ computeMode: mode });
+      setCfg(await getSettings());
+      setMsg(`✓ Compute mode = ${mode}.`);
+    } catch (e) {
+      setMsg(`Compute switch failed: ${e}`);
+    }
+  };
+
+  const applyPreset = async (id: string) => {
+    setMsg(`Applying risk preset ${id}…`);
+    try {
+      await setRiskPreset(id);
+      setRisk(await riskInfo());
+      setMsg(`✓ Risk preset = ${id}.`);
+    } catch (e) {
+      setMsg(`Preset failed: ${e}`);
     }
   };
 
@@ -221,6 +258,39 @@ export default function Settings() {
           <button className="primary" disabled={tuneBusy || !cfg} onClick={saveTuning}>{tuneBusy ? "Saving…" : "Save tuning"}</button>
           <span className="muted small">Writes to config.yaml · applies to the next Discovery run.</span>
         </div>
+      </div>
+
+      <h2>Compute</h2>
+      <p className="muted small">Which hardware discovery/training use. <b>auto</b> picks the best device and fits any card; <b>cpu</b> forces the CPU lane (safest); <b>gpu</b> forces GPU.</p>
+      <div className="ticket">
+        <div className="seg" style={{ maxWidth: 360 }}>
+          {(["auto", "cpu", "gpu"] as const).map((m) => (
+            <button key={m} className={cfg?.computeMode === m ? "on" : ""} onClick={() => setCompute(m)}>{m.toUpperCase()}</button>
+          ))}
+        </div>
+        {cfg && <p className="muted small" style={{ marginTop: 8 }}>Active: <b>{cfg.computeMode ?? "?"}</b></p>}
+      </div>
+
+      <h2>Risk &amp; sizing</h2>
+      <p className="muted small">Position-sizing limits + drawdown guards for AUTOMATED trading (Autopilot/Risky). Pick a tested preset; the limits below update.</p>
+      <div className="ticket">
+        {presets.length > 0 && (
+          <label>Preset
+            <select value={risk?.preset ?? ""} onChange={(e) => applyPreset(e.target.value)} style={{ width: 240 }}>
+              {!presets.some((p) => p.id === risk?.preset) && <option value="">{risk?.preset ?? "(current)"}</option>}
+              {presets.map((p) => <option key={p.id} value={p.id} title={p.description}>{p.label}</option>)}
+            </select>
+          </label>
+        )}
+        {risk && (
+          <div className="cards" style={{ marginTop: 12, gridTemplateColumns: "repeat(4,1fr)" }}>
+            <div className="card"><div className="card-label">RISK / TRADE</div><div className="card-value">{((risk.riskPerTrade ?? 0) * 100).toFixed(2)}%</div></div>
+            <div className="card"><div className="card-label">DAILY DD CAP</div><div className="card-value">{((risk.dailyDrawdownLimit ?? 0) * 100).toFixed(1)}%</div></div>
+            <div className="card"><div className="card-label">TOTAL DD CAP</div><div className="card-value">{((risk.totalDrawdownLimit ?? 0) * 100).toFixed(1)}%</div></div>
+            <div className="card"><div className="card-label">MAX LOT</div><div className="card-value">{risk.maxLotSize ?? "—"}</div></div>
+          </div>
+        )}
+        <p className="muted small" style={{ marginTop: 8 }}>Manual orders (Positions) are not gated by these — they apply to automated trading.</p>
       </div>
 
       <h2>Broker connection</h2>
