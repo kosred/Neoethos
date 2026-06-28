@@ -916,10 +916,19 @@ pub fn mutate(
     for _ in 0..num_mutations {
         match rng.random_range(0..4) {
             0 => {
-                // In exploitation mode, prefer tweaking weights over full indicator replacement
-                if !mutated.indices.is_empty() && (intensity < 1.0 || rng.random_bool(0.5)) {
+                // 2026-06-28 anti-stagnation: EXPLOIT (intensity < 1.0) keeps tweaking
+                // weights of the current indicators; but when STAGNANT (intensity high)
+                // bias hard toward REPLACING indicators. The old 50/50 gate + 0.3
+                // per-indicator swap meant ~10% of mutations ever changed an indicator,
+                // so the GA stayed stuck optimising the SAME indicators ("doesn't change
+                // indicators, tiny sample"). Now higher intensity → more full re-samples
+                // + a higher per-indicator swap chance.
+                let tweak_weights_prob = (0.5 / intensity as f64).clamp(0.0, 1.0);
+                if !mutated.indices.is_empty()
+                    && (intensity < 1.0 || rng.random_bool(tweak_weights_prob))
+                {
                     let idx = rng.random_range(0..mutated.indices.len());
-                    if rng.random_bool(0.3 * intensity as f64) {
+                    if rng.random_bool((0.6 * intensity as f64).clamp(0.0, 1.0)) {
                         mutated.indices[idx] = rng.random_range(0..n_indicators.max(1));
                     }
                     mutated.weights[idx] = random_coarse_weight(rng);
