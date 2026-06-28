@@ -112,9 +112,18 @@ models:
   # the regime_* force-keep) so multi-TF context actually reaches the GA.
   # 0 = legacy base-only behaviour. (root-caused + fixed 2026-06-08)
   discovery_runtime:
-    prefilter_top_k: 120  # 2026-06-28 anti-stagnation: 50->120 widens the indicator pool the GA can pick from (was ~77 features kept of 1017 → GA stuck on a tiny sample, never tried new indicators). More diversity = more regime-specialist strategies.
+    prefilter_top_k: 120  # ANTI-STAGNATION KNOB #1 — how many indicators/features the GA may pick from (top-K by correlation, of ~1017 built). Was 50 (=~77 kept) → GA stuck on a tiny sample, never tried new indicators. Higher = wider pool = more diverse strategies (but slower). RAISE if discovery stalls / finds few genes.
     prefilter_insample_frac: 0.80   # automatic 80/20 in-sample/out-of-sample validation split
     prefilter_min_per_timeframe: 6
+  # ── GA search tuning (ANTI-STAGNATION) — change these if the search "gets stuck" ──
+  # The GA can plateau early (a local optimum). These control how long/widely it
+  # explores before giving up. All optional; omitted = engine defaults shown here.
+  search_runtime:
+    convergence_patience: 250        # KNOB #2 — flat generations before the GA gives up on a combo. RAISE (e.g. 500) to explore MUCH longer before stopping (slower, finds more). The #1 lever if "it stalls at gen 50".
+    stagnation_patience: 2           # KNOB #3 — flat generations before the soft diversity-kick fires (heavier mutation + immigrants). LOWER reacts to stalls sooner.
+    min_improvement: 0.000000000001  # KNOB #4 — how big a top-fitness gain "counts" as progress (resets the stall counter). Smaller = tiny gains keep it alive longer.
+    novelty_weight: 0.0              # KNOB #5 — reward for genes that are DIFFERENT from the rest (forces regime diversity). 0 = off (cheap). Try 0.1–0.3 for more variety (costs O(n²), fine at this population).
+    disable_smc_gate: false          # KNOB #6 — set true to drop the SMC structural gate entirely if it's over-constraining the search on a given pair.
   prop_search_population: 200  # 2026-06-06 operator: 100->200 per-island (200 × 8 islands = 1600 total) — MORE breadth/diversity per generation → finds more of the rare low-DD regime-specialist genes (the deep experiment found maxDD 2.7-4.5% vs 7-9.5% shallow).
   prop_search_generations: 20000  # 2026-06-06 operator: 1000->20000 — deep GA. Time-bounded by max_hours (binds first on big TFs); on small/fast TFs lets the GA search far deeper than the old 1000 cap.
   prop_search_max_hours: 1.0  # 2026-06-06 operator: 0.5->1.0 — a full hour of deep search per combo (the experiment used 1h and found notably better genes). NOTE: a full 126-combo library run at 1h/combo exceeds current VPS credit — for the full library, add credit or lower this. Re-read per combo.
