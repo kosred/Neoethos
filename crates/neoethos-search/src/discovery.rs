@@ -1553,9 +1553,29 @@ fn embargo_bars_from_timestamps(timestamps: &[i64], embargo_minutes: usize) -> u
     ((embargo_ms + step_ms - 1) / step_ms).max(0) as usize
 }
 
-fn walkforward_summary_passed(summary: &WalkforwardSummary) -> bool {
-    summary.walk_forward_splits > 0
-        && summary.avg_pnl > 0.0
+fn walkforward_summary_passed(summary: &WalkforwardSummary, mode: DiscoveryMode) -> bool {
+    if summary.walk_forward_splits == 0 {
+        return false;
+    }
+    if matches!(mode, DiscoveryMode::Risky) {
+        // Risky = fast capital multiplication, drawdown-agnostic. The prop-firm
+        // per-window rules (daily-loss / consistency / trade-limit / min trading
+        // days) are FTMO constraints — irrelevant here and brutal enough to
+        // reject every aggressive compounder (one bad regime window kills it).
+        // The robustness bar that actually matters for risky is GENERALISATION:
+        // positive AVERAGE out-of-sample PnL AND a MAJORITY of walk-forward folds
+        // individually profitable. Walk-forward still RUNS + is recorded; this is
+        // just the risky-appropriate pass bar.
+        let positive_folds = summary.splits.iter().filter(|s| s.pnl > 0.0).count();
+        let positive_frac = if summary.splits.is_empty() {
+            0.0
+        } else {
+            positive_folds as f64 / summary.splits.len() as f64
+        };
+        return summary.avg_pnl > 0.0 && positive_frac >= 0.60;
+    }
+    // PropFirm / Strict: demand full prop-firm robustness across EVERY window.
+    summary.avg_pnl > 0.0
         && !summary.any_daily_loss_breach
         && !summary.any_consistency_violation
         && !summary.any_trade_limit_violation
@@ -1928,7 +1948,7 @@ fn build_discovery_validation_artifacts(
             metrics,
         ));
 
-        walkforward_passed &= walkforward_summary_passed(&walkforward_summary);
+        walkforward_passed &= walkforward_summary_passed(&walkforward_summary, config.mode);
         walkforward_validation_artifacts.push(WalkforwardValidationArtifactFile::new(
             WalkforwardValidationScope::for_strategy(
                 dataset_hash.clone(),
