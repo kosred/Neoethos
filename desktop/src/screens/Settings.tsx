@@ -4,14 +4,19 @@ import {
   brokerAccounts,
   reauthBroker,
   selectAccount,
+  settings as getSettings,
+  updateSettings,
   type BrokerStatus,
   type AccountInfo,
 } from "../api";
+import { HelpPanel } from "../components/Help";
 
 export default function Settings() {
   const [status, setStatus] = useState<BrokerStatus | null>(null);
   const [accounts, setAccounts] = useState<AccountInfo[]>([]);
+  const [cfg, setCfg] = useState<any>(null);
   const [busy, setBusy] = useState(false);
+  const [modeBusy, setModeBusy] = useState(false);
   const [msg, setMsg] = useState("");
 
   const refresh = async () => {
@@ -20,11 +25,36 @@ export default function Settings() {
     } catch (e) {
       setMsg(String(e));
     }
+    try {
+      setCfg(await getSettings());
+    } catch {
+      /* settings optional */
+    }
   };
 
   useEffect(() => {
     refresh();
   }, []);
+
+  const setMode = async (mode: "risky" | "prop_firm") => {
+    setModeBusy(true);
+    setMsg(`Switching discovery mode to ${mode}…`);
+    try {
+      await updateSettings({ tradingMode: mode });
+      setCfg(await getSettings());
+      setMsg(
+        `✓ Discovery mode = ${mode}. ${
+          mode === "risky"
+            ? "Aggressive account-multiplication search (goal-compounding, drawdown-agnostic)."
+            : "FTMO-style robust search (prop-firm window-pass gates)."
+        } Applies to the next discovery run.`,
+      );
+    } catch (e) {
+      setMsg(`Mode switch failed: ${e}`);
+    } finally {
+      setModeBusy(false);
+    }
+  };
 
   const doReauth = async () => {
     setBusy(true);
@@ -76,8 +106,42 @@ export default function Settings() {
   return (
     <div className="screen">
       <h1>Settings</h1>
-      <p className="sub">Broker connection</p>
+      <p className="sub">Discovery mode &amp; broker connection</p>
 
+      <HelpPanel id="settings-mode">
+        <p>The <b>discovery mode</b> decides what kind of strategies the search hunts for. Pick it here; it applies to the next Discovery / Autopilot run.</p>
+        <p><b>Prop-firm</b> = robust, FTMO-style strategies that must pass strict per-window rules (low drawdown, daily-loss limits). <b>Risky</b> = aggressive account-multiplication — it ranks by how fast it compounds toward your goal at half-Kelly and is drawdown-agnostic. Risky's internals are engine-decided; you only choose the mode + the goal.</p>
+      </HelpPanel>
+
+      <h2>Discovery mode</h2>
+      <div className="ticket">
+        <div className="seg" style={{ maxWidth: 360 }}>
+          <button
+            className={cfg?.tradingMode === "prop_firm" ? "on" : ""}
+            disabled={modeBusy}
+            onClick={() => setMode("prop_firm")}
+          >
+            🛡 Prop-firm (robust)
+          </button>
+          <button
+            className={cfg?.tradingMode === "risky" ? "on buy" : ""}
+            disabled={modeBusy}
+            onClick={() => setMode("risky")}
+          >
+            🚀 Risky (multiply)
+          </button>
+        </div>
+        {cfg && (
+          <p className="muted small" style={{ marginTop: 10 }}>
+            Active: <b>{cfg.tradingMode ?? "?"}</b>
+            {cfg.tradingMode === "risky" && cfg.riskyStartBalance != null && (
+              <> · goal €{Math.round(cfg.riskyStartBalance).toLocaleString()} → €{Math.round(cfg.riskyTargetBalance).toLocaleString()} in {cfg.riskyHorizonDays} days</>
+            )}
+          </p>
+        )}
+      </div>
+
+      <h2>Broker connection</h2>
       <div className="settings-grid">
         <div className="kv">
           <span>Configured</span>

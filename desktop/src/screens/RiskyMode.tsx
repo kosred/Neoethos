@@ -6,16 +6,36 @@ const days = (n: number | null) =>
   n == null || Number.isNaN(n) ? "never" : n >= 365 ? `${(n / 365).toFixed(1)}y` : n >= 30 ? `${(n / 30).toFixed(1)}mo` : `${Math.round(n)}d`;
 const eur = (v: number) => `€${v.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
 
+function ProjBlock({ label, proj }: { label: string; proj: any }) {
+  return (
+    <div className="ticket" style={{ margin: 0 }}>
+      <h2 style={{ marginTop: 0, fontSize: 14 }}>{label}</h2>
+      {proj ? (
+        <div className="cards" style={{ gridTemplateColumns: "1fr 1fr" }}>
+          <div className="card"><div className="card-label">EXPECTED</div><div className="card-value">{days(proj.expectedDays)}</div></div>
+          <div className="card"><div className="card-label">BEST CASE</div><div className="card-value">{days(proj.bestCaseDays)}</div></div>
+          <div className="card"><div className="card-label">RISK / TRADE</div><div className="card-value">{(proj.riskFraction * 100).toFixed(0)}%</div></div>
+          <div className="card"><div className="card-label">RUIN PROB.</div><div className="card-value" style={{ color: "#ef4444" }}>{(proj.ruinProbability * 100).toFixed(1)}%</div></div>
+        </div>
+      ) : (
+        <p className="muted">Computing…</p>
+      )}
+    </div>
+  );
+}
+
 export default function RiskyMode() {
   const { data: cfg } = usePoll(settings, 0);
   const { data: risk } = usePoll(riskInfo, 0);
   const { data: list } = usePoll(strategyList, 0);
 
   const start = cfg?.riskyStartBalance ?? 100;
-  const target = cfg?.riskyTargetBalance ?? 100000;
+  const target = cfg?.riskyTargetBalance ?? 50000;
   const horizon = cfg?.riskyHorizonDays ?? 180;
-  // Engine-decided projection for the CONFIG goal (sourced from config, NOT user input).
-  const { data: proj } = usePoll(() => riskyScenarios({ startingUsd: start, targetUsd: target }), 0, [start, target]);
+  // Engine-decided projections for BOTH headline goals (sourced from the engine,
+  // NOT user input) — 50k is the default target, 100k shown for comparison.
+  const { data: proj50 } = usePoll(() => riskyScenarios({ startingUsd: start, targetUsd: 50000 }), 0, [start]);
+  const { data: proj100 } = usePoll(() => riskyScenarios({ startingUsd: start, targetUsd: 100000 }), 0, [start]);
 
   const mult = target / start;
   const riskyStrats = (list?.strategies ?? []).filter((s) => s.mode === "risky");
@@ -45,18 +65,12 @@ export default function RiskyMode() {
         <div className="card"><div className="card-label">HORIZON</div><div className="card-value">{days(horizon)}</div></div>
       </div>
 
-      <h2>Engine estimate <span className="muted small">(not user-tunable)</span></h2>
-      {proj ? (
-        <div className="cards">
-          <div className="card"><div className="card-label">EXPECTED</div><div className="card-value">{days(proj.expectedDays)}</div></div>
-          <div className="card"><div className="card-label">BEST CASE</div><div className="card-value">{days(proj.bestCaseDays)}</div></div>
-          <div className="card"><div className="card-label">RISK / TRADE</div><div className="card-value">{(proj.riskFraction * 100).toFixed(0)}%</div></div>
-          <div className="card"><div className="card-label">RUIN PROB.</div><div className="card-value" style={{ color: "#ef4444" }}>{(proj.ruinProbability * 100).toFixed(1)}%</div></div>
-        </div>
-      ) : (
-        <p className="muted">Computing…</p>
-      )}
-      <p className="muted small">Costs (spread/commission/swap) are taken per-lot from the broker and folded into every estimate automatically.</p>
+      <h2>Engine estimate <span className="muted small">(not user-tunable · two goals)</span></h2>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <ProjBlock label={`€${eur(start).slice(1)} → €50,000`} proj={proj50} />
+        <ProjBlock label={`€${eur(start).slice(1)} → €100,000`} proj={proj100} />
+      </div>
+      <p className="muted small">Costs (spread/commission/swap) are taken per-lot from the broker and folded into every estimate automatically. The active discovery goal is set in Settings → Discovery mode.</p>
 
       <h2>Strategies found for this dream</h2>
       {riskyStrats.length === 0 ? (

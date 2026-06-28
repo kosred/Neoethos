@@ -427,6 +427,14 @@ export const chartHistory = (symbol: string, timeframe: string, beforeMs: number
 
 export const settings = () => apiGet<any>("/settings");
 
+export type SettingsUpdate = {
+  tradingMode?: "risky" | "prop_firm";
+  riskyStartBalance?: number;
+  riskyTargetBalance?: number;
+  riskyHorizonDays?: number;
+};
+export const updateSettings = (payload: SettingsUpdate) => apiPost<any>("/settings", payload);
+
 export const brokerTimeframes = () => apiGet<{ count: number; timeframes: string[] }>("/broker/timeframes");
 export const settingsPresets = () => apiGet<{ presets: { id: string; label: string; description: string }[] }>("/settings/presets");
 export const knobCatalog = () => apiGet<any>("/settings/knob-catalog");
