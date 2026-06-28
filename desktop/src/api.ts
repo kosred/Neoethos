@@ -439,6 +439,10 @@ export type SettingsUpdate = {
   stagnationPatience?: number;
   noveltyWeight?: number;
   disableSmcGate?: boolean;
+  // News gate config
+  newsCalendarEnabled?: boolean;
+  newsCalendarSource?: string;
+  newsTradingMode?: "block_on_news" | "allow_always" | "warn_only";
 };
 export const updateSettings = (payload: SettingsUpdate) => apiPost<any>("/settings", payload);
 

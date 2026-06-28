@@ -69,6 +69,17 @@ export default function Settings() {
     }
   };
 
+  const setNews = async (patch: Record<string, unknown>) => {
+    setMsg("Saving news settings…");
+    try {
+      await updateSettings(patch as any);
+      setCfg(await getSettings());
+      setMsg("✓ News settings saved to config.yaml.");
+    } catch (e) {
+      setMsg(`News save failed: ${e}`);
+    }
+  };
+
   useEffect(() => {
     refresh();
   }, []);
@@ -291,6 +302,33 @@ export default function Settings() {
           </div>
         )}
         <p className="muted small" style={{ marginTop: 8 }}>Manual orders (Positions) are not gated by these — they apply to automated trading.</p>
+      </div>
+
+      <h2>News gate</h2>
+      <p className="muted small">How automated trading behaves around high-impact news events.</p>
+      <div className="ticket">
+        <div className="ticket-row" style={{ flexWrap: "wrap", gap: 18 }}>
+          <label style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+            <input type="checkbox" checked={!!cfg?.newsCalendarEnabled} onChange={(e) => setNews({ newsCalendarEnabled: e.target.checked })} />
+            Economic calendar enabled
+          </label>
+          <label>Behaviour
+            <select value={cfg?.newsTradingMode ?? "block_on_news"} onChange={(e) => setNews({ newsTradingMode: e.target.value })} style={{ width: 220 }}>
+              <option value="block_on_news">Block on news (pause trading)</option>
+              <option value="allow_always">Allow always (ignore news)</option>
+              <option value="warn_only">Warn only</option>
+            </select>
+          </label>
+        </div>
+        {cfg?.newsCalendarSource && <p className="muted small" style={{ marginTop: 8 }}>Calendar source: <code>{cfg.newsCalendarSource}</code></p>}
+      </div>
+
+      <h2>Data location</h2>
+      <div className="ticket">
+        <p className="muted small">
+          Downloaded bars, trained models, cache and the journal all live under <code>{cfg?.dataDir ?? "—"}</code>.
+          Browse/open folders in <b>Files &amp; Storage</b>; download history + refresh broker costs in <b>Data</b>.
+        </p>
       </div>
 
       <h2>Broker connection</h2>
