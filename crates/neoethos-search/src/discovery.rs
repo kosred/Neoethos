@@ -1789,9 +1789,15 @@ fn build_discovery_validation_artifacts(
     DiscoveryValidationGates,
     Vec<CanonicalBacktestArtifactFile>,
     Vec<WalkforwardValidationArtifactFile>,
+    Vec<bool>,
 )> {
     if portfolio.is_empty() {
-        return Ok((DiscoveryValidationGates::pending(), Vec::new(), Vec::new()));
+        return Ok((
+            DiscoveryValidationGates::pending(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
     }
     let n = validation_row_count(features, ohlcv)?;
     if portfolio_signals.iter().any(|signals| signals.len() != n) {
@@ -1818,6 +1824,11 @@ fn build_discovery_validation_artifacts(
     let mut canonical_backtest_artifacts = Vec::with_capacity(portfolio.len());
     let mut walkforward_validation_artifacts = Vec::with_capacity(portfolio.len());
     let mut walkforward_passed = true;
+    // Per-gene walk-forward pass flags (aligned to `portfolio` order). The caller
+    // uses this in Risky mode to FILTER the exported portfolio down to the genes
+    // that individually clear the risky walk-forward bar (selection pressure)
+    // instead of rejecting the whole portfolio when any single gene fails.
+    let mut per_gene_wf: Vec<bool> = Vec::with_capacity(portfolio.len());
 
     // ── AREA 2 / Stage C (2026-06-09): GPU-routed POPULATION walk-forward ─────
     //
@@ -1948,7 +1959,9 @@ fn build_discovery_validation_artifacts(
             metrics,
         ));
 
-        walkforward_passed &= walkforward_summary_passed(&walkforward_summary, config.mode);
+        let gene_wf_passed = walkforward_summary_passed(&walkforward_summary, config.mode);
+        walkforward_passed &= gene_wf_passed;
+        per_gene_wf.push(gene_wf_passed);
         walkforward_validation_artifacts.push(WalkforwardValidationArtifactFile::new(
             WalkforwardValidationScope::for_strategy(
                 dataset_hash.clone(),
@@ -1982,6 +1995,7 @@ fn build_discovery_validation_artifacts(
         validation_gates,
         canonical_backtest_artifacts,
         walkforward_validation_artifacts,
+        per_gene_wf,
     ))
 }
 
@@ -4008,7 +4022,7 @@ where
     // already failed the bar would just burn the validation tail). They are
     // emitted honestly flagged `fallback_mode` and forced not-export-ready.
     let mut fallback_mode = false;
-    let (mut validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts) =
+    let (mut validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts, per_gene_wf) =
         if portfolio.is_empty() && !best_effort_fallback.is_empty() {
             fallback_mode = true;
             let fallback_reason = funnel
@@ -4061,7 +4075,7 @@ where
             let mut gates = DiscoveryValidationGates::pending();
             gates.fallback_mode = true;
             gates.fallback_reason = fallback_reason;
-            (gates, Vec::new(), Vec::new())
+            (gates, Vec::new(), Vec::new(), Vec::new())
         } else {
             build_discovery_validation_artifacts(
                 &portfolio,
@@ -4071,6 +4085,40 @@ where
                 config,
             )?
         };
+
+    // Risky-mode walk-forward FILTER (operator 2026-06-28). The portfolio-level
+    // gate was all-or-nothing: ONE marginal gene made `walkforward_passed=false`
+    // → the whole portfolio was rejected → 0 exports across the sweep. Instead,
+    // keep only the genes that individually clear the risky walk-forward bar, so
+    // walk-forward acts as SELECTION pressure and we export the robust SUBSET
+    // (never the overfit ones). Only `portfolio` is filtered — `quality_metrics`
+    // is the full screened-candidate record (a superset, searched by id
+    // downstream), not positionally aligned to `portfolio`. The clean final OOS
+    // read remains the (upcoming) sealed lockbox + the live demo-forward gate.
+    if matches!(config.mode, DiscoveryMode::Risky)
+        && !fallback_mode
+        && per_gene_wf.len() == portfolio.len()
+        && per_gene_wf.iter().any(|&p| p)
+        && !per_gene_wf.iter().all(|&p| p)
+    {
+        let keep = per_gene_wf.clone();
+        let before = portfolio.len();
+        let mut i = 0usize;
+        portfolio.retain(|_| {
+            let k = keep[i];
+            i += 1;
+            k
+        });
+        // Surviving genes each passed walk-forward → the portfolio now does too.
+        validation_gates.walkforward_passed = !portfolio.is_empty();
+        tracing::info!(
+            target: "neoethos_search::discovery",
+            kept = portfolio.len(),
+            dropped = before - portfolio.len(),
+            "risky walk-forward filter: exported only the WF-passing gene subset"
+        );
+    }
+
     if let Some(pf) = config.prop_firm_gate.as_ref() {
         // agent 2026-06-05 overfitting fix: the prop-firm window gate alone let
         // in-sample-overfit portfolios export (walk-forward was informational).
