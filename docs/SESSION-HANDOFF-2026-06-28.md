@@ -5,6 +5,12 @@ Read this first. Companion memory: `settings-consolidation-directive`, `tauri-mi
 
 ---
 
+## UPDATE (cont. 2026-06-29)
+- **Settings consolidation cont.:** News gate + Data location sections + Help "Search tuning" section (commits f0ef9bc4, 4bf7deb2 earlier). Installer rebuilt OK (17:53, 37.2MB) after a disk-pressure build failure.
+- **DISK-LEAK FOUND + FIXED (commit 24b7142f):** discovery mmaps the multi-TF cube to `%TEMP%/neoethos_feature_store/<sym>_<tf>_<PID>.fstore` — **M3 cube ≈ 12 GB each**. `delete_on_drop` cleans it on GRACEFUL exit, but FORCE-KILLING the run (we did, to swap engine builds) skips Drop → leak; accumulated ~29 GB. Reclaimed 28 GB (deleted the temp dir). Fix = startup sweep of orphan `.fstore` (Windows refuses deletion of live-mapped files → safe). **CLI rebuilt 18:11 with the fix. OPERATIONAL RULE: stop discovery via `cache/risky_stop.flag` (graceful), NOT force-kill.**
+- **Discovery GA-tuned run RESULT (proof):** EURUSD alone produced **35 validated strategies** (H1=6, M30=8, M15=12, M5=9) vs **1** pre-tuning. Stopped at EURUSD M3 (the 12 GB unit) for disk. Strategies in `cache/auto_loop/`. Note: M3 base = ~12 GB transient disk while running (cleaned after, with the fix).
+- **Latest builds:** installer `NeoEthos_0.5.0_x64-setup.exe` (17:53, has News/Data/Help + disk fix) — REINSTALL. CLI `target/release/neoethos-cli.exe` (18:11, leak-free).
+
 ## 0) IMMEDIATE GOAL
 - **Today:** finish the in-flight UI/config changes (commit + build) so they're not lost.
 - **Tomorrow:** put EXISTING discovered strategies into operation (Autopilot → demo → live) and stress-test the **Auto-Trading UI + backend** for bugs. (Tomorrow is a weekday → forex OPEN → live spots/candles/pips will actually flow.)
