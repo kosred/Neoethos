@@ -954,6 +954,12 @@ fn discovery_feature_store_path(symbol: &str, base_tf: &str) -> std::path::PathB
     let mut dir = std::env::temp_dir();
     dir.push("neoethos_feature_store");
     let _ = std::fs::create_dir_all(&dir);
+    // Sweep ORPHAN feature stores left by FORCE-KILLED prior runs (Drop's
+    // delete_on_drop only fires on graceful exit; a kill leaks the file — and
+    // the multi-TF M3 cube is ~12 GB each, so a few killed runs fill the disk).
+    // Best-effort: on Windows a file still mmap'd by a LIVE process refuses
+    // deletion, so this only removes genuine orphans from dead processes.
+    sweep_orphan_feature_stores(&dir);
     dir.push(format!(
         "{}_{}_{}.fstore",
         sanitize(symbol),
@@ -961,6 +967,38 @@ fn discovery_feature_store_path(symbol: &str, base_tf: &str) -> std::path::PathB
         std::process::id()
     ));
     dir
+}
+
+/// Delete `.fstore` files orphaned by force-killed discovery runs. Runs once per
+/// process (before this process creates any of its own stores). On Windows a
+/// live process's mapped file refuses `remove_file`, so live runs are protected.
+fn sweep_orphan_feature_stores(dir: &std::path::Path) {
+    use std::sync::OnceLock;
+    static SWEPT: OnceLock<()> = OnceLock::new();
+    if SWEPT.set(()).is_err() {
+        return; // already swept this process
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut freed = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("fstore") {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(&path).is_ok() {
+            freed += size;
+        }
+    }
+    if freed > 0 {
+        tracing::info!(
+            target: "neoethos_data::feature_store",
+            freed_mb = freed / (1024 * 1024),
+            "swept orphan feature stores from force-killed runs"
+        );
+    }
 }
 
 /// Stream one in-RAM `[samples × cols]` feature block to the mmap store, column
