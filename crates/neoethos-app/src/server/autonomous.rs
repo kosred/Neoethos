@@ -102,53 +102,125 @@ pub async fn replay(State(state): State<AppApiState>, body: Option<Json<ReplayBo
 ///
 /// Body: `StartRequest` JSON (portfolio_path required; lot_size, sl/tp optional).
 /// Returns 409 if already running, 200 with the initial status on success.
-pub async fn start_live(State(state): State<AppApiState>, Json(req): Json<StartRequest>) -> Response {
-    let mut slot = match state.live_trading.lock() {
-        Ok(g) => g,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response(),
-    };
+/// HTTP body for `/autonomous/start`. Accepts EITHER a single `portfolio_path`
+/// or a list `portfolio_paths` — run several discovered strategies at once, each
+/// in its own concurrent (internally multi-timeframe) engine. Sizing / SL / TP /
+/// warmup apply to every started engine.
+#[derive(Debug, serde::Deserialize)]
+pub struct StartLiveBody {
+    pub portfolio_path: Option<String>,
+    #[serde(default)]
+    pub portfolio_paths: Vec<String>,
+    #[serde(default = "crate::app_services::live_trading::default_lot_size")]
+    pub lot_size: f64,
+    pub stop_loss_pips: Option<f64>,
+    pub take_profit_pips: Option<f64>,
+    #[serde(default = "crate::app_services::live_trading::default_warmup_bars")]
+    pub warmup_bars: usize,
+}
 
-    if slot.as_ref().map(|h| h.is_running()).unwrap_or(false) {
+/// Aggregate status across every running engine.
+fn live_overview(handles: &[crate::app_services::live_trading::Handle]) -> serde_json::Value {
+    let engines: Vec<LiveTradingStatus> = handles.iter().map(|h| h.snapshot()).collect();
+    serde_json::json!({
+        "running": engines.iter().any(|e| e.running),
+        "engineCount": engines.len(),
+        "engines": engines,
+    })
+}
+
+pub async fn start_live(
+    State(state): State<AppApiState>,
+    Json(body): Json<StartLiveBody>,
+) -> Response {
+    // Resolve the set of portfolios to run (list + optional single, de-duped).
+    let mut paths: Vec<String> = body.portfolio_paths.clone();
+    if let Some(p) = body.portfolio_path.clone() {
+        paths.push(p);
+    }
+    paths.retain(|p| !p.trim().is_empty());
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
         return (
-            StatusCode::CONFLICT,
+            StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "live trading is already running — POST /autonomous/stop first"
+                "error": "no portfolio_path / portfolio_paths provided"
             })),
         )
             .into_response();
     }
 
-    match crate::app_services::live_trading::start(req) {
-        Ok(handle) => {
-            let status = handle.snapshot();
-            *slot = Some(handle);
-            (StatusCode::OK, Json(status)).into_response()
-        }
-        Err(e) => actionable_error(
-            StatusCode::BAD_REQUEST,
-            "Failed to start live trading. Check the portfolio_path and broker credentials.",
-            &e,
-        ),
-    }
-}
-
-/// `POST /autonomous/stop` — gracefully stop the live trading loop.
-pub async fn stop_live(State(state): State<AppApiState>) -> Response {
-    let slot = match state.live_trading.lock() {
+    let mut slot = match state.live_trading.lock() {
         Ok(g) => g,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response(),
     };
-    match slot.as_ref() {
-        Some(handle) => {
-            handle.stop();
-            (StatusCode::OK, Json(serde_json::json!({"stopped": true}))).into_response()
+    // Keep only still-running engines so the registry reflects reality.
+    slot.retain(|h| h.is_running());
+    let already: std::collections::HashSet<String> = slot
+        .iter()
+        .filter_map(|h| h.snapshot().portfolio_path)
+        .collect();
+
+    let mut started: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut failed: Vec<serde_json::Value> = Vec::new();
+    for path in paths {
+        if already.contains(&path) {
+            skipped.push(path);
+            continue;
         }
-        None => (
-            StatusCode::OK,
-            Json(serde_json::json!({"stopped": false, "reason": "was not running"})),
-        )
-            .into_response(),
+        let req = StartRequest {
+            portfolio_path: path.clone(),
+            lot_size: body.lot_size,
+            stop_loss_pips: body.stop_loss_pips,
+            take_profit_pips: body.take_profit_pips,
+            warmup_bars: body.warmup_bars,
+        };
+        match crate::app_services::live_trading::start(req) {
+            Ok(handle) => {
+                started.push(path);
+                slot.push(handle);
+            }
+            Err(e) => {
+                failed.push(serde_json::json!({"portfolio": path, "error": e.to_string()}))
+            }
+        }
     }
+
+    let code = if started.is_empty() && !failed.is_empty() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    };
+    (
+        code,
+        Json(serde_json::json!({
+            "started": started,
+            "skipped": skipped,
+            "failed": failed,
+            "overview": live_overview(&slot),
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /autonomous/stop` — gracefully stop ALL running live engines.
+pub async fn stop_live(State(state): State<AppApiState>) -> Response {
+    let mut slot = match state.live_trading.lock() {
+        Ok(g) => g,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response(),
+    };
+    let count = slot.len();
+    for handle in slot.iter() {
+        handle.stop();
+    }
+    slot.clear();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"stopped": count > 0, "enginesStopped": count})),
+    )
+        .into_response()
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -190,15 +262,13 @@ pub async fn gate(Query(q): Query<GateQuery>) -> Response {
     }
 }
 
-/// `GET /autonomous/status` — poll live trading state.
+/// `GET /autonomous/status` — poll all live engines. Returns
+/// `{ running, engineCount, engines: [LiveTradingStatus...] }`.
 pub async fn live_status(State(state): State<AppApiState>) -> Response {
-    let slot = match state.live_trading.lock() {
+    let mut slot = match state.live_trading.lock() {
         Ok(g) => g,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response(),
     };
-    let status: LiveTradingStatus = slot
-        .as_ref()
-        .map(|h| h.snapshot())
-        .unwrap_or_default();
-    Json(status).into_response()
+    slot.retain(|h| h.is_running());
+    Json(live_overview(&slot)).into_response()
 }

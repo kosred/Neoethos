@@ -71,105 +71,177 @@ function GatePanel({ gate }: { gate: GateVerdict | null }) {
   );
 }
 
+const fileTail = (p: string) => p.split(/[\\/]/).pop() ?? p;
+
 export default function Autopilot() {
   const { data: list, error, reload } = usePoll(portfoliosList, 0);
   const { data: status, reload: reloadStatus } = usePoll(autonomousStatus, 3000);
-  const [sel, setSel] = useState<PortfolioEntry | null>(null);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [focus, setFocus] = useState<PortfolioEntry | null>(null);
   const [gate, setGate] = useState<GateVerdict | null>(null);
   const [replay, setReplay] = useState<any>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
 
-  const running = !!(status?.running ?? status?.live ?? status?.active);
+  const engines: any[] = status?.engines ?? [];
+  const running = !!status?.running;
+  const runningPaths = new Set(engines.map((e) => e.portfolioPath));
+  const portfolios = list?.portfolios ?? [];
 
-  // Fetch the demo forward-test verdict whenever the selected strategy changes.
+  // Demo forward-test verdict for the focused strategy.
   useEffect(() => {
     setGate(null);
-    if (!sel?.path) return;
+    if (!focus?.path) return;
     let live = true;
-    autonomousGate(sel.path)
+    autonomousGate(focus.path)
       .then((v) => { if (live) setGate(v); })
       .catch(() => { if (live) setGate(null); });
     return () => { live = false; };
-  }, [sel?.path]);
+  }, [focus?.path]);
 
-  const act = async (fn: () => Promise<any>, label: string) => {
-    if (!sel) { setMsg("Pick a strategy first."); return; }
+  const toggle = (path: string) =>
+    setSelected((s) => (s.includes(path) ? s.filter((x) => x !== path) : [...s, path]));
+
+  const startSelected = async () => {
+    if (selected.length === 0) { setMsg("Tick at least one strategy to run."); return; }
     setBusy(true);
-    setMsg(`${label} ${sel.symbol ?? ""} ${sel.baseTf ?? ""}…`);
+    setMsg(`Starting ${selected.length} engine${selected.length === 1 ? "" : "s"}…`);
     try {
-      const r = await fn();
-      if (label === "Replaying") setReplay(r);
-      setMsg(`✓ ${label} done.`);
+      const r: any = await autonomousStart({ portfolio_paths: selected });
+      const s = r?.started?.length ?? 0;
+      const sk = r?.skipped?.length ?? 0;
+      const f = r?.failed ?? [];
+      let m = `✓ Started ${s}${sk ? `, ${sk} already running` : ""}${f.length ? `, ${f.length} blocked/failed` : ""}.`;
+      if (f.length) m += " — " + f.map((x: any) => `${fileTail(x.portfolio)}: ${x.error}`).join("; ");
+      setMsg(m);
       await reloadStatus();
     } catch (e) {
-      setMsg(`${label} failed: ${e}`);
+      setMsg(`Start failed: ${e}`);
     } finally {
       setBusy(false);
     }
   };
 
-  // Replay reads on-disk history (ReplayBody = symbol/base_tf).
-  const replayBody = sel ? { symbol: sel.symbol ?? undefined, base_tf: sel.baseTf ?? undefined } : {};
-  // Live start drives a portfolio file (StartRequest = portfolio_path).
-  const startBody = sel ? { portfolio_path: sel.path } : {};
-  const liveBlocked = !!(gate?.enforced && !gate.eligible);
+  const stopAll = async () => {
+    setBusy(true);
+    setMsg("Stopping all engines…");
+    try {
+      await autonomousStop();
+      setMsg("✓ All engines stopped.");
+      await reloadStatus();
+    } catch (e) {
+      setMsg(`Stop failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doReplay = async () => {
+    if (!focus) { setMsg("Click a strategy name to focus it, then Replay."); return; }
+    setBusy(true);
+    setMsg(`Replaying ${focus.symbol ?? ""} ${focus.baseTf ?? ""}…`);
+    try {
+      const r = await autonomousReplay({ symbol: focus.symbol ?? undefined, base_tf: focus.baseTf ?? undefined });
+      setReplay(r);
+      setMsg("✓ Replay done.");
+    } catch (e) {
+      setMsg(`Replay failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="screen">
-      <h1>Autopilot <span className={`badge ${running ? "live" : "demo"}`}>{running ? "LIVE RUNNING" : "STOPPED"}</span></h1>
-      <p className="sub">Run an EXISTING discovered strategy — dry-run on history or live — with clear file provenance</p>
+      <h1>
+        Autopilot{" "}
+        <span className={`badge ${running ? "live" : "demo"}`}>
+          {running ? `LIVE · ${engines.length} engine${engines.length === 1 ? "" : "s"}` : "STOPPED"}
+        </span>
+      </h1>
+      <p className="sub">Run one or MANY discovered strategies at once — each is internally multi-timeframe and trades concurrently</p>
 
       <HelpPanel id="autopilot">
-        <p>Autopilot runs a discovered strategy <b>for you</b> — first safely on history, then on the broker.</p>
-        <HelpStep n={1}>Pick a portfolio from the list (each row is a discovered strategy with its file path).</HelpStep>
-        <HelpStep n={2}><b>Replay (dry-run)</b> tests it on stored history with zero broker calls — safe to run anytime.</HelpStep>
-        <HelpStep n={3}>The <b>demo forward-test gate</b> below shows if the strategy has earned real money: ≥100 demo trades whose live results stay within 20% of the backtest.</HelpStep>
-        <HelpStep n={4}><b>Start live</b> runs the loop. On a <b>Demo</b> account it always runs (building the track record); on a <b>Live</b> account it's blocked until the gate passes. <b>Stop</b> halts it.</HelpStep>
+        <p>Autopilot runs your discovered strategies <b>for you</b>. Each strategy already reads every higher timeframe internally; running several together is like a trader watching multiple setups at once.</p>
+        <HelpStep n={1}>Tick the strategies you want to run (use <b>Select all</b> to deploy your whole library). Click a name to <b>focus</b> it for Replay + the demo-gate detail.</HelpStep>
+        <HelpStep n={2}><b>Replay (dry-run)</b> tests the focused strategy on stored history with zero broker calls.</HelpStep>
+        <HelpStep n={3}><b>Start selected (live)</b> launches one concurrent engine per ticked strategy. On a <b>Demo</b> account they always run (building the track record); on a <b>Live</b> account each is blocked until its demo gate passes — blocked ones are reported, the rest still start.</HelpStep>
+        <HelpStep n={4}><b>Stop all</b> halts every running engine.</HelpStep>
       </HelpPanel>
 
       <div className="btn-row">
         <button onClick={reload} disabled={busy}>Refresh strategies</button>
-        <span className="muted small">{list?.count ?? 0} portfolios found</span>
+        <span className="muted small">{list?.count ?? 0} portfolios found · {selected.length} selected</span>
       </div>
       {error && <div className="banner warn">{error}</div>}
 
-      {(list?.portfolios.length ?? 0) === 0 ? (
+      {portfolios.length === 0 ? (
         <p className="muted">No discovered strategies yet — run Discovery, then promote in Strategy Lab.</p>
       ) : (
-        <table className="tbl">
-          <thead><tr><th></th><th>Symbol</th><th>Base TF</th><th>Genes</th><th>File</th><th></th></tr></thead>
-          <tbody>
-            {list!.portfolios.map((p) => (
-              <tr key={p.path} className={sel?.path === p.path ? "row-sel" : ""}>
-                <td><input type="radio" checked={sel?.path === p.path} onChange={() => setSel(p)} /></td>
-                <td><b>{p.symbol ?? "?"}</b></td>
-                <td>{p.baseTf ?? "?"}</td>
-                <td>{p.geneCount ?? "—"}</td>
-                <td style={{ fontFamily: "monospace", fontSize: 11, color: "#9ca3af", maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={p.path}>{p.fileName}</td>
-                <td><button onClick={() => openPath(p.path).catch(() => {})}>Open</button></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <>
+          <div className="btn-row" style={{ marginBottom: 6 }}>
+            <button className="link" onClick={() => setSelected(portfolios.map((p) => p.path))}>Select all</button>
+            <button className="link" onClick={() => setSelected([])}>None</button>
+          </div>
+          <table className="tbl">
+            <thead><tr><th></th><th>Symbol</th><th>Base TF</th><th>Genes</th><th>File</th><th></th></tr></thead>
+            <tbody>
+              {portfolios.map((p) => {
+                const live = runningPaths.has(p.path);
+                return (
+                  <tr key={p.path} className={focus?.path === p.path ? "row-sel" : ""}>
+                    <td><input type="checkbox" checked={selected.includes(p.path)} onChange={() => toggle(p.path)} /></td>
+                    <td>
+                      <button className="link" onClick={() => setFocus(p)} style={{ fontWeight: 700 }}>{p.symbol ?? "?"}</button>
+                      {live && <span className="badge live" style={{ marginLeft: 6, fontSize: 9 }}>LIVE</span>}
+                    </td>
+                    <td>{p.baseTf ?? "?"}</td>
+                    <td>{p.geneCount ?? "—"}</td>
+                    <td style={{ fontFamily: "monospace", fontSize: 11, color: "#9ca3af", maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={p.path}>{p.fileName}</td>
+                    <td><button onClick={() => openPath(p.path).catch(() => {})}>Open</button></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </>
       )}
 
       <div className="ticket" style={{ marginTop: 14 }}>
-        <h2>{sel ? `${sel.symbol ?? "?"} ${sel.baseTf ?? ""}` : "Select a strategy above"}</h2>
-        {sel && <p className="muted small">{sel.path}</p>}
         <div className="btn-row">
-          <button disabled={busy || !sel} onClick={() => act(() => autonomousReplay(replayBody), "Replaying")}>Replay (dry-run)</button>
-          <button className="primary" disabled={busy || !sel || running || liveBlocked} title={liveBlocked ? "Blocked by the demo forward-test gate" : ""} onClick={() => act(() => autonomousStart(startBody), "Starting live")}>Start live</button>
-          <button className="danger" disabled={busy || !running} onClick={() => act(() => autonomousStop(), "Stopping")}>Stop</button>
+          <button disabled={busy || !focus} onClick={doReplay}>Replay focused (dry-run)</button>
+          <button className="primary" disabled={busy || selected.length === 0} onClick={startSelected}>
+            Start selected (live) · {selected.length}
+          </button>
+          <button className="danger" disabled={busy || !running} onClick={stopAll}>Stop all</button>
         </div>
-        {liveBlocked && <div className="banner warn">Live is blocked — this strategy hasn't cleared the demo forward-test yet. Run it on a Demo account first.</div>}
+        {focus && <p className="muted small" style={{ marginTop: 8 }}>Focused: {focus.symbol} {focus.baseTf} — {focus.path}</p>}
         {msg && <div className="banner info">{msg}</div>}
       </div>
 
       <GatePanel gate={gate} />
 
-      <h2>Live engine status</h2>
-      {status ? <StatGrid data={status} /> : <p className="muted">No status yet.</p>}
+      {engines.length > 0 && (
+        <>
+          <h2>Running engines <span className="muted">({engines.length})</span></h2>
+          <table className="tbl">
+            <thead><tr><th>Symbol</th><th>Base TF</th><th>Genes</th><th>Bars eval</th><th>Last signal</th><th>Open pos</th></tr></thead>
+            <tbody>
+              {engines.map((e, i) => (
+                <tr key={e.portfolioPath ?? i}>
+                  <td><b>{e.symbol ?? "?"}</b></td>
+                  <td>{e.baseTf ?? "?"}</td>
+                  <td>{e.genes ?? "—"}</td>
+                  <td>{typeof e.barsEvaluated === "number" ? e.barsEvaluated.toLocaleString() : "—"}</td>
+                  <td>{e.lastSignal ?? "—"}</td>
+                  <td>{e.openPositionId ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+
       {replay && (<><h2>Replay result</h2><StatGrid data={replay} /></>)}
     </div>
   );

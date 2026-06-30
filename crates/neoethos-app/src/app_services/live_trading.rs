@@ -41,18 +41,22 @@ pub struct StartRequest {
     pub warmup_bars: usize,
 }
 
-fn default_lot_size() -> f64 {
+pub fn default_lot_size() -> f64 {
     0.01
 }
-fn default_warmup_bars() -> usize {
+pub fn default_warmup_bars() -> usize {
     1000
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LiveTradingStatus {
     pub running: bool,
+    /// Which portfolio file this engine is running — lets the supervisor
+    /// identify each concurrent engine and the UI label its row.
+    pub portfolio_path: Option<String>,
     pub symbol: Option<String>,
     pub base_tf: Option<String>,
     pub genes: usize,
@@ -65,6 +69,7 @@ impl Default for LiveTradingStatus {
     fn default() -> Self {
         Self {
             running: false,
+            portfolio_path: None,
             symbol: None,
             base_tf: None,
             genes: 0,
@@ -127,6 +132,7 @@ pub fn start(req: StartRequest) -> Result<Handle> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let status = Arc::new(std::sync::Mutex::new(LiveTradingStatus {
         running: true,
+        portfolio_path: Some(req.portfolio_path.clone()),
         ..Default::default()
     }));
 
