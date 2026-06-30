@@ -227,12 +227,26 @@ impl FeatureStore {
 impl Drop for FeatureStore {
     fn drop(&mut self) {
         if self.delete_on_drop {
+            // Capture size before unmap so we can report exactly how much disk
+            // is reclaimed when this TF's cube is released (operator visibility
+            // — the build streams 12+ GB cubes that were previously invisible).
+            let freed_mb = std::fs::metadata(&self.path)
+                .map(|m| m.len() / (1 << 20))
+                .unwrap_or(0);
             // Unmap BEFORE deleting — Windows denies removal of a mapped file.
             self.mmap = None;
-            if let Err(e) = std::fs::remove_file(&self.path) {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => {
+                    tracing::info!(
+                        target: "neoethos_data::feature_store",
+                        path = %self.path.display(),
+                        freed_mb,
+                        "released feature cube — disk reclaimed"
+                    );
+                }
                 // Best-effort: a leftover temp file is harmless (next run
                 // truncate-creates over it); only warn so disk creep is visible.
-                if e.kind() != std::io::ErrorKind::NotFound {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                     tracing::warn!(
                         target: "neoethos_data::feature_store",
                         path = %self.path.display(),
@@ -240,6 +254,7 @@ impl Drop for FeatureStore {
                         "failed to remove feature store backing file on drop"
                     );
                 }
+                Err(_) => {}
             }
         }
     }

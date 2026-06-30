@@ -592,6 +592,18 @@ pub fn current_hardware_runtime_overrides() -> &'static HardwareRuntimeOverrides
     HARDWARE_RUNTIME_OVERRIDES.get_or_init(HardwareRuntimeOverrides::default)
 }
 
+/// Currently-available physical RAM in bytes (a fresh point-in-time probe).
+///
+/// Cheap enough to call before each feature-cube build so the builder can
+/// decide RAM-resident vs disk-mmap assembly based on the machine's actual
+/// free memory at that moment. Returns 0 if the probe fails, which callers
+/// treat as "unknown → take the safe (disk) path".
+pub fn available_memory_bytes() -> u64 {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.available_memory()
+}
+
 impl HardwareProbe {
     pub fn new() -> Self {
         Self::with_runtime_overrides(current_hardware_runtime_overrides().clone())

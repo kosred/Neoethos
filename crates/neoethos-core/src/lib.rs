@@ -50,7 +50,7 @@ pub use schema_version::{
     ensure_schema_version_readable,
 };
 pub use system::{
-    AcceleratorBackend, AcceleratorDevice, CpuBudget, GpuBudget, HardwareExecutionPlan,
-    HardwareRuntimeOverrides, PrecisionPolicy, ResolvedWorkloadAssignment, TrainingPrecision,
-    WorkloadExecutionPlan, WorkloadKind,
+    available_memory_bytes, AcceleratorBackend, AcceleratorDevice, CpuBudget, GpuBudget,
+    HardwareExecutionPlan, HardwareRuntimeOverrides, PrecisionPolicy, ResolvedWorkloadAssignment,
+    TrainingPrecision, WorkloadExecutionPlan, WorkloadKind,
 };

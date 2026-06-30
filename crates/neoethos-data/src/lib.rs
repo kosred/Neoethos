@@ -1020,6 +1020,107 @@ fn append_feature_block(
     Ok(())
 }
 
+/// Compute + align ONE higher-timeframe feature block onto the base grid.
+/// Returns `None` when the higher TF equals the base or is absent from the
+/// dataset. Shared by the in-RAM and streaming (mmap) cube builders so the
+/// F-308 stale-data handling and the alignment live in a single place.
+fn compute_aligned_higher_block(
+    ds: &SymbolDataset,
+    base_tf: &str,
+    base_ns: &[i64],
+    h_tf: &str,
+    profile: FeatureProfile,
+) -> Result<Option<(Vec<String>, Array2<f32>)>> {
+    if h_tf == base_tf {
+        return Ok(None);
+    }
+    let Some(h_ohlcv) = ds.frames.get(h_tf) else {
+        return Ok(None);
+    };
+    let h_feats = compute_hpc_feature_frame(h_ohlcv, profile)?;
+    let h_ns = h_ohlcv
+        .timestamp
+        .as_ref()
+        .context("higher tf has no timestamps")?;
+    // F-308: cap forward-fill at 2× the higher-TF period so stale higher-TF
+    // data becomes NaN (flagged downstream) instead of a frozen-constant
+    // column that would feed the GA zero / look-alike signals.
+    let max_age_ns = parse_timeframe_to_minutes(h_tf)
+        .ok()
+        .filter(|m| *m > 0)
+        .map(|m| (m as i64).saturating_mul(60).saturating_mul(1_000_000_000).saturating_mul(2));
+    let base_last = base_ns.last().copied().unwrap_or(0);
+    let h_last = h_ns.last().copied().unwrap_or(0);
+    if base_last > 0 && h_last > 0 && base_last > h_last {
+        if let Some(max_age) = max_age_ns {
+            let lag_ns = base_last - h_last;
+            if lag_ns > max_age {
+                tracing::warn!(
+                    target: "neoethos_data::prepare_multitimeframe_features",
+                    base_tf = base_tf,
+                    higher_tf = h_tf,
+                    lag_seconds = lag_ns / 1_000_000_000,
+                    max_age_seconds = max_age / 1_000_000_000,
+                    "higher-TF last bar is older than 2× period — feature columns past max_age will be NaN. Re-run --bootstrap-data for this (symbol, timeframe) to refresh."
+                );
+            }
+        }
+    }
+    let h_names: Vec<String> = h_feats
+        .names
+        .iter()
+        .map(|n| format!("{}_{}", h_tf, n))
+        .collect();
+    let h_block = match h_feats.data {
+        crate::core::features::FeatureData::InMemory(a) => a,
+        crate::core::features::FeatureData::Mmap(_) => {
+            anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
+        }
+    };
+    let aligned = align_features_by_ns(base_ns, h_ns, &h_block, true, max_age_ns);
+    Ok(Some((h_names, aligned)))
+}
+
+/// Normalise each column of an in-RAM feature block in place (robust z-score),
+/// matching the per-series normalisation `append_feature_block` applies on the
+/// streaming path so the two cube layouts stay identical.
+fn normalize_block_columns(block: &mut Array2<f32>) {
+    for mut col in block.columns_mut() {
+        let mut series: Vec<f32> = col.to_vec();
+        crate::core::normalization::normalize_feature_series_in_place(&mut series);
+        for (dst, src) in col.iter_mut().zip(series) {
+            *dst = src;
+        }
+    }
+}
+
+/// Decide whether the multi-TF feature cube is assembled in RAM (fast, no disk
+/// write/cleanup) or streamed to a disk-mmap store (the NEVER-OOM fallback).
+///
+/// `NEOETHOS_FEATURE_CUBE_MODE = ram | disk | auto` forces the choice. The
+/// default `auto` builds in RAM only when the estimated cube fits with a wide
+/// margin: in-RAM assembly peaks at ~2× the cube (per-TF blocks + the
+/// concatenated result), so we require 2.5× the cube plus a 2 GB floor for the
+/// OS and the GA's working buffers to stay free. A failed free-RAM probe (0)
+/// takes the safe disk path.
+fn should_build_cube_in_ram(cube_bytes: u64) -> bool {
+    match std::env::var("NEOETHOS_FEATURE_CUBE_MODE")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("ram") => return true,
+        Some("disk") => return false,
+        _ => {}
+    }
+    let available = neoethos_core::available_memory_bytes();
+    if available == 0 {
+        return false;
+    }
+    let needed = (cube_bytes as f64) * 2.5 + 2.0e9;
+    needed < available as f64
+}
+
 pub fn prepare_multitimeframe_features_with_options(
     ds: &SymbolDataset,
     base_tf: &str,
@@ -1040,103 +1141,115 @@ pub fn prepare_multitimeframe_features_with_options(
 
     let n_samples = base_ns.len();
 
-    // ── Out-of-core feature assembly ──────────────────────────────────────
+    // ── RAM-aware multi-resolution feature cube ───────────────────────────
     //
-    // The multi-resolution feature matrix for full M1 data is ~13 GB dense
-    // (5.27M samples x ~618 features x 4 B), and the old path held it more than
-    // once (per-TF parts + a concatenated copy) plus the GA's transposed copy
-    // — ~30-40 GB, which overflowed the Windows commit limit and OOM'd.
-    // Instead we stream each timeframe's features straight into a feature-major
-    // mmap store (one contiguous row per feature = exactly the GA's
-    // `indicators.row(idx)` layout). Peak RAM is now ONE timeframe's
-    // `compute_hpc_feature_frame` (~10 GB for base M1), not the whole cube; the
-    // store is paged from disk on demand and auto-deleted when the returned
-    // frame drops.
-    let store_path = discovery_feature_store_path(&ds.symbol, base_tf);
-    let mut writer =
-        crate::core::feature_store::FeatureStoreWriter::create(&store_path, n_samples)?;
-    let mut all_names: Vec<String> = Vec::new();
+    // The dense cube is `n_samples × features × 4 B` (~13 GB for full M1). When
+    // the machine has enough free RAM we assemble it directly in memory (no
+    // disk write, nothing to clean up); otherwise we stream each TF into a
+    // feature-major mmap store so peak RAM stays at ONE timeframe's compute —
+    // the NEVER-OOM fallback that lets discovery run on any hardware. The
+    // sink is chosen per (symbol, TF) from the cube estimate vs free RAM.
     let normalize = current_data_runtime_overrides().normalize_features;
 
-    // Base timeframe — native resolution, no alignment needed.
+    // Base timeframe — native resolution, no alignment. Computed up front
+    // (needed by both sink paths) and used to size the cube.
     let base_feats = compute_hpc_feature_frame(base_ohlcv, opts.profile)?;
-    all_names.extend(base_feats.names.iter().map(|n| {
-        if opts.prefix_base_features {
-            format!("{}_{}", base_tf, n)
-        } else {
-            n.clone()
-        }
-    }));
+    let base_names: Vec<String> = base_feats
+        .names
+        .iter()
+        .map(|n| {
+            if opts.prefix_base_features {
+                format!("{}_{}", base_tf, n)
+            } else {
+                n.clone()
+            }
+        })
+        .collect();
     let base_block = match base_feats.data {
         crate::core::features::FeatureData::InMemory(a) => a,
         crate::core::features::FeatureData::Mmap(_) => {
             anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
         }
     };
+
+    // Active higher TFs (present in the dataset, not the base).
+    let active_higher: Vec<String> = opts
+        .higher_tfs
+        .iter()
+        .filter(|h| h.as_str() != base_tf && ds.frames.contains_key(h.as_str()))
+        .cloned()
+        .collect();
+
+    // Per-TF feature count = base block width (same registry for every TF);
+    // estimate the whole cube and pick RAM vs disk-mmap accordingly.
+    let per_tf = base_block.ncols().max(1);
+    let est_features = per_tf.saturating_mul(1 + active_higher.len());
+    let cube_bytes = (n_samples as u64)
+        .saturating_mul(est_features as u64)
+        .saturating_mul(4);
+    let in_ram = should_build_cube_in_ram(cube_bytes);
+    tracing::info!(
+        target: "neoethos_data::prepare_multitimeframe_features",
+        symbol = %ds.symbol,
+        base_tf = base_tf,
+        rows = n_samples,
+        per_tf_features = per_tf,
+        timeframes = 1 + active_higher.len(),
+        est_cube_gb = format!("{:.2}", cube_bytes as f64 / 1e9),
+        available_ram_gb = format!("{:.1}", neoethos_core::available_memory_bytes() as f64 / 1e9),
+        sink = if in_ram { "RAM (no disk write)" } else { "disk mmap" },
+        "feature cube build plan"
+    );
+
+    if in_ram {
+        // Collect each TF block, then concatenate once along the feature axis.
+        // No disk store is created — nothing to leak or clean up later.
+        let mut all_names = base_names;
+        let mut base_block = base_block;
+        if normalize {
+            normalize_block_columns(&mut base_block);
+        }
+        let mut blocks: Vec<Array2<f32>> = Vec::with_capacity(1 + active_higher.len());
+        blocks.push(base_block);
+        for h_tf in &active_higher {
+            if let Some((h_names, mut aligned)) =
+                compute_aligned_higher_block(ds, base_tf, base_ns, h_tf, opts.profile)?
+            {
+                if normalize {
+                    normalize_block_columns(&mut aligned);
+                }
+                all_names.extend(h_names);
+                blocks.push(aligned);
+            }
+        }
+        let cube = {
+            let views: Vec<ndarray::ArrayView2<f32>> =
+                blocks.iter().map(|b| b.view()).collect();
+            ndarray::concatenate(ndarray::Axis(1), &views)
+                .context("assemble in-RAM feature cube")?
+        };
+        drop(blocks);
+        return Ok(FeatureFrame {
+            timestamps: base_ns.clone(),
+            names: all_names,
+            data: crate::core::features::FeatureData::InMemory(cube),
+        });
+    }
+
+    // ── Streaming disk-mmap path (NEVER-OOM fallback for large cubes) ──────
+    let store_path = discovery_feature_store_path(&ds.symbol, base_tf);
+    let mut writer =
+        crate::core::feature_store::FeatureStoreWriter::create(&store_path, n_samples)?;
+    let mut all_names = base_names;
     append_feature_block(&mut writer, &base_block, normalize)?;
     drop(base_block);
 
-    for h_tf in &opts.higher_tfs {
-        if h_tf == base_tf {
-            continue;
-        }
-        if let Some(h_ohlcv) = ds.frames.get(h_tf) {
-            let h_feats = compute_hpc_feature_frame(h_ohlcv, opts.profile)?;
-            let h_ns = h_ohlcv
-                .timestamp
-                .as_ref()
-                .context("higher tf has no timestamps")?;
-            // F-308 fix (2026-05-28): cap forward-fill at 2× the
-            // higher-TF period. Stale higher-TF data (last bar weeks
-            // before base last bar) would otherwise propagate as a
-            // frozen-constant column for the entire held-out window
-            // — indicators on constants produce constants → GA sees
-            // zero or look-alike signals → `ranked=N, post_passes_filter=0`
-            // funnel with no diagnostic. Beyond `max_age`, rows
-            // become NaN and the downstream feature-cube summary's
-            // NaN counter flags them.
-            //
-            // 2× period is the lenient bound (one missed bar is
-            // normal; two missed bars means the higher-TF source
-            // has stalled). Failure to parse the TF label leaves
-            // max_age None (legacy unbounded behaviour) — safer
-            // default for hand-rolled non-canonical TF strings.
-            let max_age_ns = parse_timeframe_to_minutes(h_tf)
-                .ok()
-                .filter(|m| *m > 0)
-                .map(|m| (m as i64).saturating_mul(60).saturating_mul(1_000_000_000).saturating_mul(2));
-            // Surface stale-higher-TF condition before the align call
-            // so operators see a clear log line even when the data
-            // looks fine downstream.
-            let base_last = base_ns.last().copied().unwrap_or(0);
-            let h_last = h_ns.last().copied().unwrap_or(0);
-            if base_last > 0 && h_last > 0 && base_last > h_last {
-                if let Some(max_age) = max_age_ns {
-                    let lag_ns = base_last - h_last;
-                    if lag_ns > max_age {
-                        tracing::warn!(
-                            target: "neoethos_data::prepare_multitimeframe_features",
-                            base_tf = base_tf,
-                            higher_tf = h_tf,
-                            lag_seconds = lag_ns / 1_000_000_000,
-                            max_age_seconds = max_age / 1_000_000_000,
-                            "higher-TF last bar is older than 2× period — feature columns past max_age will be NaN. Re-run --bootstrap-data for this (symbol, timeframe) to refresh."
-                        );
-                    }
-                }
-            }
-            let h_names = h_feats.names.clone();
-            let h_block = match h_feats.data {
-                crate::core::features::FeatureData::InMemory(a) => a,
-                crate::core::features::FeatureData::Mmap(_) => {
-                    anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
-                }
-            };
-            let aligned = align_features_by_ns(base_ns, h_ns, &h_block, true, max_age_ns);
-            drop(h_block);
-            all_names.extend(h_names.iter().map(|n| format!("{}_{}", h_tf, n)));
+    for h_tf in &active_higher {
+        if let Some((h_names, aligned)) =
+            compute_aligned_higher_block(ds, base_tf, base_ns, h_tf, opts.profile)?
+        {
+            all_names.extend(h_names);
             append_feature_block(&mut writer, &aligned, normalize)?;
-            drop(aligned);
         }
     }
 
