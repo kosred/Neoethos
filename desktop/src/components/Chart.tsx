@@ -35,6 +35,13 @@ export default function Chart({
   const reachCb = useRef<(() => void) | undefined>(undefined);
   reachCb.current = onReachStart;
 
+  // Lightweight-charts renders UTCTimestamps in UTC. Shift by the local
+  // timezone offset so the axis shows the operator's WALL-CLOCK time (e.g.
+  // Berlin/CEST = UTC+2 → bars no longer look "2h behind"). Display-only; the
+  // underlying data stays correct UTC.
+  const tzOffSec = new Date().getTimezoneOffset() * 60;
+  const toLocal = (t: number) => (t - tzOffSec) as UTCTimestamp;
+
   // create once
   useEffect(() => {
     if (!elRef.current) return;
@@ -77,7 +84,7 @@ export default function Chart({
     if (!seriesRef.current) return;
     seriesRef.current.setData(
       candles.map((c) => ({
-        time: c.time as UTCTimestamp,
+        time: toLocal(c.time),
         open: c.open,
         high: c.high,
         low: c.low,
@@ -91,7 +98,7 @@ export default function Chart({
   useEffect(() => {
     if (!seriesRef.current || !liveBar) return;
     seriesRef.current.update({
-      time: liveBar.time as UTCTimestamp,
+      time: toLocal(liveBar.time),
       open: liveBar.open,
       high: liveBar.high,
       low: liveBar.low,
@@ -124,7 +131,7 @@ export default function Chart({
         });
         lineRefs.current.set(o.name, s);
       }
-      s.setData(o.data.map((d) => ({ time: d.time as UTCTimestamp, value: d.value })));
+      s.setData(o.data.map((d) => ({ time: toLocal(d.time), value: d.value })));
     }
   }, [overlays]);
 
