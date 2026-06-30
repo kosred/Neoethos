@@ -74,7 +74,7 @@ const STALE_THRESHOLD: usize = 3;
 /// numeric id in the UI is strictly worse than rendering a slightly-
 /// wrong-but-readable label. When this returns the fallback we log
 /// the unknown id so #144's follow-up can grow the table.
-fn asset_id_to_currency(asset_id: Option<i64>) -> &'static str {
+pub(crate) fn asset_id_to_currency(asset_id: Option<i64>) -> &'static str {
     match asset_id {
         // Sourced from public Spotware OpenAPI samples + the cTrader
         // sandbox catalog. Conservative subset — additions here are

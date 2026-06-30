@@ -192,6 +192,79 @@ fn bars_to_ohlcv(bars: &[crate::app_services::ctrader_data::HistoricalBar]) -> O
     }
 }
 
+// ── Risk-based position sizing ──────────────────────────────────────────────────
+
+/// Resolve the `quote → account` FX rate so cross-pair pip values can be
+/// converted into the account currency (e.g. USD→GBP via GBPUSD). Blocking —
+/// fetches a few recent bars of the bridging pair from the broker. Returns
+/// `None` when neither orientation of the bridge pair is fetchable, so the
+/// caller falls back to a fixed lot rather than mis-size.
+fn resolve_quote_to_account_rate(quote: &str, account: &str, tf: &str) -> Option<f64> {
+    let q = quote.trim().to_ascii_uppercase();
+    let a = account.trim().to_ascii_uppercase();
+    if q.is_empty() || a.is_empty() {
+        return None;
+    }
+    if q == a {
+        return Some(1.0);
+    }
+    let last_close = |sym: &str| -> Option<f64> {
+        crate::app_services::broker_api::fetch_recent_chart_bars_blocking(sym, tf, 3)
+            .ok()
+            .and_then(|bars| bars.last().map(|b| b.close))
+            .filter(|c| c.is_finite() && *c > 0.0)
+    };
+    // ACCOUNT+QUOTE (e.g. GBPUSD): price = QUOTE units per 1 ACCOUNT → quote→account = 1/price.
+    if let Some(p) = last_close(&format!("{a}{q}")) {
+        return Some(1.0 / p);
+    }
+    // QUOTE+ACCOUNT (e.g. USDGBP): price = ACCOUNT units per 1 QUOTE → quote→account = price.
+    if let Some(p) = last_close(&format!("{q}{a}")) {
+        return Some(p);
+    }
+    None
+}
+
+/// Position size (lots) for one entry, from the account's risk budget and the
+/// strategy's OWN stop distance: `lots = balance × risk% / (sl_pips ×
+/// pip_value_per_lot_in_account)`, snapped to the symbol's lot step and clamped
+/// to `[min_lot, min(max_lot, max_lot_cap)]`. Returns `fallback` whenever a
+/// correct size can't be computed (no balance / risk / stop, missing metadata,
+/// or a cross pair whose pip value collapses to NaN without an FX rate) — it
+/// NEVER returns a wrong size.
+#[allow(clippy::too_many_arguments)]
+fn risk_based_lots(
+    balance: f64,
+    risk_fraction: f64,
+    sl_pips: f64,
+    meta: Option<&neoethos_core::symbol_metadata::SymbolMetadata>,
+    account_ccy: &str,
+    fx_quote_to_account: Option<f64>,
+    live_price: Option<f64>,
+    fallback: f64,
+    max_lot_cap: f64,
+) -> f64 {
+    if !(balance > 0.0 && risk_fraction > 0.0 && sl_pips.is_finite() && sl_pips > 0.0) {
+        return fallback;
+    }
+    let Some(meta) = meta else {
+        return fallback;
+    };
+    let pip_val = meta.pip_value_in_account(account_ccy, fx_quote_to_account, live_price);
+    if !(pip_val.is_finite() && pip_val > 0.0) {
+        return fallback;
+    }
+    let raw = (balance * risk_fraction) / (sl_pips * pip_val);
+    if !(raw.is_finite() && raw > 0.0) {
+        return fallback;
+    }
+    let step = if meta.lot_step > 0.0 { meta.lot_step } else { 0.01 };
+    let min_lot = if meta.min_lot > 0.0 { meta.min_lot } else { step };
+    let max_lot = meta.max_lot.min(max_lot_cap).max(min_lot);
+    let snapped = (raw / step).floor() * step;
+    snapped.clamp(min_lot, max_lot)
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 async fn run(
@@ -239,6 +312,54 @@ async fn run(
         genes = genes.len(),
         higher_tfs = ?higher_tfs,
         "live trading loop started"
+    );
+
+    // ── Risk-based position sizing context (resolved once at start) ────────────
+    // Size each entry by % of the LIVE account balance in the broker's REAL
+    // deposit currency — not a fixed lot. Any piece we can't resolve makes that
+    // entry fall back to req.lot_size (never a wrong size).
+    let sizing = neoethos_core::Settings::from_yaml(&crate::server::state::current_config_path()).ok();
+    let risk_fraction = sizing
+        .as_ref()
+        .map(|s| s.risk.risk_per_trade)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let max_lot_cap = sizing
+        .as_ref()
+        .map(|s| s.risk.max_lot_size)
+        .filter(|v| *v > 0.0)
+        .unwrap_or(f64::INFINITY);
+    let sym_meta = neoethos_core::symbol_metadata::resolve(&symbol);
+    let quote_ccy = sym_meta.as_ref().map(|m| m.quote.clone());
+    let sizing_tf = base_tf.clone();
+    // Balance + REAL account currency + quote→account FX, all on one blocking hop.
+    let (account_balance, account_ccy, fx_quote_to_account) =
+        tokio::task::spawn_blocking(move || {
+            match crate::app_services::broker_api::fetch_account_runtime_blocking() {
+                Ok(snap) => {
+                    let bal = snap.trader.balance;
+                    let ccy = crate::server::bridge::asset_id_to_currency(
+                        snap.trader.deposit_asset_id,
+                    )
+                    .to_string();
+                    let fx = quote_ccy
+                        .as_deref()
+                        .and_then(|q| resolve_quote_to_account_rate(q, &ccy, &sizing_tf));
+                    (bal, ccy, fx)
+                }
+                Err(_) => (0.0, String::new(), None),
+            }
+        })
+        .await
+        .unwrap_or((0.0, String::new(), None));
+    tracing::info!(
+        target: "neoethos_app::live_trading",
+        %symbol,
+        balance = account_balance,
+        account_ccy = %account_ccy,
+        risk_fraction,
+        fx_quote_to_account = ?fx_quote_to_account,
+        "risk-sizing context resolved"
     );
 
     loop {
@@ -430,7 +551,20 @@ async fn run(
                 } else {
                     OrderSide::Sell
                 };
-                let lot = req.lot_size;
+                // Size by the account's risk %, using the strategy's own stop
+                // distance; falls back to req.lot_size when not computable.
+                let last_price = base_ohlcv.close.last().copied();
+                let lot = risk_based_lots(
+                    account_balance,
+                    risk_fraction,
+                    gene_sl,
+                    sym_meta.as_ref(),
+                    &account_ccy,
+                    fx_quote_to_account,
+                    last_price,
+                    req.lot_size,
+                    max_lot_cap,
+                );
                 // Default to the strategy's OWN bracket; `req.*` is only an
                 // explicit operator override (Autopilot sends none, so the
                 // gene's discovered SL/TP is what actually gets placed).
