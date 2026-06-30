@@ -1,7 +1,7 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
-import { enginesStatus, settings } from "../api";
+import { enginesStatus, settings, dataImport, pickDataFile } from "../api";
 import { usePoll } from "../hooks";
-import { useSymbolOptions, useTimeframeOptions } from "../components/Select";
+import { useSymbolOptions, useTimeframeOptions, TimeframeSelect } from "../components/Select";
 import { HelpPanel, HelpStep } from "../components/Help";
 import {
   subscribe,
@@ -72,6 +72,35 @@ export default function Discovery() {
   const [targets, setTargets] = useState("");
   const [portfolio, setPortfolio] = useState("");
   const [msg, setMsg] = useState("");
+
+  // Import data file (lives here because data is only for search + training).
+  const [impSrc, setImpSrc] = useState("");
+  const [impSym, setImpSym] = useState("EURUSD");
+  const [impTf, setImpTf] = useState("H1");
+  const [impMsg, setImpMsg] = useState("");
+  const [impBusy, setImpBusy] = useState(false);
+
+  const browse = async () => {
+    try {
+      const p = await pickDataFile();
+      if (p) setImpSrc(p);
+    } catch (e) {
+      setImpMsg(String(e));
+    }
+  };
+  const doImport = async () => {
+    if (!impSrc) { setImpMsg("Choose a file first (Browse…)."); return; }
+    setImpBusy(true);
+    setImpMsg("Importing…");
+    try {
+      const r: any = await dataImport(impSrc, impSym.toUpperCase(), impTf.toUpperCase());
+      setImpMsg(`✓ Imported → ${r?.writtenPath ?? r?.written_path ?? "done"}`);
+    } catch (e) {
+      setImpMsg(`Import failed: ${e}`);
+    } finally {
+      setImpBusy(false);
+    }
+  };
 
   const state = st?.discovery ?? "…";
   const running = state.toLowerCase().startsWith("running");
@@ -294,6 +323,23 @@ export default function Discovery() {
           )}
         </div>
         {msg && <div className="banner info">{msg}</div>}
+      </div>
+
+      {/* ── Import data file (data is only for search + training) ── */}
+      <h2>Import data file</h2>
+      <div className="ticket">
+        <p className="muted small">Bring in a CSV / Parquet / TSV you already have — it's converted into the engine's format so you can search + train on it.</p>
+        <div className="ticket-row">
+          <button onClick={browse} disabled={impBusy}>Browse…</button>
+          <label style={{ flex: 1 }}>
+            File
+            <input value={impSrc} onChange={(e) => setImpSrc(e.target.value)} placeholder="(choose a file with Browse…)" style={{ width: "100%" }} />
+          </label>
+          <label>Symbol<input value={impSym} onChange={(e) => setImpSym(e.target.value)} style={{ width: 90 }} placeholder="EURUSD" /></label>
+          <label>TF<TimeframeSelect value={impTf} onChange={setImpTf} style={{ width: 80 }} /></label>
+          <button className="primary" disabled={impBusy || !impSrc} onClick={doImport}>Import</button>
+        </div>
+        {impMsg && <div className="banner info">{impMsg}</div>}
       </div>
     </div>
   );
