@@ -7,6 +7,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Public, no-API-key financial NEWS RSS feeds for the AI news desk
+/// (`GET /news/feed`). Verified reachable 2026-06-30 (HTTP 200 + XML). The
+/// economic *calendar* is separate (`news_calendar_source`) — ForexFactory's
+/// ffcal XML is a calendar format, not RSS, so it does NOT belong here. Used
+/// both as the default and as the runtime fallback when a user's configured
+/// feeds are all unreachable, so a stale config never leaves the desk blank.
+pub fn default_news_rss_feeds() -> Vec<String> {
+    vec![
+        "https://www.investing.com/rss/news.rss".to_string(),
+        "https://www.fxstreet.com/rss/news".to_string(),
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html".to_string(),
+    ]
+}
+
 /// System-level configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1543,12 +1557,11 @@ impl Default for NewsConfig {
             // NB: the economic *calendar* lives in `news_calendar_source`
             // (ForexFactory's ffcal XML is a custom calendar format, not
             // RSS), so it intentionally does NOT belong in this list.
-            rss_feeds: vec![
-                "https://www.dailyfx.com/feeds/market-news".to_string(),
-                "https://www.forexlive.com/feed/news".to_string(),
-                "https://feeds.marketwatch.com/marketwatch/topstories/".to_string(),
-                "https://feeds.marketwatch.com/marketwatch/marketpulse/".to_string(),
-            ],
+            // Verified reachable 2026-06-30 (200 + XML). The old defaults
+            // (dailyfx, forexlive) now 403/redirect; ForexFactory's ffcal is a
+            // calendar, not RSS (see `news_calendar_source`). Reused as the
+            // runtime fallback when a user's configured feeds all fail.
+            rss_feeds: default_news_rss_feeds(),
             enable_llm_helper: true,
             llm_helper_enabled: true,
             llm_sentiment_positive_threshold: 0.2,

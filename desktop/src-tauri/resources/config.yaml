@@ -268,9 +268,10 @@ news:
   news_event_risk_pct: 0.001  # minimal risk per event (0.1%)
   enable_news: true
   news_sources: [rss] 
-  rss_feeds: 
-    - https://www.forexfactory.com/ffcal_week_this.xml
-    - https://www.dailyfx.com/feeds/market-news
+  rss_feeds:
+    - https://www.investing.com/rss/news.rss
+    - https://www.fxstreet.com/rss/news
+    - https://www.cnbc.com/id/100003114/device/rss/rss.html
   news_local_glob: ""
   news_backfill_enabled: true
   news_backfill_days: 0  # 0 = full data span

@@ -140,7 +140,28 @@ pub async fn build_feed(feeds: Vec<String>) -> NewsFeed {
     }
 
     let total_feeds = feeds.len();
-    let (mut items, failures) = fetch_all(feeds).await;
+    let (mut items, mut failures) = fetch_all(feeds.clone()).await;
+
+    // Self-heal a stale/blocked config: if EVERY configured feed failed, retry
+    // with the curated built-in defaults (verified-reachable) the user hasn't
+    // already tried, so a dead feed URL (e.g. an old dailyfx/forexfactory entry)
+    // never leaves the desk permanently blank.
+    let mut used_fallback = false;
+    if items.is_empty() && failures >= total_feeds {
+        let tried: std::collections::HashSet<String> = feeds.into_iter().collect();
+        let fallback: Vec<String> = neoethos_core::default_news_rss_feeds()
+            .into_iter()
+            .filter(|u| !tried.contains(u))
+            .collect();
+        if !fallback.is_empty() {
+            let (fb_items, fb_failures) = fetch_all(fallback).await;
+            if !fb_items.is_empty() {
+                items = fb_items;
+                failures = fb_failures;
+                used_fallback = true;
+            }
+        }
+    }
 
     // Dedup by canonical link (some feeds syndicate the same wire story),
     // then sort newest-first; undated items sink to the bottom.
@@ -153,10 +174,12 @@ pub async fn build_feed(feeds: Vec<String>) -> NewsFeed {
 
     let notice = if items.is_empty() {
         if failures > 0 {
-            format!("All {total_feeds} news feeds were unreachable — check your connection or feed URLs in Settings → News.")
+            "All news feeds were unreachable — check your connection or the feed URLs in Settings → News.".to_string()
         } else {
             "No headlines returned by the configured feeds.".to_string()
         }
+    } else if used_fallback {
+        "Your configured feeds were unreachable — showing built-in defaults. Update them in Settings → News.".to_string()
     } else if failures > 0 {
         format!("{failures} of {total_feeds} feeds were unreachable; showing the rest.")
     } else {
