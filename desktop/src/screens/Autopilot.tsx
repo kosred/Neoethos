@@ -7,6 +7,7 @@ import {
   autonomousReplay,
   autonomousGate,
   openPath,
+  strategyList,
   type PortfolioEntry,
   type GateVerdict,
 } from "../api";
@@ -82,11 +83,39 @@ export default function Autopilot() {
   const [replay, setReplay] = useState<any>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  // Filters
+  const [modeFilter, setModeFilter] = useState<"all" | "risky" | "prop">("all");
+  const [onlyValidated, setOnlyValidated] = useState(false);
+  const [validatedKeys, setValidatedKeys] = useState<Set<string>>(new Set());
 
   const engines: any[] = status?.engines ?? [];
   const running = !!status?.running;
   const runningPaths = new Set(engines.map((e) => e.portfolioPath));
-  const portfolios = list?.portfolios ?? [];
+  const allPortfolios = list?.portfolios ?? [];
+  const portfolios = allPortfolios.filter((p) => {
+    const isProp = p.path.toLowerCase().includes("propfirm");
+    if (modeFilter === "risky" && isProp) return false;
+    if (modeFilter === "prop" && !isProp) return false;
+    if (onlyValidated && !validatedKeys.has(`${p.symbol ?? ""}|${p.baseTf ?? ""}`)) return false;
+    return true;
+  });
+
+  // Validated set (passed CPCV + Walkforward) keyed by symbol|timeframe, from the
+  // strategy report — powers the "only validated" filter.
+  useEffect(() => {
+    let live = true;
+    strategyList()
+      .then((r) => {
+        if (!live) return;
+        const keys = new Set<string>();
+        for (const s of r.strategies) {
+          if (s.cpcvPassed && s.walkforwardPassed) keys.add(`${s.symbol}|${s.timeframe}`);
+        }
+        setValidatedKeys(keys);
+      })
+      .catch(() => {});
+    return () => { live = false; };
+  }, []);
 
   // Demo forward-test verdict for the focused strategy.
   useEffect(() => {
@@ -169,14 +198,25 @@ export default function Autopilot() {
         <HelpStep n={4}><b>Stop all</b> halts every running engine.</HelpStep>
       </HelpPanel>
 
-      <div className="btn-row">
+      <div className="btn-row" style={{ flexWrap: "wrap", alignItems: "center" }}>
         <button onClick={reload} disabled={busy}>Refresh strategies</button>
-        <span className="muted small">{list?.count ?? 0} portfolios found · {selected.length} selected</span>
+        <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+          Mode
+          <select value={modeFilter} onChange={(e) => setModeFilter(e.target.value as any)}>
+            <option value="all">All</option>
+            <option value="risky">🚀 Risky</option>
+            <option value="prop">🛡 Prop-firm</option>
+          </select>
+        </label>
+        <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }} title="Only strategies whose backtest passed CPCV + Walkforward out-of-sample">
+          <input type="checkbox" checked={onlyValidated} onChange={(e) => setOnlyValidated(e.target.checked)} /> Only validated (passed OOS)
+        </label>
+        <span className="muted small">{portfolios.length} of {allPortfolios.length} shown · {selected.length} selected</span>
       </div>
       {error && <div className="banner warn">{error}</div>}
 
       {portfolios.length === 0 ? (
-        <p className="muted">No discovered strategies yet — run Discovery, then promote in Strategy Lab.</p>
+        <p className="muted">{allPortfolios.length === 0 ? "No discovered strategies yet — run Discovery, then promote in Strategy Lab." : "No strategies match the current filters."}</p>
       ) : (
         <>
           <div className="btn-row" style={{ marginBottom: 6 }}>

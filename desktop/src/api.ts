@@ -165,6 +165,12 @@ export type ReauthResult = {
 export const appInfo = () => invoke<AppInfo>("app_info");
 export const listSymbols = () => invoke<string[]>("list_symbols");
 export const listTimeframes = (symbol: string) => invoke<string[]>("list_timeframes", { symbol });
+/** Native OS file picker for data import; returns the chosen path or null. */
+export const pickDataFile = () => invoke<string | null>("pick_data_file");
+export type SymbolCoverage = { symbol: string; bars: number; firstMs: number; lastMs: number; years: number };
+/** Per-symbol local-history coverage (years + bars) for the given base TF. */
+export const dataCoverage = (symbols: string[], timeframe: string) =>
+  invoke<SymbolCoverage[]>("data_coverage", { symbols, timeframe });
 export const localChart = (symbol: string, timeframe: string, limit = 1500) =>
   invoke<Candle[]>("chart", { symbol, timeframe, limit });
 

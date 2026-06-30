@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
-import { enginesStatus, settings, dataImport, pickDataFile } from "../api";
+import { enginesStatus, settings, dataImport, pickDataFile, dataCoverage, riskInfo, type SymbolCoverage } from "../api";
 import { usePoll } from "../hooks";
 import { useSymbolOptions, useTimeframeOptions, TimeframeSelect } from "../components/Select";
 import { HelpPanel, HelpStep } from "../components/Help";
@@ -66,6 +66,8 @@ export default function Discovery() {
 
   const [selSyms, setSelSyms] = useState<string[]>([]);
   const [selTfs, setSelTfs] = useState<string[]>([]);
+  const [cov, setCov] = useState<SymbolCoverage[]>([]);
+  const [riskPct, setRiskPct] = useState<number | null>(null);
   const [adv, setAdv] = useState(false);
   const [population, setPopulation] = useState("");
   const [generations, setGenerations] = useState("");
@@ -119,6 +121,21 @@ export default function Discovery() {
   useEffect(() => {
     if (st) void drive(running, summary);
   }, [st]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Pre-flight: risk % + per-pair data coverage (years/bars) so the operator
+  // sees EXACTLY what's about to run before starting.
+  const probeTf = selTfs.length ? [...selTfs].sort((a, b) => tfRank(a) - tfRank(b))[0] : "H1";
+  useEffect(() => {
+    let live = true;
+    riskInfo().then((r) => { if (live) setRiskPct(r.riskPerTrade); }).catch(() => {});
+    return () => { live = false; };
+  }, []);
+  useEffect(() => {
+    if (selSyms.length === 0) { setCov([]); return; }
+    let live = true;
+    dataCoverage(selSyms, probeTf).then((c) => { if (live) setCov(c); }).catch(() => {});
+    return () => { live = false; };
+  }, [selSyms, probeTf]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggle =
     (set: React.Dispatch<React.SetStateAction<string[]>>) => (v: string) =>
@@ -303,13 +320,37 @@ export default function Discovery() {
           </div>
         )}
 
-        <div className="muted small" style={{ marginTop: 8 }}>
-          {(() => {
-            const ns = selSyms.length || 1;
-            const nt = selTfs.length || 1;
-            return `${ns} symbol${ns === 1 ? "" : "s"} × ${nt} timeframe${nt === 1 ? "" : "s"} = ${ns * nt} run${ns * nt === 1 ? "" : "s"}`;
-          })()}
+        {/* ── Pre-flight: exactly what's about to run ── */}
+        <div className="banner info" style={{ marginTop: 10 }}>
+          <b>Before you start</b> — Mode:{" "}
+          <b>{cfg?.tradingMode === "risky" ? "🚀 RISKY" : "🛡 PROP-FIRM"}</b>
+          {riskPct != null && <> · risk <b>{(riskPct * 100).toFixed(1)}%</b>/trade</>}
+          {" · "}
+          {(selSyms.length || 1)} pair{(selSyms.length || 1) === 1 ? "" : "s"} ×{" "}
+          {(selTfs.length || 1)} TF = <b>{(selSyms.length || 1) * (selTfs.length || 1)} run{(selSyms.length || 1) * (selTfs.length || 1) === 1 ? "" : "s"}</b>
+          {selSyms.length === 0 && <span className="muted"> (pairs + TFs from config defaults)</span>}
         </div>
+        {selSyms.length > 0 && (
+          <table className="tbl">
+            <thead><tr><th>Pair</th><th>Years of data</th><th>Bars ({probeTf})</th></tr></thead>
+            <tbody>
+              {selSyms.map((s) => {
+                const c = cov.find((x) => x.symbol === s);
+                const yrs = c?.years ?? 0;
+                return (
+                  <tr key={s}>
+                    <td><b>{s}</b></td>
+                    <td className={c && yrs < 2 ? "sell" : ""}>
+                      {c ? `${yrs.toFixed(1)}y${yrs < 2 ? " ⚠ low" : ""}` : "…"}
+                    </td>
+                    <td>{c ? (c.bars > 0 ? c.bars.toLocaleString() : "⚠ no data") : "…"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+        <p className="muted small">Years = local history span (same across TFs); bars shown for the fastest selected TF ({probeTf}). TFs run fastest-first.</p>
 
         <div className="btn-row">
           <button className="primary" disabled={q.active} onClick={launch}>

@@ -253,6 +253,65 @@ async fn chart(
     .map_err(|e| e.to_string())?
 }
 
+/// Open a native OS file picker for a data file to import (CSV/Parquet/TSV).
+/// Returns the chosen absolute path, or `None` if the user cancelled — the
+/// webview's `<input type=file>` can't expose a real path, so the import needs
+/// this native dialog.
+#[tauri::command]
+async fn pick_data_file() -> Result<Option<String>, String> {
+    let file = rfd::AsyncFileDialog::new()
+        .set_title("Choose a data file to import")
+        .add_filter("Data files", &["csv", "tsv", "parquet", "txt"])
+        .add_filter("All files", &["*"])
+        .pick_file()
+        .await;
+    Ok(file.map(|f| f.path().to_string_lossy().to_string()))
+}
+
+/// How much local history exists for a symbol on a given timeframe — so the
+/// Discovery pre-flight can show the operator EXACTLY what's about to be
+/// searched (years of data + bar count per pair) before they start.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SymbolCoverage {
+    symbol: String,
+    bars: usize,
+    first_ms: i64,
+    last_ms: i64,
+    years: f64,
+}
+
+#[tauri::command]
+async fn data_coverage(
+    symbols: Vec<String>,
+    timeframe: String,
+) -> Result<Vec<SymbolCoverage>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = resolve_data_root();
+        let out = symbols
+            .iter()
+            .map(|sym| match neoethos_data::load_symbol_timeframe(&root, sym, &timeframe) {
+                Ok(o) => {
+                    let ts = o.timestamp.unwrap_or_default();
+                    let first = ts.first().copied().unwrap_or(0);
+                    let last = ts.last().copied().unwrap_or(0);
+                    // 365.25 d/yr in ms.
+                    let years = if last > first {
+                        (last - first) as f64 / 31_557_600_000.0
+                    } else {
+                        0.0
+                    };
+                    SymbolCoverage { symbol: sym.clone(), bars: o.close.len(), first_ms: first, last_ms: last, years }
+                }
+                Err(_) => SymbolCoverage { symbol: sym.clone(), bars: 0, first_ms: 0, last_ms: 0, years: 0.0 },
+            })
+            .collect::<Vec<_>>();
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -285,6 +344,8 @@ pub fn run() {
             list_symbols,
             list_timeframes,
             chart,
+            pick_data_file,
+            data_coverage,
             // live cTrader broker (in-process, auto-auth)
             broker::broker_status,
             broker::broker_chart,
