@@ -604,6 +604,15 @@ pub fn available_memory_bytes() -> u64 {
     sys.available_memory()
 }
 
+/// Total installed physical RAM in bytes. Pairs with
+/// [`available_memory_bytes`] so callers (and the UI resource strip) can show
+/// a "X of Y GB free" readout.
+pub fn total_memory_bytes() -> u64 {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.total_memory()
+}
+
 impl HardwareProbe {
     pub fn new() -> Self {
         Self::with_runtime_overrides(current_hardware_runtime_overrides().clone())

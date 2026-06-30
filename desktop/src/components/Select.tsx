@@ -12,6 +12,42 @@ export function invalidateSymbolCache() {
   symbolsCache = null;
 }
 
+/** Shared option sources (one fetch, cached) for building custom pickers
+ *  like the multi-select queue builder on the Discovery screen. */
+export function useSymbolOptions(): string[] {
+  const [opts, setOpts] = useState<string[]>(symbolsCache ?? []);
+  useEffect(() => {
+    if (symbolsCache) {
+      setOpts(symbolsCache);
+      return;
+    }
+    dataBootstrap()
+      .then((d) => {
+        symbolsCache = (d.symbols ?? []).slice().sort();
+        setOpts(symbolsCache);
+      })
+      .catch(() => {});
+  }, []);
+  return opts;
+}
+
+export function useTimeframeOptions(): string[] {
+  const [opts, setOpts] = useState<string[]>(tfsCache ?? CANON_TFS);
+  useEffect(() => {
+    if (tfsCache) {
+      setOpts(tfsCache);
+      return;
+    }
+    brokerTimeframes()
+      .then((d) => {
+        tfsCache = d.timeframes?.length ? d.timeframes : CANON_TFS;
+        setOpts(tfsCache);
+      })
+      .catch(() => setOpts(CANON_TFS));
+  }, []);
+  return opts;
+}
+
 type Common = {
   value: string;
   onChange: (v: string) => void;

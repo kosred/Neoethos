@@ -44,6 +44,29 @@ pub struct EnginesDto {
     /// The live `(name, value)` counters the discovery job accumulates
     /// (candidates evaluated, generations done, …). Empty when idle.
     pub discovery_counters: Vec<EngineCounterDto>,
+    /// Live machine-resource readout so the UI can show what discovery is
+    /// consuming (operator visibility — the run used to be a black box).
+    /// Total / currently-available physical RAM, in GB.
+    pub ram_total_gb: f64,
+    pub ram_available_gb: f64,
+    /// On-disk size of the feature-store temp dir (MB) — the multi-TF cubes
+    /// discovery streams to disk; 0 when everything fits in RAM. Reclaimed
+    /// per-TF as each unit finishes.
+    pub feature_store_mb: u64,
+}
+
+/// Sum the on-disk `.fstore` cubes discovery is currently holding (MB).
+fn feature_store_disk_mb() -> u64 {
+    let dir = std::env::temp_dir().join("neoethos_feature_store");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let bytes: u64 = entries
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("fstore"))
+        .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+        .sum();
+    bytes / (1 << 20)
 }
 
 /// F-340 (Feature #14): one live counter from a running engine's
@@ -84,6 +107,9 @@ pub async fn engines(State(state): State<AppApiState>) -> Json<EnginesDto> {
             .into_iter()
             .map(|(name, value)| EngineCounterDto { name, value })
             .collect(),
+        ram_total_gb: neoethos_core::total_memory_bytes() as f64 / 1e9,
+        ram_available_gb: neoethos_core::available_memory_bytes() as f64 / 1e9,
+        feature_store_mb: feature_store_disk_mb(),
     })
 }
 

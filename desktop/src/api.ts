@@ -226,6 +226,9 @@ export type EnginesStatus = {
   discovery_percent?: number;
   discoveryCounters?: EngineCounter[];
   discovery_counters?: EngineCounter[];
+  ramTotalGb?: number;
+  ramAvailableGb?: number;
+  featureStoreMb?: number;
 };
 export type StartJob = {
   symbol?: string;
