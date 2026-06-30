@@ -330,19 +330,22 @@ pub fn fetch_broker_symbols_blocking() -> Result<BrokerSymbolsBundle> {
     // restrict the catalog to forex/metals/indices/commodities (dropping
     // the broker's 700+ equities & ETFs the engine never trades) using
     // the broker's classification, not name-pattern guesses.
-    let responses = transport.send_sequence(&[
-        build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
-        build_account_auth_request(account_id, &creds.access_token, "account-auth-1"),
-        build_symbols_list_request(account_id, false, "symbols-1"),
-        build_asset_class_list_request(account_id, "asset-classes-1"),
-        build_symbol_category_list_request(account_id, "symbol-categories-1"),
-    ])?;
-    if responses.len() < 3 {
-        return Err(anyhow!(
-            "expected ≥3 cTrader symbols-list responses, received {}",
-            responses.len()
-        ));
-    }
+    // Resilient: retry transient cold-connection failures and surface the
+    // real cTrader error instead of a misleading "received N" count. Needs
+    // the first 3 responses (app-auth, account-auth, symbols); asset-class +
+    // symbol-category are best-effort classification on top.
+    let responses = crate::app_services::ctrader_messages::send_sequence_resilient(
+        &transport,
+        &[
+            build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
+            build_account_auth_request(account_id, &creds.access_token, "account-auth-1"),
+            build_symbols_list_request(account_id, false, "symbols-1"),
+            build_asset_class_list_request(account_id, "asset-classes-1"),
+            build_symbol_category_list_request(account_id, "symbol-categories-1"),
+        ],
+        3,
+        "cTrader symbols list",
+    )?;
 
     let CTraderSymbolsListResult {
         account_id,
@@ -857,24 +860,29 @@ pub fn submit_market_order_blocking(
         }
     }
 
-    // cTrader relative_stop_loss is in 1e-5 base-price units.
-    // For 5-digit FX (EURUSD etc): 1 pip = 0.0001 = 10 * 1e-5, so
-    //   relative_units = pips * 10.
-    // For 3-digit JPY pairs: 1 pip = 0.01 = 1000 * 1e-5, so
-    //   relative_units = pips * 1000.
-    // Generally: relative_units = pips * 10^(digits - 4).
+    // cTrader `relativeStopLoss` / `relativeTakeProfit` is the price *distance*
+    // expressed in 1/100000 of a price unit, and the broker REJECTS any value
+    // that isn't aligned to the symbol's price precision (10^-digits) with
+    // "Relative stop loss has invalid precision".
+    //
+    // The previous digits-only heuristic fell back to `1.0` units/pip for
+    // digits < 4, so XAUUSD (digits=2) sent `26` raw units for a 26-pip stop —
+    // not a multiple of gold's 0.01 price tick (= 1000 relative units) → the
+    // broker rejected it. (It was also 10× too far for 5-digit FX.)
+    //
+    // Correct + symbol-agnostic: derive the distance from the symbol's real
+    // `pip_size` (1 price unit = 100_000 relative units), then SNAP to the
+    // price tick so the wire value is always a valid multiple. Works for
+    // 5/3-digit FX and 2-digit gold/indices alike.
     let digits = resolved.symbol.digits.max(0) as u32;
-    // For 5-digit FX, pip_in_units = 10 (i.e. 10 * 1e-5 = 0.0001).
-    // We map every "pip" to `10^(digits-4)` 1e-5 units, then clamp
-    // at 1 so 3-digit JPY (digits=3) still resolves to something sane
-    // — though cTrader's standard contracts are 5/3 digits anyway.
-    let pip_relative_units: f64 = if digits >= 4 {
-        10f64.powi((digits - 4) as i32 + 1)
-    } else {
-        1.0
+    let tick_units: i64 = 10i64.pow(5u32.saturating_sub(digits.min(5)));
+    let to_relative_units = |pips: f64| -> i64 {
+        let raw = pips * meta.pip_size * 100_000.0;
+        let snapped = ((raw / tick_units as f64).round() as i64) * tick_units;
+        snapped.max(tick_units) // never zero — at least one price tick
     };
-    let relative_stop_loss = stop_loss_pips.map(|p| (p * pip_relative_units).round() as i64);
-    let relative_take_profit = take_profit_pips.map(|p| (p * pip_relative_units).round() as i64);
+    let relative_stop_loss = stop_loss_pips.map(to_relative_units);
+    let relative_take_profit = take_profit_pips.map(to_relative_units);
 
     let new_order = CTraderNewOrderRequest {
         account_id: resolved.account_id,

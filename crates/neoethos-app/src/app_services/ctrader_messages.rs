@@ -1531,6 +1531,69 @@ pub fn parse_ctrader_error_payload_parts(payload: &Value) -> Result<(String, Str
     Ok((error.error_code, formatted))
 }
 
+/// If `response` is a cTrader error envelope (payloadType 2142), return its
+/// formatted `errorCode: description`; otherwise `None`. Lets bootstrap
+/// callers surface the REAL broker rejection instead of a misleading
+/// "received N responses" count.
+pub fn ctrader_error_detail_from_response(response: &str) -> Option<String> {
+    let envelope = parse_open_api_envelope(response).ok()?;
+    if envelope.payload_type != CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+        return None;
+    }
+    parse_ctrader_error_payload(&envelope.payload).ok()
+}
+
+/// Run a `send_sequence`, retrying transient failures (cold-connection
+/// `CANT_ROUTE`, partial response bursts on a freshly-opened socket) a few
+/// times, and surfacing the REAL cTrader error instead of a misleading
+/// "received N" count. `min_ok` = the number of leading responses the caller
+/// actually requires; any extra responses are treated as best-effort. Each
+/// attempt opens a fresh connection (send_sequence connects per call), which
+/// is exactly what a transient routing failure on a cold connection needs.
+pub fn send_sequence_resilient<T: CTraderOpenApiTransport>(
+    transport: &T,
+    messages: &[CTraderOpenApiJsonMessage],
+    min_ok: usize,
+    label: &str,
+) -> Result<Vec<String>> {
+    const MAX_ATTEMPTS: usize = 3;
+    let mut detail: Option<String> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match transport.send_sequence(messages) {
+            Ok(responses) => {
+                let err_in_prefix = responses
+                    .iter()
+                    .take(min_ok)
+                    .find_map(|r| ctrader_error_detail_from_response(r));
+                if responses.len() >= min_ok && err_in_prefix.is_none() {
+                    return Ok(responses);
+                }
+                detail = err_in_prefix
+                    .or_else(|| {
+                        responses
+                            .iter()
+                            .find_map(|r| ctrader_error_detail_from_response(r))
+                    })
+                    .or_else(|| {
+                        Some(format!(
+                            "received {} of {min_ok} required responses",
+                            responses.len()
+                        ))
+                    });
+            }
+            Err(e) => detail = Some(e.to_string()),
+        }
+        if attempt < MAX_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
+        }
+    }
+    Err(anyhow!(
+        "{label} could not reach cTrader after {MAX_ATTEMPTS} attempts — {}. \
+         If this persists, re-authenticate in Settings → Broker Setup.",
+        detail.unwrap_or_else(|| "no response".to_string())
+    ))
+}
+
 /// Snapshot of a `ProtoOAAccountDisconnectEvent` (payload type 2164).
 ///
 /// The proto carries only `ctidTraderAccountId` plus the implicit

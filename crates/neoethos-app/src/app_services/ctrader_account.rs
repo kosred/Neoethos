@@ -723,23 +723,31 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
         .account_id
         .parse::<i64>()
         .context("cTrader account id must be numeric")?;
-    let responses = transport.send_sequence(&[
-        build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-1"),
-        build_account_auth_request(account_id, &request.access_token, "account-auth-1"),
-        build_trader_request(account_id, "trader-1"),
-        build_reconcile_request(account_id, request.return_protection_orders, "reconcile-1"),
-        build_deal_list_request(
-            &CTraderDealListRequest {
-                account_id,
-                from_timestamp_ms: Some(
-                    current_unix_millis()? - DEFAULT_CTRADER_DEAL_LOOKBACK_HOURS * 60 * 60 * 1000,
-                ),
-                to_timestamp_ms: Some(current_unix_millis()?),
-                max_rows: Some(DEFAULT_CTRADER_DEAL_MAX_ROWS),
-            },
-            "deals-1",
-        ),
-    ])?;
+    // Resilient: retry transient cold-connection / CANT_ROUTE failures and
+    // surface the real cTrader error instead of a misleading "received N"
+    // count. All 5 responses are required for a full account snapshot.
+    let responses = crate::app_services::ctrader_messages::send_sequence_resilient(
+        transport,
+        &[
+            build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-1"),
+            build_account_auth_request(account_id, &request.access_token, "account-auth-1"),
+            build_trader_request(account_id, "trader-1"),
+            build_reconcile_request(account_id, request.return_protection_orders, "reconcile-1"),
+            build_deal_list_request(
+                &CTraderDealListRequest {
+                    account_id,
+                    from_timestamp_ms: Some(
+                        current_unix_millis()? - DEFAULT_CTRADER_DEAL_LOOKBACK_HOURS * 60 * 60 * 1000,
+                    ),
+                    to_timestamp_ms: Some(current_unix_millis()?),
+                    max_rows: Some(DEFAULT_CTRADER_DEAL_MAX_ROWS),
+                },
+                "deals-1",
+            ),
+        ],
+        5,
+        "cTrader account runtime",
+    )?;
     if responses.len() != 5 {
         return Err(anyhow!(
             "expected 5 cTrader account runtime responses, received {}",
