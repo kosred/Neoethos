@@ -30,7 +30,8 @@ const TF_SECONDS: Record<string, number> = {
 type Source = "local" | "broker";
 
 export default function Markets() {
-  const [source, setSource] = useState<Source>("local");
+  // Markets is broker-only (live). Local history is for Discovery/Training.
+  const [source] = useState<Source>("broker");
   const [symbols, setSymbols] = useState<string[]>([]);
   const [symbol, setSymbol] = useState("");
   const [timeframes, setTimeframes] = useState<string[]>([]);
@@ -229,10 +230,7 @@ export default function Markets() {
           <span className={`stream-pill ${connected ? "on" : ""}`} title="Live tick stream">
             {connected ? "● LIVE" : "○ offline"}
           </span>
-          <div className="seg">
-            <button className={source === "local" ? "on" : ""} onClick={() => setSource("local")}>Local</button>
-            <button className={source === "broker" ? "on" : ""} onClick={() => setSource("broker")}>Broker</button>
-          </div>
+          {/* Markets is a LIVE broker view; local history is only for Discovery/Training. */}
           <select value={symbol} onChange={(e) => setSymbol(e.target.value)}>
             {source === "broker" && brokerSyms.length > 0
               ? Object.entries(

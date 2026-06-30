@@ -494,14 +494,17 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
     // `CTraderTraderSnapshot::unrealized_pnl`.
     let trader = &snapshot.trader;
     let balance = trader.balance;
-    let equity = trader.balance + trader.unrealized_pnl;
     let used_margin: f64 = snapshot
         .reconcile
         .positions
         .iter()
         .filter_map(|p| p.used_margin)
         .sum();
-    let free_margin = (equity - used_margin).max(0.0);
+    // `equity` + `free_margin` are computed AFTER the per-position PnL fetch
+    // below (#3 fix): the broker's `trader.unrealized_pnl` is frequently 0 /
+    // stale on demo, leaving equity == balance and the dashboard's unrealized
+    // P/L at 0 even with losing open trades. We instead SUM the same
+    // broker-authoritative per-position PnL the positions table shows.
 
     // Resolve symbol_id → ticker name from the cached catalog. If the
     // catalog is empty *and* we actually have positions to label, do a
@@ -583,10 +586,13 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
                     .iter()
                     .map(|p| position_to_payload(p, None, &HashMap::new(), &currency))
                     .collect();
+                // No per-position PnL in this branch — fall back to the broker
+                // trader-snapshot unrealized field for equity/free_margin.
+                let equity = balance + snapshot.trader.unrealized_pnl;
                 return Ok(AccountSnapshotPayload {
                     balance,
                     equity,
-                    free_margin,
+                    free_margin: (equity - used_margin).max(0.0),
                     used_margin: if used_margin.is_sign_negative() && used_margin == 0.0 {
                         0.0
                     } else {
@@ -641,6 +647,18 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
     } else {
         HashMap::new()
     };
+
+    // #3 fix: account equity = balance + SUM of broker-authoritative
+    // per-position unrealized PnL (matches the positions table total). Falls
+    // back to the trader-snapshot field only when the per-position fetch was
+    // empty (e.g. it failed this cycle), never leaving equity silently == balance.
+    let account_unrealized: f64 = if pnl_by_position.is_empty() {
+        trader.unrealized_pnl
+    } else {
+        pnl_by_position.values().map(|p| p.net_unrealized_pnl).sum()
+    };
+    let equity = balance + account_unrealized;
+    let free_margin = (equity - used_margin).max(0.0);
 
     // Compute the deposit currency once so every position payload
     // gets the same account_currency string (needed by

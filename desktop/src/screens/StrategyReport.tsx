@@ -60,10 +60,25 @@ export default function StrategyReport() {
           <h2>{rep.symbol} {rep.timeframe} <span className={`badge ${rep.mode === "risky" ? "live" : "demo"}`}>{rep.mode}</span></h2>
           <p className="muted small">{rep.spanStart} → {rep.spanEnd} · {rep.years}y · {rep.trades} trades</p>
 
+          {(() => {
+            const oos = !!rep.cpcvPassed && !!rep.walkforwardPassed;
+            const full = oos && !!rep.validationComplete;
+            const txt = full
+              ? "✅ FULLY VALIDATED — passed CPCV + Walkforward, evidence complete"
+              : oos
+                ? "✅ PASSED out-of-sample (CPCV + Walkforward) — full-evidence check still pending"
+                : "⚠️ NOT validated out-of-sample — not safe to trade live";
+            return (
+              <div className={`banner ${oos ? "info" : "warn"}`} style={{ fontWeight: 600 }}>
+                {txt}
+              </div>
+            );
+          })()}
+
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "8px 0" }}>
             <Badge ok={rep.cpcvPassed} label="CPCV" />
             <Badge ok={rep.walkforwardPassed} label="Walkforward (out-of-sample)" />
-            <Badge ok={rep.validationComplete} label="Validation complete" />
+            <Badge ok={rep.validationComplete} label="Full evidence" />
           </div>
           {rep.flags.map((f, i) => <div className="banner warn" key={i}>🚩 {f}</div>)}
 

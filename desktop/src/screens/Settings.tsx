@@ -6,7 +6,6 @@ import {
   selectAccount,
   settings as getSettings,
   updateSettings,
-  settingsPresets,
   setRiskPreset,
   riskInfo,
   type BrokerStatus,
@@ -18,7 +17,7 @@ export default function Settings() {
   const [status, setStatus] = useState<BrokerStatus | null>(null);
   const [accounts, setAccounts] = useState<AccountInfo[]>([]);
   const [cfg, setCfg] = useState<any>(null);
-  const [presets, setPresets] = useState<{ id: string; label: string; description: string }[]>([]);
+  const [presets, setPresets] = useState<{ id: string; displayName: string }[]>([]);
   const [risk, setRisk] = useState<any>(null);
   const [busy, setBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
@@ -36,7 +35,10 @@ export default function Settings() {
       /* settings optional */
     }
     try {
-      setPresets((await settingsPresets()).presets);
+      // Use the REAL prop-firm presets the backend's /risk/preset accepts
+      // (ftmo/myforexfunds/…), not /settings/presets (conservative/balanced/…)
+      // which setRiskPreset rejects with `unknown preset`.
+      setPresets((await riskInfo()).availablePresets);
     } catch {
       /* presets optional */
     }
@@ -289,7 +291,7 @@ export default function Settings() {
           <label>Preset
             <select value={risk?.preset ?? ""} onChange={(e) => applyPreset(e.target.value)} style={{ width: 240 }}>
               {!presets.some((p) => p.id === risk?.preset) && <option value="">{risk?.preset ?? "(current)"}</option>}
-              {presets.map((p) => <option key={p.id} value={p.id} title={p.description}>{p.label}</option>)}
+              {presets.map((p) => <option key={p.id} value={p.id}>{p.displayName}</option>)}
             </select>
           </label>
         )}
