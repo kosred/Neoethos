@@ -19,7 +19,10 @@ export default function Positions() {
   const [msg, setMsg] = useState("");
   const { snap } = useAccountStream(); // live positions + P/L (push)
 
-  // order ticket
+  // Unified order ticket: one card, two modes.
+  const [mode, setMode] = useState<"new" | "modify">("new");
+
+  // New-order fields
   const [symbol, setSymbol] = useState("EURUSD");
   const [side, setSide] = useState<"buy" | "sell">("buy");
   const [lots, setLots] = useState(0.01);
@@ -27,7 +30,7 @@ export default function Positions() {
   const [tp, setTp] = useState<number | "">(40);
   const [busy, setBusy] = useState(false);
 
-  // SL/TP protection editor
+  // Modify-protection fields
   const [protId, setProtId] = useState<number | "">("");
   const [protSl, setProtSl] = useState<number | "">("");
   const [protTp, setProtTp] = useState<number | "">("");
@@ -41,8 +44,6 @@ export default function Positions() {
     } catch (e) {
       setErr(String(e));
     }
-    // also nudge the backend's account bridge so the SSE stream (Dashboard)
-    // reflects the new state within ~1s instead of waiting for the safety poll.
     refreshAccount().catch(() => {});
   };
 
@@ -79,7 +80,6 @@ export default function Positions() {
     setBusy(true);
     setMsg("");
     try {
-      // reconcile volume is the broker wire volume; pass it through.
       const r = await closePosition(positionId, Math.round(volume));
       show(r);
       await refresh();
@@ -88,6 +88,17 @@ export default function Positions() {
     } finally {
       setBusy(false);
     }
+  };
+
+  // Selecting a position in the table jumps to Modify mode pre-filled.
+  const editPosition = (positionId: number) => {
+    const p = positions.find((x) => x.positionId === positionId);
+    if (!p) return;
+    setMode("modify");
+    setProtId(positionId);
+    setProtSl(p.stopLoss ?? "");
+    setProtTp(p.takeProfit ?? "");
+    setProtTrail(false);
   };
 
   const saveProtection = async () => {
@@ -119,57 +130,36 @@ export default function Positions() {
 
       <HelpPanel id="positions">
         <p>Place and manage <b>manual</b> trades on your connected cTrader account, and watch open positions with live P/L.</p>
-        <HelpStep n={1}><b>New market order:</b> choose a <b>Symbol</b>, <b>BUY</b>/<b>SELL</b>, the <b>Lots</b> size, and optional <b>SL</b>/<b>TP</b> in pips, then send. These are real orders on the active account (Demo or Live — check the header).</HelpStep>
-        <HelpStep n={2}><b>Open positions</b> stream live below with profit/loss and pips. Use <b>Modify SL/TP</b> to move a stop (e.g. to breakeven) and <b>Close</b> to exit.</HelpStep>
+        <HelpStep n={1}>One <b>order ticket</b> with two modes. <b>New order:</b> Symbol, BUY/SELL, Lots and optional SL/TP <i>in pips</i> → send. These are real orders on the active account (Demo or Live — check the header).</HelpStep>
+        <HelpStep n={2}><b>Modify open:</b> pick a position (or click <b>Edit</b> in the table) and set SL/TP <i>as price levels</i> — e.g. move a stop to breakeven, or enable trailing.</HelpStep>
         <p className="muted small">Manual orders here are not risk-gated — you are in control. Automated trading lives in <b>Autopilot</b> and is protected by the demo gate.</p>
       </HelpPanel>
 
+      {/* ── Unified order ticket ── */}
       <div className="ticket">
-        <h2>New market order</h2>
-        <div className="ticket-row">
-          <label>
-            Symbol
-            <SymbolSelect value={symbol} onChange={setSymbol} style={{ width: 120 }} />
-          </label>
-          <div className="seg">
-            <button className={side === "buy" ? "on buy" : ""} onClick={() => setSide("buy")}>
-              BUY
-            </button>
-            <button className={side === "sell" ? "on sell" : ""} onClick={() => setSide("sell")}>
-              SELL
-            </button>
-          </div>
-          <label>
-            Lots
-            <input type="number" step="0.01" value={lots} onChange={(e) => setLots(Number(e.target.value))} />
-          </label>
-          <label>
-            SL pips
-            <input type="number" value={sl} onChange={(e) => setSl(e.target.value === "" ? "" : Number(e.target.value))} />
-          </label>
-          <label>
-            TP pips
-            <input type="number" value={tp} onChange={(e) => setTp(e.target.value === "" ? "" : Number(e.target.value))} />
-          </label>
-          <button className="primary" onClick={submit} disabled={busy}>
-            {busy ? "…" : `${side.toUpperCase()} ${lots}`}
-          </button>
+        <div className="seg" style={{ marginBottom: 12 }}>
+          <button className={mode === "new" ? "on" : ""} onClick={() => setMode("new")}>New order</button>
+          <button className={mode === "modify" ? "on" : ""} onClick={() => setMode("modify")}>Modify open</button>
         </div>
-        {msg && <div className="banner info">{msg}</div>}
-      </div>
 
-      <h2>Open positions</h2>
-      {err && <div className="banner warn">{err.slice(0, 160)}</div>}
-      <PositionsTable
-        live={snap?.positions ?? []}
-        currency={snap?.currency ?? acct?.currency ?? ""}
-        onClose={onClose}
-        busy={busy}
-      />
-
-      {positions.length > 0 && (
-        <div className="ticket" style={{ marginTop: 16 }}>
-          <h2>Modify SL / TP (price levels)</h2>
+        {mode === "new" ? (
+          <div className="ticket-row">
+            <label>
+              Symbol
+              <SymbolSelect value={symbol} onChange={setSymbol} style={{ width: 120 }} />
+            </label>
+            <div className="seg">
+              <button className={side === "buy" ? "on buy" : ""} onClick={() => setSide("buy")}>BUY</button>
+              <button className={side === "sell" ? "on sell" : ""} onClick={() => setSide("sell")}>SELL</button>
+            </div>
+            <label>Lots<input type="number" step="0.01" value={lots} onChange={(e) => setLots(Number(e.target.value))} /></label>
+            <label>SL pips<input type="number" value={sl} onChange={(e) => setSl(e.target.value === "" ? "" : Number(e.target.value))} /></label>
+            <label>TP pips<input type="number" value={tp} onChange={(e) => setTp(e.target.value === "" ? "" : Number(e.target.value))} /></label>
+            <button className="primary" onClick={submit} disabled={busy}>{busy ? "…" : `${side.toUpperCase()} ${lots}`}</button>
+          </div>
+        ) : positions.length === 0 ? (
+          <p className="muted">No open positions to modify.</p>
+        ) : (
           <div className="ticket-row">
             <label>
               Position
@@ -185,9 +175,7 @@ export default function Positions() {
               >
                 <option value="">— pick —</option>
                 {positions.map((p) => (
-                  <option key={p.positionId} value={p.positionId}>
-                    {p.symbol} {p.side} #{p.positionId}
-                  </option>
+                  <option key={p.positionId} value={p.positionId}>{p.symbol} {p.side} #{p.positionId}</option>
                 ))}
               </select>
             </label>
@@ -198,8 +186,19 @@ export default function Positions() {
             </label>
             <button className="primary" disabled={busy} onClick={saveProtection}>Update SL/TP</button>
           </div>
-        </div>
-      )}
+        )}
+        {msg && <div className="banner info">{msg}</div>}
+      </div>
+
+      <h2>Open positions</h2>
+      {err && <div className="banner warn">{err.slice(0, 160)}</div>}
+      <PositionsTable
+        live={snap?.positions ?? []}
+        currency={snap?.currency ?? acct?.currency ?? ""}
+        onClose={onClose}
+        onEdit={editPosition}
+        busy={busy}
+      />
     </div>
   );
 }

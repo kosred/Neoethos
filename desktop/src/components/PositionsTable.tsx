@@ -19,14 +19,17 @@ export default function PositionsTable({
   live,
   currency = "",
   onClose,
+  onEdit,
   busy,
 }: {
   live: StreamPosition[];
   currency?: string;
   onClose?: (positionId: number, volumeUnits: number) => void;
+  onEdit?: (positionId: number) => void;
   busy?: boolean;
 }) {
   if (!live || live.length === 0) return <p className="muted">No open positions.</p>;
+  const hasActions = !!(onClose || onEdit);
   let total = 0;
 
   return (
@@ -42,7 +45,7 @@ export default function PositionsTable({
           <th>Opened</th>
           <th>P/L{currency ? ` (${currency})` : ""}</th>
           <th>Pips</th>
-          {onClose && <th></th>}
+          {hasActions && <th></th>}
         </tr>
       </thead>
       <tbody>
@@ -60,11 +63,18 @@ export default function PositionsTable({
               <td className="muted">{ago(p.openTimestampMs)}</td>
               <td className={cls}><b>{p.pnlUsd >= 0 ? "+" : ""}{p.pnlUsd.toFixed(2)}</b></td>
               <td className={cls}>{p.pnlPips >= 0 ? "+" : ""}{p.pnlPips.toFixed(1)}</td>
-              {onClose && (
-                <td>
-                  <button className="danger" disabled={busy} onClick={() => onClose(p.positionId, p.volumeUnits)}>
-                    Close
-                  </button>
+              {hasActions && (
+                <td style={{ whiteSpace: "nowrap" }}>
+                  {onEdit && (
+                    <button disabled={busy} onClick={() => onEdit(p.positionId)} style={{ marginRight: 4 }}>
+                      Edit
+                    </button>
+                  )}
+                  {onClose && (
+                    <button className="danger" disabled={busy} onClick={() => onClose(p.positionId, p.volumeUnits)}>
+                      Close
+                    </button>
+                  )}
                 </td>
               )}
             </tr>
@@ -75,7 +85,7 @@ export default function PositionsTable({
         <tr>
           <td colSpan={7} style={{ textAlign: "right", color: "#6b7280" }}>Total P/L</td>
           <td className={total >= 0 ? "buy" : "sell"}><b>{total >= 0 ? "+" : ""}{total.toFixed(2)}</b></td>
-          <td colSpan={onClose ? 2 : 1}></td>
+          <td colSpan={hasActions ? 2 : 1}></td>
         </tr>
       </tfoot>
     </table>
