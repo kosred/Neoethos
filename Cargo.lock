@@ -7468,6 +7468,7 @@ dependencies = [
  "neoethos-app",
  "neoethos-core",
  "neoethos-data",
+ "rfd",
  "serde",
  "serde_json",
  "tauri",

@@ -67,6 +67,73 @@ pub fn combine_gene_signals(
     net.into_iter().map(dir_from_net).collect()
 }
 
+/// Like [`combine_gene_signals`] but ALSO returns, per bar, the average
+/// stop-loss / take-profit (in pips) of the genes that AGREE with the net
+/// direction — so the live engine can place the STRATEGY'S OWN brackets, never
+/// an externally-imposed stop. `sl_pips`/`tp_pips` are `0.0` on a bar where no
+/// agreeing gene carries a stop (a pure signal-exit strategy ⇒ the live order
+/// stays bracket-free, exactly matching the backtest's behaviour).
+pub fn combine_gene_signals_with_brackets(
+    genes: &[Gene],
+    aligned_features: &FeatureFrame,
+    base_ohlcv: &Ohlcv,
+) -> (Vec<Direction>, Vec<f64>, Vec<f64>) {
+    let n = aligned_features.n_samples();
+    let cfg = EvaluationConfig::default();
+    let mut net = vec![0i32; n];
+    let mut sl_long = vec![0.0f64; n];
+    let mut tp_long = vec![0.0f64; n];
+    let mut cnt_long = vec![0u32; n];
+    let mut sl_short = vec![0.0f64; n];
+    let mut tp_short = vec![0.0f64; n];
+    let mut cnt_short = vec![0u32; n];
+
+    for gene in genes {
+        let sigs = if gene_uses_smc(gene) {
+            signals_for_gene_full(aligned_features, base_ohlcv, gene, &cfg)
+        } else {
+            signals_for_gene(aligned_features, gene)
+        };
+        for (i, s) in sigs.iter().enumerate() {
+            if i >= n {
+                break;
+            }
+            net[i] += *s as i32;
+            if *s > 0 {
+                sl_long[i] += gene.sl_pips;
+                tp_long[i] += gene.tp_pips;
+                cnt_long[i] += 1;
+            } else if *s < 0 {
+                sl_short[i] += gene.sl_pips;
+                tp_short[i] += gene.tp_pips;
+                cnt_short[i] += 1;
+            }
+        }
+    }
+
+    let mut dirs = Vec::with_capacity(n);
+    let mut sl_out = Vec::with_capacity(n);
+    let mut tp_out = Vec::with_capacity(n);
+    for i in 0..n {
+        let dir = dir_from_net(net[i]);
+        let (sl, tp) = match dir {
+            Direction::Long if cnt_long[i] > 0 => (
+                sl_long[i] / cnt_long[i] as f64,
+                tp_long[i] / cnt_long[i] as f64,
+            ),
+            Direction::Short if cnt_short[i] > 0 => (
+                sl_short[i] / cnt_short[i] as f64,
+                tp_short[i] / cnt_short[i] as f64,
+            ),
+            _ => (0.0, 0.0),
+        };
+        dirs.push(dir);
+        sl_out.push(sl);
+        tp_out.push(tp);
+    }
+    (dirs, sl_out, tp_out)
+}
+
 /// Like [`combine_gene_signals`] but ALSO returns the netted per-bar gene
 /// confidence (Stage 3/4 prerequisite). Uses the GA's
 /// `signals_and_confidence_for_gene_full` (the same per-bar confidence the

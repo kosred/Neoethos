@@ -47,7 +47,8 @@ pub use data_replay::{
 #[cfg(feature = "ml-blend")]
 pub use data_replay::replay_blend_from_dir;
 pub use gene_signal::{
-    PrecomputedSignalEngine, combine_gene_signals, combine_gene_signals_with_confidence,
+    PrecomputedSignalEngine, combine_gene_signals, combine_gene_signals_with_brackets,
+    combine_gene_signals_with_confidence,
 };
 pub use decision::{DecisionConfig, DecisionEngine};
 pub use engine::{AutonomousEngine, EngineConfig, EngineStats};

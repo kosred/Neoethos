@@ -374,10 +374,15 @@ async fn run(
             continue;
         }
 
-        // ── Gene signal (last bar) ────────────────────────────────────────────
-        let directions =
-            neoethos_trader::combine_gene_signals(&genes, &aligned, &base_ohlcv);
+        // ── Gene signal + the strategy's OWN brackets (last bar) ──────────────
+        let (directions, sl_arr, tp_arr) =
+            neoethos_trader::combine_gene_signals_with_brackets(&genes, &aligned, &base_ohlcv);
         let direction = directions.last().copied().unwrap_or(Direction::Flat);
+        // Gene-derived SL/TP (pips) for THIS bar: we place the STRATEGY'S own
+        // brackets, never an imposed stop. 0.0 ⇒ a signal-exit-only strategy, so
+        // the live order stays bracket-free (exactly what the backtest does).
+        let gene_sl = sl_arr.last().copied().unwrap_or(0.0);
+        let gene_tp = tp_arr.last().copied().unwrap_or(0.0);
 
         bars_evaluated += 1;
         let signal_label = format!("{direction:?}");
@@ -426,8 +431,11 @@ async fn run(
                     OrderSide::Sell
                 };
                 let lot = req.lot_size;
-                let sl = req.stop_loss_pips;
-                let tp = req.take_profit_pips;
+                // Default to the strategy's OWN bracket; `req.*` is only an
+                // explicit operator override (Autopilot sends none, so the
+                // gene's discovered SL/TP is what actually gets placed).
+                let sl = req.stop_loss_pips.or((gene_sl > 0.0).then_some(gene_sl));
+                let tp = req.take_profit_pips.or((gene_tp > 0.0).then_some(gene_tp));
                 let sym = symbol.clone();
 
                 let result = tokio::task::spawn_blocking(move || {
