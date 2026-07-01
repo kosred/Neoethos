@@ -173,6 +173,8 @@ pub fn router(state: AppApiState) -> Router {
         .route("/autonomous/gate", get(autonomous::gate))
         // Permanent auto-cull blacklist of retired (never-tradable-again) strategies.
         .route("/strategy/blacklist", get(autonomous::blacklist))
+        // Live↔backtest parity harness (window-invariance of live signals).
+        .route("/autonomous/parity", get(autonomous::parity))
         .route("/broker/status", get(system_status::broker_status))
         .route("/broker/reauth", post(broker_control::reauth))
         .route(

@@ -191,7 +191,7 @@ fn tf_duration_ms(tf: &str) -> i64 {
     }
 }
 
-fn bars_to_ohlcv(bars: &[crate::app_services::ctrader_data::HistoricalBar]) -> Ohlcv {
+pub(crate) fn bars_to_ohlcv(bars: &[crate::app_services::ctrader_data::HistoricalBar]) -> Ohlcv {
     Ohlcv {
         timestamp: Some(bars.iter().map(|b| b.timestamp_ms).collect()),
         open: bars.iter().map(|b| b.open).collect(),

@@ -223,6 +223,44 @@ pub async fn blacklist() -> Response {
     Json(crate::app_services::strategy_blacklist::load()).into_response()
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct ParityQuery {
+    pub portfolio: String,
+    /// Live-style window size (defaults to the live engine's 1000).
+    pub window: Option<usize>,
+    /// Long-history reference size (default 3000).
+    pub reference: Option<usize>,
+}
+
+/// `GET /autonomous/parity?portfolio=..&window=1000&reference=3000` — the
+/// live↔backtest parity harness: does the live 1000-bar window produce the
+/// SAME signals as a long-history computation for this portfolio? FAIL means
+/// live trading cannot match the validated backtest (warmup-sensitive
+/// features) — fix BEFORE trusting live results.
+pub async fn parity(Query(q): Query<ParityQuery>) -> Response {
+    let portfolio = q.portfolio;
+    let window = q.window.unwrap_or(crate::app_services::live_trading::default_warmup_bars());
+    let reference = q.reference.unwrap_or(3000);
+    let result = tokio::task::spawn_blocking(move || {
+        crate::app_services::live_parity::run_live_parity_check(&portfolio, window, reference)
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(e)) => actionable_error(
+            StatusCode::BAD_REQUEST,
+            "Parity check failed — make sure the portfolio path exists and the broker \
+             connection is alive (it fetches recent bars).",
+            &e,
+        ),
+        Err(join_err) => actionable_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The parity task panicked.",
+            &anyhow::anyhow!("{join_err}"),
+        ),
+    }
+}
+
 /// `POST /autonomous/stop` — gracefully stop ALL running live engines.
 pub async fn stop_live(State(state): State<AppApiState>) -> Response {
     let mut slot = match state.live_trading.lock() {

@@ -547,6 +547,26 @@ export type BlacklistEntry = {
 };
 export const strategyBlacklist = () => apiGet<BlacklistEntry[]>("/strategy/blacklist");
 
+// Live↔backtest parity harness: does the live bar-window reproduce the
+// long-history signals for this portfolio? FAIL = live ≠ validated backtest.
+export type ParityReport = {
+  symbol: string;
+  baseTf: string;
+  referenceBars: number;
+  windowBars: number;
+  comparedBars: number;
+  directionMismatches: number;
+  mismatchSamples: { barTsMs: number; reference: string; window: string }[];
+  maxSlDeltaPips: number;
+  maxTpDeltaPips: number;
+  verdict: "PASS" | "FAIL";
+  note: string;
+};
+export const parityCheck = (portfolio: string, window?: number) =>
+  apiGet<ParityReport>(
+    `/autonomous/parity?portfolio=${encodeURIComponent(portfolio)}${window ? `&window=${window}` : ""}`,
+  );
+
 // ── Strategy report: monthly journal + validation verdict + flags ─────────
 export type StrategyEntry = {
   mode: string;

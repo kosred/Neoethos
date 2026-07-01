@@ -9,8 +9,10 @@ import {
   openPath,
   strategyList,
   strategyBlacklist,
+  parityCheck,
   type PortfolioEntry,
   type GateVerdict,
+  type ParityReport,
 } from "../api";
 import { usePoll } from "../hooks";
 import { HelpPanel, HelpStep, Tip } from "../components/Help";
@@ -82,6 +84,7 @@ export default function Autopilot() {
   const [focus, setFocus] = useState<PortfolioEntry | null>(null);
   const [gate, setGate] = useState<GateVerdict | null>(null);
   const [replay, setReplay] = useState<any>(null);
+  const [parity, setParity] = useState<ParityReport | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   // Filters
@@ -188,6 +191,22 @@ export default function Autopilot() {
     }
   };
 
+  const doParity = async () => {
+    if (!focus) { setMsg("Click a strategy name to focus it, then Check parity."); return; }
+    setBusy(true);
+    setParity(null);
+    setMsg(`Checking live↔backtest parity for ${focus.symbol ?? ""}… (fetches broker bars, ~10-30s)`);
+    try {
+      const r = await parityCheck(focus.path);
+      setParity(r);
+      setMsg(r.verdict === "PASS" ? "✓ Parity PASS — live signals are window-invariant." : "✗ Parity FAIL — see the report below.");
+    } catch (e) {
+      setMsg(`Parity check failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="screen">
       <h1>
@@ -263,6 +282,7 @@ export default function Autopilot() {
       <div className="ticket" style={{ marginTop: 14 }}>
         <div className="btn-row">
           <button disabled={busy || !focus} onClick={doReplay}>Replay focused (dry-run)</button>
+          <button disabled={busy || !focus} onClick={doParity} title="Does the live bar-window produce the SAME signals as the full history? FAIL = live won't match the validated backtest.">Check parity</button>
           <button className="primary" disabled={busy || selected.length === 0} onClick={startSelected}>
             Start selected (live) · {selected.length}
           </button>
@@ -273,6 +293,34 @@ export default function Autopilot() {
       </div>
 
       <GatePanel gate={gate} />
+
+      {parity && (
+        <div className="ticket" style={{ marginTop: 12, borderColor: parity.verdict === "PASS" ? "#15803d" : "#b91c1c" }}>
+          <h2 style={{ marginTop: 0 }}>
+            Live↔backtest parity{" "}
+            <span className="badge" style={{ background: parity.verdict === "PASS" ? "#15803d" : "#b91c1c" }}>{parity.verdict}</span>
+          </h2>
+          <p className="muted small">{parity.note}</p>
+          <p className="muted small">
+            {parity.symbol} {parity.baseTf} · window {parity.windowBars} vs reference {parity.referenceBars} bars · compared {parity.comparedBars} ·
+            mismatches <b>{parity.directionMismatches}</b> · max ΔSL {parity.maxSlDeltaPips.toFixed(3)} pips · max ΔTP {parity.maxTpDeltaPips.toFixed(3)} pips
+          </p>
+          {parity.mismatchSamples.length > 0 && (
+            <table className="tbl">
+              <thead><tr><th>Bar</th><th>Reference</th><th>Live window</th></tr></thead>
+              <tbody>
+                {parity.mismatchSamples.map((m) => (
+                  <tr key={m.barTsMs}>
+                    <td className="muted">{new Date(m.barTsMs).toLocaleString()}</td>
+                    <td>{m.reference}</td>
+                    <td className="sell">{m.window}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
 
       {engines.length > 0 && (
         <>
