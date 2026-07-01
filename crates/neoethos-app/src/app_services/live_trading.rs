@@ -418,7 +418,10 @@ async fn run(
             break;
         }
 
-        // Sleep until just after the next bar boundary
+        // Sleep until just after the next bar boundary — but INTERRUPTIBLY.
+        // A single long sleep made Stop appear dead: on H1 the loop wouldn't
+        // re-check the stop flag for up to an hour. Poll it every 500ms so Stop
+        // (and Stop-all) takes effect within ~½s on any timeframe.
         let now_ms = chrono::Utc::now().timestamp_millis();
         let next_boundary = (now_ms / bar_ms + 1) * bar_ms;
         let wait_ms = (next_boundary - now_ms + 3_000).max(5_000) as u64;
@@ -427,9 +430,18 @@ async fn run(
             wait_secs = wait_ms / 1000,
             "waiting for next bar"
         );
-        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-
-        if stop.load(Ordering::Relaxed) {
+        let mut waited: u64 = 0;
+        let mut stop_requested = false;
+        while waited < wait_ms {
+            if stop.load(Ordering::Relaxed) {
+                stop_requested = true;
+                break;
+            }
+            let chunk = (wait_ms - waited).min(500);
+            tokio::time::sleep(Duration::from_millis(chunk)).await;
+            waited += chunk;
+        }
+        if stop_requested || stop.load(Ordering::Relaxed) {
             break;
         }
 
