@@ -117,6 +117,10 @@ pub struct StartLiveBody {
     pub take_profit_pips: Option<f64>,
     #[serde(default = "crate::app_services::live_trading::default_warmup_bars")]
     pub warmup_bars: usize,
+    /// Auto-cull: retire a strategy after this many consecutive losing trades
+    /// (0 disables). Applies to every engine started in this request.
+    #[serde(default = "crate::app_services::live_trading::default_cull_losses")]
+    pub cull_after_consecutive_losses: u32,
 }
 
 /// Aggregate status across every running engine.
@@ -164,10 +168,16 @@ pub async fn start_live(
 
     let mut started: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut blacklisted: Vec<String> = Vec::new();
     let mut failed: Vec<serde_json::Value> = Vec::new();
     for path in paths {
         if already.contains(&path) {
             skipped.push(path);
+            continue;
+        }
+        // Auto-cull enforcement: a retired strategy can NEVER be traded again.
+        if crate::app_services::strategy_blacklist::is_blacklisted(&path) {
+            blacklisted.push(path);
             continue;
         }
         let req = StartRequest {
@@ -176,6 +186,7 @@ pub async fn start_live(
             stop_loss_pips: body.stop_loss_pips,
             take_profit_pips: body.take_profit_pips,
             warmup_bars: body.warmup_bars,
+            cull_after_consecutive_losses: body.cull_after_consecutive_losses,
         };
         match crate::app_services::live_trading::start(req) {
             Ok(handle) => {
@@ -198,11 +209,18 @@ pub async fn start_live(
         Json(serde_json::json!({
             "started": started,
             "skipped": skipped,
+            "blacklisted": blacklisted,
             "failed": failed,
             "overview": live_overview(&slot),
         })),
     )
         .into_response()
+}
+
+/// `GET /strategy/blacklist` — the permanent list of auto-retired strategies.
+/// These can never be selected for live trading or re-surfaced by discovery.
+pub async fn blacklist() -> Response {
+    Json(crate::app_services::strategy_blacklist::load()).into_response()
 }
 
 /// `POST /autonomous/stop` — gracefully stop ALL running live engines.

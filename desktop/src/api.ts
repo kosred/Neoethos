@@ -531,8 +531,21 @@ export type PortfolioEntry = {
   geneCount: number | null;
   sizeBytes: number;
   modifiedMs: number | null;
+  blacklisted?: boolean;
 };
 export const portfoliosList = () => apiGet<{ count: number; portfolios: PortfolioEntry[] }>("/portfolios/list");
+
+// Permanent auto-cull blacklist — strategies retired after too many losses.
+export type BlacklistEntry = {
+  fingerprint: string;
+  portfolioPath: string;
+  symbol: string | null;
+  reason: string;
+  consecutiveLosses: number;
+  netPnl: number;
+  retiredAtUnixMs: number;
+};
+export const strategyBlacklist = () => apiGet<BlacklistEntry[]>("/strategy/blacklist");
 
 // ── Strategy report: monthly journal + validation verdict + flags ─────────
 export type StrategyEntry = {

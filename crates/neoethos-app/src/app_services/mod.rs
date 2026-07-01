@@ -58,6 +58,7 @@ pub mod news_research;
 pub mod pending_actions;
 pub mod risky_mode_persistence;
 pub mod secure_store;
+pub mod strategy_blacklist;
 pub mod trading_types;
 pub mod training;
 pub mod validation;

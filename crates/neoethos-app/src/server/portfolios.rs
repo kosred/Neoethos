@@ -23,6 +23,9 @@ pub struct PortfolioEntry {
     pub gene_count: Option<usize>,
     pub size_bytes: u64,
     pub modified_ms: Option<i64>,
+    /// True if auto-cull permanently retired this strategy — the UI hides it and
+    /// the autopilot refuses to run it.
+    pub blacklisted: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,16 +82,20 @@ fn read_entry(p: &Path) -> PortfolioEntry {
         }
     }
 
+    let path = std::fs::canonicalize(p)
+        .map(|c| c.display().to_string().trim_start_matches(r"\\?\").to_string())
+        .unwrap_or_else(|_| p.display().to_string());
+    let blacklisted = crate::app_services::strategy_blacklist::is_blacklisted(&path);
+
     PortfolioEntry {
-        path: std::fs::canonicalize(p)
-            .map(|c| c.display().to_string().trim_start_matches(r"\\?\").to_string())
-            .unwrap_or_else(|_| p.display().to_string()),
+        path,
         file_name: p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
         symbol,
         base_tf,
         gene_count,
         size_bytes,
         modified_ms,
+        blacklisted,
     }
 }
 

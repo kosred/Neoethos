@@ -39,6 +39,11 @@ pub struct StartRequest {
     /// How many bars to fetch per TF for feature warmup. Default 1000.
     #[serde(default = "default_warmup_bars")]
     pub warmup_bars: usize,
+    /// Auto-cull: after this many CONSECUTIVE losing trades, the engine stops
+    /// itself and permanently retires the strategy (blacklist). Default 6.
+    /// 0 disables auto-cull for this engine.
+    #[serde(default = "default_cull_losses")]
+    pub cull_after_consecutive_losses: u32,
 }
 
 pub fn default_lot_size() -> f64 {
@@ -46,6 +51,9 @@ pub fn default_lot_size() -> f64 {
 }
 pub fn default_warmup_bars() -> usize {
     1000
+}
+pub fn default_cull_losses() -> u32 {
+    6
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
@@ -63,6 +71,10 @@ pub struct LiveTradingStatus {
     pub last_signal: Option<String>,
     pub open_position_id: Option<i64>,
     pub bars_evaluated: u64,
+    /// Current run of consecutive losing trades (resets to 0 on any win).
+    pub consecutive_losses: u32,
+    /// True once auto-cull retired this strategy (engine stopped + blacklisted).
+    pub retired: bool,
 }
 
 impl Default for LiveTradingStatus {
@@ -76,6 +88,8 @@ impl Default for LiveTradingStatus {
             last_signal: None,
             open_position_id: None,
             bars_evaluated: 0,
+            consecutive_losses: 0,
+            retired: false,
         }
     }
 }
@@ -323,6 +337,15 @@ async fn run(
     let mut open_position: Option<(i64, i64)> = None;
     let mut bars_evaluated: u64 = 0;
 
+    // ── Auto-cull: retire the strategy after N consecutive losing trades ───────
+    // Realized results are read from the broker's closing deals for positions
+    // THIS engine opened (catches SL/TP exits too, not just engine flips).
+    let cull_threshold = req.cull_after_consecutive_losses;
+    let portfolio_path = req.portfolio_path.clone();
+    let mut opened_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut consecutive_losses: u32 = 0;
+    let mut net_pnl_running: f64 = 0.0;
+
     tracing::info!(
         target: "neoethos_app::live_trading",
         %symbol, %base_tf,
@@ -444,6 +467,76 @@ async fn run(
             continue;
         }
         last_bar_ts = latest_ts;
+
+        // ── Auto-cull reconcile: account THIS engine's closed trades ──────────
+        // Reads the broker's closing deals (net_profit) for positions we opened
+        // — catches SL/TP exits, not just engine flips. On N consecutive losses
+        // the strategy is permanently retired (blacklisted) and the engine stops.
+        if cull_threshold > 0 && !opened_ids.is_empty() {
+            if let Ok(Ok(runtime)) = tokio::task::spawn_blocking(
+                crate::app_services::broker_api::fetch_account_runtime_blocking,
+            )
+            .await
+            {
+                for deal in &runtime.recent_deals {
+                    let Some(net) = deal.net_profit else { continue };
+                    if opened_ids.remove(&deal.position_id) {
+                        net_pnl_running += net;
+                        if net < 0.0 {
+                            consecutive_losses += 1;
+                        } else {
+                            consecutive_losses = 0;
+                        }
+                        tracing::info!(
+                            target: "neoethos_app::live_trading",
+                            position_id = deal.position_id, net_profit = net,
+                            consecutive_losses, "auto-cull: closed trade accounted"
+                        );
+                    }
+                }
+                if let Ok(mut s) = status.lock() {
+                    s.consecutive_losses = consecutive_losses;
+                }
+                if consecutive_losses >= cull_threshold {
+                    tracing::warn!(
+                        target: "neoethos_app::live_trading",
+                        %symbol, portfolio_path = %portfolio_path,
+                        consecutive_losses, threshold = cull_threshold, net_pnl = net_pnl_running,
+                        "AUTO-CULL: strategy hit the consecutive-loss limit — retiring it (blacklist)"
+                    );
+                    if let Some(fp) =
+                        crate::app_services::strategy_blacklist::fingerprint_file(&portfolio_path)
+                    {
+                        crate::app_services::strategy_blacklist::retire(
+                            crate::app_services::strategy_blacklist::BlacklistEntry {
+                                fingerprint: fp,
+                                portfolio_path: portfolio_path.clone(),
+                                symbol: Some(symbol.clone()),
+                                reason: format!(
+                                    "{consecutive_losses} consecutive losing trades (demo/live auto-cull)"
+                                ),
+                                consecutive_losses,
+                                net_pnl: net_pnl_running,
+                                retired_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                            },
+                        );
+                    }
+                    // Flatten any position we still hold before retiring.
+                    if let Some((pos_id, vol)) = open_position.take() {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            close_position_blocking(pos_id, vol)
+                        })
+                        .await;
+                    }
+                    if let Ok(mut s) = status.lock() {
+                        s.retired = true;
+                        s.running = false;
+                        s.open_position_id = None;
+                    }
+                    break;
+                }
+            }
+        }
 
         // ── Build multi-TF SymbolDataset ──────────────────────────────────────
         let mut frames: HashMap<String, Ohlcv> = HashMap::new();
@@ -614,6 +707,8 @@ async fn run(
 
                         if let Some(pos_id) = outcome.position_id {
                             open_position = Some((pos_id, broker_vol));
+                            // Track for auto-cull realized-result reconciliation.
+                            opened_ids.insert(pos_id);
                         }
 
                         if let Ok(mut s) = status.lock() {

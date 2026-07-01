@@ -8,11 +8,12 @@ import {
   autonomousGate,
   openPath,
   strategyList,
+  strategyBlacklist,
   type PortfolioEntry,
   type GateVerdict,
 } from "../api";
 import { usePoll } from "../hooks";
-import { HelpPanel, HelpStep } from "../components/Help";
+import { HelpPanel, HelpStep, Tip } from "../components/Help";
 
 function StatGrid({ data }: { data: any }) {
   if (!data || typeof data !== "object") return null;
@@ -87,12 +88,18 @@ export default function Autopilot() {
   const [modeFilter, setModeFilter] = useState<"all" | "risky" | "prop">("all");
   const [onlyValidated, setOnlyValidated] = useState(false);
   const [validatedKeys, setValidatedKeys] = useState<Set<string>>(new Set());
+  // Auto-cull: retire a strategy after this many consecutive losing trades.
+  const [cullLosses, setCullLosses] = useState(6);
+
+  const { data: blacklist } = usePoll(strategyBlacklist, 0);
+  const retired = Array.isArray(blacklist) ? blacklist : [];
 
   const engines: any[] = status?.engines ?? [];
   const running = !!status?.running;
   const runningPaths = new Set(engines.map((e) => e.portfolioPath));
   const allPortfolios = list?.portfolios ?? [];
   const portfolios = allPortfolios.filter((p) => {
+    if (p.blacklisted) return false; // retired strategies are never selectable
     const isProp = p.path.toLowerCase().includes("propfirm");
     if (modeFilter === "risky" && isProp) return false;
     if (modeFilter === "prop" && !isProp) return false;
@@ -136,11 +143,12 @@ export default function Autopilot() {
     setBusy(true);
     setMsg(`Starting ${selected.length} engine${selected.length === 1 ? "" : "s"}…`);
     try {
-      const r: any = await autonomousStart({ portfolio_paths: selected });
+      const r: any = await autonomousStart({ portfolio_paths: selected, cull_after_consecutive_losses: cullLosses });
       const s = r?.started?.length ?? 0;
       const sk = r?.skipped?.length ?? 0;
+      const bl = r?.blacklisted?.length ?? 0;
       const f = r?.failed ?? [];
-      let m = `✓ Started ${s}${sk ? `, ${sk} already running` : ""}${f.length ? `, ${f.length} blocked/failed` : ""}.`;
+      let m = `✓ Started ${s}${sk ? `, ${sk} already running` : ""}${bl ? `, ${bl} retired (skipped)` : ""}${f.length ? `, ${f.length} blocked/failed` : ""}.`;
       if (f.length) m += " — " + f.map((x: any) => `${fileTail(x.portfolio)}: ${x.error}`).join("; ");
       setMsg(m);
       await reloadStatus();
@@ -196,6 +204,7 @@ export default function Autopilot() {
         <HelpStep n={2}><b>Replay (dry-run)</b> tests the focused strategy on stored history with zero broker calls.</HelpStep>
         <HelpStep n={3}><b>Start selected (live)</b> launches one concurrent engine per ticked strategy. On a <b>Demo</b> account they always run (building the track record); on a <b>Live</b> account each is blocked until its demo gate passes — blocked ones are reported, the rest still start.</HelpStep>
         <HelpStep n={4}><b>Stop all</b> halts every running engine.</HelpStep>
+        <HelpStep n={5}><b>Auto-cull</b>: set a consecutive-loss limit. When a running strategy hits it, the engine stops itself and the strategy is <b>permanently retired</b> — blacklisted so it can never be selected or re-discovered again (kept as a record, never deleted). Retired ones appear at the bottom.</HelpStep>
       </HelpPanel>
 
       <div className="btn-row" style={{ flexWrap: "wrap", alignItems: "center" }}>
@@ -211,7 +220,11 @@ export default function Autopilot() {
         <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }} title="Only strategies whose backtest passed CPCV + Walkforward out-of-sample">
           <input type="checkbox" checked={onlyValidated} onChange={(e) => setOnlyValidated(e.target.checked)} /> Only validated (passed OOS)
         </label>
-        <span className="muted small">{portfolios.length} of {allPortfolios.length} shown · {selected.length} selected</span>
+        <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+          Auto-cull after <Tip text="After this many CONSECUTIVE losing trades, the engine stops itself and permanently retires the strategy (blacklist) — it can never be selected or re-discovered again. 0 = off." />
+          <input type="number" min={0} max={50} value={cullLosses} onChange={(e) => setCullLosses(Math.max(0, Number(e.target.value)))} style={{ width: 56 }} /> losses
+        </label>
+        <span className="muted small">{portfolios.length} of {allPortfolios.length} shown · {selected.length} selected{retired.length ? ` · ${retired.length} retired` : ""}</span>
       </div>
       {error && <div className="banner warn">{error}</div>}
 
@@ -265,16 +278,40 @@ export default function Autopilot() {
         <>
           <h2>Running engines <span className="muted">({engines.length})</span></h2>
           <table className="tbl">
-            <thead><tr><th>Symbol</th><th>Base TF</th><th>Genes</th><th>Bars eval</th><th>Last signal</th><th>Open pos</th></tr></thead>
+            <thead><tr><th>Symbol</th><th>Base TF</th><th>Genes</th><th>Bars eval</th><th>Last signal</th><th>Open pos</th><th>Loss streak</th></tr></thead>
             <tbody>
-              {engines.map((e, i) => (
-                <tr key={e.portfolioPath ?? i}>
-                  <td><b>{e.symbol ?? "?"}</b></td>
-                  <td>{e.baseTf ?? "?"}</td>
-                  <td>{e.genes ?? "—"}</td>
-                  <td>{typeof e.barsEvaluated === "number" ? e.barsEvaluated.toLocaleString() : "—"}</td>
-                  <td>{e.lastSignal ?? "—"}</td>
-                  <td>{e.openPositionId ?? "—"}</td>
+              {engines.map((e, i) => {
+                const losses = Number(e.consecutiveLosses ?? 0);
+                return (
+                  <tr key={e.portfolioPath ?? i}>
+                    <td><b>{e.symbol ?? "?"}</b>{e.retired && <span className="badge" style={{ marginLeft: 6, background: "#7f1d1d", fontSize: 9 }}>RETIRED</span>}</td>
+                    <td>{e.baseTf ?? "?"}</td>
+                    <td>{e.genes ?? "—"}</td>
+                    <td>{typeof e.barsEvaluated === "number" ? e.barsEvaluated.toLocaleString() : "—"}</td>
+                    <td>{e.lastSignal ?? "—"}</td>
+                    <td>{e.openPositionId ?? "—"}</td>
+                    <td className={losses >= Math.max(1, cullLosses - 1) ? "sell" : ""}>{losses > 0 ? `${losses} in a row` : "—"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      {retired.length > 0 && (
+        <>
+          <h2>Retired strategies <span className="muted">({retired.length})</span> <Tip text="Permanently blacklisted by auto-cull. Never traded or re-discovered again. Kept as a record — nothing is deleted." /></h2>
+          <table className="tbl">
+            <thead><tr><th>Symbol</th><th>Reason</th><th>Net P/L</th><th>Retired</th><th>File</th></tr></thead>
+            <tbody>
+              {retired.map((r) => (
+                <tr key={r.fingerprint}>
+                  <td><b>{r.symbol ?? "?"}</b></td>
+                  <td className="muted small">{r.reason}</td>
+                  <td className={r.netPnl < 0 ? "sell" : "buy"}>{r.netPnl.toFixed(2)}</td>
+                  <td className="muted small">{r.retiredAtUnixMs ? new Date(r.retiredAtUnixMs).toLocaleString() : "—"}</td>
+                  <td className="muted small" style={{ fontFamily: "monospace", maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.portfolioPath}>{fileTail(r.portfolioPath)}</td>
                 </tr>
               ))}
             </tbody>

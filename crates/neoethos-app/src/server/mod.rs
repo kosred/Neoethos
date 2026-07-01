@@ -171,6 +171,8 @@ pub fn router(state: AppApiState) -> Router {
         .route("/autonomous/stop", post(autonomous::stop_live))
         .route("/autonomous/status", get(autonomous::live_status))
         .route("/autonomous/gate", get(autonomous::gate))
+        // Permanent auto-cull blacklist of retired (never-tradable-again) strategies.
+        .route("/strategy/blacklist", get(autonomous::blacklist))
         .route("/broker/status", get(system_status::broker_status))
         .route("/broker/reauth", post(broker_control::reauth))
         .route(
