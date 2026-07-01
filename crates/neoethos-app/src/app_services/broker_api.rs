@@ -28,7 +28,7 @@ use crate::app_services::ctrader_execution::{
 };
 use crate::app_services::ctrader_messages::{
     CTraderAmendPositionSltpRequest, CTraderCancelOrderRequest, CTraderClosePositionRequest,
-    CTraderNewOrderRequest, CTraderOrderType, CTraderTradeSide,
+    CTraderNewOrderRequest, CTraderOrderType, CTraderTimeInForce, CTraderTradeSide,
 };
 use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot, CTraderCashFlowBundle,
@@ -751,14 +751,29 @@ impl From<OrderSide> for CTraderTradeSide {
 ///
 /// Blocking — wraps `ProductionCTraderExecutionBackend::execute`
 /// which uses sync WSS. Callers must `spawn_blocking`.
-pub fn submit_market_order_blocking(
+/// Everything a new-order (market OR pending) submission needs after the
+/// shared, money-critical prep: resolved account/symbol ids, the lots→wire
+/// volume (bounds-checked against the broker's min/max) and the tick-snapped
+/// relative SL/TP. Extracted so the market and pending paths compute volume +
+/// SL/TP precision through ONE code path — a bug fixed here is fixed for both.
+struct PreparedNewOrder {
+    creds: ResolvedCreds,
+    account_id: i64,
+    symbol_id: i64,
+    volume_units: i64,
+    relative_stop_loss: Option<i64>,
+    relative_take_profit: Option<i64>,
+}
+
+/// Validate inputs, resolve the symbol, convert lots→wire volume (bounds-checked)
+/// and derive the tick-snapped relative SL/TP. See the inline comments for the
+/// hard-won precision/volume history (lot_size cents, XAU tick snapping, …).
+fn prepare_new_order(
     symbol: &str,
-    side: OrderSide,
     volume_lots: f64,
     stop_loss_pips: Option<f64>,
     take_profit_pips: Option<f64>,
-    comment: Option<String>,
-) -> Result<CTraderExecutionOutcome> {
+) -> Result<PreparedNewOrder> {
     if !(volume_lots.is_finite() && volume_lots > 0.0) {
         return Err(anyhow!(
             "volume_lots must be a finite positive number (got {volume_lots})"
@@ -884,12 +899,32 @@ pub fn submit_market_order_blocking(
     let relative_stop_loss = stop_loss_pips.map(to_relative_units);
     let relative_take_profit = take_profit_pips.map(to_relative_units);
 
-    let new_order = CTraderNewOrderRequest {
+    Ok(PreparedNewOrder {
+        creds,
         account_id: resolved.account_id,
         symbol_id: resolved.light_symbol.symbol_id,
+        volume_units,
+        relative_stop_loss,
+        relative_take_profit,
+    })
+}
+
+pub fn submit_market_order_blocking(
+    symbol: &str,
+    side: OrderSide,
+    volume_lots: f64,
+    stop_loss_pips: Option<f64>,
+    take_profit_pips: Option<f64>,
+    comment: Option<String>,
+) -> Result<CTraderExecutionOutcome> {
+    let prep = prepare_new_order(symbol, volume_lots, stop_loss_pips, take_profit_pips)?;
+
+    let new_order = CTraderNewOrderRequest {
+        account_id: prep.account_id,
+        symbol_id: prep.symbol_id,
         order_type: CTraderOrderType::Market,
         trade_side: side.into(),
-        volume: volume_units,
+        volume: prep.volume_units,
         limit_price: None,
         stop_price: None,
         time_in_force: None,
@@ -906,8 +941,8 @@ pub fn submit_market_order_blocking(
         label: Some("neoethos-ui".to_string()),
         position_id: None,
         client_order_id: None,
-        relative_stop_loss,
-        relative_take_profit,
+        relative_stop_loss: prep.relative_stop_loss,
+        relative_take_profit: prep.relative_take_profit,
         guaranteed_stop_loss: None,
         trailing_stop_loss: None,
         stop_trigger_method: None,
@@ -915,11 +950,104 @@ pub fn submit_market_order_blocking(
 
     let backend = ProductionCTraderExecutionBackend::default();
     let runtime_request = CTraderExecutionRuntimeRequest {
-        client_id: creds.client_id,
-        client_secret: creds.client_secret,
-        access_token: creds.access_token,
-        environment: creds.environment,
-        account_id: creds.account_id_str,
+        client_id: prep.creds.client_id,
+        client_secret: prep.creds.client_secret,
+        access_token: prep.creds.access_token,
+        environment: prep.creds.environment,
+        account_id: prep.creds.account_id_str,
+        request: CTraderExecutionRequest::NewOrder(Box::new(new_order)),
+    };
+    backend.execute(&runtime_request)
+}
+
+/// Place a PENDING (conditional) order that the broker holds and fills only
+/// when the market reaches `trigger_price`:
+///   - `Limit` → fills at `trigger_price` or better (BUY below / SELL above market),
+///   - `Stop`  → fills once price trades through `trigger_price` (breakout entries).
+///
+/// This is the user-facing "execute when the criteria are met" primitive. The
+/// order lives broker-side (survives app restarts) so the fill happens even if
+/// NeoEthos is closed. SL/TP are pip distances from the trigger, snapped to the
+/// symbol's tick via the shared [`prepare_new_order`] path. `expiry_unix_ms`
+/// switches the order to Good-Till-Date; otherwise it is Good-Till-Cancel.
+///
+/// The trigger price's relationship to the current market (limit-below /
+/// stop-above etc.) is enforced by cTrader; an invalid side/price combination
+/// is surfaced verbatim as the broker's rejection rather than guessed at here.
+#[allow(clippy::too_many_arguments)]
+pub fn submit_pending_order_blocking(
+    symbol: &str,
+    side: OrderSide,
+    order_type: CTraderOrderType,
+    volume_lots: f64,
+    trigger_price: f64,
+    stop_loss_pips: Option<f64>,
+    take_profit_pips: Option<f64>,
+    expiry_unix_ms: Option<i64>,
+    comment: Option<String>,
+) -> Result<CTraderExecutionOutcome> {
+    if !matches!(order_type, CTraderOrderType::Limit | CTraderOrderType::Stop) {
+        return Err(anyhow!(
+            "pending order type must be Limit or Stop (got {})",
+            order_type.label()
+        ));
+    }
+    if !(trigger_price.is_finite() && trigger_price > 0.0) {
+        return Err(anyhow!(
+            "trigger_price must be a finite positive number (got {trigger_price})"
+        ));
+    }
+
+    let prep = prepare_new_order(symbol, volume_lots, stop_loss_pips, take_profit_pips)?;
+
+    // Limit orders carry `limit_price`; stop orders carry `stop_price`.
+    let (limit_price, stop_price) = match order_type {
+        CTraderOrderType::Limit => (Some(trigger_price), None),
+        CTraderOrderType::Stop => (None, Some(trigger_price)),
+        // Unreachable: guarded above.
+        _ => (None, None),
+    };
+
+    // Default GTC (rests until filled/cancelled); GTD when an expiry is given.
+    let (time_in_force, expiration_timestamp_ms) = match expiry_unix_ms {
+        Some(ms) if ms > 0 => (Some(CTraderTimeInForce::GoodTillDate), Some(ms)),
+        _ => (Some(CTraderTimeInForce::GoodTillCancel), None),
+    };
+
+    let new_order = CTraderNewOrderRequest {
+        account_id: prep.account_id,
+        symbol_id: prep.symbol_id,
+        order_type,
+        trade_side: side.into(),
+        volume: prep.volume_units,
+        limit_price,
+        stop_price,
+        time_in_force,
+        expiration_timestamp_ms,
+        // For pending orders the broker accepts relative SL/TP (distance from the
+        // order's entry), same encoding the market path uses — reuse it.
+        stop_loss: None,
+        take_profit: None,
+        comment,
+        base_slippage_price: None,
+        slippage_in_points: None,
+        label: Some("neoethos-ui".to_string()),
+        position_id: None,
+        client_order_id: None,
+        relative_stop_loss: prep.relative_stop_loss,
+        relative_take_profit: prep.relative_take_profit,
+        guaranteed_stop_loss: None,
+        trailing_stop_loss: None,
+        stop_trigger_method: None,
+    };
+
+    let backend = ProductionCTraderExecutionBackend::default();
+    let runtime_request = CTraderExecutionRuntimeRequest {
+        client_id: prep.creds.client_id,
+        client_secret: prep.creds.client_secret,
+        access_token: prep.creds.access_token,
+        environment: prep.creds.environment,
+        account_id: prep.creds.account_id_str,
         request: CTraderExecutionRequest::NewOrder(Box::new(new_order)),
     };
     backend.execute(&runtime_request)

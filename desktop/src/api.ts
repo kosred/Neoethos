@@ -413,6 +413,36 @@ export const amendProtection = (
     trailing_stop_loss: trailingStopLoss ?? null,
   });
 
+// ── Pending / conditional orders (limit & stop — "trade when price hits X") ──
+export type PendingOrder = {
+  orderId: number;
+  symbol: string;
+  side: string;
+  orderType: string;
+  volume: number;
+  volumeLots: number | null;
+  triggerPrice: number | null;
+  limitPrice: number | null;
+  stopPrice: number | null;
+  stopLoss: number | null;
+  takeProfit: number | null;
+  openTimestampMs: number | null;
+  comment: string | null;
+};
+export const brokerPendingOrders = () => apiGet<PendingOrder[]>("/orders/pending");
+export const placePendingOrder = (body: {
+  symbol: string;
+  side: "buy" | "sell";
+  orderType: "limit" | "stop";
+  volumeLots: number;
+  triggerPrice: number;
+  stopLossPips?: number | null;
+  takeProfitPips?: number | null;
+  expiryUnixMs?: number | null;
+  comment?: string | null;
+}) => apiPost<ExecResult>("/orders/pending", body);
+export const cancelOrder = (orderId: number) => apiPost<ExecResult>("/orders/cancel", { orderId });
+
 // ── Advanced settings / diagnostics / data import ─────────────────────────
 // ── Indicators + chart scroll-back ────────────────────────────────────────
 export type IndicatorLine = { name: string; values: number[] };

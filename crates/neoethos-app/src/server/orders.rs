@@ -18,9 +18,10 @@ use axum::response::{IntoResponse, Response};
 
 use crate::app_services::broker_api::{
     OrderSide, amend_position_sltp_blocking, cancel_order_blocking, close_position_blocking,
-    submit_market_order_blocking,
+    fetch_account_runtime_blocking, submit_market_order_blocking, submit_pending_order_blocking,
 };
 use crate::app_services::ctrader_errors::translate_anyhow;
+use crate::app_services::ctrader_messages::CTraderOrderType;
 
 use super::errors::internal_panic;
 use super::state::AppApiState;
@@ -111,6 +112,172 @@ pub async fn place(State(_state): State<AppApiState>, Json(body): Json<NewOrderB
     .await;
 
     outcome_to_response(result)
+}
+
+// ─── POST /orders/pending — place a conditional (limit/stop) order ──────────
+
+#[derive(Debug, serde::Deserialize)]
+pub struct NewPendingOrderBody {
+    pub symbol: String,
+    pub side: OrderSide,
+    /// "limit" or "stop" (case-insensitive). Limit fills at the trigger or
+    /// better; stop fills once price trades through the trigger.
+    #[serde(rename = "orderType")]
+    pub order_type: String,
+    #[serde(rename = "volumeLots")]
+    pub volume_lots: f64,
+    /// Price at which the resting order becomes active. This is the "criteria"
+    /// the user sets — the broker fills the order when the market reaches it.
+    #[serde(rename = "triggerPrice")]
+    pub trigger_price: f64,
+    #[serde(rename = "stopLossPips")]
+    pub stop_loss_pips: Option<f64>,
+    #[serde(rename = "takeProfitPips")]
+    pub take_profit_pips: Option<f64>,
+    /// Optional Good-Till-Date expiry (Unix ms). Omitted → Good-Till-Cancel.
+    #[serde(rename = "expiryUnixMs")]
+    pub expiry_unix_ms: Option<i64>,
+    pub comment: Option<String>,
+}
+
+pub async fn place_pending(
+    State(_state): State<AppApiState>,
+    Json(body): Json<NewPendingOrderBody>,
+) -> Response {
+    let symbol = body.symbol.trim().to_uppercase();
+    if symbol.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "symbol must be non-empty"})),
+        )
+            .into_response();
+    }
+    let order_type = match body.order_type.trim().to_ascii_lowercase().as_str() {
+        "limit" => CTraderOrderType::Limit,
+        "stop" => CTraderOrderType::Stop,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("orderType must be 'limit' or 'stop' (got '{other}')"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if !(body.trigger_price.is_finite() && body.trigger_price > 0.0) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "triggerPrice must be a finite, positive price"})),
+        )
+            .into_response();
+    }
+
+    let side = body.side;
+    let volume_lots = body.volume_lots;
+    let trigger = body.trigger_price;
+    let sl = body.stop_loss_pips;
+    let tp = body.take_profit_pips;
+    let expiry = body.expiry_unix_ms;
+    let comment = body.comment;
+
+    let result = tokio::task::spawn_blocking(move || {
+        submit_pending_order_blocking(
+            &symbol,
+            side,
+            order_type,
+            volume_lots,
+            trigger,
+            sl,
+            tp,
+            expiry,
+            comment,
+        )
+    })
+    .await;
+
+    outcome_to_response(result)
+}
+
+// ─── GET /orders/pending — list resting (limit/stop) orders ────────────────
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingOrderDto {
+    pub order_id: i64,
+    pub symbol: String,
+    pub side: String,
+    pub order_type: String,
+    /// Broker wire volume (base units) + best-effort lots (needs symbol metadata).
+    pub volume: f64,
+    pub volume_lots: Option<f64>,
+    /// Whichever of limit/stop the order carries — the price that triggers it.
+    pub trigger_price: Option<f64>,
+    pub limit_price: Option<f64>,
+    pub stop_price: Option<f64>,
+    pub stop_loss: Option<f64>,
+    pub take_profit: Option<f64>,
+    pub open_timestamp_ms: Option<i64>,
+    pub comment: Option<String>,
+}
+
+pub async fn list_pending(State(state): State<AppApiState>) -> Response {
+    let names = state.symbol_catalog_snapshot().await;
+    let result = tokio::task::spawn_blocking(fetch_account_runtime_blocking).await;
+    let snapshot = match result {
+        Ok(Ok(s)) => s,
+        Ok(Err(err)) => {
+            let raw = err.to_string();
+            if let Some(t) = translate_anyhow(&err) {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": t.message, "detail": raw, "translation": t})),
+                )
+                    .into_response();
+            }
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "Could not reach cTrader to list pending orders. Check Broker Setup.",
+                    "detail": raw,
+                })),
+            )
+                .into_response();
+        }
+        Err(join_err) => return internal_panic("Listing pending orders", join_err),
+    };
+
+    let orders: Vec<PendingOrderDto> = snapshot
+        .reconcile
+        .pending_orders
+        .into_iter()
+        .map(|o| {
+            let symbol = names
+                .get(&o.symbol_id)
+                .cloned()
+                .unwrap_or_else(|| format!("sym#{}", o.symbol_id));
+            let volume_lots = neoethos_core::symbol_metadata::resolve(&symbol)
+                .filter(|m| m.contract_size.is_finite() && m.contract_size > 0.0)
+                .map(|m| o.volume / m.contract_size);
+            PendingOrderDto {
+                order_id: o.order_id,
+                symbol,
+                side: o.trade_side,
+                order_type: o.order_type,
+                volume: o.volume,
+                volume_lots,
+                trigger_price: o.limit_price.or(o.stop_price),
+                limit_price: o.limit_price,
+                stop_price: o.stop_price,
+                stop_loss: o.stop_loss,
+                take_profit: o.take_profit,
+                open_timestamp_ms: o.open_timestamp_ms,
+                comment: o.comment,
+            }
+        })
+        .collect();
+
+    Json(orders).into_response()
 }
 
 // ─── POST /positions/{id}/close ────────────────────────────────────────────

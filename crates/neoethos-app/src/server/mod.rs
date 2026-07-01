@@ -200,6 +200,12 @@ pub fn router(state: AppApiState) -> Router {
         // `neoethos_data::convert_to_vortex` for the actual conversion.
         .route("/data/import", post(data_control::import_file))
         .route("/orders", post(orders::place))
+        // Conditional (limit/stop) orders: GET lists resting broker orders,
+        // POST places a new one that fills when price reaches the trigger.
+        .route(
+            "/orders/pending",
+            get(orders::list_pending).post(orders::place_pending),
+        )
         .route("/orders/cancel", post(orders::cancel_order))
         .route("/positions/close", post(orders::close_position))
         .route(
