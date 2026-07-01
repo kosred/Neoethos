@@ -54,6 +54,7 @@ pub mod reauth;
 pub mod live_spots;
 pub mod live_spots_streamer;
 pub mod live_trading;
+pub mod news_calendar;
 pub mod news_research;
 pub mod pending_actions;
 pub mod risky_mode_persistence;

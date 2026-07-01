@@ -116,6 +116,62 @@ pub(crate) fn asset_id_to_currency(asset_id: Option<i64>) -> &'static str {
     }
 }
 
+/// Auto-sync `system.account_currency` in config.yaml to the broker's real
+/// deposit currency (known 3-letter codes only — never the UNKNOWN sentinel).
+///
+/// Cheap on the hot path: a process-level memo of the last currency we synced
+/// means config.yaml is only READ/WRITTEN when the broker currency actually
+/// changes (first snapshot of the process, or an account switch) — not on
+/// every 5s refresh. Best-effort: failures log and never affect the snapshot.
+fn sync_account_currency_to_config(broker_ccy: &str) {
+    static LAST_SYNCED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    let ccy = broker_ccy.trim().to_ascii_uppercase();
+    if ccy.len() != 3 || ccy == "UNK" {
+        return; // UNKNOWN sentinel or malformed — never write a guess to config
+    }
+    {
+        let Ok(mut last) = LAST_SYNCED.lock() else { return };
+        if last.as_deref() == Some(ccy.as_str()) {
+            return; // already synced this currency in this process
+        }
+        *last = Some(ccy.clone());
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let path = crate::server::state::current_config_path();
+        let mut settings = match neoethos_core::Settings::from_yaml(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "neoethos_app::bridge",
+                    error = %e,
+                    "account-currency sync: config.yaml not loadable — skipping"
+                );
+                return;
+            }
+        };
+        let current = settings.system.account_currency.trim().to_ascii_uppercase();
+        if current == ccy {
+            return; // config already correct
+        }
+        settings.system.account_currency = ccy.clone();
+        match settings.save(&path) {
+            Ok(()) => tracing::info!(
+                target: "neoethos_app::bridge",
+                from = %current, to = %ccy,
+                "account-currency synced from broker → config.yaml (discovery \
+                 cost model + money views now use the real deposit currency)"
+            ),
+            Err(e) => tracing::warn!(
+                target: "neoethos_app::bridge",
+                error = %e,
+                "account-currency sync: failed to save config.yaml"
+            ),
+        }
+    });
+}
+
 /// Spawn the long-running refresh task. Returns immediately; the
 /// task lives for the lifetime of the tokio runtime (and therefore
 /// the server process).
@@ -672,6 +728,13 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
     // `compute_pnl_pips` for the A.3 fix) and the snapshot's
     // top-level `currency` field stays in sync.
     let account_currency = asset_id_to_currency(snapshot.trader.deposit_asset_id).to_string();
+
+    // Auto-sync `system.account_currency` in config.yaml to the broker's REAL
+    // deposit currency. Live sizing already reads the broker value, but the
+    // DISCOVERY cost model + €/£ views read config — a stale value (USD while
+    // the account is GBP) makes discovery optimize with wrong costs. Fire-and-
+    // forget on the blocking pool; never delays this snapshot.
+    sync_account_currency_to_config(&account_currency);
 
     let mut positions = Vec::with_capacity(snapshot.reconcile.positions.len());
     for p in &snapshot.reconcile.positions {

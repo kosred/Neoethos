@@ -734,6 +734,29 @@ async fn run(
                     }
                 }
 
+                // News gate (block_on_news): block NEW entries inside the
+                // blackout window of a high-impact event for this symbol's
+                // currencies. The flip-close above stays allowed — closing
+                // reduces risk; holding through NFP does not. Fail-soft: a
+                // calendar outage never blocks (see news_calendar.rs).
+                let gate_sym = symbol.clone();
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                if let Ok(Some(event)) = tokio::task::spawn_blocking(move || {
+                    crate::app_services::news_calendar::entry_blackout_for(&gate_sym, now_ms)
+                })
+                .await
+                {
+                    tracing::warn!(
+                        target: "neoethos_app::live_trading",
+                        %symbol, event = %event,
+                        "entry blocked by news gate (block_on_news) — skipping this bar"
+                    );
+                    if let Ok(mut s) = status.lock() {
+                        s.last_signal = Some(format!("blocked by news: {event}"));
+                    }
+                    continue;
+                }
+
                 // Open new position
                 let side = if direction == Direction::Long {
                     OrderSide::Buy
