@@ -1,28 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import Chart, { type Overlay } from "../components/Chart";
+import { useEffect, useState } from "react";
+import KChart, { KLINE_INDICATORS } from "../components/KChart";
 import PositionsTable from "../components/PositionsTable";
 import {
   serverSymbols,
-  brokerChart,
   brokerTimeframes,
-  chartHistory,
-  indicators as fetchIndicators,
   placeOrder,
   closePosition,
   refreshAccount,
-  INDICATORS,
-  OVERLAY_INDICATORS,
-  type Candle,
   type BrokerSymbol,
   type ExecResult,
 } from "../api";
 import { useSpotStream, useAccountStream } from "../hooks";
 
-const TF_SECONDS: Record<string, number> = {
-  M1: 60, M3: 180, M5: 300, M15: 900, M30: 1800,
-  H1: 3600, H4: 14400, H12: 43200, D1: 86400, W1: 604800, MN1: 2592000,
-};
-const IND_COLORS = ["#3b82f6", "#f59e0b", "#a855f7", "#22d3ee", "#ec4899"];
 const fmt = (v: number | undefined, d = 2) =>
   v === undefined ? "—" : v.toLocaleString(undefined, { maximumFractionDigits: d });
 
@@ -33,13 +22,8 @@ export default function Cockpit() {
   const [symbol, setSymbol] = useState("EURUSD");
   const [tf, setTf] = useState("H1");
   const [tfs, setTfs] = useState<string[]>(["M1", "M5", "M15", "M30", "H1", "H4", "D1"]);
-  const [candles, setCandles] = useState<Candle[]>([]);
-  const [liveBar, setLiveBar] = useState<Candle | null>(null);
   const [indicator, setIndicator] = useState("");
-  const [overlays, setOverlays] = useState<Overlay[]>([]);
   const [filter, setFilter] = useState("");
-  const histLoading = useRef(false);
-  const noMoreHist = useRef(false);
 
   // order ticket
   const [side, setSide] = useState<"buy" | "sell">("buy");
@@ -53,76 +37,6 @@ export default function Cockpit() {
     serverSymbols().then((u) => setUniverse(u.symbols)).catch(() => {});
     brokerTimeframes().then((r) => r.timeframes.length && setTfs(r.timeframes)).catch(() => {});
   }, []);
-
-  const load = useCallback(async () => {
-    if (!symbol || !tf) return;
-    setLiveBar(null);
-    noMoreHist.current = false;
-    try {
-      setCandles(await brokerChart(symbol, tf));
-    } catch {
-      setCandles([]);
-    }
-  }, [symbol, tf]);
-  useEffect(() => { load(); }, [load]);
-
-  // live forming candle from this symbol's ticks
-  const tick = ticks[symbol];
-  useEffect(() => {
-    if (!tick || candles.length === 0) return;
-    const tfSec = TF_SECONDS[tf] ?? 60;
-    const price = tick.midPrice;
-    const bucket = Math.floor(tick.brokerTimestampMs / 1000 / tfSec) * tfSec;
-    if (bucket < candles[candles.length - 1].time) return;
-    setLiveBar((prev) =>
-      prev && prev.time === bucket
-        ? { ...prev, high: Math.max(prev.high, price), low: Math.min(prev.low, price), close: price }
-        : { time: bucket, open: price, high: price, low: price, close: price },
-    );
-  }, [tick, tf, candles]);
-
-  // indicator overlay
-  useEffect(() => {
-    if (!indicator || candles.length === 0) { setOverlays([]); return; }
-    let alive = true;
-    fetchIndicators(symbol, tf, indicator)
-      .then((res) => {
-        if (!alive) return;
-        const onPrice = OVERLAY_INDICATORS.includes(indicator);
-        setOverlays(res.lines.map((line, li) => {
-          const start = candles.length - line.values.length;
-          return {
-            name: `${indicator}:${line.name}`,
-            color: IND_COLORS[li % IND_COLORS.length],
-            priceScaleId: onPrice ? "right" : "ind",
-            data: line.values
-              .map((v, i) => ({ time: candles[start + i]?.time ?? 0, value: v }))
-              .filter((d) => d.time > 0 && Number.isFinite(d.value)),
-          };
-        }));
-      })
-      .catch(() => setOverlays([]));
-    return () => { alive = false; };
-  }, [indicator, symbol, tf, candles]);
-
-  const loadOlder = useCallback(async () => {
-    if (histLoading.current || noMoreHist.current || candles.length === 0) return;
-    const oldest = candles[0];
-    histLoading.current = true;
-    try {
-      const r = await chartHistory(symbol, tf, oldest.time * 1000, 500);
-      const older: Candle[] = (r.candles ?? [])
-        .filter((c) => c.tsMs != null)
-        .map((c) => ({ time: (c.tsMs as number) / 1000, open: c.open, high: c.high, low: c.low, close: c.close }))
-        .filter((c) => c.time < oldest.time);
-      if (older.length === 0 || !r.hasMore) noMoreHist.current = true;
-      if (older.length > 0)
-        setCandles((prev) => {
-          const seen = new Set(prev.map((c) => c.time));
-          return [...older.filter((c) => !seen.has(c.time)), ...prev].sort((a, b) => a.time - b.time);
-        });
-    } catch { /* keep */ } finally { histLoading.current = false; }
-  }, [symbol, tf, candles]);
 
   const place = async () => {
     setBusy(true); setMsg("");
@@ -179,15 +93,15 @@ export default function Cockpit() {
             </select>
             <select value={indicator} onChange={(e) => setIndicator(e.target.value)}>
               <option value="">indicator</option>
-              {INDICATORS.map((n) => <option key={n} value={n}>{n}</option>)}
+              {KLINE_INDICATORS.map((n) => <option key={n.v} value={n.v}>{n.l}</option>)}
             </select>
             <span className="spacer" />
             <span className={`stream-pill ${connected ? "on" : ""}`}>{connected ? "● live" : "○"}</span>
           </div>
           <div className="ck-chart-host">
-            {candles.length === 0
-              ? <div className="empty">Loading {symbol} {tf}… (needs broker connection)</div>
-              : <Chart candles={candles} liveBar={liveBar} overlays={overlays} onReachStart={loadOlder} resetKey={`${symbol}|${tf}`} />}
+            {!symbol || !tf
+              ? <div className="empty">Select a symbol…</div>
+              : <KChart symbol={symbol} timeframe={tf} indicator={indicator} liveTick={ticks[symbol] ?? null} />}
           </div>
         </div>
 

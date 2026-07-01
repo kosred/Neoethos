@@ -349,6 +349,35 @@ button.danger {
   color: #6b7280;
 }
 
+/* KLineChart drawing toolbar (floats over the top-left of the chart). */
+.kchart-tools {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 5;
+  display: flex;
+  gap: 4px;
+  background: rgba(15, 17, 23, 0.72);
+  border: 1px solid #232a38;
+  border-radius: 8px;
+  padding: 3px;
+  backdrop-filter: blur(3px);
+}
+.kchart-tools button {
+  min-width: 26px;
+  height: 24px;
+  padding: 0 6px;
+  font-size: 12px;
+  line-height: 1;
+  color: #cbd5e1;
+  background: #161b26;
+  border: 1px solid #232a38;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.kchart-tools button:hover { background: #1f2632; color: #fff; }
+.kchart-tools button.danger { color: #ef5350; }
+
 /* ticket */
 .ticket {
   background: #141a26;
