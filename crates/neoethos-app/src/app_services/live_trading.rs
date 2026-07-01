@@ -261,8 +261,25 @@ fn risk_based_lots(
     let step = if meta.lot_step > 0.0 { meta.lot_step } else { 0.01 };
     let min_lot = if meta.min_lot > 0.0 { meta.min_lot } else { step };
     let max_lot = meta.max_lot.min(max_lot_cap).max(min_lot);
-    let snapped = (raw / step).floor() * step;
-    snapped.clamp(min_lot, max_lot)
+    let mut lots = (raw / step).floor() * step;
+
+    // Affordability guard: a small account must NEVER be handed a position it
+    // can't hold (operator saw a 47-lot order). Cap the NOTIONAL to
+    // balance × a conservative max leverage — independent of pip_value, so a
+    // mis-resolved pip value (tiny denominator → huge `raw`) can't blow the lot
+    // count up. Uses live price × contract size × the quote→account FX rate.
+    if let Some(price) = live_price.filter(|p| p.is_finite() && *p > 0.0) {
+        let fx = fx_quote_to_account.filter(|r| r.is_finite() && *r > 0.0).unwrap_or(1.0);
+        let notional_per_lot = meta.contract_size * price * fx;
+        if notional_per_lot > 0.0 {
+            const MAX_LEVERAGE: f64 = 30.0; // conservative; under-sizes safely
+            let affordable = (balance * MAX_LEVERAGE) / notional_per_lot;
+            if affordable < lots {
+                lots = (affordable / step).floor() * step;
+            }
+        }
+    }
+    lots.clamp(min_lot, max_lot)
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────────

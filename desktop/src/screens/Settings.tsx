@@ -285,7 +285,7 @@ export default function Settings() {
       </div>
 
       <h2>Risk &amp; sizing</h2>
-      <p className="muted small">Position-sizing limits + drawdown guards for AUTOMATED trading (Autopilot/Risky). Pick a tested preset; the limits below update.</p>
+      <p className="muted small">Position-sizing limits + drawdown guards for AUTOMATED trading (Autopilot/Risky). Pick a preset — the daily/total drawdown caps below update to that firm's rules. <b>Risk %/trade</b> is your own choice: change it in <b>Advanced</b> or the <b>Discovery</b> pre-flight.</p>
       <div className="ticket">
         {presets.length > 0 && (
           <label>Preset

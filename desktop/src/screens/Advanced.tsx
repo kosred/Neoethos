@@ -23,7 +23,7 @@ const GROUPS: Group[] = [
     title: "Mode & risk",
     fields: [
       { key: "tradingMode", label: "Trading mode", kind: "enum", options: [{ v: "risky", l: "🚀 Risky (multiply)" }, { v: "prop_firm", l: "🛡 Prop-firm (robust)" }], help: "Risky = aggressive account-multiplication, drawdown-agnostic. Prop-firm = FTMO-style strict rules. Drives discovery ranking + risk orientation." },
-      { key: "riskPerTrade", label: "Risk per trade", kind: "num", pct: true, step: 0.1, help: "Fraction of the account risked per trade (position sizing). Clamped to the account's max risk on save." },
+      { key: "riskPerTrade", label: "Risk per trade (%)", kind: "num", pct: true, step: 0.1, help: "Percent of the account risked per trade (position sizing). Clamped to the account's max risk on save." },
       { key: "computeMode", label: "Compute", kind: "enum", options: [{ v: "auto", l: "Auto" }, { v: "cpu", l: "CPU" }, { v: "gpu", l: "GPU" }], help: "Which hardware discovery/training prefers. Auto detects; GPU can OOM on a shared-RAM iGPU." },
     ],
   },
@@ -88,7 +88,9 @@ export default function Advanced() {
       const s: any = await settings();
       let rpt: number | undefined;
       try { rpt = (await riskInfo()).riskPerTrade; } catch { /* optional */ }
-      setForm({ ...s, riskPerTrade: rpt });
+      // Store pct fields as PERCENT in the form (fraction × 100); saveForm
+      // converts back to a fraction exactly once.
+      setForm({ ...s, riskPerTrade: rpt != null ? rpt * 100 : undefined });
     } catch (e) {
       setMsg(String(e));
     }
@@ -153,7 +155,7 @@ export default function Advanced() {
 
   const renderField = (f: Field) => {
     const raw = form[f.key];
-    const val = f.pct && typeof raw === "number" ? (raw * 100).toFixed(1) : raw ?? "";
+    const val = raw ?? ""; // pct fields already hold the % value (see load)
     return (
       <label key={f.key} style={{ minWidth: 150 }}>
         <span>{f.label} <Tip text={f.help} /></span>
@@ -164,7 +166,7 @@ export default function Advanced() {
             {f.options!.map((o) => <option key={o.v} value={o.v}>{o.l}</option>)}
           </select>
         ) : f.kind === "num" ? (
-          <input type="number" step={f.step ?? 1} value={val} onChange={(e) => setField(f.key, f.pct ? e.target.value : (e.target.value === "" ? "" : Number(e.target.value)))} onBlur={f.pct ? (e) => setField(f.key, e.target.value === "" ? undefined : Number(e.target.value) / 100) : undefined} style={{ width: 110 }} />
+          <input type="number" step={f.step ?? 1} value={val} onChange={(e) => setField(f.key, e.target.value === "" ? "" : Number(e.target.value))} style={{ width: 110 }} />
         ) : (
           <input type="text" value={raw ?? ""} onChange={(e) => setField(f.key, e.target.value)} style={{ width: 180 }} />
         )}

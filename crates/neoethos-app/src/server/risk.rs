@@ -164,6 +164,14 @@ pub async fn update_preset(
     // Flip the gate flag in sync with the preset choice. "None"
     // disables the prop-firm gate; every other preset enables it.
     settings.risk.prop_firm_rules = preset != PropFirmPreset::None;
+    // Apply the preset's numeric drawdown / profit limits IMMEDIATELY so the UI
+    // + risk gate reflect the switch (previously only the name was persisted, so
+    // the daily/total-DD caps never moved — FundedNext looked identical to None).
+    // Sizing knobs (max_lot_size / risk_per_trade) stay operator-set on purpose.
+    let constraints = PropFirmConstraints::for_preset(preset);
+    settings.risk.daily_drawdown_limit = constraints.max_daily_loss_pct as f64;
+    settings.risk.total_drawdown_limit = constraints.max_overall_drawdown_pct as f64;
+    settings.risk.monthly_profit_target_pct = constraints.min_monthly_net_profit_pct as f64;
 
     if let Err(err) = settings.save(config_path()) {
         tracing::error!(
