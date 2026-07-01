@@ -29,6 +29,7 @@ default-members = [
 
 [workspace.package]
 edition = "2024"
+license = "AGPL-3.0-or-later"
 
 # ── Shared dependency versions (pinned once for the whole workspace) ──────────
 [workspace.dependencies]

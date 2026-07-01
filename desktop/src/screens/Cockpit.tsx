@@ -187,7 +187,7 @@ export default function Cockpit() {
           <div className="ck-chart-host">
             {candles.length === 0
               ? <div className="empty">Loading {symbol} {tf}… (needs broker connection)</div>
-              : <Chart candles={candles} liveBar={liveBar} overlays={overlays} onReachStart={loadOlder} />}
+              : <Chart candles={candles} liveBar={liveBar} overlays={overlays} onReachStart={loadOlder} resetKey={`${symbol}|${tf}`} />}
           </div>
         </div>
 

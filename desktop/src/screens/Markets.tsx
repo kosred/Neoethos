@@ -286,6 +286,7 @@ export default function Markets() {
             liveBar={source === "broker" ? liveBar : null}
             overlays={overlays}
             onReachStart={loadOlder}
+            resetKey={`${source}|${symbol}|${tf}`}
           />
         )}
       </div>
