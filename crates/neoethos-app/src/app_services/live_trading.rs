@@ -18,8 +18,8 @@ use neoethos_trader::Direction;
 use serde::{Deserialize, Serialize};
 
 use crate::app_services::broker_api::{
-    OrderSide, close_position_blocking, fetch_recent_chart_bars_blocking,
-    submit_market_order_blocking,
+    OrderSide, amend_position_sltp_blocking, close_position_blocking,
+    fetch_recent_chart_bars_blocking, submit_market_order_blocking,
 };
 
 // ── Public request type ───────────────────────────────────────────────────────
@@ -346,6 +346,16 @@ async fn run(
     let mut consecutive_losses: u32 = 0;
     let mut net_pnl_running: f64 = 0.0;
 
+    // ── Trailing-stop parity (discovery hardcodes break-even + trailing ALWAYS
+    // ON: BE at +1R, then trail 1×SL behind the running extreme). The backtest
+    // measured every strategy's edge WITH this; live MUST replicate it or trades
+    // the backtest saved at break-even become full losses. State per open pos:
+    let mut pos_entry_px: f64 = 0.0;
+    let mut pos_sl_pips: f64 = 0.0;
+    let mut pos_is_long: bool = false;
+    let mut pos_extreme: f64 = 0.0;
+    let mut pos_trail_px: f64 = 0.0;
+
     tracing::info!(
         target: "neoethos_app::live_trading",
         %symbol, %base_tf,
@@ -487,6 +497,12 @@ async fn run(
                         } else {
                             consecutive_losses = 0;
                         }
+                        // If the broker closed OUR tracked position (SL/TP), drop it
+                        // so trailing doesn't try to amend a dead position.
+                        if open_position.map(|(id, _)| id) == Some(deal.position_id) {
+                            open_position = None;
+                            pos_sl_pips = 0.0;
+                        }
                         tracing::info!(
                             target: "neoethos_app::live_trading",
                             position_id = deal.position_id, net_profit = net,
@@ -542,6 +558,57 @@ async fn run(
         let mut frames: HashMap<String, Ohlcv> = HashMap::new();
         let base_ohlcv = bars_to_ohlcv(&base_bars);
         frames.insert(base_tf.clone(), base_ohlcv.clone());
+
+        // ── Trailing stop — PARITY with the discovery backtest ────────────────
+        // eval.rs hardcodes break-even + trailing ALWAYS ON: once the favorable
+        // move reaches +1R (= sl_pips) the stop trails 1×SL behind the running
+        // extreme (which is exactly break-even at +1R). Ratchet-only; no intra-bar
+        // look-ahead (we act on the just-closed bar, the broker enforces it next).
+        // Without this, trades the backtest saved at break-even become full losses.
+        if let Some((pos_id, _)) = open_position {
+            if pos_sl_pips > 0.0 && pos_entry_px > 0.0 {
+                let pip = sym_meta
+                    .as_ref()
+                    .map(|m| m.pip_size)
+                    .filter(|p| p.is_finite() && *p > 0.0)
+                    .unwrap_or(0.0001);
+                let r_dist = pos_sl_pips * pip; // 1R in price units
+                let hi = base_ohlcv.high.last().copied().unwrap_or(pos_entry_px);
+                let lo = base_ohlcv.low.last().copied().unwrap_or(pos_entry_px);
+                let mut new_trail: Option<f64> = None;
+                if pos_is_long {
+                    pos_extreme = pos_extreme.max(hi);
+                    if pos_extreme - pos_entry_px >= r_dist {
+                        let candidate = pos_extreme - r_dist;
+                        if pos_trail_px == 0.0 || candidate > pos_trail_px {
+                            pos_trail_px = candidate;
+                            new_trail = Some(candidate);
+                        }
+                    }
+                } else {
+                    pos_extreme = if pos_extreme > 0.0 { pos_extreme.min(lo) } else { lo };
+                    if pos_entry_px - pos_extreme >= r_dist {
+                        let candidate = pos_extreme + r_dist;
+                        if pos_trail_px == 0.0 || candidate < pos_trail_px {
+                            pos_trail_px = candidate;
+                            new_trail = Some(candidate);
+                        }
+                    }
+                }
+                if let Some(raw) = new_trail {
+                    let sl_price = (raw / pip).round() * pip; // snap to a broker-valid pip grid
+                    let _ = tokio::task::spawn_blocking(move || {
+                        amend_position_sltp_blocking(pos_id, Some(sl_price), None, None)
+                    })
+                    .await;
+                    tracing::info!(
+                        target: "neoethos_app::live_trading",
+                        position_id = pos_id, new_sl = sl_price, extreme = pos_extreme,
+                        "trailing stop advanced (parity: BE at +1R, then trail 1×SL)"
+                    );
+                }
+            }
+        }
 
         for htf in &higher_tfs {
             let sym = symbol.clone();
@@ -709,6 +776,13 @@ async fn run(
                             open_position = Some((pos_id, broker_vol));
                             // Track for auto-cull realized-result reconciliation.
                             opened_ids.insert(pos_id);
+                            // Seed trailing-stop state (parity with the backtest):
+                            // entry, the gene's stop distance, side, running extreme.
+                            pos_entry_px = outcome.execution_price.or(last_price).unwrap_or(0.0);
+                            pos_sl_pips = gene_sl;
+                            pos_is_long = direction == Direction::Long;
+                            pos_extreme = pos_entry_px;
+                            pos_trail_px = 0.0;
                         }
 
                         if let Ok(mut s) = status.lock() {
