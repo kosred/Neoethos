@@ -1159,6 +1159,39 @@ pub fn evolve_search(
 }
 
 #[allow(clippy::too_many_arguments)]
+// ── Discovery cancellation (process-global) ────────────────────────────────
+// Discovery runs one-at-a-time (engines_control refuses a concurrent job), so a
+// single global flag is safe. The app installs it before a run and clears it
+// after; the generation loop polls it so Stop interrupts the GA MID-SEARCH
+// instead of only at coarse phase boundaries.
+static SEARCH_CANCEL: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+> = std::sync::OnceLock::new();
+
+fn search_cancel_slot()
+-> &'static std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
+    SEARCH_CANCEL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Install (or clear with `None`) the cancellation flag the GA search polls each
+/// generation. Set before a discovery run, clear after.
+pub fn set_search_cancel(flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
+    if let Ok(mut slot) = search_cancel_slot().lock() {
+        *slot = flag;
+    }
+}
+
+fn search_cancel_requested() -> bool {
+    search_cancel_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| {
+            slot.as_ref()
+                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+        })
+        .unwrap_or(false)
+}
+
 pub fn evolve_search_with_progress_and_limits<F>(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
@@ -1416,6 +1449,16 @@ where
     }
 
     for generation in 0..generations {
+        // Operator Stop: interrupt the GA mid-search (returns the best-so-far;
+        // the discovery driver then treats the run as cancelled and skips export).
+        if search_cancel_requested() {
+            tracing::info!(
+                target: "neoethos_search",
+                generation,
+                "discovery cancelled by operator — stopping GA early"
+            );
+            break;
+        }
         let progress = (generation as f32) / ((generations - 1) as f32).max(1.0);
         let mut gate_now = gate_start + (gate_end - gate_start) * progress.powf(gate_curve);
         if stagnant_gens >= stagnation_patience {

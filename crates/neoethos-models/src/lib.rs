@@ -36,7 +36,7 @@ pub use ensemble::{
     ProbabilityCalibrationExpert, ProbabilityCalibrator,
 };
 pub use parallel_trainer::{ModelTrainingFailure, ModelTrainingProgress, ParallelTrainingSummary};
-pub use training_orchestrator::{TrainingOrchestrator, TrainingRunSummary};
+pub use training_orchestrator::{TrainingOrchestrator, TrainingRunSummary, set_training_cancel};
 
 // Hardware detection (derived from models/device.py)
 pub mod hardware;

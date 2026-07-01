@@ -104,7 +104,7 @@ pub use genetic::{
     install_strategy_evaluation_runtime_overrides,
     install_strategy_evaluation_runtime_overrides_from_env,
     install_strategy_evaluation_runtime_overrides_from_settings, month_day_indices, random_search,
-    signals_for_gene, signals_for_gene_full,
+    set_search_cancel, signals_for_gene, signals_for_gene_full,
 };
 pub use discovery_ledger::{
     DiscoverySearchLedger, GeneRecord, SearchMetadata, ledger_path, load_prior_ledger,

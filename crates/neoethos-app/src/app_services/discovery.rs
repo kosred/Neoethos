@@ -959,6 +959,12 @@ pub fn start_discovery_job(
         let search_request = request.clone();
         let tx_progress = tx.clone();
         let live_snapshot_for_progress = Arc::clone(&live_snapshot);
+        // Install the cancel flag the GA polls EACH GENERATION (discovery is
+        // single-instance, so a process-global flag is safe). This makes Stop
+        // interrupt the search mid-run instead of only at coarse phase boundaries.
+        // Cleared right after the blocking search returns.
+        neoethos_search::set_search_cancel(Some(cancel.cancel_arc()));
+        let cancel_arc_for_closure = cancel.cancel_arc();
         let search_result = tokio::task::spawn_blocking(move || {
             // Apply Walk-Forward Validation (WFV) strict bounds
             // Using 80% In-Sample for training, 20% Out-Of-Sample strictly withheld to eliminate look-ahead bias
@@ -999,6 +1005,14 @@ pub fn start_discovery_job(
                     }
                 },
             )?;
+
+            // Operator Stop during the GA: the search returned early with
+            // whatever it had. Do NOT export a cancelled run — bail with a
+            // sentinel the async side maps to a clean CANCELLED result.
+            if cancel_arc_for_closure.load(std::sync::atomic::Ordering::Relaxed) {
+                anyhow::bail!("__DISCOVERY_CANCELLED__");
+            }
+
             // 2026-05-26 operator directive (dual-mode product): save the funnel
             // BEFORE the empty-portfolio check returns an error. The funnel is
             // the operator's main debugging artifact when the GA returns
@@ -1178,9 +1192,29 @@ pub fn start_discovery_job(
             Ok::<_, anyhow::Error>(result)
         })
         .await;
+        // Clear the GA cancel flag now the blocking search has returned.
+        neoethos_search::set_search_cancel(None);
 
         let result = match search_result {
             Ok(Ok(result)) => result,
+            // Operator Stop mid-search: a clean CANCELLED, not a failure.
+            Ok(Err(err)) if err.to_string().contains("__DISCOVERY_CANCELLED__") => {
+                let base_snapshot = live_snapshot
+                    .lock()
+                    .map(|snapshot| snapshot.clone())
+                    .unwrap_or(snapshot);
+                let cancelled = cancelled_snapshot_from(
+                    base_snapshot,
+                    "operator cancelled discovery during the search",
+                );
+                send_event(&tx, ServiceEvent::DiscoveryUpdated(cancelled.clone()));
+                log_discovery_event(
+                    "ui_discovery_job",
+                    "CANCELLED",
+                    cancelled.report.summary.clone(),
+                );
+                return;
+            }
             Ok(Err(err)) => {
                 let base_snapshot = live_snapshot
                     .lock()

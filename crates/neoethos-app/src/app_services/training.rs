@@ -566,6 +566,9 @@ pub fn start_training_job(
         let train_request = request.clone();
         let tx_progress = tx.clone();
         let live_snapshot_for_progress = Arc::clone(&live_snapshot);
+        // Install the cancel flag the training loop polls between models so Stop
+        // halts training mid-run (single-instance → a process-global is safe).
+        neoethos_models::set_training_cancel(Some(cancel.cancel_arc()));
         let train_result = tokio::task::spawn_blocking(move || {
             let orchestrator =
                 TrainingOrchestrator::new(settings, train_request.models_dir.clone());
@@ -584,6 +587,28 @@ pub fn start_training_job(
             )
         })
         .await;
+        // Clear the training cancel flag now the blocking run has returned.
+        neoethos_models::set_training_cancel(None);
+
+        // Operator Stop during training: report a clean CANCELLED (the loop broke
+        // after the current model) rather than a partial SUCCESS.
+        if cancel.is_requested() {
+            let base_snapshot = live_snapshot
+                .lock()
+                .map(|snapshot| snapshot.clone())
+                .unwrap_or(snapshot);
+            let cancelled = cancelled_snapshot_from(
+                base_snapshot,
+                "operator cancelled training during model training",
+            );
+            send_event(&tx, ServiceEvent::TrainingUpdated(cancelled.clone()));
+            log_training_event(
+                "ui_training_job",
+                "CANCELLED",
+                cancelled.report.summary.clone(),
+            );
+            return;
+        }
 
         match train_result {
             Ok(Ok(summary)) => {

@@ -4,6 +4,38 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+// ── Training cancellation (process-global) ──────────────────────────────────
+// Training runs one-at-a-time (engines_control refuses a concurrent job), so a
+// single global flag is safe. The app installs it before a run and clears it
+// after; the per-model loop polls it so Stop halts training after the current
+// model instead of only at coarse phase boundaries.
+static TRAINING_CANCEL: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+> = std::sync::OnceLock::new();
+
+fn training_cancel_slot() -> &'static std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>> {
+    TRAINING_CANCEL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Install (or clear with `None`) the cancellation flag the training loop polls
+/// between models. Set before a training run, clear after.
+pub fn set_training_cancel(flag: Option<Arc<std::sync::atomic::AtomicBool>>) {
+    if let Ok(mut slot) = training_cancel_slot().lock() {
+        *slot = flag;
+    }
+}
+
+fn training_cancel_requested() -> bool {
+    training_cancel_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| {
+            slot.as_ref()
+                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+        })
+        .unwrap_or(false)
+}
+
 use crate::base::ExpertModel;
 use crate::burn_models::{active_burn_backend_name, normalize_burn_device_policy};
 use crate::ensemble::{
@@ -531,6 +563,15 @@ impl TrainingOrchestrator {
         let mut expanded = Vec::new();
 
         for name in requested_models {
+            // Operator Stop: halt after the current model rather than only at
+            // coarse phase boundaries.
+            if training_cancel_requested() {
+                warn!(
+                    target: "neoethos_models::training",
+                    "training cancelled by operator — stopping after the current model"
+                );
+                break;
+            }
             let trimmed = name.trim();
             if trimmed.is_empty() {
                 continue;

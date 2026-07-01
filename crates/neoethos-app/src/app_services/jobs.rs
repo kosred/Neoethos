@@ -105,6 +105,12 @@ impl CancellationFlag {
     pub fn is_requested(&self) -> bool {
         self.requested.load(Ordering::SeqCst)
     }
+
+    /// The raw shared flag, handed to long-running search loops (the GA) so they
+    /// can poll cancellation mid-run instead of only at coarse phase boundaries.
+    pub fn cancel_arc(&self) -> Arc<AtomicBool> {
+        self.requested.clone()
+    }
 }
 
 pub fn push_recent_event(
