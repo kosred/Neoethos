@@ -26,7 +26,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-const SCHEMA_VERSION: u32 = 1;
+/// v1 wrote the CLOSING deal's side (opposite of the position) and the raw
+/// base-unit volume in `lots`. v2 writes the POSITION side and real lots.
+/// The read API heals v1 rows on the fly (see `server::journal`).
+const SCHEMA_VERSION: u32 = 2;
 
 /// One closed round-trip trade — the unit a trade journal reports on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,8 +40,9 @@ pub struct ClosedTrade {
     /// Broker position id — the idempotency key (one closed trade / position).
     pub position_id: i64,
     pub symbol: String,
-    /// "BUY" | "SELL".
+    /// "BUY" | "SELL" — the POSITION's side (v2). v1 stored the closing deal's.
     pub side: String,
+    /// Volume in lots (v2). v1 stored raw base units (e.g. 12000 for 0.12 lots).
     pub lots: f64,
     pub entry_ts_ms: Option<i64>,
     pub entry_price: Option<f64>,

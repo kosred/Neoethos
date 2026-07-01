@@ -34,18 +34,35 @@ fn closed_trade_from_deal(
     names: &HashMap<i64, String>,
 ) -> Option<ClosedTrade> {
     let net = d.net_profit?;
+    // Resolve the broker symbol NAME from the catalog the bridge threads in.
+    // While the catalog is still EMPTY (cold start race), DEFER: recording is
+    // idempotent on position_id and the deal stays in the broker's recent-deals
+    // window, so the next refresh (catalog populated) records it with the real
+    // name. A populated catalog that lacks this id (exotic) falls back to #id.
+    let symbol = match names.get(&d.symbol_id) {
+        Some(n) => n.clone(),
+        None if names.is_empty() => return None,
+        None => format!("#{}", d.symbol_id),
+    };
+    // The deal that CLOSES a position trades the OPPOSITE side of the position
+    // (a long is closed by a SELL deal). The journal reports the POSITION.
+    let side = match d.trade_side.trim().to_ascii_uppercase().as_str() {
+        "BUY" => "SELL".to_string(),
+        "SELL" => "BUY".to_string(),
+        _ => d.trade_side.clone(), // unknown label — keep verbatim
+    };
+    // `filled_volume` is BASE UNITS (12000 = 0.12 lots EURUSD); report lots.
+    let lots = neoethos_core::symbol_metadata::resolve(&symbol)
+        .filter(|m| m.contract_size.is_finite() && m.contract_size > 0.0)
+        .map(|m| d.filled_volume / m.contract_size)
+        .unwrap_or(d.filled_volume);
     Some(ClosedTrade {
         schema_version: journal_store::new_schema_version(),
         recorded_at_unix_ms: journal_store::now_unix_ms(),
         position_id: d.position_id,
-        // Resolve the broker symbol NAME from the catalog the bridge threads in;
-        // fall back to `#<id>` only when the catalog hasn't populated yet.
-        symbol: names
-            .get(&d.symbol_id)
-            .cloned()
-            .unwrap_or_else(|| format!("#{}", d.symbol_id)),
-        side: d.trade_side.clone(),
-        lots: d.filled_volume,
+        symbol,
+        side,
+        lots,
         entry_ts_ms: None,
         entry_price: d.entry_price,
         exit_ts_ms: Some(d.execution_timestamp_ms),

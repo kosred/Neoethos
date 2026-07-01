@@ -47,13 +47,50 @@ fn resolve_data_dir() -> Result<std::path::PathBuf, Response> {
         })
 }
 
+/// Heal a served row IN PLACE (display only — the JSONL on disk is never
+/// rewritten):
+///   - `#<id>` / `sym#<id>` placeholder symbols resolve through the live
+///     symbol catalog (records written before the catalog populated).
+///   - v1 rows stored the CLOSING deal's side (opposite of the position) and
+///     raw base-unit volume; flip the side and convert units → lots.
+fn heal_row(t: &mut journal_store::ClosedTrade, names: &std::collections::HashMap<i64, String>) {
+    if let Some(id) = t
+        .symbol
+        .strip_prefix("sym#")
+        .or_else(|| t.symbol.strip_prefix('#'))
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        if let Some(name) = names.get(&id) {
+            t.symbol = name.clone();
+        }
+    }
+    if t.schema_version < 2 {
+        t.side = match t.side.trim().to_ascii_uppercase().as_str() {
+            "BUY" => "SELL".to_string(),
+            "SELL" => "BUY".to_string(),
+            _ => t.side.clone(),
+        };
+        if let Some(m) = neoethos_core::symbol_metadata::resolve(&t.symbol)
+            .filter(|m| m.contract_size.is_finite() && m.contract_size > 0.0)
+        {
+            t.lots /= m.contract_size;
+        }
+        // Serve with v2 semantics so the UI treats every row uniformly.
+        t.schema_version = 2;
+    }
+}
+
 /// `GET /journal/trades?fromMs&toMs&limit` — closed trades, most-recent first.
-pub async fn trades(State(_state): State<AppApiState>, Query(q): Query<JournalQuery>) -> Response {
+pub async fn trades(State(state): State<AppApiState>, Query(q): Query<JournalQuery>) -> Response {
     let data_dir = match resolve_data_dir() {
         Ok(d) => d,
         Err(resp) => return resp,
     };
+    let names = state.symbol_catalog_snapshot().await;
     let mut rows = journal_store::query_closed_trades(&data_dir, q.from_ms, q.to_ms);
+    for row in &mut rows {
+        heal_row(row, &names);
+    }
     rows.reverse(); // most-recent first
     rows.truncate(q.limit.unwrap_or(500));
     Json(rows).into_response()
