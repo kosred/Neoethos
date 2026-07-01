@@ -11,6 +11,7 @@
 //! journal hiccup must not affect trading. Resolution that can't happen
 //! (config unreadable) is silently skipped.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::app_services::ctrader_account::{CTraderAccountRuntimeSnapshot, CTraderDealSnapshot};
@@ -28,16 +29,21 @@ fn data_dir() -> Option<PathBuf> {
 /// Build a [`ClosedTrade`] from a deal — but only for REALIZED (closing)
 /// deals, which are the ones that carry `net_profit`. Opening fills
 /// (`net_profit == None`) are not closed trades and are skipped.
-fn closed_trade_from_deal(d: &CTraderDealSnapshot) -> Option<ClosedTrade> {
+fn closed_trade_from_deal(
+    d: &CTraderDealSnapshot,
+    names: &HashMap<i64, String>,
+) -> Option<ClosedTrade> {
     let net = d.net_profit?;
     Some(ClosedTrade {
         schema_version: journal_store::new_schema_version(),
         recorded_at_unix_ms: journal_store::now_unix_ms(),
         position_id: d.position_id,
-        // Symbol-id fallback. Resolving to the broker symbol NAME needs a
-        // symbol_id→name map that isn't in scope here; the id is honest
-        // and non-blocking. Name resolution is a follow-up polish.
-        symbol: format!("#{}", d.symbol_id),
+        // Resolve the broker symbol NAME from the catalog the bridge threads in;
+        // fall back to `#<id>` only when the catalog hasn't populated yet.
+        symbol: names
+            .get(&d.symbol_id)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", d.symbol_id)),
         side: d.trade_side.clone(),
         lots: d.filled_volume,
         entry_ts_ms: None,
@@ -54,14 +60,17 @@ fn closed_trade_from_deal(d: &CTraderDealSnapshot) -> Option<ClosedTrade> {
 
 /// Record any newly-closed deals + (if any closed) an equity sample.
 /// Best-effort: all failures are logged and swallowed.
-pub fn reconcile_best_effort(runtime: &CTraderAccountRuntimeSnapshot) {
+pub fn reconcile_best_effort(
+    runtime: &CTraderAccountRuntimeSnapshot,
+    names: &HashMap<i64, String>,
+) {
     let Some(dir) = data_dir() else {
         return;
     };
 
     let mut recorded_any = false;
     for deal in &runtime.recent_deals {
-        let Some(trade) = closed_trade_from_deal(deal) else {
+        let Some(trade) = closed_trade_from_deal(deal, names) else {
             continue;
         };
         match journal_store::record_closed_trade(&dir, &trade) {

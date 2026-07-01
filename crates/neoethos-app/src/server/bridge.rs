@@ -485,8 +485,15 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
     // Fire-and-forget on the blocking pool so journal disk I/O never delays
     // this response (the journal contract: never blocks the refresh).
     let snapshot_for_journal = snapshot.clone();
+    // Thread the symbol_id→name catalog in so closed trades store the real pair
+    // name (EURUSD) instead of `#<id>`. Populated from prior cycles once any
+    // position/symbol has been seen; empty map falls back to `#<id>`.
+    let journal_names = state.symbol_catalog_snapshot().await;
     tokio::task::spawn_blocking(move || {
-        crate::app_services::journal_reconcile::reconcile_best_effort(&snapshot_for_journal);
+        crate::app_services::journal_reconcile::reconcile_best_effort(
+            &snapshot_for_journal,
+            &journal_names,
+        );
     });
 
     // Step 3: convert to wire payload. Equity is balance + unrealized

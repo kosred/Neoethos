@@ -4,6 +4,10 @@ import { usePoll } from "../hooks";
 const fmt = (v: unknown) =>
   typeof v === "number" ? (Number.isInteger(v) ? v.toLocaleString() : v.toFixed(2)) : v == null ? "—" : String(v);
 
+const num = (v: any, d = 2) => (typeof v === "number" && isFinite(v) ? v.toFixed(d) : "—");
+const price = (v: any) => (typeof v === "number" && isFinite(v) ? v.toString() : "—");
+const fmtTime = (ms: any) => (typeof ms === "number" && ms > 0 ? new Date(ms).toLocaleString() : "—");
+
 // "winRatePct" / "max_drawdown_pct" → "WIN RATE PCT"
 const label = (k: string) =>
   k.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/_/g, " ").toUpperCase();
@@ -17,7 +21,10 @@ export default function Journal() {
       ? Object.entries(stats).filter(([, v]) => typeof v !== "object" || v === null)
       : [];
   const tradeRows: any[] = Array.isArray(trades) ? trades : (trades?.trades ?? []);
-  const cols = tradeRows.length > 0 ? Object.keys(tradeRows[0]).slice(0, 8) : [];
+  // newest first
+  const rows = [...tradeRows].sort(
+    (a, b) => (b.exitTsMs ?? b.recordedAtUnixMs ?? 0) - (a.exitTsMs ?? a.recordedAtUnixMs ?? 0),
+  );
 
   return (
     <div className="screen">
@@ -36,16 +43,44 @@ export default function Journal() {
         </div>
       )}
 
-      <h2>Trades ({tradeRows.length})</h2>
-      {tradeRows.length === 0 ? (
+      <h2>Trades ({rows.length})</h2>
+      {rows.length === 0 ? (
         <p className="muted">No closed trades recorded yet.</p>
       ) : (
         <table className="tbl">
-          <thead><tr>{cols.map((c) => <th key={c}>{c.replace(/_/g, " ")}</th>)}</tr></thead>
+          <thead>
+            <tr>
+              <th>Closed</th>
+              <th>Symbol</th>
+              <th>Side</th>
+              <th>Lots</th>
+              <th>Entry</th>
+              <th>Exit</th>
+              <th>Costs</th>
+              <th>Net P/L</th>
+              <th>Result</th>
+            </tr>
+          </thead>
           <tbody>
-            {tradeRows.slice(0, 200).map((r, i) => (
-              <tr key={i}>{cols.map((c) => <td key={c}>{fmt(r[c])}</td>)}</tr>
-            ))}
+            {rows.slice(0, 300).map((r, i) => {
+              const net = Number(r.netProfit ?? 0);
+              const costs = Number(r.commission ?? 0) + Number(r.swap ?? 0);
+              const buy = String(r.side ?? "").toUpperCase().includes("BUY");
+              const cls = net >= 0 ? "buy" : "sell";
+              return (
+                <tr key={r.positionId ?? i}>
+                  <td className="muted">{fmtTime(r.exitTsMs ?? r.recordedAtUnixMs)}</td>
+                  <td><b>{r.symbol ?? "?"}</b></td>
+                  <td className={buy ? "buy" : "sell"}>{r.side ?? "—"}</td>
+                  <td>{num(r.lots)}</td>
+                  <td>{price(r.entryPrice)}</td>
+                  <td>{price(r.exitPrice)}</td>
+                  <td className="muted">{num(costs)}</td>
+                  <td className={cls}><b>{net >= 0 ? "+" : ""}{num(net)}</b></td>
+                  <td>{net > 0 ? "✓ win" : net < 0 ? "✗ loss" : "— BE"}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}

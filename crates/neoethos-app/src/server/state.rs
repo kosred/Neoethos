@@ -455,6 +455,13 @@ impl AppApiState {
         self.inner.read().await.symbol_catalog.is_empty()
     }
 
+    /// Clone of the full symbol_id → name map, for callers that need it off the
+    /// async runtime (e.g. the journal reconcile on the blocking pool, so closed
+    /// trades store the real pair name instead of `#<id>`).
+    pub async fn symbol_catalog_snapshot(&self) -> HashMap<i64, String> {
+        self.inner.read().await.symbol_catalog.clone()
+    }
+
     // ─── Engine slot accessors ────────────────────────────────────────
 
     /// Read the current run state for the given engine.

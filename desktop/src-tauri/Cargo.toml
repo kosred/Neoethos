@@ -22,6 +22,8 @@ log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 anyhow = "1"
+# Native OS file picker for the Data Import "Browse…" button.
+rfd = "0.17"
 
 # The existing Rust core — reused verbatim, linked INTO this one binary
 # (no second process). neoethos-app exposes the full cTrader/broker stack
