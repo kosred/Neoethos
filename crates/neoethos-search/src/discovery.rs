@@ -823,10 +823,14 @@ impl DiscoveryValidationGates {
     }
 
     pub fn is_portfolio_export_ready(&self) -> bool {
-        // Prop-firm window mode is the canonical export path when
-        // active — it measures exactly what a challenge measures, so
-        // the older walkforward-consistency / CPCV gates do not apply.
-        self.prop_firm_window_passed || (self.walkforward_passed && self.cpcv_passed)
+        // MANDATORY out-of-sample validation (operator directive 2026-06-30):
+        // a strategy is export-ready ONLY if it passed BOTH out-of-sample gates
+        // — walkforward AND CPCV. The prop-firm window is an ADDITIONAL
+        // requirement for prop-firm runs (folded into `walkforward_passed` via
+        // the mode-aware criterion), never a bypass. This closes the hole where
+        // a strategy that FAILED walkforward (e.g. AUDUSD: 20 live trades, all
+        // losing) was still exported because it cleared the prop-firm window.
+        self.walkforward_passed && self.cpcv_passed
     }
 }
 
