@@ -379,6 +379,14 @@ async fn run(
         .map(|s| s.risk.max_lot_size)
         .filter(|v| *v > 0.0)
         .unwrap_or(f64::INFINITY);
+    // Portfolio-level concurrent-risk cap (0 = disabled): each entry budgets
+    // against `cap − open_positions × risk_per_trade` using the broker's LIVE
+    // position count, so many engines can't stack unbounded concurrent risk.
+    let portfolio_risk_cap = sizing
+        .as_ref()
+        .map(|s| s.risk.max_portfolio_risk)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
     let sym_meta = neoethos_core::symbol_metadata::resolve(&symbol);
     let quote_ccy = sym_meta.as_ref().map(|m| m.quote.clone());
     let sizing_tf = base_tf.clone();
@@ -763,12 +771,49 @@ async fn run(
                 } else {
                     OrderSide::Sell
                 };
+                // Fresh account state at ENTRY time: (a) the balance compounds —
+                // risky mode must size off what the account is NOW, not at engine
+                // start; (b) the broker's live open-position count feeds the
+                // portfolio-level risk budget. Fail-soft to start-time values.
+                let (entry_balance, open_positions_now) = match tokio::task::spawn_blocking(
+                    crate::app_services::broker_api::fetch_account_runtime_blocking,
+                )
+                .await
+                {
+                    Ok(Ok(rt)) => (rt.trader.balance, Some(rt.reconcile.positions.len())),
+                    _ => (account_balance, None),
+                };
+
+                // Portfolio-level concurrent-risk budget (max_portfolio_risk):
+                // remaining = cap − open_positions × risk_per_trade. Skip the
+                // entry when the budget is spent; size down when only part fits.
+                let mut effective_risk = risk_fraction;
+                if portfolio_risk_cap > 0.0 {
+                    let open_n = open_positions_now.unwrap_or(0) as f64;
+                    let remaining = portfolio_risk_cap - open_n * risk_fraction;
+                    if remaining <= f64::EPSILON {
+                        tracing::warn!(
+                            target: "neoethos_app::live_trading",
+                            %symbol, open_positions = open_n,
+                            cap = portfolio_risk_cap,
+                            "entry skipped — portfolio risk budget spent \
+                             (max_portfolio_risk reached across open positions)"
+                        );
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal =
+                                Some("blocked: portfolio risk budget spent".to_string());
+                        }
+                        continue;
+                    }
+                    effective_risk = risk_fraction.min(remaining);
+                }
+
                 // Size by the account's risk %, using the strategy's own stop
                 // distance; falls back to req.lot_size when not computable.
                 let last_price = base_ohlcv.close.last().copied();
                 let lot = risk_based_lots(
-                    account_balance,
-                    risk_fraction,
+                    entry_balance,
+                    effective_risk,
                     gene_sl,
                     sym_meta.as_ref(),
                     &account_ccy,

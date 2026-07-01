@@ -472,6 +472,7 @@ export type SettingsUpdate = {
   tradingMode?: "risky" | "prop_firm";
   computeMode?: "auto" | "cpu" | "gpu";
   riskPerTrade?: number;
+  maxPortfolioRisk?: number;
   riskyStartBalance?: number;
   riskyTargetBalance?: number;
   riskyHorizonDays?: number;

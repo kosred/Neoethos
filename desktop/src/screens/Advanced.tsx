@@ -24,6 +24,7 @@ const GROUPS: Group[] = [
     fields: [
       { key: "tradingMode", label: "Trading mode", kind: "enum", options: [{ v: "risky", l: "🚀 Risky (multiply)" }, { v: "prop_firm", l: "🛡 Prop-firm (robust)" }], help: "Risky = aggressive account-multiplication, drawdown-agnostic. Prop-firm = FTMO-style strict rules. Drives discovery ranking + risk orientation." },
       { key: "riskPerTrade", label: "Risk per trade (%)", kind: "num", pct: true, step: 0.1, help: "Percent of the account risked per trade (position sizing). Clamped to the account's max risk on save." },
+      { key: "maxPortfolioRisk", label: "Max portfolio risk (%)", kind: "num", pct: true, step: 0.5, help: "Cap on TOTAL concurrent risk across ALL running autopilot engines (e.g. 5% = entries pause once open positions already risk ~5% of the balance). 0 = off. Protects a small account when many strategies run at once." },
       { key: "computeMode", label: "Compute", kind: "enum", options: [{ v: "auto", l: "Auto" }, { v: "cpu", l: "CPU" }, { v: "gpu", l: "GPU" }], help: "Which hardware discovery/training prefers. Auto detects; GPU can OOM on a shared-RAM iGPU." },
     ],
   },
@@ -90,7 +91,14 @@ export default function Advanced() {
       try { rpt = (await riskInfo()).riskPerTrade; } catch { /* optional */ }
       // Store pct fields as PERCENT in the form (fraction × 100); saveForm
       // converts back to a fraction exactly once.
-      setForm({ ...s, riskPerTrade: rpt != null ? rpt * 100 : undefined });
+      const form: Record<string, any> = { ...s };
+      for (const g of GROUPS) {
+        for (const f of g.fields) {
+          if (f.pct && typeof form[f.key] === "number") form[f.key] = form[f.key] * 100;
+        }
+      }
+      form.riskPerTrade = rpt != null ? rpt * 100 : undefined;
+      setForm(form);
     } catch (e) {
       setMsg(String(e));
     }

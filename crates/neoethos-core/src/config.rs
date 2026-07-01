@@ -296,6 +296,13 @@ pub struct RiskConfig {
     pub min_risk_per_trade: f64,
     pub max_risk_per_trade: f64,
     pub risk_per_trade: f64,
+    /// Portfolio-level cap on TOTAL concurrent risk across all running live
+    /// engines, as a balance fraction (e.g. 0.05 = at most ~5% of the account
+    /// at risk across every open autopilot position at once). Each engine
+    /// budgets its entry against `cap − (open positions × risk_per_trade)`,
+    /// sizing down or skipping when the budget is spent. `0.0` disables the
+    /// cap (per-engine sizing only — the pre-2026-07 behavior).
+    pub max_portfolio_risk: f64,
     pub daily_drawdown_limit: f64,
     pub total_drawdown_limit: f64,
     pub min_risk_reward: f64,
@@ -356,6 +363,10 @@ impl Default for RiskConfig {
             min_risk_per_trade: 0.0,
             max_risk_per_trade: 0.030,
             risk_per_trade: 0.030,
+            // Portfolio-level concurrent-risk cap: 0 = disabled (per-engine
+            // sizing only). Opt-in via config/Advanced — never a silent
+            // sizing change for existing users.
+            max_portfolio_risk: 0.0,
             // Internal early stop sits 20% below the firm's published
             // daily-loss ceiling so a guard-rail trips before a real
             // breach. Operators override in YAML if their firm gives

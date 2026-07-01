@@ -81,6 +81,8 @@ pub struct SettingsDto {
     pub stagnation_patience: usize,
     pub novelty_weight: f64,
     pub disable_smc_gate: bool,
+    /// Portfolio-level concurrent-risk cap (balance fraction; 0 = disabled).
+    pub max_portfolio_risk: f64,
 }
 
 /// Partial-update payload for `POST /settings`. All fields optional —
@@ -122,6 +124,9 @@ pub struct SettingsUpdateDto {
     /// Risk fraction per trade (0..=max_risk_per_trade). Lets the operator set
     /// the sizing risk for the search/run directly (clamped on write).
     pub risk_per_trade: Option<f64>,
+    /// Portfolio-level cap on TOTAL concurrent risk across all live engines
+    /// (balance fraction; 0 disables). Clamped to [0, 0.5].
+    pub max_portfolio_risk: Option<f64>,
 }
 
 pub async fn settings(State(_state): State<AppApiState>) -> Response {
@@ -422,6 +427,10 @@ pub async fn update_settings(
         };
         settings.risk.risk_per_trade = rpt.clamp(0.0, cap);
     }
+    if let Some(cap) = payload.max_portfolio_risk {
+        // 0 disables; hard ceiling 50% — beyond that a "cap" is meaningless.
+        settings.risk.max_portfolio_risk = cap.clamp(0.0, 0.5);
+    }
     if let Some(raw) = payload.compute_mode {
         let mode = raw.trim().to_ascii_lowercase();
         if mode != "auto" && mode != "cpu" && mode != "gpu" {
@@ -586,5 +595,6 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         stagnation_patience: settings.models.search_runtime.stagnation_patience,
         novelty_weight: settings.models.search_runtime.novelty_weight,
         disable_smc_gate: settings.models.search_runtime.disable_smc_gate,
+        max_portfolio_risk: settings.risk.max_portfolio_risk,
     }
 }
