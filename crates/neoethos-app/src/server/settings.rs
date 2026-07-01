@@ -119,6 +119,9 @@ pub struct SettingsUpdateDto {
     pub stagnation_patience: Option<usize>,
     pub novelty_weight: Option<f64>,
     pub disable_smc_gate: Option<bool>,
+    /// Risk fraction per trade (0..=max_risk_per_trade). Lets the operator set
+    /// the sizing risk for the search/run directly (clamped on write).
+    pub risk_per_trade: Option<f64>,
 }
 
 pub async fn settings(State(_state): State<AppApiState>) -> Response {
@@ -410,6 +413,14 @@ pub async fn update_settings(
                 .into_response();
         }
         settings.system.trading_mode = mode;
+    }
+    if let Some(rpt) = payload.risk_per_trade {
+        let cap = if settings.risk.max_risk_per_trade > 0.0 {
+            settings.risk.max_risk_per_trade
+        } else {
+            0.10
+        };
+        settings.risk.risk_per_trade = rpt.clamp(0.0, cap);
     }
     if let Some(raw) = payload.compute_mode {
         let mode = raw.trim().to_ascii_lowercase();

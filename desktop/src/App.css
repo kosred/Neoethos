@@ -757,6 +757,59 @@ button.danger {
   letter-spacing: 0.04em;
 }
 
+/* ── Inline info balloon (Tip) ── */
+.tip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: #1a2333;
+  border: 1px solid #2a3142;
+  color: #8b97ab;
+  font-size: 10px;
+  cursor: help;
+  user-select: none;
+  vertical-align: middle;
+}
+.tip:hover,
+.tip:focus {
+  border-color: #3b82f6;
+  color: #cfe3ff;
+  outline: none;
+}
+.tip-balloon {
+  position: absolute;
+  bottom: 130%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: 300px;
+  background: #0b1220;
+  border: 1px solid #3b82f6;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.4;
+  color: #cfe3ff;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.12s ease;
+  z-index: 50;
+  white-space: normal;
+  text-align: left;
+}
+.tip:hover .tip-balloon,
+.tip:focus .tip-balloon {
+  opacity: 1;
+  visibility: visible;
+}
+
 /* ── Discovery: resource strip ── */
 .res-strip {
   display: flex;

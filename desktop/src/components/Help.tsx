@@ -33,6 +33,18 @@ export function HelpPanel({
   );
 }
 
+/** Inline info balloon — a small ⓘ that reveals an explanation on hover/focus.
+ *  Use next to any control the user chooses, so guidance is right where the
+ *  decision is made (not only in the panel at the top). */
+export function Tip({ text }: { text: ReactNode }) {
+  return (
+    <span className="tip" tabIndex={0} role="note">
+      ⓘ
+      <span className="tip-balloon">{text}</span>
+    </span>
+  );
+}
+
 /** One labelled step/row inside a HelpPanel. */
 export function HelpStep({ n, children }: { n: number | string; children: ReactNode }) {
   return (

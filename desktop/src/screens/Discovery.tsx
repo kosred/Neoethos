@@ -1,8 +1,8 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
-import { enginesStatus, settings, dataImport, pickDataFile, dataCoverage, riskInfo, type SymbolCoverage } from "../api";
+import { enginesStatus, settings, updateSettings, dataImport, pickDataFile, dataCoverage, riskInfo, type SymbolCoverage } from "../api";
 import { usePoll } from "../hooks";
 import { useSymbolOptions, useTimeframeOptions, TimeframeSelect } from "../components/Select";
-import { HelpPanel, HelpStep } from "../components/Help";
+import { HelpPanel, HelpStep, Tip } from "../components/Help";
 import {
   subscribe,
   getSnapshot,
@@ -59,7 +59,7 @@ function Chips({
 
 export default function Discovery() {
   const { data: st, error } = usePoll(enginesStatus, 2000);
-  const { data: cfg } = usePoll(settings, 0);
+  const { data: cfg, reload: reloadCfg } = usePoll(settings, 0);
   const q = useSyncExternalStore(subscribe, getSnapshot);
   const symOpts = useSymbolOptions();
   const tfOpts = useTimeframeOptions();
@@ -136,6 +136,22 @@ export default function Discovery() {
     dataCoverage(selSyms, probeTf).then((c) => { if (live) setCov(c); }).catch(() => {});
     return () => { live = false; };
   }, [selSyms, probeTf]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const applyMode = async (m: "risky" | "prop_firm") => {
+    try {
+      await updateSettings({ tradingMode: m });
+      reloadCfg?.();
+    } catch { /* ignore */ }
+  };
+  const applyRisk = async (pctStr: string) => {
+    const pct = Number(pctStr);
+    if (!Number.isFinite(pct) || pct <= 0) return;
+    try {
+      await updateSettings({ riskPerTrade: pct / 100 });
+      const r = await riskInfo();
+      setRiskPct(r.riskPerTrade);
+    } catch { /* ignore */ }
+  };
 
   const toggle =
     (set: React.Dispatch<React.SetStateAction<string[]>>) => (v: string) =>
@@ -320,15 +336,36 @@ export default function Discovery() {
           </div>
         )}
 
-        {/* ── Pre-flight: exactly what's about to run ── */}
-        <div className="banner info" style={{ marginTop: 10 }}>
-          <b>Before you start</b> — Mode:{" "}
-          <b>{cfg?.tradingMode === "risky" ? "🚀 RISKY" : "🛡 PROP-FIRM"}</b>
-          {riskPct != null && <> · risk <b>{(riskPct * 100).toFixed(1)}%</b>/trade</>}
-          {" · "}
-          {(selSyms.length || 1)} pair{(selSyms.length || 1) === 1 ? "" : "s"} ×{" "}
-          {(selTfs.length || 1)} TF = <b>{(selSyms.length || 1) * (selTfs.length || 1)} run{(selSyms.length || 1) * (selTfs.length || 1) === 1 ? "" : "s"}</b>
-          {selSyms.length === 0 && <span className="muted"> (pairs + TFs from config defaults)</span>}
+        {/* ── Pre-flight: choose mode/risk + see EXACTLY what will run ── */}
+        <h2 style={{ marginTop: 12 }}>Before you start — what THIS search will use</h2>
+        <div className="ticket-row" style={{ alignItems: "flex-end" }}>
+          <label>
+            Mode <Tip text="Applies to THIS search (saved to config). Risky = aggressive account-multiplication, drawdown-agnostic, ranks by fastest compounding. Prop-firm = robust FTMO-style rules (low drawdown / daily-loss limits)." />
+            <select value={cfg?.tradingMode ?? "risky"} onChange={(e) => applyMode(e.target.value as "risky" | "prop_firm")}>
+              <option value="risky">🚀 Risky</option>
+              <option value="prop_firm">🛡 Prop-firm</option>
+            </select>
+          </label>
+          <label>
+            Risk %/trade <Tip text="Fraction of the account risked per trade (position sizing). Clamped to the account's max risk. Set what you want for this search + live sizing." />
+            <input
+              type="number"
+              step="0.1"
+              min="0"
+              style={{ width: 80 }}
+              key={riskPct ?? "risk"}
+              defaultValue={riskPct != null ? (riskPct * 100).toFixed(1) : ""}
+              onBlur={(e) => applyRisk(e.target.value)}
+            />
+          </label>
+          <div className="muted small" style={{ paddingBottom: 6 }}>
+            {(selSyms.length || 1)} pair{(selSyms.length || 1) === 1 ? "" : "s"} × {(selTfs.length || 1)} TF ={" "}
+            <b>{(selSyms.length || 1) * (selTfs.length || 1)} run{(selSyms.length || 1) * (selTfs.length || 1) === 1 ? "" : "s"}</b>
+            {selSyms.length === 0 && <> · <span className="muted">pairs/TFs from config defaults</span></>}
+            {cfg?.searchGenerations != null && (
+              <> · <b>gen</b> {cfg.searchGenerations} · <b>pop</b> {cfg.searchPopulation} · <b>prefilter</b> {cfg.prefilterTopK}</>
+            )}
+          </div>
         </div>
         {selSyms.length > 0 && (
           <table className="tbl">

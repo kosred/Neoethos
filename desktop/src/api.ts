@@ -439,6 +439,7 @@ export const settings = () => apiGet<any>("/settings");
 export type SettingsUpdate = {
   tradingMode?: "risky" | "prop_firm";
   computeMode?: "auto" | "cpu" | "gpu";
+  riskPerTrade?: number;
   riskyStartBalance?: number;
   riskyTargetBalance?: number;
   riskyHorizonDays?: number;
