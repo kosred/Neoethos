@@ -7,6 +7,7 @@ import {
   placeOrder,
   closePosition,
   refreshAccount,
+  amendProtection,
   type BrokerSymbol,
   type ExecResult,
 } from "../api";
@@ -33,9 +34,28 @@ export default function Cockpit() {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
 
+  // Modify-protection editor (merged from the old Positions screen): click
+  // Edit on an open position → set SL/TP as PRICE LEVELS (breakeven, trailing).
+  const [editId, setEditId] = useState<number | null>(null);
+  const [editSl, setEditSl] = useState<number | "">("");
+  const [editTp, setEditTp] = useState<number | "">("");
+  const [editTrail, setEditTrail] = useState(false);
+  const positions = snap?.positions ?? [];
+
   useEffect(() => {
     serverSymbols().then((u) => setUniverse(u.symbols)).catch(() => {});
     brokerTimeframes().then((r) => r.timeframes.length && setTfs(r.timeframes)).catch(() => {});
+  }, []);
+
+  // The account stream only delivers snapshots when the server PUSHES one.
+  // Kick a refresh on mount + every 5s so balance/equity and the positions
+  // strip are live even if nothing else triggers a push (this was the old
+  // "No open positions" bug when landing directly on the cockpit).
+  useEffect(() => {
+    const kick = () => refreshAccount().catch(() => {});
+    kick();
+    const id = setInterval(kick, 5000);
+    return () => clearInterval(id);
   }, []);
 
   const place = async () => {
@@ -48,9 +68,46 @@ export default function Cockpit() {
   };
   const onClose = async (id: number, vol: number) => {
     setBusy(true);
-    try { await closePosition(id, Math.round(vol)); refreshAccount().catch(() => {}); }
+    try {
+      await closePosition(id, Math.round(vol));
+      if (editId === id) setEditId(null);
+      refreshAccount().catch(() => {});
+    }
     catch (e) { setMsg(`Close error: ${e}`); } finally { setBusy(false); }
   };
+
+  // Selecting a position pre-fills the inline editor with its current stops.
+  const onEdit = (positionId: number) => {
+    const p = positions.find((x) => x.positionId === positionId);
+    if (!p) return;
+    setEditId(positionId);
+    setEditSl(p.stopLoss ?? "");
+    setEditTp(p.takeProfit ?? "");
+    setEditTrail(false);
+  };
+
+  const saveProtection = async () => {
+    if (editId == null) return;
+    setBusy(true);
+    setMsg("Updating SL/TP…");
+    try {
+      const r: any = await amendProtection(
+        editId,
+        editSl === "" ? null : Number(editSl),
+        editTp === "" ? null : Number(editTp),
+        editTrail,
+      );
+      setMsg(`✓ Protection updated${r?.message ? ` · ${r.message}` : ""}`);
+      setEditId(null);
+      refreshAccount().catch(() => {});
+    } catch (e) {
+      setMsg(`SL/TP update failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const editPos = editId != null ? positions.find((p) => p.positionId === editId) : undefined;
 
   const groups: Record<string, BrokerSymbol[]> = {};
   for (const s of universe) {
@@ -132,10 +189,24 @@ export default function Cockpit() {
         </div>
       </div>
 
-      {/* Trade Watch */}
+      {/* Trade Watch — open positions with Edit (SL/TP as price levels) + Close */}
       <div className="ck-tradewatch">
-        <div className="ck-label">Positions {snap && snap.positions.length > 0 && <span className="badge live">{snap.positions.length}</span>}</div>
-        <PositionsTable live={snap?.positions ?? []} currency={cur} onClose={onClose} busy={busy} />
+        <div className="ck-label">Positions {positions.length > 0 && <span className="badge live">{positions.length}</span>}</div>
+        {editPos && (
+          <div className="ticket" style={{ marginBottom: 8 }}>
+            <div className="ticket-row">
+              <b style={{ alignSelf: "center" }}>{editPos.symbol} {editPos.side} #{editPos.positionId}</b>
+              <label>SL price<input type="number" step="0.00001" value={editSl} onChange={(e) => setEditSl(e.target.value === "" ? "" : Number(e.target.value))} /></label>
+              <label>TP price<input type="number" step="0.00001" value={editTp} onChange={(e) => setEditTp(e.target.value === "" ? "" : Number(e.target.value))} /></label>
+              <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                <input type="checkbox" checked={editTrail} onChange={(e) => setEditTrail(e.target.checked)} /> Trailing
+              </label>
+              <button className="primary" disabled={busy} onClick={saveProtection}>Update SL/TP</button>
+              <button disabled={busy} onClick={() => setEditId(null)}>Cancel</button>
+            </div>
+          </div>
+        )}
+        <PositionsTable live={positions} currency={cur} onClose={onClose} onEdit={onEdit} busy={busy} />
       </div>
     </div>
   );

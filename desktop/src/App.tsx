@@ -4,7 +4,6 @@ import Cockpit from "./screens/Cockpit";
 import Dashboard from "./screens/Dashboard";
 import Markets from "./screens/Markets";
 import MarketWatch from "./screens/MarketWatch";
-import Positions from "./screens/Positions";
 import Account from "./screens/Account";
 import Actions from "./screens/Actions";
 import Autopilot from "./screens/Autopilot";
@@ -17,7 +16,6 @@ import StrategyReport from "./screens/StrategyReport";
 import Intelligence from "./screens/Intelligence";
 import Files from "./screens/Files";
 import Data from "./screens/Data";
-import Journal from "./screens/Journal";
 import News from "./screens/News";
 import AiDesk from "./screens/AiDesk";
 import Supervisor from "./screens/Supervisor";
@@ -29,9 +27,9 @@ import "./App.css";
 
 type View =
   | "help"
-  | "cockpit" | "dashboard" | "markets" | "marketwatch" | "positions" | "account" | "actions"
+  | "cockpit" | "dashboard" | "markets" | "marketwatch" | "account" | "actions"
   | "autopilot" | "riskymode" | "risk" | "discovery" | "training" | "strategylab" | "strategyreport" | "intelligence"
-  | "files" | "data" | "journal" | "news" | "aidesk" | "supervisor" | "hardware" | "advanced" | "settings";
+  | "files" | "data" | "news" | "aidesk" | "supervisor" | "hardware" | "advanced" | "settings";
 
 type NavEntry = { id: View; label: string; icon: string } | { divider: string };
 
@@ -42,8 +40,7 @@ const NAV: NavEntry[] = [
   { id: "dashboard", label: "Dashboard", icon: "▦" },
   { id: "markets", label: "Markets", icon: "📈" },
   { id: "marketwatch", label: "Market Watch", icon: "👁" },
-  { id: "positions", label: "Positions", icon: "≡" },
-  { id: "account", label: "Account", icon: "💳" },
+  { id: "account", label: "Account & Journal", icon: "💳" },
   { id: "actions", label: "Actions", icon: "✓" },
   { divider: "Autopilot" },
   { id: "autopilot", label: "Autopilot", icon: "🤖" },
@@ -59,7 +56,6 @@ const NAV: NavEntry[] = [
   { id: "files", label: "Files & Storage", icon: "🗂" },
   { id: "data", label: "Data", icon: "🗄" },
   { divider: "Desk" },
-  { id: "journal", label: "Journal", icon: "📒" },
   { id: "news", label: "News", icon: "📰" },
   { id: "aidesk", label: "AI Desk", icon: "💬" },
   { id: "supervisor", label: "Supervisor", icon: "🧭" },
@@ -75,7 +71,6 @@ const SCREENS: Record<View, ReactNode> = {
   dashboard: <Dashboard />,
   markets: <Markets />,
   marketwatch: <MarketWatch />,
-  positions: <Positions />,
   account: <Account />,
   actions: <Actions />,
   autopilot: <Autopilot />,
@@ -88,7 +83,6 @@ const SCREENS: Record<View, ReactNode> = {
   intelligence: <Intelligence />,
   files: <Files />,
   data: <Data />,
-  journal: <Journal />,
   news: <News />,
   aidesk: <AiDesk />,
   supervisor: <Supervisor />,
