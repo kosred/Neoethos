@@ -214,6 +214,25 @@ fn tf_duration_ms(tf: &str) -> i64 {
     }
 }
 
+/// Weekend kill-zone windows — EXACT replica of the backtest's session gate
+/// (`eval.rs`, kill_zones_enabled): returns `(force_close, block_entry)` for a
+/// bar timestamp. Force-close: Friday ≥ 20:00 UTC. Entries blocked: that same
+/// window plus Monday 00:00–00:30 UTC. Same integer math as the kernel so the
+/// two sides can never disagree on a boundary bar.
+fn weekend_kill_zone(ts_ms: i64) -> (bool, bool) {
+    if ts_ms <= 0 {
+        return (false, false);
+    }
+    let sec_in_day = (ts_ms / 1000) % 86400;
+    let hour = sec_in_day / 3600;
+    let min = (sec_in_day % 3600) / 60;
+    let days_since_epoch = ts_ms / 86_400_000;
+    let weekday = (days_since_epoch + 4) % 7; // 0=Sun, 1=Mon, 5=Fri
+    let friday_kill = weekday == 5 && hour >= 20;
+    let monday_kill = weekday == 1 && hour == 0 && min < 30;
+    (friday_kill, friday_kill || monday_kill)
+}
+
 pub(crate) fn bars_to_ohlcv(bars: &[crate::app_services::ctrader_data::HistoricalBar]) -> Ohlcv {
     Ohlcv {
         timestamp: Some(bars.iter().map(|b| b.timestamp_ms).collect()),
@@ -419,6 +438,22 @@ async fn run(
         .map(|s| s.risk.max_portfolio_risk)
         .unwrap_or(0.0)
         .clamp(0.0, 1.0);
+    // Weekend kill zones — PARITY with the backtest (eval.rs): discovery runs
+    // with kill_zones_enabled from the SAME config flag, force-closing before
+    // the weekend and blocking Fri-late/Mon-open entries. Live must match or
+    // positions ride weekend gaps no validated strategy ever held through.
+    let kill_zones_enabled = sizing
+        .as_ref()
+        .map(|s| s.risk.kill_zones_enabled)
+        .unwrap_or(true);
+    // Live spread gate reference: the spread the BACKTEST charged per trade.
+    // When the live spread blows past a multiple of it (rollover, thin books),
+    // entering would pay costs the validated edge never budgeted for.
+    let backtest_spread_pips = sizing
+        .as_ref()
+        .map(|s| s.risk.backtest_spread_pips)
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.5);
     let sym_meta = neoethos_core::symbol_metadata::resolve(&symbol);
     let quote_ccy = sym_meta.as_ref().map(|m| m.quote.clone());
     let sizing_tf = base_tf.clone();
@@ -529,6 +564,38 @@ async fn run(
             continue;
         }
         last_bar_ts = latest_ts;
+
+        // ── Weekend kill zone — PARITY with the backtest ──────────────────────
+        // The backtest force-closes every position on Friday ≥ 20:00 UTC (no
+        // validated strategy ever held through a weekend gap). Mirror it live.
+        if kill_zones_enabled {
+            let (force_close, _) = weekend_kill_zone(latest_ts);
+            if force_close {
+                if let Some((pos_id, vol)) = open_position.take() {
+                    let result = tokio::task::spawn_blocking(move || {
+                        close_position_blocking(pos_id, vol)
+                    })
+                    .await?;
+                    match result {
+                        Ok(_) => tracing::info!(
+                            target: "neoethos_app::live_trading",
+                            %symbol, position_id = pos_id,
+                            "weekend kill zone — position force-closed (parity with backtest)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            target: "neoethos_app::live_trading",
+                            error = %e, position_id = pos_id,
+                            "weekend kill zone close failed — will retry next bar"
+                        ),
+                    }
+                    pos_sl_pips = 0.0;
+                    if let Ok(mut s) = status.lock() {
+                        s.open_position_id = None;
+                        s.last_signal = Some("weekend kill zone — flat".to_string());
+                    }
+                }
+            }
+        }
 
         // ── Auto-cull reconcile: account THIS engine's closed trades ──────────
         // Reads the broker's closing deals (net_profit) for positions we opened
@@ -823,6 +890,62 @@ async fn run(
                         s.last_signal = Some(format!("blocked by news: {event}"));
                     }
                     continue;
+                }
+
+                // Weekend kill zone — PARITY entry block (Fri ≥20:00 / Mon <00:30
+                // UTC): the backtest never entered in these windows.
+                if kill_zones_enabled {
+                    let (_, block_entry) = weekend_kill_zone(latest_ts);
+                    if block_entry {
+                        tracing::info!(
+                            target: "neoethos_app::live_trading",
+                            %symbol, "entry blocked — weekend kill zone (parity with backtest)"
+                        );
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal = Some("blocked: weekend kill zone".to_string());
+                        }
+                        continue;
+                    }
+                }
+
+                // Live spread gate: the validated edge budgeted
+                // `backtest_spread_pips` per round trip. If the CURRENT spread
+                // is blown out (rollover, thin book, news aftermath), entering
+                // pays costs the backtest never charged — skip the bar. Uses
+                // the live tick cache; a stale/missing tick fails OPEN (never
+                // blocks on our own data gap).
+                {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let tick = crate::app_services::live_spots::snapshot_all()
+                        .into_iter()
+                        .find(|t| t.symbol_name.eq_ignore_ascii_case(&symbol));
+                    if let Some(t) = tick {
+                        if now_ms - t.received_at_unix_ms <= 120_000 {
+                            if let (Some(bid), Some(ask)) = (t.bid, t.ask) {
+                                let pip = sym_meta
+                                    .as_ref()
+                                    .map(|m| m.pip_size)
+                                    .filter(|p| p.is_finite() && *p > 0.0)
+                                    .unwrap_or(0.0001);
+                                let spread_pips = (ask - bid) / pip;
+                                let limit = backtest_spread_pips * 2.5;
+                                if spread_pips.is_finite() && spread_pips > limit {
+                                    tracing::warn!(
+                                        target: "neoethos_app::live_trading",
+                                        %symbol, spread_pips, limit,
+                                        "entry blocked — live spread far above the backtest's \
+                                         cost assumption (skipping this bar)"
+                                    );
+                                    if let Ok(mut s) = status.lock() {
+                                        s.last_signal = Some(format!(
+                                            "blocked: spread {spread_pips:.1} pips > {limit:.1}"
+                                        ));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Open new position
