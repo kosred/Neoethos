@@ -863,27 +863,45 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Res
     let mut names = Vec::new();
     let mut columns: Vec<Vec<f64>> = Vec::new();
 
-    for (name, col) in compute_smc_feature_columns(ohlcv) {
-        names.push(name);
-        columns.push(col);
-    }
+    // Perf (2026-07-02, operator: ">24h on dense TFs, one core pinned"): the
+    // five indicator families used to run one-after-another and four of them
+    // are internally single-threaded, so on M1/M3 (millions of rows) this
+    // phase held ONE core for hours. Run the families CONCURRENTLY via a
+    // rayon::join nest (classic_ta's internal par_iter work-steals within the
+    // same pool). Memory: peak is unchanged — all five column sets existed
+    // simultaneously before this change too (they were pushed into `columns`).
+    //
+    // PARITY-CRITICAL: column ORDER feeds effective_feature_names and every
+    // discovery artifact — it must stay EXACTLY smc → classic → quant →
+    // session → regime. rayon::join returns results by POSITION (not by
+    // completion), so the chained collection below is deterministic.
+    let (smc, (classic, (quant, (session, regime)))) = rayon::join(
+        || compute_smc_feature_columns(ohlcv),
+        || {
+            rayon::join(
+                || compute_classic_ta_columns(ohlcv),
+                || {
+                    rayon::join(
+                        || compute_quant_feature_columns(ohlcv),
+                        || {
+                            rayon::join(
+                                || compute_session_feature_columns(ohlcv),
+                                || compute_regime_feature_columns(ohlcv),
+                            )
+                        },
+                    )
+                },
+            )
+        },
+    );
 
-    for (name, col) in compute_classic_ta_columns(ohlcv) {
-        names.push(name);
-        columns.push(col);
-    }
-
-    for (name, col) in compute_quant_feature_columns(ohlcv) {
-        names.push(name);
-        columns.push(col);
-    }
-
-    for (name, col) in compute_session_feature_columns(ohlcv) {
-        names.push(name);
-        columns.push(col);
-    }
-
-    for (name, col) in compute_regime_feature_columns(ohlcv) {
+    for (name, col) in smc
+        .into_iter()
+        .chain(classic)
+        .chain(quant)
+        .chain(session)
+        .chain(regime)
+    {
         names.push(name);
         columns.push(col);
     }
@@ -909,10 +927,22 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Res
     // n_rows*n_cols cells" would drown out real diagnostics. A unit
     // test that asserts feature magnitudes stay below f32::MAX would be
     // the right regression guard; tracked under follow-up audit.)
-    for (c, col) in columns.iter().enumerate() {
-        for (r, &val) in col.iter().enumerate() {
-            data[(r, c)] = val as f32;
-        }
+    //
+    // Perf (2026-07-02): parallel per-column copy — on an M1 cube this loop
+    // is ~1.8e9 scalar writes; column-parallel cuts it to seconds. Each rayon
+    // worker owns one output COLUMN (disjoint writes; identical values/order
+    // to the old serial loop — pure data-parallel copy, no parity impact).
+    {
+        use ndarray::Axis;
+        use rayon::prelude::*;
+        data.axis_iter_mut(Axis(1))
+            .into_par_iter()
+            .zip(columns.par_iter())
+            .for_each(|(mut out_col, col)| {
+                for (r, &val) in col.iter().enumerate() {
+                    out_col[r] = val as f32;
+                }
+            });
     }
 
     // HARD FAIL: a FeatureFrame without timestamps cannot be joined with
