@@ -84,6 +84,12 @@ pub struct SystemConfig {
     pub risky_start_balance_usd: f64,
     pub risky_target_balance_usd: f64,
     pub risky_horizon_days: u32,
+    /// When auto-cull permanently retires a live strategy, automatically
+    /// queue a fresh Discovery run on the same symbol + base timeframe to
+    /// refill the gap (the retired strategy itself can never come back —
+    /// its fingerprint stays blacklisted). The Symbiotic-GP retraining-trigger
+    /// loop (2026-07-02). Default ON; toggle in Settings.
+    pub auto_rediscover_on_cull: bool,
     pub multi_resolution_enabled: bool,
     pub multi_resolution_timeframes: Vec<String>,
     pub multi_resolution_prefix_base: bool,
@@ -186,6 +192,7 @@ impl Default for SystemConfig {
             risky_start_balance_usd: 100.0,
             risky_target_balance_usd: 50000.0,
             risky_horizon_days: 180,
+            auto_rediscover_on_cull: true,
             multi_resolution_enabled: true,
             multi_resolution_timeframes: CANONICAL_TIMEFRAMES
                 .iter()

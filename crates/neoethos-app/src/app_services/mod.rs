@@ -61,6 +61,7 @@ pub mod live_trading;
 pub mod news_calendar;
 pub mod news_research;
 pub mod pending_actions;
+pub mod rediscovery;
 pub mod risky_mode_persistence;
 pub mod secure_store;
 pub mod spread_stats;

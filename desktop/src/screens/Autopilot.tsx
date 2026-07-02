@@ -356,7 +356,11 @@ export default function Autopilot() {
             </span>
           </h2>
           <p className="muted small">{risk.note}</p>
-          <div className="cards" style={{ gridTemplateColumns: "repeat(5, 1fr)" }}>
+          <div className="cards" style={{ gridTemplateColumns: "repeat(6, 1fr)" }}>
+            <div className="card" title="Risk-constrained Kelly (Busseti/Ryu/Boyd): the largest risk-per-trade with ≤5% chance of EVER losing half the account, from this portfolio's own win rate + reward:risk. Set it as Risk per trade in Settings to trade at the survival-constrained optimum.">
+              <div className="card-label">RCK risk/trade</div>
+              <div className="card-value" style={{ color: "#4ade80" }}>{risk.rckRiskPct != null ? `${risk.rckRiskPct.toFixed(2)}%` : "—"}</div>
+            </div>
             <div className="card"><div className="card-label">DD p50</div><div className="card-value">{risk.maxDdP50Pct.toFixed(0)}%</div></div>
             <div className="card"><div className="card-label">DD p95</div><div className="card-value" style={{ color: risk.maxDdP95Pct > 30 ? "#ef5350" : undefined }}>{risk.maxDdP95Pct.toFixed(0)}%</div></div>
             <div className="card"><div className="card-label">DD p99</div><div className="card-value">{risk.maxDdP99Pct.toFixed(0)}%</div></div>

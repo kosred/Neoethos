@@ -82,6 +82,17 @@ export default function Settings() {
     }
   };
 
+  const setLoop = async (patch: Record<string, unknown>) => {
+    setMsg("Saving autopilot-loop settings…");
+    try {
+      await updateSettings(patch as any);
+      setCfg(await getSettings());
+      setMsg("✓ Saved to config.yaml.");
+    } catch (e) {
+      setMsg(`Save failed: ${e}`);
+    }
+  };
+
   useEffect(() => {
     refresh();
   }, []);
@@ -304,6 +315,19 @@ export default function Settings() {
           </div>
         )}
         <p className="muted small" style={{ marginTop: 8 }}>Manual orders (Positions) are not gated by these — they apply to automated trading.</p>
+      </div>
+
+      <h2>Autopilot loop</h2>
+      <p className="muted small">What happens automatically when auto-cull permanently retires a losing strategy.</p>
+      <div className="ticket">
+        <label style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={cfg?.autoRediscoverOnCull ?? true}
+            onChange={(e) => setLoop({ autoRediscoverOnCull: e.target.checked })}
+          />
+          Auto-rediscover after a cull — when a strategy is retired (blacklisted forever), automatically start a fresh Discovery on the same symbol + timeframe to refill the gap. Runs when the Discovery engine is idle.
+        </label>
       </div>
 
       <h2>News gate</h2>

@@ -42,6 +42,11 @@ pub struct TailRiskReport {
     pub ruin_threshold_pct: f64,
     pub ruin_probability_pct: f64,
     pub median_final_multiple: f64,
+    /// Risk-constrained Kelly recommendation (Busseti/Ryu/Boyd): the LARGEST
+    /// risk-per-trade (percent) such that P(ever losing half the account) ≤ 5%,
+    /// from this portfolio's own measured win rate + reward:risk. `None` when
+    /// the artifact predates r_multiple logging or the portfolio has no edge.
+    pub rck_risk_pct: Option<f64>,
     pub note: String,
 }
 
@@ -171,6 +176,28 @@ pub fn run_tail_risk(
         dds[idx.min(dds.len() - 1)] * 100.0
     };
 
+    // Risk-constrained Kelly sizing advice from the portfolio's OWN stats
+    // (win rate + avg-win/avg-loss in R). Constraint: ≤5% chance of EVER
+    // drawing down to half the account — the survival bar a small trader
+    // actually cares about. Only meaningful with R-multiples.
+    let rck_risk_pct = if have_r {
+        let rs: Vec<f64> = entries.iter().map(|e| e.1).collect();
+        let n = rs.len() as f64;
+        let wins: Vec<f64> = rs.iter().copied().filter(|r| *r > 0.0).collect();
+        let losses: Vec<f64> = rs.iter().copied().filter(|r| *r < 0.0).collect();
+        let p = wins.len() as f64 / n;
+        let avg_win = if wins.is_empty() { 0.0 } else { wins.iter().sum::<f64>() / wins.len() as f64 };
+        let avg_loss = if losses.is_empty() { 0.0 } else { (losses.iter().sum::<f64>() / losses.len() as f64).abs() };
+        if avg_loss > 1e-9 && avg_win > 0.0 {
+            let f = neoethos_core::domain::risk_constrained_kelly(p, avg_win / avg_loss, 0.5, 0.05);
+            if f > 0.0 { Some(f * 100.0) } else { None }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let p95 = pct(0.95);
     let ruin_prob = ruined as f64 / iterations as f64 * 100.0;
     let note = if ruin_prob >= 1.0 {
@@ -206,6 +233,7 @@ pub fn run_tail_risk(
         ruin_threshold_pct: RUIN_THRESHOLD * 100.0,
         ruin_probability_pct: ruin_prob,
         median_final_multiple: finals[finals.len() / 2],
+        rck_risk_pct,
         note,
     })
 }

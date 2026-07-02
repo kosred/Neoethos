@@ -709,6 +709,10 @@ async fn run(
                         s.running = false;
                         s.open_position_id = None;
                     }
+                    // Close the loop: the retirement left a coverage gap on this
+                    // (symbol, base_tf) — queue a fresh Discovery to refill it.
+                    // The retired strategy itself can never return (blacklisted).
+                    crate::app_services::rediscovery::request(symbol.clone(), base_tf.clone());
                     break;
                 }
             }

@@ -5,6 +5,7 @@ pub mod events;
 pub mod meta_controller;
 
 pub mod drift_monitor;
+pub mod kelly;
 pub mod news_filter;
 pub mod order_execution;
 pub mod portfolio;
@@ -14,6 +15,7 @@ pub mod risk;
 pub mod risky_mode;
 
 pub use demo_gate::{DemoForwardDecision, DemoForwardGateConfig, evaluate_demo_forward_gate};
+pub use kelly::risk_constrained_kelly;
 pub use promotion_gate::{
     CriterionResult, PromotionDecision, PromotionGateConfig, PromotionMetrics,
     aggregate_portfolio, evaluate_promotion,

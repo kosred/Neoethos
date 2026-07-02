@@ -474,6 +474,8 @@ export type SettingsUpdate = {
   stagnationPatience?: number;
   noveltyWeight?: number;
   disableSmcGate?: boolean;
+  // Auto-cull retirement → automatic rediscovery on the same symbol+TF.
+  autoRediscoverOnCull?: boolean;
   // News gate config
   newsCalendarEnabled?: boolean;
   newsCalendarSource?: string;
@@ -567,6 +569,9 @@ export type TailRiskReport = {
   ruinThresholdPct: number;
   ruinProbabilityPct: number;
   medianFinalMultiple: number;
+  /** Risk-constrained Kelly (Busseti/Ryu/Boyd): largest risk-per-trade (%) with
+   *  ≤5% chance of ever losing half the account. null = no edge / no R data. */
+  rckRiskPct: number | null;
   note: string;
 };
 export const tailRisk = (portfolio: string) =>

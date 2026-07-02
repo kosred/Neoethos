@@ -50,6 +50,8 @@ mod backend {
             neoethos_app::app_services::supervisor::spawn(state.clone());
             // Session-aware spread sampler (broker's real per-hour spreads).
             neoethos_app::app_services::spread_stats::spawn();
+            // Auto-cull retirement → rediscovery queue drainer (Settings-gated).
+            neoethos_app::app_services::rediscovery::spawn(state.clone());
             if let Err(e) = server::serve_on(listener, state).await {
                 eprintln!("in-process backend exited: {e:#}");
             }

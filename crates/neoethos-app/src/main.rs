@@ -425,6 +425,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app_services::supervisor::spawn(state.clone());
     // Session-aware spread sampler (records the broker's real per-hour spreads).
     app_services::spread_stats::spawn();
+    // Auto-cull retirement → rediscovery queue drainer (Settings-gated).
+    app_services::rediscovery::spawn(state.clone());
 
     // Spawn the live spot streamer (#137). Best-effort — if creds
     // are missing or the broker rejects auth, the helper logs and

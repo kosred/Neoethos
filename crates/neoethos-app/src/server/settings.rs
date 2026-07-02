@@ -57,6 +57,9 @@ pub struct SettingsDto {
     pub risky_start_balance: f64,
     pub risky_target_balance: f64,
     pub risky_horizon_days: u32,
+    /// Auto-cull retirement → automatic Discovery on the same symbol+TF to
+    /// refill the gap (the retired strategy stays blacklisted forever).
+    pub auto_rediscover_on_cull: bool,
     pub news_calendar_enabled: bool,
     pub news_calendar_source: String,
     /// `block_on_news` | `allow_always` | `warn_only`. Controls how
@@ -103,6 +106,7 @@ pub struct SettingsUpdateDto {
     pub risky_start_balance: Option<f64>,
     pub risky_target_balance: Option<f64>,
     pub risky_horizon_days: Option<u32>,
+    pub auto_rediscover_on_cull: Option<bool>,
     pub news_calendar_enabled: Option<bool>,
     pub news_calendar_source: Option<String>,
     /// Snake_case id of a [`NewsTradingMode`] variant.
@@ -464,6 +468,9 @@ pub async fn update_settings(
             settings.system.risky_horizon_days = v;
         }
     }
+    if let Some(b) = payload.auto_rediscover_on_cull {
+        settings.system.auto_rediscover_on_cull = b;
+    }
     if let Some(b) = payload.news_calendar_enabled {
         settings.news.news_calendar_enabled = b;
     }
@@ -579,6 +586,7 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         risky_start_balance: settings.system.risky_start_balance_usd,
         risky_target_balance: settings.system.risky_target_balance_usd,
         risky_horizon_days: settings.system.risky_horizon_days,
+        auto_rediscover_on_cull: settings.system.auto_rediscover_on_cull,
         news_calendar_enabled: settings.news.news_calendar_enabled,
         news_calendar_source: settings.news.news_calendar_source.clone(),
         news_trading_mode: mode.as_str().to_string(),
