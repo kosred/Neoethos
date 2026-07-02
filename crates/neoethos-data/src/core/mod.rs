@@ -4,6 +4,7 @@ pub mod discover;
 pub mod feature_registry;
 pub mod feature_store;
 pub mod features;
+pub mod footprint_features;
 pub mod hpc_ta;
 pub mod indicators;
 pub mod loader;

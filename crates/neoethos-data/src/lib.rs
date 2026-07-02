@@ -76,6 +76,7 @@ pub use crate::core::loader::*;
 pub use crate::core::parquet_migration::*;
 pub use crate::core::quant_features::*;
 pub use crate::core::regime_detection::*;
+pub use crate::core::footprint_features::*;
 pub use crate::core::resample::*;
 pub use crate::core::session_features::*;
 pub use crate::core::slicing::{slice_ohlcv, slice_ohlcv_by_date_range_ms};
@@ -875,7 +876,7 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Res
     // discovery artifact — it must stay EXACTLY smc → classic → quant →
     // session → regime. rayon::join returns results by POSITION (not by
     // completion), so the chained collection below is deterministic.
-    let (smc, (classic, (quant, (session, regime)))) = rayon::join(
+    let (smc, (classic, (quant, (session, (regime, footprint))))) = rayon::join(
         || compute_smc_feature_columns(ohlcv),
         || {
             rayon::join(
@@ -886,7 +887,17 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Res
                         || {
                             rayon::join(
                                 || compute_session_feature_columns(ohlcv),
-                                || compute_regime_feature_columns(ohlcv),
+                                || {
+                                    rayon::join(
+                                        || compute_regime_feature_columns(ohlcv),
+                                        // Footprint family (2026-07-02): bar-level
+                                        // effort-vs-result order-flow proxies.
+                                        // APPENDED LAST so every pre-existing
+                                        // portfolio's column order is unchanged
+                                        // (projection matches by name).
+                                        || compute_footprint_feature_columns(ohlcv),
+                                    )
+                                },
                             )
                         },
                     )
@@ -901,6 +912,7 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Res
         .chain(quant)
         .chain(session)
         .chain(regime)
+        .chain(footprint)
     {
         names.push(name);
         columns.push(col);
