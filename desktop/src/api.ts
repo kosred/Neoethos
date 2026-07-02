@@ -163,16 +163,12 @@ export type ReauthResult = {
 
 // ── Local vortex data (works offline, no broker) ──────────────────────────────
 export const appInfo = () => invoke<AppInfo>("app_info");
-export const listSymbols = () => invoke<string[]>("list_symbols");
-export const listTimeframes = (symbol: string) => invoke<string[]>("list_timeframes", { symbol });
 /** Native OS file picker for data import; returns the chosen path or null. */
 export const pickDataFile = () => invoke<string | null>("pick_data_file");
 export type SymbolCoverage = { symbol: string; bars: number; firstMs: number; lastMs: number; years: number };
 /** Per-symbol local-history coverage (years + bars) for the given base TF. */
 export const dataCoverage = (symbols: string[], timeframe: string) =>
   invoke<SymbolCoverage[]>("data_coverage", { symbols, timeframe });
-export const localChart = (symbol: string, timeframe: string, limit = 1500) =>
-  invoke<Candle[]>("chart", { symbol, timeframe, limit });
 
 // ── Live cTrader (in-process, auto-auth) ──────────────────────────────────────
 export const brokerStatus = () => invoke<BrokerStatus>("broker_status");
@@ -444,21 +440,9 @@ export const placePendingOrder = (body: {
 export const cancelOrder = (orderId: number) => apiPost<ExecResult>("/orders/cancel", { orderId });
 
 // ── Advanced settings / diagnostics / data import ─────────────────────────
-// ── Indicators + chart scroll-back ────────────────────────────────────────
-export type IndicatorLine = { name: string; values: number[] };
-export type IndicatorResult = {
-  symbol: string;
-  timeframe: string;
-  indicator: string;
-  candleCount: number;
-  lines: IndicatorLine[];
-};
-export const INDICATORS = ["sma", "ema", "bollinger_bands", "vwap", "rsi", "macd", "atr", "stoch"] as const;
-export const OVERLAY_INDICATORS = ["sma", "ema", "bollinger_bands", "vwap"]; // drawn on the price scale
-export const indicators = (symbol: string, timeframe: string, indicator: string, period?: number) =>
-  apiGet<IndicatorResult>(
-    `/indicators?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&indicator=${indicator}${period ? `&period=${period}` : ""}`,
-  );
+// ── Chart scroll-back ─────────────────────────────────────────────────────
+// (Indicator overlays are computed client-side by KLineChart since the v10
+// migration; the server /indicators endpoint remains for CLI/API users.)
 export const chartHistory = (symbol: string, timeframe: string, beforeMs: number, limit = 500) =>
   apiGet<{ candles: { tsMs: number | null; open: number; high: number; low: number; close: number }[]; hasMore: boolean }>(
     `/chart/history?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&beforeMs=${beforeMs}&limit=${limit}`,
@@ -498,7 +482,6 @@ export type SettingsUpdate = {
 export const updateSettings = (payload: SettingsUpdate) => apiPost<any>("/settings", payload);
 
 export const brokerTimeframes = () => apiGet<{ count: number; timeframes: string[] }>("/broker/timeframes");
-export const settingsPresets = () => apiGet<{ presets: { id: string; label: string; description: string }[] }>("/settings/presets");
 export const knobCatalog = () => apiGet<any>("/settings/knob-catalog");
 export const settingsRaw = () => apiGet<any>("/settings/raw");
 export const saveSettingsRaw = (yaml: string) => apiPost("/settings/raw", { yaml });
