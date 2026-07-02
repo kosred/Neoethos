@@ -54,6 +54,7 @@ pub mod reauth;
 pub mod live_spots;
 pub mod live_spots_streamer;
 pub mod experience_store;
+pub mod experience_train;
 pub mod live_parity;
 pub mod live_trading;
 pub mod news_calendar;

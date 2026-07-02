@@ -4,7 +4,9 @@ import {
   supervisorConfig,
   supervisorTick,
   supervisorChat,
+  experienceTrain,
   type SupervisorLogEntry,
+  type ExperienceGroup,
 } from "../api";
 import { usePoll } from "../hooks";
 import { HelpPanel, HelpStep, Tip } from "../components/Help";
@@ -29,6 +31,9 @@ export default function Supervisor() {
   // Standing directives editor (one per line).
   const [directivesText, setDirectivesText] = useState("");
   const [directivesLoaded, setDirectivesLoaded] = useState(false);
+  // Live-experience learnability report.
+  const [expGroups, setExpGroups] = useState<ExperienceGroup[] | null>(null);
+  const [expNote, setExpNote] = useState("");
 
   const cfg = data?.config;
   const log: SupervisorLogEntry[] = data?.log ?? [];
@@ -52,6 +57,21 @@ export default function Supervisor() {
       await reload();
     } catch (e) {
       setChatReply(`Failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runExperienceTrain = async () => {
+    setBusy(true);
+    setMsg("Training from live experience (time-ordered OOS)…");
+    try {
+      const r = await experienceTrain();
+      setExpGroups(r.groups);
+      setExpNote(`${r.usableRecords}/${r.totalRecords} usable records · ${r.note}`);
+      setMsg("✓ Experience report ready.");
+    } catch (e) {
+      setMsg(`Experience training failed: ${e}`);
     } finally {
       setBusy(false);
     }
@@ -185,6 +205,31 @@ export default function Supervisor() {
         <div className="btn-row" style={{ marginTop: 8 }}>
           <button className="primary" disabled={busy} onClick={saveDirectives}>Save directives</button>
         </div>
+      </div>
+
+      <h2>Live-experience learnability <Tip text="Trains a model on the EXACT feature rows your live entries acted on, tested on a strictly time-ordered holdout (the future). Answers honestly: do live outcomes carry learnable signal yet? Report only — never touches live trading." /></h2>
+      <div className="ticket">
+        <div className="btn-row">
+          <button disabled={busy} onClick={runExperienceTrain}>🧪 Train from live experience</button>
+        </div>
+        {expNote && <p className="muted small" style={{ marginTop: 6 }}>{expNote}</p>}
+        {expGroups && expGroups.length > 0 && (
+          <table className="tbl" style={{ marginTop: 6 }}>
+            <thead><tr><th>Portfolio</th><th>Records</th><th>Baseline</th><th>OOS acc</th><th>Edge</th><th>Verdict</th></tr></thead>
+            <tbody>
+              {expGroups.map((g) => (
+                <tr key={g.portfolio}>
+                  <td className="muted small" style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={g.portfolio}>{g.portfolio.split(/[\\/]/).pop()}</td>
+                  <td>{g.records}</td>
+                  <td>{g.testN > 0 ? `${g.baselinePct.toFixed(0)}%` : "—"}</td>
+                  <td>{g.testN > 0 ? `${g.oosAccuracyPct.toFixed(0)}%` : "—"}</td>
+                  <td className={g.edgePct > 5 ? "buy" : g.edgePct < 0 ? "sell" : ""}>{g.testN > 0 ? `${g.edgePct >= 0 ? "+" : ""}${g.edgePct.toFixed(1)}%` : "—"}</td>
+                  <td className="muted small" style={{ maxWidth: 320 }}>{g.verdict}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
 
       <h2>Decision log <span className="muted">({log.length})</span></h2>

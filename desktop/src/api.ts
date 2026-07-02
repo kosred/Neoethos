@@ -589,6 +589,14 @@ export const supervisorTick = () => apiPost<{ summary: string }>("/supervisor/ti
 export const supervisorChat = (message: string) =>
   apiPost<{ reply: string; summary: string }>("/supervisor/chat", { message });
 
+// Offline learning report from live experience (never touches live trading).
+export type ExperienceGroup = {
+  portfolio: string; records: number; trainN: number; testN: number;
+  baselinePct: number; oosAccuracyPct: number; edgePct: number; verdict: string;
+};
+export const experienceTrain = () =>
+  apiPost<{ totalRecords: number; usableRecords: number; groups: ExperienceGroup[]; note: string }>("/experience/train");
+
 // ── Session-aware spread stats (recorded from the broker's own ticks) ──────
 export type HourSpread = { samples: number; meanPips: number; maxPips: number };
 export type SpreadStats = {

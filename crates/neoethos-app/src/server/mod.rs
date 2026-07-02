@@ -178,6 +178,30 @@ pub fn router(state: AppApiState) -> Router {
         .route("/autonomous/parity", get(autonomous::parity))
         // Monte-Carlo tail risk of a portfolio's trade sequence (p95 DD, ruin).
         .route("/autonomous/tailrisk", get(autonomous::tail_risk))
+        // Offline learning report from live experience (never touches live).
+        .route(
+            "/experience/train",
+            post(|| async {
+                use axum::response::IntoResponse;
+                match tokio::task::spawn_blocking(
+                    crate::app_services::experience_train::train_from_experience,
+                )
+                .await
+                {
+                    Ok(Ok(report)) => axum::Json(serde_json::json!(report)).into_response(),
+                    Ok(Err(e)) => (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response(),
+                    Err(e) => (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response(),
+                }
+            }),
+        )
         // Session-aware spread stats recorded from the broker's own ticks.
         .route(
             "/data/spread-stats",
