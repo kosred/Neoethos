@@ -572,6 +572,36 @@ export type TailRiskReport = {
 export const tailRisk = (portfolio: string) =>
   apiGet<TailRiskReport>(`/autonomous/tailrisk?portfolio=${encodeURIComponent(portfolio)}`);
 
+// First-passage prop-firm challenge Monte Carlo: pass/funded probability per
+// risk-per-trade size against FTMO-style barriers, + the challenge-optimal size.
+export type ChallengeSweepPoint = {
+  riskPct: number;
+  passPhase1Pct: number;
+  fundedPct: number;
+  bustPct: number;
+  timeoutPct: number;
+  medianDaysPhase1: number;
+};
+export type ChallengeReport = {
+  portfolio: string;
+  trades: number;
+  iterations: number;
+  profitTargetPct: number;
+  phase2TargetPct: number;
+  dailyLossPct: number;
+  maxLossPct: number;
+  dayLimitPhase1: number;
+  dayLimitPhase2: number;
+  tradesPerDay: number;
+  sweep: ChallengeSweepPoint[];
+  bestRiskPct: number;
+  bestFundedPct: number;
+  attemptsFor90Pct: number;
+  note: string;
+};
+export const challengeSim = (portfolio: string) =>
+  apiGet<ChallengeReport>(`/autonomous/challenge?portfolio=${encodeURIComponent(portfolio)}`);
+
 // ── Autonomous LLM supervisor ───────────────────────────────────────────────
 export type SupervisorConfig = { enabled: boolean; intervalMinutes: number; maxActionsPerTick: number; directives: string[] };
 export type SupervisorLogEntry = {

@@ -11,10 +11,12 @@ import {
   strategyBlacklist,
   parityCheck,
   tailRisk,
+  challengeSim,
   type PortfolioEntry,
   type GateVerdict,
   type ParityReport,
   type TailRiskReport,
+  type ChallengeReport,
 } from "../api";
 import { usePoll } from "../hooks";
 import { HelpPanel, HelpStep, Tip } from "../components/Help";
@@ -88,6 +90,7 @@ export default function Autopilot() {
   const [replay, setReplay] = useState<any>(null);
   const [parity, setParity] = useState<ParityReport | null>(null);
   const [risk, setRisk] = useState<TailRiskReport | null>(null);
+  const [chal, setChal] = useState<ChallengeReport | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   // Filters
@@ -218,6 +221,22 @@ export default function Autopilot() {
     }
   };
 
+  const doChallenge = async () => {
+    if (!focus) { setMsg("Click a strategy name to focus it, then Challenge sim."); return; }
+    setBusy(true);
+    setChal(null);
+    setMsg(`Challenge first-passage Monte Carlo for ${focus.symbol ?? ""}… (2000 paths × 6 sizes × 2 phases)`);
+    try {
+      const r = await challengeSim(focus.path);
+      setChal(r);
+      setMsg(r.bestFundedPct < 5 ? "⚠ Challenge sim: this edge barely clears prop-firm barriers." : "✓ Challenge sim computed.");
+    } catch (e) {
+      setMsg(`Challenge sim failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const doParity = async () => {
     if (!focus) { setMsg("Click a strategy name to focus it, then Check parity."); return; }
     setBusy(true);
@@ -316,6 +335,7 @@ export default function Autopilot() {
           <button disabled={busy || !focus} onClick={doReplay}>Replay focused (dry-run)</button>
           <button disabled={busy || !focus} onClick={doParity} title="Does the live bar-window produce the SAME signals as the full history? FAIL = live won't match the validated backtest.">Check parity</button>
           <button disabled={busy || !focus} onClick={doTailRisk} title="Monte-Carlo the trade sequence: worst-case drawdown distribution + probability of losing half the account at YOUR current risk %. The pre-Start number.">Tail risk</button>
+          <button disabled={busy || !focus} onClick={doChallenge} title="First-passage Monte Carlo of a prop-firm challenge (FTMO-style +10% target vs −10% max / −5% daily loss): pass & funded probability per risk size, and the challenge-optimal size.">Challenge sim</button>
           <button className="primary" disabled={busy || selected.length === 0} onClick={startSelected}>
             Start selected (live) · {selected.length}
           </button>
@@ -345,6 +365,44 @@ export default function Autopilot() {
           </div>
           <p className="muted small" style={{ marginTop: 6 }}>
             {risk.trades} trades · risk {(risk.riskFraction * 100).toFixed(2)}%/trade · source: {risk.mode} · shuffling assumes independent trades — real streaks can cluster worse.
+          </p>
+        </div>
+      )}
+
+      {chal && (
+        <div className="ticket" style={{ marginTop: 12, borderColor: chal.bestFundedPct < 5 ? "#b91c1c" : chal.bestFundedPct < 25 ? "#a16207" : "#15803d" }}>
+          <h2 style={{ marginTop: 0 }}>
+            Prop-firm challenge sim (first-passage ×{chal.iterations}){" "}
+            <span className="badge" style={{ background: chal.bestFundedPct < 5 ? "#b91c1c" : chal.bestFundedPct < 25 ? "#a16207" : "#15803d" }}>
+              {chal.bestFundedPct < 5 ? "NO REAL EDGE" : chal.bestFundedPct < 25 ? "MARGINAL" : "VIABLE"}
+            </span>
+          </h2>
+          <p className="muted small">{chal.note}</p>
+          <div className="cards" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
+            <div className="card"><div className="card-label">Best risk/trade</div><div className="card-value">{chal.bestRiskPct.toFixed(2)}%</div></div>
+            <div className="card"><div className="card-label">Funded / attempt</div><div className="card-value" style={{ color: chal.bestFundedPct < 5 ? "#ef5350" : undefined }}>{chal.bestFundedPct.toFixed(0)}%</div></div>
+            <div className="card"><div className="card-label">Attempts for ≥90%</div><div className="card-value">{chal.attemptsFor90Pct > 0 ? chal.attemptsFor90Pct : "—"}</div></div>
+            <div className="card"><div className="card-label">Trade cadence</div><div className="card-value">{chal.tradesPerDay.toFixed(1)}/day</div></div>
+          </div>
+          <table className="tbl" style={{ marginTop: 6 }}>
+            <thead><tr><th>Risk/trade</th><th>Pass phase 1</th><th>Funded (1×2)</th><th>Bust</th><th>Timeout</th><th>Median days</th></tr></thead>
+            <tbody>
+              {chal.sweep.map((s) => (
+                <tr key={s.riskPct} style={s.riskPct === chal.bestRiskPct ? { background: "rgba(21,128,61,0.15)" } : undefined}>
+                  <td><b>{s.riskPct.toFixed(2)}%</b></td>
+                  <td>{s.passPhase1Pct.toFixed(0)}%</td>
+                  <td className={s.fundedPct >= 25 ? "buy" : s.fundedPct < 5 ? "sell" : ""}>{s.fundedPct.toFixed(0)}%</td>
+                  <td className="muted">{s.bustPct.toFixed(0)}%</td>
+                  <td className="muted">{s.timeoutPct.toFixed(0)}%</td>
+                  <td className="muted">{s.medianDaysPhase1 > 0 ? s.medianDaysPhase1.toFixed(0) : "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="muted small" style={{ marginTop: 6 }}>
+            Rules: +{chal.profitTargetPct.toFixed(0)}% target (phase 2: +{chal.phase2TargetPct.toFixed(0)}%) vs −{chal.maxLossPct.toFixed(0)}% max / −{chal.dailyLossPct.toFixed(0)}% daily loss ·
+            {" "}{chal.dayLimitPhase1}/{chal.dayLimitPhase2}-day windows (conservative — FTMO dropped time limits) · {chal.trades} source trades ·
+            bootstrap assumes iid trades — treat pass% as an upper bound.
           </p>
         </div>
       )}

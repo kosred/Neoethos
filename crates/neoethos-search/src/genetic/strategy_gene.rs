@@ -698,6 +698,12 @@ pub struct EvaluationConfig {
     pub smc_weight_eqh: f32,
     pub smc_weight_eql: f32,
     pub smc_weight_displacement: f32,
+    /// scoring_version 5 (2026-07-02): when `true` the GA evolves under the
+    /// Kelly log-growth objective (`scoring::ga_fitness_growth`) instead of
+    /// the prop-firm consistency formula. Set by the discovery driver for
+    /// `DiscoveryMode::Risky` only; `false` everywhere else (PropFirm/Strict,
+    /// tests, parity fixtures) keeps the v4 landscape byte-for-byte.
+    pub growth_objective: bool,
 }
 
 impl Default for EvaluationConfig {
@@ -735,6 +741,7 @@ impl Default for EvaluationConfig {
             smc_weight_eqh: smc.w_eqh,
             smc_weight_eql: smc.w_eql,
             smc_weight_displacement: smc.w_displacement,
+            growth_objective: false,
         }
     }
 }

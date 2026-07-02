@@ -178,6 +178,8 @@ pub fn router(state: AppApiState) -> Router {
         .route("/autonomous/parity", get(autonomous::parity))
         // Monte-Carlo tail risk of a portfolio's trade sequence (p95 DD, ruin).
         .route("/autonomous/tailrisk", get(autonomous::tail_risk))
+        // First-passage prop-firm challenge simulation (pass% per sizing).
+        .route("/autonomous/challenge", get(autonomous::challenge))
         // Offline learning report from live experience (never touches live).
         .route(
             "/experience/train",

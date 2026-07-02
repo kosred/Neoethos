@@ -53,7 +53,15 @@ pub struct ScoringVersion(pub u32);
 /// months hitting the operator's ≥4%/month bar (metrics[7], the same consistency
 /// the gate checks). (v1 = Sharpe-only; v2 = total-net.) Runs before this are NOT
 /// directly comparable (different fitness landscape); old artifacts still deserialize.
-pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(4);
+///
+/// 2026-07-02: bumped to `5` — two landscape changes land together:
+/// (a) the weight search space admits NEGATIVE indicator weights (contrarian
+/// terms, previously only reachable via seed inheritance and lost on first
+/// mutation), and (b) Risky/growth mode gets its OWN objective
+/// [`ga_fitness_growth`] — expected Kelly log-growth over the evaluation
+/// window — instead of borrowing the prop-firm consistency formula. PropFirm /
+/// Strict discovery still uses [`ga_fitness`] (v4 math, unchanged).
+pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(5);
 
 // ---------------------------------------------------------------------------
 // ga_fitness — was `genetic::evolution_math::score_from_metrics`
@@ -177,6 +185,79 @@ pub fn ga_fitness(metrics: &[f64; 11]) -> f64 {
     // over the whole window) cannot win on noise; the DD penalties are NOT scaled —
     // full weight, rejects blow-ups even when return is high.
     (hit + ret + sh + cons + pf + wr) * activity_mult - dd - daily_dd_pen
+}
+
+// ---------------------------------------------------------------------------
+// ga_fitness_growth — Risky-mode objective (scoring_version 5)
+// ---------------------------------------------------------------------------
+
+/// GA fitness for Risky / capital-multiplication discovery: expected
+/// **Kelly log-growth over the evaluation window**, from the gene's own
+/// measured `(win_rate, profit_factor, trades)`.
+///
+/// Rationale (operator + Curupira/first-passage analysis, 2026-07-02): the
+/// post-GA Risky ranking already scores candidates by half-Kelly log-growth
+/// scaled to the operator's horizon (`discovery.rs::calculate_income_score`),
+/// but the population it ranks was EVOLVED under the prop-firm consistency
+/// objective — the GA never searched for fast compounders. This is the same
+/// math moved INTO the search. Horizon scaling is deliberately absent: genes
+/// in one run share the evaluation window, so total window growth
+/// (`g_trade × trades`) orders them identically and needs no span input.
+///
+/// Shares the [`ga_fitness`] guards: non-finite Sharpe → `NEG_INFINITY`
+/// (metrics unusable), zero trades → −100.0 (graduated, not −∞, per GA Fix B).
+/// Genes WITHOUT an edge (pf ≤ 1) all have zero growth — a flat plateau the
+/// GA cannot climb — so a small ≤ 0 "edge gradient" (distance below pf=1 /
+/// wr=50% / net=0) slopes the landscape toward edge; any real edge
+/// (growth > 0) dominates it by construction.
+///
+/// The drawdown-tolerance difference is intentional: Risky mode is
+/// drawdown-agnostic BY DESIGN (its survival constraints live in the
+/// `risky_mode` domain manager + the risky WF filter, not the fitness), so
+/// unlike v4 there is no DD or worst-day penalty here.
+pub fn ga_fitness_growth(metrics: &[f64; 11]) -> f64 {
+    let net = metrics[0];
+    let sharpe = metrics[1];
+    let win_rate = metrics[4];
+    let profit_factor = metrics[5];
+    let trades = metrics[8];
+
+    if !sharpe.is_finite() {
+        return f64::NEG_INFINITY;
+    }
+    if trades < 1.0 {
+        return -100.0;
+    }
+
+    // p capped at 0.99: an all-wins tiny-sample gene would otherwise zero out
+    // rr (no observed losses) and score 0 — worse than genes with real edges.
+    let p = win_rate.clamp(0.0, 0.99);
+    // pf capped at 10: a lucky 3-trade gene can post an absurd PF; the cap
+    // keeps growth finite-ish and lets trade count (evidence) do the talking.
+    let pf = profit_factor.clamp(0.0, 10.0);
+    // Kelly fraction f* = p·(pf−1)/pf; half-Kelly, capped 25% — identical to
+    // the Risky ranking so search and ranking agree on what "growth" means.
+    let f_star = if pf > 1.0 && p > 0.0 {
+        p * (pf - 1.0) / pf
+    } else {
+        0.0
+    };
+    let f = (f_star * 0.5).clamp(0.0, 0.25);
+    let rr = if p > 0.0 { pf * (1.0 - p) / p } else { 0.0 };
+    let g_trade = if f > 0.0 && rr > 0.0 {
+        p * (1.0 + rr * f).ln() + (1.0 - p) * (1.0 - f).ln()
+    } else {
+        0.0
+    };
+    let growth = g_trade * trades;
+
+    // ≤ 0 by construction (each term clamps its positive side away): only
+    // shapes the BELOW-edge region, never competes with a positive growth.
+    let edge_gradient = (pf - 1.0).clamp(-1.0, 0.0) * 0.05
+        + (p - 0.5).clamp(-0.5, 0.0) * 0.05
+        + (net / 20_000.0).clamp(-2.0, 0.0) * 0.01;
+
+    growth * 10.0 + edge_gradient
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +440,48 @@ mod tests {
             c > v && (c - v - 0.35).abs() < 1e-9,
             "worst-day penalty must separate them by exactly 0.35: {c} vs {v}"
         );
+    }
+
+    #[test]
+    fn ga_fitness_growth_prefers_fast_compounder_over_consistent_grinder() {
+        // scoring_version 5: under the GROWTH objective, a 60% WR / PF 2.0 gene
+        // must outrank a 60% WR / PF 1.2 gene with identical activity — even
+        // though under the prop-firm formula their gap is much narrower.
+        let compounder = metrics(5000.0, 2.0, 0.10, 0.60, 2.0, 12.0, 200.0, 0.60);
+        let grinder = metrics(5000.0, 2.0, 0.05, 0.60, 1.2, 12.0, 200.0, 0.60);
+        let (c, g) = (ga_fitness_growth(&compounder), ga_fitness_growth(&grinder));
+        assert!(
+            c.is_finite() && g.is_finite() && c > g * 2.0 && c > 0.0 && g > 0.0,
+            "growth objective must decisively prefer the compounder: {c} vs {g}"
+        );
+    }
+
+    #[test]
+    fn ga_fitness_growth_no_edge_scores_negative_with_gradient() {
+        // pf <= 1 has zero Kelly growth; the edge-gradient must (a) be negative
+        // and (b) SLOPE toward the edge — closer-to-edge scores higher.
+        let far = metrics(-2000.0, 0.5, 0.20, 0.40, 0.7, 12.0, 100.0, 0.30);
+        let near = metrics(-200.0, 0.8, 0.10, 0.48, 0.95, 12.0, 100.0, 0.40);
+        let (f, n) = (ga_fitness_growth(&far), ga_fitness_growth(&near));
+        assert!(f < 0.0 && n < 0.0, "no-edge genes must score negative: {f}, {n}");
+        assert!(n > f, "closer-to-edge must score higher: near {n} vs far {f}");
+    }
+
+    #[test]
+    fn ga_fitness_growth_shares_hard_guards() {
+        let nan_sharpe = metrics(100.0, f64::NAN, 0.05, 0.6, 1.8, 12.0, 50.0, 0.7);
+        assert_eq!(ga_fitness_growth(&nan_sharpe), f64::NEG_INFINITY);
+        let zero_trades = metrics(100.0, 2.0, 0.05, 0.6, 1.8, 12.0, 0.0, 0.7);
+        assert_eq!(ga_fitness_growth(&zero_trades), -100.0);
+    }
+
+    #[test]
+    fn ga_fitness_growth_all_wins_tiny_sample_does_not_zero_out() {
+        // p is capped at 0.99 so an all-wins 3-trade gene keeps a positive rr
+        // and a positive (small) growth instead of collapsing to exactly 0.
+        let lucky = metrics(300.0, 3.0, 0.0, 1.0, 10.0, 12.0, 3.0, 1.0);
+        let s = ga_fitness_growth(&lucky);
+        assert!(s > 0.0 && s.is_finite(), "all-wins gene must score >0, got {s}");
     }
 
     #[test]

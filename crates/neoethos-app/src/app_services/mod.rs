@@ -41,6 +41,7 @@ pub mod broker_api;
 // to verify Phase A.1 schema assumptions against actual broker
 // bytes (see `--capture-symbols` CLI flag in main.rs).
 pub mod capture_symbols;
+pub mod challenge_sim;
 pub mod dxtrade;
 pub mod embedded_credentials;
 pub mod jobs;

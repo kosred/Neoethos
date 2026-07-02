@@ -269,6 +269,40 @@ pub async fn tail_risk(Query(q): Query<TailRiskQuery>) -> Response {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub struct ChallengeQuery {
+    pub portfolio: String,
+    /// Monte-Carlo attempts per (phase, risk) cell (default 2000, clamped 500..10000).
+    pub iterations: Option<usize>,
+}
+
+/// `GET /autonomous/challenge?portfolio=..` — first-passage Monte Carlo of a
+/// prop-firm challenge (FTMO-style: +10%/+5% targets vs −10% max / −5% daily
+/// barriers): pass & funded probability per risk-per-trade size, the
+/// challenge-optimal size, and how many attempts a ≥90% funding budget needs.
+pub async fn challenge(Query(q): Query<ChallengeQuery>) -> Response {
+    let portfolio = q.portfolio;
+    let iterations = q.iterations.unwrap_or(2000);
+    let result = tokio::task::spawn_blocking(move || {
+        crate::app_services::challenge_sim::run_challenge_sim(&portfolio, iterations)
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(e)) => actionable_error(
+            StatusCode::BAD_REQUEST,
+            "Challenge simulation failed — the portfolio needs a sibling *.trades.json \
+             with r_multiple fields (re-run discovery for older artifacts).",
+            &e,
+        ),
+        Err(join_err) => actionable_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The challenge-simulation task panicked.",
+            &anyhow::anyhow!("{join_err}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub struct ParityQuery {
     pub portfolio: String,
     /// Live-style window size (defaults to the live engine's 1000).

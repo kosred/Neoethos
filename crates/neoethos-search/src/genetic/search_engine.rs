@@ -1443,7 +1443,7 @@ where
 
     if generations == 0 {
         let metrics = evaluate_genes_cached(features, ohlcv, &genes, &eval_cfg, &eval_cache)?;
-        apply_metrics(&mut genes, &metrics);
+        apply_metrics(&mut genes, &metrics, eval_cfg.growth_objective);
         seen_memory.flush();
         return Ok(SearchResult { genes, metrics });
     }
@@ -1493,7 +1493,7 @@ where
         eval_cfg.smc_gate_threshold = gate_now.clamp(gate_lo, gate_hi);
 
         let metrics = evaluate_genes_cached(features, ohlcv, &genes, &eval_cfg, &eval_cache)?;
-        apply_metrics(&mut genes, &metrics);
+        apply_metrics(&mut genes, &metrics, eval_cfg.growth_objective);
 
         let mut scored: Vec<(f64, usize, Gene, [f64; 11])> = genes
             .iter()

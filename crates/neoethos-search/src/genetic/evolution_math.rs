@@ -541,8 +541,19 @@ impl SeenSignatureMemory {
 }
 
 fn random_coarse_weight(rng: &mut impl Rng) -> f32 {
+    // 2026-07-02 (search-space expansion, SCORING_VERSION 5 changelog): weights
+    // may now be NEGATIVE — "exit/veto when this indicator disagrees" is a real
+    // strategy pattern the GA previously could not express (the seed templates
+    // carry -0.20/-0.25 contrarian terms, but every mutation used to replace
+    // them with a positive level, so inherited negatives only ever decayed).
+    // Both signal paths (CPU `combined += w*v`, GPU kernel `weight * indicator`)
+    // and `Gene::normalize` (retains by |w|) are sign-agnostic — verified before
+    // this change. Negative draws are the 1/3 minority: the feature library is
+    // direction-aligned by design, so contrarian terms are the exception the
+    // search may reach, not the default it must fight through.
     let levels = [0.2, 0.4, 0.6, 0.8, 1.0];
-    levels[rng.random_range(0..levels.len())]
+    let w = levels[rng.random_range(0..levels.len())];
+    if rng.random_bool(1.0 / 3.0) { -w } else { w }
 }
 
 /// Static fallback threshold ladder. Calibrated for z-score-normalised
@@ -931,7 +942,14 @@ pub fn mutate(
                     if rng.random_bool((0.6 * intensity as f64).clamp(0.0, 1.0)) {
                         mutated.indices[idx] = rng.random_range(0..n_indicators.max(1));
                     }
-                    mutated.weights[idx] = random_coarse_weight(rng);
+                    // Sign-flip is the cheapest contrarian move: same indicator,
+                    // same magnitude, inverted contribution. Kept as a 25% branch
+                    // so plain magnitude resampling still dominates.
+                    if rng.random_bool(0.25) {
+                        mutated.weights[idx] = -mutated.weights[idx];
+                    } else {
+                        mutated.weights[idx] = random_coarse_weight(rng);
+                    }
                 } else {
                     let min_indicators = 1;
                     let max_indicators = max_indicators.clamp(min_indicators, n_indicators.max(1));
@@ -980,13 +998,18 @@ pub fn mutate(
 // the old name now get a compile error pointing at the canonical
 // function — which is what we want.
 
-pub fn apply_metrics(genes: &mut [Gene], metrics: &[[f64; 11]]) {
+pub fn apply_metrics(genes: &mut [Gene], metrics: &[[f64; 11]], growth_objective: bool) {
     for (gene, m) in genes.iter_mut().zip(metrics.iter()) {
         // Scoring Phase B (2026-05-25): call the canonical
         // `crate::scoring::ga_fitness` directly rather than the
-        // local `#[deprecated]` `score_from_metrics` shim. Behaviour
-        // is byte-for-byte identical (pinned by Phase-A test).
-        gene.fitness = crate::scoring::ga_fitness(m);
+        // local `#[deprecated]` `score_from_metrics` shim.
+        // scoring_version 5 (2026-07-02): Risky discovery evolves under the
+        // Kelly log-growth objective; everything else keeps the v4 formula.
+        gene.fitness = if growth_objective {
+            crate::scoring::ga_fitness_growth(m)
+        } else {
+            crate::scoring::ga_fitness(m)
+        };
         gene.sharpe_ratio = m[1];
         gene.max_drawdown = m[3];
         gene.win_rate = m[4];

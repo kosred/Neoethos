@@ -717,13 +717,20 @@ impl DiscoveryConfig {
     }
 
     pub fn evaluation_config(&self, price_hint: Option<f64>) -> EvaluationConfig {
-        EvaluationConfig::for_symbol(
+        let mut cfg = EvaluationConfig::for_symbol(
             &self.evaluation_symbol,
             &self.evaluation_account_currency,
             price_hint,
             Some(self.evaluation_spread_pips),
             Some(self.evaluation_commission_per_trade),
-        )
+        );
+        // scoring_version 5: Risky discovery evolves under the Kelly
+        // log-growth objective — the SAME math its post-GA ranking
+        // (`calculate_income_score`) scores with, so the population the
+        // ranking sees was actually searched FOR growth. PropFirm/Strict
+        // keep the v4 consistency landscape untouched.
+        cfg.growth_objective = matches!(self.mode, DiscoveryMode::Risky);
+        cfg
     }
 }
 

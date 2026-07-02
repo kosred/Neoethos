@@ -102,7 +102,7 @@ pub use ingredients::{
 };
 
 pub use named::{
-    archive_score, ga_fitness, quality_score, window_score, ScoringVersion,
+    archive_score, ga_fitness, ga_fitness_growth, quality_score, window_score, ScoringVersion,
     SCORING_VERSION_CURRENT,
 };
 
@@ -117,6 +117,7 @@ mod tests {
         // Compile-time check via fn pointers: if any of these vanishes
         // or changes shape, this test stops compiling.
         let _ga: fn(&[f64; 11]) -> f64 = ga_fitness;
+        let _ga_growth: fn(&[f64; 11]) -> f64 = ga_fitness_growth;
         let _archive: fn(&[f64; 11]) -> f64 = archive_score;
 
         // Ingredients are also published so future named scores can
@@ -133,14 +134,19 @@ mod tests {
     }
 
     #[test]
-    fn scoring_version_is_four_after_steady_income_daily_dd_penalty() {
+    fn scoring_version_is_five_after_negative_weights_and_growth_objective() {
         // 2026-06-06: 2→3 — CONSISTENT-monthly-return GA (dominant reward =
         // monthly_target_hit_rate in metrics[7]; total-net demoted).
         // 2026-07-02: 3→4 — STEADY-INCOME worst-period penalty: ga_fitness now
         // also penalises metrics[10] (max_daily_drawdown ×10.0), which the
         // evaluator computed but the GA ignored. Two equally-consistent genes
-        // now rank by who never had a catastrophic day. Artifacts from earlier
-        // versions are tagged and NOT directly comparable.
-        assert_eq!(SCORING_VERSION_CURRENT.0, 4);
+        // now rank by who never had a catastrophic day.
+        // 2026-07-02: 4→5 — (a) NEGATIVE indicator weights admitted into the
+        // search space (contrarian terms are now discoverable, not just
+        // seed-inherited); (b) Risky discovery evolves under its own
+        // ga_fitness_growth (Kelly log-growth) objective instead of the
+        // prop-firm consistency formula. Artifacts from earlier versions are
+        // tagged and NOT directly comparable.
+        assert_eq!(SCORING_VERSION_CURRENT.0, 5);
     }
 }
