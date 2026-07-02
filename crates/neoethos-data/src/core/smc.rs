@@ -56,6 +56,15 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
     let mut fib_2000 = vec![0.0_f64; n];
     let mut fib_2618 = vec![0.0_f64; n];
 
+    // FVG magnet features (operator 2026-07-02: "the market almost always
+    // returns to OLD FVGs — we don't look back far enough"). The registries
+    // below now REMEMBER unfilled gaps for much longer (cap 64/side, was 10)
+    // and these columns make the magnet VISIBLE to the GA per bar:
+    let mut fvg_magnet_dist = vec![0.0_f64; n]; // signed ATRs to nearest unfilled gap (+above/−below)
+    let mut fvg_magnet_age = vec![0.0_f64; n]; // log-scaled age (bars) of that gap
+    let mut fvg_inside = vec![0.0_f64; n]; // +1 inside a buy gap, −1 inside a sell gap
+    let mut fvg_open_count = vec![0.0_f64; n]; // unfilled gaps (both sides) / 20
+
     if n == 0 {
         return build_smc_return_vec(
             ob,
@@ -100,6 +109,10 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
             fib_1618,
             fib_2000,
             fib_2618,
+            fvg_magnet_dist,
+            fvg_magnet_age,
+            fvg_inside,
+            fvg_open_count,
         );
     }
 
@@ -110,8 +123,8 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
     const DISPLACEMENT_MULT: f64 = 1.8;
 
     // Active IPDA memory for IFVG computations
-    let mut active_buy_fvgs: Vec<(f64, f64)> = Vec::new(); // (top, bottom) boundaries
-    let mut active_sell_fvgs: Vec<(f64, f64)> = Vec::new(); // (top, bottom) boundaries
+    let mut active_buy_fvgs: Vec<(f64, f64, usize)> = Vec::new(); // (top, bottom, birth bar)
+    let mut active_sell_fvgs: Vec<(f64, f64, usize)> = Vec::new(); // (top, bottom, birth bar)
     let mut swing_highs: Vec<f64> = Vec::new();
     let mut swing_lows: Vec<f64> = Vec::new();
 
@@ -480,7 +493,7 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
             // Bearish FVG: Low of candle 1 is higher than High of candle 3
             if bot_fvg_sell < top_fvg_sell {
                 fvg[i] = -1.0;
-                active_sell_fvgs.push((top_fvg_sell, bot_fvg_sell));
+                active_sell_fvgs.push((top_fvg_sell, bot_fvg_sell, i));
             }
 
             let top_fvg_buy = ohlcv.low[i];
@@ -488,13 +501,13 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
             // Bullish FVG: High of candle 1 is lower than Low of candle 3
             if top_fvg_buy > bot_fvg_buy {
                 fvg[i] = 1.0;
-                active_buy_fvgs.push((top_fvg_buy, bot_fvg_buy));
+                active_buy_fvgs.push((top_fvg_buy, bot_fvg_buy, i));
             }
         }
 
         // Inversion FVG (IFVG) Detection
         // Retain active selling gaps; if price CLOSES above gap top, it's an IFVG flip to bullish
-        active_sell_fvgs.retain(|&(top, _bot)| {
+        active_sell_fvgs.retain(|&(top, _bot, _born)| {
             if close > top {
                 ifvg[i] = 1.0;
                 false
@@ -504,7 +517,7 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
         });
 
         // Retain active buying gaps; if price CLOSES below gap bottom, it's an IFVG flip to bearish
-        active_buy_fvgs.retain(|&(_top, bot)| {
+        active_buy_fvgs.retain(|&(_top, bot, _born)| {
             if close < bot {
                 ifvg[i] = -1.0;
                 false
@@ -513,11 +526,46 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
             }
         });
 
-        if active_buy_fvgs.len() > 10 {
+        // Long-memory registries (operator 2026-07-02): old UNFILLED gaps are
+        // the ones price returns to days later — the previous cap of 10 evicted
+        // exactly those magnets on dense TFs (M5: 10 gaps ≈ hours of memory).
+        if active_buy_fvgs.len() > 64 {
             active_buy_fvgs.remove(0);
         }
-        if active_sell_fvgs.len() > 10 {
+        if active_sell_fvgs.len() > 64 {
             active_sell_fvgs.remove(0);
+        }
+
+        // FVG MAGNET columns — make the pull of the nearest unfilled gap
+        // visible to the GA: signed distance in ATRs (+ = gap above price),
+        // log-scaled age of that gap, inside-a-gap flag, and open-gap count.
+        {
+            let mut best_dist_atr = f64::INFINITY;
+            let mut best_signed = 0.0_f64;
+            let mut best_age = 0.0_f64;
+            let atr = running_atr.max(1e-10);
+            for &(top, bot, born) in active_buy_fvgs.iter().chain(active_sell_fvgs.iter()) {
+                let mid = (top + bot) / 2.0;
+                let signed = (mid - close) / atr;
+                let dist = signed.abs();
+                if dist < best_dist_atr {
+                    best_dist_atr = dist;
+                    best_signed = signed.clamp(-10.0, 10.0);
+                    best_age = ((i - born) as f64).ln_1p() / 9.21; // ~ln(10k) → [0,1]
+                }
+            }
+            // Inside-gap flags, signed by gap side.
+            if active_buy_fvgs.iter().any(|&(top, bot, _)| close <= top && close >= bot) {
+                fvg_inside[i] = 1.0;
+            } else if active_sell_fvgs.iter().any(|&(top, bot, _)| close <= top && close >= bot) {
+                fvg_inside[i] = -1.0;
+            }
+            if best_dist_atr.is_finite() {
+                fvg_magnet_dist[i] = best_signed;
+                fvg_magnet_age[i] = best_age.clamp(0.0, 1.0);
+            }
+            fvg_open_count[i] =
+                (active_buy_fvgs.len() + active_sell_fvgs.len()) as f64 / 20.0;
         }
 
         // FVG Strength: Gap size as a fraction of ATR (normalized significance)
@@ -760,6 +808,10 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
         fib_1618,
         fib_2000,
         fib_2618,
+        fvg_magnet_dist,
+        fvg_magnet_age,
+        fvg_inside,
+        fvg_open_count,
     )
 }
 
@@ -807,6 +859,10 @@ fn build_smc_return_vec(
     fib_1618: Vec<f64>,
     fib_2000: Vec<f64>,
     fib_2618: Vec<f64>,
+    fvg_magnet_dist: Vec<f64>,
+    fvg_magnet_age: Vec<f64>,
+    fvg_inside: Vec<f64>,
+    fvg_open_count: Vec<f64>,
 ) -> Vec<(String, Vec<f64>)> {
     vec![
         ("smc_ob".to_string(), ob),
@@ -851,5 +907,11 @@ fn build_smc_return_vec(
         ("smc_fib_1618".to_string(), fib_1618),
         ("smc_fib_2000".to_string(), fib_2000),
         ("smc_fib_2618".to_string(), fib_2618),
+        // FVG magnet columns (2026-07-02) — appended at the END of the family
+        // so every pre-existing name keeps its relative position.
+        ("smc_fvg_magnet_dist".to_string(), fvg_magnet_dist),
+        ("smc_fvg_magnet_age".to_string(), fvg_magnet_age),
+        ("smc_fvg_inside".to_string(), fvg_inside),
+        ("smc_fvg_open_count".to_string(), fvg_open_count),
     ]
 }
