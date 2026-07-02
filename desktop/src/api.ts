@@ -551,6 +551,21 @@ export const parityCheck = (portfolio: string, window?: number) =>
     `/autonomous/parity?portfolio=${encodeURIComponent(portfolio)}${window ? `&window=${window}` : ""}`,
   );
 
+// ── Autonomous LLM supervisor ───────────────────────────────────────────────
+export type SupervisorConfig = { enabled: boolean; intervalMinutes: number; maxActionsPerTick: number };
+export type SupervisorLogEntry = {
+  tsMs: number;
+  kind: string; // tick | action | error | note
+  detail: string;
+  action?: any;
+  result?: string;
+};
+export const supervisorStatus = () =>
+  apiGet<{ config: SupervisorConfig; log: SupervisorLogEntry[] }>("/supervisor/status");
+export const supervisorConfig = (b: Partial<SupervisorConfig>) =>
+  apiPost<{ config: SupervisorConfig }>("/supervisor/config", b);
+export const supervisorTick = () => apiPost<{ summary: string }>("/supervisor/tick");
+
 // ── Strategy report: monthly journal + validation verdict + flags ─────────
 export type StrategyEntry = {
   mode: string;

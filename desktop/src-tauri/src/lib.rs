@@ -46,6 +46,8 @@ mod backend {
             let state = server::state::AppApiState::new();
             server::state::install_account_refresh_trigger(state.account_refresh_tx_clone());
             server::bridge::spawn(state.clone());
+            // Autonomous LLM supervisor heartbeat (no-op until enabled in the UI).
+            neoethos_app::app_services::supervisor::spawn(state.clone());
             if let Err(e) = server::serve_on(listener, state).await {
                 eprintln!("in-process backend exited: {e:#}");
             }

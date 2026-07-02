@@ -20,6 +20,7 @@ import Data from "./screens/Data";
 import Journal from "./screens/Journal";
 import News from "./screens/News";
 import AiDesk from "./screens/AiDesk";
+import Supervisor from "./screens/Supervisor";
 import Hardware from "./screens/Hardware";
 import Advanced from "./screens/Advanced";
 import Settings from "./screens/Settings";
@@ -30,7 +31,7 @@ type View =
   | "help"
   | "cockpit" | "dashboard" | "markets" | "marketwatch" | "positions" | "account" | "actions"
   | "autopilot" | "riskymode" | "risk" | "discovery" | "training" | "strategylab" | "strategyreport" | "intelligence"
-  | "files" | "data" | "journal" | "news" | "aidesk" | "hardware" | "advanced" | "settings";
+  | "files" | "data" | "journal" | "news" | "aidesk" | "supervisor" | "hardware" | "advanced" | "settings";
 
 type NavEntry = { id: View; label: string; icon: string } | { divider: string };
 
@@ -61,6 +62,7 @@ const NAV: NavEntry[] = [
   { id: "journal", label: "Journal", icon: "📒" },
   { id: "news", label: "News", icon: "📰" },
   { id: "aidesk", label: "AI Desk", icon: "💬" },
+  { id: "supervisor", label: "Supervisor", icon: "🧭" },
   { divider: "System" },
   { id: "hardware", label: "Hardware", icon: "🖥" },
   { id: "advanced", label: "Advanced", icon: "🔧" },
@@ -89,6 +91,7 @@ const SCREENS: Record<View, ReactNode> = {
   journal: <Journal />,
   news: <News />,
   aidesk: <AiDesk />,
+  supervisor: <Supervisor />,
   hardware: <Hardware />,
   advanced: <Advanced />,
   settings: <Settings />,

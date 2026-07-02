@@ -421,6 +421,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pattern as `install_config_path` directly above.
     server::state::install_account_refresh_trigger(state.account_refresh_tx_clone());
     server::bridge::spawn(state.clone());
+    // Autonomous LLM supervisor heartbeat (no-op until enabled from the UI).
+    app_services::supervisor::spawn(state.clone());
 
     // Spawn the live spot streamer (#137). Best-effort — if creds
     // are missing or the broker rejects auth, the helper logs and

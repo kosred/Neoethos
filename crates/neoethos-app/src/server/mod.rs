@@ -60,6 +60,7 @@ pub mod risky;
 pub mod settings;
 pub mod state;
 pub mod strategy_lab;
+pub mod supervisor;
 pub mod system_status;
 pub mod watchlist;
 
@@ -175,6 +176,10 @@ pub fn router(state: AppApiState) -> Router {
         .route("/strategy/blacklist", get(autonomous::blacklist))
         // Live↔backtest parity harness (window-invariance of live signals).
         .route("/autonomous/parity", get(autonomous::parity))
+        // Autonomous LLM supervisor (observe/diagnose + tiered actions).
+        .route("/supervisor/status", get(supervisor::status))
+        .route("/supervisor/config", post(supervisor::update_config))
+        .route("/supervisor/tick", post(supervisor::tick))
         .route("/broker/status", get(system_status::broker_status))
         .route("/broker/reauth", post(broker_control::reauth))
         .route(
