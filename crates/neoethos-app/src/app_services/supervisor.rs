@@ -45,6 +45,11 @@ pub struct SupervisorConfig {
     pub interval_minutes: u64,
     /// Hard cap on actions executed per tick (clamped 1..=5).
     pub max_actions_per_tick: usize,
+    /// Standing operator DIRECTIVES — injected into every tick/chat prompt so
+    /// the supervisor follows the human's strategy between conversations
+    /// (e.g. "focus discovery on EURUSD+GBPUSD M15", "never start live
+    /// engines without asking me first").
+    pub directives: Vec<String>,
 }
 
 impl Default for SupervisorConfig {
@@ -53,6 +58,7 @@ impl Default for SupervisorConfig {
             enabled: false, // explicit operator opt-in from the UI
             interval_minutes: 30,
             max_actions_per_tick: 3,
+            directives: Vec::new(),
         }
     }
 }
@@ -250,6 +256,7 @@ async fn gather_bundle(state: &AppApiState) -> serde_json::Value {
         "account": account,
         "portfolios": portfolios,
         "blacklist": blacklist,
+        "liveExperienceCount": crate::app_services::experience_store::count(),
         "supervisorMemory": memory,
     })
 }
@@ -301,18 +308,47 @@ pub async fn tick(state: AppApiState) -> Result<String> {
     if TICK_RUNNING.swap(true, Ordering::SeqCst) {
         anyhow::bail!("a supervisor tick is already running");
     }
-    let result = tick_inner(state).await;
+    let result = run_cycle(state, None).await.map(|(_, summary)| summary);
     TICK_RUNNING.store(false, Ordering::SeqCst);
     result
 }
 
-async fn tick_inner(state: AppApiState) -> Result<String> {
+/// Operator ↔ supervisor CHAT: same state bundle, same whitelisted actions —
+/// plus the operator's message steering the cycle. Returns
+/// `(assistant_reply, actions_summary)`. The supervisor and the chat are ONE
+/// brain: what you tell it here it acts on (within the same tiered authority).
+pub async fn chat(state: AppApiState, message: String) -> Result<(String, String)> {
+    if TICK_RUNNING.swap(true, Ordering::SeqCst) {
+        anyhow::bail!("a supervisor cycle is already running — try again in a moment");
+    }
+    log_entry("chat", format!("operator: {message}"), None, None);
+    let result = run_cycle(state, Some(message)).await;
+    TICK_RUNNING.store(false, Ordering::SeqCst);
+    result
+}
+
+async fn run_cycle(state: AppApiState, operator_message: Option<String>) -> Result<(String, String)> {
     let cfg = load_config();
     let max_actions = cfg.max_actions_per_tick.clamp(1, 5);
     let bundle = gather_bundle(&state).await;
 
+    let directives = if cfg.directives.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nSTANDING OPERATOR DIRECTIVES (follow these unless the operator's \
+             live message overrides them):\n- {}",
+            cfg.directives.join("\n- ")
+        )
+    };
+    let operator = operator_message
+        .as_deref()
+        .map(|m| format!("\n\nOPERATOR MESSAGE (answer it via note actions, then act):\n{m}"))
+        .unwrap_or_default();
+
     let user_prompt = format!(
-        "State bundle:\n{}\n\nReply with a JSON array of at most {max_actions} actions.",
+        "State bundle:\n{}{directives}{operator}\n\nReply with a JSON array of at most \
+         {max_actions} actions. Start with note action(s) addressed to the operator.",
         serde_json::to_string_pretty(&bundle).unwrap_or_default()
     );
 
@@ -341,14 +377,19 @@ async fn tick_inner(state: AppApiState) -> Result<String> {
     let actions = parse_actions(&reply);
     log_entry(
         "tick",
-        format!("tick complete — {} action(s) proposed", actions.len()),
+        format!("cycle complete — {} action(s) proposed", actions.len()),
         None,
         None,
     );
 
     let mut executed = 0usize;
     let mut summary_parts: Vec<String> = Vec::new();
+    // Note texts double as the assistant's REPLY to the operator (chat mode).
+    let mut reply_parts: Vec<String> = Vec::new();
     for action in actions.into_iter().take(max_actions) {
+        if let SupervisorAction::Note { text } = &action {
+            reply_parts.push(text.clone());
+        }
         let label = action_label(&action);
         let action_json = serde_json::to_value(&action).unwrap_or(serde_json::Value::Null);
         match execute(&state, action).await {
@@ -365,11 +406,16 @@ async fn tick_inner(state: AppApiState) -> Result<String> {
     }
 
     let summary = if executed == 0 && summary_parts.is_empty() {
-        "tick complete — no actions".to_string()
+        "cycle complete — no actions".to_string()
     } else {
         summary_parts.join(" | ")
     };
-    Ok(summary)
+    let assistant_reply = if reply_parts.is_empty() {
+        summary.clone()
+    } else {
+        reply_parts.join("\n\n")
+    };
+    Ok((assistant_reply, summary))
 }
 
 /// Extract the first JSON array from the reply (models occasionally wrap the

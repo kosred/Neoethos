@@ -28,7 +28,7 @@
 //! stay usable; the fix-window flag works regardless.
 
 use super::super::Ohlcv;
-use crate::core::timestamps::{TimestampUnit, infer_timestamp_unit, timestamp_to_millis};
+use crate::core::timestamps::{infer_timestamp_unit, timestamp_to_millis};
 
 /// Rolling mean/std over a fixed window using cumulative sums — O(n) total.
 struct Rolling {

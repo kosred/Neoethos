@@ -552,7 +552,7 @@ export const parityCheck = (portfolio: string, window?: number) =>
   );
 
 // ── Autonomous LLM supervisor ───────────────────────────────────────────────
-export type SupervisorConfig = { enabled: boolean; intervalMinutes: number; maxActionsPerTick: number };
+export type SupervisorConfig = { enabled: boolean; intervalMinutes: number; maxActionsPerTick: number; directives: string[] };
 export type SupervisorLogEntry = {
   tsMs: number;
   kind: string; // tick | action | error | note
@@ -565,6 +565,8 @@ export const supervisorStatus = () =>
 export const supervisorConfig = (b: Partial<SupervisorConfig>) =>
   apiPost<{ config: SupervisorConfig }>("/supervisor/config", b);
 export const supervisorTick = () => apiPost<{ summary: string }>("/supervisor/tick");
+export const supervisorChat = (message: string) =>
+  apiPost<{ reply: string; summary: string }>("/supervisor/chat", { message });
 
 // ── Session-aware spread stats (recorded from the broker's own ticks) ──────
 export type HourSpread = { samples: number; meanPips: number; maxPips: number };

@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   supervisorStatus,
   supervisorConfig,
   supervisorTick,
+  supervisorChat,
   type SupervisorLogEntry,
 } from "../api";
 import { usePoll } from "../hooks";
@@ -14,6 +15,7 @@ const KIND_BADGE: Record<string, { label: string; bg: string }> = {
   tick: { label: "TICK", bg: "#374151" },
   action: { label: "ACTION", bg: "#1d4ed8" },
   note: { label: "NOTE", bg: "#15803d" },
+  chat: { label: "CHAT", bg: "#7c3aed" },
   error: { label: "ERROR", bg: "#b91c1c" },
 };
 
@@ -21,9 +23,52 @@ export default function Supervisor() {
   const { data, error, reload } = usePoll(supervisorStatus, 10000);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  // Chat with the supervisor (same brain, same guard-rails, your steering).
+  const [chatInput, setChatInput] = useState("");
+  const [chatReply, setChatReply] = useState("");
+  // Standing directives editor (one per line).
+  const [directivesText, setDirectivesText] = useState("");
+  const [directivesLoaded, setDirectivesLoaded] = useState(false);
 
   const cfg = data?.config;
   const log: SupervisorLogEntry[] = data?.log ?? [];
+
+  useEffect(() => {
+    if (cfg && !directivesLoaded) {
+      setDirectivesText((cfg.directives ?? []).join("\n"));
+      setDirectivesLoaded(true);
+    }
+  }, [cfg, directivesLoaded]);
+
+  const sendChat = async () => {
+    const message = chatInput.trim();
+    if (!message) return;
+    setBusy(true);
+    setChatReply("…σκέφτεται (διαβάζει όλη την κατάσταση του συστήματος)…");
+    try {
+      const r = await supervisorChat(message);
+      setChatReply(r.reply);
+      setChatInput("");
+      await reload();
+    } catch (e) {
+      setChatReply(`Failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveDirectives = async () => {
+    setBusy(true);
+    try {
+      await supervisorConfig({ directives: directivesText.split("\n").map((s) => s.trim()).filter(Boolean) } as any);
+      setMsg("✓ Directives saved — every future cycle follows them.");
+      await reload();
+    } catch (e) {
+      setMsg(`Save failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const setCfg = async (patch: any) => {
     setBusy(true);
@@ -104,6 +149,41 @@ export default function Supervisor() {
             />
           </label>
           <button className="primary" disabled={busy} onClick={runNow}>{busy ? "…" : "▶ Run now"}</button>
+        </div>
+      </div>
+
+      <h2>Talk to the Supervisor <Tip text="Your message steers the next cycle: it reads the full system state + your standing directives, answers you, and can act (same whitelisted actions + guard-rails as the autonomous loop)." /></h2>
+      <div className="ticket">
+        <div className="ticket-row" style={{ alignItems: "flex-end" }}>
+          <label style={{ flex: 1 }}>
+            Message
+            <input
+              type="text"
+              value={chatInput}
+              placeholder="π.χ. Τι βλέπεις στα live engines; Ξεκίνα discovery στο GBPUSD M15…"
+              onChange={(e) => setChatInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") sendChat(); }}
+              style={{ width: "100%" }}
+            />
+          </label>
+          <button className="primary" disabled={busy || !chatInput.trim()} onClick={sendChat}>Send</button>
+        </div>
+        {chatReply && (
+          <div className="banner info" style={{ whiteSpace: "pre-wrap", marginTop: 8 }}>{chatReply}</div>
+        )}
+      </div>
+
+      <h2>Standing directives <Tip text="One per line. Injected into EVERY autonomous cycle and chat — your strategy stays in force between conversations. E.g. 'focus discovery on EURUSD+GBPUSD', 'never start live engines without asking me'." /></h2>
+      <div className="ticket">
+        <textarea
+          value={directivesText}
+          onChange={(e) => setDirectivesText(e.target.value)}
+          placeholder={"π.χ.\nΕστίασε το discovery σε EURUSD και GBPUSD M15\nΠοτέ μην ξεκινάς live engines χωρίς να με ρωτήσεις"}
+          spellCheck={false}
+          style={{ width: "100%", minHeight: 90, fontFamily: "inherit", fontSize: 13 }}
+        />
+        <div className="btn-row" style={{ marginTop: 8 }}>
+          <button className="primary" disabled={busy} onClick={saveDirectives}>Save directives</button>
         </div>
       </div>
 

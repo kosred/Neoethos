@@ -392,6 +392,12 @@ async fn run(
     let mut opened_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut consecutive_losses: u32 = 0;
     let mut net_pnl_running: f64 = 0.0;
+    // Live-learning foundation (operator 2026-07-02): remember the EXACT
+    // feature row each entry acted on; pair it with the realized outcome at
+    // close and append to the experience store. Pure data collection — the
+    // online/RL experts train OFFLINE from this (never silently live).
+    let mut pending_experience: HashMap<i64, crate::app_services::experience_store::LiveExperience> =
+        HashMap::new();
     // Rolling outcome window: true = win (net > 0). BE counts as a loss —
     // a break-even trade doesn't pay for its costs' risk.
     let mut recent_results: std::collections::VecDeque<bool> =
@@ -615,6 +621,13 @@ async fn run(
                             consecutive_losses += 1;
                         } else {
                             consecutive_losses = 0;
+                        }
+                        // Complete + persist the experience pair (entry features
+                        // → realized outcome) for offline live-learning.
+                        if let Some(mut exp) = pending_experience.remove(&deal.position_id) {
+                            exp.close_ts_ms = Some(deal.execution_timestamp_ms);
+                            exp.net_profit = Some(net);
+                            crate::app_services::experience_store::record(&exp);
                         }
                         recent_results.push_back(net > 0.0);
                         while recent_results.len() > cull_window {
@@ -1046,6 +1059,35 @@ async fn run(
                             pos_is_long = direction == Direction::Long;
                             pos_extreme = pos_entry_px;
                             pos_trail_px = 0.0;
+                            // Experience snapshot: the exact feature row this
+                            // entry acted on (paired with the outcome at close).
+                            let feat_row: Vec<f32> = {
+                                let ns = aligned.n_samples();
+                                if ns > 0 {
+                                    aligned.sample_window(ns - 1, 1).iter().copied().collect()
+                                } else {
+                                    Vec::new()
+                                }
+                            };
+                            pending_experience.insert(
+                                pos_id,
+                                crate::app_services::experience_store::LiveExperience {
+                                    schema_version: 1,
+                                    position_id: pos_id,
+                                    symbol: symbol.clone(),
+                                    base_tf: base_tf.clone(),
+                                    portfolio_path: portfolio_path.clone(),
+                                    direction: if pos_is_long { 1 } else { -1 },
+                                    sl_pips: gene_sl,
+                                    tp_pips: gene_tp,
+                                    lots: lot,
+                                    entry_ts_ms: latest_ts,
+                                    entry_price: outcome.execution_price.or(last_price),
+                                    features: feat_row,
+                                    close_ts_ms: None,
+                                    net_profit: None,
+                                },
+                            );
                         }
 
                         if let Ok(mut s) = status.lock() {

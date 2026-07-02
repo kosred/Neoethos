@@ -187,6 +187,7 @@ pub fn router(state: AppApiState) -> Router {
         .route("/supervisor/status", get(supervisor::status))
         .route("/supervisor/config", post(supervisor::update_config))
         .route("/supervisor/tick", post(supervisor::tick))
+        .route("/supervisor/chat", post(supervisor::chat))
         .route("/broker/status", get(system_status::broker_status))
         .route("/broker/reauth", post(broker_control::reauth))
         .route(

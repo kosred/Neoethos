@@ -25,6 +25,8 @@ pub struct ConfigBody {
     pub enabled: Option<bool>,
     pub interval_minutes: Option<u64>,
     pub max_actions_per_tick: Option<usize>,
+    /// Standing operator directives (replaces the whole list when present).
+    pub directives: Option<Vec<String>>,
 }
 
 pub async fn update_config(
@@ -40,6 +42,14 @@ pub async fn update_config(
     }
     if let Some(n) = body.max_actions_per_tick {
         cfg.max_actions_per_tick = n.clamp(1, 5);
+    }
+    if let Some(d) = body.directives {
+        cfg.directives = d
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .take(20)
+            .collect();
     }
     match supervisor::save_config(&cfg) {
         Ok(()) => Json(serde_json::json!({ "config": cfg })).into_response(),
@@ -58,6 +68,34 @@ pub async fn tick(State(state): State<AppApiState>) -> Response {
             StatusCode::BAD_GATEWAY,
             "Supervisor tick failed — make sure the AI Desk is signed in (ChatGPT) \
              and try again.",
+            &e,
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ChatBody {
+    pub message: String,
+}
+
+/// `POST /supervisor/chat` — talk to the supervisor: your message steers the
+/// cycle (same state bundle, same whitelisted actions, same guard-rails).
+pub async fn chat(State(state): State<AppApiState>, Json(body): Json<ChatBody>) -> Response {
+    let message = body.message.trim().to_string();
+    if message.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "message must be non-empty"})),
+        )
+            .into_response();
+    }
+    match supervisor::chat(state, message).await {
+        Ok((reply, summary)) => {
+            Json(serde_json::json!({ "reply": reply, "summary": summary })).into_response()
+        }
+        Err(e) => actionable_error(
+            StatusCode::BAD_GATEWAY,
+            "Supervisor chat failed — make sure the AI Desk is signed in (ChatGPT).",
             &e,
         ),
     }
