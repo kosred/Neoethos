@@ -4202,7 +4202,7 @@ where
     // already failed the bar would just burn the validation tail). They are
     // emitted honestly flagged `fallback_mode` and forced not-export-ready.
     let mut fallback_mode = false;
-    let (mut validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts, per_gene_wf) =
+    let (mut validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts, mut per_gene_wf) =
         if portfolio.is_empty() && !best_effort_fallback.is_empty() {
             fallback_mode = true;
             let fallback_reason = funnel
@@ -4267,6 +4267,161 @@ where
                 ranked_total,
             )?
         };
+
+    // ── Robustness filters (2026-07-02): permutation + plateau, parallel ────
+    // Two per-gene tests on the final portfolio, rayon-parallel across genes,
+    // bounded to the most recent ROBUST_WINDOW bars (cheap even on M1):
+    //
+    // #10 SIGNAL-PERMUTATION (Masters-style): shuffle the gene's signal
+    //     sequence — same exposure frequency, destroyed timing. If the REAL
+    //     net doesn't beat ≥95% of shuffles, the timing carries no information
+    //     (the profit was exposure/luck) → drop the gene.
+    // #11 PLATEAU: thresholds perturbed ±15% and re-backtested — a robust edge
+    //     sits on a performance PLATEAU (variants keep ≥30% of the real net);
+    //     an overfit one falls off a cliff → drop the gene.
+    //
+    // NEVER-ZERO: applied only when at least ONE gene survives; if they would
+    // empty the portfolio, keep it and warn loudly (OOS/PBO/demo gates remain
+    // the final authority).
+    if !fallback_mode && !portfolio.is_empty() && portfolio_signals.len() == portfolio.len() {
+        use rand::SeedableRng;
+        use rand::seq::SliceRandom;
+        use rayon::prelude::*;
+
+        const ROBUST_WINDOW: usize = 150_000;
+        const N_PERM: usize = 50;
+        const PERM_P_MAX: f64 = 0.05; // real must beat ≥95% of shuffles
+        const PLATEAU_MIN_RATIO: f64 = 0.30;
+
+        let n_all = ohlcv.close.len();
+        let w0 = n_all.saturating_sub(ROBUST_WINDOW);
+        let ts_all: &[i64] = ohlcv.timestamp.as_deref().unwrap_or(&[]);
+        let ts_win: &[i64] = if ts_all.len() == n_all { &ts_all[w0..] } else { &[] };
+        let eval_cfg_rb = config.evaluation_config(ohlcv.close.last().copied());
+
+        let verdicts: Vec<(bool, String)> = portfolio
+            .par_iter()
+            .enumerate()
+            .map(|(gi, gene)| {
+                let settings =
+                    discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
+                let sig_full = &portfolio_signals[gi];
+                if sig_full.len() != n_all {
+                    return (true, "skipped (signal length mismatch)".to_string());
+                }
+                let sig_win = &sig_full[w0..];
+                let net_of = |sigs: &[i8]| -> f64 {
+                    simulate_trades_core(
+                        &ohlcv.close[w0..],
+                        &ohlcv.high[w0..],
+                        &ohlcv.low[w0..],
+                        ts_win,
+                        sigs,
+                        &settings,
+                    )
+                    .iter()
+                    .map(|t| t.pnl)
+                    .sum()
+                };
+                let real_net = net_of(sig_win);
+                let signal_bars = sig_win.iter().filter(|s| **s != 0).count();
+                if real_net <= 0.0 || signal_bars < 30 {
+                    // Too little recent evidence to test against — pass through;
+                    // the OOS/PBO gates already judged the full history.
+                    return (true, "skipped (thin recent window)".to_string());
+                }
+
+                // #10 permutation p-value — deterministic seed per gene.
+                let seed = 0x4E45_4F45_5448_4F53u64
+                    ^ (gi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                let mut beats = 0usize;
+                let mut shuffled: Vec<i8> = sig_win.to_vec();
+                for _ in 0..N_PERM {
+                    shuffled.shuffle(&mut rng);
+                    if net_of(&shuffled) >= real_net {
+                        beats += 1;
+                    }
+                }
+                let p_value = beats as f64 / N_PERM as f64;
+                if p_value >= PERM_P_MAX {
+                    return (
+                        false,
+                        format!(
+                            "permutation FAIL (p={p_value:.2}: random timing matches the real net)"
+                        ),
+                    );
+                }
+
+                // #11 plateau: ±15% threshold perturbations must keep ≥30% net.
+                for factor in [0.85_f32, 1.15] {
+                    let mut variant = gene.clone();
+                    variant.long_threshold *= factor;
+                    variant.short_threshold *= factor;
+                    let sig_v = signals_for_gene_full(features, ohlcv, &variant, &eval_cfg_rb);
+                    if sig_v.len() != n_all {
+                        continue;
+                    }
+                    let net_v = net_of(&sig_v[w0..]);
+                    if net_v < PLATEAU_MIN_RATIO * real_net {
+                        return (
+                            false,
+                            format!(
+                                "plateau FAIL (thresholds ×{factor:.2} → net {net_v:.0} \
+                                 vs real {real_net:.0} — cliff, not plateau)"
+                            ),
+                        );
+                    }
+                }
+                (true, format!("robust (p={p_value:.2}, plateau ok)"))
+            })
+            .collect();
+
+        for (gi, (kept, why)) in verdicts.iter().enumerate() {
+            tracing::info!(
+                target: "neoethos_search::discovery",
+                gene = %portfolio[gi].strategy_id,
+                kept, reason = %why,
+                "robustness filter verdict"
+            );
+        }
+        let keep: Vec<bool> = verdicts.into_iter().map(|(k, _)| k).collect();
+        if keep.iter().any(|k| *k) && !keep.iter().all(|k| *k) {
+            let before = portfolio.len();
+            let mut i = 0usize;
+            portfolio.retain(|_| {
+                let k = keep[i];
+                i += 1;
+                k
+            });
+            let mut i = 0usize;
+            portfolio_signals.retain(|_| {
+                let k = keep[i];
+                i += 1;
+                k
+            });
+            if per_gene_wf.len() == keep.len() {
+                let mut i = 0usize;
+                per_gene_wf.retain(|_| {
+                    let k = keep[i];
+                    i += 1;
+                    k
+                });
+            }
+            tracing::info!(
+                target: "neoethos_search::discovery",
+                kept = portfolio.len(),
+                dropped = before - portfolio.len(),
+                "robustness filters: exporting only the permutation+plateau survivors"
+            );
+        } else if !keep.iter().any(|k| *k) {
+            tracing::warn!(
+                target: "neoethos_search::discovery",
+                "robustness filters would drop EVERY portfolio gene — keeping the \
+                 portfolio (never-zero) but treat these exports with suspicion"
+            );
+        }
+    }
 
     // Risky-mode walk-forward FILTER (operator 2026-06-28). The portfolio-level
     // gate was all-or-nothing: ONE marginal gene made `walkforward_passed=false`
