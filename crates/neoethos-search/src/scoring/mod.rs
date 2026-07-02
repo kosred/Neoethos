@@ -133,11 +133,14 @@ mod tests {
     }
 
     #[test]
-    fn scoring_version_is_three_after_consistency_oriented_ga() {
-        // 2026-06-06: bumped 2→3 when `ga_fitness` became CONSISTENT-monthly-return
-        // oriented (dominant reward = monthly_target_hit_rate in metrics[7]; total-net
-        // demoted). v2 (total-net) genes were lumpy and failed the window gate.
-        // Artifacts from v1/v2 runs are tagged accordingly and NOT directly comparable.
-        assert_eq!(SCORING_VERSION_CURRENT.0, 3);
+    fn scoring_version_is_four_after_steady_income_daily_dd_penalty() {
+        // 2026-06-06: 2→3 — CONSISTENT-monthly-return GA (dominant reward =
+        // monthly_target_hit_rate in metrics[7]; total-net demoted).
+        // 2026-07-02: 3→4 — STEADY-INCOME worst-period penalty: ga_fitness now
+        // also penalises metrics[10] (max_daily_drawdown ×10.0), which the
+        // evaluator computed but the GA ignored. Two equally-consistent genes
+        // now rank by who never had a catastrophic day. Artifacts from earlier
+        // versions are tagged and NOT directly comparable.
+        assert_eq!(SCORING_VERSION_CURRENT.0, 4);
     }
 }

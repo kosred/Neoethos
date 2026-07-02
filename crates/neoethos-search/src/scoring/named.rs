@@ -53,7 +53,7 @@ pub struct ScoringVersion(pub u32);
 /// months hitting the operator's ≥4%/month bar (metrics[7], the same consistency
 /// the gate checks). (v1 = Sharpe-only; v2 = total-net.) Runs before this are NOT
 /// directly comparable (different fitness landscape); old artifacts still deserialize.
-pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(3);
+pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(4);
 
 // ---------------------------------------------------------------------------
 // ga_fitness — was `genetic::evolution_math::score_from_metrics`
@@ -159,10 +159,24 @@ pub fn ga_fitness(metrics: &[f64; 11]) -> f64 {
     let wr = win_rate_component(win_rate) * 0.10;
     let dd = drawdown_penalty(max_dd);
 
+    // **2026-07-02 (scoring_version 4 — STEADY-INCOME worst-period penalty)**:
+    // the operator's product goal is a stable MONTHLY income, and the missing
+    // half of "stable" was the DOWNSIDE: v3 rewarded frequent >=4% months
+    // (slot 7) but nothing punished the occasional CATASTROPHIC period that
+    // sets a small account back months. `max_daily_drawdown` (slot 10) was
+    // computed by the evaluator and IGNORED by the GA. Penalize it now —
+    // catastrophic months are built from catastrophic days, so the daily
+    // granularity is the stricter, earlier signal. Weight 10.0 (vs overall-DD's
+    // 15.0): a 3% worst-day costs 0.30 — decisive between otherwise-equal
+    // genes, not dominant over the whole objective. Like the DD penalty it is
+    // NOT activity-scaled: a blow-up day disqualifies regardless of activity.
+    let max_daily_dd = metrics[10];
+    let daily_dd_pen = max_daily_dd.clamp(0.0, 1.0) * 10.0;
+
     // Positive components scaled by activity so low-trade candidates (1–5 trades
-    // over the whole window) cannot win on noise; the DD penalty is NOT scaled —
+    // over the whole window) cannot win on noise; the DD penalties are NOT scaled —
     // full weight, rejects blow-ups even when return is high.
-    (hit + ret + sh + cons + pf + wr) * activity_mult - dd
+    (hit + ret + sh + cons + pf + wr) * activity_mult - dd - daily_dd_pen
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +342,22 @@ mod tests {
         assert!(
             ga_fitness(&base) > ga_fitness(&heavy_dd),
             "heavier drawdown should score lower"
+        );
+    }
+
+    #[test]
+    fn ga_fitness_penalises_catastrophic_days_scoring_v4() {
+        // scoring_version 4 (steady income): two otherwise-identical genes —
+        // the one whose worst DAY was a 4% hit must rank strictly below the
+        // one that never had a day worse than 0.5%. Weight 10.0 ⇒ delta 0.35.
+        let mut calm = metrics(1000.0, 2.0, 0.05, 0.60, 1.8, 12.0, 100.0, 0.70);
+        calm[10] = 0.005;
+        let mut violent = metrics(1000.0, 2.0, 0.05, 0.60, 1.8, 12.0, 100.0, 0.70);
+        violent[10] = 0.04;
+        let (c, v) = (ga_fitness(&calm), ga_fitness(&violent));
+        assert!(
+            c > v && (c - v - 0.35).abs() < 1e-9,
+            "worst-day penalty must separate them by exactly 0.35: {c} vs {v}"
         );
     }
 
