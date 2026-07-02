@@ -121,6 +121,12 @@ pub struct StartLiveBody {
     /// (0 disables). Applies to every engine started in this request.
     #[serde(default = "crate::app_services::live_trading::default_cull_losses")]
     pub cull_after_consecutive_losses: u32,
+    /// Auto-cull, rolling window: retire when the win rate over the last
+    /// `cull_window_trades` closed trades drops below this percent (0 disables).
+    #[serde(default = "crate::app_services::live_trading::default_cull_min_win_rate_pct")]
+    pub cull_min_win_rate_pct: f64,
+    #[serde(default = "crate::app_services::live_trading::default_cull_window_trades")]
+    pub cull_window_trades: usize,
 }
 
 /// Aggregate status across every running engine.
@@ -187,6 +193,8 @@ pub async fn start_live(
             take_profit_pips: body.take_profit_pips,
             warmup_bars: body.warmup_bars,
             cull_after_consecutive_losses: body.cull_after_consecutive_losses,
+            cull_min_win_rate_pct: body.cull_min_win_rate_pct,
+            cull_window_trades: body.cull_window_trades,
         };
         match crate::app_services::live_trading::start(req) {
             Ok(handle) => {

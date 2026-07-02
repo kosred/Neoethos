@@ -93,6 +93,9 @@ export default function Autopilot() {
   const [validatedKeys, setValidatedKeys] = useState<Set<string>>(new Set());
   // Auto-cull: retire a strategy after this many consecutive losing trades.
   const [cullLosses, setCullLosses] = useState(6);
+  // Auto-cull, rolling window: min win-rate % over the last N closed trades.
+  const [cullMinWr, setCullMinWr] = useState(57);
+  const [cullWindow, setCullWindow] = useState(10);
 
   const { data: blacklist } = usePoll(strategyBlacklist, 0);
   const retired = Array.isArray(blacklist) ? blacklist : [];
@@ -146,7 +149,12 @@ export default function Autopilot() {
     setBusy(true);
     setMsg(`Starting ${selected.length} engine${selected.length === 1 ? "" : "s"}…`);
     try {
-      const r: any = await autonomousStart({ portfolio_paths: selected, cull_after_consecutive_losses: cullLosses });
+      const r: any = await autonomousStart({
+        portfolio_paths: selected,
+        cull_after_consecutive_losses: cullLosses,
+        cull_min_win_rate_pct: cullMinWr,
+        cull_window_trades: cullWindow,
+      });
       const s = r?.started?.length ?? 0;
       const sk = r?.skipped?.length ?? 0;
       const bl = r?.blacklisted?.length ?? 0;
@@ -243,6 +251,11 @@ export default function Autopilot() {
           Auto-cull after <Tip text="After this many CONSECUTIVE losing trades, the engine stops itself and permanently retires the strategy (blacklist) — it can never be selected or re-discovered again. 0 = off." />
           <input type="number" min={0} max={50} value={cullLosses} onChange={(e) => setCullLosses(Math.max(0, Number(e.target.value)))} style={{ width: 56 }} /> losses
         </label>
+        <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+          or WR &lt; <Tip text="Rolling-window cull: once the last N closed trades are in, the win rate must stay at or above this percent or the strategy retires. Catches chronic losers (e.g. 40% WR) that never streak. 0 = off." />
+          <input type="number" min={0} max={100} value={cullMinWr} onChange={(e) => setCullMinWr(Math.min(100, Math.max(0, Number(e.target.value))))} style={{ width: 56 }} />% per last
+          <input type="number" min={4} max={100} value={cullWindow} onChange={(e) => setCullWindow(Math.max(4, Number(e.target.value)))} style={{ width: 52 }} /> trades
+        </label>
         <span className="muted small">{portfolios.length} of {allPortfolios.length} shown · {selected.length} selected{retired.length ? ` · ${retired.length} retired` : ""}</span>
       </div>
       {error && <div className="banner warn">{error}</div>}
@@ -326,10 +339,12 @@ export default function Autopilot() {
         <>
           <h2>Running engines <span className="muted">({engines.length})</span></h2>
           <table className="tbl">
-            <thead><tr><th>Symbol</th><th>Base TF</th><th>Genes</th><th>Bars eval</th><th>Last signal</th><th>Open pos</th><th>Loss streak</th></tr></thead>
+            <thead><tr><th>Symbol</th><th>Base TF</th><th>Genes</th><th>Bars eval</th><th>Last signal</th><th>Open pos</th><th>Loss streak</th><th>Window WR</th></tr></thead>
             <tbody>
               {engines.map((e, i) => {
                 const losses = Number(e.consecutiveLosses ?? 0);
+                const wr = typeof e.windowWinRatePct === "number" ? e.windowWinRatePct : null;
+                const wrDanger = wr != null && Number(e.windowTrades ?? 0) >= cullWindow - 2 && wr < cullMinWr + 5;
                 return (
                   <tr key={e.portfolioPath ?? i}>
                     <td><b>{e.symbol ?? "?"}</b>{e.retired && <span className="badge" style={{ marginLeft: 6, background: "#7f1d1d", fontSize: 9 }}>RETIRED</span>}</td>
@@ -339,6 +354,7 @@ export default function Autopilot() {
                     <td>{e.lastSignal ?? "—"}</td>
                     <td>{e.openPositionId ?? "—"}</td>
                     <td className={losses >= Math.max(1, cullLosses - 1) ? "sell" : ""}>{losses > 0 ? `${losses} in a row` : "—"}</td>
+                    <td className={wrDanger ? "sell" : ""}>{wr != null ? `${wr.toFixed(0)}% (${e.windowTrades}/${cullWindow})` : "—"}</td>
                   </tr>
                 );
               })}

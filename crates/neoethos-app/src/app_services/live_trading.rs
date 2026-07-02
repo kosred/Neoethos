@@ -44,6 +44,17 @@ pub struct StartRequest {
     /// 0 disables auto-cull for this engine.
     #[serde(default = "default_cull_losses")]
     pub cull_after_consecutive_losses: u32,
+    /// Auto-cull, rolling-window criterion: over the last `cull_window_trades`
+    /// closed trades, the win rate must stay ≥ this percent or the strategy is
+    /// retired. Catches CHRONIC losers that never lose N in a row (e.g. 40% WR
+    /// alternating wins/losses bleeds the account but never streaks). Default
+    /// 57% — the operator's break-even-plus-margin floor. 0 disables.
+    #[serde(default = "default_cull_min_win_rate_pct")]
+    pub cull_min_win_rate_pct: f64,
+    /// Rolling window size (closed trades) for the win-rate criterion. The
+    /// check only fires once the window is FULL. Default 10.
+    #[serde(default = "default_cull_window_trades")]
+    pub cull_window_trades: usize,
 }
 
 pub fn default_lot_size() -> f64 {
@@ -54,6 +65,12 @@ pub fn default_warmup_bars() -> usize {
 }
 pub fn default_cull_losses() -> u32 {
     6
+}
+pub fn default_cull_min_win_rate_pct() -> f64 {
+    57.0
+}
+pub fn default_cull_window_trades() -> usize {
+    10
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
@@ -73,6 +90,10 @@ pub struct LiveTradingStatus {
     pub bars_evaluated: u64,
     /// Current run of consecutive losing trades (resets to 0 on any win).
     pub consecutive_losses: u32,
+    /// Win rate (%) over the rolling cull window, once ≥1 trade closed.
+    pub window_win_rate_pct: Option<f64>,
+    /// How many closed trades the rolling window currently holds.
+    pub window_trades: u32,
     /// True once auto-cull retired this strategy (engine stopped + blacklisted).
     pub retired: bool,
 }
@@ -89,6 +110,8 @@ impl Default for LiveTradingStatus {
             open_position_id: None,
             bars_evaluated: 0,
             consecutive_losses: 0,
+            window_win_rate_pct: None,
+            window_trades: 0,
             retired: false,
         }
     }
@@ -341,10 +364,19 @@ async fn run(
     // Realized results are read from the broker's closing deals for positions
     // THIS engine opened (catches SL/TP exits too, not just engine flips).
     let cull_threshold = req.cull_after_consecutive_losses;
+    // Rolling-window win-rate criterion (operator 2026-07-02): a chronic 40%-WR
+    // strategy alternating wins/losses never streaks to the consecutive limit
+    // but still bleeds the account — the window floor catches it.
+    let cull_min_wr = req.cull_min_win_rate_pct.clamp(0.0, 100.0);
+    let cull_window = req.cull_window_trades.clamp(4, 100);
     let portfolio_path = req.portfolio_path.clone();
     let mut opened_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut consecutive_losses: u32 = 0;
     let mut net_pnl_running: f64 = 0.0;
+    // Rolling outcome window: true = win (net > 0). BE counts as a loss —
+    // a break-even trade doesn't pay for its costs' risk.
+    let mut recent_results: std::collections::VecDeque<bool> =
+        std::collections::VecDeque::with_capacity(cull_window + 1);
 
     // ── Trailing-stop parity (discovery hardcodes break-even + trailing ALWAYS
     // ON: BE at +1R, then trail 1×SL behind the running extreme). The backtest
@@ -502,7 +534,7 @@ async fn run(
         // Reads the broker's closing deals (net_profit) for positions we opened
         // — catches SL/TP exits, not just engine flips. On N consecutive losses
         // the strategy is permanently retired (blacklisted) and the engine stops.
-        if cull_threshold > 0 && !opened_ids.is_empty() {
+        if (cull_threshold > 0 || cull_min_wr > 0.0) && !opened_ids.is_empty() {
             if let Ok(Ok(runtime)) = tokio::task::spawn_blocking(
                 crate::app_services::broker_api::fetch_account_runtime_blocking,
             )
@@ -517,6 +549,10 @@ async fn run(
                         } else {
                             consecutive_losses = 0;
                         }
+                        recent_results.push_back(net > 0.0);
+                        while recent_results.len() > cull_window {
+                            recent_results.pop_front();
+                        }
                         // If the broker closed OUR tracked position (SL/TP), drop it
                         // so trailing doesn't try to amend a dead position.
                         if open_position.map(|(id, _)| id) == Some(deal.position_id) {
@@ -530,15 +566,41 @@ async fn run(
                         );
                     }
                 }
+                let wins = recent_results.iter().filter(|w| **w).count();
+                let window_wr_pct = if recent_results.is_empty() {
+                    None
+                } else {
+                    Some(wins as f64 / recent_results.len() as f64 * 100.0)
+                };
                 if let Ok(mut s) = status.lock() {
                     s.consecutive_losses = consecutive_losses;
+                    s.window_win_rate_pct = window_wr_pct;
+                    s.window_trades = recent_results.len() as u32;
                 }
-                if consecutive_losses >= cull_threshold {
+
+                // Either criterion retires: a losing STREAK, or a FULL window
+                // whose win rate sits under the profitability floor.
+                let mut cull_reason: Option<String> = None;
+                if cull_threshold > 0 && consecutive_losses >= cull_threshold {
+                    cull_reason = Some(format!(
+                        "{consecutive_losses} consecutive losing trades (demo/live auto-cull)"
+                    ));
+                } else if cull_min_wr > 0.0 && recent_results.len() >= cull_window {
+                    if let Some(wr) = window_wr_pct {
+                        if wr < cull_min_wr {
+                            cull_reason = Some(format!(
+                                "win rate {wr:.0}% over the last {} trades is below the {cull_min_wr:.0}% floor (demo/live auto-cull)",
+                                recent_results.len()
+                            ));
+                        }
+                    }
+                }
+                if let Some(reason) = cull_reason {
                     tracing::warn!(
                         target: "neoethos_app::live_trading",
                         %symbol, portfolio_path = %portfolio_path,
-                        consecutive_losses, threshold = cull_threshold, net_pnl = net_pnl_running,
-                        "AUTO-CULL: strategy hit the consecutive-loss limit — retiring it (blacklist)"
+                        %reason, net_pnl = net_pnl_running,
+                        "AUTO-CULL: retiring strategy (blacklist)"
                     );
                     if let Some(fp) =
                         crate::app_services::strategy_blacklist::fingerprint_file(&portfolio_path)
@@ -548,9 +610,7 @@ async fn run(
                                 fingerprint: fp,
                                 portfolio_path: portfolio_path.clone(),
                                 symbol: Some(symbol.clone()),
-                                reason: format!(
-                                    "{consecutive_losses} consecutive losing trades (demo/live auto-cull)"
-                                ),
+                                reason,
                                 consecutive_losses,
                                 net_pnl: net_pnl_running,
                                 retired_at_unix_ms: chrono::Utc::now().timestamp_millis(),
