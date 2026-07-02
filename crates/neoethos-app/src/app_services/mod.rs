@@ -64,6 +64,7 @@ pub mod secure_store;
 pub mod spread_stats;
 pub mod strategy_blacklist;
 pub mod supervisor;
+pub mod tail_risk;
 pub mod trading_types;
 pub mod training;
 pub mod validation;

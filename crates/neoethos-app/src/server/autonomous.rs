@@ -232,6 +232,43 @@ pub async fn blacklist() -> Response {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub struct TailRiskQuery {
+    pub portfolio: String,
+    /// Monte-Carlo iterations (default 2000, clamped 200..20000).
+    pub iterations: Option<usize>,
+    /// Risk fraction override (defaults to risk.risk_per_trade from config).
+    pub risk: Option<f64>,
+}
+
+/// `GET /autonomous/tailrisk?portfolio=..` — Monte-Carlo the portfolio's
+/// logged trade sequence and report the max-drawdown DISTRIBUTION at the
+/// operator's current risk sizing (p95 + probability of losing half the
+/// account). The pre-Start number for risky mode.
+pub async fn tail_risk(Query(q): Query<TailRiskQuery>) -> Response {
+    let portfolio = q.portfolio;
+    let iterations = q.iterations.unwrap_or(2000);
+    let risk = q.risk;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::app_services::tail_risk::run_tail_risk(&portfolio, iterations, risk)
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(e)) => actionable_error(
+            StatusCode::BAD_REQUEST,
+            "Tail-risk analysis failed — the portfolio needs a sibling *.trades.json \
+             (re-run discovery for older artifacts).",
+            &e,
+        ),
+        Err(join_err) => actionable_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The tail-risk task panicked.",
+            &anyhow::anyhow!("{join_err}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub struct ParityQuery {
     pub portfolio: String,
     /// Live-style window size (defaults to the live engine's 1000).

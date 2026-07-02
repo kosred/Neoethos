@@ -176,6 +176,8 @@ pub fn router(state: AppApiState) -> Router {
         .route("/strategy/blacklist", get(autonomous::blacklist))
         // Live↔backtest parity harness (window-invariance of live signals).
         .route("/autonomous/parity", get(autonomous::parity))
+        // Monte-Carlo tail risk of a portfolio's trade sequence (p95 DD, ruin).
+        .route("/autonomous/tailrisk", get(autonomous::tail_risk))
         // Session-aware spread stats recorded from the broker's own ticks.
         .route(
             "/data/spread-stats",

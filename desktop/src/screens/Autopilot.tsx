@@ -10,9 +10,11 @@ import {
   strategyList,
   strategyBlacklist,
   parityCheck,
+  tailRisk,
   type PortfolioEntry,
   type GateVerdict,
   type ParityReport,
+  type TailRiskReport,
 } from "../api";
 import { usePoll } from "../hooks";
 import { HelpPanel, HelpStep, Tip } from "../components/Help";
@@ -85,6 +87,7 @@ export default function Autopilot() {
   const [gate, setGate] = useState<GateVerdict | null>(null);
   const [replay, setReplay] = useState<any>(null);
   const [parity, setParity] = useState<ParityReport | null>(null);
+  const [risk, setRisk] = useState<TailRiskReport | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   // Filters
@@ -199,6 +202,22 @@ export default function Autopilot() {
     }
   };
 
+  const doTailRisk = async () => {
+    if (!focus) { setMsg("Click a strategy name to focus it, then Tail risk."); return; }
+    setBusy(true);
+    setRisk(null);
+    setMsg(`Monte-Carlo tail risk for ${focus.symbol ?? ""}… (2000 reshuffles)`);
+    try {
+      const r = await tailRisk(focus.path);
+      setRisk(r);
+      setMsg(r.ruinProbabilityPct >= 1 ? "⚠ Tail risk: DANGER — see the report." : "✓ Tail risk computed.");
+    } catch (e) {
+      setMsg(`Tail risk failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const doParity = async () => {
     if (!focus) { setMsg("Click a strategy name to focus it, then Check parity."); return; }
     setBusy(true);
@@ -296,6 +315,7 @@ export default function Autopilot() {
         <div className="btn-row">
           <button disabled={busy || !focus} onClick={doReplay}>Replay focused (dry-run)</button>
           <button disabled={busy || !focus} onClick={doParity} title="Does the live bar-window produce the SAME signals as the full history? FAIL = live won't match the validated backtest.">Check parity</button>
+          <button disabled={busy || !focus} onClick={doTailRisk} title="Monte-Carlo the trade sequence: worst-case drawdown distribution + probability of losing half the account at YOUR current risk %. The pre-Start number.">Tail risk</button>
           <button className="primary" disabled={busy || selected.length === 0} onClick={startSelected}>
             Start selected (live) · {selected.length}
           </button>
@@ -306,6 +326,28 @@ export default function Autopilot() {
       </div>
 
       <GatePanel gate={gate} />
+
+      {risk && (
+        <div className="ticket" style={{ marginTop: 12, borderColor: risk.ruinProbabilityPct >= 1 ? "#b91c1c" : risk.maxDdP95Pct > 30 ? "#a16207" : "#15803d" }}>
+          <h2 style={{ marginTop: 0 }}>
+            Tail risk (Monte-Carlo ×{risk.iterations}){" "}
+            <span className="badge" style={{ background: risk.ruinProbabilityPct >= 1 ? "#b91c1c" : risk.maxDdP95Pct > 30 ? "#a16207" : "#15803d" }}>
+              {risk.ruinProbabilityPct >= 1 ? "DANGER" : risk.maxDdP95Pct > 30 ? "CAUTION" : "SURVIVABLE"}
+            </span>
+          </h2>
+          <p className="muted small">{risk.note}</p>
+          <div className="cards" style={{ gridTemplateColumns: "repeat(5, 1fr)" }}>
+            <div className="card"><div className="card-label">DD p50</div><div className="card-value">{risk.maxDdP50Pct.toFixed(0)}%</div></div>
+            <div className="card"><div className="card-label">DD p95</div><div className="card-value" style={{ color: risk.maxDdP95Pct > 30 ? "#ef5350" : undefined }}>{risk.maxDdP95Pct.toFixed(0)}%</div></div>
+            <div className="card"><div className="card-label">DD p99</div><div className="card-value">{risk.maxDdP99Pct.toFixed(0)}%</div></div>
+            <div className="card"><div className="card-label">Ruin (≥{risk.ruinThresholdPct.toFixed(0)}%)</div><div className="card-value" style={{ color: risk.ruinProbabilityPct >= 1 ? "#ef5350" : undefined }}>{risk.ruinProbabilityPct.toFixed(1)}%</div></div>
+            <div className="card"><div className="card-label">Median final ×</div><div className="card-value">{risk.medianFinalMultiple.toFixed(2)}</div></div>
+          </div>
+          <p className="muted small" style={{ marginTop: 6 }}>
+            {risk.trades} trades · risk {(risk.riskFraction * 100).toFixed(2)}%/trade · source: {risk.mode} · shuffling assumes independent trades — real streaks can cluster worse.
+          </p>
+        </div>
+      )}
 
       {parity && (
         <div className="ticket" style={{ marginTop: 12, borderColor: parity.verdict === "PASS" ? "#15803d" : "#b91c1c" }}>

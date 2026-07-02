@@ -551,6 +551,27 @@ export const parityCheck = (portfolio: string, window?: number) =>
     `/autonomous/parity?portfolio=${encodeURIComponent(portfolio)}${window ? `&window=${window}` : ""}`,
   );
 
+// Monte-Carlo tail risk: the max-drawdown DISTRIBUTION of the portfolio's
+// trade sequence at the CURRENT risk sizing (p95 + ruin probability).
+export type TailRiskReport = {
+  portfolio: string;
+  trades: number;
+  iterations: number;
+  riskFraction: number;
+  mode: string;
+  maxDdP50Pct: number;
+  maxDdP90Pct: number;
+  maxDdP95Pct: number;
+  maxDdP99Pct: number;
+  worstDdPct: number;
+  ruinThresholdPct: number;
+  ruinProbabilityPct: number;
+  medianFinalMultiple: number;
+  note: string;
+};
+export const tailRisk = (portfolio: string) =>
+  apiGet<TailRiskReport>(`/autonomous/tailrisk?portfolio=${encodeURIComponent(portfolio)}`);
+
 // ── Autonomous LLM supervisor ───────────────────────────────────────────────
 export type SupervisorConfig = { enabled: boolean; intervalMinutes: number; maxActionsPerTick: number; directives: string[] };
 export type SupervisorLogEntry = {
