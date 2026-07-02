@@ -219,6 +219,124 @@ mod gpu_timing {
     }
 }
 
+// ─── Device-resident buffer cache (the per-launch-overhead fix) ─────────────
+//
+// 2026-07-02 (operator: "why does the GPU keep losing to the CPU?"): the
+// hybrid splitter measured an A6000 at ~74 genes/s vs ~77k genes/s on CPU —
+// a ~1000× gap that is per-LAUNCH overhead, dominated by re-UPLOADING the
+// same per-unit-CONSTANT arrays (the indicator matrix, SMC rows, price/time
+// series) over PCIe on EVERY generation. Those arrays never change within a
+// discovery unit.
+//
+// This cache keeps such buffers RESIDENT on the device across launches, keyed
+// by (runtime, device, slot, content-fingerprint, len). A hit clones the
+// Arc-backed `Handle` (no copy); a miss uploads and replaces. Correctness
+// does not depend on pointer identity — the fingerprint samples the actual
+// bytes, so a new unit's cube (different content) can NEVER alias a stale
+// buffer. NEVER-OOM: total resident bytes are capped at half the installed
+// VRAM budget; oldest entries evict first (dropping a Handle releases the
+// allocation back to cubecl's pool).
+mod resident_device_cache {
+    use std::any::TypeId;
+    use std::collections::{HashMap, VecDeque};
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock};
+
+    type Key = (TypeId, usize, u8, u64, usize);
+
+    struct State {
+        map: HashMap<Key, (usize, cubecl::server::Handle)>,
+        order: VecDeque<Key>,
+        total_bytes: usize,
+    }
+
+    fn state() -> &'static Mutex<State> {
+        static S: OnceLock<Mutex<State>> = OnceLock::new();
+        S.get_or_init(|| {
+            Mutex::new(State {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                total_bytes: 0,
+            })
+        })
+    }
+
+    /// Content fingerprint: length + first/last 16 bytes + 64 strided 16-byte
+    /// probes. O(1) regardless of buffer size; collision odds for real f32/i32
+    /// feature data are negligible, and a collision additionally requires the
+    /// exact same length + slot + device to cause any effect.
+    fn fingerprint(bytes: &[u8]) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.len().hash(&mut h);
+        let take = 16usize;
+        if bytes.len() <= 64 * take {
+            bytes.hash(&mut h);
+        } else {
+            bytes[..take].hash(&mut h);
+            bytes[bytes.len() - take..].hash(&mut h);
+            let stride = bytes.len() / 64;
+            for i in 0..64 {
+                let s = i * stride;
+                let e = (s + take).min(bytes.len());
+                bytes[s..e].hash(&mut h);
+            }
+        }
+        h.finish()
+    }
+
+    fn budget_bytes() -> usize {
+        let mb = super::installed_memory_budgets()
+            .map(|b| b.vram_budget_mb / 2)
+            .unwrap_or(1024);
+        (mb as usize).saturating_mul(1024 * 1024)
+    }
+
+    /// Return a device handle for `bytes`, reusing a resident upload when the
+    /// content matches. Slots are namespaces (indicators, smc, close, …) so
+    /// unrelated arrays never contend on one entry.
+    pub(super) fn get_or_upload<R: cubecl::prelude::Runtime>(
+        client: &cubecl::prelude::ComputeClient<R>,
+        device: usize,
+        slot: u8,
+        bytes: &[u8],
+    ) -> cubecl::server::Handle {
+        let key: Key = (TypeId::of::<R>(), device, slot, fingerprint(bytes), bytes.len());
+        {
+            let Ok(mut st) = state().lock() else {
+                return client.create_from_slice(bytes);
+            };
+            if let Some((_, handle)) = st.map.get(&key) {
+                return handle.clone();
+            }
+            // Evict oldest until the NEW entry fits the budget.
+            let budget = budget_bytes();
+            while st.total_bytes.saturating_add(bytes.len()) > budget {
+                let Some(old) = st.order.pop_front() else { break };
+                if let Some((sz, _)) = st.map.remove(&old) {
+                    st.total_bytes = st.total_bytes.saturating_sub(sz);
+                }
+            }
+        }
+        // Upload OUTSIDE the lock (can take milliseconds for GB-scale buffers).
+        let handle = client.create_from_slice(bytes);
+        if let Ok(mut st) = state().lock() {
+            st.map.insert(key, (bytes.len(), handle.clone()));
+            st.order.push_back(key);
+            st.total_bytes = st.total_bytes.saturating_add(bytes.len());
+        }
+        handle
+    }
+
+    pub(super) const SLOT_INDICATORS: u8 = 0;
+    pub(super) const SLOT_SMC_DATA: u8 = 1;
+    pub(super) const SLOT_CLOSE: u8 = 2;
+    pub(super) const SLOT_HIGH: u8 = 3;
+    pub(super) const SLOT_LOW: u8 = 4;
+    pub(super) const SLOT_TS_DELTAS: u8 = 5;
+    pub(super) const SLOT_MONTH_IDX: u8 = 6;
+    pub(super) const SLOT_DAY_IDX: u8 = 7;
+}
+
 fn read_requested_precision_from_env() -> TrainingPrecision {
     [
         "NEOETHOS_BOT_SEARCH_EVAL_PRECISION",
@@ -1796,6 +1914,7 @@ fn gather_indicator_window<F: Copy>(
 /// to a single whole-series launch — CPU↔GPU parity is preserved.
 fn windowed_signal_synth<F, R: Runtime>(
     client: &ComputeClient<R>,
+    device_key: usize,
     indicators_flat: &[F],
     n_indicators: usize,
     gene_offsets: &[i32],
@@ -1824,6 +1943,7 @@ where
         let smc_window = &smc_data_flat[s0 * SMC_WIDTH..s1 * SMC_WIDTH];
         let (sig_w, conf_w) = launch_signal_kernel::<F, R>(
             client,
+            device_key,
             &ind_window,
             gene_offsets,
             gene_indices,
@@ -1906,6 +2026,7 @@ mod window_tests {
 
 fn launch_signal_kernel<F, R: Runtime>(
     client: &ComputeClient<R>,
+    device_key: usize,
     indicators_flat: &[F],
     gene_offsets: &[i32],
     gene_indices: &[i32],
@@ -1948,6 +2069,12 @@ where
     .context("signal kernel input validation failed")?;
 
     // Device UPLOAD phase (timed under NEOETHOS_GPU_TIMING; unchanged otherwise).
+    // The two per-unit-CONSTANT arrays (the indicator matrix + SMC rows) come
+    // from the resident cache — uploaded ONCE per unit, reused across every
+    // generation. This is the per-launch-overhead fix: PCIe re-uploads of the
+    // (potentially GB-scale) indicator matrix dominated the ~1000× GPU-lane
+    // slowdown the hybrid splitter measured. Per-generation arrays (gene
+    // weights/thresholds — a few KB) still upload fresh each call.
     let (
         indicators_handle,
         gene_offsets_handle,
@@ -1962,13 +2089,23 @@ where
         conf_handle,
     ) = gpu_timing::upload(|| {
         (
-            client.create_from_slice(F::as_bytes(indicators_flat)),
+            resident_device_cache::get_or_upload(
+                client,
+                device_key,
+                resident_device_cache::SLOT_INDICATORS,
+                F::as_bytes(indicators_flat),
+            ),
             client.create_from_slice(i32::as_bytes(gene_offsets)),
             client.create_from_slice(i32::as_bytes(gene_indices)),
             client.create_from_slice(F::as_bytes(gene_weights)),
             client.create_from_slice(F::as_bytes(long_thr)),
             client.create_from_slice(F::as_bytes(short_thr)),
-            client.create_from_slice(i32::as_bytes(smc_data)),
+            resident_device_cache::get_or_upload(
+                client,
+                device_key,
+                resident_device_cache::SLOT_SMC_DATA,
+                i32::as_bytes(smc_data),
+            ),
             client.create_from_slice(i32::as_bytes(gene_smc_flags)),
             client.create_from_slice(F::as_bytes(smc_weights)),
             client.empty(total.saturating_mul(std::mem::size_of::<i32>())),
@@ -2097,6 +2234,7 @@ fn try_generate_signal_flat_cuda(
 
         match windowed_signal_synth::<bf16, _>(
             &client,
+            device_override.unwrap_or(0),
             &indicators_bf16,
             n_indicators,
             gene_offsets,
@@ -2122,6 +2260,7 @@ fn try_generate_signal_flat_cuda(
 
     windowed_signal_synth::<f32, _>(
         &client,
+        device_override.unwrap_or(0),
         &indicators_flat,
         n_indicators,
         gene_offsets,
@@ -2217,6 +2356,7 @@ fn normalize_prices_to_pips(prices: &[f64], pip_value: f64) -> Vec<f32> {
 
 fn launch_backtest_kernel<R: Runtime>(
     client: &ComputeClient<R>,
+    device_key: usize,
     close_pips: &[f32],
     high_pips: &[f32],
     low_pips: &[f32],
@@ -2279,15 +2419,25 @@ fn launch_backtest_kernel<R: Runtime>(
         month_counts_handle,
         ftmo_handle,
     ) = gpu_timing::upload(|| {
+        use resident_device_cache as rc;
         (
-            client.create_from_slice(f32::as_bytes(close_pips)),
-            client.create_from_slice(f32::as_bytes(high_pips)),
-            client.create_from_slice(f32::as_bytes(low_pips)),
+            // Per-unit-CONSTANT series (prices/time indices): resident across
+            // launches — uploaded once, reused every generation/batch. The
+            // per-generation payloads (signals/confidences — they change each
+            // call) still upload fresh.
+            rc::get_or_upload(client, device_key, rc::SLOT_CLOSE, f32::as_bytes(close_pips)),
+            rc::get_or_upload(client, device_key, rc::SLOT_HIGH, f32::as_bytes(high_pips)),
+            rc::get_or_upload(client, device_key, rc::SLOT_LOW, f32::as_bytes(low_pips)),
             client.create_from_slice(i32::as_bytes(signals_flat)),
             client.create_from_slice(f32::as_bytes(confidences_flat)),
-            client.create_from_slice(i32::as_bytes(timestamp_deltas_ms)),
-            client.create_from_slice(i32::as_bytes(month_idx)),
-            client.create_from_slice(i32::as_bytes(day_idx)),
+            rc::get_or_upload(
+                client,
+                device_key,
+                rc::SLOT_TS_DELTAS,
+                i32::as_bytes(timestamp_deltas_ms),
+            ),
+            rc::get_or_upload(client, device_key, rc::SLOT_MONTH_IDX, i32::as_bytes(month_idx)),
+            rc::get_or_upload(client, device_key, rc::SLOT_DAY_IDX, i32::as_bytes(day_idx)),
             client.create_from_slice(f32::as_bytes(sl_pips)),
             client.create_from_slice(f32::as_bytes(tp_pips)),
             client.empty(metrics_len.saturating_mul(std::mem::size_of::<f32>())),
@@ -3068,6 +3218,7 @@ pub(crate) fn try_evaluate_population_cuda(
                     // FTMO observables are surfaced via `try_evaluate_ftmo_population_cuda`.
                     let (m, tc, mo, mc, mse, _ftmo) = launch_backtest_kernel(
                         &client,
+                        device_override.unwrap_or(0),
                         &close_pips,
                         &high_pips,
                         &low_pips,
@@ -3321,6 +3472,7 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
                     // outputs are recomputed identically but discarded here.
                     let (_m, _tc, _mo, _mc, _mse, ftmo) = launch_backtest_kernel(
                         &client,
+                        device_override.unwrap_or(0),
                         &close_pips,
                         &high_pips,
                         &low_pips,
@@ -3488,6 +3640,7 @@ mod fused_parity_tests {
 
         let (mw, tcw, mow, mcw, msew, _ftmo_w) = launch_backtest_kernel(
             &client,
+            device_override.unwrap_or(0),
             &close_pips,
             &high_pips,
             &low_pips,
