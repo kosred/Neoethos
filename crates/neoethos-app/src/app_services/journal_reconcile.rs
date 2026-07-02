@@ -32,6 +32,7 @@ fn data_dir() -> Option<PathBuf> {
 fn closed_trade_from_deal(
     d: &CTraderDealSnapshot,
     names: &HashMap<i64, String>,
+    account_id: &str,
 ) -> Option<ClosedTrade> {
     let net = d.net_profit?;
     // Resolve the broker symbol NAME from the catalog the bridge threads in.
@@ -63,6 +64,9 @@ fn closed_trade_from_deal(
         symbol,
         side,
         lots,
+        // Per-account scoping (2026-07-02): the journal serves ONE account's
+        // history at a time — stamp every row with its owner.
+        account_id: Some(account_id.to_string()),
         entry_ts_ms: None,
         entry_price: d.entry_price,
         exit_ts_ms: Some(d.execution_timestamp_ms),
@@ -85,9 +89,10 @@ pub fn reconcile_best_effort(
         return;
     };
 
+    let account_id = runtime.reconcile.account_id.to_string();
     let mut recorded_any = false;
     for deal in &runtime.recent_deals {
-        let Some(trade) = closed_trade_from_deal(deal, names) else {
+        let Some(trade) = closed_trade_from_deal(deal, names, &account_id) else {
             continue;
         };
         match journal_store::record_closed_trade(&dir, &trade) {
@@ -115,6 +120,7 @@ pub fn reconcile_best_effort(
                 // Floating PnL isn't summed here (kept off the hot path);
                 // balance is the realized-equity anchor for the curve.
                 equity: balance,
+                account_id: Some(account_id.clone()),
             },
         );
     }

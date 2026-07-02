@@ -189,9 +189,14 @@ async fn gather_bundle(state: &AppApiState) -> serde_json::Value {
         Some(dir) => {
             let now = chrono::Utc::now().timestamp_millis();
             let from = now - 7 * 24 * 3600 * 1000;
-            let trades =
+            let mut trades =
                 crate::app_services::journal_store::query_closed_trades(&dir, Some(from), None);
-            let equity = crate::app_services::journal_store::query_equity(&dir, Some(from), None);
+            let mut equity = crate::app_services::journal_store::query_equity(&dir, Some(from), None);
+            // Scope to the ACTIVE account — same rule as the Journal screen.
+            if let Some(active) = crate::app_services::journal_store::active_account_id() {
+                trades.retain(|t| t.account_id.as_deref() == Some(active.as_str()));
+                equity.retain(|e| e.account_id.as_deref() == Some(active.as_str()));
+            }
             let stats = serde_json::to_value(
                 crate::app_services::journal_stats::compute_stats(&trades, &equity),
             )

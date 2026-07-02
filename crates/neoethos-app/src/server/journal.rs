@@ -80,7 +80,11 @@ fn heal_row(t: &mut journal_store::ClosedTrade, names: &std::collections::HashMa
     }
 }
 
-/// `GET /journal/trades?fromMs&toMs&limit` — closed trades, most-recent first.
+/// `GET /journal/trades?fromMs&toMs&limit` — closed trades of the ACTIVE
+/// account only (automatic — same account selection as the execution path),
+/// most-recent first. Legacy rows written before per-account scoping carry no
+/// account id (unattributable mixed history) and are hidden once an active
+/// account is known; the JSONL on disk keeps everything.
 pub async fn trades(State(state): State<AppApiState>, Query(q): Query<JournalQuery>) -> Response {
     let data_dir = match resolve_data_dir() {
         Ok(d) => d,
@@ -88,6 +92,9 @@ pub async fn trades(State(state): State<AppApiState>, Query(q): Query<JournalQue
     };
     let names = state.symbol_catalog_snapshot().await;
     let mut rows = journal_store::query_closed_trades(&data_dir, q.from_ms, q.to_ms);
+    if let Some(active) = journal_store::active_account_id() {
+        rows.retain(|r| r.account_id.as_deref() == Some(active.as_str()));
+    }
     for row in &mut rows {
         heal_row(row, &names);
     }
@@ -96,13 +103,18 @@ pub async fn trades(State(state): State<AppApiState>, Query(q): Query<JournalQue
     Json(rows).into_response()
 }
 
-/// `GET /journal/stats?fromMs&toMs` — computed performance stats.
+/// `GET /journal/stats?fromMs&toMs` — computed performance stats, scoped to
+/// the ACTIVE account (automatic — mirrors `/journal/trades`).
 pub async fn stats(State(_state): State<AppApiState>, Query(q): Query<JournalQuery>) -> Response {
     let data_dir = match resolve_data_dir() {
         Ok(d) => d,
         Err(resp) => return resp,
     };
-    let trades = journal_store::query_closed_trades(&data_dir, q.from_ms, q.to_ms);
-    let equity = journal_store::query_equity(&data_dir, q.from_ms, q.to_ms);
+    let mut trades = journal_store::query_closed_trades(&data_dir, q.from_ms, q.to_ms);
+    let mut equity = journal_store::query_equity(&data_dir, q.from_ms, q.to_ms);
+    if let Some(active) = journal_store::active_account_id() {
+        trades.retain(|r| r.account_id.as_deref() == Some(active.as_str()));
+        equity.retain(|e| e.account_id.as_deref() == Some(active.as_str()));
+    }
     Json(journal_stats::compute_stats(&trades, &equity)).into_response()
 }

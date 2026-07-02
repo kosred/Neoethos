@@ -182,6 +182,7 @@ mod tests {
             swap: 0.0,
             net_profit: net,
             balance_after: None,
+            account_id: None,
         }
     }
 
@@ -226,6 +227,7 @@ mod tests {
             ts_ms: ts,
             balance: e,
             equity: e,
+            account_id: None,
         };
         let s = compute_stats(&[], &[eq(1, 100.0), eq(2, 110.0), eq(3, 90.0), eq(4, 120.0)]);
         assert!((s.max_drawdown_abs - 20.0).abs() < 1e-9);

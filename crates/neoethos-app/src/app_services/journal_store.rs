@@ -44,6 +44,11 @@ pub struct ClosedTrade {
     pub side: String,
     /// Volume in lots (v2). v1 stored raw base units (e.g. 12000 for 0.12 lots).
     pub lots: f64,
+    /// cTrader account this trade belongs to (stringified ctidTraderAccountId).
+    /// `None` on legacy rows written before per-account scoping — those are
+    /// unattributable mixed history and are hidden from per-account views.
+    #[serde(default)]
+    pub account_id: Option<String>,
     pub entry_ts_ms: Option<i64>,
     pub entry_price: Option<f64>,
     pub exit_ts_ms: Option<i64>,
@@ -70,6 +75,23 @@ pub struct EquitySample {
     pub ts_ms: i64,
     pub balance: f64,
     pub equity: f64,
+    /// Account scope (see [`ClosedTrade::account_id`]).
+    #[serde(default)]
+    pub account_id: Option<String>,
+}
+
+/// The ACTIVE cTrader account id (stringified) — the same selection the
+/// execution path uses (`enabled_for_execution`, else first). `None` when no
+/// broker account is configured; per-account filters then show everything.
+pub fn active_account_id() -> Option<String> {
+    let settings = crate::app_services::broker_persistence::load_broker_settings();
+    let ct = &settings.ctrader;
+    ct.accounts
+        .iter()
+        .find(|a| a.enabled_for_execution)
+        .or_else(|| ct.accounts.first())
+        .map(|a| a.account_id.trim().to_string())
+        .filter(|id| !id.is_empty())
 }
 
 pub fn now_unix_ms() -> i64 {
@@ -273,6 +295,7 @@ mod tests {
             swap: 0.0,
             net_profit: net,
             balance_after: None,
+            account_id: None,
         }
     }
 
