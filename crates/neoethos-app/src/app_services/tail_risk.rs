@@ -44,9 +44,16 @@ pub struct TailRiskReport {
     pub median_final_multiple: f64,
     /// Risk-constrained Kelly recommendation (Busseti/Ryu/Boyd): the LARGEST
     /// risk-per-trade (percent) such that P(ever losing half the account) ≤ 5%,
-    /// from this portfolio's own measured win rate + reward:risk. `None` when
-    /// the artifact predates r_multiple logging or the portfolio has no edge.
+    /// solved on the portfolio's FULL empirical R-multiple distribution — fat
+    /// left tails (rare catastrophic losses) shrink it automatically, exactly
+    /// as a CVaR-aware sizer would. `None` when the artifact predates
+    /// r_multiple logging or the portfolio has no edge.
     pub rck_risk_pct: Option<f64>,
+    /// 95th percentile of the LONGEST time-under-water streak (in trades)
+    /// across the reshuffled paths — how long this portfolio can drag below
+    /// its own equity peak before making a new high. The recovery number
+    /// prop-firm challenges implicitly test.
+    pub underwater_p95_trades: usize,
     pub note: String,
 }
 
@@ -61,26 +68,38 @@ fn trades_path_for(portfolio_path: &str) -> PathBuf {
     PathBuf::from(format!("{stem}.trades.json"))
 }
 
-/// Max drawdown (as a fraction of the running peak) of a compounded equity
-/// path over per-trade returns `rets` (each already scaled: equity ×(1+ret)).
-fn max_drawdown(rets: &[f64]) -> (f64, f64) {
+/// Max drawdown (as a fraction of the running peak), final equity, and the
+/// longest time-under-water streak (trades from an equity peak until it is
+/// reclaimed) of a compounded path over per-trade returns `rets`.
+/// Time-under-water is the prop-firm-relevant recovery number: a strategy
+/// that drags along under its peak for months fails challenges even when its
+/// max drawdown fits the limits.
+fn path_stats(rets: &[f64]) -> (f64, f64, usize) {
     let mut equity = 1.0_f64;
     let mut peak = 1.0_f64;
     let mut max_dd = 0.0_f64;
+    let mut underwater = 0usize;
+    let mut max_underwater = 0usize;
     for &r in rets {
         equity *= (1.0 + r).max(0.0); // equity can hit 0 (ruin), never negative
-        if equity > peak {
+        if equity >= peak {
             peak = equity;
+            underwater = 0;
+        } else {
+            underwater += 1;
+            if underwater > max_underwater {
+                max_underwater = underwater;
+            }
         }
         let dd = (peak - equity) / peak;
         if dd > max_dd {
             max_dd = dd;
         }
         if equity <= 0.0 {
-            return (1.0, 0.0);
+            return (1.0, 0.0, rets.len());
         }
     }
-    (max_dd, equity)
+    (max_dd, equity, max_underwater)
 }
 
 /// BLOCKING. Load the portfolio's logged trades, Monte-Carlo the sequence and
@@ -157,43 +176,39 @@ pub fn run_tail_risk(
 
     let mut dds: Vec<f64> = Vec::with_capacity(iterations);
     let mut finals: Vec<f64> = Vec::with_capacity(iterations);
+    let mut underwaters: Vec<usize> = Vec::with_capacity(iterations);
     let mut ruined = 0usize;
     let mut rng = rand::rng();
     let mut seq = rets.clone();
     for _ in 0..iterations {
         seq.shuffle(&mut rng);
-        let (dd, fin) = max_drawdown(&seq);
+        let (dd, fin, tuw) = path_stats(&seq);
         if dd >= RUIN_THRESHOLD {
             ruined += 1;
         }
         dds.push(dd);
         finals.push(fin);
+        underwaters.push(tuw);
     }
     dds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     finals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    underwaters.sort_unstable();
+    let underwater_p95_trades = underwaters
+        [(((underwaters.len() as f64 - 1.0) * 0.95).round() as usize).min(underwaters.len() - 1)];
     let pct = |p: f64| -> f64 {
         let idx = ((dds.len() as f64 - 1.0) * p).round() as usize;
         dds[idx.min(dds.len() - 1)] * 100.0
     };
 
-    // Risk-constrained Kelly sizing advice from the portfolio's OWN stats
-    // (win rate + avg-win/avg-loss in R). Constraint: ≤5% chance of EVER
-    // drawing down to half the account — the survival bar a small trader
-    // actually cares about. Only meaningful with R-multiples.
+    // Risk-constrained Kelly sizing advice, solved on the portfolio's FULL
+    // empirical R-multiple distribution (fat left tails shrink it — the
+    // CVaR-aware behaviour, no learned model needed). Constraint: ≤5% chance
+    // of EVER drawing down to half the account — the survival bar a small
+    // trader actually cares about. Only meaningful with R-multiples.
     let rck_risk_pct = if have_r {
         let rs: Vec<f64> = entries.iter().map(|e| e.1).collect();
-        let n = rs.len() as f64;
-        let wins: Vec<f64> = rs.iter().copied().filter(|r| *r > 0.0).collect();
-        let losses: Vec<f64> = rs.iter().copied().filter(|r| *r < 0.0).collect();
-        let p = wins.len() as f64 / n;
-        let avg_win = if wins.is_empty() { 0.0 } else { wins.iter().sum::<f64>() / wins.len() as f64 };
-        let avg_loss = if losses.is_empty() { 0.0 } else { (losses.iter().sum::<f64>() / losses.len() as f64).abs() };
-        if avg_loss > 1e-9 && avg_win > 0.0 {
-            let f = neoethos_core::domain::risk_constrained_kelly(p, avg_win / avg_loss, 0.5, 0.05);
-            if f > 0.0 { Some(f * 100.0) } else { None }
-        } else {
-            None
-        }
+        let f = neoethos_core::domain::risk_constrained_kelly_empirical(&rs, 0.5, 0.05);
+        if f > 0.0 { Some(f * 100.0) } else { None }
     } else {
         None
     };
@@ -234,6 +249,7 @@ pub fn run_tail_risk(
         ruin_probability_pct: ruin_prob,
         median_final_multiple: finals[finals.len() / 2],
         rck_risk_pct,
+        underwater_p95_trades,
         note,
     })
 }

@@ -569,9 +569,14 @@ export type TailRiskReport = {
   ruinThresholdPct: number;
   ruinProbabilityPct: number;
   medianFinalMultiple: number;
-  /** Risk-constrained Kelly (Busseti/Ryu/Boyd): largest risk-per-trade (%) with
-   *  ≤5% chance of ever losing half the account. null = no edge / no R data. */
+  /** Risk-constrained Kelly (Busseti/Ryu/Boyd), solved on the FULL empirical
+   *  R-multiple distribution (fat left tails shrink it — CVaR-aware): largest
+   *  risk-per-trade (%) with ≤5% chance of ever losing half the account.
+   *  null = no edge / no R data. */
   rckRiskPct: number | null;
+  /** p95 of the longest time-under-water streak (trades below the equity
+   *  peak) across reshuffled paths — the recovery number prop firms test. */
+  underwaterP95Trades: number;
   note: string;
 };
 export const tailRisk = (portfolio: string) =>

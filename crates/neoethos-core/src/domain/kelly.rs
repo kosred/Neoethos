@@ -86,6 +86,84 @@ pub fn risk_constrained_kelly(
     lo
 }
 
+/// Distribution-aware variant of [`risk_constrained_kelly`]: solves the same
+/// Busseti/Ryu/Boyd feasibility bound over the FULL empirical R-multiple
+/// sample instead of the two-outcome (win-rate, avg-RR) summary.
+///
+/// Why it matters (operator dialogue 2026-07-02, the "QR-DQN / CVaR" point):
+/// the two-outcome form cannot tell "many small losses" apart from "rare
+/// catastrophic −5R losses" when their averages match — but the drawdown
+/// constraint E[(1+f·r)^(−λ)] ≤ 1 evaluated on the raw sample weights the
+/// left tail exactly as a CVaR-aware sizer would: fat tails shrink the
+/// feasible f automatically. Same survival guarantee, no learned model.
+///
+/// Growth cap: instead of the closed-form Kelly, the growth-optimal f* is
+/// found by ternary search on the (concave) empirical log-growth
+/// `mean(ln(1+f·r))`, bounded so `1+f·r_worst > 0`.
+///
+/// Fail-safe zeros: fewer than 30 finite samples, non-positive mean edge, or
+/// NO observed loss (a tail we have never seen cannot be sized against).
+pub fn risk_constrained_kelly_empirical(
+    r_sample: &[f64],
+    dd_level: f64,
+    dd_prob: f64,
+) -> f64 {
+    if !(dd_level > 0.0 && dd_level < 1.0) || !(dd_prob > 0.0 && dd_prob < 1.0) {
+        return 0.0;
+    }
+    let rs: Vec<f64> = r_sample.iter().copied().filter(|r| r.is_finite()).collect();
+    if rs.len() < 30 {
+        return 0.0;
+    }
+    let n = rs.len() as f64;
+    if rs.iter().sum::<f64>() / n <= 0.0 {
+        return 0.0; // no edge
+    }
+    let worst = rs.iter().copied().fold(f64::INFINITY, f64::min);
+    if worst >= 0.0 {
+        return 0.0; // loss tail never observed — refuse to size against it
+    }
+    // Keep every 1 + f·r strictly positive; risking >100% is meaningless.
+    let f_max = (0.999 / -worst).min(1.0);
+
+    let growth = |f: f64| rs.iter().map(|r| (1.0 + f * r).ln()).sum::<f64>() / n;
+    // Ternary search on concave G(f) for the growth optimum.
+    let (mut lo, mut hi) = (0.0_f64, f_max);
+    for _ in 0..100 {
+        let m1 = lo + (hi - lo) / 3.0;
+        let m2 = hi - (hi - lo) / 3.0;
+        if growth(m1) < growth(m2) {
+            lo = m1;
+        } else {
+            hi = m2;
+        }
+    }
+    let f_star = 0.5 * (lo + hi);
+    if f_star <= 1e-9 || growth(f_star) <= 0.0 {
+        return 0.0;
+    }
+
+    let lambda = dd_prob.ln() / dd_level.ln();
+    let g = |f: f64| rs.iter().map(|r| (1.0 + f * r).powf(-lambda)).sum::<f64>() / n - 1.0;
+    if g(f_star) <= 0.0 {
+        return f_star;
+    }
+    let mut lo = f_star * 1e-9;
+    let mut hi = f_star;
+    if g(lo) > 0.0 {
+        return 0.0;
+    }
+    for _ in 0..80 {
+        let mid = 0.5 * (lo + hi);
+        if g(mid) <= 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +206,54 @@ mod tests {
     fn no_edge_returns_zero() {
         assert_eq!(risk_constrained_kelly(0.50, 1.0, 0.5, 0.05), 0.0);
         assert_eq!(risk_constrained_kelly(0.30, 1.5, 0.5, 0.05), 0.0);
+    }
+
+    /// Build a sample of `wins` copies of `+win_r` mixed with explicit losses.
+    fn sample(wins: usize, win_r: f64, losses: &[(usize, f64)]) -> Vec<f64> {
+        let mut v = vec![win_r; wins];
+        for &(count, loss_r) in losses {
+            v.extend(std::iter::repeat(loss_r).take(count));
+        }
+        v
+    }
+
+    #[test]
+    fn empirical_matches_parametric_on_two_outcome_sample() {
+        // 55×(+2R) + 45×(−1R) IS the two-outcome distribution p=0.55, rr=2.0 —
+        // the empirical solver must land on the closed-form answer.
+        let rs = sample(55, 2.0, &[(45, -1.0)]);
+        let emp = risk_constrained_kelly_empirical(&rs, 0.5, 0.05);
+        let par = risk_constrained_kelly(0.55, 2.0, 0.5, 0.05);
+        assert!(
+            (emp - par).abs() < 1e-3,
+            "empirical must reproduce the parametric two-outcome answer: {emp} vs {par}"
+        );
+    }
+
+    #[test]
+    fn fat_left_tail_shrinks_the_recommendation() {
+        // Same win rate (55%) and same AVERAGE loss (1R), but the fat-tail
+        // sample hides rare −5R hits: 40×(−0.5R) + 5×(−5R) → avg loss
+        // (40·0.5 + 5·5)/45 = 1.0R. A CVaR-aware sizer must risk LESS on it.
+        let thin = sample(55, 2.0, &[(45, -1.0)]);
+        let fat = sample(55, 2.0, &[(40, -0.5), (5, -5.0)]);
+        let f_thin = risk_constrained_kelly_empirical(&thin, 0.5, 0.05);
+        let f_fat = risk_constrained_kelly_empirical(&fat, 0.5, 0.05);
+        assert!(
+            f_fat > 0.0 && f_fat < f_thin,
+            "fat left tail must shrink f: fat {f_fat} vs thin {f_thin}"
+        );
+    }
+
+    #[test]
+    fn empirical_fail_safes_return_zero() {
+        // Too few samples.
+        assert_eq!(risk_constrained_kelly_empirical(&[1.0; 10], 0.5, 0.05), 0.0);
+        // No observed loss — tail unknowable.
+        assert_eq!(risk_constrained_kelly_empirical(&[1.0; 50], 0.5, 0.05), 0.0);
+        // Negative edge.
+        let losing = sample(30, 1.0, &[(70, -1.0)]);
+        assert_eq!(risk_constrained_kelly_empirical(&losing, 0.5, 0.05), 0.0);
     }
 
     #[test]
