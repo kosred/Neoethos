@@ -220,7 +220,11 @@ fn portfolio_export_requires_validation_gates() {
 }
 
 #[test]
-fn portfolio_export_succeeds_when_prop_firm_window_passed_even_without_walkforward() {
+fn portfolio_export_blocked_when_only_prop_firm_window_passed() {
+    // MANDATORY-OOS regression guard (operator directive 2026-06-30): the
+    // prop-firm window is an ADDITIONAL requirement, never a bypass. A
+    // portfolio that cleared the window but NOT walkforward+CPCV (the exact
+    // shape of the AUDUSD 20-straight-losses incident) must never export.
     let mut result = DiscoveryResult {
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
@@ -234,17 +238,15 @@ fn portfolio_export_succeeds_when_prop_firm_window_passed_even_without_walkforwa
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
     };
-    // The prop-firm window-pass gate is the canonical export path
-    // when active; walkforward and CPCV are intentionally unset.
     result.validation_gates.prop_firm_window_passed = true;
     result.validation_gates.prop_firm_window_count = 50;
     result.validation_gates.prop_firm_window_pass_rate = 0.72;
     let path = temp_path("portfolio-prop-firm-export");
 
-    save_portfolio_json(&path, &result)
-        .expect("portfolio export should pass when prop-firm gate is the active path");
-    assert!(path.exists());
-    let _ = std::fs::remove_file(path);
+    let err = save_portfolio_json(&path, &result)
+        .expect_err("prop-firm window alone must NOT unlock export (mandatory OOS)");
+    assert!(err.to_string().contains("walkforward_passed"));
+    assert!(!path.exists());
 }
 
 #[test]
@@ -573,7 +575,9 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
         // as the explicit "skip" sentinel (see ensure_sufficient_history).
         min_history_years: 0,
     };
-    assert!((overrides.resolved_prefilter_insample_frac() - 0.80).abs() < 1e-9);
+    // Stale-test fix (2026-07-02): the insample-frac fallback moved 0.80 → 0.70
+    // in the resolver; the assertions now track the CURRENT fallback.
+    assert!((overrides.resolved_prefilter_insample_frac() - 0.70).abs() < 1e-9);
     assert!((overrides.resolved_funnel_stage1_pct() - 1.0).abs() < 1e-9);
 
     let too_small = DiscoveryRuntimeOverrides {
@@ -584,7 +588,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
         stage1_window: Stage1Window::Earliest,
         min_history_years: 0,
     };
-    assert!((too_small.resolved_prefilter_insample_frac() - 0.80).abs() < 1e-9);
+    assert!((too_small.resolved_prefilter_insample_frac() - 0.70).abs() < 1e-9);
     assert!((too_small.resolved_funnel_stage1_pct() - 0.01).abs() < 1e-9);
 }
 

@@ -244,6 +244,11 @@ pub struct DiscoveryConfig {
     pub cpcv_purge_pct: f64,
     pub cpcv_min_phi: f64,
     pub cpcv_max_rows: usize,
+    /// PBO ceiling: export is blocked when the measured Probability of
+    /// Backtest Overfitting exceeds this. 0.5 = "the in-sample champion must
+    /// beat the out-of-sample median more often than a coin flip". `<= 0`
+    /// disables the gate (research/test fixtures only).
+    pub max_pbo: f64,
     pub filtering: crate::genetic::FilteringConfig,
     /// Starting account balance used for PnL%, DD%, and regime loss limits.
     pub initial_balance: f64,
@@ -368,6 +373,7 @@ impl Default for DiscoveryConfig {
             cpcv_purge_pct: 0.02,
             cpcv_min_phi: 0.80,
             cpcv_max_rows: 0,
+            max_pbo: 0.5,
             filtering: crate::genetic::FilteringConfig::default(),
             initial_balance: 100_000.0,
             max_regime_loss_pct: 3.0,
@@ -461,7 +467,14 @@ impl DiscoveryConfig {
             // making *every* `from_settings` call fall into the NaN trap
             // even when the operator had set the value — root cause #304.
             evaluation_account_currency: settings.system.account_currency.clone(),
-            evaluation_spread_pips: settings.risk.backtest_spread_pips.max(0.0),
+            // Honest-costs fix (2026-07-02): `risk.slippage_pips` existed (and
+            // the live order-cost helper charged it) but the DISCOVERY
+            // evaluator ignored it — strategies were validated against costs
+            // the live fills never see. Fold slippage into the effective
+            // spread HERE (single resolution point) so the CPU and GPU
+            // kernels charge it identically with zero kernel changes.
+            evaluation_spread_pips: settings.risk.backtest_spread_pips.max(0.0)
+                + settings.risk.slippage_pips.max(0.0),
             evaluation_commission_per_trade: settings.risk.commission_per_lot.max(0.0),
             population: model_settings.prop_search_population.max(10),
             generations: model_settings.prop_search_generations.max(1),
@@ -493,6 +506,10 @@ impl DiscoveryConfig {
             cpcv_purge_pct: model_settings.cpcv_purge_pct.max(0.0),
             cpcv_min_phi: model_settings.cpcv_min_phi.max(0.0),
             cpcv_max_rows: model_settings.cpcv_max_rows,
+            // PBO gate default 0.5 — the honest ceiling; not yet a Settings
+            // knob (deliberate: loosening it should require editing code or
+            // raw YAML, not one careless click).
+            max_pbo: 0.5,
             filtering,
             initial_balance: settings.risk.initial_balance.max(1.0),
             max_regime_loss_pct: 3.0,
@@ -778,6 +795,19 @@ pub struct DiscoveryValidationGates {
     pub walkforward_validation_artifacts: usize,
     pub cpcv_fold_count: usize,
     pub cpcv_profitable_fold_ratio: f64,
+    /// Probability of Backtest Overfitting (CSCV over the CPCV splits, López
+    /// de Prado): the fraction of splits where the IN-SAMPLE champion of the
+    /// candidate set ranked at-or-below the median OUT-of-sample. `None` when
+    /// not computable (too few candidates or the gate is disabled).
+    pub pbo: Option<f64>,
+    /// False only when PBO was computed AND exceeded `config.max_pbo` —
+    /// a portfolio whose selection process looks like luck is not exportable.
+    pub pbo_passed: bool,
+    /// How many candidate strategies fed the PBO estimate.
+    pub pbo_candidates: usize,
+    /// Honesty counter: how many candidates the whole run RANKED before any
+    /// gate — the selection pressure the survivors' metrics were bought with.
+    pub trials_tested: usize,
     pub temporal_contract_hash: Option<String>,
     /// Set when the prop-firm window-pass gate
     /// (`NEOETHOS_BOT_DISCOVERY_PROP_FIRM_GATE=1`) replaces the walkforward
@@ -813,6 +843,10 @@ impl DiscoveryValidationGates {
             walkforward_validation_artifacts: 0,
             cpcv_fold_count: 0,
             cpcv_profitable_fold_ratio: 0.0,
+            pbo: None,
+            pbo_passed: true, // pending gates fail on wf/cpcv; PBO only blocks when measured
+            pbo_candidates: 0,
+            trials_tested: 0,
             temporal_contract_hash: None,
             prop_firm_window_passed: false,
             prop_firm_window_pass_rate: 0.0,
@@ -830,7 +864,12 @@ impl DiscoveryValidationGates {
         // the mode-aware criterion), never a bypass. This closes the hole where
         // a strategy that FAILED walkforward (e.g. AUDUSD: 20 live trades, all
         // losing) was still exported because it cleared the prop-firm window.
-        self.walkforward_passed && self.cpcv_passed
+        //
+        // 2026-07-02: plus the PBO gate — when the Probability of Backtest
+        // Overfitting was measured and exceeded the configured ceiling, the
+        // selection process is statistically indistinguishable from luck and
+        // nothing gets exported, no matter how good the survivors look.
+        self.walkforward_passed && self.cpcv_passed && self.pbo_passed
     }
 }
 
@@ -1599,9 +1638,10 @@ fn evaluate_cpcv_gate(
     config: &DiscoveryConfig,
     months: &[i64],
     days: &[i64],
-) -> Result<(bool, usize, f64)> {
+    pbo_candidates: &[Gene],
+) -> Result<(bool, usize, f64, Option<f64>, bool)> {
     if portfolio.is_empty() {
-        return Ok((false, 0, 0.0));
+        return Ok((false, 0, 0.0, None, true));
     }
     // **F-018 documentation (2026-05-25)** — when CPCV is operator-
     // disabled via `enable_cpcv = false`, this gate returns
@@ -1620,7 +1660,7 @@ fn evaluate_cpcv_gate(
              portfolio promoted without out-of-sample validation. \
              For prop-firm production runs, set enable_cpcv=true."
         );
-        return Ok((true, 0, 1.0));
+        return Ok((true, 0, 1.0, None, true));
     }
 
     let n = ohlcv.close.len();
@@ -1638,7 +1678,7 @@ fn evaluate_cpcv_gate(
     );
     let splits = cv.split(capped_n);
     if splits.is_empty() {
-        return Ok((false, 0, 0.0));
+        return Ok((false, 0, 0.0, None, true));
     }
 
     // Alignment sanity check: the GPU path re-synthesizes signals on-device from
@@ -1700,7 +1740,7 @@ fn evaluate_cpcv_gate(
     let settings_template = if let Some(gene) = portfolio.first() {
         discovery_backtest_settings(config, gene, ohlcv.close.last().copied())
     } else {
-        return Ok((false, 0, 0.0));
+        return Ok((false, 0, 0.0, None, true));
     };
 
     // Full-series indicators + SMC, computed ONCE and gathered per fold. The SMC
@@ -1773,13 +1813,118 @@ fn evaluate_cpcv_gate(
     }
 
     if fold_count == 0 {
-        return Ok((false, 0, 0.0));
+        return Ok((false, 0, 0.0, None, true));
     }
     let ratio = profitable_folds as f64 / fold_count as f64;
+
+    // ── PBO — Probability of Backtest Overfitting (CSCV, López de Prado) ────
+    // For each CPCV split: crown the IN-SAMPLE champion of the candidate pool
+    // on the TRAIN side, then ask where that champion ranks OUT-of-sample on
+    // the TEST side. PBO = fraction of splits where the champion lands at or
+    // below the OOS median. High PBO ⇒ "the selection process is picking
+    // luck" — the survivors' metrics were bought with trials, not edge.
+    // Reuses the exact fold gather + population evaluator of the gate above,
+    // so IS/OOS are measured with the same engine (costs, sizing, SMC).
+    let mut pbo: Option<f64> = None;
+    let mut pbo_passed = true;
+    if config.max_pbo > 0.0 && pbo_candidates.len() >= 8 {
+        let cands: Vec<Gene> = pbo_candidates.iter().take(64).cloned().collect();
+        let eval_pool = |idx: &[usize]| -> Result<Vec<f64>> {
+            let absolute_idx: Vec<usize> = idx.iter().map(|i| offset + *i).collect();
+            let close: Vec<f64> = absolute_idx.iter().map(|i| ohlcv.close[*i]).collect();
+            let high: Vec<f64> = absolute_idx.iter().map(|i| ohlcv.high[*i]).collect();
+            let low: Vec<f64> = absolute_idx.iter().map(|i| ohlcv.low[*i]).collect();
+            let m: Vec<i64> = absolute_idx.iter().map(|i| months[*i]).collect();
+            let d: Vec<i64> = absolute_idx.iter().map(|i| days[*i]).collect();
+            let metrics = {
+                #[cfg(feature = "gpu")]
+                let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                validation_genes_population_gathered(
+                    full_indicators,
+                    &full_smc,
+                    &cands,
+                    &eval_config,
+                    &settings_template,
+                    &absolute_idx,
+                    &close,
+                    &high,
+                    &low,
+                    &m,
+                    &d,
+                )?
+            };
+            Ok(metrics
+                .into_iter()
+                .map(|arr| BacktestMetrics::from_metric_array(arr).net_profit)
+                .collect())
+        };
+
+        let mut splits_evaluated = 0usize;
+        let mut champion_below_median = 0usize;
+        for (train_idx, test_idx) in &splits {
+            if train_idx.is_empty() || test_idx.is_empty() {
+                continue;
+            }
+            let is_perf = eval_pool(train_idx)?;
+            let oos_perf = eval_pool(test_idx)?;
+            if is_perf.len() != cands.len() || oos_perf.len() != cands.len() {
+                anyhow::bail!("PBO: evaluator returned wrong candidate count — internal bug");
+            }
+            let Some(champion) = is_perf
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+            else {
+                continue;
+            };
+            let mut oos_sorted = oos_perf.clone();
+            oos_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // Lower-middle median; ties count AGAINST the champion — the
+            // conservative direction (slightly overestimates PBO).
+            let median = oos_sorted[(oos_sorted.len() - 1) / 2];
+            splits_evaluated += 1;
+            if oos_perf[champion] <= median {
+                champion_below_median += 1;
+            }
+        }
+        if splits_evaluated > 0 {
+            let p = champion_below_median as f64 / splits_evaluated as f64;
+            pbo = Some(p);
+            pbo_passed = p <= config.max_pbo;
+            tracing::info!(
+                target: "neoethos_search::discovery",
+                pbo = format!("{p:.2}"),
+                max_pbo = config.max_pbo,
+                candidates = cands.len(),
+                splits = splits_evaluated,
+                passed = pbo_passed,
+                "PBO gate — probability the in-sample champion is luck"
+            );
+            if !pbo_passed {
+                tracing::warn!(
+                    target: "neoethos_search::discovery",
+                    "PBO {p:.2} exceeds the {:.2} ceiling — the selection looks like \
+                     overfitting; export will be BLOCKED for this unit",
+                    config.max_pbo
+                );
+            }
+        }
+    } else if config.max_pbo > 0.0 {
+        tracing::info!(
+            target: "neoethos_search::discovery",
+            candidates = pbo_candidates.len(),
+            "PBO not computed — needs ≥8 candidates in the selection pool \
+             (gate does not block)"
+        );
+    }
+
     Ok((
         ratio >= config.cpcv_min_phi.clamp(0.0, 1.0),
         fold_count,
         ratio,
+        pbo,
+        pbo_passed,
     ))
 }
 
@@ -1789,6 +1934,8 @@ fn build_discovery_validation_artifacts(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+    pbo_candidates: &[Gene],
+    trials_tested: usize,
 ) -> Result<(
     DiscoveryValidationGates,
     Vec<CanonicalBacktestArtifactFile>,
@@ -1977,8 +2124,17 @@ fn build_discovery_validation_artifacts(
         ));
     }
 
-    let (cpcv_passed, cpcv_fold_count, cpcv_profitable_fold_ratio) =
-        evaluate_cpcv_gate(portfolio, portfolio_signals, features, ohlcv, config, &months, &days)?;
+    let (cpcv_passed, cpcv_fold_count, cpcv_profitable_fold_ratio, pbo, pbo_passed) =
+        evaluate_cpcv_gate(
+            portfolio,
+            portfolio_signals,
+            features,
+            ohlcv,
+            config,
+            &months,
+            &days,
+            pbo_candidates,
+        )?;
 
     let validation_gates = DiscoveryValidationGates {
         walkforward_passed,
@@ -1987,6 +2143,10 @@ fn build_discovery_validation_artifacts(
         walkforward_validation_artifacts: walkforward_validation_artifacts.len(),
         cpcv_fold_count,
         cpcv_profitable_fold_ratio,
+        pbo,
+        pbo_passed,
+        pbo_candidates: pbo_candidates.len().min(64),
+        trials_tested,
         temporal_contract_hash: Some(temporal_contract_hash),
         prop_firm_window_passed: false,
         prop_firm_window_pass_rate: 0.0,
@@ -3521,6 +3681,22 @@ where
         filtered.push((idx, gene));
         signals_map.push(sig);
     }
+
+    // ── PBO candidate snapshot (2026-07-02) ────────────────────────────────
+    // The Probability-of-Backtest-Overfitting estimate needs the SELECTION
+    // POOL, not just the final portfolio: it asks "when I crown an in-sample
+    // champion among these candidates, does that champion also perform
+    // out-of-sample?". Take the top-by-fitness base-filter survivors here —
+    // the richest honest pool before the strict gates shrink it. Capped at 64
+    // (rank statistics saturate well before that; keeps the extra CPCV-side
+    // evaluations bounded).
+    let mut pbo_candidates: Vec<Gene> = filtered.iter().map(|(_, g)| g.clone()).collect();
+    pbo_candidates.sort_by(|a, b| {
+        b.fitness
+            .partial_cmp(&a.fitness)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    pbo_candidates.truncate(64);
     // ── NEVER-ZERO best-effort snapshot (2026-06-09, operator non-negotiable) ──
     // Capture the top-by-fitness base-filtered survivors WITH their signals here,
     // at the richest point before the strict quality / prop-firm / correlation
@@ -4087,6 +4263,8 @@ where
                 features,
                 ohlcv,
                 config,
+                &pbo_candidates,
+                ranked_total,
             )?
         };
 
