@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { dataBootstrap, dataFetch, refreshBrokerCosts } from "../api";
+import { useEffect, useState } from "react";
+import { dataBootstrap, dataFetch, refreshBrokerCosts, serverSymbols, type BrokerSymbol } from "../api";
 import { usePoll } from "../hooks";
 import { useSymbolOptions, useTimeframeOptions, invalidateSymbolCache } from "../components/Select";
 import { HelpPanel, HelpStep } from "../components/Help";
@@ -10,11 +10,30 @@ const tfRank = (t: string) => {
   return i < 0 ? 99 : i;
 };
 
-function Chips({ opts, sel, onToggle }: { opts: string[]; sel: string[]; onToggle: (v: string) => void }) {
+function Chips({
+  opts,
+  sel,
+  onToggle,
+  local,
+}: {
+  opts: string[];
+  sel: string[];
+  onToggle: (v: string) => void;
+  /** Symbols that already have local data — marked with ✓ on the chip. */
+  local?: Set<string>;
+}) {
   return (
     <div className="chip-row">
       {opts.map((o) => (
-        <button key={o} type="button" className={`chip ${sel.includes(o) ? "on" : ""}`} onClick={() => onToggle(o)}>{o}</button>
+        <button
+          key={o}
+          type="button"
+          className={`chip ${sel.includes(o) ? "on" : ""}`}
+          title={local?.has(o.toUpperCase()) ? `${o} — local data already downloaded` : o}
+          onClick={() => onToggle(o)}
+        >
+          {o}{local?.has(o.toUpperCase()) ? " ✓" : ""}
+        </button>
       ))}
     </div>
   );
@@ -22,8 +41,35 @@ function Chips({ opts, sel, onToggle }: { opts: string[]; sel: string[]; onToggl
 
 export default function Data() {
   const { data, error, reload } = usePoll(dataBootstrap, 0);
-  const symOpts = useSymbolOptions();
+  const localSyms = useSymbolOptions();
   const tfOpts = useTimeframeOptions();
+  // The FULL broker symbol universe (dozens — forex/metals/indices), so NEW
+  // pairs can be downloaded, not just the ones that already have local data.
+  const [brokerSyms, setBrokerSyms] = useState<BrokerSymbol[]>([]);
+  useEffect(() => {
+    serverSymbols()
+      .then((u) => setBrokerSyms(u.symbols))
+      .catch(() => {}); // broker offline → fall back to local list below
+  }, []);
+  // Grouped by asset class; local-only symbols (imported files etc.) that the
+  // broker list doesn't carry get their own group so nothing disappears.
+  const localSet = new Set(localSyms.map((s) => s.toUpperCase()));
+  const groups: [string, string[]][] = (() => {
+    if (brokerSyms.length === 0) return localSyms.length ? [["Local", localSyms]] : [];
+    const byClass: Record<string, string[]> = {};
+    const brokerNames = new Set<string>();
+    for (const s of brokerSyms) {
+      (byClass[s.assetClass || "Other"] ??= []).push(s.symbolName);
+      brokerNames.add(s.symbolName.toUpperCase());
+    }
+    const localOnly = localSyms.filter((s) => !brokerNames.has(s.toUpperCase()));
+    const out: [string, string[]][] = Object.entries(byClass)
+      .sort()
+      .map(([c, list]) => [c, list.sort()]);
+    if (localOnly.length) out.push(["Local only", localOnly.sort()]);
+    return out;
+  })();
+  const symOpts = groups.flatMap(([, list]) => list);
   const [selSyms, setSelSyms] = useState<string[]>([]);
   const [selTfs, setSelTfs] = useState<string[]>([]);
   const [from, setFrom] = useState("2015-01-01");
@@ -88,7 +134,7 @@ export default function Data() {
 
       <HelpPanel id="data">
         <p>This screen manages the <b>price history</b> the engine searches and trains on. Everything is stored locally under your data folder (see <b>Files &amp; Storage</b>).</p>
-        <HelpStep n={1}><b>Download bars:</b> tick one or more <b>Symbols</b> and <b>Timeframes</b>, pick a <b>From</b> date, and press <b>Fetch</b>. It downloads every symbol × timeframe combination in turn (deeper dates = millions of bars, slower). Each replaces that symbol+timeframe file with the fetched range.</HelpStep>
+        <HelpStep n={1}><b>Download bars:</b> the symbol list shows the broker's <b>full universe</b> (forex, metals, indices — grouped by class), so you can bring in <b>brand-new pairs</b>, not just re-download existing ones (✓ marks pairs that already have local data). Tick Symbols + Timeframes, pick a <b>From</b> date, press <b>Fetch</b>. Each download replaces that symbol+timeframe file with the fetched range.</HelpStep>
         <HelpStep n={2}><b>Broker costs:</b> press <b>Refresh broker costs</b> once so backtests use your account's real commission/swap/spread instead of a generic table.</HelpStep>
         <HelpStep n={3}><b>Local symbols:</b> the chips at the bottom show what data you already have — available in every dropdown across the app.</HelpStep>
         <p className="muted small">Tip: Discovery searches a base timeframe plus higher ones, so download the same From date across the timeframes you plan to use.</p>
@@ -110,13 +156,22 @@ export default function Data() {
       <h2>Download bars</h2>
       <div className="ticket">
         <label className="picker-label">
-          Symbols <span className="muted">({selSyms.length || "none"})</span>
+          Symbols <span className="muted">({selSyms.length || "none"} selected · {symOpts.length} available{brokerSyms.length ? " from broker" : " — broker offline, local only"} · ✓ = has local data)</span>
           <div className="picker-actions">
             <button type="button" className="link" onClick={() => setSelSyms(symOpts)}>all</button>
+            <button type="button" className="link" onClick={() => setSelSyms(localSyms)}>with data</button>
             <button type="button" className="link" onClick={() => setSelSyms([])}>none</button>
           </div>
         </label>
-        <Chips opts={symOpts} sel={selSyms} onToggle={toggle(setSelSyms)} />
+        {groups.map(([cls, list]) => (
+          <div key={cls} style={{ marginTop: 6 }}>
+            <div className="muted small" style={{ marginBottom: 2 }}>
+              {cls}{" "}
+              <button type="button" className="link" onClick={() => setSelSyms((c) => Array.from(new Set([...c, ...list])))}>+all</button>
+            </div>
+            <Chips opts={list} sel={selSyms} onToggle={toggle(setSelSyms)} local={localSet} />
+          </div>
+        ))}
 
         <label className="picker-label" style={{ marginTop: 12 }}>
           Timeframes <span className="muted">({selTfs.length || "none"})</span>
