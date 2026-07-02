@@ -566,6 +566,14 @@ export const supervisorConfig = (b: Partial<SupervisorConfig>) =>
   apiPost<{ config: SupervisorConfig }>("/supervisor/config", b);
 export const supervisorTick = () => apiPost<{ summary: string }>("/supervisor/tick");
 
+// ── Session-aware spread stats (recorded from the broker's own ticks) ──────
+export type HourSpread = { samples: number; meanPips: number; maxPips: number };
+export type SpreadStats = {
+  symbols: Record<string, { hourly: HourSpread[] }>;
+  updatedMs: number;
+};
+export const spreadStats = () => apiGet<SpreadStats>("/data/spread-stats");
+
 // ── Strategy report: monthly journal + validation verdict + flags ─────────
 export type StrategyEntry = {
   mode: string;

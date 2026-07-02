@@ -176,6 +176,13 @@ pub fn router(state: AppApiState) -> Router {
         .route("/strategy/blacklist", get(autonomous::blacklist))
         // Live↔backtest parity harness (window-invariance of live signals).
         .route("/autonomous/parity", get(autonomous::parity))
+        // Session-aware spread stats recorded from the broker's own ticks.
+        .route(
+            "/data/spread-stats",
+            get(|| async {
+                axum::Json(crate::app_services::spread_stats::snapshot())
+            }),
+        )
         // Autonomous LLM supervisor (observe/diagnose + tiered actions).
         .route("/supervisor/status", get(supervisor::status))
         .route("/supervisor/config", post(supervisor::update_config))

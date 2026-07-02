@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { dataBootstrap, dataFetch, refreshBrokerCosts, serverSymbols, type BrokerSymbol } from "../api";
+import { dataBootstrap, dataFetch, refreshBrokerCosts, serverSymbols, spreadStats, type BrokerSymbol, type SpreadStats } from "../api";
 import { usePoll } from "../hooks";
 import { useSymbolOptions, useTimeframeOptions, invalidateSymbolCache } from "../components/Select";
 import { HelpPanel, HelpStep } from "../components/Help";
@@ -208,6 +208,8 @@ export default function Data() {
         {costMsg && <div className="banner info">{costMsg}</div>}
       </div>
 
+      <SpreadStatsPanel />
+
       {data && data.symbols.length > 0 && (
         <>
           <h2>Local symbols</h2>
@@ -217,5 +219,60 @@ export default function Data() {
         </>
       )}
     </div>
+  );
+}
+
+/** The broker's REAL spread by UTC hour, recorded from the live tick stream.
+ *  Shows why a flat backtest spread is optimistic and what value to set. */
+function SpreadStatsPanel() {
+  const [stats, setStats] = useState<SpreadStats | null>(null);
+  useEffect(() => {
+    spreadStats().then(setStats).catch(() => {});
+  }, []);
+  const symbols = Object.entries(stats?.symbols ?? {}).filter(([, v]) => v.hourly?.some((h) => h.samples > 0));
+  if (symbols.length === 0) {
+    return (
+      <>
+        <h2>Real spread by hour (recorded)</h2>
+        <p className="muted small">
+          Recording started — the app samples your broker's live bid/ask once a minute and builds a
+          per-hour spread profile here (used to sanity-check the backtest's cost assumption). Come
+          back after a few hours of the app running with the tick stream live.
+        </p>
+      </>
+    );
+  }
+  return (
+    <>
+      <h2>Real spread by hour (recorded from your broker)</h2>
+      <p className="muted small">
+        Mean pips per UTC hour · red = ≥2× the tightest hour (times a flat backtest spread underprices).
+        Use this to set an honest <code>backtest_spread_pips</code>.
+      </p>
+      <table className="tbl" style={{ fontSize: 11 }}>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            {Array.from({ length: 24 }, (_, h) => <th key={h}>{h}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {symbols.map(([sym, v]) => {
+            const means = v.hourly.map((h) => (h.samples > 0 ? h.meanPips : null));
+            const tightest = Math.min(...means.filter((m): m is number => m != null && m > 0));
+            return (
+              <tr key={sym}>
+                <td><b>{sym}</b></td>
+                {means.map((m, h) => (
+                  <td key={h} className={m != null && isFinite(tightest) && m >= tightest * 2 ? "sell" : ""} title={m != null ? `${sym} ${h}:00 UTC — mean ${m.toFixed(2)} pips (max ${v.hourly[h].maxPips.toFixed(1)}, n=${v.hourly[h].samples})` : "no samples"}>
+                    {m != null ? m.toFixed(1) : "·"}
+                  </td>
+                ))}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </>
   );
 }

@@ -60,6 +60,7 @@ pub mod news_research;
 pub mod pending_actions;
 pub mod risky_mode_persistence;
 pub mod secure_store;
+pub mod spread_stats;
 pub mod strategy_blacklist;
 pub mod supervisor;
 pub mod trading_types;
