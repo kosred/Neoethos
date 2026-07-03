@@ -30,6 +30,11 @@ pub struct AuthorizationRequest {
     /// `state` query parameter. The callback handler verifies it
     /// matches before continuing.
     pub state: String,
+    /// Optional email the operator typed to pick WHICH ChatGPT account to
+    /// connect. Passed to the issuer as `login_hint` so its sign-in page
+    /// pre-fills / targets that account. `None` ⇒ the issuer decides (its
+    /// current session or an account picker).
+    pub login_hint: Option<String>,
 }
 
 impl AuthorizationRequest {
@@ -41,7 +46,14 @@ impl AuthorizationRequest {
         Self {
             pkce: PkceChallenge::generate(),
             state,
+            login_hint: None,
         }
+    }
+
+    /// Set the email hint (which account to sign in with).
+    pub fn with_login_hint(mut self, email: Option<String>) -> Self {
+        self.login_hint = email.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+        self
     }
 
     /// Build the URL we send the operator's browser to. This is the
@@ -53,6 +65,15 @@ impl AuthorizationRequest {
         // verbose and pulling in another dep just for this is silly.
         // All the values we serialise here are ASCII-only and safe
         // to drop into a query string with minimal escaping.
+        // `prompt=login` forces the issuer to show its sign-in / account
+        // picker even if a session already exists — so the operator can
+        // switch to a DIFFERENT ChatGPT account instead of being silently
+        // reused. `login_hint` (when an email was typed) pre-fills it.
+        let hint = self
+            .login_hint
+            .as_deref()
+            .map(|e| format!("&login_hint={}", url_encode(e)))
+            .unwrap_or_default();
         format!(
             "{issuer}/oauth/authorize\
              ?response_type=code\
@@ -61,6 +82,8 @@ impl AuthorizationRequest {
              &scope={scope}\
              &code_challenge={cc}\
              &code_challenge_method={method}\
+             &prompt=login\
+             {hint}\
              &state={state}",
             issuer = CODEX_ISSUER,
             client_id = url_encode(CODEX_CLIENT_ID),
@@ -68,6 +91,7 @@ impl AuthorizationRequest {
             scope = url_encode(CODEX_SCOPES),
             cc = self.pkce.code_challenge,
             method = self.pkce.method(),
+            hint = hint,
             state = url_encode(&self.state),
         )
     }

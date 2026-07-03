@@ -10,6 +10,10 @@ export default function AiDesk() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  // Which ChatGPT account (email) to connect. Optional — passed as the
+  // OAuth `login_hint` so the sign-in page targets that account. Left
+  // empty ⇒ ChatGPT shows its own account picker.
+  const [email, setEmail] = useState("");
 
   const authed = !!status?.authenticated;
 
@@ -17,7 +21,7 @@ export default function AiDesk() {
     setBusy(true);
     setMsg("Starting ChatGPT (Codex) login — approve in the browser that opens…");
     try {
-      const r = await codexStart();
+      const r = await codexStart(email.trim() || undefined);
       if (r?.authorizeUrl) setMsg(`Open this URL to authorize: ${r.authorizeUrl}`);
       await reload();
     } catch (e) {
@@ -49,7 +53,7 @@ export default function AiDesk() {
     try {
       await codexLogout();
       await reload();
-      const r = await codexStart();
+      const r = await codexStart(email.trim() || undefined);
       if (r?.authorizeUrl) {
         setMsg(`Sign in with the account you want to use: ${r.authorizeUrl}`);
       } else {
@@ -88,6 +92,27 @@ export default function AiDesk() {
         <div className="kv"><span>Status</span><b className={authed ? "buy" : "sell"}>{authed ? "connected" : "not connected"}</b></div>
         <div className="kv"><span>Account</span><b style={{ fontSize: 12 }}>{status?.email ?? "—"}</b></div>
       </div>
+      <div className="settings-grid" style={{ marginTop: 8 }}>
+        <label className="kv" style={{ alignItems: "center" }}>
+          <span title="Optional. The ChatGPT account (email) to connect. Leave empty to pick it in the browser.">
+            ChatGPT email
+          </span>
+          <input
+            type="email"
+            value={email}
+            placeholder="you@example.com (optional)"
+            disabled={busy}
+            autoComplete="email"
+            onChange={(e) => setEmail(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && !busy && (authed ? switchAccount() : login())}
+            style={{ flex: 1, minWidth: 220 }}
+          />
+        </label>
+      </div>
+      <p className="muted" style={{ fontSize: 11, margin: "4px 0 0" }}>
+        You sign in inside ChatGPT's own page — NeoEthos never sees your password.
+        The email just tells it which account to use.
+      </p>
       <div className="btn-row">
         {authed ? (
           <>

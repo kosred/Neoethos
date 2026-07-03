@@ -382,7 +382,10 @@ export const setWatchlist = (symbols: string[]) => apiPost("/watchlist", { symbo
 
 // ── AI Desk (Codex / ChatGPT subscription) ────────────────────────────────
 export const codexStatus = () => apiGet<any>("/auth/codex/status");
-export const codexStart = () => apiPost<any>("/auth/codex/start");
+// `email` (optional) becomes the OAuth `login_hint` so the operator picks
+// WHICH ChatGPT account to connect. Empty ⇒ the issuer shows its picker.
+export const codexStart = (email?: string) =>
+  apiPost<any>("/auth/codex/start", email ? { email } : {});
 export const codexLogout = () => apiPost("/auth/codex/logout");
 export const codexChat = (prompt: string, model?: string) =>
   apiPost<{ model: string; response: string; total_tokens: number }>("/codex/chat", { prompt, model });
