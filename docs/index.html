@@ -6,19 +6,40 @@
 <title>NeoEthos — Ένα νέο ήθος | A new ethos</title>
 <meta name="description" content="Open-source (AGPL) trading intelligence built by one person on a €300 mini PC — institutional-grade honesty for the small trader. Η αλήθεια ενός απλού ανθρώπου.">
 <style>
+  /* Inter (SIL Open Font License) — self-hosted, ZERO external requests.
+     Latin + Greek subsets, weights 400/600/700. See fonts/OFL.txt. */
+  @font-face{font-family:'Inter';font-style:normal;font-weight:400;font-display:swap;
+    src:url('fonts/inter-latin-400-normal.woff2') format('woff2');
+    unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+2074,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+  @font-face{font-family:'Inter';font-style:normal;font-weight:400;font-display:swap;
+    src:url('fonts/inter-greek-400-normal.woff2') format('woff2');unicode-range:U+0370-03FF,U+1F00-1FFF}
+  @font-face{font-family:'Inter';font-style:normal;font-weight:600;font-display:swap;
+    src:url('fonts/inter-latin-600-normal.woff2') format('woff2');
+    unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+2074,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+  @font-face{font-family:'Inter';font-style:normal;font-weight:600;font-display:swap;
+    src:url('fonts/inter-greek-600-normal.woff2') format('woff2');unicode-range:U+0370-03FF,U+1F00-1FFF}
+  @font-face{font-family:'Inter';font-style:normal;font-weight:700;font-display:swap;
+    src:url('fonts/inter-latin-700-normal.woff2') format('woff2');
+    unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+2074,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+  @font-face{font-family:'Inter';font-style:normal;font-weight:700;font-display:swap;
+    src:url('fonts/inter-greek-700-normal.woff2') format('woff2');unicode-range:U+0370-03FF,U+1F00-1FFF}
   :root{
     --bg:#0b0f14; --panel:#111823; --panel2:#0e141d; --line:#1e2a3a;
     --text:#dbe4ee; --muted:#8b98a9; --blue:#4da3ff; --gold:#e8c268; --green:#4ade80;
+    --font:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
   }
   *{box-sizing:border-box;margin:0;padding:0}
   html{scroll-behavior:smooth}
-  body{background:var(--bg);color:var(--text);font-family:Georgia,'Times New Roman',serif;line-height:1.75;font-size:18px}
+  body{background:var(--bg);color:var(--text);font-family:var(--font);line-height:1.78;font-size:17.5px;
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;letter-spacing:.1px}
   .wrap{max-width:820px;margin:0 auto;padding:0 22px}
-  header{padding:84px 0 40px;text-align:center;border-bottom:1px solid var(--line);
+  header{padding:72px 0 40px;text-align:center;border-bottom:1px solid var(--line);
     background:radial-gradient(ellipse at 50% -20%, #14263f 0%, var(--bg) 60%)}
-  h1{font-size:56px;letter-spacing:1px;color:#fff}
-  .tag{color:var(--blue);font-size:22px;margin-top:10px;font-style:italic}
-  .sub{color:var(--muted);margin-top:18px;font-size:16px}
+  .logo{width:96px;height:96px;margin:0 auto 22px;display:block;border-radius:22px;
+    box-shadow:0 8px 40px rgba(77,163,255,.25);border:1px solid var(--line)}
+  h1{font-size:54px;letter-spacing:-1px;color:#fff;font-weight:700}
+  .tag{color:var(--blue);font-size:21px;margin-top:12px;font-weight:400}
+  .sub{color:var(--muted);margin-top:18px;font-size:15.5px;font-weight:400}
   .langbar{margin-top:26px}
   .langbar button{background:none;border:1px solid var(--line);color:var(--muted);
     padding:7px 18px;font-size:14px;cursor:pointer;font-family:inherit}
@@ -26,22 +47,28 @@
   .langbar button:first-child{border-radius:6px 0 0 6px}
   .langbar button:last-child{border-radius:0 6px 6px 0}
   section{padding:52px 0;border-bottom:1px solid var(--line)}
-  h2{font-size:26px;color:var(--gold);margin-bottom:22px;font-weight:normal;letter-spacing:.5px}
+  h2{font-size:27px;color:var(--gold);margin-bottom:22px;font-weight:700;letter-spacing:-.3px}
   p{margin-bottom:18px}
-  .quote{border-left:3px solid var(--blue);padding:6px 0 6px 22px;margin:26px 0;
-    font-style:italic;color:#c8d6e5;font-size:20px}
+  .quote{border-left:3px solid var(--blue);padding:10px 0 10px 24px;margin:28px 0;
+    color:#e6eef8;font-size:20.5px;font-weight:600;line-height:1.6}
   .cards{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:24px 0}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px}
-  .card b{color:#fff;display:block;margin-bottom:6px;font-size:16px}
-  .card span{color:var(--muted);font-size:15px;font-family:system-ui,sans-serif;line-height:1.55;display:block}
+  .card b{color:#fff;display:block;margin-bottom:6px;font-size:16px;font-weight:600}
+  .card span{color:var(--muted);font-size:14.5px;line-height:1.6;display:block}
   .btns{display:flex;gap:14px;flex-wrap:wrap;margin-top:26px;justify-content:center}
   .btn{display:inline-block;padding:13px 26px;border-radius:8px;text-decoration:none;
-    font-family:system-ui,sans-serif;font-size:15px;font-weight:600}
+    font-size:15px;font-weight:600}
   .btn.p{background:var(--blue);color:#06121f}
   .btn.s{border:1px solid var(--line);color:var(--text);background:var(--panel)}
   .btn.g{background:#1d3324;color:var(--green);border:1px solid #295c3a}
   a{color:var(--blue)}
-  footer{padding:44px 0 60px;text-align:center;color:var(--muted);font-size:13.5px;font-family:system-ui,sans-serif}
+  footer{padding:44px 0 60px;text-align:center;color:var(--muted);font-size:13.5px}
+  .words{background:linear-gradient(180deg,#0e141d,#0b0f14);border:1px solid var(--line);
+    border-radius:14px;padding:30px 30px 12px;margin:8px 0}
+  .word{margin-bottom:22px}
+  .word .gr{color:var(--gold);font-size:23px;font-weight:700}
+  .word .ph{color:var(--muted);font-size:14px;font-style:italic;margin-left:8px}
+  .word .def{color:#c8d6e5;font-size:16px;margin-top:6px;line-height:1.65}
   footer p{margin-bottom:10px}
   .flag{font-size:15px;letter-spacing:3px;color:var(--muted)}
   [data-l]{display:none}
@@ -56,6 +83,7 @@
 <body>
 <header>
   <div class="wrap">
+    <img class="logo" src="neoethos-icon.png" alt="NeoEthos logo" width="96" height="96">
     <h1>NeoEthos</h1>
     <div class="tag" data-l="el">Ένα νέο ήθος για τις αγορές — από έναν απλό άνθρωπο, για όλους.</div>
     <div class="tag" data-l="en">A new ethos for the markets — from one ordinary man, for everyone.</div>
@@ -95,6 +123,30 @@
     <div class="quote">With hope, and with the fact that I never gave up, I wanted to stand — even as an experiment — before the rich and say: <b>leave something for the rest of us.</b></div>
     <p>I'm no hero and no genius. I'm what psychologists call "an ordinary person". But an ordinary person with stubbornness, with time that cost dearly to find, and with one principle: <b>never lie — not to others, and not to myself.</b></p>
   </div>
+</section>
+
+<section>
+  <h2 data-l="el">Δύο λέξεις που δεν μεταφράζονται</h2>
+  <h2 data-l="en">Two words that don't translate</h2>
+
+  <div data-l="el"><p>Το όνομα «NeoEthos» — «Νέο Ήθος» — κρύβει δύο ελληνικές λέξεις που καμία γλώσσα δεν μεταφράζει ακριβώς. Είναι η ψυχή του project.</p></div>
+  <div data-l="en"><p>The name "NeoEthos" — "New Ethos" — holds two Greek words no language translates exactly. They are the soul of this project.</p></div>
+
+  <div class="words">
+    <div class="word">
+      <span class="gr">ἦθος</span><span class="ph">êthos</span>
+      <div class="def" data-l="el">Ο χαρακτήρας. Ποιος είσαι πραγματικά όταν κανείς δεν σε βλέπει — όχι κανόνες που σου επιβάλλονται απ' έξω, αλλά η ηθική φύση σου από μέσα. Απ' αυτή τη λέξη γεννήθηκε η «ηθική» κάθε γλώσσας. Ένα λογισμικό με ήθος δεν λέει ψέματα, ακόμα κι όταν κανείς δεν θα το μάθαινε.</div>
+      <div class="def" data-l="en">Character. Who you truly are when no one is watching — not rules imposed from outside, but your moral nature from within. It is the root of the word "ethics" in every language. Software with <i>êthos</i> does not lie, even when no one would ever find out.</div>
+    </div>
+    <div class="word">
+      <span class="gr">φιλότιμο</span><span class="ph">philótimo</span>
+      <div class="def" data-l="el">Κατά λέξη «η αγάπη για την τιμή». Το ήσυχο χρέος να φέρεσαι σωστά στους άλλους — να μην τους απογοητεύεις, να δίνεις περισσότερα απ' όσα παίρνεις, ακόμα κι όταν σου κοστίζει. Θεωρείται από πολλούς η ύψιστη ελληνική αρετή, και είναι διάσημα «αμετάφραστη». Είναι ο λόγος που αυτό το εργαλείο δίνεται δωρεάν σε όποιον το χρειάζεται.</div>
+      <div class="def" data-l="en">Literally "the love of honor". The quiet duty to do right by others — to not let people down, to give more than you take, even when it costs you. Considered by many the highest Greek virtue, and famously "untranslatable". It is the reason this tool is given free to anyone who needs it.</div>
+    </div>
+  </div>
+
+  <div data-l="el"><p style="color:var(--muted);font-size:15.5px">«Νέο ήθος» δεν σημαίνει να πετάξουμε το παλιό. Σημαίνει να το θυμηθούμε — σε έναν κόσμο αγορών που το έχει ξεχάσει.</p></div>
+  <div data-l="en"><p style="color:var(--muted);font-size:15.5px">"New ethos" doesn't mean throwing away the old. It means remembering it — in a world of markets that has forgotten it.</p></div>
 </section>
 
 <section>
