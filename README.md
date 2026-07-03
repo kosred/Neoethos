@@ -8,7 +8,7 @@
 
 `100% Rust on the hot path` · `cTrader native` · `no Python at runtime` · `your machine, your data, your keys`
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) · [Latest release](../../releases/latest) · [Build from source](BUILDING.md)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) · [Latest release](../../releases/latest) · [Build from source](BUILDING.md) · [Principles](PRINCIPLES.md) · [Privacy](PRIVACY.md)
 
 </div>
 
@@ -22,7 +22,8 @@ NeoEthos is the refusal of that. It puts the *whole pipeline* — research, disc
 
 ## What it does
 
-- **Discovers strategies, doesn't ship guesses.** A genetic search breeds and tests strategies across timeframes, then survives them through **mandatory** walk-forward + CPCV out-of-sample gates so what reaches you has held up on data it never trained on.
+- **Discovers strategies, doesn't ship guesses.** A genetic search breeds and tests strategies across timeframes, then survives them through **five mandatory anti-overfitting gates** — walk-forward, CPCV, PBO/CSCV (López de Prado), a permutation test and a parameter-plateau test — so what reaches you has held up on data it never trained on. See [PRINCIPLES.md](PRINCIPLES.md).
+- **Shares compute, not secrets.** **Federation** (SETI@home-style): people who trust each other pool their machines for discovery — no server needed, and every imported result still passes every local gate before any real money.
 - **Two honest modes, one master switch.** You pick the goal; *the search, the models, and the risk all re-orient around it.*
 - **Sizes for survival.** Position size is a fraction of your *live* balance (it compounds as you grow), derived from each strategy's measured edge and the broker's real per-lot costs — not a fixed, account-blowing percentage.
 - **A real model ensemble.** XGBoost, CatBoost, LightGBM, neural nets (Burn), KAN, N-BEATS, TabNet, TiDE and more — native Rust, no GIL, no embedded Python on the hot path.
@@ -77,7 +78,20 @@ cargo run --release -p neoethos-cli
 
 ## Status
 
-**v0.5.0 — "everything works."** End to end: strategy discovery with enforced out-of-sample validation, both trading modes, risk-% sizing off the live balance, market + conditional orders, a bilingual desktop app, and a live TUI. The road ahead: broker-agnostic adapters → a mobile monitor → multi-node deployment.
+**v0.5.2 — "the honesty release."** The full five-gate validation stack (walk-forward, CPCV, PBO, permutation, plateau), verified backtest↔live parity, risk-constrained Kelly sizing on the empirical trade distribution, a prop-firm challenge simulator, auto-cull with a permanent blacklist + automatic re-discovery, and Federation Phase 0. The road ahead: federation P2P mesh (design in `docs/`) → broker-agnostic adapters → a mobile monitor.
+
+## Privacy
+
+**No telemetry. No tracking. No server. Nothing leaves your machine** except the connections *you* configure (your broker, optional news calendar, optional AI assistant with your own account). Every outbound connection is enumerated and auditable in [PRIVACY.md](PRIVACY.md) — and because this is AGPL, you can verify every claim in the source.
+
+## Support the project
+
+NeoEthos is built by one person on a 6-core mini PC, with no company behind it. If it's useful to you, you can help it survive:
+
+- ⭐ **Star the repo** — discoverability is oxygen for a project with no marketing budget
+- 🐛 **Run it on demo and report issues** — real-world reports are gold
+- 🖥 **Lend compute** to a federation group, or **contribute** ([CONTRIBUTING.md](CONTRIBUTING.md))
+- 💚 **Donate** — the Sponsor button above (when enabled) funds the electricity, the hardware, and the AI-assisted development that built this. No donation buys signals, promises, or influence over the math — the math is not for sale.
 
 ## License
 

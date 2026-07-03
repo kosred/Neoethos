@@ -27,6 +27,40 @@ always go through Tauri for a shippable app.
 
 ---
 
+## 1.5 Hardware guide — what you need for what
+
+NeoEthos was developed on a **6-core, €300 mini PC** — that is the honest
+baseline, not a marketing minimum. The engine follows a **never-OOM**
+discipline: peak memory adapts to *available* hardware, so a small machine
+gets slower, never crashes.
+
+| Use case | CPU | RAM | Disk | GPU |
+|---|---|---|---|---|
+| **Run the app + live trading** | 4 cores | 8 GB | ~5 GB (app + price data) | none |
+| **Strategy discovery (comfortable)** | 6–8 cores | 16–32 GB | ~20 GB data/cache | none needed |
+| **Serious discovery coverage** (many pairs × timeframes) | 16–32 cores | 64 GB | 50 GB+ | optional |
+| **Build from source** | any | 16 GB | **~150 GB free** for `target/` on a full release build (then `cargo clean`) | — |
+| **ML training (GPU lane)** | — | 32 GB+ | — | dedicated NVIDIA (CUDA); tested on RTX/A-series under Linux |
+
+Notes from real-world experience:
+
+- **Discovery scales with COVERAGE, not clock speed** — more (symbol,
+  timeframe) combos in parallel beat a deeper search on one. This is also
+  why the built-in **Federation** (Advanced → Federation) exists: several
+  small machines out-search one big one.
+- **Dense timeframes (M1–M5) are data-volume-bound**: on 6 cores a full M5
+  history run can take ~13 h. Use `Max rows` in Settings to cap it, or
+  federate.
+- **GPU**: CPU is the default and the reliable path. A *dedicated* NVIDIA
+  card under **Linux + CUDA** accelerates discovery evaluation; the
+  Windows Vulkan GPU lane is currently blocked by an upstream `wgpu`
+  incompatibility — leave compute on `auto`/`cpu` on Windows. **Never** pick
+  `gpu` on a shared-RAM integrated GPU (it competes with the engine's RAM).
+- **Laptops are fine** for running/trading; sustained discovery runs hot —
+  a desktop/mini-PC with decent airflow is kinder for multi-hour searches.
+
+---
+
 ## 2. Prerequisites (all platforms)
 
 - **Rust** — stable toolchain, recent enough for the **2024 edition** (Rust **1.85+**). Install via [rustup](https://rustup.rs/). On Windows use the **MSVC** toolchain (`x86_64-pc-windows-msvc`), not GNU.
@@ -61,8 +95,8 @@ brew install cmake node    # if not already present
 ## 3. Get the source
 
 ```bash
-git clone https://github.com/kosred/forex-ai.git   # or your fork
-cd forex-ai
+git clone https://github.com/kosred/Neoethos.git   # or your fork
+cd Neoethos
 ```
 
 ---

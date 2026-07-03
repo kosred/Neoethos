@@ -1,0 +1,10 @@
+# Enables GitHub's "Sponsor" button on the repository.
+#
+# MAINTAINER TODO (kosred): uncomment ONE OR MORE lines below after creating
+# the account(s). Ten-minute setup guides, in Greek, live in
+# docs/SUPPORT-SETUP.el.md.
+#
+# github: [kosred]          # GitHub Sponsors (needs Stripe onboarding — works in Greece)
+# ko_fi: kosred             # ko-fi.com — easiest to set up (PayPal/Stripe)
+# liberapay: kosred         # liberapay.com — open-source friendly, EU-based
+# custom: ["https://..."]   # any other donation link
