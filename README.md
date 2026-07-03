@@ -8,7 +8,7 @@
 
 `100% Rust on the hot path` · `cTrader native` · `no Python at runtime` · `your machine, your data, your keys`
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) · [Latest release](../../releases/latest) · [Build from source](BUILDING.md) · [Principles](PRINCIPLES.md) · [Privacy](PRIVACY.md)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) · [**The story ✦**](https://kosred.github.io/Neoethos/) · [Latest release](../../releases/latest) · [Build from source](BUILDING.md) · [Principles](PRINCIPLES.md) · [Privacy](PRIVACY.md)
 
 </div>
 
