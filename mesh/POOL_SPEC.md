@@ -713,3 +713,41 @@ problems above:
 one machine* becomes the island model — OOM-safe by the existing invariant,
 migration-synced (not determinism-synced), and resource-adaptive — which is a
 smaller, safer core change than the naive design, and is the specified Phase 1.
+
+### Rust ecosystem research (2026-07-03, verified on crates.io/docs.rs)
+
+The ecosystem confirms the direction; nothing drops in wholesale, and the
+useful pieces are young — so evaluate them behind the isolated sidecar, never
+in the engine hot path.
+
+- **GA / island model — `genetic_algorithms`** (crates.io) has an island model
+  with migration hooks (`IslandGaObserver`) + parallel evaluation. BUT it is
+  *local multi-thread*, not networked, and our GA is deeply custom (tied to our
+  eval/scoring/parity). **Verdict:** borrow the migration-operator DESIGN as a
+  reference; do NOT replace `neoethos-search`. Phase 1 (island migration) is
+  ours to build — no crate spares us the core change.
+- **Transport / gossip — `p2panda-net`** is built ON iroh (our exact stack):
+  gossip pub/sub + eventual-consistency sync + blobs + node discovery. It could
+  one day replace our hand-rolled gossip, but its APIs are **pre-1.0 (breaking
+  changes expected)**. **Verdict:** we already use iroh + iroh-gossip directly
+  and it works; revisit p2panda-net after it hits 1.0. `iroh-blobs` remains the
+  pick for large-artifact (model-weight) transfer.
+- **ML training (Phase 2) — this is where off-the-shelf Rust is strongest,
+  because we already use Burn:**
+  - **`burn-collective`** (OFFICIAL, Burn 0.19): `all_reduce` gradient sync,
+    classic data-parallel. Same framework we use. Caveat: *"young, performance
+    not yet satisfactory."* For a *trusted* cluster.
+  - **`burn_p2p`** (aberration-technology, pre-release): decentralized Burn
+    training with a trainer → reducer → **validator-quorum** canonical-head
+    model, mixed hardware/peer classes. This matches our *untrusted swarm*
+    exactly. Pre-release, but the closest architectural fit for distributing
+    OUR neural training over volunteer peers.
+  - **Strategic note:** distributing ML **training** may end up *easier* than
+    distributing the **GA** — because Burn already has (young) distributed
+    primitives, whereas the GA distribution is fully custom. When Phase 2
+    starts, evaluate `burn_p2p` first rather than hand-rolling.
+
+**Maturity caveat:** `burn-collective`, `burn_p2p`, and `p2panda-net` are all
+young/pre-1.0. They are the right DIRECTION and worth tracking, but adopting a
+churning dependency is itself risk — which is exactly why the mesh is an
+isolated sidecar with its own lockfile. Track them; adopt deliberately.
