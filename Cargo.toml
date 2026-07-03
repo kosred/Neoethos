@@ -30,7 +30,7 @@ default-members = [
 # workspace + Cargo.lock under mesh/, so its bleeding-edge iroh/QUIC dependency
 # tree can never conflict with this workspace's pinned GPU/ML stack. Excluded
 # here so no root `cargo` command ever pulls it into the engine's build.
-exclude = ["mesh"]
+exclude = ["mesh", "mcp"]
 
 [workspace.package]
 edition = "2024"

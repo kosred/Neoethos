@@ -1,0 +1,41 @@
+# NeoEthos MCP — the Model Context Protocol sidecar.
+#
+# DELIBERATELY ISOLATED: its OWN workspace + Cargo.lock, excluded from the main
+# workspace. The `rmcp` (official MCP SDK) dependency tree never touches the
+# trading engine's pinned GPU/ML/rustls stack. The app's Supervisor/Codex calls
+# this over localhost HTTP; a bug here crashes only this process.
+[workspace]
+
+[package]
+name = "neoethos-mcp"
+version = "0.1.0"
+description = "NeoEthos MCP sidecar — bridges Codex/Supervisor to MCP tools (cTrader, filesystem, web) via the official rmcp SDK"
+authors = ["NeoEthos"]
+license = "AGPL-3.0-or-later"
+edition = "2024"
+rust-version = "1.91"
+
+[[bin]]
+name = "neoethos-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# Official Model Context Protocol SDK (client role + HTTP & child-process
+# transports for remote servers like cTrader and local ones like filesystem).
+rmcp = { version = "2.1", features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "transport-child-process",
+    "macros",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time"] }
+# Local HTTP API the app/Supervisor calls (list tools / invoke a tool).
+axum = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2

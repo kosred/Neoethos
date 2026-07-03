@@ -1,0 +1,26 @@
+{
+  "_comment": "Copy to mcp_servers.json (next to the neoethos-mcp binary, or pass --config PATH). Each server is connected on startup; the app's Supervisor/Codex sees their tools via GET /tools and invokes them via POST /call.",
+  "port": 7431,
+  "servers": [
+    {
+      "name": "ctrader",
+      "transport": "http",
+      "url": "https://mcp.spotware.com/mcp",
+      "_note": "cTrader official remote MCP (AI Agent Connect). Authenticates against cTrader Web on first use — a separate consent surface from the app's OAuth token; never share tokens across paths."
+    },
+    {
+      "name": "filesystem",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "_note": "Official filesystem MCP server, scoped to the given directory. Change '.' to the path you want the assistant to read/write."
+    },
+    {
+      "name": "web",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+      "_note": "Example web-search MCP (Brave). Requires the server's own API key in its environment. Swap for any web-search MCP server you prefer."
+    }
+  ]
+}
