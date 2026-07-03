@@ -42,6 +42,7 @@ pub mod data_control;
 pub mod errors;
 pub mod diagnostics;
 pub mod engines_control;
+pub mod federation;
 pub mod hardware;
 pub mod health;
 pub mod indicators;
@@ -180,6 +181,13 @@ pub fn router(state: AppApiState) -> Router {
         .route("/autonomous/tailrisk", get(autonomous::tail_risk))
         // First-passage prop-firm challenge simulation (pass% per sizing).
         .route("/autonomous/challenge", get(autonomous::challenge))
+        // Federation Phase 0 — any instance can coordinate; workers point at it.
+        .route("/federation/status", get(federation::fed_status))
+        .route("/federation/jobs", post(federation::fed_set_jobs))
+        .route("/federation/job", get(federation::fed_next_job))
+        .route("/federation/submit", post(federation::fed_submit))
+        .route("/federation/worker/start", post(federation::fed_worker_start))
+        .route("/federation/worker/stop", post(federation::fed_worker_stop))
         // Offline learning report from live experience (never touches live).
         .route(
             "/experience/train",

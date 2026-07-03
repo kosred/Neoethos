@@ -612,6 +612,23 @@ export type ChallengeReport = {
 export const challengeSim = (portfolio: string) =>
   apiGet<ChallengeReport>(`/autonomous/challenge?portfolio=${encodeURIComponent(portfolio)}`);
 
+// ── Federation Phase 0 — serverless shared discovery (SETI@home-style) ─────
+export type FedJob = { symbol: string; baseTf: string };
+export type FedStatus = {
+  jobsQueued: number;
+  leases: { job: FedJob; worker: string; leasedAtUnixMs: number }[];
+  received: { worker: string; symbol: string; baseTf: string; savedPath: string; receivedAtUnixMs: number }[];
+  tokenRequired: boolean;
+  workerRunning: boolean;
+  workerStatus: string;
+};
+export const federationStatus = () => apiGet<FedStatus>("/federation/status");
+export const federationSetJobs = (combos: FedJob[], token?: string) =>
+  apiPost<{ queued: number }>("/federation/jobs", { combos, token });
+export const federationWorkerStart = (coordinatorUrl: string, workerId?: string, token?: string) =>
+  apiPost<{ started: boolean }>("/federation/worker/start", { coordinatorUrl, workerId, token });
+export const federationWorkerStop = () => apiPost<{ stopped: boolean }>("/federation/worker/stop");
+
 // ── Autonomous LLM supervisor ───────────────────────────────────────────────
 export type SupervisorConfig = { enabled: boolean; intervalMinutes: number; maxActionsPerTick: number; directives: string[] };
 export type SupervisorLogEntry = {

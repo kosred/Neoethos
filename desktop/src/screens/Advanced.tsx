@@ -1,7 +1,121 @@
 import { useEffect, useState } from "react";
-import { settings, updateSettings, settingsRaw, saveSettingsRaw, knobCatalog, diagnosticsReport, riskInfo } from "../api";
+import {
+  settings, updateSettings, settingsRaw, saveSettingsRaw, knobCatalog, diagnosticsReport, riskInfo,
+  federationStatus, federationSetJobs, federationWorkerStart, federationWorkerStop, type FedStatus,
+} from "../api";
 import { usePoll } from "../hooks";
 import { HelpPanel, HelpStep, Tip } from "../components/Help";
+
+// Federation Phase 0 — share compute with other NeoEthos users, no server:
+// one instance plays COORDINATOR (sets a work plan, receives results); any
+// number of WORKERS point at its URL and contribute their cores.
+function FederationPanel() {
+  const { data: fed, reload } = usePoll<FedStatus>(federationStatus, 15000);
+  const [combosText, setCombosText] = useState("EURUSD M15\nGBPUSD M15\nUSDJPY H1");
+  const [token, setToken] = useState("");
+  const [coordUrl, setCoordUrl] = useState("");
+  const [workerId, setWorkerId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const publishJobs = async () => {
+    const combos = combosText
+      .split("\n")
+      .map((l) => l.trim().split(/[\s,]+/))
+      .filter((p) => p.length >= 2)
+      .map(([symbol, baseTf]) => ({ symbol, baseTf }));
+    if (combos.length === 0) { setMsg("Write one combo per line, e.g. EURUSD M15"); return; }
+    setBusy(true);
+    try {
+      const r = await federationSetJobs(combos, token.trim() || undefined);
+      setMsg(`✓ Work plan published — ${r.queued} combos queued for workers.`);
+      await reload();
+    } catch (e) { setMsg(`Publish failed: ${e}`); } finally { setBusy(false); }
+  };
+
+  const startWorker = async () => {
+    if (!coordUrl.trim()) { setMsg("Enter the coordinator URL first (e.g. http://100.x.y.z:PORT)."); return; }
+    setBusy(true);
+    try {
+      await federationWorkerStart(coordUrl.trim(), workerId.trim() || undefined, token.trim() || undefined);
+      setMsg("✓ Worker started — this machine now contributes its cores.");
+      await reload();
+    } catch (e) { setMsg(`Worker start failed: ${e}`); } finally { setBusy(false); }
+  };
+
+  const stopWorker = async () => {
+    setBusy(true);
+    try { await federationWorkerStop(); setMsg("Worker stopping…"); await reload(); }
+    catch (e) { setMsg(`Stop failed: ${e}`); } finally { setBusy(false); }
+  };
+
+  return (
+    <div>
+      <h2>Federation <span className="badge demo">PHASE 0</span></h2>
+      <p className="muted small">
+        SETI@home for strategy discovery — share compute with people you trust, no server needed.
+        One instance is the <b>coordinator</b> (publishes a work plan below and receives results into
+        <code> cache/federation_inbox</code> — they appear in the normal strategy list and still pass every
+        local gate before any real money). Others run as <b>workers</b>: they fetch a combo, run their own
+        Discovery on it, and send the result back. Expose the coordinator with Tailscale / port-forward;
+        set a shared token so only your group can submit.
+      </p>
+      {msg && <div className="banner info">{msg}</div>}
+
+      <div className="ticket">
+        <b>Coordinator — publish a work plan</b>
+        <div className="ticket-row" style={{ alignItems: "flex-end", flexWrap: "wrap", gap: 12 }}>
+          <label>
+            Combos (one per line: SYMBOL TF)
+            <textarea value={combosText} onChange={(e) => setCombosText(e.target.value)} spellCheck={false}
+              style={{ minWidth: 240, minHeight: 70, fontFamily: "inherit", fontSize: 13 }} />
+          </label>
+          <label>Shared token (optional)
+            <input type="text" value={token} onChange={(e) => setToken(e.target.value)} style={{ width: 160 }} />
+          </label>
+          <button className="primary" disabled={busy} onClick={publishJobs}>Publish work plan</button>
+        </div>
+        {fed && (
+          <p className="muted small" style={{ marginTop: 6 }}>
+            Queue: <b>{fed.jobsQueued}</b> · leased: <b>{fed.leases.length}</b> · received: <b>{fed.received.length}</b>
+            {fed.tokenRequired ? " · token required" : " · open (no token)"}
+          </p>
+        )}
+        {fed && fed.received.length > 0 && (
+          <table className="tbl">
+            <thead><tr><th>When</th><th>Worker</th><th>Combo</th><th>Saved</th></tr></thead>
+            <tbody>
+              {fed.received.slice(0, 10).map((r, i) => (
+                <tr key={i}>
+                  <td className="muted small">{new Date(r.receivedAtUnixMs).toLocaleString()}</td>
+                  <td>{r.worker}</td>
+                  <td>{r.symbol} {r.baseTf}</td>
+                  <td className="muted small" style={{ maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.savedPath}>{r.savedPath.split(/[\\/]/).pop()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="ticket" style={{ marginTop: 10 }}>
+        <b>Worker — contribute this machine {fed?.workerRunning && <span className="badge live">RUNNING</span>}</b>
+        <div className="ticket-row" style={{ alignItems: "flex-end", flexWrap: "wrap", gap: 12 }}>
+          <label>Coordinator URL
+            <input type="text" placeholder="http://100.x.y.z:PORT" value={coordUrl} onChange={(e) => setCoordUrl(e.target.value)} style={{ width: 230 }} />
+          </label>
+          <label>Worker name (optional)
+            <input type="text" placeholder="konstantinos-minipc" value={workerId} onChange={(e) => setWorkerId(e.target.value)} style={{ width: 170 }} />
+          </label>
+          {fed?.workerRunning
+            ? <button className="danger" disabled={busy} onClick={stopWorker}>Stop worker</button>
+            : <button className="primary" disabled={busy} onClick={startWorker}>Start worker</button>}
+        </div>
+        {fed?.workerStatus && <p className="muted small" style={{ marginTop: 6 }}>{fed.workerStatus}</p>}
+      </div>
+    </div>
+  );
+}
 
 // Form-driven config editor over the SAFE, typed /settings DTO — no raw-YAML
 // hand-editing needed for the common knobs. Each field maps to a DTO key
@@ -211,6 +325,8 @@ export default function Advanced() {
           </div>
         </div>
       ))}
+
+      <FederationPanel />
 
       <h2>
         Raw config.yaml + knob catalog
