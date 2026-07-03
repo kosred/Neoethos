@@ -31,6 +31,9 @@ futures-lite = "2"
 bytes = "1"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+# In-memory tar of the model directory for training-result transfer.
+tar = "0.4"
+base64 = "0.22"
 anyhow = "1"
 rand = "0.8"
 hex = "0.4"

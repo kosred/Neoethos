@@ -72,7 +72,16 @@ fn scan_intelligence() -> anyhow::Result<IntelligenceDto> {
     // install so a non-default `--config` flag still works.
     let _settings = Settings::from_yaml(super::state::current_config_path()).ok();
     let models_dir = std::path::PathBuf::from("models");
-    let models_dir_str = models_dir.display().to_string();
+    // Absolute path so out-of-process helpers (the P2P mesh sidecar) can locate
+    // the model store to transfer trained models. Falls back to the relative
+    // form if the CWD is somehow unreadable.
+    let models_dir_str = std::fs::canonicalize(&models_dir)
+        .ok()
+        .map(|p| p.display().to_string().trim_start_matches(r"\\?\").to_string())
+        .or_else(|| {
+            std::env::current_dir().ok().map(|c| c.join("models").display().to_string())
+        })
+        .unwrap_or_else(|| models_dir.display().to_string());
     if !models_dir.exists() {
         return Ok(IntelligenceDto {
             models_dir: models_dir_str,
