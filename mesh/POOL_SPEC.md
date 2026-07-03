@@ -751,3 +751,61 @@ in the engine hot path.
 young/pre-1.0. They are the right DIRECTION and worth tracking, but adopting a
 churning dependency is itself risk — which is exactly why the mesh is an
 isolated sidecar with its own lockfile. Track them; adopt deliberately.
+
+### Concrete GA design from the literature (deeper research 2026-07-03)
+
+The distributed-island-GA literature gives us specific, actionable settings —
+and it maps cleanly onto our gossip layer:
+
+- **ASYNCHRONOUS migration, not synchronous.** Islands evolve independently and
+  insert a migrant *whenever it arrives* (no barrier, no waiting). This is the
+  only model that scales in a large volunteer environment, and it fits
+  iroh-gossip exactly (messages arrive asynchronously). The EvAg result is
+  striking for us: leaving async scheduling to the platform lets the model
+  *"scale seamlessly on desktop computers without any effort from the
+  practitioner"* — i.e. our exact 1000-mini-PC scenario. (Refs 1, 6; survey
+  arXiv:2304.05811; "Analyzing sync vs async parallel distributed GAs".)
+- **Migration INTERVAL dominates; migration SIZE is minor.** Research is
+  consistent: how OFTEN you migrate matters far more than how MANY you send.
+  Practical setting: migrate every **N generations** (a tunable, start ~10–25),
+  send only a **few elites** (1–4). Low bandwidth, big diversity effect.
+  (arXiv:1004.4541 "On the Impact of Migration Topology"; "Influence of
+  Migration Intervals".)
+- **Elitist send, replace-worst-if-better.** From each island send its BEST
+  individuals; an incoming migrant replaces the island's WORST *only if it is
+  better*. Simple, proven, and monotone-safe.
+- **Topology = the gossip network.** We don't need an explicit ring/torus:
+  broadcasting a handful of elites to the shared topic gives panmictic
+  migration (every node sees them), which the literature treats as the
+  complete-graph case. If bandwidth ever bites, switch to a ring by only
+  accepting migrants from K peers. Start panmictic (simplest), refine later.
+- **EvoSpace / pool alternative.** Instead of strict islands, a shared "pool"
+  of individuals that any worker pulls from, evolves, and pushes back
+  (coordinator-light). This is the model the top of this spec describes; it and
+  the island model converge in practice on a gossip substrate. Either is valid;
+  islands are the smaller change to our existing per-node GA.
+
+**Our Phase-1 recipe, concretely:** each node runs its normal
+`neoethos-search` GA on the combo (island), unchanged and never-OOM; every N
+generations it gossips its top few genes as `Migrant` messages; on receipt, a
+node injects a migrant into its population, replacing its worst if the migrant
+scores better (re-scored locally on that node's data — the same deterministic
+re-verification doctrine, so no trust needed). The ONLY core-engine change is a
+small hook to inject external genes into the population between generations — no
+shared RNG, no barrier, no determinism requirement.
+
+### Training distribution — the safe path (iroh-blobs verified compatible)
+
+Confirmed: **`iroh-blobs` 0.103 requires iroh ^1.0** → compatible with our
+mesh's iroh 1.0.1. So model-weight transfer needs NO engine change and NO
+version conflict — it lives entirely in the isolated sidecar:
+
+- **Compute offload already works today**: a training job runs on the worker
+  via `/engines/training/start` (the expensive GPU/CPU part), never-OOM.
+- **Model return** = the worker publishes the trained model directory as a
+  BLAKE3-verified iroh-blob and gossips the ticket; the coordinator fetches it
+  and saves it to its local model store. Pure transport, engine untouched.
+- **When to reach for `burn_p2p` instead**: only if we ever want *fine-grained*
+  gradient all-reduce (one model trained collectively). That is a much deeper,
+  engine-level change; the coarse "each node trains whole models, share via
+  blobs" path above is the safe first win and needs zero engine edits.
