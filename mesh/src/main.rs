@@ -52,12 +52,23 @@ const PEER_TTL: Duration = Duration::from_secs(180);
 struct Announce {
     node_id: String,
     cpu_cores: u32,
+    ram_mb: u64,
     gpu: bool,
     work_types: Vec<String>,
     app_online: bool,
     /// True when this node's local app has queued federated jobs.
     has_work: bool,
     ts: u64,
+}
+
+/// This machine's real hardware, read once from the local app's `/hardware`
+/// (falls back to core count if the app is offline). This is what the node
+/// contributes to the swarm's total capacity.
+#[derive(Debug, Clone, Copy)]
+struct HwCaps {
+    cpu_cores: u32,
+    ram_mb: u64,
+    gpu: bool,
 }
 
 /// One unit of work (mirrors the app's FedJob; work_type: discovery|training).
@@ -95,9 +106,9 @@ enum MeshResp {
 
 #[derive(Debug, Clone)]
 struct PeerInfo {
-    /// Advertised cores — reserved for capability-matched job routing (Phase D).
-    #[allow(dead_code)]
     cpu_cores: u32,
+    ram_mb: u64,
+    gpu: bool,
     app_online: bool,
     has_work: bool,
     last_seen: Instant,
@@ -207,6 +218,28 @@ impl AppClient {
             .build()
             .expect("reqwest client");
         Self { http, base }
+    }
+
+    /// This machine's real hardware from the app's `/hardware`. Falls back to
+    /// the local logical core count (RAM 0, no GPU) when the app is offline.
+    async fn hardware(&self) -> HwCaps {
+        let fallback = HwCaps {
+            cpu_cores: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1),
+            ram_mb: 0,
+            gpu: false,
+        };
+        let Ok(r) = self.http.get(format!("{}/hardware", self.base)).send().await else {
+            return fallback;
+        };
+        let Ok(v) = r.json::<serde_json::Value>().await else {
+            return fallback;
+        };
+        HwCaps {
+            cpu_cores: v.pointer("/cpu/coresLogical").and_then(|x| x.as_u64())
+                .map(|c| c as u32).unwrap_or(fallback.cpu_cores),
+            ram_mb: v.pointer("/ram/totalMb").and_then(|x| x.as_u64()).unwrap_or(0),
+            gpu: v.pointer("/gpu/available").and_then(|x| x.as_bool()).unwrap_or(false),
+        }
     }
 
     /// (app_online, has_queued_work)
@@ -494,11 +527,11 @@ async fn main() -> Result<()> {
 
     let peers: Peers = Arc::new(Mutex::new(HashMap::new()));
 
-    // Announce loop.
+    // Announce loop — broadcast this node's REAL hardware so the swarm knows
+    // its total capacity (cores / RAM / GPUs), plus liveness + has_work.
     {
         let app = app.clone();
         let id = my_id_str.clone();
-        let cpu = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
         tokio::spawn(async move {
             // 20s keeps discovery responsive when a new peer joins between
             // ticks; the payload is a few hundred bytes, so bandwidth is a
@@ -507,10 +540,12 @@ async fn main() -> Result<()> {
             loop {
                 tick.tick().await;
                 let (online, has_work) = app.status().await;
+                let hw = app.hardware().await;
                 let ann = Announce {
                     node_id: id.clone(),
-                    cpu_cores: cpu,
-                    gpu: false,
+                    cpu_cores: hw.cpu_cores,
+                    ram_mb: hw.ram_mb,
+                    gpu: hw.gpu,
                     work_types: vec!["discovery".into()],
                     app_online: online,
                     has_work,
@@ -535,15 +570,60 @@ async fn main() -> Result<()> {
                                 id,
                                 PeerInfo {
                                     cpu_cores: a.cpu_cores,
+                                    ram_mb: a.ram_mb,
+                                    gpu: a.gpu,
                                     app_online: a.app_online,
                                     has_work: a.has_work,
                                     last_seen: Instant::now(),
                                 },
                             );
-                            tracing::info!(peer = %a.node_id, cores = a.cpu_cores, has_work = a.has_work, "peer announce");
+                            tracing::info!(peer = %a.node_id, cores = a.cpu_cores, ram_mb = a.ram_mb, gpu = a.gpu, has_work = a.has_work, "peer announce");
                         }
                     }
                 }
+            }
+        });
+    }
+
+    // Swarm-capacity summary — the whole point: the swarm reported as ONE
+    // machine. Aggregates this node + every live peer, logs it, and writes a
+    // status file the app/UI can surface ("your swarm = N cores, M GB, K GPUs").
+    {
+        let peers = peers.clone();
+        let app = app.clone();
+        let me = my_id_str.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                let mine = app.hardware().await;
+                let (mut nodes, mut cores, mut ram_mb, mut gpus) = (1u64, mine.cpu_cores as u64, mine.ram_mb, mine.gpu as u64);
+                {
+                    let mut p = peers.lock().await;
+                    p.retain(|_, v| v.last_seen.elapsed() < PEER_TTL);
+                    for (_, v) in p.iter() {
+                        nodes += 1;
+                        cores += v.cpu_cores as u64;
+                        ram_mb += v.ram_mb;
+                        gpus += v.gpu as u64;
+                    }
+                }
+                tracing::info!(
+                    nodes, total_cores = cores, total_ram_gb = ram_mb / 1024, total_gpus = gpus,
+                    "SWARM CAPACITY — the network as one machine"
+                );
+                let snapshot = serde_json::json!({
+                    "nodes": nodes,
+                    "totalCores": cores,
+                    "totalRamGb": ram_mb as f64 / 1024.0,
+                    "totalGpus": gpus,
+                    "self": { "nodeId": me, "cores": mine.cpu_cores, "ramMb": mine.ram_mb, "gpu": mine.gpu },
+                    "ts": now_secs(),
+                });
+                let _ = std::fs::write(
+                    std::env::temp_dir().join("neoethos_mesh_swarm.json"),
+                    snapshot.to_string(),
+                );
             }
         });
     }
