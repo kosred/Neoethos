@@ -629,6 +629,16 @@ export const federationWorkerStart = (coordinatorUrl: string, workerId?: string,
   apiPost<{ started: boolean }>("/federation/worker/start", { coordinatorUrl, workerId, token });
 export const federationWorkerStop = () => apiPost<{ stopped: boolean }>("/federation/worker/stop");
 
+// The mesh sidecar's aggregated swarm capacity — the network as one machine.
+export type SwarmCapacity = {
+  running: boolean;
+  nodes: number;
+  totalCores: number;
+  totalRamGb?: number;
+  totalGpus?: number;
+};
+export const swarmCapacity = () => apiGet<SwarmCapacity>("/mesh/swarm");
+
 // ── Autonomous LLM supervisor ───────────────────────────────────────────────
 export type SupervisorConfig = { enabled: boolean; intervalMinutes: number; maxActionsPerTick: number; directives: string[] };
 export type SupervisorLogEntry = {

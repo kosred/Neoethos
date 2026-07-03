@@ -188,6 +188,8 @@ pub fn router(state: AppApiState) -> Router {
         .route("/federation/submit", post(federation::fed_submit))
         .route("/federation/worker/start", post(federation::fed_worker_start))
         .route("/federation/worker/stop", post(federation::fed_worker_stop))
+        // Aggregated swarm capacity (the network as one machine) from the mesh.
+        .route("/mesh/swarm", get(federation::swarm_capacity))
         // Offline learning report from live experience (never touches live).
         .route(
             "/experience/train",

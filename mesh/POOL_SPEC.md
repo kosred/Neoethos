@@ -669,6 +669,47 @@ identically on every node.
   and `p2panda-net` (gossip built ON iroh) as building blocks — each a real
   integration, not a shortcut.
 
-**Bottom line:** the swarm *sees itself as one machine* today; *computing as
-one machine* (Phase 1) is the next dedicated, simulation-first project on the
-core engine — specified here, deliberately not rushed.
+### Operator refinement (2026-07-03) — the ISLAND MODEL resolves all three
+
+The operator's insight redirects Phase 1 from fragile per-generation
+evaluation-sync to a robust **island model**, which resolves the three hard
+problems above:
+
+- **On #2 (OOM per node) — ALREADY GUARANTEED.** The engine's never-OOM
+  invariant (`cubecl_eval.rs::auto_tune_memory_budgets`, ~1691) caps each
+  node's resident RAM to ~25% of ITS available RAM, clamped [256 MB, 4 GB]:
+  *"a 1 GB box still runs (tiny chunks, slow but never OOM)"*. So growing the
+  GLOBAL search (more generations / islands) never grows any single node's
+  memory — each node holds only ITS island, sized to ITS hardware. Small
+  8 GB nodes participate safely by construction. This is the invariant that
+  makes the whole vision possible.
+- **On #1 (deterministic sync) — the island model makes it EASY.** Islands do
+  NOT need byte-identical generations. Each node evolves its own island
+  independently and, every N generations, gossips its **elites** (a few best
+  genomes) as migrants; other nodes import them. Migration is tiny and
+  occasional, so "near-real-time" sync is trivial — no cross-node determinism
+  required. This is the EvAg / GoDE approach the research confirmed, and it
+  sidesteps the hardest part of the naive design.
+- **On #3 (help everywhere) — resource-adaptive breadth.** More nodes = more
+  islands = broader, more diverse search — automatically, on ANY combo (not
+  just slow ones), because islands are independent (no per-generation latency
+  tax). The app reads the swarm capacity (already written to
+  `neoethos_mesh_swarm.json`) and **auto-scales search breadth** (island count
+  / candidate count / combos in flight) to the visible total resources — while
+  each node stays never-OOM. The extra compute is always usable.
+
+**Revised Phase 1 (island model over the mesh):**
+1. Each node runs one or more GA islands on a shared combo, each sized to its
+   own RAM (never-OOM, already guaranteed).
+2. Elites migrate over gossip every N generations (small, infrequent).
+3. The app scales the number of islands / search breadth to the swarm's total
+   capacity. NOTE: the GA has no island primitive today — importing migrant
+   genomes into the population is the core-engine change, but it is FAR smaller
+   and safer than per-generation evaluation-sync, and needs no shared RNG.
+4. Build it simulation-first (two islands in one process, migration between
+   them) → 2 machines → many.
+
+**Bottom line:** the swarm *sees itself as one machine* today. *Computing as
+one machine* becomes the island model — OOM-safe by the existing invariant,
+migration-synced (not determinism-synced), and resource-adaptive — which is a
+smaller, safer core change than the naive design, and is the specified Phase 1.

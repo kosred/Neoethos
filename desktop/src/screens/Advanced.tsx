@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   settings, updateSettings, settingsRaw, saveSettingsRaw, knobCatalog, diagnosticsReport, riskInfo,
-  federationStatus, federationSetJobs, federationWorkerStart, federationWorkerStop, type FedStatus,
+  federationStatus, federationSetJobs, federationWorkerStart, federationWorkerStop, swarmCapacity,
+  type FedStatus, type SwarmCapacity,
 } from "../api";
 import { usePoll } from "../hooks";
 import { HelpPanel, HelpStep, Tip } from "../components/Help";
@@ -11,6 +12,7 @@ import { HelpPanel, HelpStep, Tip } from "../components/Help";
 // number of WORKERS point at its URL and contribute their cores.
 function FederationPanel() {
   const { data: fed, reload } = usePoll<FedStatus>(federationStatus, 15000);
+  const { data: swarm } = usePoll<SwarmCapacity>(swarmCapacity, 15000);
   const [combosText, setCombosText] = useState("EURUSD M15\nGBPUSD M15\nUSDJPY H1");
   const [token, setToken] = useState("");
   const [coordUrl, setCoordUrl] = useState("");
@@ -61,6 +63,22 @@ function FederationPanel() {
         set a shared token so only your group can submit.
       </p>
       {msg && <div className="banner info">{msg}</div>}
+
+      {swarm?.running && (
+        <div className="ticket" style={{ borderColor: "#295c3a", background: "#0e1a12" }}>
+          <b>🖥 Your swarm — the network as one machine</b>
+          <div className="cards" style={{ gridTemplateColumns: "repeat(4, 1fr)", marginTop: 8 }}>
+            <div className="card"><div className="card-label">Nodes</div><div className="card-value">{swarm.nodes}</div></div>
+            <div className="card"><div className="card-label">Total cores</div><div className="card-value" style={{ color: "#4ade80" }}>{swarm.totalCores}</div></div>
+            <div className="card"><div className="card-label">Total RAM</div><div className="card-value">{swarm.totalRamGb ? `${swarm.totalRamGb.toFixed(0)} GB` : "—"}</div></div>
+            <div className="card"><div className="card-label">GPUs</div><div className="card-value">{swarm.totalGpus ?? 0}</div></div>
+          </div>
+          <p className="muted small" style={{ marginTop: 6 }}>
+            Aggregated by the P2P mesh sidecar. Each node stays never-OOM (memory capped to its own hardware);
+            more nodes = broader search the app can scale into.
+          </p>
+        </div>
+      )}
 
       <div className="ticket">
         <b>Coordinator — publish a work plan</b>
