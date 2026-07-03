@@ -1,18 +1,18 @@
-# NeoEthos Mesh — the P2P sidecar
+# NeoEthos Mesh — the fully-automatic P2P sidecar
 
 > **The rich buy server farms. We share.**
-> This is the path that lets NeoEthos users on the open internet pool their
-> compute for strategy discovery — with no central server, and without anyone
-> needing a public IP.
+> NeoEthos users pool their compute for strategy discovery over the open
+> internet — **no server, no port-forwarding, no Tailscale, no human in the
+> loop.** A node just starts and joins the swarm.
 
 ## Why it's a separate program (read this first)
 
 The NeoEthos trading engine sits on a delicately pinned dependency stack
 (GPU/cubecl/burn, specific rustls/reqwest versions). `iroh` — the P2P library
-this uses — drags in a large, fast-moving tree (QUIC/quinn, its own rustls
-generation). Linking that into the engine would risk exactly the disaster the
-project must never allow: **one dependency conflict setting the whole thing
-back months.**
+this uses — brings its own large, fast-moving tree (QUIC/quinn, its own rustls
+generation). Linking that into the engine would risk the one thing the project
+must never allow: **one dependency conflict setting the whole thing back
+months.**
 
 So the mesh is a **completely isolated binary**:
 
@@ -21,89 +21,86 @@ So the mesh is a **completely isolated binary**:
 - it is listed under `exclude` in the root `Cargo.toml`, so no root `cargo`
   command ever builds it into the engine;
 - it talks to the running NeoEthos app **only over the localhost HTTP API**
-  (`/federation/*`, the endpoints shipped in v0.5.2).
+  (`/federation/*`, shipped in v0.5.2).
 
 **A bug in here can crash this process and nothing else.** The trading engine
 never even links against iroh. That is the whole design.
 
-## Status: Phase A (identity + connectivity) — DONE
+Built on **iroh 1.0** (edition 2024) — the current stable line.
 
-`neoethos-mesh` today:
+## How the automatic mesh works (no human in the loop)
 
-1. **Identity** — loads or creates a stable ed25519 key at
-   `<data-dir>/identity.key`; its public key is this node's permanent mesh
-   address.
-2. **Connectivity** — binds an iroh endpoint (QUIC + TLS 1.3) and comes online
-   via the default relay network, so the node is reachable by other NeoEthos
-   nodes anywhere, through NAT.
-3. **Bridge check** — verifies it can reach the local app's
-   `GET /federation/status`.
+1. **Identity** — a stable ed25519 key at `<data-dir>/identity.key`; its public
+   key is this node's permanent mesh address.
+2. **Automatic connectivity** — iroh's default relay network does NAT
+   hole-punching and address discovery (`discovery_n0`). The node becomes
+   reachable from anywhere with **zero network configuration** — no ports to
+   open, no VPN.
+3. **Automatic peer discovery** — every NeoEthos node subscribes to the SAME
+   fixed gossip *rendezvous topic* and periodically announces itself
+   (`{node_id, cpu_cores, work_types, app_online}`). Nodes learn about each
+   other with no manual setup.
+4. **Work bridge** — remote work requests are translated into calls to the
+   local app's `/federation/*` API, so all trading-critical logic stays in the
+   audited engine and every imported result still passes the local gates
+   (Strategy Lab, tail risk, blacklist, demo gate) before any real money.
+
+### The one unavoidable P2P detail: bootstrap
+
+Every serverless P2P network (Bitcoin, BitTorrent, IPFS) needs *some* first
+contact to join the swarm. NeoEthos uses **bootstrap seed nodes**: pass a
+comma-separated list of node ids in `NEOETHOS_MESH_SEEDS`. This is invisible to
+users — the app ships with community seed ids, or a group shares one. A node
+with no seeds still works; it simply waits to be found. (When you run a stable
+node with a public identity, share its id so others can seed off it.)
+
+## Build & run
 
 ```bash
-# Build (from this directory — its own isolated workspace):
-cargo build --release          # → target/release/neoethos-mesh
+# From THIS directory (its own isolated workspace):
+cargo build --release            # → target/release/neoethos-mesh
 
-# Run alongside a running NeoEthos app:
+# Run alongside a running NeoEthos app — that's all:
 ./target/release/neoethos-mesh --app-url http://127.0.0.1:<APP_PORT>
+
+# Optionally join faster via known seeds:
+NEOETHOS_MESH_SEEDS=<id1>,<id2> ./target/release/neoethos-mesh
 ```
 
 The app's HTTP port is ephemeral; the Federation panel (Advanced → Federation)
-is where the HTTP coordinator/worker already lives today.
+shows the local coordinator/worker that already runs today.
 
-**Distributed discovery already works today** over HTTP (Advanced →
-Federation) for a group that can reach one coordinator (Tailscale / port
-forward). This sidecar is the road to doing the same P2P over the open
-internet, serverless.
+## Roadmap — the work protocol (next)
 
-## Roadmap — Phases B–F (the spec, so anyone can continue)
+Discovery is automatic now. The remaining bricks distribute the actual work
+over the mesh (each testable, each keeping every result behind the local
+gates — the mesh changes transport, never trust):
 
-Each phase is independent and testable. Build them in order; keep every
-result flowing through the app's existing local gates (Strategy Lab, tail
-risk, blacklist, demo gate) — **the mesh changes transport, never trust.**
-
-- **Phase B — gossip announce/discover.** Use `iroh-gossip`. Topic
-  `neoethos/announce`: each node broadcasts `{node_id, capabilities
-  (cpu_cores, ram_gb, work_types, supported_symbols), rep, proto_ver}` every
-  ~5 min. Maintain a local peer table. Topic `neoethos/work/discovery`:
-  `need`/`offer` adverts for `(symbol, base_tf, seed)` combos.
-- **Phase C — the work protocol over QUIC streams (not gossip).** Signed
-  `claim → accept → result` messages (ed25519). Lease TTL (12 h) with
-  re-queue on expiry — mirror `app_services/federation.rs` semantics exactly,
-  since Phase 0 already proved them over HTTP.
-- **Phase D — capability matching.** Route GPU work only to GPU nodes,
-  discovery to CPU nodes; pick peers by capability + (later) reputation.
-- **Phase E — artifacts via `iroh-blobs`.** Portfolios/trades transferred as
-  BLAKE3-verified blobs; the requester downloads, then runs the SAME
-  deterministic verification as `federation::submit` before accepting.
-- **Phase F — trust & reputation.** Start with an explicit **allow-list of
-  node IDs** (small honest communities need nothing more). Add local
-  reputation scoring only if the allow-list stops scaling. Never build a
-  gameable global-consensus reputation before it's actually needed.
-
-### The bridge contract (mesh ⇄ app)
-
-The mesh never re-implements discovery. It calls the app it runs beside:
-
-| Mesh needs to… | Calls the local app |
-|---|---|
-| know what work to offer / results received | `GET /federation/status` |
-| publish the operator's work plan | `POST /federation/jobs` |
-| lease a combo to run locally | `GET /federation/job` |
-| run discovery for a claimed combo | `POST /engines/discovery/start` |
-| hand a peer's result to the local gates | `POST /federation/submit` |
-
-A remote peer's `claim/accept/result` is translated into these local HTTP
-calls. That keeps ALL trading-critical logic in the audited engine and this
-sidecar as pure transport.
+- **Work protocol** — signed `claim → accept → result` over iroh QUIC streams
+  (ALPN `neoethos/mesh/0`), leases with TTL + re-queue, mirroring the HTTP
+  Phase-0 semantics already proven in `app_services/federation.rs`.
+- **Capability matching** — GPU work to GPU nodes, discovery to CPU nodes.
+- **Artifacts via `iroh-blobs`** — BLAKE3-verified portfolio/trade transfer;
+  the requester re-runs the SAME deterministic verification as
+  `federation::submit` before accepting.
+- **Trust** — start with an allow-list of node ids; add reputation only if the
+  allow-list stops scaling.
 
 ## Hard lines (from PRINCIPLES.md and the design record)
 
 - **Strategies may be shared. Pooled profits may NOT be built into the
-  protocol** — that is collective-investment / regulated territory (see
-  `docs/p2p-mesh-design-2026-07-03.md` §4). The protocol carries strategies
+  protocol** — that is regulated collective-investment territory
+  (`docs/p2p-mesh-design-2026-07-03.md` §4). The protocol carries strategies
   and reputation only, never money.
 - Every imported result passes every local gate before any real money.
 - Retired (blacklisted) strategies stay dead even if a peer re-submits them.
+
+## Testing note
+
+Automatic connectivity + discovery compile and run; real cross-internet NAT
+traversal needs 2+ machines on different networks to exercise fully. Start two
+instances (different `--data-dir`) and watch them discover each other in the
+logs.
 
 ## License
 
