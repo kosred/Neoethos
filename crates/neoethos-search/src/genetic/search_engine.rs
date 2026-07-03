@@ -1575,6 +1575,21 @@ where
                 .then_with(|| a.1.cmp(&b.1))
         });
 
+        // Distributed island migration (OFF by default — no-op unless the mesh
+        // sidecar enabled it). Every INTERVAL generations, publish this
+        // island's top elites for the mesh to gossip to peer nodes. `scored`
+        // is sorted best-first, so the head is the elite set.
+        if super::migration::migration_enabled()
+            && generation % super::migration::INTERVAL == 0
+        {
+            let elites: Vec<Gene> = scored
+                .iter()
+                .take(super::migration::ELITES)
+                .map(|(_, _, g, _)| g.clone())
+                .collect();
+            super::migration::publish_elites(elites);
+        }
+
         let top_score = scored.first().map(|x| x.0).unwrap_or(f64::NEG_INFINITY);
         if top_score > best_score_seen + min_improvement {
             best_score_seen = top_score;
@@ -1848,6 +1863,19 @@ where
 
         let mut next = Vec::with_capacity(population);
         next.extend(survivors);
+
+        // Distributed island migration (OFF by default — no-op unless enabled).
+        // Fold a few elite genes received from peer islands into the next
+        // generation. They compete on THIS node's data in the upcoming
+        // evaluation (re-scored from scratch), so a bad/hostile migrant simply
+        // fails selection — no cross-node trust needed.
+        if super::migration::migration_enabled() {
+            let migrants = super::migration::take_incoming();
+            let room = population.saturating_sub(next.len());
+            for gene in migrants.into_iter().take(room.min(super::migration::ELITES)) {
+                next.push(gene);
+            }
+        }
 
         // **GA Fix C — diversity rescue (2026-05-26, taskdoc #275)**.
         // The Python prototype's reward-hack ("never trade → 0 DD →

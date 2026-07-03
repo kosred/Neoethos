@@ -61,6 +61,17 @@ struct Announce {
     ts: u64,
 }
 
+/// Tagged gossip payload — peer announcements AND island-migration elites
+/// share the one rendezvous topic.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "t")]
+enum GossipMsg {
+    Announce(Announce),
+    /// Elite genes migrating between GA islands. Opaque JSON here — the local
+    /// app deserializes them into real genes at `/mesh/migrants`.
+    Migrants { genes: serde_json::Value },
+}
+
 /// This machine's real hardware, read once from the local app's `/hardware`
 /// (falls back to core count if the app is offline). This is what the node
 /// contributes to the swarm's total capacity.
@@ -240,6 +251,29 @@ impl AppClient {
             ram_mb: v.pointer("/ram/totalMb").and_then(|x| x.as_u64()).unwrap_or(0),
             gpu: v.pointer("/gpu/available").and_then(|x| x.as_bool()).unwrap_or(false),
         }
+    }
+
+    /// Turn on island migration in the local GA (called once on startup).
+    async fn enable_migration(&self) {
+        let _ = self.http.post(format!("{}/mesh/migration/enable", self.base)).send().await;
+    }
+
+    /// Drain the local island's published elites (opaque gene JSON), if any.
+    async fn get_elites(&self) -> Option<serde_json::Value> {
+        let r = self.http.get(format!("{}/mesh/elites", self.base)).send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = r.json().await.ok()?;
+        match &v {
+            serde_json::Value::Array(a) if !a.is_empty() => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Inject a peer island's elites into the local GA's next generation.
+    async fn push_migrants(&self, genes: serde_json::Value) {
+        let _ = self.http.post(format!("{}/mesh/migrants", self.base)).json(&genes).send().await;
     }
 
     /// (app_online, has_queued_work)
@@ -540,6 +574,11 @@ async fn main() -> Result<()> {
             loop {
                 tick.tick().await;
                 let (online, has_work) = app.status().await;
+                // Enable island migration on the app as soon as it's reachable
+                // (idempotent) — a node in the swarm shares elites automatically.
+                if online {
+                    app.enable_migration().await;
+                }
                 let hw = app.hardware().await;
                 let ann = Announce {
                     node_id: id.clone(),
@@ -551,34 +590,50 @@ async fn main() -> Result<()> {
                     has_work,
                     ts: now_secs(),
                 };
-                if let Ok(json) = serde_json::to_vec(&ann) {
+                if let Ok(json) = serde_json::to_vec(&GossipMsg::Announce(ann)) {
                     let _ = sender.broadcast(Bytes::from(json)).await;
+                }
+                // Island migration: gossip this node's published elites, if any.
+                if let Some(elites) = app.get_elites().await {
+                    if let Ok(json) = serde_json::to_vec(&GossipMsg::Migrants { genes: elites }) {
+                        let _ = sender.broadcast(Bytes::from(json)).await;
+                    }
                 }
             }
         });
     }
 
-    // Discovery loop — maintain the peer table.
+    // Discovery loop — route gossip: peer announces → peer table; migrant
+    // elites → inject into the local GA.
     {
         let peers = peers.clone();
+        let app = app.clone();
         tokio::spawn(async move {
             while let Some(event) = receiver.next().await {
                 if let Ok(Event::Received(msg)) = event {
-                    if let Ok(a) = serde_json::from_slice::<Announce>(&msg.content) {
-                        if let Ok(id) = EndpointId::from_str(&a.node_id) {
-                            peers.lock().await.insert(
-                                id,
-                                PeerInfo {
-                                    cpu_cores: a.cpu_cores,
-                                    ram_mb: a.ram_mb,
-                                    gpu: a.gpu,
-                                    app_online: a.app_online,
-                                    has_work: a.has_work,
-                                    last_seen: Instant::now(),
-                                },
-                            );
-                            tracing::info!(peer = %a.node_id, cores = a.cpu_cores, ram_mb = a.ram_mb, gpu = a.gpu, has_work = a.has_work, "peer announce");
+                    match serde_json::from_slice::<GossipMsg>(&msg.content) {
+                        Ok(GossipMsg::Announce(a)) => {
+                            if let Ok(id) = EndpointId::from_str(&a.node_id) {
+                                peers.lock().await.insert(
+                                    id,
+                                    PeerInfo {
+                                        cpu_cores: a.cpu_cores,
+                                        ram_mb: a.ram_mb,
+                                        gpu: a.gpu,
+                                        app_online: a.app_online,
+                                        has_work: a.has_work,
+                                        last_seen: Instant::now(),
+                                    },
+                                );
+                                tracing::info!(peer = %a.node_id, cores = a.cpu_cores, ram_mb = a.ram_mb, gpu = a.gpu, has_work = a.has_work, "peer announce");
+                            }
                         }
+                        Ok(GossipMsg::Migrants { genes }) => {
+                            let n = genes.as_array().map(|a| a.len()).unwrap_or(0);
+                            app.push_migrants(genes).await;
+                            tracing::info!(count = n, "received migrant elites from a peer island → injected");
+                        }
+                        Err(_) => {}
                     }
                 }
             }

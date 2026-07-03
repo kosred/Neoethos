@@ -190,6 +190,10 @@ pub fn router(state: AppApiState) -> Router {
         .route("/federation/worker/stop", post(federation::fed_worker_stop))
         // Aggregated swarm capacity (the network as one machine) from the mesh.
         .route("/mesh/swarm", get(federation::swarm_capacity))
+        // Distributed island-model GA migration (mesh-driven; OFF until enabled).
+        .route("/mesh/migration/enable", post(federation::migration_enable))
+        .route("/mesh/elites", get(federation::migration_elites))
+        .route("/mesh/migrants", post(federation::migration_migrants))
         // Offline learning report from live experience (never touches live).
         .route(
             "/experience/train",
