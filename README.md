@@ -91,7 +91,7 @@ NeoEthos is built by one person on a 6-core mini PC, with no company behind it. 
 - ⭐ **Star the repo** — discoverability is oxygen for a project with no marketing budget
 - 🐛 **Run it on demo and report issues** — real-world reports are gold
 - 🖥 **Lend compute** to a federation group, or **contribute** ([CONTRIBUTING.md](CONTRIBUTING.md))
-- 💚 **Donate** — the Sponsor button above (when enabled) funds the electricity, the hardware, and the AI-assisted development that built this. No donation buys signals, promises, or influence over the math — the math is not for sale.
+- 💚 **Donate** — via [GitHub Sponsors](https://github.com/sponsors/kosred) (one-time or monthly). Donations fund the electricity, the hardware, and the AI-assisted development that built this. No donation buys signals, promises, or influence over the math — the math is not for sale.
 
 ## License
 
