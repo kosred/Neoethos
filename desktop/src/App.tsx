@@ -20,8 +20,7 @@ import News from "./screens/News";
 import AiDesk from "./screens/AiDesk";
 import Supervisor from "./screens/Supervisor";
 import Hardware from "./screens/Hardware";
-import Advanced from "./screens/Advanced";
-import Settings from "./screens/Settings";
+import Configuration from "./screens/Configuration";
 import Help from "./screens/Help";
 import "./App.css";
 
@@ -29,7 +28,7 @@ type View =
   | "help"
   | "cockpit" | "dashboard" | "markets" | "marketwatch" | "account" | "actions"
   | "autopilot" | "riskymode" | "risk" | "discovery" | "training" | "strategylab" | "strategyreport" | "intelligence"
-  | "files" | "data" | "news" | "aidesk" | "supervisor" | "hardware" | "advanced" | "settings";
+  | "files" | "data" | "news" | "aidesk" | "supervisor" | "hardware" | "settings";
 
 type NavEntry = { id: View; label: string; icon: string } | { divider: string };
 
@@ -61,7 +60,6 @@ const NAV: NavEntry[] = [
   { id: "supervisor", label: "Supervisor", icon: "🧭" },
   { divider: "System" },
   { id: "hardware", label: "Hardware", icon: "🖥" },
-  { id: "advanced", label: "Advanced", icon: "🔧" },
   { id: "settings", label: "Settings", icon: "⚙" },
 ];
 
@@ -87,8 +85,7 @@ const SCREENS: Record<View, ReactNode> = {
   aidesk: <AiDesk />,
   supervisor: <Supervisor />,
   hardware: <Hardware />,
-  advanced: <Advanced />,
-  settings: <Settings />,
+  settings: <Configuration />,
 };
 
 export default function App() {
