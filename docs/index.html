@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="el">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NeoEthos — Ένα νέο ήθος | A new ethos</title>
+<meta name="description" content="Open-source (AGPL) trading intelligence built by one person on a €300 mini PC — institutional-grade honesty for the small trader. Η αλήθεια ενός απλού ανθρώπου.">
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#111823; --panel2:#0e141d; --line:#1e2a3a;
+    --text:#dbe4ee; --muted:#8b98a9; --blue:#4da3ff; --gold:#e8c268; --green:#4ade80;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--text);font-family:Georgia,'Times New Roman',serif;line-height:1.75;font-size:18px}
+  .wrap{max-width:820px;margin:0 auto;padding:0 22px}
+  header{padding:84px 0 40px;text-align:center;border-bottom:1px solid var(--line);
+    background:radial-gradient(ellipse at 50% -20%, #14263f 0%, var(--bg) 60%)}
+  h1{font-size:56px;letter-spacing:1px;color:#fff}
+  .tag{color:var(--blue);font-size:22px;margin-top:10px;font-style:italic}
+  .sub{color:var(--muted);margin-top:18px;font-size:16px}
+  .langbar{margin-top:26px}
+  .langbar button{background:none;border:1px solid var(--line);color:var(--muted);
+    padding:7px 18px;font-size:14px;cursor:pointer;font-family:inherit}
+  .langbar button.on{color:#fff;border-color:var(--blue);background:#14263f}
+  .langbar button:first-child{border-radius:6px 0 0 6px}
+  .langbar button:last-child{border-radius:0 6px 6px 0}
+  section{padding:52px 0;border-bottom:1px solid var(--line)}
+  h2{font-size:26px;color:var(--gold);margin-bottom:22px;font-weight:normal;letter-spacing:.5px}
+  p{margin-bottom:18px}
+  .quote{border-left:3px solid var(--blue);padding:6px 0 6px 22px;margin:26px 0;
+    font-style:italic;color:#c8d6e5;font-size:20px}
+  .cards{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:24px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px}
+  .card b{color:#fff;display:block;margin-bottom:6px;font-size:16px}
+  .card span{color:var(--muted);font-size:15px;font-family:system-ui,sans-serif;line-height:1.55;display:block}
+  .btns{display:flex;gap:14px;flex-wrap:wrap;margin-top:26px;justify-content:center}
+  .btn{display:inline-block;padding:13px 26px;border-radius:8px;text-decoration:none;
+    font-family:system-ui,sans-serif;font-size:15px;font-weight:600}
+  .btn.p{background:var(--blue);color:#06121f}
+  .btn.s{border:1px solid var(--line);color:var(--text);background:var(--panel)}
+  .btn.g{background:#1d3324;color:var(--green);border:1px solid #295c3a}
+  a{color:var(--blue)}
+  footer{padding:44px 0 60px;text-align:center;color:var(--muted);font-size:13.5px;font-family:system-ui,sans-serif}
+  footer p{margin-bottom:10px}
+  .flag{font-size:15px;letter-spacing:3px;color:var(--muted)}
+  [data-l]{display:none}
+  html.el [data-l="el"]{display:block}
+  html.en [data-l="en"]{display:block}
+  span[data-l], a[data-l], b[data-l]{display:none}
+  html.el span[data-l="el"], html.el a[data-l="el"], html.el b[data-l="el"]{display:inline}
+  html.en span[data-l="en"], html.en a[data-l="en"], html.en b[data-l="en"]{display:inline}
+  @media(max-width:640px){h1{font-size:40px}.cards{grid-template-columns:1fr}body{font-size:16.5px}}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>NeoEthos</h1>
+    <div class="tag" data-l="el">Ένα νέο ήθος για τις αγορές — από έναν απλό άνθρωπο, για όλους.</div>
+    <div class="tag" data-l="en">A new ethos for the markets — from one ordinary man, for everyone.</div>
+    <div class="sub" data-l="el">Λογισμικό ανοιχτού κώδικα (AGPL) · καθόλου συλλογή δεδομένων · το μηχάνημά σου, τα κλειδιά σου</div>
+    <div class="sub" data-l="en">Open-source software (AGPL) · zero data collection · your machine, your keys</div>
+    <div class="langbar">
+      <button id="btn-el" onclick="setLang('el')">Ελληνικά</button><button id="btn-en" onclick="setLang('en')">English</button>
+    </div>
+    <div class="btns">
+      <a class="btn p" href="https://github.com/kosred/Neoethos/releases/latest"><span data-l="el">⬇ Κατέβασέ το δωρεάν</span><span data-l="en">⬇ Download free</span></a>
+      <a class="btn s" href="https://github.com/kosred/Neoethos"><span data-l="el">Ο κώδικας στο GitHub</span><span data-l="en">Source on GitHub</span></a>
+      <a class="btn g" href="https://github.com/sponsors/kosred"><span data-l="el">💚 Στήριξέ το</span><span data-l="en">💚 Support it</span></a>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<section>
+  <h2 data-l="el">Η ιστορία μου</h2>
+  <h2 data-l="en">My story</h2>
+
+  <div data-l="el">
+    <p>Δεν είμαι καλός στα λόγια, ειδικά όταν πρέπει να μιλήσω για μένα. Θα πω λοιπόν μόνο την αλήθεια.</p>
+    <p>Λέγομαι Κωνσταντίνος. Πάνω από έξι χρόνια παλεύω γύρω από το forex — έξι χρόνια από λάθη, απώλειες, διάβασμα, ξενύχτια και ξαναπροσπάθειες. Αποτέλεσμα όλης αυτής της διαδρομής είναι αυτό το λογισμικό.</p>
+    <p>Το έχτισα σε ένα ταπεινό mini PC των 300 ευρώ, που ο ανεμιστήρας του σφυρίζει πια περίεργα μετά από δύο χρόνια δουλειάς — αλλά όσο αντέχει, το παλεύουμε μαζί. Υπήρξαν μήνες που έζησα με 96 ευρώ. Υπάρχουν μήνες που ακόμα κι ένα ευρώ μού λείπει.</p>
+    <p>Το μόνο μου όνειρο είναι να είναι καλά η κόρη μου, που ζει μακριά μου, στην Αθήνα, με τη μαμά της. Όπως σκέφτομαι εκείνη, σκέφτομαι και όλους όσους έχουν νιώσει την αδικία: αυτούς που παλεύουν με λίγα απέναντι σε αγορές φτιαγμένες για τους λίγους με τα πολλά.</p>
+    <div class="quote">Ήθελα, με την ελπίδα και με το ότι δεν τα παράτησα, να σταθώ — έστω σαν πείραμα — απέναντι στους πλούσιους και να πω: <b>αφήστε κάτι και για εμάς.</b></div>
+    <p>Δεν είμαι ήρωας ούτε ιδιοφυΐα. Είμαι αυτό που λένε οι ψυχολόγοι «ένας απλός άνθρωπος». Αλλά ένας απλός άνθρωπος με πείσμα, χρόνο που πόνεσε για να βρεθεί, και μια αρχή: <b>να μην πω ποτέ ψέματα — ούτε στους άλλους, ούτε στον εαυτό μου.</b></p>
+  </div>
+
+  <div data-l="en">
+    <p>I'm not good with words, especially when I have to speak about myself. So I'll just tell the truth.</p>
+    <p>My name is Konstantinos. For more than six years I've been fighting my way through forex — six years of mistakes, losses, study, sleepless nights and starting again. Everything that journey taught me became this software.</p>
+    <p>I built it on a humble €300 mini PC whose fan now whistles strangely after two years of work — but as long as it holds, we fight on together. There have been months I lived on €96. There are months when even a single euro is missing.</p>
+    <p>My only dream is for my daughter to be well — she lives far from me, in Athens, with her mom. And the way I think of her, I think of everyone who has ever felt injustice: the people fighting with little, against markets built for the few with much.</p>
+    <div class="quote">With hope, and with the fact that I never gave up, I wanted to stand — even as an experiment — before the rich and say: <b>leave something for the rest of us.</b></div>
+    <p>I'm no hero and no genius. I'm what psychologists call "an ordinary person". But an ordinary person with stubbornness, with time that cost dearly to find, and with one principle: <b>never lie — not to others, and not to myself.</b></p>
+  </div>
+</section>
+
+<section>
+  <h2 data-l="el">Το όραμα</h2>
+  <h2 data-l="en">The vision</h2>
+
+  <div data-l="el">
+    <p>Τα σοβαρά εργαλεία — η πραγματική επιστημονική επικύρωση στρατηγικών, η διαχείριση ρίσκου με μαθηματικά επιβίωσης, τα μοντέλα — ζούσαν πάντα πίσω από θεσμικούς τοίχους και συνδρομές πέντε ψηφίων. Ο μικρός trader έπαιρνε ένα γράφημα και μια προσευχή.</p>
+    <p>Το NeoEthos είναι η άρνηση αυτού του κόσμου. Βάζει ολόκληρη τη «θεσμική» αλυσίδα — έρευνα, ανακάλυψη στρατηγικών, ρίσκο, εκτέλεση — στο μηχάνημα ενός απλού ανθρώπου. Δωρεάν. Ανοιχτό. Ελέγξιμο γραμμή προς γραμμή.</p>
+    <p>Και επειδή οι πλούσιοι αγοράζουν server farms ενώ εμείς όχι, έχει μέσα του το <b>Federation</b>: άνθρωποι που εμπιστεύονται ο ένας τον άλλον ενώνουν τους υπολογιστές τους — χίλια μικρά PC μπορούν να ψάξουν περισσότερο από ένα μεγάλο. <b>Εκείνοι αγοράζουν υπολογιστική ισχύ. Εμείς τη μοιραζόμαστε.</b> Το πλεονέκτημα που δεν αγοράζεται είναι η κοινότητα.</p>
+    <p>Ένα καλύτερο αύριο, πιο δίκαιο για όλους, δεν θα μας το χαρίσει κανείς. Χτίζεται — με κώδικα, με εντιμότητα, και μαζί.</p>
+  </div>
+
+  <div data-l="en">
+    <p>The serious tools — real scientific strategy validation, survival-math risk management, model ensembles — have always lived behind institutional walls and five-figure subscriptions. The small trader got a chart and a prayer.</p>
+    <p>NeoEthos is the refusal of that world. It puts the entire "institutional" pipeline — research, strategy discovery, risk, execution — on an ordinary person's machine. Free. Open. Auditable line by line.</p>
+    <p>And because the rich buy server farms and we cannot, it carries <b>Federation</b> inside it: people who trust each other join their computers — a thousand small PCs can out-search one big one. <b>They buy compute. We share it.</b> The advantage that can't be bought is each other.</p>
+    <p>A better, fairer tomorrow will not be gifted to us. It gets built — with code, with honesty, and together.</p>
+  </div>
+</section>
+
+<section>
+  <h2 data-l="el">Το ήθος</h2>
+  <h2 data-l="en">The ethos</h2>
+
+  <div data-l="el"><p>Το λογισμικό πήρε το όνομά του από μια δέσμευση, όχι από μάρκετινγκ. Αυτοί είναι οι κανόνες που ο κώδικας <i>επιβάλλει</i>:</p></div>
+  <div data-l="en"><p>The software is named after a commitment, not a marketing plan. These are rules the code <i>enforces</i>:</p></div>
+
+  <div class="cards">
+    <div class="card"><b data-l="el">Τα μαθηματικά λένε την αλήθεια</b><b data-l="en">The math tells the truth</b>
+      <span data-l="el">Καμία στρατηγική δεν αγγίζει χρήματα αν δεν επιβιώσει από πέντε ανεξάρτητα τεστ υπερπροσαρμογής. Οι περισσότερες πεθαίνουν. Αυτό είναι το ζητούμενο.</span>
+      <span data-l="en">No strategy touches money before surviving five independent overfitting tests. Most die. That's the point.</span></div>
+    <div class="card"><b data-l="el">Καμία υπόσχεση κέρδους</b><b data-l="en">No promise of profit</b>
+      <span data-l="el">Δεν πουλάει σήματα, μαθήματα ή όνειρα. Σου λέει την αλήθεια για το αν ένα πλεονέκτημα είναι πραγματικό — ακόμα κι όταν η απάντηση είναι «όχι».</span>
+      <span data-l="en">It sells no signals, no courses, no dreams. It tells you the truth about whether an edge is real — even when the answer is "no".</span></div>
+    <div class="card"><b data-l="el">Τίποτα δικό σου δεν φεύγει</b><b data-l="en">Nothing of yours leaves</b>
+      <span data-l="el">Μηδέν συλλογή δεδομένων, μηδέν tracking, κανένας διακομιστής. Τα κλειδιά, τα δεδομένα και οι στρατηγικές σου μένουν στο μηχάνημά σου. Επαληθεύσιμο στον κώδικα.</span>
+      <span data-l="en">Zero data collection, zero tracking, no server. Your keys, data and strategies stay on your machine. Verifiable in the source.</span></div>
+    <div class="card"><b data-l="el">Ελεύθερο για πάντα</b><b data-l="en">Free forever</b>
+      <span data-l="el">Άδεια AGPL: ό,τι χτίστηκε για όλους, μένει για όλους. Κανείς δεν μπορεί να το κλείσει πίσω από τοίχο.</span>
+      <span data-l="en">AGPL licensed: what was built for everyone stays for everyone. Nobody can wall it back in.</span></div>
+  </div>
+
+  <p style="font-family:system-ui,sans-serif;font-size:14.5px;color:var(--muted)">
+    <span data-l="el">Όλοι οι κανόνες, αναλυτικά: </span><span data-l="en">All the rules, in detail: </span>
+    <a href="https://github.com/kosred/Neoethos/blob/master/PRINCIPLES.md">PRINCIPLES.md</a> ·
+    <a href="https://github.com/kosred/Neoethos/blob/master/PRIVACY.md">PRIVACY.md</a>
+  </p>
+</section>
+
+<section>
+  <h2 data-l="el">Τι κάνει το λογισμικό</h2>
+  <h2 data-l="en">What the software does</h2>
+
+  <div class="cards">
+    <div class="card"><b data-l="el">Ανακαλύπτει στρατηγικές</b><b data-l="en">Discovers strategies</b>
+      <span data-l="el">Γενετική αναζήτηση σε εκατοντάδες χαρακτηριστικά και χρονικά πλαίσια — και πέντε πύλες επικύρωσης (walk-forward, CPCV, PBO, permutation, plateau) πριν από οτιδήποτε άλλο.</span>
+      <span data-l="en">Genetic search across hundreds of features and timeframes — and five validation gates (walk-forward, CPCV, PBO, permutation, plateau) before anything else.</span></div>
+    <div class="card"><b data-l="el">Μετρά την επιβίωση</b><b data-l="en">Measures survival</b>
+      <span data-l="el">Θέσεις με risk-constrained Kelly πάνω στην πραγματική κατανομή των συναλλαγών· προσομοίωση prop-firm challenge· ανάλυση χειρότερου σεναρίου πριν πατήσεις Start.</span>
+      <span data-l="en">Sizing by risk-constrained Kelly on the real trade distribution; prop-firm challenge simulation; worst-case analysis before you press Start.</span></div>
+    <div class="card"><b data-l="el">Συναλλάσσεται ζωντανά</b><b data-l="en">Trades live</b>
+      <span data-l="el">Μέσω cTrader Open API στον δικό σου λογαριασμό — και το ζωντανό σύστημα αναπαράγει το backtest <i>επακριβώς</i> (επαληθευμένο, όχι υποσχεμένο).</span>
+      <span data-l="en">Through the cTrader Open API on your own account — and the live engine replicates the backtest <i>exactly</i> (verified, not promised).</span></div>
+    <div class="card"><b data-l="el">Μοιράζεται</b><b data-l="en">Shares</b>
+      <span data-l="el">Federation: ενώστε υπολογιστές με ανθρώπους που εμπιστεύεστε, χωρίς κανέναν server — και κάθε αποτέλεσμα περνά ξανά από όλες τις τοπικές άμυνες.</span>
+      <span data-l="en">Federation: pool computers with people you trust, no server needed — and every result still passes every local defence.</span></div>
+  </div>
+</section>
+
+<section>
+  <h2 data-l="el">Στάσου δίπλα μου</h2>
+  <h2 data-l="en">Stand with me</h2>
+
+  <div data-l="el">
+    <p>Δεν υπάρχει εταιρεία πίσω από αυτό. Υπάρχω εγώ, ένα μικρό PC, και όσοι θελήσουν να σταθούν δίπλα μας. Αν αυτό το έργο σού είναι χρήσιμο — ή αν απλώς πιστεύεις ότι αξίζει να υπάρχει — μπορείς να βοηθήσεις:</p>
+    <p>⭐ <b>Ένα αστέρι στο GitHub</b> κοστίζει μηδέν και βοηθά άλλους να το βρουν.<br>
+    🐛 <b>Τρέξε το σε demo λογαριασμό</b> και πες μου τι σε δυσκόλεψε.<br>
+    🖥 <b>Δάνεισε τους πυρήνες σου</b> σε μια ομάδα federation.<br>
+    💚 <b>Μια μικρή δωρεά</b> — ακόμα και ένα ευρώ — πάει σε ρεύμα, hardware και στα εργαλεία που το χτίζουν, και μου επιτρέπει να συνεχίσω.</p>
+    <p style="font-size:15.5px;color:var(--muted)">Μία υπόσχεση που δεν σπάει ποτέ: <b>καμία δωρεά δεν αγοράζει σήματα, προβλέψεις ή επιρροή στα μαθηματικά.</b> Η αλήθεια δεν πωλείται — αυτός είναι όλος ο λόγος ύπαρξης του project.</p>
+  </div>
+
+  <div data-l="en">
+    <p>There is no company behind this. There is me, a small PC, and whoever chooses to stand with us. If this work is useful to you — or if you simply believe it deserves to exist — you can help:</p>
+    <p>⭐ <b>A GitHub star</b> costs nothing and helps others find it.<br>
+    🐛 <b>Run it on a demo account</b> and tell me what confused you.<br>
+    🖥 <b>Lend your cores</b> to a federation group.<br>
+    💚 <b>A small donation</b> — even one euro — goes to electricity, hardware and the tools that build this, and lets me keep going.</p>
+    <p style="font-size:15.5px;color:var(--muted)">One promise that never breaks: <b>no donation buys signals, predictions, or influence over the math.</b> The truth is not for sale — that is this project's entire reason to exist.</p>
+  </div>
+
+  <div class="btns">
+    <a class="btn g" href="https://github.com/sponsors/kosred"><span data-l="el">💚 Δωρεά μέσω GitHub Sponsors</span><span data-l="en">💚 Donate via GitHub Sponsors</span></a>
+    <a class="btn s" href="https://github.com/kosred/Neoethos"><span data-l="el">⭐ Δώσε ένα αστέρι</span><span data-l="en">⭐ Star the repo</span></a>
+  </div>
+</section>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    <p class="flag">🇬🇷</p>
+    <p data-l="el">Χτισμένο με πείσμα, στο φως, από έναν απλό άνθρωπο που πιστεύει ότι ο μικρός trader αξίζει καλύτερα εργαλεία.</p>
+    <p data-l="en">Built with stubbornness, in the open, by an ordinary man who believes the small trader deserves better tools.</p>
+    <p data-l="el"><b>Προειδοποίηση κινδύνου:</b> Οι συναλλαγές σε μοχλευμένο FX ενέχουν σοβαρό κίνδυνο απώλειας. Το NeoEthos είναι ερευνητικό/εκπαιδευτικό λογισμικό και όχι επενδυτική συμβουλή. Τίποτα εδώ δεν υπόσχεται κέρδος.</p>
+    <p data-l="en"><b>Risk warning:</b> Trading leveraged FX carries substantial risk of loss. NeoEthos is research/educational software and not financial advice. Nothing here promises profit.</p>
+    <p>AGPL-3.0 · © 2024–2026 Konstantinos Kokkinos ·
+      <a href="https://github.com/kosred/Neoethos">GitHub</a> ·
+      <a href="https://github.com/kosred/Neoethos/releases/latest"><span data-l="el">Τελευταία έκδοση</span><span data-l="en">Latest release</span></a></p>
+    <p style="opacity:.6"><span data-l="el">Αυτή η σελίδα δεν έχει cookies, trackers ή analytics — όπως και το λογισμικό.</span><span data-l="en">This page has no cookies, trackers or analytics — just like the software.</span></p>
+  </div>
+</footer>
+
+<script>
+  function setLang(l){
+    document.documentElement.className = l;
+    document.documentElement.lang = l;
+    document.getElementById('btn-el').className = l === 'el' ? 'on' : '';
+    document.getElementById('btn-en').className = l === 'en' ? 'on' : '';
+    try { localStorage.setItem('neoethos-lang', l); } catch(e) {}
+  }
+  (function(){
+    var saved = null;
+    try { saved = localStorage.getItem('neoethos-lang'); } catch(e) {}
+    var nav = (navigator.language || 'en').toLowerCase().startsWith('el') ? 'el' : 'en';
+    setLang(saved || nav);
+  })();
+</script>
+</body>
+</html>
