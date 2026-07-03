@@ -1,0 +1,56 @@
+# NeoEthos Mesh — the P2P sidecar (Federation Phase 1+).
+#
+# DELIBERATELY ISOLATED: this is its OWN workspace with its OWN Cargo.lock.
+# It shares NOTHING with the main NeoEthos workspace's pinned dependency tree
+# (GPU/cubecl/burn/rustls pins). A bug or a version conflict in here can crash
+# THIS binary and nothing else — the trading engine is untouched. The sidecar
+# talks to the running NeoEthos app ONLY over its localhost HTTP API
+# (`/federation/*`). See mesh/README.md and docs/p2p-mesh-design-2026-07-03.md.
+[workspace]
+
+[package]
+name = "neoethos-mesh"
+version = "0.1.0"
+description = "NeoEthos P2P mesh sidecar — brings serverless shared discovery to the open internet (iroh)"
+authors = ["NeoEthos"]
+license = "AGPL-3.0-or-later"
+edition = "2021"
+rust-version = "1.85"
+
+[[bin]]
+name = "neoethos-mesh"
+path = "src/main.rs"
+
+[features]
+# Default build is green and useful TODAY: stable ed25519 identity + the
+# HTTP bridge to the local NeoEthos app. No bleeding-edge deps.
+default = []
+# `--features p2p` activates the iroh endpoint (real relay connectivity).
+# GATED because iroh 0.95's tree currently pulls `ed25519-dalek 3.0.0-pre.1`,
+# a pre-release that fails to compile on current stable rustc (an UPSTREAM
+# bug, entirely outside our code). The connectivity code in main.rs is ready
+# and complete; flip this feature on the moment iroh ships a tree that builds
+# on stable. This gating is the isolation design working exactly as intended.
+p2p = ["dep:iroh"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The HTTP bridge to the LOCAL NeoEthos app (/federation/*). rustls only.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# A REAL, stable node identity (ed25519). Same curve iroh uses, so the public
+# key derived here is the node's permanent mesh address once P2P is on.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+hex = "0.4"
+
+# iroh: QUIC + TLS 1.3 + relay/hole-punch. Optional until its tree builds on
+# stable (see the `p2p` feature note above).
+iroh = { version = "0.95", optional = true }
+
+[profile.release]
+opt-level = 2

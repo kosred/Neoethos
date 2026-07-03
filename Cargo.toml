@@ -26,6 +26,11 @@ default-members = [
   "crates/neoethos-codex",
   "crates/neoethos-trader",
 ]
+# The P2P mesh sidecar (Federation Phase 1+) is DELIBERATELY isolated: its own
+# workspace + Cargo.lock under mesh/, so its bleeding-edge iroh/QUIC dependency
+# tree can never conflict with this workspace's pinned GPU/ML stack. Excluded
+# here so no root `cargo` command ever pulls it into the engine's build.
+exclude = ["mesh"]
 
 [workspace.package]
 edition = "2024"

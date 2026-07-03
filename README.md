@@ -23,7 +23,7 @@ NeoEthos is the refusal of that. It puts the *whole pipeline* — research, disc
 ## What it does
 
 - **Discovers strategies, doesn't ship guesses.** A genetic search breeds and tests strategies across timeframes, then survives them through **five mandatory anti-overfitting gates** — walk-forward, CPCV, PBO/CSCV (López de Prado), a permutation test and a parameter-plateau test — so what reaches you has held up on data it never trained on. See [PRINCIPLES.md](PRINCIPLES.md).
-- **Shares compute, not secrets.** **Federation** (SETI@home-style): people who trust each other pool their machines for discovery — no server needed, and every imported result still passes every local gate before any real money.
+- **Shares compute, not secrets.** **Federation** (SETI@home-style): people who trust each other pool their machines for discovery — no server needed, and every imported result still passes every local gate before any real money. See the [Federation guide](docs/FEDERATION.md); the serverless P2P mesh is the isolated [`mesh/`](mesh/README.md) sidecar.
 - **Two honest modes, one master switch.** You pick the goal; *the search, the models, and the risk all re-orient around it.*
 - **Sizes for survival.** Position size is a fraction of your *live* balance (it compounds as you grow), derived from each strategy's measured edge and the broker's real per-lot costs — not a fixed, account-blowing percentage.
 - **A real model ensemble.** XGBoost, CatBoost, LightGBM, neural nets (Burn), KAN, N-BEATS, TabNet, TiDE and more — native Rust, no GIL, no embedded Python on the hot path.

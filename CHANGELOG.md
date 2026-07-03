@@ -4,6 +4,109 @@ All notable changes to NeoEthos are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.5.2] — 2026-07-03 — "the honesty release"
+
+The release that makes NeoEthos safe to trust: strategies must survive a
+five-sided validation gauntlet before they can touch money, position sizing
+is derived from survival mathematics rather than hope, and — new here — many
+small machines can pool their compute against the server farms of the big
+players. Built and validated on a 6-core mini PC.
+
+### Added
+- **Five-gate anti-overfitting validation** — every exported strategy now
+  survives walk-forward, **CPCV** (combinatorially purged cross-validation),
+  **PBO/CSCV** (López de Prado's probability of backtest overfitting), a
+  **permutation test** (no profit allowed on structurally destroyed data),
+  and a **parameter-plateau test** (±15% perturbation must keep ≥30% of net).
+  The full honesty box, documented in [PRINCIPLES.md](PRINCIPLES.md).
+- **Risk-constrained Kelly sizing** (Busseti/Ryu/Boyd) solved on the *full
+  empirical R-multiple distribution* — fat left tails (rare catastrophic
+  losses) shrink the recommended size automatically, a CVaR-aware sizer with
+  no trained model. Surfaced as "RCK risk/trade" in the tail-risk panel.
+- **Prop-firm challenge simulator** — first-passage Monte Carlo against
+  FTMO-style barriers (+10%/+5% targets vs −10% max / −5% daily loss),
+  sweeping risk-per-trade to find the challenge-optimal size and the
+  attempts-for-90%-funding budget. `GET /autonomous/challenge`.
+- **Federation Phase 0** — SETI@home-style shared discovery with no server:
+  any instance can coordinate a work plan; trusted peers run discovery on
+  their own machines and submit results into an inbox where every submission
+  still passes all local gates before any real money. `/federation/*` +
+  Advanced → Federation panel.
+- **Auto-cull → automatic re-discovery** — a retired (permanently
+  blacklisted) strategy now triggers a fresh discovery on the same
+  symbol/timeframe to refill the gap (Settings-gated, default on).
+- **Trade-sequence Monte Carlo tail risk** — p95 drawdown, risk-of-ruin and
+  time-under-water p95 across thousands of reshuffles of the realized trades.
+- **Institutional-footprint feature family** and extended FVG memory (up to
+  64 unfilled gaps per side, with magnet-distance/age signals).
+- **Live-experience store + offline learnability report** — records the exact
+  feature rows live entries acted on and honestly measures whether live
+  outcomes carry learnable signal yet (report-only, never blind trust).
+- **Session-aware spread recorder**, **news gate** wired into live autopilot,
+  and a **live↔backtest parity harness** (`GET /autonomous/parity`).
+- **Project site + community pack**: [kosred.github.io/Neoethos](https://kosred.github.io/Neoethos/)
+  (bilingual, zero-tracker), PRIVACY.md, PRINCIPLES.md, CONTRIBUTING.md,
+  a real-world hardware guide, and GitHub Sponsors support.
+
+### Changed
+- **Scoring version 5** — the genetic search now admits **negative indicator
+  weights** (contrarian terms are discoverable, not just seed-inherited, with
+  a sign-flip mutation), and **Risky mode evolves under its own objective**:
+  half-Kelly expected log-growth, the same math its post-GA ranking uses.
+  PropFirm/Strict discovery keeps the v4 consistency landscape byte-for-byte.
+- **Slippage** folded into every backtest cost; scoring v4 added a
+  worst-day penalty so steady monthly income is rewarded over lumpy equity.
+- **UI consolidation** — Trade + Positions merged into one cockpit (with
+  inline SL/TP editing + trailing); Account + Journal merged into one screen.
+- All workspace crates aligned to a single version number (0.5.2).
+
+### Fixed
+- Cockpit landing directly showed "No open positions" / a dashed account
+  panel — the account stream only pushes on demand; the cockpit now refreshes
+  on mount and every 5 s.
+- Backtest↔live parity restored for trailing stops and weekend kill zones.
+
+### Deferred (documented, not abandoned)
+- **P2P mesh (iroh)** — approved architecture in
+  `docs/p2p-mesh-design-2026-07-03.md`, deliberately built as an *isolated
+  sidecar* later so it can never destabilise the pinned trading engine.
+- **cTrader MCP client** — the official `rmcp` SDK is mature; awaiting stable
+  server schemas and a concrete MCP-only workflow.
+
+## [0.5.1] — 2026-07-02
+
+Professional charting and self-defending autopilot.
+
+### Added
+- **KLineChart v10** migration — pro indicators, drawing tools and sub-panes;
+  zoom to the full history.
+- **Auto-cull** — a live strategy that breaks either a consecutive-loss limit
+  **or** a rolling-window win-rate floor (default 57% over 10 trades) is
+  stopped and **permanently retired** into a blacklist: never re-selected,
+  never re-discovered, kept as a record (never deleted).
+
+### Fixed
+- Break-even + trailing stop now applied live in the autopilot, in **parity**
+  with the discovery backtest.
+- **Stop** is now responsive across Discovery, Training and the autopilot
+  bar-boundary wait (interruptible, no more "Stop does nothing").
+- Trade Journal shows real symbols/pairs and is scoped per account.
+
+## [0.5.0] — 2026-07-01 — "everything works"
+
+End to end: strategy discovery with enforced out-of-sample validation, both
+trading modes (Risky multiply / Prop-firm robust), risk-% sizing off the live
+balance, market **and** conditional (limit/stop) orders, a bilingual desktop
+app, and a live terminal UI — all on one pure-Rust engine. License changed to
+**AGPL-3.0-or-later**.
+
+## [0.4.99] — 2026-06-14
+
+Pre-release consolidation: single-process **Tauri** desktop shell linking the
+engine crates in-process (Flutter path retired), config unified into one
+source of truth edited by both UI and TUI, GPU/CPU compute selectable at
+runtime, and a broad defensive-coding + dead-code audit across the workspace.
+
 ## [0.4.35] — 2026-06-01
 
 A professional-desk release: a full myfxbook-style trade journal,
