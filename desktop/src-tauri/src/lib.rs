@@ -38,6 +38,13 @@ mod backend {
         let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
         let _ = API_PORT.set(port);
         eprintln!("in-process backend bound on 127.0.0.1:{port}");
+        // Publish the ephemeral API port to a well-known file so the P2P mesh
+        // sidecar can find the desktop app automatically (the port is random;
+        // this is how `neoethos-mesh` locates the local /federation/* bridge).
+        let _ = std::fs::write(
+            std::env::temp_dir().join("neoethos_api_port"),
+            port.to_string(),
+        );
 
         tauri::async_runtime::spawn(async move {
             // Mirror main.rs bootstrap, minus the Flutter-supervisor bits.

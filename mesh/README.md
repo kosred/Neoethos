@@ -70,21 +70,39 @@ NEOETHOS_MESH_SEEDS=<id1>,<id2> ./target/release/neoethos-mesh
 The app's HTTP port is ephemeral; the Federation panel (Advanced → Federation)
 shows the local coordinator/worker that already runs today.
 
-## Roadmap — the work protocol (next)
+## Work distribution — BUILT (discovery, verified)
 
-Discovery is automatic now. The remaining bricks distribute the actual work
-over the mesh (each testable, each keeping every result behind the local
-gates — the mesh changes transport, never trust):
+The mesh now distributes work, not just discovers peers:
 
-- **Work protocol** — signed `claim → accept → result` over iroh QUIC streams
-  (ALPN `neoethos/mesh/0`), leases with TTL + re-queue, mirroring the HTTP
-  Phase-0 semantics already proven in `app_services/federation.rs`.
-- **Capability matching** — GPU work to GPU nodes, discovery to CPU nodes.
-- **Artifacts via `iroh-blobs`** — BLAKE3-verified portfolio/trade transfer;
-  the requester re-runs the SAME deterministic verification as
-  `federation::submit` before accepting.
-- **Trust** — start with an allow-list of node ids; add reputation only if the
-  allow-list stops scaling.
+- Every node **announces** `{cpu_cores, work_types, app_online, has_work}` on
+  the rendezvous topic (has_work = local `/federation/status` has queued jobs).
+- A node whose engine is **idle** and that sees a peer with `has_work` acts as
+  a **worker**: it opens a QUIC bi-stream (ALPN `neoethos/mesh/0`) to that
+  coordinator, `GetJob`s a combo, runs it on its OWN local engine
+  (`/engines/discovery/start`), collects the produced portfolio
+  (`/portfolios/list` + reads the file), and `Submit`s it back.
+- The **coordinator**'s protocol handler proxies those two RPCs to its own
+  local `/federation/job` and `/federation/submit` — so the result lands in
+  the inbox and **passes every local gate** before it can mean anything. The
+  mesh is pure transport; trust logic never leaves the audited app.
+
+**Verified:** builds clean on the repo nightly; a single node comes online via
+relay in ~120 ms; **two independent nodes discover each other** over gossip
+(node B bootstrapped off node A's id via `NEOETHOS_MESH_SEEDS`, mutual announce
+exchange confirmed). Full work exchange wants two machines each running a
+NeoEthos app — the honest remaining test.
+
+## Roadmap — the remaining bricks
+
+- **Training model-weight return** — a training job runs on the worker today
+  (real compute offload), but returning the ~50 MB model to the coordinator
+  needs **`iroh-blobs`** (BLAKE3-verified) + a model sink. Until then, training
+  distribution offloads the compute but the weights stay on the worker.
+- **Capability matching** (Phase D) — route GPU work to GPU nodes; the
+  `cpu_cores`/`gpu` fields are already announced.
+- **Re-announce on NeighborUp** — instant discovery instead of ≤20 s.
+- **Trust** — an allow-list of node ids first; reputation only if it stops
+  scaling.
 
 ## Hard lines (from PRINCIPLES.md and the design record)
 

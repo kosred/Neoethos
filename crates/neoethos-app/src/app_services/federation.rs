@@ -31,12 +31,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::server::state::AppApiState;
 
-/// One unit of federated work: run discovery on this combo.
+/// One unit of federated work: run `work_type` on this combo.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FedJob {
     pub symbol: String,
     pub base_tf: String,
+    /// "discovery" (default) or "training". Lets a work plan mix strategy
+    /// search and model training across the swarm. Serde-default keeps old
+    /// clients (which send only symbol+base_tf) working unchanged.
+    #[serde(default = "default_work_type")]
+    pub work_type: String,
+}
+
+fn default_work_type() -> String {
+    "discovery".to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,9 +89,13 @@ pub fn set_jobs(jobs: Vec<FedJob>, token: Option<String>) -> usize {
     c.queue = jobs
         .into_iter()
         .filter(|j| !j.symbol.trim().is_empty() && !j.base_tf.trim().is_empty())
-        .map(|j| FedJob {
-            symbol: j.symbol.trim().to_uppercase(),
-            base_tf: j.base_tf.trim().to_uppercase(),
+        .map(|j| {
+            let wt = j.work_type.trim().to_lowercase();
+            FedJob {
+                symbol: j.symbol.trim().to_uppercase(),
+                base_tf: j.base_tf.trim().to_uppercase(),
+                work_type: if wt == "training" { "training".into() } else { "discovery".into() },
+            }
         })
         .collect();
     c.leases.clear();
@@ -454,8 +467,8 @@ mod tests {
     fn queue_lease_and_submit_close_the_loop() {
         set_jobs(
             vec![
-                FedJob { symbol: "eurusd".into(), base_tf: "m15".into() },
-                FedJob { symbol: "GBPUSD".into(), base_tf: "H1".into() },
+                FedJob { symbol: "eurusd".into(), base_tf: "m15".into(), work_type: "discovery".into() },
+                FedJob { symbol: "GBPUSD".into(), base_tf: "H1".into(), work_type: "training".into() },
             ],
             Some("secret".into()),
         );
