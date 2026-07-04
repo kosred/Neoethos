@@ -4,6 +4,46 @@ All notable changes to NeoEthos are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.5.3] — 2026-07-04 — "many machines, one purpose"
+
+Everything in 0.5.2 stays exactly as verified — this release adds an
+**experimental, opt-in** way for volunteer machines to help each other, plus
+a small but real usability fix. The single-machine app a normal user installs
+is byte-for-byte the same trusted engine; the new distributed pieces are
+isolated sidecars that are **off by default** and change nothing unless you
+deliberately run them.
+
+### Added
+- **Distributed compute (experimental, opt-in)** — a self-organising P2P mesh
+  (`neoethos-mesh` sidecar, over iroh) lets small machines discover each other
+  with no server, no port-forwarding and no human in the loop, then share
+  discovery/training work and **migrate elite strategies** between independent
+  genetic searches (island model). Each node sizes its islands to *its own*
+  RAM, so an 8 GB machine never OOMs. The GA migration hook is off by default
+  and byte-identical to a normal run when disabled. See
+  [FEDERATION.md](docs/FEDERATION.md) and `mesh/POOL_SPEC.md`.
+- **MCP tool sidecar (experimental)** — an isolated `neoethos-mcp` process
+  (official `rmcp` SDK) exposes cTrader / web-search / filesystem tools over
+  the Model Context Protocol so the AI Desk / Supervisor can call them. Runs in
+  its own workspace so it never touches the pinned engine dependency stack.
+- **Choose which ChatGPT account to connect** — the AI Desk now has a
+  "ChatGPT email" field. It is passed as the OAuth `login_hint` so the sign-in
+  page targets that account; the flow always shows the account picker
+  (`prompt=login`) so a different account is never silently reused. You still
+  sign in on ChatGPT's own page — NeoEthos never sees your password.
+
+### Changed
+- Dual-platform desktop-GUI release workflow: pushing a `v*` tag now builds the
+  **Windows and Linux GUI** installers in CI (not just the CLI packages).
+- Help texts refreshed: AI Desk documents the email field, and the former
+  "Advanced" section is folded into Settings (where it now lives).
+
+### Notes
+- The distributed mesh and MCP sidecars are **compile- and boot-verified** but
+  their full multi-machine (E2E) behaviour is pending community testing on ≥2
+  machines. They ship dormant; nothing about the trusted single-machine path
+  depends on them.
+
 ## [0.5.2] — 2026-07-03 — "the honesty release"
 
 The release that makes NeoEthos safe to trust: strategies must survive a
