@@ -177,8 +177,13 @@ fn apply_backend_progress_event(snapshot: &mut JobSnapshot, event: &ModelTrainin
     snapshot.progress = JobProgress {
         percent: backend_progress_percent(completed_models, failed_models, total_models),
         stage: "backend_running".to_string(),
+        // Name the CURRENT model, not just a count. On `Started` this is the
+        // model now training; during a long/stuck model the message stays on it
+        // so the operator can see WHICH model is running (a 20h hang used to
+        // show only an anonymous "N of M finished"). Failures land in
+        // report.warnings/events with the reason, so which+why are both visible.
         message: format!(
-            "backend running: {} of {} model(s) finished ({} failed)",
+            "training model `{model}` — {} of {} finished ({} failed)",
             completed_models + failed_models,
             total_models,
             failed_models
