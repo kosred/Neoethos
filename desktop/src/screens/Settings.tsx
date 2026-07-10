@@ -259,7 +259,7 @@ export default function Settings() {
         <div className="ticket-row" style={{ flexWrap: "wrap", gap: 16 }}>
           <label style={{ minWidth: 150 }}>Indicator pool
             <input type="number" min="10" step="10" value={tune.prefilterTopK ?? ""} onChange={(e) => setT("prefilterTopK", e.target.value)} />
-            <span className="muted small">how many indicators the GA may use. Higher = more diverse strategies. <b>Raise if it stalls.</b></span>
+            <span className="muted small">how many indicators the GA may use. Higher = more diverse strategies. <b>Raise if it stalls.</b> Auto-capped at the number of available indicators + SMC — a value above that just means "use them all".</span>
           </label>
           <label style={{ minWidth: 150 }}>Explore patience
             <input type="number" min="10" step="50" value={tune.convergencePatience ?? ""} onChange={(e) => setT("convergencePatience", e.target.value)} />

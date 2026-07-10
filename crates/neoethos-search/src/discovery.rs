@@ -2685,7 +2685,26 @@ where
     funnel.record_stage("features_built", 0, features.n_features());
 
     // Feature Pre-filtering (Idea #3)
-    let prefilter_top_k = config.runtime_overrides.prefilter_top_k;
+    // The "indicator pool" (prefilter_top_k) can never meaningfully exceed the
+    // number of features that actually exist — the total indicators + SMC +
+    // regime columns. A configured pool above that is silently the whole
+    // universe; clamp it to the real ceiling HERE (the authoritative point
+    // where the true count is known) and log loudly so the operator sees the
+    // effective cap instead of a meaningless number. This is what enforces the
+    // "pool ≤ total indicators + SMC" rule the UI can only hint at.
+    let configured_top_k = config.runtime_overrides.prefilter_top_k;
+    let available_features = features.names.len();
+    let prefilter_top_k = if configured_top_k > 0 && configured_top_k > available_features {
+        tracing::info!(
+            target: "neoethos_search::discovery",
+            configured = configured_top_k,
+            available = available_features,
+            "indicator pool capped to the available indicator+SMC feature count"
+        );
+        available_features
+    } else {
+        configured_top_k
+    };
     let prefilter_insample_frac = config.runtime_overrides.resolved_prefilter_insample_frac();
 
     let prefilter_min_per_tf = config.runtime_overrides.prefilter_min_per_timeframe;
