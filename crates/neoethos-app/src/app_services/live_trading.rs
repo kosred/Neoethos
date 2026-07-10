@@ -431,6 +431,24 @@ async fn run(
         .map(|s| s.risk.risk_per_trade)
         .unwrap_or(0.0)
         .clamp(0.0, 1.0);
+    // Risky Mode sizing context. When `trading_mode == "risky"` the per-entry
+    // risk comes from the bankroll-stage ladder (30 %→50 %, tapering as the
+    // account grows) instead of the static prop-firm `risk_per_trade`. Read
+    // once here; the actual stage fraction is resolved per entry off the LIVE
+    // balance (the account compounds). The default "prop_firm" mode leaves the
+    // sizing path byte-for-byte unchanged.
+    let trading_mode_risky = sizing
+        .as_ref()
+        .map(|s| s.system.trading_mode.eq_ignore_ascii_case("risky"))
+        .unwrap_or(false);
+    let risky_start_balance = sizing
+        .as_ref()
+        .map(|s| s.system.risky_start_balance_usd)
+        .unwrap_or(0.0);
+    let risky_target_balance = sizing
+        .as_ref()
+        .map(|s| s.system.risky_target_balance_usd)
+        .unwrap_or(0.0);
     let max_lot_cap = sizing
         .as_ref()
         .map(|s| s.risk.max_lot_size)
@@ -984,13 +1002,38 @@ async fn run(
                     _ => (account_balance, None),
                 };
 
+                // Base per-trade risk. In Risky Mode we size off the bankroll-
+                // stage ladder (30 %→50 % by stage, resolved from the account's
+                // LIVE balance so it tapers as it compounds) rather than the
+                // static prop-firm `risk_per_trade`. Strictly gated on
+                // `trading_mode == "risky"`; the "prop_firm" path is unchanged.
+                // Falls back to the configured fraction when the ladder inputs
+                // are degenerate — never a wrong size.
+                let base_risk = if trading_mode_risky {
+                    let frac = neoethos_core::domain::risky_mode::stage_risk_fraction_for_bankroll(
+                        risky_start_balance,
+                        risky_target_balance,
+                        neoethos_core::domain::risky_mode::DEFAULT_DOUBLING_FACTOR,
+                        entry_balance,
+                    )
+                    .unwrap_or(risk_fraction);
+                    tracing::info!(
+                        target: "neoethos_app::live_trading",
+                        %symbol, bankroll = entry_balance, risk_pct = frac,
+                        "risky-mode stage sizing (bankroll-ladder, not the 3% prop cap)"
+                    );
+                    frac
+                } else {
+                    risk_fraction
+                };
+
                 // Portfolio-level concurrent-risk budget (max_portfolio_risk):
-                // remaining = cap − open_positions × risk_per_trade. Skip the
+                // remaining = cap − open_positions × base_risk. Skip the
                 // entry when the budget is spent; size down when only part fits.
-                let mut effective_risk = risk_fraction;
+                let mut effective_risk = base_risk;
                 if portfolio_risk_cap > 0.0 {
                     let open_n = open_positions_now.unwrap_or(0) as f64;
-                    let remaining = portfolio_risk_cap - open_n * risk_fraction;
+                    let remaining = portfolio_risk_cap - open_n * base_risk;
                     if remaining <= f64::EPSILON {
                         tracing::warn!(
                             target: "neoethos_app::live_trading",
@@ -1005,7 +1048,7 @@ async fn run(
                         }
                         continue;
                     }
-                    effective_risk = risk_fraction.min(remaining);
+                    effective_risk = base_risk.min(remaining);
                 }
 
                 // Size by the account's risk %, using the strategy's own stop
