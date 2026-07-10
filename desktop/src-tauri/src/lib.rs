@@ -370,6 +370,18 @@ pub fn run() {
             broker::reauth_broker,
             broker::refresh_broker_costs,
         ])
+        .on_window_event(|_window, event| {
+            // Heavy Discovery/Training work runs on tokio blocking threads. A
+            // tight CPU loop there can keep the process alive past window close
+            // — the operator reported a stuck search that only a full REBOOT
+            // stopped. When the operator closes the window, hard-exit the whole
+            // process so EVERY worker thread dies immediately: "close = stop",
+            // guaranteed, no orphaned CPU, no reboot. Broker positions are held
+            // server-side by cTrader, so exiting never touches live orders.
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                std::process::exit(0);
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
