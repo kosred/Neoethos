@@ -27,10 +27,12 @@
 //! dependencies on the rest of `app_services`.
 
 /// Which broker integration backs a trading adapter. Drives the
-/// capability flags below; the cTrader Open API is the only fully wired
-/// backend today, with DXtrade kept as a draft second adapter so the
-/// capability-flag abstraction stays honest (no `== "cTrader"` checks).
-// The variants are never *constructed* and `as_str` is never *called* in live
+/// capability flags below. The cTrader Open API is the only wired
+/// backend — DXtrade's draft adapter was removed 2026-07-11 (operator
+/// directive; the broker-agnostic direction is MCP bridges, see
+/// `mcp/`). The capability-flag abstraction stays so the UI never
+/// grows `== "cTrader"` checks that would lock out a future adapter.
+// The variant is never *constructed* and `as_str` is never *called* in live
 // code today — their only consumers are the broker-readiness banner helpers in
 // `broker_config`, which are themselves Phase 2-5-pending. The type is still
 // referenced in signatures and the capability-flag methods below stay live.
@@ -38,7 +40,6 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingAdapterKind {
     CTrader,
-    DxTrade,
 }
 
 impl TradingAdapterKind {
@@ -46,7 +47,6 @@ impl TradingAdapterKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CTrader => "cTrader",
-            Self::DxTrade => "DXtrade",
         }
     }
 
@@ -55,16 +55,10 @@ impl TradingAdapterKind {
     /// abstraction here — the UI must never gate these on
     /// `adapter_name == "cTrader"`, which would permanently lock out any
     /// future adapter whose execution backend handled the operations.
-    ///
-    /// Today only cTrader has the wired backends (`CancelOrder` /
-    /// `ClosePosition` via the cTrader Open API); DXtrade's draft backend
-    /// does not yet implement them. Flip the DXtrade arm to `true` once
-    /// `dxtrade.rs::cancel_order`/`close_position` ship.
     #[allow(dead_code)]
     pub fn supports_order_cancellation(self) -> bool {
         match self {
             Self::CTrader => true,
-            Self::DxTrade => false,
         }
     }
 
@@ -77,7 +71,6 @@ impl TradingAdapterKind {
     pub fn supports_position_close(self) -> bool {
         match self {
             Self::CTrader => true,
-            Self::DxTrade => false,
         }
     }
 }

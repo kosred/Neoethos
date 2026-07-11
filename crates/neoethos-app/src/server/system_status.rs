@@ -123,8 +123,8 @@ pub async fn engines(State(state): State<AppApiState>) -> Json<EnginesDto> {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrokerStatusDto {
-    /// Active broker adapter ("cTrader" / "DXtrade"). Picked from the
-    /// runtime broker_credentials.toml.
+    /// Active broker adapter ("cTrader"). Picked from the runtime
+    /// broker_credentials.toml.
     pub adapter: String,
     /// "Live" or "Demo".
     pub environment: String,

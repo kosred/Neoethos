@@ -23,7 +23,8 @@
 //! Two transient fields are explicitly NEVER serialized:
 //!
 //! - `CTraderBrokerSettings::authorization_code_input` — short-lived OAuth value
-//! - `DxTradeBrokerSettings::password` — re-entered each session
+//! (DXtrade settings removed 2026-07-11 — old `[dxtrade]` TOML sections
+//! are ignored on load, so existing files stay valid.)
 
 use crate::app_services::broker_config::BrokerSettingsState;
 use anyhow::Result;
@@ -182,8 +183,8 @@ fn apply_embedded_fallback(settings: &mut BrokerSettingsState) {
 /// Persists broker settings to disk at the resolved credentials path.
 ///
 /// Creates the parent directory if missing. Writes TOML in the standard
-/// formatting. Transient fields (`authorization_code_input`, DxTrade
-/// `password`) are excluded by their serde annotations. The shared
+/// formatting. The transient field (`authorization_code_input`) is
+/// excluded by its serde annotation. The shared
 /// writer in `neoethos-core` always stamps the current schema version
 /// regardless of what the in-memory value carries.
 pub fn save_broker_settings(settings: &BrokerSettingsState) -> Result<()> {
@@ -197,7 +198,7 @@ pub fn save_broker_settings(settings: &BrokerSettingsState) -> Result<()> {
 mod tests {
     use super::*;
     use crate::app_services::broker_config::{
-        BrokerAccountTarget, CTraderBrokerEnvironment, CTraderBrokerSettings, DxTradeBrokerSettings,
+        BrokerAccountTarget, CTraderBrokerEnvironment, CTraderBrokerSettings,
     };
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -260,13 +261,6 @@ mod tests {
                     enabled_for_execution: true,
                 }],
             },
-            dxtrade: DxTradeBrokerSettings {
-                platform_url: "https://demo.dx.example".to_string(),
-                username: "user42".to_string(),
-                domain: "default".to_string(),
-                password: "should-not-persist-either".to_string(),
-                accounts: vec![],
-            },
         }
     }
 
@@ -311,28 +305,11 @@ mod tests {
         });
     }
 
-    #[test]
-    fn dxtrade_password_is_not_persisted() {
-        let dir = tempdir_or_skip();
-        let path = dir.join("creds.toml");
-
-        with_env_path(&path, |_| {
-            let original = populated_settings();
-            save_broker_settings(&original).expect("save should succeed");
-
-            // Read the raw file to confirm the password literal is absent.
-            let raw = fs::read_to_string(&path).expect("read");
-            assert!(
-                !raw.contains("should-not-persist-either"),
-                "DxTrade password leaked into TOML:\n{raw}"
-            );
-
-            // After load, the password field is reset to the field default.
-            let loaded = load_broker_settings();
-            assert_eq!(loaded.dxtrade.password, "");
-            assert_eq!(loaded.dxtrade.username, "user42");
-        });
-    }
+    // NOTE: the `[dxtrade]` table literals in the TOML fixtures below are
+    // KEPT deliberately after the 2026-07-11 DXtrade removal — they now
+    // double as backward-compat proof that credentials files written by
+    // older builds (which contain a `[dxtrade]` section) still load
+    // cleanly (serde ignores unknown tables).
 
     #[test]
     fn ctrader_authorization_code_input_is_not_persisted() {
