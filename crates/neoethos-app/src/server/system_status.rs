@@ -38,8 +38,12 @@ pub struct EnginesDto {
     /// running job's `JobSnapshot`. `discoveryStage` is the coarse phase
     /// label (e.g. `"search_generations"`), `""` when idle.
     pub discovery_stage: String,
-    /// 0.0..=1.0 completion fraction for the active discovery run;
-    /// 0.0 when idle.
+    /// 0..=100 completion PERCENT for the active discovery run; 0 when
+    /// idle. The internal `JobProgress::percent` is a 0.0..=1.0 fraction;
+    /// this DTO multiplies by 100 because the UI renders the value
+    /// directly with a `%` suffix. (Bug fix 2026-07-11: the raw fraction
+    /// used to be forwarded, so a search at 0.78 displayed as "1%" — the
+    /// operator's "stuck at 1%" report.)
     pub discovery_percent: f64,
     /// The live `(name, value)` counters the discovery job accumulates
     /// (candidates evaluated, generations done, …). Empty when idle.
@@ -102,7 +106,8 @@ pub async fn engines(State(state): State<AppApiState>) -> Json<EnginesDto> {
         discovery_summary: state.engine_summary(JobKind::Discovery).await,
         training_summary: state.engine_summary(JobKind::Training).await,
         discovery_stage,
-        discovery_percent,
+        // Fraction → percent (see DTO field doc — fixes the "stuck at 1%" display).
+        discovery_percent: discovery_percent * 100.0,
         discovery_counters: discovery_counters
             .into_iter()
             .map(|(name, value)| EngineCounterDto { name, value })
@@ -118,8 +123,8 @@ pub async fn engines(State(state): State<AppApiState>) -> Json<EnginesDto> {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrokerStatusDto {
-    /// Active broker adapter ("cTrader" / "DXtrade"). Picked from the
-    /// runtime broker_credentials.toml.
+    /// Active broker adapter ("cTrader"). Picked from the runtime
+    /// broker_credentials.toml.
     pub adapter: String,
     /// "Live" or "Demo".
     pub environment: String,

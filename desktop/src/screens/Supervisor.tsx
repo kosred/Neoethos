@@ -3,7 +3,6 @@ import {
   supervisorStatus,
   supervisorConfig,
   supervisorTick,
-  supervisorChat,
   experienceTrain,
   type SupervisorLogEntry,
   type ExperienceGroup,
@@ -25,9 +24,10 @@ export default function Supervisor() {
   const { data, error, reload } = usePoll(supervisorStatus, 10000);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
-  // Chat with the supervisor (same brain, same guard-rails, your steering).
-  const [chatInput, setChatInput] = useState("");
-  const [chatReply, setChatReply] = useState("");
+  // NOTE: the supervisor CHAT moved to the unified AI Desk chat (mode
+  // toggle "Supervisor") — one place to talk to the LLM, per operator
+  // request 2026-07-11. This screen keeps the control panel + log and is
+  // embedded below the AI Desk chat.
   // Standing directives editor (one per line).
   const [directivesText, setDirectivesText] = useState("");
   const [directivesLoaded, setDirectivesLoaded] = useState(false);
@@ -44,23 +44,6 @@ export default function Supervisor() {
       setDirectivesLoaded(true);
     }
   }, [cfg, directivesLoaded]);
-
-  const sendChat = async () => {
-    const message = chatInput.trim();
-    if (!message) return;
-    setBusy(true);
-    setChatReply("…σκέφτεται (διαβάζει όλη την κατάσταση του συστήματος)…");
-    try {
-      const r = await supervisorChat(message);
-      setChatReply(r.reply);
-      setChatInput("");
-      await reload();
-    } catch (e) {
-      setChatReply(`Failed: ${e}`);
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const runExperienceTrain = async () => {
     setBusy(true);
@@ -170,27 +153,6 @@ export default function Supervisor() {
           </label>
           <button className="primary" disabled={busy} onClick={runNow}>{busy ? "…" : "▶ Run now"}</button>
         </div>
-      </div>
-
-      <h2>Talk to the Supervisor <Tip text="Your message steers the next cycle: it reads the full system state + your standing directives, answers you, and can act (same whitelisted actions + guard-rails as the autonomous loop)." /></h2>
-      <div className="ticket">
-        <div className="ticket-row" style={{ alignItems: "flex-end" }}>
-          <label style={{ flex: 1 }}>
-            Message
-            <input
-              type="text"
-              value={chatInput}
-              placeholder="π.χ. Τι βλέπεις στα live engines; Ξεκίνα discovery στο GBPUSD M15…"
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") sendChat(); }}
-              style={{ width: "100%" }}
-            />
-          </label>
-          <button className="primary" disabled={busy || !chatInput.trim()} onClick={sendChat}>Send</button>
-        </div>
-        {chatReply && (
-          <div className="banner info" style={{ whiteSpace: "pre-wrap", marginTop: 8 }}>{chatReply}</div>
-        )}
       </div>
 
       <h2>Standing directives <Tip text="One per line. Injected into EVERY autonomous cycle and chat — your strategy stays in force between conversations. E.g. 'focus discovery on EURUSD+GBPUSD', 'never start live engines without asking me'." /></h2>

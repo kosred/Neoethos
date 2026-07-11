@@ -259,7 +259,7 @@ export default function Settings() {
         <div className="ticket-row" style={{ flexWrap: "wrap", gap: 16 }}>
           <label style={{ minWidth: 150 }}>Indicator pool
             <input type="number" min="10" step="10" value={tune.prefilterTopK ?? ""} onChange={(e) => setT("prefilterTopK", e.target.value)} />
-            <span className="muted small">how many indicators the GA may use. Higher = more diverse strategies. <b>Raise if it stalls.</b></span>
+            <span className="muted small">how many indicators the GA may use. Higher = more diverse strategies. <b>Raise if it stalls.</b> Auto-capped at the number of available indicators + SMC — a value above that just means "use them all".</span>
           </label>
           <label style={{ minWidth: 150 }}>Explore patience
             <input type="number" min="10" step="50" value={tune.convergencePatience ?? ""} onChange={(e) => setT("convergencePatience", e.target.value)} />
@@ -327,6 +327,20 @@ export default function Settings() {
             onChange={(e) => setLoop({ autoRediscoverOnCull: e.target.checked })}
           />
           Auto-rediscover after a cull — when a strategy is retired (blacklisted forever), automatically start a fresh Discovery on the same symbol + timeframe to refill the gap. Runs when the Discovery engine is idle.
+        </label>
+        <label style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 8 }}>
+          <input
+            type="checkbox"
+            checked={!!cfg?.liveMlGate}
+            onChange={(e) => setLoop({ liveMlGate: e.target.checked })}
+          />
+          <span>
+            <b>Live ML gate</b> — the trained model ensemble scales each live entry's risk
+            (agreement × regime × anomaly). Strategies still pick the direction; the models can
+            only <b>shrink</b> size or skip a bar on a hard regime/anomaly collapse — never flip
+            a trade, never create one. Needs trained models for the engine's symbol + timeframe;
+            if none load, trading continues gene-only (logged). Takes effect on the next engine start.
+          </span>
         </label>
       </div>
 

@@ -43,6 +43,7 @@ use crate::ensemble::{
     ProbabilityCalibrationExpert,
 };
 use crate::exit_agent::ExitAgent;
+use crate::forecasting::hmm_regime::{HmmRegimeConfig, RegimeHmmExpert};
 use crate::soft_actor_critic::SoftActorCritic;
 use crate::parallel_trainer::{
     ModelConfig, ModelTrainingFailure, ModelTrainingProgress, ModelType, TrainingPayload,
@@ -318,6 +319,33 @@ impl TrainingOrchestrator {
         let base_ohlcv = dataset.frames.get(base_tf).context("base tf missing")?;
         let labels = self.derive_labels(base_ohlcv)?;
 
+        // hmm_regime trains UNSUPERVISED on a `(log_return, log_volatility)`
+        // matrix derived from the RAW base OHLCV — not on the feature frame
+        // the other experts consume — so build its observations here where
+        // the OHLCV is in scope (the dispatch closure only sees the payload).
+        // Honour the same leak-free OOS lock as the supervised experts: only
+        // bars STRICTLY before the cutoff. Build errors are reported when the
+        // model actually trains (fail loud there, with the reason), not
+        // swallowed here.
+        let hmm_bar_count = match self.oos_lock_from_ms {
+            Some(cutoff) => base_ohlcv
+                .timestamp
+                .as_ref()
+                .map(|ts| ts.iter().take_while(|&&t| t < cutoff).count())
+                .unwrap_or(base_ohlcv.close.len()),
+            None => base_ohlcv.close.len(),
+        };
+        let hmm_observations: std::sync::Arc<
+            std::result::Result<ndarray::Array2<f64>, String>,
+        > = std::sync::Arc::new(
+            RegimeHmmExpert::ohlcv_to_features(
+                &base_ohlcv.close[..hmm_bar_count],
+                &base_ohlcv.high[..hmm_bar_count],
+                &base_ohlcv.low[..hmm_bar_count],
+            )
+            .map_err(|e| e.to_string()),
+        );
+
         // Stage 4 leak-free OOS lock: truncate to rows STRICTLY before the cutoff,
         // minus a triple-barrier purge, BEFORE the warmup drop + split. The frame
         // rows are 1:1 with `base_ohlcv` (and `labels`) here, so we slice the dense
@@ -466,6 +494,7 @@ impl TrainingOrchestrator {
                     row_budget_applied,
                     config,
                     payload,
+                    &hmm_observations,
                 )
             },
         )?;
@@ -529,6 +558,16 @@ impl TrainingOrchestrator {
         }
         if self.settings.models.prop_search_enabled {
             requested_models.push("genetic".to_string());
+        }
+        // hmm_regime — the soft regime gate the ensemble's role-aware
+        // combiner expects. Loader + adapter shipped 2026-05-25 but the
+        // training request was never added, so every install reported it
+        // permanently "missing" (operator audit 2026-07-11). Train it
+        // whenever ANY training is happening (Baum-Welch on a 2-column
+        // matrix is seconds of CPU); an entirely-empty request still
+        // fails loud below — that's a misconfiguration, not a run.
+        if !requested_models.is_empty() {
+            requested_models.push("hmm_regime".to_string());
         }
         requested_models = self.expand_requested_models(requested_models);
         if self.settings.models.regime_router_enabled
@@ -2121,6 +2160,7 @@ impl TrainingOrchestrator {
             "genetic" => Ok(ModelType::Genetic),
             "neuro_evo" => Ok(ModelType::NeuroEvo),
             "neat" => Ok(ModelType::Neat),
+            "hmm_regime" => Ok(ModelType::HmmRegime),
             other => anyhow::bail!(
                 "Model `{other}` does not have a concrete ModelType mapping in the orchestrator"
             ),
@@ -4055,6 +4095,7 @@ fn apply_overfit_overrides(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn train_model_dispatch(
     models_dir: &std::path::Path,
     settings: &neoethos_core::Settings,
@@ -4063,6 +4104,12 @@ fn train_model_dispatch(
     row_budget_applied: Option<usize>,
     config: &ModelConfig,
     payload: &TrainingPayload,
+    // Pre-built `(log_return, log_volatility)` observation matrix for the
+    // HMM regime model (derived from raw OHLCV in `train_symbol_with_progress`
+    // — the payload here only carries the feature frame). `Err(reason)` when
+    // the OHLCV couldn't produce observations; surfaced loudly if hmm_regime
+    // is actually dispatched.
+    hmm_observations: &std::result::Result<ndarray::Array2<f64>, String>,
 ) -> Result<()> {
     let artifact_dir = model_artifact_dir(models_dir, symbol, base_tf, &config.name);
 
@@ -4325,6 +4372,35 @@ fn train_model_dispatch(
             )?;
             Ok(())
         }
+        ModelType::HmmRegime => {
+            // Baum-Welch EM over the pre-built (log_return, log_volatility)
+            // matrix — unsupervised, seconds of CPU, honours the same OOS
+            // cutoff as the supervised experts (sliced upstream).
+            let observations = match hmm_observations {
+                Ok(obs) => obs,
+                Err(reason) => anyhow::bail!(
+                    "hmm_regime: could not derive (log_return, log_volatility) \
+                     observations from the base OHLCV: {reason}"
+                ),
+            };
+            let model = RegimeHmmExpert::train(
+                observations,
+                vec!["log_return".to_string(), "log_volatility".to_string()],
+                HmmRegimeConfig::default(),
+            )?;
+            persist_training_artifacts(
+                &artifact_dir,
+                settings,
+                config,
+                symbol,
+                base_tf,
+                payload,
+                row_budget_applied,
+                None,
+                |staged_dir| model.save_to_path(staged_dir),
+            )?;
+            Ok(())
+        }
         ModelType::Genetic => {
             let mut model = GeneticStrategyExpert::new(
                 parse_usize_param(&config.params, "population", 64),
@@ -4541,7 +4617,8 @@ mod tests {
             .iter()
             .map(|entry| entry.name.as_str())
             .collect();
-        assert_eq!(names, vec!["lightgbm", "mlp", "patchtst"]);
+        // hmm_regime joins every non-empty plan (regime gate — wired 2026-07-11).
+        assert_eq!(names, vec!["hmm_regime", "lightgbm", "mlp", "patchtst"]);
     }
 
     #[test]
@@ -4613,9 +4690,14 @@ mod tests {
         let configs = orchestrator
             .build_training_configs(&plan)
             .expect("tree variants should map to concrete base trainers");
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].model_type, ModelType::CatBoost);
-        assert_eq!(configs[0].params.get("variant"), Some(&"alt".to_string()));
+        // catboost_alt + the always-on hmm_regime regime gate.
+        assert_eq!(configs.len(), 2);
+        let cat = configs
+            .iter()
+            .find(|c| c.name == "catboost_alt")
+            .expect("catboost_alt config present");
+        assert_eq!(cat.model_type, ModelType::CatBoost);
+        assert_eq!(cat.params.get("variant"), Some(&"alt".to_string()));
     }
 
     #[test]
@@ -4638,6 +4720,7 @@ mod tests {
             pairs,
             vec![
                 ("genetic", ModelType::Genetic),
+                ("hmm_regime", ModelType::HmmRegime),
                 ("lightgbm", ModelType::LightGBM),
                 ("online_pa", ModelType::OnlinePassiveAggressive),
                 ("patchtst", ModelType::PatchTST),
@@ -4655,9 +4738,13 @@ mod tests {
         let configs = orchestrator
             .build_training_configs(&plan)
             .expect("neat should map to a concrete model type");
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].name, "neat");
-        assert_eq!(configs[0].model_type, ModelType::Neat);
+        // neat + the always-on hmm_regime regime gate.
+        assert_eq!(configs.len(), 2);
+        let neat = configs
+            .iter()
+            .find(|c| c.name == "neat")
+            .expect("neat config present");
+        assert_eq!(neat.model_type, ModelType::Neat);
     }
 
     #[test]
@@ -4725,7 +4812,11 @@ mod tests {
         let configs = orchestrator
             .build_training_configs(&plan)
             .expect("training configs should build");
-        let config = &configs[0];
+        // Pick lightgbm explicitly — the always-on hmm_regime sorts first.
+        let config = configs
+            .iter()
+            .find(|c| c.name == "lightgbm")
+            .expect("lightgbm config present");
         let payload =
             TrainingPayload::from_dense(ndarray::Array2::<f32>::zeros((4, 1)), vec![0, 0, 0, 0])
                 .expect("build payload");

@@ -25,15 +25,6 @@ pub mod ctrader_proto_messages;
 pub mod ctrader_state_machine;
 pub mod ctrader_tls;
 pub mod discovery;
-// `dxtrade` — RESTORED 2026-05-21 after a wrongful deletion the same
-// day. The operator directive is explicit: DXtrade is planned to
-// become a fully-wired adapter alongside cTrader. The module owns the
-// REST + WebSocket client, OAuth-style session token handshake, order
-// REST API, and streaming Push API (Phases D3.1–D3.3 in the module
-// docs). Audit 2026-05-20 noted zero UI callers TODAY, but that's a
-// wiring-pending state, not an abandonment. When TradingSession
-// starts dispatching DxTrade through the runtime adapter trait, the
-// allow below comes off.
 pub mod broker_api;
 // Phase C (2026-05-28) — one-shot tool that captures real
 // `ProtoOASymbolByIdRes` payloads from the configured cTrader
@@ -42,7 +33,6 @@ pub mod broker_api;
 // bytes (see `--capture-symbols` CLI flag in main.rs).
 pub mod capture_symbols;
 pub mod challenge_sim;
-pub mod dxtrade;
 pub mod embedded_credentials;
 pub mod jobs;
 pub mod journal_reconcile;

@@ -61,6 +61,17 @@ struct Announce {
     ts: u64,
 }
 
+/// Tagged gossip payload — peer announcements AND island-migration elites
+/// share the one rendezvous topic.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "t")]
+enum GossipMsg {
+    Announce(Announce),
+    /// Elite genes migrating between GA islands. Opaque JSON here — the local
+    /// app deserializes them into real genes at `/mesh/migrants`.
+    Migrants { genes: serde_json::Value },
+}
+
 /// This machine's real hardware, read once from the local app's `/hardware`
 /// (falls back to core count if the app is offline). This is what the node
 /// contributes to the swarm's total capacity.
@@ -84,6 +95,29 @@ fn disc() -> String {
     "discovery".into()
 }
 
+/// Max bytes for one RPC message. Large enough for a tarred model directory
+/// (base64'd) returned from a training job.
+const MAX_RPC: usize = 512 * 1024 * 1024;
+
+/// Tar a directory tree into an in-memory buffer (best-effort).
+fn tar_dir(dir: &std::path::Path) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    {
+        let mut ar = tar::Builder::new(&mut buf);
+        ar.append_dir_all(".", dir).context("tar model dir")?;
+        ar.finish()?;
+    }
+    Ok(buf)
+}
+
+/// Untar an in-memory buffer into `dest` (created if needed).
+fn untar_to(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dest).ok();
+    let mut ar = tar::Archive::new(bytes);
+    ar.unpack(dest).context("untar model into store")?;
+    Ok(())
+}
+
 /// Request a worker sends to a coordinator over a QUIC bi-stream.
 #[derive(Debug, Serialize, Deserialize)]
 enum MeshReq {
@@ -93,6 +127,14 @@ enum MeshReq {
         base_tf: String,
         portfolio_json: String,
         trades_json: Option<String>,
+    },
+    /// A trained model returned from a worker: the model directory tarred and
+    /// base64'd (keeps the JSON RPC framing intact). The coordinator decodes +
+    /// untars it into its own model store.
+    SubmitTraining {
+        symbol: String,
+        base_tf: String,
+        model_tar_b64: String,
     },
 }
 
@@ -242,6 +284,39 @@ impl AppClient {
         }
     }
 
+    /// Turn on island migration in the local GA (called once on startup).
+    async fn enable_migration(&self) {
+        let _ = self.http.post(format!("{}/mesh/migration/enable", self.base)).send().await;
+    }
+
+    /// Drain the local island's published elites (opaque gene JSON), if any.
+    async fn get_elites(&self) -> Option<serde_json::Value> {
+        let r = self.http.get(format!("{}/mesh/elites", self.base)).send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = r.json().await.ok()?;
+        match &v {
+            serde_json::Value::Array(a) if !a.is_empty() => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Inject a peer island's elites into the local GA's next generation.
+    async fn push_migrants(&self, genes: serde_json::Value) {
+        let _ = self.http.post(format!("{}/mesh/migrants", self.base)).json(&genes).send().await;
+    }
+
+    /// The local model store's ABSOLUTE path (from `/intelligence`), for
+    /// tarring/untarring trained models. Returns the path even if it doesn't
+    /// exist yet (the coordinator creates it on untar).
+    async fn models_dir(&self) -> Option<PathBuf> {
+        let r = self.http.get(format!("{}/intelligence", self.base)).send().await.ok()?;
+        let v: serde_json::Value = r.json().await.ok()?;
+        let dir = v.get("modelsDir").and_then(|x| x.as_str()).filter(|s| !s.is_empty())?;
+        Some(PathBuf::from(dir))
+    }
+
     /// (app_online, has_queued_work)
     async fn status(&self) -> (bool, bool) {
         match self.http.get(format!("{}/federation/status", self.base)).send().await {
@@ -369,7 +444,7 @@ impl ProtocolHandler for MeshProto {
                 Ok(s) => s,
                 Err(_) => break,
             };
-            let req_bytes = recv.read_to_end(1 << 20).await.map_err(AcceptError::from_err)?;
+            let req_bytes = recv.read_to_end(MAX_RPC).await.map_err(AcceptError::from_err)?;
             let resp = match serde_json::from_slice::<MeshReq>(&req_bytes) {
                 Ok(MeshReq::GetJob { worker }) => {
                     let job = self.app.next_job(&worker).await;
@@ -385,6 +460,23 @@ impl ProtocolHandler for MeshProto {
                         .await;
                     tracing::info!(peer = %remote, %symbol, ok, "received a result from a peer worker");
                     MeshResp::SubmitAck { ok, msg }
+                }
+                Ok(MeshReq::SubmitTraining { symbol, base_tf, model_tar_b64 }) => {
+                    use base64::Engine;
+                    let msg = match base64::engine::general_purpose::STANDARD.decode(&model_tar_b64) {
+                        Ok(tar) => match self.app.models_dir().await {
+                            Some(dir) => match untar_to(&tar, &dir) {
+                                Ok(()) => {
+                                    tracing::info!(peer = %remote, %symbol, %base_tf, bytes = tar.len(), "received a trained model from a peer worker → saved to model store");
+                                    format!("model saved ({} bytes) to {}", tar.len(), dir.display())
+                                }
+                                Err(e) => format!("untar failed: {e}"),
+                            },
+                            None => "no local model store path available".to_string(),
+                        },
+                        Err(e) => format!("bad base64: {e}"),
+                    };
+                    MeshResp::SubmitAck { ok: msg.starts_with("model saved"), msg }
                 }
                 Err(e) => MeshResp::Err(format!("bad request: {e}")),
             };
@@ -408,7 +500,7 @@ async fn rpc(
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
     send.write_all(&serde_json::to_vec(req)?).await?;
     send.finish()?;
-    let bytes = recv.read_to_end(1 << 20).await?;
+    let bytes = recv.read_to_end(MAX_RPC).await?;
     conn.close(0u32.into(), b"done");
     Ok(serde_json::from_slice(&bytes)?)
 }
@@ -450,9 +542,33 @@ async fn run_one_job(
     }
 
     if job.work_type == "training" {
-        // Training runs locally; returning the model weights to the coordinator
-        // needs iroh-blobs (documented next step). The compute offload is real.
-        tracing::info!("training job ran locally; model-weight return is the iroh-blobs follow-up");
+        // Training ran locally; return the trained model directory to the
+        // coordinator by tarring it and sending it over the QUIC RPC.
+        use base64::Engine;
+        match app.models_dir().await {
+            Some(dir) if dir.exists() => match tar_dir(&dir) {
+                Ok(tar) => {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&tar);
+                    tracing::info!(mb = tar.len() / (1024 * 1024), "training done — sending model to coordinator");
+                    match rpc(
+                        endpoint,
+                        coordinator,
+                        &MeshReq::SubmitTraining {
+                            symbol: job.symbol.clone(),
+                            base_tf: job.base_tf.clone(),
+                            model_tar_b64: b64,
+                        },
+                    )
+                    .await?
+                    {
+                        MeshResp::SubmitAck { ok, msg } => tracing::info!(ok, %msg, "model submitted to coordinator"),
+                        other => tracing::warn!("unexpected training-submit response: {other:?}"),
+                    }
+                }
+                Err(e) => tracing::warn!("could not tar model store: {e}"),
+            },
+            _ => tracing::warn!("no model store found after training — nothing to return"),
+        }
         return Ok(true);
     }
 
@@ -540,6 +656,11 @@ async fn main() -> Result<()> {
             loop {
                 tick.tick().await;
                 let (online, has_work) = app.status().await;
+                // Enable island migration on the app as soon as it's reachable
+                // (idempotent) — a node in the swarm shares elites automatically.
+                if online {
+                    app.enable_migration().await;
+                }
                 let hw = app.hardware().await;
                 let ann = Announce {
                     node_id: id.clone(),
@@ -551,34 +672,50 @@ async fn main() -> Result<()> {
                     has_work,
                     ts: now_secs(),
                 };
-                if let Ok(json) = serde_json::to_vec(&ann) {
+                if let Ok(json) = serde_json::to_vec(&GossipMsg::Announce(ann)) {
                     let _ = sender.broadcast(Bytes::from(json)).await;
+                }
+                // Island migration: gossip this node's published elites, if any.
+                if let Some(elites) = app.get_elites().await {
+                    if let Ok(json) = serde_json::to_vec(&GossipMsg::Migrants { genes: elites }) {
+                        let _ = sender.broadcast(Bytes::from(json)).await;
+                    }
                 }
             }
         });
     }
 
-    // Discovery loop — maintain the peer table.
+    // Discovery loop — route gossip: peer announces → peer table; migrant
+    // elites → inject into the local GA.
     {
         let peers = peers.clone();
+        let app = app.clone();
         tokio::spawn(async move {
             while let Some(event) = receiver.next().await {
                 if let Ok(Event::Received(msg)) = event {
-                    if let Ok(a) = serde_json::from_slice::<Announce>(&msg.content) {
-                        if let Ok(id) = EndpointId::from_str(&a.node_id) {
-                            peers.lock().await.insert(
-                                id,
-                                PeerInfo {
-                                    cpu_cores: a.cpu_cores,
-                                    ram_mb: a.ram_mb,
-                                    gpu: a.gpu,
-                                    app_online: a.app_online,
-                                    has_work: a.has_work,
-                                    last_seen: Instant::now(),
-                                },
-                            );
-                            tracing::info!(peer = %a.node_id, cores = a.cpu_cores, ram_mb = a.ram_mb, gpu = a.gpu, has_work = a.has_work, "peer announce");
+                    match serde_json::from_slice::<GossipMsg>(&msg.content) {
+                        Ok(GossipMsg::Announce(a)) => {
+                            if let Ok(id) = EndpointId::from_str(&a.node_id) {
+                                peers.lock().await.insert(
+                                    id,
+                                    PeerInfo {
+                                        cpu_cores: a.cpu_cores,
+                                        ram_mb: a.ram_mb,
+                                        gpu: a.gpu,
+                                        app_online: a.app_online,
+                                        has_work: a.has_work,
+                                        last_seen: Instant::now(),
+                                    },
+                                );
+                                tracing::info!(peer = %a.node_id, cores = a.cpu_cores, ram_mb = a.ram_mb, gpu = a.gpu, has_work = a.has_work, "peer announce");
+                            }
                         }
+                        Ok(GossipMsg::Migrants { genes }) => {
+                            let n = genes.as_array().map(|a| a.len()).unwrap_or(0);
+                            app.push_migrants(genes).await;
+                            tracing::info!(count = n, "received migrant elites from a peer island → injected");
+                        }
+                        Err(_) => {}
                     }
                 }
             }

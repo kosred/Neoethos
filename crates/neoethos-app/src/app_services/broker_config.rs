@@ -15,7 +15,6 @@ use crate::app_services::trading_types::TradingAdapterKind;
 pub use neoethos_core::broker_config::{
     BROKER_CREDENTIALS_SCHEMA_VERSION, BrokerAccountTarget, BrokerSettingsState,
     CTRADER_OAUTH_REDIRECT_URI, CTraderBrokerEnvironment, CTraderBrokerSettings,
-    DxTradeBrokerSettings,
 };
 // `CTRADER_CREATE_DEMO_ACCOUNT_URL` / `CTRADER_CREATE_LIVE_ACCOUNT_URL`
 // constants live in `neoethos-core::broker_config` and were
@@ -84,20 +83,6 @@ impl BrokerSettingsReadiness for BrokerSettingsState {
                     missing_fields,
                     count_enabled_targets(&self.ctrader.accounts),
                     &ready_line,
-                )
-            }
-            TradingAdapterKind::DxTrade => {
-                let missing_fields = required_missing_fields(&[
-                    ("platform_url", &self.dxtrade.platform_url),
-                    ("username", &self.dxtrade.username),
-                    ("domain", &self.dxtrade.domain),
-                    ("password", &self.dxtrade.password),
-                ]);
-                build_remote_readiness(
-                    adapter,
-                    missing_fields,
-                    count_enabled_targets(&self.dxtrade.accounts),
-                    "Remote broker credentials ready.",
                 )
             }
         }
@@ -201,31 +186,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dxtrade_readiness_requires_platform_and_credentials() {
-        let mut settings = BrokerSettingsState::default();
-
-        let missing = settings.readiness(TradingAdapterKind::DxTrade);
-        assert_eq!(missing.session_state, BrokerSessionState::Disconnected);
-        assert_eq!(
-            missing.missing_fields,
-            vec![
-                "platform_url".to_string(),
-                "username".to_string(),
-                "domain".to_string(),
-                "password".to_string()
-            ]
-        );
-        assert!(!missing.can_attempt_connect);
-
-        settings.dxtrade.platform_url = "https://broker.example/specs".to_string();
-        settings.dxtrade.username = "ops-user".to_string();
-        settings.dxtrade.domain = "default".to_string();
-        settings.dxtrade.password = "ops-pass".to_string();
-
-        let ready = settings.readiness(TradingAdapterKind::DxTrade);
-        assert_eq!(ready.session_state, BrokerSessionState::ReadyForAuth);
-        assert!(ready.missing_fields.is_empty());
-        assert!(ready.can_attempt_connect);
-    }
 }

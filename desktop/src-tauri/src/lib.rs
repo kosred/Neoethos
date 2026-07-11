@@ -77,6 +77,68 @@ fn api_base() -> String {
     backend::base_url()
 }
 
+/// MCP sidecar lifecycle (task #33 — full MCP support). The isolated
+/// `neoethos-mcp` binary connects to the operator's configured MCP servers
+/// (cTrader remote, MT5 bridges, web search, …) and exposes their tools on
+/// 127.0.0.1:7431 for the Supervisor's approval-gated actions. Best-effort:
+/// a missing binary just logs — the app never depends on it.
+mod mcp_sidecar {
+    use std::sync::Mutex;
+
+    static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+
+    /// Locate + spawn the sidecar. Called AFTER `prepare_data_root` so the
+    /// CWD is the per-user data root — `mcp_servers.json` lives there and
+    /// the sidecar's relative default resolves to it.
+    pub fn start() {
+        let bin_name = if cfg!(windows) {
+            "neoethos-mcp.exe"
+        } else {
+            "neoethos-mcp"
+        };
+        let exe = std::env::var("NEOETHOS_MCP_PATH")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join(bin_name)))
+                    .filter(|p| p.exists())
+            });
+        let Some(exe) = exe else {
+            eprintln!(
+                "MCP sidecar not found (neoethos-mcp.exe beside the app or NEOETHOS_MCP_PATH) — \
+                 MCP tools unavailable this session"
+            );
+            return;
+        };
+        match std::process::Command::new(&exe)
+            .arg("--config")
+            .arg("mcp_servers.json")
+            .spawn()
+        {
+            Ok(child) => {
+                eprintln!("MCP sidecar started: {} (pid {})", exe.display(), child.id());
+                if let Ok(mut slot) = CHILD.lock() {
+                    *slot = Some(child);
+                }
+            }
+            Err(e) => eprintln!("MCP sidecar failed to start ({}): {e}", exe.display()),
+        }
+    }
+
+    /// Kill the sidecar. Called from the window-close handler BEFORE the
+    /// hard process exit — a plain `std::process::exit` would orphan it.
+    pub fn stop() {
+        if let Ok(mut slot) = CHILD.lock() {
+            if let Some(mut child) = slot.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+}
+
 /// Reveal a file or folder in the OS file manager (Windows Explorer). Files are
 /// highlighted via `/select,`; folders open directly. Lets the user find any
 /// data/model/log the app stores with one click.
@@ -346,6 +408,9 @@ pub fn run() {
             // until the broker is authenticated). Feeds the in-process server's
             // /live/spots/stream (SSE) that the UI subscribes to.
             broker::start_spot_streamer();
+            // MCP sidecar (best-effort): exposes configured MCP servers' tools
+            // to the Supervisor's approval-gated actions on 127.0.0.1:7431.
+            mcp_sidecar::start();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -370,6 +435,21 @@ pub fn run() {
             broker::reauth_broker,
             broker::refresh_broker_costs,
         ])
+        .on_window_event(|_window, event| {
+            // Heavy Discovery/Training work runs on tokio blocking threads. A
+            // tight CPU loop there can keep the process alive past window close
+            // — the operator reported a stuck search that only a full REBOOT
+            // stopped. When the operator closes the window, hard-exit the whole
+            // process so EVERY worker thread dies immediately: "close = stop",
+            // guaranteed, no orphaned CPU, no reboot. Broker positions are held
+            // server-side by cTrader, so exiting never touches live orders.
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                // Kill the MCP sidecar child FIRST — process::exit would
+                // orphan it (it's an independent OS process).
+                mcp_sidecar::stop();
+                std::process::exit(0);
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

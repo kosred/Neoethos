@@ -23,28 +23,31 @@
 //!
 //! [`build_ensemble_for_symbol`]:
 //!  1. Builds an [`super::ExpertRegistry`] with every default
-//!     loader pre-registered (30 canonical names — all wired
-//!     families from D1.2.1-D1.2.7 + the 34th model `hmm_regime`,
-//!     minus the 3 strategy-discoverer adapters removed in F-319
-//!     added 2026-05-25).
-//!  2. Calls [`super::ExpertRegistry::load_with_partial`] against
-//!     the operator's `<models_root>/<symbol>/<tf>/` directory
+//!     loader pre-registered (32 canonical names — all wired
+//!     families from D1.2.1-D1.2.7, the 34th model `hmm_regime`,
+//!     and the evolutionary voters neat/neuro_evo restored in the
+//!     F-319 revision 2026-07-11).
+//!  2. Calls [`super::ExpertRegistry::load_with_partial_replica_aware`]
+//!     against the operator's `<models_root>/<symbol>/<tf>/` directory
 //!     with the full canonical name list. Missing/degraded
 //!     artifacts are reported in the outcome (per option β —
 //!     no fail-loud) so the operator can run the bot with
-//!     whatever subset of the 33 experts has been trained.
+//!     whatever subset of the 32 experts has been trained; replica
+//!     dirs (`transformer_01/…`) load as independent voters and
+//!     orphan artifact dirs are warned about loudly.
 //!  3. Constructs a [`super::SoftVotingEnsemble`] with the
-//!     default config (genetic + neuro_evo excluded from voting
-//!     per the operator's 2026-05-17 directive — they're upstream
-//!     strategy discoverers).
+//!     default config (no default exclusions — the operator rule is
+//!     "every trained model votes"; only `genetic` stays out, as the
+//!     strategy discoverer it is search-side, never registered here).
 //!
 //! Returns the ensemble plus the load outcome so the caller's
-//! chrome / system pane can render "Loaded X/33 experts —
+//! chrome / system pane can render "Loaded X/32 experts —
 //! Y missing, Z degraded".
 //!
 //! ## What it does NOT do
 //!
-//! - Does NOT load `swarm_forecaster` (deferred per D1.2.7).
+//! - Loads `swarm_forecaster` as a LAST-ROW-ONLY voter (D1.2.8 landed
+//!   2026-07-11 — see the `swarm_adapter` module doc).
 //! - Does NOT run any training. Bootstrap is read-only against
 //!   the operator's `models_root` directory; if no experts have
 //!   been trained, the function returns an ensemble with an
@@ -65,27 +68,27 @@ use super::{
     ExpertLoadOutcome, ExpertRegistry, SoftVotingEnsemble, SoftVotingEnsembleConfig,
     deep_classification_adapters::register_deep_classification_loaders,
     deep_timeseries_adapters::register_deep_timeseries_loaders,
-    meta_adapters::register_meta_loaders, mixed_adapters::register_mixed_loaders,
-    rl_exit_adapters::register_rl_exit_loaders, tree_adapters::register_tree_loaders,
+    evolution_adapters::register_evolution_loaders, meta_adapters::register_meta_loaders,
+    mixed_adapters::register_mixed_loaders, rl_exit_adapters::register_rl_exit_loaders,
+    swarm_adapter::register_swarm_loader, tree_adapters::register_tree_loaders,
 };
-// F-319: `register_evolutionary_loaders` import removed —
-// genetic/neuro_evo/neat are strategy discoverers in `neoethos-search`,
-// not inference experts. The wrappers + bootstrap entries are gone.
 
 /// Canonical list of expert names the bootstrap tries to load.
 ///
 /// Sourced from `KNOWN_MODEL_NAMES` per
 /// [`crate::runtime::capabilities::KNOWN_MODEL_NAMES`] minus:
-///   - `swarm_forecaster` — stateful-univariate API that doesn't fit
-///     the current ExpertModel trait (deferred to D1.2.8).
-///   - `genetic`, `neuro_evo`, `neat` — strategy discoverers in
-///     `neoethos-search`, NOT inference voters (F-319, 2026-05-29
-///     operator directive). KNOWN_MODEL_NAMES still lists them as
-///     legitimate algorithms because they run inside the search
-///     crate, but they have no role in the soft-voting ensemble.
+///   - `genetic` — the strategy DISCOVERER (the GA in `neoethos-search`);
+///     the operator's search-only exemption applies to it alone.
+///   - `exit_agent` — F-318 (no production exit-side consumer).
 ///
-/// **30 names total** (KNOWN_MODEL_NAMES − swarm − 3 evolutionary
-/// search algorithms − exit_agent, + the `sac` entry voter).
+/// `neat` + `neuro_evo` REJOINED 2026-07-11 (F-319 revision, operator
+/// directive "every trained model votes"): both are trained through the
+/// shared expert path with genuine 3-class heads — see the
+/// `evolution_adapters` module doc. `swarm_forecaster` landed the same
+/// day (D1.2.8): last-row-only forecast voter — see the `swarm_adapter`
+/// module doc for the honesty constraints.
+///
+/// **33 names total** (KNOWN_MODEL_NAMES − genetic − exit_agent).
 ///
 /// `exit_agent` was removed in F-318 (2026-05-29): the model trains
 /// successfully and emits `ExitDecision3` probabilities, but
@@ -135,6 +138,14 @@ pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     // that emits Classification3 probs and soft-votes like `dqn`.
     "dqn",
     "sac",
+    // Evolutionary voters (2) — rejoined 2026-07-11 (F-319 revision):
+    // trained via the shared expert path with 3-class heads; their
+    // artifacts were being produced and never read.
+    "neat",
+    "neuro_evo",
+    // Forecasting voter (1) — D1.2.8, same day: last-row-only forecast
+    // lean (live-gate semantics; abstains on historical rows).
+    "swarm_forecaster",
 ];
 
 /// Build a fully populated [`ExpertRegistry`] with every default
@@ -149,10 +160,12 @@ pub fn build_default_registry() -> Result<ExpertRegistry> {
     register_meta_loaders(&mut registry).context("register meta loaders")?;
     register_mixed_loaders(&mut registry).context("register mixed loaders")?;
     register_rl_exit_loaders(&mut registry).context("register rl+exit loaders")?;
+    register_evolution_loaders(&mut registry).context("register evolutionary loaders")?;
+    register_swarm_loader(&mut registry).context("register swarm forecaster loader")?;
     debug_assert_eq!(
         registry.registered_names().len(),
         DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(),
-        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 30 canonical names"
+        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 33 canonical names"
     );
     Ok(registry)
 }
@@ -203,7 +216,11 @@ pub fn load_experts_for_symbol(
 ) -> Result<ExpertLoadOutcome> {
     let registry = build_default_registry()?;
     let artifact_root = models_root.join(symbol).join(timeframe);
-    Ok(registry.load_with_partial(&artifact_root, DEFAULT_BOOTSTRAP_EXPERT_NAMES))
+    // Replica-aware: resolves `transformer_01/02/…` replica dirs (which
+    // training writes when num_transformers > 1 — a plain `transformer/`
+    // dir never exists then) and warns on orphan artifacts no loader
+    // claims, instead of silently counting trained models as missing.
+    Ok(registry.load_with_partial_replica_aware(&artifact_root, DEFAULT_BOOTSTRAP_EXPERT_NAMES))
 }
 
 /// v0.5 ML-integration Stage 3 — produce the per-row role-aware
@@ -224,13 +241,52 @@ pub fn role_decisions_from_feature_frame(
     timeframe: &str,
     features: &neoethos_data::FeatureFrame,
 ) -> Result<Vec<super::EnsembleDecision>> {
+    let ensemble = build_ensemble_for_symbol(models_root, symbol, timeframe)?;
+    let df = ensemble_feature_dataframe(&ensemble, features, FrameRows::All)?;
+    ensemble.predict_with_roles(&df)
+}
+
+/// LIVE-path variant: one role-aware decision for the LAST row of `features`,
+/// against an ALREADY-BUILT ensemble.
+///
+/// The live autopilot builds its ensemble ONCE at engine start (loading ~30
+/// expert artifacts takes seconds — far too slow per bar) and calls this on
+/// every closed bar with the same multi-TF feature cube the genes evaluate.
+/// Same fail-loud column contract as [`role_decisions_from_feature_frame`];
+/// the caller treats any `Err` as "ensemble abstains" and falls back to
+/// gene-only sizing — never a wrong-columned prediction, never a blocked
+/// trade due to ML infrastructure.
+pub fn role_decision_for_last_row(
+    ensemble: &SoftVotingEnsemble,
+    features: &neoethos_data::FeatureFrame,
+) -> Result<super::EnsembleDecision> {
+    let df = ensemble_feature_dataframe(ensemble, features, FrameRows::LastOnly)?;
+    let decisions = ensemble.predict_with_roles(&df)?;
+    decisions
+        .into_iter()
+        .next_back()
+        .ok_or_else(|| anyhow::anyhow!("ensemble returned no decision for the last feature row"))
+}
+
+/// Row selector for [`ensemble_feature_dataframe`].
+enum FrameRows {
+    All,
+    LastOnly,
+}
+
+/// Shared column-contract core: read the experts' agreed feature columns,
+/// select EXACTLY those from the cube BY NAME, and build the DataFrame the
+/// experts expect. FAILS LOUD on any mismatch.
+fn ensemble_feature_dataframe(
+    ensemble: &SoftVotingEnsemble,
+    features: &neoethos_data::FeatureFrame,
+    rows: FrameRows,
+) -> Result<polars::prelude::DataFrame> {
     use anyhow::{anyhow, bail};
     use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 
     // `load_outcome` is an `EnsemblePredictor` trait method.
     use super::EnsemblePredictor;
-
-    let ensemble = build_ensemble_for_symbol(models_root, symbol, timeframe)?;
 
     // Determine the experts' shared feature-column set; assert all loaded
     // experts that expose columns agree on them.
@@ -245,16 +301,15 @@ pub fn role_decisions_from_feature_frame(
             Some(prev) => {
                 if prev.as_slice() != cols {
                     bail!(
-                        "ensemble experts disagree on feature columns for {symbol}/{timeframe}; \
+                        "ensemble experts disagree on feature columns; \
                          refusing to feed mis-columned data"
                     );
                 }
             }
         }
     }
-    let expected = expected.ok_or_else(|| {
-        anyhow!("no loaded expert exposes feature_columns for {symbol}/{timeframe}")
-    })?;
+    let expected =
+        expected.ok_or_else(|| anyhow!("no loaded expert exposes feature_columns"))?;
 
     // Build a DataFrame with EXACTLY `expected` columns, by name, from the cube.
     let mut columns = Vec::with_capacity(expected.len());
@@ -265,16 +320,22 @@ pub fn role_decisions_from_feature_frame(
             .position(|n| n == name)
             .ok_or_else(|| {
                 anyhow!(
-                    "feature '{name}' required by the {symbol}/{timeframe} ensemble is absent \
-                     from the trader feature cube; refusing to trade on incomplete features"
+                    "feature '{name}' required by the ensemble is absent from the \
+                     trader feature cube; refusing to trade on incomplete features"
                 )
             })?;
-        let col: Vec<f32> = features.feature_column(idx).to_vec();
+        let col: Vec<f32> = match rows {
+            FrameRows::All => features.feature_column(idx).to_vec(),
+            FrameRows::LastOnly => features
+                .feature_column(idx)
+                .last()
+                .copied()
+                .map(|v| vec![v])
+                .unwrap_or_default(),
+        };
         columns.push(Column::from(Series::new(name.as_str().into(), col)));
     }
-    let df = DataFrame::new(columns).context("build ensemble feature DataFrame")?;
-
-    ensemble.predict_with_roles(&df)
+    DataFrame::new(columns).context("build ensemble feature DataFrame")
 }
 
 // ---------------------------------------------------------------------------
@@ -305,21 +366,20 @@ mod tests {
 
     #[test]
     fn default_bootstrap_names_match_known_model_names_minus_swarm() {
-        // 30 voters = KNOWN_MODEL_NAMES minus swarm_forecaster,
-        // 3 evolutionary discoverers, and exit_agent; plus sac.
-        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 30);
+        // 33 voters = KNOWN_MODEL_NAMES minus genetic and exit_agent.
+        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 33);
         let names: std::collections::HashSet<&str> =
             DEFAULT_BOOTSTRAP_EXPERT_NAMES.iter().copied().collect();
+        // F-319 REVISED (2026-07-11, operator directive "every trained
+        // model votes"): only `genetic` keeps the search-only exemption.
         assert!(
-            !names.contains("swarm_forecaster"),
-            "swarm_forecaster is intentionally absent (D1.2.7 deferral)"
+            !names.contains("genetic"),
+            "genetic is the strategy discoverer — search-only exemption"
         );
-        // F-319 (2026-05-29): genetic/neuro_evo/neat are strategy
-        // discoverers in `neoethos-search`, NOT inference experts.
-        for absent in ["genetic", "neuro_evo", "neat"] {
+        for present in ["neat", "neuro_evo", "swarm_forecaster"] {
             assert!(
-                !names.contains(absent),
-                "{absent} is a strategy discoverer, not an inference voter (F-319)"
+                names.contains(present),
+                "{present} is trained — it must vote (swarm: last-row-only, D1.2.8)"
             );
         }
         // F-318 (2026-05-29): exit_agent's ExitDecision3 outputs are
@@ -345,10 +405,10 @@ mod tests {
     }
 
     #[test]
-    fn build_default_registry_installs_all_30_loaders() {
+    fn build_default_registry_installs_all_33_loaders() {
         let registry = build_default_registry().expect("build default registry");
         let registered = registry.registered_names();
-        assert_eq!(registered.len(), 30);
+        assert_eq!(registered.len(), 33);
         for required in DEFAULT_BOOTSTRAP_EXPERT_NAMES {
             assert!(
                 registry.has_loader(required),
@@ -365,7 +425,7 @@ mod tests {
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
         assert_eq!(outcome.loaded_count(), 0);
         assert_eq!(outcome.degraded_count(), 0);
-        assert_eq!(outcome.missing_count(), 30);
+        assert_eq!(outcome.missing_count(), 33);
         assert!(!outcome.has_any_loaded());
     }
 
@@ -391,8 +451,8 @@ mod tests {
         // Create the expected dir so the load can scan it.
         fs::create_dir_all(&expected).expect("mkdir");
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
-        // Still 30 missing because the dir is empty, but the
+        // Still 33 missing because the dir is empty, but the
         // function didn't error out → path resolution worked.
-        assert_eq!(outcome.missing_count(), 30);
+        assert_eq!(outcome.missing_count(), 33);
     }
 }

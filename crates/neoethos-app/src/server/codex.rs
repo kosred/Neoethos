@@ -100,7 +100,23 @@ pub struct CodexStartDto {
     pub callback_port: u16,
 }
 
-pub async fn start(State(state): State<AppApiState>) -> Response {
+/// Optional POST body for `/auth/codex/start`. Lets the operator say
+/// WHICH ChatGPT account to connect by typing its email — threaded to
+/// the issuer as `login_hint`. Absent/empty ⇒ the issuer's account
+/// picker decides (we always send `prompt=login` so it's never silently
+/// reused). The body is optional so older callers that POST nothing keep
+/// working unchanged.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexStartBody {
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
+pub async fn start(
+    State(state): State<AppApiState>,
+    body: Option<Json<CodexStartBody>>,
+) -> Response {
     // Reject overlapping logins so we don't end up with two listeners
     // racing on the same port and a confused user.
     {
@@ -119,7 +135,8 @@ pub async fn start(State(state): State<AppApiState>) -> Response {
         }
     }
 
-    let request = AuthorizationRequest::new();
+    let login_hint = body.and_then(|Json(b)| b.email);
+    let request = AuthorizationRequest::new().with_login_hint(login_hint);
     let authorize_url = request.build_authorize_url();
     let callback_port = neoethos_codex::CODEX_CALLBACK_PORT;
 

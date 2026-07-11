@@ -105,9 +105,8 @@ pub async fn credentials_post(
     };
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        // Preserve any existing DxTrade config + load the current
-        // cTrader secret so we can keep it when the form left the
-        // field blank.
+        // Load the current cTrader secret so we can keep it when the
+        // form left the field blank.
         let mut current = load_broker_settings();
         let saved_client_id = current.ctrader.client_id.clone();
         let saved_client_secret = current.ctrader.client_secret.clone();

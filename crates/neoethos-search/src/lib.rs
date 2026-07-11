@@ -103,8 +103,9 @@ pub use genetic::{
     install_smc_search_config_from_settings,
     install_strategy_evaluation_runtime_overrides,
     install_strategy_evaluation_runtime_overrides_from_env,
-    install_strategy_evaluation_runtime_overrides_from_settings, month_day_indices, random_search,
-    set_search_cancel, signals_for_gene, signals_for_gene_full,
+    install_strategy_evaluation_runtime_overrides_from_settings, migration_enabled,
+    month_day_indices, push_migrants, random_search, set_migration_enabled, set_search_cancel,
+    signals_for_gene, signals_for_gene_full, take_elites,
 };
 pub use discovery_ledger::{
     DiscoverySearchLedger, GeneRecord, SearchMetadata, ledger_path, load_prior_ledger,

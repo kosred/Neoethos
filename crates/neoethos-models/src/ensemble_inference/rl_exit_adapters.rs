@@ -31,10 +31,10 @@
 //! extension for stateful univariate forecasters, or (b) a
 //! Mutex-wrapped adapter that extracts a "close" column from the
 //! input DataFrame and re-fits on each predict — both decisions
-//! that warrant their own focused commit (D1.2.8). The producer
-//! reports `swarm_forecaster` as `missing` in the load outcome
-//! until that work lands; the SoftVoting layer is unaffected
-//! because Forecast1 outputs are already skipped.
+//! that warranted their own focused commit. D1.2.8 LANDED 2026-07-11
+//! as `super::swarm_adapter`: option (b) refined — a stateless
+//! per-predict refit that votes on the LAST row only (live-gate
+//! semantics) and honestly abstains on historical rows.
 //!
 //! ## Load contract
 //!
@@ -470,15 +470,16 @@ mod tests {
                 "registry missing loader for '{required}'"
             );
         }
-        for absent in ["genetic", "neuro_evo", "neat", "exit_agent"] {
+        // This PARTIAL registry (tree/deep/meta/mixed/rl only) never
+        // registers the evolutionary or swarm loaders — those live in
+        // `evolution_adapters` / `swarm_adapter` and ARE part of
+        // `build_default_registry` since 2026-07-11 (F-319 revision +
+        // D1.2.8). `genetic`/`exit_agent` stay out everywhere.
+        for absent in ["genetic", "neuro_evo", "neat", "exit_agent", "swarm_forecaster"] {
             assert!(
                 !reg.has_loader(absent),
-                "registry should not have loader for '{absent}' (F-318/F-319)"
+                "partial registry unexpectedly has loader for '{absent}'"
             );
         }
-        assert!(
-            !reg.has_loader("swarm_forecaster"),
-            "swarm_forecaster is intentionally deferred to D1.2.8"
-        );
     }
 }

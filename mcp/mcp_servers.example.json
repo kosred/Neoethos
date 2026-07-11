@@ -1,0 +1,50 @@
+{
+  "_comment": "Copy to mcp_servers.json (next to the neoethos-mcp binary, or pass --config PATH). Each server is connected on startup; the app's Supervisor/Codex sees their tools via GET /tools and invokes them via POST /call.",
+  "port": 7431,
+  "servers": [
+    {
+      "name": "ctrader",
+      "transport": "http",
+      "url": "https://mcp.spotware.com/mcp",
+      "_note": "cTrader official remote MCP (AI Agent Connect). Authenticates against cTrader Web on first use — a separate consent surface from the app's OAuth token; never share tokens across paths."
+    },
+    {
+      "name": "filesystem",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "_note": "Official filesystem MCP server, scoped to the given directory. Change '.' to the path you want the assistant to read/write."
+    },
+    {
+      "name": "web",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+      "_note": "Example web-search MCP (Brave). Requires the server's own API key in its environment. Swap for any web-search MCP server you prefer."
+    }
+  ],
+  "_more_servers_not_loaded": {
+    "_comment": "Researched 2026-07-11 — move an entry into `servers` to enable it. SECURITY: pin the exact version you audited; in NeoEthos every trade-affecting MCP tool call still requires the operator's approval click — never grant a third-party server autonomous order flow.",
+    "mt5_full": {
+      "name": "mt5",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["mcp-metatrader5-server"],
+      "_note": "MetaTrader 5 bridge (Windows + running MT5 terminal). Fullest alternative: github.com/MrBlackSheep91/mt5-mcp (28 tools incl. order execution — enables multi-account copy trading through Supervisor-approved actions); also github.com/ariadng/metatrader-mcp-server. Chart screenshots for LLM setup analysis: github.com/ali-rajabpour/metatrader-mcp."
+    },
+    "tradingview_screener": {
+      "name": "tradingview",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "tradingview-mcp"],
+      "_note": "TradingView screeners + 30 TA tools (github.com/atilaahmettaner/tradingview-mcp) — pair/timeframe scanning for setup selection. Read-only market data."
+    },
+    "sentiment_backtest": {
+      "name": "maverick",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["maverick-mcp"],
+      "_note": "VectorBT backtesting + reddit/x/news sentiment (github.com/wshobson/maverick-mcp) — a second opinion for the Supervisor before risk changes."
+    }
+  }
+}

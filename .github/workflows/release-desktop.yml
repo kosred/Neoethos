@@ -1,0 +1,85 @@
+name: Release desktop GUI (Windows + Linux)
+
+# Builds the NeoEthos Tauri DESKTOP app (the GUI, NOT the CLI) for Windows and
+# Linux and attaches the installers to the GitHub Release for the tag. This is
+# how dual-platform GUI installers are produced without owning both machines —
+# GitHub's runners build each target in the cloud.
+#
+# Distinct from release.yml (GPU bundle) and release-installers.yml (CLI .deb/
+# .rpm/.AppImage). Artifact names here carry a `-desktop` suffix so nothing
+# collides on the shared Release.
+#
+# Trigger: push a tag like `v0.5.3`, or run manually (workflow_dispatch).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux
+          - os: windows-latest
+            target: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads the pinned nightly from rust-toolchain.toml automatically;
+      # this just guarantees a nightly toolchain is installed on the runner.
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Linux needs the Tauri/WebKit + build toolchain (mirrors BUILDING.md §2).
+      # Windows runners already ship MSVC + CMake.
+      - name: Linux system deps
+        if: matrix.target == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl wget file cmake pkg-config \
+            libssl-dev libwebkit2gtk-4.1-dev librsvg2-dev \
+            libxdo-dev libayatana-appindicator3-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "desktop/src-tauri -> target"
+
+      - name: Frontend deps
+        working-directory: desktop
+        run: npm ci || npm install
+
+      # The MCP sidecar ships inside the installer (bundle.resources in the
+      # per-platform tauri conf files) — build it BEFORE bundling or the
+      # resource is missing and the bundle step fails. It lives in its OWN
+      # isolated workspace (mcp/), so this never touches the engine's deps.
+      - name: Build MCP sidecar
+        run: cargo build --release --manifest-path mcp/Cargo.toml
+
+      # tauri-action runs the frontend build then compiles the desktop binary
+      # with the web assets embedded, producing the platform installer, and —
+      # on a tag — uploads the bundle to the matching Release (as a draft).
+      - name: Build + upload the desktop GUI
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: "NeoEthos ${{ github.ref_name }} — desktop GUI"
+          releaseDraft: true
+          prerelease: false

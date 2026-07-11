@@ -149,3 +149,30 @@ pub async fn swarm_capacity() -> Response {
         None => Json(serde_json::json!({ "running": false, "nodes": 0, "totalCores": 0 })).into_response(),
     }
 }
+
+// ── Distributed island-model migration (Federation Phase 1) ──────────────────
+// The mesh sidecar drives these; the GA hook is OFF until `enable` is called,
+// so a node not in the swarm behaves byte-identically to a single machine.
+
+/// `POST /mesh/migration/enable` — turn on island migration for this process.
+/// The mesh calls it once on startup; every local discovery run then publishes
+/// its elites and accepts peer migrants.
+pub async fn migration_enable() -> Response {
+    neoethos_search::set_migration_enabled(true);
+    Json(serde_json::json!({ "enabled": true })).into_response()
+}
+
+/// `GET /mesh/elites` — drain the genes the local GA published this interval,
+/// for the mesh to gossip to peer islands.
+pub async fn migration_elites() -> Response {
+    Json(neoethos_search::take_elites()).into_response()
+}
+
+/// `POST /mesh/migrants` — inject a peer island's elite genes into the local
+/// GA's next generation (they are re-scored on our data before they can
+/// survive, so a bad migrant just fails selection).
+pub async fn migration_migrants(Json(genes): Json<Vec<neoethos_search::Gene>>) -> Response {
+    let n = genes.len();
+    neoethos_search::push_migrants(genes);
+    Json(serde_json::json!({ "accepted": n })).into_response()
+}

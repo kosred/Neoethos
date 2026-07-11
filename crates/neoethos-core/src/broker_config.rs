@@ -10,7 +10,7 @@
 //! ## What lives here
 //!
 //! - The pure data structs (`BrokerSettingsState`, `CTraderBrokerSettings`,
-//!   `DxTradeBrokerSettings`, `BrokerAccountTarget`, `CTraderBrokerEnvironment`).
+//!   `BrokerAccountTarget`, `CTraderBrokerEnvironment`).
 //! - Constants (schema version, Spotware sign-up URLs).
 //! - Path resolution (`credentials_file_path`) — env override →
 //!   platform config dir → cwd `.local/` fallback.
@@ -30,9 +30,8 @@
 //!
 //! ## Security
 //!
-//! Two transient fields are NEVER serialized:
+//! One transient field is NEVER serialized:
 //! - `CTraderBrokerSettings::authorization_code_input` — short-lived OAuth value
-//! - `DxTradeBrokerSettings::password` — re-entered each session
 
 use crate::schema_version::{HasSchemaVersion, SchemaVersion, default_v1};
 use anyhow::{Context, Result};
@@ -120,30 +119,6 @@ pub struct CTraderBrokerSettings {
     pub accounts: Vec<BrokerAccountTarget>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct DxTradeBrokerSettings {
-    /// Base URL of the DXtrade platform, e.g. `https://demo.dx.trade`
-    /// or `https://trade.broker.example`. The auth endpoint is
-    /// always `{platform_url}/dxsca-web/login` per the official
-    /// DXtrade REST API spec.
-    #[serde(default)]
-    pub platform_url: String,
-    #[serde(default)]
-    pub username: String,
-    /// DXtrade login domain. Required by `POST /dxsca-web/login`
-    /// alongside username + password — see the "Create Session
-    /// Token" endpoint in the DXtrade Developer Portal. Brokers
-    /// typically configure this to a fixed string per environment
-    /// (e.g. `default` for the demo realm).
-    #[serde(default)]
-    pub domain: String,
-    /// NEVER persisted to disk. The user enters this each session.
-    #[serde(skip_serializing, skip_deserializing, default)]
-    pub password: String,
-    #[serde(default)]
-    pub accounts: Vec<BrokerAccountTarget>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrokerSettingsState {
     /// Schema version of the on-disk `broker_credentials.toml`
@@ -154,8 +129,6 @@ pub struct BrokerSettingsState {
     pub schema_version: SchemaVersion,
     #[serde(default)]
     pub ctrader: CTraderBrokerSettings,
-    #[serde(default)]
-    pub dxtrade: DxTradeBrokerSettings,
 }
 
 impl Default for BrokerSettingsState {
@@ -163,7 +136,6 @@ impl Default for BrokerSettingsState {
         Self {
             schema_version: BROKER_CREDENTIALS_SCHEMA_VERSION,
             ctrader: CTraderBrokerSettings::default(),
-            dxtrade: DxTradeBrokerSettings::default(),
         }
     }
 }
@@ -357,7 +329,7 @@ mod tests {
                 }],
                 ..Default::default()
             },
-            dxtrade: DxTradeBrokerSettings::default(),
+            ..Default::default()
         };
         save_to_disk(&path, &original).expect("save");
         let loaded = load_from_disk(&path).expect("load").expect("some");
@@ -378,17 +350,11 @@ mod tests {
                 authorization_code_input: "DO-NOT-PERSIST".to_string(),
                 ..Default::default()
             },
-            dxtrade: DxTradeBrokerSettings {
-                username: "user".to_string(),
-                password: "DO-NOT-PERSIST-EITHER".to_string(),
-                ..Default::default()
-            },
             ..Default::default()
         };
         save_to_disk(&path, &original).expect("save");
         let raw = fs::read_to_string(&path).expect("read");
         assert!(!raw.contains("DO-NOT-PERSIST"));
-        assert!(!raw.contains("DO-NOT-PERSIST-EITHER"));
     }
 
     #[test]

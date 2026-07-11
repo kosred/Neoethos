@@ -1,5 +1,6 @@
 pub mod diversity;
 pub mod evolution_math;
+pub mod migration;
 pub mod regime_labels;
 pub mod runtime_overrides;
 pub mod search_engine;
@@ -51,6 +52,10 @@ pub use search_engine::{
     signals_and_confidence_for_gene_full, signals_and_confidence_for_gene_with_config,
     signals_for_gene, signals_for_gene_full, validation_genes_population,
     validation_genes_population_gathered, validation_genes_population_window,
+};
+pub use migration::{
+    migration_enabled, push_incoming as push_migrants, set_migration_enabled,
+    take_outgoing as take_elites,
 };
 pub use seed_templates::seed_professional_templates;
 pub use smc_indicators::{

@@ -20,10 +20,9 @@
 //! # Security
 //!
 //! The TOML file is intended to live OUTSIDE the git repository.
-//! Two transient fields are explicitly NEVER serialized:
+//! One transient field is explicitly NEVER serialized:
 //!
 //! - `CTraderBrokerSettings::authorization_code_input` — short-lived OAuth value
-//! - `DxTradeBrokerSettings::password` — re-entered each session
 
 use crate::app_services::broker_config::BrokerSettingsState;
 use anyhow::Result;
@@ -182,8 +181,8 @@ fn apply_embedded_fallback(settings: &mut BrokerSettingsState) {
 /// Persists broker settings to disk at the resolved credentials path.
 ///
 /// Creates the parent directory if missing. Writes TOML in the standard
-/// formatting. Transient fields (`authorization_code_input`, DxTrade
-/// `password`) are excluded by their serde annotations. The shared
+/// formatting. The transient field (`authorization_code_input`) is
+/// excluded by its serde annotation. The shared
 /// writer in `neoethos-core` always stamps the current schema version
 /// regardless of what the in-memory value carries.
 pub fn save_broker_settings(settings: &BrokerSettingsState) -> Result<()> {
@@ -197,7 +196,7 @@ pub fn save_broker_settings(settings: &BrokerSettingsState) -> Result<()> {
 mod tests {
     use super::*;
     use crate::app_services::broker_config::{
-        BrokerAccountTarget, CTraderBrokerEnvironment, CTraderBrokerSettings, DxTradeBrokerSettings,
+        BrokerAccountTarget, CTraderBrokerEnvironment, CTraderBrokerSettings,
     };
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -260,13 +259,6 @@ mod tests {
                     enabled_for_execution: true,
                 }],
             },
-            dxtrade: DxTradeBrokerSettings {
-                platform_url: "https://demo.dx.example".to_string(),
-                username: "user42".to_string(),
-                domain: "default".to_string(),
-                password: "should-not-persist-either".to_string(),
-                accounts: vec![],
-            },
         }
     }
 
@@ -312,29 +304,6 @@ mod tests {
     }
 
     #[test]
-    fn dxtrade_password_is_not_persisted() {
-        let dir = tempdir_or_skip();
-        let path = dir.join("creds.toml");
-
-        with_env_path(&path, |_| {
-            let original = populated_settings();
-            save_broker_settings(&original).expect("save should succeed");
-
-            // Read the raw file to confirm the password literal is absent.
-            let raw = fs::read_to_string(&path).expect("read");
-            assert!(
-                !raw.contains("should-not-persist-either"),
-                "DxTrade password leaked into TOML:\n{raw}"
-            );
-
-            // After load, the password field is reset to the field default.
-            let loaded = load_broker_settings();
-            assert_eq!(loaded.dxtrade.password, "");
-            assert_eq!(loaded.dxtrade.username, "user42");
-        });
-    }
-
-    #[test]
     fn ctrader_authorization_code_input_is_not_persisted() {
         let dir = tempdir_or_skip();
         let path = dir.join("creds.toml");
@@ -366,7 +335,7 @@ mod tests {
         let dir = tempdir_or_skip();
         // Write a TOML that is valid but has no ctrader section (all defaults = empty).
         let path = dir.join("empty_creds.toml");
-        fs::write(&path, "[ctrader]\n[dxtrade]\n").expect("write");
+        fs::write(&path, "[ctrader]\n").expect("write");
 
         with_env_path(&path, |_| {
             let loaded = load_broker_settings();
@@ -429,7 +398,7 @@ mod tests {
         // is what files written by builds before Phase D4 look
         // like. The `#[serde(default = "default_v1")]` attribute
         // must kick in and treat it as v1.
-        let raw = "[ctrader]\nclient_id = \"old\"\n[dxtrade]\n";
+        let raw = "[ctrader]\nclient_id = \"old\"\n";
         fs::write(&path, raw).expect("write");
         with_env_path(&path, |_| {
             let loaded = load_broker_settings();
@@ -446,7 +415,7 @@ mod tests {
         // silently mis-parsing potentially-incompatible data.
         let dir = tempdir_or_skip();
         let path = dir.join("future_creds.toml");
-        let raw = "schema_version = 999\n[ctrader]\nclient_id = \"future\"\n[dxtrade]\n";
+        let raw = "schema_version = 999\n[ctrader]\nclient_id = \"future\"\n";
         fs::write(&path, raw).expect("write");
         with_env_path(&path, |_| {
             let loaded = load_broker_settings();
@@ -475,7 +444,7 @@ mod tests {
         let local_dir = dir.join(".local").join("neoethos");
         fs::create_dir_all(&local_dir).expect("local dir");
         let local_file = local_dir.join("broker_credentials.toml");
-        fs::write(&local_file, "[ctrader]\nclient_id = \"OLDER\"\n[dxtrade]\n")
+        fs::write(&local_file, "[ctrader]\nclient_id = \"OLDER\"\n")
             .expect("local file");
 
         // dirs::config_dir() can't be redirected from a test, so
@@ -486,7 +455,7 @@ mod tests {
         let canonical_file = dir.join("canonical_creds.toml");
         fs::write(
             &canonical_file,
-            "[ctrader]\nclient_id = \"NEWER\"\n[dxtrade]\n",
+            "[ctrader]\nclient_id = \"NEWER\"\n",
         )
         .expect("canonical");
         // Force canonical's mtime to be NEWER than local's.
@@ -496,7 +465,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         fs::write(
             &canonical_file,
-            "[ctrader]\nclient_id = \"NEWER\"\n[dxtrade]\n",
+            "[ctrader]\nclient_id = \"NEWER\"\n",
         )
         .expect("canonical retouched");
 

@@ -862,8 +862,22 @@ pub fn start_discovery_job(
             return;
         }
 
+        // Label the feature-cube build clearly so it never looks frozen. On
+        // dense timeframes (M1–M5) this step can take hours; the operator used
+        // to see a static bar with no idea whether it was working or stuck.
+        snapshot.progress = JobProgress {
+            percent: Some(0.4),
+            stage: "building_features".to_string(),
+            message: format!(
+                "building the feature cube for {} ({}) — dense timeframes (M1–M5) \
+                 can take a long time; the app is working, not frozen",
+                request.symbol, request.base_tf
+            ),
+        };
+        send_event(&tx, ServiceEvent::DiscoveryUpdated(snapshot.clone()));
+
         let feature_request = request.clone();
-        let feature_build = tokio::task::spawn_blocking(move || {
+        let feature_handle = tokio::task::spawn_blocking(move || {
             let dataset =
                 ensure_timeframes_with_resample(&dataset, &feature_request.base_tf, MANDATORY_TFS)?;
             let higher_refs: Vec<&str> = feature_request
@@ -885,8 +899,36 @@ pub fn start_discovery_job(
                     anyhow::anyhow!("base timeframe missing: {}", feature_request.base_tf)
                 })?;
             Ok::<_, anyhow::Error>((features, base_ohlcv))
-        })
-        .await;
+        });
+
+        // Heartbeat: the build above is a single opaque call that can run for
+        // hours, so tick an elapsed-time message every 15s. This proves the app
+        // is alive (fixing the "frozen at a low %" confusion) without touching
+        // the feature engine. It does NOT interrupt the build — closing the app
+        // hard-stops everything; the pre-build cancel check already prevents a
+        // fresh build from starting after Stop.
+        let hb_tx = tx.clone();
+        let mut hb_snapshot = snapshot.clone();
+        let hb_symbol = request.symbol.clone();
+        let hb_started = std::time::Instant::now();
+        let heartbeat = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                ticker.tick().await;
+                let secs = hb_started.elapsed().as_secs();
+                hb_snapshot.progress.message = format!(
+                    "building feature cube for {hb_symbol}… {}m {:02}s elapsed \
+                     (dense timeframes can take hours; closing the app stops it)",
+                    secs / 60,
+                    secs % 60
+                );
+                send_event(&hb_tx, ServiceEvent::DiscoveryUpdated(hb_snapshot.clone()));
+            }
+        });
+
+        let feature_build = feature_handle.await;
+        heartbeat.abort();
 
         let (features, base_ohlcv) = match feature_build {
             Ok(Ok(parts)) => parts,

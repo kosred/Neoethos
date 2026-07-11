@@ -168,6 +168,13 @@ pub enum SupervisorAction {
     /// Fetch a public URL (research). The text excerpt lands in the log so the
     /// NEXT tick can read it.
     FetchUrl { url: String },
+    /// List the MCP tools available via the local MCP sidecar (cTrader,
+    /// filesystem, web, …). The result lands in the log for the next tick.
+    McpTools,
+    /// Invoke an MCP tool through the local MCP sidecar. `args` is the tool's
+    /// JSON arguments object. Read-only/queryable tools are fine to call; the
+    /// same T1-3 judgement guidelines apply as to every other action.
+    McpCall { server: String, tool: String, #[serde(default)] args: serde_json::Value },
 }
 
 // ── State bundle ────────────────────────────────────────────────────────────
@@ -286,6 +293,8 @@ actions (N given per request). Available actions:
   {"action":"update_settings","payload":{...}}                    — camelCase POST /settings subset, e.g. {"riskPerTrade":0.005}
   {"action":"propose_close","position_id":123,"reason":"..."}     — queues for HUMAN approval, never executes itself
   {"action":"fetch_url","url":"https://..."}                      — research; excerpt appears in your memory next tick
+  {"action":"mcp_tools"}                                          — list MCP tools available (cTrader, filesystem, web) via the local MCP sidecar
+  {"action":"mcp_call","server":"ctrader","tool":"...","args":{}} — invoke an MCP tool (same T1-3 judgement as any action)
 
 Judgement guidelines:
 - Prefer observation (note) over intervention. Act only on clear evidence.
@@ -432,9 +441,19 @@ fn parse_actions(reply: &str) -> Vec<SupervisorAction> {
     serde_json::from_str::<Vec<SupervisorAction>>(&reply[start..=end]).unwrap_or_default()
 }
 
+/// Local MCP sidecar base URL (overridable via `NEOETHOS_MCP_URL`).
+fn mcp_sidecar_url() -> String {
+    std::env::var("NEOETHOS_MCP_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:7431".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
 fn action_label(a: &SupervisorAction) -> String {
     match a {
         SupervisorAction::Note { text } => format!("note: {}", text.chars().take(160).collect::<String>()),
+        SupervisorAction::McpTools => "mcp_tools".into(),
+        SupervisorAction::McpCall { server, tool, .. } => format!("mcp_call {server}/{tool}"),
         SupervisorAction::StartDiscovery { symbol, base_tf } => format!("start_discovery {symbol} {base_tf}"),
         SupervisorAction::StopDiscovery => "stop_discovery".into(),
         SupervisorAction::StartTraining { symbol, base_tf } => format!("start_training {symbol} {base_tf}"),
@@ -539,6 +558,33 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
             })
             .await??;
             Ok(format!("fetched {} chars: {}", text.len(), text.chars().take(1500).collect::<String>()))
+        }
+
+        SupervisorAction::McpTools => {
+            let base = mcp_sidecar_url();
+            let resp = reqwest::Client::new()
+                .get(format!("{base}/tools"))
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .await
+                .context("MCP sidecar not reachable — is neoethos-mcp running?")?
+                .error_for_status()?;
+            let v: serde_json::Value = resp.json().await?;
+            Ok(format!("MCP tools: {}", serde_json::to_string(&v).unwrap_or_default().chars().take(2000).collect::<String>()))
+        }
+
+        SupervisorAction::McpCall { server, tool, args } => {
+            let base = mcp_sidecar_url();
+            let resp = reqwest::Client::new()
+                .post(format!("{base}/call"))
+                .timeout(std::time::Duration::from_secs(60))
+                .json(&serde_json::json!({ "server": server, "tool": tool, "args": args }))
+                .send()
+                .await
+                .context("MCP sidecar not reachable — is neoethos-mcp running?")?
+                .error_for_status()?;
+            let v: serde_json::Value = resp.json().await?;
+            Ok(format!("mcp_call {server}/{tool} → {}", serde_json::to_string(&v).unwrap_or_default().chars().take(2000).collect::<String>()))
         }
     }
 }

@@ -1192,6 +1192,44 @@ pub fn build_logarithmic_stages(
     stages
 }
 
+/// Live per-trade risk fraction for a given `bankroll_usd` under the
+/// Risky Mode stage ladder built from `(start, target, doubling)`.
+///
+/// Pure and stateless: it builds the SAME logarithmic stage table the
+/// [`RiskyModeManager`] uses and returns the `risk_per_trade_fraction`
+/// (0.30–0.50) of the stage the bankroll lands in. This is what lets the
+/// live autopilot size to the operator-directive 30–50 % ladder WITHOUT
+/// constructing a full stateful manager (with its kill-switch history) on
+/// the hot path.
+///
+/// Returns `None` for degenerate inputs (non-finite, `target <= start`,
+/// `doubling <= 1.0`, or a non-positive bankroll) so the caller can fall
+/// back to its own configured fraction instead of trading a wrong size.
+pub fn stage_risk_fraction_for_bankroll(
+    start_usd: f64,
+    target_usd: f64,
+    doubling: f64,
+    bankroll_usd: f64,
+) -> Option<f64> {
+    // Reject the degenerate inputs that `build_logarithmic_stages` would
+    // paper over with a single fallback stage — a live caller wants a clean
+    // `None` so it keeps its own (safer) configured fraction.
+    if !start_usd.is_finite()
+        || start_usd <= 0.0
+        || !target_usd.is_finite()
+        || target_usd <= start_usd
+        || !doubling.is_finite()
+        || doubling <= 1.0
+        || !bankroll_usd.is_finite()
+        || bankroll_usd <= 0.0
+    {
+        return None;
+    }
+    let stages = build_logarithmic_stages(start_usd, target_usd, doubling);
+    let idx = locate_stage_idx(&stages, bankroll_usd) as usize;
+    stages.get(idx).map(|s| s.risk_per_trade_fraction)
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers.
 // ---------------------------------------------------------------------------
@@ -1781,5 +1819,30 @@ mod tests {
         let stages = build_logarithmic_stages(-1.0, 100.0, 2.0);
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].stage_idx, 0);
+    }
+
+    #[test]
+    fn stage_risk_fraction_tapers_and_rejects_bad_inputs() {
+        // Early (small bankroll) sizes bigger than late (near target); both
+        // stay inside the operator band [0.30, 0.50].
+        let early = stage_risk_fraction_for_bankroll(100.0, 50_000.0, 2.0, 120.0).unwrap();
+        let late = stage_risk_fraction_for_bankroll(100.0, 50_000.0, 2.0, 40_000.0).unwrap();
+        assert!(early > late, "early {early} should exceed late {late}");
+        assert!(
+            (RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
+                .contains(&early)
+        );
+        assert!(
+            (RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
+                .contains(&late)
+        );
+        // Bankroll below the ladder clamps to the first (most aggressive) stage.
+        let below = stage_risk_fraction_for_bankroll(100.0, 50_000.0, 2.0, 10.0).unwrap();
+        assert_eq!(below, early);
+        // Degenerate inputs → None so the live caller keeps its safe fraction.
+        assert!(stage_risk_fraction_for_bankroll(100.0, 50.0, 2.0, 100.0).is_none());
+        assert!(stage_risk_fraction_for_bankroll(0.0, 50_000.0, 2.0, 100.0).is_none());
+        assert!(stage_risk_fraction_for_bankroll(100.0, 50_000.0, 1.0, 100.0).is_none());
+        assert!(stage_risk_fraction_for_bankroll(100.0, 50_000.0, 2.0, 0.0).is_none());
     }
 }

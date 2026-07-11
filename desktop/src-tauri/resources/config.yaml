@@ -59,7 +59,7 @@ risk:
   vol_horizon_bars: 5
 
 models:
-  ml_models: [lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, sklears_tree, mlp, neat, elasticnet, bayes_logit, online_pa, online_hoeffding, swarm_forecaster, isolation_forest]
+  ml_models: [lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, sklears_tree, mlp, neat, elasticnet, logistic, bayes_logit, online_pa, online_hoeffding, swarm_forecaster, isolation_forest]
   use_rl_agent: true
   use_sac_agent: true
   use_rllib_agent: false

@@ -183,7 +183,7 @@ const GROUPS: Group[] = [
   {
     title: "Anti-stagnation (GA tuning)",
     fields: [
-      { key: "prefilterTopK", label: "Indicator pool", kind: "num", help: "How many prefiltered indicators the GA may use. RAISE first if the search stalls — the #1 lever." },
+      { key: "prefilterTopK", label: "Indicator pool", kind: "num", help: "How many prefiltered indicators the GA may use. RAISE first if the search stalls — the #1 lever. Auto-capped at the number of available indicators + SMC." },
       { key: "convergencePatience", label: "Explore patience", kind: "num", help: "Flat generations before the GA gives up. Raise to search longer." },
       { key: "stagnationPatience", label: "Diversity kick", kind: "num", help: "Flat generations before heavier mutation + fresh genes kick in. Lower = reacts sooner." },
       { key: "noveltyWeight", label: "Novelty reward", kind: "num", step: 0.05, help: "0 = off. 0.1–0.3 rewards DIFFERENT genes → more market-regime variety." },

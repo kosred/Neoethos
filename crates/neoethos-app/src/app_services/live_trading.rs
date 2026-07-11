@@ -431,6 +431,32 @@ async fn run(
         .map(|s| s.risk.risk_per_trade)
         .unwrap_or(0.0)
         .clamp(0.0, 1.0);
+    // Risky Mode sizing context. When `trading_mode == "risky"` the per-entry
+    // risk comes from the bankroll-stage ladder (30 %→50 %, tapering as the
+    // account grows) instead of the static prop-firm `risk_per_trade`. Read
+    // once here; the actual stage fraction is resolved per entry off the LIVE
+    // balance (the account compounds). The default "prop_firm" mode leaves the
+    // sizing path byte-for-byte unchanged.
+    let trading_mode_risky = sizing
+        .as_ref()
+        .map(|s| s.system.trading_mode.eq_ignore_ascii_case("risky"))
+        .unwrap_or(false);
+    let risky_start_balance = sizing
+        .as_ref()
+        .map(|s| s.system.risky_start_balance_usd)
+        .unwrap_or(0.0);
+    let risky_target_balance = sizing
+        .as_ref()
+        .map(|s| s.system.risky_target_balance_usd)
+        .unwrap_or(0.0);
+    // LIVE ML gate (models.live_ml_gate, default OFF): the 32-voter soft
+    // ensemble scales per-trade risk by agreement × regime × anomaly. Genes
+    // ALWAYS pick the direction (Stage-3 invariant); ML only shrinks or, on
+    // a hard regime/anomaly collapse, skips the bar.
+    let live_ml_gate = sizing
+        .as_ref()
+        .map(|s| s.models.live_ml_gate)
+        .unwrap_or(false);
     let max_lot_cap = sizing
         .as_ref()
         .map(|s| s.risk.max_lot_size)
@@ -460,6 +486,57 @@ async fn run(
         .map(|s| s.risk.backtest_spread_pips)
         .filter(|v| v.is_finite() && *v > 0.0)
         .unwrap_or(1.5);
+    // Load the soft-voting ensemble ONCE at engine start (loading ~30 expert
+    // artifacts takes seconds — far too slow per bar). Fail-soft: if the gate
+    // is on but the ensemble can't load (nothing trained yet, wrong symbol/TF
+    // dir), log loudly and run gene-only — never block trading on ML infra.
+    let live_ensemble: Option<
+        std::sync::Arc<neoethos_models::ensemble_inference::soft_voting::SoftVotingEnsemble>,
+    > = if live_ml_gate {
+        let sym = symbol.clone();
+        let tf = base_tf.clone();
+        match tokio::task::spawn_blocking(move || {
+            neoethos_models::ensemble_inference::build_ensemble_for_symbol(
+                std::path::Path::new("models"),
+                &sym,
+                &tf,
+            )
+        })
+        .await
+        {
+            Ok(Ok(ensemble)) => {
+                let outcome =
+                    neoethos_models::ensemble_inference::EnsemblePredictor::load_outcome(&ensemble);
+                tracing::info!(
+                    target: "neoethos_app::live_trading",
+                    %symbol, %base_tf,
+                    loaded = outcome.loaded_count(),
+                    missing = outcome.missing_count(),
+                    degraded = outcome.degraded_count(),
+                    "LIVE ML gate armed — ensemble voters loaded (genes still pick direction; ML only scales size)"
+                );
+                Some(std::sync::Arc::new(ensemble))
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    target: "neoethos_app::live_trading",
+                    %symbol, %base_tf, error = %err,
+                    "models.live_ml_gate is ON but the ensemble failed to load — running gene-only"
+                );
+                None
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "neoethos_app::live_trading",
+                    %symbol, error = %join_err,
+                    "ensemble loader task failed — running gene-only"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let sym_meta = neoethos_core::symbol_metadata::resolve(&symbol);
     let quote_ccy = sym_meta.as_ref().map(|m| m.quote.clone());
     let sizing_tf = base_tf.clone();
@@ -984,13 +1061,99 @@ async fn run(
                     _ => (account_balance, None),
                 };
 
+                // Base per-trade risk. In Risky Mode we size off the bankroll-
+                // stage ladder (30 %→50 % by stage, resolved from the account's
+                // LIVE balance so it tapers as it compounds) rather than the
+                // static prop-firm `risk_per_trade`. Strictly gated on
+                // `trading_mode == "risky"`; the "prop_firm" path is unchanged.
+                // Falls back to the configured fraction when the ladder inputs
+                // are degenerate — never a wrong size.
+                let base_risk = if trading_mode_risky {
+                    let frac = neoethos_core::domain::risky_mode::stage_risk_fraction_for_bankroll(
+                        risky_start_balance,
+                        risky_target_balance,
+                        neoethos_core::domain::risky_mode::DEFAULT_DOUBLING_FACTOR,
+                        entry_balance,
+                    )
+                    .unwrap_or(risk_fraction);
+                    tracing::info!(
+                        target: "neoethos_app::live_trading",
+                        %symbol, bankroll = entry_balance, risk_pct = frac,
+                        "risky-mode stage sizing (bankroll-ladder, not the 3% prop cap)"
+                    );
+                    frac
+                } else {
+                    risk_fraction
+                };
+
+                // LIVE ML gate: the genes chose the direction above; the
+                // ensemble may only SHRINK the size (agreement × regime ×
+                // anomaly, MlScale mode) or skip the bar on a hard collapse.
+                // Any ensemble error ⇒ loud log + unchanged gene-only sizing.
+                let base_risk = if let Some(ens) = live_ensemble.as_deref() {
+                    match neoethos_models::ensemble_inference::bootstrap::role_decision_for_last_row(
+                        ens,
+                        &raw_features,
+                    ) {
+                        Ok(d) => {
+                            let ml = neoethos_trader::MlDecision {
+                                dir_probs: d.dir_probs,
+                                regime_gate: d.regime_gate,
+                                anomaly_scale: d.anomaly_scale,
+                            };
+                            let cfg = neoethos_trader::BlendConfig {
+                                mode: neoethos_trader::BlendMode::MlScale,
+                                ..Default::default()
+                            };
+                            let (out_dir, conf) = neoethos_trader::blend_decision(direction, &ml, &cfg);
+                            if matches!(out_dir, Direction::Flat) {
+                                tracing::warn!(
+                                    target: "neoethos_app::live_trading",
+                                    %symbol,
+                                    p_buy = d.dir_probs[1], p_sell = d.dir_probs[2],
+                                    regime_gate = d.regime_gate, anomaly = d.anomaly_scale,
+                                    "entry skipped — ML gate hard collapse (regime/anomaly veto)"
+                                );
+                                if let Ok(mut s) = status.lock() {
+                                    s.last_signal = Some(format!(
+                                        "skipped by ML gate (regime {:.2} × anomaly {:.2})",
+                                        d.regime_gate, d.anomaly_scale
+                                    ));
+                                }
+                                continue;
+                            }
+                            tracing::info!(
+                                target: "neoethos_app::live_trading",
+                                %symbol, conf,
+                                p_buy = d.dir_probs[1], p_sell = d.dir_probs[2],
+                                regime_gate = d.regime_gate, anomaly = d.anomaly_scale,
+                                "ML gate scaled entry risk (genes kept the direction)"
+                            );
+                            if let Ok(mut s) = status.lock() {
+                                s.last_signal = Some(format!("{direction:?} · ML×{conf:.2}"));
+                            }
+                            base_risk * conf
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "neoethos_app::live_trading",
+                                %symbol, error = %err,
+                                "ML gate abstained (gene-only sizing this bar)"
+                            );
+                            base_risk
+                        }
+                    }
+                } else {
+                    base_risk
+                };
+
                 // Portfolio-level concurrent-risk budget (max_portfolio_risk):
-                // remaining = cap − open_positions × risk_per_trade. Skip the
+                // remaining = cap − open_positions × base_risk. Skip the
                 // entry when the budget is spent; size down when only part fits.
-                let mut effective_risk = risk_fraction;
+                let mut effective_risk = base_risk;
                 if portfolio_risk_cap > 0.0 {
                     let open_n = open_positions_now.unwrap_or(0) as f64;
-                    let remaining = portfolio_risk_cap - open_n * risk_fraction;
+                    let remaining = portfolio_risk_cap - open_n * base_risk;
                     if remaining <= f64::EPSILON {
                         tracing::warn!(
                             target: "neoethos_app::live_trading",
@@ -1005,7 +1168,7 @@ async fn run(
                         }
                         continue;
                     }
-                    effective_risk = risk_fraction.min(remaining);
+                    effective_risk = base_risk.min(remaining);
                 }
 
                 // Size by the account's risk %, using the strategy's own stop

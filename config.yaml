@@ -1,44 +1,195 @@
 system:
   symbol: EURUSD
-  trading_mode: risky  # risky = account-multiplication discovery (Risky DiscoveryMode); prop_firm = FTMO-style
-
-  # F-304 (2026-05-28): account currency for the backtest cost model.
-  # Cost model uses this for commission/swap/pnl_conversion_fee FX
-  # conversions and the risk gate uses it for position-sizing pip-value
-  # math. Auto-populated from cTrader trader profile when the broker
-  # session is alive — manual setting here is the operator override.
-  # Leave empty to force fail-loud guard if no broker session is wired.
-  account_currency: USD
+  watchlist:
+  - EURUSD
+  - EURGBP
+  - EURAUD
+  - AUDJPY
+  - EURJPY
+  - AUDUSD
+  - GBPUSD
+  - XAUUSD
+  - NAT.GAS
+  - XBRUSD
+  - XTIUSD
+  - AUDCAD
+  - AUDCHF
+  - AUDNZD
+  - AUDSGD
+  - AUDZAR
+  - CADCHF
+  - CADJPY
+  - CADMXN
+  - CHFJPY
+  - CHFSGD
+  - EURCAD
+  - EURCHF
+  - EURCNH
+  - EURCZK
+  - EURDKK
+  - EURHKD
+  - EURHUF
+  - EURMXN
+  - EURNOK
+  - EURNZD
+  - EURPLN
+  - EURRON
+  - EURSEK
+  - EURSGD
+  - EURTRY
+  - EURZAR
+  - GBPAUD
+  - GBPCAD
+  - GBPCHF
+  - GBPDKK
+  - GBPJPY
+  - GBPNOK
+  - GBPNZD
+  - GBPSEK
+  - GBPSGD
+  - GBPTRY
+  - GBPZAR
+  - NOKJPY
+  - NOKSEK
+  - NZDCAD
+  - NZDCHF
+  - NZDJPY
+  - NZDSEK
+  - NZDSGD
+  - NZDUSD
+  - SEKJPY
+  - SGDJPY
+  - USDCAD
+  - USDCHF
+  - USDCNH
+  - USDCZK
+  - USDDKK
+  - USDHUF
+  - USDJPY
+  - USDMXN
+  - USDNOK
+  - USDPLN
+  - USDRON
+  - USDSEK
+  - USDSGD
+  - USDTRY
+  - USDZAR
+  - AUSTRALIA 200
+  - EUROPE 50
+  - FRANCE 40
+  - GERMANY 40
+  - HONG KONG 50
+  - ITALY 40
+  - JAPAN 225
+  - NETHERLANDS 25
+  - SPAIN 35
+  - SWITZERLAND 20
+  - UK 100
+  - US 30
+  - US 500
+  - US TECH 100
+  - XAGEUR
+  - XAGUSD
+  - XAUEUR
+  - XPDUSD
+  - XPTUSD
+  account_currency: GBP
   data_dir: data
-  base_timeframe: M1  # 1-minute base for multi-timeframe analysis
-  multi_resolution_enabled: false  # agent 2026-06-05: top-down MTF (base + strictly-HIGHER TFs only). When true, resolve_higher_timeframes returned ALL canonical TFs except the base (incl M1's 5.27M rows) as "higher" → every combo serially reloaded M1 (the pre-GA wall that stopped combos completing on laptop AND VPS) AND fed M1 noise into coarse-TF strategies. false = base+higher only → the cmd_discover base+higher load-fix actually helps + cleaner features.
-  multi_resolution_timeframes: [M1, M3, M5, M15, M30, H1, H2, H4, D1, W1, MN1]
+  ui_locale: en
+  trading_mode: risky
+  risky_start_balance_usd: 100.0
+  risky_target_balance_usd: 50000.0
+  risky_horizon_days: 180
+  auto_rediscover_on_cull: true
+  multi_resolution_enabled: false
+  multi_resolution_timeframes:
+  - M1
+  - M3
+  - M5
+  - M15
+  - M30
+  - H1
+  - H2
+  - H4
+  - D1
+  - W1
+  - MN1
   multi_resolution_prefix_base: false
+  indices_path: ''
+  use_online_indices: false
+  base_timeframe: M1
   use_volume_features: true
-  higher_timeframes: [M3, M5, M15, M30, H1, H2, H4, D1, W1, MN1]
+  higher_timeframes:
+  - M3
+  - M5
+  - M15
+  - M30
+  - H1
+  - H2
+  - H4
+  - D1
+  - W1
+  - MN1
+  required_timeframes:
+  - M1
+  - M3
+  - M5
+  - M15
+  - M30
+  - H1
+  - H4
+  - H12
+  - D1
+  - W1
+  - MN1
+  enable_level2: false
+  level2_depth_levels: 10
+  broker_timezone: ''
   poll_interval_seconds: 60
   metrics_db_path: metrics.sqlite
   cache_dir: cache
-  # Hardware is detected automatically (CPU/GPU/RAM)
-  # Set preference to "auto", "true" (force GPU), or "false" (force CPU)        
-  enable_gpu_preference: auto  # agent 2026-06-05: auto-detect (was "cpu", a laptop iGPU-OOM workaround). The search GA hybrid is compile-gated regardless of this knob; on a real GPU (L40 VPS) the gpu-vulkan build uses it, and a CPU-only build ignores it. Per-machine override stays possible.
-  # agent 2026-06-05 overfitting fix: removed dead `discovery_auto_cap` /
-  # `discovery_max_rows` / `discovery_stream` keys — never consumed by code.
-  # The REAL discovery row cap is `models.prop_search_max_rows` (see below).
-
+  n_jobs: 11
+  enable_gpu_preference: auto
+  enable_gpu: false
+  num_gpus: 0
+  device: cpu
+  evo_multiproc_per_gpu: true
+  cache_training_frames: false
+  training_cache_max_bytes: 2000000000
+  max_training_rows_per_tf: 0
+  downcast_training_float32: true
+  vortex_memory_map: true
+  smc_freshness_limit: 0
+  smc_atr_displacement: 0.0
+  smc_max_levels: 0
+  smc_use_cuda: false
+  hardware:
+    cpu_budget: null
+    training_precision: null
+    cuda_precisions: null
+    rocm_precisions: null
+    wgpu_precisions: null
+    wgpu_device_names: []
 risk:
-  initial_balance: 10000  # Fallback used when broker balance is unavailable
+  preset: none
+  initial_balance: 10000.0
+  monthly_profit_target_pct: 0.0
   min_risk_per_trade: 0.0
-  max_risk_per_trade: 0.030
-  risk_per_trade: 0.030
-  daily_drawdown_limit: 0.04
-  total_drawdown_limit: 0.07
+  max_risk_per_trade: 0.03
+  risk_per_trade: 0.03
+  max_portfolio_risk: 0.34
+  daily_drawdown_limit: 0.10000000149011612
+  total_drawdown_limit: 0.20000000298023224
   min_risk_reward: 2.0
+  max_lot_size: 10.0
+  require_stop_loss: true
   challenge_mode: true
   challenge_phase: phase_1
-  prop_firm_rules: true
+  prop_firm_rules: false
   kill_zones_enabled: true
   max_trades_per_day: 8
+  recovery_mode_enabled: true
+  feature_drift_threshold: 0.3
   high_quality_confidence: 0.65
   atr_period: 14
   atr_stop_multiplier: 1.5
@@ -50,18 +201,36 @@ risk:
   commission_per_lot: 7.0
   backtest_spread_pips: 1.5
   conformal_enabled: true
-  conformal_alpha: 0.10
+  conformal_alpha: 0.1
   conformal_abstain_min_set_size: 3
   meta_label_tp_pips: null
   meta_label_sl_pips: null
   meta_label_max_hold_bars: 100
   meta_label_min_dist: 0.0005
-  meta_label_fixed_sl: 0.0020
-  meta_label_fixed_tp: 0.0040
+  meta_label_fixed_sl: 0.002
+  meta_label_fixed_tp: 0.004
+  vol_ensemble_weights_trend: null
+  vol_ensemble_weights_range: null
+  vol_ensemble_weights_neutral: null
   vol_horizon_bars: 5
-
 models:
-  ml_models: [lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, sklears_tree, mlp, neat, elasticnet, bayes_logit, online_pa, online_hoeffding, swarm_forecaster, isolation_forest]
+  ml_models:
+  - lightgbm
+  - xgboost
+  - xgboost_rf
+  - xgboost_dart
+  - catboost
+  - catboost_alt
+  - sklears_tree
+  - mlp
+  - neat
+  - elasticnet
+  - logistic
+  - bayes_logit
+  - online_pa
+  - online_hoeffding
+  - swarm_forecaster
+  - isolation_forest
   use_rl_agent: true
   use_sac_agent: true
   use_rllib_agent: false
@@ -71,7 +240,9 @@ models:
   rl_population_size: 5
   rl_timesteps: 100000
   rl_eval_episodes: 15
-  rl_network_arch: [256, 256]
+  rl_network_arch:
+  - 256
+  - 256
   rl_parallel_envs: 1
   rl_state_bins: 255
   rl_state_encoding: normalized
@@ -88,7 +259,7 @@ models:
   rl_train_seconds: 3600
   exit_agent_hidden_dim: 128
   exit_agent_gamma: 0.99
-  exit_agent_epsilon: 0.20
+  exit_agent_epsilon: 0.2
   exit_agent_epsilon_min: 0.05
   exit_agent_epsilon_decay: 0.999
   exit_agent_memory_capacity: 10000
@@ -97,50 +268,16 @@ models:
   evo_train_seconds: 3600
   evo_hidden_size: 64
   evo_population: 32
-  evo_islands: 8  # MORE ISLANDS = MORE DIVERSITY (was 4, now 8)
+  evo_islands: 8
   evo_sigma: 0.25
-  prop_search_enabled: true  # CRITICAL: Enable strategy discovery!
-  discovery_mode: risky  # account-multiplication discovery (goal-compounding ranking, half-Kelly)
-  # Feature prefilter (in-sample correlation ranking). The prefilter ranks the
-  # multi-resolution feature cube by |corr| with the BASE TF's 1-bar forward
-  # return and keeps the top-K. A slow higher-TF indicator is near-constant
-  # across many base bars, so its 1-bar-forward corr is ~0 by construction —
-  # the top-K alone therefore discards EVERY multi-TF (H1_/H4_/M15_/...) feature
-  # and the GA's multi-TF seed templates find no prefixes (→ "0 genes" → random
-  # cold start), wasting the whole multi-resolution cube. prefilter_min_per_timeframe
-  # force-keeps each present higher-TF group's best-N features ADDITIVELY (like
-  # the regime_* force-keep) so multi-TF context actually reaches the GA.
-  # 0 = legacy base-only behaviour. (root-caused + fixed 2026-06-08)
-  discovery_runtime:
-    prefilter_top_k: 120  # ANTI-STAGNATION KNOB #1 — how many indicators/features the GA may pick from (top-K by correlation, of ~1017 built). Was 50 (=~77 kept) → GA stuck on a tiny sample, never tried new indicators. Higher = wider pool = more diverse strategies (but slower). RAISE if discovery stalls / finds few genes.
-    prefilter_insample_frac: 0.80   # automatic 80/20 in-sample/out-of-sample validation split
-    prefilter_min_per_timeframe: 6
-  # ── GA search tuning (ANTI-STAGNATION) — change these if the search "gets stuck" ──
-  # The GA can plateau early (a local optimum). These control how long/widely it
-  # explores before giving up. All optional; omitted = engine defaults shown here.
-  search_runtime:
-    convergence_patience: 250        # KNOB #2 — flat generations before the GA gives up on a combo. RAISE (e.g. 500) to explore MUCH longer before stopping (slower, finds more). The #1 lever if "it stalls at gen 50".
-    stagnation_patience: 2           # KNOB #3 — flat generations before the soft diversity-kick fires (heavier mutation + immigrants). LOWER reacts to stalls sooner.
-    min_improvement: 0.000000000001  # KNOB #4 — how big a top-fitness gain "counts" as progress (resets the stall counter). Smaller = tiny gains keep it alive longer.
-    novelty_weight: 0.0              # KNOB #5 — reward for genes that are DIFFERENT from the rest (forces regime diversity). 0 = off (cheap). Try 0.1–0.3 for more variety (costs O(n²), fine at this population).
-    disable_smc_gate: false          # KNOB #6 — set true to drop the SMC structural gate entirely if it's over-constraining the search on a given pair.
-  prop_search_population: 200  # 2026-06-06 operator: 100->200 per-island (200 × 8 islands = 1600 total) — MORE breadth/diversity per generation → finds more of the rare low-DD regime-specialist genes (the deep experiment found maxDD 2.7-4.5% vs 7-9.5% shallow).
-  prop_search_generations: 20000  # 2026-06-06 operator: 1000->20000 — deep GA. Time-bounded by max_hours (binds first on big TFs); on small/fast TFs lets the GA search far deeper than the old 1000 cap.
-  prop_search_max_hours: 1.0  # 2026-06-06 operator: 0.5->1.0 — a full hour of deep search per combo (the experiment used 1h and found notably better genes). NOTE: a full 126-combo library run at 1h/combo exceeds current VPS credit — for the full library, add credit or lower this. Re-read per combo.
-  prop_search_max_rows: 0  # operator 2026-06-05: NO cap — use ALL data per file (400k cut M1 to ~9mo -> "not enough history" + capped depth). 0=full history. Per-TF override via prop_search_max_rows_by_tf (not hardcoded).
-  prop_search_portfolio_size: 50  # 2026-06-06 operator regime-diversity mandate: keep MANY diverse regime-specialist strategies per pair (was 4). The goal is a LARGE library, each capturing a different market condition; the live ensemble + regime-detection deploys each when its edge is active. Correlation-diversification still picks the most-diverse top-N.
-  # agent 2026-06-05 overfitting fix: 0 meant unlimited (usize::MAX) -> genes used
-  # up to 58 indicators = severe overfitting; 16 caps degrees of freedom (regularization).
+  prop_search_enabled: true
+  prop_search_population: 200
+  prop_search_generations: 20000
+  prop_search_max_hours: 1.0
+  prop_search_max_rows: 0
+  prop_search_max_rows_by_tf: {}
+  prop_search_portfolio_size: 50
   prop_search_max_indicators: 16
-  prop_search_async: true
-  prop_search_async_wait: false
-  tree_device_preference: gpu
-  prop_search_parent_selection: rank
-  prop_search_survivor_selection: rank
-  prop_search_survivor_fraction: 0.10
-  prop_search_immigrant_fraction: 0.18
-  prop_search_selection_temperature: 0.75
-  prop_search_tournament_size: 10
   prop_search_checkpoint: models/strategy_evo_checkpoint.json
   prop_search_device: cpu
   prop_search_train_years: 8
@@ -148,38 +285,46 @@ models:
   prop_search_val_candidates: 0
   prop_search_val_min_positive_months: 0
   prop_search_val_min_trades_per_month: 15
-  prop_search_val_min_trades_per_day: 1.0  # operator 2026-06-05: >=1 trade per working day so we can actually observe what a strategy does
+  prop_search_val_min_trades_per_day: 1.0
   prop_search_val_min_monthly_profit_pct: 0.0
   prop_search_val_log_trades: true
   prop_search_val_trade_log_max: 50
+  prop_search_async: true
+  prop_search_async_wait: false
+  tree_device_preference: gpu
+  regularized_model_defaults: true
+  heavy_booster_min_bars: 4000
+  ml_cpcv_enabled: true
+  prop_search_parent_selection: rank
+  prop_search_survivor_selection: rank
+  prop_search_survivor_fraction: 0.1
+  prop_search_immigrant_fraction: 0.18
+  prop_search_selection_temperature: 0.75
+  prop_search_tournament_size: 10
   prop_search_opportunistic_enabled: true
   prop_search_opportunistic_min_positive_months: 3
   prop_search_opportunistic_min_trades_per_month: 10
   prop_search_opportunistic_min_trade_return_pct: 4.0
   prop_search_opportunistic_max_dd: 0.025
-  # 2026-05-26 operator directive (dual-mode product): the 5 knobs below were
-  # previously hardcoded in `crates/neoethos-search/src/discovery.rs`. Surfaced
-  # here so dual-mode operators can tune dedup aggressiveness + MC test rigour
-  # + sensitivity-test stress level from a single YAML.
-  prop_search_corr_threshold: 0.85          # |corr| ≥ this rejects strategy from portfolio (Pearson + Spearman both checked)
-  prop_search_mc_runs: 100                  # Monte-Carlo perturbation runs per candidate
-  prop_search_mc_min_profitable: 70         # min profitable MC runs to survive (out of mc_runs)
-  prop_search_sensitivity_spread_pips: 2.0  # stress-test spread (pips) — keep > production spread
-  prop_search_sensitivity_commission_per_lot: 7.0  # stress-test commission per lot (USD)
+  prop_search_use_opportunistic: true
+  prop_search_corr_threshold: 0.85
+  prop_search_mc_runs: 100
+  prop_search_mc_min_profitable: 70
+  prop_search_sensitivity_spread_pips: 2.0
+  prop_search_sensitivity_commission_per_lot: 7.0
   train_batch_size: 32
   inference_batch_size: 32
   enable_transformer_expert: true
   transformer_heads: 8
   transformer_layers: 4
   transformer_hidden_dim: 256
-  transformer_dropout: 0.10
+  transformer_dropout: 0.1
   transformer_seq_len: 64
   transformer_train_seconds: 3600
   nbeats_train_seconds: 3600
   tide_train_seconds: 3600
   tabnet_train_seconds: 3600
   kan_train_seconds: 3600
-  kan_grid_size: 9
   mlp_train_seconds: 3600
   num_transformers: 2
   swarm_memory_limit_mb: 256.0
@@ -192,82 +337,207 @@ models:
   hpo_backend: ax
   hpo_trials: 8
   hpo_trials_by_model:
-    lightgbm: 8
-    xgboost: 8
-    xgboost_rf: 6
-    xgboost_dart: 6
-    catboost: 8
-    catboost_alt: 6
-    mlp: 6
     tabnet: 6
-    nbeats: 6
-    tide: 6
-    kan: 6
+    mlp: 6
     transformer: 6
+    xgboost_rf: 6
+    xgboost: 8
+    xgboost_dart: 6
+    kan: 6
+    catboost: 8
+    tide: 6
+    catboost_alt: 6
+    lightgbm: 8
+    nbeats: 6
   hpo_max_rows: 1000000
   max_epochs_by_model:
-    tabnet: 200
     tide: 200
+    tabnet: 200
   ray_tune_max_concurrency: 8
-  export_onnx: true  # Export ONNX for fast CPU inference (one-time at startup if missing)
-  phase5_filter_meta_blender: true
-  phase5_core_models: [transformer, nbeats, tide, tabnet, kan]
+  export_onnx: true
   calibration_enabled: true
   calibration_method: platt
   calibration_min_rows: 300
   model_param_overrides: {}
   regime_router_enabled: true
   regime_router_min_models: 2
-  regime_trend_models: [transformer, patchtst, timesnet, nbeats, nbeatsx_nf, tide, tide_nf]
-  regime_range_models: [tabnet, lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, elasticnet, bayes_logit, online_pa, online_hoeffding]
+  regime_trend_models:
+  - transformer
+  - patchtst
+  - timesnet
+  - nbeats
+  - nbeatsx_nf
+  - tide
+  - tide_nf
+  regime_range_models:
+  - tabnet
+  - lightgbm
+  - xgboost
+  - xgboost_rf
+  - xgboost_dart
+  - catboost
+  - catboost_alt
+  - elasticnet
+  - bayes_logit
+  - online_pa
+  - online_hoeffding
   regime_neutral_models: []
   l1_feature_selection_enabled: true
   l1_feature_selection_per_regime: true
   l1_feature_selection_min_features: 20
   l1_feature_selection_max_features: 256
   l1_feature_selection_sample_limit: 200000
-  l1_feature_selection_c: 0.20
-  # Train using base-signal filter for meta-labeling (set false to use all rows)
+  l1_feature_selection_c: 0.2
   filter_to_base_signal: true
-  train_holdout_pct: 0.2
-  # Global pooling caps (0 = no cap)
   global_max_rows: 0
   global_max_rows_per_symbol: 0
+  symbol_hash_buckets: 32
+  global_train_ratio: 0.8
+  train_holdout_pct: 0.2
   label_use_triple_barrier: true
-  # 0 = fall back to risk.meta_label_max_hold_bars
   label_horizon_bars: 0
   label_neutral_band_atr_fraction: 0.25
-  # 0 = derive from risk.atr_stop_multiplier / risk.min_risk_reward
   label_stop_atr_multiplier: 0.0
   label_take_profit_rr: 0.0
+  walkforward_splits: 15
+  embargo_minutes: 120
+  discovery_mode: risky
+  require_walkforward_for_export: false
+  prop_firm_min_pass_rate: 0.0
+  search_runtime:
+    seed: null
+    novelty_weight: 0.2
+    stagnation_patience: 2
+    tournament_size_override: null
+    archive_cap_override: null
+    seen_retry_attempts: 16
+    smc_gate_start: 0.75
+    smc_gate_end: 0.35
+    smc_gate_curve: 1.0
+    smc_gate_stagnation_step: 0.03
+    disable_smc_gate: false
+    archive_mode: ''
+    archive_min_net: 0.0
+    archive_min_pf: 1.0
+    archive_min_sharpe: 0.0
+    parent_selection: ''
+    survivor_selection: ''
+    immigrant_ratio: 0.25
+    survivor_fraction: 0.1
+    selection_temperature: 0.75
+    convergence_patience: 250
+    min_improvement: 1e-12
+    convergence_min_elapsed_fraction: 0.5
+  discovery_runtime:
+    prefilter_top_k: 240
+    prefilter_insample_frac: 0.8
+    prefilter_min_per_timeframe: 6
+    funnel_stage1_pct: 0.25
+    stage1_window: earliest
+    min_history_years: 0
+    adaptive_thresholds: false
+    prop_firm_gate:
+      max_daily_loss_pct: null
+      max_overall_drawdown_pct: null
+      profit_target_pct: null
+      min_trading_days: null
+      window_days: 60
+      n_windows: 0
+      pass_rate: 0.0
+  eval_runtime:
+    symbol: null
+    account_currency: null
+    pip_value: null
+    quote_to_account_rate: null
+    pip_value_per_lot: null
+    spread_pips: null
+    commission_per_trade: null
+    reject_pip_fallback: false
+    smc_gate_threshold: 0.75
+    smc_w_ob: 1.0
+    smc_w_fvg: 1.0
+    smc_w_liq: 1.0
+    smc_w_mtf: 1.0
+    smc_w_premium: 1.0
+    smc_w_inducement: 1.0
+    smc_w_bos: 1.0
+    smc_w_choch: 1.0
+    smc_w_eqh: 1.0
+    smc_w_eql: 1.0
+    smc_w_displacement: 1.0
+  quality_runtime:
+    min_trades_per_month: 4
+    trading_days_per_month: 21.0
+  backtest_runtime:
+    initial_equity: 100000.0
+    month_capacity: 240
+    rayon_threads: null
+  seen_signature_runtime:
+    flush_every: 4096
+    load_max: 3000000
+    max_entries: 3000000
+    file_path: null
+  discovery_ledger:
+    enabled: true
+    cache_dir: cache/search
+    archive_top_n: 20
+    promotion_policy: additive
+  smc_search_runtime:
+    force_ratio: 0.3
+    min_flags: 1
+    force_enabled: true
+    p_ob: 0.5
+    p_fvg: 0.5
+    p_liq: 0.5
+    p_premium: 0.5
+    p_inducement: 0.5
+    p_mtf: 0.85
+    p_bos: 0.5
+    p_choch: 0.5
+    p_eqh: 0.5
+    p_eql: 0.5
+    p_displacement: 0.5
+  data_runtime:
+    normalize_features: false
+    rebuild_stale_higher_tfs: false
+  tree_runtime:
+    device: auto
+    gpu_only: false
+    gpu_count: null
+    early_stop_patience: null
+    early_stop_min_delta: null
   prop_metric_weight: 1.0
   prop_accuracy_weight: 0.1
   prop_min_trades: 0
   prop_conf_threshold: 0.55
-  walkforward_splits: 15  # 2026-06-24 operator "improve success odds": 10→15 more out-of-sample folds = tighter OOS confidence (more unseen windows tested). Still informational (not a hard gate) — see require_walkforward_for_export below.
-  embargo_minutes: 120
-  # agent 2026-06-05 overfitting fix: walk-forward as an EXPORT GATE. When true
-  # (default), a discovered portfolio is export-ready in PropFirm mode ONLY if it
-  # also passes walk-forward (out-of-sample) — not just the prop-firm window gate.
-  # This stops in-sample-overfit strategies (IS Sharpe 3-11 / PF up to 62) that
-  # fail walk-forward from exporting. Set false to restore window-gate-only.
-  require_walkforward_for_export: false  # 2026-06-06 operator regime-diversity mandate: walk-forward tests ALL-PERIOD generalization → as a HARD gate it kills regime-specialists (genes good in SOME market conditions, not all years), which is exactly what we WANT to keep. Now INFORMATIONAL: walk-forward still RUNS and is recorded per strategy (so the live system knows each strategy's OOS character), but it no longer blocks export. Robustness comes from portfolio DIVERSITY + live regime-detection, not per-strategy all-period generalization. Set true to restore the hard OOS export gate.
-  # agent 2026-06-05 overfitting fix: hard floor for the prop-firm window
-  # pass-rate (combined as max with discovery_runtime.prop_firm_gate.pass_rate,
-  # which defaults to 0.0 = ranking-only). 0.65 = a candidate must pass FTMO
-  # rules on ≥65% of random evaluation windows to survive. Raise toward 1.0 for
-  # stricter selection; lower (e.g. 0.0) to restore the old ranking-only behaviour.
-  prop_firm_min_pass_rate: 0.0  # 2026-06-06 operator regime-diversity mandate: 0.65→0.40→0.0. A hard all-window consistency floor KILLS regime-specialists (genes active in only SOME market conditions) — exactly the strategies we WANT for a diverse library. 0.0 = RANKING-ONLY: the prop-firm window-pass-rate still RANKS candidates (more-consistent first) but no longer kills any. The LOW-DD base filter (max_dd) + quality screen (MC/spread/regime) + min-trades still reject blow-ups and noise. Raise (e.g. 0.40-0.65) to demand all-window consistency again.
-  # CPCV (Combinatorial Purged Cross-Validation) settings
   enable_cpcv: true
-  cpcv_n_splits: 8   # 2026-06-24: 5→8 more combinatorial purged folds = stronger overfit detection (more train/test combinations)
+  cpcv_n_splits: 8
   cpcv_n_test_groups: 2
   cpcv_embargo_pct: 0.01
   cpcv_purge_pct: 0.02
-  cpcv_min_phi: 0.80
-  cpcv_max_rows: 200000  # agent 2026-06-05: was 0 (=full rows) → CPCV (combinatorial purged CV, the single heaviest serial validation) ran on 1.05M rows. 200k bounds it on every TF; CPCV stays enabled (López de Prado overfitting check, kept per "stats are the authority") but capped. Informational in PropFirm mode.
-
+  cpcv_min_phi: 0.8
+  cpcv_max_rows: 200000
+  enable_ddp: false
+  enable_fsdp: false
+  ddp_world_size: 1
+  transformer_d_model: 256
+  transformer_n_heads: 8
+  transformer_n_layers: 4
+  nf_hidden_dim: 256
+  tide_hidden_dim: 256
+  nbeats_hidden_dim: 256
+  kan_hidden_dim: 256
+  kan_grid_size: 9
+  tabnet_hidden_dim: 64
+  phase5_filter_meta_blender: true
+  phase5_core_models:
+  - transformer
+  - nbeats
+  - tide
+  - tabnet
+  - kan
 news:
+  news_trading_mode: block_on_news
   news_decay_minutes: 120
   news_kill_window_min: 30
   news_confidence_threshold: 0.65
@@ -275,15 +545,42 @@ news:
   news_calendar_source: forexfactory
   news_lookahead_minutes: 60
   news_trade_on_event: true
-  news_trade_confidence_threshold: 0.90
-  news_event_risk_pct: 0.001  # minimal risk per event (0.1%)
+  news_trade_confidence_threshold: 0.9
+  news_event_risk_pct: 0.001
   enable_news: true
-  news_sources: [rss] 
-  rss_feeds: 
-    - https://www.forexfactory.com/ffcal_week_this.xml
-    - https://www.dailyfx.com/feeds/market-news
-  news_local_glob: ""
-  news_backfill_enabled: true
-  news_backfill_days: 0  # 0 = full data span
+  news_sources:
+  - rss
+  rss_feeds:
+  - https://www.investing.com/rss/news.rss
+  - https://www.fxstreet.com/rss/news
+  - https://www.cnbc.com/id/100003114/device/rss/rss.html
   enable_llm_helper: true
   llm_helper_enabled: true
+  llm_sentiment_positive_threshold: 0.2
+  llm_sentiment_negative_threshold: -0.2
+  news_backfill_enabled: true
+  news_backfill_days: 0
+  news_local_glob: ''
+  perplexity_enabled: true
+  perplexity_api_key_env: PPLX_API_KEY
+  perplexity_model: sonar
+  perplexity_num_results: 10
+  perplexity_timeframe_hours: 24
+  strategist_enabled: false
+  strategist_interval_minutes: 30
+  auto_rescore_enabled: false
+  auto_rescore_days: 30
+  auto_rescore_max_events: 200
+  auto_rescore_only_missing: true
+app_runtime:
+  server_bind: 127.0.0.1:7423
+  ctrader_read_timeout_secs: 30
+  ctrader_max_attempts: 3
+  ctrader_backoff_base_ms: 200
+  ctrader_allow_partial_fill: false
+  ctrader_stream_max_attempts: 3
+  ctrader_stream_backoff_base_ms: 200
+  chart_merge_side: ''
+  pnl_audit_drift_fraction: 0.001
+  pnl_circuit_breaker_fraction: 0.01
+secrets_file: keys.txt
