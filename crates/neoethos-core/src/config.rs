@@ -583,6 +583,16 @@ pub struct ModelsConfig {
     pub calibration_enabled: bool,
     pub calibration_method: String,
     pub calibration_min_rows: usize,
+    /// LIVE ML gate (Stage 3 blend in the live autopilot). When true, the
+    /// live loop loads the symbol's soft-voting ensemble once at engine
+    /// start and, on every closed bar, scales the per-trade risk by the
+    /// ensemble's agreement × regime gate × anomaly scale (MlScale mode:
+    /// the genes ALWAYS pick the direction; ML can only SHRINK size or
+    /// skip a bar on a hard regime/anomaly collapse — never flip, never
+    /// manufacture a trade). Default FALSE: live sizing must never change
+    /// silently; the operator flips this knowingly. Fail-soft: any
+    /// ensemble error on a bar falls back to gene-only sizing, loudly.
+    pub live_ml_gate: bool,
     pub model_param_overrides: HashMap<String, HashMap<String, String>>,
     pub regime_router_enabled: bool,
     pub regime_router_min_models: usize,
@@ -1366,6 +1376,7 @@ impl Default for ModelsConfig {
             calibration_enabled: true,
             calibration_method: "platt".to_string(),
             calibration_min_rows: 300,
+            live_ml_gate: false,
             model_param_overrides: HashMap::new(),
             regime_router_enabled: false,
             regime_router_min_models: 2,

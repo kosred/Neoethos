@@ -237,13 +237,52 @@ pub fn role_decisions_from_feature_frame(
     timeframe: &str,
     features: &neoethos_data::FeatureFrame,
 ) -> Result<Vec<super::EnsembleDecision>> {
+    let ensemble = build_ensemble_for_symbol(models_root, symbol, timeframe)?;
+    let df = ensemble_feature_dataframe(&ensemble, features, FrameRows::All)?;
+    ensemble.predict_with_roles(&df)
+}
+
+/// LIVE-path variant: one role-aware decision for the LAST row of `features`,
+/// against an ALREADY-BUILT ensemble.
+///
+/// The live autopilot builds its ensemble ONCE at engine start (loading ~30
+/// expert artifacts takes seconds — far too slow per bar) and calls this on
+/// every closed bar with the same multi-TF feature cube the genes evaluate.
+/// Same fail-loud column contract as [`role_decisions_from_feature_frame`];
+/// the caller treats any `Err` as "ensemble abstains" and falls back to
+/// gene-only sizing — never a wrong-columned prediction, never a blocked
+/// trade due to ML infrastructure.
+pub fn role_decision_for_last_row(
+    ensemble: &SoftVotingEnsemble,
+    features: &neoethos_data::FeatureFrame,
+) -> Result<super::EnsembleDecision> {
+    let df = ensemble_feature_dataframe(ensemble, features, FrameRows::LastOnly)?;
+    let decisions = ensemble.predict_with_roles(&df)?;
+    decisions
+        .into_iter()
+        .next_back()
+        .ok_or_else(|| anyhow::anyhow!("ensemble returned no decision for the last feature row"))
+}
+
+/// Row selector for [`ensemble_feature_dataframe`].
+enum FrameRows {
+    All,
+    LastOnly,
+}
+
+/// Shared column-contract core: read the experts' agreed feature columns,
+/// select EXACTLY those from the cube BY NAME, and build the DataFrame the
+/// experts expect. FAILS LOUD on any mismatch.
+fn ensemble_feature_dataframe(
+    ensemble: &SoftVotingEnsemble,
+    features: &neoethos_data::FeatureFrame,
+    rows: FrameRows,
+) -> Result<polars::prelude::DataFrame> {
     use anyhow::{anyhow, bail};
     use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 
     // `load_outcome` is an `EnsemblePredictor` trait method.
     use super::EnsemblePredictor;
-
-    let ensemble = build_ensemble_for_symbol(models_root, symbol, timeframe)?;
 
     // Determine the experts' shared feature-column set; assert all loaded
     // experts that expose columns agree on them.
@@ -258,16 +297,15 @@ pub fn role_decisions_from_feature_frame(
             Some(prev) => {
                 if prev.as_slice() != cols {
                     bail!(
-                        "ensemble experts disagree on feature columns for {symbol}/{timeframe}; \
+                        "ensemble experts disagree on feature columns; \
                          refusing to feed mis-columned data"
                     );
                 }
             }
         }
     }
-    let expected = expected.ok_or_else(|| {
-        anyhow!("no loaded expert exposes feature_columns for {symbol}/{timeframe}")
-    })?;
+    let expected =
+        expected.ok_or_else(|| anyhow!("no loaded expert exposes feature_columns"))?;
 
     // Build a DataFrame with EXACTLY `expected` columns, by name, from the cube.
     let mut columns = Vec::with_capacity(expected.len());
@@ -278,16 +316,22 @@ pub fn role_decisions_from_feature_frame(
             .position(|n| n == name)
             .ok_or_else(|| {
                 anyhow!(
-                    "feature '{name}' required by the {symbol}/{timeframe} ensemble is absent \
-                     from the trader feature cube; refusing to trade on incomplete features"
+                    "feature '{name}' required by the ensemble is absent from the \
+                     trader feature cube; refusing to trade on incomplete features"
                 )
             })?;
-        let col: Vec<f32> = features.feature_column(idx).to_vec();
+        let col: Vec<f32> = match rows {
+            FrameRows::All => features.feature_column(idx).to_vec(),
+            FrameRows::LastOnly => features
+                .feature_column(idx)
+                .last()
+                .copied()
+                .map(|v| vec![v])
+                .unwrap_or_default(),
+        };
         columns.push(Column::from(Series::new(name.as_str().into(), col)));
     }
-    let df = DataFrame::new(columns).context("build ensemble feature DataFrame")?;
-
-    ensemble.predict_with_roles(&df)
+    DataFrame::new(columns).context("build ensemble feature DataFrame")
 }
 
 // ---------------------------------------------------------------------------

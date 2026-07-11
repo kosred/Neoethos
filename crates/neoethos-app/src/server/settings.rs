@@ -86,6 +86,10 @@ pub struct SettingsDto {
     pub disable_smc_gate: bool,
     /// Portfolio-level concurrent-risk cap (balance fraction; 0 = disabled).
     pub max_portfolio_risk: f64,
+    /// LIVE ML gate (models.live_ml_gate): the trained ensemble scales
+    /// per-trade risk on live entries (genes keep the direction; ML only
+    /// shrinks size / skips on a hard regime+anomaly collapse).
+    pub live_ml_gate: bool,
 }
 
 /// Partial-update payload for `POST /settings`. All fields optional —
@@ -125,6 +129,8 @@ pub struct SettingsUpdateDto {
     pub stagnation_patience: Option<usize>,
     pub novelty_weight: Option<f64>,
     pub disable_smc_gate: Option<bool>,
+    /// LIVE ML gate toggle (models.live_ml_gate).
+    pub live_ml_gate: Option<bool>,
     /// Risk fraction per trade (0..=max_risk_per_trade). Lets the operator set
     /// the sizing risk for the search/run directly (clamped on write).
     pub risk_per_trade: Option<f64>,
@@ -548,6 +554,9 @@ pub async fn update_settings(
     if let Some(v) = payload.disable_smc_gate {
         settings.models.search_runtime.disable_smc_gate = v;
     }
+    if let Some(v) = payload.live_ml_gate {
+        settings.models.live_ml_gate = v;
+    }
 
     if let Err(err) = settings.save(config_path()) {
         tracing::error!(
@@ -604,5 +613,6 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         novelty_weight: settings.models.search_runtime.novelty_weight,
         disable_smc_gate: settings.models.search_runtime.disable_smc_gate,
         max_portfolio_risk: settings.risk.max_portfolio_risk,
+        live_ml_gate: settings.models.live_ml_gate,
     }
 }
