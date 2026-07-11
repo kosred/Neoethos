@@ -50,6 +50,7 @@ pub mod intelligence;
 pub mod journal;
 pub mod knob_catalog;
 pub mod live_spots;
+pub mod mcp;
 pub mod news;
 pub mod orders;
 pub mod pending_actions;
@@ -194,6 +195,14 @@ pub fn router(state: AppApiState) -> Router {
         .route("/mesh/migration/enable", post(federation::migration_enable))
         .route("/mesh/elites", get(federation::migration_elites))
         .route("/mesh/migrants", post(federation::migration_migrants))
+        // MCP sidecar management (config file + sidecar status/tools proxy).
+        // Tool CALLS stay behind the Supervisor's approval-gated actions.
+        // POST accepted alongside PUT (the web client only speaks GET/POST).
+        .route(
+            "/mcp/config",
+            get(mcp::config_get).put(mcp::config_put).post(mcp::config_put),
+        )
+        .route("/mcp/status", get(mcp::status))
         // Offline learning report from live experience (never touches live).
         .route(
             "/experience/train",

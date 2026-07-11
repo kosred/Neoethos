@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "../../mcp/target/release/neoethos-mcp": ""
+    }
+  }
+}

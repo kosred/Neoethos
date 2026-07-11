@@ -63,6 +63,13 @@ jobs:
         working-directory: desktop
         run: npm ci || npm install
 
+      # The MCP sidecar ships inside the installer (bundle.resources in the
+      # per-platform tauri conf files) — build it BEFORE bundling or the
+      # resource is missing and the bundle step fails. It lives in its OWN
+      # isolated workspace (mcp/), so this never touches the engine's deps.
+      - name: Build MCP sidecar
+        run: cargo build --release --manifest-path mcp/Cargo.toml
+
       # tauri-action runs the frontend build then compiles the desktop binary
       # with the web assets embedded, producing the platform installer, and —
       # on a tag — uploads the bundle to the matching Release (as a draft).

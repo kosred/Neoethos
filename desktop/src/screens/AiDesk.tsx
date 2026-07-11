@@ -1,5 +1,8 @@
-import { useState } from "react";
-import { codexStatus, codexStart, codexLogout, codexChat, supervisorChat } from "../api";
+import { useEffect, useState } from "react";
+import {
+  codexStatus, codexStart, codexLogout, codexChat, supervisorChat,
+  mcpStatus, mcpConfigGet, mcpConfigSave,
+} from "../api";
 import { usePoll } from "../hooks";
 import Supervisor from "./Supervisor";
 
@@ -188,6 +191,81 @@ export default function AiDesk() {
 
       <div style={{ borderTop: "2px solid var(--line, #1e2a3a)", margin: "28px 0" }} />
       <Supervisor />
+
+      <div style={{ borderTop: "2px solid var(--line, #1e2a3a)", margin: "28px 0" }} />
+      <McpTools />
+    </div>
+  );
+}
+
+// ── MCP tool servers (external tools for the Supervisor) ────────────────────
+// Config editor + live status for the MCP sidecar. Tools connected here
+// (cTrader remote, MT5 bridges, web search, …) become available to the
+// Supervisor's ACTION framework — trade-affecting calls still require your
+// approval click. The sidecar reads mcp_servers.json at app start.
+function McpTools() {
+  const { data: st } = usePoll(mcpStatus, 15000);
+  const [content, setContent] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!loaded) {
+      mcpConfigGet()
+        .then((r) => { setContent(r.content); setLoaded(true); })
+        .catch(() => {});
+    }
+  }, [loaded]);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const r = await mcpConfigSave(content);
+      setMsg(`✓ Saved. ${r?.note ?? ""}`);
+    } catch (e) {
+      setMsg(`Save failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const tools: any[] = Array.isArray(st?.tools) ? st.tools : [];
+  return (
+    <div>
+      <h2>
+        MCP tool servers{" "}
+        <span className={`badge ${st?.reachable ? "live" : "demo"}`}>
+          {st?.reachable ? `CONNECTED · ${tools.length} tools` : "SIDECAR OFF"}
+        </span>
+      </h2>
+      <p className="muted small">
+        External tools (MCP servers) the <b>Supervisor</b> can use: the official cTrader remote,
+        MetaTrader&nbsp;5 bridges, web search, filesystem… Add servers below (JSON) — applied on the
+        next app start. <b>Trade-affecting tool calls always require your approval click</b>; a
+        third-party server never places orders on its own.
+      </p>
+      {tools.length > 0 && (
+        <p className="muted small">
+          Available: {tools.slice(0, 12).map((t: any) => t?.name ?? String(t)).join(", ")}
+          {tools.length > 12 ? ` … +${tools.length - 12} more` : ""}
+        </p>
+      )}
+      <div className="ticket">
+        <textarea
+          value={content}
+          onChange={(e) => setContent(e.target.value)}
+          spellCheck={false}
+          style={{ width: "100%", minHeight: 160, fontFamily: "monospace", fontSize: 12 }}
+          placeholder='{ "port": 7431, "servers": [ { "name": "ctrader", "transport": "http", "url": "https://mcp.spotware.com/mcp" } ] }'
+        />
+        <div className="btn-row" style={{ marginTop: 8 }}>
+          <button className="primary" disabled={busy || !content.trim()} onClick={save}>
+            Save MCP config
+          </button>
+        </div>
+        {msg && <div className="banner info" style={{ marginTop: 8 }}>{msg}</div>}
+      </div>
     </div>
   );
 }
