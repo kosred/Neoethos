@@ -93,17 +93,18 @@ use crate::runtime::capabilities::ModelFamily;
 pub mod bootstrap;
 pub mod deep_classification_adapters;
 pub mod deep_timeseries_adapters;
-// F-319 (2026-05-29, operator directive): the `evolutionary_adapters`
-// module was removed entirely. `genetic` / `neuro_evo` / `neat` were
-// architecturally misplaced — they are STRATEGY DISCOVERERS in
-// `neoethos-search`, not inference experts. Wrapping them as
-// `ExpertModel` voters and then permanently excluding them via
-// `SoftVotingEnsembleConfig::excluded_names` was the 2026-05-17
-// workaround for the original misclassification. Today we finish
-// the cleanup — the loaders, adapters, and exclusion bookkeeping
-// are all gone. The Discovery → Training → Inference pipeline is
-// now layered cleanly: GA/NeuroEvo run in the search crate;
-// trained models (trees, deep nets, statistical, RL) vote here.
+// F-319 REVISED (2026-07-11, operator directive). The 2026-05-29
+// cleanup removed the evolutionary adapters as "strategy discoverers,
+// not inference experts" — but it only removed the CONSUMER: the
+// training orchestrator kept training `neat` + `neuro_evo` through the
+// shared expert path (both implement the base ExpertModel contract
+// with genuine 3-class heads), so every run burned hours producing
+// artifacts nothing ever read. The operator's standing rule is now:
+// every model that trains, votes — the search-only exemption applies
+// to `genetic` alone (it discovers strategies; it is not a
+// classifier). `evolution_adapters` restores the neat/neuro_evo
+// voters, loading the SAME artifacts training already produces.
+pub mod evolution_adapters;
 pub mod meta_adapters;
 pub mod mixed_adapters;
 pub mod rl_exit_adapters;
@@ -265,7 +266,17 @@ pub enum ExpertRole {
 ///
 /// Returns `None` for an unmapped name (the caller decides whether to bail).
 pub fn expert_role(name: &str) -> Option<ExpertRole> {
-    match name {
+    // Replica ensemble members (`transformer_01`, `transformer_02`, …,
+    // produced when `models.num_transformers > 1`) inherit the canonical
+    // model's role — each replica is an independent voter but plays the
+    // same role as its base architecture.
+    let canonical = match name.strip_prefix("transformer_") {
+        Some(suffix) if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) => {
+            "transformer"
+        }
+        _ => name,
+    };
+    match canonical {
         // Regime gate — trend posterior gates size, does not vote.
         "hmm_regime" => Some(ExpertRole::RegimeGate),
         // Anomaly scale/veto — outlier score scales size, does not vote.
@@ -275,12 +286,17 @@ pub fn expert_role(name: &str) -> Option<ExpertRole> {
         // Both are entry/direction RL voters that confirm — never
         // originate/override — the genes' direction (Stage 3 invariant).
         "dqn" | "sac" => Some(ExpertRole::DirectionalConfirm),
-        // Genuine directional classifiers.
+        // Genuine directional classifiers. `neat` + `neuro_evo` joined
+        // 2026-07-11 (F-319 revision — see the `evolution_adapters`
+        // module doc): both train 3-class heads on the same labels as
+        // every other classifier here.
         "lightgbm" | "xgboost" | "xgboost_rf" | "xgboost_dart" | "catboost" | "catboost_alt"
         | "sklears_tree" | "mlp" | "kan" | "tabnet" | "nbeats" | "nbeatsx_nf" | "tide"
         | "tide_nf" | "transformer" | "patchtst" | "timesnet" | "elasticnet" | "logistic"
         | "bayes_logit" | "meta_blender" | "probability_calibrator" | "conformal_gate"
-        | "meta_stack" | "online_pa" | "online_hoeffding" => Some(ExpertRole::Direction),
+        | "meta_stack" | "online_pa" | "online_hoeffding" | "neat" | "neuro_evo" => {
+            Some(ExpertRole::Direction)
+        }
         _ => None,
     }
 }
@@ -763,6 +779,166 @@ impl ExpertRegistry {
             }
         }
         outcome
+    }
+
+    /// [`Self::load_with_partial`] plus two fixes for "trained but
+    /// invisible" artifacts (operator report 2026-07-11):
+    ///
+    /// 1. **Replica resolution.** Training with
+    ///    `models.num_transformers > 1` writes `transformer_01/`,
+    ///    `transformer_02/`, … and never a plain `transformer/` dir —
+    ///    so the exact-name lookup above counted the transformer as
+    ///    `missing` and NO transformer ever voted, silently wasting
+    ///    every replica's training time. When a requested name's dir is
+    ///    missing, this scans for `{name}_NN` dirs and loads EACH one
+    ///    through the canonical loader, renamed to its replica dir name
+    ///    so each is an independent voter (`expert_role` maps replica
+    ///    names to the canonical role).
+    ///
+    /// 2. **Orphan detection.** Any artifact directory on disk that no
+    ///    loader claimed is reported loudly instead of silently ignored
+    ///    — a systematic name mismatch (the transformer bug) or a
+    ///    consumer-less model must be visible, not lost in the
+    ///    "partial success" tolerance.
+    pub fn load_with_partial_replica_aware(
+        &self,
+        root: &Path,
+        requested: &[&str],
+    ) -> ExpertLoadOutcome {
+        let mut outcome = self.load_with_partial(root, requested);
+
+        // ── 1. Replica resolution for the `missing` names ──────────────
+        let mut still_missing: Vec<String> = Vec::new();
+        for name in outcome.missing.drain(..) {
+            let loader = match self.loaders.get(&name) {
+                Some(l) => l,
+                None => {
+                    still_missing.push(name);
+                    continue;
+                }
+            };
+            let mut replica_dirs: Vec<PathBuf> = std::fs::read_dir(root)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_dir()
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .and_then(|n| n.strip_prefix(&format!("{name}_")))
+                            .is_some_and(|suffix| {
+                                !suffix.is_empty()
+                                    && suffix.chars().all(|c| c.is_ascii_digit())
+                            })
+                })
+                .collect();
+            replica_dirs.sort();
+            if replica_dirs.is_empty() {
+                still_missing.push(name);
+                continue;
+            }
+            for dir in replica_dirs {
+                let replica_name = dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&name)
+                    .to_string();
+                match loader.load(&dir) {
+                    Ok(expert) => {
+                        tracing::info!(
+                            target: "neoethos_models::ensemble",
+                            canonical = %name,
+                            replica = %replica_name,
+                            "loaded replica artifact as an independent voter"
+                        );
+                        outcome.loaded.push(Box::new(RenamedExpert {
+                            name: replica_name,
+                            inner: expert,
+                        }));
+                    }
+                    Err(err) => {
+                        outcome.degraded.push(ExpertLoadError::InvalidArtifact {
+                            name: replica_name,
+                            reason: err.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        outcome.missing = still_missing;
+
+        // ── 2. Orphan artifacts: on disk, claimed by nothing ────────────
+        let claimed: std::collections::HashSet<String> = outcome
+            .loaded
+            .iter()
+            .map(|e| e.name().to_string())
+            .chain(outcome.missing.iter().cloned())
+            .chain(outcome.degraded.iter().map(|e| e.name().to_string()))
+            .collect();
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if claimed.contains(dir_name) {
+                    continue;
+                }
+                // Known non-voters, documented: `genetic` discovers
+                // strategies (search-only exemption), `exit_agent` is
+                // exit-pipeline-only (F-318), `swarm_forecaster` awaits
+                // its adapter (stateful univariate API — D1.2.7).
+                let by_design = matches!(dir_name, "genetic" | "exit_agent" | "swarm_forecaster");
+                if by_design {
+                    tracing::info!(
+                        target: "neoethos_models::ensemble",
+                        artifact = %dir_name,
+                        "trained artifact present but not a voter (by design)"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "neoethos_models::ensemble",
+                        artifact = %dir_name,
+                        "ORPHAN trained artifact — present on disk but no loader claims it; \
+                         its training time is being wasted (check loader registration/naming)"
+                    );
+                }
+            }
+        }
+
+        outcome
+    }
+}
+
+/// Thin rename shim for replica ensemble members: delegates everything
+/// to the wrapped expert but reports the replica's own name
+/// (`transformer_01`) so soft-voting treats each replica as an
+/// independent voter and per-expert weights/exclusions stay addressable.
+struct RenamedExpert {
+    name: String,
+    inner: Box<dyn ExpertModel>,
+}
+
+impl ExpertModel for RenamedExpert {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn family(&self) -> ModelFamily {
+        self.inner.family()
+    }
+    fn output_kind(&self) -> ExpertOutputKind {
+        self.inner.output_kind()
+    }
+    fn feature_columns(&self) -> &[String] {
+        self.inner.feature_columns()
+    }
+    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+        self.inner.predict(df)
     }
 }
 

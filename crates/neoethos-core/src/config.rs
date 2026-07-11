@@ -1237,6 +1237,10 @@ impl Default for ModelsConfig {
                 "sklears_tree",
                 "mlp",
                 "elasticnet",
+                // Plain L2 logistic regression — trainable since day one but
+                // absent from every request list, so it never existed on any
+                // install (operator audit 2026-07-11). Cheap linear voter.
+                "logistic",
                 "bayes_logit",
                 "online_pa",
                 "online_hoeffding",

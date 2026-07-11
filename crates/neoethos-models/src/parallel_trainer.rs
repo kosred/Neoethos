@@ -322,6 +322,10 @@ pub enum ModelType {
     Genetic,
     NeuroEvo,
     Neat,
+    /// 3-state Hidden Markov regime model (the "34th model", 2026-05-25).
+    /// Loader + adapter shipped then, but training was never wired — every
+    /// install reported it "missing" forever. Wired 2026-07-11.
+    HmmRegime,
 }
 
 // ============================================================================
