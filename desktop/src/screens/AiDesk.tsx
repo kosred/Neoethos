@@ -1,8 +1,18 @@
 import { useState } from "react";
-import { codexStatus, codexStart, codexLogout, codexChat } from "../api";
+import { codexStatus, codexStart, codexLogout, codexChat, supervisorChat } from "../api";
 import { usePoll } from "../hooks";
+import Supervisor from "./Supervisor";
 
 type Turn = { role: "you" | "ai"; text: string };
+
+// The ONE place to talk to the LLM (operator request 2026-07-11 — there
+// used to be two chat boxes: this one and another on the Supervisor
+// screen). The mode toggle routes each message:
+//  - Assistant  → plain ChatGPT chat (market questions, no system access)
+//  - Supervisor → the tool-aware supervisor (reads full system state,
+//    standing directives, and can ACT through the same whitelisted,
+//    guard-railed actions as its autonomous loop)
+type ChatMode = "assistant" | "supervisor";
 
 export default function AiDesk() {
   const { data: status, reload } = usePoll(codexStatus, 4000);
@@ -67,6 +77,8 @@ export default function AiDesk() {
     }
   };
 
+  const [mode, setMode] = useState<ChatMode>("assistant");
+
   const send = async () => {
     const prompt = input.trim();
     if (!prompt) return;
@@ -74,8 +86,13 @@ export default function AiDesk() {
     setTurns((t) => [...t, { role: "you", text: prompt }]);
     setBusy(true);
     try {
-      const r = await codexChat(prompt);
-      setTurns((t) => [...t, { role: "ai", text: r?.response ?? "(no response)" }]);
+      if (mode === "supervisor") {
+        const r = await supervisorChat(prompt);
+        setTurns((t) => [...t, { role: "ai", text: r?.reply ?? "(no reply)" }]);
+      } else {
+        const r = await codexChat(prompt);
+        setTurns((t) => [...t, { role: "ai", text: r?.response ?? "(no response)" }]);
+      }
     } catch (e) {
       setTurns((t) => [...t, { role: "ai", text: `Error: ${e}` }]);
     } finally {
@@ -125,8 +142,25 @@ export default function AiDesk() {
       </div>
       {msg && <div className="banner info">{msg}</div>}
 
+      <div className="btn-row" style={{ marginTop: 12, gap: 6 }}>
+        <button
+          className={mode === "assistant" ? "primary" : ""}
+          onClick={() => setMode("assistant")}
+          title="Plain ChatGPT chat — market questions, strategy talk. No system access."
+        >💬 Assistant</button>
+        <button
+          className={mode === "supervisor" ? "primary" : ""}
+          onClick={() => setMode("supervisor")}
+          title="Tool-aware supervisor — reads the full system state (engines, journal, autopilot) and can ACT through the whitelisted, guard-railed actions. Same brain as the autonomous loop below."
+        >🧭 Supervisor</button>
+        <span className="muted small" style={{ alignSelf: "center" }}>
+          {mode === "supervisor"
+            ? "reads the whole system and can act (guard-railed)"
+            : "plain chat — no system access"}
+        </span>
+      </div>
       <div className="chat">
-        {turns.length === 0 && <p className="muted">Ask about the markets, a strategy, or your account.</p>}
+        {turns.length === 0 && <p className="muted">Ask about the markets, a strategy, or your account — or switch to Supervisor to steer the system.</p>}
         {turns.map((t, i) => (
           <div key={i} className={`chat-turn ${t.role}`}>
             <b>{t.role === "you" ? "You" : "AI"}</b>
@@ -137,7 +171,13 @@ export default function AiDesk() {
       <div className="chat-input">
         <input
           value={input}
-          placeholder={authed ? "Type a message…" : "Connect ChatGPT first"}
+          placeholder={
+            !authed
+              ? "Connect ChatGPT first"
+              : mode === "supervisor"
+                ? "π.χ. Τι βλέπεις στα live engines; Ξεκίνα discovery στο GBPUSD M15…"
+                : "Type a message…"
+          }
           disabled={!authed || busy}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && send()}
@@ -145,6 +185,9 @@ export default function AiDesk() {
         />
         <button className="primary" onClick={send} disabled={!authed || busy}>Send</button>
       </div>
+
+      <div style={{ borderTop: "2px solid var(--line, #1e2a3a)", margin: "28px 0" }} />
+      <Supervisor />
     </div>
   );
 }

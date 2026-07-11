@@ -18,7 +18,6 @@ import Files from "./screens/Files";
 import Data from "./screens/Data";
 import News from "./screens/News";
 import AiDesk from "./screens/AiDesk";
-import Supervisor from "./screens/Supervisor";
 import Hardware from "./screens/Hardware";
 import Configuration from "./screens/Configuration";
 import Help from "./screens/Help";
@@ -28,7 +27,7 @@ type View =
   | "help"
   | "cockpit" | "dashboard" | "markets" | "marketwatch" | "account" | "actions"
   | "autopilot" | "riskymode" | "risk" | "discovery" | "training" | "strategylab" | "strategyreport" | "intelligence"
-  | "files" | "data" | "news" | "aidesk" | "supervisor" | "hardware" | "settings";
+  | "files" | "data" | "news" | "aidesk" | "hardware" | "settings";
 
 type NavEntry = { id: View; label: string; icon: string } | { divider: string };
 
@@ -56,8 +55,9 @@ const NAV: NavEntry[] = [
   { id: "data", label: "Data", icon: "🗄" },
   { divider: "Desk" },
   { id: "news", label: "News", icon: "📰" },
+  // AI Desk = the ONE LLM surface: unified chat (Assistant ↔ Supervisor
+  // modes) + the supervisor control panel (2026-07-11 consolidation).
   { id: "aidesk", label: "AI Desk", icon: "💬" },
-  { id: "supervisor", label: "Supervisor", icon: "🧭" },
   { divider: "System" },
   { id: "hardware", label: "Hardware", icon: "🖥" },
   { id: "settings", label: "Settings", icon: "⚙" },
@@ -83,7 +83,6 @@ const SCREENS: Record<View, ReactNode> = {
   data: <Data />,
   news: <News />,
   aidesk: <AiDesk />,
-  supervisor: <Supervisor />,
   hardware: <Hardware />,
   settings: <Configuration />,
 };
