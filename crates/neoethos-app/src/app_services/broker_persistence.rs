@@ -20,11 +20,13 @@
 //! # Security
 //!
 //! The TOML file is intended to live OUTSIDE the git repository.
-//! Two transient fields are explicitly NEVER serialized:
+//! One transient field is explicitly NEVER serialized:
 //!
 //! - `CTraderBrokerSettings::authorization_code_input` — short-lived OAuth value
+//!
 //! (DXtrade settings removed 2026-07-11 — old `[dxtrade]` TOML sections
-//! are ignored on load, so existing files stay valid.)
+//! are ignored on load, so files written by ≤ v0.5.3 stay valid; see the
+//! `legacy_credentials_with_dxtrade_section_still_load` test.)
 
 use crate::app_services::broker_config::BrokerSettingsState;
 use anyhow::Result;
@@ -305,11 +307,38 @@ mod tests {
         });
     }
 
-    // NOTE: the `[dxtrade]` table literals in the TOML fixtures below are
-    // KEPT deliberately after the 2026-07-11 DXtrade removal — they now
-    // double as backward-compat proof that credentials files written by
-    // older builds (which contain a `[dxtrade]` section) still load
-    // cleanly (serde ignores unknown tables).
+    /// Every build up to and including the public v0.5.2/v0.5.3 wrote a
+    /// `[dxtrade]` table into broker_credentials.toml. The struct is gone
+    /// (2026-07-11) but EXISTING users' files still contain the section —
+    /// this is the ONE dedicated proof that such files keep loading (serde
+    /// ignores unknown tables) so nobody loses their cTrader credentials
+    /// on upgrade. If this test ever fails (e.g. someone adds
+    /// `deny_unknown_fields`), every upgrading install breaks.
+    #[test]
+    fn legacy_credentials_with_dxtrade_section_still_load() {
+        let dir = tempdir_or_skip();
+        let path = dir.join("legacy.toml");
+        fs::write(
+            &path,
+            "[ctrader]
+client_id = \"keep-me\"
+
+[dxtrade]
+platform_url = \"https://demo.dx.example\"
+username = \"user42\"
+domain = \"default\"
+accounts = []
+",
+        )
+        .expect("write legacy file");
+        with_env_path(&path, |_| {
+            let loaded = load_broker_settings();
+            assert_eq!(
+                loaded.ctrader.client_id, "keep-me",
+                "legacy file with [dxtrade] section must load without losing cTrader creds"
+            );
+        });
+    }
 
     #[test]
     fn ctrader_authorization_code_input_is_not_persisted() {
