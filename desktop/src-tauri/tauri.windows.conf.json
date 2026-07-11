@@ -1,7 +1,8 @@
 {
   "bundle": {
     "resources": {
-      "../../mcp/target/release/neoethos-mcp.exe": ""
+      "../../mcp/target/release/neoethos-mcp.exe": "",
+      "../../target/release/*.dll": ""
     }
   }
 }

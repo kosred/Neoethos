@@ -118,12 +118,15 @@ codegen-units = 16
 
 [patch.crates-io]
 lightgbm3-sys = { path = "vendor/lightgbm3-sys" }
-# sklears-core patch removed 2026-05-21 (task #84) — the vendored copy
-# was the stale v0.1.0 release and got bypassed once sklears upstream
-# published 0.1.1 (which lifts the scirs2 stack to v0.4.4). Cargo was
-# warning every build that the patch was not used. If we ever need to
-# patch sklears-core again, regenerate the vendor copy at the version
-# the crate graph actually resolves to.
+# sklears-core RE-VENDORED 2026-07-12 at v0.1.1. Upstream 0.1.1 calls
+# the linux-only `read_perf_counters()` unconditionally on x86_64, so it
+# does not COMPILE on Windows/macOS (E0599 — caught by the first real CI
+# release run). The fix had previously been applied by editing the crate
+# IN THE LOCAL CARGO REGISTRY CACHE — invisible, lost on any cache clean,
+# and the reason local builds passed while CI failed. The vendored copy
+# carries that patch (zeroed CacheStats fallback on non-linux, marked
+# "Patched:" in src/benchmarking.rs) the honest, reproducible way.
+sklears-core = { path = "vendor/sklears-core" }
 rlkit = { path = "vendor/rlkit" }
 # **vector-ta 2026-05-26**: patched local copy with a one-line fix to
 # `utilities/helpers.rs:159` — replaced

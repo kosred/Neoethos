@@ -31,8 +31,7 @@
     "targets": "all",
     "resources": {
       "resources/config.yaml": "resources/config.yaml",
-      "resources/symbol_metadata.json": "resources/symbol_metadata.json",
-      "../../target/release/*.dll": ""
+      "resources/symbol_metadata.json": "resources/symbol_metadata.json"
     },
     "icon": [
       "icons/32x32.png",

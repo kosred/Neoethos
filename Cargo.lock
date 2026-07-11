@@ -11699,8 +11699,6 @@ dependencies = [
 [[package]]
 name = "sklears-core"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5076dec926d7f424ef9190b84ed526984be3d1925452f529f8792b34a786e97"
 dependencies = [
  "approx 0.5.1",
  "bytemuck",
