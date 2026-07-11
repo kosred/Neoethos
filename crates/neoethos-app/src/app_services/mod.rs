@@ -25,12 +25,6 @@ pub mod ctrader_proto_messages;
 pub mod ctrader_state_machine;
 pub mod ctrader_tls;
 pub mod discovery;
-// `dxtrade` — REMOVED 2026-07-11 (operator directive, superseding the
-// 2026-05-21 "keep DXtrade" restore). The D3 adapter never shipped past
-// auth stubs, had ZERO dispatch call sites, and the broker-agnostic
-// direction is now MCP bridges (see mcp/ — e.g. the MT5 MCP servers in
-// mcp_servers.example.json). Git history keeps the 2755-line module if
-// a native DXtrade adapter is ever wanted again.
 pub mod broker_api;
 // Phase C (2026-05-28) — one-shot tool that captures real
 // `ProtoOASymbolByIdRes` payloads from the configured cTrader

@@ -119,13 +119,6 @@ pub struct CTraderBrokerSettings {
     pub accounts: Vec<BrokerAccountTarget>,
 }
 
-// `DxTradeBrokerSettings` REMOVED 2026-07-11 (operator directive,
-// superseding the 2026-05-21 "keep DXtrade" restore): the D3 adapter
-// never shipped past auth stubs and the broker-agnostic direction is
-// now MCP bridges (see mcp/). Old `[dxtrade]` sections in
-// broker_credentials.toml are silently ignored on load (serde default
-// tolerates unknown tables), so existing files stay loadable.
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrokerSettingsState {
     /// Schema version of the on-disk `broker_credentials.toml`

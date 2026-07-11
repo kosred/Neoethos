@@ -23,10 +23,6 @@
 //! One transient field is explicitly NEVER serialized:
 //!
 //! - `CTraderBrokerSettings::authorization_code_input` — short-lived OAuth value
-//!
-//! (DXtrade settings removed 2026-07-11 — old `[dxtrade]` TOML sections
-//! are ignored on load, so files written by ≤ v0.5.3 stay valid; see the
-//! `legacy_credentials_with_dxtrade_section_still_load` test.)
 
 use crate::app_services::broker_config::BrokerSettingsState;
 use anyhow::Result;
@@ -307,39 +303,6 @@ mod tests {
         });
     }
 
-    /// Every build up to and including the public v0.5.2/v0.5.3 wrote a
-    /// `[dxtrade]` table into broker_credentials.toml. The struct is gone
-    /// (2026-07-11) but EXISTING users' files still contain the section —
-    /// this is the ONE dedicated proof that such files keep loading (serde
-    /// ignores unknown tables) so nobody loses their cTrader credentials
-    /// on upgrade. If this test ever fails (e.g. someone adds
-    /// `deny_unknown_fields`), every upgrading install breaks.
-    #[test]
-    fn legacy_credentials_with_dxtrade_section_still_load() {
-        let dir = tempdir_or_skip();
-        let path = dir.join("legacy.toml");
-        fs::write(
-            &path,
-            "[ctrader]
-client_id = \"keep-me\"
-
-[dxtrade]
-platform_url = \"https://demo.dx.example\"
-username = \"user42\"
-domain = \"default\"
-accounts = []
-",
-        )
-        .expect("write legacy file");
-        with_env_path(&path, |_| {
-            let loaded = load_broker_settings();
-            assert_eq!(
-                loaded.ctrader.client_id, "keep-me",
-                "legacy file with [dxtrade] section must load without losing cTrader creds"
-            );
-        });
-    }
-
     #[test]
     fn ctrader_authorization_code_input_is_not_persisted() {
         let dir = tempdir_or_skip();
@@ -372,7 +335,7 @@ accounts = []
         let dir = tempdir_or_skip();
         // Write a TOML that is valid but has no ctrader section (all defaults = empty).
         let path = dir.join("empty_creds.toml");
-        fs::write(&path, "[ctrader]\n[dxtrade]\n").expect("write");
+        fs::write(&path, "[ctrader]\n").expect("write");
 
         with_env_path(&path, |_| {
             let loaded = load_broker_settings();
@@ -435,7 +398,7 @@ accounts = []
         // is what files written by builds before Phase D4 look
         // like. The `#[serde(default = "default_v1")]` attribute
         // must kick in and treat it as v1.
-        let raw = "[ctrader]\nclient_id = \"old\"\n[dxtrade]\n";
+        let raw = "[ctrader]\nclient_id = \"old\"\n";
         fs::write(&path, raw).expect("write");
         with_env_path(&path, |_| {
             let loaded = load_broker_settings();
@@ -452,7 +415,7 @@ accounts = []
         // silently mis-parsing potentially-incompatible data.
         let dir = tempdir_or_skip();
         let path = dir.join("future_creds.toml");
-        let raw = "schema_version = 999\n[ctrader]\nclient_id = \"future\"\n[dxtrade]\n";
+        let raw = "schema_version = 999\n[ctrader]\nclient_id = \"future\"\n";
         fs::write(&path, raw).expect("write");
         with_env_path(&path, |_| {
             let loaded = load_broker_settings();
@@ -481,7 +444,7 @@ accounts = []
         let local_dir = dir.join(".local").join("neoethos");
         fs::create_dir_all(&local_dir).expect("local dir");
         let local_file = local_dir.join("broker_credentials.toml");
-        fs::write(&local_file, "[ctrader]\nclient_id = \"OLDER\"\n[dxtrade]\n")
+        fs::write(&local_file, "[ctrader]\nclient_id = \"OLDER\"\n")
             .expect("local file");
 
         // dirs::config_dir() can't be redirected from a test, so
@@ -492,7 +455,7 @@ accounts = []
         let canonical_file = dir.join("canonical_creds.toml");
         fs::write(
             &canonical_file,
-            "[ctrader]\nclient_id = \"NEWER\"\n[dxtrade]\n",
+            "[ctrader]\nclient_id = \"NEWER\"\n",
         )
         .expect("canonical");
         // Force canonical's mtime to be NEWER than local's.
@@ -502,7 +465,7 @@ accounts = []
         std::thread::sleep(Duration::from_millis(20));
         fs::write(
             &canonical_file,
-            "[ctrader]\nclient_id = \"NEWER\"\n[dxtrade]\n",
+            "[ctrader]\nclient_id = \"NEWER\"\n",
         )
         .expect("canonical retouched");
 

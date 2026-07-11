@@ -28,10 +28,9 @@
 
 /// Which broker integration backs a trading adapter. Drives the
 /// capability flags below. The cTrader Open API is the only wired
-/// backend — DXtrade's draft adapter was removed 2026-07-11 (operator
-/// directive; the broker-agnostic direction is MCP bridges, see
-/// `mcp/`). The capability-flag abstraction stays so the UI never
-/// grows `== "cTrader"` checks that would lock out a future adapter.
+/// backend (the broker-agnostic direction is MCP bridges — see `mcp/`).
+/// The capability-flag abstraction stays so the UI never grows
+/// `== "cTrader"` checks that would lock out a future adapter.
 // The variant is never *constructed* and `as_str` is never *called* in live
 // code today — their only consumers are the broker-readiness banner helpers in
 // `broker_config`, which are themselves Phase 2-5-pending. The type is still
