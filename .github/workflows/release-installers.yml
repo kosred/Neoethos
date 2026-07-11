@@ -53,7 +53,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          # dtolnay exports RUSTUP_TOOLCHAIN which overrides rust-toolchain.toml —
+          # pin the repo nightly explicitly (stable can't build the crate graph).
+          toolchain: nightly-2026-04-07
+
+      - name: Install mold linker
+        # .cargo/config.toml forces -fuse-ld=mold for x86_64-unknown-linux-gnu.
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Linux packaging tooling
         # cargo-deb writes Debian binary packages from `[package.metadata.deb]`.
@@ -125,8 +133,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain (with cross targets)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
+          # dtolnay exports RUSTUP_TOOLCHAIN which overrides rust-toolchain.toml —
+          # pin the repo nightly explicitly (stable can't build the crate graph).
+          toolchain: nightly-2026-04-07
           targets: x86_64-apple-darwin,aarch64-apple-darwin
 
       - name: Build Intel and Apple Silicon binaries
@@ -187,7 +198,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          # dtolnay exports RUSTUP_TOOLCHAIN which overrides rust-toolchain.toml —
+          # pin the repo nightly explicitly (stable can't build the crate graph).
+          toolchain: nightly-2026-04-07
 
       - name: Build release binaries
         run: cargo build --release -p neoethos-app -p neoethos-cli

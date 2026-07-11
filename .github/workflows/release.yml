@@ -52,9 +52,10 @@ jobs:
           submodules: false
 
       - name: Setup Rust toolchain (stable MSVC)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: stable-x86_64-pc-windows-msvc
+          # Pin the repo nightly — dtolnay's RUSTUP_TOOLCHAIN overrides the file.
+          toolchain: nightly-2026-04-07-x86_64-pc-windows-msvc
 
       - name: Cache Cargo registry + build
         uses: actions/cache@v4
@@ -70,7 +71,7 @@ jobs:
             windows-cargo-gpu-
 
       - name: Install CUDA toolkit (Windows)
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
           cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
@@ -222,7 +223,10 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          # Pin the repo nightly — dtolnay's RUSTUP_TOOLCHAIN overrides the file.
+          toolchain: nightly-2026-04-07
 
       - name: Cache Cargo registry + build
         uses: actions/cache@v4
@@ -238,7 +242,7 @@ jobs:
             linux-cargo-gpu-
 
       - name: Install CUDA toolkit (Linux)
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
           cuda: ${{ env.CUDA_TOOLKIT_VERSION }}

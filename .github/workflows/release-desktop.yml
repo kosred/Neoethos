@@ -33,10 +33,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # rustup reads the pinned nightly from rust-toolchain.toml automatically;
-      # this just guarantees a nightly toolchain is installed on the runner.
+      # EXPLICIT pin: dtolnay's action exports RUSTUP_TOOLCHAIN, which
+      # OVERRIDES rust-toolchain.toml — @nightly would build with the
+      # latest nightly instead of the repo's pinned one. Pass the pin.
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-04-07
 
       - name: Node
         uses: actions/setup-node@v4
@@ -50,7 +53,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential curl wget file cmake pkg-config \
+            build-essential curl wget file cmake pkg-config mold \
             libssl-dev libwebkit2gtk-4.1-dev librsvg2-dev \
             libxdo-dev libayatana-appindicator3-dev
 
