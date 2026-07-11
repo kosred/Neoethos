@@ -46,7 +46,8 @@
 //!
 //! ## What it does NOT do
 //!
-//! - Does NOT load `swarm_forecaster` (deferred per D1.2.7).
+//! - Loads `swarm_forecaster` as a LAST-ROW-ONLY voter (D1.2.8 landed
+//!   2026-07-11 — see the `swarm_adapter` module doc).
 //! - Does NOT run any training. Bootstrap is read-only against
 //!   the operator's `models_root` directory; if no experts have
 //!   been trained, the function returns an ensemble with an
@@ -69,26 +70,25 @@ use super::{
     deep_timeseries_adapters::register_deep_timeseries_loaders,
     evolution_adapters::register_evolution_loaders, meta_adapters::register_meta_loaders,
     mixed_adapters::register_mixed_loaders, rl_exit_adapters::register_rl_exit_loaders,
-    tree_adapters::register_tree_loaders,
+    swarm_adapter::register_swarm_loader, tree_adapters::register_tree_loaders,
 };
 
 /// Canonical list of expert names the bootstrap tries to load.
 ///
 /// Sourced from `KNOWN_MODEL_NAMES` per
 /// [`crate::runtime::capabilities::KNOWN_MODEL_NAMES`] minus:
-///   - `swarm_forecaster` — stateful-univariate API that doesn't fit
-///     the current ExpertModel trait (deferred to D1.2.8). Its trained
-///     artifact is flagged by the orphan report until the adapter ships.
 ///   - `genetic` — the strategy DISCOVERER (the GA in `neoethos-search`);
 ///     the operator's search-only exemption applies to it alone.
+///   - `exit_agent` — F-318 (no production exit-side consumer).
 ///
 /// `neat` + `neuro_evo` REJOINED 2026-07-11 (F-319 revision, operator
 /// directive "every trained model votes"): both are trained through the
 /// shared expert path with genuine 3-class heads — see the
-/// `evolution_adapters` module doc for the full story.
+/// `evolution_adapters` module doc. `swarm_forecaster` landed the same
+/// day (D1.2.8): last-row-only forecast voter — see the `swarm_adapter`
+/// module doc for the honesty constraints.
 ///
-/// **32 names total** (KNOWN_MODEL_NAMES − swarm − genetic −
-/// exit_agent).
+/// **33 names total** (KNOWN_MODEL_NAMES − genetic − exit_agent).
 ///
 /// `exit_agent` was removed in F-318 (2026-05-29): the model trains
 /// successfully and emits `ExitDecision3` probabilities, but
@@ -143,6 +143,9 @@ pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     // artifacts were being produced and never read.
     "neat",
     "neuro_evo",
+    // Forecasting voter (1) — D1.2.8, same day: last-row-only forecast
+    // lean (live-gate semantics; abstains on historical rows).
+    "swarm_forecaster",
 ];
 
 /// Build a fully populated [`ExpertRegistry`] with every default
@@ -158,10 +161,11 @@ pub fn build_default_registry() -> Result<ExpertRegistry> {
     register_mixed_loaders(&mut registry).context("register mixed loaders")?;
     register_rl_exit_loaders(&mut registry).context("register rl+exit loaders")?;
     register_evolution_loaders(&mut registry).context("register evolutionary loaders")?;
+    register_swarm_loader(&mut registry).context("register swarm forecaster loader")?;
     debug_assert_eq!(
         registry.registered_names().len(),
         DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(),
-        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 32 canonical names"
+        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 33 canonical names"
     );
     Ok(registry)
 }
@@ -362,25 +366,20 @@ mod tests {
 
     #[test]
     fn default_bootstrap_names_match_known_model_names_minus_swarm() {
-        // 32 voters = KNOWN_MODEL_NAMES minus swarm_forecaster,
-        // genetic, and exit_agent.
-        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 32);
+        // 33 voters = KNOWN_MODEL_NAMES minus genetic and exit_agent.
+        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 33);
         let names: std::collections::HashSet<&str> =
             DEFAULT_BOOTSTRAP_EXPERT_NAMES.iter().copied().collect();
-        assert!(
-            !names.contains("swarm_forecaster"),
-            "swarm_forecaster is intentionally absent (D1.2.7 deferral)"
-        );
         // F-319 REVISED (2026-07-11, operator directive "every trained
         // model votes"): only `genetic` keeps the search-only exemption.
         assert!(
             !names.contains("genetic"),
             "genetic is the strategy discoverer — search-only exemption"
         );
-        for present in ["neat", "neuro_evo"] {
+        for present in ["neat", "neuro_evo", "swarm_forecaster"] {
             assert!(
                 names.contains(present),
-                "{present} trains a 3-class head via the shared expert path — it must vote"
+                "{present} is trained — it must vote (swarm: last-row-only, D1.2.8)"
             );
         }
         // F-318 (2026-05-29): exit_agent's ExitDecision3 outputs are
@@ -406,10 +405,10 @@ mod tests {
     }
 
     #[test]
-    fn build_default_registry_installs_all_32_loaders() {
+    fn build_default_registry_installs_all_33_loaders() {
         let registry = build_default_registry().expect("build default registry");
         let registered = registry.registered_names();
-        assert_eq!(registered.len(), 32);
+        assert_eq!(registered.len(), 33);
         for required in DEFAULT_BOOTSTRAP_EXPERT_NAMES {
             assert!(
                 registry.has_loader(required),
@@ -426,7 +425,7 @@ mod tests {
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
         assert_eq!(outcome.loaded_count(), 0);
         assert_eq!(outcome.degraded_count(), 0);
-        assert_eq!(outcome.missing_count(), 32);
+        assert_eq!(outcome.missing_count(), 33);
         assert!(!outcome.has_any_loaded());
     }
 
@@ -452,8 +451,8 @@ mod tests {
         // Create the expected dir so the load can scan it.
         fs::create_dir_all(&expected).expect("mkdir");
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
-        // Still 32 missing because the dir is empty, but the
+        // Still 33 missing because the dir is empty, but the
         // function didn't error out → path resolution worked.
-        assert_eq!(outcome.missing_count(), 32);
+        assert_eq!(outcome.missing_count(), 33);
     }
 }

@@ -109,6 +109,9 @@ pub mod meta_adapters;
 pub mod mixed_adapters;
 pub mod rl_exit_adapters;
 pub mod soft_voting;
+// D1.2.8 (2026-07-11): the swarm forecaster finally votes — last-row-only
+// (live-gate) semantics; see the module doc for the honesty constraints.
+pub mod swarm_adapter;
 pub mod tree_adapters;
 
 pub use bootstrap::{
@@ -289,14 +292,15 @@ pub fn expert_role(name: &str) -> Option<ExpertRole> {
         // Genuine directional classifiers. `neat` + `neuro_evo` joined
         // 2026-07-11 (F-319 revision — see the `evolution_adapters`
         // module doc): both train 3-class heads on the same labels as
-        // every other classifier here.
+        // every other classifier here. `swarm_forecaster` joined the
+        // same day (D1.2.8): a modest forecast-lean voter on the LAST
+        // row only, neutral abstain elsewhere (see `swarm_adapter`).
         "lightgbm" | "xgboost" | "xgboost_rf" | "xgboost_dart" | "catboost" | "catboost_alt"
         | "sklears_tree" | "mlp" | "kan" | "tabnet" | "nbeats" | "nbeatsx_nf" | "tide"
         | "tide_nf" | "transformer" | "patchtst" | "timesnet" | "elasticnet" | "logistic"
         | "bayes_logit" | "meta_blender" | "probability_calibrator" | "conformal_gate"
-        | "meta_stack" | "online_pa" | "online_hoeffding" | "neat" | "neuro_evo" => {
-            Some(ExpertRole::Direction)
-        }
+        | "meta_stack" | "online_pa" | "online_hoeffding" | "neat" | "neuro_evo"
+        | "swarm_forecaster" => Some(ExpertRole::Direction),
         _ => None,
     }
 }
@@ -891,9 +895,9 @@ impl ExpertRegistry {
                 }
                 // Known non-voters, documented: `genetic` discovers
                 // strategies (search-only exemption), `exit_agent` is
-                // exit-pipeline-only (F-318), `swarm_forecaster` awaits
-                // its adapter (stateful univariate API — D1.2.7).
-                let by_design = matches!(dir_name, "genetic" | "exit_agent" | "swarm_forecaster");
+                // exit-pipeline-only (F-318). (`swarm_forecaster` votes
+                // since D1.2.8 — no longer exempt.)
+                let by_design = matches!(dir_name, "genetic" | "exit_agent");
                 if by_design {
                     tracing::info!(
                         target: "neoethos_models::ensemble",
