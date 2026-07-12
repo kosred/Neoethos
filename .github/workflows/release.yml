@@ -249,7 +249,6 @@ jobs:
           # — the 'local' .run installer is self-contained and reliable.
           method: 'local'
           cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
-          method: 'network'
           sub-packages: '["nvcc", "cudart-dev", "thrust", "libcublas-dev", "libcusparse-dev", "libcusolver-dev", "libcurand-dev"]'
 
       - name: Download libtorch (Linux, CUDA)
