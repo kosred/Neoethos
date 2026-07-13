@@ -1449,7 +1449,17 @@ struct DiscoveryTemporalPolicy<'a> {
     timeframe_label: &'a str,
     higher_timeframes: &'a [String],
     feature_names: &'a [String],
+    /// Alignment-semantics version baked into the policy hash. Bumped to
+    /// "closed-htf-bar-only-v2" for audit D02 (2026-07-13): higher-TF
+    /// features now become available at bar CLOSE (stamp + period), not at
+    /// the containing bucket's open stamp. Cubes/artifacts built under the
+    /// old lookahead alignment hash differently and cannot silently mix
+    /// with post-D02 evidence.
+    mtf_alignment: &'static str,
 }
+
+/// See [`DiscoveryTemporalPolicy::mtf_alignment`].
+const MTF_ALIGNMENT_POLICY_VERSION: &str = "closed-htf-bar-only-v2";
 
 #[derive(Debug, Serialize)]
 struct DiscoveryWalkforwardPolicy {
@@ -1498,6 +1508,7 @@ fn discovery_temporal_contract(
         timeframe_label: &config.timeframe_label,
         higher_timeframes: &config.higher_timeframes,
         feature_names,
+        mtf_alignment: MTF_ALIGNMENT_POLICY_VERSION,
     })?;
     let label_policy_hash = stable_json_hash(&(
         "strategy-search-signal-v1",

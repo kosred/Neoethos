@@ -249,12 +249,31 @@ impl FeatureFrame {
 /// `max_age_ns = None` preserves the legacy unbounded behaviour for
 /// callers that explicitly want it (e.g. UI chart preview where
 /// indicators on yesterday's last-known close are fine).
+/// `availability_lag_ns` (audit D02, 2026-07-13) is the delay between a
+/// feature row's TIMESTAMP and the moment its values become knowable.
+/// Bars are OPEN-stamped everywhere in this codebase (the resampler
+/// buckets by `div_euclid(period)`; cTrader trendbars are open-stamped),
+/// so a higher-TF bar's final OHLC-derived features only exist at
+/// `stamp + period` — its close. The old alignment (`stamp <= ts`, i.e.
+/// lag 0) handed every base bar the CONTAINING higher-TF bucket, whose
+/// final values lie up to one full period in the future: 5 minutes of
+/// lookahead per M5 feature, 4 HOURS per H4, a DAY per D1 — inflating
+/// every offline evaluation while live saw different (partial-bar)
+/// values, silently breaking backtest↔live parity. It also contradicted
+/// the declared `MultiTimeframeAvailabilityPolicy::ClosedHigherTimeframeOnly`.
+///
+/// Pass the higher TF's period as the lag for closed-bar-only alignment;
+/// pass `0` for the legacy same-stamp semantics (exact-match / non-HTF
+/// callers — byte-identical to the old behavior). Staleness
+/// (`max_age_ns`) is measured from the row's AVAILABILITY time
+/// (`stamp + lag`), not its stamp.
 pub fn align_features_by_ns(
     base_ns: &[i64],
     feature_ns: &[i64],
     feature_data: &Array2<f32>,
     ffill: bool,
     max_age_ns: Option<i64>,
+    availability_lag_ns: i64,
 ) -> Array2<f32> {
     let n_base = base_ns.len();
     let n_feat = feature_ns.len();
@@ -265,22 +284,26 @@ pub fn align_features_by_ns(
         return out;
     }
 
+    let lag = availability_lag_ns.max(0);
     let mut feat_idx = 0usize;
     for i in 0..n_base {
         let ts = base_ns[i];
-        while feat_idx < n_feat && feature_ns[feat_idx] <= ts {
+        // Advance past every row whose values are AVAILABLE at `ts`
+        // (stamp + lag <= ts). With lag 0 this is the legacy `stamp <= ts`.
+        while feat_idx < n_feat && feature_ns[feat_idx].saturating_add(lag) <= ts {
             feat_idx += 1;
         }
 
         let best_idx = if feat_idx > 0 {
             let prev = feat_idx - 1;
-            if feature_ns[prev] == ts {
+            let available_at = feature_ns[prev].saturating_add(lag);
+            if available_at == ts {
                 Some(prev)
             } else if ffill {
                 // F-308 max-age guard: drop the forward-fill when the
-                // most-recent higher-TF bar is older than the cap.
+                // most-recent AVAILABLE row is older than the cap.
                 match max_age_ns {
-                    Some(max_age) if ts - feature_ns[prev] > max_age => None,
+                    Some(max_age) if ts - available_at > max_age => None,
                     _ => Some(prev),
                 }
             } else {
@@ -312,16 +335,68 @@ mod align_tests {
 
     #[test]
     fn align_unbounded_forward_fills_to_end() {
-        // Legacy behaviour preserved when max_age = None.
+        // Legacy behaviour preserved when max_age = None (lag 0 — note this
+        // legacy mode hands t=0..4 the CONTAINING M5 bucket, i.e. lookahead;
+        // production HTF alignment passes the period as lag since D02).
         let base_ns = ns_grid(0, 1, 10);   // M1 × 10 bars
         let feat_ns = ns_grid(0, 5, 2);    // M5 × 2 bars: t=0, t=5
         let feat_data = array![[1.0_f32], [2.0_f32]];
-        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, None);
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, None, 0);
         // Without max_age, every base bar past t=5 keeps value 2.0.
         assert_eq!(aligned[(0, 0)], 1.0); // t=0
         assert_eq!(aligned[(4, 0)], 1.0); // t=4 (before first M5 close at 5)
         assert_eq!(aligned[(5, 0)], 2.0); // t=5
         assert_eq!(aligned[(9, 0)], 2.0); // t=9 — frozen, what F-308 calls the bug
+    }
+
+    #[test]
+    fn align_close_availability_never_reads_the_forming_bar() {
+        // Audit D02: with lag = the higher-TF period, a base bar may only
+        // read higher-TF bars that have CLOSED at or before its stamp.
+        let base_ns = ns_grid(0, 1, 12); // M1 × 12: t=0..11
+        let feat_ns = ns_grid(0, 5, 2); //  M5 × 2: opens t=0 (closes 5), t=5 (closes 10)
+        let feat_data = array![[1.0_f32], [2.0_f32]];
+        let lag = 5 * 60 * 1_000_000_000_i64; // one M5 period
+        let max_age = Some(10 * 60 * 1_000_000_000_i64); // 2× period, from close
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, max_age, lag);
+        // t=0..4: bar[0] is still FORMING (closes at t=5) — its final values
+        // must be invisible. The old alignment leaked 1.0 here.
+        for i in 0..5 {
+            assert!(
+                aligned[(i, 0)].is_nan(),
+                "t={i}: forming-bar leak — got {}",
+                aligned[(i, 0)]
+            );
+        }
+        // t=5..9: bar[0] closed at t=5 → its values become available; bar[1]
+        // is forming (closes t=10) and must stay invisible.
+        for i in 5..10 {
+            assert_eq!(aligned[(i, 0)], 1.0, "t={i}");
+        }
+        // t=10,11: bar[1] closed at t=10.
+        assert_eq!(aligned[(10, 0)], 2.0);
+        assert_eq!(aligned[(11, 0)], 2.0);
+    }
+
+    #[test]
+    fn align_close_availability_staleness_measured_from_close() {
+        // One M5 bar opening t=0 (closes t=5), max_age = 3 min FROM CLOSE:
+        // available t=5..8, stale (NaN) from t=9.
+        let base_ns = ns_grid(0, 1, 12);
+        let feat_ns = ns_grid(0, 5, 1);
+        let feat_data = array![[7.0_f32]];
+        let lag = 5 * 60 * 1_000_000_000_i64;
+        let max_age = Some(3 * 60 * 1_000_000_000_i64);
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, max_age, lag);
+        for i in 0..5 {
+            assert!(aligned[(i, 0)].is_nan(), "t={i}: not yet closed");
+        }
+        for i in 5..9 {
+            assert_eq!(aligned[(i, 0)], 7.0, "t={i}: fresh after close");
+        }
+        for i in 9..12 {
+            assert!(aligned[(i, 0)].is_nan(), "t={i}: stale past max_age from close");
+        }
     }
 
     #[test]
@@ -331,7 +406,7 @@ mod align_tests {
         let feat_ns = ns_grid(0, 5, 2);
         let feat_data = array![[1.0_f32], [2.0_f32]];
         let max_age_ns = Some(3_i64 * 60 * 1_000_000_000);
-        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, max_age_ns);
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, max_age_ns, 0);
         // t=0 → exact, 1.0
         assert_eq!(aligned[(0, 0)], 1.0);
         // t=1,2,3 → within 3min of t=0, still ffill to 1.0
@@ -353,7 +428,7 @@ mod align_tests {
         let base_ns = ns_grid(0, 1, 5);
         let feat_ns = ns_grid(0, 5, 1); // single feat row at t=0
         let feat_data = array![[42.0_f32]];
-        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, Some(0));
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, Some(0), 0);
         assert_eq!(aligned[(0, 0)], 42.0); // exact match
         for i in 1..5 {
             assert!(aligned[(i, 0)].is_nan(), "expected NaN at i={i}");
@@ -366,7 +441,7 @@ mod align_tests {
         let base_ns = ns_grid(0, 1, 5);
         let feat_ns = ns_grid(0, 5, 1);
         let feat_data = array![[7.0_f32]];
-        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, false, Some(i64::MAX));
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, false, Some(i64::MAX), 0);
         assert_eq!(aligned[(0, 0)], 7.0);
         for i in 1..5 {
             assert!(aligned[(i, 0)].is_nan());
@@ -378,7 +453,7 @@ mod align_tests {
         let base_ns = ns_grid(0, 1, 5);
         let feat_ns: Vec<i64> = Vec::new();
         let feat_data: Array2<f32> = Array2::zeros((0, 2));
-        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, Some(60_000_000_000));
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, Some(60_000_000_000), 0);
         assert_eq!(aligned.shape(), &[5, 2]);
         for i in 0..5 {
             for j in 0..2 {
@@ -399,7 +474,7 @@ mod align_tests {
         let feat_data = array![[99.0_f32]];
         // max_age = 2 × D1_period = 2 × 1440 × 60 × 1e9 ns
         let max_age_ns = Some(2_i64 * 1440 * 60 * 1_000_000_000);
-        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, max_age_ns);
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, max_age_ns, 0);
         // All 100 base bars are within 2 days of t=0, so ALL get 99.0.
         for i in 0..100 {
             assert_eq!(aligned[(i, 0)], 99.0);
@@ -407,7 +482,7 @@ mod align_tests {
         // Now tighten max_age to 50 minutes — only first 51 base bars
         // (t=0..50) survive; rest become NaN.
         let max_age_ns = Some(50_i64 * 60 * 1_000_000_000);
-        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, max_age_ns);
+        let aligned = align_features_by_ns(&base_ns, &feat_ns, &feat_data, true, max_age_ns, 0);
         for i in 0..=50 {
             assert_eq!(aligned[(i, 0)], 99.0, "i={i}");
         }

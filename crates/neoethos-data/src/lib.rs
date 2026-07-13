@@ -1084,13 +1084,37 @@ fn compute_aligned_higher_block(
         .timestamp
         .as_ref()
         .context("higher tf has no timestamps")?;
-    // F-308: cap forward-fill at 2× the higher-TF period so stale higher-TF
-    // data becomes NaN (flagged downstream) instead of a frozen-constant
-    // column that would feed the GA zero / look-alike signals.
-    let max_age_ns = parse_timeframe_to_minutes(h_tf)
+    // Audit D02 (2026-07-13): higher-TF bars are OPEN-stamped, so a bar's
+    // final feature values only exist at stamp + period (its close). The
+    // alignment must therefore lag availability by ONE FULL PERIOD —
+    // otherwise every base bar inside a still-forming higher-TF bucket
+    // reads that bucket's FINAL values (up to a period of lookahead: 4h on
+    // H4, a day on D1), and live — which sees a partial forming bar —
+    // silently diverges from the backtest. Refuse to align without a
+    // resolvable period: silent lookahead is worse than a hard error.
+    // (Broker-fetched calendar W1/MN1 frames may deviate from the fixed
+    // period by a few days; the resampled frames this pipeline builds use
+    // fixed buckets, for which stamp + period is the exact close.)
+    let period_ns = parse_timeframe_to_minutes(h_tf)
         .ok()
         .filter(|m| *m > 0)
-        .map(|m| (m as i64).saturating_mul(60).saturating_mul(1_000_000_000).saturating_mul(2));
+        .map(|m| {
+            (m as i64)
+                .saturating_mul(60)
+                .saturating_mul(1_000_000_000)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot resolve the bar period for higher timeframe '{h_tf}' — refusing \
+                 to align its features without close-availability (that would reintroduce \
+                 up to one period of lookahead into the feature cube)"
+            )
+        })?;
+    // F-308: cap forward-fill at 2× the higher-TF period so stale higher-TF
+    // data becomes NaN (flagged downstream) instead of a frozen-constant
+    // column that would feed the GA zero / look-alike signals. Measured
+    // from the bar's CLOSE (availability) since D02.
+    let max_age_ns = Some(period_ns.saturating_mul(2));
     let base_last = base_ns.last().copied().unwrap_or(0);
     let h_last = h_ns.last().copied().unwrap_or(0);
     if base_last > 0 && h_last > 0 && base_last > h_last {
@@ -1119,7 +1143,7 @@ fn compute_aligned_higher_block(
             anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
         }
     };
-    let aligned = align_features_by_ns(base_ns, h_ns, &h_block, true, max_age_ns);
+    let aligned = align_features_by_ns(base_ns, h_ns, &h_block, true, max_age_ns, period_ns);
     Ok(Some((h_names, aligned)))
 }
 
