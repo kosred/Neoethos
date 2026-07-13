@@ -70,19 +70,113 @@ use anyhow::Context;
 use axum::Router;
 use axum::routing::{get, post};
 use std::net::SocketAddr;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use self::state::AppApiState;
+
+/// CORS policy for the API (audit S01, 2026-07-13).
+///
+/// The old layer was `allow_origin(Any)`, which defeated the loopback-only
+/// security model through the operator's own BROWSER as confused deputy:
+/// any public webpage could `fetch("http://127.0.0.1:<port>/orders", …)`,
+/// the permissive preflight would pass, and the page could place/close
+/// REAL trades or rewrite broker credentials — no auth in front (the CLI
+/// port is a fixed default, trivially targetable).
+///
+/// Only the app's own UI surfaces are cross-origin against this server and
+/// therefore need CORS at all: the Tauri webview (`http(s)://tauri.localhost`
+/// on Windows, `tauri://localhost` on Linux/macOS) and the Vite dev server
+/// (`http://localhost:5173`). Server-side callers (MCP sidecar, mesh, curl)
+/// never send Origin preflights, so they are unaffected. Everything else —
+/// i.e. every real website — is denied.
+///
+/// Escape hatch for deliberate LAN setups (e.g. phone browser monitoring):
+/// `NEOETHOS_CORS_ALLOW_ANY=1` restores the old behavior, with a loud
+/// warning, matching the non-loopback bind warning in `serve()`.
+fn cors_layer() -> CorsLayer {
+    let allow_any = std::env::var("NEOETHOS_CORS_ALLOW_ANY")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false);
+    if allow_any {
+        tracing::warn!(
+            target: "neoethos_app::server",
+            "SECURITY: NEOETHOS_CORS_ALLOW_ANY is set — ANY website open in a \
+             browser that can reach this API may call the unauthenticated \
+             trading endpoints. Only use this behind your own auth/firewall."
+        );
+        return CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any);
+    }
+    let allowed = AllowOrigin::predicate(|origin, _| {
+        origin.to_str().map(origin_is_allowed).unwrap_or(false)
+    });
+    CorsLayer::new()
+        .allow_origin(allowed)
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
+/// The origin-allowlist behind [`cors_layer`]: the app's own UI surfaces
+/// only. scheme://host[:port] — scheme+host are compared, the port is
+/// ignored (the vite dev port and the tauri webview port can vary).
+fn origin_is_allowed(origin: &str) -> bool {
+    let rest = match origin.split_once("://") {
+        Some(("http" | "https", rest)) => rest,
+        // Tauri's custom protocol origin on Linux/macOS.
+        Some(("tauri", rest)) => rest,
+        _ => return false,
+    };
+    let host = rest.split([':', '/']).next().unwrap_or("");
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "tauri.localhost")
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::origin_is_allowed;
+
+    #[test]
+    fn app_ui_origins_are_allowed() {
+        for origin in [
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "tauri://localhost",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost",
+        ] {
+            assert!(origin_is_allowed(origin), "{origin} must be allowed");
+        }
+    }
+
+    #[test]
+    fn public_websites_are_denied() {
+        // Audit S01: with allow_origin(Any), any of these could drive the
+        // unauthenticated trading endpoints through the operator's browser.
+        for origin in [
+            "https://evil.example.com",
+            "http://attacker.io",
+            "https://localhost.evil.com",   // suffix trick
+            "http://127.0.0.1.evil.com",    // prefix trick
+            "file://localhost",             // wrong scheme
+            "null",                         // sandboxed iframe origin
+            "",
+        ] {
+            assert!(!origin_is_allowed(origin), "{origin} must be denied");
+        }
+    }
+}
 
 /// Build the axum router. Kept as a free function so tests can mount
 /// individual routes against a mock `AppApiState` without going through
 /// the actual TCP bind.
 pub fn router(state: AppApiState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = cors_layer();
 
     Router::new()
         .route("/healthz", get(health::healthz))
