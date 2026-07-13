@@ -204,6 +204,7 @@ pub async fn accounts(State(_state): State<AppApiState>) -> Response {
 // ─── POST /data/fetch ─────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FetchBody {
     pub symbol: String,
     pub timeframe: String,
@@ -295,6 +296,7 @@ pub async fn fetch(State(state): State<AppApiState>, Json(body): Json<FetchBody>
 /// layer's `DataFormat::from_extension`, so we don't ask the user to
 /// pick "CSV vs Parquet" — they just give us a file.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ImportBody {
     #[serde(rename = "sourcePath")]
     pub source_path: String,

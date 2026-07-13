@@ -27,6 +27,7 @@ use super::errors::internal_panic;
 use super::state::AppApiState;
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct NewOrderBody {
     pub symbol: String,
     pub side: OrderSide,
@@ -117,6 +118,7 @@ pub async fn place(State(_state): State<AppApiState>, Json(body): Json<NewOrderB
 // ─── POST /orders/pending — place a conditional (limit/stop) order ──────────
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct NewPendingOrderBody {
     pub symbol: String,
     pub side: OrderSide,
@@ -283,6 +285,7 @@ pub async fn list_pending(State(state): State<AppApiState>) -> Response {
 // ─── POST /positions/{id}/close ────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ClosePositionBody {
     #[serde(rename = "positionId")]
     pub position_id: i64,
@@ -315,6 +318,7 @@ pub async fn close_position(
 // ─── POST /orders/{id}/cancel ──────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CancelOrderBody {
     #[serde(rename = "orderId")]
     pub order_id: i64,
@@ -339,6 +343,7 @@ pub async fn cancel_order(
 // ─── POST /positions/protection (modify an open position's SL/TP) ──────────
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AmendPositionProtectionBody {
     #[serde(rename = "positionId")]
     pub position_id: i64,
