@@ -24,7 +24,6 @@ pub fn parse_timeframe_to_minutes(tf: &str) -> Result<i64> {
 
 pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
     let mins = parse_timeframe_to_minutes(target_tf)?;
-    let period_ns = mins * 60 * 1_000_000_000;
 
     let ts = src
         .timestamp
@@ -33,6 +32,26 @@ pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
     if ts.is_empty() {
         return Ok(src.clone());
     }
+    // Audit D01 (2026-07-13): the bucket period must be in the SAME UNIT as
+    // the timestamps. Datasets are normalized to MILLISECONDS at the load
+    // boundary, but the old constant here was nanoseconds — on ms data an
+    // "M5" bucket became ~9.5 YEARS, silently collapsing the whole series
+    // into a handful of bars. Infer the unit from the data (magnitude
+    // majority vote) and fail loud when it cannot be determined.
+    let unit = crate::core::timestamps::infer_timestamp_unit(ts).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot infer the timestamp unit of the source series for resampling to \
+             '{target_tf}' — timestamps look heterogeneous/corrupt; refusing to bucket \
+             with a guessed period"
+        )
+    })?;
+    let units_per_minute: i64 = match unit {
+        crate::core::timestamps::TimestampUnit::Seconds => 60,
+        crate::core::timestamps::TimestampUnit::Milliseconds => 60_000,
+        crate::core::timestamps::TimestampUnit::Microseconds => 60_000_000,
+        crate::core::timestamps::TimestampUnit::Nanoseconds => 60_000_000_000,
+    };
+    let period_units = mins * units_per_minute;
 
     let mut resampled_ts = Vec::new();
     let mut resampled_open = Vec::new();
@@ -45,7 +64,7 @@ pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
         None
     };
 
-    let mut current_bucket_start = ts[0].div_euclid(period_ns) * period_ns;
+    let mut current_bucket_start = ts[0].div_euclid(period_units) * period_units;
     let mut b_open = src.open[0];
     let mut b_high = src.high[0];
     let mut b_low = src.low[0];
@@ -53,7 +72,7 @@ pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
     let mut b_vol = src.volume.as_ref().map(|v| v[0]).unwrap_or(0.0);
 
     for i in 1..ts.len() {
-        let bucket = ts[i].div_euclid(period_ns) * period_ns;
+        let bucket = ts[i].div_euclid(period_units) * period_units;
         if bucket > current_bucket_start {
             resampled_ts.push(current_bucket_start);
             resampled_open.push(b_open);

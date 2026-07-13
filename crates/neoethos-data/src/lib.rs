@@ -1092,17 +1092,19 @@ fn compute_aligned_higher_block(
     // H4, a day on D1), and live — which sees a partial forming bar —
     // silently diverges from the backtest. Refuse to align without a
     // resolvable period: silent lookahead is worse than a hard error.
-    // (Broker-fetched calendar W1/MN1 frames may deviate from the fixed
-    // period by a few days; the resampled frames this pipeline builds use
-    // fixed buckets, for which stamp + period is the exact close.)
-    let period_ns = parse_timeframe_to_minutes(h_tf)
+    //
+    // Audit D01 (same day): the period must be expressed in the SAME UNIT
+    // as the timestamps — and this codebase has carried both (datasets are
+    // normalized to MILLISECONDS at the load boundary and the live path
+    // builds ms, while this file's older `*_ns` constants assumed
+    // nanoseconds, which is why the F-308 staleness cap never fired in
+    // production). Instead of guessing the unit, derive the period from
+    // the BASE GRID itself: one higher-TF period = median base spacing ×
+    // (higher minutes / base minutes). Unit-agnostic — correct for ms, ns,
+    // and synthetic test grids alike.
+    let h_mins = parse_timeframe_to_minutes(h_tf)
         .ok()
         .filter(|m| *m > 0)
-        .map(|m| {
-            (m as i64)
-                .saturating_mul(60)
-                .saturating_mul(1_000_000_000)
-        })
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "cannot resolve the bar period for higher timeframe '{h_tf}' — refusing \
@@ -1110,23 +1112,56 @@ fn compute_aligned_higher_block(
                  up to one period of lookahead into the feature cube)"
             )
         })?;
+    let base_mins = parse_timeframe_to_minutes(base_tf)
+        .ok()
+        .filter(|m| *m > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot resolve the bar period for base timeframe '{base_tf}' — needed to \
+                 express the higher-TF availability lag in the timestamp grid's own unit"
+            )
+        })?;
+    let median_base_step = {
+        let mut steps: Vec<i64> = base_ns.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0).collect();
+        if steps.is_empty() {
+            anyhow::bail!(
+                "base timeframe '{base_tf}' has no positive timestamp spacing — cannot \
+                 derive the higher-TF availability lag (dataset looks degenerate)"
+            );
+        }
+        let mid = steps.len() / 2;
+        steps.select_nth_unstable(mid);
+        steps[mid]
+    };
+    let period_units = median_base_step
+        .saturating_mul(h_mins as i64)
+        .checked_div(base_mins as i64)
+        .filter(|p| *p > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "derived a non-positive higher-TF period for '{h_tf}' over base '{base_tf}' \
+                 (median base step {median_base_step}) — refusing to align"
+            )
+        })?;
     // F-308: cap forward-fill at 2× the higher-TF period so stale higher-TF
     // data becomes NaN (flagged downstream) instead of a frozen-constant
     // column that would feed the GA zero / look-alike signals. Measured
-    // from the bar's CLOSE (availability) since D02.
-    let max_age_ns = Some(period_ns.saturating_mul(2));
+    // from the bar's CLOSE (availability) since D02; expressed in the
+    // grid's own unit since D01 (the old ×1e9 cap could never fire on the
+    // production ms grids).
+    let max_age_units = Some(period_units.saturating_mul(2));
     let base_last = base_ns.last().copied().unwrap_or(0);
     let h_last = h_ns.last().copied().unwrap_or(0);
     if base_last > 0 && h_last > 0 && base_last > h_last {
-        if let Some(max_age) = max_age_ns {
-            let lag_ns = base_last - h_last;
-            if lag_ns > max_age {
+        if let Some(max_age) = max_age_units {
+            let staleness = base_last - h_last;
+            if staleness > max_age {
                 tracing::warn!(
                     target: "neoethos_data::prepare_multitimeframe_features",
                     base_tf = base_tf,
                     higher_tf = h_tf,
-                    lag_seconds = lag_ns / 1_000_000_000,
-                    max_age_seconds = max_age / 1_000_000_000,
+                    staleness_grid_units = staleness,
+                    max_age_grid_units = max_age,
                     "higher-TF last bar is older than 2× period — feature columns past max_age will be NaN. Re-run --bootstrap-data for this (symbol, timeframe) to refresh."
                 );
             }
@@ -1143,7 +1178,7 @@ fn compute_aligned_higher_block(
             anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
         }
     };
-    let aligned = align_features_by_ns(base_ns, h_ns, &h_block, true, max_age_ns, period_ns);
+    let aligned = align_features_by_ns(base_ns, h_ns, &h_block, true, max_age_units, period_units);
     Ok(Some((h_names, aligned)))
 }
 
