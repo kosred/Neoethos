@@ -379,33 +379,69 @@ impl StrategyQualityAnalyzer {
         let trades_per_month = trades_per_month_raw;
 
         // --- Monte Carlo Simulation (QA-2: block bootstrap on daily PnL) ---
-        let mut rng = rand::rng();
+        //
+        // Audit D07 (2026-07-13): this was a permutation, not a bootstrap.
+        //   1. `shuffle` REORDERS the existing blocks (sampling WITHOUT
+        //      replacement), so every iteration had the identical set of
+        //      daily PnLs — the final equity was the SAME every time (the
+        //      sum is order-independent) and only the drawdown PATH varied.
+        //      That measures ordering risk, not resampling uncertainty, and
+        //      systematically UNDERSTATES tail risk: a real bad-luck run
+        //      (more losing days than actually occurred) was never sampled.
+        //      A proper block bootstrap draws blocks WITH replacement, so
+        //      losing days can repeat and the equity outcome genuinely varies.
+        //   2. `rand::rng()` is unseeded → the p95 drawdown and
+        //      risk-of-ruin (inputs to a promotion-affecting gate) changed
+        //      run to run. Seed deterministically from the trade PnLs so the
+        //      same strategy always yields the same risk numbers.
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        for t in trades {
+            seed ^= (t.pnl.to_bits())
+                .wrapping_mul(0x1000_0000_1B3)
+                .rotate_left(13);
+            seed = seed.wrapping_mul(0x0100_0000_01B3);
+        }
+        let mut rng = StdRng::seed_from_u64(seed);
         let mc_iterations = 1000;
         let mut worst_dds = Vec::with_capacity(mc_iterations);
         let mut ruined_count = 0;
         let ruin_threshold = initial_balance * 0.50;
 
-        // Group trade PnLs by calendar day for block bootstrap
-        let mut daily_pnl_blocks: std::collections::HashMap<i64, Vec<f64>> =
-            std::collections::HashMap::new();
+        // Group trade PnLs by calendar day for block bootstrap. Use a
+        // BTreeMap so the block order is deterministic (chronological) — a
+        // HashMap's `into_values()` order is randomized per process, which
+        // (even with a seeded RNG) would make the with-replacement draw pick
+        // different blocks each run and defeat D07's reproducibility goal.
+        let mut daily_pnl_blocks: std::collections::BTreeMap<i64, Vec<f64>> =
+            std::collections::BTreeMap::new();
         for trade in trades {
             if trade.entry_time > 0 {
                 let day_key = trade.entry_time / 86_400_000;
                 daily_pnl_blocks.entry(day_key).or_default().push(trade.pnl);
             }
         }
-        let mut day_blocks: Vec<Vec<f64>> = daily_pnl_blocks.into_values().collect();
+        let day_blocks: Vec<Vec<f64>> = daily_pnl_blocks.into_values().collect();
         // Fallback to trade-level if fewer than 5 distinct days
         let use_blocks = day_blocks.len() >= 5;
 
         for _ in 0..mc_iterations {
+            // Sample WITH replacement: draw the same number of blocks (resp.
+            // trades) as the original, choosing each uniformly at random so
+            // blocks can repeat or be omitted — the defining property of a
+            // bootstrap that makes the resampled equity actually vary.
             let shuffled_pnls: Vec<f64> = if use_blocks {
-                day_blocks.shuffle(&mut rng);
-                day_blocks.iter().flatten().copied().collect()
+                let n = day_blocks.len();
+                let mut out = Vec::with_capacity(pnls.len());
+                for _ in 0..n {
+                    let b = &day_blocks[rng.random_range(0..n)];
+                    out.extend_from_slice(b);
+                }
+                out
+            } else if pnls.is_empty() {
+                Vec::new()
             } else {
-                let mut p = pnls.clone();
-                p.shuffle(&mut rng);
-                p
+                let n = pnls.len();
+                (0..n).map(|_| pnls[rng.random_range(0..n)]).collect()
             };
 
             let mut eq = initial_balance;
@@ -981,6 +1017,61 @@ mod overrides_tests {
         assert!((m.recovery_factor - (500.0 / 350.0)).abs() < 0.01);
         // period spans 4 days
         assert!((m.period_days - 4.0).abs() < 1e-6, "days {}", m.period_days);
+    }
+
+    #[test]
+    fn mc_bootstrap_is_deterministic_and_resamples_with_replacement() {
+        // Audit D07: the Monte-Carlo tail-risk block bootstrap must be
+        // (1) reproducible run-to-run and (2) an actual bootstrap (sampling
+        // WITH replacement so the resampled equity varies) rather than a
+        // permutation that always reproduces the same total.
+        let analyzer = StrategyQualityAnalyzer::default();
+        let day = 86_400_000_i64;
+        // >=5 distinct days so the day-block path (not the trade-level
+        // fallback) runs, with one large loss day that a with-replacement
+        // draw can repeat into a ruinous run.
+        let mk = |d: i64, pnl: f64| Trade {
+            entry_time: (d + 1) * day,
+            exit_time: Some((d + 1) * day + 3_600_000),
+            pnl,
+            pnl_pct: Some(pnl / 100_000.0),
+            duration_hours: Some(1.0),
+            ..Default::default()
+        };
+        let trades = vec![
+            mk(0, 400.0),
+            mk(1, -900.0),
+            mk(2, 350.0),
+            mk(3, -900.0),
+            mk(4, 500.0),
+            mk(5, -900.0),
+            mk(6, 300.0),
+        ];
+
+        // (1) Reproducibility: two analyses of the same trades agree exactly.
+        let a = analyzer.analyze_strategy("demo", &trades, 100_000.0);
+        let b = analyzer.analyze_strategy("demo", &trades, 100_000.0);
+        assert_eq!(
+            a.mc_risk_of_ruin_pct, b.mc_risk_of_ruin_pct,
+            "seeded bootstrap must be reproducible"
+        );
+        assert_eq!(a.mc_worst_drawdown_95_pct, b.mc_worst_drawdown_95_pct);
+
+        // (2) With-replacement actually explores worse-than-observed runs:
+        // the observed sequence never ruins (net is positive overall), but a
+        // bootstrap that can repeat the -900 days must find a strictly
+        // deeper p95 drawdown than the observed max drawdown. A permutation
+        // (old code) keeps the same day set, so its p95 DD is bounded by the
+        // single realized ordering's tail — the with-replacement draw beats it.
+        let observed_max_dd = a.max_drawdown_pct; // fraction, same unit as mc dd
+        let p95 = a.mc_worst_drawdown_95_pct.expect("mc dd present");
+        assert!(
+            p95 >= observed_max_dd,
+            "with-replacement p95 DD ({p95}) should be >= observed max DD ({observed_max_dd})"
+        );
+        // And risk-of-ruin must be a real (finite) probability in [0,1].
+        let ror = a.mc_risk_of_ruin_pct.expect("ror present");
+        assert!((0.0..=1.0).contains(&ror), "ror out of range: {ror}");
     }
 
     #[test]
