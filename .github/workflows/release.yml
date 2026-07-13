@@ -78,6 +78,13 @@ jobs:
             windows-cargo-gpu-${{ env.LIBTORCH_VERSION }}-${{ env.LIBTORCH_CUDA }}-
             windows-cargo-gpu-
 
+      # candle-kernels compiles .cu → PTX via nvcc, and nvcc on Windows
+      # requires cl.exe (the MSVC host compiler) on PATH. GitHub runners
+      # only expose cl.exe inside a VS dev shell — without this step nvcc
+      # dies with an EMPTY stdout/stderr (round-6 failure signature).
+      - name: MSVC dev environment (cl.exe on PATH for nvcc)
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Install CUDA toolkit (Windows)
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
@@ -227,6 +234,7 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev \
             libx11-dev libxrandr-dev libxcursor-dev \
             libxi-dev libgl1-mesa-dev \
+            libwayland-dev libdbus-1-dev \
             python3-pip dpkg-dev
           pip3 install --user 'cmake>=3.28'
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
