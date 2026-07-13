@@ -156,10 +156,57 @@ pub fn gpu_only_mode_for(_model_name: &str) -> bool {
     current_tree_runtime().gpu_only
 }
 
+/// Number of models the parallel trainer is running CONCURRENTLY. `1` when
+/// training a single model (or when the parallel trainer isn't active), so
+/// a lone model still gets the full CPU budget.
+static TRAINING_CONCURRENCY: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(1);
+
+/// Tell the per-model thread hint how many models train at once, so each
+/// one takes `budget / concurrency` threads instead of the full budget.
+/// The parallel trainer sets this via [`TrainingConcurrencyGuard`].
+pub(crate) fn set_training_concurrency(n: usize) {
+    TRAINING_CONCURRENCY.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn training_concurrency() -> usize {
+    TRAINING_CONCURRENCY
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1)
+}
+
+/// RAII guard: sets the training concurrency for its lifetime and restores
+/// it to 1 on drop (even on panic), so the throttle never leaks into a
+/// later single-model training run.
+pub struct TrainingConcurrencyGuard;
+
+impl TrainingConcurrencyGuard {
+    pub fn new(concurrent_models: usize) -> Self {
+        set_training_concurrency(concurrent_models);
+        Self
+    }
+}
+
+impl Drop for TrainingConcurrencyGuard {
+    fn drop(&mut self) {
+        set_training_concurrency(1);
+    }
+}
+
 pub fn cpu_threads_hint_for(_model_name: &str) -> usize {
-    // Per-model NEOETHOS_BOT_{MODEL}_THREADS folded into the single config-driven
-    // CPU budget via cpu_threads_hint() (v0.4.36 config-consolidation).
-    cpu_threads_hint()
+    // Per-model NEOETHOS_BOT_{MODEL}_THREADS folded into the single
+    // config-driven CPU budget via cpu_threads_hint() (v0.4.36
+    // config-consolidation).
+    //
+    // Thread-oversubscription fix (Fable's pending task #9, 2026-07-13): the
+    // parallel trainer runs up to `budget` models AT ONCE, and each tree
+    // model (xgboost/lightgbm/catboost) reads THIS hint for its OWN internal
+    // thread pool — so without dividing, K concurrent models × budget
+    // threads = budget² threads thrashing on `budget` cores (25 threads on a
+    // 6-core box). Divide the budget by how many models run concurrently so
+    // the product stays ≈ budget. Floored at 1 and never above the budget,
+    // so it can only REDUCE oversubscription, never add it.
+    (cpu_threads_hint() / training_concurrency()).max(1)
 }
 
 pub fn gpu_count() -> usize {
@@ -413,6 +460,28 @@ pub fn cpu_threads_from_params(params: &HashMap<String, ParamValue>, default: us
 #[cfg(test)]
 mod tests {
     use super::parse_device_preference;
+    use super::{TrainingConcurrencyGuard, cpu_threads_hint, cpu_threads_hint_for};
+
+    #[test]
+    fn per_model_threads_divide_by_concurrency_and_restore() {
+        // Thread-oversubscription fix: with K models running concurrently,
+        // each tree model must get budget/K threads (never the full budget),
+        // and the guard must restore the single-model default on drop.
+        let base = cpu_threads_hint();
+        assert_eq!(cpu_threads_hint_for("xgboost"), base, "lone model gets full budget");
+        {
+            let _g = TrainingConcurrencyGuard::new(3);
+            let throttled = cpu_threads_hint_for("xgboost");
+            assert_eq!(throttled, (base / 3).max(1));
+            assert!(throttled <= base, "throttle can only reduce, never add");
+            assert!(throttled >= 1, "at least one thread per model");
+        }
+        assert_eq!(
+            cpu_threads_hint_for("xgboost"),
+            base,
+            "budget restored after the guard drops"
+        );
+    }
 
     #[test]
     fn parse_device_preference_accepts_vendor_aliases() {

@@ -188,6 +188,16 @@ where
         .build()
         .context("Failed to build Rayon thread pool")?;
 
+    // Thread-oversubscription fix (2026-07-13): up to `threads` models train
+    // concurrently, and each tree model reads `cpu_threads_hint_for` for its
+    // OWN internal pool — so tell that hint the concurrency, and it hands
+    // each model `budget / concurrency` threads instead of the full budget
+    // (previously budget² threads thrashed on `budget` cores). The guard
+    // restores the single-model default on drop, even on panic.
+    let _concurrency_guard = crate::tree_models::config::TrainingConcurrencyGuard::new(
+        threads.min(total_models),
+    );
+
     let results: Vec<Result<String, ModelTrainingFailure>> = pool.install(|| {
         model_configs
             .into_par_iter()
