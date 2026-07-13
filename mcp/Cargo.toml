@@ -28,7 +28,7 @@ rmcp = { version = "2.1", features = [
     "transport-child-process",
     "macros",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time", "sync", "io-std"] }
 # Local HTTP API the app/Supervisor calls (list tools / invoke a tool).
 axum = "0.8"
 anyhow = "1"
@@ -36,6 +36,20 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# Lifecycle fixtures exercise the real server side of both transports. Keeping
+# these features test-only avoids linking the server implementation into the
+# production sidecar.
+rmcp = { version = "2.1", features = [
+    "client",
+    "server",
+    "macros",
+    "transport-child-process",
+    "transport-io",
+    "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-server",
+] }
 
 [profile.release]
 opt-level = 2

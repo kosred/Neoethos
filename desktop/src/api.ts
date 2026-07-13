@@ -2,6 +2,11 @@
 // directly — it calls these, so the command surface is one auditable file.
 import { invoke } from "@tauri-apps/api/core";
 
+import { amendProtectionBody, dataImportBody, promoteStrategyBody } from "./apiContracts";
+import type { DataFetchBody } from "./apiContracts";
+
+export { dataFetchBody } from "./apiContracts";
+
 // ── In-process backend (full neoethos-app axum API over loopback) ─────────────
 // The Tauri shell runs the whole backend in-process and tells us the port via
 // the `api_base` command. We resolve it once and reuse it for every call.
@@ -256,7 +261,7 @@ const qs = (o: Record<string, string | undefined>) => {
 export const promotionStatus = (symbol?: string, baseTf?: string) =>
   apiGet<any>("/strategy_lab/promotion" + qs({ symbol, base_tf: baseTf }));
 export const promoteStrategy = (symbol?: string, baseTf?: string) =>
-  apiPost<any>("/strategy_lab/promote", { symbol: symbol || undefined, base_tf: baseTf || undefined });
+  apiPost<any>("/strategy_lab/promote", promoteStrategyBody(symbol, baseTf));
 
 // ── Autonomous trader ─────────────────────────────────────────────────────
 export const autonomousStatus = () => apiGet<any>("/autonomous/status");
@@ -374,7 +379,7 @@ export type DataBootstrap = {
   lastTouchedUnixMs: number | null;
 };
 export const dataBootstrap = () => apiGet<DataBootstrap>("/data/bootstrap");
-export const dataFetch = (b: unknown) => apiPost("/data/fetch", b);
+export const dataFetch = (body: DataFetchBody) => apiPost("/data/fetch", body);
 
 // ── Market Watch / watchlist ──────────────────────────────────────────────
 export const getWatchlist = () => apiGet<any>("/watchlist");
@@ -410,12 +415,10 @@ export const amendProtection = (
   takeProfitPrice?: number | null,
   trailingStopLoss?: boolean,
 ) =>
-  apiPost("/positions/protection", {
-    position_id: positionId,
-    stop_loss_price: stopLossPrice ?? null,
-    take_profit_price: takeProfitPrice ?? null,
-    trailing_stop_loss: trailingStopLoss ?? null,
-  });
+  apiPost(
+    "/positions/protection",
+    amendProtectionBody(positionId, stopLossPrice, takeProfitPrice, trailingStopLoss),
+  );
 
 // ── Pending / conditional orders (limit & stop — "trade when price hits X") ──
 export type PendingOrder = {
@@ -497,7 +500,7 @@ export const settingsRaw = () => apiGet<any>("/settings/raw");
 export const saveSettingsRaw = (yaml: string) => apiPost("/settings/raw", { yaml });
 export const diagnosticsReport = () => apiPost<any>("/diagnostics/report", {});
 export const dataImport = (sourcePath: string, symbol: string, timeframe: string) =>
-  apiPost<any>("/data/import", { source_path: sourcePath, symbol, timeframe });
+  apiPost<any>("/data/import", dataImportBody(sourcePath, symbol, timeframe));
 
 // ── Storage transparency (where every file lives) ─────────────────────────
 export type StorageEntry = {

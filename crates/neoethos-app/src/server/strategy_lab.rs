@@ -179,7 +179,7 @@ fn evaluate_promotion_for(symbol: &str, base_tf: &str) -> anyhow::Result<Promoti
 // ─── POST /strategy_lab/promote ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PromoteBody {
     pub symbol: Option<String>,
     pub base_tf: Option<String>,
