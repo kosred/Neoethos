@@ -1181,7 +1181,7 @@ pub fn set_search_cancel(flag: Option<std::sync::Arc<std::sync::atomic::AtomicBo
     }
 }
 
-fn search_cancel_requested() -> bool {
+pub(crate) fn search_cancel_requested() -> bool {
     search_cancel_slot()
         .lock()
         .ok()

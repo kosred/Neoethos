@@ -2514,6 +2514,133 @@ pub fn run_discovery_cycle(
     run_discovery_cycle_with_progress(features, ohlcv, config, |_| {})
 }
 
+/// Fraction of the dataset withheld from discovery as the honest
+/// out-of-sample tail. Matches the 80/20 split the desktop app has always
+/// applied; audit B02/B03 (2026-07-13) found the CLI and the batch
+/// orchestrator called [`run_discovery_cycle`] with the FULL series — the
+/// GA and candidate selection saw every bar, so no window was ever truly
+/// out-of-sample on those paths.
+pub const DEFAULT_OOS_HOLDOUT_FRACTION: f64 = 0.2;
+
+/// [`run_discovery_cycle`] behind the outer OOS holdout split — the single
+/// source of truth for "discovery never sees the tail" (audit B02/B03).
+///
+/// Splits the series once: discovery (GA + candidate selection + all
+/// in-sample gates) runs on the FIRST 80% only; the last 20% is withheld
+/// and used exclusively to compute forward-test + prop-firm artifacts for
+/// the selected portfolio. Every production caller (desktop app, CLI,
+/// batch orchestrator) must go through this wrapper; calling
+/// [`run_discovery_cycle`] directly is only correct for tests or callers
+/// that manage their own holdout.
+pub fn run_discovery_cycle_with_holdout(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    config: &DiscoveryConfig,
+    prop_firm_rules: PropFirmRiskRules,
+) -> Result<DiscoveryResult> {
+    run_discovery_cycle_with_holdout_and_progress(features, ohlcv, config, prop_firm_rules, |_| {})
+}
+
+/// See [`run_discovery_cycle_with_holdout`]; this variant forwards discovery
+/// progress events to `progress_fn` (same contract as
+/// [`run_discovery_cycle_with_progress`]).
+pub fn run_discovery_cycle_with_holdout_and_progress<F>(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    config: &DiscoveryConfig,
+    prop_firm_rules: PropFirmRiskRules,
+    progress_fn: F,
+) -> Result<DiscoveryResult>
+where
+    F: FnMut(DiscoveryProgress),
+{
+    // Align both inputs to the same row count before splitting so the
+    // in-sample and tail windows stay index-consistent even when the
+    // caller's OHLCV and feature cube disagree by a few rows.
+    let n_rows = ohlcv.close.len().min(features.n_samples());
+    anyhow::ensure!(
+        n_rows > 0,
+        "run_discovery_cycle_with_holdout: empty dataset (ohlcv rows = {}, feature rows = {})",
+        ohlcv.close.len(),
+        features.n_samples()
+    );
+    let is_end = ((n_rows as f64) * (1.0 - DEFAULT_OOS_HOLDOUT_FRACTION)).floor() as usize;
+    anyhow::ensure!(
+        is_end >= 64,
+        "run_discovery_cycle_with_holdout: dataset too short for an OOS holdout split \
+         ({n_rows} rows total, {is_end} in-sample). Provide more history — discovery \
+         without a held-out tail cannot produce trustworthy out-of-sample evidence."
+    );
+
+    let is_ohlcv = slice_ohlcv(ohlcv, 0, is_end);
+    let is_features = FeatureFrame {
+        timestamps: features.timestamps[..is_end].to_vec(),
+        names: features.names.clone(),
+        data: neoethos_data::FeatureData::InMemory(features.sample_window(0, is_end)),
+    };
+    tracing::info!(
+        target: "neoethos_search::discovery",
+        total_rows = n_rows,
+        in_sample_rows = is_end,
+        holdout_rows = n_rows - is_end,
+        holdout_fraction = DEFAULT_OOS_HOLDOUT_FRACTION,
+        "outer OOS holdout: discovery sees only the first {is_end} rows; the tail is \
+         withheld for forward-test + prop-firm evidence"
+    );
+
+    let mut result = run_discovery_cycle_with_progress(&is_features, &is_ohlcv, config, progress_fn)?;
+
+    // Operator Stop mid-search: the cycle returned early with a partial
+    // result the caller will discard — don't burn time forward-testing it.
+    if crate::genetic::search_engine::search_cancel_requested() {
+        return Ok(result);
+    }
+    if result.portfolio.is_empty() || is_end >= n_rows {
+        return Ok(result);
+    }
+
+    let tail_ohlcv = slice_ohlcv(ohlcv, is_end, n_rows);
+    let tail_features = FeatureFrame {
+        timestamps: features.timestamps[is_end..n_rows].to_vec(),
+        names: features.names.clone(),
+        data: neoethos_data::FeatureData::InMemory(features.sample_window(is_end, n_rows)),
+    };
+
+    match compute_discovery_forward_test_artifacts(
+        &result.portfolio,
+        &result.effective_feature_names,
+        &tail_features,
+        &tail_ohlcv,
+        config,
+    ) {
+        Ok(artifacts) => result.forward_test_validation_artifacts = artifacts,
+        Err(err) => tracing::warn!(
+            target: "neoethos_search::discovery",
+            error = %err,
+            "forward-test artifact computation on the held-out tail failed \
+             (non-fatal — portfolio export proceeds without forward-test evidence, \
+             and the live-portfolio OOS gate will keep all members)"
+        ),
+    }
+    match compute_discovery_prop_firm_artifacts(
+        &result.portfolio,
+        &result.effective_feature_names,
+        &tail_features,
+        &tail_ohlcv,
+        config,
+        prop_firm_rules,
+    ) {
+        Ok(artifacts) => result.prop_firm_validation_artifacts = artifacts,
+        Err(err) => tracing::warn!(
+            target: "neoethos_search::discovery",
+            error = %err,
+            "prop-firm artifact computation on the held-out tail failed \
+             (non-fatal — portfolio export proceeds without prop-firm evidence)"
+        ),
+    }
+    Ok(result)
+}
+
 pub fn run_discovery_cycle_with_progress<F>(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,

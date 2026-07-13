@@ -73,6 +73,8 @@ pub use discovery::{
     discovery_validation_evidence_manifest,
     discovery_validation_evidence_manifest_excluding_live_sim, ensure_non_empty_portfolio,
     ensure_portfolio_export_ready, live_validation_evidence_from_discovery, run_discovery_cycle,
+    run_discovery_cycle_with_holdout, run_discovery_cycle_with_holdout_and_progress,
+    DEFAULT_OOS_HOLDOUT_FRACTION,
     run_discovery_cycle_with_progress, save_canonical_backtest_artifacts,
     save_discovery_profile_json, save_forward_test_validation_artifacts, save_funnel_json,
     save_portfolio_json, save_promotion_summary_json, save_prop_firm_validation_artifacts,

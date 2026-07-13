@@ -1089,7 +1089,16 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             ..defaults.clone()
         }
         .apply_mode_overrides();
-        let result = neoethos_search::run_discovery_cycle(&features, base_ohlcv, &config)?;
+        // Audit B02/B03 (2026-07-13): the CLI used to run discovery on the
+        // FULL series — no held-out tail, so every "validation" window had
+        // already been seen during selection. The holdout wrapper withholds
+        // the last 20% and attaches honest forward-test/prop-firm evidence.
+        let result = neoethos_search::run_discovery_cycle_with_holdout(
+            &features,
+            base_ohlcv,
+            &config,
+            neoethos_search::PropFirmRiskRules::default(),
+        )?;
         if let Some(parent) = std::path::Path::new(&out).parent()
             && !parent.as_os_str().is_empty()
         {

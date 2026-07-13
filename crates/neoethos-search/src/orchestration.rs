@@ -1,9 +1,10 @@
 use crate::discovery::{
     DiscoveryConfig, discovery_per_kind_evidence_hashes, ensure_non_empty_portfolio,
-    run_discovery_cycle, save_canonical_backtest_artifacts, save_discovery_profile_json,
-    save_portfolio_json, save_quality_report_json, save_trade_log_json,
-    save_walkforward_validation_artifacts,
+    run_discovery_cycle_with_holdout, save_canonical_backtest_artifacts,
+    save_discovery_profile_json, save_portfolio_json, save_quality_report_json,
+    save_trade_log_json, save_walkforward_validation_artifacts,
 };
+use crate::validation::PropFirmRiskRules;
 use anyhow::Result;
 use neoethos_data::{
     MANDATORY_TFS, ensure_timeframes_with_resample, load_symbol_dataset,
@@ -132,7 +133,14 @@ impl DiscoveryOrchestrator {
                 // Previously this used `?` and aborted the whole batch on a
                 // single discovery failure, while every other error in the
                 // loop counted toward `summary.skipped_*` and continued.
-                let result = match run_discovery_cycle(&features, base_ohlcv, &runtime_config) {
+                // Audit B02/B03 (2026-07-13): batch discovery used to see the
+                // FULL series; the holdout wrapper withholds the OOS tail.
+                let result = match run_discovery_cycle_with_holdout(
+                    &features,
+                    base_ohlcv,
+                    &runtime_config,
+                    PropFirmRiskRules::default(),
+                ) {
                     Ok(r) => r,
                     Err(e) => {
                         summary.discovery_failures += 1;

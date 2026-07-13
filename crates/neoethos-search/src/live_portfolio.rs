@@ -67,9 +67,84 @@ impl LivePortfolioArtifact {
             higher_tfs: higher_tfs.to_vec(),
             effective_feature_names: result.effective_feature_names.clone(),
             normalize_features,
-            genes: result.portfolio.clone(),
+            genes: oos_surviving_genes(result),
         }
     }
+}
+
+/// OOS gate for LIVE trading (audit B02, 2026-07-13): only strategies that
+/// made money on the never-seen held-out tail reach the live portfolio.
+///
+/// The full `DiscoveryResult` (portfolio JSON, quality report, walkforward
+/// artifacts) is untouched — the evidence stays on disk for the operator.
+/// This gate applies at the ONE artifact the autonomous trader consumes.
+/// Matching is by `stable_json_hash(gene)`, the same hash
+/// `compute_discovery_forward_test_artifacts` stamps into each artifact's
+/// `scope.strategy_hash`, so no positional assumptions are made.
+///
+/// When the result carries NO forward-test artifacts (legacy caller, tests,
+/// or tail computation failed non-fatally) every member is kept and a
+/// warning says the live portfolio ships without OOS evidence.
+fn oos_surviving_genes(result: &DiscoveryResult) -> Vec<Gene> {
+    if result.portfolio.is_empty() {
+        return Vec::new();
+    }
+    if result.forward_test_validation_artifacts.is_empty() {
+        tracing::warn!(
+            target: "neoethos_search::live_portfolio",
+            members = result.portfolio.len(),
+            "live portfolio has NO forward-test artifacts — the OOS gate cannot run, \
+             all members are kept WITHOUT held-out-tail evidence"
+        );
+        return result.portfolio.clone();
+    }
+    let passing: std::collections::HashSet<&str> = result
+        .forward_test_validation_artifacts
+        .iter()
+        .filter(|a| a.summary.metrics.net_profit > 0.0)
+        .map(|a| a.scope.strategy_hash.as_str())
+        .collect();
+    let mut kept = Vec::with_capacity(result.portfolio.len());
+    for gene in &result.portfolio {
+        match crate::artifact_io::stable_json_hash(gene) {
+            Ok(hash) if passing.contains(hash.as_str()) => kept.push(gene.clone()),
+            Ok(hash) => tracing::info!(
+                target: "neoethos_search::live_portfolio",
+                strategy_hash = %hash,
+                strategy_id = %gene.strategy_id,
+                "OOS gate: dropped from LIVE portfolio — non-positive net profit on the \
+                 held-out tail (it remains in the discovery artifacts for inspection)"
+            ),
+            Err(err) => {
+                // Serialization of a Gene basically cannot fail; if it ever
+                // does, keeping the member (loudly) beats silently emptying
+                // the live portfolio over an infrastructure hiccup.
+                tracing::warn!(
+                    target: "neoethos_search::live_portfolio",
+                    strategy_id = %gene.strategy_id,
+                    error = %err,
+                    "OOS gate: could not hash gene — keeping it WITHOUT tail evidence"
+                );
+                kept.push(gene.clone());
+            }
+        }
+    }
+    if kept.is_empty() {
+        tracing::warn!(
+            target: "neoethos_search::live_portfolio",
+            candidates = result.portfolio.len(),
+            "OOS gate: NO portfolio member made money on the held-out tail — the live \
+             portfolio is EMPTY. An honest empty portfolio beats trading overfits."
+        );
+    } else if kept.len() < result.portfolio.len() {
+        tracing::info!(
+            target: "neoethos_search::live_portfolio",
+            kept = kept.len(),
+            dropped = result.portfolio.len() - kept.len(),
+            "OOS gate: live portfolio filtered by held-out-tail profitability"
+        );
+    }
+    kept
 }
 
 /// Write the live portfolio artifact as pretty JSON. Additive — does NOT touch
@@ -208,6 +283,78 @@ mod tests {
         assert_eq!(projected.feature_at(1, 0), 6.0);
         assert_eq!(projected.feature_at(0, 1), 1.0);
         assert_eq!(projected.feature_at(1, 1), 4.0);
+    }
+
+    #[test]
+    fn oos_gate_drops_tail_losers_and_keeps_tail_winners() {
+        use crate::validation::{
+            ForwardTestSummary, ForwardTestValidationArtifactFile, ForwardTestValidationScope,
+        };
+
+        fn gene(id: &str, long_threshold: f32) -> Gene {
+            Gene {
+                strategy_id: id.to_string(),
+                indices: vec![0],
+                weights: vec![1.0],
+                long_threshold,
+                short_threshold: -0.5,
+                ..Gene::default()
+            }
+        }
+        fn artifact(gene: &Gene, net_profit: f64) -> ForwardTestValidationArtifactFile {
+            let scope = ForwardTestValidationScope {
+                dataset_hash: "tail-hash".to_string(),
+                evaluation_config_hash: "eval-hash".to_string(),
+                strategy_hash: crate::artifact_io::stable_json_hash(gene).unwrap(),
+                temporal_scope: neoethos_core::contracts::TemporalScopeHashes {
+                    temporal_contract_hash: "t".to_string(),
+                    timestamp_policy_hash: "ts".to_string(),
+                    feature_availability_policy_hash: "fa".to_string(),
+                    label_policy_hash: "lp".to_string(),
+                },
+            };
+            let summary = ForwardTestSummary {
+                bars: 10,
+                metrics: crate::eval::BacktestMetrics::from_metric_array([
+                    net_profit, 1.0, 100_000.0, 0.01, 0.5, 1.2, 1.0, 0.0, 4.0, 0.8, 0.005,
+                ]),
+                span_days: 1.0,
+            };
+            ForwardTestValidationArtifactFile::new(scope, summary)
+        }
+
+        // Distinct genes so their stable hashes differ.
+        let winner = gene("winner", 0.4);
+        let loser = gene("loser", 0.6);
+        let mut result = crate::discovery::DiscoveryResult {
+            portfolio: vec![winner.clone(), loser.clone()],
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: vec!["rsi".to_string()],
+            validation_gates: crate::discovery::DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: vec![
+                artifact(&winner, 42.0),
+                artifact(&loser, -3.0),
+            ],
+            prop_firm_validation_artifacts: Vec::new(),
+            funnel_profile: None,
+        };
+
+        let live = LivePortfolioArtifact::from_discovery("EURUSD", "M1", &[], false, &result);
+        assert_eq!(
+            live.genes.iter().map(|g| g.strategy_id.as_str()).collect::<Vec<_>>(),
+            vec!["winner"],
+            "only the tail-profitable strategy may reach the live portfolio"
+        );
+
+        // Without forward-test evidence the gate cannot run: keep everyone
+        // (the legacy/test path), never silently empty the portfolio.
+        result.forward_test_validation_artifacts.clear();
+        let live = LivePortfolioArtifact::from_discovery("EURUSD", "M1", &[], false, &result);
+        assert_eq!(live.genes.len(), 2, "no artifacts → no gate → all members kept");
     }
 
     #[test]

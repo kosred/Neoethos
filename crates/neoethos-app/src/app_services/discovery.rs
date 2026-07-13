@@ -23,8 +23,7 @@ use neoethos_data::{
 use neoethos_search::DiscoveryValidationGates;
 use neoethos_search::{
     DiscoveryConfig, DiscoveryProgress, DiscoveryResult, PropFirmRiskRules,
-    compute_discovery_forward_test_artifacts, compute_discovery_prop_firm_artifacts,
-    ensure_non_empty_portfolio, run_discovery_cycle_with_progress,
+    ensure_non_empty_portfolio,
     save_canonical_backtest_artifacts, save_discovery_profile_json,
     save_forward_test_validation_artifacts, save_funnel_json, save_portfolio_json,
     save_promotion_summary_json, save_prop_firm_validation_artifacts, save_quality_report_json,
@@ -1008,35 +1007,18 @@ pub fn start_discovery_job(
         neoethos_search::set_search_cancel(Some(cancel.cancel_arc()));
         let cancel_arc_for_closure = cancel.cancel_arc();
         let search_result = tokio::task::spawn_blocking(move || {
-            // Apply Walk-Forward Validation (WFV) strict bounds
-            // Using 80% In-Sample for training, 20% Out-Of-Sample strictly withheld to eliminate look-ahead bias
-            let n_rows = base_ohlcv.close.len();
-            let wfv_bound = (n_rows as f64 * 0.8).floor() as usize;
-
-            let mut is_ohlcv = base_ohlcv.clone();
-            if let Some(ref mut ts) = is_ohlcv.timestamp {
-                ts.truncate(wfv_bound);
-            }
-            is_ohlcv.open.truncate(wfv_bound);
-            is_ohlcv.high.truncate(wfv_bound);
-            is_ohlcv.low.truncate(wfv_bound);
-            is_ohlcv.close.truncate(wfv_bound);
-            if let Some(ref mut vol) = is_ohlcv.volume {
-                vol.truncate(wfv_bound);
-            }
-
-            let wfv_feat_bound = wfv_bound.min(features.n_samples());
-            let mut is_features = features.clone();
-            is_features.timestamps.truncate(wfv_feat_bound);
-            let rows = features.n_samples().min(wfv_feat_bound);
-            is_features.data =
-                neoethos_data::FeatureData::InMemory(features.sample_window(0, rows));
-
+            // Outer OOS holdout (audit B02/B03, 2026-07-13): the 80/20
+            // split + held-out-tail forward-test/prop-firm artifacts moved
+            // INTO neoethos-search (`run_discovery_cycle_with_holdout_*`),
+            // the single source of truth shared with the CLI and the batch
+            // orchestrator — those two used to run discovery on the FULL
+            // series with no holdout at all.
             let resolved_config = search_request.config.clone().apply_mode_overrides();
-            let mut result = run_discovery_cycle_with_progress(
-                &is_features,
-                &is_ohlcv,
+            let result = neoethos_search::run_discovery_cycle_with_holdout_and_progress(
+                &features,
+                &base_ohlcv,
                 &resolved_config,
+                search_request.prop_firm_rules,
                 move |event| {
                     if let Ok(mut snapshot) = live_snapshot_for_progress.lock() {
                         apply_backend_discovery_event(&mut snapshot, &event);
@@ -1081,79 +1063,9 @@ pub fn start_discovery_job(
                 &format!("{} {}", search_request.symbol, search_request.base_tf),
             )?;
 
-            // Forward-test the portfolio on the strictly held-out 20% tail
-            // (`wfv_bound..`). This is the OOS slice the discovery cycle
-            // never saw, so the resulting forward-test summary is an
-            // unbiased estimate of out-of-sample behavior.
-            if !result.portfolio.is_empty() && wfv_bound < base_ohlcv.close.len() {
-                let tail_ohlcv = neoethos_data::Ohlcv {
-                    timestamp: base_ohlcv
-                        .timestamp
-                        .as_ref()
-                        .map(|ts| ts[wfv_bound..].to_vec()),
-                    open: base_ohlcv.open[wfv_bound..].to_vec(),
-                    high: base_ohlcv.high[wfv_bound..].to_vec(),
-                    low: base_ohlcv.low[wfv_bound..].to_vec(),
-                    close: base_ohlcv.close[wfv_bound..].to_vec(),
-                    volume: base_ohlcv.volume.as_ref().map(|v| v[wfv_bound..].to_vec()),
-                };
-                let tail_feat_start = wfv_bound.min(features.n_samples());
-                let tail_feat_rows = features.n_samples().saturating_sub(tail_feat_start);
-                if tail_feat_rows > 0 && !tail_ohlcv.close.is_empty() {
-                    let tail_features = neoethos_data::FeatureFrame {
-                        timestamps: features.timestamps[tail_feat_start..].to_vec(),
-                        names: features.names.clone(),
-                        data: neoethos_data::FeatureData::InMemory(
-                            features.sample_window(tail_feat_start, features.n_samples()),
-                        ),
-                    };
-                    match compute_discovery_forward_test_artifacts(
-                        &result.portfolio,
-                        &result.effective_feature_names,
-                        &tail_features,
-                        &tail_ohlcv,
-                        &resolved_config,
-                    ) {
-                        Ok(artifacts) => {
-                            result.forward_test_validation_artifacts = artifacts;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                target: "neoethos_app::discovery",
-                                error = %err,
-                                "forward-test artifact computation failed; portfolio export \
-                                 will proceed without forward-test evidence"
-                            );
-                        }
-                    }
-
-                    // Reuse the same OOS tail to compute prop-firm
-                    // validation evidence. The rule set is sourced from
-                    // the typed `DiscoveryRequest::prop_firm_rules`
-                    // field so non-FTMO challenges drive the gate
-                    // without code changes.
-                    match compute_discovery_prop_firm_artifacts(
-                        &result.portfolio,
-                        &result.effective_feature_names,
-                        &tail_features,
-                        &tail_ohlcv,
-                        &resolved_config,
-                        search_request.prop_firm_rules,
-                    ) {
-                        Ok(artifacts) => {
-                            result.prop_firm_validation_artifacts = artifacts;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                target: "neoethos_app::discovery",
-                                error = %err,
-                                "prop-firm artifact computation failed; portfolio export \
-                                 will proceed without prop-firm evidence"
-                            );
-                        }
-                    }
-                }
-            }
+            // Forward-test + prop-firm artifacts on the held-out 20% tail are
+            // already attached: `run_discovery_cycle_with_holdout_and_progress`
+            // computes them inside neoethos-search (audit B02/B03).
 
             let out_path = PathBuf::from("cache").join("discovery").join(format!(
                 "{}_{}.json",
