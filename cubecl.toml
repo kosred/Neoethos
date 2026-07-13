@@ -1,0 +1,19 @@
+# cubecl runtime configuration — discovered by cubecl's
+# `RuntimeConfig::from_current_dir()`, which walks UP from the process CWD,
+# so any CLI/engine run from (or under) the repo root picks this up.
+#
+# WHY THIS EXISTS (burn #4792 / cubecl-cuda stream pools):
+# cubecl-cuda assigns ONE CUDA stream per touching thread and, by default,
+# allows up to `max_streams = 128`. Discovery drives the GPU from ~N rayon
+# worker threads, so with the default each thread gets its OWN grow-only
+# VRAM pool → total VRAM ≈ N × per-pool-budget, which is exactly what filled
+# a 48 GB A6000 on M1. Collapsing to a SINGLE stream means the per-pool VRAM
+# budget bounds the WHOLE process, not each thread.
+#
+# SCOPE: this only affects gpu-cuda builds (NVIDIA). The Vulkan/wgpu path
+# already bounds its pool in-code (`create_gpu_client` in cubecl_eval.rs
+# installs a graduated pool with a finite `dealloc_period`), and CPU builds
+# never read this file. Keep the file VALID TOML — cubecl PANICS at startup
+# on a malformed config rather than ignoring it.
+[streaming]
+max_streams = 1
