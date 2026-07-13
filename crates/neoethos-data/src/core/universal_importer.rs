@@ -494,6 +494,7 @@ fn parse_csv(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
     let mut low: Vec<f64> = Vec::new();
     let mut close: Vec<f64> = Vec::new();
     let mut volume: Vec<f64> = Vec::new();
+    let mut rejected: usize = 0;
 
     for (i, rec) in rdr.records().enumerate() {
         let rec = rec.with_context(|| format!("read csv row {}", i))?;
@@ -515,14 +516,44 @@ fn parse_csv(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
             }
             (None, None, _) => i as i64,
         };
-        ts.push(ts_value);
-        open.push(parse_f64(rec.get(*open_col).unwrap_or("0")));
-        high.push(parse_f64(rec.get(*high_col).unwrap_or("0")));
-        low.push(parse_f64(rec.get(*low_col).unwrap_or("0")));
-        close.push(parse_f64(rec.get(*close_col).unwrap_or("0")));
-        if let Some(c) = volume_col {
-            volume.push(parse_f64(rec.get(c).unwrap_or("0")));
+        // D03: parse strictly and reject the row on any missing/malformed/
+        // implausible OHLC value instead of coercing it to 0.0.
+        let o = parse_f64_checked(rec.get(*open_col).unwrap_or(""));
+        let h = parse_f64_checked(rec.get(*high_col).unwrap_or(""));
+        let l = parse_f64_checked(rec.get(*low_col).unwrap_or(""));
+        let c = parse_f64_checked(rec.get(*close_col).unwrap_or(""));
+        match (o, h, l, c) {
+            (Some(o), Some(h), Some(l), Some(c)) if valid_ohlc_bar(o, h, l, c) => {
+                ts.push(ts_value);
+                open.push(o);
+                high.push(h);
+                low.push(l);
+                close.push(c);
+                if let Some(cv) = volume_col {
+                    // Volume may legitimately be 0 (FX real volume); only the
+                    // OHLC prices are validity-critical.
+                    volume.push(parse_f64(rec.get(cv).unwrap_or("0")).max(0.0));
+                }
+            }
+            _ => {
+                rejected += 1;
+            }
         }
+    }
+
+    if rejected > 0 {
+        tracing::warn!(
+            target: "neoethos_data::universal_importer",
+            rejected,
+            kept = open.len(),
+            "import: rejected malformed rows (missing/non-finite/non-positive/incoherent OHLC)"
+        );
+    }
+    if open.is_empty() && rejected > 0 {
+        anyhow::bail!(
+            "all {rejected} data rows were rejected as malformed (missing/non-finite/\
+             non-positive/incoherent OHLC) — the file contains no usable OHLC data"
+        );
     }
 
     let timestamp = if ts.is_empty() {
@@ -667,6 +698,21 @@ fn parse_f64(s: &str) -> f64 {
     parse_f64_checked(s).unwrap_or(0.0)
 }
 
+/// Audit D03 (2026-07-13): a bar is usable only when all four prices are
+/// finite and strictly positive AND the bar is coherent (high is the max,
+/// low is the min). The importers previously coerced a missing/garbage
+/// cell to `0.0`, injecting a fake price of zero — a catastrophic
+/// ~100% move that poisons every downstream return, feature and backtest.
+/// Rows that fail this are rejected and counted, never silently zeroed.
+fn valid_ohlc_bar(o: f64, h: f64, l: f64, c: f64) -> bool {
+    [o, h, l, c].iter().all(|v| v.is_finite() && *v > 0.0)
+        && h >= l
+        && h >= o
+        && h >= c
+        && l <= o
+        && l <= c
+}
+
 /// Parse a numeric cell, disambiguating the comma's role so European
 /// locale data isn't silently corrupted:
 ///   - `1,234.56` (US thousands grouping) → strip the commas → 1234.56
@@ -793,16 +839,55 @@ fn rows_to_ohlcv(rows: Vec<HashMap<String, serde_json::Value>>) -> Result<Ohlcv>
     let mut low: Vec<f64> = Vec::with_capacity(rows.len());
     let mut close: Vec<f64> = Vec::with_capacity(rows.len());
     let mut volume: Vec<f64> = Vec::with_capacity(rows.len());
+    let mut rejected: usize = 0;
 
     for (i, row) in rows.into_iter().enumerate() {
-        ts.push(extract_ts(&row).unwrap_or(i as i64));
-        open.push(extract_num(&row, &["open", "o"]).unwrap_or(0.0));
-        high.push(extract_num(&row, &["high", "h"]).unwrap_or(0.0));
-        low.push(extract_num(&row, &["low", "l"]).unwrap_or(0.0));
-        close.push(extract_num(&row, &["close", "c", "last"]).unwrap_or(0.0));
-        if let Some(v) = extract_num(&row, &["volume", "vol", "v", "tickvol"]) {
-            volume.push(v);
+        // D03: reject the row on any missing/malformed/implausible OHLC
+        // value instead of coercing it to 0.0.
+        let o = extract_num(&row, &["open", "o"]);
+        let h = extract_num(&row, &["high", "h"]);
+        let l = extract_num(&row, &["low", "l"]);
+        let c = extract_num(&row, &["close", "c", "last"]);
+        match (o, h, l, c) {
+            (Some(o), Some(h), Some(l), Some(c)) if valid_ohlc_bar(o, h, l, c) => {
+                ts.push(extract_ts(&row).unwrap_or(i as i64));
+                open.push(o);
+                high.push(h);
+                low.push(l);
+                close.push(c);
+                if let Some(v) = extract_num(&row, &["volume", "vol", "v", "tickvol"]) {
+                    volume.push(v.max(0.0));
+                }
+            }
+            _ => {
+                rejected += 1;
+            }
         }
+    }
+
+    if rejected > 0 {
+        tracing::warn!(
+            target: "neoethos_data::universal_importer",
+            rejected,
+            kept = open.len(),
+            "import: rejected malformed rows (missing/non-finite/non-positive/incoherent OHLC)"
+        );
+    }
+    if open.is_empty() && rejected > 0 {
+        anyhow::bail!(
+            "all {rejected} data rows were rejected as malformed (missing/non-finite/\
+             non-positive/incoherent OHLC) — the file contains no usable OHLC data"
+        );
+    }
+    if open.is_empty() {
+        return Ok(Ohlcv {
+            timestamp: Some(Vec::new()),
+            open,
+            high,
+            low,
+            close,
+            volume: None,
+        });
     }
 
     let unit = infer_timestamp_unit(&ts).unwrap_or(TimestampUnit::Milliseconds);
@@ -981,6 +1066,47 @@ mod tests {
         assert_eq!(ohlcv.open, vec![1.10, 1.105]);
         assert_eq!(ohlcv.close, vec![1.105, 1.11]);
         assert_eq!(ohlcv.timestamp.as_ref().unwrap()[0], 1_700_000_000_000);
+    }
+
+    #[test]
+    fn csv_rejects_malformed_rows_instead_of_zeroing_prices() {
+        // Audit D03: a blank/garbage/incoherent OHLC cell must drop the row,
+        // not become a fake price of 0.0 that injects a ~100% move.
+        let tmp = std::env::temp_dir().join("neoethos_importer_d03.csv");
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        writeln!(f, "time,open,high,low,close,volume").unwrap();
+        writeln!(f, "1700000000,1.10,1.11,1.09,1.105,1234").unwrap(); // good
+        writeln!(f, "1700000060,1.105,,1.10,1.11,2345").unwrap(); // blank high → reject
+        writeln!(f, "1700000120,1.11,1.12,1.10,xyz,999").unwrap(); // garbage close → reject
+        writeln!(f, "1700000180,1.11,1.10,1.12,1.11,50").unwrap(); // high<low incoherent → reject
+        writeln!(f, "1700000240,1.12,1.13,1.11,1.125,4321").unwrap(); // good
+        drop(f);
+        let ohlcv = parse_csv(&tmp, false).unwrap();
+        // Only the two well-formed rows survive; NO zero prices leak in.
+        assert_eq!(ohlcv.open, vec![1.10, 1.12], "only valid rows kept");
+        assert_eq!(ohlcv.close, vec![1.105, 1.125]);
+        assert!(
+            ohlcv.low.iter().all(|v| *v > 0.0),
+            "no zero-coerced prices may survive"
+        );
+        assert_eq!(ohlcv.volume.as_ref().unwrap(), &vec![1234.0, 4321.0]);
+    }
+
+    #[test]
+    fn csv_all_malformed_rows_is_an_explicit_error() {
+        // A file whose every data row is garbage must fail loudly, not
+        // return a silently-empty/zeroed series.
+        let tmp = std::env::temp_dir().join("neoethos_importer_d03_allbad.csv");
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        writeln!(f, "time,open,high,low,close").unwrap();
+        writeln!(f, "1700000000,,,,").unwrap();
+        writeln!(f, "1700000060,x,y,z,w").unwrap();
+        drop(f);
+        let err = parse_csv(&tmp, false).unwrap_err();
+        assert!(
+            err.to_string().contains("rejected as malformed"),
+            "expected explicit malformed-rows error, got: {err}"
+        );
     }
 
     /// #206 regression guard: a MetaTrader 5 raw export must import
