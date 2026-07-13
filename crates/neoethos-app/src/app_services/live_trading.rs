@@ -570,6 +570,35 @@ async fn run(
         "risk-sizing context resolved"
     );
 
+    // Session-level circuit breakers (audit S03, 2026-07-13): the config has
+    // always carried `risk.daily_drawdown_limit` / `risk.total_drawdown_limit`
+    // (fractions of balance), but NOTHING enforced them live — the autopilot
+    // had per-trade sizing caps yet could bleed the account all day with no
+    // automatic stop. Enforced below at entry time, on the fresh broker
+    // balance (realized PnL — equity-based tracking is a follow-up). The
+    // breakers only BLOCK NEW ENTRIES; exit management is untouched.
+    // `0.0` disables, matching the other risk caps.
+    let daily_dd_limit = sizing
+        .as_ref()
+        .map(|s| s.risk.daily_drawdown_limit)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let total_dd_limit = sizing
+        .as_ref()
+        .map(|s| s.risk.total_drawdown_limit)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let initial_balance_cfg = sizing
+        .as_ref()
+        .map(|s| s.risk.initial_balance)
+        .filter(|b| b.is_finite() && *b > 0.0)
+        .unwrap_or(account_balance);
+    // (UTC date id, balance at first entry-consideration of that day).
+    let mut day_start: Option<(u32, f64)> = None;
+    // Log-once latches so a tripped breaker doesn't flood the log every bar.
+    let mut daily_tripped_on: Option<u32> = None;
+    let mut total_tripped = false;
+
     loop {
         if stop.load(Ordering::Relaxed) {
             tracing::info!(target: "neoethos_app::live_trading", "stop requested");
@@ -1060,6 +1089,70 @@ async fn run(
                     Ok(Ok(rt)) => (rt.trader.balance, Some(rt.reconcile.positions.len())),
                     _ => (account_balance, None),
                 };
+
+                // ── Session circuit breakers (audit S03) — NEW ENTRIES only ──
+                // Total-drawdown halt: balance at/below
+                // initial_balance × (1 − total_drawdown_limit) stops every
+                // further entry until restart (a blown account must not keep
+                // trading itself deeper). Daily-loss stop: losing more than
+                // daily_drawdown_limit of the day's starting balance blocks
+                // entries until the next UTC day.
+                let today: u32 = {
+                    use chrono::Datelike;
+                    let d = chrono::Utc::now().date_naive();
+                    (d.year().max(0) as u32) * 10_000 + d.month() * 100 + d.day()
+                };
+                match day_start {
+                    Some((d, _)) if d == today => {}
+                    _ => day_start = Some((today, entry_balance)),
+                }
+                if total_dd_limit > 0.0 {
+                    let floor = initial_balance_cfg * (1.0 - total_dd_limit);
+                    if entry_balance <= floor {
+                        if !total_tripped {
+                            total_tripped = true;
+                            tracing::error!(
+                                target: "neoethos_app::live_trading",
+                                %symbol, balance = entry_balance,
+                                initial_balance = initial_balance_cfg,
+                                limit = total_dd_limit,
+                                "CIRCUIT BREAKER: total drawdown limit hit — ALL new \
+                                 entries halted (exit management continues). Restart \
+                                 the engine after reviewing the account."
+                            );
+                        }
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal =
+                                Some("HALTED: total drawdown limit hit".to_string());
+                        }
+                        continue;
+                    }
+                }
+                if daily_dd_limit > 0.0
+                    && let Some((d, start_bal)) = day_start
+                    && d == today
+                    && start_bal > 0.0
+                {
+                    let floor = start_bal * (1.0 - daily_dd_limit);
+                    if entry_balance <= floor {
+                        if daily_tripped_on != Some(today) {
+                            daily_tripped_on = Some(today);
+                            tracing::warn!(
+                                target: "neoethos_app::live_trading",
+                                %symbol, balance = entry_balance,
+                                day_start_balance = start_bal,
+                                limit = daily_dd_limit,
+                                "CIRCUIT BREAKER: daily loss limit hit — new entries \
+                                 blocked until the next UTC day (exits continue)"
+                            );
+                        }
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal =
+                                Some("blocked: daily loss limit (resumes next UTC day)".to_string());
+                        }
+                        continue;
+                    }
+                }
 
                 // Base per-trade risk. In Risky Mode we size off the bankroll-
                 // stage ladder (30 %→50 % by stage, resolved from the account's
