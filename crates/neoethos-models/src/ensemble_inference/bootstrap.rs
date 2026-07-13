@@ -256,11 +256,22 @@ pub fn role_decisions_from_feature_frame(
 /// the caller treats any `Err` as "ensemble abstains" and falls back to
 /// gene-only sizing — never a wrong-columned prediction, never a blocked
 /// trade due to ML infrastructure.
+///
+/// Audit B12: this used to build a ONE-row DataFrame, which starved the
+/// swarm forecaster (it refits on the frame's price series and needs
+/// history — with 1 row it always abstained live). The experts now get the
+/// trailing [`LIVE_DECISION_TAIL_ROWS`] rows and the LAST row's decision is
+/// returned; per-row classifiers pay a small batch cost, history-hungry
+/// voters actually vote.
 pub fn role_decision_for_last_row(
     ensemble: &SoftVotingEnsemble,
     features: &neoethos_data::FeatureFrame,
 ) -> Result<super::EnsembleDecision> {
-    let df = ensemble_feature_dataframe(ensemble, features, FrameRows::LastOnly)?;
+    let df = ensemble_feature_dataframe(
+        ensemble,
+        features,
+        FrameRows::Tail(LIVE_DECISION_TAIL_ROWS),
+    )?;
     let decisions = ensemble.predict_with_roles(&df)?;
     decisions
         .into_iter()
@@ -268,10 +279,17 @@ pub fn role_decision_for_last_row(
         .ok_or_else(|| anyhow::anyhow!("ensemble returned no decision for the last feature row"))
 }
 
+/// How much trailing history the live gate feeds the experts per bar.
+/// Enough for the swarm forecaster's refit-and-forecast (needs ≥16, wants a
+/// few hundred for stable candidate models) while keeping the per-bar batch
+/// cost of the row-wise classifiers negligible.
+pub const LIVE_DECISION_TAIL_ROWS: usize = 256;
+
 /// Row selector for [`ensemble_feature_dataframe`].
 enum FrameRows {
     All,
-    LastOnly,
+    /// The trailing `n` rows (fewer when the frame is shorter).
+    Tail(usize),
 }
 
 /// Shared column-contract core: read the experts' agreed feature columns,
@@ -326,12 +344,11 @@ fn ensemble_feature_dataframe(
             })?;
         let col: Vec<f32> = match rows {
             FrameRows::All => features.feature_column(idx).to_vec(),
-            FrameRows::LastOnly => features
-                .feature_column(idx)
-                .last()
-                .copied()
-                .map(|v| vec![v])
-                .unwrap_or_default(),
+            FrameRows::Tail(n) => {
+                let full = features.feature_column(idx);
+                let start = full.len().saturating_sub(n);
+                full.iter().skip(start).copied().collect()
+            }
         };
         columns.push(Column::from(Series::new(name.as_str().into(), col)));
     }

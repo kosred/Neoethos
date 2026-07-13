@@ -156,8 +156,9 @@ fn open_path(path: String) -> Result<(), String> {
 }
 
 /// Resolve the data root the same way the engine does: the operator's
-/// `config.yaml` `system.data_dir`. Falls back to the dev repo path if the
-/// configured dir is missing (PoC convenience).
+/// `config.yaml` `system.data_dir`. Falls back to `<per-user data root>/data`
+/// (audit M08: the old fallback was the developer's workstation path baked
+/// into every shipped binary — meaningless on any other machine).
 fn resolve_data_root() -> PathBuf {
     if let Ok(s) = neoethos_core::Settings::load() {
         let d = s.system.data_dir.clone();
@@ -165,7 +166,13 @@ fn resolve_data_root() -> PathBuf {
             return d;
         }
     }
-    PathBuf::from(r"C:\Users\konst\development\forex-ai\data")
+    // Same root `prepare_data_root` establishes: the directory holding the
+    // per-user config.yaml (CWD in dev/portable launches, the OS-standard
+    // per-user dir otherwise), plus `/data`.
+    neoethos_core::config::user_config_path()
+        .parent()
+        .map(|p| p.join("data"))
+        .unwrap_or_else(|| PathBuf::from("data"))
 }
 
 /// Establish the per-user data root the engine reads (config.yaml + data/ +

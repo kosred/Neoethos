@@ -620,7 +620,24 @@ pub struct SymbolMetadataTable {
     #[serde(default = "crate::schema_version::default_v1")]
     pub schema_version: crate::schema_version::SchemaVersion,
     /// Map keyed by canonical (uppercase, no-separator) symbol.
+    ///
+    /// Serialized in SORTED key order (audit M06): plain `HashMap`
+    /// iteration order is random per process, so every save rewrote the
+    /// whole file in a new order — `data/symbol_metadata.json` showed as
+    /// permanently modified in git and real changes drowned in noise.
+    /// Two saves of equivalent tables are now byte-identical.
+    #[serde(serialize_with = "sorted_entries")]
     pub entries: HashMap<String, SymbolMetadata>,
+}
+
+/// Serialize a `HashMap` through a `BTreeMap` view so key order is
+/// deterministic. Lookup semantics (the public API) are unchanged.
+fn sorted_entries<S: serde::Serializer>(
+    entries: &HashMap<String, SymbolMetadata>,
+    ser: S,
+) -> Result<S::Ok, S::Error> {
+    let sorted: std::collections::BTreeMap<&String, &SymbolMetadata> = entries.iter().collect();
+    serde::Serialize::serialize(&sorted, ser)
 }
 
 impl Default for SymbolMetadataTable {
@@ -977,6 +994,34 @@ fn fx_jpy(symbol: String, base: &str, quote: &str, typical: Option<f64>) -> Symb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_serialization_is_deterministic_and_sorted() {
+        // Audit M06: HashMap iteration order used to randomize the JSON per
+        // save, so data/symbol_metadata.json was permanently dirty in git.
+        let mut table = SymbolMetadataTable::default();
+        // Insert in deliberately non-alphabetical order.
+        for sym in ["XAUUSD", "EURUSD", "USDJPY", "GBPUSD"] {
+            table
+                .entries
+                .insert(sym.to_string(), baked_in_default(sym).unwrap());
+        }
+        let a = serde_json::to_string_pretty(&table).unwrap();
+        let b = serde_json::to_string_pretty(&table).unwrap();
+        assert_eq!(a, b, "two serializations of the same table must match");
+        // Keys must appear in sorted order in the output.
+        let positions: Vec<usize> = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+            .iter()
+            .map(|s| a.find(&format!("\"{s}\"")).expect("key present"))
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "keys must serialize in sorted order, got positions {positions:?}"
+        );
+        // Round-trip: deserialization is unchanged (plain HashMap).
+        let back: SymbolMetadataTable = serde_json::from_str(&a).unwrap();
+        assert_eq!(back.entries.len(), table.entries.len());
+    }
 
     #[test]
     fn baked_in_defaults_cover_majors_and_jpy_and_metals() {
