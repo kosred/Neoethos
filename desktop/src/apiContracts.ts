@@ -33,6 +33,22 @@ export function dataImportBody(
   return { sourcePath, symbol, timeframe };
 }
 
+export type DataFetchBody = Readonly<{
+  symbol: string;
+  timeframe: string;
+  fromMs: number;
+  toMs: number | undefined;
+}>;
+
+export function dataFetchBody(
+  symbol: string,
+  timeframe: string,
+  fromMs: number,
+  toMs?: number,
+): DataFetchBody {
+  return { symbol, timeframe, fromMs, toMs };
+}
+
 export type PromoteStrategyBody = Readonly<{
   symbol: string | undefined;
   baseTf: string | undefined;

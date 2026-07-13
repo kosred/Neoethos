@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   amendProtectionBody,
+  dataFetchBody,
   dataImportBody,
   promoteStrategyBody,
 } from "../src/apiContracts.ts";
@@ -22,6 +23,15 @@ test("dataImportBody serializes the camelCase server fixture byte-for-byte", () 
   assert.equal(
     JSON.stringify(body),
     '{"sourcePath":"C:/market-data/EURUSD.csv","symbol":"EURUSD","timeframe":"M5"}',
+  );
+});
+
+test("dataFetchBody serializes the camelCase server fixture byte-for-byte", () => {
+  const body = dataFetchBody("EURUSD", "M5", 1_700_000_000_000);
+
+  assert.equal(
+    JSON.stringify(body),
+    '{"symbol":"EURUSD","timeframe":"M5","fromMs":1700000000000}',
   );
 });
 

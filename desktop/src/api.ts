@@ -3,6 +3,9 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import { amendProtectionBody, dataImportBody, promoteStrategyBody } from "./apiContracts";
+import type { DataFetchBody } from "./apiContracts";
+
+export { dataFetchBody } from "./apiContracts";
 
 // ── In-process backend (full neoethos-app axum API over loopback) ─────────────
 // The Tauri shell runs the whole backend in-process and tells us the port via
@@ -376,7 +379,7 @@ export type DataBootstrap = {
   lastTouchedUnixMs: number | null;
 };
 export const dataBootstrap = () => apiGet<DataBootstrap>("/data/bootstrap");
-export const dataFetch = (b: unknown) => apiPost("/data/fetch", b);
+export const dataFetch = (body: DataFetchBody) => apiPost("/data/fetch", body);
 
 // ── Market Watch / watchlist ──────────────────────────────────────────────
 export const getWatchlist = () => apiGet<any>("/watchlist");

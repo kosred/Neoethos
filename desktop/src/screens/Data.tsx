@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { dataBootstrap, dataFetch, refreshBrokerCosts, serverSymbols, spreadStats, type BrokerSymbol, type SpreadStats } from "../api";
+import { dataBootstrap, dataFetch, dataFetchBody, refreshBrokerCosts, serverSymbols, spreadStats, type BrokerSymbol, type SpreadStats } from "../api";
 import { usePoll } from "../hooks";
 import { useSymbolOptions, useTimeframeOptions, invalidateSymbolCache } from "../components/Select";
 import { HelpPanel, HelpStep } from "../components/Help";
@@ -112,7 +112,7 @@ export default function Data() {
     for (const { s, t } of combos) {
       setMsg(`Downloading ${done + failed + 1}/${combos.length}: ${s} ${t}…`);
       try {
-        await dataFetch({ symbol: s.toUpperCase(), timeframe: t.toUpperCase(), from_ms: fromMs });
+        await dataFetch(dataFetchBody(s.toUpperCase(), t.toUpperCase(), fromMs));
         done++;
       } catch (e) {
         failed++;
