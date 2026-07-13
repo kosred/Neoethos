@@ -125,6 +125,45 @@ pub fn evaluate_promotion(
         };
     }
 
+    // Audit B07 (2026-07-13): reject non-finite evidence BEFORE threshold
+    // comparisons. The floor checks (`NaN >= x` → false) happened to fail
+    // safe, but `+inf` sailed through every floor (an infinite profit
+    // factor would auto-pass), and a NaN that reached the UI serialized as
+    // `null` with a passing sibling criterion — indistinguishable from a
+    // legitimate rejection. Non-finite metrics mean the evidence pipeline
+    // is broken; name the field instead of pretending to gate on it.
+    let non_finite: Vec<(&str, f64)> = [
+        ("Sharpe ratio", metrics.sharpe),
+        ("Win rate", metrics.win_rate),
+        ("Profit factor", metrics.profit_factor),
+        ("Max drawdown %", metrics.max_drawdown_pct),
+    ]
+    .into_iter()
+    .filter(|(_, v)| !v.is_finite())
+    .collect();
+    if !non_finite.is_empty() {
+        let criteria = non_finite
+            .iter()
+            .map(|(name, value)| CriterionResult {
+                name: format!("{name} (finite)"),
+                passed: false,
+                actual: *value,
+                threshold: 0.0,
+                comparison: "finite".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let fields: Vec<&str> = non_finite.iter().map(|(name, _)| *name).collect();
+        return PromotionDecision {
+            promoted: false,
+            criteria,
+            summary: format!(
+                "Rejected: non-finite metric(s) {} — the evidence pipeline produced \
+                 NaN/inf, which cannot be gated on. Fix the metric source before promoting.",
+                fields.join(", ")
+            ),
+        };
+    }
+
     let criteria = vec![
         CriterionResult {
             name: "Sharpe ratio".to_string(),
@@ -210,10 +249,18 @@ pub fn aggregate_portfolio(entries: &[PromotionMetrics]) -> Option<PromotionMetr
         sharpe: entries.iter().map(|e| e.sharpe).sum::<f64>() / n,
         win_rate: entries.iter().map(|e| e.win_rate).sum::<f64>() / n,
         profit_factor: entries.iter().map(|e| e.profit_factor).sum::<f64>() / n,
-        max_drawdown_pct: entries
-            .iter()
-            .map(|e| e.max_drawdown_pct)
-            .fold(0.0_f64, f64::max),
+        // Audit B07: `f64::max` IGNORES NaN (`f64::max(0.0, NaN) == 0.0`), so a
+        // member with NaN drawdown silently vanished from the worst-drawdown
+        // aggregate — the one field where a broken member could hide behind
+        // healthy siblings (the mean fields propagate NaN on their own).
+        // Propagate NaN explicitly; `evaluate_promotion` then rejects it
+        // loudly as non-finite evidence.
+        max_drawdown_pct: entries.iter().map(|e| e.max_drawdown_pct).fold(
+            0.0_f64,
+            |acc, dd| {
+                if dd.is_nan() { f64::NAN } else { acc.max(dd) }
+            },
+        ),
         trades: entries.iter().map(|e| e.trades).sum(),
     })
 }
@@ -308,6 +355,43 @@ mod tests {
         assert!((agg.win_rate - 0.55).abs() < 1e-9);
         assert!((agg.max_drawdown_pct - 22.0).abs() < 1e-9); // worst
         assert_eq!(agg.trades, 180); // sum
+    }
+
+    #[test]
+    fn non_finite_metrics_fail_every_field_loudly() {
+        // Audit B07: NaN, +inf and -inf must be rejected as broken evidence,
+        // never compared against thresholds. +inf profit factor used to PASS.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut m = strong();
+            m.profit_factor = bad;
+            let d = evaluate_promotion(&m, &PromotionGateConfig::default());
+            assert!(!d.promoted, "non-finite profit factor ({bad}) must block");
+            assert!(
+                d.summary.contains("non-finite"),
+                "summary must name the failure mode: {}",
+                d.summary
+            );
+            assert!(
+                d.criteria.iter().any(|c| c.name.contains("Profit factor")),
+                "criteria must name the offending field"
+            );
+        }
+    }
+
+    #[test]
+    fn nan_drawdown_cannot_hide_in_portfolio_aggregation() {
+        // Audit B07: f64::max ignores NaN, so a NaN-drawdown member used to
+        // vanish from the worst-drawdown aggregate. It must propagate and
+        // then fail the gate as non-finite evidence.
+        let mut broken = strong();
+        broken.max_drawdown_pct = f64::NAN;
+        let agg = aggregate_portfolio(&[strong(), broken]).expect("non-empty");
+        assert!(
+            agg.max_drawdown_pct.is_nan(),
+            "NaN member drawdown must poison the aggregate, not vanish"
+        );
+        let d = evaluate_promotion(&agg, &PromotionGateConfig::default());
+        assert!(!d.promoted, "poisoned aggregate must not promote");
     }
 
     #[test]
