@@ -101,7 +101,7 @@ Each matrix row must end as fixed with evidence or rejected as an invalid audit 
 
 ## Local API authentication contract
 
-The token is a 256-bit OS-random value rotated on every backend start. It is never printed. In Tauri mode, the Rust setup stores it in managed state and a custom command returns `{ baseUrl, bearerToken }` only to the bundled `main` window; the production CSP permits only bundled scripts and the generated loopback backend. In headless mode, the operator may provide `NEOETHOS_API_TOKEN`; otherwise the backend writes the generated token atomically to the user-config directory with owner-only permissions and logs only that file's path. The file is replaced on startup and removed best-effort on clean shutdown.
+The token is a 256-bit OS-random value rotated on every backend start. It is never printed. In Tauri mode, Rust setup stores it in managed state and private `api_request` / `api_subscribe` commands proxy the bundled `main` window to the ephemeral loopback backend while injecting the bearer inside Rust; the token and runtime port never enter JavaScript. The commands require the exact local main-window label/current origin/capability, and external navigation is denied. The production webview CSP therefore needs no loopback network source and keeps `connect-src 'self' ipc: http://ipc.localhost`. In headless mode, the operator may provide canonical unpadded-base64url `NEOETHOS_API_TOKEN` decoding to exactly 32 bytes; otherwise the backend writes the generated token atomically to the user-config directory with owner-only permissions and logs only that file's path. The file is replaced on startup and removed best-effort on clean shutdown.
 
 `/healthz` remains unauthenticated. All other private reads and every state-changing route require `Authorization: Bearer <token>`. Production CORS allows only the Tauri application origin; development may additionally allow the exact configured Vite origin. Non-loopback binding is refused unless an explicit remote-enable setting is present and token authentication is active. There is no endpoint that returns the token over the unauthenticated HTTP API, so a browser origin cannot “discover” it.
 
@@ -137,7 +137,7 @@ The named tests are written during authoring before any command is executed.
 
 | IDs | Exact command after authoring |
 |---|---|
-| M01, S01, S05 | `cargo test -p neoethos-app server_contract_tests -- --nocapture` |
+| M01, S01, S05 | `cargo test -p neoethos-app server_contract_tests -- --nocapture` and `cargo test -p neoethos-desktop runtime_initialization_contract -- --nocapture` |
 | M02, S02 | `cargo test --manifest-path mcp/Cargo.toml lifecycle_and_approval -- --nocapture` |
 | M03, M04, M05, M10 | `cargo test -p neoethos-core --test vendor_provenance_contract -- --nocapture` and `cargo test -p neoethos-app --test packaging_smoke -- --nocapture` |
 | M06, M07, M08 | `cargo test -p neoethos-core persistence_contract -- --nocapture` and `cargo test -p neoethos-app persistence_contract -- --nocapture` |
@@ -154,7 +154,7 @@ The named tests are written during authoring before any command is executed.
 | B14 | `cargo test -p neoethos-cli auto_loop_checkpoint_contract -- --nocapture` |
 | B15 | `cargo test -p neoethos-codex auth_stream_callback_contract -- --nocapture` |
 | S03 | `cargo test -p neoethos-app live_risk_contract -- --nocapture` and `cargo test -p neoethos-trader live_risk_contract -- --nocapture` |
-| S04 | `cargo test --manifest-path mesh/Cargo.toml mesh_trust_contract -- --nocapture` |
+| S04 | `cargo test --manifest-path mesh/Cargo.toml mesh_trust_contract -- --nocapture`, `cargo test -p neoethos-app federation_artifact_contract -- --nocapture`, and `cargo test -p neoethos-desktop mesh_sidecar_contract -- --nocapture` |
 
 Commands run without `-q`, `|| true`, tail-only filters, ignored exit codes, or warning suppression. Complete stdout/stderr is written per command to `%TEMP%\forex-ai-remediation-logs\<cycle>-<command>.log`. Logs are read from start to finish in bounded chunks; old successful-cycle logs are deleted only after their diagnostic summary is recorded. A single log is capped operationally at 100 MiB: if a command would exceed that, output is split by byte range without discarding any segment.
 
