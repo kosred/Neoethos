@@ -38,6 +38,14 @@ env:
   # neoethos-app Cargo.toml `gpu` feature definition.
   RELEASE_FEATURES: "gpu"
 
+  # candle-kernels (RL models via rlkit) compiles its CUDA kernels through
+  # bindgen_cuda, which probes `nvidia-smi` for the compute capability —
+  # CI runners have no GPU, so the probe panics unless this is set.
+  # 80 = Ampere baseline: bf16 kernels compile natively and the PTX
+  # forward-JITs onto 8.6/8.9/9.0/12.0 cards. Turing (sm_75) users still
+  # get libtorch CUDA + the Vulkan path; only candle RL kernels need 8.0+.
+  CUDA_COMPUTE_CAP: "80"
+
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
   # Windows GPU release — NSIS installer + portable zip
@@ -250,7 +258,12 @@ jobs:
           # v0.2.35's network method resolves 13.2.0 fine.
           method: 'network'
           cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
-          sub-packages: '["nvcc", "cudart-dev", "thrust", "libcublas-dev", "libcusparse-dev", "libcusolver-dev", "libcurand-dev"]'
+          # Jimver prefixes every sub-package with `cuda-`, but NVIDIA's apt
+          # repo ships the math libs WITHOUT that prefix (libcublas-dev-13-2,
+          # not cuda-libcublas-dev-13-2) → "Unable to locate package". The
+          # unprefixed ones go in non-cuda-sub-packages (Linux-only input).
+          sub-packages: '["nvcc", "cudart-dev", "thrust"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcusparse-dev", "libcusolver-dev", "libcurand-dev"]'
 
       - name: Download libtorch (Linux, CUDA)
         # PyTorch dropped the cxx11-abi-prefixed Linux libtorch starting

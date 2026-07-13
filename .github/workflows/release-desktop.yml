@@ -82,6 +82,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # linuxdeploy's binary stripping breaks on the runner (classic
           # tauri-on-CI failure: "failed to run linuxdeploy").
+          # NOTE: even with NO_STRIP, linuxdeploy still dies instantly on
+          # this runner (exits with no output ~1s after launch), so the GUI
+          # AppImage target is disabled in tauri.linux.conf.json (JSON can't
+          # carry comments — the rationale lives here). Linux GUI ships as
+          # .deb + .rpm; the CLI AppImage from release-installers.yml covers
+          # AppImage users.
           NO_STRIP: true
         with:
           projectPath: desktop

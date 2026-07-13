@@ -1,5 +1,6 @@
 {
   "bundle": {
+    "targets": ["deb", "rpm"],
     "resources": {
       "../../mcp/target/release/neoethos-mcp": ""
     }
