@@ -4,7 +4,7 @@ version = "0.5.3"
 edition.workspace = true
 # SPDX dual-license matches the repo-root LICENSE file. Required by both
 # cargo-deb (writes Debian `control` License:) and cargo-generate-rpm.
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-or-later"
 description = "NeoEthos headless CLI + TUI — a disciplined multi-model ML engine for FX strategy research and risk-aware execution."
 homepage = "https://github.com/kosred/neoethos"
 repository = "https://github.com/kosred/neoethos"
@@ -64,7 +64,7 @@ dirs = "5.0.1"
 # ──────────────────────────────────────────────────────────────────────────────
 [package.metadata.deb]
 maintainer = "neoethos contributors <neoethos@users.noreply.github.com>"
-copyright = "2024-2026, neoethos contributors; proprietary; all rights reserved"
+copyright = "2024-2026 NeoEthos contributors; licensed under AGPL-3.0-or-later"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
 neoethos is an open-source quantitative trading workspace targeting \
@@ -90,7 +90,7 @@ systemd-units = { enable = false }
 # ──────────────────────────────────────────────────────────────────────────────
 [package.metadata.generate-rpm]
 name = "neoethos-cli"
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-or-later"
 assets = [
     { source = "target/release/neoethos-cli", dest = "/usr/bin/neoethos-cli", mode = "0755" },
     { source = "assets/symbol_metadata/defaults.json", dest = "/usr/share/neoethos/symbol_metadata/defaults.json", mode = "0644" },

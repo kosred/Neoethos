@@ -5,7 +5,7 @@ edition.workspace = true
 # SPDX dual-license matches the repo-root LICENSE file. Required by both
 # cargo-deb (which prefers `license` over `license-file` when generating
 # `debian/control`) and cargo-generate-rpm. Standard Rust ecosystem choice.
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-or-later"
 description = "neoethos backend server for FX strategy research and risk-aware execution."
 homepage = "https://github.com/kosred/neoethos"
 repository = "https://github.com/kosred/neoethos"
@@ -277,7 +277,7 @@ main = true
 maintainer = "neoethos contributors <neoethos@users.noreply.github.com>"
 # SPDX expression mirrored from `package.license` above. cargo-deb writes this
 # into the Debian `control` file's `License:` line via the license-file route.
-copyright = "2024-2026, neoethos contributors; proprietary; all rights reserved"
+copyright = "2024-2026 NeoEthos contributors; licensed under AGPL-3.0-or-later"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
 neoethos is an open-source quantitative trading workspace targeting \
@@ -302,7 +302,7 @@ systemd-units = { enable = false }
 [package.metadata.generate-rpm]
 name = "neoethos"
 # Mirrors the SPDX expression in `package.license`.
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-or-later"
 assets = [
     { source = "target/release/neoethos-app", dest = "/usr/bin/neoethos-app", mode = "0755" },
     { source = "assets/symbol_metadata/defaults.json", dest = "/usr/share/neoethos/symbol_metadata/defaults.json", mode = "0644" },

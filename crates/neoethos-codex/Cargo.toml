@@ -3,7 +3,7 @@ name = "neoethos-codex"
 version = "0.5.3"
 edition.workspace = true
 description = "ChatGPT Plus/Pro OAuth fallback for NeoEthos — uses the OpenAI Codex CLI's PKCE flow."
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-or-later"
 
 # ── Why this crate exists ──────────────────────────────────────────────────────
 # The local Gemma runtime (neoethos-gemma) abort()s the backend when an

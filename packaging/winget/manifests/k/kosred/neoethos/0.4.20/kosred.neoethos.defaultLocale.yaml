@@ -7,7 +7,7 @@ PublisherUrl: https://github.com/kosred
 PublisherSupportUrl: https://github.com/kosred/neoethos/issues
 PackageName: neoethos
 PackageUrl: https://github.com/kosred/neoethos
-License: LicenseRef-Proprietary
+License: AGPL-3.0-or-later
 LicenseUrl: https://github.com/kosred/neoethos/blob/main/LICENSE
 Copyright: Copyright 2024-2026 neoethos contributors
 ShortDescription: Quantitative trading workspace for the cTrader Open API.
