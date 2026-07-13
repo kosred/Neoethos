@@ -87,9 +87,10 @@ jobs:
           Expand-Archive -Path "libtorch.zip" -DestinationPath "$env:GITHUB_WORKSPACE" -Force
           Remove-Item "libtorch.zip"
           $libtorchPath = Join-Path $env:GITHUB_WORKSPACE "libtorch"
+          # torch-sys appends include/ and lib/ ITSELF to LIBTORCH_INCLUDE/
+          # LIBTORCH_LIB — setting them to .../include produced the doubled
+          # "include\include" path (fatal C1083). LIBTORCH alone is correct.
           echo "LIBTORCH=$libtorchPath" >> $env:GITHUB_ENV
-          echo "LIBTORCH_INCLUDE=$libtorchPath/include" >> $env:GITHUB_ENV
-          echo "LIBTORCH_LIB=$libtorchPath/lib" >> $env:GITHUB_ENV
           echo "$libtorchPath/lib" >> $env:GITHUB_PATH
 
       - name: Install cargo-packager
@@ -245,9 +246,9 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
-          # NVIDIA's apt repo intermittently fails (exit 100) on runners
-          # — the 'local' .run installer is self-contained and reliable.
-          method: 'local'
+          # 'local' does NOT support sub-packages on Linux (action error);
+          # v0.2.35's network method resolves 13.2.0 fine.
+          method: 'network'
           cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
           sub-packages: '["nvcc", "cudart-dev", "thrust", "libcublas-dev", "libcusparse-dev", "libcusolver-dev", "libcurand-dev"]'
 

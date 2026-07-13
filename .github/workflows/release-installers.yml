@@ -61,7 +61,7 @@ jobs:
 
       - name: Install mold linker
         # .cargo/config.toml forces -fuse-ld=mold for x86_64-unknown-linux-gnu.
-        run: sudo apt-get update && sudo apt-get install -y mold libwayland-dev
+        run: sudo apt-get update && sudo apt-get install -y mold libwayland-dev libdbus-1-dev
 
       - name: Install Linux packaging tooling
         # cargo-deb writes Debian binary packages from `[package.metadata.deb]`.
