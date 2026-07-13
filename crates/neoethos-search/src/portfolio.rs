@@ -164,18 +164,19 @@ impl PortfolioOptimizer {
             if raw.iter().all(|v| *v <= 0.0) {
                 raw = vec![1.0; n_assets];
             }
+            // Audit D08 (2026-07-13): the previous code clamped each weight
+            // to `max_weight` and THEN renormalized (÷ sum) — which scales
+            // the capped weights back UP above the cap (e.g. [0.6,0.3,0.1],
+            // cap 0.35 → clamp [0.35,0.3,0.1] → renorm [0.467,0.4,0.133],
+            // both cap-violated). Project onto the capped simplex instead:
+            // weights are nonnegative, sum to 1, and none exceeds the cap.
             let sum_raw: f64 = raw.iter().sum();
-            let mut norm: Vec<f64> = raw.iter().map(|v| v / sum_raw).collect();
-
-            for w in &mut norm {
-                *w = w.clamp(0.0, self.max_weight);
-            }
-            let sum_capped: f64 = norm.iter().sum();
-            let norm = if sum_capped > 0.0 {
-                norm.iter().map(|v| v / sum_capped).collect::<Vec<f64>>()
+            let base: Vec<f64> = if sum_raw > 0.0 {
+                raw.iter().map(|v| v.max(0.0) / sum_raw).collect()
             } else {
                 vec![1.0 / n_assets as f64; n_assets]
             };
+            let norm = project_to_capped_simplex(&base, self.max_weight);
 
             for (i, s) in names.iter().enumerate() {
                 // F-053 fix (2026-05-25 — task #218 unwrap audit):
@@ -301,6 +302,70 @@ fn cov(a: &[f64], mean_a: f64, b: &[f64], mean_b: f64) -> f64 {
     sum / (n as f64 - 1.0)
 }
 
+/// Project nonnegative `weights` onto the capped simplex: the returned
+/// weights are nonnegative, sum to 1 (when the cap allows it), and none
+/// exceeds `cap`. Uses water-filling — cap the over-cap weights and
+/// redistribute their excess mass proportionally to the uncapped ones,
+/// repeating until none exceed the cap (audit D08).
+///
+/// Infeasible cap (`n * cap < 1`, i.e. too tight for this many assets to
+/// still sum to 1): no allocation can both sum to 1 and honor the cap, so
+/// fall back to equal weights `1/n` (the least-concentrated choice) rather
+/// than silently exceeding the cap on a subset.
+fn project_to_capped_simplex(weights: &[f64], cap: f64) -> Vec<f64> {
+    let n = weights.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let cap = cap.max(0.0);
+    if cap <= 0.0 || (n as f64) * cap < 1.0 - 1e-12 {
+        return vec![1.0 / n as f64; n];
+    }
+    // Normalize the nonnegative input to sum 1 as the starting point.
+    let mut w: Vec<f64> = {
+        let s: f64 = weights.iter().map(|v| v.max(0.0)).sum();
+        if s > 0.0 {
+            weights.iter().map(|v| v.max(0.0) / s).collect()
+        } else {
+            vec![1.0 / n as f64; n]
+        }
+    };
+    // Each pass freezes at least one more weight at the cap, so this
+    // terminates in <= n passes; the guard bounds it regardless. A weight
+    // AT the cap is frozen (not eligible for more mass) — only weights
+    // STRICTLY below the cap absorb redistributed excess, otherwise a
+    // just-capped weight would be pushed back over.
+    for _ in 0..=n {
+        let mut excess = 0.0;
+        let mut free_sum = 0.0;
+        for &wi in &w {
+            if wi >= cap - 1e-15 {
+                excess += (wi - cap).max(0.0);
+            } else {
+                free_sum += wi;
+            }
+        }
+        if excess <= 1e-15 {
+            break;
+        }
+        if free_sum <= 1e-15 {
+            // No room left to redistribute: clamp everything to the cap.
+            for wi in &mut w {
+                *wi = wi.min(cap);
+            }
+            break;
+        }
+        for wi in &mut w {
+            if *wi >= cap - 1e-15 {
+                *wi = cap;
+            } else {
+                *wi += excess * (*wi / free_sum);
+            }
+        }
+    }
+    w
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +441,47 @@ mod tests {
             .correlation_score;
         assert!((eur_corr - 1.0).abs() < 1e-6);
         assert!((gbp_corr - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn capped_simplex_respects_cap_sums_to_one_and_is_nonneg() {
+        // Audit D08: the exact case the old clamp+renormalize violated.
+        let cap = 0.35;
+        let out = project_to_capped_simplex(&[0.6, 0.3, 0.1], cap);
+        let sum: f64 = out.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9, "must sum to 1, got {sum}");
+        for w in &out {
+            assert!(*w >= -1e-12, "weights must be nonnegative: {w}");
+            assert!(*w <= cap + 1e-9, "weight {w} exceeds cap {cap}");
+        }
+        // Mass conserved: the two under-cap assets absorb the excess.
+        assert!(out[0] <= cap + 1e-9 && out[0] >= cap - 1e-9, "biggest hits cap");
+    }
+
+    #[test]
+    fn capped_simplex_cascades_when_redistribution_re_violates() {
+        // FEASIBLE (n*cap = 4*0.30 = 1.2 >= 1) but redistributing the big
+        // asset's excess pushes a medium one over the cap, and again — the
+        // water-fill must iterate (3 passes here) until all obey the cap.
+        let cap = 0.30;
+        let out = project_to_capped_simplex(&[0.5, 0.29, 0.19, 0.02], cap);
+        let sum: f64 = out.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9, "sum {sum}");
+        for w in &out {
+            assert!(*w <= cap + 1e-9, "weight {w} exceeds cap {cap}");
+            assert!(*w >= -1e-12, "weight {w} negative");
+        }
+    }
+
+    #[test]
+    fn capped_simplex_infeasible_cap_falls_back_to_equal_weights() {
+        // n*cap < 1 (3 * 0.2 = 0.6 < 1): impossible to sum to 1 under the
+        // cap — fall back to equal weights rather than silently violating.
+        let out = project_to_capped_simplex(&[0.5, 0.4, 0.1], 0.2);
+        let sum: f64 = out.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9);
+        for w in &out {
+            assert!((*w - 1.0 / 3.0).abs() < 1e-9, "expected equal weights, got {w}");
+        }
     }
 }
