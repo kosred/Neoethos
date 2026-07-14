@@ -576,27 +576,46 @@ const STATIC_THRESHOLD_LADDER: [f32; 6] = [0.10, 0.20, 0.35, 0.50, 0.70, 0.90];
 /// FX majors but mis-calibrates extreme-volatility cases (XAGUSD on M1,
 /// BTCUSD on H1). The adaptive ladder reads the actual cube and picks
 /// thresholds at the dataset's own percentile points.
-static ADAPTIVE_THRESHOLD_LADDER: std::sync::OnceLock<[f32; 6]> = std::sync::OnceLock::new();
+/// Audit D06 (2026-07-13): this was a `OnceLock` (first-write-wins-forever).
+/// In a multi-symbol batch sweep — the orchestrator runs many (symbol, TF)
+/// combos in ONE process, sequentially — only the FIRST symbol's ladder was
+/// installed and every later symbol silently inherited it (an XAGUSD ladder
+/// applied to EURUSD, etc.). It is now a replaceable cell: each discovery run
+/// installs its OWN dataset's ladder (or clears back to the static one when
+/// adaptive thresholds are off), so no ladder leaks across symbols. Discovery
+/// is single-instance and runs sequentially, so a per-run replace is correct;
+/// the `RwLock` still allows the GA's many reader threads to read concurrently
+/// within a run.
+static ADAPTIVE_THRESHOLD_LADDER: std::sync::RwLock<Option<[f32; 6]>> =
+    std::sync::RwLock::new(None);
 
-/// Install the adaptive threshold ladder derived from the feature
-/// cube. First call wins (subsequent calls are no-ops, by OnceLock
-/// semantics). The values should be sorted ascending and each must
-/// be finite + non-negative.
-///
-/// Returns `Err(installed)` if a ladder was already installed
-/// (matches the `install_*_runtime_overrides` convention elsewhere
-/// in the crate).
-pub fn install_adaptive_threshold_ladder(ladder: [f32; 6]) -> Result<(), [f32; 6]> {
-    ADAPTIVE_THRESHOLD_LADDER.set(ladder)
+/// Install (REPLACE) the adaptive threshold ladder derived from the current
+/// run's feature cube. Unlike the old first-write-wins semantics, each call
+/// overwrites, so a later symbol's run gets its own ladder. Values should be
+/// sorted ascending and finite + non-negative (the derivation clamps/sorts).
+pub fn install_adaptive_threshold_ladder(ladder: [f32; 6]) {
+    let mut guard = ADAPTIVE_THRESHOLD_LADDER
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = Some(ladder);
 }
 
-/// Read the currently-installed threshold ladder. Returns the
-/// adaptive ladder when installed, else the static fallback. Used
-/// by tests that want to verify the ladder selection path.
+/// Clear the adaptive ladder back to the static fallback. Called at the start
+/// of a run that does NOT use adaptive thresholds (or whose derivation was
+/// degenerate) so the PREVIOUS symbol's ladder cannot leak into it.
+pub fn clear_adaptive_threshold_ladder() {
+    let mut guard = ADAPTIVE_THRESHOLD_LADDER
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
+/// Read the currently-installed threshold ladder. Returns the adaptive ladder
+/// when installed, else the static fallback.
 pub fn current_threshold_ladder() -> [f32; 6] {
     ADAPTIVE_THRESHOLD_LADDER
-        .get()
-        .copied()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
         .unwrap_or(STATIC_THRESHOLD_LADDER)
 }
 
@@ -1151,20 +1170,26 @@ mod tests {
     }
 
     #[test]
-    fn install_adaptive_ladder_first_install_wins() {
-        // Use a unique value to avoid clashing with other tests that
-        // might have already installed. The static fallback is also a
-        // legal observation if no install happened.
-        let probe = current_threshold_ladder();
-        // The static fallback is `[0.10, 0.20, 0.35, 0.50, 0.70, 0.90]`.
-        // If an adaptive ladder is already installed (from another test
-        // in the same process), the assertion would be against THAT;
-        // either way the values are finite + monotone-ascending.
-        for i in 1..probe.len() {
-            assert!(probe[i] >= probe[i - 1]);
-        }
-        for v in probe.iter() {
-            assert!(v.is_finite() && *v > 0.0);
-        }
+    fn adaptive_ladder_replaces_per_run_and_clears_to_static() {
+        // Audit D06: a later run must REPLACE the ladder (not be blocked by a
+        // first-write-wins OnceLock), and clearing must revert to the static
+        // fallback so no symbol's ladder leaks into a later run.
+        let ladder_a = [0.01_f32, 0.02, 0.03, 0.04, 0.05, 0.06];
+        let ladder_b = [0.5_f32, 0.6, 0.7, 0.8, 0.9, 1.0];
+
+        install_adaptive_threshold_ladder(ladder_a);
+        assert_eq!(current_threshold_ladder(), ladder_a);
+
+        // A second symbol's run replaces the first — NOT ignored.
+        install_adaptive_threshold_ladder(ladder_b);
+        assert_eq!(
+            current_threshold_ladder(),
+            ladder_b,
+            "later run must replace the earlier ladder (D06)"
+        );
+
+        // A run with adaptive off clears back to the static fallback.
+        clear_adaptive_threshold_ladder();
+        assert_eq!(current_threshold_ladder(), STATIC_THRESHOLD_LADDER);
     }
 }

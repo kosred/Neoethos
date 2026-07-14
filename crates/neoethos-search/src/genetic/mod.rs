@@ -21,7 +21,8 @@ pub mod strategy_gene;
 pub use diversity::{DiversityKey, EvalMetrics, diversity_key, smc_mask};
 pub use evolution_math::{
     EvolutionSearchPolicy, ParentSelectionPolicy, SeenSignatureMemory,
-    SeenSignatureMemoryRuntimeOverrides, SurvivorSelectionPolicy, apply_metrics, crossover,
+    SeenSignatureMemoryRuntimeOverrides, SurvivorSelectionPolicy, apply_metrics,
+    clear_adaptive_threshold_ladder, crossover,
     current_seen_signature_memory_runtime_overrides, current_threshold_ladder,
     derive_adaptive_threshold_ladder_from_features, gene_signature_hash, generate_random_genes,
     install_adaptive_threshold_ladder, install_seen_signature_memory_runtime_overrides,

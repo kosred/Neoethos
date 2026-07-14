@@ -2767,36 +2767,36 @@ where
     // symbols would inherit the first symbol's ladder. The operator
     // should disable the feature for production multi-symbol sweeps
     // until F-277b adds per-symbol installation (deferred).
+    // F-277 + audit D06: install THIS run's adaptive ladder, or clear back to
+    // the static one, so no previous symbol's ladder leaks into this run (the
+    // batch orchestrator runs many symbols in one process). Runs are
+    // sequential (discovery is single-instance), so a per-run replace is safe.
     if config.adaptive_thresholds {
         if let Some(ladder) =
             crate::genetic::derive_adaptive_threshold_ladder_from_features(&features)
         {
-            match crate::genetic::install_adaptive_threshold_ladder(ladder) {
-                Ok(_) => tracing::info!(
-                    target: "neoethos_search::discovery",
-                    p10 = ladder[0],
-                    p25 = ladder[1],
-                    p50 = ladder[2],
-                    p75 = ladder[3],
-                    p90 = ladder[4],
-                    p99 = ladder[5],
-                    "F-277: installed adaptive threshold ladder from feature cube"
-                ),
-                Err(existing) => tracing::warn!(
-                    target: "neoethos_search::discovery",
-                    new = ?ladder,
-                    existing = ?existing,
-                    "F-277: adaptive ladder already installed (first-run wins). \
-                     Restart the process for a different symbol's ladder."
-                ),
-            }
+            crate::genetic::install_adaptive_threshold_ladder(ladder);
+            tracing::info!(
+                target: "neoethos_search::discovery",
+                p10 = ladder[0],
+                p25 = ladder[1],
+                p50 = ladder[2],
+                p75 = ladder[3],
+                p90 = ladder[4],
+                p99 = ladder[5],
+                "F-277: installed adaptive threshold ladder from this run's feature cube"
+            );
         } else {
+            crate::genetic::clear_adaptive_threshold_ladder();
             tracing::warn!(
                 target: "neoethos_search::discovery",
                 "F-277: adaptive ladder derivation returned None (degenerate \
                  feature cube: empty or zero-variance). Falling back to static ladder."
             );
         }
+    } else {
+        // Adaptive off for this run — ensure a prior run's ladder is gone.
+        crate::genetic::clear_adaptive_threshold_ladder();
     }
 
     // F-096 pre-flight: refuse to run with insufficient history per
