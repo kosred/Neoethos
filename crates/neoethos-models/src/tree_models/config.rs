@@ -198,15 +198,22 @@ pub fn cpu_threads_hint_for(_model_name: &str) -> usize {
     // config-driven CPU budget via cpu_threads_hint() (v0.4.36
     // config-consolidation).
     //
-    // Thread-oversubscription fix (Fable's pending task #9, 2026-07-13): the
-    // parallel trainer runs up to `budget` models AT ONCE, and each tree
+    // Thread-oversubscription fix (Fable's pending task #9): the parallel
+    // trainer runs up to `budget` (cores-1) models AT ONCE, and each tree
     // model (xgboost/lightgbm/catboost) reads THIS hint for its OWN internal
-    // thread pool — so without dividing, K concurrent models × budget
-    // threads = budget² threads thrashing on `budget` cores (25 threads on a
-    // 6-core box). Divide the budget by how many models run concurrently so
-    // the product stays ≈ budget. Floored at 1 and never above the budget,
-    // so it can only REDUCE oversubscription, never add it.
-    (cpu_threads_hint() / training_concurrency()).max(1)
+    // pool — so without coordination, K concurrent models each grabbing the
+    // full budget = up to cores² threads thrashing on `cores` cores (25 on a
+    // 6-core box).
+    //
+    // Operator directive (2026-07-14): the AGGREGATE thread count across all
+    // concurrently-training models should be ~2×cores — a HEALTHY mild
+    // oversubscription that keeps cores busy across I/O / allocation stalls —
+    // NOT cores² (thrash) and NOT an over-tight 1-thread-per-model
+    // serialization. So each concurrent model gets (2×cores)/concurrency
+    // threads; with the usual cores-1 concurrency that's ~2 threads/model for
+    // a ~2×cores total, and a lone model gets the full 2×cores.
+    let target_total = num_cpus::get().saturating_mul(2).max(1);
+    (target_total / training_concurrency()).max(1)
 }
 
 pub fn gpu_count() -> usize {
@@ -460,25 +467,36 @@ pub fn cpu_threads_from_params(params: &HashMap<String, ParamValue>, default: us
 #[cfg(test)]
 mod tests {
     use super::parse_device_preference;
-    use super::{TrainingConcurrencyGuard, cpu_threads_hint, cpu_threads_hint_for};
+    use super::{TrainingConcurrencyGuard, cpu_threads_hint_for};
 
     #[test]
-    fn per_model_threads_divide_by_concurrency_and_restore() {
-        // Thread-oversubscription fix: with K models running concurrently,
-        // each tree model must get budget/K threads (never the full budget),
-        // and the guard must restore the single-model default on drop.
-        let base = cpu_threads_hint();
-        assert_eq!(cpu_threads_hint_for("xgboost"), base, "lone model gets full budget");
+    fn per_model_threads_target_two_x_cores_aggregate_and_restore() {
+        // Operator directive: the aggregate across K concurrent models is
+        // ~2×cores (not cores², not 1-per-model). Each model gets
+        // (2×cores)/K threads; a lone model gets the full 2×cores; the guard
+        // restores the single-model default on drop.
+        let target_total = num_cpus::get().saturating_mul(2).max(1);
+        assert_eq!(
+            cpu_threads_hint_for("xgboost"),
+            target_total,
+            "lone model gets the full 2x-cores budget"
+        );
         {
-            let _g = TrainingConcurrencyGuard::new(3);
-            let throttled = cpu_threads_hint_for("xgboost");
-            assert_eq!(throttled, (base / 3).max(1));
-            assert!(throttled <= base, "throttle can only reduce, never add");
-            assert!(throttled >= 1, "at least one thread per model");
+            let k = 3;
+            let _g = TrainingConcurrencyGuard::new(k);
+            let per_model = cpu_threads_hint_for("xgboost");
+            assert_eq!(per_model, (target_total / k).max(1));
+            // Aggregate stays near 2×cores — never the cores² thrash.
+            assert!(
+                per_model * k <= target_total + k,
+                "aggregate {} must stay near 2x-cores ({target_total})",
+                per_model * k
+            );
+            assert!(per_model >= 1, "at least one thread per model");
         }
         assert_eq!(
             cpu_threads_hint_for("xgboost"),
-            base,
+            target_total,
             "budget restored after the guard drops"
         );
     }
