@@ -1117,7 +1117,29 @@ impl TrainingOrchestrator {
             *score_map.entry(name).or_insert(0.0) += score.max(0.0);
         }
 
-        if self.settings.models.l1_feature_selection_per_regime {
+        // Audit B08 (2026-07-13): `derive_regime_buckets` maps each sampled
+        // frame row to `base_ohlcv[sample_start + local_idx]` by POSITION.
+        // That is only correct when the feature frame is 1:1 aligned with the
+        // raw OHLCV — but `apply_base_signal_filter` + `drop_nonfinite_rows`
+        // upstream DROP rows (filter_to_base_signal defaults on), so the frame
+        // is usually shorter and the positional map points at the WRONG bar,
+        // silently mislabeling every regime bucket. Until row identity is
+        // carried through the filters (follow-up), only run the per-regime
+        // selection when the frame is provably 1:1 with the OHLCV; otherwise
+        // fall back to the (correct) global L1 selection with a warning rather
+        // than bucket on misaligned regimes.
+        let frame_aligned_with_ohlcv = frame.height() == base_ohlcv.close.len();
+        if self.settings.models.l1_feature_selection_per_regime && !frame_aligned_with_ohlcv {
+            tracing::warn!(
+                target: "neoethos_models::training_orchestrator",
+                frame_rows = frame.height(),
+                ohlcv_rows = base_ohlcv.close.len(),
+                "per-regime L1 feature selection skipped: feature frame is not 1:1 with \
+                 the OHLCV (rows were dropped upstream), so positional regime labels would \
+                 be misaligned. Using global L1 selection instead (audit B08)."
+            );
+        }
+        if self.settings.models.l1_feature_selection_per_regime && frame_aligned_with_ohlcv {
             let (trend_rows, range_rows, neutral_rows) =
                 self.derive_regime_buckets(base_ohlcv, sample_start, sampled_frame.height());
 
