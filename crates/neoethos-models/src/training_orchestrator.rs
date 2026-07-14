@@ -3703,13 +3703,26 @@ fn optimize_model_config_cpcv(
             }
         }
 
-        if fold_scores.is_empty() {
+        // Audit B09 (2026-07-13): require EVERY planned fold to complete. The
+        // fold loop `break`s on the first failure, but any folds that had
+        // already succeeded left a NON-empty `fold_scores` that was then
+        // scored — so a candidate that failed a later (typically harder) fold
+        // could still win on its lucky early folds, with metrics taken from
+        // just the first fold. Incomplete CPCV coverage is now a rejection,
+        // not a partial score.
+        if fold_scores.len() != splits.len() {
             trials.push(OptimizationTrialRecord {
                 index: trial_idx,
                 backend: backend.to_string(),
                 params: candidate_params,
                 metrics: None,
-                error: fold_error.or_else(|| Some("no CPCV folds completed".to_string())),
+                error: fold_error.or_else(|| {
+                    Some(format!(
+                        "CPCV incomplete: only {}/{} folds completed",
+                        fold_scores.len(),
+                        splits.len()
+                    ))
+                }),
                 selected: false,
             });
             continue;
