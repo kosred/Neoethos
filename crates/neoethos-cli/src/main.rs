@@ -1814,14 +1814,19 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
             "--out".to_string(),
             format!("cache/auto_loop/{}_{}.json", sym, tf),
         ];
-        match cmd_discover(&discover_args) {
-            Ok(()) => println!("  discover OK"),
+        let discover_ok = match cmd_discover(&discover_args) {
+            Ok(()) => {
+                println!("  discover OK");
+                true
+            }
             Err(err) => {
                 eprintln!("  discover FAILED: {err:#}");
                 // Continue to next; don't bail the whole loop.
+                false
             }
-        }
+        };
 
+        let mut train_ok = true;
         if !skip_training {
             // NEOETHOS_BOT_DATA_ROOT was set at the top of `cmd_auto_loop`
             // before any thread spawned; cmd_train reads it via
@@ -1837,11 +1842,27 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
             ];
             match cmd_train(&train_args) {
                 Ok(()) => println!("  train OK"),
-                Err(err) => eprintln!("  train FAILED: {err:#}"),
+                Err(err) => {
+                    eprintln!("  train FAILED: {err:#}");
+                    train_ok = false;
+                }
             }
         }
 
-        completed.push((sym.clone(), tf.clone()));
+        // Audit B14 (2026-07-13): mark this combo COMPLETE only when its
+        // stages actually succeeded, so `--resume` RETRIES failed work rather
+        // than silently skipping it. Previously `completed.push` ran
+        // unconditionally, so a transient discovery/training failure (OOM, bad
+        // data, a crash mid-run) was checkpointed as "done" and the user
+        // permanently lost those strategies on resume.
+        if discover_ok && train_ok {
+            completed.push((sym.clone(), tf.clone()));
+        } else {
+            eprintln!(
+                "  [{sym} {tf}] NOT marked complete (discover_ok={discover_ok}, \
+                 train_ok={train_ok}) — will retry on --resume"
+            );
+        }
         let checkpoint = AutoLoopCheckpoint {
             started_at: completed
                 .first()
