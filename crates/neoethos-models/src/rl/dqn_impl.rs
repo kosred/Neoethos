@@ -320,26 +320,25 @@ fn resolve_rl_training_precision_with_capability(
         && (effective_device_policy.starts_with("cuda:")
             || effective_device_policy.starts_with("gpu:"));
     let rlkit_cpu_runtime = effective_backend == "rlkit_cpu" && effective_device_policy == "cpu";
-    // rlkit 0.0.3's candle backend has NO BF16 matmul kernel on either the CPU
-    // or the CUDA device — empirically every BF16 run dies with
-    // "unsupported dtype BF16 for op matmul" (the A6000 supports BF16 in
-    // hardware, but the candle *kernel* doesn't implement it). So BF16 is never
-    // actually runnable for the DQN: force fp32 regardless of the nominal
-    // device capability. fp32 is perfectly fine for a small Q-network. The
-    // `bf16_supported` probe + runtime flags are still consulted below to build
-    // an honest degraded-reason string.
-    let bf16_available = false;
+    // FP32 is the ONE supported RL training precision (audit B11 / operator
+    // directive 2026-07-14: "since bf16 has a failure, go to the safe and
+    // well-known"). rlkit 0.0.3's candle backend has NO BF16 matmul kernel on
+    // either CPU or CUDA — every BF16 run dies with "unsupported dtype BF16
+    // for op matmul" (the A6000 supports BF16 in hardware, but the candle
+    // *kernel* does not implement it). FP32 is perfectly fine for a small
+    // Q-network. The `bf16_supported` probe + runtime flags are consulted only
+    // to build an honest degraded-reason string; they never enable BF16.
     let _ = bf16_supported;
 
-    match requested.as_str() {
-        "auto" if bf16_available => return ("bf16".to_string(), None),
-        "auto" | "fp32" => return ("fp32".to_string(), None),
-        "bf16" if bf16_available => return ("bf16".to_string(), None),
-        _ => {}
+    // fp32 (and auto, which selects the sole supported precision) are honored
+    // directly with no degradation.
+    if matches!(requested.as_str(), "auto" | "fp32") {
+        return ("fp32".to_string(), None);
     }
 
+    // Every other request (bf16 / fp8 / bf4 / unknown) is not runnable →
+    // resolve to fp32 and record WHY, so the telemetry is honest.
     let mut reasons = vec![format!("requested_rl_precision_unavailable({requested})")];
-
     match requested.as_str() {
         "bf16" => {
             if !(rlkit_cuda_runtime || rlkit_cpu_runtime) {
@@ -357,9 +356,7 @@ fn resolve_rl_training_precision_with_capability(
             }
         }
         "fp8" | "bf4" => {
-            let degraded_to = if bf16_available { "bf16" } else { "fp32" };
-            reasons.push(format!("rl_precision_degraded_to_{degraded_to}"));
-            return (degraded_to.to_string(), Some(reasons.join("; ")));
+            reasons.push("rl_precision_degraded_to_fp32".to_string());
         }
         _ => {}
     }

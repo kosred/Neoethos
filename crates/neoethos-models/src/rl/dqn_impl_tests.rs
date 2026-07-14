@@ -12,6 +12,14 @@ use ndarray::{Array1, Array2};
 use polars::prelude::NamedFrom;
 use std::path::PathBuf;
 
+/// Serializes the tests that read or mutate the process-global
+/// `NEOETHOS_BOT_DQN_TRAIN_PRECISION` env var. Rust runs tests in parallel
+/// threads of ONE process, so a test that sets the var was leaking bf16 into
+/// concurrently-running tests that assert the DEFAULT degraded reason. Every
+/// test that calls `runtime_backend_details()` (which reads that env at call
+/// time) holds this lock so they never observe each other's mutation.
+static PRECISION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -395,6 +403,7 @@ fn quadratic_fallback_basis_appends_squared_terms() {
 
 #[test]
 fn runtime_backend_details_reflect_quadratic_fallback_basis() {
+    let _env = PRECISION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut learner = TradingReinforcementLearner::new();
     learner.train_args.effective_backend = Some("quadratic_q_cpu".to_string());
     learner.train_args.fallback_basis = TradingFallbackBasis::Quadratic;
@@ -408,6 +417,7 @@ fn runtime_backend_details_reflect_quadratic_fallback_basis() {
 
 #[test]
 fn runtime_backend_details_explain_requested_gpu_fallback_to_cpu() {
+    let _env = PRECISION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut learner = TradingReinforcementLearner::new();
     learner.train_args.requested_backend = Some("rlkit".to_string());
     learner.train_args.requested_device_policy = Some("cuda:0".to_string());
@@ -427,6 +437,7 @@ fn runtime_backend_details_explain_requested_gpu_fallback_to_cpu() {
 
 #[test]
 fn runtime_backend_details_explain_requested_precision_when_unavailable() {
+    let _env = PRECISION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         std::env::set_var("NEOETHOS_BOT_DQN_TRAIN_PRECISION", "bf16");
     }
@@ -442,7 +453,10 @@ fn runtime_backend_details_explain_requested_precision_when_unavailable() {
 }
 
 #[test]
-fn rl_precision_resolution_uses_bf16_on_supported_cuda_runtime() {
+fn rl_precision_resolution_bf16_request_degrades_to_fp32_on_cuda_runtime() {
+    // FP32 is the sole supported RL precision (rlkit has no BF16 matmul
+    // kernel), so even a bf16 request on a bf16-capable CUDA device resolves
+    // to fp32 — with an honest reason rather than silently claiming bf16.
     let (effective_precision, degraded_reason) = resolve_rl_training_precision_with_capability(
         Some("bf16"),
         "rlkit_cuda",
@@ -450,17 +464,19 @@ fn rl_precision_resolution_uses_bf16_on_supported_cuda_runtime() {
         Some(true),
     );
 
-    assert_eq!(effective_precision, "bf16");
-    assert!(degraded_reason.is_none());
+    assert_eq!(effective_precision, "fp32");
+    let degraded_reason = degraded_reason.expect("bf16 request must record a degrade reason");
+    assert!(degraded_reason.contains("requested_rl_precision_unavailable(bf16)"));
 }
 
 #[test]
-fn rl_precision_resolution_uses_bf16_on_cpu_runtime() {
+fn rl_precision_resolution_bf16_request_degrades_to_fp32_on_cpu_runtime() {
     let (effective_precision, degraded_reason) =
         resolve_rl_training_precision_with_capability(Some("bf16"), "rlkit_cpu", "cpu", Some(true));
 
-    assert_eq!(effective_precision, "bf16");
-    assert!(degraded_reason.is_none());
+    assert_eq!(effective_precision, "fp32");
+    let degraded_reason = degraded_reason.expect("bf16 request must record a degrade reason");
+    assert!(degraded_reason.contains("requested_rl_precision_unavailable(bf16)"));
 }
 
 #[test]
@@ -475,7 +491,8 @@ fn rl_precision_resolution_explains_cpu_backend_limit() {
 }
 
 #[test]
-fn rl_precision_resolution_degrades_lower_precision_requests_to_bf16_when_available() {
+fn rl_precision_resolution_degrades_lower_precision_requests_to_fp32() {
+    // fp8/bf4 requests also resolve to the sole supported precision, fp32.
     let (effective_precision, degraded_reason) = resolve_rl_training_precision_with_capability(
         Some("fp8"),
         "rlkit_cuda",
@@ -483,10 +500,10 @@ fn rl_precision_resolution_degrades_lower_precision_requests_to_bf16_when_availa
         Some(true),
     );
 
-    assert_eq!(effective_precision, "bf16");
+    assert_eq!(effective_precision, "fp32");
     let degraded_reason = degraded_reason.expect("fp8 request should degrade");
     assert!(degraded_reason.contains("requested_rl_precision_unavailable(fp8)"));
-    assert!(degraded_reason.contains("rl_precision_degraded_to_bf16"));
+    assert!(degraded_reason.contains("rl_precision_degraded_to_fp32"));
 }
 
 #[test]
@@ -844,6 +861,7 @@ fn validate_artifact_rejects_zero_training_parameters() {
 
 #[test]
 fn runtime_backend_details_include_missing_training_report_for_trained_state() {
+    let _env = PRECISION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut learner = TradingReinforcementLearner::default();
     learner.train_args.train_rows = 128;
     learner.train_args.effective_backend = Some("quadratic_q_cpu".to_string());
