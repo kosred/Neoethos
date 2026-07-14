@@ -3,6 +3,42 @@
 /// Institutional-grade statistical features for regime detection,
 /// market microstructure analysis, and alpha generation.
 use super::super::Ohlcv;
+use super::timestamps::infer_timestamp_unit;
+
+/// Bars per trading day, derived from the actual timestamp spacing (audit
+/// D04). The "previous day / previous week" levels used a hardcoded 24 / 120
+/// bars — correct ONLY on H1 (24×H1 = 1 day). On M1 that "day" was 24
+/// minutes, on M5 two hours, on D1 twenty-four days — so the feature meant
+/// something different on every timeframe. Deriving the count from the median
+/// bar period (unit-agnostic, like the resample/alignment fixes) makes
+/// "previous day" actually one day on ANY timeframe. Falls back to 24 (the
+/// old H1 assumption) only when timestamps are missing/degenerate.
+fn bars_per_day(ohlcv: &Ohlcv, n: usize) -> usize {
+    const FALLBACK_H1_BARS_PER_DAY: usize = 24;
+    let Some(ts) = ohlcv.timestamp.as_deref() else {
+        return FALLBACK_H1_BARS_PER_DAY;
+    };
+    if ts.len() < 2 {
+        return FALLBACK_H1_BARS_PER_DAY;
+    }
+    let Some(unit) = infer_timestamp_unit(ts) else {
+        return FALLBACK_H1_BARS_PER_DAY;
+    };
+    // Median positive spacing = the bar period, in native units.
+    let mut steps: Vec<i64> = ts.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0).collect();
+    if steps.is_empty() {
+        return FALLBACK_H1_BARS_PER_DAY;
+    }
+    let mid = steps.len() / 2;
+    steps.select_nth_unstable(mid);
+    let step_ms = steps[mid].saturating_mul(unit.scale_to_millis());
+    if step_ms <= 0 {
+        return FALLBACK_H1_BARS_PER_DAY;
+    }
+    // One day = 86_400_000 ms. Round to nearest bar, clamp to [1, n].
+    let per_day = ((86_400_000_f64 / step_ms as f64).round() as i64).max(1) as usize;
+    per_day.clamp(1, n.max(1))
+}
 
 /// Compute advanced quantitative features for the genetic discovery engine.
 pub fn compute_quant_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
@@ -415,10 +451,11 @@ pub fn compute_quant_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
     // 19. Previous Day/Week High & Low Distance (normalized)
     // ==========================================
     {
-        // Rolling 24-bar high/low (proxy for previous day on H1)
+        // Previous-day high/low: one actual trading day of bars on ANY
+        // timeframe (audit D04 — was a hardcoded 24, i.e. H1-only).
         let mut prev_day_h_dist = vec![0.0; n];
         let mut prev_day_l_dist = vec![0.0; n];
-        let period = 24;
+        let period = bars_per_day(ohlcv, n);
         for i in period..n {
             let mut ph = f64::NEG_INFINITY;
             let mut pl = f64::INFINITY;
@@ -437,10 +474,11 @@ pub fn compute_quant_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
         cols.push(("quant_prev_day_h_dist".to_string(), prev_day_h_dist));
         cols.push(("quant_prev_day_l_dist".to_string(), prev_day_l_dist));
 
-        // Weekly (120 bars on H1)
+        // Previous-week high/low: five trading days of bars on ANY
+        // timeframe (audit D04 — was a hardcoded 120, i.e. 5×24 H1-only).
         let mut prev_week_h_dist = vec![0.0; n];
         let mut prev_week_l_dist = vec![0.0; n];
-        let w_period = 120;
+        let w_period = (period.saturating_mul(5)).clamp(1, n.max(1));
         for i in w_period..n {
             let mut ph = f64::NEG_INFINITY;
             let mut pl = f64::INFINITY;
@@ -738,4 +776,51 @@ pub fn compute_quant_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
     }
 
     cols
+}
+
+#[cfg(test)]
+mod d04_tests {
+    use super::*;
+    use crate::Ohlcv;
+
+    fn ohlcv_with_step(step_ms: i64, n: usize) -> Ohlcv {
+        let ts: Vec<i64> = (0..n as i64).map(|i| 1_700_000_000_000 + i * step_ms).collect();
+        Ohlcv {
+            timestamp: Some(ts),
+            open: vec![1.0; n],
+            high: vec![1.0; n],
+            low: vec![1.0; n],
+            close: vec![1.0; n],
+            volume: Some(vec![1.0; n]),
+        }
+    }
+
+    #[test]
+    fn bars_per_day_is_timeframe_aware() {
+        // D04: the "previous day" window must be one actual day of bars on
+        // every timeframe, not a hardcoded 24 (H1-only).
+        let n = 5000;
+        // H1 (3_600_000 ms) → 24 bars/day.
+        assert_eq!(bars_per_day(&ohlcv_with_step(3_600_000, n), n), 24);
+        // M5 (300_000 ms) → 288 bars/day.
+        assert_eq!(bars_per_day(&ohlcv_with_step(300_000, n), n), 288);
+        // M1 (60_000 ms) → 1440 bars/day.
+        assert_eq!(bars_per_day(&ohlcv_with_step(60_000, n), n), 1440);
+        // D1 (86_400_000 ms) → 1 bar/day.
+        assert_eq!(bars_per_day(&ohlcv_with_step(86_400_000, n), n), 1);
+    }
+
+    #[test]
+    fn bars_per_day_falls_back_without_timestamps() {
+        let mut o = ohlcv_with_step(300_000, 100);
+        o.timestamp = None;
+        assert_eq!(bars_per_day(&o, 100), 24, "no timestamps → legacy H1 assumption");
+    }
+
+    #[test]
+    fn bars_per_day_clamped_to_series_length() {
+        // A short D1 series still yields a usable (clamped) window.
+        let o = ohlcv_with_step(86_400_000, 3);
+        assert!(bars_per_day(&o, 3) >= 1);
+    }
 }
