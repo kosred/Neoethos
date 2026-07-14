@@ -2035,7 +2035,11 @@ impl Settings {
     /// Save settings to YAML file
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
         let yaml = serde_yaml_ng::to_string(self)?;
-        std::fs::write(path, yaml)?;
+        // Audit M07: atomic write (temp + fsync + rename) so a crash mid-write
+        // can never leave a truncated config.yaml — a corrupt config is the
+        // known "app won't open" root cause. The previous std::fs::write was
+        // non-atomic.
+        crate::storage::json::write_bytes_atomic(path, yaml.as_bytes())?;
         Ok(())
     }
 }

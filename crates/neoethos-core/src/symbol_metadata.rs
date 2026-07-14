@@ -671,9 +671,6 @@ impl SymbolMetadataTable {
 
     pub fn save_to_disk(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).ok();
-        }
         // Stamp current schema version on every save — defends
         // against in-memory construction paths that forgot to set
         // it. Cloning is cheap since `entries` is references-by-value
@@ -681,7 +678,11 @@ impl SymbolMetadataTable {
         let mut to_write = self.clone();
         to_write.schema_version = SYMBOL_METADATA_SCHEMA_VERSION;
         let text = serde_json::to_string_pretty(&to_write).context("serialize symbol metadata")?;
-        std::fs::write(path, text)
+        // Audit M07: atomic write so a crash can't leave truncated pip/tick
+        // metadata that would mis-size every trade. (write_bytes_atomic keeps
+        // the exact pretty bytes — no trailing-newline churn — and creates
+        // the parent dir itself.)
+        crate::storage::json::write_bytes_atomic(path, text.as_bytes())
             .with_context(|| format!("write symbol metadata to {}", path.display()))
     }
 

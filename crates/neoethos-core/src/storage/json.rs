@@ -12,18 +12,30 @@ pub struct JsonBackupWriteConfig {
 }
 
 pub fn write_json_atomic<T: Serialize + ?Sized>(path: impl AsRef<Path>, value: &T) -> Result<()> {
+    let mut json = serde_json::to_vec_pretty(value).context("serialize artifact")?;
+    json.push(b'\n'); // terminate json artifact
+    write_bytes_atomic(path, &json)
+}
+
+/// Atomically write raw bytes to `path` (audit M07): serialize into a UNIQUE
+/// hidden temp file in the SAME directory, fsync it, then atomically rename
+/// it over the target. A crash at any point leaves either the previous file
+/// intact or the new file complete — never a truncated/partial file. Same-
+/// directory temp guarantees the rename is a same-filesystem atomic op; the
+/// per-call-unique temp name means concurrent writers never clobber each
+/// other's staging file. Use for any canonical on-disk state (config.yaml,
+/// symbol metadata, …) where a half-written file would be corruption.
+pub fn write_bytes_atomic(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
     let path = path.as_ref();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .with_context(|| format!("create artifact directory {}", parent.display()))?;
     let tmp_path = temporary_path(path);
-    let json = serde_json::to_vec_pretty(value).context("serialize artifact")?;
     {
         let mut tmp = File::create(&tmp_path)
             .with_context(|| format!("create temp artifact {}", tmp_path.display()))?;
-        tmp.write_all(&json)
+        tmp.write_all(bytes)
             .with_context(|| format!("write temp artifact {}", tmp_path.display()))?;
-        tmp.write_all(b"\n").context("terminate json artifact")?;
         tmp.sync_all()
             .with_context(|| format!("fsync temp artifact {}", tmp_path.display()))?;
     }
@@ -341,11 +353,16 @@ pub fn read_json<T: DeserializeOwned>(path: impl AsRef<Path>, artifact_label: &s
 }
 
 pub fn temporary_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("artifact.json");
-    path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()))
+    // pid + per-call sequence → unique even for concurrent writers to the
+    // same target within one process (M07), and unique across processes.
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".{file_name}.tmp-{}-{seq}", std::process::id()))
 }
 
 pub fn stable_json_hash<T: Serialize + ?Sized>(value: &T) -> Result<String> {
@@ -398,6 +415,38 @@ mod tests {
                 .starts_with(".artifact.json.tmp-")
         );
         std::fs::remove_dir_all(&dir).expect("cleanup atomic json dir");
+    }
+
+    #[test]
+    fn write_bytes_atomic_round_trips_replaces_and_leaves_no_temp() {
+        let dir = unique_test_dir("bytes");
+        let path = dir.join("state.yaml");
+
+        write_bytes_atomic(&path, b"first: 1\n").expect("write first");
+        assert_eq!(std::fs::read(&path).unwrap(), b"first: 1\n");
+
+        // Replacing overwrites atomically and leaves no staging file behind.
+        write_bytes_atomic(&path, b"second: 2\n").expect("replace");
+        assert_eq!(std::fs::read(&path).unwrap(), b"second: 2\n");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file may linger: {leftovers:?}");
+
+        std::fs::remove_dir_all(&dir).expect("cleanup bytes dir");
+    }
+
+    #[test]
+    fn temporary_path_is_unique_per_call() {
+        // M07: two staging paths for the same target must differ so concurrent
+        // writers never clobber each other's temp file.
+        let target = Path::new("/some/dir/config.yaml");
+        let a = temporary_path(target);
+        let b = temporary_path(target);
+        assert_ne!(a, b, "each call must yield a unique temp path");
+        assert_eq!(a.parent(), target.parent(), "temp must stay in the same dir");
     }
 
     #[test]
