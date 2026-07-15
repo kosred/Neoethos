@@ -50,6 +50,14 @@ mod backend {
             // Mirror main.rs bootstrap, minus the Flutter-supervisor bits.
             // Same default config path the CLI/main.rs use when no override.
             server::state::install_config_path("config.yaml");
+            // Audit S05: install EVERY runtime override from settings, exactly
+            // as the headless main.rs does, via the one shared installer. The
+            // desktop previously installed NONE, so config.yaml runtime knobs
+            // (search population, hardware CPU budget, feature normalization,
+            // tree threads, app-server runtime) were silently ignored here.
+            let settings = neoethos_core::Settings::from_yaml("config.yaml")
+                .unwrap_or_else(|_| neoethos_core::Settings::default());
+            neoethos_app::install_runtime_overrides_from_settings(&settings);
             let state = server::state::AppApiState::new();
             server::state::install_account_refresh_trigger(state.account_refresh_tx_clone());
             server::bridge::spawn(state.clone());

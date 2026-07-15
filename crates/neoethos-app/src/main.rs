@@ -204,16 +204,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let settings = Settings::from_yaml(&args.config)?;
-    // Config-consolidation: search runtime overrides come from the single
-    // config, not the environment (S2a: genetic search; the rest staged).
-    neoethos_search::install_search_runtime_overrides_from_settings(&settings);
-    neoethos_models::tree_models::config::install_tree_runtime_from_settings(&settings);
-    neoethos_core::system::install_hardware_runtime_overrides_from_settings(&settings);
-    neoethos_data::install_data_runtime_overrides(
-        settings.models.data_runtime.normalize_features,
-        settings.models.data_runtime.rebuild_stale_higher_tfs,
-    );
-    app_services::env_overrides::install_app_runtime_overrides(settings.app_runtime.clone());
+    // Config-consolidation (audit S05): every runtime override comes from the
+    // single config via ONE shared installer, so the headless binary and the
+    // Tauri desktop shell resolve identical engine state.
+    neoethos_app::install_runtime_overrides_from_settings(&settings);
     let runtime = AppRuntimeConfig::from_settings(
         args.config.clone(),
         args.local,
