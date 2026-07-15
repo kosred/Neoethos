@@ -27,6 +27,7 @@
 //! Tighten before exposing on non-loopback interfaces.
 
 pub mod account;
+pub mod auth;
 pub mod autonomous;
 pub mod bridge;
 pub mod broker_control;
@@ -411,9 +412,45 @@ pub fn router(state: AppApiState) -> Router {
         .route("/actions/pending", get(pending_actions::list))
         .route("/actions/{id}/confirm", post(pending_actions::confirm))
         .route("/actions/{id}/reject", post(pending_actions::reject))
+        // Audit S01: bearer-token gate. Permissive when no token is installed
+        // (the loopback default — CORS already blocks browsers); enforced when
+        // serve() installs a token (mandatory for a non-loopback bind, or when
+        // the operator sets NEOETHOS_API_TOKEN). Inner to CORS so preflight
+        // still works; `/healthz` stays open (handled inside the middleware).
+        .layer(axum::middleware::from_fn(auth::require_token))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
+}
+
+/// Resolve + install the API auth token for this launch (audit S01), and
+/// FAIL CLOSED on the dangerous case: a non-loopback bind with no operator
+/// token. Returns `Err` to refuse binding; `Ok(())` means the router's
+/// bearer gate is configured (enforcing iff a token was installed).
+fn configure_api_auth(addr: &SocketAddr) -> anyhow::Result<()> {
+    match auth::configured_token() {
+        Some(token) => {
+            auth::set_api_token(token);
+            tracing::info!(
+                target: "neoethos_app::server",
+                "API bearer-token authentication ACTIVE (NEOETHOS_API_TOKEN). \
+                 Requests must send `Authorization: Bearer <token>` (except /healthz)."
+            );
+        }
+        None if !addr.ip().is_loopback() => {
+            anyhow::bail!(
+                "refusing to bind the API to non-loopback {addr} with NO authentication: \
+                 the trading endpoints (place/close orders, broker credentials) would be \
+                 reachable and trade-capable from the network. Set NEOETHOS_API_TOKEN to a \
+                 secret and send `Authorization: Bearer <token>`, or bind to 127.0.0.1."
+            );
+        }
+        None => {
+            // Loopback with no operator token: permissive (unchanged behavior).
+            // The CORS allowlist blocks cross-origin browser access.
+        }
+    }
+    Ok(())
 }
 
 /// **F-527/F-CORE3 closure (2026-05-25)**: the hard-coded fallback bind
@@ -433,6 +470,9 @@ fn default_bind_addr() -> SocketAddr {
 /// bind failed (port already in use, EACCES, etc.).
 pub async fn serve(state: AppApiState) -> anyhow::Result<()> {
     let addr = default_bind_addr();
+    // Audit S01: install auth + fail closed on a non-loopback bind with no
+    // token BEFORE binding the socket.
+    configure_api_auth(&addr)?;
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -485,6 +525,16 @@ pub async fn serve_on(
     state: AppApiState,
 ) -> anyhow::Result<()> {
     let addr = listener.local_addr().ok();
+    // Audit S01: the desktop shell always binds an ephemeral loopback port, so
+    // there is no non-loopback case to fail closed on here; honor an operator
+    // NEOETHOS_API_TOKEN if set (enforcement then applies to this listener too).
+    if let Some(token) = auth::configured_token() {
+        auth::set_api_token(token);
+        tracing::info!(
+            target: "neoethos_app::server",
+            "in-process API bearer-token authentication ACTIVE (NEOETHOS_API_TOKEN)"
+        );
+    }
     listener
         .set_nonblocking(true)
         .context("failed to set the backend listener non-blocking")?;
