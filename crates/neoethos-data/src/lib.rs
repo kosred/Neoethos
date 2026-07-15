@@ -1055,7 +1055,11 @@ fn append_feature_block(
     for c in 0..block.ncols() {
         let mut series: Vec<f32> = block.column(c).to_vec();
         if normalize {
-            crate::core::normalization::normalize_feature_series_in_place(&mut series);
+            // D09: fit robust-z stats on the training prefix, not the full
+            // series, so the OOS tail is not leaked into and the values stay
+            // stable under future appends.
+            let fit_rows = crate::core::normalization::norm_fit_rows(series.len());
+            crate::core::normalization::normalize_feature_series_in_place(&mut series, fit_rows);
         }
         writer.append_feature(&series)?;
     }
@@ -1186,9 +1190,11 @@ fn compute_aligned_higher_block(
 /// matching the per-series normalisation `append_feature_block` applies on the
 /// streaming path so the two cube layouts stay identical.
 fn normalize_block_columns(block: &mut Array2<f32>) {
+    let fit_rows = crate::core::normalization::norm_fit_rows(block.nrows());
     for mut col in block.columns_mut() {
         let mut series: Vec<f32> = col.to_vec();
-        crate::core::normalization::normalize_feature_series_in_place(&mut series);
+        // D09: fit stats on the training prefix (see append_feature_block).
+        crate::core::normalization::normalize_feature_series_in_place(&mut series, fit_rows);
         for (dst, src) in col.iter_mut().zip(series) {
             *dst = src;
         }

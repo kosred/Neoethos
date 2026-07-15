@@ -53,11 +53,12 @@ pub fn normalize_feature_matrix(data: &mut Array2<f32>) -> Vec<(f32, f32)> {
     // feature series *before* writing it to the mmap store) is bit-identical
     // to normalising the assembled in-RAM matrix here.
     let mut scratch = vec![0.0_f32; n_rows];
+    let fit_rows = norm_fit_rows(n_rows);
     for c in 0..n_cols {
         for r in 0..n_rows {
             scratch[r] = data[(r, c)];
         }
-        let (median, scale) = normalize_feature_series_in_place(&mut scratch);
+        let (median, scale) = normalize_feature_series_in_place(&mut scratch, fit_rows);
         for r in 0..n_rows {
             data[(r, c)] = scratch[r];
         }
@@ -76,8 +77,39 @@ pub fn normalize_feature_matrix(data: &mut Array2<f32>) -> Vec<(f32, f32)> {
 /// NaN / Inf cells become `0.0`; finite survivors are `(x - median) / scale`
 /// (`scale = MAD * 1.4826`, floored at `1e-9`) clipped to `±Z_CLIP`. Returns
 /// the `(median, scale)` used.
-pub fn normalize_feature_series_in_place(series: &mut [f32]) -> (f32, f32) {
-    let mut finite: Vec<f32> = series.iter().copied().filter(|v| v.is_finite()).collect();
+/// Fraction of the series (leading rows) whose statistics the robust z-score
+/// is FIT on (audit D09). Fitting on the FULL series let each row's median/MAD
+/// depend on FUTURE rows — lookahead — and historical normalized values
+/// changed whenever new bars were appended. Fitting on the training prefix and
+/// applying those immutable stats to the whole series makes the out-of-sample
+/// tail leakage-free and the whole series stable under appends. 0.8 matches the
+/// discovery 80/20 holdout.
+pub const NORM_FIT_FRACTION: f64 = 0.8;
+
+/// Number of leading rows to fit normalization stats on. Small series
+/// (<= 128 rows) fit on all of themselves so the median/MAD stay meaningful.
+pub fn norm_fit_rows(n_rows: usize) -> usize {
+    if n_rows <= 128 {
+        return n_rows;
+    }
+    (((n_rows as f64) * NORM_FIT_FRACTION) as usize).clamp(128, n_rows)
+}
+
+/// Robust z-score one feature series IN PLACE, fitting the median/MAD on the
+/// first `fit_rows` rows only (audit D09) and applying them to the whole
+/// series. `fit_rows == 0` (or `>= len`) fits on the full series — the legacy
+/// behavior, kept for callers that genuinely have only training data.
+pub fn normalize_feature_series_in_place(series: &mut [f32], fit_rows: usize) -> (f32, f32) {
+    let fit_end = if fit_rows == 0 || fit_rows > series.len() {
+        series.len()
+    } else {
+        fit_rows
+    };
+    let mut finite: Vec<f32> = series[..fit_end]
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
     let (median, scale) = if finite.is_empty() {
         (0.0_f32, 1.0_f32)
     } else {
@@ -195,6 +227,39 @@ mod tests {
             unique.len() >= 1,
             "binary col should still have distinct values"
         );
+    }
+
+    #[test]
+    fn normalization_fits_on_prefix_and_ignores_the_future_tail() {
+        // Audit D09: robust-z stats must come from the TRAINING PREFIX, so
+        // out-of-sample rows cannot leak their own values into median/scale.
+        // Prefix = a clean 0..800 ramp; tail = 200 extreme 1e9 outliers.
+        let mut series: Vec<f32> = (0..800).map(|i| i as f32).collect();
+        series.extend(std::iter::repeat_n(1.0e9_f32, 200)); // future tail
+
+        // Fit on the first 800 rows only → tail is invisible to the fit.
+        let (median, _scale) = normalize_feature_series_in_place(&mut series, 800);
+        assert!(
+            (median - 400.0).abs() < 1.0,
+            "median must be the prefix median (~400), not pulled by the 1e9 tail; got {median}"
+        );
+
+        // A full-series fit (fit_rows = 0) sees the outliers → materially
+        // different stats: proves the prefix guard actually changed behavior.
+        let mut full: Vec<f32> = (0..800).map(|i| i as f32).collect();
+        full.extend(std::iter::repeat_n(1.0e9_f32, 200));
+        let (full_median, _) = normalize_feature_series_in_place(&mut full, 0);
+        assert!(
+            (full_median - median).abs() > 50.0,
+            "full-series fit ({full_median}) must differ from prefix fit ({median})"
+        );
+    }
+
+    #[test]
+    fn norm_fit_rows_is_prefix_for_large_series_and_full_for_small() {
+        assert_eq!(norm_fit_rows(1000), 800, "80% of a large series");
+        assert_eq!(norm_fit_rows(100), 100, "small series fit on all of itself");
+        assert_eq!(norm_fit_rows(0), 0);
     }
 
     #[test]
