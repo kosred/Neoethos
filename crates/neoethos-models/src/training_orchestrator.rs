@@ -3836,6 +3836,23 @@ fn optimize_model_config(
     let Some((train_frame, train_labels, val_frame, val_labels)) =
         time_series_holdout_split(&hpo_frame, &hpo_labels, holdout_pct, embargo_rows, 256, 64)?
     else {
+        // Audit B10: the no-HPO small-data path used to emit `trials: vec![]`
+        // with no selected trial — a structurally INVALID report
+        // (validate_optimization_report requires >=1 trial and exactly one
+        // selected). Emit a VALID single base-params trial instead, marked
+        // selected, so the report round-trips and honestly records that HPO
+        // was skipped for lack of data.
+        let base_trial = OptimizationTrialRecord {
+            index: 0,
+            backend: backend.clone(),
+            params: base_params.clone(),
+            metrics: None,
+            error: Some(
+                "dataset too small for holdout-driven HPO; base params used without validation"
+                    .to_string(),
+            ),
+            selected: true,
+        };
         let report = OptimizationReport {
             model_name: config.name.clone(),
             capability_family: config.capability_family,
@@ -3852,7 +3869,7 @@ fn optimize_model_config(
             row_budget_applied,
             hpo_rows_applied,
             notes: vec!["dataset too small for holdout-driven HPO; using base params".to_string()],
-            trials: vec![],
+            trials: vec![base_trial],
         };
         return Ok((base_params, report));
     };

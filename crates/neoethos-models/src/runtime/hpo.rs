@@ -325,6 +325,42 @@ mod tests {
     }
 
     #[test]
+    fn optimization_report_rejects_empty_trials() {
+        // Audit B10: the old small-data path emitted trials: vec![] — a
+        // structurally invalid report. Confirm validation rejects it, so a
+        // regression can't silently ship one again.
+        let mut report = sample_report();
+        report.trials = vec![];
+        report.trials_completed = 0;
+        report.selected_trial_index = 0;
+        let err = validate_optimization_report(&report)
+            .expect_err("empty trials must fail")
+            .to_string();
+        assert!(err.contains("at least one trial"), "got: {err}");
+    }
+
+    #[test]
+    fn optimization_report_no_hpo_single_base_trial_is_valid() {
+        // The B10 replacement shape: one selected base trial with no metrics
+        // (HPO skipped for lack of data) must be a VALID report.
+        let report = OptimizationReport {
+            trials_completed: 0,
+            selected_trial_index: 0,
+            selected_metrics: None,
+            trials: vec![OptimizationTrialRecord {
+                index: 0,
+                backend: "lightgbm".to_string(),
+                params: HashMap::new(),
+                metrics: None,
+                error: Some("dataset too small for holdout-driven HPO".to_string()),
+                selected: true,
+            }],
+            ..sample_report()
+        };
+        validate_optimization_report(&report).expect("no-HPO base-trial report must be valid");
+    }
+
+    #[test]
     fn optimization_report_rejects_blank_backend() {
         let mut report = sample_report();
         report.backend = " ".to_string();
