@@ -1,6 +1,6 @@
 [package]
 name = "neoethos-codex"
-version = "0.5.3"
+version = "0.5.4"
 edition.workspace = true
 description = "ChatGPT Plus/Pro OAuth fallback for NeoEthos — uses the OpenAI Codex CLI's PKCE flow."
 license = "AGPL-3.0-or-later"

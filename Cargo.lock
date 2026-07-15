@@ -7320,7 +7320,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-app"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -7373,7 +7373,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-cli"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7392,7 +7392,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-codex"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7411,7 +7411,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-core"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7436,7 +7436,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-data"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7461,7 +7461,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-desktop"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "log",
@@ -7479,7 +7479,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-models"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "burn",
@@ -7527,7 +7527,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-search"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7551,7 +7551,7 @@ dependencies = [
 
 [[package]]
 name = "neoethos-trader"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "chrono",
