@@ -5,6 +5,33 @@ use crate::contracts::CANONICAL_TIMEFRAMES;
 use crate::domain::prop_firm::{PropFirmConstraints, PropFirmPreset, PropFirmRuntimeDefaults};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Serialize a `HashMap` in SORTED key order (audit M06/M07 follow-up).
+/// HashMap iteration order is randomized per process, so `Settings::save`
+/// reshuffled these config maps on every write — dirtying config.yaml in git
+/// with no real change. Sorting on serialize makes two saves of equivalent
+/// settings byte-identical. Lookup semantics (the public API) are unchanged.
+fn serialize_sorted_map<S, V>(map: &HashMap<String, V>, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    V: Serialize,
+{
+    let sorted: std::collections::BTreeMap<&String, &V> = map.iter().collect();
+    serde::Serialize::serialize(&sorted, ser)
+}
+
+/// Sorted serialization for a nested map (both levels ordered).
+fn serialize_sorted_nested_map<S>(
+    map: &HashMap<String, HashMap<String, String>>,
+    ser: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let sorted: std::collections::BTreeMap<&String, std::collections::BTreeMap<&String, &String>> =
+        map.iter().map(|(k, v)| (k, v.iter().collect())).collect();
+    serde::Serialize::serialize(&sorted, ser)
+}
 use std::path::PathBuf;
 
 /// Public, no-API-key financial NEWS RSS feeds for the AI news desk
@@ -473,6 +500,7 @@ pub struct ModelsConfig {
     pub prop_search_generations: usize,
     pub prop_search_max_hours: f64,
     pub prop_search_max_rows: usize,
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub prop_search_max_rows_by_tf: HashMap<String, usize>,
     pub prop_search_portfolio_size: usize,
     pub prop_search_max_indicators: usize,
@@ -575,8 +603,10 @@ pub struct ModelsConfig {
     pub swarm_latency_ms: usize,
     pub hpo_backend: String,
     pub hpo_trials: usize,
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub hpo_trials_by_model: HashMap<String, usize>,
     pub hpo_max_rows: usize,
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub max_epochs_by_model: HashMap<String, usize>,
     pub ray_tune_max_concurrency: usize,
     pub export_onnx: bool,
@@ -593,6 +623,7 @@ pub struct ModelsConfig {
     /// silently; the operator flips this knowingly. Fail-soft: any
     /// ensemble error on a bar falls back to gene-only sizing, loudly.
     pub live_ml_gate: bool,
+    #[serde(serialize_with = "serialize_sorted_nested_map")]
     pub model_param_overrides: HashMap<String, HashMap<String, String>>,
     pub regime_router_enabled: bool,
     pub regime_router_min_models: usize,
@@ -2048,6 +2079,44 @@ impl Settings {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn config_maps_serialize_in_sorted_deterministic_order() {
+        // M06/M07 follow-up: HashMap config fields must serialize in sorted
+        // key order so Settings::save doesn't reshuffle config.yaml on every
+        // write. Insert keys out of order and confirm two serializations
+        // match and the keys come out sorted.
+        let mut s = Settings::default();
+        for (k, v) in [("H4", 3usize), ("M1", 1), ("D1", 5), ("M5", 2)] {
+            s.models.hpo_trials_by_model.insert(k.to_string(), v);
+            s.models.prop_search_max_rows_by_tf.insert(k.to_string(), v);
+        }
+        s.models
+            .model_param_overrides
+            .insert("zeta".to_string(), HashMap::from([("b".to_string(), "1".to_string())]));
+        s.models
+            .model_param_overrides
+            .insert("alpha".to_string(), HashMap::from([("a".to_string(), "0".to_string())]));
+
+        let a = serde_yaml_ng::to_string(&s).unwrap();
+        let b = serde_yaml_ng::to_string(&s).unwrap();
+        assert_eq!(a, b, "two serializations must be byte-identical");
+
+        // hpo_trials_by_model keys appear in sorted order.
+        let positions: Vec<usize> = ["D1", "H4", "M1", "M5"]
+            .iter()
+            .map(|k| {
+                a.find(&format!("{k}:"))
+                    .unwrap_or_else(|| panic!("key {k} present"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "hpo_trials_by_model keys must be sorted"
+        );
+        // Nested override keys sorted too.
+        assert!(a.find("alpha:").unwrap() < a.find("zeta:").unwrap());
+    }
 
     #[test]
     fn test_default_settings() {
