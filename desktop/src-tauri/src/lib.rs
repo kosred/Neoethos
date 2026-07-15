@@ -104,20 +104,41 @@ mod mcp_sidecar {
         } else {
             "neoethos-mcp"
         };
-        let exe = std::env::var("NEOETHOS_MCP_PATH")
+        // Search every place the bundler might have put the sidecar, in
+        // priority order, so it is found regardless of how the installer laid
+        // it out (audit follow-up: a locally-built 0.5.3 packaged before the
+        // sidecar finished building shipped without it beside the exe).
+        let mut checked: Vec<std::path::PathBuf> = Vec::new();
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(p) = std::env::var("NEOETHOS_MCP_PATH")
             .ok()
             .map(std::path::PathBuf::from)
-            .filter(|p| p.exists())
-            .or_else(|| {
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join(bin_name)))
-                    .filter(|p| p.exists())
-            });
+        {
+            candidates.push(p);
+        }
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(dir) = exe_path.parent() {
+                candidates.push(dir.join(bin_name)); // beside the exe
+                candidates.push(dir.join("resources").join(bin_name)); // tauri resources subdir
+            }
+        }
+        let exe = candidates.into_iter().find(|p| {
+            let hit = p.exists();
+            if !hit {
+                checked.push(p.clone());
+            }
+            hit
+        });
         let Some(exe) = exe else {
             eprintln!(
-                "MCP sidecar not found (neoethos-mcp.exe beside the app or NEOETHOS_MCP_PATH) — \
-                 MCP tools unavailable this session"
+                "MCP sidecar binary '{bin_name}' not found — MCP tools unavailable this session. \
+                 Set NEOETHOS_MCP_PATH to its full path, or reinstall from a build that bundles \
+                 it. Checked: {}",
+                checked
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             return;
         };
