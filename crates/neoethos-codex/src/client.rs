@@ -175,6 +175,23 @@ impl CodexClient {
         Ok(new_auth)
     }
 
+    /// Force a token refresh regardless of expiry (audit B15) — used when the
+    /// server rejects the current token with 401 even though our local
+    /// freshness check thought it was valid (revoked server-side, clock skew,
+    /// or expired in the send window).
+    async fn force_refresh(&self, auth: &StoredAuth) -> Result<StoredAuth, CodexError> {
+        let refresh = auth
+            .refresh_token
+            .as_ref()
+            .ok_or(CodexError::NotAuthenticated)?
+            .expose()
+            .to_string();
+        let bundle = refresh_token(&refresh).await?;
+        let new_auth = StoredAuth::from_bundle(bundle);
+        self.store.save(&new_auth)?;
+        Ok(new_auth)
+    }
+
     /// Send a chat request. Returns the parsed response on 2xx, or
     /// `CodexError::ApiCall { status, body }` for anything else.
     /// The caller maps non-2xx into HTTP responses for the UI.
@@ -193,7 +210,7 @@ impl CodexClient {
         &self,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, CodexError> {
-        let auth = self.current_auth().await?;
+        let mut auth = self.current_auth().await?;
 
         // Map ChatCompletion-shaped messages → Responses API shape.
         // Convention used by official Codex CLI: system messages
@@ -227,9 +244,38 @@ impl CodexClient {
         };
 
         let url = format!("{CODEX_API_BASE}/codex/responses");
+        // B15: send, and on a 401 refresh the token ONCE and retry — a token
+        // that expired in the send window or was revoked server-side now
+        // recovers automatically instead of failing the operator's request.
+        // `status()` only borrows the response, so we inspect it for the retry
+        // decision and still read the body below.
+        let mut refreshed = false;
+        let response = loop {
+            let resp = self.send_responses(&auth, &api_request, &url).await?;
+            if resp.status().as_u16() == 401 && !refreshed && auth.refresh_token.is_some() {
+                refreshed = true;
+                auth = self.force_refresh(&auth).await?;
+                continue;
+            }
+            break resp;
+        };
+
+        let status = response.status();
+        let text = response.text().await?;
+        return self.finish_chat(&request, status, text);
+    }
+
+    /// Build + send ONE Responses-API request. Split out of `chat` so the 401
+    /// refresh-retry (B15) can re-send with a fresh token.
+    async fn send_responses(
+        &self,
+        auth: &StoredAuth,
+        api_request: &ResponsesApiRequest,
+        url: &str,
+    ) -> Result<reqwest::Response, CodexError> {
         let response = self
             .http
-            .post(&url)
+            .post(url)
             .bearer_auth(auth.access_token.expose())
             // **F-291**: SSE response — ask for the event stream.
             .header("Accept", "text/event-stream")
@@ -280,13 +326,22 @@ impl CodexClient {
                  Chrome/131.0.0.0 Safari/537.36",
             )
             .header("Accept-Language", "en-US,en;q=0.9")
-            .json(&api_request)
+            .json(api_request)
             .send()
             .await?;
+        Ok(response)
+    }
 
-        let status = response.status();
-        let text = response.text().await?;
-
+    /// Turn a drained Responses-API reply (status + body) into the final chat
+    /// result: map non-2xx to friendly operator errors, else parse the SSE
+    /// stream. Split out of `chat` so the send can be retried (B15) before this
+    /// runs. Not async — the body is already read and the SSE parse is pure.
+    fn finish_chat(
+        &self,
+        request: &ChatCompletionRequest,
+        status: reqwest::StatusCode,
+        text: String,
+    ) -> Result<ChatCompletionResponse, CodexError> {
         if !status.is_success() {
             // **2026-05-26 fix**: detect Cloudflare anti-bot challenge
             // (always returned as HTML containing `cf_chl` markers) and
@@ -338,7 +393,10 @@ impl CodexClient {
         // surface incremental tokens yet). Aggregate the `output_text`
         // deltas + usage and remap to the Chat Completions shape our
         // caller (server::codex::chat) expects.
-        let (assistant_text, usage) = parse_sse_response(&text);
+        // B15: a terminal error / truncated stream now fails loudly (HTTP 502)
+        // instead of returning an empty "success".
+        let (assistant_text, usage) =
+            parse_sse_response(&text).map_err(|body| CodexError::ApiCall { status: 502, body })?;
         Ok(ChatCompletionResponse {
             id: None,
             model: Some(request.model.clone()),
@@ -426,17 +484,28 @@ struct ResponsesInputContent {
 /// carried by a `response.output_text.done` frame so a reply is never
 /// silently dropped. Unknown frame types are ignored — the wire format
 /// gains event types over time and we only depend on the text ones.
-fn parse_sse_response(body: &str) -> (String, Option<ChatUsage>) {
+///
+/// Returns the assistant text + usage on a
+/// clean stream, or `Err(message)` when the stream carried a TERMINAL ERROR or
+/// was TRUNCATED (audit B15). Previously this silently returned whatever
+/// partial text it had scraped — so a mid-stream server error or a cut
+/// connection looked like a successful (empty/partial) answer to the operator.
+fn parse_sse_response(body: &str) -> Result<(String, Option<ChatUsage>), String> {
     let mut text = String::new();
     let mut done_text: Option<String> = None;
     let mut usage: Option<ChatUsage> = None;
+    let mut saw_terminal = false; // response.completed / response.done / [DONE]
 
     for line in body.lines() {
         let payload = match line.strip_prefix("data:") {
             Some(p) => p.trim(),
             None => continue,
         };
-        if payload.is_empty() || payload == "[DONE]" {
+        if payload.is_empty() {
+            continue;
+        }
+        if payload == "[DONE]" {
+            saw_terminal = true;
             continue;
         }
         let v: serde_json::Value = match serde_json::from_str(payload) {
@@ -454,7 +523,18 @@ fn parse_sse_response(body: &str) -> (String, Option<ChatUsage>) {
                     done_text = Some(t.to_string());
                 }
             }
+            // B15: a terminal error event must fail the call, not be ignored.
+            Some("error") | Some("response.failed") | Some("response.error") => {
+                let msg = v
+                    .pointer("/response/error/message")
+                    .or_else(|| v.pointer("/error/message"))
+                    .or_else(|| v.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("the AI provider reported a stream error");
+                return Err(format!("Codex stream error: {msg}"));
+            }
             Some("response.completed") | Some("response.done") => {
+                saw_terminal = true;
                 if let Some(u) = v.pointer("/response/usage") {
                     let input_tokens =
                         u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0)
@@ -485,7 +565,15 @@ fn parse_sse_response(body: &str) -> (String, Option<ChatUsage>) {
     } else {
         text
     };
-    (final_text, usage)
+    // B15: a stream that produced NO text and never reached a terminal frame
+    // was truncated (dropped connection mid-answer). Surface it as an error
+    // instead of returning an empty "success".
+    if final_text.is_empty() && !saw_terminal {
+        return Err(
+            "Codex stream ended without a reply (connection truncated). Try again.".to_string(),
+        );
+    }
+    Ok((final_text, usage))
 }
 
 /// Split Chat-Completions-shaped messages into the Responses-API pair
@@ -661,7 +749,7 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":3,\"total_tokens\":13}}}\n",
             "\n",
         );
-        let (text, usage) = parse_sse_response(body);
+        let (text, usage) = parse_sse_response(body).expect("clean stream");
         assert_eq!(text, "Hello, world");
         let u = usage.unwrap();
         assert_eq!(u.prompt_tokens, 10);
@@ -676,7 +764,7 @@ mod tests {
             "data: {\"type\":\"response.output_text.done\",\"text\":\"Full reply.\"}\n",
             "\n",
         );
-        let (text, usage) = parse_sse_response(body);
+        let (text, usage) = parse_sse_response(body).expect("done frame");
         assert_eq!(text, "Full reply.");
         assert!(usage.is_none());
     }
@@ -691,7 +779,28 @@ mod tests {
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n",
             "data: [DONE]\n",
         );
-        let (text, _usage) = parse_sse_response(body);
+        let (text, _usage) = parse_sse_response(body).expect("has terminal [DONE]");
         assert_eq!(text, "ok");
+    }
+
+    #[test]
+    fn parse_sse_surfaces_a_terminal_error_event() {
+        // B15: a mid-stream error event must fail, not return partial text.
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"message\":\"rate limit exceeded\"}}\n",
+        );
+        let err = parse_sse_response(body).expect_err("error event must fail");
+        assert!(err.contains("rate limit exceeded"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_sse_flags_a_truncated_stream() {
+        // B15: a stream with no text and no terminal frame = truncated.
+        let body = ": keep-alive only, connection dropped\n";
+        let err = parse_sse_response(body).expect_err("truncation must fail");
+        assert!(err.contains("truncated"), "got: {err}");
     }
 }

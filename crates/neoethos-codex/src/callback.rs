@@ -26,7 +26,7 @@
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout_at};
 
 use crate::error::CodexError;
 use crate::CODEX_CALLBACK_PORT;
@@ -73,23 +73,26 @@ impl CallbackServer {
         &self,
         timeout_secs: u64,
     ) -> Result<CallbackResult, CodexError> {
-        let accept_result = timeout(
-            Duration::from_secs(timeout_secs),
-            self.listener.accept(),
-        )
-        .await
-        .map_err(|_| CodexError::CallbackTimeout(timeout_secs))?;
+        // Audit B15: ONE overall deadline covers BOTH the accept AND the read.
+        // Previously only `accept()` was bounded; the subsequent `read()` had
+        // no timeout, so a client that connected but sent bytes slowly (or
+        // never) — a slowloris — hung the login listener indefinitely.
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+        let accept_result = timeout_at(deadline, self.listener.accept())
+            .await
+            .map_err(|_| CodexError::CallbackTimeout(timeout_secs))?;
 
         let (mut socket, _peer) = accept_result.map_err(CodexError::CallbackBind)?;
 
         // Read just enough of the request to parse the request line.
         // Real-world Chrome/Edge/Firefox redirects send the request
         // in one syscall < 1 KB; we read up to 4 KB to be safe and
-        // throw away the headers.
+        // throw away the headers. The read shares the overall deadline.
         let mut buf = [0u8; 4096];
-        let n = socket
-            .read(&mut buf)
+        let n = timeout_at(deadline, socket.read(&mut buf))
             .await
+            .map_err(|_| CodexError::CallbackTimeout(timeout_secs))?
             .map_err(CodexError::CallbackBind)?;
         let request = String::from_utf8_lossy(&buf[..n]);
 
