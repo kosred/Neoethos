@@ -145,6 +145,45 @@ pub async fn confirm(
                 }
             }
         }
+        // Audit S02: the operator confirmed a NON-read-only MCP tool — NOW
+        // invoke it through the sidecar (the LLM could only PROPOSE it).
+        ActionKind::McpCall { server, tool, args } => {
+            let base = crate::app_services::supervisor::mcp_sidecar_url();
+            let payload = serde_json::json!({ "server": server, "tool": tool, "args": args });
+            let sent = reqwest::Client::new()
+                .post(format!("{base}/call"))
+                .timeout(std::time::Duration::from_secs(60))
+                .json(&payload)
+                .send()
+                .await;
+            match sent.and_then(|r| r.error_for_status()) {
+                Ok(resp) => {
+                    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+                    mark_completed(
+                        &id,
+                        ActionStatus::Executed,
+                        format!("MCP {server}/{tool} executed"),
+                    );
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "action_id": id,
+                        "status": "executed",
+                        "mcp": { "server": server, "tool": tool, "result": v },
+                    }))
+                    .into_response()
+                }
+                Err(err) => {
+                    let err = anyhow::Error::from(err);
+                    let note = format!("MCP {server}/{tool} failed: {err}");
+                    mark_completed(&id, ActionStatus::Failed, note);
+                    actionable_error(
+                        StatusCode::BAD_GATEWAY,
+                        "The MCP tool call could not be completed — is the sidecar running?",
+                        &err,
+                    )
+                }
+            }
+        }
     }
 }
 

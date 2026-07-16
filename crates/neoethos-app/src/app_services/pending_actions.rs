@@ -60,6 +60,15 @@ pub enum ActionKind {
         volume_units: i64,
         symbol_hint: Option<String>,
     },
+    /// Invoke a NON-read-only MCP tool through the local sidecar (audit S02).
+    /// The Supervisor queues this instead of executing it, so the operator
+    /// confirms before any MCP-driven mutation (place/cancel an order, write a
+    /// file, …). Read-only MCP tools are allowlisted and run without a queue.
+    McpCall {
+        server: String,
+        tool: String,
+        args: serde_json::Value,
+    },
 }
 
 impl ActionKind {
@@ -81,6 +90,9 @@ impl ActionKind {
                 };
                 let sym = symbol_hint.as_deref().unwrap_or("?");
                 format!("Close {vol} of position #{position_id} ({sym})")
+            }
+            Self::McpCall { server, tool, .. } => {
+                format!("Run MCP tool {server}/{tool}")
             }
         }
     }

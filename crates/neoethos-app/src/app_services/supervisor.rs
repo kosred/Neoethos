@@ -442,11 +442,32 @@ fn parse_actions(reply: &str) -> Vec<SupervisorAction> {
 }
 
 /// Local MCP sidecar base URL (overridable via `NEOETHOS_MCP_URL`).
-fn mcp_sidecar_url() -> String {
+pub(crate) fn mcp_sidecar_url() -> String {
     std::env::var("NEOETHOS_MCP_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:7431".to_string())
         .trim_end_matches('/')
         .to_string()
+}
+
+/// Audit S02: conservative read-only allowlist for MCP tools the LLM may run
+/// without operator approval. Matched on the tool name's leading verb; ANYTHING
+/// not clearly read-only — including unknown tools — is treated as mutating and
+/// must be confirmed. Fail-closed by design.
+fn is_read_only_mcp_tool(tool: &str) -> bool {
+    // Take the last path segment (drop any `server.`/`server/`/`ns:` prefix),
+    // lowercase, and compare its leading token.
+    let name = tool
+        .rsplit(['.', '/', ':'])
+        .next()
+        .unwrap_or(tool)
+        .to_ascii_lowercase();
+    const READ_ONLY_VERBS: &[&str] = &[
+        "list", "get", "read", "search", "fetch", "status", "describe", "find",
+        "query", "show", "info", "count", "lookup", "view", "inspect", "resolve",
+    ];
+    READ_ONLY_VERBS.iter().any(|v| {
+        name == *v || name.starts_with(&format!("{v}_")) || name.starts_with(&format!("{v}-"))
+    })
 }
 
 fn action_label(a: &SupervisorAction) -> String {
@@ -574,6 +595,24 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
         }
 
         SupervisorAction::McpCall { server, tool, args } => {
+            // Audit S02: the LLM may execute ONLY read-only MCP tools directly.
+            // Anything mutating/unknown is queued as a pending action so the
+            // OPERATOR confirms before it runs (place/cancel orders, write/
+            // delete files, …) — the same protection money moves already get.
+            if !is_read_only_mcp_tool(&tool) {
+                let id = crate::app_services::pending_actions::propose(
+                    crate::app_services::pending_actions::ActionKind::McpCall {
+                        server: server.clone(),
+                        tool: tool.clone(),
+                        args: args.clone(),
+                    },
+                    format!("Supervisor requested MCP {server}/{tool} (not read-only)"),
+                )?;
+                return Ok(format!(
+                    "MCP {server}/{tool} is not a read-only tool — queued for OPERATOR \
+                     approval (action {id}); it will NOT run until the operator confirms."
+                ));
+            }
             let base = mcp_sidecar_url();
             let resp = reqwest::Client::new()
                 .post(format!("{base}/call"))
@@ -631,4 +670,39 @@ pub fn spawn(state: AppApiState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod s02_tests {
+    use super::is_read_only_mcp_tool;
+
+    #[test]
+    fn read_only_tools_are_allowed_directly() {
+        for t in [
+            "list_positions", "get_account", "read_file", "search_web",
+            "fetch", "status", "describe-tool", "find_symbol", "query",
+            "ctrader.get_orders", "fs/read_file", "ns:list",
+        ] {
+            assert!(is_read_only_mcp_tool(t), "{t} should be read-only");
+        }
+    }
+
+    #[test]
+    fn mutating_or_unknown_tools_require_approval() {
+        // Fail-closed: anything not clearly read-only must be gated.
+        for t in [
+            "place_order", "cancel_order", "write_file", "delete_file",
+            "modify_position", "send_email", "transfer", "execute", "run",
+            "ctrader.close_position", "fs/write", "do_something_weird",
+        ] {
+            assert!(!is_read_only_mcp_tool(t), "{t} must require approval");
+        }
+    }
+
+    #[test]
+    fn read_only_prefix_must_be_a_whole_token() {
+        // "getaway"/"reader" must NOT count as read-only via substring.
+        assert!(!is_read_only_mcp_tool("getaway_launch"));
+        assert!(!is_read_only_mcp_tool("listen_and_trade"));
+    }
 }
