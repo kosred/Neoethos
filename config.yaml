@@ -337,27 +337,28 @@ models:
   hpo_backend: ax
   hpo_trials: 8
   hpo_trials_by_model:
-    tabnet: 6
+    catboost: 8
+    catboost_alt: 6
+    kan: 6
+    lightgbm: 8
     mlp: 6
+    nbeats: 6
+    tabnet: 6
+    tide: 6
     transformer: 6
-    xgboost_rf: 6
     xgboost: 8
     xgboost_dart: 6
-    kan: 6
-    catboost: 8
-    tide: 6
-    catboost_alt: 6
-    lightgbm: 8
-    nbeats: 6
+    xgboost_rf: 6
   hpo_max_rows: 1000000
   max_epochs_by_model:
-    tide: 200
     tabnet: 200
+    tide: 200
   ray_tune_max_concurrency: 8
   export_onnx: true
   calibration_enabled: true
   calibration_method: platt
   calibration_min_rows: 300
+  live_ml_gate: false
   model_param_overrides: {}
   regime_router_enabled: true
   regime_router_min_models: 2

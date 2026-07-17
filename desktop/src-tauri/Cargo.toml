@@ -1,6 +1,6 @@
 [package]
 name = "neoethos-desktop"
-version = "0.5.5"
+version = "0.5.6"
 description = "NeoEthos desktop (Tauri) — single-process Rust core + web UI"
 authors = ["NeoEthos"]
 license = "AGPL-3.0-or-later"
