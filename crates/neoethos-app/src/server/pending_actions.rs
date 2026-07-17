@@ -226,12 +226,18 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    use crate::app_services::pending_actions::{ActionKind, clear_for_tests, propose};
+    use crate::app_services::pending_actions::{
+        ActionKind, TEST_QUEUE_LOCK, clear_for_tests, propose,
+    };
 
     use super::super::state::AppApiState;
 
     #[tokio::test]
     async fn list_returns_wire_shape_with_pending_close_position() {
+        // The pending-actions queue is process-global; hold the shared test
+        // lock so a concurrent confirm/reject test can't drain our proposed
+        // action between propose() and the router list (2026-07-18 flake fix).
+        let _q = TEST_QUEUE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_for_tests();
         let _id = propose(
             ActionKind::ClosePosition {

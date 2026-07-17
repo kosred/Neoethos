@@ -427,11 +427,21 @@ pub fn clear_for_tests() {
     }
 }
 
+/// Serializes EVERY test that touches the process-global pending-actions
+/// QUEUE — including the server-layer wire-shape test in
+/// `server::pending_actions` (2026-07-18 flake fix: that test proposed an
+/// action and listed it via the router WITHOUT holding this lock, so a
+/// concurrently-running confirm/reject test could drain the queue between
+/// its propose and its list → "proposed action must appear" failed
+/// intermittently in full-suite runs).
+#[cfg(test)]
+pub static TEST_QUEUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::TEST_QUEUE_LOCK as TEST_LOCK;
 
     fn temp_audit_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
