@@ -3,7 +3,7 @@
 /// Institutional-grade statistical features for regime detection,
 /// market microstructure analysis, and alpha generation.
 use super::super::Ohlcv;
-use super::timestamps::infer_timestamp_unit;
+use super::timestamps::{infer_timestamp_unit, timestamp_to_millis};
 
 /// Bars per trading day, derived from the actual timestamp spacing (audit
 /// D04). The "previous day / previous week" levels used a hardcoded 24 / 120
@@ -31,7 +31,16 @@ fn bars_per_day(ohlcv: &Ohlcv, n: usize) -> usize {
     }
     let mid = steps.len() / 2;
     steps.select_nth_unstable(mid);
-    let step_ms = steps[mid].saturating_mul(unit.scale_to_millis());
+    // Unit-conversion fix (2026-07-16, found by the source-only re-audit):
+    // `scale_to_millis()` is a MULTIPLIER only for seconds — for µs/ns it is
+    // the DIVISOR. Multiplying (the old code) inflated an ns step by 1e6×,
+    // collapsing bars_per_day to 1 on ns-stamped data. Latent in production
+    // (datasets are ms-normalized at load) but wrong; use the canonical
+    // converter which applies the correct direction per unit.
+    let step_ms = match timestamp_to_millis(steps[mid], unit) {
+        Ok(ms) => ms,
+        Err(_) => return FALLBACK_H1_BARS_PER_DAY,
+    };
     if step_ms <= 0 {
         return FALLBACK_H1_BARS_PER_DAY;
     }
@@ -808,6 +817,27 @@ mod d04_tests {
         assert_eq!(bars_per_day(&ohlcv_with_step(60_000, n), n), 1440);
         // D1 (86_400_000 ms) → 1 bar/day.
         assert_eq!(bars_per_day(&ohlcv_with_step(86_400_000, n), n), 1);
+    }
+
+    #[test]
+    fn bars_per_day_converts_ns_and_us_units_correctly() {
+        // Regression (2026-07-16): scale_to_millis is a divisor for µs/ns;
+        // the old multiply collapsed ns-stamped M1 to 1 bar/day.
+        let n = 5000;
+        // ns-stamped M1: base ~1.7e18 ns, step 60e9 ns → 1440 bars/day.
+        let ts_ns: Vec<i64> = (0..n as i64)
+            .map(|i| 1_700_000_000_000_000_000 + i * 60_000_000_000)
+            .collect();
+        let mut o = ohlcv_with_step(60_000, n);
+        o.timestamp = Some(ts_ns);
+        assert_eq!(bars_per_day(&o, n), 1440, "ns M1 must be 1440 bars/day");
+        // µs-stamped M5: step 300e6 µs → 288 bars/day.
+        let ts_us: Vec<i64> = (0..n as i64)
+            .map(|i| 1_700_000_000_000_000 + i * 300_000_000)
+            .collect();
+        let mut o = ohlcv_with_step(300_000, n);
+        o.timestamp = Some(ts_us);
+        assert_eq!(bars_per_day(&o, n), 288, "µs M5 must be 288 bars/day");
     }
 
     #[test]
