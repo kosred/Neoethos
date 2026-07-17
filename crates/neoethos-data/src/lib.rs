@@ -1178,7 +1178,8 @@ fn compute_aligned_higher_block(
         .collect();
     let h_block = match h_feats.data {
         crate::core::features::FeatureData::InMemory(a) => a,
-        crate::core::features::FeatureData::Mmap(_) => {
+        crate::core::features::FeatureData::Mmap(_)
+        | crate::core::features::FeatureData::MmapWindow { .. } => {
             anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
         }
     };
@@ -1274,7 +1275,8 @@ pub fn prepare_multitimeframe_features_with_options(
         .collect();
     let base_block = match base_feats.data {
         crate::core::features::FeatureData::InMemory(a) => a,
-        crate::core::features::FeatureData::Mmap(_) => {
+        crate::core::features::FeatureData::Mmap(_)
+        | crate::core::features::FeatureData::MmapWindow { .. } => {
             anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
         }
     };

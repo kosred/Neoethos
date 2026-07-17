@@ -66,6 +66,20 @@ impl Default for FeatureBuildOptions {
 pub enum FeatureData {
     InMemory(Array2<f32>),
     Mmap(std::sync::Arc<crate::core::feature_store::FeatureStore>),
+    /// A contiguous ROW WINDOW `[start, end)` over a mmap store — a VIEW, no
+    /// materialization (2026-07-18 never-OOM fix). The discovery holdout
+    /// split used to copy 80% of a multi-GB disk cube into an in-RAM
+    /// `Array2` before the GA even started — peak RAM became a function of
+    /// the DATASET size instead of the hardware, freezing small boxes on
+    /// dense timeframes (EURUSD M5 = 7.3 GB cube → ~5.8 GB surprise
+    /// allocation). This variant serves the same accessors zero-copy off
+    /// the OS page cache; only the small slices callers explicitly request
+    /// (`sample_window`) are ever materialized.
+    MmapWindow {
+        store: std::sync::Arc<crate::core::feature_store::FeatureStore>,
+        start: usize,
+        end: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +120,7 @@ impl FeatureFrame {
         match &self.data {
             FeatureData::InMemory(a) => a.nrows(),
             FeatureData::Mmap(s) => s.n_samples(),
+            FeatureData::MmapWindow { start, end, .. } => end - start,
         }
     }
 
@@ -115,6 +130,7 @@ impl FeatureFrame {
         match &self.data {
             FeatureData::InMemory(a) => a.ncols(),
             FeatureData::Mmap(s) => s.n_features(),
+            FeatureData::MmapWindow { store, .. } => store.n_features(),
         }
     }
 
@@ -124,6 +140,9 @@ impl FeatureFrame {
         match &self.data {
             FeatureData::InMemory(a) => a.column(idx),
             FeatureData::Mmap(s) => ndarray::ArrayView1::from(s.feature_row(idx)),
+            FeatureData::MmapWindow { store, start, end } => {
+                ndarray::ArrayView1::from(&store.feature_row(idx)[*start..*end])
+            }
         }
     }
 
@@ -139,6 +158,23 @@ impl FeatureFrame {
                 for f in 0..ncols {
                     out.column_mut(f)
                         .assign(&ndarray::ArrayView1::from(&s.feature_row(f)[start..end]));
+                }
+                out
+            }
+            FeatureData::MmapWindow {
+                store,
+                start: w_start,
+                ..
+            } => {
+                // Offsets are window-relative; map onto the underlying store.
+                let (abs_start, abs_end) = (w_start + start, w_start + end);
+                let rows = end - start;
+                let ncols = store.n_features();
+                let mut out = Array2::zeros((rows, ncols));
+                for f in 0..ncols {
+                    out.column_mut(f).assign(&ndarray::ArrayView1::from(
+                        &store.feature_row(f)[abs_start..abs_end],
+                    ));
                 }
                 out
             }
@@ -161,12 +197,48 @@ impl FeatureFrame {
         }
     }
 
+    /// A `FeatureFrame` over the contiguous row range `[start, end)` that is a
+    /// zero-copy VIEW when the backing is a mmap store (never-OOM fix
+    /// 2026-07-18) and a materialized copy only for the (already-in-RAM)
+    /// in-memory backing. This is what the discovery holdout split uses: the
+    /// old path materialized 80% of a multi-GB disk cube into RAM before the
+    /// GA even started, freezing small machines on dense timeframes.
+    pub fn row_window(&self, start: usize, end: usize) -> FeatureFrame {
+        let start = start.min(self.n_samples());
+        let end = end.min(self.n_samples()).max(start);
+        let data = match &self.data {
+            FeatureData::InMemory(_) => FeatureData::InMemory(self.sample_window(start, end)),
+            FeatureData::Mmap(store) => FeatureData::MmapWindow {
+                store: store.clone(),
+                start,
+                end,
+            },
+            FeatureData::MmapWindow {
+                store,
+                start: w_start,
+                ..
+            } => FeatureData::MmapWindow {
+                store: store.clone(),
+                start: w_start + start,
+                end: w_start + end,
+            },
+        };
+        FeatureFrame {
+            timestamps: self.timestamps[start..end].to_vec(),
+            names: self.names.clone(),
+            data,
+        }
+    }
+
     /// Single feature value at logical `(sample, feature)`.
     #[inline]
     pub fn feature_at(&self, sample: usize, feature: usize) -> f32 {
         match &self.data {
             FeatureData::InMemory(a) => a[(sample, feature)],
             FeatureData::Mmap(s) => s.feature_row(feature)[sample],
+            FeatureData::MmapWindow { store, start, .. } => {
+                store.feature_row(feature)[start + sample]
+            }
         }
     }
 
@@ -183,6 +255,11 @@ impl FeatureFrame {
         match &self.data {
             FeatureData::InMemory(a) => a.t(),
             FeatureData::Mmap(s) => s.as_view(),
+            // Column-window of the [features x samples] store view: a valid
+            // STRIDED ArrayView2 (row stride = full n_samples) - zero-copy.
+            FeatureData::MmapWindow { store, start, end } => {
+                store.as_view().slice_move(ndarray::s![.., *start..*end])
+            }
         }
     }
 
@@ -193,6 +270,13 @@ impl FeatureFrame {
             FeatureData::InMemory(a) => Box::new(a.iter().copied()),
             FeatureData::Mmap(s) => {
                 Box::new((0..s.n_features()).flat_map(move |f| s.feature_row(f).iter().copied()))
+            }
+            FeatureData::MmapWindow { store, start, end } => {
+                let (s0, s1) = (*start, *end);
+                Box::new(
+                    (0..store.n_features())
+                        .flat_map(move |f| store.feature_row(f)[s0..s1].iter().copied()),
+                )
             }
         }
     }
@@ -213,6 +297,16 @@ impl FeatureFrame {
                 for f in 0..nf {
                     out.column_mut(f)
                         .assign(&ndarray::ArrayView1::from(s.feature_row(f)));
+                }
+                out
+            }
+            FeatureData::MmapWindow { store, start, end } => {
+                let (nf, rows) = (store.n_features(), end - start);
+                let mut out = Array2::zeros((rows, nf));
+                for f in 0..nf {
+                    out.column_mut(f).assign(&ndarray::ArrayView1::from(
+                        &store.feature_row(f)[*start..*end],
+                    ));
                 }
                 out
             }
@@ -489,5 +583,79 @@ mod align_tests {
         for i in 51..100 {
             assert!(aligned[(i, 0)].is_nan(), "expected NaN at i={i}, got {}", aligned[(i, 0)]);
         }
+    }
+}
+
+#[cfg(test)]
+mod mmap_window_tests {
+    use super::*;
+    use crate::core::feature_store::{FeatureStore, FeatureStoreWriter};
+
+    /// Build a tiny on-disk store (3 features × 10 samples), open it, and
+    /// prove every accessor of a `row_window` VIEW matches the materialized
+    /// equivalent — the never-OOM fix must be a pure representation change.
+    #[test]
+    fn mmap_window_view_matches_materialized_slice() {
+        let dir = std::env::temp_dir().join(format!(
+            "neoethos_mmap_window_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.fstore");
+        let mut w = FeatureStoreWriter::create(&path, 10).unwrap();
+        for f in 0..3u32 {
+            let series: Vec<f32> = (0..10).map(|i| (f * 100 + i) as f32).collect();
+            w.append_feature(&series).unwrap();
+        }
+        w.finish().unwrap();
+        let store = FeatureStore::open(&path, 3, 10, false).unwrap();
+
+        let frame = FeatureFrame {
+            timestamps: (0..10).collect(),
+            names: vec!["a".into(), "b".into(), "c".into()],
+            data: FeatureData::Mmap(std::sync::Arc::new(store)),
+        };
+
+        let win = frame.row_window(2, 7); // rows 2..7
+        assert!(matches!(win.data, FeatureData::MmapWindow { .. }), "mmap → view, no copy");
+        assert_eq!(win.n_samples(), 5);
+        assert_eq!(win.n_features(), 3);
+        assert_eq!(win.timestamps, vec![2, 3, 4, 5, 6]);
+
+        // feature_column / feature_at
+        assert_eq!(win.feature_column(1).to_vec(), vec![102.0, 103.0, 104.0, 105.0, 106.0]);
+        assert_eq!(win.feature_at(0, 2), 202.0);
+        assert_eq!(win.feature_at(4, 0), 6.0);
+
+        // sample_window with window-relative offsets
+        let sw = win.sample_window(1, 3); // absolute rows 3..5
+        assert_eq!(sw[(0, 0)], 3.0);
+        assert_eq!(sw[(1, 2)], 204.0);
+
+        // as_indicators_view: [features × window] strided view
+        let iv = win.as_indicators_view();
+        assert_eq!(iv.shape(), &[3, 5]);
+        assert_eq!(iv[(2, 0)], 202.0);
+        assert_eq!(iv[(0, 4)], 6.0);
+
+        // iter_values covers exactly the window
+        assert_eq!(win.iter_values().count(), 15);
+        assert!(win.iter_values().all(|v| v.rem_euclid(100.0) >= 2.0 && v.rem_euclid(100.0) <= 6.0));
+
+        // Nested window narrows onto the same store
+        let inner = win.row_window(1, 4); // absolute 3..6
+        assert_eq!(inner.feature_column(0).to_vec(), vec![3.0, 4.0, 5.0]);
+
+        // to_dense of the window equals the direct materialized slice
+        assert_eq!(win.to_dense_samples_major(), frame.sample_window(2, 7));
+
+        drop(win);
+        drop(inner);
+        drop(frame);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

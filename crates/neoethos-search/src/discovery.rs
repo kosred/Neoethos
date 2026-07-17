@@ -2584,11 +2584,13 @@ where
     );
 
     let is_ohlcv = slice_ohlcv(ohlcv, 0, is_end);
-    let is_features = FeatureFrame {
-        timestamps: features.timestamps[..is_end].to_vec(),
-        names: features.names.clone(),
-        data: neoethos_data::FeatureData::InMemory(features.sample_window(0, is_end)),
-    };
+    // Never-OOM fix (2026-07-18): `row_window` is a zero-copy VIEW for
+    // mmap-backed cubes. The old `sample_window` materialized 80% of the
+    // disk cube in RAM before the GA even started — on EURUSD M5 that was a
+    // surprise ~5.8 GB allocation plus a full read of the 7.3 GB store,
+    // which froze the operator's machine mid-discovery. In-memory cubes
+    // still copy (they already fit in RAM by construction).
+    let is_features = features.row_window(0, is_end);
     tracing::info!(
         target: "neoethos_search::discovery",
         total_rows = n_rows,
@@ -2611,11 +2613,10 @@ where
     }
 
     let tail_ohlcv = slice_ohlcv(ohlcv, is_end, n_rows);
-    let tail_features = FeatureFrame {
-        timestamps: features.timestamps[is_end..n_rows].to_vec(),
-        names: features.names.clone(),
-        data: neoethos_data::FeatureData::InMemory(features.sample_window(is_end, n_rows)),
-    };
+    // Same never-OOM treatment for the held-out tail: a view, not a copy.
+    // The forward-test projection then copies only the (small) effective
+    // feature columns it actually needs.
+    let tail_features = features.row_window(is_end, n_rows);
 
     match compute_discovery_forward_test_artifacts(
         &result.portfolio,
