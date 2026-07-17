@@ -17,6 +17,14 @@ on:
         options:
           - "false"
           - "true"
+      enable_gpu:
+        description: "Enable GPU testing (NVIDIA/AMD)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 env:
   CARGO_TERM_COLOR: always
@@ -79,6 +87,106 @@ jobs:
         if: ${{ inputs.run_default_features == 'true' }}
         run: cargo test --workspace
 
+  # GPU-accelerated Linux job with NVIDIA CUDA support
+  workspace-linux-gpu-nvidia:
+    name: Workspace check/test (Linux + NVIDIA GPU)
+    runs-on: [self-hosted, linux, gpu, nvidia]
+    if: ${{ inputs.enable_gpu == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check NVIDIA GPU availability
+        run: |
+          nvidia-smi
+          echo "CUDA version:"
+          nvcc --version
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake pkg-config \
+            libasound2-dev libudev-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libx11-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-gpu-nvidia-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-gpu-nvidia-ci-
+
+      - name: Build with NVIDIA GPU support
+        run: cargo build --workspace --release --features cuda
+        env:
+          CUDA_PATH: /usr/local/cuda
+
+      - name: Run tests with NVIDIA GPU
+        run: cargo test --workspace --release --features cuda
+        env:
+          CUDA_PATH: /usr/local/cuda
+
+  # GPU-accelerated Linux job with AMD ROCm support
+  workspace-linux-gpu-amd:
+    name: Workspace check/test (Linux + AMD GPU)
+    runs-on: [self-hosted, linux, gpu, amd]
+    if: ${{ inputs.enable_gpu == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check AMD GPU availability
+        run: |
+          rocm-smi
+          echo "ROCm version:"
+          hipcc --version
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake pkg-config \
+            libasound2-dev libudev-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libx11-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-gpu-amd-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-gpu-amd-ci-
+
+      - name: Build with AMD GPU support
+        run: cargo build --workspace --release --features rocm
+        env:
+          ROCM_PATH: /opt/rocm
+
+      - name: Run tests with AMD GPU
+        run: cargo test --workspace --release --features rocm
+        env:
+          ROCM_PATH: /opt/rocm
+
   # V0.4 audit Task #46 — extend CI beyond Linux so the cfg(windows) /
   # cfg(macos) paths get exercised on every dispatch. The codebase has
   # Windows-specific autostart code, file-system path quirks, and a
@@ -126,3 +234,25 @@ jobs:
           restore-keys: macos-workspace-ci-
       - name: Cargo check workspace without default features
         run: cargo check --workspace --all-targets --no-default-features
+
+  workspace-ios:
+    name: Workspace check (iOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ios-workspace-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ios-workspace-ci-
+      - name: Cargo check workspace for iOS
+        run: cargo check --workspace --target aarch64-apple-ios --no-default-features
