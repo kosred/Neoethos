@@ -27,6 +27,24 @@ pub fn write_json_atomic<T: Serialize + ?Sized>(path: impl AsRef<Path>, value: &
 /// symbol metadata, …) where a half-written file would be corruption.
 pub fn write_bytes_atomic(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
     let path = path.as_ref();
+    // M07 writer lock: serialize same-target writers within this process so
+    // two threads saving the same file can't interleave their temp-write +
+    // rename sequences (each write stays all-or-nothing regardless, but
+    // without the lock the LOSER's rename could land after the winner's,
+    // reordering updates non-deterministically). Keyed by the path as given;
+    // callers use canonical config/artifact paths so aliasing is not a
+    // concern in practice. Cross-PROCESS coordination remains last-writer-
+    // wins via the atomic rename (unchanged semantics, never a torn file).
+    static WRITER_LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let lock = {
+        let registry = WRITER_LOCKS.get_or_init(Default::default);
+        let mut map = registry.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(path.to_path_buf()).or_default().clone()
+    };
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .with_context(|| format!("create artifact directory {}", parent.display()))?;
@@ -39,7 +57,7 @@ pub fn write_bytes_atomic(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
         tmp.sync_all()
             .with_context(|| format!("fsync temp artifact {}", tmp_path.display()))?;
     }
-    fs::rename(&tmp_path, path).with_context(|| {
+    rename_with_windows_retry(&tmp_path, path).with_context(|| {
         format!(
             "atomically rename {} to {}",
             tmp_path.display(),
@@ -352,6 +370,40 @@ pub fn read_json<T: DeserializeOwned>(path: impl AsRef<Path>, artifact_label: &s
         .with_context(|| format!("parse {artifact_label} artifact {}", path.display()))
 }
 
+/// `fs::rename` with a bounded retry on Windows transient failures (M07).
+///
+/// Rust's `std::fs::rename` DOES replace an existing destination on Windows
+/// (`MoveFileExW`/`FileRenameInfoEx` with replace-existing — verified by the
+/// replace test in this module on Windows). What CAN happen is a TRANSIENT
+/// sharing violation / access-denied when another process holds the
+/// destination open without `FILE_SHARE_DELETE` at that instant — antivirus
+/// scanners and concurrent readers are the classic culprits. Those clear in
+/// milliseconds, so retry briefly instead of failing a config/metadata save
+/// over a scanner's 20 ms window. Non-transient errors fail immediately.
+fn rename_with_windows_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 10;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                // ERROR_ACCESS_DENIED (5) / ERROR_SHARING_VIOLATION (32) are
+                // the transient Windows cases; PermissionDenied covers the
+                // mapped kind on other platforms. Anything else is real.
+                let transient = matches!(err.raw_os_error(), Some(5) | Some(32))
+                    || err.kind() == std::io::ErrorKind::PermissionDenied;
+                if !transient || attempt + 1 == ATTEMPTS {
+                    return Err(err);
+                }
+                last_err = Some(err);
+                std::thread::sleep(BACKOFF);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("rename retry exhausted")))
+}
+
 pub fn temporary_path(path: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -436,6 +488,49 @@ mod tests {
         assert!(leftovers.is_empty(), "no temp file may linger: {leftovers:?}");
 
         std::fs::remove_dir_all(&dir).expect("cleanup bytes dir");
+    }
+
+    #[test]
+    fn concurrent_writers_to_same_path_never_corrupt() {
+        // M07 hardening: 8 threads × 25 writes each hammering ONE target.
+        // Every observed final state must be ONE COMPLETE payload (never a
+        // torn/interleaved file), no temp files may linger, and the writes
+        // must serialize (the per-path writer lock) so replace-over-open
+        // windows on Windows are also exercised.
+        let dir = unique_test_dir("concurrent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let path_ref = &path;
+
+        std::thread::scope(|scope| {
+            for writer in 0..8u32 {
+                scope.spawn(move || {
+                    for i in 0..25u32 {
+                        // Distinct, self-consistent payload per write: the
+                        // marker appears at both ends so a torn mix of two
+                        // writers is detectable.
+                        let marker = format!("w{writer}-i{i}");
+                        let body = format!("{marker}|{}|{marker}\n", "x".repeat(512));
+                        write_bytes_atomic(path_ref, body.as_bytes())
+                            .expect("concurrent atomic write must succeed");
+                    }
+                });
+            }
+        });
+
+        let content = std::fs::read_to_string(&path).expect("final file readable");
+        let parts: Vec<&str> = content.trim_end().split('|').collect();
+        assert_eq!(parts.len(), 3, "payload structure intact: {content:?}");
+        assert_eq!(parts[0], parts[2], "head/tail markers must match (no torn write)");
+        assert_eq!(parts[1].len(), 512, "body length intact");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files may linger: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).expect("cleanup concurrent dir");
     }
 
     #[test]
