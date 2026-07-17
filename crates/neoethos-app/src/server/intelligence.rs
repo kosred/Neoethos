@@ -95,30 +95,7 @@ fn scan_intelligence() -> anyhow::Result<IntelligenceDto> {
         });
     }
 
-    let mut artifacts: Vec<String> = Vec::new();
-    let mut latest_mtime: Option<SystemTime> = None;
-
-    if let Ok(read_dir) = std::fs::read_dir(&models_dir) {
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if is_artifact(name) {
-                        artifacts.push(name.to_string());
-                    }
-                }
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        latest_mtime = Some(match latest_mtime {
-                            Some(prev) if prev > mtime => prev,
-                            _ => mtime,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    artifacts.sort();
+    let (artifacts, latest_mtime) = scan_models_dir(&models_dir);
 
     let last_touched_unix_ms = latest_mtime
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -137,6 +114,74 @@ fn scan_intelligence() -> anyhow::Result<IntelligenceDto> {
         walkforward_splits: wf_splits,
         walkforward_avg_accuracy: wf_avg,
     })
+}
+
+/// Scan the models directory for TRAINED MODELS (2026-07-17 fix — operator:
+/// "τα βλέπει σαν αρχείο αλλά δεν τα αξιοποιεί").
+///
+/// Trained models live in NESTED directories — `models/<SYMBOL>/<TF>/<name>/`
+/// — exactly the layout the ensemble loader (`load_experts_for_symbol`)
+/// consumes. The old scan looked only at TOP-LEVEL FILES, so every trained
+/// expert was invisible to the Intelligence screen: the operator saw a full
+/// models directory on disk but "0 models" in the app. Each model dir is now
+/// reported as `SYMBOL/TF/model_name`, alongside any top-level loose artifact
+/// files (model_targets.json, walkforward.json, legacy single-file models).
+fn scan_models_dir(models_dir: &Path) -> (Vec<String>, Option<SystemTime>) {
+    let mut artifacts: Vec<String> = Vec::new();
+    let mut latest_mtime: Option<SystemTime> = None;
+    let mut touch = |meta: Option<std::fs::Metadata>| {
+        if let Some(mtime) = meta.and_then(|m| m.modified().ok()) {
+            latest_mtime = Some(match latest_mtime {
+                Some(prev) if prev > mtime => prev,
+                _ => mtime,
+            });
+        }
+    };
+
+    if let Ok(read_dir) = std::fs::read_dir(models_dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if is_artifact(name) {
+                        artifacts.push(name.to_string());
+                    }
+                }
+                touch(entry.metadata().ok());
+            } else if path.is_dir() {
+                let symbol = entry.file_name().to_string_lossy().to_string();
+                let Ok(tf_dirs) = std::fs::read_dir(&path) else {
+                    continue;
+                };
+                for tf_entry in tf_dirs.flatten() {
+                    if !tf_entry.path().is_dir() {
+                        continue;
+                    }
+                    let tf = tf_entry.file_name().to_string_lossy().to_string();
+                    let Ok(model_dirs) = std::fs::read_dir(tf_entry.path()) else {
+                        continue;
+                    };
+                    for model_entry in model_dirs.flatten() {
+                        let model_path = model_entry.path();
+                        let name = model_entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with('_') {
+                            continue; // sentinels, not models
+                        }
+                        if model_path.is_dir() {
+                            artifacts.push(format!("{symbol}/{tf}/{name}"));
+                            touch(model_entry.metadata().ok());
+                        } else if model_path.is_file() && is_artifact(&name) {
+                            // Flat per-TF artifact files (older layouts).
+                            artifacts.push(format!("{symbol}/{tf}/{name}"));
+                            touch(model_entry.metadata().ok());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    artifacts.sort();
+    (artifacts, latest_mtime)
 }
 
 fn is_artifact(name: &str) -> bool {
@@ -208,4 +253,50 @@ fn parse_walkforward(models_dir: &Path) -> (Option<u32>, Option<f64>) {
         .map(|n| n as u32);
     let avg = value.get("avg_accuracy").and_then(|v| v.as_f64());
     (splits, avg)
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn nested_trained_model_dirs_are_visible() {
+        // 2026-07-17: the Intelligence scan must surface trained models in
+        // the nested models/<SYMBOL>/<TF>/<name>/ layout the ensemble loader
+        // consumes — the old top-level-files-only scan showed 0 models.
+        let root = std::env::temp_dir().join(format!(
+            "neoethos_intel_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for model in ["dqn", "hmm_regime", "swarm_forecaster"] {
+            std::fs::create_dir_all(root.join("EURUSD").join("M15").join(model)).unwrap();
+        }
+        std::fs::create_dir_all(root.join("EURUSD").join("M15").join("_healthcheck")).unwrap();
+        std::fs::write(root.join("model_targets.json"), "{}").unwrap();
+        std::fs::write(root.join("training.txt"), "log").unwrap(); // not an artifact
+
+        let (artifacts, mtime) = scan_models_dir(&root);
+        assert!(
+            artifacts.contains(&"EURUSD/M15/dqn".to_string()),
+            "nested model dirs must be listed: {artifacts:?}"
+        );
+        assert!(artifacts.contains(&"EURUSD/M15/hmm_regime".to_string()));
+        assert!(artifacts.contains(&"EURUSD/M15/swarm_forecaster".to_string()));
+        assert!(artifacts.contains(&"model_targets.json".to_string()));
+        assert!(
+            !artifacts.iter().any(|a| a.contains("_healthcheck")),
+            "sentinels must be excluded"
+        );
+        assert!(
+            !artifacts.iter().any(|a| a.contains("training.txt")),
+            "non-artifact files excluded"
+        );
+        assert_eq!(artifacts.len(), 4, "3 models + 1 json: {artifacts:?}");
+        assert!(mtime.is_some());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
