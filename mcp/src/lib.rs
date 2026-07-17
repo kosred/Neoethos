@@ -247,8 +247,29 @@ async fn call_tool(
             });
         }
     };
-    match service.peer().call_tool(params).await {
-        Ok(result) => match serde_json::to_value(result) {
+    // Shutdown-deadlock defense-in-depth (2026-07-16): a tool call may not
+    // outlive this bound even if the upstream MCP server hangs forever.
+    // Without it, a hung call kept the axum graceful-shutdown drain waiting
+    // (the primary fix cancels services AT the shutdown signal; this cap
+    // guarantees the handler itself always terminates too). 300s is generous
+    // for any real tool.
+    const TOOL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+    let call = tokio::time::timeout(TOOL_CALL_TIMEOUT, service.peer().call_tool(params));
+    match call.await {
+        Err(_elapsed) => {
+            return Json(CallResult {
+                ok: false,
+                result: serde_json::Value::Null,
+                error: Some(format!(
+                    "tool call '{}' on '{}' timed out after {}s (upstream MCP server \
+                     unresponsive)",
+                    body.tool,
+                    body.server,
+                    TOOL_CALL_TIMEOUT.as_secs()
+                )),
+            });
+        }
+        Ok(Ok(result)) => match serde_json::to_value(result) {
             Ok(result) => Json(CallResult {
                 ok: true,
                 result,
@@ -260,7 +281,7 @@ async fn call_tool(
                 error: Some(format!("serialize tool result: {error}")),
             }),
         },
-        Err(error) => Json(CallResult {
+        Ok(Err(error)) => Json(CallResult {
             ok: false,
             result: serde_json::Value::Null,
             error: Some(error.to_string()),

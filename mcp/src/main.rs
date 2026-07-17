@@ -31,11 +31,24 @@ async fn serve_api(state: AppState, port: u16) -> Result<()> {
     tracing::info!(
         "NeoEthos MCP sidecar on http://127.0.0.1:{port} — /health /tools /call"
     );
+    // Shutdown-deadlock fix (2026-07-16): axum's graceful shutdown waits for
+    // in-flight requests to finish AFTER this future resolves — but an
+    // in-flight `/call` blocked on a hung MCP server only finishes once its
+    // service is cancelled, and the old code cancelled services AFTER serve
+    // returned. Circular wait: serve → /call → service → (after serve).
+    // Cancel the services HERE, at the signal, before the future resolves —
+    // pending peer calls then error out immediately and the drain completes.
+    // `shutdown_all` is idempotent (Option::take per service), so the
+    // belt-and-braces second call in `main` stays safe.
+    let shutdown_state = state.clone();
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             match tokio::signal::ctrl_c().await {
                 Ok(()) => tracing::info!("shutdown signal received"),
                 Err(error) => tracing::error!(%error, "failed to listen for shutdown signal"),
+            }
+            if let Err(error) = shutdown_state.shutdown_all().await {
+                tracing::warn!(%error, "MCP service shutdown reported errors (continuing drain)");
             }
         })
         .await
