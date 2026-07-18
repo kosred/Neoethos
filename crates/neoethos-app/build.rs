@@ -242,32 +242,28 @@ fn extract_toml_string_value(after_key: &str) -> String {
 }
 
 /// #205: GPU backends are mutually exclusive — picking two vendors at
-/// once will compile cleanly today but at link time you get
-/// duplicate-symbol or "no backend selected" depending on which
-/// llama-cpp-2 build path wins the race. We fail fast at build.rs
-/// instead with a clear message naming the offending features.
+/// once produces duplicate-symbol or wrong-backend links. Fail fast at
+/// build.rs with a clear message naming the offending features.
 ///
-/// Acceptable single picks (env vars Cargo sets when a feature is on):
-///   CARGO_FEATURE_GPU_NVIDIA
-///   CARGO_FEATURE_GPU_VULKAN
-///   CARGO_FEATURE_GPU_ROCM
-///   CARGO_FEATURE_GPU_APPLE
-///   CARGO_FEATURE_GPU         (legacy alias, equals gpu-nvidia)
-/// The legacy `gpu` alias resolves to `gpu-nvidia` per Cargo.toml so
-/// when both are set simultaneously (someone wrote `--features
-/// gpu,gpu-nvidia` belt-and-braces) we treat that as the SAME vendor,
-/// not a conflict.
+/// Alias folding (2026-07-18 deep-audit fix): Cargo sets a feature env for
+/// EVERY activated feature, including those pulled in by an alias. So
+///   - `gpu` = ["gpu-nvidia"]   → GPU + GPU_NVIDIA both set = ONE vendor
+///   - `gpu-apple` = ["gpu-vulkan"] → GPU_APPLE + GPU_VULKAN both set —
+///     the OLD check counted these as TWO vendors and PANICKED on every
+///     `--features gpu-apple` build even though the alias is by-design
+///     (MoltenVK: apple IS the vulkan path). Both aliases now fold into
+///     their target vendor before counting.
 fn assert_at_most_one_gpu_feature() {
     let nvidia = std::env::var("CARGO_FEATURE_GPU_NVIDIA").is_ok()
         || std::env::var("CARGO_FEATURE_GPU").is_ok();
-    let vulkan = std::env::var("CARGO_FEATURE_GPU_VULKAN").is_ok();
-    let rocm = std::env::var("CARGO_FEATURE_GPU_ROCM").is_ok();
     let apple = std::env::var("CARGO_FEATURE_GPU_APPLE").is_ok();
+    // gpu-apple implies gpu-vulkan (same backend via MoltenVK) — one vendor.
+    let vulkan = std::env::var("CARGO_FEATURE_GPU_VULKAN").is_ok() || apple;
+    let rocm = std::env::var("CARGO_FEATURE_GPU_ROCM").is_ok();
     let selected: Vec<&str> = [
         ("gpu-nvidia", nvidia),
-        ("gpu-vulkan", vulkan),
+        ("gpu-vulkan/gpu-apple", vulkan),
         ("gpu-rocm", rocm),
-        ("gpu-apple", apple),
     ]
     .iter()
     .filter_map(|(n, on)| if *on { Some(*n) } else { None })
@@ -275,8 +271,8 @@ fn assert_at_most_one_gpu_feature() {
     if selected.len() > 1 {
         panic!(
             "neoethos-app: multiple GPU backends selected ({}). Pick exactly ONE — \
-             llama-cpp-2 builds with a single ggml backend and a dual build wastes \
-             link time + binary size. See crates/neoethos-app/Cargo.toml feature \
+             a dual build produces duplicate/wrong-backend links and wastes link \
+             time + binary size. See crates/neoethos-app/Cargo.toml feature \
              block for descriptions of each option.",
             selected.join(", ")
         );
@@ -323,15 +319,15 @@ fn assert_gpu_toolkit_available() {
              then re-run cargo build. (Probed CUDA_PATH env var and /usr/local/cuda.)"
         );
     }
+    // 2026-07-18 deep-audit fix: the Vulkan SDK hard-requirement dated from
+    // the removed llama backend (ggml compiled Vulkan shaders at BUILD time).
+    // The current Vulkan path is cubecl-wgpu + burn-wgpu, which compile WGSL
+    // through naga at RUNTIME — NO SDK is needed to build. The old panic
+    // blocked perfectly-valid gpu-vulkan builds on machines without the SDK.
     if vulkan && std::env::var("VULKAN_SDK").is_err() {
-        panic!(
-            "neoethos-app: gpu-vulkan selected but the Vulkan SDK is not on this \
-             machine. Install from https://vulkan.lunarg.com/sdk/home then re-run \
-             cargo build. (Probed VULKAN_SDK env var.)\n\
-             \n\
-             Note: the Vulkan SDK is only required at BUILD time. At RUNTIME the \
-             Vulkan ICD ships with every modern GPU driver, so the finished .exe \
-             runs on machines without the SDK installed."
+        println!(
+            "cargo:warning=neoethos-app: gpu-vulkan build without VULKAN_SDK — fine: \
+             the wgpu path needs no SDK at build time (runtime uses the driver's ICD)."
         );
     }
     if rocm
@@ -345,40 +341,55 @@ fn assert_gpu_toolkit_available() {
              Note: ROCm on Windows is experimental — Linux is the supported path."
         );
     }
-    if apple && !cfg!(target_os = "macos") {
-        panic!(
-            "neoethos-app: gpu-apple selected on a non-macOS host. The Metal \
-             backend only links + runs on macOS. Pick gpu-vulkan instead for \
-             cross-platform GPU support."
-        );
-    }
+    // gpu-apple is an alias for gpu-vulkan (MoltenVK) since the Metal/llama
+    // backend was removed — it builds anywhere the vulkan path builds, so
+    // the old macOS-only panic no longer applies.
+    let _ = apple;
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
     println!("cargo:rerun-if-env-changed=HIP_PATH");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
 }
 
-/// When the `gpu` feature is enabled, force the linker to keep
-/// `libtorch_cuda` so `tch::Cuda::device_count()` actually returns the
-/// hardware GPU count at runtime. tch-rs only emits a plain
-/// `cargo:rustc-link-lib=torch_cuda` which the linker strips because
-/// no symbols from it are referenced — the workaround is the standard
-/// `--no-as-needed` link arg pair.
+/// Force the linker to keep `libtorch_cuda` so `tch::Cuda::device_count()`
+/// actually returns the hardware GPU count at runtime. tch-rs only emits a
+/// plain `cargo:rustc-link-lib=torch_cuda`, which the linker strips because
+/// no symbols from it are referenced directly.
+///
+/// 2026-07-18 deep-audit fixes:
+/// - GATE: the old check looked only at the `gpu` ALIAS env, so a direct
+///   `--features gpu-nvidia` build silently skipped the force-link and CUDA
+///   was invisible at runtime. Both spellings now count.
+/// - MSVC: the old code emitted GNU-ld syntax (`-Wl,--no-as-needed`,
+///   `-l…`) unconditionally — link.exe does not understand those flags, so
+///   every Windows GPU link would have FAILED. Windows now uses the
+///   documented tch-rs MSVC trick: `/INCLUDE:` an exported torch_cuda
+///   symbol (`at::cuda::warp_size()`) so the library cannot be stripped.
 fn force_link_libtorch_cuda() {
-    if std::env::var("CARGO_FEATURE_GPU").is_err() {
+    let gpu_on = std::env::var("CARGO_FEATURE_GPU").is_ok()
+        || std::env::var("CARGO_FEATURE_GPU_NVIDIA").is_ok();
+    if !gpu_on {
         return;
     }
+    let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if let Ok(libtorch) = std::env::var("LIBTORCH") {
-        println!("cargo:rustc-link-arg-bins=-Wl,--no-as-needed");
-        println!("cargo:rustc-link-arg-bins=-L{libtorch}/lib");
-        println!("cargo:rustc-link-arg-bins=-ltorch_cuda");
-        println!("cargo:rustc-link-arg-bins=-Wl,--as-needed");
+        if msvc {
+            println!("cargo:rustc-link-arg-bins=/LIBPATH:{libtorch}/lib");
+            println!("cargo:rustc-link-arg-bins=/INCLUDE:?warp_size@cuda@at@@YAHXZ");
+        } else {
+            println!("cargo:rustc-link-arg-bins=-Wl,--no-as-needed");
+            println!("cargo:rustc-link-arg-bins=-L{libtorch}/lib");
+            println!("cargo:rustc-link-arg-bins=-ltorch_cuda");
+            println!("cargo:rustc-link-arg-bins=-Wl,--as-needed");
+        }
         println!("cargo:rerun-if-env-changed=LIBTORCH");
     } else {
         println!(
-            "cargo:warning=neoethos-app built with `gpu` feature but LIBTORCH env not set; \
-             libtorch_cuda will not be force-linked and tch::Cuda::device_count() may return 0"
+            "cargo:warning=neoethos-app built with a CUDA GPU feature but LIBTORCH env not \
+             set; libtorch_cuda will not be force-linked and tch::Cuda::device_count() may \
+             return 0"
         );
     }
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GPU");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GPU_NVIDIA");
 }
