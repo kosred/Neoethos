@@ -709,11 +709,18 @@ async fn run(
             }
         }
 
-        // ── Auto-cull reconcile: account THIS engine's closed trades ──────────
+        // ── Broker reconcile: account THIS engine's closed trades ─────────────
         // Reads the broker's closing deals (net_profit) for positions we opened
-        // — catches SL/TP exits, not just engine flips. On N consecutive losses
-        // the strategy is permanently retired (blacklisted) and the engine stops.
-        if (cull_threshold > 0 || cull_min_wr > 0.0) && !opened_ids.is_empty() {
+        // — catches SL/TP exits, not just engine-initiated closes. On N
+        // consecutive losses the strategy is permanently retired (blacklisted)
+        // and the engine stops.
+        //
+        // 2026-07-18 deep-audit fix: this MUST run whenever we track open ids,
+        // not only when culling is configured — under hold-to-bracket parity
+        // (below) it is the ONLY place a broker-side SL/TP exit clears
+        // `open_position`; gating it on cull settings would leave the engine
+        // holding a phantom position forever and never re-entering.
+        if !opened_ids.is_empty() {
             if let Ok(Ok(runtime)) = tokio::task::spawn_blocking(
                 crate::app_services::broker_api::fetch_account_runtime_blocking,
             )
@@ -971,32 +978,28 @@ async fn run(
         }
 
         // ── Execution ─────────────────────────────────────────────────────────
+        // PARITY (2026-07-18 deep audit): the discovery kernel (eval.rs)
+        // consults the signal ONLY while FLAT. While a position is open the
+        // signal is ignored entirely — exits happen exclusively via SL/TP/
+        // trailing (broker-enforced live) plus the weekend force-close; the
+        // production EvaluationConfig ships max_hold_bars = 0. The previous
+        // live code closed + reopened on EVERY non-flat bar (paying the
+        // spread per bar and resetting the trailing state) and closed on a
+        // Flat signal — a trade profile no validated backtest ever had.
         match direction {
             Direction::Long | Direction::Short => {
-                // Flip: close any open position first
-                if let Some((pos_id, vol)) = open_position.take() {
-                    let result = tokio::task::spawn_blocking(move || {
-                        close_position_blocking(pos_id, vol)
-                    })
-                    .await?;
-                    match result {
-                        Ok(_) => tracing::info!(
-                            target: "neoethos_app::live_trading",
-                            position_id = pos_id, "closed previous position"
-                        ),
-                        Err(e) => tracing::warn!(
-                            target: "neoethos_app::live_trading",
-                            error = %e, position_id = pos_id,
-                            "failed to close previous position"
-                        ),
-                    }
+                if open_position.is_some() {
+                    // Hold to bracket — the trailing block above keeps the
+                    // broker-side stop in sync; nothing to execute this bar.
+                    continue;
                 }
 
                 // News gate (block_on_news): block NEW entries inside the
                 // blackout window of a high-impact event for this symbol's
-                // currencies. The flip-close above stays allowed — closing
-                // reduces risk; holding through NFP does not. Fail-soft: a
-                // calendar outage never blocks (see news_calendar.rs).
+                // currencies. Exits (weekend force-close, auto-cull flatten,
+                // broker-side brackets) are never gated — closing reduces
+                // risk. Fail-soft: a calendar outage never blocks (see
+                // news_calendar.rs).
                 let gate_sym = symbol.clone();
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 if let Ok(Some(event)) = tokio::task::spawn_blocking(move || {
@@ -1264,13 +1267,31 @@ async fn run(
                     effective_risk = base_risk.min(remaining);
                 }
 
-                // Size by the account's risk %, using the strategy's own stop
-                // distance; falls back to req.lot_size when not computable.
+                // Size by the account's risk %, using the EFFECTIVE stop
+                // distance actually placed on the order (gene SL / override /
+                // default) so risk-per-trade matches the real bracket; falls
+                // back to req.lot_size when not computable.
+                // Default to the strategy's OWN bracket; `req.*` is only an
+                // explicit operator override (Autopilot sends none, so the
+                // gene's discovered SL/TP is what actually gets placed).
+                // PARITY: the discovery kernel NEVER runs bracket-free — a
+                // gene without its own SL/TP is evaluated with the 20/40-pip
+                // defaults (discovery.rs backtest-settings builder). Under
+                // hold-to-bracket execution a naked position would never
+                // close, so live mirrors the same defaults.
+                let sl = req
+                    .stop_loss_pips
+                    .or((gene_sl > 0.0).then_some(gene_sl))
+                    .or(Some(20.0));
+                let tp = req
+                    .take_profit_pips
+                    .or((gene_tp > 0.0).then_some(gene_tp))
+                    .or(Some(40.0));
                 let last_price = base_ohlcv.close.last().copied();
                 let lot = risk_based_lots(
                     entry_balance,
                     effective_risk,
-                    gene_sl,
+                    sl.unwrap_or(0.0),
                     sym_meta.as_ref(),
                     &account_ccy,
                     fx_quote_to_account,
@@ -1278,11 +1299,6 @@ async fn run(
                     req.lot_size,
                     max_lot_cap,
                 );
-                // Default to the strategy's OWN bracket; `req.*` is only an
-                // explicit operator override (Autopilot sends none, so the
-                // gene's discovered SL/TP is what actually gets placed).
-                let sl = req.stop_loss_pips.or((gene_sl > 0.0).then_some(gene_sl));
-                let tp = req.take_profit_pips.or((gene_tp > 0.0).then_some(gene_tp));
                 let sym = symbol.clone();
 
                 let result = tokio::task::spawn_blocking(move || {
@@ -1313,9 +1329,11 @@ async fn run(
                             // Track for auto-cull realized-result reconciliation.
                             opened_ids.insert(pos_id);
                             // Seed trailing-stop state (parity with the backtest):
-                            // entry, the gene's stop distance, side, running extreme.
+                            // entry, the EFFECTIVE stop distance (the same one the
+                            // kernel trails with — gene SL, operator override, or
+                            // the 20-pip default), side, running extreme.
                             pos_entry_px = outcome.execution_price.or(last_price).unwrap_or(0.0);
-                            pos_sl_pips = gene_sl;
+                            pos_sl_pips = sl.unwrap_or(0.0);
                             pos_is_long = direction == Direction::Long;
                             pos_extreme = pos_entry_px;
                             pos_trail_px = 0.0;
@@ -1338,8 +1356,11 @@ async fn run(
                                     base_tf: base_tf.clone(),
                                     portfolio_path: portfolio_path.clone(),
                                     direction: if pos_is_long { 1 } else { -1 },
-                                    sl_pips: gene_sl,
-                                    tp_pips: gene_tp,
+                                    // The EFFECTIVE brackets placed on the order
+                                    // (gene / override / kernel default) — what
+                                    // actually governed this trade's exit.
+                                    sl_pips: sl.unwrap_or(0.0),
+                                    tp_pips: tp.unwrap_or(0.0),
                                     lots: lot,
                                     entry_ts_ms: latest_ts,
                                     entry_price: outcome.execution_price.or(last_price),
@@ -1374,29 +1395,9 @@ async fn run(
             }
 
             Direction::Flat => {
-                // Close any open position
-                if let Some((pos_id, vol)) = open_position.take() {
-                    let result = tokio::task::spawn_blocking(move || {
-                        close_position_blocking(pos_id, vol)
-                    })
-                    .await?;
-                    match result {
-                        Ok(_) => tracing::info!(
-                            target: "neoethos_app::live_trading",
-                            position_id = pos_id,
-                            "closed position on Flat signal"
-                        ),
-                        Err(e) => tracing::warn!(
-                            target: "neoethos_app::live_trading",
-                            error = %e, position_id = pos_id,
-                            "failed to close on Flat"
-                        ),
-                    }
-
-                    if let Ok(mut s) = status.lock() {
-                        s.open_position_id = None;
-                    }
-                }
+                // PARITY: the backtest does NOT exit on a flat signal — an
+                // open position runs to its SL/TP/trailing bracket (or the
+                // weekend force-close). Nothing to execute.
             }
         }
     }
