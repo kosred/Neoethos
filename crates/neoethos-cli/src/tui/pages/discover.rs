@@ -427,22 +427,37 @@ pub(super) fn strip_ansi_for_display(line: &str) -> String {
 }
 
 fn strip_ansi(line: &str) -> String {
+    // Iterate over CHARS, not bytes: pushing `byte as char` re-interprets
+    // each raw UTF-8 byte as a Latin-1 codepoint, turning every multi-byte
+    // character (→ · ⏳, Greek text) into mojibake in the live-log panels.
     let mut out = String::with_capacity(line.len());
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            i += 2;
-            while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
-                i += 1;
-            }
-            if i < bytes.len() {
-                i += 1;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break; // CSI final byte ends the escape sequence
+                }
             }
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            out.push(c);
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strip_ansi_preserves_multibyte_utf8() {
+        assert_eq!(strip_ansi("gen 5 → 6 · ολοκληρώθηκε"), "gen 5 → 6 · ολοκληρώθηκε");
+    }
+
+    #[test]
+    fn strip_ansi_removes_color_codes() {
+        assert_eq!(strip_ansi("\u{1b}[1;32mOK\u{1b}[0m done"), "OK done");
+    }
 }

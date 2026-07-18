@@ -222,7 +222,10 @@ fn recent_activity_lines(shared: &AppShared) -> Vec<Line<'static>> {
     // last 8 distinct entries across SECTION DISCOVERY + CLI.
     let log_path = std::path::PathBuf::from("logs").join("neoethos.log");
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if let Ok(content) = std::fs::read_to_string(&log_path) {
+    // Bounded tail read (shared with the Logs page) — this draw runs per
+    // frame on the LANDING page, and an unbounded read_to_string of a
+    // multi-hundred-MB discovery log would freeze the whole TUI.
+    if let Some(content) = super::logs::read_log_tail(&log_path) {
         // Very simple parser — sectioned logs are key=value blocks
         // separated by blank lines + section dividers.
         for block in content.split("--- CURRENT ---").skip(1) {

@@ -47,7 +47,19 @@ pub fn blacklist_path() -> Option<PathBuf> {
 /// disk always maps to the same value, and a byte-identical re-export of the
 /// same strategy maps to the same value (discovery's serializer is
 /// deterministic) — so a re-discovered clone is caught too.
+///
+/// Uses the canonical FNV-1a from neoethos-core: `DefaultHasher`'s algorithm
+/// is documented as unstable across Rust releases, so persisting its output
+/// meant a toolchain bump could silently invalidate every stored fingerprint
+/// and un-retire culled strategies (2026-07-18 deep-audit fix).
 pub fn fingerprint_bytes(bytes: &[u8]) -> String {
+    format!("{:016x}", neoethos_core::utils::hashing::fnv1a64(bytes))
+}
+
+/// The pre-2026-07-18 fingerprint (std `DefaultHasher`) — kept ONLY so
+/// entries recorded by older builds still match in [`is_blacklisted`].
+/// Never used for new entries.
+fn legacy_fingerprint_bytes(bytes: &[u8]) -> String {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
     format!("{:016x}", h.finish())
@@ -73,9 +85,15 @@ pub fn is_blacklisted(portfolio_path: &str) -> bool {
         return false;
     }
     let norm = normalize_path(portfolio_path);
-    let fp = fingerprint_file(portfolio_path);
+    // Compute BOTH fingerprints from one read: the stable FNV-1a used for
+    // new entries, and the legacy DefaultHasher value so entries recorded
+    // by pre-migration builds keep blocking their strategies.
+    let bytes = std::fs::read(portfolio_path).ok();
+    let fp = bytes.as_deref().map(fingerprint_bytes);
+    let fp_legacy = bytes.as_deref().map(legacy_fingerprint_bytes);
     entries.iter().any(|e| {
-        (fp.as_deref().is_some() && Some(e.fingerprint.as_str()) == fp.as_deref())
+        Some(e.fingerprint.as_str()) == fp.as_deref()
+            || Some(e.fingerprint.as_str()) == fp_legacy.as_deref()
             || normalize_path(&e.portfolio_path) == norm
     })
 }
@@ -92,23 +110,44 @@ pub fn retire(entry: BlacklistEntry) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match serde_json::to_string_pretty(&entries) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                tracing::warn!(
-                    target: "neoethos_app::strategy_blacklist",
-                    error = %e, path = %path.display(),
-                    "failed to write strategy blacklist"
-                );
-            }
-        }
-        Err(e) => tracing::warn!(
+    // Atomic write (M07 primitive): the blacklist is SAFETY state — a torn
+    // write would lose the whole graveyard and make every retired strategy
+    // selectable for live trading again.
+    if let Err(e) = neoethos_core::storage::json::write_json_atomic(&path, &entries) {
+        tracing::warn!(
             target: "neoethos_app::strategy_blacklist",
-            error = %e, "failed to serialize strategy blacklist"
-        ),
+            error = %e, path = %path.display(),
+            "failed to write strategy blacklist"
+        );
     }
 }
 
 fn normalize_path(p: &str) -> String {
     p.replace('\\', "/").to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_is_pinned_fnv1a() {
+        // Literal pin of the canonical FNV-1a 64 value. If this assertion
+        // ever fails, the fingerprint algorithm changed and every persisted
+        // blacklist entry would stop matching — exactly the failure mode
+        // the 2026-07-18 DefaultHasher→FNV migration fixed. Do not "update"
+        // this constant without a blacklist migration plan.
+        assert_eq!(fingerprint_bytes(b"hello"), "a430d84680aabd0b");
+    }
+
+    #[test]
+    fn legacy_and_current_fingerprints_differ_but_both_match() {
+        // Sanity: the legacy DefaultHasher value is a different string (so
+        // the migration path in is_blacklisted is actually exercised), and
+        // both are 16-hex-digit strings.
+        let cur = fingerprint_bytes(b"portfolio-bytes");
+        let legacy = legacy_fingerprint_bytes(b"portfolio-bytes");
+        assert_eq!(cur.len(), 16);
+        assert_eq!(legacy.len(), 16);
+    }
 }

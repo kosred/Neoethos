@@ -249,8 +249,8 @@ fn candidate_paths() -> Result<Vec<PathBuf>> {
 /// staleness checks work.
 ///
 /// Idempotent: a re-save with the same field values rewrites the
-/// file in place. Concurrent saves rely on the OS's atomic write —
-/// this is the same guarantee broker_persistence offers.
+/// file in place. Uses the M07 atomic writer (temp + fsync + rename)
+/// so a crash mid-save can never leave a torn JSON on disk.
 // **F-231/F-501/F-630 closure (2026-05-25)**: `save_risky_mode_state`
 // is now USED by `record_kill_switch_trip` and `auto_re_arm_if_ready`
 // below, so the `#[allow(dead_code)]` that masked it during the
@@ -269,7 +269,7 @@ pub fn save_risky_mode_state(state: &RiskyModeStateFile) -> Result<()> {
 
     let serialised =
         serde_json::to_string_pretty(&to_write).context("serialise risky mode state to JSON")?;
-    fs::write(&path, serialised)
+    neoethos_core::storage::json::write_bytes_atomic(&path, serialised.as_bytes())
         .with_context(|| format!("write risky mode state to {}", path.display()))?;
 
     tracing::info!(

@@ -246,10 +246,45 @@ fn render_registry(area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
+    // The store uses the nested models/<SYMBOL>/<TF>/<model_name>/ layout
+    // (same contract as the app's scan_models_dir) — listing only the top
+    // level would show bare symbol directories and hide every trained
+    // model. Walk two levels down and report "SYMBOL/TF/name"; keep any
+    // top-level artifact files as-is.
     let mut entries: Vec<String> = Vec::new();
-    if let Ok(read) = std::fs::read_dir(std::path::PathBuf::from("cache").join("models")) {
+    let root = std::path::PathBuf::from("cache").join("models");
+    if let Ok(read) = std::fs::read_dir(&root) {
         for e in read.flatten() {
-            entries.push(e.file_name().to_string_lossy().to_string());
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('_') {
+                continue; // sentinel files/dirs
+            }
+            if !e.path().is_dir() {
+                entries.push(name);
+                continue;
+            }
+            let mut found_nested = false;
+            if let Ok(tfs) = std::fs::read_dir(e.path()) {
+                for tf in tfs.flatten() {
+                    let tf_name = tf.file_name().to_string_lossy().to_string();
+                    if !tf.path().is_dir() || tf_name.starts_with('_') {
+                        continue;
+                    }
+                    if let Ok(models) = std::fs::read_dir(tf.path()) {
+                        for m in models.flatten() {
+                            let m_name = m.file_name().to_string_lossy().to_string();
+                            if m_name.starts_with('_') {
+                                continue;
+                            }
+                            entries.push(format!("{name}/{tf_name}/{m_name}"));
+                            found_nested = true;
+                        }
+                    }
+                }
+            }
+            if !found_nested {
+                entries.push(name);
+            }
         }
     }
     entries.sort();

@@ -89,7 +89,9 @@ pub fn save_config(cfg: &SupervisorConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(&path, serde_json::to_string_pretty(cfg)?)
+    // Atomic write: the config carries operator-typed directives — a torn
+    // write on crash would silently reset the supervisor (and lose them).
+    neoethos_core::storage::json::write_json_atomic(&path, cfg)
         .with_context(|| format!("write {}", path.display()))
 }
 

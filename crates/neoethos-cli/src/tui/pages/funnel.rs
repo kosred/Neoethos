@@ -176,6 +176,20 @@ fn render_funnel_value(v: &serde_json::Value, path: &std::path::Path) -> Vec<Lin
 }
 
 fn collect_funnel_files() -> Vec<std::path::PathBuf> {
+    // Called TWICE per frame (run list + latest panel) at ~30 fps, and each
+    // call stats every funnel file in three cache dirs. Memoize for 2 s —
+    // funnel JSONs appear on discovery-run timescales.
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, Vec<std::path::PathBuf>)>> = Mutex::new(None);
+    {
+        let guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, files)) = guard.as_ref() {
+            if at.elapsed() < Duration::from_secs(2) {
+                return files.clone();
+            }
+        }
+    }
     let mut found: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
     for root in &["cache/discovery", "cache/discovery_test", "cache/auto_loop"] {
         let p = std::path::Path::new(root);
@@ -197,5 +211,7 @@ fn collect_funnel_files() -> Vec<std::path::PathBuf> {
         }
     }
     found.sort_by(|a, b| b.0.cmp(&a.0));
-    found.into_iter().map(|(_, p)| p).collect()
+    let files: Vec<std::path::PathBuf> = found.into_iter().map(|(_, p)| p).collect();
+    *CACHE.lock().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), files.clone()));
+    files
 }

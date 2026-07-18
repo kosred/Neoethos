@@ -95,6 +95,15 @@ fn disc() -> String {
     "discovery".into()
 }
 
+/// True iff `s` is safe to use as a single path component (model-store
+/// subdirectory). Wire fields from peers MUST pass this before being joined
+/// into a local filesystem path — rejects `..`, separators, drive letters.
+fn safe_path_component(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Max bytes for one RPC message. Large enough for a tarred model directory
 /// (base64'd) returned from a training job.
 const MAX_RPC: usize = 512 * 1024 * 1024;
@@ -422,8 +431,13 @@ impl AppClient {
         }
         let (_, path) = best?;
         let portfolio_json = std::fs::read_to_string(&path).ok()?;
-        let trades_path = path.replace(".live_portfolio.json", ".trades.json");
-        let trades_json = std::fs::read_to_string(&trades_path).ok();
+        // Only derive the trades path when the expected suffix is present —
+        // a blind replace() on a non-matching path is a no-op and would
+        // re-read the portfolio file itself as "trades".
+        let trades_json = path
+            .strip_suffix(".live_portfolio.json")
+            .map(|stem| format!("{stem}.trades.json"))
+            .and_then(|p| std::fs::read_to_string(p).ok());
         Some((portfolio_json, trades_json))
     }
 }
@@ -463,18 +477,34 @@ impl ProtocolHandler for MeshProto {
                 }
                 Ok(MeshReq::SubmitTraining { symbol, base_tf, model_tar_b64 }) => {
                     use base64::Engine;
-                    let msg = match base64::engine::general_purpose::STANDARD.decode(&model_tar_b64) {
-                        Ok(tar) => match self.app.models_dir().await {
-                            Some(dir) => match untar_to(&tar, &dir) {
-                                Ok(()) => {
-                                    tracing::info!(peer = %remote, %symbol, %base_tf, bytes = tar.len(), "received a trained model from a peer worker → saved to model store");
-                                    format!("model saved ({} bytes) to {}", tar.len(), dir.display())
+                    // symbol/base_tf come off the wire — sanitize before they
+                    // become path components, and untar into the combo's OWN
+                    // subtree so a peer's archive can never overwrite models
+                    // for other symbols/timeframes in the local store.
+                    let msg = if !safe_path_component(&symbol) || !safe_path_component(&base_tf) {
+                        format!("rejected: unsafe symbol/baseTf path components ({symbol}/{base_tf})")
+                    } else {
+                        match base64::engine::general_purpose::STANDARD.decode(&model_tar_b64) {
+                            Ok(tar) => match self.app.models_dir().await {
+                                Some(dir) => {
+                                    let dest =
+                                        dir.join(symbol.to_uppercase()).join(base_tf.to_uppercase());
+                                    match untar_to(&tar, &dest) {
+                                        Ok(()) => {
+                                            tracing::info!(peer = %remote, %symbol, %base_tf, bytes = tar.len(), "received a trained model from a peer worker → saved to model store");
+                                            format!(
+                                                "model saved ({} bytes) to {}",
+                                                tar.len(),
+                                                dest.display()
+                                            )
+                                        }
+                                        Err(e) => format!("untar failed: {e}"),
+                                    }
                                 }
-                                Err(e) => format!("untar failed: {e}"),
+                                None => "no local model store path available".to_string(),
                             },
-                            None => "no local model store path available".to_string(),
-                        },
-                        Err(e) => format!("bad base64: {e}"),
+                            Err(e) => format!("bad base64: {e}"),
+                        }
                     };
                     MeshResp::SubmitAck { ok: msg.starts_with("model saved"), msg }
                 }
@@ -542,13 +572,27 @@ async fn run_one_job(
     }
 
     if job.work_type == "training" {
-        // Training ran locally; return the trained model directory to the
-        // coordinator by tarring it and sending it over the QUIC RPC.
+        // Training ran locally; return ONLY this job's combo subtree
+        // (models/<SYMBOL>/<TF>/) to the coordinator. Tarring the whole
+        // store would ship every unrelated model, blow past MAX_RPC, and
+        // overwrite the coordinator's other models on untar.
         use base64::Engine;
-        match app.models_dir().await {
+        let combo_dir = app.models_dir().await.map(|root| {
+            let upper = root.join(job.symbol.to_uppercase()).join(job.base_tf.to_uppercase());
+            if upper.exists() { upper } else { root.join(&job.symbol).join(&job.base_tf) }
+        });
+        match combo_dir {
             Some(dir) if dir.exists() => match tar_dir(&dir) {
                 Ok(tar) => {
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&tar);
+                    if b64.len() + 4096 > MAX_RPC {
+                        tracing::warn!(
+                            mb = tar.len() / (1024 * 1024),
+                            "trained model exceeds the {}MB RPC cap — not sending",
+                            MAX_RPC / (1024 * 1024)
+                        );
+                        return Ok(true);
+                    }
                     tracing::info!(mb = tar.len() / (1024 * 1024), "training done — sending model to coordinator");
                     match rpc(
                         endpoint,
@@ -567,7 +611,10 @@ async fn run_one_job(
                 }
                 Err(e) => tracing::warn!("could not tar model store: {e}"),
             },
-            _ => tracing::warn!("no model store found after training — nothing to return"),
+            _ => tracing::warn!(
+                symbol = %job.symbol, tf = %job.base_tf,
+                "no trained model directory for this combo — nothing to return"
+            ),
         }
         return Ok(true);
     }
@@ -757,10 +804,14 @@ async fn main() -> Result<()> {
                     "self": { "nodeId": me, "cores": mine.cpu_cores, "ramMb": mine.ram_mb, "gpu": mine.gpu },
                     "ts": now_secs(),
                 });
-                let _ = std::fs::write(
-                    std::env::temp_dir().join("neoethos_mesh_swarm.json"),
-                    snapshot.to_string(),
-                );
+                // Atomic-ish publish: write a temp file then rename over the
+                // target so the app's /mesh/swarm reader never sees a torn
+                // (half-written) JSON document.
+                let dest = std::env::temp_dir().join("neoethos_mesh_swarm.json");
+                let tmp = std::env::temp_dir().join("neoethos_mesh_swarm.json.tmp");
+                if std::fs::write(&tmp, snapshot.to_string()).is_ok() {
+                    let _ = std::fs::rename(&tmp, &dest);
+                }
             }
         });
     }

@@ -67,19 +67,14 @@ fn persist_locked(file: &SpreadStatsFile) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    match serde_json::to_string(file) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                tracing::warn!(
-                    target: "neoethos_app::spread_stats",
-                    error = %e, "failed to persist spread stats"
-                );
-            }
-        }
-        Err(e) => tracing::warn!(
+    // Atomic write (M07 primitive): a crash mid-write must not corrupt the
+    // accumulated stats file — a torn JSON would silently reset months of
+    // per-hour spread history on the next load.
+    if let Err(e) = neoethos_core::storage::json::write_json_atomic(&path, file) {
+        tracing::warn!(
             target: "neoethos_app::spread_stats",
-            error = %e, "failed to serialize spread stats"
-        ),
+            error = %e, "failed to persist spread stats"
+        );
     }
 }
 

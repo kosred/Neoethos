@@ -168,8 +168,22 @@ pub fn submit(
     std::fs::create_dir_all(&inbox).context("create federation_inbox")?;
 
     let ts = chrono::Utc::now().timestamp_millis();
-    let sym = symbol.trim().to_uppercase();
-    let tf = base_tf.trim().to_uppercase();
+    // symbol/base_tf arrive over HTTP and become filename components —
+    // keep only [A-Za-z0-9_-] (defense-in-depth against separator/..
+    // tricks, mirroring the mesh sidecar's safe_path_component).
+    let sanitize = |s: &str| -> String {
+        s.trim()
+            .to_uppercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(32)
+            .collect()
+    };
+    let sym = sanitize(symbol);
+    let tf = sanitize(base_tf);
+    if sym.is_empty() || tf.is_empty() {
+        anyhow::bail!("submitted symbol/baseTf contain no usable characters — rejected");
+    }
     let stem = format!("fed_{sym}_{tf}_{ts}");
     let pf_path = inbox.join(format!("{stem}.live_portfolio.json"));
     std::fs::write(&pf_path, portfolio_json).context("write submitted portfolio")?;

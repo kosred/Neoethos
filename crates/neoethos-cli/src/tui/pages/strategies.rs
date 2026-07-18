@@ -240,6 +240,7 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
     draw_details(detail_area, buf, &portfolios[sel]);
 }
 
+#[derive(Clone)]
 struct StratMetrics {
     net_profit: f64,
     return_pct: f64,
@@ -248,18 +249,54 @@ struct StratMetrics {
     win: f64,
 }
 
+/// (mtime, len) → (initial_capital, metrics) cache for the quality sidecar —
+/// same rationale as `count_cache`: draw_details runs per frame, and the
+/// sidecar can be megabytes; re-reading + token-scanning it 30×/s hammers
+/// the disk for data that only changes when discovery rewrites the file.
+type QualityEntry = (u64, u64, f64, Vec<StratMetrics>);
+fn quality_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, QualityEntry>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, QualityEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn load_quality(path: &std::path::Path) -> (f64, Vec<StratMetrics>) {
+    let meta = std::fs::metadata(path).ok();
+    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mtime = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(cache) = quality_cache().lock() {
+        if let Some((c_mtime, c_len, initial, metrics)) = cache.get(path) {
+            if *c_mtime == mtime && *c_len == len {
+                return (*initial, metrics.clone());
+            }
+        }
+    }
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let metrics = extract_strategy_metrics(&text);
+    let initial = scan_numbers(&text, "initial_capital")
+        .first()
+        .copied()
+        .unwrap_or(0.0);
+    if let Ok(mut cache) = quality_cache().lock() {
+        cache.insert(path.to_path_buf(), (mtime, len, initial, metrics.clone()));
+    }
+    (initial, metrics)
+}
+
 fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
     if area.height == 0 {
         return;
     }
     let mut sidecar = p.path.clone().into_os_string();
     sidecar.push(".quality.json");
-    let text = std::fs::read_to_string(std::path::PathBuf::from(sidecar)).unwrap_or_default();
-    let metrics = extract_strategy_metrics(&text);
-    let initial = scan_numbers(&text, "initial_capital")
-        .first()
-        .copied()
-        .unwrap_or(0.0);
+    let (initial, metrics) = load_quality(&PathBuf::from(sidecar));
     let total_net: f64 = metrics.iter().map(|m| m.net_profit).sum();
 
     // Header carries the money view: starting capital + Σ net € across the
@@ -403,6 +440,9 @@ struct PortfolioSummary {
     strategies: usize,
     bytes: u64,
     modified: String,
+    /// Real mtime for sorting — the display string is time-of-day only,
+    /// so sorting by it would order yesterday-23:59 above today-08:00.
+    modified_secs: u64,
     path: PathBuf,
 }
 
@@ -436,23 +476,29 @@ fn scan_portfolios() -> Vec<PortfolioSummary> {
             let path = entry.path();
             let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
             let strategies = count_strategies(&path);
-            let modified = entry
+            let modified_secs = entry
                 .metadata()
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| format_ts(d.as_secs()))
-                .unwrap_or_else(|| "—".to_string());
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let modified = if modified_secs > 0 {
+                format_ts(modified_secs)
+            } else {
+                "—".to_string()
+            };
             out.push(PortfolioSummary {
                 name: name_str,
                 strategies,
                 bytes,
                 modified,
+                modified_secs,
                 path,
             });
         }
     }
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out.sort_by(|a, b| b.modified_secs.cmp(&a.modified_secs));
     out
 }
 

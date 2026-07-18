@@ -211,6 +211,22 @@ pub fn launch_import(shared: &mut AppShared) {
 }
 
 fn collect_inventory(root: &std::path::Path) -> Vec<(String, String, usize, u64)> {
+    // draw() runs per frame (~30 fps); a full read_dir + per-file metadata
+    // walk of the data tree every frame is tens of thousands of syscalls
+    // per second on a large dataset. Memoize for 2 s — inventory changes
+    // on import timescales, not frame timescales.
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    type InventoryCache = Option<(Instant, std::path::PathBuf, Vec<(String, String, usize, u64)>)>;
+    static CACHE: Mutex<InventoryCache> = Mutex::new(None);
+    {
+        let guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, cached_root, rows)) = guard.as_ref() {
+            if cached_root == root && at.elapsed() < Duration::from_secs(2) {
+                return rows.clone();
+            }
+        }
+    }
     let mut out: Vec<(String, String, usize, u64)> = Vec::new();
     if let Ok(read) = std::fs::read_dir(root) {
         for entry in read.flatten() {
@@ -243,6 +259,8 @@ fn collect_inventory(root: &std::path::Path) -> Vec<(String, String, usize, u64)
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
+    *CACHE.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some((Instant::now(), root.to_path_buf(), out.clone()));
     out
 }
 
@@ -250,6 +268,12 @@ fn timeframe_sort_key(a: &String, b: &String) -> std::cmp::Ordering {
     // Sort canonical chart timeframes by minute value so the
     // operator reads them as M1, M5, M15, H1, H4, D1, W1, MN1.
     fn to_minutes(tf: &str) -> u64 {
+        // MN1 must be checked BEFORE the single-letter split: "MN1" split
+        // at 1 is ("M", "N1"), whose parse-failure used to collapse the
+        // monthly timeframe to 0 minutes and sort it before M1.
+        if tf.starts_with("MN") {
+            return 100_000;
+        }
         let (kind, num) = tf.split_at(1);
         let n: u64 = num.parse().unwrap_or(0);
         match kind {
@@ -257,7 +281,7 @@ fn timeframe_sort_key(a: &String, b: &String) -> std::cmp::Ordering {
             "H" => n * 60,
             "D" => n * 1440,
             "W" => n * 10_080,
-            _ => 100_000, // MN1 etc.
+            _ => 100_000,
         }
     }
     to_minutes(a).cmp(&to_minutes(b))
