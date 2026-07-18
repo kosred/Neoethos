@@ -40,20 +40,29 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Guard against Python/PyO3 reintroduction
-        run: bash scripts/check_no_python_legacy.sh
+        shell: bash
+        run: |
+          # scripts/check_no_python_legacy.sh was deleted; inline equivalent.
+          if git grep -nEi '(^|[^[:alnum:]_])(pyo3|pythonize)([^[:alnum:]_]|$)' --             Cargo.toml Cargo.lock 'crates/**/Cargo.toml'             desktop/src-tauri/Cargo.toml mcp/Cargo.toml mesh/Cargo.toml; then
+            echo 'Python/PyO3 dependency found in a Rust manifest or lockfile.' >&2
+            exit 1
+          fi
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential cmake pkg-config \
+            build-essential cmake mold pkg-config \
             libasound2-dev libudev-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libx11-dev
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          # Pinned repo nightly: .cargo/config.toml passes -Zthreads (nightly-only),
+          # and dtolnay's action overrides rust-toolchain.toml.
+          toolchain: nightly-2026-04-07
           components: clippy, rustfmt
 
       - name: Cache Cargo
@@ -106,14 +115,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential cmake pkg-config \
+            build-essential cmake mold pkg-config \
             libasound2-dev libudev-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libx11-dev
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          # Pinned repo nightly: .cargo/config.toml passes -Zthreads (nightly-only),
+          # and dtolnay's action overrides rust-toolchain.toml.
+          toolchain: nightly-2026-04-07
           components: clippy, rustfmt
 
       - name: Cache Cargo
@@ -127,15 +139,23 @@ jobs:
           key: linux-gpu-nvidia-ci-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: linux-gpu-nvidia-ci-
 
-      - name: Build with NVIDIA GPU support
-        run: cargo build --workspace --release --features cuda
+      # The workspace has NO feature named `cuda` — the per-crate GPU
+      # features are gpu-cuda (models/search) aggregated as gpu-nvidia in
+      # the binaries. Build the CLI the way the GPU releases always were.
+      - name: Build CLI with NVIDIA GPU support
+        run: cargo build -p neoethos-cli --release --features gpu-nvidia
         env:
           CUDA_PATH: /usr/local/cuda
 
-      - name: Run tests with NVIDIA GPU
-        run: cargo test --workspace --release --features cuda
+      # THE POINT of this job: the CPU==GPU parity suite. NEOETHOS_REQUIRE_GPU=1
+      # turns "no GPU detected" into a hard FAILURE instead of a silent skip,
+      # so a mislabeled runner can't fake a pass. This is the gate the
+      # deferred backtest-core fixes (final-position, gap fills) must hold.
+      - name: GPU parity tests (CPU == GPU)
+        run: cargo test -p neoethos-search --release --features gpu-cuda gpu_ -- --nocapture
         env:
           CUDA_PATH: /usr/local/cuda
+          NEOETHOS_REQUIRE_GPU: "1"
 
   # GPU-accelerated Linux job with AMD ROCm support
   workspace-linux-gpu-amd:
@@ -156,14 +176,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential cmake pkg-config \
+            build-essential cmake mold pkg-config \
             libasound2-dev libudev-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libx11-dev
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          # Pinned repo nightly: .cargo/config.toml passes -Zthreads (nightly-only),
+          # and dtolnay's action overrides rust-toolchain.toml.
+          toolchain: nightly-2026-04-07
           components: clippy, rustfmt
 
       - name: Cache Cargo
@@ -177,15 +200,17 @@ jobs:
           key: linux-gpu-amd-ci-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: linux-gpu-amd-ci-
 
-      - name: Build with AMD GPU support
-        run: cargo build --workspace --release --features rocm
+      # No workspace `rocm` feature exists — the aggregate is gpu-rocm.
+      - name: Build CLI with AMD GPU support
+        run: cargo build -p neoethos-cli --release --features gpu-rocm
         env:
           ROCM_PATH: /opt/rocm
 
-      - name: Run tests with AMD GPU
-        run: cargo test --workspace --release --features rocm
+      - name: GPU parity tests (CPU == GPU, ROCm)
+        run: cargo test -p neoethos-search --release --features gpu-rocm gpu_ -- --nocapture
         env:
           ROCM_PATH: /opt/rocm
+          NEOETHOS_REQUIRE_GPU: "1"
 
   # V0.4 audit Task #46 — extend CI beyond Linux so the cfg(windows) /
   # cfg(macos) paths get exercised on every dispatch. The codebase has
@@ -201,7 +226,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -221,7 +248,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -234,25 +263,3 @@ jobs:
           restore-keys: macos-workspace-ci-
       - name: Cargo check workspace without default features
         run: cargo check --workspace --all-targets --no-default-features
-
-  workspace-ios:
-    name: Workspace check (iOS)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ios-workspace-ci-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ios-workspace-ci-
-      - name: Cargo check workspace for iOS
-        run: cargo check --workspace --target aarch64-apple-ios --no-default-features

@@ -9,20 +9,6 @@ BINDGEN_EXTRA_CLANG_ARGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 # The runtime UCRT DLLs (api-ms-win-crt-*.dll) ship with VS C++
 # Redistributable; if missing, copy them alongside neoethos-cli.exe.
 
-# OpenMP duplicate-symbol workaround (MSVC toolchain 14.51.36231+).
-#
-# Two OpenMP libraries land in the final link of `neoethos-app`:
-#   - `VCOMP.lib` (MSVC's OpenMP runtime), auto-linked because
-#     `llama-cpp-sys-2`'s ggml-cpu.c.obj calls `_vcomp_*` MSVC-specific
-#     primitives — we cannot exclude VCOMP without breaking llama-cpp.
-#   - `lightgbm3-sys/c_api.cpp.obj`, which has `omp_get_thread_num`
-#     etc. compiled-in (statically linked OpenMP).
-#
-# Both define `omp_get_thread_num` → LNK2005 (multiply defined symbol).
-# Pure exclusion of either breaks the other. `/FORCE:MULTIPLE` tells
-# the linker to keep the first definition and downgrade the duplicate
-# to a warning (LNK4006); both copies implement the same standard
-# OpenMP ABI so picking either is correct.
 # target-cpu=x86-64-v3: emit AVX2/BMI2/FMA SIMD (the microarch level for
 # Intel Haswell 2013+ and AMD Zen 2017+). Operator decision 2026-06-04:
 # NeoEthos only targets post-2013 hardware — requiring AVX2 is intended,
@@ -34,7 +20,7 @@ BINDGEN_EXTRA_CLANG_ARGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 # than locking to the exact build machine.
 [target.x86_64-pc-windows-msvc]
 # + -Zthreads=8 (parallel rustc frontend) for faster local Windows builds too.
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "link-arg=/FORCE:MULTIPLE", "-C", "link-arg=/IGNORE:4006", "-Z", "threads=8"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-Z", "threads=8"]
 
 # agent 2026-06-05: AVX2/BMI2/FMA SIMD on Linux too (local WSL2 build + the L40
 # VPS). The Windows section above already requested `target-cpu=x86-64-v3`, but
