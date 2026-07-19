@@ -335,20 +335,19 @@ fn write_backup(path: &std::path::Path) -> std::io::Result<Option<PathBuf>> {
     Ok(Some(backup))
 }
 
-/// Write `contents` to `path` atomically via temp-file + rename.
-fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+/// Write `contents` to `path` atomically via the M07 primitive
+/// (temp + fsync + rename, per-path writer lock, Windows retry).
+///
+/// 2026-07-19 deep-audit fix: the old local implementation did
+/// remove-then-rename on the claim that Windows can't rename over an
+/// existing file — which is FALSE for Rust std (MoveFileExW with
+/// REPLACE_EXISTING; empirically verified on this machine). Worse, a
+/// crash between the remove and the rename left NO config.yaml at all —
+/// the exact "app won't open" corruption class M07 was built to close.
+fn write_atomic(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     std::fs::create_dir_all(parent)?;
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, contents)?;
-    // On Windows, `rename` over an existing file fails — explicitly
-    // remove the target first. The temp file stays as the
-    // crash-recovery artefact if rename then fails.
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    neoethos_core::storage::json::write_bytes_atomic(path, contents.as_bytes())
 }
 
 /// POST /settings — merge-update + persist to config.yaml.

@@ -229,11 +229,19 @@ fn promote_if_gated(symbol: &str, base_tf: &str) -> anyhow::Result<PromoteRespon
     // Re-evaluate the gate server-side — never trust a client claim
     // that the portfolio passed. This is the authoritative check.
     let status = evaluate_promotion_for(symbol, base_tf)?;
+    // 2026-07-19 deep-audit fix: use the RESOLVED symbol/base_tf from the
+    // gate evaluation everywhere below. The raw args may be EMPTY (the body
+    // omitted them and the gate resolved config defaults internally) — the
+    // old code then built `models/""/""` as the copy source, which is the
+    // models ROOT: a passing gate would have copied the ENTIRE model store
+    // flat into live_models/, a layout live inference cannot read.
+    let symbol = status.symbol.clone();
+    let base_tf = status.base_tf.clone();
     if !status.decision.promoted {
         return Ok(PromoteResponseDto {
             promoted: false,
-            symbol: symbol.to_string(),
-            base_tf: base_tf.to_string(),
+            symbol,
+            base_tf,
             live_models_path: None,
             files_copied: 0,
             message: format!("Promotion blocked: {}", status.decision.summary),
@@ -241,13 +249,13 @@ fn promote_if_gated(symbol: &str, base_tf: &str) -> anyhow::Result<PromoteRespon
     }
 
     // Gate passed — copy the trained artifacts to live_models/.
-    let src = PathBuf::from(MODELS_DIR).join(symbol).join(base_tf);
-    let dst = PathBuf::from(LIVE_MODELS_DIR).join(symbol).join(base_tf);
+    let src = PathBuf::from(MODELS_DIR).join(&symbol).join(&base_tf);
+    let dst = PathBuf::from(LIVE_MODELS_DIR).join(&symbol).join(&base_tf);
     if !src.exists() {
         return Ok(PromoteResponseDto {
             promoted: false,
-            symbol: symbol.to_string(),
-            base_tf: base_tf.to_string(),
+            symbol,
+            base_tf,
             live_models_path: None,
             files_copied: 0,
             message: format!(
@@ -262,21 +270,20 @@ fn promote_if_gated(symbol: &str, base_tf: &str) -> anyhow::Result<PromoteRespon
 
     tracing::info!(
         target: "neoethos_app::strategy_lab::promote",
-        symbol, base_tf,
+        %symbol, %base_tf,
         files = files_copied,
         dst = %dst.display(),
         "promoted portfolio to live_models"
     );
 
+    let message = format!("Promoted {symbol} {base_tf} to live trading ({files_copied} files).");
     Ok(PromoteResponseDto {
         promoted: true,
-        symbol: symbol.to_string(),
-        base_tf: base_tf.to_string(),
+        symbol,
+        base_tf,
         live_models_path: Some(dst.display().to_string()),
         files_copied,
-        message: format!(
-            "Promoted {symbol} {base_tf} to live trading ({files_copied} files)."
-        ),
+        message,
     })
 }
 

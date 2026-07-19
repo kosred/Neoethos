@@ -320,8 +320,12 @@ pub async fn report(
     Query(q): Query<ReportQuery>,
 ) -> Result<Json<StrategyReportDto>, axum::http::StatusCode> {
     let cache = cache_dir(&state);
-    // sanitise: only allow auto_loop* dirs + a plain base name
-    if !q.dir.starts_with("auto_loop") || q.base.contains('/') || q.base.contains('\\') {
+    // Sanitise: only allow auto_loop* dirs + a plain base name. Both
+    // components must be single path segments — the old check validated
+    // only `base`, so a `dir=auto_loop_x\..\..` passed the prefix test
+    // and escaped the cache directory (2026-07-19 deep-audit fix).
+    let is_plain = |s: &str| !s.contains('/') && !s.contains('\\') && !s.contains("..");
+    if !q.dir.starts_with("auto_loop") || !is_plain(&q.dir) || !is_plain(&q.base) {
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
     let dir = cache.join(&q.dir);
