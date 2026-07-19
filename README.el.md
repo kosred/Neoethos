@@ -1,6 +1,6 @@
 <div align="center">
 
-[![English](https://img.shields.io/badge/Read%20it%20in-English-1f6feb?style=for-the-badge)](README.md)
+[![Read it in English](assets/badge-lang-en.svg)](README.md)
 
 # NeoEthos
 
