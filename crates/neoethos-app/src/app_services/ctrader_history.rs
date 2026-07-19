@@ -428,25 +428,40 @@ pub fn fetch_tick_data_with_transport<T: CTraderOpenApiTransport>(
             symbol_name: request.symbol_name.clone(),
         },
     )?;
-    let responses = transport.send_sequence(&[build_get_tick_data_request(
-        resolved.account_id,
-        resolved.light_symbol.symbol_id,
-        request.quote_side.as_i32(),
-        request.from_timestamp_ms,
-        request.to_timestamp_ms,
-        "history-ticks-1",
-    )])?;
-    if responses.len() != 1 {
+    // Re-authenticate on this fresh WSS connection before the tick request —
+    // `send_sequence` opens a brand-new socket each call (see the identical
+    // note on the trendbars path above), so the auth from `resolve_symbol`
+    // does not carry over. This helper used to send the tick request ALONE,
+    // which the broker answers with ProtoOAErrorRes (2026-07-18 deep-audit
+    // fix; latent — no production caller yet).
+    let responses = transport.send_sequence(&[
+        build_application_auth_request(&request.client_id, &request.client_secret, "ticks-app-auth-1"),
+        build_account_auth_request(resolved.account_id, &request.access_token, "ticks-account-auth-1"),
+        build_get_tick_data_request(
+            resolved.account_id,
+            resolved.light_symbol.symbol_id,
+            request.quote_side.as_i32(),
+            request.from_timestamp_ms,
+            request.to_timestamp_ms,
+            "history-ticks-1",
+        ),
+    ])?;
+    if responses.len() != 3 {
         return Err(anyhow!(
-            "expected 1 cTrader tick-data response, received {}",
+            "expected 3 cTrader tick-data auth/data responses, received {}",
             responses.len()
         ));
     }
     ensure_success_payload_type(
         &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[2],
         CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE,
     )?;
-    let result = parse_tick_data_response(&responses[0], &resolved.symbol)?;
+    let result = parse_tick_data_response(&responses[2], &resolved.symbol)?;
     validate_tick_window(
         &result,
         request.from_timestamp_ms,

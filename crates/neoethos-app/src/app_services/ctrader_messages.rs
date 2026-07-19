@@ -1778,10 +1778,11 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
             let expected_payload_type = expected_response_payload_type(message.payload_type)?;
             let serialized = serde_json::to_string(message)
                 .context("failed to serialize cTrader open api message")?;
-            // DIAG: stamp request shape so we can see exactly what was sent
-            // before we hit the response-count mismatch in the bridge.
-            // Remove this block once the protocol-flow bug is closed.
-            tracing::info!(
+            // Per-frame transport trace. Was INFO during the 2026-06 protocol-
+            // flow investigation (now closed) — at info level it fired on every
+            // frame of every bridge poll and dominated log growth. DEBUG keeps
+            // it available via RUST_LOG=neoethos_app::ctrader_transport=debug.
+            tracing::debug!(
                 target: "neoethos_app::ctrader_transport",
                 request_msg_id = %message.client_msg_id,
                 request_payload_type = message.payload_type,
@@ -1802,11 +1803,11 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
                             return Err(anyhow!("empty cTrader open api response"));
                         }
                         let envelope = parse_open_api_envelope(text.as_ref())?;
-                        // DIAG (remove with the trace above): log every incoming
-                        // envelope so we can see whether non-matching responses
-                        // are spot ticks, errors, or correctly-targeted replies
-                        // with mismatched client_msg_id.
-                        tracing::info!(
+                        // Per-frame receive trace — DEBUG for the same reason as
+                        // the send-side trace above (was INFO during the closed
+                        // 2026-06 protocol-flow investigation; at info it logged
+                        // a 220-char body preview per frame per poll).
+                        tracing::debug!(
                             target: "neoethos_app::ctrader_transport",
                             recv_payload_type = envelope.payload_type,
                             recv_msg_id = %envelope.client_msg_id,

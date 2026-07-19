@@ -320,7 +320,38 @@ pub fn spawn(config: LiveSpotsStreamerConfig) {
                 generation = my_gen,
                 "connecting to cTrader spot stream"
             );
-            let cfg = config.clone();
+            let mut cfg = config.clone();
+            // 2026-07-18 deep-audit fix: refresh the access token before EVERY
+            // (re)connect. cTrader access tokens live ~30 minutes; the old loop
+            // re-authenticated each reconnect with the SPAWN-TIME token, so
+            // after the first expiry every reconnect failed auth with the same
+            // stale token forever — Market Watch went permanently dark until an
+            // app restart. Fail-soft: on refresh failure keep the previous
+            // token (the reconnect may still succeed if it hasn't expired).
+            {
+                let client_id = cfg.client_id.clone();
+                let client_secret = cfg.client_secret.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::app_services::broker_api::ensure_fresh_token_bundle(
+                        &client_id,
+                        &client_secret,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(bundle)) => cfg.access_token = bundle.access_token,
+                    Ok(Err(err)) => tracing::warn!(
+                        target: "neoethos_app::live_spots_streamer",
+                        error = %err,
+                        "token refresh before spot-stream connect failed — using previous token"
+                    ),
+                    Err(join_err) => tracing::warn!(
+                        target: "neoethos_app::live_spots_streamer",
+                        error = %join_err,
+                        "token refresh task failed — using previous token"
+                    ),
+                }
+            }
             let outcome = tokio::task::spawn_blocking(move || run_blocking(cfg, my_gen)).await;
             match outcome {
                 Ok(Ok(())) => {

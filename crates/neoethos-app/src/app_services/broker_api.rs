@@ -145,7 +145,13 @@ fn now_unix() -> i64 {
 ///
 /// Blocking (does a token-endpoint HTTP POST when refreshing); callers already
 /// run broker work inside `spawn_blocking`.
-fn ensure_fresh_token_bundle(client_id: &str, client_secret: &str) -> Result<CTraderTokenBundle> {
+/// `pub(crate)`: the spot-streamer's reconnect loop also needs a fresh
+/// token before every (re)connect — its spawn-time token dies after ~30
+/// minutes and a reconnect with a stale token would fail auth forever.
+pub(crate) fn ensure_fresh_token_bundle(
+    client_id: &str,
+    client_secret: &str,
+) -> Result<CTraderTokenBundle> {
     let store = production_ctrader_token_store();
     let bundle = store
         .load_token_bundle_with_legacy_fallback()

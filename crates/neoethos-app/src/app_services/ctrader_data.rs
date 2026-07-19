@@ -1135,16 +1135,30 @@ pub fn parse_tick_data_response(
     }
 
     let mut ticks = Vec::with_capacity(envelope.payload.tick_data.len());
-    let mut previous_timestamp = None;
+    let mut previous_timestamp: Option<i64> = None;
+    let mut previous_tick_raw: Option<i64> = None;
     for tick in envelope.payload.tick_data {
         let timestamp_ms = match previous_timestamp {
             None => tick.timestamp,
             Some(previous) => previous - tick.timestamp,
         };
         previous_timestamp = Some(timestamp_ms);
+        // 2026-07-18 deep-audit fix: per the Spotware spec BOTH fields of
+        // `ProtoOATickData` are delta-compressed — the first (newest) tick
+        // carries absolute values, every later one a delta from the previous
+        // tick, decoded with the SAME subtraction convention as `timestamp`.
+        // The old code delta-decoded only the timestamp and treated each raw
+        // `tick` as an absolute price, so every tick after the first came out
+        // as a near-zero delta. (Latent — no production caller yet; the
+        // real-data fixture test remains the TODO gating live use.)
+        let raw_price = match previous_tick_raw {
+            None => tick.tick,
+            Some(previous) => previous - tick.tick,
+        };
+        previous_tick_raw = Some(raw_price);
         ticks.push(HistoricalTick {
             timestamp_ms,
-            price: relative_price_to_absolute(tick.tick, symbol.digits),
+            price: relative_price_to_absolute(raw_price, symbol.digits),
         });
     }
     ticks.sort_by_key(|tick| tick.timestamp_ms);
