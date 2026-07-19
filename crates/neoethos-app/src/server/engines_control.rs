@@ -349,8 +349,14 @@ pub async fn training_start(
             .into_response();
     }
 
+    // 2026-07-19 deep-audit fix: thread the RESOLVED config path (CLI
+    // --config override or the canonical user-data config.yaml) instead of
+    // the literal "config.yaml" — a CWD-relative path that does not exist
+    // in an installed app, so training would fail to load Settings (or
+    // load a stale dev copy) while discovery right above resolved
+    // correctly. Same S05 class as the runtime-overrides fix.
     let request = TrainingRequest {
-        config_path: "config.yaml".to_string(),
+        config_path: state.config_path().display().to_string(),
         models_dir: PathBuf::from("models"),
         symbol: symbol.clone(),
         base_tf: base_tf.clone(),
@@ -618,8 +624,9 @@ fn spawn_state_drainer(
 /// (not an HTTP path), wiring up its own drainer with no further
 /// auto-chain. Pulled out so the recursive shape stays readable.
 fn spawn_auto_chained_training(state: AppApiState, symbol: String, base_tf: String) {
+    // Same resolved-config-path rule as training_start (2026-07-19 fix).
     let request = TrainingRequest {
-        config_path: "config.yaml".to_string(),
+        config_path: state.config_path().display().to_string(),
         models_dir: PathBuf::from("models"),
         symbol,
         base_tf,
