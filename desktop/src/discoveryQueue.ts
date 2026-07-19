@@ -69,10 +69,12 @@ export function startQueue(): void {
 }
 
 export async function stopQueue(): Promise<void> {
+  // Mark the in-flight item too — after this the driver stops ticking, so a
+  // "running" row left behind would show as running forever.
   set({
     active: false,
     items: state.items.map((i) =>
-      i.status === "pending"
+      i.status === "pending" || i.status === "running"
         ? { ...i, status: "failed", note: "cancelled" }
         : i,
     ),
