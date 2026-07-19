@@ -1,41 +1,43 @@
-# Σχέδιο δημοσίευσης — για τον Κωνσταντίνο
+# Posting playbook
 
-Όλα τα κείμενα εδώ μέσα είναι **έτοιμα για copy-paste** (ενημερωμένα για
-v0.5.6). Ένα κανάλι τη φορά, με τον ρυθμό σου. Δεν χρειάζεται τίποτα άλλο
-από ένα paste.
+*Ελληνική έκδοση: [README.el.md](README.el.md)*
 
-## Προτεινόμενη σειρά
+Every text in this folder is **ready to copy-paste** (updated for v0.5.6).
+One channel at a time, at your own pace. Nothing else is needed beyond a
+single paste.
 
-| # | Κανάλι | Αρχείο | Πότε |
-|---|--------|--------|------|
-| 1 | **r/rust** | `reddit-rust.md` | Ξεκίνα εδώ — η πιο φιλική τεχνική κοινότητα. Καθημερινή, 15:00–18:00 ώρα Ελλάδας. |
-| 2 | **Awesome lists + This Week in Rust** | `low-effort-channels.md` | Όποτε θες — είναι σκέτα pull requests, μηδενική έκθεση. |
-| 3 | **r/algotrading** | `reddit-algotrading.md` | 3–4 μέρες μετά το r/rust. |
-| 4 | **Show HN** | `hackernews.md` | Όταν νιώσεις έτοιμος. Τρίτη–Πέμπτη, 15:00–17:00 ώρα Ελλάδας. Μετά το submit, ποστάρεις ΑΜΕΣΩΣ το πρώτο σχόλιο από το αρχείο. |
-| 5 | **X/Twitter** | `twitter-thread.md` | Όποτε — δουλεύει και ως follow-up των παραπάνω. |
+## Recommended order
 
-## Κανόνες επιβίωσης (για εμάς τους εσωστρεφείς)
+| # | Channel | File | When |
+|---|---------|------|------|
+| 1 | **r/rust** | `reddit-rust.md` | Start here — the friendliest technical community. Weekday, 13:00–16:00 UTC. |
+| 2 | **Awesome lists + This Week in Rust** | `low-effort-channels.md` | Any time — they are plain pull requests, zero exposure. |
+| 3 | **r/algotrading** | `reddit-algotrading.md` | 3–4 days after r/rust. |
+| 4 | **Show HN** | `hackernews.md` | When you feel ready. Tue–Thu, 13:00–15:00 UTC. After submitting, post the prepared first comment IMMEDIATELY. |
+| 5 | **X/Twitter** | `twitter-thread.md` | Whenever — also works as a follow-up to the above. |
 
-- **Ένα κανάλι τη μέρα, μάξιμουμ.** Αν πάει καλά το ένα, τα άλλα περιμένουν.
-- **Απαντάς ΜΟΝΟ στις τεχνικές ερωτήσεις**, με τον ρυθμό σου — και μετά από
-  ώρες είναι μια χαρά. Σύντομες απαντήσεις = απόλυτα αποδεκτές.
-- **Στους κυνικούς δεν απαντάς.** Σε κάθε trading thread θα υπάρξει ένα
-  «όλα τα bots χάνουν» — το README σου ήδη συμφωνεί μαζί τους στα σημεία
-  που έχουν δίκιο. Δεν χρωστάς debate σε κανέναν.
-- **Ποτέ υπόσχεση κέρδους, πουθενά** — ούτε σε σχόλιο, ούτε αστειευόμενος.
-  Το «it tells you the truth about an edge, including when there isn't
-  one» είναι η ασπίδα σου και η ταυτότητά σου.
-- Αν ένα post δεν «πιάσει», δεν σημαίνει τίποτα — το HN επιτρέπει ευγενικό
-  resubmit μετά από μερικές εβδομάδες, και τα subreddits έχουν τεράστια
-  διακύμανση ανά μέρα/ώρα.
-- **Το αστέρι χτίζει αστέρι.** Στόχος του πρώτου post δεν είναι το viral —
-  είναι τα πρώτα 20–50 stars που κάνουν το repo να δείχνει ζωντανό στους
-  επόμενους που θα το βρουν.
+## Survival rules (for those of us who find posting hard)
 
-## Πριν το πρώτο post (2′ έλεγχος)
+- **One channel per day, maximum.** If one takes off, the others can wait.
+- **Reply ONLY to technical questions**, at your own pace — hours later is
+  perfectly fine. Short answers are perfectly acceptable.
+- **Never engage the cynics.** Every trading thread gets one "all bots
+  lose" comment — the README already agrees with them where they're right.
+  You owe nobody a debate.
+- **Never promise profit, anywhere** — not in a comment, not as a joke.
+  "It tells you the truth about an edge, including when there isn't one"
+  is both your shield and your identity.
+- If a post doesn't take off, it means nothing — HN allows a polite
+  resubmit after a few weeks, and subreddit reach varies wildly by
+  day and hour.
+- **Stars build stars.** The goal of the first post is not going viral —
+  it's the first 20–50 stars that make the repo look alive to everyone
+  who finds it afterwards.
 
-- [ ] Το [latest release](https://github.com/kosred/Neoethos/releases/latest)
-      κατεβαίνει και τρέχει (v0.5.6 ✓).
-- [ ] Η [σελίδα της ιστορίας](https://kosred.github.io/Neoethos/) ανοίγει ✓.
-- [ ] Έχεις λίγο χρόνο τις επόμενες ~3 ώρες για 2–3 απαντήσεις (όχι
-      υποχρεωτικό, αλλά βοηθά το πρώτο κύμα).
+## Before the first post (2-minute check)
+
+- [ ] The [latest release](https://github.com/kosred/Neoethos/releases/latest)
+      downloads and runs (v0.5.6 ✓).
+- [ ] The [story page](https://kosred.github.io/Neoethos/) loads ✓.
+- [ ] You have some availability over the next ~3 hours for 2–3 replies
+      (not mandatory, but it helps the first wave).
