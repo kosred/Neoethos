@@ -1,5 +1,7 @@
 <div align="center">
 
+[![Ελληνικά](https://img.shields.io/badge/%CE%94%CE%B9%CE%B1%CE%B2%CE%AC%CF%83%CF%84%CE%B5%20%CF%84%CE%BF%20%CF%83%CF%84%CE%B1-%CE%95%CE%BB%CE%BB%CE%B7%CE%BD%CE%B9%CE%BA%CE%AC-0D5EAF?style=for-the-badge)](README.el.md)
+
 # NeoEthos
 
 ### *A new ethos for trading — institutional-grade discipline, in the hands of one person.*
