@@ -21,6 +21,36 @@ fn cast_tensor_dtype(tensor: Tensor, dtype: DType) -> Result<Tensor> {
     }
 }
 
+/// Copy every parameter from `src` into `dst`'s own storage.
+///
+/// `NeuralNetwork` is `#[derive(Clone)]` over a candle `VarMap`, whose inner
+/// `HashMap<String, Var>` sits behind an `Arc` — so `clone()` SHARES the
+/// variables. A target network built that way is never frozen: every
+/// optimizer step on the online network moves the "target" too, which
+/// destroys the whole point of a DQN target network. The target must own
+/// independent variables and be synced by copying tensors.
+fn copy_network_weights(src: &NeuralNetwork, dst: &NeuralNetwork) -> Result<()> {
+    let src_map = src
+        .varmap
+        .data()
+        .lock()
+        .map_err(|e| AlgorithmError::InternalError(format!("source varmap poisoned: {e}")))?;
+    let dst_map = dst
+        .varmap
+        .data()
+        .lock()
+        .map_err(|e| AlgorithmError::InternalError(format!("target varmap poisoned: {e}")))?;
+    for (name, src_var) in src_map.iter() {
+        let dst_var = dst_map.get(name).ok_or_else(|| {
+            AlgorithmError::ModelUpdateFailed(format!(
+                "target network is missing parameter '{name}' during weight sync"
+            ))
+        })?;
+        dst_var.set(&src_var.as_tensor().detach())?;
+    }
+    Ok(())
+}
+
 /// DQN state encoding mode.
 #[derive(Default, Debug, Eq, PartialEq)]
 pub enum DNQStateMode {
@@ -120,8 +150,11 @@ where
         let q_network =
             NeuralNetwork::new_with_dtype(state_dim, hidden_dims, action_dim, dtype, device)?;
 
-        // 目标网络初始化为Q网络的副本
-        let target_network = q_network.clone();
+        // The target network must own INDEPENDENT variables (see
+        // `copy_network_weights`); `q_network.clone()` would share them.
+        let target_network =
+            NeuralNetwork::new_with_dtype(state_dim, hidden_dims, action_dim, dtype, device)?;
+        copy_network_weights(&q_network, &target_network)?;
 
         // 创建优化器
         let optimizer = optim::AdamW::new(q_network.varmap.all_vars(), nn::ParamsAdamW::default())?;
@@ -141,9 +174,10 @@ where
         })
     }
 
-    /// Updates the target network to match the Q-network.
-    fn update_target_network(&mut self) {
-        self.target_network = self.q_network.clone();
+    /// Updates the target network to match the Q-network (hard sync into the
+    /// target's OWN variables — never an Arc-sharing clone).
+    fn update_target_network(&mut self) -> Result<()> {
+        copy_network_weights(&self.q_network, &self.target_network)
     }
 
     /// Updates the Q-network using a batch of samples from the replay buffer.
@@ -208,9 +242,11 @@ where
         let state_tensor = cast_tensor_dtype(Tensor::stack(&states, 0)?, network_dtype)?;
         let next_state_tensor = cast_tensor_dtype(Tensor::stack(&next_states, 0)?, network_dtype)?;
 
-        // 计算当前状态的Q值
+        // 计算当前状态的Q值。The target-network pass is detached: the TD
+        // target is a constant in the DQN loss — gradients must only flow
+        // through the online network's Q(s,a).
         let current_q_values = self.q_network.forward(&state_tensor)?;
-        let next_q_values = self.target_network.forward(&next_state_tensor)?;
+        let next_q_values = self.target_network.forward(&next_state_tensor)?.detach();
 
         // 计算最大Q值
         let max_next_q_values = next_q_values.max_keepdim(1)?.squeeze(1)?;
@@ -360,7 +396,7 @@ where
             }
 
             if self.step_count % args.update_interval == 0 {
-                self.update_target_network();
+                self.update_target_network()?;
             }
 
             total_reward += reward.0;
@@ -407,7 +443,7 @@ where
         self.step_count = 0;
 
         // 初始化目标网络
-        self.update_target_network();
+        self.update_target_network()?;
 
         // 创建进度条
         let pb = ProgressBar::new(args.epochs as u64);
