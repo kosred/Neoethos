@@ -78,7 +78,7 @@ cargo run --release -p neoethos-cli
 
 ## Status
 
-**v0.5.2 — "the honesty release."** The full five-gate validation stack (walk-forward, CPCV, PBO, permutation, plateau), verified backtest↔live parity, risk-constrained Kelly sizing on the empirical trade distribution, a prop-firm challenge simulator, auto-cull with a permanent blacklist + automatic re-discovery, and Federation Phase 0. The road ahead: federation P2P mesh (design in `docs/`) → broker-agnostic adapters → a mobile monitor.
+**v0.5.6.** Everything from v0.5.2 — "the honesty release" (the five-gate validation stack: walk-forward, CPCV, PBO, permutation, plateau; risk-constrained Kelly sizing on the empirical trade distribution; the prop-firm challenge simulator; auto-cull with a permanent blacklist + automatic re-discovery; Federation Phase 0) — plus, since then: the **serverless P2P mesh sidecar is real** ([`mesh/`](mesh/README.md) — automatic relay connectivity, peer discovery over gossip, cross-machine discovery work distribution, swarm capacity aggregation), an isolated **MCP tool sidecar** for the AI supervisor, **hold-to-bracket live-execution parity** with the validated discovery kernel, never-OOM holdout views, and a **line-by-line audit of the entire first-party codebase** (July 2026). The road ahead: island-model distributed discovery (in testing on two machines) → broker-agnostic adapters → a mobile monitor.
 
 ## Privacy
 
