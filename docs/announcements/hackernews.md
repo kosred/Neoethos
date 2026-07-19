@@ -32,8 +32,10 @@ Technical bits HN might find interesting:
   losses shrink the size automatically, no learned model needed.
 
 - "Federation": a SETI@home-style mode where trusted peers pool discovery
-  compute with no server — any instance can coordinate; imported results
-  still pass every local validation gate.
+  compute — shipped as an isolated P2P sidecar on iroh (QUIC + relays,
+  automatic NAT traversal, gossip peer discovery; no server, no
+  port-forwarding). Any instance can coordinate; imported results still
+  pass every local validation gate.
 
 - Never-OOM discipline: peak memory adapts to available hardware, never to
   user parameters; the engine chunks down instead of crashing.

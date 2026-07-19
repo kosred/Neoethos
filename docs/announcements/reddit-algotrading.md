@@ -30,8 +30,10 @@ Other things it does that I haven't seen together in open source:
   size (spoiler: it's not the Kelly size)
 - **Auto-cull with a permanent blacklist** — live losers get retired forever
   and a fresh discovery is queued automatically
-- **Federation** — SETI@home-style: friends can pool compute for discovery
-  with no server; every imported result still passes every local gate
+- **Federation** — SETI@home-style: friends can pool compute for discovery,
+  now shipped as an isolated **P2P mesh sidecar** (iroh/QUIC — automatic
+  relay connectivity and peer discovery, no server, no port-forwarding);
+  every imported result still passes every local gate
 - Native ML ensemble in Rust (XGBoost/LightGBM/CatBoost/Burn NNs) that may
   only *veto* trades, never set direction — and only after proving edge on
   live experience data
@@ -44,7 +46,7 @@ a PRIVACY.md you can verify against the source.
 subscription — I built this because small traders deserve the same
 discipline institutions have.
 
-Honest caveats: it's v0.5.2, Windows installers are prebuilt (Linux builds
+Honest caveats: it's v0.5.6, Windows installers are prebuilt (Linux builds
 from source), forex-focused via cTrader, and no strategy it finds is a
 promise of profit — the whole point is that it tells you the *truth* about
 an edge, including when there isn't one.
