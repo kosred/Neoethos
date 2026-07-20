@@ -14,6 +14,31 @@ edition.workspace = true
 name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# UI↔CLI PARITY (2026-07-21). Discovery/training/eval run IN-PROCESS inside
+# this shell, so the desktop must be buildable with exactly the same GPU
+# lanes as `neoethos-cli` — otherwise the shipped app is silently CPU-only on
+# a machine with a card, which is what happened before these existed: the
+# dependency below carried `default-features = false` with a comment claiming
+# "the desktop shell drives the broker, not the heavy discovery/training GPU
+# path". That stopped being true when the backend moved in-process.
+#
+# DEFAULT STAYS CPU-ONLY on purpose: the normal Windows installer must not
+# require libcuda/libtorch to be present, or it crashes at startup on every
+# machine without them. A GPU box builds explicitly:
+#
+#   cd desktop && npx tauri build -- --features gpu-nvidia     # CUDA
+#   cd desktop && npx tauri build -- --features gpu-vulkan     # AMD/Intel/any
+#
+# The names mirror `neoethos-cli` one-for-one — no capability may differ
+# between front-ends.
+default = []
+gpu = ["gpu-nvidia"]
+gpu-nvidia = ["neoethos-app/gpu-nvidia"]
+gpu-vulkan = ["neoethos-app/gpu-vulkan"]
+gpu-rocm = ["neoethos-app/gpu-rocm"]
+gpu-apple = ["neoethos-app/gpu-apple"]
+
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 
@@ -29,9 +54,10 @@ rfd = "0.17"
 
 # The existing Rust core — reused verbatim, linked INTO this one binary
 # (no second process). neoethos-app exposes the full cTrader/broker stack
-# (broker_api, ctrader_*, account, live_spots_streamer, reauth) as a library.
-# default-features = false → no GPU/libtorch; the desktop shell drives the
-# broker, not the heavy discovery/training GPU path.
+# (broker_api, ctrader_*, account, live_spots_streamer, reauth) as a library
+# AND the discovery/training engines, which run inside this process.
+# `default-features = false` keeps the default build free of GPU/libtorch;
+# the `gpu-*` features above turn those lanes on for a GPU build.
 neoethos-data = { path = "../../crates/neoethos-data" }
 neoethos-core = { path = "../../crates/neoethos-core" }
 neoethos-app = { path = "../../crates/neoethos-app", default-features = false }

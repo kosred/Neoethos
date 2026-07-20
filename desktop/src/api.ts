@@ -340,6 +340,9 @@ export type HardwareInfo = {
   cpu: { model: string; coresLogical: number; coresPhysical: number; loadAvg: number };
   ram: { totalMb: number; usedMb: number; availableMb: number };
   gpu: { name: string; available: boolean; kind: string };
+  /** Whether THIS BUILD has a GPU lane compiled in (`gpu.available` is about
+   *  the machine; this is about the binary). Both must be true for GPU work. */
+  gpuSupport: { compiled: boolean; backend: string; detail: string };
 };
 export const hardwareInfo = () => apiGet<HardwareInfo>("/hardware");
 

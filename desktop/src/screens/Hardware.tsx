@@ -29,8 +29,33 @@ export default function Hardware() {
           <div className="settings-grid">
             <div className="kv"><span>Device</span><b style={{ fontSize: 12 }}>{data.gpu.name || "—"}</b></div>
             <div className="kv"><span>Backend</span><b>{data.gpu.kind}</b></div>
-            <div className="kv"><span>Available</span><b className={data.gpu.available ? "buy" : "sell"}>{data.gpu.available ? "yes" : "no"}</b></div>
+            <div className="kv"><span>Card detected</span><b className={data.gpu.available ? "buy" : "sell"}>{data.gpu.available ? "yes" : "no"}</b></div>
+            <div className="kv">
+              <span>GPU lane in this build</span>
+              <b className={data.gpuSupport?.compiled ? "buy" : "sell"}>
+                {data.gpuSupport?.compiled ? data.gpuSupport.backend.toUpperCase() : "not compiled"}
+              </b>
+            </div>
           </div>
+          {/* Both conditions must hold before any GPU work happens. Saying so
+              here is what stops a rented card from sitting idle unnoticed. */}
+          {data.gpuSupport && !data.gpuSupport.compiled && data.gpu.available && (
+            <div className="banner warn">
+              <b>A GPU is present but this build cannot use it.</b> {data.gpuSupport.detail}
+            </div>
+          )}
+          {data.gpuSupport?.compiled && !data.gpu.available && (
+            <div className="banner warn">
+              This build has the <b>{data.gpuSupport.backend.toUpperCase()}</b> lane compiled in,
+              but no usable card was detected — work runs on the CPU.
+            </div>
+          )}
+          {data.gpuSupport?.compiled && data.gpu.available && (
+            <div className="banner info">
+              ✓ GPU lane <b>{data.gpuSupport.backend.toUpperCase()}</b> compiled in and a card is
+              present — discovery and training can use it.
+            </div>
+          )}
         </>
       )}
     </div>

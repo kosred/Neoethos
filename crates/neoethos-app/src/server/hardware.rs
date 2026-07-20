@@ -17,6 +17,75 @@ pub struct HardwareDto {
     pub cpu: CpuDto,
     pub ram: RamDto,
     pub gpu: GpuDto,
+    /// Whether THIS BINARY was compiled with a GPU lane at all.
+    ///
+    /// The GPU evaluator lives behind the `gpu-*` cargo features, so a
+    /// default build has no GPU code in it — on a machine with a card that
+    /// binary runs CPU-only and, before this field existed, said nothing
+    /// about it. `gpu.available` answers "is there a card?"; this answers
+    /// "can this build use one?". Both must be true for GPU work to happen,
+    /// and the UI now says which one is missing instead of leaving the
+    /// operator to wonder why a rented card sits idle.
+    pub gpu_support: GpuSupportDto,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuSupportDto {
+    /// True when a `gpu-*` feature was enabled for this build.
+    pub compiled: bool,
+    /// Which lane was compiled in: `"cuda"`, `"vulkan"`, `"rocm"`, or
+    /// `"none"`. Mirrors the cargo feature actually selected.
+    pub backend: String,
+    /// Operator-facing one-liner, safe to render verbatim.
+    pub detail: String,
+}
+
+/// Resolve the compiled-in GPU lane from the cargo features. Kept here (not
+/// in the probe) because it is a property of the BINARY, not the machine.
+fn gpu_support_dto() -> GpuSupportDto {
+    // The vendor features are mutually exclusive in practice; check the most
+    // specific first so a multi-feature build reports its primary lane.
+    #[cfg(feature = "gpu-nvidia")]
+    {
+        return GpuSupportDto {
+            compiled: true,
+            backend: "cuda".to_string(),
+            detail: "This build includes the CUDA GPU lane.".to_string(),
+        };
+    }
+    #[cfg(all(feature = "gpu-rocm", not(feature = "gpu-nvidia")))]
+    {
+        return GpuSupportDto {
+            compiled: true,
+            backend: "rocm".to_string(),
+            detail: "This build includes the ROCm GPU lane.".to_string(),
+        };
+    }
+    #[cfg(all(
+        feature = "gpu-vulkan",
+        not(feature = "gpu-nvidia"),
+        not(feature = "gpu-rocm")
+    ))]
+    {
+        return GpuSupportDto {
+            compiled: true,
+            backend: "vulkan".to_string(),
+            detail: "This build includes the Vulkan/wgpu GPU lane.".to_string(),
+        };
+    }
+    #[cfg(not(any(feature = "gpu-nvidia", feature = "gpu-rocm", feature = "gpu-vulkan")))]
+    {
+        GpuSupportDto {
+            compiled: false,
+            backend: "none".to_string(),
+            detail: "This build is CPU-only — no GPU lane was compiled in. Even \
+                     with a card installed, discovery and training will run on \
+                     the CPU. Rebuild with a gpu feature (e.g. \
+                     `--features gpu-nvidia`) to use it."
+                .to_string(),
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -115,6 +184,7 @@ fn probe_hardware_blocking() -> HardwareDto {
             available_mb: available_kb / (1024 * 1024),
         },
         gpu,
+        gpu_support: gpu_support_dto(),
     }
 }
 
@@ -184,5 +254,8 @@ fn empty_hardware_dto() -> HardwareDto {
             available: false,
             kind: "unknown".to_string(),
         },
+        // The compiled-in lane is known even when the machine probe fails —
+        // it is a property of the binary, not of the hardware.
+        gpu_support: gpu_support_dto(),
     }
 }
