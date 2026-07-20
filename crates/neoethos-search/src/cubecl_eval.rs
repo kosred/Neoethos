@@ -1683,6 +1683,31 @@ fn install_gpu_buffer_cap(probed: u64) {
     }
 }
 
+/// VRAM budget (MB) for the resident-upload cache + pool trim, from the smallest
+/// card's capacity.
+///
+/// 60% of the card, with the CEILING derived from the card instead of a flat
+/// literal. It used to be `clamp(384, 24576)`: a hard 24 GB cap that only ever
+/// bound BIG cards — a 48 GB A6000 was held to 24 GB (and the resident cache,
+/// which gets half, to 12 GB) while 24 GB of the card sat unused. The ceiling is
+/// now "card minus a driver/working reserve", so a big card actually uses its
+/// capacity and a small card gets slightly MORE headroom than the old formula.
+///
+/// The reserve covers the driver context, cubecl's own allocations and the
+/// transient per-launch buffers — everything that is NOT the resident data.
+///
+/// Unknown VRAM (wgpu/ROCm report 0) keeps the conservative 2 GB so the pool
+/// trim still bounds usage.
+fn vram_budget_mb_for(min_vram_gb: f64) -> u64 {
+    if !min_vram_gb.is_finite() || min_vram_gb <= 0.0 {
+        return 2048;
+    }
+    let reserve_gb = (min_vram_gb * 0.15).clamp(1.0, 6.0);
+    let ceiling_mb = (((min_vram_gb - reserve_gb) * 1024.0).max(384.0)) as u64;
+    let target_mb = (min_vram_gb * 1024.0 * 0.60) as u64;
+    target_mb.clamp(384, ceiling_mb.max(384))
+}
+
 /// Probe the host RAM + GPU VRAM and install memory budgets sized to fit, so the
 /// average user needs no manual tuning. Idempotent (first install wins) and
 /// safe: explicit `NEOETHOS_BOT_SEARCH_*` env vars still override per-knob. On a
@@ -1726,11 +1751,7 @@ pub fn auto_tune_memory_budgets() {
     // .max_page_size` to install `GPU_BUFFER_CAP_BYTES`. So we set `gpu_buffer_mb`
     // to 0 here = "probe at client build"; `gpu_buffer_elem_cap` ignores a 0 budget
     // and reads the probed cap. The pool-trim budget (`v`) still scales with VRAM.
-    let vram_budget_mb = if min_vram_gb.is_finite() {
-        ((min_vram_gb * 1024.0 * 0.60) as u64).clamp(384, 24576)
-    } else {
-        2048
-    };
+    let vram_budget_mb = vram_budget_mb_for(min_vram_gb);
     let gpu_buffer_mb = 0usize; // 0 ⇒ probe the device's real cap at client build
 
     let budgets = MemoryBudgets {
@@ -3717,5 +3738,56 @@ mod fused_parity_tests {
             sig_nonzero > 0,
             "expected the synthetic combo to generate signals; got {sig_nonzero}"
         );
+    }
+}
+
+#[cfg(test)]
+mod vram_budget_tests {
+    use super::vram_budget_mb_for;
+
+    /// The budget must SCALE with the card. The old formula clamped at a flat
+    /// 24 GB, so every card above 40 GB got the same budget as a 40 GB one and
+    /// left the rest idle — the reason a rented A6000 could not hold a large
+    /// feature cube resident even though it had the room.
+    #[test]
+    fn budget_scales_with_the_card_instead_of_a_flat_ceiling() {
+        // 48 GB A6000: 60% = 28.8 GB, ceiling = 48 - 6 = 42 GB → 28.8 GB.
+        let a6000 = vram_budget_mb_for(48.0);
+        assert!(
+            (29_000..=29_800).contains(&a6000),
+            "A6000 budget should be ~28.8 GB, got {a6000} MB"
+        );
+        assert!(a6000 > 24576, "must exceed the old flat 24 GB clamp");
+
+        // 80 GB card keeps scaling.
+        assert!(vram_budget_mb_for(80.0) > a6000);
+    }
+
+    #[test]
+    fn mid_and_small_cards_are_unchanged_or_safer() {
+        // 24 GB (A5000-class): 60% = 14.4 GB, well under both ceilings — the
+        // old formula gave the same number.
+        let mid = vram_budget_mb_for(24.0);
+        assert!((14_000..=14_800).contains(&mid), "got {mid} MB");
+
+        // 8 GB: 60% = 4.8 GB, ceiling = 8 - 1.2 = 6.8 GB → 4.8 GB (unchanged).
+        let small = vram_budget_mb_for(8.0);
+        assert!((4_800..=5_000).contains(&small), "got {small} MB");
+
+        // 2 GB: 60% = 1.2 GB but the ceiling (2 - 1 = 1 GB) now binds, so a
+        // tiny card reserves MORE than the old formula allowed.
+        let tiny = vram_budget_mb_for(2.0);
+        assert_eq!(tiny, 1024, "tiny card must respect the driver reserve");
+        assert!(tiny < 1229, "must be below the old 60%-of-2GB value");
+    }
+
+    #[test]
+    fn unknown_or_absent_vram_falls_back_conservatively() {
+        assert_eq!(vram_budget_mb_for(f64::INFINITY), 2048);
+        assert_eq!(vram_budget_mb_for(0.0), 2048);
+        assert_eq!(vram_budget_mb_for(-1.0), 2048);
+        assert_eq!(vram_budget_mb_for(f64::NAN), 2048);
+        // Never below the floor, whatever the card reports.
+        assert!(vram_budget_mb_for(0.25) >= 384);
     }
 }
