@@ -76,6 +76,37 @@ mod backend {
     pub fn base_url() -> String {
         format!("http://127.0.0.1:{}", API_PORT.get().copied().unwrap_or(0))
     }
+
+    /// True when a Discovery/Training/Autopilot engine is currently running.
+    /// Used by the window-close guard: closing the app hard-kills every
+    /// worker thread ("close = stop"), which on 2026-07-20 destroyed a
+    /// ~30-hour discovery run at 95.5% via an accidental close. Implemented
+    /// as a tiny loopback HTTP probe of our own in-process API (std-only —
+    /// no HTTP-client dependency in the shell). Fail-open: if the probe
+    /// can't answer quickly, we do NOT block the close.
+    pub fn engine_running() -> bool {
+        use std::io::{Read, Write};
+        let Some(&port) = API_PORT.get() else {
+            return false;
+        };
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let timeout = std::time::Duration::from_millis(700);
+        let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(timeout));
+        let _ = stream.set_write_timeout(Some(timeout));
+        let request = format!(
+            "GET /engines/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        let mut body = String::new();
+        let _ = stream.take(64 * 1024).read_to_string(&mut body);
+        // {"discovery":"Running",...} / training / autoTrader — any engine.
+        body.contains("\"Running")
+    }
 }
 
 /// Base URL of the in-process backend (e.g. `http://127.0.0.1:54321`). The web
@@ -142,11 +173,21 @@ mod mcp_sidecar {
             );
             return;
         };
-        match std::process::Command::new(&exe)
-            .arg("--config")
-            .arg("mcp_servers.json")
-            .spawn()
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--config").arg("mcp_servers.json");
+        // Windows: spawn WITHOUT a console window (2026-07-20). The sidecar is
+        // a console binary, so it opened a visible cmd window the operator had
+        // to leave alone — closing it kills the sidecar and every MCP tool with
+        // it. CREATE_NO_WINDOW keeps the process running fully headless, so
+        // there is nothing to close by accident. Its logs still reach the app's
+        // stderr/log file.
+        #[cfg(windows)]
         {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.spawn() {
             Ok(child) => {
                 eprintln!("MCP sidecar started: {} (pid {})", exe.display(), child.id());
                 if let Ok(mut slot) = CHILD.lock() {
@@ -227,6 +268,26 @@ fn prepare_data_root(app: &tauri::App) {
     if !overridden && std::path::Path::new("config.yaml").exists() {
         eprintln!("data root → current dir (config.yaml present)");
         return;
+    }
+
+    // Installed launch with an arbitrary CWD (Start-Menu / Explorer shortcut
+    // without a "Start in" directory): the installer lays config.yaml BESIDE
+    // the exe. Prefer that root before the per-user fallback — otherwise the
+    // fallback lands in an EMPTY per-user dir and every engine call fails
+    // with "data directory does not exist" even though the real root is
+    // right next to the binary (observed live 2026-07-20).
+    if !overridden
+        && let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+        && dir.join("config.yaml").exists()
+    {
+        match std::env::set_current_dir(dir) {
+            Ok(()) => {
+                eprintln!("data root → exe dir (config.yaml present): {}", dir.display());
+                return;
+            }
+            Err(e) => eprintln!("set working dir {} failed: {e}", dir.display()),
+        }
     }
 
     // Override-aware canonical path (user_config_path honours the override).
@@ -479,7 +540,29 @@ pub fn run() {
             // process so EVERY worker thread dies immediately: "close = stop",
             // guaranteed, no orphaned CPU, no reboot. Broker positions are held
             // server-side by cTrader, so exiting never touches live orders.
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // Accidental-close guard (2026-07-20): a ~30h discovery run
+                // was killed at 95.5% by an unintended window close. When an
+                // engine is running, ask before dying; fail-open if the
+                // probe can't answer so a wedged backend never traps the
+                // operator in an unclosable window.
+                if backend::engine_running() {
+                    let close_anyway = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title("NeoEthos — engine running")
+                        .set_description(
+                            "A Discovery/Training/Autopilot engine is RUNNING.\n\
+                             Closing the app will KILL it and all unsaved \
+                             progress will be lost (results are only written \
+                             at the very end of a run).\n\nClose anyway?",
+                        )
+                        .set_buttons(rfd::MessageButtons::YesNo)
+                        .show();
+                    if !matches!(close_anyway, rfd::MessageDialogResult::Yes) {
+                        api.prevent_close();
+                        return;
+                    }
+                }
                 // Kill the MCP sidecar child FIRST — process::exit would
                 // orphan it (it's an independent OS process).
                 mcp_sidecar::stop();

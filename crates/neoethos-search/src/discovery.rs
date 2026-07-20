@@ -967,6 +967,17 @@ pub enum DiscoveryProgress {
         rejected_by_correlation: usize,
         target_portfolio: usize,
     },
+    /// Coarse boundary marker for the long, otherwise-silent post-GA stages
+    /// (quality screen, portfolio selection, validation gates, robustness
+    /// filters, holdout replay). Purely informational: on dense timeframes
+    /// these blocks run for HOURS with no other event, and the UI would
+    /// otherwise freeze on the last milestone — which operators read as a
+    /// hang (observed live 2026-07-20: a healthy EURCAD M3 run was killed at
+    /// 95.5% because "it looked stuck").
+    StageAdvanced {
+        stage: &'static str,
+        detail: String,
+    },
     Completed {
         candidate_count: usize,
         filtered_count: usize,
@@ -2560,7 +2571,7 @@ pub fn run_discovery_cycle_with_holdout_and_progress<F>(
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
     prop_firm_rules: PropFirmRiskRules,
-    progress_fn: F,
+    mut progress_fn: F,
 ) -> Result<DiscoveryResult>
 where
     F: FnMut(DiscoveryProgress),
@@ -2601,7 +2612,8 @@ where
          withheld for forward-test + prop-firm evidence"
     );
 
-    let mut result = run_discovery_cycle_with_progress(&is_features, &is_ohlcv, config, progress_fn)?;
+    let mut result =
+        run_discovery_cycle_with_progress(&is_features, &is_ohlcv, config, &mut progress_fn)?;
 
     // Operator Stop mid-search: the cycle returned early with a partial
     // result the caller will discard — don't burn time forward-testing it.
@@ -2611,6 +2623,16 @@ where
     if result.portfolio.is_empty() || is_end >= n_rows {
         return Ok(result);
     }
+
+    progress_fn(DiscoveryProgress::StageAdvanced {
+        stage: "holdout_forward_test",
+        detail: format!(
+            "replaying {} strategies on the held-out {}-row tail (forward-test + \
+             prop-firm evidence) — silent but active",
+            result.portfolio.len(),
+            n_rows - is_end
+        ),
+    });
 
     let tail_ohlcv = slice_ohlcv(ohlcv, is_end, n_rows);
     // Same never-OOM treatment for the held-out tail: a view, not a copy.
@@ -3895,6 +3917,13 @@ where
     let mut quality_metrics = Vec::new();
     let mut logged_trades = Vec::new();
     if Gene::requires_quality_screen(&config.filtering) {
+        progress_fn(DiscoveryProgress::StageAdvanced {
+            stage: "quality_screen",
+            detail: format!(
+                "screening {filtered_count} candidates (full backtest + Monte-Carlo \
+                 perturbations each) — silent but active"
+            ),
+        });
         type QualityCandidate = (usize, Gene, Vec<i8>, StrategyMetrics, bool, Vec<Trade>);
         let analyzer = quality_analyzer_for_config(config);
         let initial_balance = config.initial_balance;
@@ -4127,6 +4156,12 @@ where
             opportunistic_passed,
             evaluated_candidates: filtered_count,
             logged_trade_sets,
+        });
+        progress_fn(DiscoveryProgress::StageAdvanced {
+            stage: "selecting_portfolio",
+            detail: "ranking survivors + prop-firm gate + correlation pruning — \
+                     silent but active"
+                .to_string(),
         });
 
         let mut screened_genes = Vec::with_capacity(strict_passed.len());
@@ -4367,6 +4402,17 @@ where
     // already failed the bar would just burn the validation tail). They are
     // emitted honestly flagged `fallback_mode` and forced not-export-ready.
     let mut fallback_mode = false;
+    if !portfolio.is_empty() {
+        progress_fn(DiscoveryProgress::StageAdvanced {
+            stage: "validation_gates",
+            detail: format!(
+                "walk-forward + CPCV + PBO + canonical backtests on {} strategies — \
+                 the LONGEST silent stage on dense timeframes (can run for hours; \
+                 do not stop the run)",
+                portfolio.len()
+            ),
+        });
+    }
     let (mut validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts, mut per_gene_wf) =
         if portfolio.is_empty() && !best_effort_fallback.is_empty() {
             fallback_mode = true;
@@ -4452,6 +4498,14 @@ where
         use rand::SeedableRng;
         use rand::seq::SliceRandom;
         use rayon::prelude::*;
+
+        progress_fn(DiscoveryProgress::StageAdvanced {
+            stage: "robustness_filters",
+            detail: format!(
+                "permutation + plateau tests on {} genes — silent but active",
+                portfolio.len()
+            ),
+        });
 
         const ROBUST_WINDOW: usize = 150_000;
         const N_PERM: usize = 50;

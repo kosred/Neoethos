@@ -4,8 +4,10 @@ version = "0.5.6"
 description = "NeoEthos desktop (Tauri) — single-process Rust core + web UI"
 authors = ["NeoEthos"]
 license = "AGPL-3.0-or-later"
-edition = "2021"
-rust-version = "1.77.2"
+# Inherit the workspace edition (2024) like every other crate — this was the
+# only member still pinned to the Tauri scaffold's 2021, which silently barred
+# 2024-only syntax (let-chains) from the shell alone.
+edition.workspace = true
 
 [lib]
 # Keep the Tauri-generated entry name so main.rs's `app_lib::run()` is unchanged.

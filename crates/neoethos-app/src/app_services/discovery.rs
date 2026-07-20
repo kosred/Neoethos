@@ -371,6 +371,33 @@ fn apply_backend_discovery_event(snapshot: &mut JobSnapshot, event: &DiscoveryPr
                 ),
             );
         }
+        DiscoveryProgress::StageAdvanced { stage, detail } => {
+            // Boundary markers for the long, otherwise-silent post-GA blocks
+            // (2026-07-20: a healthy run frozen at "quality_screen 95.5%" for
+            // hours was mistaken for a hang and killed). Percent is a fixed,
+            // monotonic per-stage map inside the 0.945–0.99 tail window.
+            let percent = match *stage {
+                "quality_screen" => 0.945,
+                "selecting_portfolio" => 0.96,
+                "validation_gates" => 0.975,
+                "robustness_filters" => 0.985,
+                // The holdout replay runs in the WRAPPER, after the inner
+                // cycle's Completed (0.99) — same value avoids a visible
+                // percent regression while the message switches to the tail.
+                "holdout_forward_test" => 0.99,
+                _ => 0.95,
+            };
+            snapshot.progress = JobProgress {
+                percent: Some(percent),
+                stage: (*stage).to_string(),
+                message: detail.clone(),
+            };
+            snapshot.report.events = push_recent_event(
+                &snapshot.report.events,
+                JobEventLevel::Info,
+                format!("stage advanced: {stage} — {detail}"),
+            );
+        }
         DiscoveryProgress::Completed {
             candidate_count,
             filtered_count,
@@ -1000,6 +1027,45 @@ pub fn start_discovery_job(
         let search_request = request.clone();
         let tx_progress = tx.clone();
         let live_snapshot_for_progress = Arc::clone(&live_snapshot);
+        // Staleness heartbeat (2026-07-20): the post-GA stages can run for
+        // HOURS between progress events on dense timeframes, and a frozen
+        // percent reads as a hang (a healthy EURCAD M3 run was killed at
+        // 95.5% for exactly this reason). Track when the last REAL event
+        // landed; every 20s of silence past 45s, re-emit the current
+        // snapshot with an appended "still working — Xm in this stage"
+        // liveness note. The note is transient (never stored in the
+        // snapshot), so real events always show their own clean message.
+        let last_event_at = Arc::new(Mutex::new(std::time::Instant::now()));
+        let last_event_for_progress = Arc::clone(&last_event_at);
+        let hb_live_snapshot = Arc::clone(&live_snapshot);
+        let hb_tx = tx.clone();
+        let stale_heartbeat = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(20));
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                ticker.tick().await;
+                let silent_secs = last_event_at
+                    .lock()
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0);
+                if silent_secs < 45 {
+                    continue;
+                }
+                let Ok(current) = hb_live_snapshot.lock().map(|s| s.clone()) else {
+                    continue;
+                };
+                let mut beat = current;
+                beat.progress.message = format!(
+                    "{} · still working — {}m {:02}s since the last update (long silent \
+                     validation stages are NORMAL on dense timeframes; closing the app \
+                     kills the run)",
+                    beat.progress.message,
+                    silent_secs / 60,
+                    silent_secs % 60
+                );
+                send_event(&hb_tx, ServiceEvent::DiscoveryUpdated(beat));
+            }
+        });
         // Install the cancel flag the GA polls EACH GENERATION (discovery is
         // single-instance, so a process-global flag is safe). This makes Stop
         // interrupt the search mid-run instead of only at coarse phase boundaries.
@@ -1020,6 +1086,9 @@ pub fn start_discovery_job(
                 &resolved_config,
                 search_request.prop_firm_rules,
                 move |event| {
+                    if let Ok(mut last) = last_event_for_progress.lock() {
+                        *last = std::time::Instant::now();
+                    }
                     if let Ok(mut snapshot) = live_snapshot_for_progress.lock() {
                         apply_backend_discovery_event(&mut snapshot, &event);
                         send_event(
@@ -1146,6 +1215,7 @@ pub fn start_discovery_job(
             Ok::<_, anyhow::Error>(result)
         })
         .await;
+        stale_heartbeat.abort();
         // Clear the GA cancel flag now the blocking search has returned.
         neoethos_search::set_search_cancel(None);
 
