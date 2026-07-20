@@ -1190,7 +1190,14 @@ fn compute_aligned_higher_block(
 /// Normalise each column of an in-RAM feature block in place (robust z-score),
 /// matching the per-series normalisation `append_feature_block` applies on the
 /// streaming path so the two cube layouts stay identical.
-fn normalize_block_columns(block: &mut Array2<f32>) {
+/// Normalize every column in place. Generic over the storage so it works on an
+/// owned block AND on a mutable VIEW into the final cube — the in-RAM assembly
+/// normalizes each timeframe's columns after placing them, avoiding a second
+/// copy of the block.
+fn normalize_block_columns<S>(block: &mut ndarray::ArrayBase<S, ndarray::Ix2>)
+where
+    S: ndarray::DataMut<Elem = f32>,
+{
     let fit_rows = crate::core::normalization::norm_fit_rows(block.nrows());
     for mut col in block.columns_mut() {
         let mut series: Vec<f32> = col.to_vec();
@@ -1205,12 +1212,22 @@ fn normalize_block_columns(block: &mut Array2<f32>) {
 /// Decide whether the multi-TF feature cube is assembled in RAM (fast, no disk
 /// write/cleanup) or streamed to a disk-mmap store (the NEVER-OOM fallback).
 ///
-/// `NEOETHOS_FEATURE_CUBE_MODE = ram | disk | auto` forces the choice. The
-/// default `auto` builds in RAM only when the estimated cube fits with a wide
-/// margin: in-RAM assembly peaks at ~2× the cube (per-TF blocks + the
-/// concatenated result), so we require 2.5× the cube plus a 2 GB floor for the
-/// OS and the GA's working buffers to stay free. A failed free-RAM probe (0)
-/// takes the safe disk path.
+/// `NEOETHOS_FEATURE_CUBE_MODE = ram | disk | auto` forces the choice.
+///
+/// The `auto` requirement is derived from the assembly's ACTUAL peak, which is
+/// why it changed on 2026-07-20. The old assembly built every per-TF block and
+/// then `concatenate`d them, so both the blocks and the result were live at
+/// once — a ~2× peak, demanded as 2.5× for margin. That was an artifact of the
+/// implementation, not a property of the data: a 10.5 GB cube "needed" 28 GB
+/// and went to disk on a 32 GB machine with 22 GB free, paying a 10 GB write
+/// plus mmap page-fault traffic for the whole GA.
+///
+/// [`try_assemble_cube_in_ram`] now allocates the cube ONCE and fills each
+/// timeframe's columns in place, freeing each block immediately — so the peak
+/// is the cube plus ONE timeframe block (~1.1× on a 10-TF build). We require
+/// 1.5× plus the same 2 GB floor for the OS and the GA's working buffers. A
+/// failed free-RAM probe (0) still takes the safe disk path, and any surprise
+/// during assembly falls back to disk rather than growing memory.
 fn should_build_cube_in_ram(cube_bytes: u64) -> bool {
     match std::env::var("NEOETHOS_FEATURE_CUBE_MODE")
         .ok()
@@ -1225,8 +1242,92 @@ fn should_build_cube_in_ram(cube_bytes: u64) -> bool {
     if available == 0 {
         return false;
     }
-    let needed = (cube_bytes as f64) * 2.5 + 2.0e9;
+    let needed = (cube_bytes as f64) * 1.5 + 2.0e9;
     needed < available as f64
+}
+
+/// Assemble the multi-timeframe cube directly in RAM, allocating it ONCE and
+/// writing each timeframe into its own column range.
+///
+/// Peak memory is the cube plus a single timeframe block, because each block is
+/// dropped as soon as its columns are copied (the previous `concatenate`
+/// approach held every block AND the result simultaneously — a 2× peak).
+///
+/// Returns `Ok(None)` — never a partial cube — if the real column widths do not
+/// match the estimate the RAM/disk decision was made from. The caller then
+/// takes the streaming disk path, so a width surprise costs time but never
+/// loses features and never grows past the budget that was approved.
+#[allow(clippy::too_many_arguments)]
+fn try_assemble_cube_in_ram(
+    ds: &SymbolDataset,
+    base_tf: &str,
+    base_ns: &[i64],
+    opts: &FeatureBuildOptions,
+    active_higher: &[String],
+    base_block: &Array2<f32>,
+    base_names: &[String],
+    normalize: bool,
+    n_samples: usize,
+    est_features: usize,
+) -> Result<Option<FeatureFrame>> {
+    use ndarray::s;
+
+    let base_cols = base_block.ncols();
+    if base_cols > est_features {
+        return Ok(None);
+    }
+    let mut cube = Array2::<f32>::zeros((n_samples, est_features));
+    let mut names: Vec<String> = Vec::with_capacity(est_features);
+    let mut col = 0usize;
+
+    // Base timeframe: copy in, then normalize the destination view in place.
+    {
+        let mut dst = cube.slice_mut(s![.., col..col + base_cols]);
+        dst.assign(base_block);
+        if normalize {
+            normalize_block_columns(&mut dst);
+        }
+    }
+    names.extend(base_names.iter().cloned());
+    col += base_cols;
+
+    for h_tf in active_higher {
+        let Some((h_names, aligned)) =
+            compute_aligned_higher_block(ds, base_tf, base_ns, h_tf, opts.profile)?
+        else {
+            // Every entry in `active_higher` was filtered to exist in the
+            // dataset, so this is the width-surprise case: bail to disk.
+            return Ok(None);
+        };
+        let w = aligned.ncols();
+        if col + w > est_features {
+            return Ok(None);
+        }
+        cube.slice_mut(s![.., col..col + w]).assign(&aligned);
+        // Free this timeframe BEFORE the next one is computed — this is what
+        // keeps the peak at cube + one block.
+        drop(aligned);
+        if normalize {
+            let mut dst = cube.slice_mut(s![.., col..col + w]);
+            normalize_block_columns(&mut dst);
+        }
+        names.extend(h_names);
+        col += w;
+    }
+
+    if col != est_features || names.len() != est_features {
+        // Fewer columns than the allocation: returning the cube as-is would
+        // append all-zero phantom features. Shrinking here would need a second
+        // full copy (the very peak this function exists to avoid), so hand the
+        // build to the streaming path instead.
+        return Ok(None);
+    }
+
+    Ok(Some(FeatureFrame {
+        timestamps: base_ns.to_vec(),
+        names,
+        data: crate::core::features::FeatureData::InMemory(cube),
+    }))
 }
 
 pub fn prepare_multitimeframe_features_with_options(
@@ -1311,38 +1412,33 @@ pub fn prepare_multitimeframe_features_with_options(
     );
 
     if in_ram {
-        // Collect each TF block, then concatenate once along the feature axis.
-        // No disk store is created — nothing to leak or clean up later.
-        let mut all_names = base_names;
-        let mut base_block = base_block;
-        if normalize {
-            normalize_block_columns(&mut base_block);
+        // Allocate the cube ONCE and fill it timeframe by timeframe, freeing
+        // each block as it lands (see `try_assemble_cube_in_ram`). `base_block`
+        // stays borrowed so the disk path below can still use it if the
+        // assembly bails.
+        if let Some(frame) = try_assemble_cube_in_ram(
+            ds,
+            base_tf,
+            base_ns,
+            opts,
+            &active_higher,
+            &base_block,
+            &base_names,
+            normalize,
+            n_samples,
+            est_features,
+        )? {
+            return Ok(frame);
         }
-        let mut blocks: Vec<Array2<f32>> = Vec::with_capacity(1 + active_higher.len());
-        blocks.push(base_block);
-        for h_tf in &active_higher {
-            if let Some((h_names, mut aligned)) =
-                compute_aligned_higher_block(ds, base_tf, base_ns, h_tf, opts.profile)?
-            {
-                if normalize {
-                    normalize_block_columns(&mut aligned);
-                }
-                all_names.extend(h_names);
-                blocks.push(aligned);
-            }
-        }
-        let cube = {
-            let views: Vec<ndarray::ArrayView2<f32>> =
-                blocks.iter().map(|b| b.view()).collect();
-            ndarray::concatenate(ndarray::Axis(1), &views)
-                .context("assemble in-RAM feature cube")?
-        };
-        drop(blocks);
-        return Ok(FeatureFrame {
-            timestamps: base_ns.clone(),
-            names: all_names,
-            data: crate::core::features::FeatureData::InMemory(cube),
-        });
+        tracing::warn!(
+            target: "neoethos_data::prepare_multitimeframe_features",
+            symbol = %ds.symbol,
+            base_tf = base_tf,
+            est_features,
+            "in-RAM cube assembly bailed (per-timeframe feature widths did not match \
+             the estimate the RAM budget was approved from) — streaming to the disk \
+             store instead. No features are lost; this is slower, please report it."
+        );
     }
 
     // ── Streaming disk-mmap path (NEVER-OOM fallback for large cubes) ──────
@@ -1654,5 +1750,120 @@ mod tests {
 
         fs::remove_dir_all(&root)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cube_assembly_tests {
+    use super::*;
+
+    /// Build a small multi-timeframe dataset: a base grid plus one higher
+    /// timeframe resampled from it, so `prepare_multitimeframe_features` has
+    /// real work to align.
+    fn tiny_dataset(n: usize) -> SymbolDataset {
+        let base_ms = 1_700_000_000_000_i64;
+        let mut timestamp = Vec::with_capacity(n);
+        let (mut open, mut high, mut low, mut close, mut volume) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            // Deterministic, non-degenerate series (constant columns would
+            // normalize to zero everywhere and weaken the comparison).
+            let t = i as f64;
+            let px = 1.10 + (t * 0.7).sin() * 0.01 + t * 1e-5;
+            timestamp.push(base_ms + (i as i64) * 60_000);
+            open.push(px);
+            high.push(px + 0.0008);
+            low.push(px - 0.0008);
+            close.push(px + (t * 0.3).cos() * 0.0004);
+            volume.push(100.0 + (i % 17) as f64);
+        }
+        let m1 = Ohlcv {
+            timestamp: Some(timestamp),
+            open,
+            high,
+            low,
+            close,
+            volume: Some(volume),
+        };
+        let m5 = resample_ohlcv(&m1, "M5").expect("resample M5");
+        let mut frames = std::collections::HashMap::new();
+        frames.insert("M1".to_string(), m1);
+        frames.insert("M5".to_string(), m5);
+        SymbolDataset {
+            symbol: "TESTFX".to_string(),
+            frames,
+        }
+    }
+
+    /// The in-RAM assembly (allocate once, fill per timeframe) must produce a
+    /// cube byte-identical to the streaming disk-mmap path. If these ever
+    /// diverge, discovery results depend on how much free RAM the machine
+    /// happened to have — the worst kind of non-determinism.
+    #[test]
+    fn ram_and_disk_cubes_are_identical() {
+        let ds = tiny_dataset(6000);
+        let opts = FeatureBuildOptions {
+            higher_tfs: vec!["M5".to_string()],
+            ..Default::default()
+        };
+
+        // SAFETY: single-threaded test setup; the env var is read inside
+        // `should_build_cube_in_ram` on this same thread.
+        unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "ram") };
+        let ram = prepare_multitimeframe_features_with_options(&ds, "M1", &opts, None)
+            .expect("in-RAM cube");
+        unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "disk") };
+        let disk = prepare_multitimeframe_features_with_options(&ds, "M1", &opts, None)
+            .expect("disk cube");
+        unsafe { std::env::remove_var("NEOETHOS_FEATURE_CUBE_MODE") };
+
+        assert!(
+            matches!(ram.data, crate::core::features::FeatureData::InMemory(_)),
+            "ram mode must not touch disk"
+        );
+        assert_eq!(ram.names, disk.names, "column ORDER + names must match");
+        assert_eq!(ram.timestamps, disk.timestamps);
+        assert_eq!(ram.n_samples(), disk.n_samples());
+        assert_eq!(ram.names.len(), disk.names.len());
+        assert!(ram.n_samples() > 0 && !ram.names.is_empty());
+
+        for r in 0..ram.n_samples() {
+            for c in 0..ram.names.len() {
+                let a = ram.feature_at(r, c);
+                let b = disk.feature_at(r, c);
+                match (a.is_nan(), b.is_nan()) {
+                    (true, true) => {}
+                    _ => assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "cube mismatch at row {r} col {c} ({})",
+                        ram.names[c]
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_ram_budget_tracks_available_memory_and_honours_the_override() {
+        // The decision must scale with the cube AND the machine — not a fixed
+        // fraction. A byte-sized cube always fits; an absurd one never does.
+        unsafe { std::env::remove_var("NEOETHOS_FEATURE_CUBE_MODE") };
+        assert!(should_build_cube_in_ram(1));
+        assert!(!should_build_cube_in_ram(u64::MAX / 4));
+
+        // The 1.5x + 2 GB rule, checked against the real probe.
+        let available = neoethos_core::available_memory_bytes();
+        if available > 8_000_000_000 {
+            let just_fits = (((available as f64) - 2.0e9) / 1.5) as u64;
+            assert!(should_build_cube_in_ram(just_fits.saturating_sub(1_000_000)));
+            assert!(!should_build_cube_in_ram(just_fits + 1_000_000_000));
+        }
+
+        unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "disk") };
+        assert!(!should_build_cube_in_ram(1), "explicit disk wins");
+        unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "ram") };
+        assert!(should_build_cube_in_ram(u64::MAX / 4), "explicit ram wins");
+        unsafe { std::env::remove_var("NEOETHOS_FEATURE_CUBE_MODE") };
     }
 }
