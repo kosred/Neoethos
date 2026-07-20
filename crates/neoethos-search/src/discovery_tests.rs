@@ -1585,3 +1585,75 @@ fn empty_portfolio_diagnosis_falls_back_when_no_bottleneck_set() {
     assert!(msg.contains("passed_base_filter"), "infers bottleneck: {msg}");
     assert!(msg.contains("max-drawdown") || msg.contains("min-profit"));
 }
+
+/// Reference implementation of the tie-corrected Spearman midrank, written
+/// the naive O(n²) way (rescan the slice for every element). The shipping
+/// `spearman_corr_i8` computes the same quantity from a 256-bucket
+/// histogram in O(n); these two must agree exactly.
+fn spearman_corr_i8_naive(a: &[i8], b: &[i8]) -> f64 {
+    let n = a.len().min(b.len());
+    if n < 2 {
+        return 0.0;
+    }
+    let rank_of = |vals: &[i8], v: i8| -> f64 {
+        let count = vals[..n].iter().filter(|&&x| x == v).count() as f64;
+        let before = vals[..n].iter().filter(|&&x| x < v).count() as f64;
+        before + (count + 1.0) / 2.0
+    };
+    let ranks_a: Vec<f64> = a[..n].iter().map(|&v| rank_of(&a[..n], v)).collect();
+    let ranks_b: Vec<f64> = b[..n].iter().map(|&v| rank_of(&b[..n], v)).collect();
+    let mean_a: f64 = ranks_a.iter().sum::<f64>() / n as f64;
+    let mean_b: f64 = ranks_b.iter().sum::<f64>() / n as f64;
+    let (mut num, mut denom_a, mut denom_b) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for i in 0..n {
+        let da = ranks_a[i] - mean_a;
+        let db = ranks_b[i] - mean_b;
+        num += da * db;
+        denom_a += da * da;
+        denom_b += db * db;
+    }
+    if denom_a <= 1e-12 || denom_b <= 1e-12 {
+        return 0.0;
+    }
+    num / (denom_a.sqrt() * denom_b.sqrt())
+}
+
+#[test]
+fn spearman_histogram_matches_the_naive_rank_scan() {
+    // Deterministic pseudo-random trit signals (the real shape: -1/0/+1),
+    // plus the degenerate and perfectly-(anti)correlated edge cases.
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let n = 4096;
+    let a: Vec<i8> = (0..n).map(|_| (next() % 3) as i8 - 1).collect();
+    let b: Vec<i8> = (0..n).map(|_| (next() % 3) as i8 - 1).collect();
+    let inverted: Vec<i8> = a.iter().map(|v| -v).collect();
+    let constant = vec![0_i8; n];
+    // Full i8 range too — the histogram must handle every bucket, not just trits.
+    let wide_a: Vec<i8> = (0..n).map(|i| (i % 256) as i16 as i8).collect();
+    let wide_b: Vec<i8> = (0..n).map(|i| ((i * 7) % 256) as i16 as i8).collect();
+
+    for (label, x, y) in [
+        ("independent", &a, &b),
+        ("self", &a, &a),
+        ("inverted", &a, &inverted),
+        ("constant", &a, &constant),
+        ("wide range", &wide_a, &wide_b),
+    ] {
+        let fast = spearman_corr_i8(x, y);
+        let naive = spearman_corr_i8_naive(x, y);
+        assert!(
+            (fast - naive).abs() < 1e-12,
+            "{label}: fast={fast} naive={naive}"
+        );
+    }
+    // Sanity anchors on top of the equivalence check.
+    assert!((spearman_corr_i8(&a, &a) - 1.0).abs() < 1e-12);
+    assert!((spearman_corr_i8(&a, &inverted) + 1.0).abs() < 1e-12);
+    assert_eq!(spearman_corr_i8(&a, &constant), 0.0);
+}

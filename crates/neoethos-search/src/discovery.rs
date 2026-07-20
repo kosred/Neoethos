@@ -4796,28 +4796,66 @@ fn min_trades_required(timestamps: &[i64], min_trades_per_day: f64, n_rows: usiz
 
 /// DS-2: Spearman rank correlation for i8 signals.
 /// For discrete values (-1, 0, 1), ranks ties by mean rank. Detects monotonic (non-linear) dependency.
+/// Midrank of every possible `i8` value, from ONE pass over the slice.
+///
+/// A signal is `i8`, so it has at most 256 distinct values (in practice 3:
+/// −1/0/+1) and an element's midrank depends ONLY on its value — never on
+/// its position. So a single 256-bucket histogram yields every rank:
+/// `rank(v) = (#elements < v) + (count(v) + 1) / 2` — the same tie-corrected
+/// midrank formula as before, just computed once per value instead of once
+/// per element.
+///
+/// Perf (2026-07-20): the previous implementation rescanned the WHOLE slice
+/// twice for every element, making Spearman O(n²). On a 1.36M-bar M3 signal
+/// that is ~3.7e12 element comparisons per array — ~30 minutes per gene PAIR
+/// single-threaded, so the portfolio's correlation pruning (O(genes²) pairs)
+/// could not finish in days. It presented as a discovery run frozen at
+/// "quality_screen 95.5%" burning exactly one core. This is O(n).
+fn i8_midranks(vals: &[i8]) -> [f64; 256] {
+    let mut counts = [0usize; 256];
+    for &v in vals {
+        counts[(v as i16 + 128) as usize] += 1;
+    }
+    let mut ranks = [0.0_f64; 256];
+    let mut before = 0usize;
+    for (bucket, &count) in counts.iter().enumerate() {
+        if count > 0 {
+            ranks[bucket] = before as f64 + (count as f64 + 1.0) / 2.0;
+            before += count;
+        }
+    }
+    ranks
+}
+
+#[inline]
+fn midrank_of(ranks: &[f64; 256], v: i8) -> f64 {
+    ranks[(v as i16 + 128) as usize]
+}
+
 fn spearman_corr_i8(a: &[i8], b: &[i8]) -> f64 {
     let n = a.len().min(b.len());
     if n < 2 {
         return 0.0;
     }
-    // For i8 with only 3 distinct values, compute rank as fractional rank
-    // mean_rank(v) = (first_idx + last_idx) / 2 over sorted positions
-    let rank_of = |vals: &[i8], v: i8| -> f64 {
-        let count = vals[..n].iter().filter(|&&x| x == v).count() as f64;
-        let before = vals[..n].iter().filter(|&&x| x < v).count() as f64;
-        before + (count + 1.0) / 2.0
-    };
-    let ranks_a: Vec<f64> = a[..n].iter().map(|&v| rank_of(&a[..n], v)).collect();
-    let ranks_b: Vec<f64> = b[..n].iter().map(|&v| rank_of(&b[..n], v)).collect();
-    let mean_a: f64 = ranks_a.iter().sum::<f64>() / n as f64;
-    let mean_b: f64 = ranks_b.iter().sum::<f64>() / n as f64;
+    let (a, b) = (&a[..n], &b[..n]);
+    let ranks_a = i8_midranks(a);
+    let ranks_b = i8_midranks(b);
+    // Means over the SAME element order as before, so the floating-point
+    // result is identical to the old per-element implementation.
+    let mut sum_a = 0.0_f64;
+    let mut sum_b = 0.0_f64;
+    for i in 0..n {
+        sum_a += midrank_of(&ranks_a, a[i]);
+        sum_b += midrank_of(&ranks_b, b[i]);
+    }
+    let mean_a = sum_a / n as f64;
+    let mean_b = sum_b / n as f64;
     let mut num = 0.0_f64;
     let mut denom_a = 0.0_f64;
     let mut denom_b = 0.0_f64;
     for i in 0..n {
-        let da = ranks_a[i] - mean_a;
-        let db = ranks_b[i] - mean_b;
+        let da = midrank_of(&ranks_a, a[i]) - mean_a;
+        let db = midrank_of(&ranks_b, b[i]) - mean_b;
         num += da * db;
         denom_a += da * da;
         denom_b += db * db;
