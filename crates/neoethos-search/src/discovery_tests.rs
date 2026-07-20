@@ -1657,3 +1657,61 @@ fn spearman_histogram_matches_the_naive_rank_scan() {
     assert!((spearman_corr_i8(&a, &inverted) + 1.0).abs() < 1e-12);
     assert_eq!(spearman_corr_i8(&a, &constant), 0.0);
 }
+
+/// The operator's risk band must reach the BACKTEST, not just live sizing.
+/// Before 2026-07-21 `discovery_backtest_settings` fell through to
+/// `BacktestSettings::default()` for these two fields, so discovery always
+/// sized at 0.5%..3% no matter what `config.yaml` said — while the Discovery
+/// pre-flight told the operator the value applied to "this search". Risky mode
+/// could therefore never search at the aggressive size it exists for.
+#[test]
+fn operator_risk_band_reaches_the_discovery_backtest() {
+    let mut settings = neoethos_core::Settings::default();
+    settings.risk.min_risk_per_trade = 0.05;
+    settings.risk.max_risk_per_trade = 0.30;
+
+    let config = DiscoveryConfig::from_settings(&settings);
+    assert!((config.risk_per_trade_min - 0.05).abs() < 1e-12);
+    assert!((config.risk_per_trade_max - 0.30).abs() < 1e-12);
+
+    let gene = Gene {
+        sl_pips: 20.0,
+        tp_pips: 40.0,
+        ..Default::default()
+    };
+    let settings_out = discovery_backtest_settings(&config, &gene, Some(1.25));
+    assert!(
+        (settings_out.risk_per_trade_max - 0.30).abs() < 1e-12,
+        "the backtest must size at the operator's 30%, got {}",
+        settings_out.risk_per_trade_max
+    );
+    assert!((settings_out.risk_per_trade_min - 0.05).abs() < 1e-12);
+}
+
+#[test]
+fn risk_band_is_clamped_and_ordered() {
+    // A min above max would otherwise size every trade at the floor.
+    let mut settings = neoethos_core::Settings::default();
+    settings.risk.min_risk_per_trade = 0.40;
+    settings.risk.max_risk_per_trade = 0.10;
+    let config = DiscoveryConfig::from_settings(&settings);
+    assert!(
+        config.risk_per_trade_max >= config.risk_per_trade_min,
+        "max {} must not fall below min {}",
+        config.risk_per_trade_max,
+        config.risk_per_trade_min
+    );
+
+    // Absurd values are bounded to [0, 100%].
+    let mut settings = neoethos_core::Settings::default();
+    settings.risk.min_risk_per_trade = -1.0;
+    settings.risk.max_risk_per_trade = 12.0;
+    let config = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(config.risk_per_trade_min, 0.0);
+    assert_eq!(config.risk_per_trade_max, 1.0);
+
+    // A bare default keeps the historical band so nothing else shifts.
+    let d = DiscoveryConfig::default();
+    assert!((d.risk_per_trade_min - 0.005).abs() < 1e-12);
+    assert!((d.risk_per_trade_max - 0.03).abs() < 1e-12);
+}

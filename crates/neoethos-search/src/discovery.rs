@@ -252,6 +252,19 @@ pub struct DiscoveryConfig {
     pub filtering: crate::genetic::FilteringConfig,
     /// Starting account balance used for PnL%, DD%, and regime loss limits.
     pub initial_balance: f64,
+    /// Per-trade risk band the backtest sizes positions with, as balance
+    /// fractions. A trade is sized so a full stop-loss costs
+    /// `min + (max - min) * confidence` of equity at entry.
+    ///
+    /// These come from the operator's `risk.min_risk_per_trade` /
+    /// `risk.max_risk_per_trade`. Before 2026-07-21 the discovery backtest
+    /// silently used `BacktestSettings::default()` (0.5%..3%) no matter what
+    /// the config said, so raising the risk knob changed live sizing but NOT
+    /// the search — even though the Discovery pre-flight told the operator it
+    /// applied to "this search". Risky mode in particular could never actually
+    /// search at the aggressive size it exists for.
+    pub risk_per_trade_min: f64,
+    pub risk_per_trade_max: f64,
     /// Reject a gene if any regime-specific PnL drops below
     /// `-initial_balance * max_regime_loss_pct / 100`.
     pub max_regime_loss_pct: f64,
@@ -376,6 +389,10 @@ impl Default for DiscoveryConfig {
             max_pbo: 0.5,
             filtering: crate::genetic::FilteringConfig::default(),
             initial_balance: 100_000.0,
+            // Historical BacktestSettings defaults, kept so a bare
+            // DiscoveryConfig::default() behaves exactly as before.
+            risk_per_trade_min: 0.005,
+            risk_per_trade_max: 0.03,
             max_regime_loss_pct: 3.0,
             higher_timeframes: Vec::new(),
             runtime_overrides: DiscoveryRuntimeOverrides::default(),
@@ -512,6 +529,14 @@ impl DiscoveryConfig {
             max_pbo: 0.5,
             filtering,
             initial_balance: settings.risk.initial_balance.max(1.0),
+            // The operator's own risk band now reaches the search. Clamped to
+            // a sane [0, 100%] and ordered so a mis-set min can never exceed
+            // max (which would size every trade at the floor).
+            risk_per_trade_min: settings.risk.min_risk_per_trade.clamp(0.0, 1.0),
+            risk_per_trade_max: settings
+                .risk
+                .max_risk_per_trade
+                .clamp(settings.risk.min_risk_per_trade.clamp(0.0, 1.0), 1.0),
             max_regime_loss_pct: 3.0,
             higher_timeframes: settings.system.higher_timeframes.clone(),
             runtime_overrides: DiscoveryRuntimeOverrides::from_settings(settings),
@@ -1228,6 +1253,8 @@ fn discovery_backtest_settings(
         commission_per_trade: evaluation.commission_per_trade,
         pip_value_per_lot: evaluation.pip_value_per_lot,
         kill_zones_enabled: true,
+        risk_per_trade_min: config.risk_per_trade_min,
+        risk_per_trade_max: config.risk_per_trade_max,
         ..crate::eval::BacktestSettings::default()
     }
 }
