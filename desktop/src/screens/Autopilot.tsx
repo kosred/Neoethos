@@ -20,6 +20,7 @@ import {
 } from "../api";
 import { usePoll } from "../hooks";
 import { HelpPanel, HelpStep, Tip } from "../components/Help";
+import { FilterChips, ago, stamp, tfRank, toggleIn } from "../components/filters";
 
 function StatGrid({ data }: { data: any }) {
   if (!data || typeof data !== "object") return null;
@@ -93,10 +94,15 @@ export default function Autopilot() {
   const [chal, setChal] = useState<ChallengeReport | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
-  // Filters
+  // Filters — same set as Strategy Report (operator request 2026-07-21), sharing
+  // the chip/format helpers so the two screens can never drift apart.
   const [modeFilter, setModeFilter] = useState<"all" | "risky" | "prop">("all");
   const [onlyValidated, setOnlyValidated] = useState(false);
   const [validatedKeys, setValidatedKeys] = useState<Set<string>>(new Set());
+  const [symFilter, setSymFilter] = useState<string[]>([]);
+  const [tfFilter, setTfFilter] = useState<string[]>([]);
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState<"discovered" | "symbol" | "genes">("discovered");
   // Auto-cull: retire a strategy after this many consecutive losing trades.
   const [cullLosses, setCullLosses] = useState(6);
   // Auto-cull, rolling window: min win-rate % over the last N closed trades.
@@ -110,14 +116,50 @@ export default function Autopilot() {
   const running = !!status?.running;
   const runningPaths = new Set(engines.map((e) => e.portfolioPath));
   const allPortfolios = list?.portfolios ?? [];
-  const portfolios = allPortfolios.filter((p) => {
-    if (p.blacklisted) return false; // retired strategies are never selectable
-    const isProp = p.path.toLowerCase().includes("propfirm");
-    if (modeFilter === "risky" && isProp) return false;
-    if (modeFilter === "prop" && !isProp) return false;
-    if (onlyValidated && !validatedKeys.has(`${p.symbol ?? ""}|${p.baseTf ?? ""}`)) return false;
-    return true;
-  });
+  const selectable = allPortfolios.filter((p) => !p.blacklisted); // retired are never selectable
+  const symbolOpts = Array.from(new Set(selectable.map((p) => p.symbol ?? "?"))).sort();
+  const tfOpts = Array.from(new Set(selectable.map((p) => p.baseTf ?? "?"))).sort(
+    (a, b) => tfRank(a) - tfRank(b),
+  );
+  const q = search.trim().toUpperCase();
+  const portfolios = selectable
+    .filter((p) => {
+      const isProp = p.path.toLowerCase().includes("propfirm");
+      if (modeFilter === "risky" && isProp) return false;
+      if (modeFilter === "prop" && !isProp) return false;
+      if (onlyValidated && !validatedKeys.has(`${p.symbol ?? ""}|${p.baseTf ?? ""}`)) return false;
+      if (symFilter.length && !symFilter.includes(p.symbol ?? "?")) return false;
+      if (tfFilter.length && !tfFilter.includes(p.baseTf ?? "?")) return false;
+      if (q && !`${p.symbol ?? ""} ${p.baseTf ?? ""} ${p.fileName}`.toUpperCase().includes(q)) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      if (sortBy === "discovered") return (b.modifiedMs ?? 0) - (a.modifiedMs ?? 0);
+      if (sortBy === "genes") return (b.geneCount ?? 0) - (a.geneCount ?? 0);
+      return (a.symbol ?? "").localeCompare(b.symbol ?? "") || tfRank(a.baseTf ?? "") - tfRank(b.baseTf ?? "");
+    });
+  // Rollup of what is currently shown, so "what do I have per timeframe" is one
+  // glance instead of counting rows.
+  const byTf = (() => {
+    const m = new Map<string, { n: number; live: number }>();
+    for (const p of portfolios) {
+      const k = p.baseTf ?? "?";
+      const e = m.get(k) ?? { n: 0, live: 0 };
+      e.n += 1;
+      if (runningPaths.has(p.path)) e.live += 1;
+      m.set(k, e);
+    }
+    return [...m.entries()].sort((a, b) => tfRank(a[0]) - tfRank(b[0]));
+  })();
+  const newest = selectable.reduce<number | null>(
+    (acc, p) => (p.modifiedMs && (!acc || p.modifiedMs > acc) ? p.modifiedMs : acc),
+    null,
+  );
+  const filtersOn =
+    symFilter.length > 0 || tfFilter.length > 0 || modeFilter !== "all" || onlyValidated || q !== "";
+  const clearFilters = () => {
+    setSymFilter([]); setTfFilter([]); setModeFilter("all"); setOnlyValidated(false); setSearch("");
+  };
 
   // Validated set (passed CPCV + Walkforward) keyed by symbol|timeframe, from the
   // strategy report — powers the "only validated" filter.
@@ -275,6 +317,10 @@ export default function Autopilot() {
       <div className="btn-row" style={{ flexWrap: "wrap", alignItems: "center" }}>
         <button onClick={reload} disabled={busy}>Refresh strategies</button>
         <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+          Search
+          <input value={search} placeholder="EURUSD, M5…" onChange={(e) => setSearch(e.target.value)} style={{ width: 140 }} />
+        </label>
+        <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
           Mode
           <select value={modeFilter} onChange={(e) => setModeFilter(e.target.value as any)}>
             <option value="all">All</option>
@@ -282,9 +328,18 @@ export default function Autopilot() {
             <option value="prop">🛡 Prop-firm</option>
           </select>
         </label>
+        <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+          Sort
+          <select value={sortBy} onChange={(e) => setSortBy(e.target.value as typeof sortBy)}>
+            <option value="discovered">Newest first</option>
+            <option value="genes">Most genes</option>
+            <option value="symbol">Symbol · TF</option>
+          </select>
+        </label>
         <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }} title="Only strategies whose backtest passed CPCV + Walkforward out-of-sample">
           <input type="checkbox" checked={onlyValidated} onChange={(e) => setOnlyValidated(e.target.checked)} /> Only validated (passed OOS)
         </label>
+        {filtersOn && <button className="link" onClick={clearFilters}>clear filters</button>}
         <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
           Auto-cull after <Tip text="After this many CONSECUTIVE losing trades, the engine stops itself and permanently retires the strategy (blacklist) — it can never be selected or re-discovered again. 0 = off." />
           <input type="number" min={0} max={50} value={cullLosses} onChange={(e) => setCullLosses(Math.max(0, Number(e.target.value)))} style={{ width: 56 }} /> losses
@@ -294,8 +349,25 @@ export default function Autopilot() {
           <input type="number" min={0} max={100} value={cullMinWr} onChange={(e) => setCullMinWr(Math.min(100, Math.max(0, Number(e.target.value))))} style={{ width: 56 }} />% per last
           <input type="number" min={4} max={100} value={cullWindow} onChange={(e) => setCullWindow(Math.max(4, Number(e.target.value)))} style={{ width: 52 }} /> trades
         </label>
-        <span className="muted small">{portfolios.length} of {allPortfolios.length} shown · {selected.length} selected{retired.length ? ` · ${retired.length} retired` : ""}</span>
+        <span className="muted small">
+          {portfolios.length} of {allPortfolios.length} shown · {selected.length} selected
+          {retired.length ? ` · ${retired.length} retired` : ""}
+          {newest ? ` · newest ${stamp(newest)}` : ""}
+        </span>
       </div>
+      <FilterChips label="Pairs" opts={symbolOpts} sel={symFilter} onToggle={toggleIn(setSymFilter)} />
+      <FilterChips label="Timeframes" opts={tfOpts} sel={tfFilter} onToggle={toggleIn(setTfFilter)} />
+      {byTf.length > 1 && (
+        <div className="cards" style={{ gridTemplateColumns: `repeat(${Math.min(6, byTf.length)}, 1fr)` }}>
+          {byTf.map(([tf, e]) => (
+            <div className="card" key={tf} title={`${e.n} strategies on ${tf}${e.live ? `, ${e.live} running live` : ""}`}>
+              <div className="card-label">{tf}</div>
+              <div className="card-value">{e.n}</div>
+              {e.live > 0 && <div className="muted small">{e.live} live</div>}
+            </div>
+          ))}
+        </div>
+      )}
       {error && <div className="banner warn">{error}</div>}
 
       {portfolios.length === 0 ? (
@@ -307,13 +379,16 @@ export default function Autopilot() {
             <button className="link" onClick={() => setSelected([])}>None</button>
           </div>
           <table className="tbl">
-            <thead><tr><th></th><th>Symbol</th><th>Base TF</th><th>Genes</th><th>File</th><th></th></tr></thead>
+            <thead><tr><th></th><th>Discovered</th><th>Symbol</th><th>Base TF</th><th>Genes</th><th>File</th><th></th></tr></thead>
             <tbody>
               {portfolios.map((p) => {
                 const live = runningPaths.has(p.path);
                 return (
                   <tr key={p.path} className={focus?.path === p.path ? "row-sel" : ""}>
                     <td><input type="checkbox" checked={selected.includes(p.path)} onChange={() => toggle(p.path)} /></td>
+                    <td className="muted small" style={{ whiteSpace: "nowrap" }} title={ago(p.modifiedMs)}>
+                      {stamp(p.modifiedMs)}
+                    </td>
                     <td>
                       <button className="link" onClick={() => setFocus(p)} style={{ fontWeight: 700 }}>{p.symbol ?? "?"}</button>
                       {live && <span className="badge live" style={{ marginLeft: 6, fontSize: 9 }}>LIVE</span>}

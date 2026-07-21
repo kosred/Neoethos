@@ -1,33 +1,12 @@
 import { useMemo, useState } from "react";
 import { strategyList, strategyReport, type StrategyEntry, type StrategyReport as Report } from "../api";
 import { usePoll } from "../hooks";
+import { FilterChips, ago, stamp, tfRank, toggleIn } from "../components/filters";
 
 const eur = (v: number) => `€${v.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
 const Badge = ({ ok, label }: { ok: boolean | null; label: string }) => (
   <span className={`badge ${ok ? "demo" : "live"}`} title={label}>{ok ? "✓" : "✗"} {label}</span>
 );
-
-// "2026-07-21 01:08" — sortable at a glance, no locale surprises.
-const stamp = (ms: number | null) => {
-  if (!ms) return "—";
-  const d = new Date(ms);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-};
-const ago = (ms: number | null) => {
-  if (!ms) return "";
-  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-  return `${Math.floor(s / 86400)}d ago`;
-};
-
-// Fastest-first, so timeframe filters read in the order runs actually go.
-const TF_ORDER = ["MN1", "W1", "D1", "H12", "H8", "H6", "H4", "H3", "H2", "H1", "M30", "M20", "M15", "M12", "M10", "M6", "M5", "M4", "M3", "M2", "M1"];
-const tfRank = (t: string) => {
-  const i = TF_ORDER.indexOf(t);
-  return i < 0 ? 999 : i;
-};
 
 type SortKey = "discovered" | "cagr" | "dd" | "trades" | "symbol";
 
@@ -98,8 +77,6 @@ export default function StrategyReport() {
     [all],
   );
 
-  const toggle = (set: React.Dispatch<React.SetStateAction<string[]>>) => (v: string) =>
-    set((cur) => (cur.includes(v) ? cur.filter((x) => x !== v) : [...cur, v]));
   const clearAll = () => {
     setSymFilter([]); setTfFilter([]); setModeFilter("all");
     setValidOnly(false); setHideFlagged(false); setSearch("");
@@ -168,34 +145,8 @@ export default function StrategyReport() {
           <span className="muted small">{rows.length} of {all.length}</span>
         </div>
 
-        {symbols.length > 1 && (
-          <>
-            <div className="muted small" style={{ marginTop: 8 }}>
-              Pairs <span className="muted">({symFilter.length || "all"})</span>
-            </div>
-            <div className="chip-row">
-              {symbols.map((s) => (
-                <button key={s} type="button" className={`chip ${symFilter.includes(s) ? "on" : ""}`} onClick={() => toggle(setSymFilter)(s)}>
-                  {s}
-                </button>
-              ))}
-            </div>
-          </>
-        )}
-        {timeframes.length > 1 && (
-          <>
-            <div className="muted small" style={{ marginTop: 8 }}>
-              Timeframes <span className="muted">({tfFilter.length || "all"})</span>
-            </div>
-            <div className="chip-row">
-              {timeframes.map((t) => (
-                <button key={t} type="button" className={`chip ${tfFilter.includes(t) ? "on" : ""}`} onClick={() => toggle(setTfFilter)(t)}>
-                  {t}
-                </button>
-              ))}
-            </div>
-          </>
-        )}
+        <FilterChips label="Pairs" opts={symbols} sel={symFilter} onToggle={toggleIn(setSymFilter)} />
+        <FilterChips label="Timeframes" opts={timeframes} sel={tfFilter} onToggle={toggleIn(setTfFilter)} />
       </div>
 
       {/* ── Per-timeframe rollup of what is currently shown ────────────────── */}
