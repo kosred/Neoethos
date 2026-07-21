@@ -161,12 +161,16 @@ export default function Actions() {
               <option value="stop">Stop</option>
             </select>
           </label>
-          {/* min guards: the spinner arrows step below zero without one, and a
-              negative lot / price / distance is meaningless on a real order. */}
+          {/* Lots and pip DISTANCES are floored at zero — cTrader takes SL/TP as
+              a positive distance and derives the side ("BUY: entry - SL,
+              SELL: entry + SL"), so a sell's stop sitting above entry is still
+              a positive number. The trigger PRICE is deliberately unfloored:
+              prices can go negative on commodities (WTI settled at -$37.63 on
+              2020-04-20) and XTIUSD / XBRUSD / NAT.GAS are watchlisted. */}
           <label>Lots<input type="number" min="0.01" step="0.01" value={lots} onChange={(e) => setLots(Math.max(0, Number(e.target.value)))} style={{ width: 80 }} /></label>
           <label>
             Trigger price <Tip text="The price at which the order activates. This is your 'when the criteria are met' level." />
-            <input type="number" min="0" step="0.00001" value={trigger} placeholder={spot ? String(spot.midPrice) : "price"} onChange={(e) => setTrigger(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} style={{ width: 110 }} />
+            <input type="number" step="0.00001" value={trigger} placeholder={spot ? String(spot.midPrice) : "price"} onChange={(e) => setTrigger(e.target.value === "" ? "" : Number(e.target.value))} style={{ width: 110 }} />
           </label>
           <label>SL pips<input type="number" min="0" value={sl} onChange={(e) => setSl(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} style={{ width: 80 }} /></label>
           <label>TP pips<input type="number" min="0" value={tp} onChange={(e) => setTp(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} style={{ width: 80 }} /></label>

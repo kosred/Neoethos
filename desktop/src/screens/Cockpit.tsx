@@ -198,8 +198,14 @@ export default function Cockpit() {
           <div className="ticket" style={{ marginBottom: 8 }}>
             <div className="ticket-row">
               <b style={{ alignSelf: "center" }}>{editPos.symbol} {editPos.side} #{editPos.positionId}</b>
-              <label>SL price<input type="number" min="0" step="0.00001" value={editSl} onChange={(e) => setEditSl(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} /></label>
-              <label>TP price<input type="number" min="0" step="0.00001" value={editTp} onChange={(e) => setEditTp(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} /></label>
+              {/* NO min here, unlike the pips fields above: these are ABSOLUTE
+                  price levels, and a price can legitimately be negative on
+                  commodities — WTI crude settled at -$37.63 on 2020-04-20, and
+                  XTIUSD / XBRUSD / NAT.GAS are in the operator's watchlist.
+                  Clamping these at zero would block a valid stop in exactly the
+                  market where a stop matters most. */}
+              <label>SL price<input type="number" step="0.00001" value={editSl} onChange={(e) => setEditSl(e.target.value === "" ? "" : Number(e.target.value))} /></label>
+              <label>TP price<input type="number" step="0.00001" value={editTp} onChange={(e) => setEditTp(e.target.value === "" ? "" : Number(e.target.value))} /></label>
               <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
                 <input type="checkbox" checked={editTrail} onChange={(e) => setEditTrail(e.target.checked)} /> Trailing
               </label>
