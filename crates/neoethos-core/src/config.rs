@@ -330,6 +330,26 @@ pub struct RiskConfig {
     pub min_risk_per_trade: f64,
     pub max_risk_per_trade: f64,
     pub risk_per_trade: f64,
+    /// PER-MODE risk band. `None` (the default, and what every pre-2026-07-21
+    /// config has) falls back to the shared `min/max_risk_per_trade` above, so
+    /// existing setups are untouched.
+    ///
+    /// Why this exists: Risky and Prop-firm are two *different products* that
+    /// happen to share one engine — aggressive compounding vs surviving a
+    /// challenge whose daily-loss rule is a few percent. A single shared risk
+    /// band silently carried one mode's sizing into the other: switching
+    /// `system.trading_mode` to `prop_firm` while the band still said 30% made
+    /// every candidate break the firm's daily rule on its first loss, so the
+    /// search could never return anything — with nothing on screen explaining
+    /// why. Set these once and each mode keeps its own sizing forever.
+    #[serde(default)]
+    pub risky_min_risk_per_trade: Option<f64>,
+    #[serde(default)]
+    pub risky_max_risk_per_trade: Option<f64>,
+    #[serde(default)]
+    pub prop_firm_min_risk_per_trade: Option<f64>,
+    #[serde(default)]
+    pub prop_firm_max_risk_per_trade: Option<f64>,
     /// Portfolio-level cap on TOTAL concurrent risk across all running live
     /// engines, as a balance fraction (e.g. 0.05 = at most ~5% of the account
     /// at risk across every open autopilot position at once). Each engine
@@ -397,6 +417,12 @@ impl Default for RiskConfig {
             min_risk_per_trade: 0.0,
             max_risk_per_trade: 0.030,
             risk_per_trade: 0.030,
+            // Unset by default: each mode inherits the shared band until the
+            // operator gives it its own.
+            risky_min_risk_per_trade: None,
+            risky_max_risk_per_trade: None,
+            prop_firm_min_risk_per_trade: None,
+            prop_firm_max_risk_per_trade: None,
             // Portfolio-level concurrent-risk cap: 0 = disabled (per-engine
             // sizing only). Opt-in via config/Advanced — never a silent
             // sizing change for existing users.

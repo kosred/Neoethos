@@ -265,6 +265,13 @@ pub struct DiscoveryConfig {
     /// search at the aggressive size it exists for.
     pub risk_per_trade_min: f64,
     pub risk_per_trade_max: f64,
+    /// Per-mode overrides of the band above, resolved by
+    /// [`Self::apply_mode_overrides`]. `None` = inherit the shared band.
+    /// Risky and Prop-firm are different products; one shared sizing knob
+    /// silently carried 30%-compounding risk into a challenge search (where
+    /// the firm's daily rule makes it unpassable) and vice versa.
+    pub risky_risk_band: Option<(f64, f64)>,
+    pub prop_firm_risk_band: Option<(f64, f64)>,
     /// Reject a gene if any regime-specific PnL drops below
     /// `-initial_balance * max_regime_loss_pct / 100`.
     pub max_regime_loss_pct: f64,
@@ -353,6 +360,19 @@ pub struct PropFirmGateOverrides {
     pub pass_rate: f64,
 }
 
+/// Resolve one trading mode's per-trade risk band from its config pair.
+///
+/// A band counts as SET only when a positive, finite max is given; the min
+/// defaults to 0 so sizing scales up from zero with signal confidence — the
+/// same shape as the shared band. Values are ordered and clamped to [0, 100%]
+/// so a mis-typed entry can never invert the band or exceed the account.
+/// `None` means "inherit the shared `risk.min/max_risk_per_trade`".
+fn resolve_mode_risk_band(min: Option<f64>, max: Option<f64>) -> Option<(f64, f64)> {
+    let max = max.filter(|m| m.is_finite() && *m > 0.0)?;
+    let min = min.filter(|m| m.is_finite()).unwrap_or(0.0).clamp(0.0, 1.0);
+    Some((min, max.clamp(min, 1.0)))
+}
+
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
@@ -393,6 +413,8 @@ impl Default for DiscoveryConfig {
             // DiscoveryConfig::default() behaves exactly as before.
             risk_per_trade_min: 0.005,
             risk_per_trade_max: 0.03,
+            risky_risk_band: None,
+            prop_firm_risk_band: None,
             max_regime_loss_pct: 3.0,
             higher_timeframes: Vec::new(),
             runtime_overrides: DiscoveryRuntimeOverrides::default(),
@@ -537,6 +559,14 @@ impl DiscoveryConfig {
                 .risk
                 .max_risk_per_trade
                 .clamp(settings.risk.min_risk_per_trade.clamp(0.0, 1.0), 1.0),
+            risky_risk_band: resolve_mode_risk_band(
+                settings.risk.risky_min_risk_per_trade,
+                settings.risk.risky_max_risk_per_trade,
+            ),
+            prop_firm_risk_band: resolve_mode_risk_band(
+                settings.risk.prop_firm_min_risk_per_trade,
+                settings.risk.prop_firm_max_risk_per_trade,
+            ),
             max_regime_loss_pct: 3.0,
             higher_timeframes: settings.system.higher_timeframes.clone(),
             runtime_overrides: DiscoveryRuntimeOverrides::from_settings(settings),
@@ -588,6 +618,33 @@ impl DiscoveryConfig {
     /// where the operator wants to lock in a specific value, but the
     /// happy-path call needs none of them.
     pub fn apply_mode_overrides(mut self) -> Self {
+        // MODE-SCOPED SIZING (2026-07-21). Risky and Prop-firm are two
+        // different products sharing one engine: one compounds aggressively,
+        // the other must survive a challenge whose daily-loss rule is a few
+        // percent. They used to share ONE risk band, so switching
+        // `system.trading_mode` silently carried the other mode's sizing —
+        // a 30% risky band made every prop-firm candidate break the daily rule
+        // on its first loss, and the search returned nothing with no
+        // explanation. Each mode now takes its own band when one is set;
+        // `None` inherits the shared `risk.min/max_risk_per_trade` exactly as
+        // before, so existing configs are untouched.
+        let mode_band = match self.mode {
+            DiscoveryMode::Risky => self.risky_risk_band,
+            DiscoveryMode::PropFirm => self.prop_firm_risk_band,
+            _ => None,
+        };
+        if let Some((min, max)) = mode_band {
+            self.risk_per_trade_min = min;
+            self.risk_per_trade_max = max;
+        }
+        tracing::info!(
+            target: "neoethos_search::discovery",
+            mode = ?self.mode,
+            risk_per_trade_min = self.risk_per_trade_min,
+            risk_per_trade_max = self.risk_per_trade_max,
+            mode_scoped = mode_band.is_some(),
+            "resolved per-trade risk band for this search"
+        );
         // Config-consolidation (2026-06-03): the mode comes from `self.mode`
         // (set by `from_settings` from `models.discovery_mode`) and the
         // discovery runtime knobs from `self.runtime_overrides` (set by

@@ -1715,3 +1715,98 @@ fn risk_band_is_clamped_and_ordered() {
     assert!((d.risk_per_trade_min - 0.005).abs() < 1e-12);
     assert!((d.risk_per_trade_max - 0.03).abs() < 1e-12);
 }
+
+/// Risky and Prop-firm must NOT share one sizing knob. Before 2026-07-21 they
+/// did: flipping `system.trading_mode` silently carried the other mode's risk
+/// into the search, so a 30% risky band made every prop-firm candidate break
+/// the firm's daily-loss rule on its first loss — the search returned nothing
+/// and the screen gave no reason.
+#[test]
+fn each_mode_keeps_its_own_risk_band() {
+    let mut settings = neoethos_core::Settings::default();
+    settings.risk.min_risk_per_trade = 0.0;
+    settings.risk.max_risk_per_trade = 0.03; // shared fallback
+    settings.risk.risky_max_risk_per_trade = Some(0.30);
+    settings.risk.prop_firm_max_risk_per_trade = Some(0.01);
+
+    let risky = DiscoveryConfig {
+        mode: DiscoveryMode::Risky,
+        ..DiscoveryConfig::from_settings(&settings)
+    }
+    .apply_mode_overrides();
+    assert!(
+        (risky.risk_per_trade_max - 0.30).abs() < 1e-12,
+        "risky must size at 30%, got {}",
+        risky.risk_per_trade_max
+    );
+
+    let prop = DiscoveryConfig {
+        mode: DiscoveryMode::PropFirm,
+        ..DiscoveryConfig::from_settings(&settings)
+    }
+    .apply_mode_overrides();
+    assert!(
+        (prop.risk_per_trade_max - 0.01).abs() < 1e-12,
+        "prop-firm must size at 1%, got {}",
+        prop.risk_per_trade_max
+    );
+
+    // The one that matters most: the same settings produce DIFFERENT sizing.
+    assert!(risky.risk_per_trade_max > prop.risk_per_trade_max * 10.0);
+}
+
+#[test]
+fn unset_mode_band_inherits_the_shared_one() {
+    // Every pre-existing config has no per-mode values — behaviour must not move.
+    let mut settings = neoethos_core::Settings::default();
+    settings.risk.min_risk_per_trade = 0.002;
+    settings.risk.max_risk_per_trade = 0.05;
+    assert_eq!(settings.risk.risky_max_risk_per_trade, None);
+
+    for mode in [DiscoveryMode::Risky, DiscoveryMode::PropFirm, DiscoveryMode::Strict] {
+        let c = DiscoveryConfig {
+            mode,
+            ..DiscoveryConfig::from_settings(&settings)
+        }
+        .apply_mode_overrides();
+        assert!((c.risk_per_trade_min - 0.002).abs() < 1e-12, "{mode:?}");
+        assert!((c.risk_per_trade_max - 0.05).abs() < 1e-12, "{mode:?}");
+    }
+}
+
+#[test]
+fn mode_band_rejects_nonsense_and_orders_itself() {
+    let mut settings = neoethos_core::Settings::default();
+    settings.risk.max_risk_per_trade = 0.03;
+
+    // A zero / negative / non-finite max means "not set" -> inherit.
+    for bad in [Some(0.0), Some(-0.5), Some(f64::NAN)] {
+        settings.risk.risky_max_risk_per_trade = bad;
+        let c = DiscoveryConfig {
+            mode: DiscoveryMode::Risky,
+            ..DiscoveryConfig::from_settings(&settings)
+        }
+        .apply_mode_overrides();
+        assert!((c.risk_per_trade_max - 0.03).abs() < 1e-12, "bad={bad:?}");
+    }
+
+    // min above max cannot invert the band, and nothing exceeds 100%.
+    settings.risk.risky_min_risk_per_trade = Some(0.9);
+    settings.risk.risky_max_risk_per_trade = Some(0.2);
+    let c = DiscoveryConfig {
+        mode: DiscoveryMode::Risky,
+        ..DiscoveryConfig::from_settings(&settings)
+    }
+    .apply_mode_overrides();
+    assert!(c.risk_per_trade_max >= c.risk_per_trade_min);
+    assert!(c.risk_per_trade_max <= 1.0 && c.risk_per_trade_min >= 0.0);
+
+    settings.risk.risky_min_risk_per_trade = None;
+    settings.risk.risky_max_risk_per_trade = Some(9.0);
+    let c = DiscoveryConfig {
+        mode: DiscoveryMode::Risky,
+        ..DiscoveryConfig::from_settings(&settings)
+    }
+    .apply_mode_overrides();
+    assert_eq!(c.risk_per_trade_max, 1.0, "capped at 100% of the account");
+}

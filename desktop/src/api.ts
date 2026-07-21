@@ -707,6 +707,8 @@ export type StrategyEntry = {
   finalFrom1000: number;
   maxDdPct: number;
   flags: string[];
+  /** When the strategy was discovered (unix ms), from the artifact's mtime. */
+  discoveredAtMs: number | null;
 };
 export type MonthRow = { month: string; balance: number; returnPct: number; trades: number };
 export type StrategyReport = StrategyEntry & { monthly: MonthRow[]; yearly: MonthRow[] };

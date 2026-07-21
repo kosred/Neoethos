@@ -53,6 +53,13 @@ pub struct StrategyEntry {
     pub max_dd_pct: f64,
     /// Honest red flags (out-of-sample failed, low sample, units anomaly, …).
     pub flags: Vec<String>,
+    /// When this strategy was DISCOVERED — the portfolio artifact's last-write
+    /// time, in unix milliseconds. `None` when the file cannot be stat'ed.
+    ///
+    /// Without it the list is undated: after months of runs the operator can
+    /// see WHAT was found but not WHEN, so a stale result from an old config
+    /// is indistinguishable from one produced minutes ago.
+    pub discovered_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,6 +104,17 @@ fn mode_of(dir: &Path) -> String {
     } else {
         "risky".to_string()
     }
+}
+
+/// Last-write time of `p` as unix milliseconds. `None` on any failure — a
+/// missing timestamp is shown as "—" rather than guessed.
+fn file_modified_ms(p: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(p).ok()?.modified().ok()?;
+    let ms = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    i64::try_from(ms).ok()
 }
 
 fn read_json(p: &Path) -> Option<serde_json::Value> {
@@ -254,6 +272,8 @@ fn build(dir: &Path, base: &str, with_monthly: bool) -> Option<(StrategyEntry, V
         final_from_1000: if eq.is_finite() { round2(eq) } else { 0.0 },
         max_dd_pct: round2(max_dd * 100.0),
         flags,
+        // Discovery time = when the run wrote this portfolio's trade log.
+        discovered_at_ms: file_modified_ms(&dir.join(format!("{base}.json.trades.json"))),
     };
 
     let yearly = if with_monthly {
