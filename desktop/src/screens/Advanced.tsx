@@ -306,7 +306,20 @@ export default function Advanced() {
             {f.options!.map((o) => <option key={o.v} value={o.v}>{o.l}</option>)}
           </select>
         ) : f.kind === "num" ? (
-          <input type="number" step={f.step ?? 1} value={val} onChange={(e) => setField(f.key, e.target.value === "" ? "" : Number(e.target.value))} style={{ width: 110 }} />
+          // Every numeric knob here is a non-negative quantity (a balance, a
+          // count, a percentage). `min` blocks the spinner arrows and clamping
+          // on change blocks typed/pasted negatives — a negative risk or
+          // population is meaningless and must never reach the backend.
+          <input
+            type="number"
+            min={0}
+            step={f.step ?? 1}
+            value={val}
+            onChange={(e) =>
+              setField(f.key, e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))
+            }
+            style={{ width: 110 }}
+          />
         ) : (
           <input type="text" value={raw ?? ""} onChange={(e) => setField(f.key, e.target.value)} style={{ width: 180 }} />
         )}

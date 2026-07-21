@@ -170,9 +170,11 @@ export default function Cockpit() {
               <button className={side === "buy" ? "on buy" : ""} style={{ flex: 1 }} onClick={() => setSide("buy")}>BUY</button>
               <button className={side === "sell" ? "on sell" : ""} style={{ flex: 1 }} onClick={() => setSide("sell")}>SELL</button>
             </div>
-            <label className="ck-field">Lots<input type="number" step="0.01" value={lots} onChange={(e) => setLots(Number(e.target.value))} /></label>
-            <label className="ck-field">SL pips<input type="number" value={sl} onChange={(e) => setSl(e.target.value === "" ? "" : Number(e.target.value))} /></label>
-            <label className="ck-field">TP pips<input type="number" value={tp} onChange={(e) => setTp(e.target.value === "" ? "" : Number(e.target.value))} /></label>
+            {/* min guards: without one the spinner arrows step below zero, and
+                this ticket places REAL orders on the live account. */}
+            <label className="ck-field">Lots<input type="number" min="0.01" step="0.01" value={lots} onChange={(e) => setLots(Math.max(0, Number(e.target.value)))} /></label>
+            <label className="ck-field">SL pips<input type="number" min="0" value={sl} onChange={(e) => setSl(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} /></label>
+            <label className="ck-field">TP pips<input type="number" min="0" value={tp} onChange={(e) => setTp(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} /></label>
             <button className="primary" style={{ width: "100%", marginTop: 6 }} disabled={busy} onClick={place}>
               {busy ? "…" : `${side.toUpperCase()} ${symbol} ${lots}`}
             </button>
@@ -196,8 +198,8 @@ export default function Cockpit() {
           <div className="ticket" style={{ marginBottom: 8 }}>
             <div className="ticket-row">
               <b style={{ alignSelf: "center" }}>{editPos.symbol} {editPos.side} #{editPos.positionId}</b>
-              <label>SL price<input type="number" step="0.00001" value={editSl} onChange={(e) => setEditSl(e.target.value === "" ? "" : Number(e.target.value))} /></label>
-              <label>TP price<input type="number" step="0.00001" value={editTp} onChange={(e) => setEditTp(e.target.value === "" ? "" : Number(e.target.value))} /></label>
+              <label>SL price<input type="number" min="0" step="0.00001" value={editSl} onChange={(e) => setEditSl(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} /></label>
+              <label>TP price<input type="number" min="0" step="0.00001" value={editTp} onChange={(e) => setEditTp(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} /></label>
               <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
                 <input type="checkbox" checked={editTrail} onChange={(e) => setEditTrail(e.target.checked)} /> Trailing
               </label>

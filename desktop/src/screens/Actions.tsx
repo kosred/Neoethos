@@ -161,13 +161,15 @@ export default function Actions() {
               <option value="stop">Stop</option>
             </select>
           </label>
-          <label>Lots<input type="number" step="0.01" value={lots} onChange={(e) => setLots(Number(e.target.value))} style={{ width: 80 }} /></label>
+          {/* min guards: the spinner arrows step below zero without one, and a
+              negative lot / price / distance is meaningless on a real order. */}
+          <label>Lots<input type="number" min="0.01" step="0.01" value={lots} onChange={(e) => setLots(Math.max(0, Number(e.target.value)))} style={{ width: 80 }} /></label>
           <label>
             Trigger price <Tip text="The price at which the order activates. This is your 'when the criteria are met' level." />
-            <input type="number" step="0.00001" value={trigger} placeholder={spot ? String(spot.midPrice) : "price"} onChange={(e) => setTrigger(e.target.value === "" ? "" : Number(e.target.value))} style={{ width: 110 }} />
+            <input type="number" min="0" step="0.00001" value={trigger} placeholder={spot ? String(spot.midPrice) : "price"} onChange={(e) => setTrigger(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} style={{ width: 110 }} />
           </label>
-          <label>SL pips<input type="number" value={sl} onChange={(e) => setSl(e.target.value === "" ? "" : Number(e.target.value))} style={{ width: 80 }} /></label>
-          <label>TP pips<input type="number" value={tp} onChange={(e) => setTp(e.target.value === "" ? "" : Number(e.target.value))} style={{ width: 80 }} /></label>
+          <label>SL pips<input type="number" min="0" value={sl} onChange={(e) => setSl(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} style={{ width: 80 }} /></label>
+          <label>TP pips<input type="number" min="0" value={tp} onChange={(e) => setTp(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} style={{ width: 80 }} /></label>
           <label>
             Expiry <Tip text="Optional. Order auto-cancels at this time (Good-Till-Date). Leave blank to rest until filled or cancelled." />
             <input type="datetime-local" value={expiry} onChange={(e) => setExpiry(e.target.value)} />

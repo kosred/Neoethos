@@ -92,6 +92,27 @@ export default function App() {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [status, setStatus] = useState<BrokerStatus | null>(null);
 
+  // A focused <input type="number"> changes its VALUE when the mouse wheel
+  // passes over it. Scrolling a settings page therefore silently rewrites the
+  // knobs under the cursor — the operator found risk-per-trade, drawdown caps
+  // and population sitting at NEGATIVE numbers after nothing but scrolling.
+  // On a trading system that is not a cosmetic bug. Blurring on wheel keeps
+  // the page scrolling normally while making the value untouchable.
+  useEffect(() => {
+    const onWheel = (e: WheelEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (
+        el instanceof HTMLInputElement &&
+        el.type === "number" &&
+        document.activeElement === el
+      ) {
+        el.blur();
+      }
+    };
+    document.addEventListener("wheel", onWheel, { passive: true });
+    return () => document.removeEventListener("wheel", onWheel);
+  }, []);
+
   useEffect(() => {
     appInfo().then(setInfo).catch(() => {});
     const tick = () => brokerStatus().then(setStatus).catch(() => {});
