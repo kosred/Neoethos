@@ -2115,19 +2115,27 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
                 device_override,
             )
         }));
-        match gpu {
+        // Classify the outcome, then let the shared policy decide. The default
+        // (NEOETHOS_REQUIRE_GPU unset) always recomputes on the CPU — identical
+        // to the historical behaviour. With it set, an availability fault fails
+        // loud instead of silently draining a rented card's hours on the CPU.
+        use crate::gpu_fallback::{decide_env, FallbackDecision, GpuFailure};
+        let failure = match gpu {
             Ok(Ok(v)) if v.len() == n_genes => return v,
-            Ok(Ok(_)) => tracing::warn!(
-                target: "neoethos_search::eval",
-                "validation GPU lane returned the wrong gene count — recomputing on CPU"
+            Ok(Ok(_)) => GpuFailure::WrongShape,
+            Ok(Err(_)) => GpuFailure::AllocationPressure,
+            Err(_) => GpuFailure::AllocationPressure, // cubecl#243 pool panic
+        };
+        match decide_env(failure) {
+            FallbackDecision::FailLoud => panic!(
+                "NEOETHOS_REQUIRE_GPU is set but the validation GPU lane failed \
+                 ({failure:?}); refusing to run the whole validation on the CPU. \
+                 Unset NEOETHOS_REQUIRE_GPU to allow the CPU fallback."
             ),
-            Ok(Err(e)) => tracing::warn!(
+            FallbackDecision::RecomputeOnCpu => tracing::warn!(
                 target: "neoethos_search::eval",
-                "validation GPU lane failed ({e}) — recomputing on CPU"
-            ),
-            Err(_) => tracing::warn!(
-                target: "neoethos_search::eval",
-                "validation GPU lane panicked (cubecl pool/#243?) — recomputing on CPU"
+                ?failure,
+                "validation GPU lane unusable — recomputing on CPU"
             ),
         }
     }
@@ -2617,7 +2625,7 @@ mod gpu_cpu_parity_tests {
             Err(e) => {
                 // On a real GPU box set NEOETHOS_REQUIRE_GPU=1 so a device/driver
                 // misconfig fails LOUD instead of vacuously skipping.
-                if std::env::var("NEOETHOS_REQUIRE_GPU").is_ok() {
+                if crate::gpu_fallback::require_gpu() {
                     panic!("NEOETHOS_REQUIRE_GPU set but GPU eval failed: {e}");
                 }
                 eprintln!("GPU parity test SKIPPED (no usable GPU device): {e}");
@@ -2833,7 +2841,7 @@ mod gpu_cpu_parity_tests {
         ) {
             Ok(g) => g,
             Err(e) => {
-                if std::env::var("NEOETHOS_REQUIRE_GPU").is_ok() {
+                if crate::gpu_fallback::require_gpu() {
                     panic!("NEOETHOS_REQUIRE_GPU set but GPU FTMO eval failed: {e}");
                 }
                 eprintln!("GPU FTMO parity test SKIPPED (no usable GPU device): {e}");
@@ -3041,7 +3049,7 @@ mod gpu_cpu_parity_tests {
         let gpu_a = match run_gpu_with_cap("8") {
             Ok(g) => g,
             Err(e) => {
-                if std::env::var("NEOETHOS_REQUIRE_GPU").is_ok() {
+                if crate::gpu_fallback::require_gpu() {
                     panic!("NEOETHOS_REQUIRE_GPU set but heavy-row GPU eval failed: {e}");
                 }
                 eprintln!("GPU heavy-row parity test SKIPPED (no usable GPU device): {e}");
@@ -3503,7 +3511,7 @@ mod gpu_cpu_parity_tests {
             &settings,
             None,
         ) {
-            if std::env::var("NEOETHOS_REQUIRE_GPU").is_ok() {
+            if crate::gpu_fallback::require_gpu() {
                 panic!("NEOETHOS_REQUIRE_GPU set but GPU CPCV eval failed: {e}");
             }
             eprintln!("GPU CPCV parity test SKIPPED (no usable GPU device): {e}");
@@ -3783,7 +3791,7 @@ mod gpu_cpu_parity_tests {
             &settings,
             None,
         ) {
-            if std::env::var("NEOETHOS_REQUIRE_GPU").is_ok() {
+            if crate::gpu_fallback::require_gpu() {
                 panic!("NEOETHOS_REQUIRE_GPU set but GPU walk-forward eval failed: {e}");
             }
             eprintln!("GPU walk-forward parity test SKIPPED (no usable GPU device): {e}");
