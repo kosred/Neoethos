@@ -7418,6 +7418,7 @@ dependencies = [
  "config",
  "dirs 5.0.1",
  "ndarray 0.17.2",
+ "pollster",
  "reqwest 0.13.4",
  "rusqlite",
  "secrecy",
@@ -7431,6 +7432,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "wgpu",
  "windows 0.62.0",
 ]
 

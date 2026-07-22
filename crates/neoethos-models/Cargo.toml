@@ -154,6 +154,7 @@ pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", 
 #                  via radv/amdvlk. Real ROCm support is a candle
 #                  upstream blocker.
 gpu-cuda = [
+    "neoethos-core/gpu-cuda",
     "neuro-evolution",
     "dep:cubecl",
     # NOTE: `burn-cuda-backend` is deliberately NOT enabled here. Empirically
@@ -177,6 +178,5 @@ gpu-cuda = [
     "rlkit/cuda",
     "candle-core/cuda",
 ]
-gpu-vulkan = ["burn-wgpu-backend"]
-gpu-rocm = ["burn-wgpu-backend"]
-
+gpu-vulkan = ["burn-wgpu-backend", "neoethos-core/gpu-wgpu"]
+gpu-rocm = ["burn-wgpu-backend", "neoethos-core/gpu-rocm"]

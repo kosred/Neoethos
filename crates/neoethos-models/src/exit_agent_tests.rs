@@ -382,7 +382,7 @@ fn save_rejects_synthetic_trained_state_without_replay_memory() {
 #[test]
 fn predict_runtime_uses_shared_three_class_confidence_gate() -> Result<()> {
     let mut agent = ExitAgent::with_hidden_dim(6, 16);
-    let device = agent.device;
+    let device = agent.device.clone();
     agent.feature_columns = vec![
         "f1".to_string(),
         "f2".to_string(),

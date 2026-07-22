@@ -4,6 +4,14 @@ version = "0.5.6"
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Compile-time runtime inventory. Hardware discovery must advertise only
+# backends that the current binary can actually execute.
+gpu-cuda = []
+gpu-rocm = []
+gpu-wgpu = ["dep:wgpu", "dep:pollster"]
+
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -50,6 +58,8 @@ secrecy = "0.10"
 # canonical on-disk shape so both neoethos-app and neoethos-cli can
 # read + write `broker_credentials.toml` without a workspace cycle.
 toml = "0.8.20"
+wgpu = { version = "29.0.3", optional = true }
+pollster = { version = "0.4.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # F-101 follow-up (2026-05-25 — corrected after verbose build):

@@ -2,6 +2,7 @@ use crate::config::Settings;
 use crate::contracts::{DeviceAssignment, RuntimeDegradedReason};
 use serde::{Deserialize, Serialize};
 use std::env;
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 use std::process::Command;
 use sysinfo::System;
 use tracing::{info, warn};
@@ -44,6 +45,7 @@ impl crate::schema_version::HasSchemaVersion for HardwareProfile {
 
 pub struct HardwareProbe {
     sys: System,
+    #[allow(dead_code)] // consumed by backend-specific probe features
     runtime_overrides: HardwareRuntimeOverrides,
 }
 
@@ -135,22 +137,54 @@ impl TrainingPrecision {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AcceleratorDevice {
+    /// Stable profile-local identifier. Backend runtimes should use
+    /// `backend_index`, which follows their device-class-specific indexing.
     pub id: usize,
     pub name: String,
     pub backend: AcceleratorBackend,
+    #[serde(default)]
+    pub device_class: AcceleratorDeviceClass,
+    #[serde(default)]
+    pub backend_index: usize,
     pub memory_gb: f64,
     pub supported_precisions: Vec<TrainingPrecision>,
     pub compute_capability: Option<(i64, i64)>,
     pub source: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AcceleratorDeviceClass {
+    DiscreteGpu,
+    IntegratedGpu,
+    VirtualGpu,
+    #[default]
+    Other,
+}
+
 impl AcceleratorDevice {
     pub fn device_string(&self) -> String {
-        format!("{}:{}", self.backend.as_str(), self.id)
+        if let Some(selector) = self.cubecl_wgpu_selector() {
+            format!("{}:{selector}", self.backend.as_str())
+        } else {
+            format!("{}:{}", self.backend.as_str(), self.backend_index)
+        }
     }
 
     pub fn supports_precision(&self, precision: TrainingPrecision) -> bool {
         self.supported_precisions.contains(&precision)
+    }
+
+    pub fn cubecl_wgpu_selector(&self) -> Option<String> {
+        if !self.backend.is_wgpu_family() {
+            return None;
+        }
+        let kind = match self.device_class {
+            AcceleratorDeviceClass::DiscreteGpu => "discrete",
+            AcceleratorDeviceClass::IntegratedGpu => "integrated",
+            AcceleratorDeviceClass::VirtualGpu => "virtual",
+            AcceleratorDeviceClass::Other => "default",
+        };
+        Some(format!("{kind}:{}", self.backend_index))
     }
 }
 
@@ -309,9 +343,9 @@ impl HardwareExecutionPlan {
                     .to_string(),
             );
         }
-        if primary_backend.is_wgpu_family() || primary_backend == AcceleratorBackend::Rocm {
+        if primary_backend == AcceleratorBackend::Rocm {
             warnings.push(
-                "Non-CUDA deep planning applies to Burn/deep workloads; current search/RL native tensor paths remain CUDA-only unless explicitly refactored."
+                "ROCm deep planning applies to Burn/deep workloads; current search/RL native tensor paths still require an implemented ROCm runtime and therefore use CPU fallback."
                     .to_string(),
             );
         }
@@ -353,6 +387,22 @@ impl HardwareExecutionPlan {
                 .as_str(),
             "cpu" | "off" | "false"
         );
+        let search_gpu_enabled = gpu_enabled
+            && search_gpu_requested
+            && (primary_backend == AcceleratorBackend::Cuda || primary_backend.is_wgpu_family());
+        let search_device = if !search_gpu_enabled {
+            "cpu".to_string()
+        } else if primary_backend == AcceleratorBackend::Cuda {
+            "cuda:all".to_string()
+        } else {
+            backend_devices
+                .first()
+                .map(|device| device.device_string())
+                .unwrap_or_else(|| "cpu".to_string())
+        };
+        let search_device_ids = search_gpu_enabled
+            .then(|| backend_devices.iter().map(|device| device.id).collect())
+            .unwrap_or_default();
 
         let mut workloads = Vec::new();
         workloads.push(WorkloadExecutionPlan {
@@ -393,26 +443,18 @@ impl HardwareExecutionPlan {
         });
         workloads.push(WorkloadExecutionPlan {
             workload: WorkloadKind::StrategySearch,
-            backend: if gpu_enabled && search_gpu_requested && !cuda_devices.is_empty() {
-                AcceleratorBackend::Cuda
+            backend: if search_gpu_enabled {
+                primary_backend
             } else {
                 AcceleratorBackend::Cpu
             },
-            device: if gpu_enabled && search_gpu_requested && !cuda_devices.is_empty() {
-                "cuda:all".to_string()
-            } else {
-                "cpu".to_string()
-            },
-            device_ids: if gpu_enabled && search_gpu_requested && !cuda_devices.is_empty() {
-                cuda_devices.iter().map(|device| device.id).collect()
-            } else {
-                Vec::new()
-            },
+            device: search_device,
+            device_ids: search_device_ids,
             precision: TrainingPrecision::Fp32,
             cpu_threads: cpu_budget,
             batch_size: if gpu_enabled { train_batch_size } else { 0 },
             memory_budget_gb: memory_budget_gb * 0.45,
-            notes: vec!["Search evaluation now uses CUDA kernels for GA offspring generation, generic signal synthesis, and the per-gene stateful backtest loop; signal synthesis can follow the requested training precision, while the price-normalized backtest kernel stays FP32 for pip-safe arithmetic; WGPU/ROCm/Metal discovery still reports CPU fallback until native evaluator kernels exist there.".to_string()],
+            notes: vec!["Search evaluation uses the compiled CubeCL CUDA or WGPU runtime for GA offspring generation, signal synthesis, and the stateful backtest loop; price-normalized backtest arithmetic remains FP32 for pip-safe parity. ROCm stays an explicit CPU fallback until its runtime path is implemented.".to_string()],
         });
         workloads.push(WorkloadExecutionPlan {
             workload: WorkloadKind::TreeTraining,
@@ -666,12 +708,36 @@ impl HardwareProbe {
     }
 
     fn detect_accelerator_devices(&self) -> Vec<AcceleratorDevice> {
-        let mut devices = self.detect_nvidia_accelerators();
+        #[allow(unused_mut)] // CPU-only builds compile every backend block out.
+        let mut devices = Vec::new();
+        #[cfg(feature = "gpu-cuda")]
+        devices.extend(self.detect_nvidia_accelerators());
+        #[cfg(feature = "gpu-rocm")]
         devices.extend(self.detect_rocm_accelerators(devices.len()));
-        devices.extend(self.detect_wgpu_hint_accelerators(devices.len()));
+        #[cfg(feature = "gpu-wgpu")]
+        {
+            let detected = self.detect_wgpu_accelerators();
+            if detected.is_empty() {
+                devices.extend(self.detect_wgpu_hint_accelerators(devices.len()));
+            } else {
+                devices.extend(detected);
+            }
+        }
         devices
     }
 
+    #[cfg(feature = "gpu-wgpu")]
+    fn detect_wgpu_accelerators(&self) -> Vec<AcceleratorDevice> {
+        let Some(infos) = probe_wgpu_adapter_infos() else {
+            return Vec::new();
+        };
+        let precision_override = self
+            .runtime_overrides
+            .precision_override(AcceleratorBackend::Wgpu);
+        normalize_wgpu_adapter_infos(&infos, precision_override.as_deref())
+    }
+
+    #[cfg(feature = "gpu-cuda")]
     fn detect_nvidia_accelerators(&self) -> Vec<AcceleratorDevice> {
         let (names, mems) = self.detect_gpus_nvidia_smi();
         let compute_caps = self.detect_nvidia_compute_caps();
@@ -698,6 +764,8 @@ impl HardwareProbe {
                     id: idx,
                     name,
                     backend: AcceleratorBackend::Cuda,
+                    device_class: AcceleratorDeviceClass::DiscreteGpu,
+                    backend_index: idx,
                     memory_gb: mems.get(idx).copied().unwrap_or(0.0),
                     supported_precisions,
                     compute_capability,
@@ -707,6 +775,7 @@ impl HardwareProbe {
             .collect()
     }
 
+    #[cfg(feature = "gpu-cuda")]
     fn detect_gpus_nvidia_smi(&self) -> (Vec<String>, Vec<f64>) {
         let mut names = Vec::new();
         let mut mems = Vec::new();
@@ -754,6 +823,7 @@ impl HardwareProbe {
         (vec![], vec![])
     }
 
+    #[cfg(feature = "gpu-cuda")]
     fn detect_nvidia_compute_caps(&self) -> Vec<Option<(i64, i64)>> {
         let smi_candidates = if cfg!(target_os = "windows") {
             vec![
@@ -788,6 +858,7 @@ impl HardwareProbe {
         Vec::new()
     }
 
+    #[cfg(feature = "gpu-rocm")]
     fn detect_rocm_accelerators(&self, id_offset: usize) -> Vec<AcceleratorDevice> {
         // GROUP H remediation: 2s timeout (operator directive 2026-05-25).
         let rocminfo = run_hw_probe_with_timeout(Command::new("rocminfo"));
@@ -811,6 +882,8 @@ impl HardwareProbe {
                         id: id_offset + idx,
                         name,
                         backend: AcceleratorBackend::Rocm,
+                        device_class: AcceleratorDeviceClass::DiscreteGpu,
+                        backend_index: idx,
                         memory_gb: 0.0,
                         supported_precisions: self
                             .runtime_overrides
@@ -828,6 +901,7 @@ impl HardwareProbe {
         Vec::new()
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     fn detect_wgpu_hint_accelerators(&self, id_offset: usize) -> Vec<AcceleratorDevice> {
         self.runtime_overrides
             .wgpu_device_names
@@ -837,6 +911,8 @@ impl HardwareProbe {
                 id: id_offset + idx,
                 name: name.clone(),
                 backend: AcceleratorBackend::Wgpu,
+                device_class: AcceleratorDeviceClass::Other,
+                backend_index: idx,
                 memory_gb: 0.0,
                 supported_precisions: self
                     .runtime_overrides
@@ -849,6 +925,129 @@ impl HardwareProbe {
     }
 }
 
+#[cfg(feature = "gpu-wgpu")]
+fn wgpu_probe_backends() -> wgpu::Backends {
+    #[cfg(target_os = "macos")]
+    {
+        wgpu::Backends::METAL
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        wgpu::Backends::BROWSER_WEBGPU
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_family = "wasm")))]
+    {
+        // CubeCL's AutoGraphicsApi selects Vulkan on Windows and Linux. Probe
+        // the same backend so reported ordinals match WgpuDevice selection.
+        wgpu::Backends::VULKAN
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn probe_wgpu_adapter_infos() -> Option<Vec<wgpu::AdapterInfo>> {
+    const WGPU_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let backends = wgpu_probe_backends();
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            pollster::block_on(instance.enumerate_adapters(backends))
+                .into_iter()
+                .map(|adapter| adapter.get_info())
+                .collect::<Vec<_>>()
+        }))
+        .ok();
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(WGPU_PROBE_TIMEOUT) {
+        Ok(Some(infos)) => Some(infos),
+        Ok(None) => {
+            tracing::warn!(
+                target: "neoethos_core::system",
+                "WGPU adapter enumeration panicked; treating WGPU as unavailable"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "neoethos_core::system",
+                timeout_ms = WGPU_PROBE_TIMEOUT.as_millis() as u64,
+                "WGPU adapter enumeration timed out; treating WGPU as unavailable"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn normalize_wgpu_adapter_infos(
+    infos: &[wgpu::AdapterInfo],
+    precision_override: Option<&[TrainingPrecision]>,
+) -> Vec<AcceleratorDevice> {
+    let mut discrete_index = 0usize;
+    let mut integrated_index = 0usize;
+    let mut virtual_index = 0usize;
+    let mut other_index = 0usize;
+    let mut devices = Vec::new();
+
+    for info in infos {
+        let backend = match info.backend {
+            wgpu::Backend::Vulkan => AcceleratorBackend::Vulkan,
+            wgpu::Backend::Metal => AcceleratorBackend::Metal,
+            wgpu::Backend::Dx12 => AcceleratorBackend::Dx12,
+            wgpu::Backend::Gl | wgpu::Backend::BrowserWebGpu => AcceleratorBackend::Wgpu,
+            wgpu::Backend::Noop => continue,
+        };
+        let (device_class, backend_index) = match info.device_type {
+            wgpu::DeviceType::DiscreteGpu => {
+                let index = discrete_index;
+                discrete_index += 1;
+                (AcceleratorDeviceClass::DiscreteGpu, index)
+            }
+            wgpu::DeviceType::IntegratedGpu => {
+                let index = integrated_index;
+                integrated_index += 1;
+                (AcceleratorDeviceClass::IntegratedGpu, index)
+            }
+            wgpu::DeviceType::VirtualGpu => {
+                let index = virtual_index;
+                virtual_index += 1;
+                (AcceleratorDeviceClass::VirtualGpu, index)
+            }
+            wgpu::DeviceType::Other => {
+                let index = other_index;
+                other_index += 1;
+                (AcceleratorDeviceClass::Other, index)
+            }
+            wgpu::DeviceType::Cpu => continue,
+        };
+        let id = devices.len();
+        devices.push(AcceleratorDevice {
+            id,
+            name: info.name.clone(),
+            backend,
+            device_class,
+            backend_index,
+            // wgpu does not expose reliable dedicated VRAM. In particular,
+            // Windows reports shared-memory iGPU values inconsistently.
+            memory_gb: 0.0,
+            supported_precisions: precision_override
+                .map(<[TrainingPrecision]>::to_vec)
+                .unwrap_or_else(|| vec![TrainingPrecision::Fp32]),
+            compute_capability: None,
+            source: format!(
+                "wgpu:{:?}:vendor={:#06x}:device={:#06x}:driver={}",
+                info.backend, info.vendor, info.device, info.driver
+            ),
+        });
+    }
+    devices
+}
+
 /// GROUP H remediation (operator directive 2026-05-25, F-890):
 /// run an external hardware-probe subprocess (`nvidia-smi`,
 /// `rocminfo`, `rocm-smi`) with a hard 2-second timeout. On a healthy
@@ -857,6 +1056,7 @@ impl HardwareProbe {
 /// path. We spawn on a separate thread and accept that the
 /// subprocess may continue running in the background — the main
 /// process is unblocked which is what matters.
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 fn run_hw_probe_with_timeout(mut cmd: Command) -> Option<std::process::Output> {
     const HW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -891,9 +1091,11 @@ impl HardwareProfile {
             .iter()
             .map(|device| {
                 format!(
-                    "{}:{}:{:.3}:{:?}:{:?}",
+                    "{}:{}:{:?}:{}:{:.3}:{:?}:{:?}",
                     device.backend.as_str(),
                     device.name,
+                    device.device_class,
+                    device.backend_index,
                     device.memory_gb,
                     device.supported_precisions,
                     device.compute_capability
@@ -1061,7 +1263,10 @@ impl<'a> AutoTuner<'a> {
     }
 
     fn resolve_cpu_budget(&self, total_cores: usize) -> usize {
-        resolve_cpu_budget(total_cores, &HardwareRuntimeOverrides::from_settings(self.settings))
+        resolve_cpu_budget(
+            total_cores,
+            &HardwareRuntimeOverrides::from_settings(self.settings),
+        )
     }
 
     fn apply_thread_env_defaults(&self, hints: &AutoTuneHints) {
@@ -1138,6 +1343,7 @@ fn parse_training_precision(value: &str) -> Option<TrainingPrecision> {
     }
 }
 
+#[cfg(feature = "gpu-cuda")]
 fn parse_compute_capability(value: &str) -> Option<(i64, i64)> {
     let mut parts = value.split('.');
     let major = parts.next()?.trim().parse::<i64>().ok()?;
@@ -1221,6 +1427,62 @@ mod tests {
         assert_eq!(settings.models.backtest_runtime.rayon_threads, Some(3));
     }
 
+    #[cfg(feature = "gpu-wgpu")]
+    fn wgpu_adapter_info(
+        name: &str,
+        backend: wgpu::Backend,
+        device_type: wgpu::DeviceType,
+        vendor: u32,
+        device: u32,
+    ) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: name.to_string(),
+            vendor,
+            device,
+            device_type,
+            device_pci_bus_id: String::new(),
+            driver: "test-driver".to_string(),
+            driver_info: "1.0".to_string(),
+            backend,
+            subgroup_min_size: 32,
+            subgroup_max_size: 64,
+            transient_saves_memory: false,
+        }
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_adapter_info_maps_integrated_gpu_without_fake_vram() {
+        let infos = vec![
+            wgpu_adapter_info(
+                "AMD Radeon Graphics",
+                wgpu::Backend::Vulkan,
+                wgpu::DeviceType::IntegratedGpu,
+                0x1002,
+                0x1638,
+            ),
+            wgpu_adapter_info(
+                "Microsoft Basic Render Driver",
+                wgpu::Backend::Vulkan,
+                wgpu::DeviceType::Cpu,
+                0,
+                0,
+            ),
+        ];
+
+        let devices = normalize_wgpu_adapter_infos(&infos, None);
+
+        assert_eq!(devices.len(), 1, "software adapters are not accelerators");
+        assert_eq!(devices[0].backend, AcceleratorBackend::Vulkan);
+        assert_eq!(
+            devices[0].device_class,
+            AcceleratorDeviceClass::IntegratedGpu
+        );
+        assert_eq!(devices[0].backend_index, 0);
+        assert_eq!(devices[0].memory_gb, 0.0, "shared memory is not fake VRAM");
+        assert!(devices[0].source.contains("wgpu"));
+    }
+
     fn profile(gpus: usize, vram_gb: f64) -> HardwareProfile {
         HardwareProfile {
             schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,
@@ -1235,6 +1497,8 @@ mod tests {
                     id: idx,
                     name: format!("GPU {idx}"),
                     backend: AcceleratorBackend::Cuda,
+                    device_class: AcceleratorDeviceClass::DiscreteGpu,
+                    backend_index: idx,
                     memory_gb: vram_gb,
                     supported_precisions: vec![
                         TrainingPrecision::Fp32,
@@ -1267,6 +1531,46 @@ mod tests {
             plan.workload(WorkloadKind::Ui).unwrap().backend,
             AcceleratorBackend::Cpu
         );
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn hardware_plan_assigns_integrated_wgpu_to_strategy_search() {
+        let mut settings = Settings::default();
+        settings.system.enable_gpu_preference = "gpu".to_string();
+        settings.models.prop_search_device = "auto".to_string();
+        let profile = HardwareProfile {
+            schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,
+            cpu_cores: 12,
+            total_ram_gb: 32.0,
+            available_ram_gb: 20.0,
+            gpu_names: vec!["AMD Radeon Graphics".to_string()],
+            num_gpus: 1,
+            gpu_mem_gb: vec![0.0],
+            accelerator_devices: vec![AcceleratorDevice {
+                id: 0,
+                name: "AMD Radeon Graphics".to_string(),
+                backend: AcceleratorBackend::Vulkan,
+                device_class: AcceleratorDeviceClass::IntegratedGpu,
+                backend_index: 0,
+                memory_gb: 0.0,
+                supported_precisions: vec![TrainingPrecision::Fp32],
+                compute_capability: None,
+                source: "test-wgpu".to_string(),
+            }],
+            timestamp: "test".to_string(),
+            platform_label: "test".to_string(),
+        };
+
+        let plan = HardwareExecutionPlan::from_settings_and_profile(&settings, profile);
+        let search = plan
+            .workload(WorkloadKind::StrategySearch)
+            .expect("strategy-search plan should exist");
+
+        assert_eq!(search.backend, AcceleratorBackend::Wgpu);
+        assert_eq!(search.device, "vulkan:integrated:0");
+        assert_eq!(search.device_ids, vec![0]);
+        assert!(search.runtime_degraded_reason().is_none());
     }
 
     #[test]
@@ -1312,6 +1616,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn hardware_probe_consumes_typed_wgpu_overrides() {
         let runtime_overrides = HardwareRuntimeOverrides {
@@ -1395,6 +1700,8 @@ mod tests {
                 id: 0,
                 name: "AMD GPU".to_string(),
                 backend: AcceleratorBackend::Rocm,
+                device_class: AcceleratorDeviceClass::DiscreteGpu,
+                backend_index: 0,
                 memory_gb: 24.0,
                 supported_precisions: vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16],
                 compute_capability: None,
@@ -1433,6 +1740,8 @@ mod tests {
                 id: 0,
                 name: "AMD GPU".to_string(),
                 backend: AcceleratorBackend::Rocm,
+                device_class: AcceleratorDeviceClass::DiscreteGpu,
+                backend_index: 0,
                 memory_gb: 24.0,
                 supported_precisions: vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16],
                 compute_capability: None,

@@ -59,8 +59,7 @@ gpu = ["dep:cubecl", "dep:half", "dep:cubecl-runtime"]
 #   the direct-SPIR-V passthrough crashes AMD's Vulkan driver). Runs on the
 #   integrated AMD GPU here and on any wgpu adapter (Vulkan/DX12/Metal).
 # - gpu-rocm   → cubecl HIP (AMD discrete, Linux).
-gpu-cuda = ["gpu", "dep:tch", "cubecl/cuda"]
-gpu-vulkan = ["gpu", "cubecl/wgpu"]
-gpu-rocm = ["gpu", "cubecl/hip"]
+gpu-cuda = ["gpu", "dep:tch", "cubecl/cuda", "neoethos-core/gpu-cuda"]
+gpu-vulkan = ["gpu", "cubecl/wgpu", "neoethos-core/gpu-wgpu"]
+gpu-rocm = ["gpu", "cubecl/hip", "neoethos-core/gpu-rocm"]
 strategy-db = ["dep:duckdb"]
-

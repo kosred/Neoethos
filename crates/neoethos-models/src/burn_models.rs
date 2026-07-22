@@ -223,7 +223,7 @@ pub(crate) fn validate_burn_device_selection(
                 ));
             }
         }
-        "wgpu_discrete_gpu" | "wgpu_integrated_gpu" => {
+        "wgpu_discrete_gpu" | "wgpu_integrated_gpu" | "wgpu_virtual_gpu" => {
             if effective != "external_device"
                 && effective != "gpu"
                 && !effective.starts_with("gpu:")
@@ -280,15 +280,48 @@ fn resolve_cuda_device_policy(_normalized: &str) -> (CudaDevice, String, String)
 }
 
 #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
-fn parse_wgpu_gpu_index(normalized: &str) -> Option<usize> {
-    normalized
+fn parse_wgpu_device_selector(normalized: &str) -> Option<(WgpuDevice, String, String)> {
+    let selector = normalized
         .strip_prefix("cuda:")
         .or_else(|| normalized.strip_prefix("gpu:"))
         .or_else(|| normalized.strip_prefix("wgpu:"))
         .or_else(|| normalized.strip_prefix("rocm:"))
         .or_else(|| normalized.strip_prefix("metal:"))
-        .or_else(|| normalized.strip_prefix("vulkan:"))
-        .and_then(|value| value.parse::<usize>().ok())
+        .or_else(|| normalized.strip_prefix("vulkan:"))?;
+
+    if let Ok(index) = selector.parse::<usize>() {
+        return Some((
+            WgpuDevice::DiscreteGpu(index),
+            format!("gpu:{index}"),
+            "wgpu_discrete_gpu".to_string(),
+        ));
+    }
+
+    let (device_class, raw_index) = selector.split_once(':')?;
+    let index = raw_index.parse::<usize>().ok()?;
+    match device_class {
+        "discrete" | "dgpu" => Some((
+            WgpuDevice::DiscreteGpu(index),
+            format!("gpu:discrete:{index}"),
+            "wgpu_discrete_gpu".to_string(),
+        )),
+        "integrated" | "igpu" => Some((
+            WgpuDevice::IntegratedGpu(index),
+            format!("gpu:integrated:{index}"),
+            "wgpu_integrated_gpu".to_string(),
+        )),
+        "virtual" | "vgpu" => Some((
+            WgpuDevice::VirtualGpu(index),
+            format!("gpu:virtual:{index}"),
+            "wgpu_virtual_gpu".to_string(),
+        )),
+        "default" => Some((
+            WgpuDevice::DefaultDevice,
+            "default".to_string(),
+            "wgpu_default".to_string(),
+        )),
+        _ => None,
+    }
 }
 
 #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
@@ -301,12 +334,8 @@ fn resolve_wgpu_device_policy(normalized: &str) -> (WgpuDevice, String, String) 
             "wgpu_default".to_string(),
         ),
         other => {
-            if let Some(index) = parse_wgpu_gpu_index(other) {
-                (
-                    WgpuDevice::DiscreteGpu(index),
-                    format!("gpu:{index}"),
-                    "wgpu_discrete_gpu".to_string(),
-                )
+            if let Some(selection) = parse_wgpu_device_selector(other) {
+                selection
             } else {
                 (
                     WgpuDevice::DefaultDevice,
@@ -415,14 +444,7 @@ pub fn default_train_device() -> <TrainBackend as BackendTypes>::Device {
 }
 
 fn parse_accelerator_index(policy: &str) -> Option<usize> {
-    policy
-        .strip_prefix("cuda:")
-        .or_else(|| policy.strip_prefix("gpu:"))
-        .or_else(|| policy.strip_prefix("wgpu:"))
-        .or_else(|| policy.strip_prefix("rocm:"))
-        .or_else(|| policy.strip_prefix("metal:"))
-        .or_else(|| policy.strip_prefix("vulkan:"))
-        .and_then(|value| value.parse::<usize>().ok())
+    policy.rsplit(':').next()?.parse::<usize>().ok()
 }
 
 pub trait ManagedBurnBackend: Backend {
@@ -1234,14 +1256,13 @@ fn b_spline_basis<B: Backend>(
         .map(|t| (t as f32 - spline_order as f32) * h + grid_min)
         .collect();
     let m = n_knots - 1; // number of order-0 intervals
-    let g = Tensor::<B, 1>::from_data(TensorData::new(knots, [n_knots]), &dev)
-        .reshape([1, 1, n_knots]);
+    let g =
+        Tensor::<B, 1>::from_data(TensorData::new(knots, [n_knots]), &dev).reshape([1, 1, n_knots]);
     let xc = x.clamp(grid_min, grid_max).unsqueeze_dim::<3>(2); // [batch, in_f, 1]
     let left = g.clone().slice([0..1, 0..1, 0..m]);
     let right = g.clone().slice([0..1, 0..1, 1..m + 1]);
     // order-0 indicator: (x >= grid[t]) AND (x < grid[t+1]); product == logical-and.
-    let mut bases =
-        xc.clone().greater_equal(left).float() * xc.clone().lower(right).float(); // [batch,in_f,m]
+    let mut bases = xc.clone().greater_equal(left).float() * xc.clone().lower(right).float(); // [batch,in_f,m]
     let mut width = m;
     for p in 1..=spline_order {
         width -= 1; // basis width shrinks by one each recursion step
@@ -1279,10 +1300,18 @@ impl<B: Backend> KANLayer<B> {
         let base = burn::tensor::activation::silu(x.clone())
             .matmul(self.base_weight.val().swap_dims(0, 1)); // [batch, out_f]
         // spline path: flatten (in_f, coeffs) and contract with the per-edge coeffs.
-        let bsp =
-            b_spline_basis::<B>(x, KAN_GRID_MIN, KAN_GRID_MAX, self.grid_size, self.spline_order)
-                .reshape([batch, self.in_f * coeffs]);
-        let w = self.spline_weight.val().reshape([self.out_f, self.in_f * coeffs]);
+        let bsp = b_spline_basis::<B>(
+            x,
+            KAN_GRID_MIN,
+            KAN_GRID_MAX,
+            self.grid_size,
+            self.spline_order,
+        )
+        .reshape([batch, self.in_f * coeffs]);
+        let w = self
+            .spline_weight
+            .val()
+            .reshape([self.out_f, self.in_f * coeffs]);
         let spline = bsp.matmul(w.swap_dims(0, 1)); // [batch, out_f]
         // LayerNorm + dropout for stability/regularisation only (NOT a nonlinearity).
         self.dropout.forward(self.norm.forward(base + spline))
@@ -1816,7 +1845,9 @@ impl<B: Backend> BurnTimesNet<B> {
         let agg = agg + emb; // residual (one TimesBlock)
 
         // Head: global average pool over L -> [B, C] -> LayerNorm -> classes.
-        let pooled = self.period_norm.forward(agg.mean_dim(2).reshape([batch, self.channels]));
+        let pooled = self
+            .period_norm
+            .forward(agg.mean_dim(2).reshape([batch, self.channels]));
         self.out_head.forward(pooled)
     }
 }
@@ -2017,7 +2048,7 @@ fn resolve_burn_training_precision_for_backend<B: Backend>(
         || selection.effective_policy.starts_with("gpu:")
         || matches!(
             selection.execution_backend.as_str(),
-            "wgpu_default" | "wgpu_discrete_gpu" | "wgpu_integrated_gpu"
+            "wgpu_default" | "wgpu_discrete_gpu" | "wgpu_integrated_gpu" | "wgpu_virtual_gpu"
         );
     let supports_bf16 = if gpu_requested {
         let hardware = HardwareInfo::detect();
@@ -2445,8 +2476,7 @@ where
         // existence will now skip the validation phase silently
         // instead of crashing mid-epoch.
         if !val_is_empty {
-            let (Some(x_val), Some(y_val)) = (x_val_array.as_ref(), y_val_labels.as_ref())
-            else {
+            let (Some(x_val), Some(y_val)) = (x_val_array.as_ref(), y_val_labels.as_ref()) else {
                 tracing::warn!(
                     target: "neoethos_models::burn",
                     "validation phase skipped: x_val_array/y_val_labels are None despite \
@@ -2653,7 +2683,10 @@ mod tests {
         );
         let p = sparsemax(z).into_data().to_vec::<f32>().expect("to_vec");
         let sum: f32 = p.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-4, "sparsemax must sum to 1, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-4,
+            "sparsemax must sum to 1, got {sum}"
+        );
         let zeros = p.iter().filter(|&&x| x.abs() < 1e-6).count();
         assert!(zeros >= 1, "sparsemax must produce exact zeros, got {p:?}");
     }
@@ -2708,7 +2741,10 @@ mod tests {
             .to_vec::<f32>()
             .expect("to_vec");
         for s in sums {
-            assert!((s - 1.0).abs() < 1e-3, "B-spline basis must sum to 1, got {s}");
+            assert!(
+                (s - 1.0).abs() < 1e-3,
+                "B-spline basis must sum to 1, got {s}"
+            );
         }
     }
 
@@ -2716,18 +2752,28 @@ mod tests {
     fn kan_forward_is_finite_and_input_sensitive() {
         let device = Default::default();
         let model = BurnKANConfig::new(8).init::<InferBackend>(&device);
-        let x1 = Tensor::<InferBackend, 2>::from_data(TensorData::new(vec![0.5f32; 8], [1, 8]), &device);
+        let x1 =
+            Tensor::<InferBackend, 2>::from_data(TensorData::new(vec![0.5f32; 8], [1, 8]), &device);
         let x2 = Tensor::<InferBackend, 2>::from_data(
-            TensorData::new((0..8).map(|v| v as f32 * 0.3 - 1.0).collect::<Vec<f32>>(), [1, 8]),
+            TensorData::new(
+                (0..8).map(|v| v as f32 * 0.3 - 1.0).collect::<Vec<f32>>(),
+                [1, 8],
+            ),
             &device,
         );
         let y1 = model.forward(x1);
         assert_eq!(y1.dims(), [1, 3]);
         let v1 = y1.into_data().to_vec::<f32>().expect("v");
-        assert!(v1.iter().all(|v| v.is_finite()), "KAN output must be finite");
+        assert!(
+            v1.iter().all(|v| v.is_finite()),
+            "KAN output must be finite"
+        );
         let v2 = model.forward(x2).into_data().to_vec::<f32>().expect("v");
         let diff: f32 = v1.iter().zip(&v2).map(|(a, b)| (a - b).abs()).sum();
-        assert!(diff > 1e-5, "KAN must be input-sensitive (learnable edges), diff={diff}");
+        assert!(
+            diff > 1e-5,
+            "KAN must be input-sensitive (learnable edges), diff={diff}"
+        );
     }
 
     #[test]
@@ -2736,7 +2782,9 @@ mod tests {
         let model = BurnNBeatsxConfig::new(16).init::<InferBackend>(&device);
         let x = Tensor::<InferBackend, 2>::from_data(
             TensorData::new(
-                (0..32).map(|v| (v % 16) as f32 * 0.1 - 0.8).collect::<Vec<f32>>(),
+                (0..32)
+                    .map(|v| (v % 16) as f32 * 0.1 - 0.8)
+                    .collect::<Vec<f32>>(),
                 [2, 16],
             ),
             &device,
@@ -2800,7 +2848,9 @@ mod tests {
             .init::<InferBackend>(&device);
         let x = Tensor::<InferBackend, 2>::from_data(
             TensorData::new(
-                (0..32).map(|v| (v % 8) as f32 * 0.15 - 0.6).collect::<Vec<f32>>(),
+                (0..32)
+                    .map(|v| (v % 8) as f32 * 0.15 - 0.6)
+                    .collect::<Vec<f32>>(),
                 [4, 8],
             ),
             &device,
@@ -2826,7 +2876,9 @@ mod tests {
             .init::<InferBackend>(&device);
         let x = Tensor::<InferBackend, 2>::from_data(
             TensorData::new(
-                (0..32).map(|v| (v % 8) as f32 * 0.1 - 0.4).collect::<Vec<f32>>(),
+                (0..32)
+                    .map(|v| (v % 8) as f32 * 0.1 - 0.4)
+                    .collect::<Vec<f32>>(),
                 [4, 8],
             ),
             &device,
@@ -2954,6 +3006,17 @@ mod tests {
         assert_eq!(normalize_burn_device_policy("vulkan:1"), "gpu:1");
         assert_eq!(normalize_burn_device_policy("cuda"), "gpu");
         assert_eq!(normalize_burn_device_policy("wgpu"), "gpu");
+    }
+
+    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+    #[test]
+    fn wgpu_policy_preserves_integrated_adapter_class() {
+        let normalized = normalize_burn_device_policy("vulkan:integrated:0");
+        let (device, effective_policy, execution_backend) = resolve_wgpu_device_policy(&normalized);
+
+        assert_eq!(device, WgpuDevice::IntegratedGpu(0));
+        assert_eq!(effective_policy, "gpu:integrated:0");
+        assert_eq!(execution_backend, "wgpu_integrated_gpu");
     }
 
     #[test]

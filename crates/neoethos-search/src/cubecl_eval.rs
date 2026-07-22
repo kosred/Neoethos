@@ -3,9 +3,9 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, bail};
 #[cfg(feature = "gpu-cuda")]
 use cubecl::cuda::{CudaDevice, CudaRuntime};
+use cubecl::prelude::*;
 #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-use cubecl::prelude::*;
 use half::bf16;
 use ndarray::ArrayView2;
 use neoethos_core::TrainingPrecision;
@@ -300,7 +300,13 @@ mod resident_device_cache {
         slot: u8,
         bytes: &[u8],
     ) -> cubecl::server::Handle {
-        let key: Key = (TypeId::of::<R>(), device, slot, fingerprint(bytes), bytes.len());
+        let key: Key = (
+            TypeId::of::<R>(),
+            device,
+            slot,
+            fingerprint(bytes),
+            bytes.len(),
+        );
         {
             let Ok(mut st) = state().lock() else {
                 return client.create_from_slice(bytes);
@@ -311,7 +317,9 @@ mod resident_device_cache {
             // Evict oldest until the NEW entry fits the budget.
             let budget = budget_bytes();
             while st.total_bytes.saturating_add(bytes.len()) > budget {
-                let Some(old) = st.order.pop_front() else { break };
+                let Some(old) = st.order.pop_front() else {
+                    break;
+                };
                 if let Some((sz, _)) = st.map.remove(&old) {
                     st.total_bytes = st.total_bytes.saturating_sub(sz);
                 }
@@ -420,11 +428,27 @@ fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<Cud
 /// `wgpu` (naga → SPIR-V) path, NOT `wgpu-spirv`: the direct SPIR-V passthrough
 /// crashes AMD's Vulkan driver, so naga emits validated SPIR-V.
 ///
-/// MULTI-GPU (2026-06-06): `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE=<n>` pins this
-/// process to discrete GPU `n` (`WgpuDevice::DiscreteGpu(n)`) — combo-level
-/// parallelism: launch one discovery process per A6000 (env=0 and env=1) and
-/// both cards run concurrently. Unset ⇒ `DefaultDevice` (the best adapter; the
-/// first discrete GPU on a multi-GPU box).
+/// `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE=<kind>:<n>` pins this process to the
+/// class-specific adapter ordinal reported by the hardware probe, e.g.
+/// `integrated:0` or `discrete:1`. A bare integer remains a backwards-compatible
+/// discrete selector. Unset ⇒ `DefaultDevice`.
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+fn parse_wgpu_device_selector(raw: &str) -> Option<WgpuDevice> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if let Ok(index) = normalized.parse::<usize>() {
+        return Some(WgpuDevice::DiscreteGpu(index));
+    }
+    let (kind, raw_index) = normalized.split_once(':')?;
+    let index = raw_index.parse::<usize>().ok()?;
+    match kind {
+        "discrete" | "dgpu" => Some(WgpuDevice::DiscreteGpu(index)),
+        "integrated" | "igpu" => Some(WgpuDevice::IntegratedGpu(index)),
+        "virtual" | "vgpu" => Some(WgpuDevice::VirtualGpu(index)),
+        "default" => Some(WgpuDevice::DefaultDevice),
+        _ => None,
+    }
+}
+
 #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
 fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<WgpuRuntime>> {
     // `WgpuDevice`/`WgpuRuntime` come from the module-level import (line ~7).
@@ -432,15 +456,16 @@ fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<Wgp
     // `bounded_wgpu_pools` below, which imports them itself.
     use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, Vulkan, init_setup};
 
-    // Multi-GPU sharding (Stage 2): an explicit `device_override` (one per lane)
-    // wins; otherwise the legacy singular env var; otherwise the best adapter.
+    // Experimental multi-GPU sharding passes a discrete `device_override` per
+    // lane. The supported scheduler path uses the typed singular selector so
+    // integrated and virtual adapters are pinned to the right CubeCL variant.
     let env_device = std::env::var("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE")
         .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok());
-    let base_device = match device_override.or(env_device) {
-        Some(n) => WgpuDevice::DiscreteGpu(n),
-        None => WgpuDevice::DefaultDevice,
-    };
+        .and_then(|value| parse_wgpu_device_selector(&value));
+    let base_device = device_override
+        .map(WgpuDevice::DiscreteGpu)
+        .or(env_device)
+        .unwrap_or(WgpuDevice::DefaultDevice);
 
     // AREA 1 (2026-06-09): initialize the wgpu server for this device EXACTLY ONCE,
     // with the adapter's REAL limits + a BOUNDED memory pool, then reuse it.
@@ -465,14 +490,12 @@ fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<Wgp
     // to the driver (cubecl's default is `None` = grow-only, the documented
     // 60k-row-H1 → 15GB peak). The reactive `trim_gpu_pool_if_over_budget` stays as
     // the backstop. The registry below guarantees the once-per-key invariant.
-    static INITIALIZED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<isize>>> =
-        std::sync::OnceLock::new();
-    // Key the cache on the resolved override (or -1 for "default adapter"). All
-    // callers in one process with the same override share the one bounded device.
-    let key: isize = device_override
-        .or(env_device)
-        .map(|n| n as isize)
-        .unwrap_or(-1);
+    static INITIALIZED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<WgpuDevice>>,
+    > = std::sync::OnceLock::new();
+    // Key the cache on the complete class-aware selector. IntegratedGpu(0) and
+    // DiscreteGpu(0) are different CubeCL servers and must not alias.
+    let key = base_device.clone();
 
     let initialized =
         INITIALIZED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -992,8 +1015,10 @@ fn backtest_population_kernel(
                 if in_pos_v == 1 {
                     swap_per_day_gap.store(swap_long_pips_per_day);
                 }
-                let swap_credit_gap =
-                    swap_per_day_gap.read() * position_days.read() * pip_value_per_lot * pos_lots.read();
+                let swap_credit_gap = swap_per_day_gap.read()
+                    * position_days.read()
+                    * pip_value_per_lot
+                    * pos_lots.read();
                 pnl_cell.store(pnl_cell.read() + swap_credit_gap);
                 // PnL conversion fee applied last; skip if out-of-range.
                 if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
@@ -1081,7 +1106,10 @@ fn backtest_population_kernel(
                     // Apply only the trail from PRIOR bars (no intra-bar look-ahead — must
                     // match the CPU eval: this bar's high can't move the stop its own low is
                     // checked against). `trail_px == 0.0` is the unset sentinel.
-                    if trailing_enabled != 0 && trail_px.read() > 0.0 && trail_px.read() > sl_cell.read() {
+                    if trailing_enabled != 0
+                        && trail_px.read() > 0.0
+                        && trail_px.read() > sl_cell.read()
+                    {
                         sl_cell.store(trail_px.read());
                     }
                     let sl_v = sl_cell.read();
@@ -1105,7 +1133,10 @@ fn backtest_population_kernel(
                 } else if past_min_hold {
                     let sl_cell = RuntimeCell::<f32>::new(entry_px_v + sl_distance);
                     let tp = entry_px_v - tp_distance;
-                    if trailing_enabled != 0 && trail_px.read() > 0.0 && trail_px.read() < sl_cell.read() {
+                    if trailing_enabled != 0
+                        && trail_px.read() > 0.0
+                        && trail_px.read() < sl_cell.read()
+                    {
                         sl_cell.store(trail_px.read());
                     }
                     let sl_v = sl_cell.read();
@@ -1156,8 +1187,10 @@ fn backtest_population_kernel(
                     if in_pos_v2 == 1 {
                         swap_per_day.store(swap_long_pips_per_day);
                     }
-                    let swap_credit =
-                        swap_per_day.read() * position_days.read() * pip_value_per_lot * pos_lots.read();
+                    let swap_credit = swap_per_day.read()
+                        * position_days.read()
+                        * pip_value_per_lot
+                        * pos_lots.read();
                     pnl_cell.store(pnl_cell.read() + swap_credit);
                     if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
                         pnl_cell.store(pnl_cell.read() * (1.0 - pnl_conversion_fee_rate));
@@ -1213,7 +1246,8 @@ fn backtest_population_kernel(
                         if risk_based_sizing != 0 {
                             // RuntimeCell idiom (cubecl rejects if-as-value that mixes
                             // array-read cube values with bare literals).
-                            let conf_c = RuntimeCell::<f32>::new(confidences_flat[signal_base + i - 1]);
+                            let conf_c =
+                                RuntimeCell::<f32>::new(confidences_flat[signal_base + i - 1]);
                             if conf_c.read() < 0.0 {
                                 conf_c.store(0.0);
                             }
@@ -1503,10 +1537,18 @@ fn validate_signal_kernel_inputs<F>(
         );
     }
     if long_thr.len() != n_genes {
-        bail!("long_thr length {} must equal n_genes {}", long_thr.len(), n_genes);
+        bail!(
+            "long_thr length {} must equal n_genes {}",
+            long_thr.len(),
+            n_genes
+        );
     }
     if short_thr.len() != n_genes {
-        bail!("short_thr length {} must equal n_genes {}", short_thr.len(), n_genes);
+        bail!(
+            "short_thr length {} must equal n_genes {}",
+            short_thr.len(),
+            n_genes
+        );
     }
     if gene_smc_flags.len() != n_genes * SMC_WIDTH {
         bail!(
@@ -1542,7 +1584,10 @@ fn validate_signal_kernel_inputs<F>(
     let n_indicators = indicators_flat.len() / n_samples;
     let total_entries = gene_offsets[n_genes];
     if total_entries < 0 {
-        bail!("gene_offsets[n_genes] = {} must be non-negative", total_entries);
+        bail!(
+            "gene_offsets[n_genes] = {} must be non-negative",
+            total_entries
+        );
     }
     if (total_entries as usize) > gene_indices.len() {
         bail!(
@@ -1995,7 +2040,9 @@ where
 
 #[cfg(test)]
 mod window_tests {
-    use super::{backtest_gene_batch, gather_indicator_window, gene_chunk_size, signal_window_size};
+    use super::{
+        backtest_gene_batch, gather_indicator_window, gene_chunk_size, signal_window_size,
+    };
 
     #[test]
     fn gene_chunk_size_bounds_host_buffer_and_never_zero() {
@@ -2042,6 +2089,32 @@ mod window_tests {
         // The full series is covered by an integer number of windows.
         let windows = 5_270_000usize.div_ceil(w);
         assert!(windows >= 2);
+    }
+}
+
+#[cfg(all(test, feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+mod wgpu_device_selector_tests {
+    use super::parse_wgpu_device_selector;
+    use cubecl::wgpu::WgpuDevice;
+
+    #[test]
+    fn parses_integrated_and_legacy_discrete_device_selectors() {
+        assert_eq!(
+            parse_wgpu_device_selector("integrated:0"),
+            Some(WgpuDevice::IntegratedGpu(0))
+        );
+        assert_eq!(
+            parse_wgpu_device_selector("discrete:2"),
+            Some(WgpuDevice::DiscreteGpu(2))
+        );
+        assert_eq!(
+            parse_wgpu_device_selector("2"),
+            Some(WgpuDevice::DiscreteGpu(2))
+        );
+        assert_eq!(
+            parse_wgpu_device_selector("default:0"),
+            Some(WgpuDevice::DefaultDevice)
+        );
     }
 }
 
@@ -2143,24 +2216,26 @@ where
     // generated `launch` is infallible (returns `()`), so no `.context()?`.
     // KERNEL phase (timed).
     gpu_timing::kernel(|| {
-    synthesize_signals_kernel::launch::<F, R>(
-        client,
-        CubeCount::Static(cubes, 1, 1),
-        CubeDim::new_1d(units),
-        unsafe { ArrayArg::from_raw_parts(indicators_handle.clone(), indicators_flat.len()) },
-        unsafe { ArrayArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len()) },
-        unsafe { ArrayArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len()) },
-        unsafe { ArrayArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len()) },
-        unsafe { ArrayArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
-        unsafe { ArrayArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
-        unsafe { ArrayArg::from_raw_parts(smc_data_handle.clone(), smc_data.len()) },
-        unsafe { ArrayArg::from_raw_parts(gene_smc_flags_handle.clone(), gene_smc_flags.len()) },
-        unsafe { ArrayArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
-        unsafe { ArrayArg::from_raw_parts(output_handle.clone(), total) },
-        unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
-        n_samples as u32,
-        gate_threshold,
-    );
+        synthesize_signals_kernel::launch::<F, R>(
+            client,
+            CubeCount::Static(cubes, 1, 1),
+            CubeDim::new_1d(units),
+            unsafe { ArrayArg::from_raw_parts(indicators_handle.clone(), indicators_flat.len()) },
+            unsafe { ArrayArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len()) },
+            unsafe { ArrayArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len()) },
+            unsafe { ArrayArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len()) },
+            unsafe { ArrayArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
+            unsafe { ArrayArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
+            unsafe { ArrayArg::from_raw_parts(smc_data_handle.clone(), smc_data.len()) },
+            unsafe {
+                ArrayArg::from_raw_parts(gene_smc_flags_handle.clone(), gene_smc_flags.len())
+            },
+            unsafe { ArrayArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
+            unsafe { ArrayArg::from_raw_parts(output_handle.clone(), total) },
+            unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
+            n_samples as u32,
+            gate_threshold,
+        );
     }); // end gpu_timing::kernel
 
     // READBACK phase (timed): blocking VRAM→host copy that syncs the kernel.
@@ -2446,7 +2521,12 @@ fn launch_backtest_kernel<R: Runtime>(
             // launches — uploaded once, reused every generation/batch. The
             // per-generation payloads (signals/confidences — they change each
             // call) still upload fresh.
-            rc::get_or_upload(client, device_key, rc::SLOT_CLOSE, f32::as_bytes(close_pips)),
+            rc::get_or_upload(
+                client,
+                device_key,
+                rc::SLOT_CLOSE,
+                f32::as_bytes(close_pips),
+            ),
             rc::get_or_upload(client, device_key, rc::SLOT_HIGH, f32::as_bytes(high_pips)),
             rc::get_or_upload(client, device_key, rc::SLOT_LOW, f32::as_bytes(low_pips)),
             client.create_from_slice(i32::as_bytes(signals_flat)),
@@ -2457,7 +2537,12 @@ fn launch_backtest_kernel<R: Runtime>(
                 rc::SLOT_TS_DELTAS,
                 i32::as_bytes(timestamp_deltas_ms),
             ),
-            rc::get_or_upload(client, device_key, rc::SLOT_MONTH_IDX, i32::as_bytes(month_idx)),
+            rc::get_or_upload(
+                client,
+                device_key,
+                rc::SLOT_MONTH_IDX,
+                i32::as_bytes(month_idx),
+            ),
             rc::get_or_upload(client, device_key, rc::SLOT_DAY_IDX, i32::as_bytes(day_idx)),
             client.create_from_slice(f32::as_bytes(sl_pips)),
             client.create_from_slice(f32::as_bytes(tp_pips)),
@@ -2479,54 +2564,62 @@ fn launch_backtest_kernel<R: Runtime>(
     // the real GPU time is realized at the readback sync below — the split still
     // tells the operator whether launch-enqueue itself is a bottleneck.
     gpu_timing::kernel(|| {
-    backtest_population_kernel::launch::<R>(
-        client,
-        CubeCount::Static(cubes, 1, 1),
-        CubeDim::new_1d(units),
-        unsafe { ArrayArg::from_raw_parts(close_handle.clone(), n_samples) },
-        unsafe { ArrayArg::from_raw_parts(high_handle.clone(), n_samples) },
-        unsafe { ArrayArg::from_raw_parts(low_handle.clone(), n_samples) },
-        unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), signals_flat.len()) },
-        unsafe { ArrayArg::from_raw_parts(timestamp_delta_handle.clone(), n_samples) },
-        unsafe { ArrayArg::from_raw_parts(month_handle.clone(), month_idx.len()) },
-        unsafe { ArrayArg::from_raw_parts(day_handle.clone(), day_idx.len()) },
-        unsafe { ArrayArg::from_raw_parts(sl_handle.clone(), sl_pips.len()) },
-        unsafe { ArrayArg::from_raw_parts(tp_handle.clone(), tp_pips.len()) },
-        unsafe { ArrayArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
-        unsafe { ArrayArg::from_raw_parts(trade_counts_handle.clone(), n_genes) },
-        unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
-        unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
-        n_samples as u32,
-        month_capacity as u32,
-        settings.initial_equity() as f32,
-        settings.max_hold_bars as u32,
-        settings.min_hold_bars as u32,
-        settings.max_trades_per_day as u32,
-        saturating_i32(settings.gap_threshold_ms),
-        if use_timestamps { 1i32 } else { 0i32 },
-        if settings.trailing_enabled { 1i32 } else { 0i32 },
-        settings.trailing_atr_multiplier as f32,
-        settings.trailing_be_trigger_r as f32,
-        settings.spread_pips as f32,
-        settings.commission_per_trade as f32,
-        settings.pip_value_per_lot as f32,
-        // Phase C.3 (2026-05-28) — broker-supplied carry costs.
-        settings.swap_long_pips_per_day as f32,
-        settings.swap_short_pips_per_day as f32,
-        settings.pnl_conversion_fee_rate as f32,
-        // Phase 2 (2026-06-06) — confidence-scaled risk-based sizing knobs +
-        // per-month start-equity output for slot-7. ORDER MUST MATCH the kernel
-        // signature appended after pnl_conversion_fee_rate.
-        unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), confidences_flat.len()) },
-        if settings.risk_based_sizing { 1i32 } else { 0i32 },
-        settings.risk_per_trade_min as f32,
-        settings.risk_per_trade_max as f32,
-        settings.high_quality_confidence as f32,
-        unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
-        // FTMO prop-firm observables — LAST kernel argument (matches the kernel
-        // signature). `n_genes * FTMO_WIDTH` f32s laid out per gene.
-        unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
-    );
+        backtest_population_kernel::launch::<R>(
+            client,
+            CubeCount::Static(cubes, 1, 1),
+            CubeDim::new_1d(units),
+            unsafe { ArrayArg::from_raw_parts(close_handle.clone(), n_samples) },
+            unsafe { ArrayArg::from_raw_parts(high_handle.clone(), n_samples) },
+            unsafe { ArrayArg::from_raw_parts(low_handle.clone(), n_samples) },
+            unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), signals_flat.len()) },
+            unsafe { ArrayArg::from_raw_parts(timestamp_delta_handle.clone(), n_samples) },
+            unsafe { ArrayArg::from_raw_parts(month_handle.clone(), month_idx.len()) },
+            unsafe { ArrayArg::from_raw_parts(day_handle.clone(), day_idx.len()) },
+            unsafe { ArrayArg::from_raw_parts(sl_handle.clone(), sl_pips.len()) },
+            unsafe { ArrayArg::from_raw_parts(tp_handle.clone(), tp_pips.len()) },
+            unsafe { ArrayArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
+            unsafe { ArrayArg::from_raw_parts(trade_counts_handle.clone(), n_genes) },
+            unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
+            unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
+            n_samples as u32,
+            month_capacity as u32,
+            settings.initial_equity() as f32,
+            settings.max_hold_bars as u32,
+            settings.min_hold_bars as u32,
+            settings.max_trades_per_day as u32,
+            saturating_i32(settings.gap_threshold_ms),
+            if use_timestamps { 1i32 } else { 0i32 },
+            if settings.trailing_enabled {
+                1i32
+            } else {
+                0i32
+            },
+            settings.trailing_atr_multiplier as f32,
+            settings.trailing_be_trigger_r as f32,
+            settings.spread_pips as f32,
+            settings.commission_per_trade as f32,
+            settings.pip_value_per_lot as f32,
+            // Phase C.3 (2026-05-28) — broker-supplied carry costs.
+            settings.swap_long_pips_per_day as f32,
+            settings.swap_short_pips_per_day as f32,
+            settings.pnl_conversion_fee_rate as f32,
+            // Phase 2 (2026-06-06) — confidence-scaled risk-based sizing knobs +
+            // per-month start-equity output for slot-7. ORDER MUST MATCH the kernel
+            // signature appended after pnl_conversion_fee_rate.
+            unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), confidences_flat.len()) },
+            if settings.risk_based_sizing {
+                1i32
+            } else {
+                0i32
+            },
+            settings.risk_per_trade_min as f32,
+            settings.risk_per_trade_max as f32,
+            settings.high_quality_confidence as f32,
+            unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
+            // FTMO prop-firm observables — LAST kernel argument (matches the kernel
+            // signature). `n_genes * FTMO_WIDTH` f32s laid out per gene.
+            unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
+        );
     }); // end gpu_timing::kernel
 
     // READBACK phase (timed). `read_one_unchecked` is the blocking VRAM→host copy
@@ -2712,8 +2805,7 @@ where
         let s1 = (s0 + w).min(n_samples);
         let wlen = s1 - s0;
         let win_total = n_genes.saturating_mul(wlen);
-        let ind_window =
-            gather_indicator_window(indicators_flat, n_indicators, n_samples, s0, s1);
+        let ind_window = gather_indicator_window(indicators_flat, n_indicators, n_samples, s0, s1);
         let smc_window = &smc_data_flat[s0 * SMC_WIDTH..s1 * SMC_WIDTH];
         // Per-window inputs + transient window output buffers (freed each pass).
         let (indicators_handle, smc_data_handle, sig_w, conf_w) = gpu_timing::upload(|| {
@@ -2731,14 +2823,23 @@ where
                 CubeCount::Static(sig_cubes, 1, 1),
                 CubeDim::new_1d(sig_units),
                 unsafe { ArrayArg::from_raw_parts(indicators_handle.clone(), ind_window.len()) },
-                unsafe { ArrayArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len()) },
-                unsafe { ArrayArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len()) },
-                unsafe { ArrayArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len()) },
+                unsafe {
+                    ArrayArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len())
+                },
+                unsafe {
+                    ArrayArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len())
+                },
+                unsafe {
+                    ArrayArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len())
+                },
                 unsafe { ArrayArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
                 unsafe { ArrayArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
                 unsafe { ArrayArg::from_raw_parts(smc_data_handle.clone(), smc_window.len()) },
                 unsafe {
-                    ArrayArg::from_raw_parts(gene_smc_flags_handle.clone(), gene_smc_flags_flat.len())
+                    ArrayArg::from_raw_parts(
+                        gene_smc_flags_handle.clone(),
+                        gene_smc_flags_flat.len(),
+                    )
                 },
                 unsafe { ArrayArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
                 unsafe { ArrayArg::from_raw_parts(sig_w.clone(), win_total) },
@@ -2860,7 +2961,11 @@ where
             settings.max_trades_per_day as u32,
             saturating_i32(settings.gap_threshold_ms),
             if use_timestamps { 1i32 } else { 0i32 },
-            if settings.trailing_enabled { 1i32 } else { 0i32 },
+            if settings.trailing_enabled {
+                1i32
+            } else {
+                0i32
+            },
             settings.trailing_atr_multiplier as f32,
             settings.trailing_be_trigger_r as f32,
             settings.spread_pips as f32,
@@ -2870,7 +2975,11 @@ where
             settings.swap_short_pips_per_day as f32,
             settings.pnl_conversion_fee_rate as f32,
             unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
-            if settings.risk_based_sizing { 1i32 } else { 0i32 },
+            if settings.risk_based_sizing {
+                1i32
+            } else {
+                0i32
+            },
             settings.risk_per_trade_min as f32,
             settings.risk_per_trade_max as f32,
             settings.high_quality_confidence as f32,
@@ -2949,7 +3058,10 @@ fn fused_eval_batch_dispatch<R: Runtime>(
             .iter()
             .map(|v| bf16::from_f32(*v))
             .collect::<Vec<_>>();
-        let long_thr_bf16 = long_thr.iter().map(|v| bf16::from_f32(*v)).collect::<Vec<_>>();
+        let long_thr_bf16 = long_thr
+            .iter()
+            .map(|v| bf16::from_f32(*v))
+            .collect::<Vec<_>>();
         let short_thr_bf16 = short_thr
             .iter()
             .map(|v| bf16::from_f32(*v))
@@ -3135,8 +3247,8 @@ pub(crate) fn try_evaluate_population_cuda(
             let bn = b1 - b0;
             // Same catch_unwind guard as the windowed path: a cubecl pool/#243
             // panic becomes a fail-loud Err → eval.rs recomputes on CPU.
-            let res: Result<()> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || -> Result<()> {
+            let res: Result<()> =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                     let idx0 = gene_offsets[b0] as usize;
                     let idx1 = gene_offsets[b1] as usize;
                     let base = gene_offsets[b0];
@@ -3175,115 +3287,115 @@ pub(crate) fn try_evaluate_population_cuda(
                     month_counts.extend_from_slice(&mc);
                     month_start_eq_flat.extend_from_slice(&mse);
                     Ok(())
-                },
-            ))
-            .map_err(|payload| {
-                let msg = payload
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "<non-string panic>".to_string());
-                anyhow::anyhow!("GPU fused batch [{b0},{b1}) panicked (cubecl pool/#243): {msg}")
-            })
-            .and_then(|inner| inner);
+                }))
+                .map_err(|payload| {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic>".to_string());
+                    anyhow::anyhow!(
+                        "GPU fused batch [{b0},{b1}) panicked (cubecl pool/#243): {msg}"
+                    )
+                })
+                .and_then(|inner| inner);
             res?;
             trim_gpu_pool_if_over_budget(&client);
             b0 = b1;
         }
     } else {
-    let g_chunk = gene_chunk_size(n_genes, n_samples);
-    let mut c0 = 0usize;
-    while c0 < n_genes {
-        let c1 = (c0 + g_chunk).min(n_genes);
+        let g_chunk = gene_chunk_size(n_genes, n_samples);
+        let mut c0 = 0usize;
+        while c0 < n_genes {
+            let c1 = (c0 + g_chunk).min(n_genes);
 
-        // AREA 1 (2026-06-09): wrap the per-chunk GPU work in `catch_unwind`.
-        // cubecl 0.10 has NO Result-returning launch — a pool exhaustion or the
-        // cubecl#243 class of failure surfaces as a PANIC, not an `Err`. Without
-        // this the panic would unwind across `try_evaluate_population_cuda`,
-        // poison the worker thread, and only reach the eval.rs hybrid match as an
-        // opaque thread-join error. Catching it HERE lets a single bad chunk fail
-        // LOUD (a tracing::warn upstream carries the message) and convert to an
-        // `Err` → the existing eval.rs:1896-1917 fallback recomputes on CPU. The
-        // build is `panic = "unwind"` (workspace Cargo.toml) so this is sound; the
-        // SUCCESS path is byte-identical (the closure just runs the same launches).
-        let chunk_res: Result<()> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            || -> Result<()> {
-                // Slice + rebase the CSR gene arrays for the chunk [c0, c1).
-                let idx0 = gene_offsets[c0] as usize;
-                let idx1 = gene_offsets[c1] as usize;
-                let base = gene_offsets[c0];
-                let chunk_offsets: Vec<i32> =
-                    gene_offsets[c0..=c1].iter().map(|o| *o - base).collect();
-                let (signals_flat, confidences_flat) = try_generate_signal_flat_cuda(
-                    indicators,
-                    &chunk_offsets,
-                    &gene_indices[idx0..idx1],
-                    &gene_weights[idx0..idx1],
-                    &long_thr[c0..c1],
-                    &short_thr[c0..c1],
-                    smc_data,
-                    &gene_smc_flags[c0..c1],
-                    gate_threshold,
-                    smc_weights,
-                    device_override,
-                )?;
-                // Release the signal-synth device buffers before the backtest allocates.
-                trim_gpu_pool_if_over_budget(&client);
-
-                let chunk_n = c1 - c0;
-                let batch = backtest_gene_batch(chunk_n, n_samples);
-                let mut g0 = 0usize;
-                while g0 < chunk_n {
-                    let g1 = (g0 + batch).min(chunk_n);
-                    // The metrics path ignores the new FTMO vec (last tuple slot);
-                    // FTMO observables are surfaced via `try_evaluate_ftmo_population_cuda`.
-                    let (m, tc, mo, mc, mse, _ftmo) = launch_backtest_kernel(
-                        &client,
-                        device_override.unwrap_or(0),
-                        &close_pips,
-                        &high_pips,
-                        &low_pips,
-                        &signals_flat[g0 * n_samples..g1 * n_samples],
-                        &confidences_flat[g0 * n_samples..g1 * n_samples],
-                        &timestamp_deltas_ms,
-                        use_timestamps,
-                        &month_idx,
-                        &day_idx,
-                        &sl_pips_all[c0 + g0..c0 + g1],
-                        &tp_pips_all[c0 + g0..c0 + g1],
-                        settings,
-                        month_capacity,
+            // AREA 1 (2026-06-09): wrap the per-chunk GPU work in `catch_unwind`.
+            // cubecl 0.10 has NO Result-returning launch — a pool exhaustion or the
+            // cubecl#243 class of failure surfaces as a PANIC, not an `Err`. Without
+            // this the panic would unwind across `try_evaluate_population_cuda`,
+            // poison the worker thread, and only reach the eval.rs hybrid match as an
+            // opaque thread-join error. Catching it HERE lets a single bad chunk fail
+            // LOUD (a tracing::warn upstream carries the message) and convert to an
+            // `Err` → the existing eval.rs:1896-1917 fallback recomputes on CPU. The
+            // build is `panic = "unwind"` (workspace Cargo.toml) so this is sound; the
+            // SUCCESS path is byte-identical (the closure just runs the same launches).
+            let chunk_res: Result<()> =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    // Slice + rebase the CSR gene arrays for the chunk [c0, c1).
+                    let idx0 = gene_offsets[c0] as usize;
+                    let idx1 = gene_offsets[c1] as usize;
+                    let base = gene_offsets[c0];
+                    let chunk_offsets: Vec<i32> =
+                        gene_offsets[c0..=c1].iter().map(|o| *o - base).collect();
+                    let (signals_flat, confidences_flat) = try_generate_signal_flat_cuda(
+                        indicators,
+                        &chunk_offsets,
+                        &gene_indices[idx0..idx1],
+                        &gene_weights[idx0..idx1],
+                        &long_thr[c0..c1],
+                        &short_thr[c0..c1],
+                        smc_data,
+                        &gene_smc_flags[c0..c1],
+                        gate_threshold,
+                        smc_weights,
+                        device_override,
                     )?;
-                    metrics_flat.extend_from_slice(&m);
-                    trade_counts.extend_from_slice(&tc);
-                    monthly_flat.extend_from_slice(&mo);
-                    month_counts.extend_from_slice(&mc);
-                    month_start_eq_flat.extend_from_slice(&mse);
-                    g0 = g1;
-                    // Trim the pool between gene-batches so a huge-row TF (many
-                    // batches per chunk) can't let the reserved high-water mark
-                    // climb mid-eval.
+                    // Release the signal-synth device buffers before the backtest allocates.
                     trim_gpu_pool_if_over_budget(&client);
-                }
-                Ok(())
-            },
-        ))
-        .map_err(|payload| {
-            // Best-effort extraction of the panic message for a fail-loud Err.
-            let msg = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "<non-string panic>".to_string());
-            anyhow::anyhow!("GPU gene-chunk [{c0},{c1}) panicked (cubecl pool/#243): {msg}")
-        })
-        .and_then(|inner| inner);
-        chunk_res?; // → propagates to the eval.rs hybrid match → CPU recompute
 
-        c0 = c1;
-    }
+                    let chunk_n = c1 - c0;
+                    let batch = backtest_gene_batch(chunk_n, n_samples);
+                    let mut g0 = 0usize;
+                    while g0 < chunk_n {
+                        let g1 = (g0 + batch).min(chunk_n);
+                        // The metrics path ignores the new FTMO vec (last tuple slot);
+                        // FTMO observables are surfaced via `try_evaluate_ftmo_population_cuda`.
+                        let (m, tc, mo, mc, mse, _ftmo) = launch_backtest_kernel(
+                            &client,
+                            device_override.unwrap_or(0),
+                            &close_pips,
+                            &high_pips,
+                            &low_pips,
+                            &signals_flat[g0 * n_samples..g1 * n_samples],
+                            &confidences_flat[g0 * n_samples..g1 * n_samples],
+                            &timestamp_deltas_ms,
+                            use_timestamps,
+                            &month_idx,
+                            &day_idx,
+                            &sl_pips_all[c0 + g0..c0 + g1],
+                            &tp_pips_all[c0 + g0..c0 + g1],
+                            settings,
+                            month_capacity,
+                        )?;
+                        metrics_flat.extend_from_slice(&m);
+                        trade_counts.extend_from_slice(&tc);
+                        monthly_flat.extend_from_slice(&mo);
+                        month_counts.extend_from_slice(&mc);
+                        month_start_eq_flat.extend_from_slice(&mse);
+                        g0 = g1;
+                        // Trim the pool between gene-batches so a huge-row TF (many
+                        // batches per chunk) can't let the reserved high-water mark
+                        // climb mid-eval.
+                        trim_gpu_pool_if_over_budget(&client);
+                    }
+                    Ok(())
+                }))
+                .map_err(|payload| {
+                    // Best-effort extraction of the panic message for a fail-loud Err.
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic>".to_string());
+                    anyhow::anyhow!("GPU gene-chunk [{c0},{c1}) panicked (cubecl pool/#243): {msg}")
+                })
+                .and_then(|inner| inner);
+            chunk_res?; // → propagates to the eval.rs hybrid match → CPU recompute
+
+            c0 = c1;
+        }
     } // end `else` (windowed host path); the `if use_fused` branch filled the
-      // same metric vecs above.
+    // same metric vecs above.
 
     let mut results = Vec::with_capacity(n_genes);
     for g in 0..n_genes {
@@ -3353,11 +3465,8 @@ pub(crate) fn try_evaluate_population_cuda(
         // "other" = total minus the attributed phases (host result-assembly above,
         // pool trims, the catch_unwind plumbing). A large `kernel` or `upload`
         // share at a SMALL n_genes is the per-launch-overhead signature.
-        let attributed = phases.client_get
-            + phases.host_prep
-            + phases.upload
-            + phases.kernel
-            + phases.readback;
+        let attributed =
+            phases.client_get + phases.host_prep + phases.upload + phases.kernel + phases.readback;
         let other = total.saturating_sub(attributed);
         tracing::info!(
             target: "neoethos_search::gpu",
@@ -3462,8 +3571,8 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
     while c0 < n_genes {
         let c1 = (c0 + g_chunk).min(n_genes);
 
-        let chunk_res: Result<()> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            || -> Result<()> {
+        let chunk_res: Result<()> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                 let idx0 = gene_offsets[c0] as usize;
                 let idx1 = gene_offsets[c1] as usize;
                 let base = gene_offsets[c0];
@@ -3513,17 +3622,18 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
                     trim_gpu_pool_if_over_budget(&client);
                 }
                 Ok(())
-            },
-        ))
-        .map_err(|payload| {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "<non-string panic>".to_string());
-            anyhow::anyhow!("GPU ftmo gene-chunk [{c0},{c1}) panicked (cubecl pool/#243): {msg}")
-        })
-        .and_then(|inner| inner);
+            }))
+            .map_err(|payload| {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic>".to_string());
+                anyhow::anyhow!(
+                    "GPU ftmo gene-chunk [{c0},{c1}) panicked (cubecl pool/#243): {msg}"
+                )
+            })
+            .and_then(|inner| inner);
         chunk_res?;
 
         c0 = c1;
@@ -3606,7 +3716,9 @@ mod fused_parity_tests {
         let long_thr: Vec<f32> = vec![0.5, 0.5, 0.5];
         let short_thr: Vec<f32> = vec![-0.5, -0.5, -0.5];
 
-        let timestamps: Vec<i64> = (0..n_samples).map(|i| 1_600_000_000_000 + i as i64 * 3_600_000).collect();
+        let timestamps: Vec<i64> = (0..n_samples)
+            .map(|i| 1_600_000_000_000 + i as i64 * 3_600_000)
+            .collect();
         // Bucket day/month proportionally to n_samples so the counts stay bounded
         // (~4 months, ~60 days) regardless of how big n_samples gets — keeps the
         // month buffer within month_capacity for the large multi-window run.
@@ -3661,7 +3773,7 @@ mod fused_parity_tests {
 
         let (mw, tcw, mow, mcw, msew, _ftmo_w) = launch_backtest_kernel(
             &client,
-            device_override.unwrap_or(0),
+            0,
             &close_pips,
             &high_pips,
             &low_pips,
@@ -3724,7 +3836,10 @@ mod fused_parity_tests {
             sig.len(),
             &mw[..mw.len().min(7)]
         );
-        assert!(bits_eq(&mw, &mf), "metrics_flat mismatch (fused vs windowed)");
+        assert!(
+            bits_eq(&mw, &mf),
+            "metrics_flat mismatch (fused vs windowed)"
+        );
         assert_eq!(tcw, tcf, "trade_counts mismatch");
         assert!(bits_eq(&mow, &mof), "monthly_flat mismatch");
         assert_eq!(mcw, mcf, "month_counts mismatch");

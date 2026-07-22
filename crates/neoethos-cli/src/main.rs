@@ -21,7 +21,10 @@ fn main() -> Result<()> {
     neoethos_core::system::install_hardware_runtime_overrides_from_settings(&startup_settings);
     neoethos_data::install_data_runtime_overrides(
         startup_settings.models.data_runtime.normalize_features,
-        startup_settings.models.data_runtime.rebuild_stale_higher_tfs,
+        startup_settings
+            .models
+            .data_runtime
+            .rebuild_stale_higher_tfs,
     );
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -219,7 +222,9 @@ fn cmd_slice_dataset(args: &[String]) -> Result<()> {
     }
 
     let from_date = parse_flag(args, "--from-date").ok_or_else(|| {
-        anyhow::anyhow!("slice-dataset requires --from-date YYYY-MM-DD (inclusive lower bound, UTC)")
+        anyhow::anyhow!(
+            "slice-dataset requires --from-date YYYY-MM-DD (inclusive lower bound, UTC)"
+        )
     })?;
     let to_date = parse_flag(args, "--to-date").ok_or_else(|| {
         anyhow::anyhow!("slice-dataset requires --to-date YYYY-MM-DD (exclusive upper bound, UTC)")
@@ -260,8 +265,8 @@ fn cmd_slice_dataset(args: &[String]) -> Result<()> {
     // Writer — canonical Vortex layout, byte-compatible with the loader.
     let written = neoethos_data::write_symbol_timeframe_vortex(&out_root, &symbol, &base, &slice)
         .map_err(|err| {
-            anyhow::anyhow!("slice-dataset: failed to write slice to {out_root}: {err}")
-        })?;
+        anyhow::anyhow!("slice-dataset: failed to write slice to {out_root}: {err}")
+    })?;
 
     let (first_ms, last_ms) = span.expect("span is Some when kept_rows > 0");
     println!(
@@ -419,9 +424,8 @@ fn cmd_discovery_promote_weekly(args: &[String]) -> Result<()> {
     // The live portfolio whose full genes we carry. Default path mirrors the
     // discover command's `{out}.live_portfolio.json`, keyed off the ledger's
     // cache layout; override with --portfolio.
-    let portfolio_path = parse_flag(args, "--portfolio").unwrap_or_else(|| {
-        format!("{}/{}_{}.live_portfolio.json", cache_dir, symbol, tf)
-    });
+    let portfolio_path = parse_flag(args, "--portfolio")
+        .unwrap_or_else(|| format!("{}/{}_{}.live_portfolio.json", cache_dir, symbol, tf));
 
     let mut existing_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let existing_count = match neoethos_search::load_live_portfolio_json(&portfolio_path) {
@@ -476,9 +480,7 @@ fn cmd_discovery_promote_weekly(args: &[String]) -> Result<()> {
         total,
         new_genes: new_genes.clone(),
     };
-    if let Err(err) =
-        neoethos_core::storage::json::write_json_atomic(&summary_path, &summary)
-    {
+    if let Err(err) = neoethos_core::storage::json::write_json_atomic(&summary_path, &summary) {
         tracing::warn!(
             target: "neoethos_cli::discovery_promote_weekly",
             error = %err,
@@ -491,7 +493,10 @@ fn cmd_discovery_promote_weekly(args: &[String]) -> Result<()> {
         "discovery-promote-weekly {} {} (policy={}): added {} new, carried {}, total {}",
         symbol, tf, ledger_cfg.promotion_policy, added, carried, total
     );
-    println!("  ledger: {}", neoethos_search::ledger_path(&cache_dir, &symbol, &tf).display());
+    println!(
+        "  ledger: {}",
+        neoethos_search::ledger_path(&cache_dir, &symbol, &tf).display()
+    );
     println!("  summary written: {}", summary_path);
     if added > 0 {
         println!("  new strategies this run:");
@@ -536,9 +541,7 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
             "off" | "genes" | "genes_only" | "genesonly" => neoethos_trader::BlendMode::GenesOnly,
             "confirm" | "mlconfirm" => neoethos_trader::BlendMode::MlConfirm,
             "scale" | "mlscale" => neoethos_trader::BlendMode::MlScale,
-            other => anyhow::bail!(
-                "--blend must be off|confirm|scale (got '{other}')"
-            ),
+            other => anyhow::bail!("--blend must be off|confirm|scale (got '{other}')"),
         };
         if matches!(mode, neoethos_trader::BlendMode::GenesOnly) {
             neoethos_trader::replay_portfolio_from_dir(
@@ -547,7 +550,8 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
                 neoethos_trader::EngineConfig::default(),
             )?
         } else {
-            let models_root = parse_flag(args, "--models-root").unwrap_or_else(|| "models".to_string());
+            let models_root =
+                parse_flag(args, "--models-root").unwrap_or_else(|| "models".to_string());
             let mut blend = neoethos_trader::BlendConfig {
                 mode,
                 ..Default::default()
@@ -633,12 +637,19 @@ fn cmd_forward_test(args: &[String]) -> Result<()> {
         oos_ms,
     )?;
 
-    println!(
-        "FAITHFUL OOS forward-test (gene real SL/TP + risk sizing; holdout from {oos_from}):"
-    );
+    println!("FAITHFUL OOS forward-test (gene real SL/TP + risk sizing; holdout from {oos_from}):");
     println!(
         "{:<16}{:>5}{:>5}{:>8}{:>8}{:>8}{:>8}{:>10}{:>7}{:>8}  verdict",
-        "gene", "#ind", "#smc", "IS_PF", "IS_DD%", "OOS_PF", "OOS_DD%", "OOS_net", "OOS_tr", "WFE_shp"
+        "gene",
+        "#ind",
+        "#smc",
+        "IS_PF",
+        "IS_DD%",
+        "OOS_PF",
+        "OOS_DD%",
+        "OOS_net",
+        "OOS_tr",
+        "WFE_shp"
     );
     let mut survives = 0usize;
     for r in &results {
@@ -705,9 +716,8 @@ fn cmd_forward_test(args: &[String]) -> Result<()> {
 fn cmd_blend_test(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?;
     let root = parse_root(args, settings.as_ref());
-    let portfolio = parse_flag(args, "--portfolio").ok_or_else(|| {
-        anyhow::anyhow!("blend-test requires --portfolio <live_portfolio.json>")
-    })?;
+    let portfolio = parse_flag(args, "--portfolio")
+        .ok_or_else(|| anyhow::anyhow!("blend-test requires --portfolio <live_portfolio.json>"))?;
     let models_root =
         parse_flag(args, "--models-root").unwrap_or_else(|| "models_oos_locked".to_string());
     let gate_floor = parse_flag(args, "--gate-floor")
@@ -760,7 +770,9 @@ fn cmd_blend_test(args: &[String]) -> Result<()> {
         let eq_ok = s.equity >= genes.equity - 1e-9;
         let traded = s.positions_opened >= 1;
         if pnl_ok && eq_ok && traded {
-            println!("  -> {name}: ACCEPT (>= genes-only on realized_pnl AND equity, still trades)");
+            println!(
+                "  -> {name}: ACCEPT (>= genes-only on realized_pnl AND equity, still trades)"
+            );
         } else if !traded {
             println!("  -> {name}: REJECT (blend vetoed every trade)");
         } else {
@@ -1044,9 +1056,8 @@ fn cmd_discover(args: &[String]) -> Result<()> {
                 want_tfs.push(h.clone());
             }
         }
-        want_tfs.retain(|tf| {
-            neoethos_data::symbol_timeframe_vortex_path(&root, &symbol, tf).exists()
-        });
+        want_tfs
+            .retain(|tf| neoethos_data::symbol_timeframe_vortex_path(&root, &symbol, tf).exists());
         if !want_tfs.iter().any(|t| t == &base) {
             want_tfs.push(base.clone());
         }
@@ -1393,7 +1404,7 @@ fn cmd_config(args: &[String]) -> Result<()> {
 /// sizes (works on any machine, no GPU needed).
 fn cmd_schedule(args: &[String]) -> Result<()> {
     use neoethos_core::scheduler::{
-        plan_combo, AdmissionPolicy, ComboItem, ComboShape, WorkScheduler,
+        AdmissionPolicy, ComboItem, ComboShape, WorkScheduler, plan_combo,
     };
 
     let settings = resolve_cli_settings(args)?.unwrap_or_else(neoethos_core::Settings::default);
@@ -1423,9 +1434,7 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
     }
 
     let symbols: Vec<String> = match parse_flag(args, "--symbols") {
-        Some(s) if !s.trim().is_empty() => {
-            s.split(',').map(|x| x.trim().to_uppercase()).collect()
-        }
+        Some(s) if !s.trim().is_empty() => s.split(',').map(|x| x.trim().to_uppercase()).collect(),
         _ => neoethos_data::discover_symbols(&root)?,
     };
     let tfs: Vec<String> = parse_flag(args, "--timeframes")
@@ -1438,11 +1447,8 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
     let hw = probe.detect();
     let policy = AdmissionPolicy::default();
     println!(
-        "Hardware: {} cores, {:.0}GB RAM avail, {} usable GPU(s) VRAM={:?}GB",
-        hw.cpu_cores,
-        hw.available_ram_gb,
-        hw.gpu_mem_gb.iter().filter(|m| **m > 0.0).count(),
-        hw.gpu_mem_gb
+        "Hardware: {} cores, {:.0}GB RAM avail, {} detected GPU(s) names={:?} VRAM={:?}GB",
+        hw.cpu_cores, hw.available_ram_gb, hw.num_gpus, hw.gpu_names, hw.gpu_mem_gb
     );
 
     // Build admission plans for the runtime's actual one-device-per-worker
@@ -1532,7 +1538,7 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
         if !stopping {
             for a in sched.poll() {
                 let (sym, tf) = id_combo.get(&a.id).cloned().unwrap_or_default();
-                match spawn_discover_combo(&a, &sym, &tf, &root, &resolved) {
+                match spawn_discover_combo(&a, &sym, &tf, &root, &resolved, &hw) {
                     Ok(child) => {
                         println!(
                             "  ▶ {} on cards {:?} (population/device {}, {} cpu threads)",
@@ -1553,7 +1559,10 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
                 break;
             }
             // Nothing running and nothing dispatchable — avoid a spin loop.
-            eprintln!("scheduler stalled with {} pending and no free capacity — stopping", sched.pending_len());
+            eprintln!(
+                "scheduler stalled with {} pending and no free capacity — stopping",
+                sched.pending_len()
+            );
             break;
         }
 
@@ -1627,6 +1636,7 @@ fn spawn_discover_combo(
     timeframe: &str,
     root: &str,
     resolved: &neoethos_core::resolved_config::ResolvedConfig,
+    hardware: &neoethos_core::system::HardwareProfile,
 ) -> Result<std::process::Child> {
     let exe = std::env::current_exe().context("locating current executable")?;
     let mut cmd = std::process::Command::new(exe);
@@ -1655,14 +1665,49 @@ fn spawn_discover_combo(
     // at 120 MiB, clean run). Combo-level throughput (one combo per card,
     // concurrent) is preserved; the multi-device code in eval.rs stays in place,
     // gated behind the plural env which we simply no longer set.
-    if let Some(&card) = a.card_ids.first() {
-        cmd.env("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE", card.to_string());
-        cmd.env("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE", card.to_string());
+    for (key, value) in gpu_assignment_env(a, hardware) {
+        cmd.env(key, value);
     }
     cmd.env("NEOETHOS_BOT_CPU_BUDGET", a.cpu_threads.to_string());
     cmd.env("NEOETHOS_BOT_DATA_ROOT", root);
     cmd.spawn()
         .with_context(|| format!("spawning discover for {symbol}/{timeframe}"))
+}
+
+fn gpu_assignment_env(
+    assignment: &neoethos_core::scheduler::Assignment,
+    hardware: &neoethos_core::system::HardwareProfile,
+) -> std::collections::BTreeMap<&'static str, String> {
+    use neoethos_core::system::AcceleratorBackend;
+
+    let mut envs = std::collections::BTreeMap::new();
+    let Some(&slot) = assignment.card_ids.first() else {
+        return envs;
+    };
+    if let Some(device) = hardware.accelerator_devices.get(slot) {
+        match device.backend {
+            AcceleratorBackend::Cuda => {
+                envs.insert(
+                    "NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE",
+                    device.backend_index.to_string(),
+                );
+            }
+            backend if backend.is_wgpu_family() => {
+                if let Some(selector) = device.cubecl_wgpu_selector() {
+                    envs.insert("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE", selector);
+                }
+            }
+            AcceleratorBackend::Cpu | AcceleratorBackend::Rocm => {}
+            _ => {}
+        }
+        return envs;
+    }
+
+    // Backwards compatibility for synthetic/legacy profiles that contain only
+    // `gpu_mem_gb` and therefore cannot describe a backend or adapter class.
+    envs.insert("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE", slot.to_string());
+    envs.insert("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE", slot.to_string());
+    envs
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -2654,7 +2699,9 @@ fn print_help() {
     println!(
         "  blend-test --portfolio <live_portfolio.json> --models-root models_oos_locked [--root data] [--gate-floor 0.34] [--veto-below 0.15]  Re-validate the gene<->ML blend on the NETTED portfolio: GenesOnly vs MlConfirm vs MlScale on the same engine + non-degradation verdict. Point --models-root at a LEAK-FREE root (train --oos-from)."
     );
-    println!("  train --symbol EURUSD --base H1 [--models-dir models] [--oos-from 2023-01-01]  Train the ML ensemble. --oos-from trains LEAK-LOCKED experts (rows < cutoff, purged) to a SEPARATE root for OOS blend validation.");
+    println!(
+        "  train --symbol EURUSD --base H1 [--models-dir models] [--oos-from 2023-01-01]  Train the ML ensemble. --oos-from trains LEAK-LOCKED experts (rows < cutoff, purged) to a SEPARATE root for OOS blend validation."
+    );
     println!("  migrate-data --root data [--force] [--delete-source]");
     println!(
         "  slice-dataset --symbol EURUSD --base M1 --root <SRC> --out-root <DST> --from-date 2018-01-01 --to-date 2021-01-01"
@@ -2732,8 +2779,55 @@ fn system_time_string() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cli_record, section_record};
+    use super::{cli_record, gpu_assignment_env, section_record};
     use neoethos_core::sectioned_log::SubsystemSection;
+
+    #[test]
+    fn integrated_wgpu_assignment_uses_typed_selector_without_cuda_pin() {
+        use neoethos_core::scheduler::Assignment;
+        use neoethos_core::system::{
+            AcceleratorBackend, AcceleratorDevice, AcceleratorDeviceClass, HardwareProfile,
+            TrainingPrecision,
+        };
+
+        let assignment = Assignment {
+            id: "EURUSD/M1".to_string(),
+            card_ids: vec![0],
+            genes_per_card: 128,
+            cpu_threads: 3,
+            class: neoethos_core::scheduler::ComboClass::Light,
+        };
+        let profile = HardwareProfile {
+            schema_version: neoethos_core::system::HARDWARE_PROFILE_SCHEMA_VERSION,
+            cpu_cores: 12,
+            total_ram_gb: 32.0,
+            available_ram_gb: 24.0,
+            gpu_names: vec!["AMD Radeon Graphics".to_string()],
+            num_gpus: 1,
+            gpu_mem_gb: vec![0.0],
+            accelerator_devices: vec![AcceleratorDevice {
+                id: 0,
+                name: "AMD Radeon Graphics".to_string(),
+                backend: AcceleratorBackend::Vulkan,
+                device_class: AcceleratorDeviceClass::IntegratedGpu,
+                backend_index: 0,
+                memory_gb: 0.0,
+                supported_precisions: vec![TrainingPrecision::Fp32],
+                compute_capability: None,
+                source: "test".to_string(),
+            }],
+            timestamp: "test".to_string(),
+            platform_label: "test".to_string(),
+        };
+
+        let envs = gpu_assignment_env(&assignment, &profile);
+
+        assert_eq!(
+            envs.get("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE"),
+            Some(&"integrated:0".to_string())
+        );
+        assert!(!envs.contains_key("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE"));
+    }
 
     #[test]
     fn cli_record_targets_cli_section() {
