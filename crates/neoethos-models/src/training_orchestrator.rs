@@ -663,14 +663,17 @@ impl TrainingOrchestrator {
             .iter()
             .map(|entry| {
                 let mut params = self.default_model_params(&entry.name);
+                self.inject_runtime_model_params(&entry.name, &mut params);
+                self.apply_model_param_overrides(&entry.name, &mut params);
+                // Resource limits and accelerator provenance are authoritative.
+                // Apply them last so stale settings or per-model overrides cannot
+                // oversubscribe the detected machine or route work to another device.
                 self.apply_hardware_plan_params(
                     &entry.name,
                     entry.family,
                     &hardware_plan,
                     &mut params,
                 );
-                self.inject_runtime_model_params(&entry.name, &mut params);
-                self.apply_model_param_overrides(&entry.name, &mut params);
                 Ok(ModelConfig {
                     name: entry.name.clone(),
                     model_type: self.map_model_type(&entry.name)?,
@@ -715,6 +718,29 @@ impl TrainingOrchestrator {
         params.insert(
             "__planned_precision".to_string(),
             workload.precision.as_str().to_string(),
+        );
+        params.insert(
+            "__planned_cpu_threads".to_string(),
+            workload.cpu_threads.to_string(),
+        );
+        params.insert(
+            "__planned_batch_size".to_string(),
+            workload.batch_size.to_string(),
+        );
+        params.insert(
+            "__planned_memory_budget_gb".to_string(),
+            format!("{:.6}", workload.memory_budget_gb),
+        );
+        params.insert(
+            "cpu_threads".to_string(),
+            workload.cpu_threads.to_string(),
+        );
+        if workload.batch_size > 0 {
+            params.insert("batch_size".to_string(), workload.batch_size.to_string());
+        }
+        params.insert(
+            "memory_budget_gb".to_string(),
+            format!("{:.6}", workload.memory_budget_gb),
         );
 
         match family {
@@ -2550,6 +2576,21 @@ fn training_runtime_profile(
     let planned_backend = parse_string_param(&config.params, "__planned_backend");
     let planned_device = parse_string_param(&config.params, "__planned_device");
     let planned_precision = parse_string_param(&config.params, "__planned_precision");
+    let planned_cpu_threads = config
+        .params
+        .get("__planned_cpu_threads")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    let planned_batch_size = config
+        .params
+        .get("__planned_batch_size")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    let planned_memory_budget_gb = config
+        .params
+        .get("__planned_memory_budget_gb")
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0);
     // RLlib honesty: the `backend` param is now ALWAYS the truthful effective
     // backend (`rlkit`), never a bare "rllib". The original rllib/Ray REQUEST is
     // carried in `__rllib_requested` (the back-compat fallback `backend == "rllib"`
@@ -2612,6 +2653,9 @@ fn training_runtime_profile(
         planned_backend,
         planned_device,
         planned_precision,
+        planned_cpu_threads,
+        planned_batch_size,
+        planned_memory_budget_gb,
         checkpoint_path: parse_string_param(&config.params, "checkpoint").map(PathBuf::from),
         async_requested: parse_bool_param(&config.params, "async", false),
         async_wait_requested: parse_bool_param(&config.params, "async_wait", false),
@@ -3547,7 +3591,46 @@ fn generate_hpo_candidate_params(
         _ => {}
     }
 
+    enforce_planned_resource_caps(&mut params);
     params
+}
+
+fn enforce_planned_resource_caps(params: &mut HashMap<String, String>) {
+    for (key, planned_key) in [
+        ("cpu_threads", "__planned_cpu_threads"),
+        ("batch_size", "__planned_batch_size"),
+    ] {
+        let Some(planned) = params
+            .get(planned_key)
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let effective = params
+            .get(key)
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or(planned, |requested| requested.min(planned));
+        params.insert(key.to_string(), effective.to_string());
+    }
+
+    let Some(planned_memory_gb) = params
+        .get("__planned_memory_budget_gb")
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    else {
+        return;
+    };
+    let effective_memory_gb = params
+        .get("memory_budget_gb")
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map_or(planned_memory_gb, |requested| {
+            requested.min(planned_memory_gb)
+        });
+    params.insert(
+        "memory_budget_gb".to_string(),
+        format!("{effective_memory_gb:.6}"),
+    );
 }
 
 fn select_hpo_dataset(
@@ -4753,6 +4836,148 @@ mod tests {
     }
 
     #[test]
+    fn hardware_plan_params_reach_the_deep_trainer_contract() {
+        use neoethos_core::system::{
+            AcceleratorBackend, AcceleratorDevice, AcceleratorDeviceClass, HardwareProfile,
+            TrainingPrecision, HARDWARE_PROFILE_SCHEMA_VERSION,
+        };
+
+        let mut orchestrator = orchestrator_with_models(&["mlp"]);
+        orchestrator.settings.system.enable_gpu_preference = "cuda".to_string();
+        orchestrator.settings.system.hardware.cpu_budget = Some(5);
+        let profile = HardwareProfile {
+            schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,
+            cpu_cores: 12,
+            total_ram_gb: 32.0,
+            available_ram_gb: 20.0,
+            gpu_names: vec!["Test GPU".to_string()],
+            num_gpus: 1,
+            gpu_mem_gb: vec![8.0],
+            accelerator_devices: vec![AcceleratorDevice {
+                id: 0,
+                name: "Test GPU".to_string(),
+                backend: AcceleratorBackend::Cuda,
+                device_class: AcceleratorDeviceClass::DiscreteGpu,
+                backend_index: 0,
+                memory_gb: 8.0,
+                supported_precisions: vec![TrainingPrecision::Fp32],
+                compute_capability: Some((8, 0)),
+                source: "test".to_string(),
+            }],
+            timestamp: "test".to_string(),
+            platform_label: "test".to_string(),
+        };
+        let plan = HardwareExecutionPlan::from_settings_and_profile(&orchestrator.settings, profile);
+        let workload = plan
+            .workload(WorkloadKind::DeepTraining)
+            .expect("deep-training workload should exist");
+        let mut params = HashMap::from([("batch_size".to_string(), "17".to_string())]);
+
+        orchestrator.apply_hardware_plan_params(
+            "mlp",
+            ModelFamily::Deep,
+            &plan,
+            &mut params,
+        );
+
+        assert_eq!(
+            params.get("__planned_cpu_threads"),
+            Some(&workload.cpu_threads.to_string())
+        );
+        assert_eq!(
+            params.get("__planned_batch_size"),
+            Some(&workload.batch_size.to_string())
+        );
+        assert_eq!(
+            params.get("__planned_memory_budget_gb"),
+            Some(&format!("{:.6}", workload.memory_budget_gb))
+        );
+        assert_eq!(params.get("cpu_threads"), Some(&"5".to_string()));
+        assert_eq!(
+            params.get("batch_size"),
+            Some(&workload.batch_size.to_string())
+        );
+        assert_eq!(
+            params.get("memory_budget_gb"),
+            Some(&format!("{:.6}", workload.memory_budget_gb))
+        );
+    }
+
+    #[test]
+    fn model_overrides_cannot_escape_the_resolved_hardware_plan() {
+        let mut orchestrator = orchestrator_with_models(&["mlp"]);
+        orchestrator.settings.models.model_param_overrides.insert(
+            "mlp".to_string(),
+            HashMap::from([
+                ("cpu_threads".to_string(), usize::MAX.to_string()),
+                ("batch_size".to_string(), usize::MAX.to_string()),
+                ("memory_budget_gb".to_string(), f64::MAX.to_string()),
+                ("device".to_string(), "definitely-invalid".to_string()),
+                ("training_precision".to_string(), "invalid".to_string()),
+            ]),
+        );
+        let dispatch_plan = orchestrator
+            .create_dispatch_plan()
+            .expect("dispatch plan should build");
+
+        let configs = orchestrator
+            .build_training_configs(&dispatch_plan)
+            .expect("training configs should build");
+        let mlp = configs
+            .iter()
+            .find(|config| config.name == "mlp")
+            .expect("mlp config should exist");
+
+        assert_eq!(
+            mlp.params.get("cpu_threads"),
+            mlp.params.get("__planned_cpu_threads")
+        );
+        assert_eq!(
+            mlp.params.get("batch_size"),
+            mlp.params.get("__planned_batch_size")
+        );
+        assert_eq!(
+            mlp.params.get("memory_budget_gb"),
+            mlp.params.get("__planned_memory_budget_gb")
+        );
+        assert_ne!(
+            mlp.params.get("device").map(String::as_str),
+            Some("definitely-invalid")
+        );
+        assert_ne!(
+            mlp.params.get("training_precision").map(String::as_str),
+            Some("invalid")
+        );
+    }
+
+    #[test]
+    fn hpo_candidates_cannot_exceed_the_planned_batch_size() {
+        let base_params = HashMap::from([
+            ("batch_size".to_string(), "32".to_string()),
+            ("__planned_batch_size".to_string(), "32".to_string()),
+        ]);
+        let config = ModelConfig {
+            name: "mlp".to_string(),
+            model_type: ModelType::MLP,
+            capability_family: ModelFamily::Deep,
+            capability_state: CapabilityState::Verified,
+            params: base_params.clone(),
+        };
+
+        for trial_idx in 1..16 {
+            let candidate =
+                generate_hpo_candidate_params(&config, &base_params, trial_idx, 16, "tpe");
+            let batch_size = candidate["batch_size"]
+                .parse::<usize>()
+                .expect("batch size should be numeric");
+            assert!(
+                batch_size <= 32,
+                "trial {trial_idx} escaped the planned batch-size cap: {batch_size}"
+            );
+        }
+    }
+
+    #[test]
     fn build_training_configs_maps_configured_models_to_concrete_model_types() {
         let orchestrator =
             orchestrator_with_models(&["lightgbm", "online_pa", "patchtst", "genetic"]);
@@ -4892,6 +5117,9 @@ mod tests {
         assert_eq!(profile.effective_label_horizon_bars, 3);
         assert_eq!(profile.meta_label_max_hold_bars, 3);
         assert!(!profile.label_use_triple_barrier);
+        assert!(profile.planned_cpu_threads.is_some());
+        assert!(profile.planned_batch_size.is_some());
+        assert!(profile.planned_memory_budget_gb.is_some());
     }
 
     #[test]

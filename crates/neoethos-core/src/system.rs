@@ -351,7 +351,7 @@ impl HardwareExecutionPlan {
         }
 
         let cpu_budget = resolve_cpu_budget(profile.cpu_cores.max(1), runtime_overrides);
-        let memory_budget_gb = profile.available_ram_gb.max(1.0);
+        let host_memory_budget_gb = profile.available_ram_gb.max(1.0);
         let device_ids: Vec<usize> = if gpu_enabled {
             backend_devices.iter().map(|device| device.id).collect()
         } else {
@@ -403,6 +403,23 @@ impl HardwareExecutionPlan {
         let search_device_ids = search_gpu_enabled
             .then(|| backend_devices.iter().map(|device| device.id).collect())
             .unwrap_or_default();
+        let search_backend = if search_gpu_enabled {
+            primary_backend
+        } else {
+            AcceleratorBackend::Cpu
+        };
+        let tree_gpu_enabled = gpu_enabled && tree_gpu_requested && !cuda_devices.is_empty();
+        let tree_backend = if tree_gpu_enabled {
+            AcceleratorBackend::Cuda
+        } else {
+            AcceleratorBackend::Cpu
+        };
+        let rl_gpu_enabled = gpu_enabled && !cuda_devices.is_empty();
+        let rl_backend = if rl_gpu_enabled {
+            AcceleratorBackend::Cuda
+        } else {
+            AcceleratorBackend::Cpu
+        };
 
         let mut workloads = Vec::new();
         workloads.push(WorkloadExecutionPlan {
@@ -421,7 +438,7 @@ impl HardwareExecutionPlan {
             ),
             cpu_threads: cpu_budget.clamp(1, 8),
             batch_size: 0,
-            memory_budget_gb: memory_budget_gb * 0.20,
+            memory_budget_gb: host_memory_budget_gb * 0.20,
             notes: vec![
                 "Vortex/cTrader I/O stays CPU-bound and isolated from UI/inference threads."
                     .to_string(),
@@ -435,7 +452,7 @@ impl HardwareExecutionPlan {
             precision: TrainingPrecision::Fp32,
             cpu_threads: cpu_budget,
             batch_size: 0,
-            memory_budget_gb: memory_budget_gb * 0.35,
+            memory_budget_gb: host_memory_budget_gb * 0.35,
             notes: vec![
                 "ICT/SMC remains feature engineering only; model decisions stay autonomous."
                     .to_string(),
@@ -443,40 +460,41 @@ impl HardwareExecutionPlan {
         });
         workloads.push(WorkloadExecutionPlan {
             workload: WorkloadKind::StrategySearch,
-            backend: if search_gpu_enabled {
-                primary_backend
-            } else {
-                AcceleratorBackend::Cpu
-            },
+            backend: search_backend,
             device: search_device,
             device_ids: search_device_ids,
             precision: TrainingPrecision::Fp32,
             cpu_threads: cpu_budget,
-            batch_size: if gpu_enabled { train_batch_size } else { 0 },
-            memory_budget_gb: memory_budget_gb * 0.45,
+            batch_size: if search_gpu_enabled {
+                train_batch_size
+            } else {
+                0
+            },
+            memory_budget_gb: planned_memory_budget_gb(
+                &profile,
+                search_backend,
+                0.45,
+                0.80,
+            ),
             notes: vec!["Search evaluation uses the compiled CubeCL CUDA or WGPU runtime for GA offspring generation, signal synthesis, and the stateful backtest loop; price-normalized backtest arithmetic remains FP32 for pip-safe parity. ROCm stays an explicit CPU fallback until its runtime path is implemented.".to_string()],
         });
         workloads.push(WorkloadExecutionPlan {
             workload: WorkloadKind::TreeTraining,
-            backend: if gpu_enabled && tree_gpu_requested && !cuda_devices.is_empty() {
-                AcceleratorBackend::Cuda
-            } else {
-                AcceleratorBackend::Cpu
-            },
-            device: if gpu_enabled && tree_gpu_requested && !cuda_devices.is_empty() {
+            backend: tree_backend,
+            device: if tree_gpu_enabled {
                 "cuda:0".to_string()
             } else {
                 "cpu".to_string()
             },
-            device_ids: if gpu_enabled && tree_gpu_requested && !cuda_devices.is_empty() {
+            device_ids: if tree_gpu_enabled {
                 vec![0]
             } else {
                 Vec::new()
             },
             precision: TrainingPrecision::Fp32,
             cpu_threads: cpu_budget,
-            batch_size: train_batch_size,
-            memory_budget_gb: memory_budget_gb * 0.35,
+            batch_size: if tree_gpu_enabled { train_batch_size } else { 64 },
+            memory_budget_gb: planned_memory_budget_gb(&profile, tree_backend, 0.35, 0.70),
             notes: vec!["Tree GPU support depends on each native backend feature; fallback must stay explicit in metadata.".to_string()],
         });
         workloads.push(WorkloadExecutionPlan {
@@ -487,7 +505,12 @@ impl HardwareExecutionPlan {
             precision: preferred_precision,
             cpu_threads: cpu_budget,
             batch_size: train_batch_size,
-            memory_budget_gb: memory_budget_gb * 0.55,
+            memory_budget_gb: planned_memory_budget_gb(
+                &profile,
+                primary_backend,
+                0.55,
+                0.80,
+            ),
             notes: vec![format!(
                 "Burn/deep training should use planner policy with effective precision {}.",
                 preferred_precision.as_str()
@@ -495,25 +518,21 @@ impl HardwareExecutionPlan {
         });
         workloads.push(WorkloadExecutionPlan {
             workload: WorkloadKind::RlTraining,
-            backend: if gpu_enabled && !cuda_devices.is_empty() {
-                AcceleratorBackend::Cuda
-            } else {
-                AcceleratorBackend::Cpu
-            },
-            device: if gpu_enabled && !cuda_devices.is_empty() {
+            backend: rl_backend,
+            device: if rl_gpu_enabled {
                 "cuda:0".to_string()
             } else {
                 "cpu".to_string()
             },
-            device_ids: if gpu_enabled && !cuda_devices.is_empty() {
+            device_ids: if rl_gpu_enabled {
                 vec![0]
             } else {
                 Vec::new()
             },
             precision: TrainingPrecision::Fp32,
             cpu_threads: cpu_budget,
-            batch_size: train_batch_size,
-            memory_budget_gb: memory_budget_gb * 0.35,
+            batch_size: if rl_gpu_enabled { train_batch_size } else { 64 },
+            memory_budget_gb: planned_memory_budget_gb(&profile, rl_backend, 0.35, 0.70),
             notes: vec![
                 "RL CUDA remains feature-gated; unavailable CUDA must degrade explicitly to CPU."
                     .to_string(),
@@ -527,7 +546,12 @@ impl HardwareExecutionPlan {
             precision: preferred_precision,
             cpu_threads: cpu_budget.clamp(1, 16),
             batch_size: infer_batch_size,
-            memory_budget_gb: memory_budget_gb * 0.20,
+            memory_budget_gb: planned_memory_budget_gb(
+                &profile,
+                primary_backend,
+                0.20,
+                0.50,
+            ),
             notes: vec![
                 "Inference uses smaller reserved budget so live execution and UI stay responsive."
                     .to_string(),
@@ -541,7 +565,7 @@ impl HardwareExecutionPlan {
             precision: TrainingPrecision::Fp32,
             cpu_threads: 2.min(cpu_budget).max(1),
             batch_size: 0,
-            memory_budget_gb: memory_budget_gb * 0.05,
+            memory_budget_gb: host_memory_budget_gb * 0.05,
             notes: vec!["UI stays message-channel driven and never owns ML/GPU work.".to_string()],
         });
 
@@ -1126,9 +1150,7 @@ impl HardwareProfile {
     pub fn wgpu_capable_devices(&self) -> Vec<&AcceleratorDevice> {
         self.accelerator_devices
             .iter()
-            .filter(|device| {
-                device.backend.is_wgpu_family() || device.backend == AcceleratorBackend::Rocm
-            })
+            .filter(|device| device.backend.is_wgpu_family())
             .collect()
     }
 
@@ -1361,6 +1383,36 @@ fn min_gpu_memory_gb(profile: &HardwareProfile) -> f64 {
     if min_vram.is_finite() { min_vram } else { 0.0 }
 }
 
+fn planned_memory_budget_gb(
+    profile: &HardwareProfile,
+    backend: AcceleratorBackend,
+    host_fraction: f64,
+    gpu_fraction: f64,
+) -> f64 {
+    if !backend.is_gpu() {
+        return profile.available_ram_gb.max(1.0) * host_fraction.clamp(0.0, 1.0);
+    }
+
+    let devices = profile.devices_for_planned_backend(backend);
+    let min_dedicated_gb = devices
+        .iter()
+        .map(|device| device.memory_gb)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let capacity_gb = if min_dedicated_gb.is_finite() {
+        min_dedicated_gb
+    } else if backend.is_wgpu_family() && !devices.is_empty() {
+        // wgpu intentionally does not report dedicated VRAM. This is an
+        // allocation allowance derived from currently available shared host
+        // memory, not a claim about physical VRAM capacity.
+        (profile.available_ram_gb.max(1.0) * 0.25).clamp(1.0, 8.0)
+    } else {
+        0.0
+    };
+
+    capacity_gb * gpu_fraction.clamp(0.0, 1.0)
+}
+
 fn training_batch_size(enable_gpu: bool, min_vram_gb: f64) -> usize {
     if !enable_gpu {
         return 64;
@@ -1533,6 +1585,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gpu_memory_budget_is_derived_from_device_memory_not_host_ram() {
+        let mut settings = Settings::default();
+        settings.system.enable_gpu_preference = "cuda".to_string();
+        settings.models.prop_search_device = "auto".to_string();
+        let plan = HardwareExecutionPlan::from_settings_and_profile(&settings, profile(1, 8.0));
+
+        for kind in [
+            WorkloadKind::StrategySearch,
+            WorkloadKind::DeepTraining,
+            WorkloadKind::Inference,
+        ] {
+            let gpu_budget = plan
+                .workload_assignment(kind)
+                .and_then(|assignment| assignment.gpu_budget)
+                .expect("GPU workload should expose a GPU budget");
+            assert!(
+                gpu_budget.memory_budget_gb <= 8.0,
+                "{kind:?} advertised {:.1} GB against an 8 GB device",
+                gpu_budget.memory_budget_gb
+            );
+        }
+    }
+
     #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn hardware_plan_assigns_integrated_wgpu_to_strategy_search() {
@@ -1570,6 +1646,11 @@ mod tests {
         assert_eq!(search.backend, AcceleratorBackend::Wgpu);
         assert_eq!(search.device, "vulkan:integrated:0");
         assert_eq!(search.device_ids, vec![0]);
+        assert_eq!(search.memory_budget_gb, 4.0);
+        assert!(
+            search.memory_budget_gb < 20.0,
+            "shared-memory allowance must remain below available host RAM"
+        );
         assert!(search.runtime_degraded_reason().is_none());
     }
 

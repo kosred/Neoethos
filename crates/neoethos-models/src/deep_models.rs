@@ -360,6 +360,8 @@ impl BurnDeepExpert {
                 | "wgpu_cpu"
                 | "wgpu_default"
                 | "wgpu_discrete_gpu"
+                | "wgpu_integrated_gpu"
+                | "wgpu_virtual_gpu"
                 // Native Burn CUDA backend (gpu-cuda build): neural models train
                 // on the card. `resolve_cuda_device_policy` reports "cuda".
                 | "cuda"
@@ -1832,6 +1834,27 @@ mod tests {
         let err = BurnDeepExpert::validate_runtime_params(&params)
             .expect_err("unknown execution backend should fail");
         assert!(err.to_string().contains("unsupported backend"));
+    }
+
+    #[test]
+    fn validate_runtime_params_accepts_integrated_wgpu_provenance() {
+        let params = HashMap::from([
+            (
+                "requested_device_policy".to_string(),
+                "gpu:integrated:0".to_string(),
+            ),
+            (
+                "effective_device_policy".to_string(),
+                "gpu:integrated:0".to_string(),
+            ),
+            (
+                "execution_backend".to_string(),
+                "wgpu_integrated_gpu".to_string(),
+            ),
+        ]);
+
+        BurnDeepExpert::validate_runtime_params(&params)
+            .expect("integrated WGPU runtime provenance should round-trip");
     }
 
     #[test]

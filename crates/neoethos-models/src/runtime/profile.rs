@@ -33,6 +33,12 @@ pub struct TrainingRuntimeProfile {
     pub planned_backend: Option<String>,
     pub planned_device: Option<String>,
     pub planned_precision: Option<String>,
+    #[serde(default)]
+    pub planned_cpu_threads: Option<usize>,
+    #[serde(default)]
+    pub planned_batch_size: Option<usize>,
+    #[serde(default)]
+    pub planned_memory_budget_gb: Option<f64>,
     pub checkpoint_path: Option<PathBuf>,
     pub async_requested: bool,
     pub async_wait_requested: bool,
@@ -124,6 +130,20 @@ fn validate_training_runtime_profile(profile: &TrainingRuntimeProfile) -> Result
             anyhow::bail!("training runtime profile {field_name} must not be blank");
         }
     }
+    if profile.planned_cpu_threads == Some(0) {
+        anyhow::bail!("training runtime profile planned_cpu_threads must be positive when set");
+    }
+    if profile.planned_batch_size == Some(0) {
+        anyhow::bail!("training runtime profile planned_batch_size must be positive when set");
+    }
+    if profile
+        .planned_memory_budget_gb
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        anyhow::bail!(
+            "training runtime profile planned_memory_budget_gb must be finite and non-negative when set"
+        );
+    }
     Ok(())
 }
 
@@ -198,6 +218,9 @@ mod tests {
             planned_backend: Some("cuda".to_string()),
             planned_device: Some("cuda:0".to_string()),
             planned_precision: Some("fp32".to_string()),
+            planned_cpu_threads: Some(8),
+            planned_batch_size: Some(256),
+            planned_memory_budget_gb: Some(6.4),
             checkpoint_path: None,
             async_requested: false,
             async_wait_requested: false,
