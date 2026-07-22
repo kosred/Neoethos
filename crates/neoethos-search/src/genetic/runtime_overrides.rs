@@ -795,6 +795,23 @@ pub fn current_genetic_search_runtime_overrides() -> GeneticSearchRuntimeOverrid
         .unwrap_or_default()
 }
 
+/// Whether the SMC gate is bypassed — the ONE field the per-gene signal-synth
+/// hot path needs.
+///
+/// Perf (2026-07-22): the per-gene synthesis read this via
+/// `current_genetic_search_runtime_overrides()`, which CLONES the whole
+/// overrides struct — and that struct owns a `String` (`archive_scoring.mode`),
+/// so every gene evaluation heap-allocated a String just to read one bool. In a
+/// GA run that is population × generations allocations per combo (e.g.
+/// 200 × 450 = 90k), pure churn on the hottest CPU path. This borrows the
+/// installed value and copies out only the bool — no allocation.
+pub fn smc_gate_disabled() -> bool {
+    GENETIC_SEARCH_RUNTIME_OVERRIDES
+        .get()
+        .map(|o| o.smc_gate.disable_gate)
+        .unwrap_or_else(|| SmcGateOverrides::default().disable_gate)
+}
+
 /// Convenience accessor returning the canonical
 /// [`neoethos_core::contracts::DeterminismPolicy`] derived from the
 /// installed genetic-search runtime overrides. Production callers can
@@ -807,6 +824,22 @@ pub fn current_determinism_policy() -> DeterminismPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smc_gate_disabled_matches_the_full_accessor() {
+        // The lean per-gene accessor must return exactly what reading the field
+        // off the full (cloned) struct would — it only skips the allocation.
+        assert_eq!(
+            smc_gate_disabled(),
+            current_genetic_search_runtime_overrides().smc_gate.disable_gate,
+        );
+        // And with nothing installed it falls back to the default, same as the
+        // full path's `unwrap_or_default`.
+        assert_eq!(
+            smc_gate_disabled(),
+            GeneticSearchRuntimeOverrides::default().smc_gate.disable_gate,
+        );
+    }
 
     #[test]
     fn defaults_match_legacy_env_defaults() {

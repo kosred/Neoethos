@@ -1519,9 +1519,9 @@ fn synthesize_signals_and_confidence_cpu(
     // population × generations env reads per discovery run). Now
     // resolved through the typed `SmcGateOverrides::disable_gate`
     // boundary so the env is hit at most once per process.
-    let smc_bypass = crate::genetic::current_genetic_search_runtime_overrides()
-        .smc_gate
-        .disable_gate;
+    // Perf: read ONLY the bool — cloning the whole overrides struct here
+    // heap-allocated a String per gene (see `smc_gate_disabled`).
+    let smc_bypass = crate::genetic::smc_gate_disabled();
     let active_sum = if smc_bypass { 0.0 } else { active_sum };
     let gate = gate_threshold.min(active_sum);
 

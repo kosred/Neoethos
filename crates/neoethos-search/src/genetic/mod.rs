@@ -45,7 +45,7 @@ pub use runtime_overrides::{
     install_genetic_search_runtime_overrides_from_settings,
     install_strategy_evaluation_runtime_overrides,
     install_strategy_evaluation_runtime_overrides_from_env,
-    install_strategy_evaluation_runtime_overrides_from_settings,
+    install_strategy_evaluation_runtime_overrides_from_settings, smc_gate_disabled,
 };
 pub use search_engine::{
     WalkforwardPopulationGenePack, evaluate_genes, evolve_search, evolve_search_with_progress,

@@ -308,9 +308,9 @@ pub fn signals_and_confidence_for_gene_full(
     // through the typed `SmcGateOverrides::disable_gate` boundary so
     // the env is hit at most once per process (in
     // `GeneticSearchRuntimeOverrides::from_env`).
-    let smc_bypass = super::runtime_overrides::current_genetic_search_runtime_overrides()
-        .smc_gate
-        .disable_gate;
+    // Perf: only the bool is needed; the full-struct clone allocated a String
+    // per gene (see `smc_gate_disabled`).
+    let smc_bypass = super::runtime_overrides::smc_gate_disabled();
     let active_sum = if smc_bypass { 0.0 } else { active_sum };
     let gate = config.smc_gate_threshold.min(active_sum);
 
