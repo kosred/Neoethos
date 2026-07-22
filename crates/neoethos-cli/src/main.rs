@@ -11,7 +11,11 @@ fn main() -> Result<()> {
     // Config-consolidation: search runtime overrides come from the single
     // config (canonical user config.yaml), not the environment. Falls back
     // to defaults if it can't be loaded. (S2a: genetic search; rest staged.)
-    let startup_settings = neoethos_core::Settings::load().unwrap_or_default();
+    let mut startup_settings = neoethos_core::Settings::load().unwrap_or_default();
+    let process_cpu_assignment = std::env::var("NEOETHOS_BOT_CPU_BUDGET")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    startup_settings.apply_process_cpu_assignment(process_cpu_assignment);
     neoethos_search::install_search_runtime_overrides_from_settings(&startup_settings);
     neoethos_models::tree_models::config::install_tree_runtime_from_settings(&startup_settings);
     neoethos_core::system::install_hardware_runtime_overrides_from_settings(&startup_settings);
@@ -1375,22 +1379,21 @@ fn cmd_config(args: &[String]) -> Result<()> {
 ///
 /// Persists checkpoint to cache/auto_loop_checkpoint.json — on crash,
 /// re-run with --resume to continue.
-/// Multi-GPU / hybrid scheduler driver (Stage 1).
+/// Multi-GPU / hybrid scheduler driver.
 ///
 /// Enumerates symbol×TF combos, asks `scheduler::plan_combo` how each should be
-/// admitted, then runs the schedulable (single-card / CPU) combos across all
-/// cards concurrently — each as a subprocess `discover` pinned to a card via
-/// `NEOETHOS_BOT_SEARCH_EVAL_{WGPU,CUDA}_DEVICE`. Combos that need the GA
-/// population SHARDED across >1 card are DEFERRED to Stage 2 (intra-combo
-/// multi-GPU) and reported, never silently dropped. Training co-scheduling on
-/// separate cards is Stage 3.
+/// admitted, then runs single-card / CPU combos across all cards concurrently —
+/// each as a subprocess `discover` pinned via
+/// `NEOETHOS_BOT_SEARCH_EVAL_{WGPU,CUDA}_DEVICE`. Oversized populations are
+/// reported as requiring single-device chunking; they are never described as
+/// cross-card shards that the worker does not execute.
 ///
 /// `--dry-run` prints the full admission plan WITHOUT spawning — the way to
 /// validate the decisions against a real hardware probe + real on-disk data
 /// sizes (works on any machine, no GPU needed).
 fn cmd_schedule(args: &[String]) -> Result<()> {
     use neoethos_core::scheduler::{
-        plan_combo, AdmissionPolicy, ComboAdmissionPlan, ComboItem, ComboShape, WorkScheduler,
+        plan_combo, AdmissionPolicy, ComboItem, ComboShape, WorkScheduler,
     };
 
     let settings = resolve_cli_settings(args)?.unwrap_or_else(neoethos_core::Settings::default);
@@ -1442,15 +1445,12 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
         hw.gpu_mem_gb
     );
 
-    // Build admission plans, partitioning schedulable (<=1 card) from the
-    // sharding-heavy combos deferred to Stage 2.
+    // Build admission plans for the runtime's actual one-device-per-worker
+    // contract. Oversized populations remain schedulable only because the
+    // evaluator chunks them on that same device.
     let mut id_combo: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     let mut schedulable: Vec<ComboItem> = Vec::new();
-    // With Stage 2 (population sharding) landed, multi-card heavy combos are no
-    // longer deferred — the GA shards across all their cards. `deferred` is kept
-    // (empty) so the reporting/--resume shape is unchanged.
-    let deferred: Vec<(String, ComboAdmissionPlan)> = Vec::new();
     for sym in &symbols {
         for tf in &tfs {
             let id = format!("{sym}/{tf}");
@@ -1467,9 +1467,8 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
     }
 
     println!(
-        "\n=== Admission plan: {} schedulable, {} deferred-to-Stage2 ===",
-        schedulable.len(),
-        deferred.len()
+        "\n=== Admission plan: {} schedulable ===",
+        schedulable.len()
     );
     for it in &schedulable {
         let tag = if it.plan.cards_per_combo == 0 {
@@ -1480,7 +1479,7 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
             ""
         };
         println!(
-            "  [{:?}] {:<14} rows≈{:>9}  cards={} genes/card={} cpu={} RAM≈{:.1}GB VRAM/card≈{:.1}GB{}",
+            "  [{:?}] {:<14} rows≈{:>9}  assigned_cards={} population/device={} cpu={} RAM≈{:.1}GB VRAM/device≈{:.1}GB{}",
             it.plan.class,
             it.id,
             it.shape.series_rows,
@@ -1492,22 +1491,9 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
             tag
         );
     }
-    for (id, plan) in &deferred {
-        println!(
-            "  [DEFER] {:<14} needs {} cards (population sharding) — Stage 2; RAM≈{:.1}GB",
-            id, plan.cards_per_combo, plan.est_ram_per_combo_gb
-        );
-    }
-
     if dry_run {
         println!("\n--dry-run: plan only, no processes spawned.");
         return Ok(());
-    }
-    if !deferred.is_empty() {
-        println!(
-            "\nNOTE: {} heavy combo(s) need multi-GPU sharding (Stage 2) and are NOT run now.",
-            deferred.len()
-        );
     }
 
     let checkpoint_path = std::path::PathBuf::from("cache").join("schedule_checkpoint.json");
@@ -1549,7 +1535,7 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
                 match spawn_discover_combo(&a, &sym, &tf, &root, &resolved) {
                     Ok(child) => {
                         println!(
-                            "  ▶ {} on cards {:?} ({} genes/card, {} cpu threads)",
+                            "  ▶ {} on cards {:?} (population/device {}, {} cpu threads)",
                             a.id, a.card_ids, a.genes_per_card, a.cpu_threads
                         );
                         children.insert(a.id.clone(), child);
@@ -1609,10 +1595,9 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
     }
 
     println!(
-        "\nSchedule done: {} completed, {} failed, {} deferred-to-Stage2.",
+        "\nSchedule done: {} completed, {} failed.",
         completed.len(),
-        failed.len(),
-        deferred.len()
+        failed.len()
     );
     if !failed.is_empty() {
         println!("  failed: {failed:?}");
@@ -1634,8 +1619,8 @@ fn estimate_series_rows(root: &str, symbol: &str, tf: &str, bytes_per_bar: f64) 
     (bytes / bytes_per_bar.max(1.0)).ceil() as usize
 }
 
-/// Spawn one `discover` subprocess pinned to its assigned card. Stage 1 pins to
-/// a single card (`card_ids[0]`); multi-card sharding is Stage 2.
+/// Spawn one `discover` subprocess pinned to its assigned card. The planner and
+/// worker both use the single-device contract (`card_ids[0]`).
 fn spawn_discover_combo(
     a: &neoethos_core::scheduler::Assignment,
     symbol: &str,
@@ -1660,8 +1645,8 @@ fn spawn_discover_combo(
         .arg(resolved.search.portfolio_size.to_string())
         .arg("--out")
         .arg(format!("cache/schedule/{symbol}_{timeframe}.json"));
-    // NOTE: intra-combo GPU sharding (Stage 2, the plural *_DEVICES env) is
-    // DISABLED at the dispatch layer — the cubecl wgpu multi-device path panics
+    // NOTE: intra-combo GPU sharding (the plural *_DEVICES env) is DISABLED at
+    // the dispatch layer — the cubecl wgpu multi-device path panics
     // at runtime ("Memory page 0 doesn't exist" in cubecl-runtime client.rs) and
     // falls back to slow CPU recompute. Validated 2026-06-07 on the 2×A6000 VPS:
     // M1 ran 58 min on CPU (gen 305/20000, 0 results) before we caught it. Until

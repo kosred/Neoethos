@@ -4,20 +4,18 @@
 //! single combo's workload dimensions, they compute
 //!   1. how many combos of this footprint may run concurrently without
 //!      exceeding host RAM, and
-//!   2. across how many GPUs a single combo's GA population must be sharded so
-//!      that no card exceeds its VRAM.
+//!   2. whether a single combo's full GA population fits the one GPU device
+//!      that the worker process actually uses.
 //!
-//! The whole point is **"never OOM by construction"**: every returned plan is
-//! guaranteed *by the arithmetic* to stay under the usable RAM / VRAM budgets.
-//! The scheduler (Stage 1+) consumes these plans to decide dispatch; this
-//! module owns *only* the memory math, so it is trivially unit-testable with no
-//! hardware present.
+//! The planner reports whether the unchunked workload fits the usable RAM / VRAM
+//! budgets. A false `fits_on_gpu` is an explicit requirement for the worker to
+//! use its bounded single-device chunking path or fall back to CPU; it is never
+//! permission to pretend the work was split across installed cards.
 //!
 //! Decision rule (the operator's design, locked):
-//!   - **Heavy** combo (footprint monopolises RAM) → run alone, shard the GA
-//!     population across **all** cards = max single-combo speed. This is also
-//!     the only RAM-feasible option for the heaviest timeframes (e.g. M1) and
-//!     simultaneously fixes the single-card GPU OOM.
+//!   - **Heavy** combo (footprint monopolises RAM) → run alone on one card and
+//!     chunk its population inside the worker when the full population does
+//!     not fit. CubeCL multi-device clients are not safe in this codebase yet.
 //!   - **Light** combo → pack several concurrently across the cards = throughput.
 
 use crate::system::HardwareProfile;
@@ -75,8 +73,7 @@ pub struct AdmissionPolicy {
     /// fragmentation.
     pub ram_overhead_factor: f64,
     /// A combo is "heavy" when its RAM footprint is `>=` this fraction of usable
-    /// RAM: it then monopolises the box (concurrency 1) and shards across all
-    /// cards.
+    /// RAM: it then monopolises the host RAM budget (concurrency 1).
     pub heavy_ram_fraction: f64,
 }
 
@@ -96,7 +93,7 @@ impl Default for AdmissionPolicy {
 /// How a combo should be scheduled relative to the rest of the box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComboClass {
-    /// Footprint monopolises RAM: run alone, shard population across all cards.
+    /// Footprint monopolises host RAM: run alone on one GPU or the CPU lane.
     Heavy,
     /// Footprint is small: pack several concurrently to fill the box.
     Light,
@@ -109,9 +106,12 @@ pub struct ComboAdmissionPlan {
     /// How many combos of this footprint fit in usable RAM *and* on the cards at
     /// once (always `>= 1`).
     pub max_concurrency: usize,
-    /// GPUs to shard this combo's population across (`0` => CPU-only / no GPU).
+    /// GPU devices assigned to this worker (`0` => CPU-only / no GPU). This is
+    /// currently at most one because a child process pins to one device.
     pub cards_per_combo: usize,
-    /// Population shard size per card (`0` when `cards_per_combo == 0`).
+    /// Full population assigned to the selected card (`0` on the CPU lane).
+    /// When it exceeds the per-device capacity, the evaluator must chunk it on
+    /// that same card; it must never imply unimplemented cross-card sharding.
     pub genes_per_card: usize,
     /// CPU threads to grant each concurrent worker (cores split across the
     /// active workers, never below 1).
@@ -120,8 +120,8 @@ pub struct ComboAdmissionPlan {
     pub est_ram_per_combo_gb: f64,
     /// Estimated VRAM used per card given `genes_per_card`, GB.
     pub est_vram_per_card_gb: f64,
-    /// Whether the population fits across the available cards at the row count.
-    /// `false` => the scheduler must chunk rows or fall back to the CPU lane.
+    /// Whether the full population fits on one selected GPU at the row count.
+    /// `false` => the worker must chunk on that device or use the CPU lane.
     pub fits_on_gpu: bool,
     /// Fail-loud explanations (warnings / decisions) for logging.
     pub notes: Vec<String>,
@@ -151,10 +151,10 @@ pub fn genes_per_card(device_vram_gb: f64, shape: ComboShape, policy: &Admission
 
 /// Conservative VRAM (GB) assumed for a GPU that exists but doesn't report its
 /// memory (common on consumer Vulkan/wgpu adapters, which surface 0). The
-/// per-combo never-OOM auto-tuner (pool trim + gene-chunking) makes every combo
-/// fit any card regardless of size, so the scheduler only needs the card COUNT
-/// to dispatch one combo per card — the value here just has to be non-zero so
-/// `plan_combo` admits the combo instead of bailing.
+/// worker's bounded pool + gene-chunking path can stream oversized populations,
+/// so the scheduler still needs the card COUNT to dispatch one combo per card.
+/// The assumed value is used only to expose that chunking is required; it must
+/// not be treated as measured dedicated VRAM.
 const ASSUMED_VRAM_GB: f64 = 8.0;
 
 /// Per-GPU usable VRAM in GB, one entry per detected card.
@@ -163,8 +163,8 @@ const ASSUMED_VRAM_GB: f64 = 8.0;
 /// VRAM (consumer wgpu/Vulkan adapters surface 0) but GPUs DO exist, fall back
 /// to counting the devices with [`ASSUMED_VRAM_GB`] each — otherwise a consumer
 /// multi-GPU box would be seen as "0 cards" and run everything sequentially.
-/// Since the never-OOM work bounds every combo to fit any card, the scheduler
-/// only needs the count, not the exact size.
+/// The worker-side bounded pool and chunking keep the actual allocation bounded;
+/// this fallback is not a claim about dedicated memory capacity.
 fn gpu_device_vrams(hw: &HardwareProfile) -> Vec<f64> {
     let from_list: Vec<f64> = hw.gpu_mem_gb.iter().copied().filter(|m| *m > 0.0).collect();
     if !from_list.is_empty() {
@@ -185,16 +185,13 @@ fn gpu_device_vrams(hw: &HardwareProfile) -> Vec<f64> {
     vec![ASSUMED_VRAM_GB; device_count]
 }
 
-fn ceil_div(a: usize, b: usize) -> usize {
-    if b == 0 { 0 } else { a.div_ceil(b) }
-}
-
 fn cpu_threads_per_worker(cores: usize, active_workers: usize) -> usize {
     (cores / active_workers.max(1)).max(1)
 }
 
 /// Plan how a single combo should be admitted against `hw`, guaranteeing the
-/// returned shard sizes never exceed the usable RAM / VRAM budgets.
+/// returned single-device workload description exposes when chunking is needed
+/// to stay inside usable RAM / VRAM budgets.
 pub fn plan_combo(
     shape: ComboShape,
     hw: &HardwareProfile,
@@ -220,7 +217,7 @@ pub fn plan_combo(
         ));
     }
 
-    // --- GPU side: count cards, size shards ---------------------------------
+    // --- GPU side: count cards, size one-device work -------------------------
     let gpu_vrams = gpu_device_vrams(hw);
     let num_gpus = gpu_vrams.len();
     let per_gene_gb = vram_per_gene_bytes(shape, policy) as f64 / BYTES_PER_GB;
@@ -241,7 +238,8 @@ pub fn plan_combo(
         };
     }
 
-    // Size shards against the SMALLEST card so an even split is safe everywhere.
+    // A worker is pinned to one card. Size the full assigned population against
+    // the smallest selectable card so every logical slot has a safe contract.
     let min_vram = gpu_vrams.iter().copied().fold(f64::INFINITY, f64::min);
     let per_card_cap = genes_per_card(min_vram, shape, policy);
 
@@ -264,27 +262,18 @@ pub fn plan_combo(
         };
     }
 
-    let cards_needed = ceil_div(shape.population, per_card_cap).max(1);
-
-    let (cards_per_combo, max_concurrency) = if heavy {
-        // Heavy: throw all cards at this one combo (never more than there are
-        // genes), and run nothing else alongside it.
-        let cards = num_gpus.min(shape.population.max(1));
-        (cards, 1)
+    let cards_per_combo = 1;
+    let max_concurrency = if heavy {
+        1
     } else {
-        // Light: use the fewest cards that fit, then pack as many such combos as
-        // the cards and RAM allow.
-        let cards = cards_needed.min(num_gpus);
-        let gpu_bound = (num_gpus / cards.max(1)).max(1);
-        (cards, max_concurrency_ram.min(gpu_bound).max(1))
+        max_concurrency_ram.min(num_gpus).max(1)
     };
-
-    let genes = ceil_div(shape.population, cards_per_combo.max(1));
+    let genes = shape.population;
     let fits_on_gpu = genes <= per_card_cap;
     if !fits_on_gpu {
         notes.push(format!(
-            "population {} over {} cards = {} genes/card > cap {} — reduce population or chunk rows",
-            shape.population, cards_per_combo, genes, per_card_cap
+            "population {} must run on one card but exceeds its cap of {} genes — chunk on one card or use CPU",
+            shape.population, per_card_cap
         ));
     }
     let est_vram_per_card_gb = genes as f64 * per_gene_gb;
@@ -357,10 +346,9 @@ struct RunningItem {
 ///
 /// Multi-card scaling is **combo-level**: each combo runs on ONE card and many
 /// combos run concurrently, one per card, bounded by free cards + usable RAM.
-/// (Intra-combo GPU sharding — splitting one combo across several cards — is
-/// disabled because cubecl wgpu cannot drive multiple device contexts
-/// concurrently in one process; the per-combo sharding math in `plan_combo`
-/// stays for a future cubecl fix but the scheduler dispatches one card each.)
+/// Intra-combo GPU sharding is disabled because CubeCL WGPU cannot safely drive
+/// the project's multiple device contexts concurrently in one process. The
+/// admission plan and dispatch contract therefore both assign one card.
 /// On a many-card, big-RAM box this fills every card with a different combo.
 ///
 /// Invariants:
@@ -537,20 +525,35 @@ mod tests {
     }
 
     #[test]
-    fn heavy_m1_shards_across_all_cards_and_fits() {
+    fn heavy_m1_uses_one_card_and_requires_chunking() {
         let p = AdmissionPolicy::default();
-        // ~74GB cube => heavy on a 116GB box; pop 4000 over 8×48GB cards.
+        // ~74GB cube => heavy on a 116GB box. The installed card count must not
+        // make the single-device worker appear to fit without chunking.
         let shape = ComboShape::new(5_000_000, 4000, 2000);
         let plan = plan_combo(shape, &hw(60, 116.0, &[48.0; 8]), &p);
         assert_eq!(plan.class, ComboClass::Heavy);
         assert_eq!(plan.max_concurrency, 1, "heavy monopolises the box");
-        assert_eq!(plan.cards_per_combo, 8, "all cards on the one heavy combo");
-        assert_eq!(plan.genes_per_card, 500);
-        assert!(plan.fits_on_gpu);
-        // Never exceeds the usable VRAM budget on a 48GB card.
-        assert!(plan.est_vram_per_card_gb <= 48.0 * p.vram_usable_fraction);
+        assert_eq!(plan.cards_per_combo, 1);
+        assert_eq!(plan.genes_per_card, 4000);
+        assert!(!plan.fits_on_gpu);
+        assert!(plan.est_vram_per_card_gb > 48.0 * p.vram_usable_fraction);
         // Heavy => the single worker gets all cores.
         assert_eq!(plan.cpu_threads_per_worker, 60);
+    }
+
+    #[test]
+    fn single_device_worker_plan_does_not_divide_population_across_installed_cards() {
+        let p = AdmissionPolicy::default();
+        // The runtime pins each combo to exactly one card. A population that
+        // would fit only after division by eight must therefore be rejected,
+        // not advertised as an eight-way shard that the child never executes.
+        let shape = ComboShape::new(5_000_000, 4000, 2000);
+        let plan = plan_combo(shape, &hw(60, 116.0, &[48.0; 8]), &p);
+
+        assert_eq!(plan.cards_per_combo, 1);
+        assert_eq!(plan.genes_per_card, shape.population);
+        assert!(!plan.fits_on_gpu);
+        assert!(plan.notes.iter().any(|note| note.contains("one card")));
     }
 
     #[test]

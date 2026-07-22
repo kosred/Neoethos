@@ -1209,6 +1209,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn process_cpu_assignment_overrides_persistent_setting() {
+        let mut settings = crate::config::Settings::default();
+        settings.system.hardware.cpu_budget = Some(12);
+        settings.models.backtest_runtime.rayon_threads = Some(12);
+
+        settings.apply_process_cpu_assignment(Some(3));
+
+        assert_eq!(settings.system.hardware.cpu_budget, Some(3));
+        assert_eq!(settings.models.backtest_runtime.rayon_threads, Some(3));
+    }
+
     fn profile(gpus: usize, vram_gb: f64) -> HardwareProfile {
         HardwareProfile {
             schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,

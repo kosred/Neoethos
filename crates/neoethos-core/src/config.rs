@@ -1815,6 +1815,18 @@ pub fn user_config_path() -> PathBuf {
 }
 
 impl Settings {
+    /// Apply an ephemeral CPU share assigned by a parent scheduler before any
+    /// process-wide thread pool or hardware policy is initialized. This keeps
+    /// the core/model budget and the search evaluator's Rayon pool aligned.
+    /// `None` (or zero) preserves the operator's persistent configuration.
+    pub fn apply_process_cpu_assignment(&mut self, assignment: Option<usize>) {
+        let Some(threads) = assignment.filter(|threads| *threads > 0) else {
+            return;
+        };
+        self.system.hardware.cpu_budget = Some(threads);
+        self.models.backtest_runtime.rayon_threads = Some(threads);
+    }
+
     /// Load settings from YAML config file
     pub fn from_yaml(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;

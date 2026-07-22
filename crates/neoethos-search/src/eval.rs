@@ -1699,8 +1699,9 @@ mod hybrid_split {
 
 /// GPU device ids the scheduler pinned for THIS process, from the plural
 /// `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES` (or CUDA twin), e.g. "0,1,2,3".
-/// Empty when unset (single-device behaviour is preserved). The Stage-1
-/// scheduler sets this for a heavy combo so the GA shards across all its cards.
+/// Empty when unset (the supported scheduler path). The scheduler deliberately
+/// does not set this plural override because the current CubeCL multi-device
+/// path is unstable; it remains an experimental/manual override only.
 #[cfg(feature = "gpu")]
 fn eval_gpu_devices() -> Vec<usize> {
     std::env::var("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES")
@@ -1814,13 +1815,12 @@ pub fn evaluate_population_core(
             let devices = eval_gpu_devices();
             let gpu_count = hybrid_split::gpu_count(n_genes);
             if gpu_count > 0 && gpu_count < n_genes {
-                // ── Multi-GPU sharding (Stage 2) ─────────────────────────
-                // When the scheduler pins >1 card (NEOETHOS_BOT_SEARCH_EVAL_
-                // WGPU_DEVICES=0,1,..), shard the GPU-assigned prefix across the
-                // cards: one thread + one device client per lane, the CPU lane
-                // takes the remainder, gathered back in gene order. Genes beyond
-                // the per-card VRAM cap stay on the CPU lane (never dropped —
-                // see lane_partition::placed_genes).
+                // ── Experimental multi-GPU sharding ──────────────────────
+                // A manual plural-device override shards the GPU-assigned prefix
+                // across cards. The production scheduler does not enable this
+                // path until CubeCL multi-device client isolation is proven.
+                // Genes beyond the optional cap stay on the CPU lane and are
+                // never dropped (see lane_partition::placed_genes).
                 if devices.len() > 1 {
                     let cap = eval_genes_per_card_cap();
                     let lanes = crate::lane_partition::partition_gpu_lanes(
