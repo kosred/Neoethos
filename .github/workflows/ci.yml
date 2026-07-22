@@ -241,6 +241,11 @@ jobs:
           restore-keys: windows-workspace-ci-
       - name: Cargo check workspace without default features
         run: cargo check --workspace --all-targets --no-default-features
+      # Compile the WGPU path on every Windows dispatch even when the runner has
+      # no physical GPU. This catches WinRT/D3D12 dependency-family drift before
+      # it reaches a release or an optional self-hosted GPU parity job.
+      - name: Cargo check Windows WGPU path
+        run: cargo check -p neoethos-search --features gpu-vulkan --locked
 
   workspace-macos:
     name: Workspace check (macOS)

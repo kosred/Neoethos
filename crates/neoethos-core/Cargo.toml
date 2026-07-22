@@ -61,9 +61,11 @@ toml = "0.8.20"
 #   - `Win32_Foundation` — required by the WindowsAndMessaging types
 # `Win32_UI_Input_KeyboardAndMouse` was the only feature truly orphaned
 # by the F-101 deletion.
-windows = { version = "0.62.1", features = [
+# Keep this exact pin aligned with wgpu-hal 29.0.3's gpu-allocator 0.28.0.
+# gpu-allocator's Windows constraint ends at 0.62.0; allowing Cargo to select
+# 0.62.1+ gives wgpu-hal two incompatible WinRT/D3D12 type families.
+windows = { version = "=0.62.0", features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
 ] }
-
