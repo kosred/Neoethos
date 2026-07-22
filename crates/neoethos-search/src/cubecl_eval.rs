@@ -2678,23 +2678,289 @@ fn copy_window_into_persistent<T: CubePrimitive>(
     }
 }
 
-/// Opt-in (default OFF) GPU signal→backtest FUSION. When set, the eval keeps
-/// each gene-batch's synthesized signals RESIDENT in VRAM and feeds them
-/// straight to the backtest kernel — eliminating the genes×samples signal
-/// readback (measured 688ms on the A6000, vs a 0.09ms kernel) and the matching
-/// re-upload. Default-off until A6000 byte-parity is proven, because this is
-/// the hottest real-money path. **2026-06-10, task #39.**
-fn cuda_eval_fused_enabled() -> bool {
+/// Build a tiny deterministic combo and run BOTH the windowed host path and the
+/// fused VRAM-resident path on `client`, returning `true` iff every per-gene
+/// output buffer is bit-for-bit identical AND the combo produced real
+/// (non-trivial) signals. This is the EXACT check the
+/// [`fused_parity_tests::fused_path_is_byte_identical_to_windowed_path`] test
+/// asserts, factored out so the discovery startup gate can self-verify the fast
+/// path on the actual card before enabling it — the fast path never turns on
+/// where it is not provably safe. A trivial combo (no signals) can't prove
+/// parity and returns `false`. Every bit mismatch is logged (which buffer) so a
+/// future divergence is diagnosable from the discovery log alone.
+///
+/// `FUSED_TEST_NSAMPLES` forces the MULTI-window accumulator path (e.g. 200000 +
+/// a tiny `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB=1` cap → many signal windows); the
+/// default 300 is a single window that runs in well under a second.
+///
+/// Why the fast (default) single-window probe is a COMPLETE card/driver gate:
+/// windowing partitions a *map* (per-sample signal synth, each sample
+/// independent), not a *reduce* — it re-runs the SAME synth kernel on sub-ranges
+/// and stitches the results with bit-exact integer memcpys, adding no new
+/// floating-point op. So a card that is byte-identical single-window is
+/// byte-identical multi-window; the probe only needs to catch a card/driver
+/// where the fused KERNELS themselves diverge (precision/rounding), which shows
+/// up in one window. The multi-window accumulator keeps its own coverage via the
+/// `FUSED_TEST_NSAMPLES` knob and the `gpu_population_eval_matches_cpu_heavy_rows`
+/// parity test.
+#[cfg(feature = "gpu")]
+fn fused_path_parity_holds<R: Runtime>(client: &ComputeClient<R>) -> Result<bool> {
+    let n_samples: usize = std::env::var("FUSED_TEST_NSAMPLES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(300);
+    let n_genes = 3usize;
+    let n_indicators = 2usize;
+
+    let close: Vec<f64> = (0..n_samples)
+        .map(|i| 1.10 + 0.005 * (i as f64 * 0.1).sin())
+        .collect();
+    // WIDE intrabar range (±60 pips) so a fixed SL/TP is hit intrabar and the
+    // position actually CLOSES (trade_count increments on close).
+    let high: Vec<f64> = close.iter().map(|c| c + 0.006).collect();
+    let low: Vec<f64> = close.iter().map(|c| c - 0.006).collect();
+
+    // STRONG ±5 square-wave indicators (indicator-major flat) → clean alternating
+    // signal with transitions every 30/45 bars so the backtest opens/closes real
+    // trades (the meaningfulness guard below).
+    let mut ind_flat = Vec::with_capacity(n_indicators * n_samples);
+    ind_flat.extend((0..n_samples).map(|i| if (i / 30) % 2 == 0 { 5.0f32 } else { -5.0 }));
+    ind_flat.extend((0..n_samples).map(|i| if (i / 45) % 2 == 0 { 5.0f32 } else { -5.0 }));
+    let indicators = ndarray::Array2::from_shape_vec((n_indicators, n_samples), ind_flat)
+        .map_err(|e| anyhow::anyhow!("fused parity probe: indicator shape error: {e}"))?;
+
+    // CSR genes: g0→ind0, g1→ind1, g2→0.5·ind0+0.5·ind1.
+    let gene_offsets: Vec<i32> = vec![0, 1, 2, 4];
+    let gene_indices: Vec<i32> = vec![0, 1, 0, 1];
+    let gene_weights: Vec<f32> = vec![1.0, 1.0, 0.5, 0.5];
+    let long_thr: Vec<f32> = vec![0.5, 0.5, 0.5];
+    let short_thr: Vec<f32> = vec![-0.5, -0.5, -0.5];
+
+    let timestamps: Vec<i64> = (0..n_samples)
+        .map(|i| 1_600_000_000_000 + i as i64 * 3_600_000)
+        .collect();
+    let month_div = (n_samples / 4).max(1) as i64;
+    let day_div = (n_samples / 60).max(1) as i64;
+    let month_idx: Vec<i64> = (0..n_samples).map(|i| i as i64 / month_div).collect();
+    let day_idx: Vec<i64> = (0..n_samples).map(|i| i as i64 / day_div).collect();
+    let sl_pips: Vec<f64> = vec![20.0, 15.0, 30.0];
+    let tp_pips: Vec<f64> = vec![40.0, 30.0, 60.0];
+    let smc_data: Vec<SmcRow> = vec![[0i8; SMC_WIDTH]; n_samples];
+    let gene_smc_flags: Vec<SmcRow> = vec![[0i8; SMC_WIDTH]; n_genes];
+    let gate_threshold = 0.0f32;
+    let smc_weights = [0.0f32; SMC_WIDTH];
+    // Fixed 1-lot sizing — matches the production gate (the backtest core gets no
+    // confidences) so the synthetic combo actually opens trades.
+    let mut settings = BacktestSettings::default();
+    settings.risk_based_sizing = false;
+    settings.min_hold_bars = 0;
+    settings.max_hold_bars = 3;
+    let month_capacity = settings.month_capacity();
+
+    // ── WINDOWED path: synth signals to host, then backtest (re-upload). ──
+    let (sig, conf) = try_generate_signal_flat_cuda(
+        indicators.view(),
+        &gene_offsets,
+        &gene_indices,
+        &gene_weights,
+        &long_thr,
+        &short_thr,
+        &smc_data,
+        &gene_smc_flags,
+        gate_threshold,
+        &smc_weights,
+        None,
+    )?;
+
+    let close_pips = normalize_prices_to_pips(&close, settings.pip_value);
+    let high_pips = normalize_prices_to_pips(&high, settings.pip_value);
+    let low_pips = normalize_prices_to_pips(&low, settings.pip_value);
+    let (ts_deltas, use_ts) = timestamp_delta_ms(&timestamps, n_samples);
+    let month_i32: Vec<i32> = month_idx.iter().map(|v| saturating_i32(*v)).collect();
+    let day_i32: Vec<i32> = day_idx.iter().map(|v| saturating_i32(*v)).collect();
+    let sl_f32: Vec<f32> = sl_pips.iter().map(|v| *v as f32).collect();
+    let tp_f32: Vec<f32> = tp_pips.iter().map(|v| *v as f32).collect();
+
+    let (mw, tcw, mow, mcw, msew, _ftmo_w) = launch_backtest_kernel(
+        client,
+        0,
+        &close_pips,
+        &high_pips,
+        &low_pips,
+        &sig,
+        &conf,
+        &ts_deltas,
+        use_ts,
+        &month_i32,
+        &day_i32,
+        &sl_f32,
+        &tp_f32,
+        &settings,
+        month_capacity,
+    )?;
+
+    // ── FUSED path: signals stay in VRAM, fed straight to the backtest. ──
+    let indicators_f32: Vec<f32> = indicators.iter().copied().collect();
+    let smc_flat = flatten_i32_rows(&smc_data);
+    let flags_flat = flatten_i32_flags(&gene_smc_flags);
+    let (mf, tcf, mof, mcf, msef, _ftmo_f) = fused_eval_batch_dispatch(
+        client,
+        &indicators_f32,
+        n_indicators,
+        &gene_offsets,
+        &gene_indices,
+        &gene_weights,
+        &long_thr,
+        &short_thr,
+        &smc_flat,
+        &flags_flat,
+        &smc_weights,
+        gate_threshold,
+        &close_pips,
+        &high_pips,
+        &low_pips,
+        &ts_deltas,
+        use_ts,
+        &month_i32,
+        &day_i32,
+        &sl_f32,
+        &tp_f32,
+        &settings,
+        month_capacity,
+        n_genes,
+        n_samples,
+    )?;
+
+    // BIT-for-bit equality: compare raw bit patterns (not `==`) so a legitimately
+    // equal NaN (same bits, produced identically by both paths) counts as equal.
+    fn bits_eq(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+    let sig_nonzero = sig.iter().filter(|s| **s != 0).count();
+    let mut ok = true;
+    if !bits_eq(&mw, &mf) {
+        tracing::warn!(target: "neoethos_search::cubecl_eval", "fused parity probe: metrics_flat mismatch");
+        ok = false;
+    }
+    if tcw != tcf {
+        tracing::warn!(target: "neoethos_search::cubecl_eval", "fused parity probe: trade_counts mismatch");
+        ok = false;
+    }
+    if !bits_eq(&mow, &mof) {
+        tracing::warn!(target: "neoethos_search::cubecl_eval", "fused parity probe: monthly_flat mismatch");
+        ok = false;
+    }
+    if mcw != mcf {
+        tracing::warn!(target: "neoethos_search::cubecl_eval", "fused parity probe: month_counts mismatch");
+        ok = false;
+    }
+    if !bits_eq(&msew, &msef) {
+        tracing::warn!(target: "neoethos_search::cubecl_eval", "fused parity probe: month_start_eq_flat mismatch");
+        ok = false;
+    }
+    // Meaningfulness guard: a combo that produced no signals can't prove parity.
+    if sig_nonzero == 0 {
+        tracing::warn!(target: "neoethos_search::cubecl_eval", "fused parity probe: synthetic combo produced no signals — parity not established");
+        ok = false;
+    }
+    tracing::info!(
+        target: "neoethos_search::cubecl_eval",
+        signals_nonzero = sig_nonzero,
+        n_samples,
+        byte_identical = ok,
+        "fused VRAM-resident parity probe complete"
+    );
+    Ok(ok)
+}
+
+/// Whether the fused VRAM-resident eval is active for this process. The fast
+/// path keeps the genes×samples signal matrix on the GPU — eliminating the
+/// signal readback (measured 688ms on the A6000, vs a 0.09ms kernel) and the
+/// matching re-upload — so the win is largest on DENSE timeframes (M1/M5, the
+/// most bars) and discrete cards. Resolution order:
+///   1. explicit `NEOETHOS_GPU_FUSED_EVAL` (`1`/`true`/`on` or `0`/`false`/`off`)
+///      — operator override, wins in either direction, skips the probe;
+///   2. otherwise AUTO — run the byte-parity self-check on THIS machine's GPU and
+///      enable iff the fused path is bit-for-bit identical to the proven windowed
+///      path. Any mismatch / error / panic keeps the windowed path (fail-safe;
+///      parity is sacred on the real-money path).
+///
+/// Was default-OFF behind a hidden env var (task #39, 2026-06-10). Made
+/// self-enabling 2026-07-22 per the operator directive "anything that can give
+/// acceleration must happen automatically" — the probe reuses the same check the
+/// parity test asserts, so the fast path turns itself on wherever it is proven
+/// safe (e.g. the A6000) with zero tuning. Memoised: the probe runs once.
+fn fused_eval_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("NEOETHOS_GPU_FUSED_EVAL")
-            .ok()
-            .map(|v| {
-                let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-            })
-            .unwrap_or(false)
-    })
+    *ENABLED.get_or_init(resolve_fused_eval_enabled)
+}
+
+fn resolve_fused_eval_enabled() -> bool {
+    if let Ok(raw) = std::env::var("NEOETHOS_GPU_FUSED_EVAL") {
+        let v = raw.trim();
+        let on = v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on");
+        let off = v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off");
+        if on || off {
+            tracing::info!(
+                target: "neoethos_search::cubecl_eval",
+                fused_eval = on,
+                "fused VRAM-resident eval set by explicit NEOETHOS_GPU_FUSED_EVAL override"
+            );
+            return on;
+        }
+        tracing::warn!(
+            target: "neoethos_search::cubecl_eval",
+            value = %v,
+            "NEOETHOS_GPU_FUSED_EVAL has an unrecognized value — ignoring it and auto-detecting instead"
+        );
+    }
+    // AUTO: `create_gpu_client` + the kernels can panic on a cubecl pool edge
+    // (#243) — catch it so a probe failure is fail-safe (stay windowed), never a
+    // crashed discovery. `AssertUnwindSafe` because the client/kernels aren't
+    // `UnwindSafe` but nothing observable is left half-mutated on a panic here.
+    let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<bool> {
+        let client = create_gpu_client(None)?;
+        fused_path_parity_holds(&client)
+    }));
+    match probed {
+        Ok(Ok(true)) => {
+            tracing::info!(
+                target: "neoethos_search::cubecl_eval",
+                "fused VRAM-resident eval AUTO-ENABLED — startup parity check is byte-identical to the windowed path on this GPU; dense timeframes now run fully on the card (no host round-trip)"
+            );
+            true
+        }
+        Ok(Ok(false)) => {
+            tracing::warn!(
+                target: "neoethos_search::cubecl_eval",
+                "fused VRAM-resident eval left OFF — startup parity check did not match the windowed path bit-for-bit on this GPU; staying on the proven windowed path (fail-safe). Force with NEOETHOS_GPU_FUSED_EVAL=1 only if you have separately verified this card."
+            );
+            false
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "neoethos_search::cubecl_eval",
+                error = %e,
+                "fused VRAM-resident eval left OFF — startup parity check could not run; staying on the proven windowed path"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "neoethos_search::cubecl_eval",
+                "fused VRAM-resident eval left OFF — startup parity check panicked; staying on the proven windowed path"
+            );
+            false
+        }
+    }
+}
+
+/// Force the fused-eval decision (probe + log) up-front at discovery start so it
+/// happens before the GA loop rather than lazily mid-generation. Idempotent
+/// (memoised).
+pub fn ensure_fused_eval_decided() {
+    let _ = fused_eval_enabled();
 }
 
 /// FUSED windowed signal-synth + backtest for ONE gene-batch. The signal kernel
@@ -3235,7 +3501,7 @@ pub(crate) fn try_evaluate_population_cuda(
     // TFs (M1, 6M rows) too; the gene-batch already bounds genes×samples to fit
     // VRAM (never-OOM). It fills the SAME metric vecs as the windowed path, so
     // the assembly below — and the result — is byte-identical (A6000-proven).
-    let use_fused = cuda_eval_fused_enabled();
+    let use_fused = fused_eval_enabled();
     if use_fused {
         let indicators_f32: Vec<f32> = indicators.iter().copied().collect();
         let smc_data_flat = flatten_i32_rows(smc_data);
@@ -3666,8 +3932,15 @@ const ZERO_METRICS: [f64; 11] = [0.0; 11];
 #[cfg(test)]
 mod fused_parity_tests {
     use super::*;
-    use ndarray::Array2;
 
+    // The fused VRAM-resident path MUST be byte-identical to the proven windowed
+    // host path. This asserts the EXACT `fused_path_parity_holds` probe the
+    // discovery startup gate uses to auto-enable the fast path — so passing here
+    // means the production auto-enable decision is trustworthy. Runs only where a
+    // GPU client builds (A6000 via `cargo test --features gpu-nvidia`, the AMD
+    // iGPU via `--features gpu-vulkan`); no-ops on a GPU-less CI box. Force the
+    // MULTI-window accumulator path with `FUSED_TEST_NSAMPLES=200000` +
+    // `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB=1`.
     #[test]
     fn fused_path_is_byte_identical_to_windowed_path() {
         // Skip cleanly if no GPU is present (keeps GPU-less CI green).
@@ -3675,183 +3948,11 @@ mod fused_parity_tests {
             Ok(c) => c,
             Err(_) => return,
         };
-
-        // Deterministic synthetic combo that actually produces trades: a sine
-        // close (±50 pips) with oscillating indicators driving the signals.
-        // `n_samples` is env-tunable so the A6000 run can force the MULTI-window
-        // accumulator path (FUSED_TEST_NSAMPLES=200000 + a tiny
-        // NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB=1 cap → many signal windows); the
-        // default 300 is one window. Both must be byte-identical to windowed.
-        let n_samples: usize = std::env::var("FUSED_TEST_NSAMPLES")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(300);
-        let n_genes = 3usize;
-        let n_indicators = 2usize;
-
-        let close: Vec<f64> = (0..n_samples)
-            .map(|i| 1.10 + 0.005 * (i as f64 * 0.1).sin())
-            .collect();
-        // WIDE intrabar range (±60 pips) so a fixed SL(15-30)/TP(30-60) is hit
-        // intrabar and the position actually CLOSES (trade_count increments on
-        // close) — narrow bars would let it enter but never close.
-        let high: Vec<f64> = close.iter().map(|c| c + 0.006).collect();
-        let low: Vec<f64> = close.iter().map(|c| c - 0.006).collect();
-
-        // STRONG ±5 square-wave indicators (indicator-major flat). Combined with
-        // the ±0.5 thresholds these give |margin/gap| ≫ 1 → confidence clamps to
-        // 1.0 (full lot sizing under risk-based sizing) and a clean alternating
-        // +1/-1 signal with transitions every 30/45 bars, so the backtest opens
-        // and closes real trades (the meaningful-reduction guard below).
-        let mut ind_flat = Vec::with_capacity(n_indicators * n_samples);
-        ind_flat.extend((0..n_samples).map(|i| if (i / 30) % 2 == 0 { 5.0f32 } else { -5.0 }));
-        ind_flat.extend((0..n_samples).map(|i| if (i / 45) % 2 == 0 { 5.0f32 } else { -5.0 }));
-        let indicators = Array2::from_shape_vec((n_indicators, n_samples), ind_flat).unwrap();
-
-        // CSR genes: g0→ind0, g1→ind1, g2→0.5·ind0+0.5·ind1.
-        let gene_offsets: Vec<i32> = vec![0, 1, 2, 4];
-        let gene_indices: Vec<i32> = vec![0, 1, 0, 1];
-        let gene_weights: Vec<f32> = vec![1.0, 1.0, 0.5, 0.5];
-        let long_thr: Vec<f32> = vec![0.5, 0.5, 0.5];
-        let short_thr: Vec<f32> = vec![-0.5, -0.5, -0.5];
-
-        let timestamps: Vec<i64> = (0..n_samples)
-            .map(|i| 1_600_000_000_000 + i as i64 * 3_600_000)
-            .collect();
-        // Bucket day/month proportionally to n_samples so the counts stay bounded
-        // (~4 months, ~60 days) regardless of how big n_samples gets — keeps the
-        // month buffer within month_capacity for the large multi-window run.
-        let month_div = (n_samples / 4).max(1) as i64;
-        let day_div = (n_samples / 60).max(1) as i64;
-        let month_idx: Vec<i64> = (0..n_samples).map(|i| i as i64 / month_div).collect();
-        let day_idx: Vec<i64> = (0..n_samples).map(|i| i as i64 / day_div).collect();
-        // Per-gene SL/TP varied so the genes produce DIFFERENT trade outcomes
-        // (varied metrics), not a trivially-identical set.
-        let sl_pips: Vec<f64> = vec![20.0, 15.0, 30.0];
-        let tp_pips: Vec<f64> = vec![40.0, 30.0, 60.0];
-        let smc_data: Vec<SmcRow> = vec![[0i8; SMC_WIDTH]; n_samples];
-        let gene_smc_flags: Vec<SmcRow> = vec![[0i8; SMC_WIDTH]; n_genes];
-        let gate_threshold = 0.0f32;
-        let smc_weights = [0.0f32; SMC_WIDTH];
-        // Fixed 1-lot sizing — matches the PRODUCTION gate (simulate_trades_core
-        // gets no confidences) and the FTMO parity test. With risk-based sizing on,
-        // the synthetic combo's lots round below the min and no trade opens.
-        let mut settings = BacktestSettings::default();
-        settings.risk_based_sizing = false;
-        // Force a short hold so every opened position CLOSES (trade_count
-        // increments on close) regardless of whether SL/TP triggers first —
-        // guarantees the backtest reduction is exercised with real trades.
-        settings.min_hold_bars = 0;
-        settings.max_hold_bars = 3;
-        let month_capacity = settings.month_capacity();
-
-        // ── WINDOWED path: synth signals to host, then backtest (re-upload). ──
-        let (sig, conf) = try_generate_signal_flat_cuda(
-            indicators.view(),
-            &gene_offsets,
-            &gene_indices,
-            &gene_weights,
-            &long_thr,
-            &short_thr,
-            &smc_data,
-            &gene_smc_flags,
-            gate_threshold,
-            &smc_weights,
-            None,
-        )
-        .expect("windowed signal synth");
-
-        let close_pips = normalize_prices_to_pips(&close, settings.pip_value);
-        let high_pips = normalize_prices_to_pips(&high, settings.pip_value);
-        let low_pips = normalize_prices_to_pips(&low, settings.pip_value);
-        let (ts_deltas, use_ts) = timestamp_delta_ms(&timestamps, n_samples);
-        let month_i32: Vec<i32> = month_idx.iter().map(|v| saturating_i32(*v)).collect();
-        let day_i32: Vec<i32> = day_idx.iter().map(|v| saturating_i32(*v)).collect();
-        let sl_f32: Vec<f32> = sl_pips.iter().map(|v| *v as f32).collect();
-        let tp_f32: Vec<f32> = tp_pips.iter().map(|v| *v as f32).collect();
-
-        let (mw, tcw, mow, mcw, msew, _ftmo_w) = launch_backtest_kernel(
-            &client,
-            0,
-            &close_pips,
-            &high_pips,
-            &low_pips,
-            &sig,
-            &conf,
-            &ts_deltas,
-            use_ts,
-            &month_i32,
-            &day_i32,
-            &sl_f32,
-            &tp_f32,
-            &settings,
-            month_capacity,
-        )
-        .expect("windowed backtest");
-
-        // ── FUSED path: signals stay in VRAM, fed straight to the backtest. ──
-        let indicators_f32: Vec<f32> = indicators.iter().copied().collect();
-        let smc_flat = flatten_i32_rows(&smc_data);
-        let flags_flat = flatten_i32_flags(&gene_smc_flags);
-        let (mf, tcf, mof, mcf, msef, _ftmo_f) = fused_eval_batch_dispatch(
-            &client,
-            &indicators_f32,
-            n_indicators,
-            &gene_offsets,
-            &gene_indices,
-            &gene_weights,
-            &long_thr,
-            &short_thr,
-            &smc_flat,
-            &flags_flat,
-            &smc_weights,
-            gate_threshold,
-            &close_pips,
-            &high_pips,
-            &low_pips,
-            &ts_deltas,
-            use_ts,
-            &month_i32,
-            &day_i32,
-            &sl_f32,
-            &tp_f32,
-            &settings,
-            month_capacity,
-            n_genes,
-            n_samples,
-        )
-        .expect("fused eval");
-
-        // BIT-for-bit equality across every per-gene output buffer. We compare
-        // raw bit patterns (not `==`) so a legitimately-equal NaN (same bit
-        // pattern, produced identically by both paths) counts as equal — `f32 ==`
-        // makes NaN != NaN. This is the strict byte-parity check we actually want.
-        fn bits_eq(a: &[f32], b: &[f32]) -> bool {
-            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-        }
-        let sig_nonzero = sig.iter().filter(|s| **s != 0).count();
-        eprintln!(
-            "PARITY DIAG: signals_nonzero={sig_nonzero}/{} trade_counts={tcw:?} metrics0={:?}",
-            sig.len(),
-            &mw[..mw.len().min(7)]
-        );
         assert!(
-            bits_eq(&mw, &mf),
-            "metrics_flat mismatch (fused vs windowed)"
-        );
-        assert_eq!(tcw, tcf, "trade_counts mismatch");
-        assert!(bits_eq(&mow, &mof), "monthly_flat mismatch");
-        assert_eq!(mcw, mcf, "month_counts mismatch");
-        assert!(bits_eq(&msew, &msef), "month_start_eq_flat mismatch");
-
-        // Meaningfulness guard: the signal kernel produced real non-trivial
-        // output that BOTH paths fed into the backtest. This is what makes the
-        // parity non-trivial — and it is what caught the original signal-transport
-        // RACE (before the client.sync() barrier the two paths diverged here).
-        assert!(
-            sig_nonzero > 0,
-            "expected the synthetic combo to generate signals; got {sig_nonzero}"
+            fused_path_parity_holds(&client)
+                .expect("fused parity probe should run once a GPU client exists"),
+            "fused VRAM-resident path diverged from the windowed path on this GPU \
+             (see the warn logs for which buffer mismatched)"
         );
     }
 }

@@ -2853,6 +2853,15 @@ where
     #[cfg(feature = "gpu")]
     crate::cubecl_eval::auto_tune_memory_budgets();
 
+    // Auto-enable the fused VRAM-resident eval (signals stay on the GPU, no host
+    // round-trip) IFF it proves byte-identical to the windowed path on THIS
+    // machine's card — resolved + logged up-front so the ~sub-second probe runs
+    // before the GA loop, not lazily mid-generation. The operator can still force
+    // it either way via NEOETHOS_GPU_FUSED_EVAL. This is the biggest win on dense
+    // timeframes (M1/M5), where the signal matrix is largest.
+    #[cfg(feature = "gpu")]
+    crate::cubecl_eval::ensure_fused_eval_decided();
+
     // 2026-05-26 operator directive (dual-mode product): instrument the
     // 16-stage rejection funnel before any pipeline work so a panic /
     // preflight failure still leaves a partially-populated funnel for the
