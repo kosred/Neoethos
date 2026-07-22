@@ -2144,12 +2144,14 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
     (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect()
 }
 
-/// CPU-only twin of [`validation_backtest_population`] for the non-GPU build, so
-/// `discovery.rs` (and any other validation consumer) compiles and runs the SAME
-/// code path with or without the `gpu` feature. Behaviour is identical to the
-/// GPU twin's fallback arm: a full-population CPU re-evaluation.
-#[cfg(not(feature = "gpu"))]
-pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+/// Pure-CPU population evaluation — the canonical semantic reference for the
+/// whole validation tail, available in EVERY build (with or without `gpu`).
+///
+/// It is what the non-GPU build runs, what the GPU build's fallback arm mirrors,
+/// and the in-process reference the GPU benchmark harness (Task 6) checks parity
+/// against. There is exactly one CPU population implementation, so the reference
+/// can never drift from what actually runs.
+pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
     let PopulationEvalInputs {
         close,
         high,
@@ -2201,6 +2203,15 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         )
     };
     (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect()
+}
+
+/// CPU-only twin of [`validation_backtest_population`] for the non-GPU build, so
+/// `discovery.rs` (and any other validation consumer) compiles and runs the SAME
+/// code path with or without the `gpu` feature. Behaviour is identical to the
+/// GPU twin's fallback arm: a full-population CPU re-evaluation.
+#[cfg(not(feature = "gpu"))]
+pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+    validation_backtest_population_cpu(inputs)
 }
 
 #[cfg(test)]
