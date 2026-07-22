@@ -2379,40 +2379,50 @@ pub fn compute_discovery_forward_test_artifacts(
         }
     }
 
-    let mut artifacts = Vec::with_capacity(portfolio.len());
-    for gene in portfolio {
-        let settings = discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
-        let strategy_hash = stable_json_hash(gene)?;
-        let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
-        let evaluation_config = config.evaluation_config(tail_ohlcv.close.last().copied());
-        let signals = signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
-        if signals.len() != n {
-            anyhow::bail!(
-                "forward-test signals length {} does not match validation row count {}",
-                signals.len(),
-                n
-            );
-        }
-        let summary = compute_forward_test_summary(ForwardTestInput {
-            close: &tail_ohlcv.close[..n],
-            high: &tail_ohlcv.high[..n],
-            low: &tail_ohlcv.low[..n],
-            signals: &signals[..n],
-            months: &months[..n],
-            days: &days[..n],
-            timestamps,
-            settings: &settings,
-        })?;
-        artifacts.push(ForwardTestValidationArtifactFile::new(
-            ForwardTestValidationScope::new(
-                tail_dataset_hash.clone(),
-                evaluation_config_hash,
-                strategy_hash,
-                &temporal_contract,
-            ),
-            summary,
-        ));
-    }
+    // Each portfolio gene's forward-test replay is fully independent, so run
+    // them across the rayon pool instead of one-at-a-time. `par_iter()` on a
+    // slice is an INDEXED parallel iterator, so `collect::<Result<Vec<_>>>()`
+    // preserves gene order and short-circuits on the first error exactly like
+    // the serial `?` did — byte-identical artifacts, but no single-core stall
+    // on this silent validation-tail stage.
+    let artifacts = portfolio
+        .par_iter()
+        .map(|gene| -> Result<ForwardTestValidationArtifactFile> {
+            let settings =
+                discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
+            let strategy_hash = stable_json_hash(gene)?;
+            let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
+            let evaluation_config = config.evaluation_config(tail_ohlcv.close.last().copied());
+            let signals =
+                signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
+            if signals.len() != n {
+                anyhow::bail!(
+                    "forward-test signals length {} does not match validation row count {}",
+                    signals.len(),
+                    n
+                );
+            }
+            let summary = compute_forward_test_summary(ForwardTestInput {
+                close: &tail_ohlcv.close[..n],
+                high: &tail_ohlcv.high[..n],
+                low: &tail_ohlcv.low[..n],
+                signals: &signals[..n],
+                months: &months[..n],
+                days: &days[..n],
+                timestamps,
+                settings: &settings,
+            })?;
+            Ok(ForwardTestValidationArtifactFile::new(
+                ForwardTestValidationScope::new(
+                    tail_dataset_hash.clone(),
+                    evaluation_config_hash,
+                    strategy_hash,
+                    &temporal_contract,
+                ),
+                summary,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(artifacts)
 }
 
@@ -2484,42 +2494,51 @@ pub fn compute_discovery_prop_firm_artifacts(
     let tail_dataset_hash = discovery_dataset_hash(tail_features, tail_ohlcv)?;
     let timestamps = &tail_features.timestamps[..n];
 
-    let mut artifacts = Vec::with_capacity(portfolio.len());
-    for gene in portfolio {
-        let settings = discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
-        let strategy_hash = stable_json_hash(gene)?;
-        let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
-        let evaluation_config = config.evaluation_config(tail_ohlcv.close.last().copied());
-        let signals = signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
-        if signals.len() != n {
-            anyhow::bail!(
-                "prop-firm signals length {} does not match validation row count {}",
-                signals.len(),
-                n
+    // Same independence as the forward-test tail above: replay each gene on the
+    // held-out window in parallel. Order-preserving indexed collect keeps the
+    // artifact order and first-error semantics identical to the serial loop —
+    // the prop-firm risk numbers are unchanged, the machine just stops idling
+    // on 1 core through this stage.
+    let artifacts = portfolio
+        .par_iter()
+        .map(|gene| -> Result<PropFirmRiskValidationArtifactFile> {
+            let settings =
+                discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
+            let strategy_hash = stable_json_hash(gene)?;
+            let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
+            let evaluation_config = config.evaluation_config(tail_ohlcv.close.last().copied());
+            let signals =
+                signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
+            if signals.len() != n {
+                anyhow::bail!(
+                    "prop-firm signals length {} does not match validation row count {}",
+                    signals.len(),
+                    n
+                );
+            }
+            let trades = simulate_trades_core(
+                &tail_ohlcv.close[..n],
+                &tail_ohlcv.high[..n],
+                &tail_ohlcv.low[..n],
+                timestamps,
+                &signals[..n],
+                &settings,
             );
-        }
-        let trades = simulate_trades_core(
-            &tail_ohlcv.close[..n],
-            &tail_ohlcv.high[..n],
-            &tail_ohlcv.low[..n],
-            timestamps,
-            &signals[..n],
-            &settings,
-        );
-        let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
-            trades: &trades,
-            initial_balance: config.initial_balance,
-            rules,
-        });
-        let scope = PropFirmRiskValidationScope::new(
-            tail_dataset_hash.clone(),
-            evaluation_config_hash,
-            strategy_hash,
-            &rules,
-            &temporal_contract,
-        )?;
-        artifacts.push(PropFirmRiskValidationArtifactFile::new(scope, summary));
-    }
+            let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
+                trades: &trades,
+                initial_balance: config.initial_balance,
+                rules,
+            });
+            let scope = PropFirmRiskValidationScope::new(
+                tail_dataset_hash.clone(),
+                evaluation_config_hash,
+                strategy_hash,
+                &rules,
+                &temporal_contract,
+            )?;
+            Ok(PropFirmRiskValidationArtifactFile::new(scope, summary))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(artifacts)
 }
 
