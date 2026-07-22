@@ -39,8 +39,8 @@ fn main() {
 mod gpu {
     use ndarray::Array2;
     use neoethos_search::eval::{
-        validation_backtest_population, validation_backtest_population_cpu, BacktestSettings,
-        PopulationEvalInputs, SmcRow,
+        BacktestSettings, PopulationEvalInputs, SmcRow, validation_backtest_population,
+        validation_backtest_population_cpu,
     };
     use std::time::Instant;
 
@@ -169,7 +169,11 @@ mod gpu {
     /// the money metrics and the max trade-count delta.
     fn parity(cpu: &[[f64; 11]], gpu: &[[f64; 11]]) -> Result<(f64, f64), String> {
         if cpu.len() != gpu.len() {
-            return Err(format!("gene-count mismatch cpu={} gpu={}", cpu.len(), gpu.len()));
+            return Err(format!(
+                "gene-count mismatch cpu={} gpu={}",
+                cpu.len(),
+                gpu.len()
+            ));
         }
         let mut worst_rel = 0.0_f64;
         let mut worst_trades = 0.0_f64;
@@ -229,7 +233,11 @@ mod gpu {
 
             let _ = cpu_ref;
             let cube_mb = (rows * N_FEATURES * 4) as f64 / (1024.0 * 1024.0);
-            let evals_per_s = if gpu_ms > 0.0 { (pop as f64) / (gpu_ms / 1e3) } else { 0.0 };
+            let evals_per_s = if gpu_ms > 0.0 {
+                (pop as f64) / (gpu_ms / 1e3)
+            } else {
+                0.0
+            };
             let speedup = if gpu_ms > 0.0 { cpu_ms / gpu_ms } else { 0.0 };
 
             let parity_str = match parity(&cpu, &gpu) {

@@ -2119,7 +2119,7 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         // (NEOETHOS_REQUIRE_GPU unset) always recomputes on the CPU — identical
         // to the historical behaviour. With it set, an availability fault fails
         // loud instead of silently draining a rented card's hours on the CPU.
-        use crate::gpu_fallback::{decide_env, FallbackDecision, GpuFailure};
+        use crate::gpu_fallback::{FallbackDecision, GpuFailure, decide_env};
         let failure = match gpu {
             Ok(Ok(v)) if v.len() == n_genes => return v,
             Ok(Ok(_)) => GpuFailure::WrongShape,
