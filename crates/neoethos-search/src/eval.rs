@@ -2629,6 +2629,76 @@ mod overrides_tests {
             "a 500-pip adaptive stop must change the trade outcome vs the 15-pip scalar"
         );
     }
+
+    #[test]
+    fn trailing_stop_moves_to_break_even_and_saves_the_trade() {
+        // Long entry at bar 1 (signal at bar 0), entry = 1.0000, sl = 20 pips
+        // (1R = 0.0020). Bar 2 runs +1R (high 1.0021) → the trail ratchets the
+        // stop up to ~entry. Bar 3 reverses through the ORIGINAL stop
+        // (low 0.9975, below 0.9980). With trailing ON the position exits at the
+        // ratcheted ~break-even stop; with trailing OFF it runs to the full
+        // 20-pip loss. This is exactly the break-even protection production
+        // relies on (EvaluationConfig::for_symbol sets trailing_enabled = true).
+        let close = vec![1.0000_f64, 1.0000, 1.0010, 0.9975, 0.9975];
+        let high = vec![1.0001_f64, 1.0001, 1.0021, 1.0000, 0.9976];
+        let low = vec![0.9999_f64, 1.0000, 1.0000, 0.9975, 0.9974];
+        let signals = vec![1_i8, 0, 0, 0, 0];
+        let months = vec![0_i64; 5];
+        let days = vec![0_i64; 5];
+
+        let mut base = BacktestSettings::default();
+        base.sl_pips = 20.0;
+        base.tp_pips = 40.0; // far — never hit here
+        base.max_hold_bars = 0;
+        base.min_hold_bars = 0;
+        base.pip_value = 0.0001;
+        base.pip_value_per_lot = 10.0;
+        base.spread_pips = 0.0;
+        base.commission_per_trade = 0.0;
+        base.swap_long_pips_per_day = 0.0;
+        base.swap_short_pips_per_day = 0.0;
+        base.pnl_conversion_fee_rate = 0.0;
+        base.kill_zones_enabled = false;
+        base.risk_based_sizing = false; // fixed 1 lot → deterministic PnL
+        base.trailing_be_trigger_r = 1.0;
+        base.trailing_atr_multiplier = 1.0;
+
+        let run = |s: &BacktestSettings| {
+            fast_evaluate_strategy_core(
+                &close, &high, &low, &signals, &[], &months, &days, &[], s,
+            )
+        };
+
+        let mut off = base.clone();
+        off.trailing_enabled = false;
+        let m_off = run(&off);
+        let mut on = base.clone();
+        on.trailing_enabled = true;
+        let m_on = run(&on);
+
+        // Both close exactly one trade on bar 3.
+        assert_eq!(m_off[8], 1.0, "trailing OFF should close one trade");
+        assert_eq!(m_on[8], 1.0, "trailing ON should close one trade");
+        // Trailing OFF runs to the full 20-pip stop: -20 * pip_value_per_lot.
+        assert!(
+            (m_off[0] - (-20.0 * 10.0)).abs() < 1e-6,
+            "trailing OFF should take the full 20-pip loss, got {}",
+            m_off[0]
+        );
+        // Trailing ON exits at ~break-even → dramatically better than the full
+        // loss (the whole point of the break-even trail).
+        assert!(
+            m_on[0] > m_off[0] + 150.0,
+            "trailing ON (break-even) should save most of the 20-pip loss: on={}, off={}",
+            m_on[0],
+            m_off[0]
+        );
+        assert!(
+            m_on[0] >= -1.0 * 10.0,
+            "trailing ON should exit at ~break-even (>= -1 pip), got {}",
+            m_on[0]
+        );
+    }
 }
 
 #[cfg(all(test, feature = "gpu"))]
