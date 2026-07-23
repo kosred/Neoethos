@@ -128,8 +128,8 @@ pub use quality::{
     install_quality_runtime_overrides_from_settings,
 };
 pub use stop_target::{
-    StopTargetSettings, adaptive_sl_tp_pips_series, compute_stop_distance_series,
-    infer_stop_target_pips,
+    StopTargetSettings, adaptive_base_pips_series, adaptive_sl_tp_pips_series,
+    compute_stop_distance_series, infer_stop_target_pips,
 };
 pub use validation::{
     CANONICAL_BACKTEST_ARTIFACT_KIND, CANONICAL_BACKTEST_SCHEMA_VERSION,

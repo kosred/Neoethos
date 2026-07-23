@@ -2172,8 +2172,15 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
 
     // Respect the same env kill-switches the GA hybrid honours: if a kernel is
     // disabled, go straight to CPU (no point building a GPU launch that the
-    // kernel-enabled guard would reject).
-    if cuda_eval_signal_kernel_enabled() && cuda_eval_backtest_kernel_enabled() {
+    // kernel-enabled guard would reject). Also force CPU when adaptive per-entry
+    // stops are active — the cubecl kernel does not yet compute them (Stage 3), so
+    // routing an adaptive gene through it would diverge from the CPU lane. Same
+    // guard `evaluate_population_core` uses on the GA side.
+    let adaptive_stops_active = settings.adaptive_base_pips.is_some();
+    if !adaptive_stops_active
+        && cuda_eval_signal_kernel_enabled()
+        && cuda_eval_backtest_kernel_enabled()
+    {
         let device_override = eval_gpu_devices().first().copied();
         // catch_unwind is the ONLY mitigation for cubecl #243 pool-panics
         // (no Result-returning launch in cubecl 0.10). `AssertUnwindSafe` is

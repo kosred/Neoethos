@@ -1001,6 +1001,27 @@ pub fn adaptive_sl_tp_pips_series(
     Some((sl_pips, tp_pips))
 }
 
+/// The per-bar base stop distance in PIPS (multiplier 1) for adaptive stops,
+/// using the OPEN-INDEPENDENT Parkinson high/low range estimator (+ the tail
+/// expected-shortfall on close). This matters for parity: the discovery scoring
+/// path has the full OHLCV, but the gathered / walk-forward-window validation
+/// paths only carry high/low/close — using an estimator that needs `open` would
+/// make the validation base series differ from the scoring one and evaluate a
+/// different strategy. Parkinson depends only on high/low/close, which every
+/// path has, so the base is identical everywhere. A gene's `stop_vol_mult` then
+/// scales this shared series. `None` when the series can't be built.
+pub fn adaptive_base_pips_series(high: &[f64], low: &[f64], close: &[f64], pip_size: f64) -> Option<Vec<f64>> {
+    if !(pip_size.is_finite() && pip_size > 0.0) {
+        return None;
+    }
+    let mut settings = StopTargetSettings::default();
+    settings.vol_estimator = "parkinson".to_string();
+    // `open` is unused by the Parkinson estimator — pass `close` as a harmless
+    // placeholder so callers without an open series get the identical result.
+    let dist = compute_stop_distance_series(close, high, low, close, &settings)?;
+    Some(dist.iter().map(|d| (d / pip_size).max(1e-9)).collect())
+}
+
 /// Whether adaptive volatility-scaled stops are enabled for this process — the
 /// Stage-2c dev gate. `NEOETHOS_ADAPTIVE_STOPS=1|true|on`. Default off. When on,
 /// gene generation seeds a searchable `stop_vol_mult` and the discovery backtest
