@@ -27,6 +27,11 @@ pub struct PopulationEvalInputs<'a> {
     pub timestamps: &'a [i64],
     pub sl_pips: &'a [f64],
     pub tp_pips: &'a [f64],
+    /// Per-gene adaptive volatility multiplier (`Gene.stop_vol_mult`). Empty or
+    /// `0.0` entries mean the gene uses its fixed `sl_pips`/`tp_pips`; `> 0` pairs
+    /// with `settings.adaptive_base_pips` to scale the per-entry stop by
+    /// volatility. Pass `&[]` where adaptive stops don't apply (GPU validation).
+    pub stop_vol_mult: &'a [f64],
     pub smc_data: &'a [SmcRow],
     pub gene_smc_flags: &'a [SmcRow],
     pub gate_threshold: f32,
@@ -1811,6 +1816,7 @@ pub fn evaluate_population_core(
         timestamps,
         sl_pips,
         tp_pips,
+        stop_vol_mult,
         smc_data,
         gene_smc_flags,
         gate_threshold,
@@ -1841,6 +1847,9 @@ pub fn evaluate_population_core(
         let mut gene_settings = settings.clone();
         gene_settings.sl_pips = sl_pips[g];
         gene_settings.tp_pips = tp_pips[g];
+        // Per-gene adaptive stop multiplier (0.0 / empty slice => fixed path).
+        // Pairs with the shared `adaptive_base_pips` on the cloned settings.
+        gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
         // Risk-based sizing uses the per-bar confidence; with
         // `risk_based_sizing == false` the slice is ignored (legacy).
         fast_evaluate_strategy_core(
@@ -2116,6 +2125,7 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         timestamps,
         sl_pips,
         tp_pips,
+        stop_vol_mult,
         smc_data,
         gene_smc_flags,
         gate_threshold,
@@ -2151,6 +2161,9 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         let mut gene_settings = settings.clone();
         gene_settings.sl_pips = sl_pips[g];
         gene_settings.tp_pips = tp_pips[g];
+        // Per-gene adaptive stop multiplier (0.0 / empty slice => fixed path).
+        // Pairs with the shared `adaptive_base_pips` on the cloned settings.
+        gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
         fast_evaluate_strategy_core(
             close, high, low, &signals, &confidences, month_idx, day_idx, timestamps,
             &gene_settings,
@@ -2243,6 +2256,7 @@ pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> V
         timestamps,
         sl_pips,
         tp_pips,
+        stop_vol_mult,
         smc_data,
         gene_smc_flags,
         gate_threshold,
@@ -2273,6 +2287,9 @@ pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> V
         let mut gene_settings = settings.clone();
         gene_settings.sl_pips = sl_pips[g];
         gene_settings.tp_pips = tp_pips[g];
+        // Per-gene adaptive stop multiplier (0.0 / empty slice => fixed path).
+        // Pairs with the shared `adaptive_base_pips` on the cloned settings.
+        gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
         fast_evaluate_strategy_core(
             close, high, low, &signals, &confidences, month_idx, day_idx, timestamps,
             &gene_settings,

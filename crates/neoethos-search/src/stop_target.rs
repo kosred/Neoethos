@@ -1001,6 +1001,30 @@ pub fn adaptive_sl_tp_pips_series(
     Some((sl_pips, tp_pips))
 }
 
+/// Whether adaptive volatility-scaled stops are enabled for this process — the
+/// Stage-2c dev gate. `NEOETHOS_ADAPTIVE_STOPS=1|true|on`. Default off. When on,
+/// gene generation seeds a searchable `stop_vol_mult` and the discovery backtest
+/// scales each entry's stop by the bar's volatility. Stage 5 productionizes this
+/// to a `Settings` field + auto-enable (mirrors the fused-eval rollout).
+pub fn adaptive_stops_enabled() -> bool {
+    std::env::var("NEOETHOS_ADAPTIVE_STOPS")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
+/// Reward:risk multiple for adaptive stops (`TP = rr × stop`). The operator wants
+/// ~2R kept out of the stop. `NEOETHOS_ADAPTIVE_STOP_RR`, default 2.0.
+pub fn adaptive_stops_rr() -> f64 {
+    std::env::var("NEOETHOS_ADAPTIVE_STOP_RR")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .unwrap_or(2.0)
+}
+
 #[cfg(test)]
 mod adaptive_stop_tests {
     use super::*;

@@ -412,7 +412,7 @@ pub fn evaluate_genes_cached(
         config.smc_weight_displacement,
     ];
 
-    let b_settings = BacktestSettings {
+    let mut b_settings = BacktestSettings {
         max_hold_bars: config.max_hold_bars,
         trailing_enabled: config.trailing_enabled,
         trailing_atr_multiplier: config.trailing_atr_multiplier,
@@ -423,6 +423,7 @@ pub fn evaluate_genes_cached(
         pip_value_per_lot: config.pip_value_per_lot,
         ..Default::default()
     };
+    let stop_vol_mults = resolve_adaptive_stops(genes, ohlcv, config, &mut b_settings);
 
     crate::eval::evaluate_population_core(crate::eval::PopulationEvalInputs {
         close: &ohlcv.close,
@@ -439,6 +440,7 @@ pub fn evaluate_genes_cached(
         timestamps: &features.timestamps,
         sl_pips: &sl_pips,
         tp_pips: &tp_pips,
+        stop_vol_mult: &stop_vol_mults,
         smc_data: &cache.smc_data,
         gene_smc_flags: &gene_smc_flags,
         gate_threshold: config.smc_gate_threshold,
@@ -574,6 +576,10 @@ pub fn validation_genes_population(
             timestamps: &features.timestamps,
             sl_pips: &sl_pips,
             tp_pips: &tp_pips,
+            // Validation adaptive-stop wiring is the next chunk; until then the
+            // OOS path uses the gene's fixed sl/tp (empty => fixed). Adaptive
+            // stops are env-gated OFF, so this is dormant.
+            stop_vol_mult: &[],
             smc_data: &smc_data,
             gene_smc_flags: &gene_smc_flags,
             gate_threshold: config.smc_gate_threshold,
@@ -758,6 +764,9 @@ pub fn validation_genes_population_gathered(
             timestamps: &[],
             sl_pips: &sl_pips,
             tp_pips: &tp_pips,
+            // Validation adaptive-stop wiring is the next chunk (dormant while
+            // adaptive is env-gated off).
+            stop_vol_mult: &[],
             smc_data: &gathered_smc,
             gene_smc_flags: &gene_smc_flags,
             gate_threshold: config.smc_gate_threshold,
@@ -965,6 +974,9 @@ pub fn validation_genes_population_window(
             timestamps: win_ts,
             sl_pips: &pack.sl_pips,
             tp_pips: &pack.tp_pips,
+            // Validation adaptive-stop wiring is the next chunk (dormant while
+            // adaptive is env-gated off).
+            stop_vol_mult: &[],
             smc_data: win_smc,
             gene_smc_flags: &pack.gene_smc_flags,
             gate_threshold: pack.gate_threshold,
@@ -1033,7 +1045,7 @@ pub fn evaluate_genes(
         config.smc_weight_displacement,
     ];
 
-    let b_settings = BacktestSettings {
+    let mut b_settings = BacktestSettings {
         max_hold_bars: config.max_hold_bars,
         trailing_enabled: config.trailing_enabled,
         trailing_atr_multiplier: config.trailing_atr_multiplier,
@@ -1044,6 +1056,7 @@ pub fn evaluate_genes(
         pip_value_per_lot: config.pip_value_per_lot,
         ..Default::default()
     };
+    let stop_vol_mults = resolve_adaptive_stops(genes, ohlcv, config, &mut b_settings);
 
     crate::eval::evaluate_population_core(crate::eval::PopulationEvalInputs {
         close: &ohlcv.close,
@@ -1060,6 +1073,7 @@ pub fn evaluate_genes(
         timestamps: &features.timestamps,
         sl_pips: &sl_pips,
         tp_pips: &tp_pips,
+        stop_vol_mult: &stop_vol_mults,
         smc_data: &smc_data,
         gene_smc_flags: &gene_smc_flags,
         gate_threshold: config.smc_gate_threshold,
@@ -1119,6 +1133,45 @@ fn resolve_stop_target_arrays(
         });
     }
     (sl_pips, tp_pips)
+}
+
+/// Per-gene adaptive stop multiplier array for `PopulationEvalInputs`, and — when
+/// ANY gene is adaptive (`stop_vol_mult > 0`) — installs the shared per-bar base
+/// vol-distance series (in pips) and reward:risk onto `settings` so the backtest
+/// scales each entry's stop by volatility. When no gene is adaptive, `settings`
+/// is left untouched (fixed path, byte-identical) and every returned mult is 0.
+/// Computing the base series ONCE here (not per gene) is why the gene only needs
+/// a scalar multiplier — see `BacktestSettings::adaptive_base_pips`.
+fn resolve_adaptive_stops(
+    genes: &[Gene],
+    ohlcv: &Ohlcv,
+    config: &EvaluationConfig,
+    settings: &mut BacktestSettings,
+) -> Vec<f64> {
+    let mults: Vec<f64> = genes.iter().map(|g| g.stop_vol_mult).collect();
+    if mults.iter().any(|&m| m > 0.0) {
+        let pip = if config.pip_value.is_finite() && config.pip_value > 0.0 {
+            config.pip_value
+        } else {
+            super::strategy_gene::default_pip_size(&config.symbol)
+        };
+        // base = vol/tail stop distance in pips at mult=1 (rr here is irrelevant —
+        // we only keep the stop leg; the per-entry TP uses `adaptive_rr`).
+        if let Some((base_pips, _)) = crate::stop_target::adaptive_sl_tp_pips_series(
+            &ohlcv.open,
+            &ohlcv.high,
+            &ohlcv.low,
+            &ohlcv.close,
+            &crate::stop_target::StopTargetSettings::default(),
+            pip,
+            1.0,
+            1.0,
+        ) {
+            settings.adaptive_base_pips = Some(base_pips.into());
+            settings.adaptive_rr = crate::stop_target::adaptive_stops_rr();
+        }
+    }
+    mults
 }
 
 pub fn random_search(

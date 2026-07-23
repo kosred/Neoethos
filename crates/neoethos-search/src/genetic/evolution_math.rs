@@ -755,6 +755,15 @@ pub fn new_random_gene(
         let tp = (sl * rr).clamp(12.0, 45.0);
         (sl, tp)
     };
+    // Adaptive stops (Stage 2c): when enabled, seed a searchable volatility
+    // multiplier so the stop scales with volatility at entry (the fixed sl/tp
+    // above are then ignored in favour of `mult × vol-distance`). Off → 0.0 =
+    // fixed-stop, byte-identical to before.
+    let stop_vol_mult = if crate::stop_target::adaptive_stops_enabled() {
+        rng.random_range(0.5..=3.0)
+    } else {
+        0.0
+    };
     let strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);
     let mut gene = Gene {
         indices,
@@ -785,9 +794,7 @@ pub fn new_random_gene(
         sl_pips,
         slice_pass_rate: 0.0,
         consistency: 0.0,
-        // Fixed-stop by default (0.0 = use sl_pips/tp_pips). The adaptive-enable
-        // path overwrites this with a searchable volatility multiplier.
-        stop_vol_mult: 0.0,
+        stop_vol_mult,
     };
     randomize_smc_flags(&mut gene, smc_cfg, rng);
     enforce_min_structural_smc_flags(&mut gene, smc_cfg, rng);
