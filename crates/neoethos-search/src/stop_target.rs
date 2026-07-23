@@ -956,3 +956,105 @@ pub fn infer_stop_target_pips(
     sl_pips = sl_pips.max(1e-9);
     Some((sl_pips, tp_pips.max(1e-9), rr_out))
 }
+
+/// Per-bar volatility-adaptive `(sl_pips, tp_pips)` for a whole dataset — the
+/// foundation of the adaptive-stop mode (Stage 1, 2026-07-23). It turns the
+/// vol/tail stop-distance series ([`compute_stop_distance_series`], price units)
+/// into PIP distances the existing fixed-pip backtest/live paths already
+/// consume, so wiring it in later changes nothing except that the value now
+/// varies per ENTRY bar:
+///   `sl_pips[i] = vol_mult * dist[i] / pip_size`,   `tp_pips[i] = rr * sl_pips[i]`.
+///
+/// `vol_mult` is the gene's searchable knob (how many vol-units the stop sits
+/// at); `rr` is the reward:risk multiple kept OUT of the stop so profit stays a
+/// fixed multiple of the risk (the operator wants ~2R). Returns `None` when the
+/// series can't be built or a scalar is non-finite/non-positive, so the caller
+/// falls back to the gene's fixed `sl_pips`/`tp_pips`.
+///
+/// Deterministic and allocation-simple on purpose: the same inputs MUST yield
+/// the same series on the CPU backtest and (Stage 3) the GPU kernel and (Stage
+/// 4) the live loop, or the adaptive path breaks CPU↔GPU / backtest↔live parity.
+pub fn adaptive_sl_tp_pips_series(
+    open: &[f64],
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    settings: &StopTargetSettings,
+    pip_size: f64,
+    vol_mult: f64,
+    rr: f64,
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    if !(pip_size.is_finite() && pip_size > 0.0)
+        || !(vol_mult.is_finite() && vol_mult > 0.0)
+        || !(rr.is_finite() && rr > 0.0)
+    {
+        return None;
+    }
+    let dist = compute_stop_distance_series(open, high, low, close, settings)?;
+    let mut sl_pips = Vec::with_capacity(dist.len());
+    let mut tp_pips = Vec::with_capacity(dist.len());
+    for d in dist {
+        let sl = (d * vol_mult / pip_size).max(1e-9);
+        sl_pips.push(sl);
+        tp_pips.push((sl * rr).max(1e-9));
+    }
+    Some((sl_pips, tp_pips))
+}
+
+#[cfg(test)]
+mod adaptive_stop_tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_sl_tp_series_scales_with_vol_and_holds_rr() {
+        // Calm first half, ~6x more volatile second half — the adaptive stop
+        // must WIDEN where the market is choppier (the whole point of ATR/vol
+        // scaling) while the reward:risk stays pinned.
+        let n = 400usize;
+        let (mut open, mut high, mut low, mut close) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            let amp = if i < n / 2 { 0.0005 } else { 0.0030 };
+            let c = 1.10 + amp * ((i as f64) * 0.3).sin();
+            open.push(c);
+            close.push(c);
+            high.push(c + amp);
+            low.push(c - amp);
+        }
+        let s = StopTargetSettings::default();
+        let (sl, tp) =
+            adaptive_sl_tp_pips_series(&open, &high, &low, &close, &s, 0.0001, 1.0, 2.0)
+                .expect("series builds on a long-enough dataset");
+        assert_eq!(sl.len(), n);
+        assert_eq!(tp.len(), n);
+        // Reward:risk held exactly, per bar.
+        for i in 0..n {
+            assert!((tp[i] - 2.0 * sl[i]).abs() < 1e-9, "TP must be exactly rr*SL");
+            assert!(sl[i] > 0.0);
+        }
+        // The volatile half's median stop must exceed the calm half's.
+        let median = |v: &[f64]| {
+            let mut w = v.to_vec();
+            w.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            w[w.len() / 2]
+        };
+        let calm = median(&sl[60..n / 2]);
+        let volatile = median(&sl[n / 2 + 60..]);
+        assert!(
+            volatile > calm,
+            "volatile-regime stop ({volatile:.2}p) should exceed the calm stop ({calm:.2}p)"
+        );
+        // vol_mult scales the stop linearly.
+        let (sl2, _) =
+            adaptive_sl_tp_pips_series(&open, &high, &low, &close, &s, 0.0001, 2.0, 2.0).unwrap();
+        assert!((sl2[300] - 2.0 * sl[300]).abs() < 1e-6, "2x vol_mult => 2x stop");
+        // Bad scalars → None so the caller falls back to the gene's fixed pips.
+        assert!(
+            adaptive_sl_tp_pips_series(&open, &high, &low, &close, &s, 0.0, 1.0, 2.0).is_none()
+        );
+        assert!(
+            adaptive_sl_tp_pips_series(&open, &high, &low, &close, &s, 0.0001, -1.0, 2.0)
+                .is_none()
+        );
+    }
+}
