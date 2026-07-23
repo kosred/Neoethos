@@ -736,12 +736,22 @@ pub fn new_random_gene(
     let weights: Vec<f32> = (0..count).map(|_| random_coarse_weight(rng)).collect();
     let long_threshold = random_coarse_threshold(rng);
     let short_threshold = -random_coarse_threshold(rng);
+    // SL/TP in pips. Operator directive (2026-07-23): keep ~2R reward:risk but
+    // STOP targeting huge distances. Large TPs are rarely reached live — the
+    // position exits on the next signal flip long before a 70-100 pip target —
+    // so the backtest (which holds to TP) was letting the GA reward-hack by
+    // pinning TP at the old 100-pip ceiling (median discovered TP was 64p, 43%
+    // over 70p). Smaller-SL bounds with the reward:risk still ~2R land TP in
+    // ~20-40 pips while leaving the GA free to SEARCH within them. (The
+    // volatility-adaptive ATR path in `stop_target.rs` is the follow-up that
+    // makes these distances scale with market volatility; these tightened
+    // fixed-pip bounds are the interim step.)
     let (sl_pips, tp_pips) = if rng.random_bool(0.2) {
         (15.0, 30.0)
     } else {
-        let sl: f64 = rng.random_range(5.0..=50.0);
-        let rr: f64 = rng.random_range(1.5..=3.0);
-        let tp = (sl * rr).clamp(10.0, 100.0);
+        let sl: f64 = rng.random_range(6.0..=20.0);
+        let rr: f64 = rng.random_range(1.5..=2.5);
+        let tp = (sl * rr).clamp(12.0, 45.0);
         (sl, tp)
     };
     let strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);
@@ -984,12 +994,15 @@ pub fn mutate(
             }
             2 => {
                 let range = 0.2 * intensity as f64;
+                // Match the tightened generation bounds (2026-07-23): keep
+                // mutation inside the smaller TP/SL envelope so evolution can't
+                // drift a gene back toward the old 100-pip target.
                 mutated.tp_pips = (mutated.tp_pips
                     * rng.random_range((1.0 - range)..(1.0 + range)))
-                .clamp(10.0, 100.0);
+                .clamp(12.0, 45.0);
                 mutated.sl_pips = (mutated.sl_pips
                     * rng.random_range((1.0 - range)..(1.0 + range)))
-                .clamp(5.0, 50.0);
+                .clamp(6.0, 20.0);
             }
             _ => {
                 // In exploitation mode, reduce the chance of randomly flipping SMC flags
