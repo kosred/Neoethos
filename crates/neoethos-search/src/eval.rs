@@ -185,6 +185,18 @@ pub struct BacktestSettings {
     pub risk_per_trade_max: f64,
     /// Confidence at/above which a trade is sized at `risk_per_trade_max`.
     pub high_quality_confidence: f64,
+
+    /// **Adaptive stops Stage 2 (2026-07-23)** — optional per-BAR SL/TP in pips.
+    /// When BOTH are `Some`, a position captures its SL/TP from the ENTRY bar's
+    /// index, so the stop scales with volatility at entry (tight in calm markets,
+    /// wider when choppy) while the reward stays a fixed multiple of the stop;
+    /// risk-based sizing uses the same per-entry SL so a wider stop => smaller
+    /// position at constant risk. When either is `None` the scalar
+    /// `sl_pips`/`tp_pips` fixed path runs, byte-for-byte as before. `Arc<[f64]>`
+    /// so cloning `BacktestSettings` per gene stays cheap. Built by
+    /// [`crate::stop_target::adaptive_sl_tp_pips_series`].
+    pub adaptive_sl_pips: Option<std::sync::Arc<[f64]>>,
+    pub adaptive_tp_pips: Option<std::sync::Arc<[f64]>>,
 }
 
 impl BacktestSettings {
@@ -344,6 +356,9 @@ impl Default for BacktestSettings {
             risk_per_trade_min: 0.005,
             risk_per_trade_max: 0.03,
             high_quality_confidence: 0.65,
+            // Adaptive stops OFF by default → the scalar sl_pips/tp_pips path.
+            adaptive_sl_pips: None,
+            adaptive_tp_pips: None,
         }
     }
 }
@@ -634,6 +649,22 @@ fn apply_carry_and_fee_scaled(
     }
 }
 
+/// Per-ENTRY `(sl_pips, tp_pips)` for the position opening at bar `i`. The
+/// adaptive per-bar arrays win when BOTH are present and finite/positive at `i`;
+/// otherwise the scalar fixed `sl_pips`/`tp_pips`. Returning the scalar on the
+/// None path keeps the fixed-pip backtest byte-identical.
+#[inline]
+fn entry_sl_tp_pips(settings: &BacktestSettings, i: usize) -> (f64, f64) {
+    if let (Some(sl), Some(tp)) = (&settings.adaptive_sl_pips, &settings.adaptive_tp_pips) {
+        let s = sl.get(i).copied().unwrap_or(settings.sl_pips);
+        let t = tp.get(i).copied().unwrap_or(settings.tp_pips);
+        if s.is_finite() && s > 0.0 && t.is_finite() && t > 0.0 {
+            return (s, t);
+        }
+    }
+    (settings.sl_pips, settings.tp_pips)
+}
+
 /// Risk-based, confidence-scaled lot size for a single trade entry.
 ///
 /// Returns the constant `pos_lots` multiplier applied to every PnL / cost /
@@ -654,7 +685,7 @@ fn apply_carry_and_fee_scaled(
 /// Net effect: a full-SL loss ≈ `risk_pct × equity`, a TP win ≈
 /// `risk_pct × equity × (tp/sl)`.
 #[inline]
-fn risk_based_pos_lots(conf: f64, equity: f64, settings: &BacktestSettings) -> f64 {
+fn risk_based_pos_lots(conf: f64, equity: f64, eff_sl_pips: f64, settings: &BacktestSettings) -> f64 {
     let conf = conf.clamp(0.0, 1.0);
     let risk_min = settings.risk_per_trade_min;
     let risk_max = settings.risk_per_trade_max;
@@ -668,8 +699,10 @@ fn risk_based_pos_lots(conf: f64, equity: f64, settings: &BacktestSettings) -> f
         1.0
     };
     let risk_pct = risk_min + (risk_max - risk_min) * conf_scale;
-    // Guard a tiny/zero SL so the divisor can't blow the lot size up.
-    let eff_sl = settings.sl_pips.max(1.0);
+    // Guard a tiny/zero SL so the divisor can't blow the lot size up. `eff_sl_pips`
+    // is the position's ENTRY stop (adaptive per-entry when enabled, else the
+    // scalar `sl_pips`) so a wider stop sizes a smaller position at constant risk.
+    let eff_sl = eff_sl_pips.max(1.0);
     let pip_value_per_lot = settings.pip_value_per_lot;
     let denom = eff_sl * pip_value_per_lot;
     let pos_lots = if equity > 0.0 && denom.abs() > 1e-12 && denom.is_finite() {
@@ -708,6 +741,12 @@ pub fn fast_evaluate_strategy_core(
     let use_risk_sizing = settings.risk_based_sizing && !confidences.is_empty();
     // Captured at each entry; constant for the life of an open position.
     let mut pos_lots: f64 = 1.0;
+    // Per-entry SL/TP in pips (adaptive-per-entry when enabled, else the scalar
+    // `sl_pips`/`tp_pips`). Captured at entry, held for the trade's life. Init to
+    // the scalar so an open-before-first-entry read (impossible — only used while
+    // in_pos) is still well-defined.
+    let mut pos_sl_pips: f64 = settings.sl_pips;
+    let mut pos_tp_pips: f64 = settings.tp_pips;
 
     let initial_equity = settings.initial_equity();
     let month_capacity = settings.month_capacity();
@@ -901,8 +940,8 @@ pub fn fast_evaluate_strategy_core(
 
             if past_min_hold {
                 if in_pos == 1 {
-                    let mut sl = entry_px - (settings.sl_pips * pip);
-                    let tp = entry_px + (settings.tp_pips * pip);
+                    let mut sl = entry_px - (pos_sl_pips * pip);
+                    let tp = entry_px + (pos_tp_pips * pip);
                     // Apply the trail locked in by PRIOR bars. NO intra-bar look-ahead:
                     // this bar's high must NOT move the stop that this bar's low is then
                     // checked against (the old order optimistically avoided losses → the
@@ -922,17 +961,17 @@ pub fn fast_evaluate_strategy_core(
                     // so it protects FUTURE bars (a bar's own high can't save its own low).
                     if !exit && settings.trailing_enabled {
                         let mv = hi - entry_px;
-                        if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
+                        if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
                             let candidate =
-                                hi - (settings.trailing_atr_multiplier * settings.sl_pips * pip);
+                                hi - (settings.trailing_atr_multiplier * pos_sl_pips * pip);
                             if trail_px == 0.0 || candidate > trail_px {
                                 trail_px = candidate;
                             }
                         }
                     }
                 } else {
-                    let mut sl = entry_px + (settings.sl_pips * pip);
-                    let tp = entry_px - (settings.tp_pips * pip);
+                    let mut sl = entry_px + (pos_sl_pips * pip);
+                    let tp = entry_px - (pos_tp_pips * pip);
                     // Short: apply the trail from PRIOR bars only (no intra-bar look-ahead,
                     // see the long branch). Until +trigger `trail_px` is 0.0 (unset) and the
                     // original `entry_px + sl_pips` stop holds.
@@ -949,9 +988,9 @@ pub fn fast_evaluate_strategy_core(
                     // Only AFTER the exit check: ratchet the trail down from THIS bar's low.
                     if !exit && settings.trailing_enabled {
                         let mv = entry_px - lo;
-                        if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
+                        if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
                             let candidate =
-                                lo + (settings.trailing_atr_multiplier * settings.sl_pips * pip);
+                                lo + (settings.trailing_atr_multiplier * pos_sl_pips * pip);
                             if trail_px == 0.0 || candidate < trail_px {
                                 trail_px = candidate;
                             }
@@ -1046,9 +1085,17 @@ pub fn fast_evaluate_strategy_core(
                 // cost, float-PnL and carry/fee below. When sizing is off
                 // (or no confidence slice) `pos_lots` is forced to 1.0 =
                 // exact legacy fixed-1-lot behaviour.
+                // Adaptive stops: capture the ENTRY SL/TP from the SIGNAL bar
+                // (i-1) — the same causally-available just-closed bar the signal
+                // and confidence come from, matching live's "signal + bracket from
+                // one closed bar". Held for the trade's life. The fixed path
+                // returns the scalar sl_pips/tp_pips (byte-identical).
+                let (entry_sl, entry_tp) = entry_sl_tp_pips(settings, i - 1);
+                pos_sl_pips = entry_sl;
+                pos_tp_pips = entry_tp;
                 if use_risk_sizing {
                     let conf = confidences.get(i - 1).copied().unwrap_or(1.0) as f64;
-                    pos_lots = risk_based_pos_lots(conf, equity, settings);
+                    pos_lots = risk_based_pos_lots(conf, equity, pos_sl_pips, settings);
                 } else {
                     pos_lots = 1.0;
                 }
@@ -2507,6 +2554,70 @@ mod overrides_tests {
             (m[0] - (-20.0 * pip_value_per_lot)).abs() < 1e-9,
             "empty confidence slice must force fixed-1-lot, got {}",
             m[0]
+        );
+    }
+
+    #[test]
+    fn adaptive_stops_constant_series_equals_scalar_and_varying_changes_outcome() {
+        // Long entry at bar 1 (signal at bar 0). Price drifts down so a 15-pip
+        // stop is hit at bar 3 but a very wide stop is not.
+        let close = vec![1.0000_f64, 1.0000, 0.9990, 0.9980, 0.9975];
+        let high = vec![1.0002_f64, 1.0002, 1.0002, 1.0002, 1.0002];
+        let low = vec![0.9998_f64, 0.9998, 0.9989, 0.9979, 0.9974];
+        let signals = vec![1_i8, 0, 0, 0, 0];
+        let months = vec![0_i64; 5];
+        let days = vec![0_i64; 5];
+        let n = close.len();
+
+        let mut base = BacktestSettings::default();
+        base.sl_pips = 15.0;
+        base.tp_pips = 30.0;
+        base.max_hold_bars = 0;
+        base.min_hold_bars = 0;
+        base.pip_value = 0.0001;
+        base.pip_value_per_lot = 10.0;
+        base.spread_pips = 0.0;
+        base.commission_per_trade = 0.0;
+        base.swap_long_pips_per_day = 0.0;
+        base.swap_short_pips_per_day = 0.0;
+        base.pnl_conversion_fee_rate = 0.0;
+        base.kill_zones_enabled = false;
+        base.risk_based_sizing = false; // fixed 1 lot → deterministic PnL
+
+        let run = |s: &BacktestSettings| {
+            fast_evaluate_strategy_core(
+                &close, &high, &low, &signals, &[], &months, &days, &[], s,
+            )
+        };
+
+        // (1) fixed scalar path.
+        let fixed = run(&base);
+        assert_eq!(fixed[8], 1.0, "the 15-pip scalar stop should produce one trade");
+
+        // (2) an adaptive series IDENTICAL to the scalar must be byte-identical.
+        let mut same = base.clone();
+        same.adaptive_sl_pips = Some(vec![15.0_f64; n].into());
+        same.adaptive_tp_pips = Some(vec![30.0_f64; n].into());
+        let same_m = run(&same);
+        for k in 0..11 {
+            assert_eq!(
+                fixed[k].to_bits(),
+                same_m[k].to_bits(),
+                "constant adaptive series must be byte-identical to the scalar path (slot {k})"
+            );
+        }
+
+        // (3) a much WIDER stop captured at the entry (signal) bar 0 → the stop
+        // that fired for the tight scalar no longer fires → different outcome.
+        let mut wide = base.clone();
+        let mut sl_series = vec![15.0_f64; n];
+        sl_series[0] = 500.0; // entry captures the signal bar (i-1 = 0)
+        wide.adaptive_sl_pips = Some(sl_series.into());
+        wide.adaptive_tp_pips = Some(vec![1000.0_f64; n].into());
+        let wide_m = run(&wide);
+        assert!(
+            wide_m[8].to_bits() != fixed[8].to_bits() || wide_m[0].to_bits() != fixed[0].to_bits(),
+            "a 500-pip adaptive stop must change the trade outcome vs the 15-pip scalar"
         );
     }
 }

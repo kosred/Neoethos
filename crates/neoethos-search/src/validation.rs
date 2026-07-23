@@ -1682,6 +1682,8 @@ mod tests {
             risk_per_trade_min: 0.005,
             risk_per_trade_max: 0.03,
             high_quality_confidence: 0.65,
+            adaptive_sl_pips: None,
+            adaptive_tp_pips: None,
         }
     }
 
