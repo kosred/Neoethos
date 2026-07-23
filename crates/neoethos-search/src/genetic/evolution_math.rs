@@ -293,6 +293,7 @@ pub fn gene_signature_hash(gene: &Gene) -> u64 {
     h = fnv1a_update(h, &[gene.use_displacement as u8]);
     h = fnv1a_update(h, &quantize_f64(gene.tp_pips, 100.0).to_le_bytes());
     h = fnv1a_update(h, &quantize_f64(gene.sl_pips, 100.0).to_le_bytes());
+    h = fnv1a_update(h, &quantize_f64(gene.stop_vol_mult, 100.0).to_le_bytes());
     h
 }
 
@@ -784,6 +785,9 @@ pub fn new_random_gene(
         sl_pips,
         slice_pass_rate: 0.0,
         consistency: 0.0,
+        // Fixed-stop by default (0.0 = use sl_pips/tp_pips). The adaptive-enable
+        // path overwrites this with a searchable volatility multiplier.
+        stop_vol_mult: 0.0,
     };
     randomize_smc_flags(&mut gene, smc_cfg, rng);
     enforce_min_structural_smc_flags(&mut gene, smc_cfg, rng);
@@ -927,6 +931,13 @@ pub fn crossover(a: &Gene, b: &Gene, generation: usize, rng: &mut impl Rng) -> G
     } else {
         b.sl_pips
     };
+    // Adaptive-stop multiplier is inherited like the fixed stops so the GA can
+    // recombine it (0.0 on both parents => stays fixed-stop).
+    child.stop_vol_mult = if rng.random_bool(0.5) {
+        a.stop_vol_mult
+    } else {
+        b.stop_vol_mult
+    };
 
     child
 }
@@ -994,15 +1005,25 @@ pub fn mutate(
             }
             2 => {
                 let range = 0.2 * intensity as f64;
-                // Match the tightened generation bounds (2026-07-23): keep
-                // mutation inside the smaller TP/SL envelope so evolution can't
-                // drift a gene back toward the old 100-pip target.
-                mutated.tp_pips = (mutated.tp_pips
-                    * rng.random_range((1.0 - range)..(1.0 + range)))
-                .clamp(12.0, 45.0);
-                mutated.sl_pips = (mutated.sl_pips
-                    * rng.random_range((1.0 - range)..(1.0 + range)))
-                .clamp(6.0, 20.0);
+                if mutated.stop_vol_mult > 0.0 {
+                    // Adaptive-stop gene: perturb the volatility multiplier (the
+                    // active stop knob) instead of the unused fixed pips. Clamped
+                    // to a sane band so the stop stays a small multiple of the
+                    // bar's vol distance.
+                    mutated.stop_vol_mult = (mutated.stop_vol_mult
+                        * rng.random_range((1.0 - range)..(1.0 + range)))
+                    .clamp(0.3, 4.0);
+                } else {
+                    // Fixed-stop gene: match the tightened generation bounds
+                    // (2026-07-23) so evolution can't drift back to the old
+                    // 100-pip target.
+                    mutated.tp_pips = (mutated.tp_pips
+                        * rng.random_range((1.0 - range)..(1.0 + range)))
+                    .clamp(12.0, 45.0);
+                    mutated.sl_pips = (mutated.sl_pips
+                        * rng.random_range((1.0 - range)..(1.0 + range)))
+                    .clamp(6.0, 20.0);
+                }
             }
             _ => {
                 // In exploitation mode, reduce the chance of randomly flipping SMC flags

@@ -38,6 +38,16 @@ pub struct Gene {
     pub sl_pips: f64,
     pub slice_pass_rate: f64,
     pub consistency: f64,
+    /// **Adaptive stops (2026-07-23)** — volatility multiplier for the per-entry
+    /// stop. `0.0` (the serde default for genes saved before this field existed)
+    /// means "use the fixed `sl_pips`/`tp_pips`". When `> 0`, the stop is
+    /// `stop_vol_mult ×` the dataset's per-bar vol/tail distance and the target is
+    /// a fixed reward:risk multiple of it, so the stop scales with volatility at
+    /// entry. The GA searches this like any other gene parameter; both the IS
+    /// scoring backtest and the OOS validation derive SL/TP from it, so they
+    /// evaluate the SAME strategy.
+    #[serde(default)]
+    pub stop_vol_mult: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -664,6 +674,11 @@ impl Gene {
         }
         if !self.sl_pips.is_finite() || self.sl_pips <= 0.0 {
             self.sl_pips = 20.0;
+        }
+        // A non-finite/negative adaptive multiplier collapses to 0.0 = fixed-stop
+        // (the safe fallback); a valid positive multiplier is left untouched.
+        if !self.stop_vol_mult.is_finite() || self.stop_vol_mult < 0.0 {
+            self.stop_vol_mult = 0.0;
         }
     }
 }

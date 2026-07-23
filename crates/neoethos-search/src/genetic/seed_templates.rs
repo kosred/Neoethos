@@ -283,6 +283,7 @@ fn build_variant(
         sl_pips,
         slice_pass_rate: 0.0,
         consistency: 0.0,
+        stop_vol_mult: 0.0,
     };
     gene.normalize(n_features.max(1), 1);
     Some(gene)
