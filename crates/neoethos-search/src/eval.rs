@@ -186,17 +186,22 @@ pub struct BacktestSettings {
     /// Confidence at/above which a trade is sized at `risk_per_trade_max`.
     pub high_quality_confidence: f64,
 
-    /// **Adaptive stops Stage 2 (2026-07-23)** — optional per-BAR SL/TP in pips.
-    /// When BOTH are `Some`, a position captures its SL/TP from the ENTRY bar's
-    /// index, so the stop scales with volatility at entry (tight in calm markets,
-    /// wider when choppy) while the reward stays a fixed multiple of the stop;
-    /// risk-based sizing uses the same per-entry SL so a wider stop => smaller
-    /// position at constant risk. When either is `None` the scalar
-    /// `sl_pips`/`tp_pips` fixed path runs, byte-for-byte as before. `Arc<[f64]>`
-    /// so cloning `BacktestSettings` per gene stays cheap. Built by
-    /// [`crate::stop_target::adaptive_sl_tp_pips_series`].
-    pub adaptive_sl_pips: Option<std::sync::Arc<[f64]>>,
-    pub adaptive_tp_pips: Option<std::sync::Arc<[f64]>>,
+    /// **Adaptive stops (2026-07-23)** — volatility-scaled per-entry SL/TP.
+    /// `adaptive_base_pips` is the per-BAR base stop distance in pips (the
+    /// dataset's vol/tail distance at vol_mult = 1), shared across the whole
+    /// population as a single `Arc`. When it is `Some` AND `adaptive_vol_mult >
+    /// 0`, a trade opened at bar i takes `sl = adaptive_vol_mult * base[i]`,
+    /// `tp = adaptive_rr * sl` — so the stop scales with the volatility at entry
+    /// (tight in calm markets, wider when choppy) while the reward stays a fixed
+    /// multiple of the risk; risk-based sizing uses the same per-entry SL so a
+    /// wider stop sizes a smaller position at constant risk. `adaptive_vol_mult`
+    /// is set PER GENE (the gene's searchable `stop_vol_mult`) so the base series
+    /// is computed once per combo and each gene just scales it — no per-gene
+    /// allocation on the hot path. When base is `None` or the mult is `0` the
+    /// scalar `sl_pips`/`tp_pips` fixed path runs, byte-for-byte as before.
+    pub adaptive_base_pips: Option<std::sync::Arc<[f64]>>,
+    pub adaptive_vol_mult: f64,
+    pub adaptive_rr: f64,
 }
 
 impl BacktestSettings {
@@ -356,9 +361,10 @@ impl Default for BacktestSettings {
             risk_per_trade_min: 0.005,
             risk_per_trade_max: 0.03,
             high_quality_confidence: 0.65,
-            // Adaptive stops OFF by default → the scalar sl_pips/tp_pips path.
-            adaptive_sl_pips: None,
-            adaptive_tp_pips: None,
+            // Adaptive stops OFF by default (mult 0) → the scalar sl_pips/tp_pips path.
+            adaptive_base_pips: None,
+            adaptive_vol_mult: 0.0,
+            adaptive_rr: 2.0,
         }
     }
 }
@@ -649,17 +655,22 @@ fn apply_carry_and_fee_scaled(
     }
 }
 
-/// Per-ENTRY `(sl_pips, tp_pips)` for the position opening at bar `i`. The
-/// adaptive per-bar arrays win when BOTH are present and finite/positive at `i`;
+/// Per-ENTRY `(sl_pips, tp_pips)` for the position opening at bar `i`. When the
+/// gene's `adaptive_vol_mult > 0` and a base vol-distance series is present, the
+/// stop scales with volatility at `i` (`sl = mult * base[i]`, `tp = rr * sl`);
 /// otherwise the scalar fixed `sl_pips`/`tp_pips`. Returning the scalar on the
-/// None path keeps the fixed-pip backtest byte-identical.
+/// off/degenerate path keeps the fixed-pip backtest byte-identical.
 #[inline]
 fn entry_sl_tp_pips(settings: &BacktestSettings, i: usize) -> (f64, f64) {
-    if let (Some(sl), Some(tp)) = (&settings.adaptive_sl_pips, &settings.adaptive_tp_pips) {
-        let s = sl.get(i).copied().unwrap_or(settings.sl_pips);
-        let t = tp.get(i).copied().unwrap_or(settings.tp_pips);
-        if s.is_finite() && s > 0.0 && t.is_finite() && t > 0.0 {
-            return (s, t);
+    if settings.adaptive_vol_mult > 0.0 {
+        if let Some(base) = &settings.adaptive_base_pips {
+            if let Some(&d) = base.get(i) {
+                let sl = settings.adaptive_vol_mult * d;
+                let tp = settings.adaptive_rr * sl;
+                if sl.is_finite() && sl > 0.0 && tp.is_finite() && tp > 0.0 {
+                    return (sl, tp);
+                }
+            }
         }
     }
     (settings.sl_pips, settings.tp_pips)
@@ -1869,7 +1880,8 @@ pub fn evaluate_population_core(
         // diverge and corrupt the merged fitness. When the base settings carry an
         // adaptive series, force ALL genes onto the CPU lane (same fail-safe the
         // fixed-1-lot era used via PHASE1_GPU_SIZING_PORTED=false).
-        let adaptive_stops_active = settings.adaptive_sl_pips.is_some();
+        let adaptive_stops_active =
+            settings.adaptive_base_pips.is_some() && settings.adaptive_vol_mult > 0.0;
         if PHASE1_GPU_SIZING_PORTED
             && !adaptive_stops_active
             && cuda_eval_signal_kernel_enabled()
@@ -2613,8 +2625,10 @@ mod overrides_tests {
 
         // (2) an adaptive series IDENTICAL to the scalar must be byte-identical.
         let mut same = base.clone();
-        same.adaptive_sl_pips = Some(vec![15.0_f64; n].into());
-        same.adaptive_tp_pips = Some(vec![30.0_f64; n].into());
+        // base stop 15p, mult 1, rr 2 → sl 15 / tp 30 = the scalar path exactly.
+        same.adaptive_base_pips = Some(vec![15.0_f64; n].into());
+        same.adaptive_vol_mult = 1.0;
+        same.adaptive_rr = 2.0;
         let same_m = run(&same);
         for k in 0..11 {
             assert_eq!(
@@ -2627,10 +2641,11 @@ mod overrides_tests {
         // (3) a much WIDER stop captured at the entry (signal) bar 0 → the stop
         // that fired for the tight scalar no longer fires → different outcome.
         let mut wide = base.clone();
-        let mut sl_series = vec![15.0_f64; n];
-        sl_series[0] = 500.0; // entry captures the signal bar (i-1 = 0)
-        wide.adaptive_sl_pips = Some(sl_series.into());
-        wide.adaptive_tp_pips = Some(vec![1000.0_f64; n].into());
+        let mut base_series = vec![15.0_f64; n];
+        base_series[0] = 500.0; // entry captures the signal bar (i-1 = 0)
+        wide.adaptive_base_pips = Some(base_series.into());
+        wide.adaptive_vol_mult = 1.0;
+        wide.adaptive_rr = 2.0;
         let wide_m = run(&wide);
         assert!(
             wide_m[8].to_bits() != fixed[8].to_bits() || wide_m[0].to_bits() != fixed[0].to_bits(),
