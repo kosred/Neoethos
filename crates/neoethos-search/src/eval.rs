@@ -1265,6 +1265,10 @@ pub fn simulate_trades_core(
     let mut entry_px = 0.0;
     let mut entry_idx = 0usize;
     let mut trail_px = 0.0;
+    // Per-entry SL/TP in pips (adaptive-per-entry when enabled, else the scalar).
+    // Captured at entry, held for the trade's life. See `entry_sl_tp_pips`.
+    let mut pos_sl_pips: f64 = settings.sl_pips;
+    let mut pos_tp_pips: f64 = settings.tp_pips;
     // Per-trade excursions (operator 2026-06-06): MFE/MAE tracked while a position
     // is open, reset at entry, emitted in each Trade record.
     let mut mfe_money = 0.0_f64;
@@ -1339,7 +1343,7 @@ pub fn simulate_trades_core(
                         mfe: mfe_money,
                         mae: mae_money,
                         r_multiple: pnl
-                            / (settings.sl_pips * settings.pip_value_per_lot).max(1e-9),
+                            / (pos_sl_pips * settings.pip_value_per_lot).max(1e-9),
                     });
                     in_pos = 0;
                     continue;
@@ -1373,8 +1377,8 @@ pub fn simulate_trades_core(
                 settings.min_hold_bars == 0 || bars_held >= settings.min_hold_bars as i64;
 
             if in_pos == 1 && !exit && past_min_hold {
-                let mut sl = entry_px - (settings.sl_pips * pip);
-                let tp = entry_px + (settings.tp_pips * pip);
+                let mut sl = entry_px - (pos_sl_pips * pip);
+                let tp = entry_px + (pos_tp_pips * pip);
                 // Apply only the trail locked in by PRIOR bars — NO intra-bar look-ahead
                 // (this bar's high must not move the stop its own low is checked against).
                 if settings.trailing_enabled && trail_px > 0.0 && trail_px > sl {
@@ -1390,17 +1394,17 @@ pub fn simulate_trades_core(
                 // AFTER the exit check: ratchet the trail up from THIS bar's high (next bar).
                 if !exit && settings.trailing_enabled {
                     let mv = hi - entry_px;
-                    if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
+                    if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
                         let candidate =
-                            hi - (settings.trailing_atr_multiplier * settings.sl_pips * pip);
+                            hi - (settings.trailing_atr_multiplier * pos_sl_pips * pip);
                         if trail_px == 0.0 || candidate > trail_px {
                             trail_px = candidate;
                         }
                     }
                 }
             } else if in_pos == -1 && !exit && past_min_hold {
-                let mut sl = entry_px + (settings.sl_pips * pip);
-                let tp = entry_px - (settings.tp_pips * pip);
+                let mut sl = entry_px + (pos_sl_pips * pip);
+                let tp = entry_px - (pos_tp_pips * pip);
                 if settings.trailing_enabled && trail_px > 0.0 && trail_px < sl {
                     sl = trail_px;
                 }
@@ -1414,9 +1418,9 @@ pub fn simulate_trades_core(
                 // AFTER the exit check: ratchet the trail down from THIS bar's low (next bar).
                 if !exit && settings.trailing_enabled {
                     let mv = entry_px - lo;
-                    if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
+                    if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
                         let candidate =
-                            lo + (settings.trailing_atr_multiplier * settings.sl_pips * pip);
+                            lo + (settings.trailing_atr_multiplier * pos_sl_pips * pip);
                         if trail_px == 0.0 || candidate < trail_px {
                             trail_px = candidate;
                         }
@@ -1457,7 +1461,7 @@ pub fn simulate_trades_core(
                     mfe: mfe_money,
                     mae: mae_money,
                     r_multiple: pnl
-                        / (settings.sl_pips * settings.pip_value_per_lot).max(1e-9),
+                        / (pos_sl_pips * settings.pip_value_per_lot).max(1e-9),
                 });
                 in_pos = 0;
             }
@@ -1487,6 +1491,11 @@ pub fn simulate_trades_core(
 
             if !block_entry {
                 let s = signals[i - 1];
+                // Adaptive stops: capture the ENTRY SL/TP from the signal bar
+                // (i-1), held for the trade's life; fixed path returns the scalar.
+                let (entry_sl, entry_tp) = entry_sl_tp_pips(settings, i - 1);
+                pos_sl_pips = entry_sl;
+                pos_tp_pips = entry_tp;
                 in_pos = s;
                 // Bug #1 fix: half-spread at entry
                 entry_px = close[i] + (s as f64) * half_spread_px;
