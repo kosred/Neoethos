@@ -1863,7 +1863,15 @@ pub fn evaluate_population_core(
         // on a real RTX A6000 (Vulkan). Was `false` while the kernel was
         // fixed-1-lot (would have corrupted fitness).
         const PHASE1_GPU_SIZING_PORTED: bool = true;
+        // Adaptive per-entry stops (Stage 2c) are CPU-only until Stage 3 ports the
+        // per-bar series to the cubecl kernel: routing a gene through the GPU lane
+        // while the CPU lane uses adaptive SL/TP would make the two lanes' metrics
+        // diverge and corrupt the merged fitness. When the base settings carry an
+        // adaptive series, force ALL genes onto the CPU lane (same fail-safe the
+        // fixed-1-lot era used via PHASE1_GPU_SIZING_PORTED=false).
+        let adaptive_stops_active = settings.adaptive_sl_pips.is_some();
         if PHASE1_GPU_SIZING_PORTED
+            && !adaptive_stops_active
             && cuda_eval_signal_kernel_enabled()
             && cuda_eval_backtest_kernel_enabled()
             && n_genes >= 4
