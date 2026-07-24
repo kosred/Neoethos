@@ -3129,6 +3129,149 @@ mod gpu_cpu_parity_tests {
         }
     }
 
+    /// GPU↔CPU parity for ADAPTIVE per-entry stops. Same synthetic combo as the
+    /// fixed test, but each gene carries `stop_vol_mult > 0` and the settings a
+    /// per-bar base vol series, so BOTH lanes scale the stop by volatility at each
+    /// entry (`sl = mult × base[signal_bar]`, `tp = 2 × sl`). Proves the ported
+    /// kernel's per-entry capture matches the CPU `entry_sl_tp_pips` — the gate
+    /// before the adaptive→CPU guard is lifted. Skips cleanly with no GPU.
+    #[test]
+    fn gpu_population_eval_matches_cpu_adaptive_stops() {
+        let n_samples = 800usize;
+        let n_features = 6usize;
+        let n_genes = 4usize;
+
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| 1.10 + ((i as f64) * 0.02).sin() * 0.01)
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0008).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0008).collect();
+        let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
+            (((i + f * 11) as f32) * 0.05).sin() * 0.8
+        });
+        let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
+        let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 4];
+        let gene_weights: Vec<f32> = vec![1.0; 8];
+        let long_thr: Vec<f32> = vec![0.3; n_genes];
+        let short_thr: Vec<f32> = vec![-0.3; n_genes];
+        // Fixed sl/tp are present but IGNORED once the multiplier is active.
+        let sl_pips: Vec<f64> = vec![25.0; n_genes];
+        let tp_pips: Vec<f64> = vec![50.0; n_genes];
+        // Per-gene adaptive multipliers (all > 0 ⇒ every gene runs adaptive).
+        let stop_vol_mult: Vec<f64> = vec![1.2, 2.0, 0.8, 1.5];
+        let smc_data: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
+        let gene_smc_flags: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
+        let smc_weights = [0.0f32; 11];
+        let gate_threshold = 0.0f32;
+        let timestamps: Vec<i64> = (0..n_samples as i64).map(|i| i * 60_000).collect();
+        let month_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 100).collect();
+        let day_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 30).collect();
+
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = true;
+        settings.risk_per_trade_min = 0.005;
+        settings.risk_per_trade_max = 0.03;
+        settings.high_quality_confidence = 0.65;
+        // Shared per-bar base vol series (the exact production builder) + 2R.
+        let base =
+            crate::stop_target::adaptive_base_pips_series(&high, &low, &close, settings.pip_value)
+                .expect("base vol series builds on 800 bars");
+        assert_eq!(base.len(), n_samples, "base series must align with n_samples");
+        settings.adaptive_base_pips = Some(base.into());
+        settings.adaptive_rr = 2.0;
+
+        // CPU reference — each gene runs adaptive via its own multiplier.
+        let cpu: Vec<[f64; 11]> = (0..n_genes)
+            .map(|g| {
+                let (signals, conf) = synthesize_signals_and_confidence_cpu(
+                    indicators.view(),
+                    &gene_offsets,
+                    &gene_indices,
+                    &gene_weights,
+                    &long_thr,
+                    &short_thr,
+                    &smc_data,
+                    &gene_smc_flags,
+                    gate_threshold,
+                    &smc_weights,
+                    g,
+                    n_samples,
+                );
+                let mut s = settings.clone();
+                s.sl_pips = sl_pips[g];
+                s.tp_pips = tp_pips[g];
+                s.adaptive_vol_mult = stop_vol_mult[g];
+                fast_evaluate_strategy_core(
+                    &close, &high, &low, &signals, &conf, &month_idx, &day_idx, &timestamps, &s,
+                )
+            })
+            .collect();
+
+        // GPU path — the ported kernel, fed the REAL multiplier + base series
+        // (calls the device path directly, bypassing the adaptive→CPU guard).
+        let gpu = match crate::cubecl_eval::try_evaluate_population_cuda(
+            &close,
+            &high,
+            &low,
+            indicators.view(),
+            &gene_offsets,
+            &gene_indices,
+            &gene_weights,
+            &long_thr,
+            &short_thr,
+            &month_idx,
+            &day_idx,
+            &timestamps,
+            &sl_pips,
+            &tp_pips,
+            &stop_vol_mult,
+            &smc_data,
+            &gene_smc_flags,
+            gate_threshold,
+            &smc_weights,
+            &settings,
+            None,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                if crate::gpu_fallback::require_gpu() {
+                    panic!("NEOETHOS_REQUIRE_GPU set but adaptive GPU eval failed: {e}");
+                }
+                eprintln!("adaptive GPU parity test SKIPPED (no usable GPU device): {e}");
+                return;
+            }
+        };
+        assert_eq!(gpu.len(), n_genes, "gpu returned wrong gene count");
+        // At least one gene must trade, else the parity assertion is vacuous.
+        assert!(
+            cpu.iter().any(|m| m[8] > 0.0),
+            "expected the adaptive combo to open trades"
+        );
+        for g in 0..n_genes {
+            let (ct, gt) = (cpu[g][8], gpu[g][8]);
+            assert!(
+                (ct - gt).abs() <= 1.0,
+                "adaptive gene {g} trade-count mismatch: cpu={ct} gpu={gt} (kernel adaptive bug)"
+            );
+            for m in [0usize, 1, 2, 3, 4, 5, 6, 7, 9, 10] {
+                let (c, v) = (cpu[g][m], gpu[g][m]);
+                let tol = 1e-2 * c.abs().max(1.0) + 1e-3;
+                assert!(
+                    (c - v).abs() <= tol,
+                    "adaptive gene {g} metric[{m}] mismatch: cpu={c} gpu={v} tol={tol}"
+                );
+            }
+        }
+    }
+
     /// AREA 1 (2026-06-09) regression lock for the raised per-buffer cap. The
     /// 800-row case above fits one window/one batch, so it never exercised the
     /// windowing/batching machinery the cap-raise relies on as its safety net.
