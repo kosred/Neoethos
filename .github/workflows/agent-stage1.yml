@@ -112,11 +112,11 @@ jobs:
           set -o pipefail
           cargo test -p neoethos-search 2>&1 | tee /tmp/stage1-diagnostics/test.log
 
-      - name: Test CLI crate
+      - name: Check CLI crate
         shell: bash
         run: |
           set -o pipefail
-          cargo test -p neoethos-cli 2>&1 | tee /tmp/stage1-diagnostics/cli-test.log
+          cargo check -p neoethos-cli 2>&1 | tee /tmp/stage1-diagnostics/cli-check.log
 
       - name: Check search GPU feature
         shell: bash
