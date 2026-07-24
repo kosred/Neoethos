@@ -193,7 +193,13 @@ impl TinyPopulationFixture {
             },
             ..ParityPolicy::default()
         };
-        compare_traces("cpu_reference", "gpu_candidate", &reference, &candidate, policy)
+        compare_traces(
+            "cpu_reference",
+            "gpu_candidate",
+            &reference,
+            &candidate,
+            policy,
+        )
     }
 }
 

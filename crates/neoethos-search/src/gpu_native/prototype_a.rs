@@ -32,7 +32,12 @@ impl PrototypeATelemetry {
             h2d_bytes: self
                 .resident_upload_bytes
                 .saturating_add(self.streamed_dataset_upload_bytes)
-                .saturating_add(self.gene_upload_bytes),
+                .saturating_add(self.gene_upload_bytes)
+                .saturating_add(if self.chained_reuploads > 0 {
+                    self.full_readback_bytes
+                } else {
+                    0
+                }),
             d2h_bytes: self
                 .full_readback_bytes
                 .saturating_add(self.compact_readback_bytes),
@@ -65,6 +70,11 @@ pub fn prototype_a_capabilities() -> EngineCapabilities {
         device_filtering: false,
         compact_readback: true,
     }
+}
+
+pub fn disable_prototype_a_telemetry() {
+    #[cfg(feature = "gpu")]
+    crate::cubecl_eval::disable_cubecl_transfer_telemetry();
 }
 
 pub fn reset_prototype_a_telemetry() {

@@ -45,8 +45,9 @@ pub(crate) struct CubeClTransferTelemetry {
 
 mod transfer_telemetry {
     use super::CubeClTransferTelemetry;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+    static ENABLED: AtomicBool = AtomicBool::new(false);
     static GPU_CALLS: AtomicU64 = AtomicU64::new(0);
     static RESIDENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
     static RESIDENT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
@@ -62,6 +63,16 @@ mod transfer_telemetry {
     static SYNCHRONIZATION_EVENTS: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn reset() {
+        ENABLED.store(true, Ordering::Relaxed);
+        clear();
+    }
+
+    pub(super) fn disable() {
+        ENABLED.store(false, Ordering::Relaxed);
+        clear();
+    }
+
+    fn clear() {
         for counter in [
             &GPU_CALLS,
             &RESIDENT_CACHE_HITS,
@@ -100,28 +111,46 @@ mod transfer_telemetry {
     }
 
     pub(super) fn record_call() {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
         GPU_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn record_streamed_dataset_upload(bytes: usize) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
         STREAMED_DATASET_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     pub(super) fn record_gene_upload(bytes: usize) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
         GENE_UPLOADS.fetch_add(1, Ordering::Relaxed);
         GENE_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     pub(super) fn record_resident_hit() {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
         RESIDENT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn record_resident_miss(bytes: usize) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
         RESIDENT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
         RESIDENT_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     pub(super) fn record_readback(use_fused: bool, compact_bytes: usize, dense_bytes: usize) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
         COMPACT_READBACKS.fetch_add(1, Ordering::Relaxed);
         COMPACT_READBACK_BYTES.fetch_add(compact_bytes as u64, Ordering::Relaxed);
         SYNCHRONIZATION_EVENTS.fetch_add(1, Ordering::Relaxed);
@@ -137,10 +166,13 @@ pub(crate) fn reset_cubecl_transfer_telemetry() {
     transfer_telemetry::reset();
 }
 
+pub(crate) fn disable_cubecl_transfer_telemetry() {
+    transfer_telemetry::disable();
+}
+
 pub(crate) fn cubecl_transfer_telemetry_snapshot() -> CubeClTransferTelemetry {
     transfer_telemetry::snapshot()
 }
-
 
 // ─── F-CORE3 consolidation — CUDA env-var registry ──────────────────
 //
@@ -2802,7 +2834,11 @@ fn launch_backtest_kernel<R: Runtime>(
         (vec![0.0f32], vec![0.0f32; n_genes])
     };
     let base_len = base_f32.len();
-    let adaptive_rr_f32 = if adaptive_on { settings.adaptive_rr as f32 } else { 2.0 };
+    let adaptive_rr_f32 = if adaptive_on {
+        settings.adaptive_rr as f32
+    } else {
+        2.0
+    };
     let base_pips_dummy = client.create_from_slice(f32::as_bytes(&base_f32));
     let stop_vol_mult_dummy = client.create_from_slice(f32::as_bytes(&mult_f32));
     // cubecl 0.10 migration: Handle-by-value `from_raw_parts(handle, len)`
@@ -3325,16 +3361,24 @@ where
     let signals_handle = client.empty(total.saturating_mul(std::mem::size_of::<i32>()));
     let conf_handle = client.empty(total.saturating_mul(std::mem::size_of::<f32>()));
     // Gene-independent inputs are identical every window — upload ONCE.
-    let gene_upload_bytes = gene_offsets.len().saturating_mul(std::mem::size_of::<i32>())
-        + gene_indices.len().saturating_mul(std::mem::size_of::<i32>())
+    let gene_upload_bytes = gene_offsets
+        .len()
+        .saturating_mul(std::mem::size_of::<i32>())
+        + gene_indices
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
         + gene_weights.len().saturating_mul(std::mem::size_of::<F>())
         + long_thr.len().saturating_mul(std::mem::size_of::<F>())
         + short_thr.len().saturating_mul(std::mem::size_of::<F>())
-        + gene_smc_flags_flat.len().saturating_mul(std::mem::size_of::<i32>())
+        + gene_smc_flags_flat
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
         + smc_weights.len().saturating_mul(std::mem::size_of::<F>())
         + sl_pips.len().saturating_mul(std::mem::size_of::<f32>())
         + tp_pips.len().saturating_mul(std::mem::size_of::<f32>())
-        + stop_vol_mult.len().saturating_mul(std::mem::size_of::<f32>());
+        + stop_vol_mult
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>());
     transfer_telemetry::record_gene_upload(gene_upload_bytes);
     let (
         gene_offsets_handle,
@@ -3513,7 +3557,11 @@ where
         (vec![0.0f32], vec![0.0f32; n_genes])
     };
     let base_len = base_f32.len();
-    let adaptive_rr_f32 = if adaptive_on { settings.adaptive_rr as f32 } else { 2.0 };
+    let adaptive_rr_f32 = if adaptive_on {
+        settings.adaptive_rr as f32
+    } else {
+        2.0
+    };
     let base_pips_dummy = client.create_from_slice(f32::as_bytes(&base_f32));
     let stop_vol_mult_dummy = client.create_from_slice(f32::as_bytes(&mult_f32));
     let bt_units = backtest_kernel_units(client);
@@ -3994,9 +4042,15 @@ pub(crate) fn try_evaluate_population_cuda(
     let compact_readback_bytes = metrics_flat
         .len()
         .saturating_mul(std::mem::size_of::<f32>())
-        + trade_counts.len().saturating_mul(std::mem::size_of::<i32>())
-        + monthly_flat.len().saturating_mul(std::mem::size_of::<f32>())
-        + month_counts.len().saturating_mul(std::mem::size_of::<i32>())
+        + trade_counts
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
+        + monthly_flat
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>())
+        + month_counts
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
         + month_start_eq_flat
             .len()
             .saturating_mul(std::mem::size_of::<f32>());
