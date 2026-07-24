@@ -1028,12 +1028,18 @@ pub fn adaptive_base_pips_series(high: &[f64], low: &[f64], close: &[f64], pip_s
 /// scales each entry's stop by the bar's volatility. Stage 5 productionizes this
 /// to a `Settings` field + auto-enable (mirrors the fused-eval rollout).
 pub fn adaptive_stops_enabled() -> bool {
-    std::env::var("NEOETHOS_ADAPTIVE_STOPS")
-        .map(|v| {
+    // Default ON: the operator wants the stop to scale with volatility
+    // automatically — no toggle, no env var to remember. `NEOETHOS_ADAPTIVE_STOPS`
+    // is now only an emergency ESCAPE HATCH: set it to 0/false/off to fall back to
+    // the old fixed-pip stops (e.g. to reproduce a pre-adaptive run). Any other
+    // value, or unset, keeps adaptive on.
+    match std::env::var("NEOETHOS_ADAPTIVE_STOPS") {
+        Ok(v) => {
             let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-        })
-        .unwrap_or(false)
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    }
 }
 
 /// Reward:risk multiple for adaptive stops (`TP = rr × stop`). The operator wants
