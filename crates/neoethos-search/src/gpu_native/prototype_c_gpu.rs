@@ -214,7 +214,7 @@ fn launch_sparse_first_hit<R: Runtime>(
         .context("stitch Prototype C GPU outcomes")
 }
 
-#[cfg(all(test, feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+#[cfg(all(test, any(feature = "gpu-cuda", feature = "gpu-vulkan")))]
 mod tests {
     use super::*;
     use crate::gpu_native::prototype_bc::{FirstHitRequest, prototype_c_event_first_hit};

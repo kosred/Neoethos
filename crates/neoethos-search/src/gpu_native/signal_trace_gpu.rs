@@ -356,7 +356,7 @@ fn launch_signal_trace<R: Runtime>(
     })
 }
 
-#[cfg(all(test, feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+#[cfg(all(test, any(feature = "gpu-cuda", feature = "gpu-vulkan")))]
 mod tests {
     use super::*;
 

@@ -61,6 +61,12 @@ NEOETHOS_RUN_CUDA_SMOKE=1 cargo test \
   -p neoethos-gpu-cuda --features cuda \
   tests::real_cuda_smoke_is_explicitly_gpu_gated -- --exact --nocapture
 
+# Direct CUDA correctness probes for the CubeCL compact-event and trace kernels.
+cargo test -p neoethos-search --features gpu-cuda \
+  gpu_event_first_hit_matches_reference_when_adapter_is_available -- --nocapture
+cargo test -p neoethos-search --features gpu-cuda \
+  direct_gpu_trace_matches_cpu_when_an_adapter_is_available -- --nocapture
+
 python3 - "$OUT" "$GPU_NAME" "$GPU_UUID" "$DRIVER" "$VRAM_MIB" \
   "$CUDA_TOOLKIT" "$RAM_KIB" "$DISK_KIB" "$POWER_LIMIT_W" \
   "$MAX_SM_CLOCK_MHZ" "$TEMP_C" <<'PY'
