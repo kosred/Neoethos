@@ -687,6 +687,9 @@ impl Gene {
 pub struct SearchResult {
     pub genes: Vec<Gene>,
     pub metrics: Vec<[f64; 11]>,
+    /// Effective SMC gate used for the metrics in this result. This is the
+    /// annealed final-generation value, not the static runtime start value.
+    pub effective_smc_gate_threshold: f32,
 }
 
 #[derive(Debug, Clone)]

@@ -1212,8 +1212,11 @@ pub fn random_search(
     for gene in genes.iter_mut() {
         gene.normalize(n_indicators, 1);
     }
-    let metrics = evaluate_genes(features, ohlcv, &genes, &EvaluationConfig::default())?;
-    Ok(SearchResult { genes, metrics })
+    let eval_cfg = EvaluationConfig::default();
+    let metrics = evaluate_genes(features, ohlcv, &genes, &eval_cfg)?;
+    Ok(SearchResult { genes, metrics, 
+    effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
+})
 }
 
 pub fn evolve_search(
@@ -1521,7 +1524,9 @@ where
         let metrics = evaluate_genes_cached(features, ohlcv, &genes, &eval_cfg, &eval_cache)?;
         apply_metrics(&mut genes, &metrics, eval_cfg.growth_objective);
         seen_memory.flush();
-        return Ok(SearchResult { genes, metrics });
+        return Ok(SearchResult { genes, metrics, 
+    effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
+});
     }
 
     for generation in 0..generations {
@@ -1808,11 +1813,15 @@ where
                         .map(|(g, _, _)| g.clone())
                         .collect(),
                     metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
+                
+                    effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
                 });
             }
             return Ok(SearchResult {
                 genes: top_candidates,
                 metrics: top_metrics,
+            
+                effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
             });
         }
 
@@ -1865,11 +1874,15 @@ where
                         .map(|(g, _, _)| g.clone())
                         .collect(),
                     metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
+                
+                    effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
                 });
             }
             return Ok(SearchResult {
                 genes: top_candidates,
                 metrics: top_metrics,
+            
+                effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
             });
         }
 
@@ -1902,11 +1915,15 @@ where
                         .map(|(g, _, _)| g.clone())
                         .collect(),
                     metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
+                
+                    effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
                 });
             }
             return Ok(SearchResult {
                 genes: top_candidates,
                 metrics: best_metrics,
+            
+                effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
             });
         }
 
@@ -2117,6 +2134,8 @@ where
     Ok(SearchResult {
         genes,
         metrics: best_metrics,
+    
+        effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
     })
 }
 

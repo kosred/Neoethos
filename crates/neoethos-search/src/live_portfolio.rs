@@ -341,6 +341,8 @@ mod tests {
             ],
             prop_firm_validation_artifacts: Vec::new(),
             funnel_profile: None,
+        
+            effective_smc_gate_threshold: f32::NAN,
         };
 
         let live = LivePortfolioArtifact::from_discovery("EURUSD", "M1", &[], false, &result);

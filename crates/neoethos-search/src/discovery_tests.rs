@@ -66,6 +66,8 @@ fn empty_portfolio_is_an_explicit_error() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let err = ensure_non_empty_portfolio(&result, "EURUSD M1")
@@ -92,6 +94,8 @@ fn non_empty_portfolio_is_accepted() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     ensure_non_empty_portfolio(&result, "EURUSD M1").expect("expected non-empty portfolio to pass");
@@ -153,6 +157,7 @@ fn finalize_candidates_with_progress_emits_filter_and_portfolio_milestones() {
         &features,
         &ohlcv,
         &config,
+        0.75,
         features.names.clone(),
         &mut funnel,
         |event| progress_events.push(event),
@@ -210,6 +215,8 @@ fn portfolio_export_requires_validation_gates() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
     let path = temp_path("portfolio-gates");
 
@@ -237,6 +244,8 @@ fn portfolio_export_blocked_when_only_prop_firm_window_passed() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
     result.validation_gates.prop_firm_window_passed = true;
     result.validation_gates.prop_firm_window_count = 50;
@@ -360,6 +369,8 @@ fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
     result.validation_gates.walkforward_passed = true;
     result.validation_gates.cpcv_passed = true;
@@ -387,6 +398,8 @@ fn discovery_profile_exports_validation_gate_status() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
     result.validation_gates.walkforward_passed = true;
     result.validation_gates.cpcv_passed = true;
@@ -468,6 +481,8 @@ fn save_canonical_backtest_artifacts_writes_one_file_per_strategy() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let written = save_canonical_backtest_artifacts(&dir, &result)
@@ -505,6 +520,8 @@ fn save_walkforward_validation_artifacts_writes_one_file_per_strategy() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let written = save_walkforward_validation_artifacts(&dir, &result)
@@ -537,6 +554,8 @@ fn save_canonical_backtest_artifacts_skips_when_empty() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let written = save_canonical_backtest_artifacts(&dir, &result)
@@ -628,6 +647,8 @@ fn discovery_profile_exports_runtime_override_resolution() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let profile = build_discovery_profile(&config, &result);
@@ -808,6 +829,8 @@ fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
         forward_test_validation_artifacts: artifacts,
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let written = save_forward_test_validation_artifacts(&dir, &result)
@@ -850,6 +873,8 @@ fn discovery_profile_exports_forward_test_artifact_count() {
         )],
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
     result.validation_gates.walkforward_passed = true;
     result.validation_gates.cpcv_passed = true;
@@ -897,6 +922,8 @@ fn empty_discovery_result_with_gates(
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     }
 }
 
@@ -1079,6 +1106,8 @@ fn save_prop_firm_validation_artifacts_writes_one_file_per_strategy() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: vec![prop_firm_artifact_with_pass_flag("fnv64:abc", true)],
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let written = save_prop_firm_validation_artifacts(&dir, &result)
@@ -1122,6 +1151,8 @@ fn populated_discovery_result(
             .map(|idx| prop_firm_artifact_with_pass_flag(&format!("prop-{idx}"), true))
             .collect(),
         funnel_profile: None,
+    
+        effective_smc_gate_threshold: f32::NAN,
     }
 }
 

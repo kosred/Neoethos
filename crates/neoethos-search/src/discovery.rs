@@ -814,6 +814,16 @@ impl DiscoveryConfig {
         cfg.growth_objective = matches!(self.mode, DiscoveryMode::Risky);
         cfg
     }
+
+    pub fn evaluation_config_with_smc_gate(
+        &self,
+        price_hint: Option<f64>,
+        effective_smc_gate_threshold: f32,
+    ) -> EvaluationConfig {
+        let mut cfg = self.evaluation_config(price_hint);
+        cfg.smc_gate_threshold = effective_smc_gate_threshold;
+        cfg
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -825,6 +835,8 @@ pub struct DiscoveryResult {
     /// Feature names as they existed *after* prefiltering inside discovery.
     /// Gene indices refer to columns in this list, not the caller's original names.
     pub effective_feature_names: Vec<String>,
+    /// Final annealed SMC gate used by the GA and every post-search replay.
+    pub effective_smc_gate_threshold: f32,
     pub validation_gates: DiscoveryValidationGates,
     pub canonical_backtest_artifacts: Vec<CanonicalBacktestArtifactFile>,
     pub walkforward_validation_artifacts: Vec<WalkforwardValidationArtifactFile>,
@@ -1749,6 +1761,7 @@ fn evaluate_cpcv_gate(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+    effective_smc_gate_threshold: f32,
     months: &[i64],
     days: &[i64],
     pbo_candidates: &[Gene],
@@ -1822,7 +1835,10 @@ fn evaluate_cpcv_gate(
 
     let mut fold_count = 0usize;
     let mut profitable_folds = 0usize;
-    let eval_config = config.evaluation_config(ohlcv.close.last().copied());
+    let eval_config = config.evaluation_config_with_smc_gate(
+        ohlcv.close.last().copied(),
+        effective_smc_gate_threshold,
+    );
 
     // AREA 2 / Stage B (2026-06-09) — GPU-route the CPCV gate.
     //
@@ -2047,6 +2063,7 @@ fn build_discovery_validation_artifacts(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+    effective_smc_gate_threshold: f32,
     pbo_candidates: &[Gene],
     trials_tested: usize,
 ) -> Result<(
@@ -2119,7 +2136,10 @@ fn build_discovery_validation_artifacts(
         .iter()
         .map(|gene| discovery_backtest_settings(config, gene, ohlcv.close.last().copied()))
         .collect();
-    let wf_eval_config = config.evaluation_config(ohlcv.close.last().copied());
+    let wf_eval_config = config.evaluation_config_with_smc_gate(
+        ohlcv.close.last().copied(),
+        effective_smc_gate_threshold,
+    );
     let wf_full_indicators = features.as_indicators_view();
     let (wob, wfvg, wliq, wtrend, wprem, wind, wbos, wchoch, weqh, weql, wdisp) =
         build_smc_arrays(features, ohlcv);
@@ -2244,6 +2264,7 @@ fn build_discovery_validation_artifacts(
             features,
             ohlcv,
             config,
+            effective_smc_gate_threshold,
             &months,
             &days,
             pbo_candidates,
@@ -2293,6 +2314,27 @@ pub fn compute_discovery_forward_test_artifacts(
     tail_features: &FeatureFrame,
     tail_ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+) -> Result<Vec<ForwardTestValidationArtifactFile>> {
+    let effective_smc_gate_threshold = config
+        .evaluation_config(tail_ohlcv.close.last().copied())
+        .smc_gate_threshold;
+    compute_discovery_forward_test_artifacts_with_smc_gate(
+        portfolio,
+        effective_feature_names,
+        tail_features,
+        tail_ohlcv,
+        config,
+        effective_smc_gate_threshold,
+    )
+}
+
+pub fn compute_discovery_forward_test_artifacts_with_smc_gate(
+    portfolio: &[Gene],
+    effective_feature_names: &[String],
+    tail_features: &FeatureFrame,
+    tail_ohlcv: &Ohlcv,
+    config: &DiscoveryConfig,
+    effective_smc_gate_threshold: f32,
 ) -> Result<Vec<ForwardTestValidationArtifactFile>> {
     if portfolio.is_empty() {
         return Ok(Vec::new());
@@ -2345,40 +2387,6 @@ pub fn compute_discovery_forward_test_artifacts(
     let (months, days) = month_day_indices(&tail_features.timestamps);
     let timestamps = &tail_features.timestamps[..n];
 
-    // **F-315 (2026-05-29) — partial diagnostic, full fix deferred to F-315b**.
-    //
-    // The stage-1 GA in `search_engine.rs:818` anneals the SMC gate
-    // from `gate_start` (default 0.75) down to `gate_end` (default
-    // 0.35) across generations. The forward-test pass below
-    // re-evaluates each survivor with the STATIC
-    // `runtime.smc_weights.gate_threshold` from
-    // `current_strategy_evaluation_runtime_overrides()` (default 0.75
-    // per `runtime_overrides.rs:417`). Candidates that survived the
-    // last generation under e.g. 0.35 may fail forward-test with 0.75
-    // — the asymmetry the F-315 ticket flagged. The proper fix is to
-    // forward the stage-1 final gate value through `SearchResult` and
-    // override the forward-test runtime gate to match; that touches
-    // 7 SearchResult construction sites in search_engine.rs plus the
-    // discovery + forward-test plumbing. **F-315b** tracks the
-    // architectural follow-up. For this ticket, we emit a warn at
-    // the top of `current_strategy_evaluation_runtime_overrides()`
-    // when the operator's static gate exceeds 0.5 (i.e. clearly above
-    // the GA's typical `gate_end` of 0.35) so the asymmetry surfaces
-    // in the discovery log instead of staying invisible.
-    {
-        use crate::genetic::runtime_overrides::current_strategy_evaluation_runtime_overrides;
-        let static_gate = current_strategy_evaluation_runtime_overrides()
-            .smc_weights
-            .gate_threshold;
-        if static_gate > 0.5 {
-            tracing::warn!(
-                target: "neoethos_search::discovery",
-                forward_test_smc_gate = static_gate,
-                "F-315 mismatch: forward-test SMC gate ({static_gate:.2}) is well above the GA stage-1 typical end (0.35). Survivors of the final generation may fail forward-test for a threshold they never passed in stage-1. Lower the runtime override (`smc_weights.gate_threshold`) toward 0.35 to align, or wait for F-315b to plumb the GA's final gate through SearchResult."
-            );
-        }
-    }
-
     // Each portfolio gene's forward-test replay is fully independent, so run
     // them across the rayon pool instead of one-at-a-time. `par_iter()` on a
     // slice is an INDEXED parallel iterator, so `collect::<Result<Vec<_>>>()`
@@ -2392,7 +2400,10 @@ pub fn compute_discovery_forward_test_artifacts(
                 discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
             let strategy_hash = stable_json_hash(gene)?;
             let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
-            let evaluation_config = config.evaluation_config(tail_ohlcv.close.last().copied());
+            let evaluation_config = config.evaluation_config_with_smc_gate(
+                tail_ohlcv.close.last().copied(),
+                effective_smc_gate_threshold,
+            );
             let signals =
                 signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
             if signals.len() != n {
@@ -2446,6 +2457,29 @@ pub fn compute_discovery_prop_firm_artifacts(
     tail_features: &FeatureFrame,
     tail_ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+    rules: PropFirmRiskRules,
+) -> Result<Vec<PropFirmRiskValidationArtifactFile>> {
+    let effective_smc_gate_threshold = config
+        .evaluation_config(tail_ohlcv.close.last().copied())
+        .smc_gate_threshold;
+    compute_discovery_prop_firm_artifacts_with_smc_gate(
+        portfolio,
+        effective_feature_names,
+        tail_features,
+        tail_ohlcv,
+        config,
+        effective_smc_gate_threshold,
+        rules,
+    )
+}
+
+pub fn compute_discovery_prop_firm_artifacts_with_smc_gate(
+    portfolio: &[Gene],
+    effective_feature_names: &[String],
+    tail_features: &FeatureFrame,
+    tail_ohlcv: &Ohlcv,
+    config: &DiscoveryConfig,
+    effective_smc_gate_threshold: f32,
     rules: PropFirmRiskRules,
 ) -> Result<Vec<PropFirmRiskValidationArtifactFile>> {
     if portfolio.is_empty() {
@@ -2506,7 +2540,10 @@ pub fn compute_discovery_prop_firm_artifacts(
                 discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
             let strategy_hash = stable_json_hash(gene)?;
             let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
-            let evaluation_config = config.evaluation_config(tail_ohlcv.close.last().copied());
+            let evaluation_config = config.evaluation_config_with_smc_gate(
+                tail_ohlcv.close.last().copied(),
+                effective_smc_gate_threshold,
+            );
             let signals =
                 signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
             if signals.len() != n {
@@ -2743,12 +2780,13 @@ where
     // feature columns it actually needs.
     let tail_features = features.row_window(is_end, n_rows);
 
-    match compute_discovery_forward_test_artifacts(
+    match compute_discovery_forward_test_artifacts_with_smc_gate(
         &result.portfolio,
         &result.effective_feature_names,
         &tail_features,
         &tail_ohlcv,
         config,
+        result.effective_smc_gate_threshold,
     ) {
         Ok(artifacts) => result.forward_test_validation_artifacts = artifacts,
         Err(err) => tracing::warn!(
@@ -2759,12 +2797,13 @@ where
              and the live-portfolio OOS gate will keep all members)"
         ),
     }
-    match compute_discovery_prop_firm_artifacts(
+    match compute_discovery_prop_firm_artifacts_with_smc_gate(
         &result.portfolio,
         &result.effective_feature_names,
         &tail_features,
         &tail_ohlcv,
         config,
+        result.effective_smc_gate_threshold,
         prop_firm_rules,
     ) {
         Ok(artifacts) => result.prop_firm_validation_artifacts = artifacts,
@@ -3127,6 +3166,7 @@ where
         },
     )?;
 
+    let effective_smc_gate_threshold = search.effective_smc_gate_threshold;
     let stage1_count = search.genes.len();
     funnel.record_stage("stage1_candidates_generated", 0, stage1_count);
     // The archive that survived the GA is what we hand the IS evaluator. The
@@ -3143,6 +3183,7 @@ where
         &features,
         &ohlcv,
         config,
+        effective_smc_gate_threshold,
         effective_feature_names,
         &mut funnel,
         progress_fn,
@@ -3626,6 +3667,7 @@ fn finalize_candidates_with_progress<F>(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+    effective_smc_gate_threshold: f32,
     effective_feature_names: Vec<String>,
     funnel: &mut crate::funnel_profile::FunnelProfile,
     mut progress_fn: F,
@@ -3936,7 +3978,10 @@ where
     // `signals_for_gene` ignored gene SMC flags; some candidates passed the
     // search archive (with their SMC-gated trade count) but were then pruned
     // here because the un-gated count was higher than min_trades.
-    let eval_config_for_signals = config.evaluation_config(ohlcv.close.last().copied());
+    let eval_config_for_signals = config.evaluation_config_with_smc_gate(
+        ohlcv.close.last().copied(),
+        effective_smc_gate_threshold,
+    );
 
     // Diagnostic counter #2: how many genes generated ANY non-zero
     // signal at all? A gene with `long_threshold > max possible
@@ -4586,6 +4631,7 @@ where
                 features,
                 ohlcv,
                 config,
+                effective_smc_gate_threshold,
                 &pbo_candidates,
                 ranked_total,
             )?
@@ -4628,7 +4674,10 @@ where
         let w0 = n_all.saturating_sub(ROBUST_WINDOW);
         let ts_all: &[i64] = ohlcv.timestamp.as_deref().unwrap_or(&[]);
         let ts_win: &[i64] = if ts_all.len() == n_all { &ts_all[w0..] } else { &[] };
-        let eval_cfg_rb = config.evaluation_config(ohlcv.close.last().copied());
+        let eval_cfg_rb = config.evaluation_config_with_smc_gate(
+            ohlcv.close.last().copied(),
+            effective_smc_gate_threshold,
+        );
 
         let verdicts: Vec<(bool, String)> = portfolio
             .par_iter()
@@ -4875,6 +4924,8 @@ where
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: Some(funnel.clone()),
+    
+        effective_smc_gate_threshold,
     })
 }
 
