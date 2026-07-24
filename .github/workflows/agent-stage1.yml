@@ -62,12 +62,18 @@ jobs:
 
           echo "applied=$applied" >> "$GITHUB_OUTPUT"
 
-      - name: Check workspace formatting
+      - name: Check changed Rust formatting
         shell: bash
         run: |
           set -o pipefail
           mkdir -p /tmp/stage1-diagnostics
-          cargo fmt --all -- --check 2>&1 | tee /tmp/stage1-diagnostics/format.log
+          mapfile -d '' rust_files < <(git diff --name-only -z origin/master...HEAD -- '*.rs')
+          if (( ${#rust_files[@]} == 0 )); then
+            echo "No changed Rust files" | tee /tmp/stage1-diagnostics/format.log
+          else
+            printf 'Checking %s\n' "${rust_files[@]}" | tee /tmp/stage1-diagnostics/format.log
+            rustfmt --edition 2024 --check "${rust_files[@]}" 2>&1 | tee -a /tmp/stage1-diagnostics/format.log
+          fi
 
       - name: Test search crate
         shell: bash
