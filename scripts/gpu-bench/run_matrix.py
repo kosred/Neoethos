@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Generate or execute an attributed rented-NVIDIA benchmark matrix.
 
-Only workloads with a real execution adapter are marked executable. Missing
-Prototype B/C, historical-legacy, or snapshot adapters remain blocked in the
-manifest instead of producing fake benchmark JSON.
+Only workloads with a real execution adapter are marked executable. Unsupported
+prototype/fixture combinations remain typed blocked jobs; no placeholder report
+is ever presented as a measurement.
 """
 from __future__ import annotations
 
@@ -32,6 +32,9 @@ class Job:
     prototype: str
     benchmark_pass: str
     fixture: str
+    snapshot: str | None
+    dataset_hash: str
+    config_hash: str
     executable: bool
     blocked_reason: str | None
     output: str
@@ -95,6 +98,18 @@ def wrapped_command(
     return command, environment
 
 
+def snapshot_files(args: argparse.Namespace, timeframes: tuple[str, ...]) -> dict[str, pathlib.Path]:
+    if args.snapshot_dir is None or not args.snapshot_dir.is_dir():
+        raise SystemExit("--fixture snapshot requires --snapshot-dir <directory>")
+    snapshots: dict[str, pathlib.Path] = {}
+    for timeframe in timeframes:
+        path = args.snapshot_dir / args.snapshot_pattern.format(timeframe=timeframe)
+        if not path.is_file():
+            raise SystemExit(f"missing {timeframe} snapshot: {path}")
+        snapshots[timeframe] = path.resolve()
+    return snapshots
+
+
 def build_jobs(args: argparse.Namespace) -> list[Job]:
     root = args.worktrees_root.resolve()
     candidate = root / "candidate"
@@ -102,25 +117,19 @@ def build_jobs(args: argparse.Namespace) -> list[Job]:
     checked_head(candidate, args.candidate_sha)
     checked_head(legacy, args.legacy_sha)
 
+    config_hash = sha256(args.config) if args.config and args.config.is_file() else stable_hash({
+        "population": args.population,
+        "bars": args.bars,
+        "features": args.features,
+        "batch_size": args.batch_size,
+        "fixture": args.fixture,
+    })
     if args.fixture == "snapshot":
-        if args.dataset is None or not args.dataset.is_file():
-            raise SystemExit("--fixture snapshot requires --dataset <file>")
-        if args.config is None or not args.config.is_file():
-            raise SystemExit("--fixture snapshot requires --config <file>")
-        dataset_hash = sha256(args.dataset)
-        config_hash = sha256(args.config)
-        timeframes = tuple(x.strip() for x in args.timeframes.split(",") if x.strip())
+        timeframes = tuple(x.strip().upper() for x in args.timeframes.split(",") if x.strip())
+        snapshots = snapshot_files(args, timeframes)
     else:
-        dataset_hash = stable_hash({"fixture": "tiny-population-v1"})
-        config_hash = stable_hash(
-            {
-                "population": args.population,
-                "bars": args.bars,
-                "features": args.features,
-                "batch_size": args.batch_size,
-            }
-        )
         timeframes = ("TINY",)
+        snapshots = {}
 
     prototypes = tuple(x.strip().lower() for x in args.prototypes.split(",") if x.strip())
     jobs: list[Job] = []
@@ -129,14 +138,12 @@ def build_jobs(args: argparse.Namespace) -> list[Job]:
         ("candidate", args.candidate_sha, candidate),
     ):
         for timeframe in timeframes:
+            snapshot = snapshots.get(timeframe)
+            dataset_hash = sha256(snapshot) if snapshot else stable_hash({"fixture": "tiny-population-v1"})
             for prototype in (("legacy",) if ref_name == "legacy" else prototypes):
                 for benchmark_pass in PASSES:
                     output = (
-                        args.out
-                        / ref_name
-                        / timeframe
-                        / prototype
-                        / f"{benchmark_pass}.json"
+                        args.out / ref_name / timeframe / prototype / f"{benchmark_pass}.json"
                     ).resolve()
                     executable = False
                     blocked: str | None = None
@@ -146,19 +153,16 @@ def build_jobs(args: argparse.Namespace) -> list[Job]:
                     if ref_name == "legacy":
                         blocked = (
                             "historical commit predates the attributed bench adapter; "
-                            "a legacy execution adapter is required before comparison"
-                        )
-                    elif args.fixture == "snapshot":
-                        blocked = (
-                            "snapshot loader/executor is not implemented in Stage 1; "
-                            "manifest only"
+                            "a pinned legacy execution adapter is required"
                         )
                     elif prototype != "a":
-                        blocked = f"Prototype {prototype.upper()} has no executable kernel yet"
+                        blocked = (
+                            f"Prototype {prototype.upper()} has a correctness kernel but no "
+                            "full population/snapshot benchmark adapter yet"
+                        )
                     else:
                         binary = candidate_binary(candidate)
-                        bench_args = [
-                            "--execute-tiny",
+                        common = [
                             "--git-sha", git_sha,
                             "--baseline-sha", args.legacy_sha,
                             "--dataset-hash", dataset_hash,
@@ -166,41 +170,50 @@ def build_jobs(args: argparse.Namespace) -> list[Job]:
                             "--timeframe", timeframe,
                             "--backend", "gpu_required",
                             "--prototype", prototype,
-                            "--fixture", "tiny",
                             "--pass", benchmark_pass,
-                            "--population", str(args.population),
                             "--batch-size", str(args.batch_size),
-                            "--bars", str(args.bars),
-                            "--features", str(args.features),
                             "--warmups", str(args.warmups),
                             "--repetitions", str(args.repetitions),
                             "--out", str(output),
                         ]
+                        if snapshot is None:
+                            bench_args = [
+                                "--execute-tiny", "--fixture", "tiny",
+                                "--population", str(args.population),
+                                "--bars", str(args.bars),
+                                "--features", str(args.features),
+                                *common,
+                            ]
+                        else:
+                            bench_args = [
+                                "--execute-snapshot", "--fixture", "snapshot",
+                                "--snapshot", str(snapshot),
+                                *common,
+                            ]
                         command, environment = wrapped_command(
                             binary, bench_args, benchmark_pass, output
                         )
                         executable = True
 
-                    job_id = "/".join(
-                        (ref_name, timeframe, prototype, benchmark_pass)
-                    )
-                    jobs.append(
-                        Job(
-                            job_id=job_id,
-                            ref_name=ref_name,
-                            git_sha=git_sha,
-                            worktree=str(worktree),
-                            timeframe=timeframe,
-                            prototype=prototype,
-                            benchmark_pass=benchmark_pass,
-                            fixture=args.fixture,
-                            executable=executable,
-                            blocked_reason=blocked,
-                            output=str(output),
-                            command=command,
-                            environment=environment,
-                        )
-                    )
+                    job_id = "/".join((ref_name, timeframe, prototype, benchmark_pass))
+                    jobs.append(Job(
+                        job_id=job_id,
+                        ref_name=ref_name,
+                        git_sha=git_sha,
+                        worktree=str(worktree),
+                        timeframe=timeframe,
+                        prototype=prototype,
+                        benchmark_pass=benchmark_pass,
+                        fixture=args.fixture,
+                        snapshot=str(snapshot) if snapshot else None,
+                        dataset_hash=dataset_hash,
+                        config_hash=config_hash,
+                        executable=executable,
+                        blocked_reason=blocked,
+                        output=str(output),
+                        command=command,
+                        environment=environment,
+                    ))
     return jobs
 
 
@@ -208,13 +221,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate-sha", required=True)
     parser.add_argument("--legacy-sha", default=LEGACY_SHA)
-    parser.add_argument(
-        "--worktrees-root",
-        type=pathlib.Path,
-        default=pathlib.Path("cache/gpu-bench/worktrees"),
-    )
+    parser.add_argument("--worktrees-root", type=pathlib.Path, default=pathlib.Path("cache/gpu-bench/worktrees"))
     parser.add_argument("--fixture", choices=("tiny", "snapshot"), default="tiny")
-    parser.add_argument("--dataset", type=pathlib.Path)
+    parser.add_argument("--snapshot-dir", type=pathlib.Path)
+    parser.add_argument("--snapshot-pattern", default="{timeframe}.json")
     parser.add_argument("--config", type=pathlib.Path)
     parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("cache/gpu-bench/runs"))
     parser.add_argument("--timeframes", default=",".join(SNAPSHOT_TIMEFRAMES))
@@ -238,10 +248,7 @@ def main() -> int:
     )
     executable = [job for job in jobs if job.executable]
     blocked = [job for job in jobs if not job.executable]
-    print(
-        f"wrote {manifest}: total={len(jobs)} executable={len(executable)} "
-        f"blocked={len(blocked)}"
-    )
+    print(f"wrote {manifest}: total={len(jobs)} executable={len(executable)} blocked={len(blocked)}")
     for job in jobs:
         if job.executable:
             print(shlex.join(job.command))
@@ -251,17 +258,13 @@ def main() -> int:
     if not args.execute:
         return 0
     if blocked and not args.skip_blocked:
-        raise SystemExit(
-            "matrix contains blocked jobs; use --skip-blocked to execute only supported jobs"
-        )
+        raise SystemExit("matrix contains blocked jobs; use --skip-blocked to execute only supported jobs")
     for job in executable:
         output = pathlib.Path(job.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         binary = candidate_binary(pathlib.Path(job.worktree))
         if not binary.is_file():
-            raise SystemExit(
-                f"missing release binary {binary}; build the pinned candidate worktree first"
-            )
+            raise SystemExit(f"missing release binary {binary}; build the pinned candidate worktree first")
         env = os.environ.copy()
         env.update(job.environment)
         subprocess.run(job.command, cwd=job.worktree, env=env, check=True)

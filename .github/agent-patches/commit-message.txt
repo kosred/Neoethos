@@ -1,1 +1,1 @@
-feat(gpu): add executable Prototype C CubeCL first-hit kernel
+feat(gpu): add executable versioned snapshot benchmarks
