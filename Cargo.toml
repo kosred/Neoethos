@@ -10,6 +10,7 @@ members = [
   "crates/neoethos-codex",
   "crates/neoethos-trader",
   "crates/neoethos-gpu-contracts",
+  "crates/neoethos-gpu-cuda",
   # Tauri desktop shell (single-process replacement for the Flutter+HTTP
   # split). Shares target/ so it links the already-built neoethos-* rlibs
   # instead of recompiling the whole dep tree. Deliberately NOT in
@@ -65,8 +66,8 @@ thiserror   = "2.0.16"
 #   - `lto = "fat"`     — cross-crate inlining + dead-code stripping.
 #       Particularly important here because `neoethos-app` still links
 #       the old egui UI tree (task #89 will delete it) which is never
-#       exercised in `--server` mode; fat LTO lets the linker drop the
-#       unreached code paths.
+#       exercised in `--server` mode; fat LTO lets the linker drop
+#       the unreached code paths.
 #   - `codegen-units = 1` — single LLVM module so LTO can see everything.
 #   - `strip = "symbols"` — drop DWARF + Windows debug symbols. Stack
 #       traces in panic messages are kept (panic infrastructure is
