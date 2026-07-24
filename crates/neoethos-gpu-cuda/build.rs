@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/layout_asserts.cpp");
     println!("cargo:rerun-if-changed=native/stub.cpp");
     println!("cargo:rerun-if-changed=native/smoke.cu");
+    println!("cargo:rerun-if-changed=native/prototype_b.cu");
     println!("cargo:rerun-if-env-changed=CUDACXX");
 
     let cuda_feature = env::var_os("CARGO_FEATURE_CUDA").is_some();
@@ -23,7 +24,11 @@ fn main() {
         if !available {
             panic!("feature `cuda` requires nvcc; set CUDACXX or install the CUDA toolkit");
         }
-        build.cuda(true).compiler(nvcc).file("native/smoke.cu");
+        build
+            .cuda(true)
+            .compiler(nvcc)
+            .file("native/smoke.cu")
+            .file("native/prototype_b.cu");
     } else {
         build.file("native/stub.cpp");
     }

@@ -19,6 +19,10 @@ static_assert(offsetof(NeoScenarioDescriptor, reserved) == 64);
 static_assert(sizeof(NeoTradeOutcome) == 56);
 static_assert(sizeof(NeoMetrics) == 80);
 static_assert(sizeof(NeoPropFirmState) == 56);
+static_assert(sizeof(NeoFirstHitEvent) == 24);
+static_assert(alignof(NeoFirstHitEvent) == 4);
+static_assert(offsetof(NeoFirstHitEvent, stop_price) == 16);
+static_assert(sizeof(NeoFirstHitResult) == 8);
 
 extern "C" std::uint32_t neoethos_gpu_cuda_abi_version() {
   return NEOETHOS_GPU_ABI_VERSION;

@@ -101,9 +101,30 @@ struct NeoPropFirmState {
   std::uint32_t flags;
 };
 
+struct NeoFirstHitEvent {
+  std::uint32_t entry_bar;
+  std::uint32_t last_bar;
+  std::int32_t direction;
+  std::int32_t precedence;
+  float stop_price;
+  float target_price;
+};
+
+struct NeoFirstHitResult {
+  std::int32_t exit_bar;
+  std::int32_t exit_reason;
+};
+
 std::uint32_t neoethos_gpu_cuda_abi_version();
 std::int32_t neoethos_gpu_cuda_runtime_available();
 std::int32_t neoethos_gpu_cuda_smoke(const std::uint32_t* input,
                                      std::uint32_t* output,
                                      std::size_t len);
+std::int32_t neoethos_gpu_cuda_warp_first_hit(
+    const float* highs,
+    const float* lows,
+    std::size_t rows,
+    const NeoFirstHitEvent* events,
+    NeoFirstHitResult* results,
+    std::size_t event_count);
 }
