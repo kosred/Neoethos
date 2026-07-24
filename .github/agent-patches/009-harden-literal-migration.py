@@ -38,4 +38,42 @@ if text.count(old_checkpoint) != 1:
     raise RuntimeError("could not patch checkpoint literal handling exactly once")
 text = text.replace(old_checkpoint, new_checkpoint, 1)
 
+# The original migration kept the first DiscoveryConfig/DiscoveryResult edits
+# only in memory, then re-read discovery.rs while adding test literal fields.
+# Persist those structural edits before the repository-wide literal pass.
+marker = '''# Every synthetic/test literal gets an explicit non-production sentinel. The
+# real finalize constructor is replaced with the actual gate below.
+'''
+replacement = '''# Persist the structural config/result changes before the repository-wide
+# literal pass reads discovery.rs again.
+write(discovery_path, discovery)
+
+# Every synthetic/test literal gets an explicit non-production sentinel. The
+# real finalize constructor is replaced with the actual gate below.
+'''
+if text.count(marker) != 1:
+    raise RuntimeError("could not insert discovery structural write exactly once")
+text = text.replace(marker, replacement, 1)
+
+# The only direct test call to the now-expanded private finalizer needs an
+# explicit fixture gate. Production passes the real SearchResult value.
+insert_before = '''# Document the verified migration commit name for the workflow bot.
+'''
+test_patch = '''# Update the direct finalizer fixture with an explicit SMC gate.
+discovery_tests_path = "crates/neoethos-search/src/discovery_tests.rs"
+discovery_tests = read(discovery_tests_path)
+discovery_tests = replace_exact(
+    discovery_tests,
+    "        &config,\\n        features.names.clone(),\\n        &mut funnel,\\n",
+    "        &config,\\n        0.75,\\n        features.names.clone(),\\n        &mut funnel,\\n",
+    label="finalizer test gate",
+)
+write(discovery_tests_path, discovery_tests)
+
+# Document the verified migration commit name for the workflow bot.
+'''
+if text.count(insert_before) != 1:
+    raise RuntimeError("could not insert finalizer fixture patch exactly once")
+text = text.replace(insert_before, test_patch, 1)
+
 path.write_text(text, encoding="utf-8")
