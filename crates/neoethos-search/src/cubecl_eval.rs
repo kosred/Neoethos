@@ -26,6 +26,122 @@ const BACKTEST_CORE_METRIC_WIDTH: usize = 7;
 //   [5] trading_days            = count of days with >=1 trade (as f32)
 const FTMO_WIDTH: usize = 6;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CubeClTransferTelemetry {
+    pub gpu_calls: u64,
+    pub resident_cache_hits: u64,
+    pub resident_cache_misses: u64,
+    pub resident_upload_bytes: u64,
+    pub streamed_dataset_upload_bytes: u64,
+    pub gene_uploads: u64,
+    pub gene_upload_bytes: u64,
+    pub full_readbacks: u64,
+    pub full_readback_bytes: u64,
+    pub compact_readbacks: u64,
+    pub compact_readback_bytes: u64,
+    pub chained_reuploads: u64,
+    pub synchronization_events: u64,
+}
+
+mod transfer_telemetry {
+    use super::CubeClTransferTelemetry;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static GPU_CALLS: AtomicU64 = AtomicU64::new(0);
+    static RESIDENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+    static RESIDENT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+    static RESIDENT_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static STREAMED_DATASET_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static GENE_UPLOADS: AtomicU64 = AtomicU64::new(0);
+    static GENE_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static FULL_READBACKS: AtomicU64 = AtomicU64::new(0);
+    static FULL_READBACK_BYTES: AtomicU64 = AtomicU64::new(0);
+    static COMPACT_READBACKS: AtomicU64 = AtomicU64::new(0);
+    static COMPACT_READBACK_BYTES: AtomicU64 = AtomicU64::new(0);
+    static CHAINED_REUPLOADS: AtomicU64 = AtomicU64::new(0);
+    static SYNCHRONIZATION_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn reset() {
+        for counter in [
+            &GPU_CALLS,
+            &RESIDENT_CACHE_HITS,
+            &RESIDENT_CACHE_MISSES,
+            &RESIDENT_UPLOAD_BYTES,
+            &STREAMED_DATASET_UPLOAD_BYTES,
+            &GENE_UPLOADS,
+            &GENE_UPLOAD_BYTES,
+            &FULL_READBACKS,
+            &FULL_READBACK_BYTES,
+            &COMPACT_READBACKS,
+            &COMPACT_READBACK_BYTES,
+            &CHAINED_REUPLOADS,
+            &SYNCHRONIZATION_EVENTS,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn snapshot() -> CubeClTransferTelemetry {
+        CubeClTransferTelemetry {
+            gpu_calls: GPU_CALLS.load(Ordering::Relaxed),
+            resident_cache_hits: RESIDENT_CACHE_HITS.load(Ordering::Relaxed),
+            resident_cache_misses: RESIDENT_CACHE_MISSES.load(Ordering::Relaxed),
+            resident_upload_bytes: RESIDENT_UPLOAD_BYTES.load(Ordering::Relaxed),
+            streamed_dataset_upload_bytes: STREAMED_DATASET_UPLOAD_BYTES.load(Ordering::Relaxed),
+            gene_uploads: GENE_UPLOADS.load(Ordering::Relaxed),
+            gene_upload_bytes: GENE_UPLOAD_BYTES.load(Ordering::Relaxed),
+            full_readbacks: FULL_READBACKS.load(Ordering::Relaxed),
+            full_readback_bytes: FULL_READBACK_BYTES.load(Ordering::Relaxed),
+            compact_readbacks: COMPACT_READBACKS.load(Ordering::Relaxed),
+            compact_readback_bytes: COMPACT_READBACK_BYTES.load(Ordering::Relaxed),
+            chained_reuploads: CHAINED_REUPLOADS.load(Ordering::Relaxed),
+            synchronization_events: SYNCHRONIZATION_EVENTS.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(super) fn record_call() {
+        GPU_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_streamed_dataset_upload(bytes: usize) {
+        STREAMED_DATASET_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_gene_upload(bytes: usize) {
+        GENE_UPLOADS.fetch_add(1, Ordering::Relaxed);
+        GENE_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_resident_hit() {
+        RESIDENT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_resident_miss(bytes: usize) {
+        RESIDENT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        RESIDENT_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_readback(use_fused: bool, compact_bytes: usize, dense_bytes: usize) {
+        COMPACT_READBACKS.fetch_add(1, Ordering::Relaxed);
+        COMPACT_READBACK_BYTES.fetch_add(compact_bytes as u64, Ordering::Relaxed);
+        SYNCHRONIZATION_EVENTS.fetch_add(1, Ordering::Relaxed);
+        if !use_fused && dense_bytes > 0 {
+            FULL_READBACKS.fetch_add(1, Ordering::Relaxed);
+            FULL_READBACK_BYTES.fetch_add(dense_bytes as u64, Ordering::Relaxed);
+            CHAINED_REUPLOADS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) fn reset_cubecl_transfer_telemetry() {
+    transfer_telemetry::reset();
+}
+
+pub(crate) fn cubecl_transfer_telemetry_snapshot() -> CubeClTransferTelemetry {
+    transfer_telemetry::snapshot()
+}
+
+
 // ─── F-CORE3 consolidation — CUDA env-var registry ──────────────────
 //
 // **2026-05-25**: the 7 inline `std::env::var(...)` reads previously
@@ -309,9 +425,11 @@ mod resident_device_cache {
         );
         {
             let Ok(mut st) = state().lock() else {
+                super::transfer_telemetry::record_resident_miss(bytes.len());
                 return client.create_from_slice(bytes);
             };
             if let Some((_, handle)) = st.map.get(&key) {
+                super::transfer_telemetry::record_resident_hit();
                 return handle.clone();
             }
             // Evict oldest until the NEW entry fits the budget.
@@ -327,6 +445,7 @@ mod resident_device_cache {
         }
         // Upload OUTSIDE the lock (can take milliseconds for GB-scale buffers).
         let handle = client.create_from_slice(bytes);
+        super::transfer_telemetry::record_resident_miss(bytes.len());
         if let Ok(mut st) = state().lock() {
             st.map.insert(key, (bytes.len(), handle.clone()));
             st.order.push_back(key);
@@ -2103,6 +2222,10 @@ where
         let wlen = s1 - s0;
         let ind_window = gather_indicator_window(indicators_flat, n_indicators, n_samples, s0, s1);
         let smc_window = &smc_data_flat[s0 * SMC_WIDTH..s1 * SMC_WIDTH];
+        transfer_telemetry::record_streamed_dataset_upload(
+            ind_window.len().saturating_mul(std::mem::size_of::<F>())
+                + smc_window.len().saturating_mul(std::mem::size_of::<i32>()),
+        );
         let (sig_w, conf_w) = launch_signal_kernel::<F, R>(
             client,
             device_key,
@@ -3202,6 +3325,17 @@ where
     let signals_handle = client.empty(total.saturating_mul(std::mem::size_of::<i32>()));
     let conf_handle = client.empty(total.saturating_mul(std::mem::size_of::<f32>()));
     // Gene-independent inputs are identical every window — upload ONCE.
+    let gene_upload_bytes = gene_offsets.len().saturating_mul(std::mem::size_of::<i32>())
+        + gene_indices.len().saturating_mul(std::mem::size_of::<i32>())
+        + gene_weights.len().saturating_mul(std::mem::size_of::<F>())
+        + long_thr.len().saturating_mul(std::mem::size_of::<F>())
+        + short_thr.len().saturating_mul(std::mem::size_of::<F>())
+        + gene_smc_flags_flat.len().saturating_mul(std::mem::size_of::<i32>())
+        + smc_weights.len().saturating_mul(std::mem::size_of::<F>())
+        + sl_pips.len().saturating_mul(std::mem::size_of::<f32>())
+        + tp_pips.len().saturating_mul(std::mem::size_of::<f32>())
+        + stop_vol_mult.len().saturating_mul(std::mem::size_of::<f32>());
+    transfer_telemetry::record_gene_upload(gene_upload_bytes);
     let (
         gene_offsets_handle,
         gene_indices_handle,
@@ -3230,6 +3364,10 @@ where
         let win_total = n_genes.saturating_mul(wlen);
         let ind_window = gather_indicator_window(indicators_flat, n_indicators, n_samples, s0, s1);
         let smc_window = &smc_data_flat[s0 * SMC_WIDTH..s1 * SMC_WIDTH];
+        transfer_telemetry::record_streamed_dataset_upload(
+            ind_window.len().saturating_mul(std::mem::size_of::<F>())
+                + smc_window.len().saturating_mul(std::mem::size_of::<i32>()),
+        );
         // Per-window inputs + transient window output buffers (freed each pass).
         let (indicators_handle, smc_data_handle, sig_w, conf_w) = gpu_timing::upload(|| {
             (
@@ -3622,6 +3760,8 @@ pub(crate) fn try_evaluate_population_cuda(
         bail!("cuda population evaluate path received inconsistent dimensions");
     }
 
+    transfer_telemetry::record_call();
+
     // NEOETHOS_GPU_TIMING: open a per-call measurement frame (no-op when unset).
     // The total is timed from here; the inner phases (client-get/host-prep/upload/
     // kernel/readback) are attributed below. PARITY: pure side-effect — `begin()`
@@ -3850,6 +3990,20 @@ pub(crate) fn try_evaluate_population_cuda(
         }
     } // end `else` (windowed host path); the `if use_fused` branch filled the
     // same metric vecs above.
+
+    let compact_readback_bytes = metrics_flat
+        .len()
+        .saturating_mul(std::mem::size_of::<f32>())
+        + trade_counts.len().saturating_mul(std::mem::size_of::<i32>())
+        + monthly_flat.len().saturating_mul(std::mem::size_of::<f32>())
+        + month_counts.len().saturating_mul(std::mem::size_of::<i32>())
+        + month_start_eq_flat
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>());
+    let dense_readback_bytes = n_genes
+        .saturating_mul(n_samples)
+        .saturating_mul(std::mem::size_of::<i32>() + std::mem::size_of::<f32>());
+    transfer_telemetry::record_readback(use_fused, compact_readback_bytes, dense_readback_bytes);
 
     let mut results = Vec::with_capacity(n_genes);
     for g in 0..n_genes {
