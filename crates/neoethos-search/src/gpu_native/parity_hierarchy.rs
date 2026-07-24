@@ -186,17 +186,84 @@ pub fn compare_traces(
         &candidate.scores_before_threshold,
         policy.score,
     )
-    .or_else(|| compare_exact_slice(ParityLevel::SignalDirection, "signal", &reference.signals, &candidate.signals))
-    .or_else(|| compare_f32_slice(ParityLevel::Confidence, "confidence", &reference.confidences, &candidate.confidences, policy.confidence))
-    .or_else(|| compare_exact_slice(ParityLevel::EntryEvents, "entry", &reference.entries, &candidate.entries))
-    .or_else(|| compare_exact_slice(ParityLevel::ExitBarAndReason, "exit", &reference.exits, &candidate.exits))
+    .or_else(|| {
+        compare_exact_slice(
+            ParityLevel::SignalDirection,
+            "signal",
+            &reference.signals,
+            &candidate.signals,
+        )
+    })
+    .or_else(|| {
+        compare_f32_slice(
+            ParityLevel::Confidence,
+            "confidence",
+            &reference.confidences,
+            &candidate.confidences,
+            policy.confidence,
+        )
+    })
+    .or_else(|| {
+        compare_exact_slice(
+            ParityLevel::EntryEvents,
+            "entry",
+            &reference.entries,
+            &candidate.entries,
+        )
+    })
+    .or_else(|| {
+        compare_exact_slice(
+            ParityLevel::ExitBarAndReason,
+            "exit",
+            &reference.exits,
+            &candidate.exits,
+        )
+    })
     .or_else(|| compare_trade_identity(&reference.accepted_trades, &candidate.accepted_trades))
-    .or_else(|| compare_trade_values(&reference.accepted_trades, &candidate.accepted_trades, policy))
-    .or_else(|| compare_trade_equity(&reference.accepted_trades, &candidate.accepted_trades, policy.pnl_and_equity))
-    .or_else(|| compare_risk_states(&reference.risk_states, &candidate.risk_states, policy.risk_state))
-    .or_else(|| compare_metrics(&reference.final_metrics, &candidate.final_metrics, policy.metrics))
-    .or_else(|| compare_exact_slice(ParityLevel::ValidationVerdict, "verdict", &reference.validation_verdicts, &candidate.validation_verdicts))
-    .or_else(|| compare_exact_slice(ParityLevel::SurvivorOrdering, "survivor", &reference.survivor_order, &candidate.survivor_order));
+    .or_else(|| {
+        compare_trade_values(
+            &reference.accepted_trades,
+            &candidate.accepted_trades,
+            policy,
+        )
+    })
+    .or_else(|| {
+        compare_trade_equity(
+            &reference.accepted_trades,
+            &candidate.accepted_trades,
+            policy.pnl_and_equity,
+        )
+    })
+    .or_else(|| {
+        compare_risk_states(
+            &reference.risk_states,
+            &candidate.risk_states,
+            policy.risk_state,
+        )
+    })
+    .or_else(|| {
+        compare_metrics(
+            &reference.final_metrics,
+            &candidate.final_metrics,
+            policy.metrics,
+        )
+    })
+    .or_else(|| {
+        compare_exact_slice(
+            ParityLevel::ValidationVerdict,
+            "verdict",
+            &reference.validation_verdicts,
+            &candidate.validation_verdicts,
+        )
+    })
+    .or_else(|| {
+        compare_exact_slice(
+            ParityLevel::SurvivorOrdering,
+            "survivor",
+            &reference.survivor_order,
+            &candidate.survivor_order,
+        )
+    });
 
     TraceComparisonReport {
         reference_backend: reference_backend.into(),
@@ -220,13 +287,8 @@ fn compare_float_slice(
         .zip(actual)
         .enumerate()
         .find_map(|(index, (expected, actual))| {
-            (!tolerance.matches_f64(*expected, *actual)).then(|| divergence(
-                level,
-                index,
-                field,
-                expected,
-                actual,
-            ))
+            (!tolerance.matches_f64(*expected, *actual))
+                .then(|| divergence(level, index, field, expected, actual))
         })
 }
 
@@ -245,13 +307,8 @@ fn compare_f32_slice(
         .zip(actual)
         .enumerate()
         .find_map(|(index, (expected, actual))| {
-            (!tolerance.matches_f32(*expected, *actual)).then(|| divergence(
-                level,
-                index,
-                field,
-                expected,
-                actual,
-            ))
+            (!tolerance.matches_f32(*expected, *actual))
+                .then(|| divergence(level, index, field, expected, actual))
         })
 }
 
@@ -273,7 +330,10 @@ fn compare_exact_slice<T: PartialEq + core::fmt::Debug>(
         })
 }
 
-fn compare_trade_identity(expected: &[TradeTrace], actual: &[TradeTrace]) -> Option<ParityDivergence> {
+fn compare_trade_identity(
+    expected: &[TradeTrace],
+    actual: &[TradeTrace],
+) -> Option<ParityDivergence> {
     if expected.len() != actual.len() {
         return length_mismatch(
             ParityLevel::AcceptedTradeSequence,
@@ -282,17 +342,37 @@ fn compare_trade_identity(expected: &[TradeTrace], actual: &[TradeTrace]) -> Opt
             actual.len(),
         );
     }
-    expected.iter().zip(actual).enumerate().find_map(|(index, (e, a))| {
-        let expected_id = (e.candidate_id, e.scenario_id, e.entry_bar, e.exit_bar, e.direction, e.exit_reason);
-        let actual_id = (a.candidate_id, a.scenario_id, a.entry_bar, a.exit_bar, a.direction, a.exit_reason);
-        (expected_id != actual_id).then(|| divergence(
-            ParityLevel::AcceptedTradeSequence,
-            index,
-            "trade_identity",
-            &expected_id,
-            &actual_id,
-        ))
-    })
+    expected
+        .iter()
+        .zip(actual)
+        .enumerate()
+        .find_map(|(index, (e, a))| {
+            let expected_id = (
+                e.candidate_id,
+                e.scenario_id,
+                e.entry_bar,
+                e.exit_bar,
+                e.direction,
+                e.exit_reason,
+            );
+            let actual_id = (
+                a.candidate_id,
+                a.scenario_id,
+                a.entry_bar,
+                a.exit_bar,
+                a.direction,
+                a.exit_reason,
+            );
+            (expected_id != actual_id).then(|| {
+                divergence(
+                    ParityLevel::AcceptedTradeSequence,
+                    index,
+                    "trade_identity",
+                    &expected_id,
+                    &actual_id,
+                )
+            })
+        })
 }
 
 fn compare_trade_values(
@@ -300,17 +380,39 @@ fn compare_trade_values(
     actual: &[TradeTrace],
     policy: ParityPolicy,
 ) -> Option<ParityDivergence> {
-    expected.iter().zip(actual).enumerate().find_map(|(index, (e, a))| {
-        if !policy.size_and_costs.matches_f64(e.size, a.size) {
-            Some(divergence(ParityLevel::PositionSizeAndCosts, index, "size", &e.size, &a.size))
-        } else if !policy.size_and_costs.matches_f64(e.costs, a.costs) {
-            Some(divergence(ParityLevel::PositionSizeAndCosts, index, "costs", &e.costs, &a.costs))
-        } else if !policy.pnl_and_equity.matches_f64(e.pnl, a.pnl) {
-            Some(divergence(ParityLevel::PositionSizeAndCosts, index, "pnl", &e.pnl, &a.pnl))
-        } else {
-            None
-        }
-    })
+    expected
+        .iter()
+        .zip(actual)
+        .enumerate()
+        .find_map(|(index, (e, a))| {
+            if !policy.size_and_costs.matches_f64(e.size, a.size) {
+                Some(divergence(
+                    ParityLevel::PositionSizeAndCosts,
+                    index,
+                    "size",
+                    &e.size,
+                    &a.size,
+                ))
+            } else if !policy.size_and_costs.matches_f64(e.costs, a.costs) {
+                Some(divergence(
+                    ParityLevel::PositionSizeAndCosts,
+                    index,
+                    "costs",
+                    &e.costs,
+                    &a.costs,
+                ))
+            } else if !policy.pnl_and_equity.matches_f64(e.pnl, a.pnl) {
+                Some(divergence(
+                    ParityLevel::PositionSizeAndCosts,
+                    index,
+                    "pnl",
+                    &e.pnl,
+                    &a.pnl,
+                ))
+            } else {
+                None
+            }
+        })
 }
 
 fn compare_trade_equity(
@@ -318,15 +420,21 @@ fn compare_trade_equity(
     actual: &[TradeTrace],
     tolerance: FloatTolerance,
 ) -> Option<ParityDivergence> {
-    expected.iter().zip(actual).enumerate().find_map(|(index, (e, a))| {
-        (!tolerance.matches_f64(e.equity_after, a.equity_after)).then(|| divergence(
-            ParityLevel::EquityAfterTrade,
-            index,
-            "equity_after",
-            &e.equity_after,
-            &a.equity_after,
-        ))
-    })
+    expected
+        .iter()
+        .zip(actual)
+        .enumerate()
+        .find_map(|(index, (e, a))| {
+            (!tolerance.matches_f64(e.equity_after, a.equity_after)).then(|| {
+                divergence(
+                    ParityLevel::EquityAfterTrade,
+                    index,
+                    "equity_after",
+                    &e.equity_after,
+                    &a.equity_after,
+                )
+            })
+        })
 }
 
 fn compare_risk_states(
@@ -342,36 +450,58 @@ fn compare_risk_states(
             actual.len(),
         );
     }
-    expected.iter().zip(actual).enumerate().find_map(|(index, (e, a))| {
-        let expected_identity = (e.candidate_id, e.scenario_id, e.bar, e.day_id, e.month_id, e.flags);
-        let actual_identity = (a.candidate_id, a.scenario_id, a.bar, a.day_id, a.month_id, a.flags);
-        if expected_identity != actual_identity {
-            return Some(divergence(
-                ParityLevel::CalendarAndPropFirmState,
-                index,
-                "risk_state_identity",
-                &expected_identity,
-                &actual_identity,
-            ));
-        }
-        for (field, expected, actual) in [
-            ("equity", e.equity, a.equity),
-            ("peak_equity", e.peak_equity, a.peak_equity),
-            ("day_start_equity", e.day_start_equity, a.day_start_equity),
-            ("month_start_equity", e.month_start_equity, a.month_start_equity),
-        ] {
-            if !tolerance.matches_f64(expected, actual) {
+    expected
+        .iter()
+        .zip(actual)
+        .enumerate()
+        .find_map(|(index, (e, a))| {
+            let expected_identity = (
+                e.candidate_id,
+                e.scenario_id,
+                e.bar,
+                e.day_id,
+                e.month_id,
+                e.flags,
+            );
+            let actual_identity = (
+                a.candidate_id,
+                a.scenario_id,
+                a.bar,
+                a.day_id,
+                a.month_id,
+                a.flags,
+            );
+            if expected_identity != actual_identity {
                 return Some(divergence(
                     ParityLevel::CalendarAndPropFirmState,
                     index,
-                    field,
-                    &expected,
-                    &actual,
+                    "risk_state_identity",
+                    &expected_identity,
+                    &actual_identity,
                 ));
             }
-        }
-        None
-    })
+            for (field, expected, actual) in [
+                ("equity", e.equity, a.equity),
+                ("peak_equity", e.peak_equity, a.peak_equity),
+                ("day_start_equity", e.day_start_equity, a.day_start_equity),
+                (
+                    "month_start_equity",
+                    e.month_start_equity,
+                    a.month_start_equity,
+                ),
+            ] {
+                if !tolerance.matches_f64(expected, actual) {
+                    return Some(divergence(
+                        ParityLevel::CalendarAndPropFirmState,
+                        index,
+                        field,
+                        &expected,
+                        &actual,
+                    ));
+                }
+            }
+            None
+        })
 }
 
 fn compare_metrics(
@@ -387,17 +517,23 @@ fn compare_metrics(
             actual.len(),
         );
     }
-    expected.iter().zip(actual).enumerate().find_map(|(row, (e, a))| {
-        e.iter().zip(a).enumerate().find_map(|(column, (e, a))| {
-            (!tolerance.matches_f64(*e, *a)).then(|| divergence(
-                ParityLevel::FinalMetrics,
-                row,
-                &format!("metric[{column}]"),
-                e,
-                a,
-            ))
+    expected
+        .iter()
+        .zip(actual)
+        .enumerate()
+        .find_map(|(row, (e, a))| {
+            e.iter().zip(a).enumerate().find_map(|(column, (e, a))| {
+                (!tolerance.matches_f64(*e, *a)).then(|| {
+                    divergence(
+                        ParityLevel::FinalMetrics,
+                        row,
+                        &format!("metric[{column}]"),
+                        e,
+                        a,
+                    )
+                })
+            })
         })
-    })
 }
 
 fn length_mismatch(
@@ -406,7 +542,13 @@ fn length_mismatch(
     expected: usize,
     actual: usize,
 ) -> Option<ParityDivergence> {
-    Some(divergence(level, 0, &format!("{field}.len"), &expected, &actual))
+    Some(divergence(
+        level,
+        0,
+        &format!("{field}.len"),
+        &expected,
+        &actual,
+    ))
 }
 
 fn divergence(
@@ -469,7 +611,13 @@ mod tests {
             survivor_order: vec![20, 10],
             ..ParityTrace::default()
         };
-        let report = compare_traces("cpu", "gpu", &reference, &candidate, ParityPolicy::default());
+        let report = compare_traces(
+            "cpu",
+            "gpu",
+            &reference,
+            &candidate,
+            ParityPolicy::default(),
+        );
         assert_eq!(
             report.first_divergence.unwrap().level,
             ParityLevel::SignalDirection
@@ -488,7 +636,13 @@ mod tests {
             survivor_order: vec![2, 1],
             ..ParityTrace::default()
         };
-        let report = compare_traces("cpu", "gpu", &reference, &candidate, ParityPolicy::default());
+        let report = compare_traces(
+            "cpu",
+            "gpu",
+            &reference,
+            &candidate,
+            ParityPolicy::default(),
+        );
         assert_eq!(
             report.first_divergence.unwrap().level,
             ParityLevel::SurvivorOrdering

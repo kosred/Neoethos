@@ -579,9 +579,7 @@ impl DiscoveryConfig {
             mc_min_profitable: model_settings
                 .prop_search_mc_min_profitable
                 .min(model_settings.prop_search_mc_runs.max(1)),
-            sensitivity_spread_pips: model_settings
-                .prop_search_sensitivity_spread_pips
-                .max(0.0),
+            sensitivity_spread_pips: model_settings.prop_search_sensitivity_spread_pips.max(0.0),
             sensitivity_commission_per_lot: model_settings
                 .prop_search_sensitivity_commission_per_lot
                 .max(0.0),
@@ -1068,10 +1066,7 @@ pub enum DiscoveryProgress {
     /// otherwise freeze on the last milestone — which operators read as a
     /// hang (observed live 2026-07-20: a healthy EURCAD M3 run was killed at
     /// 95.5% because "it looked stuck").
-    StageAdvanced {
-        stage: &'static str,
-        detail: String,
-    },
+    StageAdvanced { stage: &'static str, detail: String },
     Completed {
         candidate_count: usize,
         filtered_count: usize,
@@ -1205,8 +1200,10 @@ fn remedy_for_stage(stage: &str) -> &'static str {
             "candidates passed every gate but failed final export-readiness — check the \
              validation-gate configuration."
         }
-        _ => "review the saved funnel JSON (cache/discovery/<symbol>_<tf>.json) for the full \
-              stage-by-stage breakdown.",
+        _ => {
+            "review the saved funnel JSON (cache/discovery/<symbol>_<tf>.json) for the full \
+              stage-by-stage breakdown."
+        }
     }
 }
 
@@ -1236,7 +1233,8 @@ fn trim_recent_history(
         anyhow::bail!(
             "Cannot run discovery on empty history for {} {} — \
              import at least the minimum bars (run `neoethos-cli import`) then retry.",
-            config.evaluation_symbol, config.timeframe_label
+            config.evaluation_symbol,
+            config.timeframe_label
         );
     }
 
@@ -1376,7 +1374,8 @@ pub fn faithful_oos_eval(
     let higher_refs: Vec<&str> = artifact.higher_tfs.iter().map(|s| s.as_str()).collect();
     let raw_features =
         neoethos_data::prepare_multitimeframe_features(&dataset, &base_tf, &higher_refs, None)?;
-    let features = crate::project_features_to_effective(&raw_features, &artifact.effective_feature_names)?;
+    let features =
+        crate::project_features_to_effective(&raw_features, &artifact.effective_feature_names)?;
     if features.n_samples() != base_ohlcv.len() {
         anyhow::bail!(
             "feature/bar length mismatch {symbol} {base_tf}: {} vs {}",
@@ -1443,8 +1442,16 @@ pub fn faithful_oos_eval(
             is_max_drawdown: gene.max_drawdown,
             is_trades: gene.trades_count,
             oos_monthly_hit_rate,
-            wfe_sharpe: if is_sharpe.abs() > 1e-9 { oos.sharpe / is_sharpe } else { 0.0 },
-            wfe_pf: if is_pf.abs() > 1e-9 { oos.profit_factor / is_pf } else { 0.0 },
+            wfe_sharpe: if is_sharpe.abs() > 1e-9 {
+                oos.sharpe / is_sharpe
+            } else {
+                0.0
+            },
+            wfe_pf: if is_pf.abs() > 1e-9 {
+                oos.profit_factor / is_pf
+            } else {
+                0.0
+            },
             oos,
         });
     }
@@ -1835,10 +1842,8 @@ fn evaluate_cpcv_gate(
 
     let mut fold_count = 0usize;
     let mut profitable_folds = 0usize;
-    let eval_config = config.evaluation_config_with_smc_gate(
-        ohlcv.close.last().copied(),
-        effective_smc_gate_threshold,
-    );
+    let eval_config = config
+        .evaluation_config_with_smc_gate(ohlcv.close.last().copied(), effective_smc_gate_threshold);
 
     // AREA 2 / Stage B (2026-06-09) — GPU-route the CPCV gate.
     //
@@ -2091,7 +2096,8 @@ fn build_discovery_validation_artifacts(
         anyhow::bail!(
             "Internal bug: discovery validation requires portfolio signals aligned to feature rows \
              (expected {} rows, {}). Please report this with config.yaml and the discovery log.",
-            n, mismatched
+            n,
+            mismatched
         );
     }
 
@@ -2136,10 +2142,8 @@ fn build_discovery_validation_artifacts(
         .iter()
         .map(|gene| discovery_backtest_settings(config, gene, ohlcv.close.last().copied()))
         .collect();
-    let wf_eval_config = config.evaluation_config_with_smc_gate(
-        ohlcv.close.last().copied(),
-        effective_smc_gate_threshold,
-    );
+    let wf_eval_config = config
+        .evaluation_config_with_smc_gate(ohlcv.close.last().copied(), effective_smc_gate_threshold);
     let wf_full_indicators = features.as_indicators_view();
     let (wob, wfvg, wliq, wtrend, wprem, wind, wbos, wchoch, weqh, weql, wdisp) =
         build_smc_arrays(features, ohlcv);
@@ -3044,7 +3048,8 @@ where
     // `cols=N`. base = unprefixed/regime; each higher TF shows its survivor
     // count. A higher TF reading 0 here means the warm-start can't use it.
     {
-        let mut by_tf: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut by_tf: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
         for name in &effective_feature_names {
             let key = timeframe_group(name)
                 .map(|g| g.to_string())
@@ -3761,9 +3766,7 @@ where
                     && (col_max - col_min).abs() < 1e-9
                 {
                     zero_var_cols += 1;
-                    if named_examples.len() < 5
-                        && c < features.names.len()
-                    {
+                    if named_examples.len() < 5 && c < features.names.len() {
                         named_examples.push(features.names[c].clone());
                     }
                 }
@@ -3978,10 +3981,8 @@ where
     // `signals_for_gene` ignored gene SMC flags; some candidates passed the
     // search archive (with their SMC-gated trade count) but were then pruned
     // here because the un-gated count was higher than min_trades.
-    let eval_config_for_signals = config.evaluation_config_with_smc_gate(
-        ohlcv.close.last().copied(),
-        effective_smc_gate_threshold,
-    );
+    let eval_config_for_signals = config
+        .evaluation_config_with_smc_gate(ohlcv.close.last().copied(), effective_smc_gate_threshold);
 
     // Diagnostic counter #2: how many genes generated ANY non-zero
     // signal at all? A gene with `long_threshold > max possible
@@ -4459,13 +4460,13 @@ where
         // reject reasons (counted_zero = the window-pass simulation produced
         // zero windows for this gene, e.g. dataset too short or all windows
         // crashed; below_pass_rate = some windows ran but pass-rate < floor).
-        funnel.record_stage("passed_prop_firm_window", pre_prop_firm, next_filtered.len());
+        funnel.record_stage(
+            "passed_prop_firm_window",
+            pre_prop_firm,
+            next_filtered.len(),
+        );
         if dbg_counted_zero > 0 {
-            funnel.add_reject_reason(
-                "passed_prop_firm_window",
-                "counted_zero",
-                dbg_counted_zero,
-            );
+            funnel.add_reject_reason("passed_prop_firm_window", "counted_zero", dbg_counted_zero);
         }
         if dbg_below_pass_rate > 0 {
             funnel.add_reject_reason(
@@ -4570,72 +4571,76 @@ where
             ),
         });
     }
-    let (mut validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts, mut per_gene_wf) =
-        if portfolio.is_empty() && !best_effort_fallback.is_empty() {
-            fallback_mode = true;
-            let fallback_reason = funnel
-                .stages
-                .iter()
-                .filter(|s| s.count_in > 0)
-                .max_by_key(|s| s.rejected)
-                .map(|s| s.name.clone())
-                .unwrap_or_else(|| "strict_gates".to_string());
-            let analyzer = quality_analyzer_for_config(config);
-            for ((_, gene), sig) in best_effort_fallback {
-                if portfolio.len() >= FALLBACK_PORTFOLIO_MAX {
+    let (
+        mut validation_gates,
+        canonical_backtest_artifacts,
+        walkforward_validation_artifacts,
+        mut per_gene_wf,
+    ) = if portfolio.is_empty() && !best_effort_fallback.is_empty() {
+        fallback_mode = true;
+        let fallback_reason = funnel
+            .stages
+            .iter()
+            .filter(|s| s.count_in > 0)
+            .max_by_key(|s| s.rejected)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "strict_gates".to_string());
+        let analyzer = quality_analyzer_for_config(config);
+        for ((_, gene), sig) in best_effort_fallback {
+            if portfolio.len() >= FALLBACK_PORTFOLIO_MAX {
+                break;
+            }
+            let mut ok = true;
+            for existing in &portfolio_signals {
+                if pearson_corr_i8(&sig, existing).abs() >= config.corr_threshold {
+                    ok = false;
                     break;
                 }
-                let mut ok = true;
-                for existing in &portfolio_signals {
-                    if pearson_corr_i8(&sig, existing).abs() >= config.corr_threshold {
-                        ok = false;
-                        break;
-                    }
-                }
-                if !ok {
-                    continue;
-                }
-                let trades = crate::eval::simulate_trades_core(
-                    &ohlcv.close,
-                    &ohlcv.high,
-                    &ohlcv.low,
-                    &features.timestamps,
-                    &sig,
-                    &discovery_backtest_settings(config, &gene, ohlcv.close.last().copied()),
-                );
-                quality_metrics.push(analyzer.analyze_strategy(
-                    &gene.strategy_id,
-                    &trades,
-                    config.initial_balance,
-                ));
-                portfolio_signals.push(sig);
-                portfolio.push(gene);
             }
-            funnel.record_stage("fallback_best_effort", 0, portfolio.len());
-            tracing::warn!(
-                target: "neoethos_search::discovery",
-                promoted = portfolio.len(),
-                reason = %fallback_reason,
-                "NEVER-ZERO: the strict funnel emptied the portfolio — promoting the \
-                 best-found genes (did NOT pass the prop bar) so the run is not empty. \
-                 Flagged fallback_mode + not-export-ready."
+            if !ok {
+                continue;
+            }
+            let trades = crate::eval::simulate_trades_core(
+                &ohlcv.close,
+                &ohlcv.high,
+                &ohlcv.low,
+                &features.timestamps,
+                &sig,
+                &discovery_backtest_settings(config, &gene, ohlcv.close.last().copied()),
             );
-            let mut gates = DiscoveryValidationGates::pending();
-            gates.fallback_mode = true;
-            gates.fallback_reason = fallback_reason;
-            (gates, Vec::new(), Vec::new(), Vec::new())
-        } else {
-            build_discovery_validation_artifacts(
-                &portfolio,
-                &portfolio_signals,
-                features,
-                ohlcv,
-                config,
-                effective_smc_gate_threshold,
-                &pbo_candidates,
-                ranked_total,
-            )?
-        };
+            quality_metrics.push(analyzer.analyze_strategy(
+                &gene.strategy_id,
+                &trades,
+                config.initial_balance,
+            ));
+            portfolio_signals.push(sig);
+            portfolio.push(gene);
+        }
+        funnel.record_stage("fallback_best_effort", 0, portfolio.len());
+        tracing::warn!(
+            target: "neoethos_search::discovery",
+            promoted = portfolio.len(),
+            reason = %fallback_reason,
+            "NEVER-ZERO: the strict funnel emptied the portfolio — promoting the \
+             best-found genes (did NOT pass the prop bar) so the run is not empty. \
+             Flagged fallback_mode + not-export-ready."
+        );
+        let mut gates = DiscoveryValidationGates::pending();
+        gates.fallback_mode = true;
+        gates.fallback_reason = fallback_reason;
+        (gates, Vec::new(), Vec::new(), Vec::new())
+    } else {
+        build_discovery_validation_artifacts(
+            &portfolio,
+            &portfolio_signals,
+            features,
+            ohlcv,
+            config,
+            effective_smc_gate_threshold,
+            &pbo_candidates,
+            ranked_total,
+        )?
+    };
 
     // ── Robustness filters (2026-07-02): permutation + plateau, parallel ────
     // Two per-gene tests on the final portfolio, rayon-parallel across genes,
@@ -4673,7 +4678,11 @@ where
         let n_all = ohlcv.close.len();
         let w0 = n_all.saturating_sub(ROBUST_WINDOW);
         let ts_all: &[i64] = ohlcv.timestamp.as_deref().unwrap_or(&[]);
-        let ts_win: &[i64] = if ts_all.len() == n_all { &ts_all[w0..] } else { &[] };
+        let ts_win: &[i64] = if ts_all.len() == n_all {
+            &ts_all[w0..]
+        } else {
+            &[]
+        };
         let eval_cfg_rb = config.evaluation_config_with_smc_gate(
             ohlcv.close.last().copied(),
             effective_smc_gate_threshold,
@@ -4712,8 +4721,8 @@ where
                 }
 
                 // #10 permutation p-value — deterministic seed per gene.
-                let seed = 0x4E45_4F45_5448_4F53u64
-                    ^ (gi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let seed =
+                    0x4E45_4F45_5448_4F53u64 ^ (gi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
                 let mut beats = 0usize;
                 let mut shuffled: Vec<i8> = sig_win.to_vec();
@@ -4924,7 +4933,7 @@ where
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: Some(funnel.clone()),
-    
+
         effective_smc_gate_threshold,
     })
 }
@@ -5140,7 +5149,11 @@ pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult
             "CANDIDATE METRICS — id | trades(/mo,/day) | hold | WR | PF | Sharpe | maxDD | verdict"
         );
         for q in &result.quality_metrics {
-            let flag = if q.sharpe_ratio > 3.0 { " [!] OVERFIT?" } else { "" };
+            let flag = if q.sharpe_ratio > 3.0 {
+                " [!] OVERFIT?"
+            } else {
+                ""
+            };
             tracing::info!(
                 target: "neoethos_search::discovery",
                 "  {} | {} trades ({:.1}/mo, {:.2}/day) | {:.1}h hold | WR {:.0}% | PF {:.2} | Sharpe {:.2}{} | maxDD {:.1}% | {}",
@@ -5158,11 +5171,7 @@ pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult
             );
             // Pro money-view (2026-06-06): "how much € in how long, with what curve" —
             // ratios alone (Sharpe 7) hide that a strategy made ~5% over 9 months (useless).
-            let curve_min = q
-                .equity_curve
-                .iter()
-                .cloned()
-                .fold(f64::INFINITY, f64::min);
+            let curve_min = q.equity_curve.iter().cloned().fold(f64::INFINITY, f64::min);
             tracing::info!(
                 target: "neoethos_search::discovery",
                 "      money: EUR {:.0} -> {:.0} (net {:+.0}, {:.1} months, {:.2}%/mo) | recovery {:.2} | curve min EUR {:.0} | maxDD EUR {:.0}",

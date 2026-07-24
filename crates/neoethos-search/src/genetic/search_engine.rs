@@ -423,8 +423,14 @@ pub fn evaluate_genes_cached(
         pip_value_per_lot: config.pip_value_per_lot,
         ..Default::default()
     };
-    let stop_vol_mults =
-        resolve_adaptive_stops(genes, &ohlcv.high, &ohlcv.low, &ohlcv.close, config, &mut b_settings);
+    let stop_vol_mults = resolve_adaptive_stops(
+        genes,
+        &ohlcv.high,
+        &ohlcv.low,
+        &ohlcv.close,
+        config,
+        &mut b_settings,
+    );
 
     crate::eval::evaluate_population_core(crate::eval::PopulationEvalInputs {
         close: &ohlcv.close,
@@ -560,8 +566,14 @@ pub fn validation_genes_population(
     // belt-and-suspenders so a stray template can never silently change sizing.
     let mut settings = settings_template.clone();
     settings.risk_based_sizing = false;
-    let stop_vol_mults =
-        resolve_adaptive_stops(genes, &ohlcv.high, &ohlcv.low, &ohlcv.close, config, &mut settings);
+    let stop_vol_mults = resolve_adaptive_stops(
+        genes,
+        &ohlcv.high,
+        &ohlcv.low,
+        &ohlcv.close,
+        config,
+        &mut settings,
+    );
 
     Ok(crate::eval::validation_backtest_population(
         crate::eval::PopulationEvalInputs {
@@ -821,7 +833,11 @@ impl WalkforwardPopulationGenePack {
     /// (`risk_based_sizing = false`) so the GPU metrics match the single-gene
     /// walk-forward's legacy fixed-1-lot backtest, regardless of what the caller
     /// passes (belt-and-suspenders, mirroring [`validation_genes_population`]).
-    pub fn new(genes: &[Gene], config: &EvaluationConfig, settings_template: &BacktestSettings) -> Self {
+    pub fn new(
+        genes: &[Gene],
+        config: &EvaluationConfig,
+        settings_template: &BacktestSettings,
+    ) -> Self {
         let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
         let mut sl_pips = Vec::with_capacity(genes.len());
         let mut tp_pips = Vec::with_capacity(genes.len());
@@ -981,7 +997,8 @@ pub fn validation_genes_population_window(
         } else {
             0.0001
         };
-        if let Some(base) = crate::stop_target::adaptive_base_pips_series(win_high, win_low, win_close, pip)
+        if let Some(base) =
+            crate::stop_target::adaptive_base_pips_series(win_high, win_low, win_close, pip)
         {
             win_settings.adaptive_base_pips = Some(base.into());
             win_settings.adaptive_rr = crate::stop_target::adaptive_stops_rr();
@@ -1084,8 +1101,14 @@ pub fn evaluate_genes(
         pip_value_per_lot: config.pip_value_per_lot,
         ..Default::default()
     };
-    let stop_vol_mults =
-        resolve_adaptive_stops(genes, &ohlcv.high, &ohlcv.low, &ohlcv.close, config, &mut b_settings);
+    let stop_vol_mults = resolve_adaptive_stops(
+        genes,
+        &ohlcv.high,
+        &ohlcv.low,
+        &ohlcv.close,
+        config,
+        &mut b_settings,
+    );
 
     crate::eval::evaluate_population_core(crate::eval::PopulationEvalInputs {
         close: &ohlcv.close,
@@ -1188,7 +1211,8 @@ fn resolve_adaptive_stops(
         };
         // Open-independent base series so scoring and every validation path (some
         // of which lack an `open` column) compute the IDENTICAL per-bar stop.
-        if let Some(base_pips) = crate::stop_target::adaptive_base_pips_series(high, low, close, pip)
+        if let Some(base_pips) =
+            crate::stop_target::adaptive_base_pips_series(high, low, close, pip)
         {
             settings.adaptive_base_pips = Some(base_pips.into());
             settings.adaptive_rr = crate::stop_target::adaptive_stops_rr();
@@ -1214,9 +1238,11 @@ pub fn random_search(
     }
     let eval_cfg = EvaluationConfig::default();
     let metrics = evaluate_genes(features, ohlcv, &genes, &eval_cfg)?;
-    Ok(SearchResult { genes, metrics, 
-    effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
-})
+    Ok(SearchResult {
+        genes,
+        metrics,
+        effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
+    })
 }
 
 pub fn evolve_search(
@@ -1524,9 +1550,11 @@ where
         let metrics = evaluate_genes_cached(features, ohlcv, &genes, &eval_cfg, &eval_cache)?;
         apply_metrics(&mut genes, &metrics, eval_cfg.growth_objective);
         seen_memory.flush();
-        return Ok(SearchResult { genes, metrics, 
-    effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
-});
+        return Ok(SearchResult {
+            genes,
+            metrics,
+            effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
+        });
     }
 
     for generation in 0..generations {
@@ -1660,9 +1688,7 @@ where
         // sidecar enabled it). Every INTERVAL generations, publish this
         // island's top elites for the mesh to gossip to peer nodes. `scored`
         // is sorted best-first, so the head is the elite set.
-        if super::migration::migration_enabled()
-            && generation % super::migration::INTERVAL == 0
-        {
+        if super::migration::migration_enabled() && generation % super::migration::INTERVAL == 0 {
             let elites: Vec<Gene> = scored
                 .iter()
                 .take(super::migration::ELITES)
@@ -1813,14 +1839,14 @@ where
                         .map(|(g, _, _)| g.clone())
                         .collect(),
                     metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
-                
+
                     effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
                 });
             }
             return Ok(SearchResult {
                 genes: top_candidates,
                 metrics: top_metrics,
-            
+
                 effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
             });
         }
@@ -1874,14 +1900,14 @@ where
                         .map(|(g, _, _)| g.clone())
                         .collect(),
                     metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
-                
+
                     effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
                 });
             }
             return Ok(SearchResult {
                 genes: top_candidates,
                 metrics: top_metrics,
-            
+
                 effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
             });
         }
@@ -1915,14 +1941,14 @@ where
                         .map(|(g, _, _)| g.clone())
                         .collect(),
                     metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
-                
+
                     effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
                 });
             }
             return Ok(SearchResult {
                 genes: top_candidates,
                 metrics: best_metrics,
-            
+
                 effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
             });
         }
@@ -1965,7 +1991,10 @@ where
         if super::migration::migration_enabled() {
             let migrants = super::migration::take_incoming();
             let room = population.saturating_sub(next.len());
-            for gene in migrants.into_iter().take(room.min(super::migration::ELITES)) {
+            for gene in migrants
+                .into_iter()
+                .take(room.min(super::migration::ELITES))
+            {
                 next.push(gene);
             }
         }
@@ -2134,7 +2163,7 @@ where
     Ok(SearchResult {
         genes,
         metrics: best_metrics,
-    
+
         effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
     })
 }
@@ -2169,8 +2198,9 @@ mod adaptive_wiring_tests {
         let config = EvaluationConfig::for_symbol("EURUSD", "USD", Some(1.10), None, None);
         let smc = SmcSearchConfig::default();
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let mut genes: Vec<Gene> =
-            (0..3).map(|_| new_random_gene(4, 2, 0, &smc, &mut rng)).collect();
+        let mut genes: Vec<Gene> = (0..3)
+            .map(|_| new_random_gene(4, 2, 0, &smc, &mut rng))
+            .collect();
         genes[0].stop_vol_mult = 1.5;
         genes[1].stop_vol_mult = 0.0;
         genes[2].stop_vol_mult = 3.0;
@@ -2178,7 +2208,11 @@ mod adaptive_wiring_tests {
         // Some genes adaptive → base series + reward:risk installed.
         let mut settings = crate::eval::BacktestSettings::default();
         let mults = resolve_adaptive_stops(&genes, &high, &low, &close, &config, &mut settings);
-        assert_eq!(mults, vec![1.5, 0.0, 3.0], "returns each gene's stop_vol_mult");
+        assert_eq!(
+            mults,
+            vec![1.5, 0.0, 3.0],
+            "returns each gene's stop_vol_mult"
+        );
         let base = settings
             .adaptive_base_pips
             .as_ref()

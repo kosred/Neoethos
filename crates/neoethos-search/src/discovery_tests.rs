@@ -66,7 +66,7 @@ fn empty_portfolio_is_an_explicit_error() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
 
@@ -94,7 +94,7 @@ fn non_empty_portfolio_is_accepted() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
 
@@ -215,7 +215,7 @@ fn portfolio_export_requires_validation_gates() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
     let path = temp_path("portfolio-gates");
@@ -244,7 +244,7 @@ fn portfolio_export_blocked_when_only_prop_firm_window_passed() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
     result.validation_gates.prop_firm_window_passed = true;
@@ -369,7 +369,7 @@ fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
     result.validation_gates.walkforward_passed = true;
@@ -398,7 +398,7 @@ fn discovery_profile_exports_validation_gate_status() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
     result.validation_gates.walkforward_passed = true;
@@ -481,7 +481,7 @@ fn save_canonical_backtest_artifacts_writes_one_file_per_strategy() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
 
@@ -520,7 +520,7 @@ fn save_walkforward_validation_artifacts_writes_one_file_per_strategy() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
 
@@ -554,7 +554,7 @@ fn save_canonical_backtest_artifacts_skips_when_empty() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
 
@@ -647,7 +647,7 @@ fn discovery_profile_exports_runtime_override_resolution() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
 
@@ -744,7 +744,14 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
         quota.names
     );
     // The base top-K survivors are preserved (additive, no regression).
-    assert!(quota.names.iter().filter(|n| n.starts_with("base_")).count() >= 3);
+    assert!(
+        quota
+            .names
+            .iter()
+            .filter(|n| n.starts_with("base_"))
+            .count()
+            >= 3
+    );
 }
 
 #[test]
@@ -829,7 +836,7 @@ fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
         forward_test_validation_artifacts: artifacts,
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
 
@@ -873,7 +880,7 @@ fn discovery_profile_exports_forward_test_artifact_count() {
         )],
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
     result.validation_gates.walkforward_passed = true;
@@ -922,7 +929,7 @@ fn empty_discovery_result_with_gates(
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     }
 }
@@ -1106,7 +1113,7 @@ fn save_prop_firm_validation_artifacts_writes_one_file_per_strategy() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: vec![prop_firm_artifact_with_pass_flag("fnv64:abc", true)],
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
 
@@ -1151,7 +1158,7 @@ fn populated_discovery_result(
             .map(|idx| prop_firm_artifact_with_pass_flag(&format!("prop-{idx}"), true))
             .collect(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     }
 }
@@ -1375,8 +1382,7 @@ fn run_discovery_cycle_bails_on_empty_evaluation_symbol() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_symbol = String::new();
-    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
-        .expect_err("empty symbol must bail");
+    let err = run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("empty symbol must bail");
     let msg = err.to_string();
     assert!(
         msg.contains("evaluation_symbol is empty"),
@@ -1390,8 +1396,8 @@ fn run_discovery_cycle_bails_on_empty_account_currency() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_account_currency = String::new();
-    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
-        .expect_err("empty account_currency must bail");
+    let err =
+        run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("empty account_currency must bail");
     let msg = err.to_string();
     assert!(
         msg.contains("evaluation_account_currency"),
@@ -1405,8 +1411,7 @@ fn run_discovery_cycle_bails_on_nan_spread() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_spread_pips = f64::NAN;
-    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
-        .expect_err("NaN spread must bail");
+    let err = run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("NaN spread must bail");
     assert!(
         err.to_string().contains("evaluation_spread_pips"),
         "expected spread diagnostic, got: {err}"
@@ -1419,8 +1424,7 @@ fn run_discovery_cycle_bails_on_nan_commission() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_commission_per_trade = f64::NAN;
-    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
-        .expect_err("NaN commission must bail");
+    let err = run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("NaN commission must bail");
     assert!(
         err.to_string().contains("evaluation_commission_per_trade"),
         "expected commission diagnostic, got: {err}"
@@ -1490,7 +1494,11 @@ fn min_trades_per_month_scale_drops_for_higher_tfs() {
     // Sanity: for operator's default 15 trades/month, D1 must produce
     // a sane floor (e.g. ≤ 3 trades/month so realistic swing
     // strategies aren't auto-rejected).
-    assert!(15.0 * d1 <= 3.0, "D1 floor at base=15 must be ≤ 3, got {}", 15.0 * d1);
+    assert!(
+        15.0 * d1 <= 3.0,
+        "D1 floor at base=15 must be ≤ 3, got {}",
+        15.0 * d1
+    );
 }
 
 #[test]
@@ -1613,7 +1621,10 @@ fn empty_portfolio_diagnosis_falls_back_when_no_bottleneck_set() {
     funnel.bottleneck_stage = String::new();
 
     let msg = describe_empty_portfolio_funnel(&funnel);
-    assert!(msg.contains("passed_base_filter"), "infers bottleneck: {msg}");
+    assert!(
+        msg.contains("passed_base_filter"),
+        "infers bottleneck: {msg}"
+    );
     assert!(msg.contains("max-drawdown") || msg.contains("min-profit"));
 }
 
@@ -1794,7 +1805,11 @@ fn unset_mode_band_inherits_the_shared_one() {
     settings.risk.max_risk_per_trade = 0.05;
     assert_eq!(settings.risk.risky_max_risk_per_trade, None);
 
-    for mode in [DiscoveryMode::Risky, DiscoveryMode::PropFirm, DiscoveryMode::Strict] {
+    for mode in [
+        DiscoveryMode::Risky,
+        DiscoveryMode::PropFirm,
+        DiscoveryMode::Strict,
+    ] {
         let c = DiscoveryConfig {
             mode,
             ..DiscoveryConfig::from_settings(&settings)

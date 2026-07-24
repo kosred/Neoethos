@@ -84,7 +84,7 @@ fn success_snapshot_carries_candidate_and_portfolio_counters() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
 
@@ -210,7 +210,7 @@ fn success_snapshot_emits_best_oos_sharpe_from_forward_test_artifacts() {
         forward_test_validation_artifacts: forward_artifacts,
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
 
@@ -260,7 +260,7 @@ fn success_snapshot_omits_best_oos_sharpe_when_forward_test_artifacts_empty() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-    
+
         effective_smc_gate_threshold: f32::NAN,
     };
     let snapshot = completed_snapshot(JobSnapshot::new(JobKind::Discovery), &result);

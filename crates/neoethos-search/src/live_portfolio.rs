@@ -158,11 +158,15 @@ pub fn save_live_portfolio_json(
     result: &DiscoveryResult,
 ) -> anyhow::Result<()> {
     let normalize_features = neoethos_data::current_data_runtime_overrides().normalize_features;
-    let artifact =
-        LivePortfolioArtifact::from_discovery(symbol, base_tf, higher_tfs, normalize_features, result);
-    let json = serde_json::to_string_pretty(&artifact).map_err(|e| {
-        anyhow::anyhow!("failed to serialize live portfolio artifact: {e}")
-    })?;
+    let artifact = LivePortfolioArtifact::from_discovery(
+        symbol,
+        base_tf,
+        higher_tfs,
+        normalize_features,
+        result,
+    );
+    let json = serde_json::to_string_pretty(&artifact)
+        .map_err(|e| anyhow::anyhow!("failed to serialize live portfolio artifact: {e}"))?;
     std::fs::write(&path, json).map_err(|e| {
         anyhow::anyhow!(
             "failed to write live portfolio artifact to {}: {e}",
@@ -252,7 +256,11 @@ mod tests {
             symbol: "EURGBP".to_string(),
             base_tf: "D1".to_string(),
             higher_tfs: vec!["W1".to_string()],
-            effective_feature_names: vec!["rsi".to_string(), "atr".to_string(), "W1_rsi".to_string()],
+            effective_feature_names: vec![
+                "rsi".to_string(),
+                "atr".to_string(),
+                "W1_rsi".to_string(),
+            ],
             normalize_features: false,
             genes: vec![gene],
         };
@@ -265,10 +273,7 @@ mod tests {
     #[test]
     fn project_selects_and_reorders_by_name() {
         // raw frame: 3 cols [a, b, c]; effective wants [c, a] (subset + reorder).
-        let data = ndarray::array![
-            [1.0_f32, 2.0, 3.0],
-            [4.0, 5.0, 6.0],
-        ];
+        let data = ndarray::array![[1.0_f32, 2.0, 3.0], [4.0, 5.0, 6.0],];
         let raw = FeatureFrame {
             timestamps: vec![0, 1],
             names: vec!["a".to_string(), "b".to_string(), "c".to_string()],
@@ -341,13 +346,16 @@ mod tests {
             ],
             prop_firm_validation_artifacts: Vec::new(),
             funnel_profile: None,
-        
+
             effective_smc_gate_threshold: f32::NAN,
         };
 
         let live = LivePortfolioArtifact::from_discovery("EURUSD", "M1", &[], false, &result);
         assert_eq!(
-            live.genes.iter().map(|g| g.strategy_id.as_str()).collect::<Vec<_>>(),
+            live.genes
+                .iter()
+                .map(|g| g.strategy_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["winner"],
             "only the tail-profitable strategy may reach the live portfolio"
         );
@@ -356,7 +364,11 @@ mod tests {
         // (the legacy/test path), never silently empty the portfolio.
         result.forward_test_validation_artifacts.clear();
         let live = LivePortfolioArtifact::from_discovery("EURUSD", "M1", &[], false, &result);
-        assert_eq!(live.genes.len(), 2, "no artifacts → no gate → all members kept");
+        assert_eq!(
+            live.genes.len(),
+            2,
+            "no artifacts → no gate → all members kept"
+        );
     }
 
     #[test]

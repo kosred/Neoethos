@@ -238,7 +238,7 @@ impl SearchCheckpointArtifactFile {
         SearchResult {
             genes: self.genes.clone(),
             metrics: self.metrics.clone(),
-        
+
             effective_smc_gate_threshold: self.effective_smc_gate_threshold,
         }
     }
@@ -370,7 +370,7 @@ mod tests {
             SearchResult {
                 genes: vec![gene],
                 metrics: vec![[1.0; 11]],
-            
+
                 effective_smc_gate_threshold: 0.75,
             },
         )
