@@ -1883,16 +1883,12 @@ pub fn evaluate_population_core(
         // on a real RTX A6000 (Vulkan). Was `false` while the kernel was
         // fixed-1-lot (would have corrupted fitness).
         const PHASE1_GPU_SIZING_PORTED: bool = true;
-        // Adaptive per-entry stops (Stage 2c) are CPU-only until Stage 3 ports the
-        // per-bar series to the cubecl kernel: routing a gene through the GPU lane
-        // while the CPU lane uses adaptive SL/TP would make the two lanes' metrics
-        // diverge and corrupt the merged fitness. When the base settings carry an
-        // adaptive series, force ALL genes onto the CPU lane (same fail-safe the
-        // fixed-1-lot era used via PHASE1_GPU_SIZING_PORTED=false).
-        let adaptive_stops_active =
-            settings.adaptive_base_pips.is_some() && settings.adaptive_vol_mult > 0.0;
+        // Adaptive per-entry stops are now ported to the cubecl backtest kernel
+        // (base series + per-gene multiplier uploaded, per-entry capture, proven
+        // bit-parity with the CPU by the `..._adaptive_stops` parity test), so
+        // adaptive genes run on the GPU lane exactly like fixed ones — the old
+        // adaptive→CPU fail-safe is no longer needed.
         if PHASE1_GPU_SIZING_PORTED
-            && !adaptive_stops_active
             && cuda_eval_signal_kernel_enabled()
             && cuda_eval_backtest_kernel_enabled()
             && n_genes >= 4
@@ -2173,16 +2169,10 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
     };
 
     // Respect the same env kill-switches the GA hybrid honours: if a kernel is
-    // disabled, go straight to CPU (no point building a GPU launch that the
-    // kernel-enabled guard would reject). Also force CPU when adaptive per-entry
-    // stops are active — the cubecl kernel does not yet compute them (Stage 3), so
-    // routing an adaptive gene through it would diverge from the CPU lane. Same
-    // guard `evaluate_population_core` uses on the GA side.
-    let adaptive_stops_active = settings.adaptive_base_pips.is_some();
-    if !adaptive_stops_active
-        && cuda_eval_signal_kernel_enabled()
-        && cuda_eval_backtest_kernel_enabled()
-    {
+    // disabled, go straight to CPU. Adaptive per-entry stops are now computed by
+    // the cubecl kernel (bit-parity proven), so an adaptive population no longer
+    // needs to be forced onto the CPU lane.
+    if cuda_eval_signal_kernel_enabled() && cuda_eval_backtest_kernel_enabled() {
         let device_override = eval_gpu_devices().first().copied();
         // catch_unwind is the ONLY mitigation for cubecl #243 pool-panics
         // (no Result-returning launch in cubecl 0.10). `AssertUnwindSafe` is
