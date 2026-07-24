@@ -47,11 +47,7 @@ impl RankKey {
         Ok(Self {
             primary_fitness: quantize_f64("fitness", gene.fitness, policy.fitness_scale)?,
             sharpe: quantize_f64("sharpe_ratio", gene.sharpe_ratio, policy.ratio_scale)?,
-            profit_factor: quantize_f64(
-                "profit_factor",
-                gene.profit_factor,
-                policy.ratio_scale,
-            )?,
+            profit_factor: quantize_f64("profit_factor", gene.profit_factor, policy.ratio_scale)?,
             inverse_drawdown: quantize_f64(
                 "max_drawdown",
                 -gene.max_drawdown,
@@ -90,7 +86,12 @@ pub fn canonical_gene_bytes(gene: &Gene) -> Result<Vec<u8>, RankKeyError> {
     }
 
     let mut terms = Vec::with_capacity(gene.indices.len());
-    for (index, weight) in gene.indices.iter().copied().zip(gene.weights.iter().copied()) {
+    for (index, weight) in gene
+        .indices
+        .iter()
+        .copied()
+        .zip(gene.weights.iter().copied())
+    {
         terms.push((index as u64, canonical_f32("weight", weight)?));
     }
     terms.sort_unstable_by_key(|(index, weight_bits)| (*index, *weight_bits));
@@ -182,8 +183,12 @@ impl fmt::Display for RankKeyError {
                 f,
                 "gene shape mismatch: {indices} indicator indices but {weights} weights"
             ),
-            Self::NonFinite { field } => write!(f, "non-finite value in canonical rank field {field}"),
-            Self::OutOfRange { field } => write!(f, "quantized rank field {field} exceeds i64 range"),
+            Self::NonFinite { field } => {
+                write!(f, "non-finite value in canonical rank field {field}")
+            }
+            Self::OutOfRange { field } => {
+                write!(f, "quantized rank field {field} exceeds i64 range")
+            }
         }
     }
 }
