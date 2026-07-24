@@ -4,9 +4,9 @@
 //! with a GPU backend and writes diagnostic score/signal/confidence/SMC buffers.
 
 use anyhow::{Context, Result, bail};
-use cubecl::prelude::*;
 #[cfg(feature = "gpu-cuda")]
 use cubecl::cuda::CudaRuntime;
+use cubecl::prelude::*;
 #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
 use cubecl::wgpu::WgpuRuntime;
 
@@ -61,9 +61,11 @@ impl SignalTraceInput {
         {
             bail!("signal trace gene/SMC shape mismatch");
         }
-        if self.gene_indices.iter().any(|index| {
-            *index < 0 || (*index as usize) >= self.feature_count
-        }) {
+        if self
+            .gene_indices
+            .iter()
+            .any(|index| *index < 0 || (*index as usize) >= self.feature_count)
+        {
             bail!("signal trace gene index outside feature range");
         }
         if self
@@ -335,9 +337,15 @@ fn launch_signal_trace<R: Runtime>(
     let confidence_bytes = client
         .read_one(confidence_out)
         .context("read trace confidences")?;
-    let smc_score_bytes = client.read_one(smc_score_out).context("read trace SMC scores")?;
-    let smc_gate_bytes = client.read_one(smc_gate_out).context("read trace SMC gates")?;
-    let final_bytes = client.read_one(final_out).context("read trace final signals")?;
+    let smc_score_bytes = client
+        .read_one(smc_score_out)
+        .context("read trace SMC scores")?;
+    let smc_gate_bytes = client
+        .read_one(smc_gate_out)
+        .context("read trace SMC gates")?;
+    let final_bytes = client
+        .read_one(final_out)
+        .context("read trace final signals")?;
     Ok(SignalTraceOutput {
         scores_before_threshold: f32::from_bytes(score_bytes.as_ref()).to_vec(),
         raw_signals: i32::from_bytes(raw_bytes.as_ref()).to_vec(),
