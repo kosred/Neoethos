@@ -21,6 +21,16 @@ text = text.replace(
 )
 root.write_text(text, encoding="utf-8")
 
+for script in (
+    Path("scripts/gpu-bench/preflight.sh"),
+    Path("scripts/gpu-bench/prepare_worktrees.sh"),
+    Path("scripts/gpu-bench/run_matrix.py"),
+    Path("scripts/gpu-bench/collate.py"),
+):
+    if not script.is_file():
+        raise RuntimeError(f"missing rented-GPU script: {script}")
+    script.chmod(0o755)
+
 workflow = Path(".github/workflows/agent-stage1.yml")
 text = workflow.read_text(encoding="utf-8")
 text = replace_once(
