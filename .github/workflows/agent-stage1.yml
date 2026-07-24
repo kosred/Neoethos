@@ -1,29 +1,27 @@
-name: Agent Stage 1 patch and test
+name: GPU-native Stage 1 verification
 
 on:
   pull_request:
     branches: [master]
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: read
 
 concurrency:
-  group: agent-stage1-${{ github.event.pull_request.number }}
+  group: gpu-native-stage1-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  apply-and-test:
+  verify:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     steps:
       - name: Check out PR branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install mold when missing
         shell: bash
@@ -46,35 +44,7 @@ jobs:
           shared-key: gpu-native-stage1
           cache-on-failure: true
 
-      - name: Apply queued agent migrations
-        id: patches
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/stage1-diagnostics
-          exec > >(tee /tmp/stage1-diagnostics/migration.log) 2>&1
-          shopt -s nullglob
-          applied=false
-
-          scripts=(.github/agent-patches/*.py)
-          for script in "${scripts[@]}"; do
-            echo "Running deterministic migration $script"
-            python3 "$script"
-            rm "$script"
-            applied=true
-          done
-
-          patches=(.github/agent-patches/*.patch)
-          for patch in "${patches[@]}"; do
-            echo "Applying $patch"
-            git apply --3way "$patch"
-            rm "$patch"
-            applied=true
-          done
-
-          echo "applied=$applied" >> "$GITHUB_OUTPUT"
-
-      - name: Format changed Rust files
+      - name: Check formatting of changed Rust files
         shell: bash
         run: |
           set -o pipefail
@@ -83,8 +53,9 @@ jobs:
           if (( ${#rust_files[@]} == 0 )); then
             echo "No changed Rust files" | tee /tmp/stage1-diagnostics/format.log
           else
-            printf 'Formatting %s\n' "${rust_files[@]}" | tee /tmp/stage1-diagnostics/format.log
-            rustfmt --edition 2024 --config skip_children=true "${rust_files[@]}" 2>&1 | tee -a /tmp/stage1-diagnostics/format.log
+            printf 'Checking %s\n' "${rust_files[@]}" | tee /tmp/stage1-diagnostics/format.log
+            rustfmt --check --edition 2024 --config skip_children=true "${rust_files[@]}" \
+              2>&1 | tee -a /tmp/stage1-diagnostics/format.log
           fi
 
       - name: Test GPU contracts crate
@@ -99,21 +70,51 @@ jobs:
           set -o pipefail
           cargo test -p neoethos-gpu-cuda 2>&1 | tee /tmp/stage1-diagnostics/cuda-scaffold-test.log
 
-      - name: Lint rented-GPU run kit
+      - name: Lint and smoke-test rented-GPU kit
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           bash -n scripts/gpu-bench/preflight.sh scripts/gpu-bench/prepare_worktrees.sh
           python3 -m py_compile \
             scripts/gpu-bench/run_matrix.py \
             scripts/gpu-bench/collate.py \
             scripts/gpu-bench/prepare_snapshot.py
+          tmp="$(mktemp -d)"
+          export SNAPSHOT_SMOKE_DIR="$tmp"
+          python3 - <<'PY'
+          import csv, math, os, pathlib
+          root = pathlib.Path(os.environ["SNAPSHOT_SMOKE_DIR"])
+          path = root / "M1.csv"
+          with path.open("w", newline="", encoding="utf-8") as handle:
+              writer = csv.writer(handle)
+              writer.writerow(["timestamp", "high", "low", "close", "feature_0", "feature_1"])
+              for bar in range(96):
+                  close = 1.10 + math.sin(bar * 0.1) * 0.002
+                  writer.writerow([
+                      1_700_000_000_000 + bar * 60_000,
+                      close + 0.0005,
+                      close - 0.0005,
+                      close,
+                      math.sin(bar * 0.07),
+                      math.cos(bar * 0.11),
+                  ])
+          PY
+          python3 scripts/gpu-bench/prepare_snapshot.py \
+            --csv "$tmp/M1.csv" --out "$tmp/M1.json" --timeframe M1 --population 8
+          python3 - <<'PY'
+          import json, os, pathlib
+          payload = json.loads((pathlib.Path(os.environ["SNAPSHOT_SMOKE_DIR"]) / "M1.json").read_text())
+          assert payload["schema_version"] == 1
+          assert payload["timeframe"] == "M1"
+          assert len(payload["close"]) == 96
+          assert len(payload["long_thresholds"]) == 8
+          PY
 
       - name: Test search crate
         shell: bash
         run: |
           set -o pipefail
-          cargo test -p neoethos-search 2>&1 | tee /tmp/stage1-diagnostics/test.log
+          cargo test -p neoethos-search 2>&1 | tee /tmp/stage1-diagnostics/search-test.log
 
       - name: Check CLI crate
         shell: bash
@@ -125,13 +126,26 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo check -p neoethos-search --features gpu-vulkan 2>&1 | tee /tmp/stage1-diagnostics/gpu-check.log
+          cargo check -p neoethos-search --features gpu-vulkan \
+            2>&1 | tee /tmp/stage1-diagnostics/search-gpu-check.log
 
       - name: Check CLI GPU feature
         shell: bash
         run: |
           set -o pipefail
-          cargo check -p neoethos-cli --features gpu-vulkan 2>&1 | tee /tmp/stage1-diagnostics/cli-gpu-check.log
+          cargo check -p neoethos-cli --features gpu-vulkan \
+            2>&1 | tee /tmp/stage1-diagnostics/cli-gpu-check.log
+
+      - name: Direct WGPU correctness probes
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p neoethos-search --features gpu-vulkan \
+            gpu_event_first_hit_matches_reference_when_adapter_is_available -- --nocapture \
+            2>&1 | tee /tmp/stage1-diagnostics/prototype-c-direct.log
+          cargo test -p neoethos-search --features gpu-vulkan \
+            direct_gpu_trace_matches_cpu_when_an_adapter_is_available -- --nocapture \
+            2>&1 | tee /tmp/stage1-diagnostics/signal-trace-direct.log
 
       - name: Upload failure diagnostics
         if: failure()
@@ -141,22 +155,3 @@ jobs:
           path: /tmp/stage1-diagnostics
           if-no-files-found: error
           retention-days: 3
-
-      - name: Commit verified migration results
-        shell: bash
-        run: |
-          set -euo pipefail
-          if git diff --quiet && git diff --cached --quiet; then
-            echo "No verified changes to commit"
-            exit 0
-          fi
-          message="chore(agent): apply verified Stage 1 migration"
-          if [[ -f .github/agent-patches/commit-message.txt ]]; then
-            message="$(cat .github/agent-patches/commit-message.txt)"
-            rm .github/agent-patches/commit-message.txt
-          fi
-          git config user.name "neoethos-stage1-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add -A
-          git commit -m "$message"
-          git push origin "HEAD:${{ github.head_ref }}"
