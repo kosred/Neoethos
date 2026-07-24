@@ -2514,6 +2514,9 @@ fn launch_backtest_kernel<R: Runtime>(
     day_idx: &[i32],
     sl_pips: &[f32],
     tp_pips: &[f32],
+    // Per-gene adaptive volatility multiplier (empty / all-zero ⇒ fixed-stop
+    // path). Pairs with `settings.adaptive_base_pips` + `settings.adaptive_rr`.
+    stop_vol_mult: &[f64],
     settings: &BacktestSettings,
     month_capacity: usize,
 ) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>)> {
@@ -2607,13 +2610,32 @@ fn launch_backtest_kernel<R: Runtime>(
 
     let units = backtest_kernel_units(client);
     let cubes = (n_genes as u32).div_ceil(units);
-    // Adaptive-stop kernel args. `launch_backtest_kernel` is the FIXED-stop entry
-    // point (parity fixtures + FTMO path), so pass inert dummies: an all-zero
-    // per-gene multiplier makes the kernel's `stop_vol_mult[gene] > 0` check
-    // always false → the scalar sl/tp path → byte-identical. `base_pips` is a
-    // 1-element placeholder (never read when the multiplier is 0).
-    let base_pips_dummy = client.create_from_slice(f32::as_bytes(&[0.0f32]));
-    let stop_vol_mult_dummy = client.create_from_slice(f32::as_bytes(&vec![0.0f32; n_genes]));
+    // Adaptive-stop kernel args. When the settings carry a per-bar base vol
+    // series aligned to n_samples AND some gene has a positive multiplier, upload
+    // the REAL base (f32) + per-gene multiplier and use settings.adaptive_rr;
+    // otherwise inert dummies (all-zero multiplier ⇒ the kernel's
+    // `stop_vol_mult[gene] > 0` check is always false ⇒ the scalar sl/tp path,
+    // byte-identical). base + rr ride on `settings` (already threaded); the length
+    // guard keeps a windowed slice from mis-indexing the full-series base.
+    let adaptive_on = stop_vol_mult.iter().any(|&m| m > 0.0)
+        && settings
+            .adaptive_base_pips
+            .as_ref()
+            .map(|b| b.len() == n_samples)
+            .unwrap_or(false);
+    let (base_f32, mult_f32): (Vec<f32>, Vec<f32>) = if adaptive_on {
+        let base = settings.adaptive_base_pips.as_ref().unwrap();
+        (
+            base.iter().map(|&d| d as f32).collect(),
+            stop_vol_mult.iter().map(|&m| m as f32).collect(),
+        )
+    } else {
+        (vec![0.0f32], vec![0.0f32; n_genes])
+    };
+    let base_len = base_f32.len();
+    let adaptive_rr_f32 = if adaptive_on { settings.adaptive_rr as f32 } else { 2.0 };
+    let base_pips_dummy = client.create_from_slice(f32::as_bytes(&base_f32));
+    let stop_vol_mult_dummy = client.create_from_slice(f32::as_bytes(&mult_f32));
     // cubecl 0.10 migration: Handle-by-value `from_raw_parts(handle, len)`
     // (clone to keep originals for read-back), raw-value scalars (no
     // `ScalarArg::new`), infallible `launch` (no `.context()?`).
@@ -2672,9 +2694,9 @@ fn launch_backtest_kernel<R: Runtime>(
             settings.risk_per_trade_min as f32,
             settings.risk_per_trade_max as f32,
             settings.high_quality_confidence as f32,
-            unsafe { ArrayArg::from_raw_parts(base_pips_dummy.clone(), 1) },
+            unsafe { ArrayArg::from_raw_parts(base_pips_dummy.clone(), base_len) },
             unsafe { ArrayArg::from_raw_parts(stop_vol_mult_dummy.clone(), n_genes) },
-            2.0f32,
+            adaptive_rr_f32,
             unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
             // FTMO prop-firm observables — LAST kernel argument (matches the kernel
             // signature). `n_genes * FTMO_WIDTH` f32s laid out per gene.
@@ -2856,6 +2878,7 @@ fn fused_path_parity_holds<R: Runtime>(client: &ComputeClient<R>) -> Result<bool
         &day_i32,
         &sl_f32,
         &tp_f32,
+        &[], // fixed-stop parity fixture: no adaptive multiplier
         &settings,
         month_capacity,
     )?;
@@ -2886,6 +2909,7 @@ fn fused_path_parity_holds<R: Runtime>(client: &ComputeClient<R>) -> Result<bool
         &day_i32,
         &sl_f32,
         &tp_f32,
+        &[], // fixed-stop parity fixture
         &settings,
         month_capacity,
         n_genes,
@@ -3057,6 +3081,7 @@ fn fused_signal_backtest_batch<F, R: Runtime>(
     day_idx: &[i32],
     sl_pips: &[f32],
     tp_pips: &[f32],
+    stop_vol_mult: &[f64],
     settings: &BacktestSettings,
     month_capacity: usize,
     n_genes: usize,
@@ -3259,10 +3284,28 @@ where
             client.empty(ftmo_len.saturating_mul(std::mem::size_of::<f32>())),
         )
     });
-    // Adaptive-stop kernel args — inert dummies (fixed-stop parity, see
-    // `launch_backtest_kernel`). All-zero per-gene multiplier ⇒ scalar sl/tp path.
-    let base_pips_dummy = client.create_from_slice(f32::as_bytes(&[0.0f32]));
-    let stop_vol_mult_dummy = client.create_from_slice(f32::as_bytes(&vec![0.0f32; n_genes]));
+    // Adaptive-stop kernel args (fused path). Real base+mult when adaptive is on
+    // and the base aligns with n_samples, else inert dummies (fixed → scalar sl/tp
+    // path, byte-identical). Mirrors `launch_backtest_kernel`.
+    let adaptive_on = stop_vol_mult.iter().any(|&m| m > 0.0)
+        && settings
+            .adaptive_base_pips
+            .as_ref()
+            .map(|b| b.len() == n_samples)
+            .unwrap_or(false);
+    let (base_f32, mult_f32): (Vec<f32>, Vec<f32>) = if adaptive_on {
+        let base = settings.adaptive_base_pips.as_ref().unwrap();
+        (
+            base.iter().map(|&d| d as f32).collect(),
+            stop_vol_mult.iter().map(|&m| m as f32).collect(),
+        )
+    } else {
+        (vec![0.0f32], vec![0.0f32; n_genes])
+    };
+    let base_len = base_f32.len();
+    let adaptive_rr_f32 = if adaptive_on { settings.adaptive_rr as f32 } else { 2.0 };
+    let base_pips_dummy = client.create_from_slice(f32::as_bytes(&base_f32));
+    let stop_vol_mult_dummy = client.create_from_slice(f32::as_bytes(&mult_f32));
     let bt_units = backtest_kernel_units(client);
     let bt_cubes = (n_genes as u32).div_ceil(bt_units);
     gpu_timing::kernel(|| {
@@ -3313,9 +3356,9 @@ where
             settings.risk_per_trade_min as f32,
             settings.risk_per_trade_max as f32,
             settings.high_quality_confidence as f32,
-            unsafe { ArrayArg::from_raw_parts(base_pips_dummy.clone(), 1) },
+            unsafe { ArrayArg::from_raw_parts(base_pips_dummy.clone(), base_len) },
             unsafe { ArrayArg::from_raw_parts(stop_vol_mult_dummy.clone(), n_genes) },
-            2.0f32,
+            adaptive_rr_f32,
             unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
             unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
         );
@@ -3376,6 +3419,7 @@ fn fused_eval_batch_dispatch<R: Runtime>(
     day_idx: &[i32],
     sl_pips: &[f32],
     tp_pips: &[f32],
+    stop_vol_mult: &[f64],
     settings: &BacktestSettings,
     month_capacity: usize,
     n_genes: usize,
@@ -3425,6 +3469,7 @@ fn fused_eval_batch_dispatch<R: Runtime>(
             day_idx,
             sl_pips,
             tp_pips,
+            stop_vol_mult,
             settings,
             month_capacity,
             n_genes,
@@ -3458,6 +3503,7 @@ fn fused_eval_batch_dispatch<R: Runtime>(
         day_idx,
         sl_pips,
         tp_pips,
+        stop_vol_mult,
         settings,
         month_capacity,
         n_genes,
@@ -3480,6 +3526,7 @@ pub(crate) fn try_evaluate_population_cuda(
     timestamps: &[i64],
     sl_pips: &[f64],
     tp_pips: &[f64],
+    stop_vol_mult: &[f64],
     smc_data: &[SmcRow],
     gene_smc_flags: &[SmcRow],
     gate_threshold: f32,
@@ -3609,6 +3656,7 @@ pub(crate) fn try_evaluate_population_cuda(
                         &day_idx,
                         &sl_pips_all[b0..b1],
                         &tp_pips_all[b0..b1],
+                        &stop_vol_mult[b0..b1],
                         settings,
                         month_capacity,
                         bn,
@@ -3697,6 +3745,7 @@ pub(crate) fn try_evaluate_population_cuda(
                             &day_idx,
                             &sl_pips_all[c0 + g0..c0 + g1],
                             &tp_pips_all[c0 + g0..c0 + g1],
+                            &stop_vol_mult[c0 + g0..c0 + g1],
                             settings,
                             month_capacity,
                         )?;
@@ -3847,6 +3896,7 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
     timestamps: &[i64],
     sl_pips: &[f64],
     tp_pips: &[f64],
+    stop_vol_mult: &[f64],
     smc_data: &[SmcRow],
     gene_smc_flags: &[SmcRow],
     gate_threshold: f32,
@@ -3947,6 +3997,7 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
                         &day_idx,
                         &sl_pips_all[c0 + g0..c0 + g1],
                         &tp_pips_all[c0 + g0..c0 + g1],
+                        &stop_vol_mult[c0 + g0..c0 + g1],
                         settings,
                         month_capacity,
                     )?;
