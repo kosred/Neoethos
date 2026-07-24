@@ -1,6 +1,8 @@
 name: Agent Stage 1 patch and test
 
 on:
+  push:
+    branches: [agent/gpu-native-stage1]
   pull_request:
     branches: [master]
 
@@ -9,19 +11,30 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: agent-stage1-${{ github.event.pull_request.number }}
+  group: agent-stage1-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   apply-and-test:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Check out PR branch
+      - name: Resolve branch name
+        id: branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "name=${{ github.head_ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
+          ref: ${{ steps.branch.outputs.name }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -82,4 +95,4 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add -A
           git commit -m "$message"
-          git push origin "HEAD:${{ github.head_ref }}"
+          git push origin "HEAD:${{ steps.branch.outputs.name }}"
