@@ -1796,8 +1796,25 @@ pub fn auto_tune_memory_budgets() {
     // .max_page_size` to install `GPU_BUFFER_CAP_BYTES`. So we set `gpu_buffer_mb`
     // to 0 here = "probe at client build"; `gpu_buffer_elem_cap` ignores a 0 budget
     // and reads the probed cap. The pool-trim budget (`v`) still scales with VRAM.
-    let vram_budget_mb = vram_budget_mb_for(min_vram_gb);
-    let gpu_buffer_mb = 0usize; // 0 ⇒ probe the device's real cap at client build
+    let (vram_budget_mb, gpu_buffer_mb) = if min_vram_gb.is_finite() {
+        // Discrete card with real dedicated VRAM: pool-trim from the card, and
+        // leave the per-buffer cap at 0 so it's probed from the device at client
+        // build (the true `max_storage_buffer_binding_size`).
+        (vram_budget_mb_for(min_vram_gb), 0usize)
+    } else {
+        // Shared-memory GPU (integrated graphics — the probe reports no dedicated
+        // VRAM). Its buffers come out of SYSTEM RAM, so the usable budget is
+        // available RAM minus what the OS and the CPU lane (host signal buffers,
+        // rayon) already need — NOT the device's advertised max-buffer limit,
+        // which is the whole of RAM and makes the fused path OOM. `avail_ram_gb`
+        // is already post-OS "available" RAM; take a conservative slice of it so
+        // the GPU chunking coexists with the CPU lane inside shared memory. Pool
+        // trim ~30%, per-buffer cap ~15% (bounds the fused resident buffer =
+        // gene-batch × n_samples). Clamped so a tiny box still runs.
+        let pool_mb = ((avail_ram_gb * 1024.0 * 0.30) as u64).clamp(512, 8192);
+        let buf_mb = ((avail_ram_gb * 1024.0 * 0.15) as u64).clamp(256, 4096) as usize;
+        (pool_mb, buf_mb)
+    };
 
     let budgets = MemoryBudgets {
         host_budget_mb,
@@ -1847,9 +1864,15 @@ fn gpu_buffer_elem_cap() -> usize {
         (Some(env), Some(p)) => env.min(p),
         // Env override only (no client built yet): honor it verbatim.
         (Some(env), None) => env,
-        // No env override: prefer the probed cap, else the (non-zero) budget,
-        // else the floor.
-        (None, Some(p)) => p,
+        // No env override: use the probed cap, but let a (non-zero) budget CAP it.
+        // On a shared-memory GPU (integrated graphics) the probed device limit is
+        // the whole system RAM — far more than the fused/windowed path can fill
+        // without OOM — so the RAM-derived budget must bound it. On a discrete
+        // card the budget is left 0 (probe wins), unchanged.
+        (None, Some(p)) => match budget_bytes {
+            Some(b) => p.min(b),
+            None => p,
+        },
         (None, None) => budget_bytes.unwrap_or(GPU_BUFFER_CAP_FLOOR),
     };
     (bytes.saturating_div(4)).max(1) as usize // 4 bytes/element (i32/f32)
