@@ -34,6 +34,7 @@ pub mod eval;
 pub mod export_state;
 pub mod funnel_profile;
 pub mod gpu_fallback;
+pub mod gpu_native;
 // `pub mod gauntlet;` — DELETED 2026-05-26 (operator directive: dual-mode product).
 // `StrategyGauntlet` had zero callers in the workspace; the quality floors
 // (win-rate, profit-factor, drawdown caps) it scaffolded are now enforced by
