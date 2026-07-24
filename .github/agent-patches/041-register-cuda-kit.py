@@ -9,11 +9,15 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
 
 root = Path("Cargo.toml")
 text = root.read_text(encoding="utf-8")
-text = replace_once(
-    text,
-    '  "crates/neoethos-gpu-contracts",\n',
-    '  "crates/neoethos-gpu-contracts",\n  "crates/neoethos-gpu-cuda",\n',
-    "CUDA workspace member",
+member = '  "crates/neoethos-gpu-contracts",\n'
+if text.count(member) != 2:
+    raise RuntimeError(
+        f"CUDA workspace member: expected contracts in members and default-members, found {text.count(member)}"
+    )
+text = text.replace(
+    member,
+    member + '  "crates/neoethos-gpu-cuda",\n',
+    1,
 )
 root.write_text(text, encoding="utf-8")
 
