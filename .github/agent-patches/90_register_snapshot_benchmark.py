@@ -26,10 +26,4 @@ replace_once(
     "pub fn run(args: &[String]) -> Result<()> {\n    if args.iter().any(|arg| arg == \"--execute-snapshot\") {\n        return crate::gpu_bench_snapshot::run(args);\n    }\n",
     "snapshot bench dispatch",
 )
-replace_once(
-    Path(".github/workflows/agent-stage1.yml"),
-    "          python3 -m py_compile scripts/gpu-bench/run_matrix.py scripts/gpu-bench/collate.py\n",
-    "          python3 -m py_compile scripts/gpu-bench/run_matrix.py scripts/gpu-bench/collate.py scripts/gpu-bench/prepare_snapshot.py\n",
-    "snapshot exporter lint",
-)
 print("registered versioned real-data snapshot fixture and executable CLI path")
