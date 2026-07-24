@@ -48,7 +48,8 @@ pub fn smoke_add_one(input: &[u32]) -> Result<Vec<u32>, CudaSmokeError> {
     }
     let mut output = vec![0_u32; input.len()];
     // SAFETY: pointers are valid for `input.len()` elements and non-overlapping.
-    let status = unsafe { neoethos_gpu_cuda_smoke(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+    let status =
+        unsafe { neoethos_gpu_cuda_smoke(input.as_ptr(), output.as_mut_ptr(), input.len()) };
     if status == 0 {
         Ok(output)
     } else {

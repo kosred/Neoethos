@@ -7487,6 +7487,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "neoethos-gpu-cuda"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "neoethos-gpu-contracts",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "neoethos-models"
 version = "0.5.6"
 dependencies = [
