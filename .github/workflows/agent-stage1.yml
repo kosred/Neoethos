@@ -104,7 +104,10 @@ jobs:
         run: |
           set -o pipefail
           bash -n scripts/gpu-bench/preflight.sh scripts/gpu-bench/prepare_worktrees.sh
-          python3 -m py_compile scripts/gpu-bench/run_matrix.py scripts/gpu-bench/collate.py
+          python3 -m py_compile \
+            scripts/gpu-bench/run_matrix.py \
+            scripts/gpu-bench/collate.py \
+            scripts/gpu-bench/prepare_snapshot.py
 
       - name: Test search crate
         shell: bash
