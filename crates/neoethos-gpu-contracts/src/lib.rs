@@ -259,8 +259,8 @@ pub mod scenario_rng {
 
 #[cfg(test)]
 mod tests {
-    use super::device::*;
     use super::ABI_VERSION;
+    use super::device::*;
 
     #[test]
     fn dataset_header_carries_shared_abi_version() {

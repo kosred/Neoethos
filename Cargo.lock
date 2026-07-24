@@ -7480,6 +7480,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "neoethos-gpu-contracts"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "neoethos-models"
 version = "0.5.6"
 dependencies = [
@@ -7541,6 +7548,7 @@ dependencies = [
  "ndarray 0.17.2",
  "neoethos-core",
  "neoethos-data",
+ "neoethos-gpu-contracts",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "rayon",
