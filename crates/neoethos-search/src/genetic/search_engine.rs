@@ -2119,3 +2119,69 @@ where
         metrics: best_metrics,
     })
 }
+
+#[cfg(test)]
+mod adaptive_wiring_tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    /// Deterministic synthetic high/low/close long enough for the vol window.
+    fn synthetic_hlc(n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let (mut high, mut low, mut close) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            let c = 1.10 + 0.01 * ((i as f64) * 0.2).sin();
+            let amp = 0.001 + 0.001 * (((i as f64) * 0.05).cos().abs());
+            close.push(c);
+            high.push(c + amp);
+            low.push(c - amp);
+        }
+        (high, low, close)
+    }
+
+    /// Proves the Stage-2c wiring: a gene's `stop_vol_mult` flows through
+    /// `resolve_adaptive_stops` into a per-gene multiplier array AND installs the
+    /// shared per-bar base vol series (+ 2R) onto the settings — so an adaptive
+    /// gene is actually scored on a volatility-scaled stop. When every gene is
+    /// fixed, the base series is NOT installed (the byte-identical fixed path).
+    #[test]
+    fn resolve_adaptive_stops_installs_base_series_and_per_gene_mults() {
+        let n = 200usize;
+        let (high, low, close) = synthetic_hlc(n);
+        let config = EvaluationConfig::for_symbol("EURUSD", "USD", Some(1.10), None, None);
+        let smc = SmcSearchConfig::default();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut genes: Vec<Gene> =
+            (0..3).map(|_| new_random_gene(4, 2, 0, &smc, &mut rng)).collect();
+        genes[0].stop_vol_mult = 1.5;
+        genes[1].stop_vol_mult = 0.0;
+        genes[2].stop_vol_mult = 3.0;
+
+        // Some genes adaptive → base series + reward:risk installed.
+        let mut settings = crate::eval::BacktestSettings::default();
+        let mults = resolve_adaptive_stops(&genes, &high, &low, &close, &config, &mut settings);
+        assert_eq!(mults, vec![1.5, 0.0, 3.0], "returns each gene's stop_vol_mult");
+        let base = settings
+            .adaptive_base_pips
+            .as_ref()
+            .expect("base series installed when a gene is adaptive");
+        assert_eq!(base.len(), n);
+        assert!(
+            base.iter().all(|&b| b.is_finite() && b > 0.0),
+            "base pips must be finite and positive"
+        );
+        assert_eq!(settings.adaptive_rr, 2.0);
+
+        // All fixed → base series NOT installed (fixed path stays byte-identical).
+        let mut fixed = genes.clone();
+        for g in &mut fixed {
+            g.stop_vol_mult = 0.0;
+        }
+        let mut settings2 = crate::eval::BacktestSettings::default();
+        let mults2 = resolve_adaptive_stops(&fixed, &high, &low, &close, &config, &mut settings2);
+        assert_eq!(mults2, vec![0.0, 0.0, 0.0]);
+        assert!(
+            settings2.adaptive_base_pips.is_none(),
+            "no base series installed when every gene is fixed"
+        );
+    }
+}
