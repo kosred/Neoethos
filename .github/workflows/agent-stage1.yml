@@ -38,6 +38,11 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install repository system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold lld clang pkg-config
+
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
