@@ -794,6 +794,16 @@ fn backtest_population_kernel(
     risk_per_trade_min: f32,
     risk_per_trade_max: f32,
     high_quality_confidence: f32,
+    // Adaptive stops (2026-07-24): per-BAR base stop distance in pips
+    // (`base_pips`, shared across genes), per-GENE volatility multiplier
+    // (`stop_vol_mult`), and the reward:risk. When `stop_vol_mult[gene] > 0` an
+    // entry captures `sl = mult × base_pips[signal_bar]`, `tp = adaptive_rr × sl`
+    // (see the entry block) — otherwise the scalar `sl_pips`/`tp_pips` path, so a
+    // fixed-stop population is byte-identical. `base_pips` has `n_samples`
+    // elements; a fixed-only launch passes a 1-element dummy (never read).
+    base_pips: &Array<f32>,
+    stop_vol_mult: &Array<f32>,
+    adaptive_rr: f32,
     // Per-month STARTING equity (sibling of monthly_pnls_out); the host divides
     // monthly_pnls_out / month_start_equities_out to get monthly_target_hit_rate
     // (metric slot 7), matching eval.rs:1110-1131.
@@ -836,8 +846,13 @@ fn backtest_population_kernel(
             terminate!();
         }
 
-        let sl_distance = sl_pips[gene];
-        let tp_distance = tp_pips[gene];
+        // Per-entry SL/TP distance in pips. For a fixed-stop gene these stay at
+        // the scalar sl_pips[gene]/tp_pips[gene] (byte-identical); for an adaptive
+        // gene (stop_vol_mult[gene] > 0) they are RE-CAPTURED at each entry from
+        // the signal-bar volatility (below), mirroring the CPU `entry_sl_tp_pips`.
+        // RuntimeCell because cubecl 0.9 forbids reassigning a `let` binding.
+        let sl_distance = RuntimeCell::<f32>::new(sl_pips[gene]);
+        let tp_distance = RuntimeCell::<f32>::new(tp_pips[gene]);
 
         let equity = RuntimeCell::<f32>::new(initial_equity);
         let peak_equity = RuntimeCell::<f32>::new(initial_equity);
@@ -1101,8 +1116,8 @@ fn backtest_population_kernel(
                 let past_min_hold = min_hold_bars == 0 || bars_held >= min_hold_bars as i32;
 
                 if past_min_hold && in_pos_v2 == 1 {
-                    let sl_cell = RuntimeCell::<f32>::new(entry_px_v - sl_distance);
-                    let tp = entry_px_v + tp_distance;
+                    let sl_cell = RuntimeCell::<f32>::new(entry_px_v - sl_distance.read());
+                    let tp = entry_px_v + tp_distance.read();
                     // Apply only the trail from PRIOR bars (no intra-bar look-ahead — must
                     // match the CPU eval: this bar's high can't move the stop its own low is
                     // checked against). `trail_px == 0.0` is the unset sentinel.
@@ -1123,16 +1138,16 @@ fn backtest_population_kernel(
                     // AFTER the exit check: ratchet the trail up from THIS bar's high.
                     if exit_cell.read() == 0 && trailing_enabled != 0 {
                         let mv = hi - entry_px_v;
-                        if mv >= (trailing_be_trigger_r * sl_distance) {
-                            let candidate = hi - (trailing_atr_multiplier * sl_distance);
+                        if mv >= (trailing_be_trigger_r * sl_distance.read()) {
+                            let candidate = hi - (trailing_atr_multiplier * sl_distance.read());
                             if trail_px.read() == 0.0 || candidate > trail_px.read() {
                                 trail_px.store(candidate);
                             }
                         }
                     }
                 } else if past_min_hold {
-                    let sl_cell = RuntimeCell::<f32>::new(entry_px_v + sl_distance);
-                    let tp = entry_px_v - tp_distance;
+                    let sl_cell = RuntimeCell::<f32>::new(entry_px_v + sl_distance.read());
+                    let tp = entry_px_v - tp_distance.read();
                     if trailing_enabled != 0
                         && trail_px.read() > 0.0
                         && trail_px.read() < sl_cell.read()
@@ -1150,8 +1165,8 @@ fn backtest_population_kernel(
                     // AFTER the exit check: ratchet the trail down from THIS bar's low.
                     if exit_cell.read() == 0 && trailing_enabled != 0 {
                         let mv = entry_px_v - lo;
-                        if mv >= (trailing_be_trigger_r * sl_distance) {
-                            let candidate = lo + (trailing_atr_multiplier * sl_distance);
+                        if mv >= (trailing_be_trigger_r * sl_distance.read()) {
+                            let candidate = lo + (trailing_atr_multiplier * sl_distance.read());
                             if trail_px.read() == 0.0 || candidate < trail_px.read() {
                                 trail_px.store(candidate);
                             }
@@ -1239,6 +1254,18 @@ fn backtest_population_kernel(
                         trail_px.store(0.0);
                         // Phase C.3: reset carry accumulator at new entry.
                         position_days.store(0.0);
+                        // Adaptive stops: re-capture the per-entry SL/TP. An
+                        // adaptive gene (stop_vol_mult>0) scales the SIGNAL-bar
+                        // (i-1) base vol distance — the same causally-available bar
+                        // the signal/confidence use — and sets TP = rr × SL,
+                        // mirroring the CPU `entry_sl_tp_pips`. A fixed gene leaves
+                        // sl_distance/tp_distance at the scalar sl_pips/tp_pips.
+                        // Captured BEFORE the sizing below so eff_sl uses it.
+                        if stop_vol_mult[gene] > 0.0 {
+                            let sl_a = stop_vol_mult[gene] * base_pips[i - 1];
+                            sl_distance.store(sl_a);
+                            tp_distance.store(adaptive_rr * sl_a);
+                        }
                         // Phase 2: risk-based, confidence-scaled lot size, captured
                         // at entry from running equity + the prior-bar confidence
                         // (causal i-1, same shift as the signal read). Mirrors
@@ -1266,8 +1293,8 @@ fn backtest_population_kernel(
                                 + (risk_per_trade_max - risk_per_trade_min) * conf_scale.read();
                             // eff_sl = sl_distance.max(1.0)
                             let eff_sl = RuntimeCell::<f32>::new(1.0);
-                            if sl_distance > 1.0 {
-                                eff_sl.store(sl_distance);
+                            if sl_distance.read() > 1.0 {
+                                eff_sl.store(sl_distance.read());
                             }
                             let denom = eff_sl.read() * pip_value_per_lot;
                             let eq_now = equity.read();
@@ -2580,6 +2607,13 @@ fn launch_backtest_kernel<R: Runtime>(
 
     let units = backtest_kernel_units(client);
     let cubes = (n_genes as u32).div_ceil(units);
+    // Adaptive-stop kernel args. `launch_backtest_kernel` is the FIXED-stop entry
+    // point (parity fixtures + FTMO path), so pass inert dummies: an all-zero
+    // per-gene multiplier makes the kernel's `stop_vol_mult[gene] > 0` check
+    // always false → the scalar sl/tp path → byte-identical. `base_pips` is a
+    // 1-element placeholder (never read when the multiplier is 0).
+    let base_pips_dummy = client.create_from_slice(f32::as_bytes(&[0.0f32]));
+    let stop_vol_mult_dummy = client.create_from_slice(f32::as_bytes(&vec![0.0f32; n_genes]));
     // cubecl 0.10 migration: Handle-by-value `from_raw_parts(handle, len)`
     // (clone to keep originals for read-back), raw-value scalars (no
     // `ScalarArg::new`), infallible `launch` (no `.context()?`).
@@ -2638,6 +2672,9 @@ fn launch_backtest_kernel<R: Runtime>(
             settings.risk_per_trade_min as f32,
             settings.risk_per_trade_max as f32,
             settings.high_quality_confidence as f32,
+            unsafe { ArrayArg::from_raw_parts(base_pips_dummy.clone(), 1) },
+            unsafe { ArrayArg::from_raw_parts(stop_vol_mult_dummy.clone(), n_genes) },
+            2.0f32,
             unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
             // FTMO prop-firm observables — LAST kernel argument (matches the kernel
             // signature). `n_genes * FTMO_WIDTH` f32s laid out per gene.
@@ -3222,6 +3259,10 @@ where
             client.empty(ftmo_len.saturating_mul(std::mem::size_of::<f32>())),
         )
     });
+    // Adaptive-stop kernel args — inert dummies (fixed-stop parity, see
+    // `launch_backtest_kernel`). All-zero per-gene multiplier ⇒ scalar sl/tp path.
+    let base_pips_dummy = client.create_from_slice(f32::as_bytes(&[0.0f32]));
+    let stop_vol_mult_dummy = client.create_from_slice(f32::as_bytes(&vec![0.0f32; n_genes]));
     let bt_units = backtest_kernel_units(client);
     let bt_cubes = (n_genes as u32).div_ceil(bt_units);
     gpu_timing::kernel(|| {
@@ -3272,6 +3313,9 @@ where
             settings.risk_per_trade_min as f32,
             settings.risk_per_trade_max as f32,
             settings.high_quality_confidence as f32,
+            unsafe { ArrayArg::from_raw_parts(base_pips_dummy.clone(), 1) },
+            unsafe { ArrayArg::from_raw_parts(stop_vol_mult_dummy.clone(), n_genes) },
+            2.0f32,
             unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
             unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
         );
