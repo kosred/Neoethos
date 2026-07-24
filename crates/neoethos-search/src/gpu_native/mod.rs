@@ -8,5 +8,6 @@ pub mod instrumentation;
 pub mod parity_hierarchy;
 pub mod population_fixture;
 pub mod prototype_a;
+pub mod prototype_bc;
 pub mod ranking;
 pub mod semantics;
