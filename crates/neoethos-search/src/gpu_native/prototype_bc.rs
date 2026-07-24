@@ -75,11 +75,17 @@ pub struct SubgroupSupport {
 
 impl SubgroupSupport {
     pub const fn unavailable() -> Self {
-        Self { available: false, width: None }
+        Self {
+            available: false,
+            width: None,
+        }
     }
 
     pub const fn known(width: u32) -> Self {
-        Self { available: true, width: Some(width) }
+        Self {
+            available: true,
+            width: Some(width),
+        }
     }
 
     pub fn usable_width(self) -> Option<usize> {
@@ -119,8 +125,15 @@ pub struct RoutingDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrototypeError {
     EmptyPricePath,
-    PriceLengthMismatch { highs: usize, lows: usize },
-    InvalidWindow { entry_bar: usize, last_bar: usize, rows: usize },
+    PriceLengthMismatch {
+        highs: usize,
+        lows: usize,
+    },
+    InvalidWindow {
+        entry_bar: usize,
+        last_bar: usize,
+        rows: usize,
+    },
     NonFiniteLevel,
     UnsupportedSubgroupWidth(Option<u32>),
 }
@@ -170,8 +183,8 @@ pub fn route_strategy(profile: StrategyPathProfile, subgroup: SubgroupSupport) -
     }
 
     let static_stop = profile.fixed_at_entry ^ profile.adaptive_at_entry;
-    let density_valid = profile.event_density.is_finite()
-        && (0.0..=1.0).contains(&profile.event_density);
+    let density_valid =
+        profile.event_density.is_finite() && (0.0..=1.0).contains(&profile.event_density);
     if !static_stop || !density_valid {
         return RoutingDecision {
             prototype: PrototypeKind::AExactPersistent,
@@ -197,11 +210,17 @@ pub fn route_strategy(profile: StrategyPathProfile, subgroup: SubgroupSupport) -
     }
 }
 
-pub fn reference_first_hit(path: PricePath<'_>, request: FirstHitRequest) -> Result<Option<FirstHit>, PrototypeError> {
+pub fn reference_first_hit(
+    path: PricePath<'_>,
+    request: FirstHitRequest,
+) -> Result<Option<FirstHit>, PrototypeError> {
     validate_request(path, request)?;
     for bar in request.entry_bar.saturating_add(1)..=request.last_bar {
         if let Some(reason) = hit_on_bar(path.highs[bar], path.lows[bar], request) {
-            return Ok(Some(FirstHit { exit_bar: bar, reason }));
+            return Ok(Some(FirstHit {
+                exit_bar: bar,
+                reason,
+            }));
         }
     }
     Ok(None)
@@ -223,8 +242,14 @@ pub fn prototype_b_first_hit(
         let mut bar = first_bar.saturating_add(lane);
         while bar <= request.last_bar {
             if let Some(reason) = hit_on_bar(path.highs[bar], path.lows[bar], request) {
-                let lane_hit = FirstHit { exit_bar: bar, reason };
-                if earliest.map(|current| lane_hit.exit_bar < current.exit_bar).unwrap_or(true) {
+                let lane_hit = FirstHit {
+                    exit_bar: bar,
+                    reason,
+                };
+                if earliest
+                    .map(|current| lane_hit.exit_bar < current.exit_bar)
+                    .unwrap_or(true)
+                {
                     earliest = Some(lane_hit);
                 }
                 break;
@@ -257,7 +282,10 @@ fn validate_path(path: PricePath<'_>) -> Result<(), PrototypeError> {
         return Err(PrototypeError::EmptyPricePath);
     }
     if path.highs.len() != path.lows.len() {
-        return Err(PrototypeError::PriceLengthMismatch { highs: path.highs.len(), lows: path.lows.len() });
+        return Err(PrototypeError::PriceLengthMismatch {
+            highs: path.highs.len(),
+            lows: path.lows.len(),
+        });
     }
     Ok(())
 }
@@ -288,7 +316,9 @@ fn hit_on_bar(high: f64, low: f64, request: FirstHitRequest) -> Option<ExitReaso
 
     match (stop_hit, target_hit, request.same_bar_precedence) {
         (true, true, SameBarPrecedence::StopFirst) | (true, false, _) => Some(ExitReason::StopLoss),
-        (true, true, SameBarPrecedence::TargetFirst) | (false, true, _) => Some(ExitReason::TakeProfit),
+        (true, true, SameBarPrecedence::TargetFirst) | (false, true, _) => {
+            Some(ExitReason::TakeProfit)
+        }
         (false, false, _) => None,
     }
 }
@@ -320,7 +350,8 @@ mod tests {
         let expected = reference_first_hit(path(&highs, &lows), request).unwrap();
         for width in [8, 16, 32, 64] {
             assert_eq!(
-                prototype_b_first_hit(path(&highs, &lows), request, SubgroupSupport::known(width)).unwrap(),
+                prototype_b_first_hit(path(&highs, &lows), request, SubgroupSupport::known(width))
+                    .unwrap(),
                 expected
             );
         }
@@ -338,9 +369,21 @@ mod tests {
             target_price: 105.0,
             same_bar_precedence: SameBarPrecedence::StopFirst,
         };
-        assert_eq!(reference_first_hit(path(&highs, &lows), request).unwrap().unwrap().reason, ExitReason::StopLoss);
+        assert_eq!(
+            reference_first_hit(path(&highs, &lows), request)
+                .unwrap()
+                .unwrap()
+                .reason,
+            ExitReason::StopLoss
+        );
         request.same_bar_precedence = SameBarPrecedence::TargetFirst;
-        assert_eq!(reference_first_hit(path(&highs, &lows), request).unwrap().unwrap().reason, ExitReason::TakeProfit);
+        assert_eq!(
+            reference_first_hit(path(&highs, &lows), request)
+                .unwrap()
+                .unwrap()
+                .reason,
+            ExitReason::TakeProfit
+        );
     }
 
     #[test]
@@ -348,7 +391,11 @@ mod tests {
         let highs = [100.0, 101.0, 106.0, 103.0, 104.0, 105.0];
         let lows = [100.0, 99.0, 98.0, 94.0, 96.0, 97.0];
         let events = [
-            EntryEvent { candidate_id: 11, scenario_id: 101, request: long_request(SameBarPrecedence::StopFirst) },
+            EntryEvent {
+                candidate_id: 11,
+                scenario_id: 101,
+                request: long_request(SameBarPrecedence::StopFirst),
+            },
             EntryEvent {
                 candidate_id: 22,
                 scenario_id: 202,
@@ -361,26 +408,45 @@ mod tests {
             },
         ];
         let outcomes = prototype_c_event_first_hit(path(&highs, &lows), &events).unwrap();
-        assert_eq!((outcomes[0].candidate_id, outcomes[0].scenario_id), (11, 101));
-        assert_eq!((outcomes[1].candidate_id, outcomes[1].scenario_id), (22, 202));
+        assert_eq!(
+            (outcomes[0].candidate_id, outcomes[0].scenario_id),
+            (11, 101)
+        );
+        assert_eq!(
+            (outcomes[1].candidate_id, outcomes[1].scenario_id),
+            (22, 202)
+        );
     }
 
     #[test]
     fn routing_is_conservative_and_typed() {
         let path_dependent = route_strategy(
-            StrategyPathProfile { fixed_at_entry: true, trailing: true, event_density: 0.01, ..StrategyPathProfile::default() },
+            StrategyPathProfile {
+                fixed_at_entry: true,
+                trailing: true,
+                event_density: 0.01,
+                ..StrategyPathProfile::default()
+            },
             SubgroupSupport::known(32),
         );
         assert_eq!(path_dependent.prototype, PrototypeKind::AExactPersistent);
 
         let sparse = route_strategy(
-            StrategyPathProfile { fixed_at_entry: true, event_density: 0.05, ..StrategyPathProfile::default() },
+            StrategyPathProfile {
+                fixed_at_entry: true,
+                event_density: 0.05,
+                ..StrategyPathProfile::default()
+            },
             SubgroupSupport::unavailable(),
         );
         assert_eq!(sparse.prototype, PrototypeKind::CSparseFirstHit);
 
         let dense = route_strategy(
-            StrategyPathProfile { adaptive_at_entry: true, event_density: 0.5, ..StrategyPathProfile::default() },
+            StrategyPathProfile {
+                adaptive_at_entry: true,
+                event_density: 0.5,
+                ..StrategyPathProfile::default()
+            },
             SubgroupSupport::known(32),
         );
         assert_eq!(dense.prototype, PrototypeKind::BWarpCooperative);
@@ -390,11 +456,17 @@ mod tests {
     fn unsupported_subgroup_returns_typed_error() {
         let highs = [100.0, 101.0];
         let lows = [100.0, 99.0];
-        let request = FirstHitRequest { last_bar: 1, ..long_request(SameBarPrecedence::StopFirst) };
+        let request = FirstHitRequest {
+            last_bar: 1,
+            ..long_request(SameBarPrecedence::StopFirst)
+        };
         assert_eq!(
             prototype_b_first_hit(path(&highs, &lows), request, SubgroupSupport::known(12)),
             Err(PrototypeError::UnsupportedSubgroupWidth(Some(12)))
         );
-        assert_eq!(prototype_b_status(SubgroupSupport::known(12)), EngineStatus::UnsupportedCapability);
+        assert_eq!(
+            prototype_b_status(SubgroupSupport::known(12)),
+            EngineStatus::UnsupportedCapability
+        );
     }
 }
