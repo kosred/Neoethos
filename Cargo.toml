@@ -9,6 +9,7 @@ members = [
   "crates/neoethos-app",
   "crates/neoethos-codex",
   "crates/neoethos-trader",
+  "crates/neoethos-gpu-contracts",
   # Tauri desktop shell (single-process replacement for the Flutter+HTTP
   # split). Shares target/ so it links the already-built neoethos-* rlibs
   # instead of recompiling the whole dep tree. Deliberately NOT in
@@ -25,6 +26,7 @@ default-members = [
   "crates/neoethos-app",
   "crates/neoethos-codex",
   "crates/neoethos-trader",
+  "crates/neoethos-gpu-contracts",
 ]
 # The P2P mesh sidecar (Federation Phase 1+) is DELIBERATELY isolated: its own
 # workspace + Cargo.lock under mesh/, so its bleeding-edge iroh/QUIC dependency
