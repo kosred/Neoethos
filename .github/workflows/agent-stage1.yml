@@ -93,6 +93,19 @@ jobs:
           set -o pipefail
           cargo test -p neoethos-gpu-contracts 2>&1 | tee /tmp/stage1-diagnostics/contracts-test.log
 
+      - name: Test CUDA ABI scaffold
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p neoethos-gpu-cuda 2>&1 | tee /tmp/stage1-diagnostics/cuda-scaffold-test.log
+
+      - name: Lint rented-GPU run kit
+        shell: bash
+        run: |
+          set -o pipefail
+          bash -n scripts/gpu-bench/preflight.sh scripts/gpu-bench/prepare_worktrees.sh
+          python3 -m py_compile scripts/gpu-bench/run_matrix.py scripts/gpu-bench/collate.py
+
       - name: Test search crate
         shell: bash
         run: |
