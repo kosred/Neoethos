@@ -99,11 +99,23 @@ jobs:
           set -o pipefail
           cargo test -p neoethos-search 2>&1 | tee /tmp/stage1-diagnostics/test.log
 
+      - name: Test CLI crate
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p neoethos-cli 2>&1 | tee /tmp/stage1-diagnostics/cli-test.log
+
       - name: Check search GPU feature
         shell: bash
         run: |
           set -o pipefail
           cargo check -p neoethos-search --features gpu-vulkan 2>&1 | tee /tmp/stage1-diagnostics/gpu-check.log
+
+      - name: Check CLI GPU feature
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check -p neoethos-cli --features gpu-vulkan 2>&1 | tee /tmp/stage1-diagnostics/cli-gpu-check.log
 
       - name: Upload failure diagnostics
         if: failure()
