@@ -68,7 +68,9 @@ pub mod validation;
 
 pub use backend::{
     AcceleratorHint, BackendConfigError, DevicePreference, EvaluationBackend, FallbackPolicy,
-    evaluate_population_core_with_backend,
+    current_evaluation_backend, evaluate_population_core_with_backend,
+    evaluate_population_core_with_backend_and_audit, install_evaluation_backend,
+    install_evaluation_backend_from_settings,
 };
 // `pub use challenge::{ChallengeOptimizer, ChallengeTarget};` — DELETED 2026-05-26.
 pub use discovery::{
@@ -178,6 +180,9 @@ pub fn install_search_runtime_overrides_from_env() {
 /// the remaining five still read env until their migration lands.
 /// Production binaries call this once at startup after loading `Settings`.
 pub fn install_search_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
+    install_evaluation_backend_from_settings(s).unwrap_or_else(|error| {
+        panic!("invalid discovery evaluation backend configuration: {error}")
+    });
     install_backtest_runtime_overrides_from_settings(s); // ✓ S2d config
     install_quality_runtime_overrides_from_settings(s); // ✓ S2c config
     install_genetic_search_runtime_overrides_from_settings(s); // ✓ S2a config

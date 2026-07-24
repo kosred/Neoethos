@@ -2685,7 +2685,9 @@ fn print_help() {
     println!("  features --symbol EURUSD --timeframe M1 --root data");
     println!("  prepare --symbol EURUSD --base M1 --higher H1,H4 --root data");
     println!("  resample --symbol EURUSD --base M1 --target H1 --root data");
-    println!("  bench --dry-run --fixture tiny --prototype a --backend cuda --out cache/gpu-bench/plan.json");
+    println!(
+        "  bench --dry-run --fixture tiny --prototype a --backend cuda --out cache/gpu-bench/plan.json"
+    );
     println!("  train --symbol EURUSD --base M1 --higher H1,H4 --horizon 1 --root data");
     println!(
         "  search --symbol EURUSD --base M1 --higher H1,H4 --genes 64 --generations 5 --max-indicators 12 --root data"

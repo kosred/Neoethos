@@ -2720,6 +2720,13 @@ pub fn run_discovery_cycle_with_holdout_and_progress<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
+    crate::gpu_native::capability::gpu_pipeline_preflight(
+        crate::backend::current_evaluation_backend(),
+        &crate::gpu_native::capability::GpuCapabilityManifest::stage1_baseline(),
+        &crate::gpu_native::capability::PipelineStage::FULL_DISCOVERY,
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
     // Align both inputs to the same row count before splitting so the
     // in-sample and tail windows stay index-consistent even when the
     // caller's OHLCV and feature cube disagree by a few rows.

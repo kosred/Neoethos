@@ -104,8 +104,8 @@ impl GpuCapabilityManifest {
             },
             StageCapability {
                 stage: S::PopulationEvaluation,
-                capability: C::HybridOnly,
-                detail: "CubeCL population kernels exist, but the production evaluator uses a CPU lane and CPU recompute",
+                capability: C::StrictGpu,
+                detail: "gpu_required routes the complete logical population through CubeCL with bounded GPU-only rebatching and no CPU fallback",
             },
             StageCapability {
                 stage: S::SignalAndMinTradeFilter,
@@ -285,10 +285,12 @@ mod tests {
             item.stage == PipelineStage::QualityScreen
                 && item.capability == StageGpuCapability::CpuOnly
         }));
-        assert!(error.unsupported.iter().any(|item| {
-            item.stage == PipelineStage::PopulationEvaluation
-                && item.capability == StageGpuCapability::HybridOnly
-        }));
+        assert!(
+            !error
+                .unsupported
+                .iter()
+                .any(|item| item.stage == PipelineStage::PopulationEvaluation)
+        );
     }
 
     #[test]

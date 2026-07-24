@@ -432,28 +432,31 @@ pub fn evaluate_genes_cached(
         &mut b_settings,
     );
 
-    crate::eval::evaluate_population_core(crate::eval::PopulationEvalInputs {
-        close: &ohlcv.close,
-        high: &ohlcv.high,
-        low: &ohlcv.low,
-        indicators: cache.indicators.view(),
-        gene_offsets: &offsets,
-        gene_indices: &indices,
-        gene_weights: &weights,
-        long_thr: &long_thr,
-        short_thr: &short_thr,
-        month_idx: &cache.months,
-        day_idx: &cache.days,
-        timestamps: &features.timestamps,
-        sl_pips: &sl_pips,
-        tp_pips: &tp_pips,
-        stop_vol_mult: &stop_vol_mults,
-        smc_data: &cache.smc_data,
-        gene_smc_flags: &gene_smc_flags,
-        gate_threshold: config.smc_gate_threshold,
-        weights: &smc_weights,
-        settings: &b_settings,
-    })
+    crate::backend::evaluate_population_core_with_backend(
+        crate::eval::PopulationEvalInputs {
+            close: &ohlcv.close,
+            high: &ohlcv.high,
+            low: &ohlcv.low,
+            indicators: cache.indicators.view(),
+            gene_offsets: &offsets,
+            gene_indices: &indices,
+            gene_weights: &weights,
+            long_thr: &long_thr,
+            short_thr: &short_thr,
+            month_idx: &cache.months,
+            day_idx: &cache.days,
+            timestamps: &features.timestamps,
+            sl_pips: &sl_pips,
+            tp_pips: &tp_pips,
+            stop_vol_mult: &stop_vol_mults,
+            smc_data: &cache.smc_data,
+            gene_smc_flags: &gene_smc_flags,
+            gate_threshold: config.smc_gate_threshold,
+            weights: &smc_weights,
+            settings: &b_settings,
+        },
+        crate::backend::current_evaluation_backend(),
+    )
     .map_err(|e| anyhow!(e))
 }
 

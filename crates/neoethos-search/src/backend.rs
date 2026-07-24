@@ -9,6 +9,7 @@
 use neoethos_core::Settings;
 use std::error::Error;
 use std::fmt;
+use std::sync::{OnceLock, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DevicePreference {
@@ -178,15 +179,277 @@ impl EvaluationBackend {
     }
 }
 
-/// Transitional typed entry point. Commit 0.1 deliberately preserves the
-/// evaluator's runtime behaviour; Commit 0.2 consumes the policy in the GPU
-/// failure/fallback decision and later commits thread it through every stage.
+fn backend_slot() -> &'static RwLock<EvaluationBackend> {
+    static BACKEND: OnceLock<RwLock<EvaluationBackend>> = OnceLock::new();
+    BACKEND.get_or_init(|| RwLock::new(EvaluationBackend::AUTO))
+}
+
+/// Install the resolved backend for production discovery. The lock is mutable so
+/// tests and long-lived frontends may install a freshly loaded config before a new
+/// work unit without relying on ambient process environment reads.
+pub fn install_evaluation_backend(backend: EvaluationBackend) -> Result<(), BackendConfigError> {
+    backend.validate()?;
+    let mut slot = backend_slot()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = backend;
+    Ok(())
+}
+
+pub fn install_evaluation_backend_from_settings(
+    settings: &Settings,
+) -> Result<EvaluationBackend, BackendConfigError> {
+    let backend = EvaluationBackend::from_settings_and_process_env(settings)?;
+    install_evaluation_backend(backend)?;
+    Ok(backend)
+}
+
+pub fn current_evaluation_backend() -> EvaluationBackend {
+    *backend_slot()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Production entry point for population evaluation. CPU canonical mode is
+/// explicitly audited; optional GPU modes retain the legacy adaptive hybrid;
+/// strict GPU mode executes the full logical population on the GPU and can only
+/// recover by deterministic, bounded GPU rebatching.
 pub fn evaluate_population_core_with_backend(
     inputs: crate::eval::PopulationEvalInputs<'_>,
     backend: EvaluationBackend,
 ) -> Result<Vec<[f64; 11]>, String> {
+    let audit = crate::gpu_native::cpu_strategy::CpuStrategyAuditContext::production(0);
+    evaluate_population_core_with_backend_and_audit(inputs, backend, &audit)
+}
+
+pub fn evaluate_population_core_with_backend_and_audit(
+    inputs: crate::eval::PopulationEvalInputs<'_>,
+    backend: EvaluationBackend,
+    audit: &crate::gpu_native::cpu_strategy::CpuStrategyAuditContext,
+) -> Result<Vec<[f64; 11]>, String> {
+    use crate::gpu_native::cpu_strategy::{self, CpuStrategyCategory};
+
     backend.validate().map_err(|error| error.to_string())?;
-    crate::eval::evaluate_population_core(inputs)
+    match (backend.device, backend.fallback) {
+        (DevicePreference::Cpu, _) => cpu_strategy::run(
+            backend,
+            audit,
+            CpuStrategyCategory::PopulationEvaluation,
+            "backend::cpu_canonical_population",
+            || crate::eval::validation_backtest_population_cpu(inputs),
+        )
+        .map_err(|error| error.to_string()),
+        (DevicePreference::Gpu, FallbackPolicy::ForbidCpu) => {
+            evaluate_gpu_required_population(inputs, backend, audit)
+        }
+        _ => crate::eval::evaluate_population_core(inputs),
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn evaluate_gpu_required_population(
+    _inputs: crate::eval::PopulationEvalInputs<'_>,
+    _backend: EvaluationBackend,
+    audit: &crate::gpu_native::cpu_strategy::CpuStrategyAuditContext,
+) -> Result<Vec<[f64; 11]>, String> {
+    audit
+        .snapshot()
+        .assert_zero_executed()
+        .map_err(|error| error.to_string())?;
+    Err(
+        "gpu_required was selected, but neoethos-search was compiled without a GPU backend feature"
+            .to_string(),
+    )
+}
+
+#[cfg(feature = "gpu")]
+fn evaluate_gpu_required_population(
+    inputs: crate::eval::PopulationEvalInputs<'_>,
+    backend: EvaluationBackend,
+    audit: &crate::gpu_native::cpu_strategy::CpuStrategyAuditContext,
+) -> Result<Vec<[f64; 11]>, String> {
+    use crate::cubecl_eval::{
+        cuda_eval_backtest_kernel_enabled, cuda_eval_signal_kernel_enabled,
+        try_evaluate_population_cuda,
+    };
+    use crate::gpu_fallback::{GpuAction, GpuAttempt, GpuFailure, GpuRetryPolicy, decide_action};
+
+    if !cuda_eval_signal_kernel_enabled() || !cuda_eval_backtest_kernel_enabled() {
+        return Err("gpu_required population evaluation cannot start because a required CubeCL signal/backtest kernel is disabled".to_string());
+    }
+
+    let crate::eval::PopulationEvalInputs {
+        close,
+        high,
+        low,
+        indicators,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        month_idx,
+        day_idx,
+        timestamps,
+        sl_pips,
+        tp_pips,
+        stop_vol_mult,
+        smc_data,
+        gene_smc_flags,
+        gate_threshold,
+        weights,
+        settings,
+    } = inputs;
+
+    let n_genes = long_thr.len();
+    if n_genes == 0 {
+        audit
+            .snapshot()
+            .assert_zero_executed()
+            .map_err(|error| error.to_string())?;
+        return Ok(Vec::new());
+    }
+    if gene_offsets.len() != n_genes + 1 || gene_smc_flags.len() != n_genes {
+        return Err(
+            "gpu_required population evaluation received inconsistent gene CSR/SMC dimensions"
+                .to_string(),
+        );
+    }
+
+    let retry_policy = GpuRetryPolicy::default();
+    let mut attempt = GpuAttempt::first(n_genes);
+
+    loop {
+        let batch_size = attempt.batch_size.clamp(1, n_genes);
+        let mut output = Vec::with_capacity(n_genes);
+        let mut failure: Option<(GpuFailure, String)> = None;
+        let mut start = 0usize;
+
+        while start < n_genes {
+            let end = (start + batch_size).min(n_genes);
+            let idx_start = gene_offsets[start] as usize;
+            let idx_end = gene_offsets[end] as usize;
+            if idx_start > idx_end || idx_end > gene_indices.len() || idx_end > gene_weights.len() {
+                return Err(
+                    "gpu_required population evaluation received invalid CSR offsets".to_string(),
+                );
+            }
+            let base = gene_offsets[start];
+            let rebased_offsets: Vec<i32> = gene_offsets[start..=end]
+                .iter()
+                .map(|offset| *offset - base)
+                .collect();
+            let stop_slice = if stop_vol_mult.len() >= end {
+                &stop_vol_mult[start..end]
+            } else {
+                &[]
+            };
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                try_evaluate_population_cuda(
+                    close,
+                    high,
+                    low,
+                    indicators,
+                    &rebased_offsets,
+                    &gene_indices[idx_start..idx_end],
+                    &gene_weights[idx_start..idx_end],
+                    &long_thr[start..end],
+                    &short_thr[start..end],
+                    month_idx,
+                    day_idx,
+                    timestamps,
+                    &sl_pips[start..end],
+                    &tp_pips[start..end],
+                    stop_slice,
+                    smc_data,
+                    &gene_smc_flags[start..end],
+                    gate_threshold,
+                    weights,
+                    settings,
+                    None,
+                )
+            }));
+
+            match outcome {
+                Ok(Ok(batch)) if batch.len() == end - start => output.extend(batch),
+                Ok(Ok(batch)) => {
+                    failure = Some((
+                        GpuFailure::WrongShape,
+                        format!(
+                            "GPU returned {} rows for a {}-candidate batch",
+                            batch.len(),
+                            end - start
+                        ),
+                    ));
+                    break;
+                }
+                Ok(Err(error)) => {
+                    let detail = error.to_string();
+                    let lower = detail.to_ascii_lowercase();
+                    let kind = if lower.contains("adapter") || lower.contains("no device") {
+                        GpuFailure::NoAdapter
+                    } else if lower.contains("device lost") {
+                        GpuFailure::DeviceLost
+                    } else if lower.contains("unsupported") {
+                        GpuFailure::UnsupportedBackend
+                    } else {
+                        GpuFailure::AllocationPressure
+                    };
+                    failure = Some((kind, detail));
+                    break;
+                }
+                Err(payload) => {
+                    let detail = payload
+                        .downcast_ref::<&str>()
+                        .map(|value| (*value).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string GPU panic".to_string());
+                    failure = Some((GpuFailure::AllocationPressure, detail));
+                    break;
+                }
+            }
+            start = end;
+        }
+
+        if let Some((kind, detail)) = failure {
+            match decide_action(kind, backend, attempt, retry_policy) {
+                GpuAction::RetryOnGpu { next_batch_size } => {
+                    tracing::warn!(
+                        target: "neoethos_search::backend",
+                        ?kind,
+                        retry_index = attempt.retry_index,
+                        previous_batch_size = attempt.batch_size,
+                        next_batch_size,
+                        error = %detail,
+                        "gpu_required population batch failed; retrying only on GPU with a smaller deterministic batch"
+                    );
+                    attempt = GpuAttempt {
+                        retry_index: attempt.retry_index.saturating_add(1),
+                        batch_size: next_batch_size,
+                    };
+                    continue;
+                }
+                GpuAction::FailLoud => {
+                    return Err(format!(
+                        "gpu_required population evaluation failed closed after {} retries: {:?}: {}",
+                        attempt.retry_index, kind, detail
+                    ));
+                }
+                GpuAction::FallbackToCpu => {
+                    return Err(
+                        "internal policy error: gpu_required selected a CPU fallback".to_string(),
+                    );
+                }
+            }
+        }
+
+        audit
+            .snapshot()
+            .assert_zero_executed()
+            .map_err(|error| error.to_string())?;
+        return Ok(output);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
