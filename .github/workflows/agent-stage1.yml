@@ -62,12 +62,12 @@ jobs:
 
           echo "applied=$applied" >> "$GITHUB_OUTPUT"
 
-      - name: Format workspace
+      - name: Check workspace formatting
         shell: bash
         run: |
           set -o pipefail
           mkdir -p /tmp/stage1-diagnostics
-          cargo fmt --all 2>&1 | tee /tmp/stage1-diagnostics/format.log
+          cargo fmt --all -- --check 2>&1 | tee /tmp/stage1-diagnostics/format.log
 
       - name: Test search crate
         shell: bash
