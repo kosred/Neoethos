@@ -42,7 +42,8 @@ impl Drop for StageRange {
 #[macro_export]
 macro_rules! gpu_stage_range {
     ($name:expr) => {
-        let _neoethos_gpu_stage_range = $crate::gpu_native::instrumentation::StageRange::push($name);
+        let _neoethos_gpu_stage_range =
+            $crate::gpu_native::instrumentation::StageRange::push($name);
     };
 }
 
