@@ -36,6 +36,12 @@ jobs:
           toolchain: nightly-2026-04-07
           components: rustfmt
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpu-native-stage1
+          cache-on-failure: true
+
       - name: Apply queued agent migrations
         id: patches
         shell: bash
