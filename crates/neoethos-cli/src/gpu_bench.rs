@@ -148,14 +148,19 @@ fn hardware(args: &[String]) -> HardwareMetadata {
         cuda_toolkit_version: flag(args, "--cuda-toolkit"),
         gpu_clock_mhz: flag(args, "--gpu-clock-mhz").and_then(|value| value.parse().ok()),
         power_limit_watts: flag(args, "--power-limit-watts").and_then(|value| value.parse().ok()),
-        temperature_celsius: flag(args, "--temperature-celsius").and_then(|value| value.parse().ok()),
+        temperature_celsius: flag(args, "--temperature-celsius")
+            .and_then(|value| value.parse().ok()),
         dedicated_vram_bytes: flag(args, "--vram-bytes").and_then(|value| value.parse().ok()),
         cuda_occupancy: flag(args, "--cuda-occupancy").and_then(|value| value.parse().ok()),
     }
 }
 
 fn coverage(args: &[String]) -> Result<CapabilityCoverage> {
-    let total = parse_usize(args, "--coverage-total", parse_usize(args, "--candidates", 0)?)?;
+    let total = parse_usize(
+        args,
+        "--coverage-total",
+        parse_usize(args, "--candidates", 0)?,
+    )?;
     let supported = parse_usize(args, "--coverage-supported", total)?;
     if supported > total {
         anyhow::bail!("--coverage-supported cannot exceed --coverage-total");
@@ -197,7 +202,8 @@ fn parity_status(args: &[String]) -> Result<ParityStatus> {
         }),
         "failed" | "fail" | "false" => Ok(ParityStatus {
             matched: false,
-            first_divergent_level: flag(args, "--parity-level").and_then(|value| value.parse().ok()),
+            first_divergent_level: flag(args, "--parity-level")
+                .and_then(|value| value.parse().ok()),
             detail: flag(args, "--parity-detail"),
         }),
         other => anyhow::bail!("unknown --parity value `{other}`"),
@@ -240,7 +246,12 @@ fn parse_fixture(raw: Option<&str>) -> Result<FixtureMode> {
 }
 
 fn parse_pass(raw: Option<&str>) -> Result<BenchmarkPass> {
-    match raw.unwrap_or("clean_timing").trim().to_ascii_lowercase().as_str() {
+    match raw
+        .unwrap_or("clean_timing")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "clean" | "clean_timing" | "clean-timing" => Ok(BenchmarkPass::CleanTiming),
         "diagnostics" => Ok(BenchmarkPass::Diagnostics),
         "nsight_systems" | "nsight-systems" | "nsys" => Ok(BenchmarkPass::NsightSystems),
@@ -250,7 +261,12 @@ fn parse_pass(raw: Option<&str>) -> Result<BenchmarkPass> {
 }
 
 fn parse_engine_status(raw: Option<&str>) -> Result<EngineStatus> {
-    match raw.unwrap_or("not_benchmarked").trim().to_ascii_lowercase().as_str() {
+    match raw
+        .unwrap_or("not_benchmarked")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "ready" => Ok(EngineStatus::Ready),
         "not_implemented" | "not-implemented" => Ok(EngineStatus::NotImplemented),
         "not_benchmarked" | "not-benchmarked" => Ok(EngineStatus::NotBenchmarked),
@@ -278,27 +294,43 @@ fn parse_f64_csv(raw: &str, name: &str) -> Result<Vec<f64>> {
 
 fn parse_usize(args: &[String], name: &str, default: usize) -> Result<usize> {
     flag(args, name)
-        .map(|value| value.parse().with_context(|| format!("invalid {name} `{value}`")))
+        .map(|value| {
+            value
+                .parse()
+                .with_context(|| format!("invalid {name} `{value}`"))
+        })
         .transpose()
         .map(|value| value.unwrap_or(default))
 }
 
 fn parse_u64(args: &[String], name: &str, default: u64) -> Result<u64> {
     flag(args, name)
-        .map(|value| value.parse().with_context(|| format!("invalid {name} `{value}`")))
+        .map(|value| {
+            value
+                .parse()
+                .with_context(|| format!("invalid {name} `{value}`"))
+        })
         .transpose()
         .map(|value| value.unwrap_or(default))
 }
 
 fn parse_optional_u64(args: &[String], name: &str) -> Result<Option<u64>> {
     flag(args, name)
-        .map(|value| value.parse().with_context(|| format!("invalid {name} `{value}`")))
+        .map(|value| {
+            value
+                .parse()
+                .with_context(|| format!("invalid {name} `{value}`"))
+        })
         .transpose()
 }
 
 fn parse_optional_f64(args: &[String], name: &str) -> Result<Option<f64>> {
     flag(args, name)
-        .map(|value| value.parse().with_context(|| format!("invalid {name} `{value}`")))
+        .map(|value| {
+            value
+                .parse()
+                .with_context(|| format!("invalid {name} `{value}`"))
+        })
         .transpose()
 }
 

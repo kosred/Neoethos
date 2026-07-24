@@ -4,6 +4,7 @@ use neoethos_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod gpu_bench;
 mod tui;
 
 fn main() -> Result<()> {
@@ -91,6 +92,7 @@ fn main() -> Result<()> {
         "forward-test" => cmd_forward_test(&args[2..]),
         "blend-test" => cmd_blend_test(&args[2..]),
         "batch-discover" => cmd_batch_discover(&args[2..]),
+        "bench" => gpu_bench::run(&args[2..]),
         "migrate-data" => cmd_migrate_data(&args[2..]),
         "slice-dataset" => cmd_slice_dataset(&args[2..]),
         "import" => cmd_import(&args[2..]),
@@ -2683,6 +2685,7 @@ fn print_help() {
     println!("  features --symbol EURUSD --timeframe M1 --root data");
     println!("  prepare --symbol EURUSD --base M1 --higher H1,H4 --root data");
     println!("  resample --symbol EURUSD --base M1 --target H1 --root data");
+    println!("  bench --dry-run --fixture tiny --prototype a --backend cuda --out cache/gpu-bench/plan.json");
     println!("  train --symbol EURUSD --base M1 --higher H1,H4 --horizon 1 --root data");
     println!(
         "  search --symbol EURUSD --base M1 --higher H1,H4 --genes 64 --generations 5 --max-indicators 12 --root data"
