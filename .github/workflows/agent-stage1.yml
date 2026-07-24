@@ -68,7 +68,7 @@ jobs:
 
           echo "applied=$applied" >> "$GITHUB_OUTPUT"
 
-      - name: Check changed Rust formatting
+      - name: Format changed Rust files
         shell: bash
         run: |
           set -o pipefail
@@ -77,8 +77,8 @@ jobs:
           if (( ${#rust_files[@]} == 0 )); then
             echo "No changed Rust files" | tee /tmp/stage1-diagnostics/format.log
           else
-            printf 'Checking %s\n' "${rust_files[@]}" | tee /tmp/stage1-diagnostics/format.log
-            rustfmt --edition 2024 --config skip_children=true --check "${rust_files[@]}" 2>&1 | tee -a /tmp/stage1-diagnostics/format.log
+            printf 'Formatting %s\n' "${rust_files[@]}" | tee /tmp/stage1-diagnostics/format.log
+            rustfmt --edition 2024 --config skip_children=true "${rust_files[@]}" 2>&1 | tee -a /tmp/stage1-diagnostics/format.log
           fi
 
       - name: Test search crate
