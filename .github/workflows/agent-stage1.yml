@@ -1,0 +1,72 @@
+name: Agent Stage 1 patch and test
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: agent-stage1-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  apply-and-test:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply queued agent patches
+        id: patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(.github/agent-patches/*.patch)
+          if (( ${#patches[@]} == 0 )); then
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          for patch in "${patches[@]}"; do
+            echo "Applying $patch"
+            git apply --3way "$patch"
+            rm "$patch"
+          done
+          echo "applied=true" >> "$GITHUB_OUTPUT"
+
+      - name: Format workspace
+        run: cargo fmt --all
+
+      - name: Test search crate
+        run: cargo test -p neoethos-search
+
+      - name: Check search GPU feature
+        run: cargo check -p neoethos-search --features gpu-vulkan
+
+      - name: Commit verified patch results
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No verified changes to commit"
+            exit 0
+          fi
+          git config user.name "neoethos-stage1-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "chore(agent): apply verified Stage 1 patch"
+          git push origin "HEAD:${{ github.head_ref }}"
