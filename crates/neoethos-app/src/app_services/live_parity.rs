@@ -79,6 +79,9 @@ fn signals_for_frames(
         &artifact.genes,
         &aligned,
         &base_ohlcv,
+        // Same canonical pip the discovery backtest used, so adaptive-stop
+        // brackets replay identically here.
+        neoethos_search::default_pip_size(&artifact.symbol),
     );
     let ts = base_ohlcv.timestamp.clone().unwrap_or_default();
     // Feature rows align to the TAIL of the ohlcv (warmup rows dropped) — pair

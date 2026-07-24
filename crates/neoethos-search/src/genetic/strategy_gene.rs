@@ -168,7 +168,7 @@ fn symbol_kind(symbol: &str) -> &'static str {
 /// Exposed as `pub(crate)` for use in `search_engine.rs::resolve_stop_target_arrays`
 /// (F-761 closure — replaces the hardcoded `0.0001` EURUSD-pip fallback
 /// with this symbol-aware lookup).
-pub(crate) fn default_pip_size(symbol: &str) -> f64 {
+pub fn default_pip_size(symbol: &str) -> f64 {
     // GROUP C remediation: empty symbol → NaN sentinel so downstream
     // pip math collapses and the fitness guard rejects the strategy.
     if symbol.trim().is_empty() {

@@ -64,4 +64,4 @@ pub use smc_indicators::{
     enforce_population_smc_ratio, install_smc_search_config_from_env,
     install_smc_search_config_from_settings, randomize_smc_flags,
 };
-pub use strategy_gene::{EvaluationConfig, FilteringConfig, Gene, SearchResult};
+pub use strategy_gene::{EvaluationConfig, FilteringConfig, Gene, SearchResult, default_pip_size};

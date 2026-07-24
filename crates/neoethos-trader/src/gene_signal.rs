@@ -77,6 +77,7 @@ pub fn combine_gene_signals_with_brackets(
     genes: &[Gene],
     aligned_features: &FeatureFrame,
     base_ohlcv: &Ohlcv,
+    pip_size: f64,
 ) -> (Vec<Direction>, Vec<f64>, Vec<f64>) {
     let n = aligned_features.n_samples();
     let cfg = EvaluationConfig::default();
@@ -87,6 +88,33 @@ pub fn combine_gene_signals_with_brackets(
     let mut sl_short = vec![0.0f64; n];
     let mut tp_short = vec![0.0f64; n];
     let mut cnt_short = vec![0u32; n];
+
+    // Adaptive stops (backtest↔live parity): when any gene is adaptive, build the
+    // SAME open-independent per-bar base vol series the discovery backtest uses,
+    // so a promoted adaptive gene places the exact volatility-scaled bracket it
+    // was scored on. `stop_vol_mult == 0` genes keep their fixed pips.
+    let adaptive_base: Option<Vec<f64>> = if genes.iter().any(|g| g.stop_vol_mult > 0.0) {
+        neoethos_search::adaptive_base_pips_series(
+            &base_ohlcv.high,
+            &base_ohlcv.low,
+            &base_ohlcv.close,
+            pip_size,
+        )
+    } else {
+        None
+    };
+    let adaptive_rr = neoethos_search::adaptive_stops_rr();
+    let gene_sl_tp_at = |gene: &Gene, i: usize| -> (f64, f64) {
+        if gene.stop_vol_mult > 0.0 {
+            if let Some(&d) = adaptive_base.as_ref().and_then(|b| b.get(i)) {
+                if d.is_finite() && d > 0.0 {
+                    let sl = gene.stop_vol_mult * d;
+                    return (sl, adaptive_rr * sl);
+                }
+            }
+        }
+        (gene.sl_pips, gene.tp_pips)
+    };
 
     for gene in genes {
         let sigs = if gene_uses_smc(gene) {
@@ -99,13 +127,14 @@ pub fn combine_gene_signals_with_brackets(
                 break;
             }
             net[i] += *s as i32;
+            let (g_sl, g_tp) = gene_sl_tp_at(gene, i);
             if *s > 0 {
-                sl_long[i] += gene.sl_pips;
-                tp_long[i] += gene.tp_pips;
+                sl_long[i] += g_sl;
+                tp_long[i] += g_tp;
                 cnt_long[i] += 1;
             } else if *s < 0 {
-                sl_short[i] += gene.sl_pips;
-                tp_short[i] += gene.tp_pips;
+                sl_short[i] += g_sl;
+                tp_short[i] += g_tp;
                 cnt_short[i] += 1;
             }
         }

@@ -94,7 +94,7 @@ pub use genetic::{
     FilteringConfig, Gene, GeneticSearchRuntimeOverrides, ParentSelectionPolicy, SearchResult,
     SeenSignatureMemoryRuntimeOverrides, SelectionPolicyOverrides, SmcGateOverrides,
     SmcWeightRuntimeOverrides, StrategyEvaluationRuntimeOverrides, SurvivorSelectionPolicy,
-    current_determinism_policy, current_genetic_search_runtime_overrides,
+    current_determinism_policy, current_genetic_search_runtime_overrides, default_pip_size,
     current_seen_signature_memory_runtime_overrides, current_strategy_evaluation_runtime_overrides,
     evaluate_genes, evolve_search, evolve_search_with_progress,
     evolve_search_with_progress_and_limits, install_genetic_search_runtime_overrides,
@@ -129,7 +129,7 @@ pub use quality::{
 };
 pub use stop_target::{
     StopTargetSettings, adaptive_base_pips_series, adaptive_sl_tp_pips_series,
-    compute_stop_distance_series, infer_stop_target_pips,
+    adaptive_stops_enabled, adaptive_stops_rr, compute_stop_distance_series, infer_stop_target_pips,
 };
 pub use validation::{
     CANONICAL_BACKTEST_ARTIFACT_KIND, CANONICAL_BACKTEST_SCHEMA_VERSION,

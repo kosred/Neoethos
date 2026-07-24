@@ -950,8 +950,19 @@ async fn run(
         }
 
         // ── Gene signal + the strategy's OWN brackets (last bar) ──────────────
-        let (directions, sl_arr, tp_arr) =
-            neoethos_trader::combine_gene_signals_with_brackets(&genes, &aligned, &base_ohlcv);
+        // Pass the symbol pip size so adaptive-stop genes scale their bracket by
+        // live volatility exactly like the discovery backtest (parity).
+        let bracket_pip_size = sym_meta
+            .as_ref()
+            .map(|m| m.pip_size)
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .unwrap_or(0.0001);
+        let (directions, sl_arr, tp_arr) = neoethos_trader::combine_gene_signals_with_brackets(
+            &genes,
+            &aligned,
+            &base_ohlcv,
+            bracket_pip_size,
+        );
         let direction = directions.last().copied().unwrap_or(Direction::Flat);
         // Gene-derived SL/TP (pips) for THIS bar: we place the STRATEGY'S own
         // brackets, never an imposed stop. 0.0 ⇒ a signal-exit-only strategy, so
