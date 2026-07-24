@@ -29,6 +29,7 @@ pub mod discovery_ledger;
 // module shipped was never wired. If the scheduler-driven routing
 // lands later, reintroduce a fresh helper at that time.
 
+pub mod backend;
 pub mod eval;
 pub mod export_state;
 pub mod funnel_profile;
@@ -64,29 +65,35 @@ pub mod stop_target;
 pub mod strategy_db;
 pub mod validation;
 
+pub use backend::{
+    AcceleratorHint, BackendConfigError, DevicePreference, EvaluationBackend, FallbackPolicy,
+    evaluate_population_core_with_backend,
+};
 // `pub use challenge::{ChallengeOptimizer, ChallengeTarget};` — DELETED 2026-05-26.
 pub use discovery::{
-    DiscoveryConfig, DiscoveryPerKindEvidenceHashes, DiscoveryProgress, DiscoveryResult,
-    DiscoveryRunProfile, DiscoveryRuntimeOverrides, DiscoveryValidationGates, LoggedStrategyTrades,
-    GeneOosResult, Stage1Window, build_discovery_profile, compute_discovery_forward_test_artifacts,
-    faithful_oos_eval,
-    compute_discovery_prop_firm_artifacts, discovery_per_kind_evidence_hashes,
-    discovery_validation_evidence_manifest,
+    DEFAULT_OOS_HOLDOUT_FRACTION, DiscoveryConfig, DiscoveryPerKindEvidenceHashes, DiscoveryProgress,
+    DiscoveryResult, DiscoveryRunProfile, DiscoveryRuntimeOverrides, DiscoveryValidationGates,
+    GeneOosResult, LoggedStrategyTrades, Stage1Window, build_discovery_profile,
+    compute_discovery_forward_test_artifacts, compute_discovery_prop_firm_artifacts,
+    discovery_per_kind_evidence_hashes, discovery_validation_evidence_manifest,
     discovery_validation_evidence_manifest_excluding_live_sim, ensure_non_empty_portfolio,
-    ensure_portfolio_export_ready, live_validation_evidence_from_discovery, run_discovery_cycle,
-    run_discovery_cycle_with_holdout, run_discovery_cycle_with_holdout_and_progress,
-    DEFAULT_OOS_HOLDOUT_FRACTION,
-    run_discovery_cycle_with_progress, save_canonical_backtest_artifacts,
-    save_discovery_profile_json, save_forward_test_validation_artifacts, save_funnel_json,
-    save_portfolio_json, save_promotion_summary_json, save_prop_firm_validation_artifacts,
-    save_quality_report_json, save_trade_log_json, save_walkforward_validation_artifacts,
+    ensure_portfolio_export_ready, faithful_oos_eval, live_validation_evidence_from_discovery,
+    run_discovery_cycle, run_discovery_cycle_with_holdout,
+    run_discovery_cycle_with_holdout_and_progress, run_discovery_cycle_with_progress,
+    save_canonical_backtest_artifacts, save_discovery_profile_json,
+    save_forward_test_validation_artifacts, save_funnel_json, save_portfolio_json,
+    save_promotion_summary_json, save_prop_firm_validation_artifacts, save_quality_report_json,
+    save_trade_log_json, save_walkforward_validation_artifacts,
+};
+pub use discovery_ledger::{
+    DiscoverySearchLedger, GeneRecord, SearchMetadata, ledger_path, load_prior_ledger,
+    save_discovery_ledger, seed_seen_from_ledger,
 };
 pub use eval::{
     BacktestMetrics, BacktestRuntimeOverrides, BacktestSettings,
     current_backtest_runtime_overrides, evaluate_population_core, fast_evaluate_strategy_core,
     install_backtest_runtime_overrides, install_backtest_runtime_overrides_from_env,
-    install_backtest_runtime_overrides_from_settings,
-    simulate_trades_core,
+    install_backtest_runtime_overrides_from_settings, simulate_trades_core,
 };
 // `pub use gauntlet::{GauntletConfig, StrategyGauntlet};` — DELETED 2026-05-26.
 pub use genetic::{
@@ -94,25 +101,21 @@ pub use genetic::{
     FilteringConfig, Gene, GeneticSearchRuntimeOverrides, ParentSelectionPolicy, SearchResult,
     SeenSignatureMemoryRuntimeOverrides, SelectionPolicyOverrides, SmcGateOverrides,
     SmcWeightRuntimeOverrides, StrategyEvaluationRuntimeOverrides, SurvivorSelectionPolicy,
-    current_determinism_policy, current_genetic_search_runtime_overrides, default_pip_size,
+    current_determinism_policy, current_genetic_search_runtime_overrides,
     current_seen_signature_memory_runtime_overrides, current_strategy_evaluation_runtime_overrides,
-    evaluate_genes, evolve_search, evolve_search_with_progress,
+    default_pip_size, evaluate_genes, evolve_search, evolve_search_with_progress,
     evolve_search_with_progress_and_limits, install_genetic_search_runtime_overrides,
     install_genetic_search_runtime_overrides_from_env,
     install_genetic_search_runtime_overrides_from_settings,
     install_seen_signature_memory_runtime_overrides,
     install_seen_signature_memory_runtime_overrides_from_env,
-    install_seen_signature_memory_runtime_overrides_from_settings, install_smc_search_config_from_env,
-    install_smc_search_config_from_settings,
+    install_seen_signature_memory_runtime_overrides_from_settings,
+    install_smc_search_config_from_env, install_smc_search_config_from_settings,
     install_strategy_evaluation_runtime_overrides,
     install_strategy_evaluation_runtime_overrides_from_env,
     install_strategy_evaluation_runtime_overrides_from_settings, migration_enabled,
     month_day_indices, push_migrants, random_search, set_migration_enabled, set_search_cancel,
     signals_for_gene, signals_for_gene_full, take_elites,
-};
-pub use discovery_ledger::{
-    DiscoverySearchLedger, GeneRecord, SearchMetadata, ledger_path, load_prior_ledger,
-    save_discovery_ledger, seed_seen_from_ledger,
 };
 pub use live_portfolio::{
     LIVE_PORTFOLIO_SCHEMA_VERSION, LivePortfolioArtifact, load_live_portfolio_json,
@@ -124,8 +127,7 @@ pub use portfolio::{AllocationResult, PortfolioOptimizer, SymbolMetrics};
 pub use quality::{
     QualityRuntimeOverrides, StrategyMetrics, StrategyQualityAnalyzer, StrategyRanker, Trade,
     current_quality_runtime_overrides, install_quality_runtime_overrides,
-    install_quality_runtime_overrides_from_env,
-    install_quality_runtime_overrides_from_settings,
+    install_quality_runtime_overrides_from_env, install_quality_runtime_overrides_from_settings,
 };
 pub use stop_target::{
     StopTargetSettings, adaptive_base_pips_series, adaptive_sl_tp_pips_series,
@@ -134,11 +136,10 @@ pub use stop_target::{
 pub use validation::{
     CANONICAL_BACKTEST_ARTIFACT_KIND, CANONICAL_BACKTEST_SCHEMA_VERSION,
     CanonicalBacktestArtifactFile, CanonicalBacktestScope, CombinatorialPurgedCV,
-    FORWARD_TEST_VALIDATION_ARTIFACT_KIND, FORWARD_TEST_VALIDATION_SCHEMA_VERSION,
-    ForwardTestInput, ForwardTestSummary, ForwardTestValidationArtifactFile,
-    ForwardTestValidationScope, LIVE_EXECUTION_SIMULATION_ARTIFACT_KIND,
-    LIVE_EXECUTION_SIMULATION_SCHEMA_VERSION, LiveExecutionRuntimeModel,
-    LiveExecutionSimulationArtifactFile, LiveExecutionSimulationScope,
+    FORWARD_TEST_VALIDATION_ARTIFACT_KIND, FORWARD_TEST_VALIDATION_SCHEMA_VERSION, ForwardTestInput,
+    ForwardTestSummary, ForwardTestValidationArtifactFile, ForwardTestValidationScope,
+    LIVE_EXECUTION_SIMULATION_ARTIFACT_KIND, LIVE_EXECUTION_SIMULATION_SCHEMA_VERSION,
+    LiveExecutionRuntimeModel, LiveExecutionSimulationArtifactFile, LiveExecutionSimulationScope,
     LiveExecutionSimulationSummary, PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND,
     PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION, PropFirmRiskInput, PropFirmRiskRules,
     PropFirmRiskValidationArtifactFile, PropFirmRiskValidationScope, PropFirmRiskValidationSummary,
@@ -149,8 +150,8 @@ pub use validation::{
     read_forward_test_validation_artifact, read_live_execution_simulation_artifact,
     read_prop_firm_risk_validation_artifact, read_walkforward_validation_artifact,
     write_canonical_backtest_artifact_atomic, write_forward_test_validation_artifact_atomic,
-    write_live_execution_simulation_artifact_atomic,
-    write_prop_firm_risk_validation_artifact_atomic, write_walkforward_validation_artifact_atomic,
+    write_live_execution_simulation_artifact_atomic, write_prop_firm_risk_validation_artifact_atomic,
+    write_walkforward_validation_artifact_atomic,
 };
 
 /// Convenience entry point that installs every typed runtime-override
