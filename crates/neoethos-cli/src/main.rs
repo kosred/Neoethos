@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod gpu_bench;
+mod gpu_bench_snapshot;
 mod tui;
 
 fn main() -> Result<()> {

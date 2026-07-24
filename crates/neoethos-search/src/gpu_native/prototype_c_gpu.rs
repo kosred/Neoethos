@@ -5,9 +5,9 @@
 //! pairs. It is a correctness prototype, not the final range-index architecture.
 
 use anyhow::{Context, Result, bail};
-use cubecl::prelude::*;
 #[cfg(feature = "gpu-cuda")]
 use cubecl::cuda::CudaRuntime;
+use cubecl::prelude::*;
 #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
 use cubecl::wgpu::WgpuRuntime;
 
@@ -81,22 +81,22 @@ fn sparse_first_hit_kernel(
     }
 }
 
+#[cfg(feature = "gpu-cuda")]
 pub fn try_prototype_c_gpu_first_hit(
     path: PricePath<'_>,
     events: &[EntryEvent],
 ) -> Result<Vec<SparseOutcome>> {
-    #[cfg(feature = "gpu-cuda")]
-    {
-        let client = crate::cubecl_eval::create_gpu_client(None)?;
-        return launch_sparse_first_hit::<CudaRuntime>(&client, path, events);
-    }
-    #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
-    {
-        let client = crate::cubecl_eval::create_gpu_client(None)?;
-        return launch_sparse_first_hit::<WgpuRuntime>(&client, path, events);
-    }
-    #[allow(unreachable_code)]
-    bail!("Prototype C GPU path requires gpu-cuda or gpu-vulkan")
+    let client = crate::cubecl_eval::create_gpu_client(None)?;
+    launch_sparse_first_hit::<CudaRuntime>(&client, path, events)
+}
+
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+pub fn try_prototype_c_gpu_first_hit(
+    path: PricePath<'_>,
+    events: &[EntryEvent],
+) -> Result<Vec<SparseOutcome>> {
+    let client = crate::cubecl_eval::create_gpu_client(None)?;
+    launch_sparse_first_hit::<WgpuRuntime>(&client, path, events)
 }
 
 fn launch_sparse_first_hit<R: Runtime>(
@@ -157,11 +157,7 @@ fn launch_sparse_first_hit<R: Runtime>(
     let exit_bar_handle = client.empty(events.len() * core::mem::size_of::<i32>());
     let exit_reason_handle = client.empty(events.len() * core::mem::size_of::<i32>());
 
-    let units = client
-        .properties()
-        .hardware
-        .max_units_per_cube
-        .clamp(1, 64);
+    let units = client.properties().hardware.max_units_per_cube.clamp(1, 64);
     let cubes = (events.len() as u32).div_ceil(units);
     sparse_first_hit_kernel::launch::<R>(
         client,
@@ -180,8 +176,14 @@ fn launch_sparse_first_hit<R: Runtime>(
         events.len() as u32,
     );
 
-    let exit_bars = i32::from_bytes(&client.read_one(exit_bar_handle)).to_vec();
-    let exit_reasons = i32::from_bytes(&client.read_one(exit_reason_handle)).to_vec();
+    let exit_bar_bytes = client
+        .read_one(exit_bar_handle)
+        .context("read Prototype C exit bars")?;
+    let exit_reason_bytes = client
+        .read_one(exit_reason_handle)
+        .context("read Prototype C exit reasons")?;
+    let exit_bars = i32::from_bytes(exit_bar_bytes.as_ref()).to_vec();
+    let exit_reasons = i32::from_bytes(exit_reason_bytes.as_ref()).to_vec();
     if exit_bars.len() != events.len() || exit_reasons.len() != events.len() {
         bail!("Prototype C GPU readback shape mismatch");
     }
@@ -215,15 +217,16 @@ fn launch_sparse_first_hit<R: Runtime>(
 #[cfg(all(test, feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
 mod tests {
     use super::*;
-    use crate::gpu_native::prototype_bc::{
-        FirstHitRequest, prototype_c_event_first_hit,
-    };
+    use crate::gpu_native::prototype_bc::{FirstHitRequest, prototype_c_event_first_hit};
 
     #[test]
     fn gpu_event_first_hit_matches_reference_when_adapter_is_available() {
         let highs = [100.0, 101.0, 106.0, 103.0, 104.0, 105.0];
         let lows = [100.0, 99.0, 98.0, 94.0, 96.0, 97.0];
-        let path = PricePath { highs: &highs, lows: &lows };
+        let path = PricePath {
+            highs: &highs,
+            lows: &lows,
+        };
         let events = [EntryEvent {
             candidate_id: 11,
             scenario_id: 101,

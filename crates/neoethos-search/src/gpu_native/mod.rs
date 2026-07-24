@@ -13,3 +13,4 @@ pub mod prototype_bc;
 pub mod prototype_c_gpu;
 pub mod ranking;
 pub mod semantics;
+pub mod snapshot_fixture;

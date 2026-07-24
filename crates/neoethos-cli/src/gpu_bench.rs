@@ -13,6 +13,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "--execute-snapshot") {
+        return crate::gpu_bench_snapshot::run(args);
+    }
     let output = flag(args, "--out")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("cache/gpu-bench/report.json"));

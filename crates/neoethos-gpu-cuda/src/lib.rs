@@ -218,12 +218,7 @@ mod tests {
             stop_price: 95.0,
             target_price: 105.0,
         }];
-        let result = warp_first_hit(
-            &[100.0, 106.0, 101.0],
-            &[100.0, 94.0, 99.0],
-            &events,
-        )
-        .unwrap();
+        let result = warp_first_hit(&[100.0, 106.0, 101.0], &[100.0, 94.0, 99.0], &events).unwrap();
         assert_eq!(
             result,
             vec![CudaFirstHitResult {

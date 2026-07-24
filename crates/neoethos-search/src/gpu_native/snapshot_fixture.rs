@@ -126,8 +126,8 @@ pub struct SnapshotPopulationFixture {
 impl SnapshotPopulationFixture {
     pub fn from_json_path(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
-        let bytes = fs::read(path)
-            .map_err(|error| format!("read snapshot {}: {error}", path.display()))?;
+        let bytes =
+            fs::read(path).map_err(|error| format!("read snapshot {}: {error}", path.display()))?;
         let dto: SnapshotFixtureDto = serde_json::from_slice(&bytes)
             .map_err(|error| format!("parse snapshot {}: {error}", path.display()))?;
         Self::from_dto(dto)
@@ -168,7 +168,9 @@ impl SnapshotPopulationFixture {
             ("gene_smc_flags", dto.gene_smc_flags.len()),
         ] {
             if len != population {
-                return Err(format!("snapshot {name} length {len} != population {population}"));
+                return Err(format!(
+                    "snapshot {name} length {len} != population {population}"
+                ));
             }
         }
         if dto.gene_offsets.len() != population + 1
@@ -178,9 +180,11 @@ impl SnapshotPopulationFixture {
         {
             return Err("snapshot gene CSR arrays are inconsistent".into());
         }
-        if dto.gene_indices.iter().any(|index| {
-            *index < 0 || (*index as usize) >= dto.feature_count
-        }) {
+        if dto
+            .gene_indices
+            .iter()
+            .any(|index| *index < 0 || (*index as usize) >= dto.feature_count)
+        {
             return Err("snapshot gene index is outside the feature range".into());
         }
         if dto
@@ -202,11 +206,8 @@ impl SnapshotPopulationFixture {
             }
         }
 
-        let indicators = Array2::from_shape_vec(
-            (dto.feature_count, bars),
-            dto.indicators,
-        )
-        .map_err(|error| format!("construct snapshot indicator matrix: {error}"))?;
+        let indicators = Array2::from_shape_vec((dto.feature_count, bars), dto.indicators)
+            .map_err(|error| format!("construct snapshot indicator matrix: {error}"))?;
         let settings = dto.settings.to_settings();
         Ok(Self {
             timeframe: dto.timeframe,

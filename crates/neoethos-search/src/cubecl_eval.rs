@@ -554,7 +554,9 @@ fn read_cuda_device_id_from_env() -> usize {
 /// generic over `R: Runtime` and runs unchanged on whichever backend was built.
 /// (When both features are on, CUDA wins.)
 #[cfg(feature = "gpu-cuda")]
-fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<CudaRuntime>> {
+pub(crate) fn create_gpu_client(
+    device_override: Option<usize>,
+) -> Result<ComputeClient<CudaRuntime>> {
     let device_id = device_override.unwrap_or_else(cuda_device_id);
     let device_count = tch::Cuda::device_count();
     if device_count <= device_id as i64 {
@@ -601,7 +603,9 @@ fn parse_wgpu_device_selector(raw: &str) -> Option<WgpuDevice> {
 }
 
 #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
-fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<WgpuRuntime>> {
+pub(crate) fn create_gpu_client(
+    device_override: Option<usize>,
+) -> Result<ComputeClient<WgpuRuntime>> {
     // `WgpuDevice`/`WgpuRuntime` come from the module-level import (line ~7).
     // The pool-option structs (`MemoryPoolOptions`/`PoolType`) are used inside
     // `bounded_wgpu_pools` below, which imports them itself.

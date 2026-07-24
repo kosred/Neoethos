@@ -24,8 +24,8 @@ pub fn run(args: &[String]) -> Result<()> {
     let output = PathBuf::from(
         flag(args, "--out").unwrap_or_else(|| "cache/gpu-bench/snapshot-report.json".into()),
     );
-    let fixture = SnapshotPopulationFixture::from_json_path(&snapshot_path)
-        .map_err(anyhow::Error::msg)?;
+    let fixture =
+        SnapshotPopulationFixture::from_json_path(&snapshot_path).map_err(anyhow::Error::msg)?;
     let prototype = parse_prototype(flag(args, "--prototype").as_deref())?;
     if prototype != PrototypeId::A {
         anyhow::bail!("full snapshot execution currently supports Prototype A only");
@@ -55,7 +55,9 @@ pub fn run(args: &[String]) -> Result<()> {
     disable_prototype_a_telemetry();
     for warmup in 0..warmups {
         let audit = CpuStrategyAuditContext::production(0x5350_5741_0000 + warmup as u64);
-        fixture.evaluate(backend, &audit).map_err(anyhow::Error::msg)?;
+        fixture
+            .evaluate(backend, &audit)
+            .map_err(anyhow::Error::msg)?;
         audit
             .snapshot()
             .assert_zero_executed()
@@ -72,7 +74,9 @@ pub fn run(args: &[String]) -> Result<()> {
     for repetition in 0..repetitions {
         let audit = CpuStrategyAuditContext::production(0x5350_4d45_0000 + repetition as u64);
         let started = Instant::now();
-        candidate = fixture.evaluate(backend, &audit).map_err(anyhow::Error::msg)?;
+        candidate = fixture
+            .evaluate(backend, &audit)
+            .map_err(anyhow::Error::msg)?;
         wall_samples.push(started.elapsed().as_secs_f64());
         audit
             .snapshot()
@@ -161,7 +165,10 @@ pub fn run(args: &[String]) -> Result<()> {
         ],
     );
     report.write_json(&output)?;
-    println!("Executable snapshot GPU benchmark written to {}", output.display());
+    println!(
+        "Executable snapshot GPU benchmark written to {}",
+        output.display()
+    );
     Ok(())
 }
 
@@ -173,21 +180,33 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 
 fn parse_usize(args: &[String], name: &str, default: usize) -> Result<usize> {
     flag(args, name)
-        .map(|value| value.parse::<usize>().with_context(|| format!("parse {name}")))
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .with_context(|| format!("parse {name}"))
+        })
         .transpose()
         .map(|value| value.unwrap_or(default))
 }
 
 fn parse_u64(args: &[String], name: &str, default: u64) -> Result<u64> {
     flag(args, name)
-        .map(|value| value.parse::<u64>().with_context(|| format!("parse {name}")))
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .with_context(|| format!("parse {name}"))
+        })
         .transpose()
         .map(|value| value.unwrap_or(default))
 }
 
 fn optional_u64(args: &[String], name: &str) -> Result<Option<u64>> {
     flag(args, name)
-        .map(|value| value.parse::<u64>().with_context(|| format!("parse {name}")))
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .with_context(|| format!("parse {name}"))
+        })
         .transpose()
 }
 
@@ -201,7 +220,12 @@ fn parse_prototype(raw: Option<&str>) -> Result<PrototypeId> {
 }
 
 fn parse_pass(raw: Option<&str>) -> Result<BenchmarkPass> {
-    match raw.unwrap_or("clean_timing").trim().to_ascii_lowercase().as_str() {
+    match raw
+        .unwrap_or("clean_timing")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "clean_timing" | "clean" => Ok(BenchmarkPass::CleanTiming),
         "diagnostics" => Ok(BenchmarkPass::Diagnostics),
         "nsight_systems" | "nsys" => Ok(BenchmarkPass::NsightSystems),
@@ -221,8 +245,10 @@ fn hardware(args: &[String]) -> HardwareMetadata {
         cuda_toolkit_version: flag(args, "--cuda-toolkit-version"),
         gpu_clock_mhz: flag(args, "--gpu-clock-mhz").and_then(|value| value.parse().ok()),
         power_limit_watts: flag(args, "--power-limit-watts").and_then(|value| value.parse().ok()),
-        temperature_celsius: flag(args, "--temperature-celsius").and_then(|value| value.parse().ok()),
-        dedicated_vram_bytes: flag(args, "--dedicated-vram-bytes").and_then(|value| value.parse().ok()),
+        temperature_celsius: flag(args, "--temperature-celsius")
+            .and_then(|value| value.parse().ok()),
+        dedicated_vram_bytes: flag(args, "--dedicated-vram-bytes")
+            .and_then(|value| value.parse().ok()),
         cuda_occupancy: flag(args, "--cuda-occupancy").and_then(|value| value.parse().ok()),
     }
 }
