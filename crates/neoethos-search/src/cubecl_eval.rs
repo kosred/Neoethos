@@ -1477,6 +1477,52 @@ pub(crate) fn cuda_eval_backtest_kernel_enabled() -> bool {
     cuda_env_knobs().backtest_kernel_enabled
 }
 
+/// Whether the discovery eval should SKIP the GPU lane because the only GPU is
+/// an integrated / shared-memory adapter.
+///
+/// Real-data verdict (2026-07-24, release CLI on real M5 EURUSD, AMD Ryzen 5
+/// 5675U iGPU): an integrated GPU is a NET LOSS for the fine-grained population
+/// eval. The backtest kernel itself is ~0.09 ms, but the per-call host↔device
+/// upload + readback over the SHARED-memory bus is ~1 s, so the GPU lane runs
+/// 10-20× slower than the 6-core CPU and only drags each generation; the fused
+/// (readback-free) path can't rescue it because its VRAM-resident signal matrix
+/// OOMs the iGPU's tiny device-local heap. The hybrid splitter already demotes a
+/// slow GPU toward the CPU, but on an integrated adapter that costs several
+/// wasted probe generations (and a possible transient OOM) before it converges —
+/// so we skip the GPU lane outright and run pure-CPU from the first generation.
+///
+/// The auto-tuner marks an integrated GPU by installing a non-zero
+/// `gpu_buffer_mb` (the discrete-card branch leaves it 0). This is idempotent —
+/// it ensures the budget is installed even on the lighter `search` path. Opt
+/// back in with `NEOETHOS_BOT_SEARCH_USE_IGPU=1` (e.g. to re-measure a strong
+/// APU, or after a driver/kernel change) — that forces the normal hybrid path,
+/// which still measures and demotes as usual.
+pub(crate) fn integrated_gpu_eval_disabled() -> bool {
+    if matches!(
+        std::env::var("NEOETHOS_BOT_SEARCH_USE_IGPU")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true") | Some("on") | Some("TRUE") | Some("On")
+    ) {
+        return false;
+    }
+    auto_tune_memory_budgets();
+    let disabled = installed_memory_budgets().is_some_and(|b| b.gpu_buffer_mb > 0);
+    if disabled {
+        // Log the skip ONCE (not every generation) so the run makes clear why the
+        // GPU isn't engaged — fail-loud transparency, not a silent fallback.
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            tracing::info!(
+                target: "neoethos_search::cubecl_eval",
+                "discovery GPU lane SKIPPED — only an integrated/shared-memory GPU is present, which is a net loss for this eval (kernel ~0.09 ms but ~1 s per-call upload/readback over the shared bus, 10-20x slower than the CPU, and the fused path OOMs its tiny device-local heap). Running discovery fully on the CPU. Override with NEOETHOS_BOT_SEARCH_USE_IGPU=1."
+            );
+        });
+    }
+    disabled
+}
+
 // **2026-05-25 — task #261**: switched from concrete `CudaRuntime` to a
 // generic `R: Runtime` parameter so these helpers (and the kernel-launch
 // fns below) compile against any cubecl runtime — CUDA (NVIDIA), Vulkan
@@ -2998,6 +3044,32 @@ fn resolve_fused_eval_enabled() -> bool {
             value = %v,
             "NEOETHOS_GPU_FUSED_EVAL has an unrecognized value — ignoring it and auto-detecting instead"
         );
+    }
+    // Make sure the hardware-sized budgets are installed before we read the
+    // integrated-GPU marker below — the app's discovery path calls this first, but
+    // the lighter `search` CLI path does not. `auto_tune_memory_budgets` is
+    // idempotent (first install wins), so this is a no-op when it already ran.
+    auto_tune_memory_budgets();
+    // INTEGRATED-GPU GATE (2026-07-24, real-data verdict): on a shared-memory GPU
+    // the fused path is a NET LOSS and it OOMs. The auto-tuner marks such a device
+    // by installing a non-zero `gpu_buffer_mb` (the discrete-card branch leaves it
+    // 0 — see `auto_tune_memory_budgets`). Measured on the AMD iGPU (Ryzen 5
+    // 5675U, real M5 EURUSD): the fused path keeps the whole genes×samples signal
+    // matrix VRAM-resident, whose peak exceeds the iGPU's tiny Vulkan device-local
+    // heap (far below its advertised 2 GB per-buffer limit) → `wgpu error: Out of
+    // Memory` EVERY generation, then a CPU recompute. The proven WINDOWED path,
+    // by contrast, reads each window back to host so its peak is one window — it
+    // runs there without OOM and the hybrid splitter measures it fairly (and, since
+    // the kernel is 0.09 ms but per-call upload/readback is ~1 s on the shared bus,
+    // correctly demotes it toward the CPU). So on an integrated GPU we skip the
+    // fused probe entirely and stay windowed. The explicit env override above still
+    // wins, so a user who wants to test fusion on their iGPU can force it.
+    if installed_memory_budgets().is_some_and(|b| b.gpu_buffer_mb > 0) {
+        tracing::info!(
+            target: "neoethos_search::cubecl_eval",
+            "fused VRAM-resident eval left OFF — integrated/shared-memory GPU detected (its device-local heap is too small for the VRAM-resident signal matrix; the fused path OOMs there). Using the proven windowed path, which the hybrid splitter demotes to the CPU if the GPU is slower. Force with NEOETHOS_GPU_FUSED_EVAL=1 to override."
+        );
+        return false;
     }
     // AUTO: `create_gpu_client` + the kernels can panic on a cubecl pool edge
     // (#243) — catch it so a probe failure is fail-safe (stay windowed), never a
