@@ -47,6 +47,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p /tmp/stage1-diagnostics
+          exec > >(tee /tmp/stage1-diagnostics/migration.log) 2>&1
           shopt -s nullglob
           applied=false
 
