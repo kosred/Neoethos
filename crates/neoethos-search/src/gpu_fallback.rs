@@ -315,7 +315,13 @@ mod tests {
 
     #[test]
     fn legacy_wrong_shape_is_never_hidden() {
-        assert_eq!(decide(GpuFailure::WrongShape, false), FallbackDecision::FailLoud);
-        assert_eq!(decide(GpuFailure::WrongShape, true), FallbackDecision::FailLoud);
+        assert_eq!(
+            decide(GpuFailure::WrongShape, false),
+            FallbackDecision::FailLoud
+        );
+        assert_eq!(
+            decide(GpuFailure::WrongShape, true),
+            FallbackDecision::FailLoud
+        );
     }
 }

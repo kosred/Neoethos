@@ -19,9 +19,9 @@ mod cubecl_eval;
 // Pure CSR population partitioning for multi-GPU sharding (Stage 2). Not GPU-
 // gated: it is plain slice math, so it compiles + unit-tests on any build. The
 // device-execution glue that consumes it lives in `eval.rs` behind `gpu`.
-mod lane_partition;
 pub mod discovery;
 pub mod discovery_ledger;
+mod lane_partition;
 // `mod scheduler_assignment;` — DELETED 2026-05-25 (verbose-build pass):
 // the file was a 19-LOC orphan with zero callers. The scheduler-driven
 // GPU routing it scaffolded is dispatched directly via `BackendKind`
@@ -72,11 +72,12 @@ pub use backend::{
 };
 // `pub use challenge::{ChallengeOptimizer, ChallengeTarget};` — DELETED 2026-05-26.
 pub use discovery::{
-    DEFAULT_OOS_HOLDOUT_FRACTION, DiscoveryConfig, DiscoveryPerKindEvidenceHashes, DiscoveryProgress,
-    DiscoveryResult, DiscoveryRunProfile, DiscoveryRuntimeOverrides, DiscoveryValidationGates,
-    GeneOosResult, LoggedStrategyTrades, Stage1Window, build_discovery_profile,
-    compute_discovery_forward_test_artifacts, compute_discovery_prop_firm_artifacts,
-    discovery_per_kind_evidence_hashes, discovery_validation_evidence_manifest,
+    DEFAULT_OOS_HOLDOUT_FRACTION, DiscoveryConfig, DiscoveryPerKindEvidenceHashes,
+    DiscoveryProgress, DiscoveryResult, DiscoveryRunProfile, DiscoveryRuntimeOverrides,
+    DiscoveryValidationGates, GeneOosResult, LoggedStrategyTrades, Stage1Window,
+    build_discovery_profile, compute_discovery_forward_test_artifacts,
+    compute_discovery_prop_firm_artifacts, discovery_per_kind_evidence_hashes,
+    discovery_validation_evidence_manifest,
     discovery_validation_evidence_manifest_excluding_live_sim, ensure_non_empty_portfolio,
     ensure_portfolio_export_ready, faithful_oos_eval, live_validation_evidence_from_discovery,
     run_discovery_cycle, run_discovery_cycle_with_holdout,
@@ -132,15 +133,17 @@ pub use quality::{
 };
 pub use stop_target::{
     StopTargetSettings, adaptive_base_pips_series, adaptive_sl_tp_pips_series,
-    adaptive_stops_enabled, adaptive_stops_rr, compute_stop_distance_series, infer_stop_target_pips,
+    adaptive_stops_enabled, adaptive_stops_rr, compute_stop_distance_series,
+    infer_stop_target_pips,
 };
 pub use validation::{
     CANONICAL_BACKTEST_ARTIFACT_KIND, CANONICAL_BACKTEST_SCHEMA_VERSION,
     CanonicalBacktestArtifactFile, CanonicalBacktestScope, CombinatorialPurgedCV,
-    FORWARD_TEST_VALIDATION_ARTIFACT_KIND, FORWARD_TEST_VALIDATION_SCHEMA_VERSION, ForwardTestInput,
-    ForwardTestSummary, ForwardTestValidationArtifactFile, ForwardTestValidationScope,
-    LIVE_EXECUTION_SIMULATION_ARTIFACT_KIND, LIVE_EXECUTION_SIMULATION_SCHEMA_VERSION,
-    LiveExecutionRuntimeModel, LiveExecutionSimulationArtifactFile, LiveExecutionSimulationScope,
+    FORWARD_TEST_VALIDATION_ARTIFACT_KIND, FORWARD_TEST_VALIDATION_SCHEMA_VERSION,
+    ForwardTestInput, ForwardTestSummary, ForwardTestValidationArtifactFile,
+    ForwardTestValidationScope, LIVE_EXECUTION_SIMULATION_ARTIFACT_KIND,
+    LIVE_EXECUTION_SIMULATION_SCHEMA_VERSION, LiveExecutionRuntimeModel,
+    LiveExecutionSimulationArtifactFile, LiveExecutionSimulationScope,
     LiveExecutionSimulationSummary, PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND,
     PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION, PropFirmRiskInput, PropFirmRiskRules,
     PropFirmRiskValidationArtifactFile, PropFirmRiskValidationScope, PropFirmRiskValidationSummary,
@@ -151,8 +154,8 @@ pub use validation::{
     read_forward_test_validation_artifact, read_live_execution_simulation_artifact,
     read_prop_firm_risk_validation_artifact, read_walkforward_validation_artifact,
     write_canonical_backtest_artifact_atomic, write_forward_test_validation_artifact_atomic,
-    write_live_execution_simulation_artifact_atomic, write_prop_firm_risk_validation_artifact_atomic,
-    write_walkforward_validation_artifact_atomic,
+    write_live_execution_simulation_artifact_atomic,
+    write_prop_firm_risk_validation_artifact_atomic, write_walkforward_validation_artifact_atomic,
 };
 
 /// Convenience entry point that installs every typed runtime-override

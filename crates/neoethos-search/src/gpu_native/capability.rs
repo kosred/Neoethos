@@ -92,22 +92,86 @@ impl GpuCapabilityManifest {
         use PipelineStage as S;
         use StageGpuCapability as C;
         Self::new([
-            StageCapability { stage: S::FeaturePreparation, capability: C::CpuOnly, detail: "feature/SMC preparation remains host-side" },
-            StageCapability { stage: S::GaGenerationSelection, capability: C::CpuOnly, detail: "generation, selection, mutation, crossover, dedup and archive are CPU-side" },
-            StageCapability { stage: S::PopulationEvaluation, capability: C::HybridOnly, detail: "CubeCL population kernels exist, but the production evaluator uses a CPU lane and CPU recompute" },
-            StageCapability { stage: S::SignalAndMinTradeFilter, capability: C::CpuOnly, detail: "post-GA signal synthesis and minimum-trade filtering use CPU/Rayon" },
-            StageCapability { stage: S::QualityScreen, capability: C::CpuOnly, detail: "trade simulation and quality/regime diagnostics remain CPU-side" },
-            StageCapability { stage: S::MonteCarlo, capability: C::HybridOnly, detail: "GPU population evaluation exists but failure and surrounding reductions remain CPU-routed" },
-            StageCapability { stage: S::PropFirmWindow, capability: C::CpuOnly, detail: "prop-firm rolling-window simulation is CPU-side" },
-            StageCapability { stage: S::CandidateCorrelation, capability: C::CpuOnly, detail: "candidate Pearson/Spearman pruning is CPU-side" },
-            StageCapability { stage: S::WalkForward, capability: C::HybridOnly, detail: "GPU metric evaluation exists but host gathering and CPU diagnostics remain" },
-            StageCapability { stage: S::Cpcv, capability: C::HybridOnly, detail: "GPU fold evaluation exists but host gathers/reductions remain" },
-            StageCapability { stage: S::Pbo, capability: C::CpuOnly, detail: "PBO ranking and fold selection remain host-side" },
-            StageCapability { stage: S::RobustnessPermutationPlateau, capability: C::CpuOnly, detail: "permutation and parameter plateau checks use CPU/Rayon" },
-            StageCapability { stage: S::RiskDiagnostics, capability: C::CpuOnly, detail: "canonical risk diagnostics repeat CPU simulation" },
-            StageCapability { stage: S::CanonicalReplay, capability: C::CpuOnly, detail: "canonical artifact replay is CPU-side" },
-            StageCapability { stage: S::ForwardTailReplay, capability: C::CpuOnly, detail: "forward-tail replay is CPU-side" },
-            StageCapability { stage: S::SurvivorRanking, capability: C::CpuOnly, detail: "final ranking/selection remains host-side" },
+            StageCapability {
+                stage: S::FeaturePreparation,
+                capability: C::CpuOnly,
+                detail: "feature/SMC preparation remains host-side",
+            },
+            StageCapability {
+                stage: S::GaGenerationSelection,
+                capability: C::CpuOnly,
+                detail: "generation, selection, mutation, crossover, dedup and archive are CPU-side",
+            },
+            StageCapability {
+                stage: S::PopulationEvaluation,
+                capability: C::HybridOnly,
+                detail: "CubeCL population kernels exist, but the production evaluator uses a CPU lane and CPU recompute",
+            },
+            StageCapability {
+                stage: S::SignalAndMinTradeFilter,
+                capability: C::CpuOnly,
+                detail: "post-GA signal synthesis and minimum-trade filtering use CPU/Rayon",
+            },
+            StageCapability {
+                stage: S::QualityScreen,
+                capability: C::CpuOnly,
+                detail: "trade simulation and quality/regime diagnostics remain CPU-side",
+            },
+            StageCapability {
+                stage: S::MonteCarlo,
+                capability: C::HybridOnly,
+                detail: "GPU population evaluation exists but failure and surrounding reductions remain CPU-routed",
+            },
+            StageCapability {
+                stage: S::PropFirmWindow,
+                capability: C::CpuOnly,
+                detail: "prop-firm rolling-window simulation is CPU-side",
+            },
+            StageCapability {
+                stage: S::CandidateCorrelation,
+                capability: C::CpuOnly,
+                detail: "candidate Pearson/Spearman pruning is CPU-side",
+            },
+            StageCapability {
+                stage: S::WalkForward,
+                capability: C::HybridOnly,
+                detail: "GPU metric evaluation exists but host gathering and CPU diagnostics remain",
+            },
+            StageCapability {
+                stage: S::Cpcv,
+                capability: C::HybridOnly,
+                detail: "GPU fold evaluation exists but host gathers/reductions remain",
+            },
+            StageCapability {
+                stage: S::Pbo,
+                capability: C::CpuOnly,
+                detail: "PBO ranking and fold selection remain host-side",
+            },
+            StageCapability {
+                stage: S::RobustnessPermutationPlateau,
+                capability: C::CpuOnly,
+                detail: "permutation and parameter plateau checks use CPU/Rayon",
+            },
+            StageCapability {
+                stage: S::RiskDiagnostics,
+                capability: C::CpuOnly,
+                detail: "canonical risk diagnostics repeat CPU simulation",
+            },
+            StageCapability {
+                stage: S::CanonicalReplay,
+                capability: C::CpuOnly,
+                detail: "canonical artifact replay is CPU-side",
+            },
+            StageCapability {
+                stage: S::ForwardTailReplay,
+                capability: C::CpuOnly,
+                detail: "forward-tail replay is CPU-side",
+            },
+            StageCapability {
+                stage: S::SurvivorRanking,
+                capability: C::CpuOnly,
+                detail: "final ranking/selection remains host-side",
+            },
         ])
     }
 
@@ -252,6 +316,9 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.unsupported.len(), 1);
-        assert_eq!(error.unsupported[0].capability, StageGpuCapability::Unsupported);
+        assert_eq!(
+            error.unsupported[0].capability,
+            StageGpuCapability::Unsupported
+        );
     }
 }

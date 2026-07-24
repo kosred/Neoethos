@@ -192,7 +192,10 @@ pub fn evaluate_population_core_with_backend(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendConfigError {
     UnknownPreference(String),
-    InvalidBoolean { key: &'static str, value: String },
+    InvalidBoolean {
+        key: &'static str,
+        value: String,
+    },
     ConflictingPolicy {
         device: DevicePreference,
         fallback: FallbackPolicy,
@@ -249,15 +252,31 @@ mod tests {
 
     #[test]
     fn legacy_values_keep_their_meaning() {
-        assert_eq!(EvaluationBackend::parse("cpu").unwrap(), EvaluationBackend::CPU_CANONICAL);
-        assert_eq!(EvaluationBackend::parse("auto").unwrap(), EvaluationBackend::AUTO);
-        assert_eq!(EvaluationBackend::parse("gpu").unwrap(), EvaluationBackend::GPU_PREFERRED);
+        assert_eq!(
+            EvaluationBackend::parse("cpu").unwrap(),
+            EvaluationBackend::CPU_CANONICAL
+        );
+        assert_eq!(
+            EvaluationBackend::parse("auto").unwrap(),
+            EvaluationBackend::AUTO
+        );
+        assert_eq!(
+            EvaluationBackend::parse("gpu").unwrap(),
+            EvaluationBackend::GPU_PREFERRED
+        );
     }
 
     #[test]
     fn gpu_required_is_a_new_strict_value() {
-        assert_eq!(EvaluationBackend::parse("gpu_required").unwrap(), EvaluationBackend::GPU_REQUIRED);
-        assert!(EvaluationBackend::parse("gpu_required").unwrap().gpu_required());
+        assert_eq!(
+            EvaluationBackend::parse("gpu_required").unwrap(),
+            EvaluationBackend::GPU_REQUIRED
+        );
+        assert!(
+            EvaluationBackend::parse("gpu_required")
+                .unwrap()
+                .gpu_required()
+        );
     }
 
     #[test]
@@ -298,8 +317,8 @@ mod tests {
 
     #[test]
     fn invalid_boolean_fails_loud() {
-        let error = EvaluationBackend::resolve_for_discovery("auto", "gpu", Some("maybe"))
-            .unwrap_err();
+        let error =
+            EvaluationBackend::resolve_for_discovery("auto", "gpu", Some("maybe")).unwrap_err();
         assert!(matches!(error, BackendConfigError::InvalidBoolean { .. }));
     }
 

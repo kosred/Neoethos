@@ -231,7 +231,10 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(CpuStrategyAuditError::CpuForbidden { .. })));
+        assert!(matches!(
+            result,
+            Err(CpuStrategyAuditError::CpuForbidden { .. })
+        ));
         assert!(!closure_ran);
         let snapshot = audit.snapshot();
         assert_eq!(snapshot.total_attempted(), 1);
