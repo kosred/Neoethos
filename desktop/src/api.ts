@@ -653,6 +653,14 @@ export type SwarmCapacity = {
 };
 export const swarmCapacity = () => apiGet<SwarmCapacity>("/mesh/swarm");
 
+// Mesh opt-in toggle — the desktop shell owns the sidecar lifecycle (Tauri
+// commands, not the HTTP backend). `enabled` = the operator opted in (auto-start
+// with the app); `running` = the sidecar process is alive right now.
+export type MeshStatus = { enabled: boolean; running: boolean };
+export const meshStatus = () => invoke<MeshStatus>("mesh_status");
+export const meshSetEnabled = (enabled: boolean) =>
+  invoke<MeshStatus>("mesh_set_enabled", { enabled });
+
 // ── Autonomous LLM supervisor ───────────────────────────────────────────────
 export type SupervisorConfig = { enabled: boolean; intervalMinutes: number; maxActionsPerTick: number; directives: string[] };
 export type SupervisorLogEntry = {

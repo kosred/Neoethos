@@ -73,6 +73,13 @@ jobs:
       - name: Build MCP sidecar
         run: cargo build --release --manifest-path mcp/Cargo.toml
 
+      # The P2P mesh sidecar ships inside the installer too (same per-platform
+      # bundle.resources mechanism). Its OWN isolated workspace (mesh/) — never
+      # touches the engine's pinned deps. The desktop auto-launches it when the
+      # operator opts in (Federation → Turn mesh ON).
+      - name: Build mesh sidecar
+        run: cargo build --release --manifest-path mesh/Cargo.toml
+
       # tauri-action runs the frontend build then compiles the desktop binary
       # with the web assets embedded, producing the platform installer, and —
       # on a tag — uploads the bundle to the matching Release (as a draft).

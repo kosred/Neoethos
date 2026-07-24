@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import {
   settings, updateSettings, settingsRaw, saveSettingsRaw, knobCatalog, diagnosticsReport, riskInfo,
   federationStatus, federationSetJobs, federationWorkerStart, federationWorkerStop, swarmCapacity,
-  type FedStatus, type SwarmCapacity,
+  meshStatus, meshSetEnabled,
+  type FedStatus, type SwarmCapacity, type MeshStatus,
 } from "../api";
 import { usePoll } from "../hooks";
 import { HelpPanel, HelpStep, Tip } from "../components/Help";
@@ -13,6 +14,20 @@ import { HelpPanel, HelpStep, Tip } from "../components/Help";
 function FederationPanel() {
   const { data: fed, reload } = usePoll<FedStatus>(federationStatus, 15000);
   const { data: swarm } = usePoll<SwarmCapacity>(swarmCapacity, 15000);
+  const { data: mesh, reload: reloadMesh } = usePoll<MeshStatus>(meshStatus, 10000);
+
+  const toggleMesh = async () => {
+    setBusy(true);
+    try {
+      const s = await meshSetEnabled(!mesh?.enabled);
+      setMsg(
+        s.enabled
+          ? "✓ Mesh ON — this machine joins the swarm and pools compute with your other nodes."
+          : "Mesh OFF — this machine left the swarm.",
+      );
+      await reloadMesh();
+    } catch (e) { setMsg(`Mesh toggle failed: ${e}`); } finally { setBusy(false); }
+  };
   const [combosText, setCombosText] = useState("EURUSD M15\nGBPUSD M15\nUSDJPY H1");
   const [token, setToken] = useState("");
   const [coordUrl, setCoordUrl] = useState("");
@@ -63,6 +78,30 @@ function FederationPanel() {
         set a shared token so only your group can submit.
       </p>
       {msg && <div className="banner info">{msg}</div>}
+
+      <div className="ticket" style={{ borderColor: mesh?.running ? "#295c3a" : undefined }}>
+        <div className="ticket-row" style={{ alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <b>🌐 Mesh — pool your computers as one</b>
+            <div className="muted small" style={{ marginTop: 4, maxWidth: 560 }}>
+              Turns this machine into a swarm node: it discovers your other NeoEthos
+              machines automatically (no server, no port-forwarding) and pools their
+              CPUs so discovery covers more ground in the same time. Off by default —
+              pooling compute over the internet is your choice.
+            </div>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <button className={mesh?.enabled ? "danger" : "primary"} disabled={busy} onClick={toggleMesh}>
+              {mesh?.enabled ? "Turn mesh OFF" : "Turn mesh ON"}
+            </button>
+            <div className="muted small" style={{ marginTop: 4 }}>
+              {mesh?.enabled
+                ? (mesh?.running ? "● running" : "● enabled (starting…)")
+                : "○ off"}
+            </div>
+          </div>
+        </div>
+      </div>
 
       {swarm?.running && (
         <div className="ticket" style={{ borderColor: "#295c3a", background: "#0e1a12" }}>

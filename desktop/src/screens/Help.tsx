@@ -105,7 +105,7 @@ const SECTIONS: Sec[] = [
       "News gate: pause / allow / warn around high-impact events.",
       "Broker Setup: re-authenticate or pick a granted account if trading says it can't route.",
       "Advanced (lower on the screen): run diagnostics, import a CSV/Parquet file, switch presets or hand-edit any setting (affects everything).",
-      "Your swarm (experimental, opt-in): if you run the mesh sidecar, this card shows the pooled compute of every volunteer machine as one — off by default and safe to ignore.",
+      "Mesh — pool your computers (experimental, opt-in): in Advanced → Federation, 'Turn mesh ON' makes this machine join a swarm of your other NeoEthos PCs automatically (no server/port-forwarding) and pools their CPUs so discovery covers more ground. Off by default; the swarm card then shows the pooled compute as one machine.",
     ] },
   { id: "tuning", icon: "🧬", title: "Search tuning (anti-stagnation)", group: "System",
     what: "If Discovery stalls early or finds few strategies, these knobs (in Settings) widen/deepen the genetic search. The GA can settle on a local optimum — raise these to push it to keep exploring different indicators.",

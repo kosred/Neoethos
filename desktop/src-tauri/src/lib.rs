@@ -209,6 +209,166 @@ mod mcp_sidecar {
     }
 }
 
+/// P2P mesh sidecar lifecycle — makes the mesh a FIRST-CLASS, app-managed
+/// feature instead of a binary the operator must launch by hand. The isolated
+/// `neoethos-mesh` binary (its OWN workspace — the engine never links iroh)
+/// joins the serverless swarm, discovers peers automatically, and bridges work
+/// to this app's local `/federation/*` API. Because pooling compute over the
+/// open internet is a conscious privacy/network choice, it is STRICTLY OPT-IN:
+/// the sidecar only runs when the operator enabled the mesh (a `mesh_enabled`
+/// marker in the data root, flipped by the Federation UI toggle). Best-effort,
+/// exactly like `mcp_sidecar`: a missing binary just logs and the app never
+/// depends on it.
+mod mesh_sidecar {
+    use std::sync::Mutex;
+
+    static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+
+    /// Opt-in marker in the data root (CWD after `prepare_data_root`). Its mere
+    /// presence means the operator turned the mesh ON. A marker file keeps this
+    /// desktop-shell-local and independent of the engine's `Settings` struct.
+    fn enabled_marker() -> std::path::PathBuf {
+        std::path::PathBuf::from("mesh_enabled")
+    }
+
+    pub fn is_enabled() -> bool {
+        enabled_marker().exists()
+    }
+
+    /// Whether the child process is currently alive (reaps it if it exited).
+    pub fn is_running() -> bool {
+        let Ok(mut slot) = CHILD.lock() else {
+            return false;
+        };
+        match slot.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(None) => true,             // still running
+                _ => {
+                    *slot = None; // exited or errored → clear the dead handle
+                    false
+                }
+            },
+            None => false,
+        }
+    }
+
+    /// Locate the sidecar binary — the SAME search order as `mcp_sidecar` so it
+    /// is found however the installer laid it out (env override, beside the exe,
+    /// or a `resources/` subdir).
+    fn locate() -> Option<std::path::PathBuf> {
+        let bin_name = if cfg!(windows) {
+            "neoethos-mesh.exe"
+        } else {
+            "neoethos-mesh"
+        };
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(p) = std::env::var("NEOETHOS_MESH_PATH")
+            .ok()
+            .map(std::path::PathBuf::from)
+        {
+            candidates.push(p);
+        }
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(dir) = exe_path.parent() {
+                candidates.push(dir.join(bin_name));
+                candidates.push(dir.join("resources").join(bin_name));
+            }
+        }
+        candidates.into_iter().find(|p| p.exists())
+    }
+
+    /// Start the sidecar IF the operator opted in and it isn't already running.
+    /// Called at startup (a no-op when disabled) and by the UI toggle. MUST run
+    /// after `backend::start` so the ephemeral API-port file the mesh reads to
+    /// find our `/federation` bridge already exists.
+    pub fn start() {
+        if !is_enabled() || is_running() {
+            return;
+        }
+        let Some(exe) = locate() else {
+            eprintln!(
+                "mesh sidecar 'neoethos-mesh' not found — mesh unavailable this session. \
+                 Set NEOETHOS_MESH_PATH to its full path, or reinstall from a build that \
+                 bundles it beside the app."
+            );
+            return;
+        };
+        let mut cmd = std::process::Command::new(&exe);
+        // The mesh auto-resolves its --app-url from temp/neoethos_api_port; we
+        // only pin its identity + swarm state under the data root so a stable
+        // node id survives restarts.
+        cmd.arg("--data-dir").arg("mesh");
+        // Windows: run fully headless (no console window to close by accident) —
+        // same rationale as the MCP sidecar.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.spawn() {
+            Ok(child) => {
+                eprintln!("mesh sidecar started: {} (pid {})", exe.display(), child.id());
+                if let Ok(mut slot) = CHILD.lock() {
+                    *slot = Some(child);
+                }
+            }
+            Err(e) => eprintln!("mesh sidecar failed to start ({}): {e}", exe.display()),
+        }
+    }
+
+    /// Kill the sidecar. Called from the window-close handler BEFORE the hard
+    /// process exit (a plain `process::exit` would orphan it).
+    pub fn stop() {
+        if let Ok(mut slot) = CHILD.lock() {
+            if let Some(mut child) = slot.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    /// Persist the operator's opt-in choice and start/stop the sidecar to match.
+    pub fn set_enabled(enabled: bool) {
+        if enabled {
+            let _ = std::fs::write(enabled_marker(), "1");
+            start();
+        } else {
+            let _ = std::fs::remove_file(enabled_marker());
+            stop();
+        }
+    }
+}
+
+/// Mesh on/off state for the Federation UI toggle.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MeshStatus {
+    /// The operator has opted in (the sidecar auto-starts with the app).
+    enabled: bool,
+    /// The sidecar process is alive right now.
+    running: bool,
+}
+
+/// Current mesh opt-in + process state (the Federation panel polls this).
+#[tauri::command]
+fn mesh_status() -> MeshStatus {
+    MeshStatus {
+        enabled: mesh_sidecar::is_enabled(),
+        running: mesh_sidecar::is_running(),
+    }
+}
+
+/// Flip the mesh on/off from the UI: persists the opt-in and starts/stops the
+/// sidecar immediately (no app restart needed).
+#[tauri::command]
+fn mesh_set_enabled(enabled: bool) -> MeshStatus {
+    mesh_sidecar::set_enabled(enabled);
+    MeshStatus {
+        enabled: mesh_sidecar::is_enabled(),
+        running: mesh_sidecar::is_running(),
+    }
+}
+
 /// Reveal a file or folder in the OS file manager (Windows Explorer). Files are
 /// highlighted via `/select,`; folders open directly. Lets the user find any
 /// data/model/log the app stores with one click.
@@ -508,12 +668,19 @@ pub fn run() {
             // MCP sidecar (best-effort): exposes configured MCP servers' tools
             // to the Supervisor's approval-gated actions on 127.0.0.1:7431.
             mcp_sidecar::start();
+            // P2P mesh sidecar (best-effort, OPT-IN): auto-starts only if the
+            // operator enabled the mesh in the Federation panel. Runs AFTER
+            // backend::start so the API-port file it reads already exists.
+            mesh_sidecar::start();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             // in-process backend base URL + file manager
             api_base,
             open_path,
+            // P2P mesh sidecar opt-in toggle (Federation panel)
+            mesh_status,
+            mesh_set_enabled,
             // local vortex data
             app_info,
             list_symbols,
@@ -563,9 +730,10 @@ pub fn run() {
                         return;
                     }
                 }
-                // Kill the MCP sidecar child FIRST — process::exit would
-                // orphan it (it's an independent OS process).
+                // Kill the sidecar children FIRST — process::exit would
+                // orphan them (they're independent OS processes).
                 mcp_sidecar::stop();
+                mesh_sidecar::stop();
                 std::process::exit(0);
             }
         })
