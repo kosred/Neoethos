@@ -70,13 +70,32 @@ jobs:
           echo "applied=$applied" >> "$GITHUB_OUTPUT"
 
       - name: Format workspace
-        run: cargo fmt --all
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/stage1-diagnostics
+          cargo fmt --all 2>&1 | tee /tmp/stage1-diagnostics/format.log
 
       - name: Test search crate
-        run: cargo test -p neoethos-search
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p neoethos-search 2>&1 | tee /tmp/stage1-diagnostics/test.log
 
       - name: Check search GPU feature
-        run: cargo check -p neoethos-search --features gpu-vulkan
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check -p neoethos-search --features gpu-vulkan 2>&1 | tee /tmp/stage1-diagnostics/gpu-check.log
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-diagnostics-${{ github.run_id }}
+          path: /tmp/stage1-diagnostics
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Commit verified migration results
         shell: bash
