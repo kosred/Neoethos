@@ -668,4 +668,86 @@ mod tests {
         };
         assert!(compare_traces("a", "b", &trace, &trace, ParityPolicy::default()).is_match());
     }
+
+    #[test]
+    fn levels_four_through_nine_report_the_first_causal_field() {
+        let reference = ParityTrace {
+            entries: vec![EntryEventTrace {
+                candidate_id: 1,
+                scenario_id: 2,
+                bar: 3,
+                direction: 1,
+            }],
+            exits: vec![ExitEventTrace {
+                candidate_id: 1,
+                scenario_id: 2,
+                bar: 4,
+                reason: 1,
+            }],
+            accepted_trades: vec![TradeTrace {
+                candidate_id: 1,
+                scenario_id: 2,
+                entry_bar: 3,
+                exit_bar: 4,
+                direction: 1,
+                exit_reason: 1,
+                size: 2.0,
+                costs: 3.0,
+                pnl: -10.0,
+                equity_after: 99_990.0,
+            }],
+            risk_states: vec![RiskStateTrace {
+                candidate_id: 1,
+                scenario_id: 2,
+                bar: 4,
+                day_id: 5,
+                month_id: 6,
+                equity: 99_990.0,
+                peak_equity: 100_000.0,
+                day_start_equity: 100_000.0,
+                month_start_equity: 100_000.0,
+                flags: 0,
+            }],
+            ..ParityTrace::default()
+        };
+
+        let mut candidate = reference.clone();
+        candidate.entries[0].bar = 9;
+        assert_first_level(&reference, &candidate, ParityLevel::EntryEvents);
+
+        candidate = reference.clone();
+        candidate.exits[0].reason = 2;
+        assert_first_level(&reference, &candidate, ParityLevel::ExitBarAndReason);
+
+        candidate = reference.clone();
+        candidate.accepted_trades[0].direction = -1;
+        assert_first_level(&reference, &candidate, ParityLevel::AcceptedTradeSequence);
+
+        candidate = reference.clone();
+        candidate.accepted_trades[0].costs = 4.0;
+        assert_first_level(&reference, &candidate, ParityLevel::PositionSizeAndCosts);
+
+        candidate = reference.clone();
+        candidate.accepted_trades[0].equity_after = 99_980.0;
+        assert_first_level(&reference, &candidate, ParityLevel::EquityAfterTrade);
+
+        candidate = reference.clone();
+        candidate.risk_states[0].flags = 1;
+        assert_first_level(
+            &reference,
+            &candidate,
+            ParityLevel::CalendarAndPropFirmState,
+        );
+    }
+
+    fn assert_first_level(reference: &ParityTrace, candidate: &ParityTrace, expected: ParityLevel) {
+        let report = compare_traces(
+            "reference",
+            "candidate",
+            reference,
+            candidate,
+            ParityPolicy::default(),
+        );
+        assert_eq!(report.first_divergence.unwrap().level, expected);
+    }
 }

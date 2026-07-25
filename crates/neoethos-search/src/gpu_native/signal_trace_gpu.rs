@@ -266,15 +266,49 @@ pub fn cpu_signal_trace(input: &SignalTraceInput) -> Result<SignalTraceOutput> {
 }
 
 #[cfg(feature = "gpu-cuda")]
-pub fn gpu_signal_trace(input: &SignalTraceInput) -> Result<SignalTraceOutput> {
-    let client = crate::cubecl_eval::create_gpu_client(None)?;
+pub fn gpu_signal_trace(
+    input: &SignalTraceInput,
+) -> Result<SignalTraceOutput, crate::gpu_native::engine::EngineError> {
+    let client = create_diagnostic_client()?;
     launch_signal_trace::<CudaRuntime>(&client, input)
+        .map_err(|error| crate::gpu_native::engine::EngineError::Backend(error.to_string()))
 }
 
 #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
-pub fn gpu_signal_trace(input: &SignalTraceInput) -> Result<SignalTraceOutput> {
-    let client = crate::cubecl_eval::create_gpu_client(None)?;
+pub fn gpu_signal_trace(
+    input: &SignalTraceInput,
+) -> Result<SignalTraceOutput, crate::gpu_native::engine::EngineError> {
+    let client = create_diagnostic_client()?;
     launch_signal_trace::<WgpuRuntime>(&client, input)
+        .map_err(|error| crate::gpu_native::engine::EngineError::Backend(error.to_string()))
+}
+
+#[cfg(feature = "gpu-cuda")]
+fn create_diagnostic_client()
+-> Result<ComputeClient<CudaRuntime>, crate::gpu_native::engine::EngineError> {
+    map_diagnostic_client(crate::cubecl_eval::create_gpu_client(None))
+}
+
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+fn create_diagnostic_client()
+-> Result<ComputeClient<WgpuRuntime>, crate::gpu_native::engine::EngineError> {
+    map_diagnostic_client(crate::cubecl_eval::create_gpu_client(None))
+}
+
+fn map_diagnostic_client<R: Runtime>(
+    result: Result<ComputeClient<R>>,
+) -> Result<ComputeClient<R>, crate::gpu_native::engine::EngineError> {
+    result.map_err(|error| {
+        let message = error.to_string();
+        if crate::gpu_native::prototype_a::is_known_no_adapter_error(&message) {
+            crate::gpu_native::engine::EngineError::UnsupportedCapability {
+                operation: "diagnostic_gpu_adapter",
+                detail: message,
+            }
+        } else {
+            crate::gpu_native::engine::EngineError::Backend(message)
+        }
+    })
 }
 
 fn launch_signal_trace<R: Runtime>(
@@ -379,10 +413,18 @@ mod tests {
         let expected = cpu_signal_trace(&input).unwrap();
         let actual = match gpu_signal_trace(&input) {
             Ok(actual) => actual,
-            Err(error) => {
+            Err(crate::gpu_native::engine::EngineError::UnsupportedCapability {
+                operation: "diagnostic_gpu_adapter",
+                detail,
+            }) => {
+                let error = crate::gpu_native::engine::EngineError::UnsupportedCapability {
+                    operation: "diagnostic_gpu_adapter",
+                    detail,
+                };
                 eprintln!("signal trace GPU test skipped: {error:#}");
                 return;
             }
+            Err(error) => panic!("signal trace GPU execution failed: {error:#}"),
         };
         assert_eq!(actual, expected);
     }

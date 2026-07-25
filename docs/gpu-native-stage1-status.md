@@ -14,6 +14,8 @@ This record reports implemented and verified behaviour. It is not a performance 
 - Canonical integer ranking and deterministic gene serialization define exact survivor ordering.
 - The causal twelve-level parity comparator reports the first divergent level with field-specific abs/rel/ULP policies.
 - A separate compile-time GPU trace specialization emits score-before-threshold, raw/final signal, confidence, SMC score and SMC gate for parity levels 1–3; it is not a runtime branch in the production kernel.
+- A second test-only CubeCL specialization emits device-associated entry/exit/trade/size-cost/equity/calendar/FTMO traces for levels 4–9. Fixed and adaptive-at-entry stops, same-bar stop precedence, trailing break-even, costs, risk sizing, day/month rollover and all three FTMO flags have deterministic CPU-oracle and direct Vulkan parity coverage.
+- Levels 10–12 remain in the deterministic integration harness: Prototype A supplies level-10 metrics, while the host-owned validation and canonical-ranking stages must supply explicit candidate IDs, verdicts and survivor IDs. The harness shape-checks those artifacts and never fabricates levels 11–12 from metric positions.
 - `neoethos-gpu-contracts` provides host DTOs, C-compatible device POD layouts, ABI assertions and the Philox reference contract.
 - Session/backend/device/generation-bound handles, explicit synchronization semantics and transfer invariants are defined by `BacktestEngine`.
 - Optional NVTX ranges and attributed JSON benchmark reports separate clean timing, diagnostics, Nsight Systems and Nsight Compute passes.
@@ -23,6 +25,9 @@ This record reports implemented and verified behaviour. It is not a performance 
 ### Prototype A
 
 - The existing fused CubeCL population evaluator is the exact correctness baseline.
+- A real long-lived `GpuDiscoverySession<PrototypeAResources<R>>` implements the generic `BacktestEngine` contract. It owns and reuses one backend client plus resident dataset, gene, scenario, workspace, metrics and selection resources.
+- Dataset, gene, scenario, metrics, selection and event handles are bound to session/backend/device/generation/buffer kind and validated at every operation.
+- Evaluation consumes resident handles; chained selection stays on device, and `readback_compact` is the intentional host boundary. The direct Vulkan acceptance test proves one logical dataset upload, no dense intermediate D2H and no chained re-upload.
 - `gpu_required` reaches the real population evaluator rather than acting as a decorative configuration value.
 - `bench --execute-tiny` runs a deterministic GPU population workload with CPU oracle work outside timing, per-repetition zero-CPU audit and compact attributed JSON output.
 - Transfer telemetry reports resident-cache hits/misses, uploads, dense/compact readbacks, chained reuploads and synchronization events. Telemetry is disabled during clean timing/profiler passes.
@@ -61,14 +66,15 @@ The following remain unverified until a real NVIDIA GPU is rented:
 - the relative cost of compute, allocation, synchronization, H2D and D2H;
 - any final architecture selection or speedup claim.
 
-## Remaining card-independent completion gaps
+## Card-independent completion status
 
-These are implementation gaps, not requests for another planning cycle. The exact handoff and acceptance criteria are in `docs/gpu-native-stage1-opus-handoff.md`.
+The two implementation gaps defined in `docs/gpu-native-stage1-opus-handoff.md` are complete on the candidate branch:
 
-- The generic `BacktestEngine` residency/handle contract is implemented, but the existing full-semantics Prototype-A evaluator has not yet been completely refactored into an end-to-end handle-chained trait implementation. Current acceptance is proven through the real fused evaluator plus transfer telemetry, not a fabricated adapter.
-- The separate GPU causal trace currently covers levels 1–3 and SMC gating. Full per-entry/per-exit/trade/size-cost/equity/calendar trace buffers for levels 4–9 remain additional correctness instrumentation.
+- Gap A: the full-semantics Prototype-A evaluator is wired through the real handle-chained, device-resident `BacktestEngine`; no host-side map is presented as device residency.
+- Gap B: diagnostic causal traces cover levels 4–9 and report their first divergence through `ParityTrace`/`compare_traces`; direct tests bypass scheduler policy and emit candidate/scenario identity from the device.
+- Known CubeCL default/class-selector adapter-absence panics are caught inside client initialization while the registry lock is live, the tentative init key is removed, and callers receive typed unsupported status. Unknown panics and parity mismatches still fail.
 
-These two gaps touch the full execution semantics and should be implemented with a real checkout, focused review and direct backend tests. A host-side map disguised as device handles or final-metric-only parity must not be accepted as completion.
+This closes the card-independent Stage-1 implementation work. It does not close the rented-A6000 evidence gate below and is not twelve-level engine parity: Prototype A proves level 10, while levels 11–12 are independently owned host-stage artifacts.
 
 ## Explicit limitations and later-stage work
 

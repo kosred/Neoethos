@@ -12,6 +12,54 @@ use crate::gpu_native::prototype_a::{
 use crate::gpu_native::snapshot_fixture::SnapshotSettingsDto;
 use ndarray::Array2;
 use neoethos_gpu_contracts::device::ScenarioDescriptor;
+use std::collections::HashSet;
+
+/// Host-owned outputs for parity levels 11-12.
+///
+/// Stage 1 keeps validation and canonical ranking on the host.  The integration
+/// harness therefore accepts their real outputs explicitly; it must never infer
+/// a verdict or survivor identity from a metric row or its position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostIntegrationArtifacts {
+    pub candidate_ids: Vec<u64>,
+    pub validation_verdicts: Vec<bool>,
+    pub survivor_order: Vec<u64>,
+}
+
+impl HostIntegrationArtifacts {
+    fn validate(&self, metric_rows: usize) -> Result<(), String> {
+        if self.candidate_ids.len() != metric_rows {
+            return Err(format!(
+                "integration candidate ID count {} does not match metric row count {metric_rows}",
+                self.candidate_ids.len()
+            ));
+        }
+        if self.validation_verdicts.len() != metric_rows {
+            return Err(format!(
+                "integration validation verdict count {} does not match metric row count {metric_rows}",
+                self.validation_verdicts.len()
+            ));
+        }
+        let candidate_ids = self.candidate_ids.iter().copied().collect::<HashSet<_>>();
+        if candidate_ids.len() != self.candidate_ids.len() {
+            return Err("integration candidate IDs must be unique".into());
+        }
+        let survivor_ids = self.survivor_order.iter().copied().collect::<HashSet<_>>();
+        if survivor_ids.len() != self.survivor_order.len() {
+            return Err("integration survivor IDs must be unique".into());
+        }
+        if let Some(unknown) = self
+            .survivor_order
+            .iter()
+            .find(|candidate_id| !candidate_ids.contains(candidate_id))
+        {
+            return Err(format!(
+                "integration survivor ID {unknown} is not present in candidate IDs"
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TinyPopulationFixture {
@@ -236,6 +284,10 @@ impl TinyPopulationFixture {
         reference: &[[f64; 11]],
         candidate: &[[f64; 11]],
     ) -> TraceComparisonReport {
+        // Prototype A owns level 10 only. Validation and canonical ranking stay
+        // in their host-owned stages and are exercised by
+        // `compare_integration_artifacts`; do not fabricate levels 11-12 from
+        // metric positions here.
         let reference = ParityTrace {
             final_metrics: reference.to_vec(),
             ..ParityTrace::default()
@@ -244,21 +296,63 @@ impl TinyPopulationFixture {
             final_metrics: candidate.to_vec(),
             ..ParityTrace::default()
         };
-        let policy = ParityPolicy {
-            metrics: FloatTolerance {
-                absolute: 1.0e-3,
-                relative: 1.0e-3,
-                max_ulps: 64,
-            },
-            ..ParityPolicy::default()
-        };
         compare_traces(
             "cpu_reference",
             "gpu_candidate",
             &reference,
             &candidate,
-            policy,
+            prototype_a_parity_policy(),
         )
+    }
+
+    /// Build the levels 10-12 integration trace from outputs supplied by the
+    /// stages that own them. Candidate IDs are shape-checked here even though
+    /// [`ParityTrace`] stores the verdict vector positionally.
+    pub fn integration_trace(
+        metrics: &[[f64; 11]],
+        artifacts: &HostIntegrationArtifacts,
+    ) -> Result<ParityTrace, String> {
+        artifacts.validate(metrics.len())?;
+        Ok(ParityTrace {
+            final_metrics: metrics.to_vec(),
+            validation_verdicts: artifacts.validation_verdicts.clone(),
+            survivor_order: artifacts.survivor_order.clone(),
+            ..ParityTrace::default()
+        })
+    }
+
+    pub fn compare_integration_artifacts(
+        reference_metrics: &[[f64; 11]],
+        reference_artifacts: &HostIntegrationArtifacts,
+        candidate_metrics: &[[f64; 11]],
+        candidate_artifacts: &HostIntegrationArtifacts,
+    ) -> Result<TraceComparisonReport, String> {
+        if reference_artifacts.candidate_ids != candidate_artifacts.candidate_ids {
+            return Err(format!(
+                "integration candidate IDs differ: reference={:?}, candidate={:?}",
+                reference_artifacts.candidate_ids, candidate_artifacts.candidate_ids
+            ));
+        }
+        let reference = Self::integration_trace(reference_metrics, reference_artifacts)?;
+        let candidate = Self::integration_trace(candidate_metrics, candidate_artifacts)?;
+        Ok(compare_traces(
+            "cpu_reference",
+            "gpu_candidate",
+            &reference,
+            &candidate,
+            prototype_a_parity_policy(),
+        ))
+    }
+}
+
+fn prototype_a_parity_policy() -> ParityPolicy {
+    ParityPolicy {
+        metrics: FloatTolerance {
+            absolute: 1.0e-3,
+            relative: 1.0e-3,
+            max_ulps: 64,
+        },
+        ..ParityPolicy::default()
     }
 }
 
@@ -280,6 +374,85 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), 8);
         assert_eq!(fixture.candidate_bars(), 8 * 256);
+    }
+
+    #[test]
+    fn deterministic_integration_trace_carries_explicit_levels_ten_through_twelve() {
+        let metrics = vec![
+            [1.0, 0.0, 100_001.0, 0.0, 0.5, 1.2, 1.0, 0.0, 2.0, 0.0, 0.0],
+            [3.0, 0.0, 100_003.0, 0.0, 0.5, 1.2, 1.0, 0.0, 1.0, 0.0, 0.0],
+        ];
+        let artifacts = HostIntegrationArtifacts {
+            candidate_ids: vec![41, 7],
+            validation_verdicts: vec![true, false],
+            survivor_order: vec![41],
+        };
+        let trace = TinyPopulationFixture::integration_trace(&metrics, &artifacts).unwrap();
+
+        assert_eq!(trace.final_metrics, metrics);
+        assert_eq!(trace.validation_verdicts, vec![true, false]);
+        assert_eq!(trace.survivor_order, vec![41]);
+    }
+
+    #[test]
+    fn integration_artifacts_report_level_eleven_before_level_twelve() {
+        let metrics = vec![
+            [1.0, 0.0, 100_001.0, 0.0, 0.5, 1.2, 1.0, 0.0, 2.0, 0.0, 0.0],
+            [3.0, 0.0, 100_003.0, 0.0, 0.5, 1.2, 1.0, 0.0, 1.0, 0.0, 0.0],
+        ];
+        let reference = HostIntegrationArtifacts {
+            candidate_ids: vec![41, 7],
+            validation_verdicts: vec![true, false],
+            survivor_order: vec![41],
+        };
+        let mut candidate = reference.clone();
+        candidate.validation_verdicts[1] = true;
+        candidate.survivor_order = vec![7];
+        let mut candidate_metrics = metrics.clone();
+        candidate_metrics[0][0] += 5.0e-4;
+
+        let report = TinyPopulationFixture::compare_integration_artifacts(
+            &metrics,
+            &reference,
+            &candidate_metrics,
+            &candidate,
+        )
+        .unwrap();
+        assert_eq!(
+            report.first_divergence.unwrap().level,
+            crate::gpu_native::parity_hierarchy::ParityLevel::ValidationVerdict
+        );
+
+        candidate.validation_verdicts = reference.validation_verdicts.clone();
+        let report = TinyPopulationFixture::compare_integration_artifacts(
+            &metrics,
+            &reference,
+            &candidate_metrics,
+            &candidate,
+        )
+        .unwrap();
+        assert_eq!(
+            report.first_divergence.unwrap().level,
+            crate::gpu_native::parity_hierarchy::ParityLevel::SurvivorOrdering
+        );
+    }
+
+    #[test]
+    fn integration_artifacts_reject_positional_or_unknown_id_claims() {
+        let metrics = vec![[0.0; 11], [0.0; 11]];
+        let mismatched = HostIntegrationArtifacts {
+            candidate_ids: vec![41],
+            validation_verdicts: vec![true],
+            survivor_order: vec![41],
+        };
+        assert!(TinyPopulationFixture::integration_trace(&metrics, &mismatched).is_err());
+
+        let unknown_survivor = HostIntegrationArtifacts {
+            candidate_ids: vec![41, 7],
+            validation_verdicts: vec![true, false],
+            survivor_order: vec![99],
+        };
+        assert!(TinyPopulationFixture::integration_trace(&metrics, &unknown_survivor).is_err());
     }
 
     #[cfg(not(feature = "gpu"))]

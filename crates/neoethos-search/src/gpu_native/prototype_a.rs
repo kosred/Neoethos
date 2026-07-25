@@ -398,6 +398,9 @@ pub fn prototype_a_capabilities() -> EngineCapabilities {
 
 pub fn is_known_no_adapter_error(message: &str) -> bool {
     message.contains("No possible adapter available")
+        || message.contains("No Discrete GPU device found")
+        || message.contains("No Integrated GPU device found")
+        || message.contains("No Virtual GPU device found")
 }
 
 pub fn disable_prototype_a_telemetry() {
@@ -498,6 +501,15 @@ mod tests {
     fn no_adapter_classifier_matches_only_the_known_cubecl_absence_signature() {
         assert!(is_known_no_adapter_error(
             "No possible adapter available, requested_backends: Backends(VULKAN)"
+        ));
+        assert!(is_known_no_adapter_error(
+            "No Integrated GPU device found for index 99"
+        ));
+        assert!(is_known_no_adapter_error(
+            "No Discrete GPU device found for index 99"
+        ));
+        assert!(is_known_no_adapter_error(
+            "No Virtual GPU device found for index 99"
         ));
         assert!(!is_known_no_adapter_error(
             "wgpu validation error; requested_backends: Backends(VULKAN)"

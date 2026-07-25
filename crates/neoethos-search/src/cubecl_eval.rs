@@ -661,7 +661,7 @@ pub(crate) fn create_gpu_client(
     let mut seen = initialized
         .lock()
         .map_err(|_| anyhow::anyhow!("wgpu device-init registry mutex poisoned"))?;
-    if seen.insert(key) {
+    if seen.insert(key.clone()) {
         // We can't read the device limits without registering, so the bounded pool
         // is built from a CONSERVATIVE `max_page` = the cap ceiling (2GiB), which is
         // >= the largest single buffer the windowing machinery ever builds
@@ -677,7 +677,25 @@ pub(crate) fn create_gpu_client(
                 pool_options: bounded_wgpu_pools(POOL_MAX_PAGE, POOL_ALIGNMENT),
             },
         };
-        let setup = init_setup::<Vulkan>(&base_device, runtime_options);
+        // CubeCL reports missing/default or class-pinned adapters by panicking.
+        // Catch that panic while this registry guard is still live so the
+        // once-per-device key can be removed and the mutex is not poisoned for
+        // every later GPU test in the same process. Unknown panics still fail
+        // after the guard is released.
+        let setup = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            init_setup::<Vulkan>(&base_device, runtime_options)
+        })) {
+            Ok(setup) => setup,
+            Err(payload) => {
+                seen.remove(&key);
+                let message = panic_payload_message(payload.as_ref());
+                drop(seen);
+                if crate::gpu_native::prototype_a::is_known_no_adapter_error(&message) {
+                    bail!("wgpu adapter unavailable: {message}");
+                }
+                std::panic::resume_unwind(payload);
+            }
+        };
         let binding_limit = setup.device.limits().max_storage_buffer_binding_size as u64;
         let buffer_limit = setup.adapter.limits().max_buffer_size;
         let real_cap = binding_limit.min(buffer_limit);
@@ -694,6 +712,17 @@ pub(crate) fn create_gpu_client(
     drop(seen); // release the registry lock before building the (cheap) client
 
     Ok(WgpuRuntime::client(&base_device))
+}
+
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else {
+        "non-string panic during wgpu adapter initialization".to_string()
+    }
 }
 
 /// Build a GRADUATED set of sliced memory pools (mirroring cubecl's default

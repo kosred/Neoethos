@@ -78,8 +78,17 @@ pub fn create_prototype_a_engine(
             "Prototype A max gene batch must be non-zero".into(),
         ));
     }
-    let client = create_gpu_client(device_override)
-        .map_err(|error| EngineError::Backend(error.to_string()))?;
+    let client = create_gpu_client(device_override).map_err(|error| {
+        let message = error.to_string();
+        if crate::gpu_native::prototype_a::is_known_no_adapter_error(&message) {
+            EngineError::UnsupportedCapability {
+                operation: "prototype_a_gpu_adapter",
+                detail: message,
+            }
+        } else {
+            EngineError::Backend(message)
+        }
+    })?;
     let identity = EngineIdentity {
         session_id,
         backend_id: active_backend_id(),

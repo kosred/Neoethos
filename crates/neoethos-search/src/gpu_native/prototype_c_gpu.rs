@@ -242,10 +242,15 @@ mod tests {
         let expected = prototype_c_event_first_hit(path, &events).unwrap();
         let actual = match try_prototype_c_gpu_first_hit(path, &events) {
             Ok(actual) => actual,
-            Err(error) => {
+            Err(error)
+                if crate::gpu_native::prototype_a::is_known_no_adapter_error(
+                    &error.to_string(),
+                ) =>
+            {
                 eprintln!("Prototype C direct GPU test skipped: {error:#}");
                 return;
             }
+            Err(error) => panic!("Prototype C direct GPU execution failed: {error:#}"),
         };
         assert_eq!(actual, expected);
     }
