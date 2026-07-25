@@ -38,6 +38,7 @@ This record reports implemented and verified behaviour. It is not a performance 
 - A deterministic compact-event host reference preserves candidate/scenario identity and order.
 - A CubeCL compact-event first-hit/stitch kernel is available for CUDA/WGPU builds for the fixed/adaptive-at-entry subset.
 - The CubeCL host launcher and kernel compile in the Vulkan feature build; direct WGPU and CUDA parity probes are part of the final CI/preflight paths.
+- Hosted runners without a Vulkan adapter explicitly skip only the known CubeCL no-adapter condition; every other panic or parity mismatch remains a CI failure.
 - Break-even, trailing and prop-firm/path-dependent strategies route conservatively to the exact persistent walk.
 
 ### Real-data snapshots
@@ -60,13 +61,20 @@ The following remain unverified until a real NVIDIA GPU is rented:
 - the relative cost of compute, allocation, synchronization, H2D and D2H;
 - any final architecture selection or speedup claim.
 
+## Remaining card-independent completion gaps
+
+These are implementation gaps, not requests for another planning cycle. The exact handoff and acceptance criteria are in `docs/gpu-native-stage1-opus-handoff.md`.
+
+- The generic `BacktestEngine` residency/handle contract is implemented, but the existing full-semantics Prototype-A evaluator has not yet been completely refactored into an end-to-end handle-chained trait implementation. Current acceptance is proven through the real fused evaluator plus transfer telemetry, not a fabricated adapter.
+- The separate GPU causal trace currently covers levels 1–3 and SMC gating. Full per-entry/per-exit/trade/size-cost/equity/calendar trace buffers for levels 4–9 remain additional correctness instrumentation.
+
+These two gaps touch the full execution semantics and should be implemented with a real checkout, focused review and direct backend tests. A host-side map disguised as device handles or final-metric-only parity must not be accepted as completion.
+
 ## Explicit limitations and later-stage work
 
 - Stage 1 does not make full discovery GPU-native. Quality screening, prop-firm windows, correlation, PBO, canonical/forward replay, robustness and other inventoried candidate-dependent CPU stages remain Stage 2.
 - The full device-resident GA (generation, selection, crossover, mutation, deduplication and archive management) remains Stage 2.
-- The generic `BacktestEngine` residency/handle contract is implemented, but the existing full-semantics Prototype-A evaluator has not yet been completely refactored into an end-to-end handle-chained trait implementation. Current acceptance is proven through the real fused evaluator plus transfer telemetry, not a fabricated adapter.
 - Prototype B/C currently cover the declared static/adaptive-at-entry first-hit intersection, not every strategy feature.
-- The separate GPU causal trace currently covers levels 1–3 and SMC gating. Full per-entry/per-exit/equity/calendar trace buffers for levels 4–9 remain additional correctness instrumentation.
 - Historical legacy measurement needs a pinned adapter because the historical commit predates the attributed benchmark command.
 - Passing integration parity does not prove full-pipeline GPU-native execution.
 
