@@ -2,7 +2,7 @@
 
 This directory prepares attributed, fail-fast benchmark runs. It does not claim speedups or select an engine.
 
-1. Run `bash preflight.sh`. By default it requires an RTX A6000-class name, at least 45,000 MiB VRAM, CUDA/Nsight/CUPTI, and executes the real Rust → C ABI → CUDA allocation/upload/kernel/readback smoke tests. The CUDA-gated test also exercises the warp-cooperative Prototype-B first-hit path.
+1. Run `bash preflight.sh`. By default it requires an RTX A6000-class name, at least 45,000 MiB VRAM, CUDA/Nsight/CUPTI, and executes the real Rust → C ABI → CUDA allocation/upload/kernel/readback smoke tests. The CUDA-gated tests exercise Prototype B, Prototype C and the causal signal/trade traces, reject successful-looking skips, and run Compute Sanitizer memcheck as a fail-loud gate.
 2. Create detached, clean historical and candidate worktrees with `bash prepare_worktrees.sh <root> <candidate-sha> [legacy-sha]`.
 3. Build the candidate release binary inside its pinned worktree before paid benchmark execution.
 4. For real-data fixtures, export one canonical CSV per timeframe with columns `timestamp,high,low,close,<feature...>` and run, for example:

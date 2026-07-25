@@ -7,6 +7,8 @@ MIN_VRAM_MIB="${NEOETHOS_MIN_VRAM_MIB:-45000}"
 MIN_RAM_KIB="${NEOETHOS_MIN_RAM_KIB:-16000000}"
 MIN_DISK_KIB="${NEOETHOS_MIN_DISK_KIB:-20000000}"
 mkdir -p "$(dirname "$OUT")"
+PROBE_LOG_DIR="$(dirname "$OUT")/preflight-logs"
+mkdir -p "$PROBE_LOG_DIR"
 
 required=(git cargo rustc python3 g++ nvidia-smi nvcc nsys ncu compute-sanitizer)
 missing=()
@@ -56,16 +58,61 @@ if ! find /usr/local /opt -path '*CUPTI*' -name 'libcupti.so*' -print -quit 2>/d
   exit 26
 fi
 
+run_required_cuda_probe() {
+  local label="$1"
+  shift
+  local log="$PROBE_LOG_DIR/${label}.stdout.log"
+  set +e
+  "$@" 2>&1 | tee "$log"
+  local status=${PIPESTATUS[0]}
+  set -e
+  if (( status != 0 )); then
+    return "$status"
+  fi
+  if grep -Eqi 'GPU test skipped|CUDA smoke skipped|adapter.*skipped' "$log"; then
+    printf 'Required CUDA probe reported a skip: %s\n' "$label" >&2
+    return 27
+  fi
+}
+
 # Real Rust -> C ABI -> CUDA allocation/upload/kernel/readback smoke path.
-NEOETHOS_RUN_CUDA_SMOKE=1 cargo test \
+run_required_cuda_probe prototype-b-smoke \
+  env NEOETHOS_RUN_CUDA_SMOKE=1 cargo test \
   -p neoethos-gpu-cuda --features cuda \
   tests::real_cuda_smoke_is_explicitly_gpu_gated -- --exact --nocapture
 
 # Direct CUDA correctness probes for the CubeCL compact-event and trace kernels.
-cargo test -p neoethos-search --features gpu-cuda \
+run_required_cuda_probe prototype-c-direct \
+  env NEOETHOS_REQUIRE_GPU=1 cargo test -p neoethos-search --features gpu-cuda \
   gpu_event_first_hit_matches_reference_when_adapter_is_available -- --nocapture
-cargo test -p neoethos-search --features gpu-cuda \
+run_required_cuda_probe signal-trace-direct \
+  env NEOETHOS_REQUIRE_GPU=1 cargo test -p neoethos-search --features gpu-cuda \
   direct_gpu_trace_matches_cpu_when_an_adapter_is_available -- --nocapture
+run_required_cuda_probe trade-trace-direct \
+  env NEOETHOS_REQUIRE_GPU=1 cargo test -p neoethos-search --features gpu-cuda \
+  direct_trade_trace_levels_four_through_nine_match_cpu -- --nocapture
+
+# Execute memcheck rather than merely checking that the binary exists.
+# `cargo test` launches the test binary as a child, so track all descendants;
+# the non-zero sanitizer exit code turns detected memory errors into a hard gate.
+run_required_cuda_probe compute-sanitizer-native \
+  env NEOETHOS_RUN_CUDA_SMOKE=1 compute-sanitizer \
+  --tool memcheck \
+  --target-processes all \
+  --require-cuda-init no \
+  --error-exitcode 86 \
+  --log-file "$PROBE_LOG_DIR/compute-sanitizer-native.log" \
+  cargo test -p neoethos-gpu-cuda --features cuda \
+  tests::real_cuda_smoke_is_explicitly_gpu_gated -- --exact --nocapture
+run_required_cuda_probe compute-sanitizer-gpu-native \
+  env NEOETHOS_REQUIRE_GPU=1 compute-sanitizer \
+  --tool memcheck \
+  --target-processes all \
+  --require-cuda-init no \
+  --error-exitcode 86 \
+  --log-file "$PROBE_LOG_DIR/compute-sanitizer-gpu-native.log" \
+  cargo test -p neoethos-search --features gpu-cuda \
+  gpu_native:: -- --nocapture --test-threads=1
 
 python3 - "$OUT" "$GPU_NAME" "$GPU_UUID" "$DRIVER" "$VRAM_MIB" \
   "$CUDA_TOOLKIT" "$RAM_KIB" "$DISK_KIB" "$POWER_LIMIT_W" \
@@ -92,6 +139,8 @@ payload = {
     "cupti_present": True,
     "compute_sanitizer_present": True,
     "cuda_smoke_passed": True,
+    "direct_cuda_parity_passed": True,
+    "compute_sanitizer_passed": True,
 }
 path = pathlib.Path(out)
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

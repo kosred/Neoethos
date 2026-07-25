@@ -78,7 +78,11 @@ jobs:
           python3 -m py_compile \
             scripts/gpu-bench/run_matrix.py \
             scripts/gpu-bench/collate.py \
-            scripts/gpu-bench/prepare_snapshot.py
+            scripts/gpu-bench/prepare_snapshot.py \
+            scripts/gpu-bench/test_preflight_contract.py \
+            scripts/gpu-bench/test_stage1_ci_contract.py
+          python3 scripts/gpu-bench/test_preflight_contract.py
+          python3 scripts/gpu-bench/test_stage1_ci_contract.py
           tmp="$(mktemp -d)"
           export SNAPSHOT_SMOKE_DIR="$tmp"
           python3 - <<'PY'
@@ -140,37 +144,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          run_probe() {
-            local test_name="$1"
-            local log_path="$2"
-            set +e
-            cargo test -p neoethos-search --features gpu-vulkan \
-              "$test_name" -- --nocapture 2>&1 | tee "$log_path"
-            local cargo_status=${PIPESTATUS[0]}
-            set -e
-
-            if (( cargo_status == 0 )); then
-              return 0
-            fi
-
-            if grep -Eq \
-              'No possible adapter available|requested_backends: Backends\(VULKAN\)' \
-              "$log_path"; then
-              echo "Direct WGPU probe skipped: this runner exposes no Vulkan adapter ($test_name)."
-              return 0
-            fi
-
-            echo "Direct WGPU probe failed for a reason other than adapter absence: $test_name" >&2
-            return "$cargo_status"
-          }
-
-          run_probe \
-            gpu_event_first_hit_matches_reference_when_adapter_is_available \
-            /tmp/stage1-diagnostics/prototype-c-direct.log
-          run_probe \
-            direct_gpu_trace_matches_cpu_when_an_adapter_is_available \
-            /tmp/stage1-diagnostics/signal-trace-direct.log
+          cargo test -p neoethos-search --features gpu-vulkan \
+            gpu_native:: -- --nocapture \
+            2>&1 | tee /tmp/stage1-diagnostics/gpu-native-direct.log
 
       - name: Upload failure diagnostics
         if: failure()
