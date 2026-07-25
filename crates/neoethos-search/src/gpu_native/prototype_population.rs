@@ -5,17 +5,42 @@ use crate::gpu_native::prototype_a::{
     PrototypeAUploadError,
 };
 use crate::gpu_native::prototype_bc::PrototypeKind;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PrototypePopulationWorkload {
     pub dataset: PrototypeADatasetUpload,
     pub genes: PrototypeAGeneUpload,
     pub scenarios: PrototypeAScenarioUpload,
     pub requirements: PrototypeBcRequirements,
+}
+
+#[derive(Deserialize)]
+struct UncheckedPrototypePopulationWorkload {
+    dataset: PrototypeADatasetUpload,
+    genes: PrototypeAGeneUpload,
+    scenarios: PrototypeAScenarioUpload,
+    requirements: PrototypeBcRequirements,
+}
+
+impl<'de> Deserialize<'de> for PrototypePopulationWorkload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let unchecked = UncheckedPrototypePopulationWorkload::deserialize(deserializer)?;
+        Self::from_uploads(
+            unchecked.dataset,
+            unchecked.genes,
+            unchecked.scenarios,
+            unchecked.requirements,
+        )
+        .map_err(D::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +61,7 @@ pub enum PrototypeBcIneligibilityReason {
     NonFiniteStaticLevels,
     AdaptiveAtEntryUnavailable,
     UnsupportedScenario,
+    InvalidWorkload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +106,12 @@ pub enum PrototypePopulationError {
         actual: u64,
     },
     DuplicateEligibilityIndex(usize),
+    NonCanonicalEligibility,
+    GeneFeatureIndexOutOfBounds {
+        gene_position: usize,
+        index: i32,
+        feature_count: usize,
+    },
 }
 
 impl fmt::Display for PrototypePopulationError {
@@ -109,6 +141,20 @@ impl fmt::Display for PrototypePopulationError {
             Self::DuplicateEligibilityIndex(index) => {
                 write!(f, "Prototype B/C eligibility index {index} is duplicated")
             }
+            Self::NonCanonicalEligibility => {
+                write!(
+                    f,
+                    "Prototype B/C eligibility is not the canonical intersection"
+                )
+            }
+            Self::GeneFeatureIndexOutOfBounds {
+                gene_position,
+                index,
+                feature_count,
+            } => write!(
+                f,
+                "Prototype B/C gene term {gene_position} references feature {index}, outside 0..{feature_count}"
+            ),
         }
     }
 }
@@ -128,15 +174,7 @@ impl PrototypePopulationWorkload {
         scenarios: PrototypeAScenarioUpload,
         requirements: PrototypeBcRequirements,
     ) -> Result<Self, PrototypePopulationError> {
-        validate_dataset_shape(&dataset)?;
-        PrototypeARebatchPlan::new(&genes, &scenarios, genes.population())?;
-
-        let mut candidate_ids = BTreeSet::new();
-        for candidate_id in genes.candidate_ids.iter().copied() {
-            if !candidate_ids.insert(candidate_id) {
-                return Err(PrototypePopulationError::DuplicateCandidateId(candidate_id));
-            }
-        }
+        validate_uploads(&dataset, &genes, &scenarios)?;
 
         Ok(Self {
             dataset,
@@ -147,6 +185,13 @@ impl PrototypePopulationWorkload {
     }
 
     pub fn common_bc_intersection(&self, _prototype: PrototypeKind) -> CommonBcEligibility {
+        if self.validate_invariants().is_err() {
+            return invalid_workload_eligibility(&self.genes.candidate_ids);
+        }
+        self.canonical_bc_intersection()
+    }
+
+    fn canonical_bc_intersection(&self) -> CommonBcEligibility {
         let candidate_ids = &self.genes.candidate_ids;
         let mut unsupported = BTreeMap::<PrototypeBcIneligibilityReason, Vec<u64>>::new();
         let mut full_workload_rejections = Vec::new();
@@ -220,6 +265,10 @@ impl PrototypePopulationWorkload {
         &self,
         eligibility: &CommonBcEligibility,
     ) -> Result<Self, PrototypePopulationError> {
+        self.validate_invariants()?;
+        if *eligibility != self.canonical_bc_intersection() {
+            return Err(PrototypePopulationError::NonCanonicalEligibility);
+        }
         if eligibility.supported_gene_indices.is_empty() {
             return Err(PrototypePopulationError::EmptySupportedPartition);
         }
@@ -291,6 +340,10 @@ impl PrototypePopulationWorkload {
         Self::from_uploads(self.dataset.clone(), genes, scenarios, self.requirements)
     }
 
+    fn validate_invariants(&self) -> Result<(), PrototypePopulationError> {
+        validate_uploads(&self.dataset, &self.genes, &self.scenarios)
+    }
+
     fn adaptive_at_entry_is_supported(&self, stop_vol_multiplier: f64) -> bool {
         stop_vol_multiplier.is_finite()
             && stop_vol_multiplier > 0.0
@@ -325,6 +378,45 @@ fn insert_unsupported(
     candidate_id: u64,
 ) {
     unsupported.entry(reason).or_default().push(candidate_id);
+}
+
+fn invalid_workload_eligibility(candidate_ids: &[u64]) -> CommonBcEligibility {
+    CommonBcEligibility {
+        supported_candidate_ids: Vec::new(),
+        supported_gene_indices: Vec::new(),
+        unsupported: BTreeMap::from([(
+            PrototypeBcIneligibilityReason::InvalidWorkload,
+            candidate_ids.to_vec(),
+        )]),
+    }
+}
+
+fn validate_uploads(
+    dataset: &PrototypeADatasetUpload,
+    genes: &PrototypeAGeneUpload,
+    scenarios: &PrototypeAScenarioUpload,
+) -> Result<(), PrototypePopulationError> {
+    validate_dataset_shape(dataset)?;
+    PrototypeARebatchPlan::new(genes, scenarios, genes.population())?;
+
+    for (gene_position, index) in genes.indices.iter().copied().enumerate() {
+        if index < 0 || index as usize >= dataset.feature_count {
+            return Err(PrototypePopulationError::GeneFeatureIndexOutOfBounds {
+                gene_position,
+                index,
+                feature_count: dataset.feature_count,
+            });
+        }
+    }
+
+    let mut candidate_ids = BTreeSet::new();
+    for candidate_id in genes.candidate_ids.iter().copied() {
+        if !candidate_ids.insert(candidate_id) {
+            return Err(PrototypePopulationError::DuplicateCandidateId(candidate_id));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_dataset_shape(
@@ -398,6 +490,14 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn forged_all_supported() -> CommonBcEligibility {
+        CommonBcEligibility {
+            supported_candidate_ids: vec![0, 1],
+            supported_gene_indices: vec![0, 1],
+            unsupported: BTreeMap::new(),
+        }
     }
 
     #[test]
@@ -596,6 +696,125 @@ mod tests {
         assert_eq!(
             eligibility,
             workload.common_bc_intersection(PrototypeKind::CSparseFirstHit)
+        );
+    }
+
+    #[test]
+    fn partition_rejects_forged_global_trailing_and_prop_firm_eligibility() {
+        let mut trailing = mixed_fixed_and_adaptive_workload();
+        trailing.dataset.settings.trailing_enabled = true;
+        assert_eq!(
+            trailing.supported_partition(&forged_all_supported()),
+            Err(PrototypePopulationError::NonCanonicalEligibility)
+        );
+
+        let mut prop_firm = mixed_fixed_and_adaptive_workload();
+        prop_firm.requirements.prop_firm_state = PropFirmRequirement::Required;
+        assert_eq!(
+            prop_firm.supported_partition(&forged_all_supported()),
+            Err(PrototypePopulationError::NonCanonicalEligibility)
+        );
+    }
+
+    #[test]
+    fn partition_rejects_forged_candidate_exclusions_and_reordering() {
+        let mut adaptive = mixed_fixed_and_adaptive_workload();
+        adaptive.dataset.settings.adaptive_base_pips = None;
+        assert_eq!(
+            adaptive.supported_partition(&forged_all_supported()),
+            Err(PrototypePopulationError::NonCanonicalEligibility)
+        );
+
+        let mut scenario = mixed_fixed_and_adaptive_workload();
+        scenario.scenarios.scenarios[1].scenario_type = 99;
+        assert_eq!(
+            scenario.supported_partition(&forged_all_supported()),
+            Err(PrototypePopulationError::NonCanonicalEligibility)
+        );
+
+        let reordered = CommonBcEligibility {
+            supported_candidate_ids: vec![1, 0],
+            supported_gene_indices: vec![1, 0],
+            unsupported: BTreeMap::new(),
+        };
+        assert_eq!(
+            mixed_fixed_and_adaptive_workload().supported_partition(&reordered),
+            Err(PrototypePopulationError::NonCanonicalEligibility)
+        );
+    }
+
+    #[test]
+    fn malformed_serialized_workload_cannot_bypass_upload_validation() {
+        let workload = mixed_fixed_and_adaptive_workload();
+        let mut serialized = serde_json::to_value(workload).unwrap();
+        serialized["genes"]["stop_vol_multipliers"] = serde_json::json!([]);
+
+        let decoded = serde_json::from_value::<PrototypePopulationWorkload>(serialized);
+
+        assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn public_mutation_fails_closed_without_panicking() {
+        let mut workload = mixed_fixed_and_adaptive_workload();
+        workload.genes.stop_vol_multipliers.clear();
+
+        let eligibility = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workload.common_bc_intersection(PrototypeKind::BWarpCooperative)
+        }))
+        .expect("eligibility must reject malformed public state without panicking");
+        assert!(eligibility.supported_candidate_ids.is_empty());
+        assert_eq!(
+            eligibility
+                .unsupported
+                .get(&PrototypeBcIneligibilityReason::InvalidWorkload),
+            Some(&vec![0, 1])
+        );
+
+        let partition = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workload.supported_partition(&forged_all_supported())
+        }))
+        .expect("partition must reject malformed public state without panicking");
+        assert!(partition.is_err());
+    }
+
+    #[test]
+    fn cross_upload_gene_indices_are_validated_before_execution() {
+        let fixture = TinyPopulationFixture::new(2, 64, 4);
+        let (dataset, mut genes, scenarios) = fixture.prototype_a_uploads();
+        genes.indices[0] = -1;
+        assert_eq!(
+            PrototypePopulationWorkload::from_uploads(
+                dataset.clone(),
+                genes,
+                scenarios.clone(),
+                PrototypeBcRequirements {
+                    prop_firm_state: PropFirmRequirement::NotRequested,
+                },
+            ),
+            Err(PrototypePopulationError::GeneFeatureIndexOutOfBounds {
+                gene_position: 0,
+                index: -1,
+                feature_count: dataset.feature_count,
+            })
+        );
+
+        let (_, mut genes, _) = fixture.prototype_a_uploads();
+        genes.indices[0] = dataset.feature_count as i32;
+        assert_eq!(
+            PrototypePopulationWorkload::from_uploads(
+                dataset.clone(),
+                genes,
+                scenarios,
+                PrototypeBcRequirements {
+                    prop_firm_state: PropFirmRequirement::NotRequested,
+                },
+            ),
+            Err(PrototypePopulationError::GeneFeatureIndexOutOfBounds {
+                gene_position: 0,
+                index: dataset.feature_count as i32,
+                feature_count: dataset.feature_count,
+            })
         );
     }
 }
