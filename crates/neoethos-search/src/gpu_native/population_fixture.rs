@@ -9,6 +9,9 @@ use crate::gpu_native::parity_hierarchy::{
 use crate::gpu_native::prototype_a::{
     PrototypeADatasetUpload, PrototypeAGeneUpload, PrototypeAScenarioUpload,
 };
+use crate::gpu_native::prototype_population::{
+    PrototypeBcRequirements, PrototypePopulationError, PrototypePopulationWorkload,
+};
 use crate::gpu_native::snapshot_fixture::SnapshotSettingsDto;
 use ndarray::Array2;
 use neoethos_gpu_contracts::device::ScenarioDescriptor;
@@ -247,6 +250,14 @@ impl TinyPopulationFixture {
         )
     }
 
+    pub fn population_workload(
+        &self,
+        requirements: PrototypeBcRequirements,
+    ) -> Result<PrototypePopulationWorkload, PrototypePopulationError> {
+        let (dataset, genes, scenarios) = self.prototype_a_uploads();
+        PrototypePopulationWorkload::from_uploads(dataset, genes, scenarios, requirements)
+    }
+
     pub fn evaluate(
         &self,
         backend: EvaluationBackend,
@@ -465,5 +476,23 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("compiled without a GPU backend"));
         audit.snapshot().assert_zero_executed().unwrap();
+    }
+
+    #[test]
+    fn tiny_fixture_exports_an_explicit_bc_population_workload() {
+        let fixture = TinyPopulationFixture::new(2, 64, 4);
+        let workload = fixture
+            .population_workload(
+                crate::gpu_native::prototype_population::PrototypeBcRequirements {
+                    prop_firm_state:
+                        crate::gpu_native::prototype_population::PropFirmRequirement::NotRequested,
+                },
+            )
+            .unwrap();
+        let (dataset, genes, scenarios) = fixture.prototype_a_uploads();
+
+        assert_eq!(workload.dataset, dataset);
+        assert_eq!(workload.genes, genes);
+        assert_eq!(workload.scenarios, scenarios);
     }
 }

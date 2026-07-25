@@ -5,7 +5,14 @@ use crate::eval::{BacktestSettings, PopulationEvalInputs, SmcRow};
 use crate::gpu_native::cpu_strategy::CpuStrategyAuditContext;
 use crate::gpu_native::parity_hierarchy::TraceComparisonReport;
 use crate::gpu_native::population_fixture::TinyPopulationFixture;
+use crate::gpu_native::prototype_a::{
+    PrototypeADatasetUpload, PrototypeAGeneUpload, PrototypeAScenarioUpload,
+};
+use crate::gpu_native::prototype_population::{
+    PrototypeBcRequirements, PrototypePopulationError, PrototypePopulationWorkload,
+};
 use ndarray::Array2;
+use neoethos_gpu_contracts::device::ScenarioDescriptor;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -286,6 +293,58 @@ impl SnapshotPopulationFixture {
         (self.population() as u64).saturating_mul(self.bars() as u64)
     }
 
+    pub fn population_workload(
+        &self,
+        requirements: PrototypeBcRequirements,
+    ) -> Result<PrototypePopulationWorkload, PrototypePopulationError> {
+        let candidate_ids = (0..self.population())
+            .map(|index| index as u64)
+            .collect::<Vec<_>>();
+        let scenarios = candidate_ids
+            .iter()
+            .copied()
+            .map(|candidate_id| ScenarioDescriptor {
+                base_candidate_id: candidate_id,
+                scenario_id: candidate_id,
+                rng_counter: 0,
+                window_offset: 0,
+                window_len: self.bars() as u32,
+                scenario_type: 0,
+                ..ScenarioDescriptor::default()
+            })
+            .collect();
+        PrototypePopulationWorkload::from_uploads(
+            PrototypeADatasetUpload {
+                close: self.close.clone(),
+                high: self.high.clone(),
+                low: self.low.clone(),
+                indicators: self.indicators.iter().copied().collect(),
+                feature_count: self.features(),
+                months: self.months.clone(),
+                days: self.days.clone(),
+                timestamps: self.timestamps.clone(),
+                smc_data: self.smc_data.clone(),
+                settings: SnapshotSettingsDto::from_settings(&self.settings),
+            },
+            PrototypeAGeneUpload {
+                candidate_ids,
+                offsets: self.gene_offsets.clone(),
+                indices: self.gene_indices.clone(),
+                weights: self.gene_weights.clone(),
+                long_thresholds: self.long_thresholds.clone(),
+                short_thresholds: self.short_thresholds.clone(),
+                stop_pips: self.stop_pips.clone(),
+                target_pips: self.target_pips.clone(),
+                stop_vol_multipliers: self.stop_vol_multipliers.clone(),
+                smc_flags: self.gene_smc_flags.clone(),
+                smc_weights: self.smc_weights,
+                gate_threshold: 0.0,
+            },
+            PrototypeAScenarioUpload { scenarios },
+            requirements,
+        )
+    }
+
     pub fn evaluate(
         &self,
         backend: EvaluationBackend,
@@ -398,5 +457,24 @@ mod tests {
                 .unwrap_err()
                 .contains("high length")
         );
+    }
+
+    #[test]
+    fn snapshot_exports_an_explicit_bc_population_workload() {
+        let fixture = SnapshotPopulationFixture::from_dto(dto()).unwrap();
+        let workload = fixture
+            .population_workload(
+                crate::gpu_native::prototype_population::PrototypeBcRequirements {
+                    prop_firm_state:
+                        crate::gpu_native::prototype_population::PropFirmRequirement::NotRequested,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(workload.dataset.close, vec![1.0, 1.1, 1.2]);
+        assert_eq!(workload.genes.candidate_ids, vec![0]);
+        assert_eq!(workload.genes.indices, vec![0, 1]);
+        assert_eq!(workload.scenarios.scenarios[0].base_candidate_id, 0);
+        assert_eq!(workload.scenarios.scenarios[0].window_len, 3);
     }
 }
