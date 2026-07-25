@@ -293,10 +293,13 @@ impl SnapshotPopulationFixture {
         (self.population() as u64).saturating_mul(self.bars() as u64)
     }
 
-    pub fn population_workload(
+    pub fn prototype_a_uploads(
         &self,
-        requirements: PrototypeBcRequirements,
-    ) -> Result<PrototypePopulationWorkload, PrototypePopulationError> {
+    ) -> (
+        PrototypeADatasetUpload,
+        PrototypeAGeneUpload,
+        PrototypeAScenarioUpload,
+    ) {
         let candidate_ids = (0..self.population())
             .map(|index| index as u64)
             .collect::<Vec<_>>();
@@ -313,7 +316,7 @@ impl SnapshotPopulationFixture {
                 ..ScenarioDescriptor::default()
             })
             .collect();
-        PrototypePopulationWorkload::from_uploads(
+        (
             PrototypeADatasetUpload {
                 close: self.close.clone(),
                 high: self.high.clone(),
@@ -341,8 +344,15 @@ impl SnapshotPopulationFixture {
                 gate_threshold: 0.0,
             },
             PrototypeAScenarioUpload { scenarios },
-            requirements,
         )
+    }
+
+    pub fn population_workload(
+        &self,
+        requirements: PrototypeBcRequirements,
+    ) -> Result<PrototypePopulationWorkload, PrototypePopulationError> {
+        let (dataset, genes, scenarios) = self.prototype_a_uploads();
+        PrototypePopulationWorkload::from_uploads(dataset, genes, scenarios, requirements)
     }
 
     pub fn evaluate(
@@ -462,6 +472,7 @@ mod tests {
     #[test]
     fn snapshot_exports_an_explicit_bc_population_workload() {
         let fixture = SnapshotPopulationFixture::from_dto(dto()).unwrap();
+        let (dataset, genes, scenarios) = fixture.prototype_a_uploads();
         let workload = fixture
             .population_workload(
                 crate::gpu_native::prototype_population::PrototypeBcRequirements {
@@ -471,10 +482,17 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(workload.dataset.close, vec![1.0, 1.1, 1.2]);
-        assert_eq!(workload.genes.candidate_ids, vec![0]);
-        assert_eq!(workload.genes.indices, vec![0, 1]);
-        assert_eq!(workload.scenarios.scenarios[0].base_candidate_id, 0);
-        assert_eq!(workload.scenarios.scenarios[0].window_len, 3);
+        assert_eq!(workload.dataset, dataset);
+        assert_eq!(workload.genes, genes);
+        assert_eq!(workload.scenarios, scenarios);
+        assert_eq!(
+            workload.dataset.encode().unwrap(),
+            dataset.encode().unwrap()
+        );
+        assert_eq!(workload.genes.encode().unwrap(), genes.encode().unwrap());
+        assert_eq!(
+            workload.scenarios.encode().unwrap(),
+            scenarios.encode().unwrap()
+        );
     }
 }

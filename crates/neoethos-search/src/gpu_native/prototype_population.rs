@@ -38,23 +38,11 @@ pub enum PrototypeBcIneligibilityReason {
     UnsupportedScenario,
 }
 
-impl PrototypeBcIneligibilityReason {
-    pub const fn report_key(self) -> &'static str {
-        match self {
-            Self::GlobalTrailingOrBreakEven => "global_trailing_or_break_even",
-            Self::PropFirmStateRequired => "prop_firm_state_required",
-            Self::NonFiniteStaticLevels => "non_finite_static_levels",
-            Self::AdaptiveAtEntryUnavailable => "adaptive_at_entry_unavailable",
-            Self::UnsupportedScenario => "unsupported_scenario",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommonBcEligibility {
     pub supported_candidate_ids: Vec<u64>,
     pub supported_gene_indices: Vec<usize>,
-    pub unsupported: BTreeMap<String, Vec<u64>>,
+    pub unsupported: BTreeMap<PrototypeBcIneligibilityReason, Vec<u64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,16 +65,6 @@ impl CommonBcEligibility {
             supported_candidates: self.supported_candidate_ids.len(),
             unsupported_candidates: unsupported_ids.len(),
         }
-    }
-
-    pub fn full_workload_rejections(&self) -> Vec<PrototypeBcIneligibilityReason> {
-        [
-            PrototypeBcIneligibilityReason::GlobalTrailingOrBreakEven,
-            PrototypeBcIneligibilityReason::PropFirmStateRequired,
-        ]
-        .into_iter()
-        .filter(|reason| self.unsupported.contains_key(reason.report_key()))
-        .collect()
     }
 }
 
@@ -170,7 +148,7 @@ impl PrototypePopulationWorkload {
 
     pub fn common_bc_intersection(&self, _prototype: PrototypeKind) -> CommonBcEligibility {
         let candidate_ids = &self.genes.candidate_ids;
-        let mut unsupported = BTreeMap::<String, Vec<u64>>::new();
+        let mut unsupported = BTreeMap::<PrototypeBcIneligibilityReason, Vec<u64>>::new();
         let mut full_workload_rejections = Vec::new();
 
         if self.dataset.settings.trailing_enabled {
@@ -182,7 +160,7 @@ impl PrototypePopulationWorkload {
         }
         if !full_workload_rejections.is_empty() {
             for reason in full_workload_rejections.iter().copied() {
-                unsupported.insert(reason.report_key().to_owned(), candidate_ids.clone());
+                unsupported.insert(reason, candidate_ids.clone());
             }
             return CommonBcEligibility {
                 supported_candidate_ids: Vec::new(),
@@ -342,14 +320,11 @@ impl PrototypePopulationWorkload {
 }
 
 fn insert_unsupported(
-    unsupported: &mut BTreeMap<String, Vec<u64>>,
+    unsupported: &mut BTreeMap<PrototypeBcIneligibilityReason, Vec<u64>>,
     reason: PrototypeBcIneligibilityReason,
     candidate_id: u64,
 ) {
-    unsupported
-        .entry(reason.report_key().to_owned())
-        .or_default()
-        .push(candidate_id);
+    unsupported.entry(reason).or_default().push(candidate_id);
 }
 
 fn validate_dataset_shape(
@@ -497,8 +472,10 @@ mod tests {
 
         assert!(eligibility.supported_candidate_ids.is_empty());
         assert_eq!(
-            eligibility.full_workload_rejections(),
-            vec![PrototypeBcIneligibilityReason::GlobalTrailingOrBreakEven]
+            eligibility
+                .unsupported
+                .get(&PrototypeBcIneligibilityReason::GlobalTrailingOrBreakEven),
+            Some(&vec![0, 1])
         );
         assert_eq!(eligibility.coverage().total_candidates, 2);
         assert_eq!(eligibility.coverage().unsupported_candidates, 2);
@@ -522,8 +499,10 @@ mod tests {
 
         assert!(eligibility.supported_candidate_ids.is_empty());
         assert_eq!(
-            eligibility.full_workload_rejections(),
-            vec![PrototypeBcIneligibilityReason::PropFirmStateRequired]
+            eligibility
+                .unsupported
+                .get(&PrototypeBcIneligibilityReason::PropFirmStateRequired),
+            Some(&vec![0, 1])
         );
     }
 
@@ -550,7 +529,7 @@ mod tests {
         assert_eq!(
             eligibility
                 .unsupported
-                .get(PrototypeBcIneligibilityReason::UnsupportedScenario.report_key()),
+                .get(&PrototypeBcIneligibilityReason::UnsupportedScenario),
             Some(&vec![1])
         );
         assert_eq!(partition.genes.candidate_ids, vec![0]);
@@ -579,13 +558,13 @@ mod tests {
         assert_eq!(
             eligibility
                 .unsupported
-                .get(PrototypeBcIneligibilityReason::NonFiniteStaticLevels.report_key()),
+                .get(&PrototypeBcIneligibilityReason::NonFiniteStaticLevels),
             Some(&vec![0])
         );
         assert_eq!(
             eligibility
                 .unsupported
-                .get(PrototypeBcIneligibilityReason::AdaptiveAtEntryUnavailable.report_key()),
+                .get(&PrototypeBcIneligibilityReason::AdaptiveAtEntryUnavailable),
             Some(&vec![1])
         );
     }
