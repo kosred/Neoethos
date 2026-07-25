@@ -9,7 +9,9 @@ mkdir -p "$ROOT"
 ROOT="$(cd "$ROOT" && pwd)"
 
 ensure_worktree() {
-  local name="$1" sha="$2" path="$ROOT/$name"
+  local name="$1"
+  local sha="$2"
+  local path="$ROOT/$name"
   if [[ -e "$path/.git" || -f "$path/.git" ]]; then
     actual="$(git -C "$path" rev-parse HEAD)"
     if [[ "$actual" != "$sha" ]]; then

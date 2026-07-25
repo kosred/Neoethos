@@ -79,8 +79,10 @@ jobs:
             scripts/gpu-bench/run_matrix.py \
             scripts/gpu-bench/collate.py \
             scripts/gpu-bench/prepare_snapshot.py \
+            scripts/gpu-bench/test_prepare_worktrees.py \
             scripts/gpu-bench/test_preflight_contract.py \
             scripts/gpu-bench/test_stage1_ci_contract.py
+          python3 scripts/gpu-bench/test_prepare_worktrees.py
           python3 scripts/gpu-bench/test_preflight_contract.py
           python3 scripts/gpu-bench/test_stage1_ci_contract.py
           tmp="$(mktemp -d)"
