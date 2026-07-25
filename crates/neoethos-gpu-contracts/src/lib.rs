@@ -7,6 +7,15 @@
 use serde::{Deserialize, Serialize};
 
 pub const ABI_VERSION: u32 = 1;
+pub const POPULATION_SETTINGS_FLAG_RISK_BASED_SIZING: u32 = 1 << 0;
+pub const POPULATION_PRECEDENCE_STOP_FIRST: u32 = 0;
+pub const POPULATION_DIRECTION_LONG: i32 = 1;
+pub const POPULATION_DIRECTION_SHORT: i32 = -1;
+pub const POPULATION_EXIT_NONE: i32 = 0;
+pub const POPULATION_EXIT_STOP: i32 = 1;
+pub const POPULATION_EXIT_TARGET: i32 = 2;
+pub const POPULATION_EXIT_MAX_HOLD: i32 = 3;
+pub const POPULATION_EXIT_GAP: i32 = 4;
 
 pub mod host {
     use super::*;
@@ -168,6 +177,79 @@ pub mod device {
         pub flags: u32,
     }
 
+    /// Fixed-width settings shared by Prototype B/C native entry points.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+    pub struct NeoPopulationSettings {
+        pub abi_version: u32,
+        pub flags: u32,
+        pub max_hold_bars: u32,
+        pub min_hold_bars: u32,
+        pub max_trades_per_day: u32,
+        pub month_capacity: u32,
+        pub gap_threshold_ms: i64,
+        pub initial_equity: f64,
+        pub pip_value: f64,
+        pub spread_pips: f64,
+        pub commission_per_trade: f64,
+        pub pip_value_per_lot: f64,
+        pub swap_long_pips_per_day: f64,
+        pub swap_short_pips_per_day: f64,
+        pub pnl_conversion_fee_rate: f64,
+        pub risk_per_trade_min: f64,
+        pub risk_per_trade_max: f64,
+        pub high_quality_confidence: f64,
+        pub adaptive_rr: f64,
+    }
+
+    /// Canonical causal entry emitted from a signal observed on the prior bar.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+    pub struct NeoPopulationEvent {
+        pub candidate_id: u64,
+        pub scenario_id: u64,
+        pub entry_bar: u32,
+        pub last_bar: u32,
+        pub direction: i32,
+        pub precedence: u32,
+        pub stop_price: f64,
+        pub target_price: f64,
+    }
+
+    /// First-hit result positionally aligned with its input event.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct NeoPopulationOutcome {
+        pub candidate_id: u64,
+        pub scenario_id: u64,
+        pub exit_bar: i32,
+        pub exit_reason: i32,
+    }
+
+    /// Raw canonical level-10 metric row. Slot seven is the monthly hit rate.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+    pub struct NeoPopulationMetricRow {
+        pub candidate_id: u64,
+        pub scenario_id: u64,
+        pub values: [f64; 11],
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct NeoPopulationCounters {
+        pub event_count: u64,
+        pub accepted_trade_count: u64,
+        pub kernel_submissions: u64,
+        pub synchronization_events: u64,
+        pub dataset_upload_bytes: u64,
+        pub gene_upload_bytes: u64,
+        pub scenario_upload_bytes: u64,
+        pub compact_readback_bytes: u64,
+        pub full_readback_bytes: u64,
+        pub reserved: [u64; 3],
+    }
+
     const _: () = {
         use core::mem::{align_of, offset_of, size_of};
 
@@ -193,6 +275,29 @@ pub mod device {
         assert!(size_of::<TradeOutcome>() == 56);
         assert!(size_of::<Metrics>() == 80);
         assert!(size_of::<PropFirmState>() == 56);
+
+        assert!(size_of::<NeoPopulationSettings>() == 128);
+        assert!(align_of::<NeoPopulationSettings>() == 8);
+        assert!(offset_of!(NeoPopulationSettings, gap_threshold_ms) == 24);
+        assert!(offset_of!(NeoPopulationSettings, initial_equity) == 32);
+        assert!(offset_of!(NeoPopulationSettings, adaptive_rr) == 120);
+
+        assert!(size_of::<NeoPopulationEvent>() == 48);
+        assert!(align_of::<NeoPopulationEvent>() == 8);
+        assert!(offset_of!(NeoPopulationEvent, direction) == 24);
+        assert!(offset_of!(NeoPopulationEvent, stop_price) == 32);
+
+        assert!(size_of::<NeoPopulationOutcome>() == 24);
+        assert!(align_of::<NeoPopulationOutcome>() == 8);
+        assert!(offset_of!(NeoPopulationOutcome, exit_bar) == 16);
+
+        assert!(size_of::<NeoPopulationMetricRow>() == 104);
+        assert!(align_of::<NeoPopulationMetricRow>() == 8);
+        assert!(offset_of!(NeoPopulationMetricRow, values) == 16);
+
+        assert!(size_of::<NeoPopulationCounters>() == 96);
+        assert!(align_of::<NeoPopulationCounters>() == 8);
+        assert!(offset_of!(NeoPopulationCounters, reserved) == 72);
     };
 }
 
