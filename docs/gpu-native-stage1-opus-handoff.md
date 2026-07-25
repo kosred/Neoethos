@@ -35,6 +35,8 @@ Read first:
 
 ## Remaining card-independent Stage 1 gaps
 
+Complete these as two focused commits. Run the full read-only CI after each commit and include a short change report.
+
 ### Gap A — real Prototype-A `BacktestEngine` implementation
 
 Implement the existing full-semantics fused evaluator behind the generic `BacktestEngine` contract without fabricating device residency.
@@ -77,6 +79,22 @@ Acceptance requirements:
 - levels 10–12 continue through the deterministic integration harness.
 
 Do not claim twelve-level engine parity while levels 4–9 are represented only by final metrics.
+
+## Verification order
+
+After each remaining gap:
+
+1. formatting check for changed Rust files;
+2. `cargo test -p neoethos-gpu-contracts`;
+3. `cargo test -p neoethos-gpu-cuda`;
+4. `cargo test -p neoethos-search`;
+5. `cargo check -p neoethos-cli`;
+6. `cargo check -p neoethos-search --features gpu-vulkan`;
+7. `cargo check -p neoethos-cli --features gpu-vulkan`;
+8. direct WGPU Prototype-C and trace probes when a Vulkan adapter exists;
+9. confirm that hosted no-adapter skips match only the known CubeCL adapter-absence signature.
+
+Do not mark the PR ready for review until this matrix is green or an exact blocker is documented.
 
 ## Real-A6000 gate after the two gaps
 
