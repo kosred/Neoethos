@@ -44,6 +44,15 @@ pub enum PopulationOracleError {
         outcome_candidate_id: u64,
         outcome_scenario_id: u64,
     },
+    OutcomeSemanticMismatch {
+        index: usize,
+        candidate_id: u64,
+        scenario_id: u64,
+        expected_exit_bar: i32,
+        expected_exit_reason: i32,
+        actual_exit_bar: i32,
+        actual_exit_reason: i32,
+    },
 }
 
 impl fmt::Display for PopulationOracleError {
@@ -69,6 +78,20 @@ impl fmt::Display for PopulationOracleError {
                 f,
                 "population outcome {index} identity ({outcome_candidate_id}, {outcome_scenario_id}) \
                  does not match event identity ({event_candidate_id}, {event_scenario_id})"
+            ),
+            Self::OutcomeSemanticMismatch {
+                index,
+                candidate_id,
+                scenario_id,
+                expected_exit_bar,
+                expected_exit_reason,
+                actual_exit_bar,
+                actual_exit_reason,
+            } => write!(
+                f,
+                "population outcome {index} for ({candidate_id}, {scenario_id}) has exit \
+                 ({actual_exit_bar}, {actual_exit_reason}), expected \
+                 ({expected_exit_bar}, {expected_exit_reason}) for its positional event"
             ),
         }
     }
@@ -313,7 +336,7 @@ fn reduce_population_outcomes_with_signals(
     events: &[NeoPopulationEvent],
     outcomes: &[NeoPopulationOutcome],
 ) -> Result<(Vec<NeoPopulationMetricRow>, u64), PopulationOracleError> {
-    validate_outcome_alignment(events, outcomes)?;
+    validate_outcome_alignment(workload, events, outcomes)?;
     let settings = workload.dataset.settings.to_settings();
     if settings.trailing_enabled {
         return Err(PopulationOracleError::UnsupportedTrailingState);
@@ -347,6 +370,7 @@ fn reduce_population_outcomes_with_signals(
 }
 
 fn validate_outcome_alignment(
+    workload: &PrototypePopulationWorkload,
     events: &[NeoPopulationEvent],
     outcomes: &[NeoPopulationOutcome],
 ) -> Result<(), PopulationOracleError> {
@@ -364,6 +388,22 @@ fn validate_outcome_alignment(
                 event_scenario_id: event.scenario_id,
                 outcome_candidate_id: outcome.candidate_id,
                 outcome_scenario_id: outcome.scenario_id,
+            });
+        }
+    }
+    let expected = resolve_population_outcomes(workload, events)?;
+    for (index, ((event, expected), actual)) in
+        events.iter().zip(expected.iter()).zip(outcomes).enumerate()
+    {
+        if expected.exit_bar != actual.exit_bar || expected.exit_reason != actual.exit_reason {
+            return Err(PopulationOracleError::OutcomeSemanticMismatch {
+                index,
+                candidate_id: event.candidate_id,
+                scenario_id: event.scenario_id,
+                expected_exit_bar: expected.exit_bar,
+                expected_exit_reason: expected.exit_reason,
+                actual_exit_bar: actual.exit_bar,
+                actual_exit_reason: actual.exit_reason,
             });
         }
     }
@@ -1192,6 +1232,39 @@ mod tests {
                 "gap/re-entry metric slot {slot}: oracle={oracle}, cpu={cpu}"
             );
         }
+    }
+
+    #[test]
+    fn reduction_rejects_reordered_same_identity_outcomes() {
+        let mut workload = canonical_cost_fixture();
+        workload.dataset.settings.gap_threshold_ms = 86_400_000;
+        workload.dataset.indicators[1] = 1.0;
+        let events = emit_population_events(&workload).unwrap();
+        let mut outcomes = resolve_population_outcomes(&workload, &events).unwrap();
+
+        assert_eq!(
+            (events[0].candidate_id, events[0].scenario_id),
+            (events[1].candidate_id, events[1].scenario_id)
+        );
+        assert_ne!(
+            (outcomes[0].exit_bar, outcomes[0].exit_reason),
+            (outcomes[1].exit_bar, outcomes[1].exit_reason)
+        );
+        assert!(reduce_population_outcomes(&workload, &events, &outcomes).is_ok());
+
+        outcomes.swap(0, 1);
+        assert_eq!(
+            reduce_population_outcomes(&workload, &events, &outcomes),
+            Err(PopulationOracleError::OutcomeSemanticMismatch {
+                index: 0,
+                candidate_id: 101,
+                scenario_id: 1001,
+                expected_exit_bar: 2,
+                expected_exit_reason: neoethos_gpu_contracts::POPULATION_EXIT_GAP,
+                actual_exit_bar: -1,
+                actual_exit_reason: neoethos_gpu_contracts::POPULATION_EXIT_NONE,
+            })
+        );
     }
 
     #[test]
