@@ -6,7 +6,12 @@ use crate::gpu_native::cpu_strategy::CpuStrategyAuditContext;
 use crate::gpu_native::parity_hierarchy::{
     FloatTolerance, ParityPolicy, ParityTrace, TraceComparisonReport, compare_traces,
 };
+use crate::gpu_native::prototype_a::{
+    PrototypeADatasetUpload, PrototypeAGeneUpload, PrototypeAScenarioUpload,
+};
+use crate::gpu_native::snapshot_fixture::SnapshotSettingsDto;
 use ndarray::Array2;
+use neoethos_gpu_contracts::device::ScenarioDescriptor;
 
 #[derive(Debug, Clone)]
 pub struct TinyPopulationFixture {
@@ -138,6 +143,60 @@ impl TinyPopulationFixture {
 
     pub fn candidate_bars(&self) -> u64 {
         (self.population() as u64).saturating_mul(self.bars() as u64)
+    }
+
+    pub fn prototype_a_uploads(
+        &self,
+    ) -> (
+        PrototypeADatasetUpload,
+        PrototypeAGeneUpload,
+        PrototypeAScenarioUpload,
+    ) {
+        let candidate_ids = (0..self.population())
+            .map(|index| index as u64)
+            .collect::<Vec<_>>();
+        let scenarios = candidate_ids
+            .iter()
+            .copied()
+            .map(|candidate_id| ScenarioDescriptor {
+                base_candidate_id: candidate_id,
+                scenario_id: candidate_id,
+                rng_counter: 0,
+                window_offset: 0,
+                window_len: self.bars() as u32,
+                scenario_type: 0,
+                ..ScenarioDescriptor::default()
+            })
+            .collect();
+        (
+            PrototypeADatasetUpload {
+                close: self.close.clone(),
+                high: self.high.clone(),
+                low: self.low.clone(),
+                indicators: self.indicators.iter().copied().collect(),
+                feature_count: self.features(),
+                months: self.months.clone(),
+                days: self.days.clone(),
+                timestamps: self.timestamps.clone(),
+                smc_data: self.smc_data.clone(),
+                settings: SnapshotSettingsDto::from_settings(&self.settings),
+            },
+            PrototypeAGeneUpload {
+                candidate_ids,
+                offsets: self.gene_offsets.clone(),
+                indices: self.gene_indices.clone(),
+                weights: self.gene_weights.clone(),
+                long_thresholds: self.long_thresholds.clone(),
+                short_thresholds: self.short_thresholds.clone(),
+                stop_pips: self.stop_pips.clone(),
+                target_pips: self.target_pips.clone(),
+                stop_vol_multipliers: self.stop_vol_multipliers.clone(),
+                smc_flags: self.gene_smc_flags.clone(),
+                smc_weights: self.smc_weights,
+                gate_threshold: 0.0,
+            },
+            PrototypeAScenarioUpload { scenarios },
+        )
     }
 
     pub fn evaluate(

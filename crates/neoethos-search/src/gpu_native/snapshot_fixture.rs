@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 pub const SNAPSHOT_FIXTURE_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotSettingsDto {
     pub max_hold_bars: usize,
     pub min_hold_bars: usize,
@@ -38,7 +38,35 @@ pub struct SnapshotSettingsDto {
 }
 
 impl SnapshotSettingsDto {
-    fn to_settings(&self) -> BacktestSettings {
+    pub(crate) fn from_settings(settings: &BacktestSettings) -> Self {
+        Self {
+            max_hold_bars: settings.max_hold_bars,
+            min_hold_bars: settings.min_hold_bars,
+            max_trades_per_day: settings.max_trades_per_day,
+            gap_threshold_ms: settings.gap_threshold_ms,
+            trailing_enabled: settings.trailing_enabled,
+            trailing_atr_multiplier: settings.trailing_atr_multiplier,
+            trailing_be_trigger_r: settings.trailing_be_trigger_r,
+            pip_value: settings.pip_value,
+            spread_pips: settings.spread_pips,
+            commission_per_trade: settings.commission_per_trade,
+            pip_value_per_lot: settings.pip_value_per_lot,
+            swap_long_pips_per_day: settings.swap_long_pips_per_day,
+            swap_short_pips_per_day: settings.swap_short_pips_per_day,
+            pnl_conversion_fee_rate: settings.pnl_conversion_fee_rate,
+            risk_based_sizing: settings.risk_based_sizing,
+            risk_per_trade_min: settings.risk_per_trade_min,
+            risk_per_trade_max: settings.risk_per_trade_max,
+            high_quality_confidence: settings.high_quality_confidence,
+            adaptive_base_pips: settings
+                .adaptive_base_pips
+                .as_ref()
+                .map(|values| values.to_vec()),
+            adaptive_rr: settings.adaptive_rr,
+        }
+    }
+
+    pub(crate) fn to_settings(&self) -> BacktestSettings {
         let mut settings = BacktestSettings::default();
         settings.max_hold_bars = self.max_hold_bars;
         settings.min_hold_bars = self.min_hold_bars;

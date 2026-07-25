@@ -9,8 +9,12 @@ use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 use half::bf16;
 use ndarray::ArrayView2;
 use neoethos_core::TrainingPrecision;
+use neoethos_gpu_contracts::device::ScenarioDescriptor;
 
 use crate::eval::{BacktestSettings, SmcRow};
+use crate::gpu_native::prototype_a::{
+    PrototypeADatasetUpload, PrototypeAGeneUpload, PrototypeAScenarioUpload,
+};
 
 const SMC_WIDTH: usize = 11;
 const BACKTEST_CORE_METRIC_WIDTH: usize = 7;
@@ -775,6 +779,7 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
     // precision the CPU uses; written only where the final signal survives.
     confidences_out: &mut Array<f32>,
     n_samples: u32,
+    gene_start: u32,
     gate_threshold: F,
 ) {
     // cubecl 0.9: ABSOLUTE_POS and Array::len() are `usize`, and array
@@ -788,7 +793,7 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
     let pos = ABSOLUTE_POS;
     if pos < output.len() {
         let n_samples = n_samples as usize;
-        let gene = pos / n_samples;
+        let gene = (pos / n_samples) + gene_start as usize;
         let sample = pos % n_samples;
 
         let start = gene_offsets[gene] as usize;
@@ -916,6 +921,8 @@ fn backtest_population_kernel(
     monthly_pnls_out: &mut Array<f32>,
     month_counts_out: &mut Array<i32>,
     n_samples: u32,
+    gene_start: u32,
+    gene_count: u32,
     month_capacity: u32,
     initial_equity: f32,
     max_hold_bars: u32,
@@ -972,14 +979,15 @@ fn backtest_population_kernel(
     // Every scalar accumulator that gets reassigned must use RuntimeCell —
     // `let mut x = literal;` and `let mut x = param;` both produce
     // immutable bindings in cubecl 0.9, and any later `=`/`+=` panics.
-    if ABSOLUTE_POS < trade_counts_out.len() {
-        let gene = ABSOLUTE_POS;
+    if ABSOLUTE_POS < gene_count as usize {
+        let local_gene = ABSOLUTE_POS;
+        let gene = local_gene + gene_start as usize;
         let n_samples = n_samples as usize;
         let month_capacity = month_capacity as usize;
         let max_hold_bars = max_hold_bars as usize;
         let min_hold_bars = min_hold_bars as usize;
         let max_trades_per_day = max_trades_per_day as usize;
-        let signal_base = gene * n_samples;
+        let signal_base = local_gene * n_samples;
         let month_base = gene * month_capacity;
         let metric_base = gene * BACKTEST_CORE_METRIC_WIDTH;
         let ftmo_base = gene * FTMO_WIDTH;
@@ -2489,6 +2497,7 @@ where
             unsafe { ArrayArg::from_raw_parts(output_handle.clone(), total) },
             unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
             n_samples as u32,
+            0,
             gate_threshold,
         );
     }); // end gpu_timing::kernel
@@ -2870,6 +2879,8 @@ fn launch_backtest_kernel<R: Runtime>(
             unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
             unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
             n_samples as u32,
+            0,
+            n_genes as u32,
             month_capacity as u32,
             settings.initial_equity() as f32,
             settings.max_hold_bars as u32,
@@ -3282,17 +3293,676 @@ pub fn ensure_fused_eval_decided() {
     let _ = fused_eval_enabled();
 }
 
-/// FUSED windowed signal-synth + backtest for ONE gene-batch. The signal kernel
+pub(crate) struct PrototypeADatasetWindow {
+    sample_start: usize,
+    sample_len: usize,
+    indicators: cubecl::server::Handle,
+    smc_data: cubecl::server::Handle,
+}
+
+pub(crate) struct PrototypeADatasetResident {
+    windows: Vec<PrototypeADatasetWindow>,
+    close: cubecl::server::Handle,
+    high: cubecl::server::Handle,
+    low: cubecl::server::Handle,
+    timestamp_deltas: cubecl::server::Handle,
+    months: cubecl::server::Handle,
+    days: cubecl::server::Handle,
+    adaptive_base: cubecl::server::Handle,
+    adaptive_base_len: usize,
+    signals_workspace: cubecl::server::Handle,
+    confidences_workspace: cubecl::server::Handle,
+    window_signals_workspace: cubecl::server::Handle,
+    window_confidences_workspace: cubecl::server::Handle,
+    workspace_gene_capacity: usize,
+    pub(crate) n_samples: usize,
+    pub(crate) n_indicators: usize,
+    use_timestamps: bool,
+    pub(crate) month_capacity: usize,
+    settings: BacktestSettings,
+    pub(crate) upload_bytes: usize,
+    pub(crate) workspace_allocations: u64,
+}
+
+pub(crate) struct PrototypeAGenesResident {
+    _candidate_ids: cubecl::server::Handle,
+    offsets: cubecl::server::Handle,
+    indices: cubecl::server::Handle,
+    weights: cubecl::server::Handle,
+    long_thresholds: cubecl::server::Handle,
+    short_thresholds: cubecl::server::Handle,
+    stop_pips: cubecl::server::Handle,
+    target_pips: cubecl::server::Handle,
+    stop_vol_multipliers: cubecl::server::Handle,
+    smc_flags: cubecl::server::Handle,
+    smc_weights: cubecl::server::Handle,
+    metrics_workspace: cubecl::server::Handle,
+    trade_counts_workspace: cubecl::server::Handle,
+    monthly_workspace: cubecl::server::Handle,
+    month_counts_workspace: cubecl::server::Handle,
+    month_start_eq_workspace: cubecl::server::Handle,
+    ftmo_workspace: cubecl::server::Handle,
+    month_capacity: usize,
+    gate_threshold: f32,
+    any_adaptive: bool,
+    pub(crate) canonical_candidate_ids: Vec<u64>,
+    pub(crate) n_genes: usize,
+    pub(crate) upload_bytes: usize,
+    pub(crate) workspace_allocations: u64,
+}
+
+pub(crate) struct PrototypeAScenariosResident {
+    #[allow(dead_code)]
+    descriptors: cubecl::server::Handle,
+    pub(crate) canonical_descriptors: Vec<ScenarioDescriptor>,
+    pub(crate) upload_bytes: usize,
+}
+
+pub(crate) fn upload_prototype_a_dataset<R: Runtime>(
+    client: &ComputeClient<R>,
+    upload: &PrototypeADatasetUpload,
+    max_gene_batch: usize,
+) -> Result<PrototypeADatasetResident> {
+    let n_samples = upload.close.len();
+    let n_indicators = upload.feature_count;
+    if n_samples == 0
+        || n_indicators == 0
+        || upload.indicators.len() != n_samples.saturating_mul(n_indicators)
+    {
+        bail!("Prototype A dataset upload has inconsistent dimensions");
+    }
+    let settings = upload.settings.to_settings();
+    let close = normalize_prices_to_pips(&upload.close, settings.pip_value);
+    let high = normalize_prices_to_pips(&upload.high, settings.pip_value);
+    let low = normalize_prices_to_pips(&upload.low, settings.pip_value);
+    let (timestamp_deltas, use_timestamps) = timestamp_delta_ms(&upload.timestamps, n_samples);
+    let months = upload
+        .months
+        .iter()
+        .map(|value| saturating_i32(*value))
+        .collect::<Vec<_>>();
+    let days = upload
+        .days
+        .iter()
+        .map(|value| saturating_i32(*value))
+        .collect::<Vec<_>>();
+    let smc_data = flatten_i32_rows(&upload.smc_data);
+    let adaptive_base = settings
+        .adaptive_base_pips
+        .as_ref()
+        .filter(|values| values.len() == n_samples)
+        .map(|values| values.iter().map(|value| *value as f32).collect::<Vec<_>>())
+        .unwrap_or_else(|| vec![0.0]);
+    let adaptive_base_len = adaptive_base.len();
+
+    let workspace_gene_capacity =
+        backtest_gene_batch(max_gene_batch.max(1), n_samples).min(max_gene_batch.max(1));
+    let window_size = signal_window_size(n_indicators, workspace_gene_capacity, n_samples);
+    let mut windows = Vec::new();
+    let mut sample_start = 0usize;
+    while sample_start < n_samples {
+        let sample_end = (sample_start + window_size).min(n_samples);
+        let indicators = gather_indicator_window(
+            &upload.indicators,
+            n_indicators,
+            n_samples,
+            sample_start,
+            sample_end,
+        );
+        let smc_start = sample_start.saturating_mul(SMC_WIDTH);
+        let smc_end = sample_end.saturating_mul(SMC_WIDTH);
+        windows.push(PrototypeADatasetWindow {
+            sample_start,
+            sample_len: sample_end - sample_start,
+            indicators: client.create_from_slice(f32::as_bytes(&indicators)),
+            smc_data: client.create_from_slice(i32::as_bytes(&smc_data[smc_start..smc_end])),
+        });
+        sample_start = sample_end;
+    }
+
+    let upload_bytes = upload
+        .indicators
+        .len()
+        .saturating_mul(std::mem::size_of::<f32>())
+        .saturating_add(smc_data.len().saturating_mul(std::mem::size_of::<i32>()))
+        .saturating_add(
+            (close.len() + high.len() + low.len() + adaptive_base.len())
+                .saturating_mul(std::mem::size_of::<f32>()),
+        )
+        .saturating_add(
+            (timestamp_deltas.len() + months.len() + days.len())
+                .saturating_mul(std::mem::size_of::<i32>()),
+        );
+    let signal_workspace_len = workspace_gene_capacity.saturating_mul(n_samples);
+    let window_workspace_len = workspace_gene_capacity.saturating_mul(window_size);
+    Ok(PrototypeADatasetResident {
+        windows,
+        close: client.create_from_slice(f32::as_bytes(&close)),
+        high: client.create_from_slice(f32::as_bytes(&high)),
+        low: client.create_from_slice(f32::as_bytes(&low)),
+        timestamp_deltas: client.create_from_slice(i32::as_bytes(&timestamp_deltas)),
+        months: client.create_from_slice(i32::as_bytes(&months)),
+        days: client.create_from_slice(i32::as_bytes(&days)),
+        adaptive_base: client.create_from_slice(f32::as_bytes(&adaptive_base)),
+        adaptive_base_len,
+        signals_workspace: client
+            .empty(signal_workspace_len.saturating_mul(std::mem::size_of::<i32>())),
+        confidences_workspace: client
+            .empty(signal_workspace_len.saturating_mul(std::mem::size_of::<f32>())),
+        window_signals_workspace: client
+            .empty(window_workspace_len.saturating_mul(std::mem::size_of::<i32>())),
+        window_confidences_workspace: client
+            .empty(window_workspace_len.saturating_mul(std::mem::size_of::<f32>())),
+        workspace_gene_capacity,
+        n_samples,
+        n_indicators,
+        use_timestamps,
+        month_capacity: settings.month_capacity(),
+        settings,
+        upload_bytes,
+        workspace_allocations: 4,
+    })
+}
+
+pub(crate) fn upload_prototype_a_genes<R: Runtime>(
+    client: &ComputeClient<R>,
+    upload: &PrototypeAGeneUpload,
+    month_capacity: usize,
+) -> Result<PrototypeAGenesResident> {
+    let n_genes = upload.candidate_ids.len();
+    if n_genes == 0 || upload.offsets.len() != n_genes + 1 {
+        bail!("Prototype A gene upload has inconsistent dimensions");
+    }
+    let smc_flags = flatten_i32_flags(&upload.smc_flags);
+    let stop_pips = upload
+        .stop_pips
+        .iter()
+        .map(|value| *value as f32)
+        .collect::<Vec<_>>();
+    let target_pips = upload
+        .target_pips
+        .iter()
+        .map(|value| *value as f32)
+        .collect::<Vec<_>>();
+    let stop_vol_multipliers = upload
+        .stop_vol_multipliers
+        .iter()
+        .map(|value| *value as f32)
+        .collect::<Vec<_>>();
+    let upload_bytes = upload
+        .candidate_ids
+        .len()
+        .saturating_mul(std::mem::size_of::<u64>())
+        .saturating_add(
+            (upload.offsets.len() + upload.indices.len() + smc_flags.len())
+                .saturating_mul(std::mem::size_of::<i32>()),
+        )
+        .saturating_add(
+            (upload.weights.len()
+                + upload.long_thresholds.len()
+                + upload.short_thresholds.len()
+                + stop_pips.len()
+                + target_pips.len()
+                + stop_vol_multipliers.len()
+                + upload.smc_weights.len())
+            .saturating_mul(std::mem::size_of::<f32>()),
+        );
+    let metrics_len = n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+    let monthly_len = n_genes.saturating_mul(month_capacity);
+    let ftmo_len = n_genes.saturating_mul(FTMO_WIDTH);
+    Ok(PrototypeAGenesResident {
+        _candidate_ids: client.create_from_slice(u64::as_bytes(&upload.candidate_ids)),
+        offsets: client.create_from_slice(i32::as_bytes(&upload.offsets)),
+        indices: client.create_from_slice(i32::as_bytes(&upload.indices)),
+        weights: client.create_from_slice(f32::as_bytes(&upload.weights)),
+        long_thresholds: client.create_from_slice(f32::as_bytes(&upload.long_thresholds)),
+        short_thresholds: client.create_from_slice(f32::as_bytes(&upload.short_thresholds)),
+        stop_pips: client.create_from_slice(f32::as_bytes(&stop_pips)),
+        target_pips: client.create_from_slice(f32::as_bytes(&target_pips)),
+        stop_vol_multipliers: client.create_from_slice(f32::as_bytes(&stop_vol_multipliers)),
+        smc_flags: client.create_from_slice(i32::as_bytes(&smc_flags)),
+        smc_weights: client.create_from_slice(f32::as_bytes(&upload.smc_weights)),
+        metrics_workspace: client.empty(metrics_len.saturating_mul(std::mem::size_of::<f32>())),
+        trade_counts_workspace: client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+        monthly_workspace: client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>())),
+        month_counts_workspace: client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+        month_start_eq_workspace: client
+            .empty(monthly_len.saturating_mul(std::mem::size_of::<f32>())),
+        ftmo_workspace: client.empty(ftmo_len.saturating_mul(std::mem::size_of::<f32>())),
+        month_capacity,
+        gate_threshold: upload.gate_threshold,
+        any_adaptive: upload.stop_vol_multipliers.iter().any(|value| *value > 0.0),
+        canonical_candidate_ids: upload.candidate_ids.clone(),
+        n_genes,
+        upload_bytes,
+        workspace_allocations: 6,
+    })
+}
+
+pub(crate) fn upload_prototype_a_scenarios<R: Runtime>(
+    client: &ComputeClient<R>,
+    upload: &PrototypeAScenarioUpload,
+) -> Result<PrototypeAScenariosResident> {
+    if upload.scenarios.is_empty() {
+        bail!("Prototype A scenario upload is empty");
+    }
+    let bytes = encode_scenario_descriptors(&upload.scenarios);
+    Ok(PrototypeAScenariosResident {
+        descriptors: client.create_from_slice(&bytes),
+        canonical_descriptors: upload.scenarios.clone(),
+        upload_bytes: bytes.len(),
+    })
+}
+
+fn encode_scenario_descriptors(scenarios: &[ScenarioDescriptor]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(
+        scenarios
+            .len()
+            .saturating_mul(std::mem::size_of::<ScenarioDescriptor>()),
+    );
+    for scenario in scenarios {
+        bytes.extend_from_slice(&scenario.base_candidate_id.to_le_bytes());
+        bytes.extend_from_slice(&scenario.scenario_id.to_le_bytes());
+        bytes.extend_from_slice(&scenario.rng_counter.to_le_bytes());
+        bytes.extend_from_slice(&scenario.window_offset.to_le_bytes());
+        bytes.extend_from_slice(&scenario.window_len.to_le_bytes());
+        bytes.extend_from_slice(&scenario.scenario_type.to_le_bytes());
+        bytes.extend_from_slice(&scenario.spread_ticks.to_le_bytes());
+        bytes.extend_from_slice(&scenario.slippage_ticks.to_le_bytes());
+        bytes.extend_from_slice(&scenario.commission_micros.to_le_bytes());
+        bytes.extend_from_slice(&scenario.perturbation_offset.to_le_bytes());
+        bytes.extend_from_slice(&scenario.perturbation_count.to_le_bytes());
+        bytes.extend_from_slice(&scenario.reserved.to_le_bytes());
+    }
+    bytes
+}
+
+/// Device-resident output of a fused gene-batch backtest: the six per-gene metric
+/// buffers stay ON THE GPU (a cheap Arc-backed `ComputeClient` clone keeps the
+/// server alive) and are read to host exactly ONCE, later, by
+/// [`read_fused_resident_metrics`]. This is the honest device-residency boundary
+/// the `BacktestEngine` contract needs — nothing dense is read back and the compact
+/// metrics are not materialised on the host until that single explicit readback.
+/// `n_genes`/`month_capacity` carry the layout the reader/engine slices by.
+pub(crate) struct FusedResidentMetrics<R: Runtime> {
+    client: ComputeClient<R>,
+    metrics: cubecl::server::Handle,
+    trade_counts: cubecl::server::Handle,
+    monthly: cubecl::server::Handle,
+    month_counts: cubecl::server::Handle,
+    month_start_eq: cubecl::server::Handle,
+    ftmo: cubecl::server::Handle,
+    pub(crate) n_genes: usize,
+    pub(crate) month_capacity: usize,
+}
+
+/// Read the retained device metrics of a fused gene-batch to host — the single
+/// intended compact readback boundary. Consumes the handles. Byte-identical to
+/// the readback that `fused_signal_backtest_batch` used to do inline.
+pub(crate) fn read_fused_resident_metrics<R: Runtime>(
+    resident: FusedResidentMetrics<R>,
+) -> (Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>) {
+    let FusedResidentMetrics {
+        client,
+        metrics,
+        trade_counts,
+        monthly,
+        month_counts,
+        month_start_eq,
+        ftmo,
+        ..
+    } = resident;
+    let (
+        metrics_bytes,
+        trade_counts_bytes,
+        monthly_bytes,
+        month_counts_bytes,
+        month_start_eq_bytes,
+        ftmo_bytes,
+    ) = gpu_timing::readback(|| {
+        (
+            client.read_one_unchecked(metrics),
+            client.read_one_unchecked(trade_counts),
+            client.read_one_unchecked(monthly),
+            client.read_one_unchecked(month_counts),
+            client.read_one_unchecked(month_start_eq),
+            client.read_one_unchecked(ftmo),
+        )
+    });
+    (
+        f32::from_bytes(&metrics_bytes).to_vec(),
+        i32::from_bytes(&trade_counts_bytes).to_vec(),
+        f32::from_bytes(&monthly_bytes).to_vec(),
+        i32::from_bytes(&month_counts_bytes).to_vec(),
+        f32::from_bytes(&month_start_eq_bytes).to_vec(),
+        f32::from_bytes(&ftmo_bytes).to_vec(),
+    )
+}
+
+pub(crate) fn evaluate_prototype_a_resident<R: Runtime>(
+    client: &ComputeClient<R>,
+    dataset: &PrototypeADatasetResident,
+    genes: &PrototypeAGenesResident,
+    max_gene_batch: usize,
+) -> Result<(Vec<FusedResidentMetrics<R>>, u64)> {
+    if dataset.n_samples == 0 || genes.n_genes == 0 || max_gene_batch == 0 {
+        bail!("Prototype A resident evaluation requires non-empty bounded inputs");
+    }
+    let batch_size = dataset
+        .workspace_gene_capacity
+        .min(max_gene_batch)
+        .min(genes.n_genes)
+        .max(1);
+    let mut synchronization_events = 0u64;
+    let signal_units = signal_kernel_units(client);
+
+    let mut gene_start = 0usize;
+    while gene_start < genes.n_genes {
+        let gene_end = (gene_start + batch_size).min(genes.n_genes);
+        let batch_genes = gene_end - gene_start;
+        let total = batch_genes.saturating_mul(dataset.n_samples);
+        let signals = dataset.signals_workspace.clone();
+        let confidences = dataset.confidences_workspace.clone();
+
+        for window in &dataset.windows {
+            let window_total = batch_genes.saturating_mul(window.sample_len);
+            let window_signals = dataset.window_signals_workspace.clone();
+            let window_confidences = dataset.window_confidences_workspace.clone();
+            let signal_cubes = (window_total as u32).div_ceil(signal_units);
+            synthesize_signals_kernel::launch::<f32, R>(
+                client,
+                CubeCount::Static(signal_cubes, 1, 1),
+                CubeDim::new_1d(signal_units),
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        window.indicators.clone(),
+                        dataset.n_indicators.saturating_mul(window.sample_len),
+                    )
+                },
+                unsafe { ArrayArg::from_raw_parts(genes.offsets.clone(), genes.n_genes + 1) },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        genes.indices.clone(),
+                        genes.indices.size_in_used() as usize / std::mem::size_of::<i32>(),
+                    )
+                },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        genes.weights.clone(),
+                        genes.weights.size_in_used() as usize / std::mem::size_of::<f32>(),
+                    )
+                },
+                unsafe { ArrayArg::from_raw_parts(genes.long_thresholds.clone(), genes.n_genes) },
+                unsafe { ArrayArg::from_raw_parts(genes.short_thresholds.clone(), genes.n_genes) },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        window.smc_data.clone(),
+                        window.sample_len.saturating_mul(SMC_WIDTH),
+                    )
+                },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        genes.smc_flags.clone(),
+                        genes.n_genes.saturating_mul(SMC_WIDTH),
+                    )
+                },
+                unsafe { ArrayArg::from_raw_parts(genes.smc_weights.clone(), SMC_WIDTH) },
+                unsafe { ArrayArg::from_raw_parts(window_signals.clone(), window_total) },
+                unsafe { ArrayArg::from_raw_parts(window_confidences.clone(), window_total) },
+                window.sample_len as u32,
+                gene_start as u32,
+                genes.gate_threshold,
+            );
+            cubecl::future::block_on(client.sync())
+                .map_err(|error| anyhow::anyhow!("Prototype A signal event failed: {error:?}"))?;
+            synchronization_events = synchronization_events.saturating_add(1);
+
+            let copy_cubes = (window_total as u32).div_ceil(signal_units);
+            copy_window_into_persistent::launch::<i32, R>(
+                client,
+                CubeCount::Static(copy_cubes, 1, 1),
+                CubeDim::new_1d(signal_units),
+                unsafe { ArrayArg::from_raw_parts(window_signals, window_total) },
+                unsafe { ArrayArg::from_raw_parts(signals.clone(), total) },
+                window.sample_len as u32,
+                dataset.n_samples as u32,
+                window.sample_start as u32,
+                window_total as u32,
+            );
+            copy_window_into_persistent::launch::<f32, R>(
+                client,
+                CubeCount::Static(copy_cubes, 1, 1),
+                CubeDim::new_1d(signal_units),
+                unsafe { ArrayArg::from_raw_parts(window_confidences, window_total) },
+                unsafe { ArrayArg::from_raw_parts(confidences.clone(), total) },
+                window.sample_len as u32,
+                dataset.n_samples as u32,
+                window.sample_start as u32,
+                window_total as u32,
+            );
+        }
+
+        cubecl::future::block_on(client.sync())
+            .map_err(|error| anyhow::anyhow!("Prototype A signal-copy event failed: {error:?}"))?;
+        synchronization_events = synchronization_events.saturating_add(1);
+
+        let metrics_len = genes.n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+        let monthly_len = genes.n_genes.saturating_mul(dataset.month_capacity);
+        let ftmo_len = genes.n_genes.saturating_mul(FTMO_WIDTH);
+        let adaptive_on = genes.any_adaptive && dataset.adaptive_base_len == dataset.n_samples;
+        let backtest_units = backtest_kernel_units(client);
+        let backtest_cubes = (batch_genes as u32).div_ceil(backtest_units);
+        backtest_population_kernel::launch::<R>(
+            client,
+            CubeCount::Static(backtest_cubes, 1, 1),
+            CubeDim::new_1d(backtest_units),
+            unsafe { ArrayArg::from_raw_parts(dataset.close.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(dataset.high.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(dataset.low.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(signals, total) },
+            unsafe {
+                ArrayArg::from_raw_parts(dataset.timestamp_deltas.clone(), dataset.n_samples)
+            },
+            unsafe { ArrayArg::from_raw_parts(dataset.months.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(dataset.days.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(genes.stop_pips.clone(), genes.n_genes) },
+            unsafe { ArrayArg::from_raw_parts(genes.target_pips.clone(), genes.n_genes) },
+            unsafe { ArrayArg::from_raw_parts(genes.metrics_workspace.clone(), metrics_len) },
+            unsafe {
+                ArrayArg::from_raw_parts(genes.trade_counts_workspace.clone(), genes.n_genes)
+            },
+            unsafe { ArrayArg::from_raw_parts(genes.monthly_workspace.clone(), monthly_len) },
+            unsafe {
+                ArrayArg::from_raw_parts(genes.month_counts_workspace.clone(), genes.n_genes)
+            },
+            dataset.n_samples as u32,
+            gene_start as u32,
+            batch_genes as u32,
+            dataset.month_capacity as u32,
+            dataset.settings.initial_equity() as f32,
+            dataset.settings.max_hold_bars as u32,
+            dataset.settings.min_hold_bars as u32,
+            dataset.settings.max_trades_per_day as u32,
+            saturating_i32(dataset.settings.gap_threshold_ms),
+            if dataset.use_timestamps { 1 } else { 0 },
+            if dataset.settings.trailing_enabled {
+                1
+            } else {
+                0
+            },
+            dataset.settings.trailing_atr_multiplier as f32,
+            dataset.settings.trailing_be_trigger_r as f32,
+            dataset.settings.spread_pips as f32,
+            dataset.settings.commission_per_trade as f32,
+            dataset.settings.pip_value_per_lot as f32,
+            dataset.settings.swap_long_pips_per_day as f32,
+            dataset.settings.swap_short_pips_per_day as f32,
+            dataset.settings.pnl_conversion_fee_rate as f32,
+            unsafe { ArrayArg::from_raw_parts(confidences, total) },
+            if dataset.settings.risk_based_sizing {
+                1
+            } else {
+                0
+            },
+            dataset.settings.risk_per_trade_min as f32,
+            dataset.settings.risk_per_trade_max as f32,
+            dataset.settings.high_quality_confidence as f32,
+            unsafe {
+                ArrayArg::from_raw_parts(dataset.adaptive_base.clone(), dataset.adaptive_base_len)
+            },
+            unsafe { ArrayArg::from_raw_parts(genes.stop_vol_multipliers.clone(), genes.n_genes) },
+            if adaptive_on {
+                dataset.settings.adaptive_rr as f32
+            } else {
+                2.0
+            },
+            unsafe {
+                ArrayArg::from_raw_parts(genes.month_start_eq_workspace.clone(), monthly_len)
+            },
+            unsafe { ArrayArg::from_raw_parts(genes.ftmo_workspace.clone(), ftmo_len) },
+        );
+        gene_start = gene_end;
+    }
+    Ok((
+        vec![FusedResidentMetrics {
+            client: client.clone(),
+            metrics: genes.metrics_workspace.clone(),
+            trade_counts: genes.trade_counts_workspace.clone(),
+            monthly: genes.monthly_workspace.clone(),
+            month_counts: genes.month_counts_workspace.clone(),
+            month_start_eq: genes.month_start_eq_workspace.clone(),
+            ftmo: genes.ftmo_workspace.clone(),
+            n_genes: genes.n_genes,
+            month_capacity: genes.month_capacity,
+        }],
+        synchronization_events,
+    ))
+}
+
+pub(crate) fn read_prototype_a_resident_metrics<R: Runtime>(
+    outputs: Vec<FusedResidentMetrics<R>>,
+) -> Result<(Vec<[f64; 11]>, usize)> {
+    let mut rows = Vec::new();
+    let mut readback_bytes = 0usize;
+    for output in outputs {
+        let n_genes = output.n_genes;
+        let month_capacity = output.month_capacity;
+        readback_bytes = readback_bytes.saturating_add(
+            n_genes
+                .saturating_mul(
+                    BACKTEST_CORE_METRIC_WIDTH
+                        .saturating_add(FTMO_WIDTH)
+                        .saturating_mul(std::mem::size_of::<f32>())
+                        .saturating_add(2usize.saturating_mul(std::mem::size_of::<i32>())),
+                )
+                .saturating_add(
+                    n_genes
+                        .saturating_mul(month_capacity)
+                        .saturating_mul(2)
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                ),
+        );
+        let (metrics, trade_counts, monthly, month_counts, month_start_eq, _ftmo) =
+            read_fused_resident_metrics(output);
+        rows.extend(assemble_metric_rows(
+            &metrics,
+            &trade_counts,
+            &monthly,
+            &month_counts,
+            &month_start_eq,
+            month_capacity,
+            n_genes,
+        )?);
+    }
+    Ok((rows, readback_bytes))
+}
+
+fn assemble_metric_rows(
+    metrics_flat: &[f32],
+    trade_counts: &[i32],
+    monthly_flat: &[f32],
+    month_counts: &[i32],
+    month_start_eq_flat: &[f32],
+    month_capacity: usize,
+    n_genes: usize,
+) -> Result<Vec<[f64; 11]>> {
+    if metrics_flat.len() != n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH)
+        || trade_counts.len() != n_genes
+        || monthly_flat.len() != n_genes.saturating_mul(month_capacity)
+        || month_counts.len() != n_genes
+        || month_start_eq_flat.len() != n_genes.saturating_mul(month_capacity)
+    {
+        bail!("Prototype A compact metric readback returned an invalid shape");
+    }
+    let mut rows = Vec::with_capacity(n_genes);
+    for gene in 0..n_genes {
+        let metric_base = gene.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+        let month_base = gene.saturating_mul(month_capacity);
+        let month_count = month_counts[gene].max(0) as usize;
+        let month_limit = month_count.min(month_capacity);
+        let month_returns = monthly_flat[month_base..month_base + month_limit]
+            .iter()
+            .map(|value| *value as f64)
+            .collect::<Vec<_>>();
+        let (average_month, month_stddev) = mean_std(&month_returns);
+        let sharpe = if month_stddev > 0.0 {
+            (average_month / month_stddev) * 3.4641
+        } else {
+            0.0
+        };
+        let consistency = if month_stddev > 0.0 {
+            (average_month / month_stddev).clamp(0.0, 1.0)
+        } else if average_month > 0.0 && month_returns.len() < 2 {
+            1.0
+        } else {
+            0.0
+        };
+        const MONTHLY_RETURN_TARGET: f64 = 0.04;
+        let mut hit = 0usize;
+        let mut counted = 0usize;
+        for month in 0..month_limit {
+            let base = month_start_eq_flat[month_base + month] as f64;
+            if base > 0.0 {
+                counted += 1;
+                if (monthly_flat[month_base + month] as f64) / base >= MONTHLY_RETURN_TARGET {
+                    hit += 1;
+                }
+            }
+        }
+        let monthly_hit = if counted > 0 {
+            hit as f64 / counted as f64
+        } else {
+            0.0
+        };
+        rows.push([
+            metrics_flat[metric_base] as f64,
+            sharpe,
+            metrics_flat[metric_base + 1] as f64,
+            metrics_flat[metric_base + 2] as f64,
+            metrics_flat[metric_base + 3] as f64,
+            metrics_flat[metric_base + 4] as f64,
+            metrics_flat[metric_base + 5] as f64,
+            monthly_hit,
+            trade_counts[gene] as f64,
+            consistency,
+            metrics_flat[metric_base + 6] as f64,
+        ]);
+    }
+    Ok(rows)
+}
+
+/// FUSED windowed signal-synth + backtest for ONE gene-batch, leaving the per-gene
+/// metric scalars DEVICE-RESIDENT (see [`FusedResidentMetrics`]). The signal kernel
 /// writes each sample-window's signals(i32)/conf(f32) into a PERSISTENT VRAM
 /// buffer (via a GPU-side copy — no host roundtrip) that the backtest kernel
 /// then reads DIRECTLY — no readback of the genes×samples matrix, no re-upload.
-/// Only the per-gene metric scalars are read back. Handles all timeframes
-/// (1 window for light TFs, many for M1). Both handles stay local (inferred
-/// type), so no `Handle` type crosses a signature. Numerically identical to the
-/// windowed host path: same kernels, same inputs, same f32/bf16 precision — the
-/// bytes are simply not round-tripped through host RAM.
+/// Handles all timeframes (1 window for light TFs, many for M1). Numerically
+/// identical to the windowed host path: same kernels, same inputs, same f32/bf16
+/// precision — the bytes are simply not round-tripped through host RAM. The thin
+/// [`fused_signal_backtest_batch`] wrapper adds the compact readback for the
+/// existing host-returning callers (byte-identical). Callers guarantee `total > 0`.
 #[allow(clippy::too_many_arguments)]
-fn fused_signal_backtest_batch<F, R: Runtime>(
+fn fused_signal_backtest_batch_resident<F, R: Runtime>(
     client: &ComputeClient<R>,
     indicators_flat: &[F],
     // The signal kernel derives the indicator count from `indicators_flat.len() /
@@ -3321,20 +3991,13 @@ fn fused_signal_backtest_batch<F, R: Runtime>(
     month_capacity: usize,
     n_genes: usize,
     n_samples: usize,
-) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>)>
+) -> Result<FusedResidentMetrics<R>>
 where
     F: Float + CubeElement,
 {
     let total = n_genes.saturating_mul(n_samples);
     if total == 0 {
-        return Ok((
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ));
+        bail!("fused resident backtest requires at least one gene and one sample");
     }
     // Same input validation the non-fused signal kernel runs — a bad GA gene
     // index must fail LOUD, not read garbage VRAM (real-money path).
@@ -3454,6 +4117,7 @@ where
                 unsafe { ArrayArg::from_raw_parts(sig_w.clone(), win_total) },
                 unsafe { ArrayArg::from_raw_parts(conf_w.clone(), win_total) },
                 wlen as u32,
+                0,
                 gate_threshold,
             );
         });
@@ -3589,6 +4253,8 @@ where
             unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
             unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
             n_samples as u32,
+            0,
+            n_genes as u32,
             month_capacity as u32,
             settings.initial_equity() as f32,
             settings.max_hold_bars as u32,
@@ -3626,32 +4292,84 @@ where
         );
     });
 
-    // READBACK: only the per-gene metric scalars (NOT the genes×samples matrix).
-    let (
-        metrics_bytes,
-        trade_counts_bytes,
-        monthly_bytes,
-        month_counts_bytes,
-        month_start_eq_bytes,
-        ftmo_bytes,
-    ) = gpu_timing::readback(|| {
-        (
-            client.read_one_unchecked(metrics_handle),
-            client.read_one_unchecked(trade_counts_handle),
-            client.read_one_unchecked(monthly_handle),
-            client.read_one_unchecked(month_counts_handle),
-            client.read_one_unchecked(month_start_eq_handle),
-            client.read_one_unchecked(ftmo_handle),
-        )
-    });
-    Ok((
-        f32::from_bytes(&metrics_bytes).to_vec(),
-        i32::from_bytes(&trade_counts_bytes).to_vec(),
-        f32::from_bytes(&monthly_bytes).to_vec(),
-        i32::from_bytes(&month_counts_bytes).to_vec(),
-        f32::from_bytes(&month_start_eq_bytes).to_vec(),
-        f32::from_bytes(&ftmo_bytes).to_vec(),
-    ))
+    Ok(FusedResidentMetrics {
+        client: client.clone(),
+        metrics: metrics_handle,
+        trade_counts: trade_counts_handle,
+        monthly: monthly_handle,
+        month_counts: month_counts_handle,
+        month_start_eq: month_start_eq_handle,
+        ftmo: ftmo_handle,
+        n_genes,
+        month_capacity,
+    })
+}
+
+/// Compatibility boundary for the existing population evaluator. New
+/// device-chained callers retain the result of
+/// [`fused_signal_backtest_batch_resident`] and defer this compact readback until
+/// `BacktestEngine::readback_compact`.
+#[allow(clippy::too_many_arguments)]
+fn fused_signal_backtest_batch<F, R: Runtime>(
+    client: &ComputeClient<R>,
+    indicators_flat: &[F],
+    n_indicators: usize,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[F],
+    long_thr: &[F],
+    short_thr: &[F],
+    smc_data_flat: &[i32],
+    gene_smc_flags_flat: &[i32],
+    smc_weights: &[F],
+    gate_threshold: F,
+    close_pips: &[f32],
+    high_pips: &[f32],
+    low_pips: &[f32],
+    timestamp_deltas_ms: &[i32],
+    use_timestamps: bool,
+    month_idx: &[i32],
+    day_idx: &[i32],
+    sl_pips: &[f32],
+    tp_pips: &[f32],
+    stop_vol_mult: &[f64],
+    settings: &BacktestSettings,
+    month_capacity: usize,
+    n_genes: usize,
+    n_samples: usize,
+) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>)>
+where
+    F: Float + CubeElement,
+{
+    let resident = fused_signal_backtest_batch_resident(
+        client,
+        indicators_flat,
+        n_indicators,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        smc_data_flat,
+        gene_smc_flags_flat,
+        smc_weights,
+        gate_threshold,
+        close_pips,
+        high_pips,
+        low_pips,
+        timestamp_deltas_ms,
+        use_timestamps,
+        month_idx,
+        day_idx,
+        sl_pips,
+        tp_pips,
+        stop_vol_mult,
+        settings,
+        month_capacity,
+        n_genes,
+        n_samples,
+    )?;
+    Ok(read_fused_resident_metrics(resident))
 }
 
 /// Precision-dispatching wrapper for [`fused_signal_backtest_batch`] mirroring

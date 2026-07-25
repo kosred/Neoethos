@@ -374,6 +374,7 @@ fn transfer_snapshot(args: &[String]) -> Result<TransferSnapshot> {
         compact_d2h_readbacks: parse_u64(args, "--compact-readbacks", 0)?,
         chained_reuploads: parse_u64(args, "--chained-reuploads", 0)?,
         synchronization_events: parse_u64(args, "--sync-events", 0)?,
+        workspace_allocations: parse_u64(args, "--workspace-allocations", 0)?,
         h2d_bytes: parse_u64(args, "--h2d-bytes", 0)?,
         d2h_bytes: parse_u64(args, "--d2h-bytes", 0)?,
     })

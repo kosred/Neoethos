@@ -3,7 +3,6 @@
 use neoethos_gpu_contracts::device::HandleToken;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -98,6 +97,7 @@ impl_handle!(DeviceEventHandle, BufferKind::Event);
 
 pub trait TypedDeviceHandle: Copy {
     const KIND: BufferKind;
+    fn from_token(token: HandleToken) -> Self;
     fn token(self) -> HandleToken;
 }
 
@@ -105,6 +105,9 @@ macro_rules! impl_typed_handle {
     ($name:ident, $kind:expr) => {
         impl TypedDeviceHandle for $name {
             const KIND: BufferKind = $kind;
+            fn from_token(token: HandleToken) -> Self {
+                Self(token)
+            }
             fn token(self) -> HandleToken {
                 self.0
             }
@@ -119,22 +122,43 @@ impl_typed_handle!(DeviceMetricsHandle, BufferKind::Metrics);
 impl_typed_handle!(DeviceSelectionHandle, BufferKind::Selection);
 impl_typed_handle!(DeviceEventHandle, BufferKind::Event);
 
-#[derive(Debug, Clone)]
-pub struct GpuDiscoverySession {
+pub struct GpuDiscoverySession<B = ()> {
     identity: EngineIdentity,
-    generation: Arc<AtomicU64>,
-    transfers: Arc<TransferCounters>,
+    next_generation: AtomicU64,
+    valid_from_generation: AtomicU64,
+    transfers: TransferCounters,
     synchronization: SynchronizationMode,
+    backend: B,
 }
 
-impl GpuDiscoverySession {
+impl GpuDiscoverySession<()> {
     pub fn new(identity: EngineIdentity, synchronization: SynchronizationMode) -> Self {
+        Self::with_backend(identity, synchronization, ())
+    }
+}
+
+impl<B> GpuDiscoverySession<B> {
+    pub fn with_backend(
+        identity: EngineIdentity,
+        synchronization: SynchronizationMode,
+        backend: B,
+    ) -> Self {
         Self {
             identity,
-            generation: Arc::new(AtomicU64::new(1)),
-            transfers: Arc::new(TransferCounters::default()),
+            next_generation: AtomicU64::new(1),
+            valid_from_generation: AtomicU64::new(1),
+            transfers: TransferCounters::default(),
             synchronization,
+            backend,
         }
+    }
+
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
     }
 
     pub fn identity(&self) -> EngineIdentity {
@@ -146,11 +170,26 @@ impl GpuDiscoverySession {
     }
 
     pub fn current_generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.next_generation.load(Ordering::Acquire)
+    }
+
+    pub fn allocate_handle<H: TypedDeviceHandle>(&self) -> H {
+        let generation = self.next_generation.fetch_add(1, Ordering::AcqRel);
+        H::from_token(HandleToken {
+            session_id: self.identity.session_id,
+            backend_id: self.identity.backend_id,
+            device_id: self.identity.device_id,
+            generation,
+            buffer_kind: H::KIND.id(),
+            reserved: 0,
+        })
     }
 
     pub fn reset_workspace(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+        let valid_from = self.next_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.valid_from_generation
+            .store(valid_from, Ordering::Release);
+        valid_from
     }
 
     pub fn validate<H: TypedDeviceHandle>(&self, handle: H) -> Result<(), HandleValidationError> {
@@ -173,9 +212,10 @@ impl GpuDiscoverySession {
                 actual: token.device_id,
             });
         }
-        if token.generation != self.current_generation() {
+        let valid_from = self.valid_from_generation.load(Ordering::Acquire);
+        if token.generation < valid_from {
             return Err(HandleValidationError::StaleGeneration {
-                expected: self.current_generation(),
+                expected: valid_from,
                 actual: token.generation,
             });
         }
@@ -206,6 +246,7 @@ pub struct TransferCounters {
     compact_d2h_readbacks: AtomicU64,
     chained_reuploads: AtomicU64,
     synchronization_events: AtomicU64,
+    workspace_allocations: AtomicU64,
     h2d_bytes: AtomicU64,
     d2h_bytes: AtomicU64,
 }
@@ -245,6 +286,11 @@ impl TransferCounters {
         self.synchronization_events.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_workspace_allocations(&self, count: u64) {
+        self.workspace_allocations
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> TransferSnapshot {
         TransferSnapshot {
             dataset_uploads: self.dataset_uploads.load(Ordering::Relaxed),
@@ -254,6 +300,7 @@ impl TransferCounters {
             compact_d2h_readbacks: self.compact_d2h_readbacks.load(Ordering::Relaxed),
             chained_reuploads: self.chained_reuploads.load(Ordering::Relaxed),
             synchronization_events: self.synchronization_events.load(Ordering::Relaxed),
+            workspace_allocations: self.workspace_allocations.load(Ordering::Relaxed),
             h2d_bytes: self.h2d_bytes.load(Ordering::Relaxed),
             d2h_bytes: self.d2h_bytes.load(Ordering::Relaxed),
         }
@@ -269,6 +316,7 @@ pub struct TransferSnapshot {
     pub compact_d2h_readbacks: u64,
     pub chained_reuploads: u64,
     pub synchronization_events: u64,
+    pub workspace_allocations: u64,
     pub h2d_bytes: u64,
     pub d2h_bytes: u64,
 }
@@ -294,16 +342,31 @@ impl TransferSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HostSurvivorSummary {
     pub candidate_ids: Vec<u64>,
+    pub scenario_ids: Vec<u64>,
+    pub metrics: Vec<[f64; 11]>,
     pub rank_keys: Vec<Vec<i64>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceFilterPolicy {
+    /// Preserve all evaluated rows in canonical candidate/scenario order. This
+    /// is the Stage-1 readback path and performs no host-side filtering.
+    All,
+    /// Reserved for the Stage-2 device filtering implementation.
+    TopK(usize),
+    /// Reserved for the Stage-2 device filtering implementation.
+    MinimumTradeCount(u64),
+}
+
 pub trait BacktestEngine {
+    type Backend;
+
     fn status(&self) -> EngineStatus;
     fn capabilities(&self) -> EngineCapabilities;
-    fn session(&self) -> &GpuDiscoverySession;
+    fn session(&self) -> &GpuDiscoverySession<Self::Backend>;
 
     fn upload_dataset(&mut self, bytes: &[u8]) -> Result<DatasetHandle, EngineError>;
     fn upload_genes(&mut self, bytes: &[u8]) -> Result<GeneBufferHandle, EngineError>;
@@ -320,6 +383,7 @@ pub trait BacktestEngine {
     fn filter(
         &mut self,
         metrics: DeviceMetricsHandle,
+        policy: DeviceFilterPolicy,
         wait_for: Option<DeviceEventHandle>,
     ) -> Result<(DeviceSelectionHandle, Option<DeviceEventHandle>), EngineError>;
 
@@ -349,8 +413,17 @@ pub enum TransferInvariantError {
 #[derive(Debug)]
 pub enum EngineError {
     Handle(HandleValidationError),
+    UnexpectedHandle {
+        operation: &'static str,
+        expected: HandleToken,
+        actual: HandleToken,
+    },
     TransferInvariant(TransferInvariantError),
     Status(EngineStatus),
+    UnsupportedCapability {
+        operation: &'static str,
+        detail: String,
+    },
     Backend(String),
 }
 
@@ -382,8 +455,19 @@ impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Handle(error) => error.fmt(f),
+            Self::UnexpectedHandle {
+                operation,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "unexpected device handle for {operation}: expected {expected:?}, got {actual:?}"
+            ),
             Self::TransferInvariant(error) => error.fmt(f),
             Self::Status(status) => write!(f, "engine is not ready: {status:?}"),
+            Self::UnsupportedCapability { operation, detail } => {
+                write!(f, "unsupported engine capability {operation}: {detail}")
+            }
             Self::Backend(message) => write!(f, "engine backend error: {message}"),
         }
     }
@@ -441,6 +525,40 @@ mod tests {
         assert!(matches!(
             session.transfer_snapshot().assert_device_resident_chain(),
             Err(TransferInvariantError::FullReadbacks(1))
+        ));
+    }
+
+    #[test]
+    fn session_owns_backend_resource_and_allocates_unique_live_handles() {
+        let session = GpuDiscoverySession::with_backend(
+            identity(5),
+            SynchronizationMode::ExplicitEvents,
+            String::from("cubecl-client"),
+        );
+        assert_eq!(session.backend(), "cubecl-client");
+
+        let dataset = session.allocate_handle::<DatasetHandle>();
+        let genes = session.allocate_handle::<GeneBufferHandle>();
+        assert_ne!(dataset.token().generation, genes.token().generation);
+        session.validate(dataset).unwrap();
+        session.validate(genes).unwrap();
+    }
+
+    #[test]
+    fn workspace_reset_stales_every_pre_reset_allocation() {
+        let session = GpuDiscoverySession::new(identity(6), SynchronizationMode::ExplicitEvents);
+        let dataset = session.allocate_handle::<DatasetHandle>();
+        let genes = session.allocate_handle::<GeneBufferHandle>();
+
+        session.reset_workspace();
+
+        assert!(matches!(
+            session.validate(dataset),
+            Err(HandleValidationError::StaleGeneration { .. })
+        ));
+        assert!(matches!(
+            session.validate(genes),
+            Err(HandleValidationError::StaleGeneration { .. })
         ));
     }
 }
