@@ -218,12 +218,23 @@ pub mod device {
 
     /// First-hit result positionally aligned with its input event.
     #[repr(C)]
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct NeoPopulationOutcome {
         pub candidate_id: u64,
         pub scenario_id: u64,
         pub exit_bar: i32,
         pub exit_reason: i32,
+    }
+
+    impl Default for NeoPopulationOutcome {
+        fn default() -> Self {
+            Self {
+                candidate_id: 0,
+                scenario_id: 0,
+                exit_bar: -1,
+                exit_reason: POPULATION_EXIT_NONE,
+            }
+        }
     }
 
     /// Raw canonical level-10 metric row. Slot seven is the monthly hit rate.

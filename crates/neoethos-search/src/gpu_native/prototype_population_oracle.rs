@@ -6,18 +6,23 @@
 //! benchmark paths must prepare these results before entering their timed loop.
 
 use crate::eval::{BacktestSettings, current_backtest_runtime_overrides};
-use crate::gpu_native::prototype_population::PrototypePopulationWorkload;
+use crate::gpu_native::prototype_bc::PrototypeKind;
+use crate::gpu_native::prototype_population::{
+    PrototypeBcIneligibilityReason, PrototypePopulationWorkload,
+};
 use neoethos_gpu_contracts::device::{
     NeoPopulationCounters, NeoPopulationEvent, NeoPopulationMetricRow, NeoPopulationOutcome,
     NeoPopulationSettings,
 };
 use neoethos_gpu_contracts::{
-    ABI_VERSION, POPULATION_DIRECTION_LONG, POPULATION_EXIT_GAP, POPULATION_EXIT_MAX_HOLD,
-    POPULATION_EXIT_NONE, POPULATION_EXIT_STOP, POPULATION_EXIT_TARGET,
+    ABI_VERSION, POPULATION_DIRECTION_LONG, POPULATION_DIRECTION_SHORT, POPULATION_EXIT_GAP,
+    POPULATION_EXIT_MAX_HOLD, POPULATION_EXIT_NONE, POPULATION_EXIT_STOP, POPULATION_EXIT_TARGET,
     POPULATION_PRECEDENCE_STOP_FIRST, POPULATION_SETTINGS_FLAG_RISK_BASED_SIZING,
 };
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
+use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OraclePopulationEvaluation {
@@ -29,10 +34,52 @@ pub struct OraclePopulationEvaluation {
     pub counters: NeoPopulationCounters,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PopulationOracleError {
+    IneligibleWorkload {
+        reason: PrototypeBcIneligibilityReason,
+        candidate_ids: Vec<u64>,
+    },
     UnsupportedTrailingState,
     FixedWidthOverflow(&'static str),
+    EventCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidEventDirection {
+        index: usize,
+        direction: i32,
+    },
+    InvalidEventPrecedence {
+        index: usize,
+        precedence: u32,
+    },
+    EventBarOutOfBounds {
+        index: usize,
+        entry_bar: u32,
+        last_bar: u32,
+        bars: usize,
+    },
+    EventNonFinitePrice {
+        index: usize,
+        field: &'static str,
+    },
+    ForeignEventIdentity {
+        index: usize,
+        candidate_id: u64,
+        scenario_id: u64,
+    },
+    DuplicateEvent {
+        index: usize,
+        candidate_id: u64,
+        scenario_id: u64,
+        entry_bar: u32,
+    },
+    EventCanonicalMismatch {
+        index: usize,
+        expected: NeoPopulationEvent,
+        actual: NeoPopulationEvent,
+    },
     OutcomeCountMismatch {
         events: usize,
         outcomes: usize,
@@ -58,12 +105,73 @@ pub enum PopulationOracleError {
 impl fmt::Display for PopulationOracleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::IneligibleWorkload {
+                reason,
+                candidate_ids,
+            } => write!(
+                f,
+                "Prototype B/C oracle workload is ineligible for {reason:?}: {candidate_ids:?}"
+            ),
             Self::UnsupportedTrailingState => {
                 write!(f, "Prototype B/C oracle does not support trailing state")
             }
             Self::FixedWidthOverflow(field) => {
                 write!(f, "{field} does not fit the fixed-width population ABI")
             }
+            Self::EventCountMismatch { expected, actual } => write!(
+                f,
+                "population event count {actual} does not match canonical count {expected}"
+            ),
+            Self::InvalidEventDirection { index, direction } => {
+                write!(
+                    f,
+                    "population event {index} has invalid direction {direction}"
+                )
+            }
+            Self::InvalidEventPrecedence { index, precedence } => write!(
+                f,
+                "population event {index} has invalid precedence {precedence}"
+            ),
+            Self::EventBarOutOfBounds {
+                index,
+                entry_bar,
+                last_bar,
+                bars,
+            } => write!(
+                f,
+                "population event {index} has bar range {entry_bar}..={last_bar} \
+                 outside dataset length {bars}"
+            ),
+            Self::EventNonFinitePrice { index, field } => {
+                write!(f, "population event {index} has non-finite {field}")
+            }
+            Self::ForeignEventIdentity {
+                index,
+                candidate_id,
+                scenario_id,
+            } => write!(
+                f,
+                "population event {index} has foreign identity ({candidate_id}, {scenario_id})"
+            ),
+            Self::DuplicateEvent {
+                index,
+                candidate_id,
+                scenario_id,
+                entry_bar,
+            } => write!(
+                f,
+                "population event {index} duplicates ({candidate_id}, {scenario_id}) \
+                 at entry bar {entry_bar}"
+            ),
+            Self::EventCanonicalMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "population event {index} differs from canonical event: \
+                 expected {expected:?}, actual {actual:?}"
+            ),
             Self::OutcomeCountMismatch { events, outcomes } => write!(
                 f,
                 "population outcome count {outcomes} does not match event count {events}"
@@ -117,9 +225,17 @@ struct OpenPosition {
 struct CandidateReduction {
     row: NeoPopulationMetricRow,
     accepted_trades: u64,
+    event_cursor_advances: usize,
 }
 
 pub fn population_settings(
+    workload: &PrototypePopulationWorkload,
+) -> Result<NeoPopulationSettings, PopulationOracleError> {
+    validate_population_oracle_workload(workload)?;
+    population_settings_unchecked(workload)
+}
+
+fn population_settings_unchecked(
     workload: &PrototypePopulationWorkload,
 ) -> Result<NeoPopulationSettings, PopulationOracleError> {
     let source = workload.dataset.settings.to_settings();
@@ -155,15 +271,48 @@ pub fn population_settings(
     })
 }
 
+pub fn validate_population_oracle_workload(
+    workload: &PrototypePopulationWorkload,
+) -> Result<(), PopulationOracleError> {
+    for prototype in [
+        PrototypeKind::BWarpCooperative,
+        PrototypeKind::CSparseFirstHit,
+    ] {
+        let eligibility = workload.common_bc_intersection(prototype);
+        if let Some((&reason, candidate_ids)) = eligibility.unsupported.iter().next() {
+            return Err(PopulationOracleError::IneligibleWorkload {
+                reason,
+                candidate_ids: candidate_ids.clone(),
+            });
+        }
+
+        let all_indices = 0..workload.genes.population();
+        if eligibility.supported_candidate_ids != workload.genes.candidate_ids
+            || !eligibility
+                .supported_gene_indices
+                .iter()
+                .copied()
+                .eq(all_indices)
+        {
+            return Err(PopulationOracleError::IneligibleWorkload {
+                reason: PrototypeBcIneligibilityReason::InvalidWorkload,
+                candidate_ids: workload.genes.candidate_ids.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn evaluate_population_oracle(
     workload: &PrototypePopulationWorkload,
 ) -> Result<OraclePopulationEvaluation, PopulationOracleError> {
-    let settings = population_settings(workload)?;
+    validate_population_oracle_workload(workload)?;
+    let settings = population_settings_unchecked(workload)?;
     let signals = synthesize_population_signals(workload);
     let events = emit_population_events_with_signals(workload, &signals)?;
-    let outcomes = resolve_population_outcomes(workload, &events)?;
-    let (metrics, accepted_trade_count) =
-        reduce_population_outcomes_with_signals(workload, &signals, &events, &outcomes)?;
+    let outcomes = resolve_population_outcomes_unchecked(workload, &events)?;
+    let (metrics, accepted_trade_count, _) =
+        reduce_population_outcomes_with_signals_unchecked(workload, &signals, &events, &outcomes)?;
     Ok(OraclePopulationEvaluation {
         settings,
         counters: NeoPopulationCounters {
@@ -180,11 +329,30 @@ pub fn evaluate_population_oracle(
 pub fn emit_population_events(
     workload: &PrototypePopulationWorkload,
 ) -> Result<Vec<NeoPopulationEvent>, PopulationOracleError> {
+    validate_population_oracle_workload(workload)?;
     let signals = synthesize_population_signals(workload);
     emit_population_events_with_signals(workload, &signals)
 }
 
+pub fn validate_population_events(
+    workload: &PrototypePopulationWorkload,
+    events: &[NeoPopulationEvent],
+) -> Result<(), PopulationOracleError> {
+    validate_population_oracle_workload(workload)?;
+    let signals = synthesize_population_signals(workload);
+    let canonical = emit_population_events_with_signals(workload, &signals)?;
+    validate_population_events_against_canonical(workload, events, &canonical)
+}
+
 pub fn resolve_population_outcomes(
+    workload: &PrototypePopulationWorkload,
+    events: &[NeoPopulationEvent],
+) -> Result<Vec<NeoPopulationOutcome>, PopulationOracleError> {
+    validate_population_events(workload, events)?;
+    resolve_population_outcomes_unchecked(workload, events)
+}
+
+fn resolve_population_outcomes_unchecked(
     workload: &PrototypePopulationWorkload,
     events: &[NeoPopulationEvent],
 ) -> Result<Vec<NeoPopulationOutcome>, PopulationOracleError> {
@@ -225,10 +393,14 @@ pub fn resolve_population_outcomes(
 
                 let high = workload.dataset.high[bar];
                 let low = workload.dataset.low[bar];
-                let (stop_hit, target_hit) = if event.direction == POPULATION_DIRECTION_LONG {
-                    (low <= event.stop_price, high >= event.target_price)
-                } else {
-                    (high >= event.stop_price, low <= event.target_price)
+                let (stop_hit, target_hit) = match event.direction {
+                    POPULATION_DIRECTION_LONG => {
+                        (low <= event.stop_price, high >= event.target_price)
+                    }
+                    POPULATION_DIRECTION_SHORT => {
+                        (high >= event.stop_price, low <= event.target_price)
+                    }
+                    _ => unreachable!("unchecked resolver requires validated directions"),
                 };
                 if stop_hit {
                     outcome.exit_bar = bar as i32;
@@ -256,9 +428,11 @@ pub fn reduce_population_outcomes(
     events: &[NeoPopulationEvent],
     outcomes: &[NeoPopulationOutcome],
 ) -> Result<Vec<NeoPopulationMetricRow>, PopulationOracleError> {
+    validate_population_events(workload, events)?;
+    validate_outcome_alignment(workload, events, outcomes)?;
     let signals = synthesize_population_signals(workload);
-    reduce_population_outcomes_with_signals(workload, &signals, events, outcomes)
-        .map(|(rows, _)| rows)
+    reduce_population_outcomes_with_signals_unchecked(workload, &signals, events, outcomes)
+        .map(|(rows, _, _)| rows)
 }
 
 fn emit_population_events_with_signals(
@@ -330,13 +504,118 @@ fn emit_population_events_with_signals(
     Ok(events)
 }
 
-fn reduce_population_outcomes_with_signals(
+fn validate_population_events_against_canonical(
+    workload: &PrototypePopulationWorkload,
+    events: &[NeoPopulationEvent],
+    canonical: &[NeoPopulationEvent],
+) -> Result<(), PopulationOracleError> {
+    if events.len() != canonical.len() {
+        return Err(PopulationOracleError::EventCountMismatch {
+            expected: canonical.len(),
+            actual: events.len(),
+        });
+    }
+
+    let known_identities = workload
+        .genes
+        .candidate_ids
+        .iter()
+        .copied()
+        .zip(
+            workload
+                .scenarios
+                .scenarios
+                .iter()
+                .map(|scenario| scenario.scenario_id),
+        )
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let bars = workload.dataset.bars();
+    for (index, event) in events.iter().enumerate() {
+        if !known_identities.contains(&(event.candidate_id, event.scenario_id)) {
+            return Err(PopulationOracleError::ForeignEventIdentity {
+                index,
+                candidate_id: event.candidate_id,
+                scenario_id: event.scenario_id,
+            });
+        }
+        if !matches!(
+            event.direction,
+            POPULATION_DIRECTION_LONG | POPULATION_DIRECTION_SHORT
+        ) {
+            return Err(PopulationOracleError::InvalidEventDirection {
+                index,
+                direction: event.direction,
+            });
+        }
+        if event.precedence != POPULATION_PRECEDENCE_STOP_FIRST {
+            return Err(PopulationOracleError::InvalidEventPrecedence {
+                index,
+                precedence: event.precedence,
+            });
+        }
+        if event.entry_bar as usize >= bars
+            || event.last_bar as usize >= bars
+            || event.entry_bar > event.last_bar
+        {
+            return Err(PopulationOracleError::EventBarOutOfBounds {
+                index,
+                entry_bar: event.entry_bar,
+                last_bar: event.last_bar,
+                bars,
+            });
+        }
+        if !event.stop_price.is_finite() {
+            return Err(PopulationOracleError::EventNonFinitePrice {
+                index,
+                field: "stop_price",
+            });
+        }
+        if !event.target_price.is_finite() {
+            return Err(PopulationOracleError::EventNonFinitePrice {
+                index,
+                field: "target_price",
+            });
+        }
+        if !seen.insert((event.candidate_id, event.scenario_id, event.entry_bar)) {
+            return Err(PopulationOracleError::DuplicateEvent {
+                index,
+                candidate_id: event.candidate_id,
+                scenario_id: event.scenario_id,
+                entry_bar: event.entry_bar,
+            });
+        }
+    }
+
+    for (index, (expected, actual)) in canonical.iter().zip(events).enumerate() {
+        if !population_event_exact_eq(expected, actual) {
+            return Err(PopulationOracleError::EventCanonicalMismatch {
+                index,
+                expected: *expected,
+                actual: *actual,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn population_event_exact_eq(expected: &NeoPopulationEvent, actual: &NeoPopulationEvent) -> bool {
+    expected.candidate_id == actual.candidate_id
+        && expected.scenario_id == actual.scenario_id
+        && expected.entry_bar == actual.entry_bar
+        && expected.last_bar == actual.last_bar
+        && expected.direction == actual.direction
+        && expected.precedence == actual.precedence
+        && expected.stop_price.to_bits() == actual.stop_price.to_bits()
+        && expected.target_price.to_bits() == actual.target_price.to_bits()
+}
+
+fn reduce_population_outcomes_with_signals_unchecked(
     workload: &PrototypePopulationWorkload,
     signals: &[CandidateSignals],
     events: &[NeoPopulationEvent],
     outcomes: &[NeoPopulationOutcome],
-) -> Result<(Vec<NeoPopulationMetricRow>, u64), PopulationOracleError> {
-    validate_outcome_alignment(workload, events, outcomes)?;
+) -> Result<(Vec<NeoPopulationMetricRow>, u64, usize), PopulationOracleError> {
     let settings = workload.dataset.settings.to_settings();
     if settings.trailing_enabled {
         return Err(PopulationOracleError::UnsupportedTrailingState);
@@ -344,29 +623,53 @@ fn reduce_population_outcomes_with_signals(
 
     let mut rows = Vec::with_capacity(workload.genes.population());
     let mut accepted_trade_count = 0_u64;
-    for gene_index in 0..workload.genes.population() {
+    let mut event_cursor_advances = 0_usize;
+    let candidate_ranges = partition_candidate_event_ranges(workload, events)?;
+    for (gene_index, range) in candidate_ranges.into_iter().enumerate() {
         let candidate_id = workload.genes.candidate_ids[gene_index];
         let scenario_id = workload.scenarios.scenarios[gene_index].scenario_id;
-        let candidate_events = events
-            .iter()
-            .copied()
-            .zip(outcomes.iter().copied())
-            .filter(|(event, _)| {
-                event.candidate_id == candidate_id && event.scenario_id == scenario_id
-            })
-            .collect::<Vec<_>>();
         let reduction = reduce_candidate(
             workload,
             &settings,
             &signals[gene_index],
             candidate_id,
             scenario_id,
-            &candidate_events,
+            &events[range.clone()],
+            &outcomes[range],
         );
         rows.push(reduction.row);
         accepted_trade_count = accepted_trade_count.saturating_add(reduction.accepted_trades);
+        event_cursor_advances =
+            event_cursor_advances.saturating_add(reduction.event_cursor_advances);
     }
-    Ok((rows, accepted_trade_count))
+    Ok((rows, accepted_trade_count, event_cursor_advances))
+}
+
+fn partition_candidate_event_ranges(
+    workload: &PrototypePopulationWorkload,
+    events: &[NeoPopulationEvent],
+) -> Result<Vec<Range<usize>>, PopulationOracleError> {
+    let mut cursor = 0;
+    let mut ranges = Vec::with_capacity(workload.genes.population());
+    for gene_index in 0..workload.genes.population() {
+        let candidate_id = workload.genes.candidate_ids[gene_index];
+        let scenario_id = workload.scenarios.scenarios[gene_index].scenario_id;
+        let start = cursor;
+        while events.get(cursor).is_some_and(|event| {
+            event.candidate_id == candidate_id && event.scenario_id == scenario_id
+        }) {
+            cursor += 1;
+        }
+        ranges.push(start..cursor);
+    }
+    if let Some(event) = events.get(cursor) {
+        return Err(PopulationOracleError::ForeignEventIdentity {
+            index: cursor,
+            candidate_id: event.candidate_id,
+            scenario_id: event.scenario_id,
+        });
+    }
+    Ok(ranges)
 }
 
 fn validate_outcome_alignment(
@@ -391,7 +694,7 @@ fn validate_outcome_alignment(
             });
         }
     }
-    let expected = resolve_population_outcomes(workload, events)?;
+    let expected = resolve_population_outcomes_unchecked(workload, events)?;
     for (index, ((event, expected), actual)) in
         events.iter().zip(expected.iter()).zip(outcomes).enumerate()
     {
@@ -516,7 +819,8 @@ fn reduce_candidate(
     signals: &CandidateSignals,
     candidate_id: u64,
     scenario_id: u64,
-    events: &[(NeoPopulationEvent, NeoPopulationOutcome)],
+    events: &[NeoPopulationEvent],
+    outcomes: &[NeoPopulationOutcome],
 ) -> CandidateReduction {
     let initial_equity = current_backtest_runtime_overrides().initial_equity;
     let month_capacity = current_backtest_runtime_overrides().month_capacity;
@@ -546,7 +850,17 @@ fn reduce_candidate(
     let pip = guarded_pip(settings.pip_value);
     let half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
     let bars = workload.dataset.bars();
+    let mut event_cursor = 0;
+    let mut event_cursor_advances = 0;
     for bar in 1..bars {
+        while events
+            .get(event_cursor)
+            .is_some_and(|event| (event.entry_bar as usize) < bar)
+        {
+            event_cursor += 1;
+            event_cursor_advances += 1;
+        }
+
         let month = workload.dataset.months[bar];
         if month != last_month {
             if last_month != -1 {
@@ -648,6 +962,13 @@ fn reduce_candidate(
                 }
                 // A regular SL/TP/max-hold exit occurs inside the open-position
                 // branch, so canonical evaluation cannot re-enter on this bar.
+                while events
+                    .get(event_cursor)
+                    .is_some_and(|event| event.entry_bar as usize == bar)
+                {
+                    event_cursor += 1;
+                    event_cursor_advances += 1;
+                }
                 continue;
             }
             // Gap handling precedes the open/flat branch in the canonical
@@ -655,11 +976,14 @@ fn reduce_candidate(
             // may consume the prior bar's signal below.
         }
 
-        if let Some((event, outcome)) = events
-            .iter()
-            .copied()
-            .find(|(event, _)| event.entry_bar as usize == bar)
+        if events
+            .get(event_cursor)
+            .is_some_and(|event| event.entry_bar as usize == bar)
         {
+            let event = events[event_cursor];
+            let outcome = outcomes[event_cursor];
+            event_cursor += 1;
+            event_cursor_advances += 1;
             if settings.max_trades_per_day > 0 && day_trade_count >= settings.max_trades_per_day {
                 continue;
             }
@@ -758,6 +1082,7 @@ fn reduce_candidate(
             ],
         },
         accepted_trades,
+        event_cursor_advances,
     }
 }
 
@@ -1184,6 +1509,13 @@ mod tests {
         })
     }
 
+    fn gap_reentry_fixture() -> PrototypePopulationWorkload {
+        let mut workload = canonical_cost_fixture();
+        workload.dataset.settings.gap_threshold_ms = 86_400_000;
+        workload.dataset.indicators[1] = 1.0;
+        workload
+    }
+
     #[test]
     fn oracle_emits_canonical_events_and_preserves_positional_outcome_identity() {
         let workload = canonical_cost_fixture();
@@ -1291,9 +1623,7 @@ mod tests {
 
     #[test]
     fn gap_exit_allows_canonical_same_bar_reentry() {
-        let mut workload = canonical_cost_fixture();
-        workload.dataset.settings.gap_threshold_ms = 86_400_000;
-        workload.dataset.indicators[1] = 1.0;
+        let workload = gap_reentry_fixture();
 
         let expected = full_cpu_metrics(&workload);
         let actual = evaluate_population_oracle(&workload).unwrap();
@@ -1315,9 +1645,7 @@ mod tests {
 
     #[test]
     fn reduction_rejects_reordered_same_identity_outcomes() {
-        let mut workload = canonical_cost_fixture();
-        workload.dataset.settings.gap_threshold_ms = 86_400_000;
-        workload.dataset.indicators[1] = 1.0;
+        let workload = gap_reentry_fixture();
         let events = emit_population_events(&workload).unwrap();
         let mut outcomes = resolve_population_outcomes(&workload, &events).unwrap();
 
@@ -1344,6 +1672,168 @@ mod tests {
                 actual_exit_reason: neoethos_gpu_contracts::POPULATION_EXIT_NONE,
             })
         );
+    }
+
+    #[test]
+    fn candidate_major_ranges_and_cursor_consume_repeated_events_once() {
+        let workload = gap_reentry_fixture();
+        let events = emit_population_events(&workload).unwrap();
+        let ranges = partition_candidate_event_ranges(&workload, &events).unwrap();
+        let outcomes = resolve_population_outcomes(&workload, &events).unwrap();
+        let signals = synthesize_population_signals(&workload);
+        let (_, _, event_cursor_advances) = reduce_population_outcomes_with_signals_unchecked(
+            &workload, &signals, &events, &outcomes,
+        )
+        .unwrap();
+        let actual = evaluate_population_oracle(&workload).unwrap();
+
+        assert_eq!(ranges, vec![0..2, 2..3, 3..3]);
+        assert_eq!(event_cursor_advances, events.len());
+        assert_eq!(actual.counters.event_count, 3);
+        assert_eq!(actual.counters.accepted_trade_count, 3);
+        assert_eq!(actual.metrics[0].values[8], 1.0);
+        assert_eq!(actual.metrics[1].values[8], 1.0);
+        assert_eq!(actual.metrics[2].values[8], 0.0);
+    }
+
+    #[test]
+    fn oracle_fails_closed_for_each_common_eligibility_gap() {
+        let mut prop_firm = canonical_cost_fixture();
+        prop_firm.requirements.prop_firm_state = PropFirmRequirement::Required;
+        assert_eq!(
+            evaluate_population_oracle(&prop_firm),
+            Err(PopulationOracleError::IneligibleWorkload {
+                reason: crate::gpu_native::prototype_population::PrototypeBcIneligibilityReason::
+                    PropFirmStateRequired,
+                candidate_ids: vec![101, 202, 303],
+            })
+        );
+
+        let mut unsupported_scenario = canonical_cost_fixture();
+        unsupported_scenario.scenarios.scenarios[1].scenario_type = 7;
+        assert_eq!(
+            emit_population_events(&unsupported_scenario),
+            Err(PopulationOracleError::IneligibleWorkload {
+                reason: crate::gpu_native::prototype_population::PrototypeBcIneligibilityReason::
+                    UnsupportedScenario,
+                candidate_ids: vec![202],
+            })
+        );
+
+        let mut excluded_candidate = canonical_cost_fixture();
+        excluded_candidate.genes.stop_pips[0] = f64::NAN;
+        assert_eq!(
+            population_settings(&excluded_candidate),
+            Err(PopulationOracleError::IneligibleWorkload {
+                reason: crate::gpu_native::prototype_population::PrototypeBcIneligibilityReason::
+                    NonFiniteStaticLevels,
+                candidate_ids: vec![101],
+            })
+        );
+
+        let mut missing_adaptive_levels = canonical_cost_fixture();
+        missing_adaptive_levels.genes.stop_vol_multipliers[2] = 1.0;
+        assert_eq!(
+            resolve_population_outcomes(&missing_adaptive_levels, &[]),
+            Err(PopulationOracleError::IneligibleWorkload {
+                reason: crate::gpu_native::prototype_population::PrototypeBcIneligibilityReason::
+                    AdaptiveAtEntryUnavailable,
+                candidate_ids: vec![303],
+            })
+        );
+    }
+
+    #[test]
+    fn public_event_validation_rejects_malformed_and_foreign_events() {
+        let workload = gap_reentry_fixture();
+        let canonical = emit_population_events(&workload).unwrap();
+        assert!(validate_population_events(&workload, &canonical).is_ok());
+
+        let mut invalid_direction = canonical.clone();
+        invalid_direction[0].direction = 0;
+        assert!(matches!(
+            validate_population_events(&workload, &invalid_direction),
+            Err(PopulationOracleError::InvalidEventDirection {
+                index: 0,
+                direction: 0
+            })
+        ));
+        assert!(matches!(
+            resolve_population_outcomes(&workload, &invalid_direction),
+            Err(PopulationOracleError::InvalidEventDirection {
+                index: 0,
+                direction: 0
+            })
+        ));
+
+        let mut invalid_precedence = canonical.clone();
+        invalid_precedence[0].precedence = 9;
+        assert!(matches!(
+            validate_population_events(&workload, &invalid_precedence),
+            Err(PopulationOracleError::InvalidEventPrecedence {
+                index: 0,
+                precedence: 9
+            })
+        ));
+
+        let mut invalid_bar = canonical.clone();
+        invalid_bar[0].entry_bar = workload.dataset.bars() as u32;
+        assert!(matches!(
+            validate_population_events(&workload, &invalid_bar),
+            Err(PopulationOracleError::EventBarOutOfBounds { index: 0, .. })
+        ));
+
+        let mut non_finite = canonical.clone();
+        non_finite[0].stop_price = f64::NAN;
+        assert!(matches!(
+            validate_population_events(&workload, &non_finite),
+            Err(PopulationOracleError::EventNonFinitePrice {
+                index: 0,
+                field: "stop_price"
+            })
+        ));
+
+        let mut foreign = canonical.clone();
+        foreign[0].candidate_id = 999;
+        assert!(matches!(
+            validate_population_events(&workload, &foreign),
+            Err(PopulationOracleError::ForeignEventIdentity { index: 0, .. })
+        ));
+
+        let mut duplicate = canonical.clone();
+        duplicate[1] = duplicate[0];
+        assert!(matches!(
+            validate_population_events(&workload, &duplicate),
+            Err(PopulationOracleError::DuplicateEvent { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn public_event_validation_rejects_count_order_and_exact_field_drift() {
+        let workload = gap_reentry_fixture();
+        let canonical = emit_population_events(&workload).unwrap();
+
+        assert!(matches!(
+            validate_population_events(&workload, &canonical[..canonical.len() - 1]),
+            Err(PopulationOracleError::EventCountMismatch {
+                expected: 3,
+                actual: 2
+            })
+        ));
+
+        let mut reordered = canonical.clone();
+        reordered.swap(0, 1);
+        assert!(matches!(
+            validate_population_events(&workload, &reordered),
+            Err(PopulationOracleError::EventCanonicalMismatch { index: 0, .. })
+        ));
+
+        let mut modified = canonical;
+        modified[0].target_price += 1.0;
+        assert!(matches!(
+            validate_population_events(&workload, &modified),
+            Err(PopulationOracleError::EventCanonicalMismatch { index: 0, .. })
+        ));
     }
 
     #[test]

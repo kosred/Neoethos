@@ -3,6 +3,32 @@ use neoethos_gpu_contracts::device::{
     NeoPopulationCounters, NeoPopulationEvent, NeoPopulationMetricRow, NeoPopulationOutcome,
     NeoPopulationSettings,
 };
+use neoethos_gpu_contracts::{
+    ABI_VERSION, POPULATION_DIRECTION_LONG, POPULATION_DIRECTION_SHORT, POPULATION_EXIT_GAP,
+    POPULATION_EXIT_MAX_HOLD, POPULATION_EXIT_NONE, POPULATION_EXIT_STOP, POPULATION_EXIT_TARGET,
+    POPULATION_PRECEDENCE_STOP_FIRST, POPULATION_SETTINGS_FLAG_RISK_BASED_SIZING,
+};
+
+#[test]
+fn population_abi_constants_are_numerically_pinned() {
+    assert_eq!(ABI_VERSION, 1);
+    assert_eq!(POPULATION_SETTINGS_FLAG_RISK_BASED_SIZING, 1);
+    assert_eq!(POPULATION_DIRECTION_LONG, 1);
+    assert_eq!(POPULATION_DIRECTION_SHORT, -1);
+    assert_eq!(POPULATION_PRECEDENCE_STOP_FIRST, 0);
+    assert_eq!(POPULATION_EXIT_NONE, 0);
+    assert_eq!(POPULATION_EXIT_STOP, 1);
+    assert_eq!(POPULATION_EXIT_TARGET, 2);
+    assert_eq!(POPULATION_EXIT_MAX_HOLD, 3);
+    assert_eq!(POPULATION_EXIT_GAP, 4);
+}
+
+#[test]
+fn population_outcome_default_is_the_unresolved_sentinel() {
+    let outcome = NeoPopulationOutcome::default();
+    assert_eq!(outcome.exit_bar, -1);
+    assert_eq!(outcome.exit_reason, POPULATION_EXIT_NONE);
+}
 
 #[test]
 fn population_settings_has_stable_c_layout() {
