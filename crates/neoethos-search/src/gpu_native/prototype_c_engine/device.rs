@@ -1176,7 +1176,12 @@ impl<R: Runtime> PrototypeCBacktestEngine<R> {
                     ))
                 })?
         };
+        // The control scalar is a real device-to-host transfer and is counted as
+        // one, so the transfer evidence never understates traffic.
         let total_values = i32::from_bytes(total_bytes.as_ref());
+        self.session
+            .transfers()
+            .record_compact_readback((total_values.len() * size_of::<i32>()) as u64);
         let emitted = total_values
             .first()
             .copied()

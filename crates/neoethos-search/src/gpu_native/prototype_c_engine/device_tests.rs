@@ -150,8 +150,9 @@ fn fixed_stop_population_matches_the_canonical_oracle() {
         .assert_device_resident_chain()
         .expect("one dataset upload, no dense intermediate D2H, no chained re-upload");
     assert_eq!(
-        run.transfers.compact_d2h_readbacks, 1,
-        "the compact metric readback is the only result boundary"
+        run.transfers.compact_d2h_readbacks, 2,
+        "exactly two compact device-to-host transfers per evaluation: the one-element \
+         event-total control scalar and the compact metric readback"
     );
 }
 
