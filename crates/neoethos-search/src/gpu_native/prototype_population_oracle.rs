@@ -44,6 +44,17 @@ fn outcome_bar_probes() -> usize {
     OUTCOME_BAR_PROBES.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+fn outcome_schedule_slots_for_probe(
+    events: &[NeoPopulationEvent],
+    bars: usize,
+    min_hold_bars: usize,
+    max_hold_bars: usize,
+) -> usize {
+    build_outcome_schedules(events, 0..events.len(), bars, min_hold_bars, max_hold_bars)
+        .allocated_slots()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OraclePopulationEvaluation {
     pub settings: NeoPopulationSettings,
@@ -266,6 +277,29 @@ impl OrderedPrice {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScheduledOutcomeEvent {
+    bar: usize,
+    event_index: usize,
+}
+
+#[derive(Debug, Default)]
+struct OutcomeSchedules {
+    gap_activations: Vec<ScheduledOutcomeEvent>,
+    level_activations: Vec<ScheduledOutcomeEvent>,
+    max_hold_exits: Vec<ScheduledOutcomeEvent>,
+}
+
+impl OutcomeSchedules {
+    #[cfg(test)]
+    fn allocated_slots(&self) -> usize {
+        self.gap_activations
+            .capacity()
+            .saturating_add(self.level_activations.capacity())
+            .saturating_add(self.max_hold_exits.capacity())
+    }
+}
+
 pub fn population_settings(
     workload: &PrototypePopulationWorkload,
 ) -> Result<NeoPopulationSettings, PopulationOracleError> {
@@ -418,37 +452,21 @@ fn resolve_population_outcomes_unchecked(
         .collect::<Vec<_>>();
     let candidate_ranges = partition_candidate_event_ranges(workload, events)?;
 
-    // One forward bar walk per candidate. Events enter the gap/level/expiry
-    // schedules once; ordered price indexes report only thresholds crossed by
-    // the current bar, so overlapping event horizons never rescan future bars.
+    // One forward bar walk per candidate. Flat schedules use O(E) memory and
+    // monotonic cursors, so overlapping event horizons never rescan suffixes.
+    // Ordered active-price indexes make event updates O(log E), for total
+    // O(P*B + E log E) time and O(B + E) resolver memory.
     for range in candidate_ranges {
-        let mut gap_activations = vec![Vec::<usize>::new(); bars];
-        let mut level_activations = vec![Vec::<usize>::new(); bars];
-        let mut max_hold_exits = vec![Vec::<usize>::new(); bars];
-        for event_index in range {
-            let event = events[event_index];
-            let entry_bar = event.entry_bar as usize;
-            let last_bar = (event.last_bar as usize).min(bars.saturating_sub(1));
-            if entry_bar >= last_bar {
-                continue;
-            }
-
-            let gap_activation = entry_bar.saturating_add(1);
-            if gap_activation <= last_bar {
-                gap_activations[gap_activation].push(event_index);
-            }
-            let level_activation = entry_bar.saturating_add(settings.min_hold_bars.max(1));
-            if level_activation <= last_bar {
-                level_activations[level_activation].push(event_index);
-            }
-            if settings.max_hold_bars > 0 {
-                let max_hold_exit =
-                    entry_bar.saturating_add(settings.max_hold_bars.max(settings.min_hold_bars));
-                if max_hold_exit <= last_bar {
-                    max_hold_exits[max_hold_exit].push(event_index);
-                }
-            }
-        }
+        let schedules = build_outcome_schedules(
+            events,
+            range,
+            bars,
+            settings.min_hold_bars,
+            settings.max_hold_bars,
+        );
+        let mut gap_cursor = 0;
+        let mut level_cursor = 0;
+        let mut max_hold_cursor = 0;
 
         let mut active = HashSet::<usize>::new();
         let mut long_stops = BTreeMap::<OrderedPrice, Vec<usize>>::new();
@@ -460,10 +478,12 @@ fn resolve_population_outcomes_unchecked(
             #[cfg(test)]
             record_outcome_bar_probe();
 
-            for &event_index in &gap_activations[bar] {
-                active.insert(event_index);
+            for scheduled in scheduled_at_bar(&schedules.gap_activations, &mut gap_cursor, bar) {
+                active.insert(scheduled.event_index);
             }
-            for &event_index in &level_activations[bar] {
+            for scheduled in scheduled_at_bar(&schedules.level_activations, &mut level_cursor, bar)
+            {
+                let event_index = scheduled.event_index;
                 if !active.contains(&event_index) {
                     continue;
                 }
@@ -493,6 +513,8 @@ fn resolve_population_outcomes_unchecked(
                 stops.entry(stop_price).or_default().push(event_index);
                 targets.entry(target_price).or_default().push(event_index);
             }
+            let max_hold_at_bar =
+                scheduled_at_bar(&schedules.max_hold_exits, &mut max_hold_cursor, bar);
 
             if gap_bars[bar] {
                 for event_index in active.drain() {
@@ -543,7 +565,8 @@ fn resolve_population_outcomes_unchecked(
                     POPULATION_EXIT_TARGET,
                 );
             }
-            for &event_index in &max_hold_exits[bar] {
+            for scheduled in max_hold_at_bar {
+                let event_index = scheduled.event_index;
                 if active.remove(&event_index) {
                     resolve_outcome(&mut outcomes[event_index], bar, POPULATION_EXIT_MAX_HOLD);
                 }
@@ -551,6 +574,86 @@ fn resolve_population_outcomes_unchecked(
         }
     }
     Ok(outcomes)
+}
+
+fn build_outcome_schedules(
+    events: &[NeoPopulationEvent],
+    range: Range<usize>,
+    bars: usize,
+    min_hold_bars: usize,
+    max_hold_bars: usize,
+) -> OutcomeSchedules {
+    let event_count = range.len();
+    let mut schedules = OutcomeSchedules {
+        gap_activations: Vec::with_capacity(event_count),
+        level_activations: Vec::with_capacity(event_count),
+        max_hold_exits: if max_hold_bars > 0 {
+            Vec::with_capacity(event_count)
+        } else {
+            Vec::new()
+        },
+    };
+    for event_index in range {
+        let event = events[event_index];
+        let entry_bar = event.entry_bar as usize;
+        let last_bar = (event.last_bar as usize).min(bars.saturating_sub(1));
+        if entry_bar >= last_bar {
+            continue;
+        }
+
+        let gap_activation = entry_bar.saturating_add(1);
+        if gap_activation <= last_bar {
+            schedules.gap_activations.push(ScheduledOutcomeEvent {
+                bar: gap_activation,
+                event_index,
+            });
+        }
+        let level_activation = entry_bar.saturating_add(min_hold_bars.max(1));
+        if level_activation <= last_bar {
+            schedules.level_activations.push(ScheduledOutcomeEvent {
+                bar: level_activation,
+                event_index,
+            });
+        }
+        if max_hold_bars > 0 {
+            let max_hold_exit = entry_bar.saturating_add(max_hold_bars.max(min_hold_bars));
+            if max_hold_exit <= last_bar {
+                schedules.max_hold_exits.push(ScheduledOutcomeEvent {
+                    bar: max_hold_exit,
+                    event_index,
+                });
+            }
+        }
+    }
+
+    debug_assert!(schedule_is_sorted(&schedules.gap_activations));
+    debug_assert!(schedule_is_sorted(&schedules.level_activations));
+    debug_assert!(schedule_is_sorted(&schedules.max_hold_exits));
+    schedules
+}
+
+fn schedule_is_sorted(schedule: &[ScheduledOutcomeEvent]) -> bool {
+    schedule.windows(2).all(|pair| pair[0].bar <= pair[1].bar)
+}
+
+fn scheduled_at_bar<'a>(
+    schedule: &'a [ScheduledOutcomeEvent],
+    cursor: &mut usize,
+    bar: usize,
+) -> &'a [ScheduledOutcomeEvent] {
+    debug_assert!(
+        schedule
+            .get(*cursor)
+            .is_none_or(|scheduled| scheduled.bar >= bar)
+    );
+    let start = *cursor;
+    while schedule
+        .get(*cursor)
+        .is_some_and(|scheduled| scheduled.bar == bar)
+    {
+        *cursor += 1;
+    }
+    &schedule[start..*cursor]
 }
 
 fn resolve_at_or_above(
@@ -1907,6 +2010,17 @@ mod tests {
     }
 
     #[test]
+    fn gap_resolution_advances_same_bar_max_hold_schedule_cursor() {
+        let mut workload = gap_reentry_fixture();
+        workload.dataset.settings.max_hold_bars = 1;
+        let events = emit_population_events(&workload).unwrap();
+        let outcomes = resolve_population_outcomes(&workload, &events).unwrap();
+
+        assert_eq!(outcomes[0].exit_reason, POPULATION_EXIT_GAP);
+        assert_eq!(outcomes[1].exit_reason, POPULATION_EXIT_MAX_HOLD);
+    }
+
+    #[test]
     fn candidate_major_ranges_and_cursor_consume_repeated_events_once() {
         let workload = gap_reentry_fixture();
         let events = emit_population_events(&workload).unwrap();
@@ -1929,7 +2043,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_outcome_resolution_examines_each_candidate_bar_once() {
+    fn dense_outcome_resolution_avoids_suffix_bar_rescans() {
         let workload = dense_no_hit_fixture(64);
         let events = emit_population_events(&workload).unwrap();
 
@@ -1938,14 +2052,15 @@ mod tests {
         let probes = outcome_bar_probes();
         let expected_bar_passes =
             workload.genes.population() * workload.dataset.bars().saturating_sub(1);
-        let linear_bound = workload.genes.population() * workload.dataset.bars() + events.len();
+        let single_pass_bar_bound =
+            workload.genes.population() * workload.dataset.bars() + events.len();
 
         assert_eq!(events.len(), 63);
         assert_eq!(outcomes.len(), events.len());
         assert_eq!(probes, expected_bar_passes);
         assert!(
-            probes <= linear_bound,
-            "dense resolution examined {probes} bars; candidate-major O(P*B+E) bound is {linear_bound}"
+            probes <= single_pass_bar_bound,
+            "dense resolution examined {probes} bars; single-pass bar-probe bound is {single_pass_bar_bound}"
         );
 
         reset_outcome_bar_probes();
@@ -1962,6 +2077,40 @@ mod tests {
             outcome_bar_probes(),
             expected_bar_passes,
             "public reduction must resolve exactly once to validate supplied outcomes"
+        );
+    }
+
+    #[test]
+    fn sparse_outcome_schedules_allocate_by_event_count_not_bar_count() {
+        let bars = 6_000_000;
+        let events = vec![
+            NeoPopulationEvent {
+                candidate_id: 101,
+                scenario_id: 1001,
+                entry_bar: 5,
+                last_bar: (bars - 1) as u32,
+                direction: POPULATION_DIRECTION_LONG,
+                precedence: POPULATION_PRECEDENCE_STOP_FIRST,
+                stop_price: 90.0,
+                target_price: 110.0,
+            },
+            NeoPopulationEvent {
+                candidate_id: 101,
+                scenario_id: 1001,
+                entry_bar: (bars - 10) as u32,
+                last_bar: (bars - 1) as u32,
+                direction: POPULATION_DIRECTION_LONG,
+                precedence: POPULATION_PRECEDENCE_STOP_FIRST,
+                stop_price: 90.0,
+                target_price: 110.0,
+            },
+        ];
+
+        let allocated_slots = outcome_schedule_slots_for_probe(&events, bars, 0, 0);
+        assert!(
+            allocated_slots <= events.len().saturating_mul(3),
+            "sparse schedules allocated {allocated_slots} slots for {} events at {bars} bars",
+            events.len()
         );
     }
 

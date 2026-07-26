@@ -97,6 +97,10 @@ impl CommonBcEligibility {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrototypePopulationError {
     Upload(PrototypeAUploadError),
+    NonFiniteDatasetValue {
+        field: &'static str,
+        index: usize,
+    },
     DuplicateCandidateId(u64),
     EmptySupportedPartition,
     EligibilityIndexOutOfBounds(usize),
@@ -118,6 +122,9 @@ impl fmt::Display for PrototypePopulationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Upload(error) => write!(f, "{error}"),
+            Self::NonFiniteDatasetValue { field, index } => {
+                write!(f, "Prototype B/C dataset {field}[{index}] must be finite")
+            }
             Self::DuplicateCandidateId(candidate_id) => {
                 write!(f, "Prototype B/C candidate ID {candidate_id} is duplicated")
             }
@@ -455,6 +462,15 @@ fn validate_dataset_shape(
         }
         .into());
     }
+    for (field, values) in [
+        ("close", dataset.close.as_slice()),
+        ("high", dataset.high.as_slice()),
+        ("low", dataset.low.as_slice()),
+    ] {
+        if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+            return Err(PrototypePopulationError::NonFiniteDatasetValue { field, index });
+        }
+    }
     Ok(())
 }
 
@@ -498,6 +514,38 @@ mod tests {
             supported_gene_indices: vec![0, 1],
             unsupported: BTreeMap::new(),
         }
+    }
+
+    fn assert_non_finite_ohlc_rejected(field: &'static str, index: usize, value: f64) {
+        let fixture = TinyPopulationFixture::new(2, 64, 4);
+        let (mut dataset, genes, scenarios) = fixture.prototype_a_uploads();
+        match field {
+            "close" => dataset.close[index] = value,
+            "high" => dataset.high[index] = value,
+            "low" => dataset.low[index] = value,
+            _ => unreachable!("test only covers OHLC fields"),
+        }
+
+        let result = PrototypePopulationWorkload::from_uploads(
+            dataset,
+            genes,
+            scenarios,
+            PrototypeBcRequirements {
+                prop_firm_state: PropFirmRequirement::NotRequested,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(PrototypePopulationError::NonFiniteDatasetValue { field, index }),
+            "{field}[{index}]={value:?} must be rejected before B/C eligibility",
+        );
+    }
+
+    #[test]
+    fn workload_construction_rejects_each_non_finite_ohlc_field() {
+        assert_non_finite_ohlc_rejected("high", 3, f64::INFINITY);
+        assert_non_finite_ohlc_rejected("low", 7, f64::NEG_INFINITY);
+        assert_non_finite_ohlc_rejected("close", 11, f64::NAN);
     }
 
     #[test]
@@ -755,6 +803,20 @@ mod tests {
     }
 
     #[test]
+    fn serialized_non_finite_close_fails_closed_without_panicking() {
+        let mut workload = mixed_fixed_and_adaptive_workload();
+        workload.dataset.close[5] = f64::NAN;
+
+        let decoded = std::panic::catch_unwind(|| {
+            serde_json::to_value(workload)
+                .and_then(serde_json::from_value::<PrototypePopulationWorkload>)
+        })
+        .expect("malformed OHLC deserialization must return an error, not panic");
+
+        assert!(decoded.is_err());
+    }
+
+    #[test]
     fn public_mutation_fails_closed_without_panicking() {
         let mut workload = mixed_fixed_and_adaptive_workload();
         workload.genes.stop_vol_multipliers.clear();
@@ -776,6 +838,35 @@ mod tests {
         }))
         .expect("partition must reject malformed public state without panicking");
         assert!(partition.is_err());
+    }
+
+    #[test]
+    fn public_non_finite_ohlc_mutation_fails_closed_without_panicking() {
+        let mut workload = mixed_fixed_and_adaptive_workload();
+        workload.dataset.high[9] = f64::INFINITY;
+
+        let eligibility = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workload.common_bc_intersection(PrototypeKind::BWarpCooperative)
+        }))
+        .expect("eligibility must reject non-finite public OHLC state without panicking");
+        assert_eq!(
+            eligibility
+                .unsupported
+                .get(&PrototypeBcIneligibilityReason::InvalidWorkload),
+            Some(&vec![0, 1])
+        );
+
+        let partition = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workload.supported_partition(&forged_all_supported())
+        }))
+        .expect("partition must reject non-finite public OHLC state without panicking");
+        assert_eq!(
+            partition,
+            Err(PrototypePopulationError::NonFiniteDatasetValue {
+                field: "high",
+                index: 9,
+            })
+        );
     }
 
     #[test]
