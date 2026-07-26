@@ -841,11 +841,8 @@ pub fn fast_evaluate_strategy_core(
 
         let d_val = *day_idx.get(i).unwrap_or(&last_day);
         if d_val != last_day {
-            if last_day != -1 && day_peak > 0.0 {
-                let dd = (day_peak - day_low) / day_peak;
-                if dd > max_daily_dd {
-                    max_daily_dd = dd;
-                }
+            if last_day != -1 {
+                finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
             }
             last_day = d_val;
             day_peak = equity;
@@ -908,6 +905,7 @@ pub fn fast_evaluate_strategy_core(
                     peak_equity = equity;
                 }
                 if equity > day_peak {
+                    finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
                     day_peak = equity;
                     day_low = equity;
                 } else if equity < day_low {
@@ -947,6 +945,7 @@ pub fn fast_evaluate_strategy_core(
                 peak_equity = equity + best_float_pnl;
             }
             if (equity + best_float_pnl) > day_peak {
+                finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
                 day_peak = equity + best_float_pnl;
                 // A new same-day peak starts a new causal drawdown segment.
                 // Preserve this bar's worst excursion (the canonical
@@ -1086,6 +1085,7 @@ pub fn fast_evaluate_strategy_core(
                     peak_equity = equity;
                 }
                 if equity > day_peak {
+                    finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
                     day_peak = equity;
                     day_low = equity;
                 } else if equity < day_low {
@@ -1150,11 +1150,8 @@ pub fn fast_evaluate_strategy_core(
 
     // The boundary block finalizes only completed days. Include the current
     // final day so a terminal same-day peak-to-trough move is never dropped.
-    if last_day != -1 && day_peak > 0.0 {
-        let dd = (day_peak - day_low) / day_peak;
-        if dd > max_daily_dd {
-            max_daily_dd = dd;
-        }
+    if last_day != -1 {
+        finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
     }
 
     let net_profit = equity - initial_equity;
@@ -1284,6 +1281,15 @@ pub fn fast_evaluate_strategy_core(
         sanitize(consistency),
         sanitize(max_daily_dd),
     ]
+}
+
+fn finalize_daily_drawdown_segment(day_peak: f64, day_low: f64, max_daily_dd: &mut f64) {
+    if day_peak > 0.0 {
+        let drawdown = (day_peak - day_low) / day_peak;
+        if drawdown > *max_daily_dd {
+            *max_daily_dd = drawdown;
+        }
+    }
 }
 
 pub fn simulate_trades_core(
@@ -2557,6 +2563,47 @@ mod overrides_tests {
         assert!(
             (metrics[10] - expected).abs() < 1.0e-12,
             "daily DD must be (110k-105k)/110k={expected}, got {}",
+            metrics[10]
+        );
+    }
+
+    #[test]
+    fn daily_drawdown_preserves_a_trough_before_a_later_same_day_peak() {
+        let close = [100.0, 100.0, -9_900.0, 100.0, 20_100.0, 20_100.0];
+        let high = [100.0, 100.0, 100.0, 100.0, 20_100.0, 20_100.0];
+        let low = [100.0, 100.0, -9_900.0, 100.0, 20_100.0, 20_100.0];
+        // Realized equity path: 100k -> 90k -> 110k -> 110k, all on day zero.
+        let signals = [1_i8, 0, 1, 0, 0, 0];
+        let months = [0_i64; 6];
+        let days = [0_i64, 0, 0, 0, 0, 1];
+        let mut settings = BacktestSettings::default();
+        settings.sl_pips = 10_000.0;
+        settings.tp_pips = 20_000.0;
+        settings.pip_value = 1.0;
+        settings.pip_value_per_lot = 1.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.risk_based_sizing = false;
+
+        let metrics = fast_evaluate_strategy_core(
+            &close,
+            &high,
+            &low,
+            &signals,
+            &[],
+            &months,
+            &days,
+            &[],
+            &settings,
+        );
+
+        assert_eq!(metrics[8], 2.0);
+        assert!(
+            (metrics[10] - 0.10).abs() < 1.0e-12,
+            "the 100k -> 90k segment must remain a 10% daily drawdown after the 110k peak, got {}",
             metrics[10]
         );
     }

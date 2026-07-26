@@ -19,10 +19,30 @@ use neoethos_gpu_contracts::{
     POPULATION_EXIT_MAX_HOLD, POPULATION_EXIT_NONE, POPULATION_EXIT_STOP, POPULATION_EXIT_TARGET,
     POPULATION_PRECEDENCE_STOP_FIRST, POPULATION_SETTINGS_FLAG_RISK_BASED_SIZING,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::ops::Range;
+
+#[cfg(test)]
+thread_local! {
+    static OUTCOME_BAR_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_outcome_bar_probes() {
+    OUTCOME_BAR_PROBES.with(|probes| probes.set(0));
+}
+
+#[cfg(test)]
+fn record_outcome_bar_probe() {
+    OUTCOME_BAR_PROBES.with(|probes| probes.set(probes.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn outcome_bar_probes() -> usize {
+    OUTCOME_BAR_PROBES.with(std::cell::Cell::get)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OraclePopulationEvaluation {
@@ -228,6 +248,24 @@ struct CandidateReduction {
     event_cursor_advances: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct OrderedPrice(u64);
+
+impl OrderedPrice {
+    fn new(value: f64) -> Option<Self> {
+        if !value.is_finite() {
+            return None;
+        }
+        let value = if value == 0.0 { 0.0 } else { value };
+        let bits = value.to_bits();
+        if bits & (1_u64 << 63) == 0 {
+            Some(Self(bits ^ (1_u64 << 63)))
+        } else {
+            Some(Self(!bits))
+        }
+    }
+}
+
 pub fn population_settings(
     workload: &PrototypePopulationWorkload,
 ) -> Result<NeoPopulationSettings, PopulationOracleError> {
@@ -310,6 +348,7 @@ pub fn evaluate_population_oracle(
     let settings = population_settings_unchecked(workload)?;
     let signals = synthesize_population_signals(workload);
     let events = emit_population_events_with_signals(workload, &signals)?;
+    validate_population_events_against_canonical(workload, &events, &events)?;
     let outcomes = resolve_population_outcomes_unchecked(workload, &events)?;
     let (metrics, accepted_trade_count, _) =
         reduce_population_outcomes_with_signals_unchecked(workload, &signals, &events, &outcomes)?;
@@ -331,7 +370,9 @@ pub fn emit_population_events(
 ) -> Result<Vec<NeoPopulationEvent>, PopulationOracleError> {
     validate_population_oracle_workload(workload)?;
     let signals = synthesize_population_signals(workload);
-    emit_population_events_with_signals(workload, &signals)
+    let events = emit_population_events_with_signals(workload, &signals)?;
+    validate_population_events_against_canonical(workload, &events, &events)?;
+    Ok(events)
 }
 
 pub fn validate_population_events(
@@ -363,64 +404,205 @@ fn resolve_population_outcomes_unchecked(
     let bars = workload.dataset.bars();
     i32::try_from(bars.saturating_sub(1))
         .map_err(|_| PopulationOracleError::FixedWidthOverflow("outcome exit_bar"))?;
-    Ok(events
+    let mut outcomes = events
         .iter()
-        .map(|event| {
-            let mut outcome = NeoPopulationOutcome {
-                candidate_id: event.candidate_id,
-                scenario_id: event.scenario_id,
-                exit_bar: -1,
-                exit_reason: POPULATION_EXIT_NONE,
-            };
+        .map(|event| NeoPopulationOutcome {
+            candidate_id: event.candidate_id,
+            scenario_id: event.scenario_id,
+            exit_bar: -1,
+            exit_reason: POPULATION_EXIT_NONE,
+        })
+        .collect::<Vec<_>>();
+    let gap_bars = (0..bars)
+        .map(|bar| is_gap_exit(workload, &settings, bar))
+        .collect::<Vec<_>>();
+    let candidate_ranges = partition_candidate_event_ranges(workload, events)?;
+
+    // One forward bar walk per candidate. Events enter the gap/level/expiry
+    // schedules once; ordered price indexes report only thresholds crossed by
+    // the current bar, so overlapping event horizons never rescan future bars.
+    for range in candidate_ranges {
+        let mut gap_activations = vec![Vec::<usize>::new(); bars];
+        let mut level_activations = vec![Vec::<usize>::new(); bars];
+        let mut max_hold_exits = vec![Vec::<usize>::new(); bars];
+        for event_index in range {
+            let event = events[event_index];
             let entry_bar = event.entry_bar as usize;
             let last_bar = (event.last_bar as usize).min(bars.saturating_sub(1));
             if entry_bar >= last_bar {
-                return outcome;
+                continue;
             }
 
-            for bar in entry_bar + 1..=last_bar {
-                if is_gap_exit(workload, &settings, bar) {
-                    outcome.exit_bar = bar as i32;
-                    outcome.exit_reason = POPULATION_EXIT_GAP;
-                    break;
+            let gap_activation = entry_bar.saturating_add(1);
+            if gap_activation <= last_bar {
+                gap_activations[gap_activation].push(event_index);
+            }
+            let level_activation = entry_bar.saturating_add(settings.min_hold_bars.max(1));
+            if level_activation <= last_bar {
+                level_activations[level_activation].push(event_index);
+            }
+            if settings.max_hold_bars > 0 {
+                let max_hold_exit =
+                    entry_bar.saturating_add(settings.max_hold_bars.max(settings.min_hold_bars));
+                if max_hold_exit <= last_bar {
+                    max_hold_exits[max_hold_exit].push(event_index);
                 }
-                let bars_held = bar - entry_bar;
-                let past_min_hold =
-                    settings.min_hold_bars == 0 || bars_held >= settings.min_hold_bars;
-                if !past_min_hold {
+            }
+        }
+
+        let mut active = HashSet::<usize>::new();
+        let mut long_stops = BTreeMap::<OrderedPrice, Vec<usize>>::new();
+        let mut long_targets = BTreeMap::<OrderedPrice, Vec<usize>>::new();
+        let mut short_stops = BTreeMap::<OrderedPrice, Vec<usize>>::new();
+        let mut short_targets = BTreeMap::<OrderedPrice, Vec<usize>>::new();
+
+        for bar in 1..bars {
+            #[cfg(test)]
+            record_outcome_bar_probe();
+
+            for &event_index in &gap_activations[bar] {
+                active.insert(event_index);
+            }
+            for &event_index in &level_activations[bar] {
+                if !active.contains(&event_index) {
                     continue;
                 }
-
-                let high = workload.dataset.high[bar];
-                let low = workload.dataset.low[bar];
-                let (stop_hit, target_hit) = match event.direction {
-                    POPULATION_DIRECTION_LONG => {
-                        (low <= event.stop_price, high >= event.target_price)
+                let event = events[event_index];
+                let (stops, targets) = match event.direction {
+                    POPULATION_DIRECTION_LONG => (&mut long_stops, &mut long_targets),
+                    POPULATION_DIRECTION_SHORT => (&mut short_stops, &mut short_targets),
+                    _ => {
+                        return Err(PopulationOracleError::InvalidEventDirection {
+                            index: event_index,
+                            direction: event.direction,
+                        });
                     }
-                    POPULATION_DIRECTION_SHORT => {
-                        (high >= event.stop_price, low <= event.target_price)
-                    }
-                    _ => unreachable!("unchecked resolver requires validated directions"),
                 };
-                if stop_hit {
-                    outcome.exit_bar = bar as i32;
-                    outcome.exit_reason = POPULATION_EXIT_STOP;
-                    break;
+                let stop_price = OrderedPrice::new(event.stop_price).ok_or(
+                    PopulationOracleError::EventNonFinitePrice {
+                        index: event_index,
+                        field: "stop_price",
+                    },
+                )?;
+                let target_price = OrderedPrice::new(event.target_price).ok_or(
+                    PopulationOracleError::EventNonFinitePrice {
+                        index: event_index,
+                        field: "target_price",
+                    },
+                )?;
+                stops.entry(stop_price).or_default().push(event_index);
+                targets.entry(target_price).or_default().push(event_index);
+            }
+
+            if gap_bars[bar] {
+                for event_index in active.drain() {
+                    resolve_outcome(&mut outcomes[event_index], bar, POPULATION_EXIT_GAP);
                 }
-                if target_hit {
-                    outcome.exit_bar = bar as i32;
-                    outcome.exit_reason = POPULATION_EXIT_TARGET;
-                    break;
-                }
-                if settings.max_hold_bars > 0 && bars_held >= settings.max_hold_bars {
-                    outcome.exit_bar = bar as i32;
-                    outcome.exit_reason = POPULATION_EXIT_MAX_HOLD;
-                    break;
+                continue;
+            }
+
+            let low = OrderedPrice::new(workload.dataset.low[bar]);
+            let high = OrderedPrice::new(workload.dataset.high[bar]);
+            if let Some(low) = low {
+                resolve_at_or_above(
+                    &mut long_stops,
+                    low,
+                    &mut active,
+                    &mut outcomes,
+                    bar,
+                    POPULATION_EXIT_STOP,
+                );
+            }
+            if let Some(high) = high {
+                resolve_at_or_below(
+                    &mut short_stops,
+                    high,
+                    &mut active,
+                    &mut outcomes,
+                    bar,
+                    POPULATION_EXIT_STOP,
+                );
+            }
+            if let Some(high) = high {
+                resolve_at_or_below(
+                    &mut long_targets,
+                    high,
+                    &mut active,
+                    &mut outcomes,
+                    bar,
+                    POPULATION_EXIT_TARGET,
+                );
+            }
+            if let Some(low) = low {
+                resolve_at_or_above(
+                    &mut short_targets,
+                    low,
+                    &mut active,
+                    &mut outcomes,
+                    bar,
+                    POPULATION_EXIT_TARGET,
+                );
+            }
+            for &event_index in &max_hold_exits[bar] {
+                if active.remove(&event_index) {
+                    resolve_outcome(&mut outcomes[event_index], bar, POPULATION_EXIT_MAX_HOLD);
                 }
             }
-            outcome
-        })
-        .collect())
+        }
+    }
+    Ok(outcomes)
+}
+
+fn resolve_at_or_above(
+    events_by_price: &mut BTreeMap<OrderedPrice, Vec<usize>>,
+    threshold: OrderedPrice,
+    active: &mut HashSet<usize>,
+    outcomes: &mut [NeoPopulationOutcome],
+    bar: usize,
+    reason: i32,
+) {
+    let matches = events_by_price.split_off(&threshold);
+    for event_indices in matches.into_values() {
+        resolve_active_indices(event_indices, active, outcomes, bar, reason);
+    }
+}
+
+fn resolve_at_or_below(
+    events_by_price: &mut BTreeMap<OrderedPrice, Vec<usize>>,
+    threshold: OrderedPrice,
+    active: &mut HashSet<usize>,
+    outcomes: &mut [NeoPopulationOutcome],
+    bar: usize,
+    reason: i32,
+) {
+    while events_by_price
+        .first_key_value()
+        .is_some_and(|(&price, _)| price <= threshold)
+    {
+        let (_, event_indices) = events_by_price
+            .pop_first()
+            .expect("first_key_value confirmed a matching price");
+        resolve_active_indices(event_indices, active, outcomes, bar, reason);
+    }
+}
+
+fn resolve_active_indices(
+    event_indices: Vec<usize>,
+    active: &mut HashSet<usize>,
+    outcomes: &mut [NeoPopulationOutcome],
+    bar: usize,
+    reason: i32,
+) {
+    for event_index in event_indices {
+        if active.remove(&event_index) {
+            resolve_outcome(&mut outcomes[event_index], bar, reason);
+        }
+    }
+}
+
+fn resolve_outcome(outcome: &mut NeoPopulationOutcome, bar: usize, reason: i32) {
+    outcome.exit_bar = bar as i32;
+    outcome.exit_reason = reason;
 }
 
 pub fn reduce_population_outcomes(
@@ -877,11 +1059,8 @@ fn reduce_candidate(
 
         let day = workload.dataset.days[bar];
         if day != last_day {
-            if last_day != -1 && day_peak > 0.0 {
-                let drawdown = (day_peak - day_low) / day_peak;
-                if drawdown > max_daily_drawdown {
-                    max_daily_drawdown = drawdown;
-                }
+            if last_day != -1 {
+                finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_drawdown);
             }
             last_day = day;
             day_peak = equity;
@@ -913,6 +1092,7 @@ fn reduce_candidate(
                     &mut day_peak,
                     &mut day_low,
                     &mut max_drawdown,
+                    &mut max_daily_drawdown,
                 );
                 open_position = None;
             } else {
@@ -922,6 +1102,7 @@ fn reduce_candidate(
                     peak_equity = equity + best_float_pnl;
                 }
                 if equity + best_float_pnl > day_peak {
+                    finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_drawdown);
                     day_peak = equity + best_float_pnl;
                     day_low = equity + worst_float_pnl;
                 } else if equity + worst_float_pnl < day_low {
@@ -957,6 +1138,7 @@ fn reduce_candidate(
                         &mut day_peak,
                         &mut day_low,
                         &mut max_drawdown,
+                        &mut max_daily_drawdown,
                     );
                     open_position = None;
                 }
@@ -1012,11 +1194,8 @@ fn reduce_candidate(
         }
     }
 
-    if last_day != -1 && day_peak > 0.0 {
-        let drawdown = (day_peak - day_low) / day_peak;
-        if drawdown > max_daily_drawdown {
-            max_daily_drawdown = drawdown;
-        }
+    if last_day != -1 {
+        finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_drawdown);
     }
 
     let net_profit = equity - initial_equity;
@@ -1152,11 +1331,13 @@ fn update_realized_risk(
     day_peak: &mut f64,
     day_low: &mut f64,
     max_drawdown: &mut f64,
+    max_daily_drawdown: &mut f64,
 ) {
     if equity > *peak_equity {
         *peak_equity = equity;
     }
     if equity > *day_peak {
+        finalize_daily_drawdown_segment(*day_peak, *day_low, max_daily_drawdown);
         *day_peak = equity;
         *day_low = equity;
     } else if equity < *day_low {
@@ -1166,6 +1347,15 @@ fn update_realized_risk(
         let drawdown = (*peak_equity - equity) / *peak_equity;
         if drawdown > *max_drawdown {
             *max_drawdown = drawdown;
+        }
+    }
+}
+
+fn finalize_daily_drawdown_segment(day_peak: f64, day_low: f64, max_daily_drawdown: &mut f64) {
+    if day_peak > 0.0 {
+        let drawdown = (day_peak - day_low) / day_peak;
+        if drawdown > *max_daily_drawdown {
+            *max_daily_drawdown = drawdown;
         }
     }
 }
@@ -1478,6 +1668,35 @@ mod tests {
         workload
     }
 
+    fn trough_then_peak_daily_drawdown_fixture() -> PrototypePopulationWorkload {
+        let mut workload = daily_drawdown_fixture();
+        workload.dataset.close = vec![100.0, 100.0, -9_900.0, 100.0, 20_100.0, 20_100.0];
+        workload.dataset.high = vec![100.0, 100.0, 100.0, 100.0, 20_100.0, 20_100.0];
+        workload.dataset.low = vec![100.0, 100.0, -9_900.0, 100.0, 20_100.0, 20_100.0];
+        workload.genes.stop_pips = vec![10_000.0];
+        workload.genes.target_pips = vec![20_000.0];
+        workload
+    }
+
+    fn dense_no_hit_fixture(bars: usize) -> PrototypePopulationWorkload {
+        let mut workload = daily_drawdown_fixture();
+        workload.dataset.close = vec![100.0; bars];
+        workload.dataset.high = vec![100.0; bars];
+        workload.dataset.low = vec![100.0; bars];
+        workload.dataset.indicators = vec![1.0; bars];
+        workload.dataset.months = vec![0; bars];
+        workload.dataset.days = vec![0; bars];
+        workload.dataset.timestamps = (0..bars).map(|bar| bar as i64 * 60_000).collect();
+        workload.dataset.smc_data = vec![[0; 11]; bars];
+        workload.dataset.settings.max_hold_bars = 0;
+        workload.dataset.settings.min_hold_bars = 0;
+        workload.dataset.settings.gap_threshold_ms = 0;
+        workload.genes.stop_pips = vec![10.0];
+        workload.genes.target_pips = vec![50.0];
+        workload.scenarios.scenarios[0].window_len = bars as u32;
+        workload
+    }
+
     fn full_cpu_metrics(workload: &PrototypePopulationWorkload) -> Vec<[f64; 11]> {
         let dataset = &workload.dataset;
         let genes = &workload.genes;
@@ -1597,6 +1816,19 @@ mod tests {
     }
 
     #[test]
+    fn oracle_daily_drawdown_preserves_a_trough_before_a_later_same_day_peak() {
+        let workload = trough_then_peak_daily_drawdown_fixture();
+        let actual = evaluate_population_oracle(&workload).unwrap();
+
+        assert_eq!(actual.metrics[0].values[8], 2.0);
+        assert!(
+            (actual.metrics[0].values[10] - 0.10).abs() < 1.0e-12,
+            "the independent oracle must retain the 100k -> 90k daily segment after the 110k peak, got {}",
+            actual.metrics[0].values[10]
+        );
+    }
+
+    #[test]
     fn oracle_metric_row_keeps_raw_monthly_hit_rate_in_slot_seven() {
         let workload = canonical_cost_fixture();
         let row = evaluate_population_oracle(&workload).unwrap().metrics[0];
@@ -1694,6 +1926,72 @@ mod tests {
         assert_eq!(actual.metrics[0].values[8], 1.0);
         assert_eq!(actual.metrics[1].values[8], 1.0);
         assert_eq!(actual.metrics[2].values[8], 0.0);
+    }
+
+    #[test]
+    fn dense_outcome_resolution_examines_each_candidate_bar_once() {
+        let workload = dense_no_hit_fixture(64);
+        let events = emit_population_events(&workload).unwrap();
+
+        reset_outcome_bar_probes();
+        let outcomes = resolve_population_outcomes(&workload, &events).unwrap();
+        let probes = outcome_bar_probes();
+        let expected_bar_passes =
+            workload.genes.population() * workload.dataset.bars().saturating_sub(1);
+        let linear_bound = workload.genes.population() * workload.dataset.bars() + events.len();
+
+        assert_eq!(events.len(), 63);
+        assert_eq!(outcomes.len(), events.len());
+        assert_eq!(probes, expected_bar_passes);
+        assert!(
+            probes <= linear_bound,
+            "dense resolution examined {probes} bars; candidate-major O(P*B+E) bound is {linear_bound}"
+        );
+
+        reset_outcome_bar_probes();
+        evaluate_population_oracle(&workload).unwrap();
+        assert_eq!(
+            outcome_bar_probes(),
+            expected_bar_passes,
+            "evaluate must resolve the canonical event stream exactly once"
+        );
+
+        reset_outcome_bar_probes();
+        reduce_population_outcomes(&workload, &events, &outcomes).unwrap();
+        assert_eq!(
+            outcome_bar_probes(),
+            expected_bar_passes,
+            "public reduction must resolve exactly once to validate supplied outcomes"
+        );
+    }
+
+    #[test]
+    fn ordered_price_matches_finite_numeric_order_and_normalizes_signed_zero() {
+        let prices = [-1_000.0, -1.0, -0.0, 0.0, 1.0, 1_000.0];
+        assert_eq!(OrderedPrice::new(-0.0), OrderedPrice::new(0.0));
+        for pair in prices.windows(2) {
+            if pair[0] < pair[1] {
+                assert!(OrderedPrice::new(pair[0]).unwrap() < OrderedPrice::new(pair[1]).unwrap());
+            }
+        }
+        assert_eq!(OrderedPrice::new(f64::NAN), None);
+        assert_eq!(OrderedPrice::new(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn indexed_outcome_resolution_keeps_stop_first_same_bar_precedence() {
+        let mut workload = canonical_cost_fixture();
+        workload.dataset.high[2] = 200.0;
+        workload.dataset.low[2] = 0.0;
+        let events = emit_population_events(&workload).unwrap();
+        let outcomes = resolve_population_outcomes(&workload, &events).unwrap();
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.exit_reason == POPULATION_EXIT_STOP)
+        );
     }
 
     #[test]

@@ -39,6 +39,19 @@ fn cubecl_daily_drawdown_from_extrema(day_peak: f64, day_low: f64) -> f64 {
     }
 }
 
+#[cfg(test)]
+fn cubecl_daily_drawdown_after_peak_transition(
+    max_daily_dd: f64,
+    day_peak: f64,
+    day_low: f64,
+    new_peak: f64,
+    new_low: f64,
+) -> f64 {
+    max_daily_dd
+        .max(cubecl_daily_drawdown_from_extrema(day_peak, day_low))
+        .max(cubecl_daily_drawdown_from_extrema(new_peak, new_low))
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CubeClTransferTelemetry {
     pub gpu_calls: u64,
@@ -1260,6 +1273,13 @@ fn backtest_population_kernel(
                     peak_equity.store(eq);
                 }
                 if eq > day_peak.read() {
+                    let previous_day_peak = day_peak.read();
+                    if previous_day_peak > 0.0 {
+                        let previous_dd = (previous_day_peak - day_low.read()) / previous_day_peak;
+                        if previous_dd > max_daily_dd.read() {
+                            max_daily_dd.store(previous_dd);
+                        }
+                    }
                     day_peak.store(eq);
                     day_low.store(eq);
                 } else if eq < day_low.read() {
@@ -1302,6 +1322,13 @@ fn backtest_population_kernel(
                     peak_equity.store(eq + best_float_pnl);
                 }
                 if (eq + best_float_pnl) > day_peak.read() {
+                    let previous_day_peak = day_peak.read();
+                    if previous_day_peak > 0.0 {
+                        let previous_dd = (previous_day_peak - day_low.read()) / previous_day_peak;
+                        if previous_dd > max_daily_dd.read() {
+                            max_daily_dd.store(previous_dd);
+                        }
+                    }
                     day_peak.store(eq + best_float_pnl);
                     // Start a new causal same-day drawdown segment at the new
                     // peak, retaining this bar's worst excursion.
@@ -1439,6 +1466,14 @@ fn backtest_population_kernel(
                         peak_equity.store(eq2);
                     }
                     if eq2 > day_peak.read() {
+                        let previous_day_peak = day_peak.read();
+                        if previous_day_peak > 0.0 {
+                            let previous_dd =
+                                (previous_day_peak - day_low.read()) / previous_day_peak;
+                            if previous_dd > max_daily_dd.read() {
+                                max_daily_dd.store(previous_dd);
+                            }
+                        }
                         day_peak.store(eq2);
                         day_low.store(eq2);
                     } else if eq2 < day_low.read() {
@@ -2359,8 +2394,9 @@ where
 #[cfg(test)]
 mod window_tests {
     use super::{
-        backtest_gene_batch, cubecl_daily_drawdown_from_extrema, gather_indicator_window,
-        gene_chunk_size, signal_window_size,
+        backtest_gene_batch, cubecl_daily_drawdown_after_peak_transition,
+        cubecl_daily_drawdown_from_extrema, gather_indicator_window, gene_chunk_size,
+        signal_window_size,
     };
 
     #[test]
@@ -2368,6 +2404,17 @@ mod window_tests {
         let observed = cubecl_daily_drawdown_from_extrema(110_000.0, 105_000.0);
         let expected = 5_000.0 / 110_000.0;
         assert!((observed - expected).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn cubecl_daily_drawdown_finalizes_the_previous_segment_before_a_new_peak() {
+        let observed = cubecl_daily_drawdown_after_peak_transition(
+            0.0, 100_000.0, 90_000.0, 110_000.0, 110_000.0,
+        );
+        assert!(
+            (observed - 0.10).abs() < 1.0e-12,
+            "the device arithmetic must retain the 100k -> 90k segment before resetting at 110k, got {observed}"
+        );
     }
 
     #[test]
