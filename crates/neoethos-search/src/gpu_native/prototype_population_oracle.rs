@@ -455,7 +455,7 @@ fn resolve_population_outcomes_unchecked(
     // One forward bar walk per candidate. Flat schedules use O(E) memory and
     // monotonic cursors, so overlapping event horizons never rescan suffixes.
     // Ordered active-price indexes make event updates O(log E), for total
-    // O(P*B + E log E) time and O(B + E) resolver memory.
+    // O(P*B + E log E) time and O(B + P + E) resolver memory.
     for range in candidate_ranges {
         let schedules = build_outcome_schedules(
             events,
