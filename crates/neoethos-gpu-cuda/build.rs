@@ -7,6 +7,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/stub.cpp");
     println!("cargo:rerun-if-changed=native/smoke.cu");
     println!("cargo:rerun-if-changed=native/prototype_b.cu");
+    println!("cargo:rerun-if-changed=native/prototype_b_population.cu");
     println!("cargo:rerun-if-env-changed=CUDACXX");
 
     let cuda_feature = env::var_os("CARGO_FEATURE_CUDA").is_some();
@@ -28,7 +29,8 @@ fn main() {
             .cuda(true)
             .compiler(nvcc)
             .file("native/smoke.cu")
-            .file("native/prototype_b.cu");
+            .file("native/prototype_b.cu")
+            .file("native/prototype_b_population.cu");
     } else {
         build.file("native/stub.cpp");
     }

@@ -10,6 +10,7 @@ pub mod population_fixture;
 pub mod prototype_a;
 #[cfg(feature = "gpu")]
 mod prototype_a_engine;
+pub mod prototype_b_engine;
 pub mod prototype_bc;
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-vulkan"))]
 pub mod prototype_c_gpu;

@@ -310,7 +310,18 @@ pub fn population_settings(
 fn population_settings_unchecked(
     workload: &PrototypePopulationWorkload,
 ) -> Result<NeoPopulationSettings, PopulationOracleError> {
-    let source = workload.dataset.settings.to_settings();
+    population_settings_for_dataset(&workload.dataset)
+}
+
+/// Fixed-width settings for one dataset upload.
+///
+/// Device engines need the exact same mapping as the oracle but only own the
+/// dataset upload at that point, so the conversion is shared here rather than
+/// re-expressed per backend.
+pub fn population_settings_for_dataset(
+    dataset: &crate::gpu_native::prototype_a::PrototypeADatasetUpload,
+) -> Result<NeoPopulationSettings, PopulationOracleError> {
+    let source = dataset.settings.to_settings();
     let runtime = current_backtest_runtime_overrides();
     Ok(NeoPopulationSettings {
         abi_version: ABI_VERSION,

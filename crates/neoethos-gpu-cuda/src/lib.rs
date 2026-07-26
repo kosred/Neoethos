@@ -1,7 +1,21 @@
 //! Stable Rust wrapper around the Stage 1 CUDA C ABI scaffold.
 
 use neoethos_gpu_contracts::ABI_VERSION;
+use neoethos_gpu_contracts::device::{
+    DatasetHeader, GeneDescriptor, NeoPopulationCounters, NeoPopulationEvent,
+    NeoPopulationMetricRow, NeoPopulationOutcome, NeoPopulationSettings, ScenarioDescriptor,
+};
 use thiserror::Error;
+
+mod population;
+
+pub use population::{
+    CudaPopulationError, PopulationDatasetView, PopulationDiagnostics, PopulationGeneView,
+    PopulationSession, population_status_message,
+};
+
+/// Number of SMC slots carried by one row of the canonical SMC contract.
+pub const SMC_SLOTS: usize = 11;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
