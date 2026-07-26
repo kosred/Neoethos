@@ -5,8 +5,7 @@
 //! compiled everywhere.
 
 use super::{
-    C_EXIT_GAP, C_EXIT_MAX_HOLD, C_EXIT_NONE, C_EXIT_STOP, C_EXIT_TARGET, C_METRIC_WIDTH,
-    CPopulationHostBuffers, SMC_WIDTH, survivor_summary_from_device_metrics,
+    C_METRIC_WIDTH, CPopulationHostBuffers, SMC_WIDTH, survivor_summary_from_device_metrics,
 };
 use crate::gpu_native::engine::{
     BacktestEngine, DatasetHandle, DeviceEventHandle, DeviceFilterPolicy, DeviceMetricsHandle,
@@ -25,6 +24,13 @@ use cubecl::prelude::*;
 pub type PrototypeCActiveRuntime = cubecl::cuda::CudaRuntime;
 #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
 pub type PrototypeCActiveRuntime = cubecl::wgpu::WgpuRuntime;
+
+/// Exit reason encoding shared with the canonical contracts.
+const C_EXIT_NONE: i32 = 0;
+const C_EXIT_STOP: i32 = 1;
+const C_EXIT_TARGET: i32 = 2;
+const C_EXIT_MAX_HOLD: i32 = 3;
+const C_EXIT_GAP: i32 = 4;
 
 #[cfg(feature = "gpu-cuda")]
 const PROTOTYPE_C_BACKEND_ID: u32 = 21;

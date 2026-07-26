@@ -27,8 +27,21 @@ pub fn run(args: &[String]) -> Result<()> {
     let fixture =
         SnapshotPopulationFixture::from_json_path(&snapshot_path).map_err(anyhow::Error::msg)?;
     let prototype = parse_prototype(flag(args, "--prototype").as_deref())?;
-    if prototype != PrototypeId::A {
-        anyhow::bail!("full snapshot execution currently supports Prototype A only");
+    if matches!(prototype, PrototypeId::B | PrototypeId::C) {
+        let identity = BenchmarkIdentity {
+            git_sha: flag(args, "--git-sha").unwrap_or_else(|| "unresolved".into()),
+            baseline_sha: flag(args, "--baseline-sha")
+                .unwrap_or_else(|| "2be1408ee3986026fdbb2a5a74aaaf6ac67e5209".into()),
+            dataset_hash: flag(args, "--dataset-hash").unwrap_or_else(|| "unresolved".into()),
+            config_hash: flag(args, "--config-hash").unwrap_or_else(|| "unresolved".into()),
+            seed: parse_u64(args, "--seed", 0)?,
+            timeframe: fixture.timeframe().to_string(),
+            backend: flag(args, "--backend").unwrap_or_else(|| "gpu_required".into()),
+            prototype,
+            fixture: FixtureMode::Snapshot,
+            pass: parse_pass(flag(args, "--pass").as_deref())?,
+        };
+        return crate::gpu_bench_population::run_snapshot(args, output, identity, &fixture);
     }
     let backend_raw = flag(args, "--backend").unwrap_or_else(|| "gpu_required".into());
     let backend = EvaluationBackend::parse(&backend_raw)

@@ -120,11 +120,17 @@ fn run_tiny_population_benchmark(
     };
     use std::time::Instant;
 
-    if identity.prototype != PrototypeId::A {
-        anyhow::bail!("--execute-tiny currently executes Prototype A only");
-    }
     if identity.fixture != FixtureMode::Tiny {
         anyhow::bail!("--execute-tiny requires --fixture tiny");
+    }
+    match identity.prototype {
+        PrototypeId::A => {}
+        PrototypeId::B | PrototypeId::C => {
+            return crate::gpu_bench_population::run_tiny(args, output, identity, requested_sweep);
+        }
+        PrototypeId::Legacy => anyhow::bail!(
+            "--execute-tiny has no legacy adapter; the historical baseline predates this command"
+        ),
     }
     let backend = EvaluationBackend::parse(&identity.backend)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -329,7 +335,7 @@ fn sweep(args: &[String]) -> Result<SweepPoint> {
     })
 }
 
-fn hardware(args: &[String]) -> HardwareMetadata {
+pub(crate) fn hardware(args: &[String]) -> HardwareMetadata {
     HardwareMetadata {
         cpu: flag(args, "--cpu").unwrap_or_else(|| "unresolved".to_string()),
         ram_bytes: flag(args, "--ram-bytes").and_then(|value| value.parse().ok()),

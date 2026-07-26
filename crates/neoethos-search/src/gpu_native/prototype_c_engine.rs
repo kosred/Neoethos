@@ -27,13 +27,6 @@ use crate::gpu_native::prototype_b_engine::compact_rank_fields;
 pub const C_METRIC_WIDTH: usize = 11;
 pub(crate) const SMC_WIDTH: usize = 11;
 
-/// Exit reason encoding shared with the canonical contracts.
-pub(crate) const C_EXIT_NONE: i32 = 0;
-pub(crate) const C_EXIT_STOP: i32 = 1;
-pub(crate) const C_EXIT_TARGET: i32 = 2;
-pub(crate) const C_EXIT_MAX_HOLD: i32 = 3;
-pub(crate) const C_EXIT_GAP: i32 = 4;
-
 // ---------------------------------------------------------------------------
 // Host-side device state
 // ---------------------------------------------------------------------------
@@ -114,12 +107,16 @@ impl CPopulationHostBuffers {
             timestamp_pair,
             months: dataset.months.iter().map(|v| saturating_i32(*v)).collect(),
             days: dataset.days.iter().map(|v| saturating_i32(*v)).collect(),
-            smc_rows: dataset
-                .smc_data
-                .iter()
-                .flatten()
-                .map(|value| i32::from(*value))
-                .collect(),
+            smc_rows: {
+                let rows = dataset
+                    .smc_data
+                    .iter()
+                    .flatten()
+                    .map(|value| i32::from(*value))
+                    .collect::<Vec<i32>>();
+                debug_assert_eq!(rows.len(), bars * SMC_WIDTH);
+                rows
+            },
             adaptive_base_pips: adaptive_base_pips.unwrap_or_else(|| vec![0.0]),
             has_adaptive_base,
             bars,

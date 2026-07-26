@@ -1,12 +1,14 @@
 //! Machine-readable GPU discovery benchmark contracts.
 
 use crate::gpu_native::engine::{EngineStatus, TransferSnapshot};
+use crate::gpu_native::prototype_population::{CommonBcEligibility, PrototypePopulationWorkload};
 use crate::gpu_native::semantics::{
     DISCOVERY_SEMANTICS_VERSION, TRADING_SEMANTICS_VERSION, discovery_semantics_hash,
     semantics_hash_hex, trading_semantics_hash,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::Path;
 
@@ -268,6 +270,181 @@ fn percentile(sorted: &[f64], percentile: f64) -> f64 {
         let fraction = position - lower as f64;
         sorted[lower] + (sorted[upper] - sorted[lower]) * fraction
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generic population benchmark runner
+// ---------------------------------------------------------------------------
+
+/// Options shared by every prototype's population benchmark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PopulationBenchmarkOptions {
+    pub warmups: usize,
+    pub repetitions: usize,
+}
+
+impl Default for PopulationBenchmarkOptions {
+    fn default() -> Self {
+        Self {
+            warmups: 2,
+            repetitions: 5,
+        }
+    }
+}
+
+/// Measured outcome of one population benchmark.
+///
+/// The metrics are the last repetition's compact survivor rows, so the caller
+/// can compare them against a reference it prepared *before* timing started.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PopulationBenchmarkOutcome {
+    pub wall_samples: Vec<f64>,
+    pub candidate_ids: Vec<u64>,
+    pub scenario_ids: Vec<u64>,
+    pub metrics: Vec<[f64; 11]>,
+    pub transfers: TransferSnapshot,
+    pub coverage: CapabilityCoverage,
+    pub accepted_trades: f64,
+}
+
+#[derive(Debug)]
+pub enum PopulationBenchmarkError {
+    Engine(crate::gpu_native::engine::EngineError),
+    CpuStrategyExecuted(crate::gpu_native::cpu_strategy::CpuStrategyAuditError),
+    NoSupportedCandidates,
+    EmptyMeasurement,
+}
+
+impl fmt::Display for PopulationBenchmarkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Engine(error) => write!(f, "{error}"),
+            Self::CpuStrategyExecuted(error) => write!(f, "{error}"),
+            Self::NoSupportedCandidates => write!(
+                f,
+                "no candidate is inside the common capability intersection; there is nothing to \
+                 measure and the run must not report a match"
+            ),
+            Self::EmptyMeasurement => {
+                write!(f, "the benchmark produced no measured repetition")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PopulationBenchmarkError {}
+
+impl From<crate::gpu_native::engine::EngineError> for PopulationBenchmarkError {
+    fn from(error: crate::gpu_native::engine::EngineError) -> Self {
+        Self::Engine(error)
+    }
+}
+
+/// Run one prototype's population workload through the shared measurement
+/// protocol: upload once, warm up, then time each repetition end to end.
+///
+/// Reference (oracle) work belongs to the caller and must already be done: this
+/// function performs no CPU strategy computation. Each measured repetition
+/// carries a CPU-strategy audit context and asserts that nothing executed
+/// through the shared CPU-strategy helper; the engines under test contain no
+/// such call site at all, so the assertion is a tripwire for future edits, not
+/// a claim that a CPU path exists and was suppressed.
+pub fn execute_population_benchmark<E>(
+    engine: &mut E,
+    workload: &PrototypePopulationWorkload,
+    eligibility: &CommonBcEligibility,
+    options: &PopulationBenchmarkOptions,
+) -> Result<PopulationBenchmarkOutcome, PopulationBenchmarkError>
+where
+    E: crate::gpu_native::engine::BacktestEngine,
+{
+    use crate::gpu_native::cpu_strategy::CpuStrategyAuditContext;
+    use crate::gpu_native::engine::DeviceFilterPolicy;
+    use std::time::Instant;
+
+    let coverage_summary = eligibility.coverage();
+    if coverage_summary.supported_candidates == 0 {
+        return Err(PopulationBenchmarkError::NoSupportedCandidates);
+    }
+
+    // Encoding happens once, outside every timed region.
+    let dataset_bytes = workload
+        .dataset
+        .encode()
+        .map_err(|error| PopulationBenchmarkError::Engine(engine_error(error)))?;
+    let gene_bytes = workload
+        .genes
+        .encode()
+        .map_err(|error| PopulationBenchmarkError::Engine(engine_error(error)))?;
+    let scenario_bytes = workload
+        .scenarios
+        .encode()
+        .map_err(|error| PopulationBenchmarkError::Engine(engine_error(error)))?;
+
+    let dataset = engine.upload_dataset(&dataset_bytes)?;
+    let genes = engine.upload_genes(&gene_bytes)?;
+    let scenarios = engine.upload_scenarios(&scenario_bytes)?;
+
+    let run_once = |engine: &mut E| -> Result<
+        crate::gpu_native::engine::HostSurvivorSummary,
+        PopulationBenchmarkError,
+    > {
+        let (metrics, evaluate_event) = engine.evaluate(dataset, genes, scenarios, None)?;
+        let (selection, filter_event) =
+            engine.filter(metrics, DeviceFilterPolicy::All, evaluate_event)?;
+        Ok(engine.readback_compact(selection, filter_event)?)
+    };
+
+    for _ in 0..options.warmups {
+        run_once(engine)?;
+    }
+
+    let repetitions = options.repetitions.max(1);
+    let mut wall_samples = Vec::with_capacity(repetitions);
+    let mut last: Option<crate::gpu_native::engine::HostSurvivorSummary> = None;
+    for repetition in 0..repetitions {
+        let audit = CpuStrategyAuditContext::production(0x4243_5f4d_4541_5300 + repetition as u64);
+        let started = Instant::now();
+        let summary = run_once(engine)?;
+        wall_samples.push(started.elapsed().as_secs_f64());
+        audit
+            .snapshot()
+            .assert_zero_executed()
+            .map_err(PopulationBenchmarkError::CpuStrategyExecuted)?;
+        last = Some(summary);
+    }
+
+    let summary = last.ok_or(PopulationBenchmarkError::EmptyMeasurement)?;
+    let accepted_trades = summary
+        .metrics
+        .iter()
+        .map(|metrics| metrics[8].max(0.0))
+        .sum::<f64>();
+    let mut unsupported_reasons = BTreeMap::new();
+    for (reason, candidate_ids) in &eligibility.unsupported {
+        unsupported_reasons.insert(format!("{reason:?}"), candidate_ids.len());
+    }
+
+    Ok(PopulationBenchmarkOutcome {
+        wall_samples,
+        candidate_ids: summary.candidate_ids,
+        scenario_ids: summary.scenario_ids,
+        metrics: summary.metrics,
+        transfers: engine.session().transfer_snapshot(),
+        coverage: CapabilityCoverage {
+            total_candidates: coverage_summary.total_candidates,
+            supported_candidates: coverage_summary.supported_candidates,
+            unsupported_candidates: coverage_summary.unsupported_candidates,
+            unsupported_reasons,
+        },
+        accepted_trades,
+    })
+}
+
+fn engine_error(
+    error: crate::gpu_native::prototype_a::PrototypeAUploadError,
+) -> crate::gpu_native::engine::EngineError {
+    crate::gpu_native::engine::EngineError::Backend(error.to_string())
 }
 
 #[cfg(test)]
