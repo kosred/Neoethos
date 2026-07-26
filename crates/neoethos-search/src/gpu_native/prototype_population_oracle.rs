@@ -593,16 +593,25 @@ fn reduce_candidate(
                     &mut gross_profit,
                     &mut gross_loss,
                 );
-                update_realized_risk(equity, &mut peak_equity, &mut day_low, &mut max_drawdown);
+                update_realized_risk(
+                    equity,
+                    &mut peak_equity,
+                    &mut day_peak,
+                    &mut day_low,
+                    &mut max_drawdown,
+                );
                 open_position = None;
             } else {
                 let (worst_float_pnl, best_float_pnl) =
                     floating_pnl(workload, settings, position, bar, pip);
-                if equity + worst_float_pnl < day_low {
-                    day_low = equity + worst_float_pnl;
-                }
                 if equity + best_float_pnl > peak_equity {
                     peak_equity = equity + best_float_pnl;
+                }
+                if equity + best_float_pnl > day_peak {
+                    day_peak = equity + best_float_pnl;
+                    day_low = equity + worst_float_pnl;
+                } else if equity + worst_float_pnl < day_low {
+                    day_low = equity + worst_float_pnl;
                 }
                 if peak_equity > 0.0 {
                     let drawdown = (peak_equity - (equity + worst_float_pnl)) / peak_equity;
@@ -628,7 +637,13 @@ fn reduce_candidate(
                         &mut gross_profit,
                         &mut gross_loss,
                     );
-                    update_realized_risk(equity, &mut peak_equity, &mut day_low, &mut max_drawdown);
+                    update_realized_risk(
+                        equity,
+                        &mut peak_equity,
+                        &mut day_peak,
+                        &mut day_low,
+                        &mut max_drawdown,
+                    );
                     open_position = None;
                 }
                 // A regular SL/TP/max-hold exit occurs inside the open-position
@@ -670,6 +685,13 @@ fn reduce_candidate(
             });
             day_trade_count += 1;
             accepted_trades = accepted_trades.saturating_add(1);
+        }
+    }
+
+    if last_day != -1 && day_peak > 0.0 {
+        let drawdown = (day_peak - day_low) / day_peak;
+        if drawdown > max_daily_drawdown {
+            max_daily_drawdown = drawdown;
         }
     }
 
@@ -802,13 +824,17 @@ fn realize_position(
 fn update_realized_risk(
     equity: f64,
     peak_equity: &mut f64,
+    day_peak: &mut f64,
     day_low: &mut f64,
     max_drawdown: &mut f64,
 ) {
     if equity > *peak_equity {
         *peak_equity = equity;
     }
-    if equity < *day_low {
+    if equity > *day_peak {
+        *day_peak = equity;
+        *day_low = equity;
+    } else if equity < *day_low {
         *day_low = equity;
     }
     if *peak_equity > 0.0 {
@@ -1088,6 +1114,45 @@ mod tests {
         .unwrap()
     }
 
+    fn daily_drawdown_fixture() -> PrototypePopulationWorkload {
+        let mut workload = canonical_cost_fixture();
+        workload.dataset.close = vec![100.0, 100.0, 10_100.0, 100.0, -4_900.0, -4_900.0];
+        workload.dataset.high = vec![100.0, 100.0, 10_100.0, 100.0, 100.0, -4_900.0];
+        workload.dataset.low = vec![100.0, 100.0, 10_100.0, 100.0, -4_900.0, -4_900.0];
+        workload.dataset.indicators = vec![1.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+        workload.dataset.feature_count = 1;
+        workload.dataset.months = vec![0; 6];
+        workload.dataset.days = vec![0, 0, 0, 0, 0, 1];
+        workload.dataset.timestamps = (0..6).map(|bar| bar * 60_000).collect();
+        workload.dataset.smc_data = vec![[0; 11]; 6];
+        workload.dataset.settings.pip_value = 1.0;
+        workload.dataset.settings.pip_value_per_lot = 1.0;
+        workload.dataset.settings.spread_pips = 0.0;
+        workload.dataset.settings.commission_per_trade = 0.0;
+        workload.dataset.settings.swap_long_pips_per_day = 0.0;
+        workload.dataset.settings.swap_short_pips_per_day = 0.0;
+        workload.dataset.settings.pnl_conversion_fee_rate = 0.0;
+        workload.genes.candidate_ids = vec![101];
+        workload.genes.offsets = vec![0, 1];
+        workload.genes.indices = vec![0];
+        workload.genes.weights = vec![1.0];
+        workload.genes.long_thresholds = vec![0.5];
+        workload.genes.short_thresholds = vec![-0.5];
+        workload.genes.stop_pips = vec![5_000.0];
+        workload.genes.target_pips = vec![10_000.0];
+        workload.genes.stop_vol_multipliers = vec![0.0];
+        workload.genes.smc_flags = vec![[0; 11]];
+        workload.scenarios.scenarios = vec![ScenarioDescriptor {
+            base_candidate_id: 101,
+            scenario_id: 1001,
+            window_offset: 0,
+            window_len: 6,
+            scenario_type: 0,
+            ..ScenarioDescriptor::default()
+        }];
+        workload
+    }
+
     fn full_cpu_metrics(workload: &PrototypePopulationWorkload) -> Vec<[f64; 11]> {
         let dataset = &workload.dataset;
         let genes = &workload.genes;
@@ -1183,6 +1248,20 @@ mod tests {
         assert_eq!(actual.metrics[2].values[8], 0.0);
         assert!(actual.metrics[0].values[10] > 0.0);
         assert!(actual.metrics[1].values[10] > actual.metrics[0].values[10]);
+    }
+
+    #[test]
+    fn oracle_daily_drawdown_tracks_intraday_peak_and_day_boundary() {
+        let workload = daily_drawdown_fixture();
+        let actual = evaluate_population_oracle(&workload).unwrap();
+        let expected = 5_000.0 / 110_000.0;
+
+        assert_eq!(actual.metrics[0].values[8], 2.0);
+        assert!(
+            (actual.metrics[0].values[10] - expected).abs() < 1.0e-12,
+            "oracle daily DD must be (110k-105k)/110k={expected}, got {}",
+            actual.metrics[0].values[10]
+        );
     }
 
     #[test]

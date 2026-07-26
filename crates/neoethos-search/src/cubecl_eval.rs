@@ -30,6 +30,15 @@ const BACKTEST_CORE_METRIC_WIDTH: usize = 7;
 //   [5] trading_days            = count of days with >=1 trade (as f32)
 const FTMO_WIDTH: usize = 6;
 
+#[cfg(test)]
+fn cubecl_daily_drawdown_from_extrema(day_peak: f64, day_low: f64) -> f64 {
+    if day_peak > 0.0 {
+        (day_peak - day_low) / day_peak
+    } else {
+        0.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CubeClTransferTelemetry {
     pub gpu_calls: u64,
@@ -1250,7 +1259,10 @@ fn backtest_population_kernel(
                 if eq > peak_equity.read() {
                     peak_equity.store(eq);
                 }
-                if eq < day_low.read() {
+                if eq > day_peak.read() {
+                    day_peak.store(eq);
+                    day_low.store(eq);
+                } else if eq < day_low.read() {
                     day_low.store(eq);
                 }
                 let pe = peak_equity.read();
@@ -1279,9 +1291,6 @@ fn backtest_population_kernel(
                 }
                 let worst_float_pnl = worst_base.read() * pos_lots.read();
                 let eq = equity.read();
-                if (eq + worst_float_pnl) < day_low.read() {
-                    day_low.store(eq + worst_float_pnl);
-                }
 
                 // #1375 workaround: long best-case intrabar = high-entry, short = entry-low.
                 let best_base = RuntimeCell::<f32>::new((entry_px_v - lo) * pip_value_per_lot);
@@ -1291,6 +1300,14 @@ fn backtest_population_kernel(
                 let best_float_pnl = best_base.read() * pos_lots.read();
                 if (eq + best_float_pnl) > peak_equity.read() {
                     peak_equity.store(eq + best_float_pnl);
+                }
+                if (eq + best_float_pnl) > day_peak.read() {
+                    day_peak.store(eq + best_float_pnl);
+                    // Start a new causal same-day drawdown segment at the new
+                    // peak, retaining this bar's worst excursion.
+                    day_low.store(eq + worst_float_pnl);
+                } else if (eq + worst_float_pnl) < day_low.read() {
+                    day_low.store(eq + worst_float_pnl);
                 }
 
                 let pe = peak_equity.read();
@@ -1421,7 +1438,10 @@ fn backtest_population_kernel(
                     if eq2 > peak_equity.read() {
                         peak_equity.store(eq2);
                     }
-                    if eq2 < day_low.read() {
+                    if eq2 > day_peak.read() {
+                        day_peak.store(eq2);
+                        day_low.store(eq2);
+                    } else if eq2 < day_low.read() {
                         day_low.store(eq2);
                     }
                     let pe2 = peak_equity.read();
@@ -1518,6 +1538,12 @@ fn backtest_population_kernel(
         // at least one bar was processed (last_day != -1). This exactly mirrors
         // the CPU iterating its last BTreeMap day.
         if last_day.read() != -1 {
+            if day_peak.read() > 0.0 {
+                let dd = (day_peak.read() - day_low.read()) / day_peak.read();
+                if dd > max_daily_dd.read() {
+                    max_daily_dd.store(dd);
+                }
+            }
             let dp = current_day_pnl.read();
             if dp < 0.0 {
                 let neg = -dp;
@@ -2333,8 +2359,16 @@ where
 #[cfg(test)]
 mod window_tests {
     use super::{
-        backtest_gene_batch, gather_indicator_window, gene_chunk_size, signal_window_size,
+        backtest_gene_batch, cubecl_daily_drawdown_from_extrema, gather_indicator_window,
+        gene_chunk_size, signal_window_size,
     };
+
+    #[test]
+    fn cubecl_daily_drawdown_arithmetic_uses_same_day_peak_and_low() {
+        let observed = cubecl_daily_drawdown_from_extrema(110_000.0, 105_000.0);
+        let expected = 5_000.0 / 110_000.0;
+        assert!((observed - expected).abs() < 1.0e-12);
+    }
 
     #[test]
     fn gene_chunk_size_bounds_host_buffer_and_never_zero() {

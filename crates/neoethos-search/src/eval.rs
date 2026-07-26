@@ -701,7 +701,12 @@ fn entry_sl_tp_pips(settings: &BacktestSettings, i: usize) -> (f64, f64) {
 /// Net effect: a full-SL loss ≈ `risk_pct × equity`, a TP win ≈
 /// `risk_pct × equity × (tp/sl)`.
 #[inline]
-fn risk_based_pos_lots(conf: f64, equity: f64, eff_sl_pips: f64, settings: &BacktestSettings) -> f64 {
+fn risk_based_pos_lots(
+    conf: f64,
+    equity: f64,
+    eff_sl_pips: f64,
+    settings: &BacktestSettings,
+) -> f64 {
     let conf = conf.clamp(0.0, 1.0);
     let risk_min = settings.risk_per_trade_min;
     let risk_max = settings.risk_per_trade_max;
@@ -861,7 +866,8 @@ pub fn fast_evaluate_strategy_core(
                 } else {
                     (entry_px - close[i]) / pip * settings.pip_value_per_lot
                 };
-                let pnl = pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
+                let pnl =
+                    pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
                 // Phase C.2: apply broker swap + conversion fee. The swap
                 // term inside also scales with size; pass a per-lot-scaled
                 // pnl AND scale the returned delta so the swap (which uses
@@ -881,7 +887,12 @@ pub fn fast_evaluate_strategy_core(
                     0
                 };
                 let pnl = apply_carry_and_fee_scaled(
-                    pnl, pos_lots, in_pos, entry_ts_ms, exit_ts_ms, settings,
+                    pnl,
+                    pos_lots,
+                    in_pos,
+                    entry_ts_ms,
+                    exit_ts_ms,
+                    settings,
                 );
                 equity += pnl;
                 current_month_pnl += pnl;
@@ -896,7 +907,10 @@ pub fn fast_evaluate_strategy_core(
                 if equity > peak_equity {
                     peak_equity = equity;
                 }
-                if equity < day_low {
+                if equity > day_peak {
+                    day_peak = equity;
+                    day_low = equity;
+                } else if equity < day_low {
                     day_low = equity;
                 }
                 let current_dd = if peak_equity > 0.0 {
@@ -923,10 +937,6 @@ pub fn fast_evaluate_strategy_core(
                 } else {
                     (entry_px - hi) / pip * settings.pip_value_per_lot
                 };
-            if (equity + worst_float_pnl) < day_low {
-                day_low = equity + worst_float_pnl;
-            }
-
             let best_float_pnl = pos_lots
                 * if in_pos == 1 {
                     (hi - entry_px) / pip * settings.pip_value_per_lot
@@ -935,6 +945,16 @@ pub fn fast_evaluate_strategy_core(
                 };
             if (equity + best_float_pnl) > peak_equity {
                 peak_equity = equity + best_float_pnl;
+            }
+            if (equity + best_float_pnl) > day_peak {
+                day_peak = equity + best_float_pnl;
+                // A new same-day peak starts a new causal drawdown segment.
+                // Preserve this bar's worst excursion (the canonical
+                // best-before-worst intrabar convention) but discard troughs
+                // that occurred before the new peak.
+                day_low = equity + worst_float_pnl;
+            } else if (equity + worst_float_pnl) < day_low {
+                day_low = equity + worst_float_pnl;
             }
 
             let current_dd = if peak_equity > 0.0 {
@@ -1031,7 +1051,8 @@ pub fn fast_evaluate_strategy_core(
                 // half-spread cost both scale by the entry-captured
                 // `pos_lots`. (Half-spread was already paid at entry via the
                 // adjusted entry_px; this is the exit-side half + commission.)
-                let pnl = pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
+                let pnl =
+                    pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
                 // Phase C.2: apply broker swap + conversion fee (size-aware).
                 let entry_ts_ms = if use_timestamps && entry_idx >= 0 {
                     timestamps.get(entry_idx as usize).copied().unwrap_or(0)
@@ -1044,7 +1065,12 @@ pub fn fast_evaluate_strategy_core(
                     0
                 };
                 let pnl = apply_carry_and_fee_scaled(
-                    pnl, pos_lots, in_pos, entry_ts_ms, exit_ts_ms, settings,
+                    pnl,
+                    pos_lots,
+                    in_pos,
+                    entry_ts_ms,
+                    exit_ts_ms,
+                    settings,
                 );
                 equity += pnl;
                 current_month_pnl += pnl;
@@ -1059,7 +1085,10 @@ pub fn fast_evaluate_strategy_core(
                 if equity > peak_equity {
                     peak_equity = equity;
                 }
-                if equity < day_low {
+                if equity > day_peak {
+                    day_peak = equity;
+                    day_low = equity;
+                } else if equity < day_low {
                     day_low = equity;
                 }
 
@@ -1116,6 +1145,15 @@ pub fn fast_evaluate_strategy_core(
                     pos_lots = 1.0;
                 }
             }
+        }
+    }
+
+    // The boundary block finalizes only completed days. Include the current
+    // final day so a terminal same-day peak-to-trough move is never dropped.
+    if last_day != -1 && day_peak > 0.0 {
+        let dd = (day_peak - day_low) / day_peak;
+        if dd > max_daily_dd {
+            max_daily_dd = dd;
         }
     }
 
@@ -1358,8 +1396,7 @@ pub fn simulate_trades_core(
                         duration_hours,
                         mfe: mfe_money,
                         mae: mae_money,
-                        r_multiple: pnl
-                            / (pos_sl_pips * settings.pip_value_per_lot).max(1e-9),
+                        r_multiple: pnl / (pos_sl_pips * settings.pip_value_per_lot).max(1e-9),
                     });
                     in_pos = 0;
                     continue;
@@ -1411,8 +1448,7 @@ pub fn simulate_trades_core(
                 if !exit && settings.trailing_enabled {
                     let mv = hi - entry_px;
                     if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
-                        let candidate =
-                            hi - (settings.trailing_atr_multiplier * pos_sl_pips * pip);
+                        let candidate = hi - (settings.trailing_atr_multiplier * pos_sl_pips * pip);
                         if trail_px == 0.0 || candidate > trail_px {
                             trail_px = candidate;
                         }
@@ -1435,8 +1471,7 @@ pub fn simulate_trades_core(
                 if !exit && settings.trailing_enabled {
                     let mv = entry_px - lo;
                     if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
-                        let candidate =
-                            lo + (settings.trailing_atr_multiplier * pos_sl_pips * pip);
+                        let candidate = lo + (settings.trailing_atr_multiplier * pos_sl_pips * pip);
                         if trail_px == 0.0 || candidate < trail_px {
                             trail_px = candidate;
                         }
@@ -1476,8 +1511,7 @@ pub fn simulate_trades_core(
                     duration_hours,
                     mfe: mfe_money,
                     mae: mae_money,
-                    r_multiple: pnl
-                        / (pos_sl_pips * settings.pip_value_per_lot).max(1e-9),
+                    r_multiple: pnl / (pos_sl_pips * settings.pip_value_per_lot).max(1e-9),
                 });
                 in_pos = 0;
             }
@@ -1911,7 +1945,14 @@ pub fn evaluate_population_core(
         // Risk-based sizing uses the per-bar confidence; with
         // `risk_based_sizing == false` the slice is ignored (legacy).
         fast_evaluate_strategy_core(
-            close, high, low, &signals, &confidences, month_idx, day_idx, timestamps,
+            close,
+            high,
+            low,
+            &signals,
+            &confidences,
+            month_idx,
+            day_idx,
+            timestamps,
             &gene_settings,
         )
     };
@@ -2016,8 +2057,7 @@ pub fn evaluate_population_core(
                                 .map(&eval_gene_cpu)
                                 .collect();
                             let cpu_dt = t.elapsed();
-                            let joined: Vec<_> =
-                                handles.into_iter().map(|h| h.join()).collect();
+                            let joined: Vec<_> = handles.into_iter().map(|h| h.join()).collect();
                             (joined, cpu_lane, cpu_dt)
                         });
 
@@ -2106,8 +2146,10 @@ pub fn evaluate_population_core(
                         (r, t.elapsed())
                     });
                     let t = std::time::Instant::now();
-                    let cpu_lane: Vec<[f64; 11]> =
-                        (gpu_count..n_genes).into_par_iter().map(&eval_gene_cpu).collect();
+                    let cpu_lane: Vec<[f64; 11]> = (gpu_count..n_genes)
+                        .into_par_iter()
+                        .map(&eval_gene_cpu)
+                        .collect();
                     let cpu_dt = t.elapsed();
                     (gpu_thread.join(), cpu_lane, cpu_dt)
                 });
@@ -2233,7 +2275,14 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         // Pairs with the shared `adaptive_base_pips` on the cloned settings.
         gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
         fast_evaluate_strategy_core(
-            close, high, low, &signals, &confidences, month_idx, day_idx, timestamps,
+            close,
+            high,
+            low,
+            &signals,
+            &confidences,
+            month_idx,
+            day_idx,
+            timestamps,
             &gene_settings,
         )
     };
@@ -2361,7 +2410,14 @@ pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> V
         // Pairs with the shared `adaptive_base_pips` on the cloned settings.
         gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
         fast_evaluate_strategy_core(
-            close, high, low, &signals, &confidences, month_idx, day_idx, timestamps,
+            close,
+            high,
+            low,
+            &signals,
+            &confidences,
+            month_idx,
+            day_idx,
+            timestamps,
             &gene_settings,
         )
     };
@@ -2464,6 +2520,47 @@ mod overrides_tests {
         assert!(observed.month_capacity > 0);
     }
 
+    #[test]
+    fn daily_drawdown_tracks_intraday_peak_and_finalizes_at_day_boundary() {
+        let close = [100.0, 100.0, 10_100.0, 100.0, -4_900.0, -4_900.0];
+        let high = [100.0, 100.0, 10_100.0, 100.0, 100.0, -4_900.0];
+        let low = [100.0, 100.0, 10_100.0, 100.0, -4_900.0, -4_900.0];
+        // First long: +10k target on bar 2. Second long: -5k stop on bar 4.
+        let signals = [1_i8, 0, 1, 0, 0, 0];
+        let months = [0_i64; 6];
+        let days = [0_i64, 0, 0, 0, 0, 1];
+        let mut settings = BacktestSettings::default();
+        settings.sl_pips = 5_000.0;
+        settings.tp_pips = 10_000.0;
+        settings.pip_value = 1.0;
+        settings.pip_value_per_lot = 1.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.risk_based_sizing = false;
+
+        let metrics = fast_evaluate_strategy_core(
+            &close,
+            &high,
+            &low,
+            &signals,
+            &[],
+            &months,
+            &days,
+            &[],
+            &settings,
+        );
+        let expected = 5_000.0 / 110_000.0;
+        assert_eq!(metrics[8], 2.0);
+        assert!(
+            (metrics[10] - expected).abs() < 1.0e-12,
+            "daily DD must be (110k-105k)/110k={expected}, got {}",
+            metrics[10]
+        );
+    }
+
     // ─── Phase C.2 carry-cost + conversion-fee helper ────────────────
     //
     // These tests pin the math used by every trade-close branch of the
@@ -2542,7 +2639,10 @@ mod overrides_tests {
         // entry_ts = 0 means "no timestamp data": skip swap entirely.
         let s = settings_with_carry(-100.0, -100.0, 0.0, 10.0);
         let net = apply_carry_and_fee(50.0, 1, 0, 1_700_000_000_000, &s);
-        assert!((net - 50.0).abs() < 1e-9, "expected 50.0 (no swap), got {net}");
+        assert!(
+            (net - 50.0).abs() < 1e-9,
+            "expected 50.0 (no swap), got {net}"
+        );
     }
 
     #[test]
@@ -2619,7 +2719,15 @@ mod overrides_tests {
         settings.high_quality_confidence = 0.65;
 
         fast_evaluate_strategy_core(
-            &close, &high, &low, &signals, confidences, &months, &days, &[], &settings,
+            &close,
+            &high,
+            &low,
+            &signals,
+            confidences,
+            &months,
+            &days,
+            &[],
+            &settings,
         )
     }
 
@@ -2637,7 +2745,10 @@ mod overrides_tests {
             let m = run_single_sl_trade(sl_pips, true, risk, risk, &conf);
             let net_profit = m[0];
             let trade_count = m[8];
-            assert_eq!(trade_count, 1.0, "expected exactly one trade (sl={sl_pips})");
+            assert_eq!(
+                trade_count, 1.0,
+                "expected exactly one trade (sl={sl_pips})"
+            );
             assert!(
                 (net_profit - expected_loss).abs() < 1e-6,
                 "sl={sl_pips}: full-SL loss should be {expected_loss} (1% of {initial_equity}), got {net_profit}"
@@ -2701,14 +2812,15 @@ mod overrides_tests {
         base.risk_based_sizing = false; // fixed 1 lot → deterministic PnL
 
         let run = |s: &BacktestSettings| {
-            fast_evaluate_strategy_core(
-                &close, &high, &low, &signals, &[], &months, &days, &[], s,
-            )
+            fast_evaluate_strategy_core(&close, &high, &low, &signals, &[], &months, &days, &[], s)
         };
 
         // (1) fixed scalar path.
         let fixed = run(&base);
-        assert_eq!(fixed[8], 1.0, "the 15-pip scalar stop should produce one trade");
+        assert_eq!(
+            fixed[8], 1.0,
+            "the 15-pip scalar stop should produce one trade"
+        );
 
         // (2) an adaptive series IDENTICAL to the scalar must be byte-identical.
         let mut same = base.clone();
@@ -2774,9 +2886,7 @@ mod overrides_tests {
         base.trailing_atr_multiplier = 1.0;
 
         let run = |s: &BacktestSettings| {
-            fast_evaluate_strategy_core(
-                &close, &high, &low, &signals, &[], &months, &days, &[], s,
-            )
+            fast_evaluate_strategy_core(&close, &high, &low, &signals, &[], &months, &days, &[], s)
         };
 
         let mut off = base.clone();
@@ -2904,7 +3014,15 @@ mod gpu_cpu_parity_tests {
                 // sizing; the GPU kernel recomputes confidence on-device, so this
                 // asserts both lanes agree on sizing AND slot-7.
                 fast_evaluate_strategy_core(
-                    &close, &high, &low, &signals, &conf, &month_idx, &day_idx, &timestamps, &s,
+                    &close,
+                    &high,
+                    &low,
+                    &signals,
+                    &conf,
+                    &month_idx,
+                    &day_idx,
+                    &timestamps,
+                    &s,
                 )
             })
             .collect();
@@ -3111,8 +3229,7 @@ mod gpu_cpu_parity_tests {
                 let mut s = settings.clone();
                 s.sl_pips = sl_pips[g];
                 s.tp_pips = tp_pips[g];
-                let trades =
-                    simulate_trades_core(&close, &high, &low, &timestamps, &signals, &s);
+                let trades = simulate_trades_core(&close, &high, &low, &timestamps, &signals, &s);
                 let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
                     trades: &trades,
                     initial_balance,
@@ -3244,7 +3361,11 @@ mod gpu_cpu_parity_tests {
         let base =
             crate::stop_target::adaptive_base_pips_series(&high, &low, &close, settings.pip_value)
                 .expect("base vol series builds on 800 bars");
-        assert_eq!(base.len(), n_samples, "base series must align with n_samples");
+        assert_eq!(
+            base.len(),
+            n_samples,
+            "base series must align with n_samples"
+        );
         settings.adaptive_base_pips = Some(base.into());
         settings.adaptive_rr = 2.0;
 
@@ -3270,7 +3391,15 @@ mod gpu_cpu_parity_tests {
                 s.tp_pips = tp_pips[g];
                 s.adaptive_vol_mult = stop_vol_mult[g];
                 fast_evaluate_strategy_core(
-                    &close, &high, &low, &signals, &conf, &month_idx, &day_idx, &timestamps, &s,
+                    &close,
+                    &high,
+                    &low,
+                    &signals,
+                    &conf,
+                    &month_idx,
+                    &day_idx,
+                    &timestamps,
+                    &s,
                 )
             })
             .collect();
@@ -3453,7 +3582,15 @@ mod gpu_cpu_parity_tests {
                 s.sl_pips = sl_pips[g];
                 s.tp_pips = tp_pips[g];
                 fast_evaluate_strategy_core(
-                    &close, &high, &low, &signals, &conf, &month_idx, &day_idx, &timestamps, &s,
+                    &close,
+                    &high,
+                    &low,
+                    &signals,
+                    &conf,
+                    &month_idx,
+                    &day_idx,
+                    &timestamps,
+                    &s,
                 )
             })
             .collect();
@@ -3514,8 +3651,8 @@ mod gpu_cpu_parity_tests {
                 return;
             }
         };
-        let gpu_b = run_gpu_with_cap("16")
-            .expect("second-granularity GPU eval after the first succeeded");
+        let gpu_b =
+            run_gpu_with_cap("16").expect("second-granularity GPU eval after the first succeeded");
 
         assert_eq!(gpu_a.len(), n_genes, "gpu(cap=8) wrong gene count");
         assert_eq!(gpu_b.len(), n_genes, "gpu(cap=16) wrong gene count");
@@ -3699,8 +3836,7 @@ mod gpu_cpu_parity_tests {
             let mut s = settings.clone();
             s.sl_pips = sl_pips[run];
             s.tp_pips = tp_pips[run];
-            let trades =
-                simulate_trades_core(&close, &high, &low, &timestamps, &signals, &s);
+            let trades = simulate_trades_core(&close, &high, &low, &timestamps, &signals, &s);
             let net: f64 = trades.iter().map(|t| t.pnl).sum();
             cpu_net.push(net);
             if net > 0.0 {
@@ -3865,9 +4001,7 @@ mod gpu_cpu_parity_tests {
                 row
             })
             .collect();
-        let smc_weights = [
-            0.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-        ];
+        let smc_weights = [0.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
         let gate_threshold = 1.0f32;
 
         // Full-series month/day buckets (gathered per fold below).
@@ -3930,7 +4064,15 @@ mod gpu_cpu_parity_tests {
                 s.sl_pips = sl_pips[g];
                 s.tp_pips = tp_pips[g];
                 fast_evaluate_strategy_core(
-                    &g_close, &g_high, &g_low, &g_sig, &g_conf, &g_month, &g_day, &[], &s,
+                    &g_close,
+                    &g_high,
+                    &g_low,
+                    &g_sig,
+                    &g_conf,
+                    &g_month,
+                    &g_day,
+                    &[],
+                    &s,
                 )
             })
             .collect();
@@ -4199,7 +4341,9 @@ mod gpu_cpu_parity_tests {
 
         // ── GPU PATH — contiguous slice of the indicators/SMC; the kernel
         // re-synthesizes signals on the slice and backtests (or CPU-falls-back). ──
-        let win_ind = indicators.slice(ndarray::s![.., test_start..end]).to_owned();
+        let win_ind = indicators
+            .slice(ndarray::s![.., test_start..end])
+            .to_owned();
         let win_smc: Vec<SmcRow> = full_smc[test_start..end].to_vec();
 
         // Half (1): the re-synthesized window signals must equal the precomputed
@@ -4285,7 +4429,11 @@ mod gpu_cpu_parity_tests {
             weights: &smc_weights,
             settings: &settings,
         });
-        assert_eq!(gpu.len(), n_genes, "gpu walk-forward returned wrong gene count");
+        assert_eq!(
+            gpu.len(),
+            n_genes,
+            "gpu walk-forward returned wrong gene count"
+        );
 
         // The WF path consumes metric slots 0 (net_profit), 3 (max_dd), 4
         // (win_rate), 8 (trade_count); slot 10 (max_daily_dd) feeds the risk
