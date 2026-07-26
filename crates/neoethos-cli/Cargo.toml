@@ -37,6 +37,10 @@ anyhow = "1.0"
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Deterministic attribution hashes for the Rust-only benchmark preparation
+# commands (snapshot SHA-256, config/dataset hashes). Same version the app and
+# codex crates already resolve, so no new graph entry.
+sha2 = "0.10"
 # `tracing` is consumed at every error-path in main.rs / tui/* for
 # structured logging (warn!/debug!). Pre-existing usage; the dep
 # line was inadvertently dropped during an earlier refactor and

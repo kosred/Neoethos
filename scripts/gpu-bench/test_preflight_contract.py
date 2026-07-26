@@ -31,10 +31,20 @@ class PreflightContractTests(unittest.TestCase):
             "--tool memcheck",
             "--target-processes all",
             "--error-exitcode",
-            "compute_sanitizer_passed",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, self.source)
+
+    def test_report_is_written_by_the_rust_cli_without_python(self) -> None:
+        # The payload moved out of an inline Python heredoc into
+        # `neoethos-cli bench-preflight-report`, which now owns the schema and
+        # the `compute_sanitizer_passed` field. The paid-run path stays
+        # Python-free.
+        self.assertIn("bench-preflight-report", self.source)
+        self.assertIn("--gpu-uuid", self.source)
+        for forbidden in ("python3", "python "):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.source)
 
     def test_successful_cargo_skip_output_is_rejected(self) -> None:
         self.assertIn("run_required_cuda_probe", self.source)

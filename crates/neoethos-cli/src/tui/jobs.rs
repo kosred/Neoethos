@@ -308,11 +308,10 @@ impl JobManager {
     /// The watcher thread then observes the exit and marks the job Stopped.
     pub fn stop_latest(&mut self, prefix: &str) -> bool {
         let prefix = prefix.to_lowercase();
-        if let Some(job) = self
-            .jobs
-            .iter_mut()
-            .rev()
-            .find(|j| j.status == JobStatus::Running && j.label.to_lowercase().starts_with(&prefix))
+        if let Some(job) =
+            self.jobs.iter_mut().rev().find(|j| {
+                j.status == JobStatus::Running && j.label.to_lowercase().starts_with(&prefix)
+            })
         {
             if let Some(pid) = job.pid {
                 kill_pid(pid);

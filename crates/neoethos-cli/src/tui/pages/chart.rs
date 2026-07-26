@@ -218,7 +218,11 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         ])
     } else {
         let last = st.candles.last().map(|c| c.close).unwrap_or(0.0);
-        let lo = st.candles.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
+        let lo = st
+            .candles
+            .iter()
+            .map(|c| c.low)
+            .fold(f64::INFINITY, f64::min);
         let hi = st
             .candles
             .iter()
@@ -255,7 +259,11 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         return;
     }
 
-    let lo = st.candles.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
+    let lo = st
+        .candles
+        .iter()
+        .map(|c| c.low)
+        .fold(f64::INFINITY, f64::min);
     let hi = st
         .candles
         .iter()

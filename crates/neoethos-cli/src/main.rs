@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod gpu_bench;
 mod gpu_bench_population;
+mod gpu_bench_prepare;
 mod gpu_bench_snapshot;
 mod tui;
 
@@ -95,6 +96,10 @@ fn main() -> Result<()> {
         "blend-test" => cmd_blend_test(&args[2..]),
         "batch-discover" => cmd_batch_discover(&args[2..]),
         "bench" => gpu_bench::run(&args[2..]),
+        "bench-prepare" => gpu_bench_prepare::run_prepare(&args[2..]),
+        "bench-matrix" => gpu_bench_prepare::run_matrix(&args[2..]),
+        "bench-collate" => gpu_bench_prepare::run_collate(&args[2..]),
+        "bench-preflight-report" => gpu_bench_prepare::run_preflight_report(&args[2..]),
         "migrate-data" => cmd_migrate_data(&args[2..]),
         "slice-dataset" => cmd_slice_dataset(&args[2..]),
         "import" => cmd_import(&args[2..]),

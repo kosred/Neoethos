@@ -186,7 +186,9 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
 
     // Split: portfolio table on top, the selected portfolio's per-strategy
     // metrics below — so the user can actually SEE what a discovery found.
-    let detail_h = (inner.height / 2).clamp(0, 14).min(inner.height.saturating_sub(4));
+    let detail_h = (inner.height / 2)
+        .clamp(0, 14)
+        .min(inner.height.saturating_sub(4));
     let table_area = Rect {
         height: inner.height.saturating_sub(detail_h),
         ..inner
@@ -254,8 +256,7 @@ struct StratMetrics {
 /// sidecar can be megabytes; re-reading + token-scanning it 30×/s hammers
 /// the disk for data that only changes when discovery rewrites the file.
 type QualityEntry = (u64, u64, f64, Vec<StratMetrics>);
-fn quality_cache()
--> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, QualityEntry>> {
+fn quality_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, QualityEntry>> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<PathBuf, QualityEntry>>,
     > = std::sync::OnceLock::new();
@@ -521,8 +522,8 @@ const STRATEGY_ARRAY_KEYS: &[&str] = &[
 /// (mtime_secs, len) → count cache so the 71 MB knowledge file isn't
 /// re-read and re-scanned on every redraw. Keyed per path; a changed
 /// mtime or size invalidates the entry.
-fn count_cache()
--> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, u64, usize)>> {
+fn count_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, u64, usize)>>
+{
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, u64, usize)>>,
     > = std::sync::OnceLock::new();

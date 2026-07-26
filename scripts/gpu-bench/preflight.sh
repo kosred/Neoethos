@@ -10,7 +10,10 @@ mkdir -p "$(dirname "$OUT")"
 PROBE_LOG_DIR="$(dirname "$OUT")/preflight-logs"
 mkdir -p "$PROBE_LOG_DIR"
 
-required=(git cargo rustc python3 g++ nvidia-smi nvcc nsys ncu compute-sanitizer)
+# Python is deliberately absent: the paid-run path is Rust-only. The legacy
+# helpers under scripts/gpu-bench/*.py are isolated tooling and are never called
+# from here.
+required=(git cargo rustc g++ nvidia-smi nvcc nsys ncu compute-sanitizer)
 missing=()
 for command_name in "${required[@]}"; do
   command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
@@ -114,35 +117,16 @@ run_required_cuda_probe compute-sanitizer-gpu-native \
   cargo test -p neoethos-search --features gpu-cuda \
   gpu_native:: -- --nocapture --test-threads=1
 
-python3 - "$OUT" "$GPU_NAME" "$GPU_UUID" "$DRIVER" "$VRAM_MIB" \
-  "$CUDA_TOOLKIT" "$RAM_KIB" "$DISK_KIB" "$POWER_LIMIT_W" \
-  "$MAX_SM_CLOCK_MHZ" "$TEMP_C" <<'PY'
-import json, pathlib, sys
-(
-    out, gpu, uuid, driver, vram, toolkit, ram, disk,
-    power_limit, max_sm_clock, temperature,
-) = sys.argv[1:]
-payload = {
-    "schema_version": 1,
-    "gpu_visible": True,
-    "gpu": gpu,
-    "gpu_uuid": uuid,
-    "driver_version": driver,
-    "cuda_toolkit_version": toolkit or None,
-    "vram_bytes": int(vram) * 1024 * 1024,
-    "ram_bytes": int(ram) * 1024,
-    "disk_free_bytes": int(disk) * 1024,
-    "power_limit_watts": float(power_limit),
-    "max_sm_clock_mhz": int(max_sm_clock),
-    "temperature_celsius": int(temperature),
-    "nsight_environment_checked": True,
-    "cupti_present": True,
-    "compute_sanitizer_present": True,
-    "cuda_smoke_passed": True,
-    "direct_cuda_parity_passed": True,
-    "compute_sanitizer_passed": True,
-}
-path = pathlib.Path(out)
-path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-print(path)
-PY
+# The preflight report is written by the Rust CLI, not by an inline script.
+cargo run --quiet --release -p neoethos-cli -- bench-preflight-report \
+  --out "$OUT" \
+  --gpu "$GPU_NAME" \
+  --gpu-uuid "$GPU_UUID" \
+  --driver "$DRIVER" \
+  --vram-mib "$VRAM_MIB" \
+  --cuda-toolkit "$CUDA_TOOLKIT" \
+  --ram-kib "$RAM_KIB" \
+  --disk-kib "$DISK_KIB" \
+  --power-limit-watts "$POWER_LIMIT_W" \
+  --max-sm-clock-mhz "$MAX_SM_CLOCK_MHZ" \
+  --temperature-celsius "$TEMP_C"

@@ -22,13 +22,21 @@ use crate::tui::theme;
 pub fn make_config_form() -> FormState {
     let s = neoethos_core::Settings::load().unwrap_or_default();
     FormState::new(vec![
-        Field::new("Symbol", s.system.symbol.clone(), "Primary symbol, e.g. EURUSD"),
+        Field::new(
+            "Symbol",
+            s.system.symbol.clone(),
+            "Primary symbol, e.g. EURUSD",
+        ),
         Field::new(
             "Account currency",
             s.system.account_currency.clone(),
             "Deposit currency, e.g. USD / EUR",
         ),
-        Field::new("Base timeframe", s.system.base_timeframe.clone(), "e.g. M1, M5, M30, H1"),
+        Field::new(
+            "Base timeframe",
+            s.system.base_timeframe.clone(),
+            "e.g. M1, M5, M30, H1",
+        ),
         Field::new(
             "Compute mode",
             s.system.enable_gpu_preference.clone(),
@@ -157,17 +165,73 @@ pub fn save_config_form(form: &FormState) -> String {
     }
 
     // Numeric knobs — parse + reject bad input rather than silently zeroing.
-    apply_usize(form, "Population", &mut s.models.prop_search_population, &mut changed, &mut rejected);
-    apply_usize(form, "Generations", &mut s.models.prop_search_generations, &mut changed, &mut rejected);
-    apply_usize(form, "Portfolio size", &mut s.models.prop_search_portfolio_size, &mut changed, &mut rejected);
-    apply_f64(form, "Max hours/combo", &mut s.models.prop_search_max_hours, 0.0, f64::MAX, &mut changed, &mut rejected);
-    apply_f64(form, "Prop-firm pass rate", &mut s.models.prop_firm_min_pass_rate, 0.0, 1.0, &mut changed, &mut rejected);
+    apply_usize(
+        form,
+        "Population",
+        &mut s.models.prop_search_population,
+        &mut changed,
+        &mut rejected,
+    );
+    apply_usize(
+        form,
+        "Generations",
+        &mut s.models.prop_search_generations,
+        &mut changed,
+        &mut rejected,
+    );
+    apply_usize(
+        form,
+        "Portfolio size",
+        &mut s.models.prop_search_portfolio_size,
+        &mut changed,
+        &mut rejected,
+    );
+    apply_f64(
+        form,
+        "Max hours/combo",
+        &mut s.models.prop_search_max_hours,
+        0.0,
+        f64::MAX,
+        &mut changed,
+        &mut rejected,
+    );
+    apply_f64(
+        form,
+        "Prop-firm pass rate",
+        &mut s.models.prop_firm_min_pass_rate,
+        0.0,
+        1.0,
+        &mut changed,
+        &mut rejected,
+    );
 
     // Risky-mode goal params (FIX B). Balances are positive USD; horizon is a
     // positive day count. These persist under `system.risky_*`.
-    apply_f64(form, "Risky start balance", &mut s.system.risky_start_balance_usd, 0.0, f64::MAX, &mut changed, &mut rejected);
-    apply_f64(form, "Risky target balance", &mut s.system.risky_target_balance_usd, 0.0, f64::MAX, &mut changed, &mut rejected);
-    apply_u32(form, "Risky horizon days", &mut s.system.risky_horizon_days, &mut changed, &mut rejected);
+    apply_f64(
+        form,
+        "Risky start balance",
+        &mut s.system.risky_start_balance_usd,
+        0.0,
+        f64::MAX,
+        &mut changed,
+        &mut rejected,
+    );
+    apply_f64(
+        form,
+        "Risky target balance",
+        &mut s.system.risky_target_balance_usd,
+        0.0,
+        f64::MAX,
+        &mut changed,
+        &mut rejected,
+    );
+    apply_u32(
+        form,
+        "Risky horizon days",
+        &mut s.system.risky_horizon_days,
+        &mut changed,
+        &mut rejected,
+    );
 
     if !rejected.is_empty() {
         return format!("Not saved — invalid: {}", rejected.join(", "));
