@@ -36,13 +36,21 @@ fn main() {
         if !available {
             panic!("feature `cuda` requires nvcc; set CUDACXX or install the CUDA toolkit");
         }
+        // `no_default_flags` is required, not cosmetic: cc-rs otherwise emits
+        // its gcc-shaped defaults (`-ffunction-sections`, `-fdata-sections`,
+        // `-gdwarf-4`, ...) unwrapped, and nvcc fails on the first one. The
+        // flags nvcc actually needs are supplied explicitly below, with host
+        // options routed through `-Xcompiler`.
         let mut device = cc::Build::new();
         device
             .cuda(true)
             .cpp(true)
-            .std("c++17")
+            .no_default_flags(true)
             .include("native")
             .compiler(nvcc)
+            .flag("-std=c++17")
+            .flag("-O2")
+            .flag("-Xcompiler=-fPIC")
             .file("native/smoke.cu")
             .file("native/prototype_b.cu")
             .file("native/prototype_b_population.cu");
