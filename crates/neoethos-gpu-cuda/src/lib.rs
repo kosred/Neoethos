@@ -42,6 +42,7 @@ pub struct CudaFirstHitResult {
 unsafe extern "C" {
     fn neoethos_gpu_cuda_abi_version() -> u32;
     fn neoethos_gpu_cuda_runtime_available() -> i32;
+    fn neoethos_gpu_cuda_device_count() -> i32;
     fn neoethos_gpu_cuda_smoke(input: *const u32, output: *mut u32, len: usize) -> i32;
     fn neoethos_gpu_cuda_warp_first_hit(
         highs: *const f32,
@@ -87,6 +88,17 @@ pub fn validate_abi() -> Result<(), CudaSmokeError> {
 pub fn runtime_available() -> bool {
     // SAFETY: no arguments, no memory access, stable C ABI.
     unsafe { neoethos_gpu_cuda_runtime_available() == 1 }
+}
+
+/// Number of visible CUDA devices.
+///
+/// This exists so the CubeCL CUDA lane can bounds-check a device index without
+/// depending on `tch`, which would drag a multi-gigabyte libtorch install onto
+/// every machine that only wants to run a GPU benchmark.
+pub fn device_count() -> usize {
+    // SAFETY: no arguments, no memory access, stable C ABI.
+    let count = unsafe { neoethos_gpu_cuda_device_count() };
+    count.max(0) as usize
 }
 
 pub fn smoke_add_one(input: &[u32]) -> Result<Vec<u32>, CudaSmokeError> {

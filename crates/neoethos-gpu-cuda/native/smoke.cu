@@ -70,3 +70,11 @@ extern "C" std::int32_t neoethos_gpu_cuda_smoke(const std::uint32_t* input,
   cudaFree(device_input);
   return status;
 }
+
+extern "C" std::int32_t neoethos_gpu_cuda_device_count() {
+  int count = 0;
+  if (cudaGetDeviceCount(&count) != cudaSuccess) {
+    return 0;
+  }
+  return static_cast<std::int32_t>(count);
+}

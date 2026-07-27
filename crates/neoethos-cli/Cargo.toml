@@ -22,6 +22,11 @@ gpu-nvidia = ["neoethos-models/gpu-cuda", "neoethos-search/gpu-cuda"]
 # Minimal native-CUDA build: Prototype B only, no CubeCL and no libtorch. Used
 # by the rented-GPU kit to prove the B kernel before provisioning anything else.
 gpu-b-native = ["neoethos-search/gpu-b-native"]
+# Benchmark-only CUDA: the search GPU lane (CubeCL CUDA + the native B engine)
+# without the model stack, so a rented box can run the whole A/B/C matrix with
+# rustc and nvcc alone — no libtorch download, no LIBTORCH env, no CUDA-version
+# matching against a prebuilt tensor library.
+gpu-bench-cuda = ["neoethos-search/gpu-cuda"]
 gpu-vulkan = ["neoethos-models/gpu-vulkan", "neoethos-search/gpu-vulkan"]
 gpu-rocm = ["neoethos-models/gpu-rocm", "neoethos-search/gpu-rocm"]
 gpu-apple = ["gpu-vulkan"]

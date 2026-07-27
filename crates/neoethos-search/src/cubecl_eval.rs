@@ -584,8 +584,12 @@ pub(crate) fn create_gpu_client(
     device_override: Option<usize>,
 ) -> Result<ComputeClient<CudaRuntime>> {
     let device_id = device_override.unwrap_or_else(cuda_device_id);
-    let device_count = tch::Cuda::device_count();
-    if device_count <= device_id as i64 {
+    // Device enumeration goes through our own C ABI rather than `tch`: the only
+    // thing that was ever needed from libtorch here is a device count, and
+    // dragging a multi-gigabyte install onto every CUDA machine to obtain it is
+    // not a trade worth making.
+    let device_count = neoethos_gpu_cuda::device_count();
+    if device_count <= device_id {
         bail!(
             "GPU evaluator requested CUDA device {} but only {} CUDA devices are available",
             device_id,

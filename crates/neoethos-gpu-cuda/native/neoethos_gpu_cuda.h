@@ -286,6 +286,8 @@ void neoethos_gpu_cuda_population_destroy(NeoCudaPopulationSession* session);
 
 std::uint32_t neoethos_gpu_cuda_abi_version();
 std::int32_t neoethos_gpu_cuda_runtime_available();
+/// Number of visible CUDA devices, or 0 when the runtime is unavailable.
+std::int32_t neoethos_gpu_cuda_device_count();
 std::int32_t neoethos_gpu_cuda_smoke(const std::uint32_t* input,
                                      std::uint32_t* output,
                                      std::size_t len);
