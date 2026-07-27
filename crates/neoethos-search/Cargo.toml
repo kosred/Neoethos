@@ -67,11 +67,16 @@ gpu = ["dep:cubecl", "dep:half", "dep:cubecl-runtime"]
 gpu-cuda = [
     "gpu",
     "dep:tch",
-    "dep:neoethos-gpu-cuda",
+    "gpu-b-native",
     "cubecl/cuda",
     "neoethos-core/gpu-cuda",
-    "neoethos-gpu-cuda/cuda",
 ]
+# Prototype B is a native-CUDA engine: it links the `neoethos-gpu-cuda` C ABI
+# and needs neither CubeCL nor libtorch. This feature exists on its own so a
+# rented GPU box can prove the B kernel with nothing but rustc, a C++ compiler
+# and nvcc, instead of provisioning the entire GPU dependency chain first.
+# `gpu-cuda` implies it, so a full build is unchanged.
+gpu-b-native = ["dep:neoethos-gpu-cuda", "neoethos-gpu-cuda/cuda"]
 gpu-vulkan = ["gpu", "cubecl/wgpu", "neoethos-core/gpu-wgpu"]
 gpu-rocm = ["gpu", "cubecl/hip", "neoethos-core/gpu-rocm"]
 strategy-db = ["dep:duckdb"]

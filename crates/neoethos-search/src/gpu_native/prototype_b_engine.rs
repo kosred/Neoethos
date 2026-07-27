@@ -188,12 +188,12 @@ pub const fn prototype_b_engine_capabilities() -> EngineCapabilities {
     prototype_b_capabilities()
 }
 
-#[cfg(not(feature = "gpu-cuda"))]
+#[cfg(not(feature = "gpu-b-native"))]
 pub fn prototype_b_engine_status() -> EngineStatus {
     EngineStatus::UnsupportedCapability
 }
 
-#[cfg(feature = "gpu-cuda")]
+#[cfg(feature = "gpu-b-native")]
 pub fn prototype_b_engine_status() -> EngineStatus {
     if neoethos_gpu_cuda::runtime_available() {
         EngineStatus::NotBenchmarked
@@ -205,7 +205,7 @@ pub fn prototype_b_engine_status() -> EngineStatus {
 /// Typed refusal for builds without the native CUDA runtime. Prototype B is a
 /// native-CUDA engine by definition; there is no portable substitute and no
 /// CPU fallback.
-#[cfg(not(feature = "gpu-cuda"))]
+#[cfg(not(feature = "gpu-b-native"))]
 pub fn create_prototype_b_engine(
     _device_override: Option<usize>,
     _session_id: u64,
@@ -217,10 +217,10 @@ pub fn create_prototype_b_engine(
     })
 }
 
-#[cfg(feature = "gpu-cuda")]
+#[cfg(feature = "gpu-b-native")]
 pub use cuda_engine::{PrototypeBBacktestEngine, PrototypeBResources, create_prototype_b_engine};
 
-#[cfg(feature = "gpu-cuda")]
+#[cfg(feature = "gpu-b-native")]
 mod cuda_engine {
     use super::{
         PrototypeBPopulationInputs, prototype_b_engine_capabilities, survivor_summary_from_rows,
@@ -841,7 +841,7 @@ mod tests {
     /// Real-device population parity. This test executes; it never reports a
     /// successful-looking skip. A missing CUDA runtime is the only tolerated
     /// non-execution, and it is announced explicitly.
-    #[cfg(feature = "gpu-cuda")]
+    #[cfg(feature = "gpu-b-native")]
     #[test]
     fn cuda_population_metrics_match_the_canonical_oracle() {
         use crate::gpu_native::engine::{BacktestEngine, DeviceFilterPolicy};
@@ -864,6 +864,12 @@ mod tests {
         let mut engine = match create_prototype_b_engine(None, 77, max_events) {
             Ok(engine) => engine,
             Err(EngineError::UnsupportedCapability { detail, .. }) => {
+                // On a rented GPU a silent skip is worse than a failure: it
+                // reports green while proving nothing and the box is billed.
+                assert!(
+                    std::env::var("NEOETHOS_REQUIRE_GPU").as_deref() != Ok("1"),
+                    "NEOETHOS_REQUIRE_GPU=1 but no CUDA runtime is available: {detail}"
+                );
                 eprintln!("Prototype B CUDA parity skipped: no CUDA runtime ({detail})");
                 return;
             }
@@ -924,7 +930,7 @@ mod tests {
             .expect("device residency invariant");
     }
 
-    #[cfg(not(feature = "gpu-cuda"))]
+    #[cfg(not(feature = "gpu-b-native"))]
     #[test]
     fn cuda_free_builds_refuse_prototype_b_with_a_typed_status() {
         assert_eq!(

@@ -18,6 +18,17 @@ struct DeviceRun {
     transfers: crate::gpu_native::engine::TransferSnapshot,
 }
 
+/// Fail instead of skipping when the caller declared that a GPU must exist.
+///
+/// A rented box is billed per minute; a green suite that quietly proved
+/// nothing is the most expensive possible outcome.
+fn assert_skip_is_allowed(detail: &str) {
+    assert!(
+        std::env::var("NEOETHOS_REQUIRE_GPU").as_deref() != Ok("1"),
+        "NEOETHOS_REQUIRE_GPU=1 but no CubeCL adapter is available: {detail}"
+    );
+}
+
 /// Drive one workload through the full engine contract.
 ///
 /// Returns `None` only when this machine has no CubeCL adapter at all.
@@ -28,6 +39,7 @@ fn run_on_device(workload: &PrototypePopulationWorkload, session_id: u64) -> Opt
         Err(EngineError::UnsupportedCapability { operation, detail })
             if operation == "prototype_c_gpu_adapter" =>
         {
+            assert_skip_is_allowed(&detail);
             eprintln!("Prototype C device test skipped: no CubeCL adapter ({detail})");
             return None;
         }
@@ -198,9 +210,10 @@ fn a_second_evaluation_reuses_the_resident_dataset() {
     let max_events = workload.genes.population() * workload.dataset.bars();
     let mut engine = match create_prototype_c_engine(None, 404, max_events) {
         Ok(engine) => engine,
-        Err(EngineError::UnsupportedCapability { operation, .. })
+        Err(EngineError::UnsupportedCapability { operation, detail })
             if operation == "prototype_c_gpu_adapter" =>
         {
+            assert_skip_is_allowed(&detail);
             eprintln!("Prototype C residency test skipped: no CubeCL adapter");
             return;
         }
@@ -258,9 +271,10 @@ fn a_second_dataset_upload_is_refused() {
     let workload = fixed_stop_workload(2, 128);
     let mut engine = match create_prototype_c_engine(None, 405, 4096) {
         Ok(engine) => engine,
-        Err(EngineError::UnsupportedCapability { operation, .. })
+        Err(EngineError::UnsupportedCapability { operation, detail })
             if operation == "prototype_c_gpu_adapter" =>
         {
+            assert_skip_is_allowed(&detail);
             eprintln!("Prototype C reupload test skipped: no CubeCL adapter");
             return;
         }
@@ -281,9 +295,10 @@ fn an_over_capacity_population_is_refused_instead_of_truncated() {
     let workload = fixed_stop_workload(4, 256);
     let mut engine = match create_prototype_c_engine(None, 406, 1) {
         Ok(engine) => engine,
-        Err(EngineError::UnsupportedCapability { operation, .. })
+        Err(EngineError::UnsupportedCapability { operation, detail })
             if operation == "prototype_c_gpu_adapter" =>
         {
+            assert_skip_is_allowed(&detail);
             eprintln!("Prototype C capacity test skipped: no CubeCL adapter");
             return;
         }
@@ -317,9 +332,10 @@ fn an_ineligible_population_is_refused_before_any_device_work() {
 
     let mut engine = match create_prototype_c_engine(None, 407, 4096) {
         Ok(engine) => engine,
-        Err(EngineError::UnsupportedCapability { operation, .. })
+        Err(EngineError::UnsupportedCapability { operation, detail })
             if operation == "prototype_c_gpu_adapter" =>
         {
+            assert_skip_is_allowed(&detail);
             eprintln!("Prototype C eligibility test skipped: no CubeCL adapter");
             return;
         }

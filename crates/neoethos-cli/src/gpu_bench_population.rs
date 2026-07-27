@@ -7,7 +7,11 @@
 //! silently ran somewhere else is worse than no measurement.
 
 use anyhow::{Context, Result};
-#[cfg(any(feature = "gpu-nvidia", feature = "gpu-vulkan"))]
+#[cfg(any(
+    feature = "gpu-nvidia",
+    feature = "gpu-b-native",
+    feature = "gpu-vulkan"
+))]
 use neoethos_search::gpu_native::benchmark::execute_population_benchmark;
 use neoethos_search::gpu_native::benchmark::{
     BenchmarkIdentity, BenchmarkReport, DistributionSummary, ParityStatus,
@@ -169,7 +173,7 @@ fn execute(
     )
 }
 
-#[cfg(feature = "gpu-nvidia")]
+#[cfg(any(feature = "gpu-nvidia", feature = "gpu-b-native"))]
 fn run_prototype_b(
     workload: &PrototypePopulationWorkload,
     eligibility: &neoethos_search::gpu_native::prototype_population::CommonBcEligibility,
@@ -186,7 +190,7 @@ fn run_prototype_b(
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
-#[cfg(not(feature = "gpu-nvidia"))]
+#[cfg(not(any(feature = "gpu-nvidia", feature = "gpu-b-native")))]
 fn run_prototype_b(
     _workload: &PrototypePopulationWorkload,
     _eligibility: &neoethos_search::gpu_native::prototype_population::CommonBcEligibility,
@@ -196,8 +200,9 @@ fn run_prototype_b(
     _max_events: usize,
 ) -> Result<PopulationBenchmarkOutcome> {
     anyhow::bail!(
-        "Prototype B is a native-CUDA engine: rebuild the CLI with --features gpu-nvidia on a \
-         CUDA device. No other engine may stand in for it."
+        "Prototype B is a native-CUDA engine: rebuild the CLI with --features gpu-b-native \
+         (rustc + nvcc only) or --features gpu-nvidia (full stack) on a CUDA device. No other \
+         engine may stand in for it."
     )
 }
 
@@ -478,7 +483,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "gpu-nvidia"))]
+    #[cfg(not(any(feature = "gpu-nvidia", feature = "gpu-b-native")))]
     #[test]
     fn prototype_b_is_refused_without_a_cuda_build_rather_than_substituted() {
         let workload = TinyPopulationFixture::new(2, 128, 4)
@@ -496,7 +501,7 @@ mod tests {
             4096,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("gpu-nvidia"), "{error}");
+        assert!(error.to_string().contains("gpu-b-native"), "{error}");
     }
 
     #[cfg(not(any(feature = "gpu-nvidia", feature = "gpu-vulkan")))]

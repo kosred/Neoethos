@@ -40,7 +40,6 @@ pub struct PreparedSnapshot {
 }
 
 pub fn run_prepare(args: &[String]) -> Result<()> {
-    let csv = PathBuf::from(flag(args, "--csv").context("bench-prepare requires --csv <file>")?);
     let out = PathBuf::from(flag(args, "--out").context("bench-prepare requires --out <file>")?);
     let timeframe = flag(args, "--timeframe")
         .context("bench-prepare requires --timeframe <H1|M30|M15|M5|M1>")?;
@@ -56,9 +55,173 @@ pub fn run_prepare(args: &[String]) -> Result<()> {
         commission: parse_f64(args, "--commission", 0.0)?,
         pip_value_per_lot: parse_f64(args, "--pip-value-per-lot", 10.0)?,
     };
-    let prepared = prepare_snapshot(&csv, &out, &timeframe, &options)?;
+
+    // Two input paths. `--symbol` reads the project's own store and computes
+    // the same feature set discovery uses, so a paid run measures real market
+    // data. `--csv` remains for an externally supplied series.
+    let prepared = match (flag(args, "--symbol"), flag(args, "--csv")) {
+        (Some(_), Some(_)) => {
+            bail!("bench-prepare accepts either --symbol or --csv, not both")
+        }
+        (Some(symbol), None) => {
+            let request = StoreRequest {
+                data_root: PathBuf::from(
+                    flag(args, "--data-root")
+                        .or_else(|| flag(args, "--root"))
+                        .unwrap_or_else(|| "data".to_string()),
+                ),
+                symbol,
+                timeframe: timeframe.clone(),
+                bars: parse_usize(args, "--bars", 50_000)?,
+                max_features: parse_usize(args, "--max-features", 32)?,
+            };
+            prepare_snapshot_from_store(&request, &out, &options)?
+        }
+        (None, Some(csv)) => prepare_snapshot(Path::new(&csv), &out, &timeframe, &options)?,
+        (None, None) => {
+            bail!("bench-prepare requires --symbol <SYMBOL> (real store) or --csv <file>")
+        }
+    };
     println!("{}", serde_json::to_string_pretty(&prepared)?);
     Ok(())
+}
+
+/// Snapshot request against the project's own dataset store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoreRequest {
+    pub data_root: PathBuf,
+    pub symbol: String,
+    pub timeframe: String,
+    /// Number of most recent bars to keep. Snapshots are JSON, so an unbounded
+    /// M1 history would produce a file nobody can move to a rented box.
+    pub bars: usize,
+    pub max_features: usize,
+}
+
+/// Build a snapshot from real stored history and the canonical feature set.
+///
+/// Indicator warmup rows are dropped rather than zero-filled: a synthetic zero
+/// at the head of the series would change signals and therefore the workload.
+pub fn prepare_snapshot_from_store(
+    request: &StoreRequest,
+    out: &Path,
+    options: &PrepareOptions,
+) -> Result<PreparedSnapshot> {
+    if options.population == 0 {
+        bail!("--population must be positive");
+    }
+    if request.bars < 64 {
+        bail!("--bars must be at least 64, got {}", request.bars);
+    }
+    if request.max_features == 0 {
+        bail!("--max-features must be positive");
+    }
+
+    let ohlcv = neoethos_data::load_symbol_timeframe(
+        &request.data_root,
+        &request.symbol,
+        &request.timeframe,
+    )
+    .with_context(|| {
+        format!(
+            "load {} {} from {}",
+            request.symbol,
+            request.timeframe,
+            request.data_root.display()
+        )
+    })?;
+    let timestamps = ohlcv.timestamp.clone().with_context(|| {
+        format!(
+            "{} {} has no timestamp column; a benchmark snapshot needs a calendar",
+            request.symbol, request.timeframe
+        )
+    })?;
+    if timestamps.len() != ohlcv.close.len() {
+        bail!(
+            "{} {} timestamp length {} does not match {} bars",
+            request.symbol,
+            request.timeframe,
+            timestamps.len(),
+            ohlcv.close.len()
+        );
+    }
+
+    let frame = neoethos_data::compute_hpc_features(&ohlcv).with_context(|| {
+        format!(
+            "compute features for {} {}",
+            request.symbol, request.timeframe
+        )
+    })?;
+    let view = frame.as_indicators_view();
+    let (available_features, feature_rows) = (view.nrows(), view.ncols());
+    if feature_rows != ohlcv.close.len() {
+        bail!(
+            "feature frame has {feature_rows} rows but the series has {} bars",
+            ohlcv.close.len()
+        );
+    }
+    let feature_count = available_features.min(request.max_features);
+    if feature_count == 0 {
+        bail!("the computed feature frame is empty");
+    }
+
+    // First row where every retained feature is finite: indicator warmup.
+    let warmup = (0..feature_rows)
+        .find(|row| (0..feature_count).all(|feature| view[[feature, *row]].is_finite()))
+        .context("every row contains a non-finite feature value")?;
+    let usable = feature_rows - warmup;
+    if usable < 64 {
+        bail!(
+            "only {usable} bars remain after {warmup} warmup rows; \
+             a snapshot needs at least 64"
+        );
+    }
+    let start = warmup + usable.saturating_sub(request.bars);
+    let bars = feature_rows - start;
+
+    let mut indicators = Vec::with_capacity(feature_count * bars);
+    for feature in 0..feature_count {
+        for row in start..feature_rows {
+            let value = view[[feature, row]];
+            if !value.is_finite() {
+                bail!(
+                    "feature {} is non-finite at bar {row} after warmup trimming",
+                    frame.names.get(feature).map_or("<unnamed>", String::as_str)
+                );
+            }
+            indicators.push(value);
+        }
+    }
+
+    let close = ohlcv.close[start..].to_vec();
+    let high = ohlcv.high[start..].to_vec();
+    let low = ohlcv.low[start..].to_vec();
+    let timestamps = timestamps[start..].to_vec();
+    for (field, values) in [("close", &close), ("high", &high), ("low", &low)] {
+        if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+            bail!("{field}[{index}] of the stored series is not finite");
+        }
+    }
+
+    let source_description = format!(
+        "{} {} from {} — bars {start}..{feature_rows} of {feature_rows}, {feature_count} of \
+         {available_features} canonical features",
+        request.symbol,
+        request.timeframe,
+        request.data_root.display()
+    );
+    let dto = build_snapshot_dto(
+        &request.timeframe,
+        source_description,
+        close,
+        high,
+        low,
+        timestamps,
+        indicators,
+        feature_count,
+        options,
+    );
+    finalize_snapshot(dto, out, &request.timeframe)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -120,30 +283,53 @@ pub fn prepare_snapshot(
         }
     }
 
-    let genes = deterministic_genes(options.population, feature_count, options.terms_per_gene);
-    let months = series
-        .timestamps
-        .iter()
-        .map(|value| month_id(*value))
-        .collect();
-    let days = series
-        .timestamps
-        .iter()
-        .map(|value| value.div_euclid(86_400_000))
-        .collect();
     let source_hash = hex_digest(&raw);
     let source_name = csv
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| csv.display().to_string());
 
-    let dto = SnapshotFixtureDto {
+    let dto = build_snapshot_dto(
+        timeframe,
+        format!("{source_name} sha256={source_hash}"),
+        series.close,
+        series.high,
+        series.low,
+        series.timestamps,
+        indicators,
+        feature_count,
+        options,
+    );
+    finalize_snapshot(dto, out, timeframe)
+}
+
+/// Assemble the versioned DTO shared by both input paths.
+#[allow(clippy::too_many_arguments)]
+fn build_snapshot_dto(
+    timeframe: &str,
+    source_description: String,
+    close: Vec<f64>,
+    high: Vec<f64>,
+    low: Vec<f64>,
+    timestamps: Vec<i64>,
+    indicators: Vec<f32>,
+    feature_count: usize,
+    options: &PrepareOptions,
+) -> SnapshotFixtureDto {
+    let bars = close.len();
+    let genes = deterministic_genes(options.population, feature_count, options.terms_per_gene);
+    let months = timestamps.iter().map(|value| month_id(*value)).collect();
+    let days = timestamps
+        .iter()
+        .map(|value| value.div_euclid(86_400_000))
+        .collect();
+    SnapshotFixtureDto {
         schema_version: SNAPSHOT_FIXTURE_SCHEMA_VERSION,
         timeframe: timeframe.to_ascii_uppercase(),
-        source_description: format!("{source_name} sha256={source_hash}"),
-        close: series.close,
-        high: series.high,
-        low: series.low,
+        source_description,
+        close,
+        high,
+        low,
         indicators,
         feature_count,
         gene_offsets: genes.offsets,
@@ -153,7 +339,7 @@ pub fn prepare_snapshot(
         short_thresholds: genes.short_thresholds,
         months,
         days,
-        timestamps: series.timestamps,
+        timestamps,
         stop_pips: vec![options.stop_pips; options.population],
         target_pips: vec![options.target_pips; options.population],
         stop_vol_multipliers: vec![0.0; options.population],
@@ -182,8 +368,15 @@ pub fn prepare_snapshot(
             adaptive_base_pips: None,
             adaptive_rr: 2.0,
         },
-    };
+    }
+}
 
+/// Validate, write and attribute one snapshot.
+fn finalize_snapshot(
+    dto: SnapshotFixtureDto,
+    out: &Path,
+    timeframe: &str,
+) -> Result<PreparedSnapshot> {
     // Validate through the same fixture the benchmark consumes, so an invalid
     // snapshot fails here rather than on rented hardware.
     let fixture = SnapshotPopulationFixture::from_dto(dto.clone())

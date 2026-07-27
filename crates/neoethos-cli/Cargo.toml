@@ -19,6 +19,9 @@ default = []
 # headless/VPS path is no longer silently CPU-only.
 gpu = ["gpu-nvidia"]
 gpu-nvidia = ["neoethos-models/gpu-cuda", "neoethos-search/gpu-cuda"]
+# Minimal native-CUDA build: Prototype B only, no CubeCL and no libtorch. Used
+# by the rented-GPU kit to prove the B kernel before provisioning anything else.
+gpu-b-native = ["neoethos-search/gpu-b-native"]
 gpu-vulkan = ["neoethos-models/gpu-vulkan", "neoethos-search/gpu-vulkan"]
 gpu-rocm = ["neoethos-models/gpu-rocm", "neoethos-search/gpu-rocm"]
 gpu-apple = ["gpu-vulkan"]
