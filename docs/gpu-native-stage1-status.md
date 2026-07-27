@@ -38,7 +38,9 @@ This record reports implemented and verified behaviour. It is not a performance 
 - Unsupported subgroup widths return typed `UnsupportedCapability`/errors.
 - The native CUDA scaffold contains a one-warp-per-event first-hit kernel using lane-strided scans and `__shfl_down_sync` earliest-hit reduction. Its C ABI, layouts, input validation and honest no-CUDA stub are host-CI verifiable; actual `nvcc` compilation and runtime parity remain gated to the rented NVIDIA session.
 - A persistent population session now exists behind the same C ABI. One session owns one non-default stream, one logical dataset upload and every device workspace; `evaluate` runs the complete canonical chain on that stream — signal synthesis, causal entry emission in candidate-major/bar-ascending order, warp-cooperative first hit with exact gap/stop/target/max-hold precedence, and the f64 cost, sizing and metric reduction. Emission uses a block-wide scan so ordering is deterministic, and event-capacity overflow is a typed failure rather than a truncation. The adaptive-at-entry base distance crosses the ABI as f64 so the canonical stop distance is never narrowed.
-- `PrototypeBBacktestEngine` enforces the same handle, event and transfer contracts as Prototype A, refuses populations outside the common B/C intersection before any kernel is submitted, and destroys the native session on every drop path. Host-side projection, eligibility and identity checking are covered in the CUDA-free build; `nvcc` compilation and the device parity test remain gated to the rented session.
+- `PrototypeBBacktestEngine` enforces the same handle, event and transfer contracts as Prototype A, refuses populations outside the common B/C intersection before any kernel is submitted, and destroys the native session on every drop path.
+- **Executed on a real NVIDIA GPU (RTX 3060 Ti, CUDA 12.2, driver 535.288.01, 2026-07-27).** `nvcc` compiles the device unit, the Rust → C ABI → CUDA smoke test runs, and the population parity test matches the canonical oracle at level 10 with `NEOETHOS_REQUIRE_GPU=1` set, so it could not have passed by skipping. Compute Sanitizer memcheck over the same path reports zero errors. Total rental cost of that gate: $0.05.
+- Two build failures were found there that no CUDA-free check could reach, and both are fixed: cc-rs handed gcc flags to `nvcc` and emitted `--device-c` without a device-link step, and the `mold` linker pinned by `.cargo/config.toml` silently dropped nvcc's fatbin-registration constructors, producing a binary that built and linked cleanly and then failed every launch with "invalid device function".
 
 ### Prototype C
 
@@ -62,14 +64,21 @@ This record reports implemented and verified behaviour. It is not a performance 
 
 The run kit performs GPU/VRAM/RAM/disk checks, verifies CUDA, CUPTI, Nsight Systems, Nsight Compute and Compute Sanitizer, pins legacy/candidate worktrees, and runs the real Rust → C ABI → CUDA smoke/parity tests before paid measurements. The preflight also executes direct CUDA correctness probes for the warp-cooperative B subset, compact-event C subset and causal signal trace.
 
-The following remain unverified until a real NVIDIA GPU is rented:
+Verified on a rented RTX 3060 Ti on 2026-07-27, for $0.05:
 
-- native CUDA compilation and runtime parity of Prototype B, including its persistent population session;
-- actual CUDA smoke execution and Compute Sanitizer;
+- native CUDA compilation of the whole device unit;
+- Rust → C ABI → CUDA smoke execution;
+- Prototype B persistent population session parity against the canonical oracle at level 10, with skips turned into failures;
+- Compute Sanitizer memcheck over the B population path — zero errors.
+
+The following still require the *target* card and remain unverified:
+
 - CUDA execution of Prototype C and the trace specialization (its population pipeline is proven on Vulkan, not yet on CUDA);
-- A/B/C wall time, occupancy and VRAM measurements;
+- A/B/C wall time, occupancy and VRAM measurements on an A6000-class device;
 - the relative cost of compute, allocation, synchronization, H2D and D2H;
 - any final architecture selection or speedup claim.
+
+A 3060 Ti proves correctness, not performance. Nothing measured on it may inform the A/B/C choice.
 
 ## Card-independent completion status
 
@@ -81,7 +90,7 @@ The two implementation gaps defined in `docs/gpu-native-stage1-opus-handoff.md` 
 
 The B/C population adapters defined in the Stage-1 B/C plan are also complete on this branch:
 
-- Prototype B: persistent native-CUDA population session plus its `BacktestEngine` adapter, card-independent complete and real-CUDA unverified.
+- Prototype B: persistent native-CUDA population session plus its `BacktestEngine` adapter, complete and **verified on real CUDA hardware** for correctness and memory safety.
 - Prototype C: resident CubeCL population pipeline plus its `BacktestEngine` adapter, card-independent complete **and executed against the canonical oracle on a real Vulkan adapter**.
 - One shared benchmark protocol runs both through `bench --execute-tiny` / `--execute-snapshot` with `--prototype b|c`, measuring only the supported partition and reporting the remainder as a coverage gap. Dispatch never falls back to another engine or to the CPU.
 
