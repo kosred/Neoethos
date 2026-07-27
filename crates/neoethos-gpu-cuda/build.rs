@@ -112,7 +112,14 @@ fn compile_device_objects() {
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=neoethos_gpu_cuda_native");
+    // `+whole-archive` is load-bearing. nvcc registers each fatbin from a
+    // constructor in `.init_array`; nothing in Rust references that constructor
+    // by symbol, so a normal archive link keeps the fatbin *data* while
+    // dropping the registration. The kernels then fail at launch with "invalid
+    // device function" even though the build and the link both succeeded —
+    // observed on a real RTX 3060 Ti, where the fatbin sections were present in
+    // the test binary but `__cudaRegisterFatBinary` was absent.
+    println!("cargo:rustc-link-lib=static:+whole-archive=neoethos_gpu_cuda_native");
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");
     if let Ok(path) = env::var("CUDA_PATH") {
