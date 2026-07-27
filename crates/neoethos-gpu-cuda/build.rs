@@ -46,9 +46,14 @@ fn main() {
             .cuda(true)
             .cpp(true)
             .no_default_flags(true)
+            // cc-rs adds `-Wall -Wextra` outside its "default flags" set, and
+            // nvcc rejects those too; device warnings are requested explicitly.
+            .warnings(false)
+            .extra_warnings(false)
             .include("native")
             .compiler(nvcc)
             .flag("-std=c++17")
+            .flag("-Xcompiler=-Wall")
             .flag("-O2")
             .flag("-Xcompiler=-fPIC")
             .file("native/smoke.cu")
