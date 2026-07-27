@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "identity": {
+    "git_sha": "1efc3c93b22b4cc8dce4906d9ced6d0f5b9c73f6",
+    "baseline_sha": "2be1408ee3986026fdbb2a5a74aaaf6ac67e5209",
+    "dataset_hash": "unresolved",
+    "config_hash": "unresolved",
+    "seed": 0,
+    "timeframe": "M1",
+    "backend": "gpu_required",
+    "prototype": "c",
+    "fixture": "tiny",
+    "pass": "clean_timing"
+  },
+  "hardware": {
+    "cpu": "unresolved",
+    "ram_bytes": null,
+    "gpu": null,
+    "device_class": null,
+    "driver_version": null,
+    "cuda_runtime_version": null,
+    "cuda_toolkit_version": null,
+    "gpu_clock_mhz": null,
+    "power_limit_watts": null,
+    "temperature_celsius": null,
+    "dedicated_vram_bytes": null,
+    "cuda_occupancy": null
+  },
+  "trading_semantics_version": 1,
+  "trading_semantics_hash": "6b35746d1b70f22b",
+  "discovery_semantics_version": 1,
+  "discovery_semantics_hash": "f2bebccc737707c3",
+  "engine_status": "NotBenchmarked",
+  "warmup_count": 2,
+  "measured_repetitions": 7,
+  "sweep": {
+    "population": 256,
+    "batch_size": 256,
+    "bar_count": 4096,
+    "feature_count": 16,
+    "scenario_count": 1,
+    "calendar_days": null
+  },
+  "total_wall_seconds": {
+    "count": 7,
+    "median": 0.012504566,
+    "p95": 0.012551534,
+    "variance": 9.262393293469343e-10,
+    "min": 0.012459145,
+    "max": 0.012567077
+  },
+  "stage_wall_seconds": {},
+  "throughput": {
+    "candidates_per_second": 20472.521797237903,
+    "candidate_bars_per_second": 83855449.28148645,
+    "trades_per_second": 5118050.4785212055,
+    "peak_vram_bytes": null,
+    "event_density": 0.061034202575683594,
+    "hold_bars": null
+  },
+  "transfers": {
+    "dataset_uploads": 1,
+    "gene_uploads": 1,
+    "scenario_uploads": 1,
+    "full_d2h_readbacks": 0,
+    "compact_d2h_readbacks": 18,
+    "chained_reuploads": 0,
+    "synchronization_events": 9,
+    "h2d_bytes": 601140,
+    "d2h_bytes": 101412
+  },
+  "coverage": {
+    "total_candidates": 256,
+    "supported_candidates": 256,
+    "unsupported_candidates": 0,
+    "unsupported_reasons": {}
+  },
+  "parity": {
+    "matched": false,
+    "first_divergent_level": 10,
+    "detail": "metric[0][28] expected=-85.63672897062497 actual=-85.9453125"
+  },
+  "notes": [
+    "Workload execution occurred inside neoethos-cli bench; the canonical oracle ran before timing.",
+    "Measured 256 of 256 candidates; the remainder is a declared capability gap and was not evaluated by any other engine.",
+    "Engine status remains not_benchmarked until the attributed discrete-NVIDIA matrix is complete.",
+    "Parity failed: this run is a correctness failure, not a performance result."
+  ]
+}

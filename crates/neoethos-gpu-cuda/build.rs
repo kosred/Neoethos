@@ -82,6 +82,14 @@ fn compile_device_objects() {
             .arg("-std=c++17")
             .arg(format!("-gencode=arch={arch}"))
             .arg("-Xcompiler=-fPIC")
+            // No fused multiply-add contraction. Measured on an RTX A6000 over
+            // 20 000 real EURUSD H1 bars: with contraction enabled one
+            // candidate in 256 diverged from the canonical CPU result by 0.62 %,
+            // because a fused multiply-add flipped a stop/target boundary
+            // comparison. Disabling it restores exact parity at 4 096, 20 000
+            // and 200 000 bars for about 2 % of throughput. Exactness is the
+            // point of this engine; the 2 % is not negotiable against it.
+            .arg("-fmad=false")
             .arg("-I")
             .arg("native");
         if debug {

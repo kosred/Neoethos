@@ -104,6 +104,38 @@ This closes the card-independent Stage-1 implementation work. It does not close 
 - Historical legacy measurement needs a pinned adapter because the historical commit predates the attributed benchmark command.
 - Passing integration parity does not prove full-pipeline GPU-native execution.
 
+## First real A/B/C measurements (RTX A6000, 2026-07-27)
+
+Raw reports and full caveats: `docs/measurements/`. Two findings dominate.
+
+**The f32 CubeCL lane is disqualified on correctness at production series
+length.** Prototypes A and C share the fused f32 accumulation and produce
+identical wrong values against the canonical CPU reference. The error compounds
+with the series: 0.36 % at 4 096 bars, 1.8 % at 20 000, and **54 % at 200 000**
+(candidate 0 reported as +3 940.88 against a canonical +8 506.33). Prototype A
+is the evaluator the production discovery GPU lane already uses, so this is a
+statement about the shipped product, not only about a prototype.
+
+**Prototype B reproduces the canonical semantics exactly at every scale once FMA
+contraction is disabled**, which costs about 2 % of throughput and is now
+permanent in `neoethos-gpu-cuda/build.rs`. With contraction on, one candidate in
+256 diverged by 0.62 % at 20 000 bars because a fused multiply-add flipped a
+stop/target boundary comparison.
+
+Throughput against the production CPU evaluator on the same 36-core box
+(31.4 M candidate-bars/s, EURUSD M5, 256 x 200 000):
+
+| engine | candidate-bars/s | vs CPU | reproduces the semantics |
+|---|---|---|---|
+| A (f32) | 146-156 M | 4.7x | no |
+| C (f32) | 101 M | 3.2x | no |
+| B (f64, no FMA) | 50 M | 1.6x | yes |
+
+Among engines that are correct there is currently one candidate, so this is not
+an A/B/C choice yet — it is a correctness disqualification of two of the three.
+No sweep, no Nsight pass, no occupancy or VRAM figures, one symbol and one
+population size. **No architecture has been selected.**
+
 ## Stop gates preserved
 
 No engine is selected, no existing backend is removed, no A6000-specific tuning is applied and no speedup is claimed before real measurements and a recorded human decision gate. Every timing figure produced so far is a local functional check, not a comparison: the Vulkan numbers come from an integrated adapter and say nothing about the A6000 or about A-versus-B-versus-C.
