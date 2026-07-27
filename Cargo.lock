@@ -9795,15 +9795,16 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
 dependencies = [
  "aws-lc-rs",
  "bytes",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "lru-slab",
- "rand 0.9.4",
+ "rand 0.10.1",
+ "rand_pcg 0.10.2",
  "ring",
  "rustc-hash 2.1.2",
  "rustls",
@@ -10002,6 +10003,15 @@ checksum = "b48ac3f7ffaab7fac4d2376632268aa5f89abdb55f7ebf8f4d11fffccb2320f7"
 dependencies = [
  "rand_core 0.9.5",
  "serde",
+]
+
+[[package]]
+name = "rand_pcg"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -12229,7 +12239,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc5ede4d7e538e12dd40a0417488a93dec6e82804e9189e0b2f1aad30795acb6"
 dependencies = [
  "rand 0.9.4",
- "rand_pcg",
+ "rand_pcg 0.9.0",
  "rayon",
  "serde",
 ]
