@@ -18,6 +18,13 @@
 set -euo pipefail
 
 STAGE="${1:-all}"
+
+# The repo pins mold on Linux for link speed. mold 1.0.3 splits `.init_array`
+# and leaves nvcc's fatbin-registration constructors outside the dynamic tag,
+# so CUDA kernels build, link, and then fail at launch with "invalid device
+# function". Every CUDA build here uses the default linker instead. RUSTFLAGS
+# replaces .cargo/config.toml's list, so target-cpu is restated.
+export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=bfd}"
 RESULTS="${NEOETHOS_RESULTS_DIR:-cache/gpu-bench/remote}"
 mkdir -p "$RESULTS"
 
@@ -57,6 +64,17 @@ if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
   # shellcheck disable=SC1091
   . "$HOME/.cargo/env"
+fi
+
+# bindgen (pulled in transitively) needs libclang; cmake is needed by several
+# native dependencies. Installing them up front avoids a build that dies ten
+# minutes in on a metered box.
+if command -v apt-get >/dev/null 2>&1; then
+  log "stage 0: build dependencies"
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    git curl build-essential pkg-config libssl-dev libclang-dev clang cmake \
+    >/dev/null 2>&1 || true
 fi
 
 # ---------------------------------------------------------------------------
