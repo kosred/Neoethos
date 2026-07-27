@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 #[cfg(any(
     feature = "gpu-nvidia",
     feature = "gpu-b-native",
+    feature = "gpu-bench-cuda",
     feature = "gpu-vulkan"
 ))]
 use neoethos_search::gpu_native::benchmark::execute_population_benchmark;
@@ -206,7 +207,11 @@ fn run_prototype_b(
     )
 }
 
-#[cfg(any(feature = "gpu-nvidia", feature = "gpu-vulkan"))]
+#[cfg(any(
+    feature = "gpu-nvidia",
+    feature = "gpu-bench-cuda",
+    feature = "gpu-vulkan"
+))]
 fn run_prototype_c(
     workload: &PrototypePopulationWorkload,
     eligibility: &neoethos_search::gpu_native::prototype_population::CommonBcEligibility,
@@ -223,7 +228,11 @@ fn run_prototype_c(
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
-#[cfg(not(any(feature = "gpu-nvidia", feature = "gpu-vulkan")))]
+#[cfg(not(any(
+    feature = "gpu-nvidia",
+    feature = "gpu-bench-cuda",
+    feature = "gpu-vulkan"
+)))]
 fn run_prototype_c(
     _workload: &PrototypePopulationWorkload,
     _eligibility: &neoethos_search::gpu_native::prototype_population::CommonBcEligibility,
