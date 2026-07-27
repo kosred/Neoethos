@@ -4629,6 +4629,13 @@ pub(crate) fn try_evaluate_population_cuda(
     device_override: Option<usize>,
 ) -> Result<Vec<[f64; 11]>> {
     let n_genes = long_thr.len();
+    // Last line of defence for the optional `stop_vol_mult` contract: an empty
+    // slice means "no adaptive stops", and every batch slice below would panic
+    // on it. That panic is caught upstream and retried on the CPU, which turns
+    // a contract violation into a silent CPU fallback — exactly what a
+    // GPU-required run must never do.
+    let stop_vol_mult_fallback = crate::eval::normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
     let n_samples = close.len();
     if n_genes == 0 || n_samples == 0 {
         return Ok(vec![ZERO_METRICS; n_genes]);
@@ -5021,6 +5028,13 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
     device_override: Option<usize>,
 ) -> Result<Vec<[f32; FTMO_WIDTH]>> {
     let n_genes = long_thr.len();
+    // Last line of defence for the optional `stop_vol_mult` contract: an empty
+    // slice means "no adaptive stops", and every batch slice below would panic
+    // on it. That panic is caught upstream and retried on the CPU, which turns
+    // a contract violation into a silent CPU fallback — exactly what a
+    // GPU-required run must never do.
+    let stop_vol_mult_fallback = crate::eval::normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
     let n_samples = close.len();
     if n_genes == 0 || n_samples == 0 {
         return Ok(vec![[0.0f32; FTMO_WIDTH]; n_genes]);

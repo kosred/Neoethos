@@ -1896,6 +1896,19 @@ fn eval_genes_per_card_cap() -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// Materialise the optional `stop_vol_mult` contract into a full-length slice.
+///
+/// The field is documented as optional: an empty slice means every gene uses
+/// its fixed stops. The CPU walk honours that with `.get(g).unwrap_or(0.0)`,
+/// but the GPU dispatch slices it per batch and panics on an empty input. That
+/// panic is caught and retried on the CPU, so the violation surfaced as a
+/// *silent fallback* — a GPU-required run quietly producing CPU numbers, and a
+/// CPU/GPU parity test comparing the CPU against itself and passing. Both lanes
+/// must see identical input, so normalise once at every entry point.
+pub(crate) fn normalized_stop_vol_mult(stop_vol_mult: &[f64], n_genes: usize) -> Option<Vec<f64>> {
+    stop_vol_mult.is_empty().then(|| vec![0.0; n_genes])
+}
+
 pub fn evaluate_population_core(
     inputs: PopulationEvalInputs<'_>,
 ) -> Result<Vec<[f64; 11]>, String> {
@@ -1924,6 +1937,8 @@ pub fn evaluate_population_core(
     init_rayon();
     let n_genes = long_thr.len();
     let n_samples = close.len();
+    let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
 
     // Per-gene CPU evaluation (signal synthesis + SL/TP backtest). Shared by
     // the full-CPU path and the CPU lane of the CPU+GPU hybrid below.
@@ -2251,6 +2266,8 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
     init_rayon();
     let n_genes = long_thr.len();
     let n_samples = close.len();
+    let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
     if n_genes == 0 {
         return Vec::new();
     }
@@ -2391,6 +2408,8 @@ pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> V
     init_rayon();
     let n_genes = long_thr.len();
     let n_samples = close.len();
+    let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
     if n_genes == 0 {
         return Vec::new();
     }
