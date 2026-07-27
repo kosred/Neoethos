@@ -1,5 +1,16 @@
 #include "neoethos_gpu_cuda.h"
+#include <cstdio>
 #include <cuda_runtime.h>
+
+namespace {
+/// Report the concrete CUDA error behind a numeric status.
+///
+/// A bare status code is unactionable on rented hardware, where every minute
+/// of guesswork is billed. Failures are rare, so this always prints.
+void report(const char* stage, cudaError_t error) {
+  std::fprintf(stderr, "[neoethos-cuda] %s failed: %s\n", stage, cudaGetErrorString(error));
+}
+}  // namespace
 
 namespace {
 __global__ void add_one_kernel(const std::uint32_t* input,
@@ -41,10 +52,18 @@ extern "C" std::int32_t neoethos_gpu_cuda_smoke(const std::uint32_t* input,
     const unsigned threads = 256;
     const unsigned blocks = static_cast<unsigned>((len + threads - 1) / threads);
     add_one_kernel<<<blocks, threads>>>(device_input, device_output, len);
-    if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+    const cudaError_t launch = cudaGetLastError();
+    const cudaError_t sync = cudaDeviceSynchronize();
+    if (launch != cudaSuccess || sync != cudaSuccess) {
+      report("smoke kernel launch", launch != cudaSuccess ? launch : sync);
       status = -6;
-    } else if (cudaMemcpy(output, device_output, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
-      status = -7;
+    } else {
+      const cudaError_t copy =
+          cudaMemcpy(output, device_output, bytes, cudaMemcpyDeviceToHost);
+      if (copy != cudaSuccess) {
+        report("smoke device-to-host copy", copy);
+        status = -7;
+      }
     }
   }
   cudaFree(device_output);
