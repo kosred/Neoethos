@@ -50,3 +50,30 @@ routed lane is correct but leaves most of the card's throughput unused.
 - One card, one symbol, population 256.
 
 Rental cost for this test: $0.14. Instance destroyed, ephemeral key deleted.
+
+---
+
+# Resident session — same card, 2026-07-28
+
+The per-call session build was replaced by a session and dataset that stay
+resident, keyed by dataset identity. Same command, same snapshots, same card.
+
+| bars | routed, per-call session | routed, resident session | Prototype B directly |
+|---|---|---|---|
+| 4 096 | 2.7 M cand-bars/s | **36.0 M** | 50.4 M |
+| 20 000 | 11.9 M | **50.4 M** | 50.6 M |
+| 200 000 | 36.5 M | **46.5 M** | 47.9 M |
+
+Parity stayed `True` at every size, under `NEOETHOS_REQUIRE_GPU=1`.
+
+At 20 000 bars the discovery entry point is now indistinguishable from calling
+the engine directly — 50.4 against 50.6 — and at 200 000 it reaches 97 %. The
+adapter overhead that cost 18x at 4 096 bars is gone as a first-order effect.
+
+4 096 bars still runs at 71 % of direct. What remains there is not the dataset:
+it is the per-call gene and scenario upload plus the metric readback, which are
+fixed costs against only 1 M candidate-bars of work. That is the correct
+residual to have — those buffers genuinely change on every call, unlike the
+dataset — and it shrinks to nothing as soon as the work per call grows.
+
+Rental cost for this run: $0.08.
