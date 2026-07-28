@@ -24,6 +24,21 @@ pub fn run(args: &[String]) -> Result<()> {
     let output = PathBuf::from(
         flag(args, "--out").unwrap_or_else(|| "cache/gpu-bench/snapshot-report.json".into()),
     );
+    // A snapshot carries its own population, bar count and feature count. Those
+    // flags belong to the tiny fixture, and silently ignoring them here produced
+    // a real false result: a scaling sweep that varied `--population` measured
+    // the same 256 candidates four times while the caller's arithmetic reported
+    // a 64x speedup that never happened. A parameter that cannot change the
+    // measurement must be refused, not absorbed.
+    for ignored in ["--population", "--bars", "--features"] {
+        if flag(args, ignored).is_some() {
+            anyhow::bail!(
+                "{ignored} does not apply to --execute-snapshot: the snapshot defines its own \
+                 shape. Rebuild the snapshot with `bench-prepare {ignored} ...` instead, so the \
+                 report cannot describe a workload that was never run."
+            );
+        }
+    }
     let fixture =
         SnapshotPopulationFixture::from_json_path(&snapshot_path).map_err(anyhow::Error::msg)?;
     let prototype = parse_prototype(flag(args, "--prototype").as_deref())?;
