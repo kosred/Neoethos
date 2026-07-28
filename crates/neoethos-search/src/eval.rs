@@ -2314,7 +2314,25 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
     // disabled, go straight to CPU. Adaptive per-entry stops are now computed by
     // the cubecl kernel (bit-parity proven), so an adaptive population no longer
     // needs to be forced onto the CPU lane.
-    if cuda_eval_signal_kernel_enabled() && cuda_eval_backtest_kernel_enabled() {
+    //
+    // The integrated-GPU gate belongs here too, and its absence was a real
+    // crash: a 2026-07-28 AUDUSD H1 discovery (88 032 bars) died with
+    // `wgpu error: Out of Memory` after ~9 minutes. The GA lane had correctly
+    // logged "discovery GPU lane SKIPPED — only an integrated/shared-memory GPU
+    // is present" and run on the CPU, but this validation lane never consulted
+    // that gate, so the Monte-Carlo screen kept dispatching populations to the
+    // iGPU's tiny device-local heap until one exhausted it.
+    //
+    // The `catch_unwind` below cannot save it: wgpu reports allocation failure
+    // as a *fatal* error on its own internal thread, which unwinds that thread
+    // rather than the caller. A guard that keeps the work off the device is the
+    // only thing that holds the never-OOM invariant — peak memory must be a
+    // function of the available hardware, and a run may be slow but must not
+    // crash.
+    if cuda_eval_signal_kernel_enabled()
+        && cuda_eval_backtest_kernel_enabled()
+        && !integrated_gpu_eval_disabled()
+    {
         let device_override = eval_gpu_devices().first().copied();
         // catch_unwind is the ONLY mitigation for cubecl #243 pool-panics
         // (no Result-returning launch in cubecl 0.10). `AssertUnwindSafe` is

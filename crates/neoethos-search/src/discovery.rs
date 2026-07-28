@@ -2672,6 +2672,37 @@ pub fn approx_bars_per_year(tf: &str) -> usize {
     }
 }
 
+/// Which gate inside the quality screen rejected how many candidates.
+///
+/// The screen is four independent tests chained with `&&`, and it is routinely
+/// the funnel's bottleneck, so a single collapsed "rejected 7 792" number is
+/// not actionable: widening the Monte-Carlo floor and widening the regime check
+/// are different decisions with different risks, and only the split says which
+/// one is even relevant.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct QualityScreenRejects {
+    /// Failed both the strict and the opportunistic metric bars.
+    base_quality: usize,
+    /// Lost more than `max_regime_loss_pct` in some market regime.
+    regime: usize,
+    /// The batched Monte-Carlo evaluation itself failed (a real bug, not a
+    /// verdict on the candidate).
+    mc_error: usize,
+    /// Fewer than `mc_min_profitable` of `mc_runs` perturbations stayed
+    /// profitable.
+    mc_floor: usize,
+    /// Subset of `mc_floor` that came within 10 runs of the floor.
+    mc_near_miss: usize,
+    /// Went unprofitable once the stress spread/commission were applied.
+    sensitivity: usize,
+}
+
+impl QualityScreenRejects {
+    fn total(&self) -> usize {
+        self.base_quality + self.regime + self.mc_error + self.mc_floor + self.sensitivity
+    }
+}
+
 pub fn run_discovery_cycle(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
@@ -4080,6 +4111,9 @@ where
 
     let filtered_count = filtered.len();
     let mut quality_metrics = Vec::new();
+    // Filled by the quality screen below; stays all-zero when the screen is
+    // skipped, so the funnel never reports invented rejections.
+    let mut quality_rejects = QualityScreenRejects::default();
     let mut logged_trades = Vec::new();
     if Gene::requires_quality_screen(&config.filtering) {
         progress_fn(DiscoveryProgress::StageAdvanced {
@@ -4124,6 +4158,31 @@ where
         // ONE batched GPU population launch (CPU fallback) per candidate via
         // `validation_genes_population`, replacing the per-run serial
         // `signals_for_gene_full` + `simulate_trades_core`.
+        // Per-reason rejection counters for the quality screen. This stage is
+        // routinely the funnel's bottleneck — a real AUDUSD H4 run took 7 793
+        // candidates to 1 here — and until now it reported a single collapsed
+        // number, so there was no way to tell whether the survivors were being
+        // killed by the base metrics, the regime check, the Monte-Carlo
+        // perturbation floor or the spread sensitivity test. Answering "which
+        // gate costs us the candidates" is the prerequisite for any decision
+        // about widening one, and it cannot be answered by staring at a total.
+        //
+        // These are the atomics the 2026-05-26 note above said a follow-up
+        // would need. They are pure instrumentation: every counter sits next to
+        // a `return None` that already existed, so the surviving set is
+        // unchanged.
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let rejected_base_quality = AtomicUsize::new(0);
+        let rejected_regime = AtomicUsize::new(0);
+        let rejected_mc_error = AtomicUsize::new(0);
+        let rejected_mc_floor = AtomicUsize::new(0);
+        let rejected_sensitivity = AtomicUsize::new(0);
+        // Monte-Carlo pass counts of the candidates the floor rejected, so the
+        // floor can be judged against the distribution it is cutting rather
+        // than in the abstract: "7 000 rejects that scored 68/100" and "7 000
+        // that scored 4/100" call for opposite decisions.
+        let mc_near_miss = AtomicUsize::new(0);
+
         let pairs: Vec<((usize, Gene), Vec<i8>)> = filtered.into_iter().zip(signals_map).collect();
         let screened: Vec<Option<QualityCandidate>> = pairs
             .into_par_iter()
@@ -4143,6 +4202,7 @@ where
                     !strict_quality && passes_opportunistic_quality(&metrics, &config.filtering);
 
                 if !(strict_quality || opportunistic_quality) {
+                    rejected_base_quality.fetch_add(1, AtomicOrdering::Relaxed);
                     return None;
                 }
 
@@ -4154,6 +4214,7 @@ where
                     config.max_regime_loss_pct,
                 );
                 if !regime_robust {
+                    rejected_regime.fetch_add(1, AtomicOrdering::Relaxed);
                     return None;
                 }
 
@@ -4235,11 +4296,19 @@ where
                             strategy_id = %gene.strategy_id,
                             "Monte-Carlo batched eval failed — rejecting candidate"
                         );
+                        rejected_mc_error.fetch_add(1, AtomicOrdering::Relaxed);
                         return None;
                     }
                 };
 
                 if (profitable_runs as u32) < config.mc_min_profitable {
+                    rejected_mc_floor.fetch_add(1, AtomicOrdering::Relaxed);
+                    // Within 10 points of the floor: the candidate is robust on
+                    // most perturbations and lost on a minority, which is a very
+                    // different signal from one that collapses outright.
+                    if profitable_runs as u32 + 10 >= config.mc_min_profitable {
+                        mc_near_miss.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
                     return None;
                 }
 
@@ -4259,6 +4328,7 @@ where
                 );
                 let sens_pnl: f64 = sens_trades.iter().map(|t| t.pnl).sum();
                 if sens_pnl < 0.0 {
+                    rejected_sensitivity.fetch_add(1, AtomicOrdering::Relaxed);
                     return None;
                 }
 
@@ -4272,6 +4342,27 @@ where
                 ))
             })
             .collect();
+
+        quality_rejects = QualityScreenRejects {
+            base_quality: rejected_base_quality.load(AtomicOrdering::Relaxed),
+            regime: rejected_regime.load(AtomicOrdering::Relaxed),
+            mc_error: rejected_mc_error.load(AtomicOrdering::Relaxed),
+            mc_floor: rejected_mc_floor.load(AtomicOrdering::Relaxed),
+            mc_near_miss: mc_near_miss.load(AtomicOrdering::Relaxed),
+            sensitivity: rejected_sensitivity.load(AtomicOrdering::Relaxed),
+        };
+        tracing::info!(
+            target: "neoethos_search::funnel",
+            rejected_base_quality = quality_rejects.base_quality,
+            rejected_regime = quality_rejects.regime,
+            rejected_monte_carlo = quality_rejects.mc_floor,
+            monte_carlo_near_miss = quality_rejects.mc_near_miss,
+            monte_carlo_floor = config.mc_min_profitable,
+            monte_carlo_runs = config.mc_runs,
+            rejected_monte_carlo_error = quality_rejects.mc_error,
+            rejected_spread_sensitivity = quality_rejects.sensitivity,
+            "quality screen — which gate rejected the candidates"
+        );
 
         let mut strict_passed: Vec<QualityCandidate> = Vec::new();
         let mut opportunistic_passed = 0usize;
@@ -4346,6 +4437,22 @@ where
     // par_iter closure above. If operators report this stage is the
     // bottleneck, follow-up adds those atomics.
     funnel.record_stage("passed_quality", post_min_trades, filtered.len());
+    // Per-gate breakdown, so the persisted funnel answers "which test cost us
+    // the candidates" without needing the run's logs. Only non-zero reasons are
+    // recorded; a skipped screen therefore adds nothing.
+    if quality_rejects.total() > 0 {
+        for (reason, count) in [
+            ("base_quality_metrics", quality_rejects.base_quality),
+            ("regime_robustness", quality_rejects.regime),
+            ("monte_carlo_perturbation", quality_rejects.mc_floor),
+            ("monte_carlo_eval_error", quality_rejects.mc_error),
+            ("spread_slippage_sensitivity", quality_rejects.sensitivity),
+        ] {
+            if count > 0 {
+                funnel.add_reject_reason("passed_quality", reason, count);
+            }
+        }
+    }
 
     // Prop-firm window-pass gate. Default behavior in `PropFirm` mode.
     // For each surviving candidate, simulate trades on N 60-day windows
