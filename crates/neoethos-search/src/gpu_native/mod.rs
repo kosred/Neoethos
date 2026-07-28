@@ -12,6 +12,8 @@ pub mod prototype_a;
 mod prototype_a_engine;
 pub mod prototype_b_engine;
 pub mod prototype_b_mirror;
+#[cfg(feature = "gpu-b-adapter")]
+pub mod prototype_b_population_eval;
 pub mod prototype_bc;
 pub mod prototype_c_engine;
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-vulkan"))]

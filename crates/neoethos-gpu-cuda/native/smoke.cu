@@ -78,3 +78,24 @@ extern "C" std::int32_t neoethos_gpu_cuda_device_count() {
   }
   return static_cast<std::int32_t>(count);
 }
+
+// Free device memory, so a session can be sized from the hardware rather than
+// from what the caller asked for. Returns 0 when it cannot be determined, which
+// callers must treat as "unknown" and refuse to guess around.
+extern "C" std::uint64_t neoethos_gpu_cuda_device_free_memory(std::int32_t device) {
+  int previous = 0;
+  if (cudaGetDevice(&previous) != cudaSuccess) {
+    return 0ull;
+  }
+  if (cudaSetDevice(device) != cudaSuccess) {
+    return 0ull;
+  }
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  const cudaError_t status = cudaMemGetInfo(&free_bytes, &total_bytes);
+  cudaSetDevice(previous);
+  if (status != cudaSuccess) {
+    return 0ull;
+  }
+  return static_cast<std::uint64_t>(free_bytes);
+}

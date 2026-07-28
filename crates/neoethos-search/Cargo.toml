@@ -75,7 +75,13 @@ gpu-cuda = [
 # rented GPU box can prove the B kernel with nothing but rustc, a C++ compiler
 # and nvcc, instead of provisioning the entire GPU dependency chain first.
 # `gpu-cuda` implies it, so a full build is unchanged.
-gpu-b-native = ["dep:neoethos-gpu-cuda", "neoethos-gpu-cuda/cuda"]
+# The B adapter's types and control flow, without requiring nvcc. The native
+# crate has an honest no-CUDA stub, so this lets the discovery-side adapter be
+# type-checked on a developer machine and in CI, where the full `gpu-b-native`
+# build cannot even start. It reports no devices at runtime, so nothing routes
+# to the GPU under this feature alone.
+gpu-b-adapter = ["dep:neoethos-gpu-cuda"]
+gpu-b-native = ["gpu-b-adapter", "neoethos-gpu-cuda/cuda"]
 gpu-vulkan = ["gpu", "cubecl/wgpu", "neoethos-core/gpu-wgpu"]
 gpu-rocm = ["gpu", "cubecl/hip", "neoethos-core/gpu-rocm"]
 strategy-db = ["dep:duckdb"]

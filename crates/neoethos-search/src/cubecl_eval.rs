@@ -4750,6 +4750,33 @@ pub(crate) fn try_evaluate_population_cuda(
     device_override: Option<usize>,
 ) -> Result<Vec<[f64; 11]>> {
     let n_genes = long_thr.len();
+    // ── Prototype B first, wherever it is available ───────────────────────────
+    // Every discovery lane funnels through this function — GA scoring, the
+    // Monte-Carlo quality screen, walk-forward and CPCV — so routing here routes
+    // all of them at once.
+    //
+    // A 2026-07-28 measurement on one RTX 2080 Ti, three real EURUSD snapshots:
+    // this CubeCL lane in f32 is 54 % wrong at 200 000 bars (net profit 3 940.88
+    // against the canonical 8 506.33, and that is the first candidate's headline
+    // metric). Given double precision it becomes approximately right but still
+    // not exact, and drops to 11.5 M candidate-bars/s. Prototype B reproduces
+    // the CPU exactly at 4 096 / 20 000 / 200 000 bars and sustains ~47 M — it is
+    // both the only correct GPU lane and the fastest correct one.
+    //
+    // The fallback below is the CPU, never the f32 lane: an engine that is half
+    // wrong at production series length must not silently rank strategies.
+    #[cfg(feature = "gpu-b-adapter")]
+    {
+        use crate::gpu_native::prototype_b_population_eval as prototype_b;
+        if prototype_b::prototype_b_available() {
+            return prototype_b::try_evaluate_population_b(
+                close, high, low, indicators, gene_offsets, gene_indices, gene_weights,
+                long_thr, short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips,
+                stop_vol_mult, smc_data, gene_smc_flags, gate_threshold, smc_weights,
+                settings, device_override,
+            );
+        }
+    }
     // Last line of defence for the optional `stop_vol_mult` contract: an empty
     // slice means "no adaptive stops", and every batch slice below would panic
     // on it. That panic is caught upstream and retried on the CPU, which turns

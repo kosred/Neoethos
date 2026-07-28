@@ -43,6 +43,7 @@ unsafe extern "C" {
     fn neoethos_gpu_cuda_abi_version() -> u32;
     fn neoethos_gpu_cuda_runtime_available() -> i32;
     fn neoethos_gpu_cuda_device_count() -> i32;
+    fn neoethos_gpu_cuda_device_free_memory(device: i32) -> u64;
     fn neoethos_gpu_cuda_smoke(input: *const u32, output: *mut u32, len: usize) -> i32;
     fn neoethos_gpu_cuda_warp_first_hit(
         highs: *const f32,
@@ -99,6 +100,22 @@ pub fn device_count() -> usize {
     // SAFETY: no arguments, no memory access, stable C ABI.
     let count = unsafe { neoethos_gpu_cuda_device_count() };
     count.max(0) as usize
+}
+
+/// Free memory on `device`, in bytes, or `None` when it cannot be determined.
+///
+/// A session's event capacity has to be a function of the hardware, never of
+/// the caller's parameters — that is the whole of the never-OOM invariant. This
+/// is what makes that possible in-process, instead of shelling out to
+/// `nvidia-smi` and parsing it. `None` means unknown, and a caller must refuse
+/// to guess rather than assume a comfortable number.
+pub fn device_free_memory_bytes(device: usize) -> Option<u64> {
+    if !runtime_available() {
+        return None;
+    }
+    // SAFETY: takes an integer by value, returns an integer, stable C ABI.
+    let free = unsafe { neoethos_gpu_cuda_device_free_memory(device as i32) };
+    (free > 0).then_some(free)
 }
 
 pub fn smoke_add_one(input: &[u32]) -> Result<Vec<u32>, CudaSmokeError> {

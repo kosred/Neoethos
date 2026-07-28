@@ -5,6 +5,7 @@
 
 extern "C" std::int32_t neoethos_gpu_cuda_runtime_available() { return 0; }
 extern "C" std::int32_t neoethos_gpu_cuda_device_count() { return 0; }
+extern "C" std::uint64_t neoethos_gpu_cuda_device_free_memory(std::int32_t) { return 0ull; }
 extern "C" std::int32_t neoethos_gpu_cuda_smoke(const std::uint32_t*,
                                                   std::uint32_t*,
                                                   std::size_t) {
