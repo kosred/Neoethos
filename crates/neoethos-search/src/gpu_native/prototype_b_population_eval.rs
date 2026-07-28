@@ -76,6 +76,93 @@ fn event_capacity(device: usize, population: usize, bars: usize) -> Result<usize
     Ok(capacity as usize)
 }
 
+
+// ── Resident session ─────────────────────────────────────────────────────────
+//
+// Measured on an RTX 2080 Ti, 2026-07-28: building a session and re-uploading
+// the dataset on every call cost 2.7 M candidate-bars/s at 4 096 bars against
+// 49.5 M for the same kernel driven by a session that stays alive — an 18x loss,
+// falling to 23 % at 200 000 bars because the overhead is per call rather than
+// per bar. That shape is exactly wrong here: the Monte-Carlo quality screen
+// calls this evaluator once per surviving candidate (7 793 in a real AUDUSD H4
+// run) and the GA calls it every generation.
+//
+// The native session refuses a second `upload_dataset`, so reuse means keeping
+// the session alive while the dataset is unchanged and rebuilding it when it is
+// not. Genes and scenarios carry no such restriction and are re-uploaded every
+// call, which is correct — they are what actually varies.
+
+/// Cheap identity for an uploaded dataset: length plus a strided sample.
+///
+/// Same approach the CubeCL resident cache uses, for the same reason — hashing
+/// every byte of a 200 000-bar dataset on every call would reintroduce exactly
+/// the per-call cost this cache exists to remove. Floats are hashed by their
+/// bit pattern, so two datasets that differ only in a NaN payload are still
+/// treated as different.
+fn sample_hash<T, F>(values: &[T], to_bits: F, hasher: &mut impl std::hash::Hasher)
+where
+    F: Fn(&T) -> u64,
+{
+    use std::hash::Hash;
+    values.len().hash(hasher);
+    if values.is_empty() {
+        return;
+    }
+    const SAMPLES: usize = 256;
+    if values.len() <= SAMPLES {
+        for value in values {
+            to_bits(value).hash(hasher);
+        }
+    } else {
+        let stride = values.len() / SAMPLES;
+        for index in 0..SAMPLES {
+            to_bits(&values[index * stride]).hash(hasher);
+        }
+        to_bits(&values[values.len() - 1]).hash(hasher);
+    }
+}
+
+fn dataset_key(dataset: &PrototypeADatasetUpload, smc_rows: &[i8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for slice in [&dataset.close, &dataset.high, &dataset.low] {
+        sample_hash(slice, |v| v.to_bits(), &mut hasher);
+    }
+    sample_hash(&dataset.indicators, |v| v.to_bits() as u64, &mut hasher);
+    dataset.feature_count.hash(&mut hasher);
+    for slice in [&dataset.months, &dataset.days, &dataset.timestamps] {
+        sample_hash(slice, |v| *v as u64, &mut hasher);
+    }
+    sample_hash(smc_rows, |v| *v as u64, &mut hasher);
+    // Settings participate because `adaptive_base_pips` is uploaded with the
+    // dataset: two runs over identical bars but different adaptive stops are
+    // different datasets on the device.
+    format!("{:?}", dataset.settings).hash(&mut hasher);
+    hasher.finish()
+}
+
+struct ResidentSession {
+    session: PopulationSession,
+    key: u64,
+    device: i32,
+    capacity: usize,
+}
+
+/// The session holds a raw device handle, which is why it is not `Send` by
+/// itself. Sending it between threads is sound here for a specific reason:
+/// every native entry point begins with `cudaSetDevice(session->device)`, so a
+/// call from a different thread binds the right device before touching
+/// anything, and all access is serialized by the mutex below. Without that
+/// per-entry binding this would be unsound.
+struct SendResident(ResidentSession);
+unsafe impl Send for SendResident {}
+
+fn resident_slot() -> &'static std::sync::Mutex<Option<SendResident>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<SendResident>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 /// Evaluate a population on Prototype B.
 ///
 /// Mirrors `cubecl_eval::try_evaluate_population_cuda` argument for argument so
@@ -162,23 +249,52 @@ pub(crate) fn try_evaluate_population_b(
 
     let device = device_override.unwrap_or(0) as i32;
     let capacity = event_capacity(device as usize, n_genes, bars)?;
-    let mut session = PopulationSession::create(device, capacity)
-        .map_err(|error| anyhow!("prototype B session: {error}"))?;
+    let key = dataset_key(&dataset, &smc_rows);
 
-    session
-        .upload_dataset(PopulationDatasetView {
-            close: &dataset.close,
-            high: &dataset.high,
-            low: &dataset.low,
-            indicators: &dataset.indicators,
-            feature_count: dataset.feature_count,
-            months: &dataset.months,
-            days: &dataset.days,
-            timestamps: &dataset.timestamps,
-            smc_rows: &smc_rows,
-            adaptive_base_pips: adaptive_base.as_deref(),
-        })
-        .map_err(|error| anyhow!("prototype B dataset upload: {error}"))?;
+    // Hold the slot for the whole evaluation. That serializes device access the
+    // way the CubeCL lane's launch lock does, which is deliberate: the quality
+    // screen calls this from a rayon `par_iter`, and one session per worker
+    // thread would multiply VRAM by the thread count and reintroduce the OOM
+    // this design exists to avoid.
+    let mut slot = resident_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let reusable = slot
+        .as_ref()
+        .is_some_and(|r| r.0.key == key && r.0.device == device && r.0.capacity >= capacity);
+    if !reusable {
+        // Drop the old session before creating the new one so the two never
+        // hold device memory at the same time.
+        *slot = None;
+        let mut session = PopulationSession::create(device, capacity)
+            .map_err(|error| anyhow!("prototype B session: {error}"))?;
+        session
+            .upload_dataset(PopulationDatasetView {
+                close: &dataset.close,
+                high: &dataset.high,
+                low: &dataset.low,
+                indicators: &dataset.indicators,
+                feature_count: dataset.feature_count,
+                months: &dataset.months,
+                days: &dataset.days,
+                timestamps: &dataset.timestamps,
+                smc_rows: &smc_rows,
+                adaptive_base_pips: adaptive_base.as_deref(),
+            })
+            .map_err(|error| anyhow!("prototype B dataset upload: {error}"))?;
+        *slot = Some(SendResident(ResidentSession {
+            session,
+            key,
+            device,
+            capacity,
+        }));
+    }
+    let session = &mut slot
+        .as_mut()
+        .expect("resident session was just installed")
+        .0
+        .session;
 
     session
         .upload_genes(PopulationGeneView {
