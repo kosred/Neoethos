@@ -49,16 +49,30 @@ pub(crate) fn prototype_b_available() -> bool {
 /// die. `max_events` is the one knob that would otherwise let a large population
 /// dictate an allocation, so it is derived here from free VRAM and clamped, and
 /// the per-candidate workspaces are subtracted first.
-fn event_capacity(device: usize, population: usize, bars: usize) -> Result<usize> {
+fn event_capacity(
+    device: usize,
+    population: usize,
+    bars: usize,
+    feature_count: usize,
+) -> Result<usize> {
     let free = neoethos_gpu_cuda::device_free_memory_bytes(device)
         .ok_or_else(|| anyhow!("prototype B: cannot read free device memory to size the session"))?;
     // Leave headroom for context and fragmentation.
     let budget = (free / 10) * 7;
+    // The resident dataset. This dominates on a dense timeframe and omitting it
+    // is not a rounding error: EURUSD M1 is 5.27 M bars against 257 features,
+    // which is ~5.4 GB of indicators alone. Sizing that ignored the dataset
+    // would hand back an event capacity the card cannot host and turn the
+    // never-OOM invariant into a crash at exactly the workload it exists for.
+    //   close/high/low f64, months/days/timestamps i64, SMC_SLOTS bytes per bar,
+    //   plus feature-major f32 indicators.
+    let dataset = bars as u64 * (3 * 8 + 3 * 8 + 11 + feature_count as u64 * 4);
     // signals (1 B) + confidences (4 B) per candidate-bar, monthly buckets and
     // metric rows per candidate, plus a fixed reserve.
     let per_candidate_bar = 5u64;
     let per_candidate = 3_840u64 + 104;
-    let fixed = population as u64 * bars as u64 * per_candidate_bar
+    let fixed = dataset
+        + population as u64 * bars as u64 * per_candidate_bar
         + population as u64 * per_candidate
         + 64 * 1024 * 1024;
     let room = budget.saturating_sub(fixed);
@@ -248,7 +262,7 @@ pub(crate) fn try_evaluate_population_b(
     let adaptive_base = dataset.settings.to_settings().adaptive_base_pips.clone();
 
     let device = device_override.unwrap_or(0) as i32;
-    let capacity = event_capacity(device as usize, n_genes, bars)?;
+    let capacity = event_capacity(device as usize, n_genes, bars, feature_count)?;
     let key = dataset_key(&dataset, &smc_rows);
 
     // Hold the slot for the whole evaluation. That serializes device access the
