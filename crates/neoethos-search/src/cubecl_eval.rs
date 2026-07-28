@@ -2839,7 +2839,7 @@ fn timestamp_delta_ms(timestamps: &[i64], n_samples: usize) -> (Vec<i32>, bool) 
     (deltas, true)
 }
 
-fn normalize_prices_to_pips(prices: &[f64], pip_value: f64) -> Vec<f32> {
+fn normalize_prices_to_pips(prices: &[f64], pip_value: f64) -> Vec<f64> {
     let safe_pip = if pip_value.abs() < 1e-12 {
         1e-12
     } else {
@@ -2847,7 +2847,7 @@ fn normalize_prices_to_pips(prices: &[f64], pip_value: f64) -> Vec<f32> {
     };
     prices
         .iter()
-        .map(|price| (*price / safe_pip) as f32)
+        .map(|price| *price / safe_pip)
         .collect()
 }
 
@@ -2864,23 +2864,34 @@ macro_rules! define_launch_backtest_kernel {
     fn $name<R: Runtime>(
         client: &ComputeClient<R>,
         device_key: usize,
-        close_pips: &[$f],
-        high_pips: &[$f],
-        low_pips: &[$f],
+        close_pips: &[f64],
+        high_pips: &[f64],
+        low_pips: &[f64],
         signals_flat: &[i32],
-        confidences_flat: &[$f],
+        confidences_flat: &[f32],
         timestamp_deltas_ms: &[i32],
         use_timestamps: bool,
         month_idx: &[i32],
         day_idx: &[i32],
-        sl_pips: &[$f],
-        tp_pips: &[$f],
+        sl_pips: &[f64],
+        tp_pips: &[f64],
         // Per-gene adaptive volatility multiplier (empty / all-zero ⇒ fixed-stop
         // path). Pairs with `settings.adaptive_base_pips` + `settings.adaptive_rr`.
         stop_vol_mult: &[f64],
         settings: &BacktestSettings,
         month_capacity: usize,
     ) -> Result<(Vec<$f>, Vec<i32>, Vec<$f>, Vec<i32>, Vec<$f>, Vec<$f>)> {
+        // Narrow once, here, so the element type is the ONLY difference between
+        // the lanes: the f32 lane reproduces exactly the rounding it always did
+        // (it simply happens one step later), and the f64 lane carries the
+        // host's full precision into VRAM instead of receiving values that were
+        // already rounded on the way in.
+        let close_pips: Vec<$f> = close_pips.iter().map(|&v| v as $f).collect();
+        let high_pips: Vec<$f> = high_pips.iter().map(|&v| v as $f).collect();
+        let low_pips: Vec<$f> = low_pips.iter().map(|&v| v as $f).collect();
+        let sl_pips: Vec<$f> = sl_pips.iter().map(|&v| v as $f).collect();
+        let tp_pips: Vec<$f> = tp_pips.iter().map(|&v| v as $f).collect();
+        let confidences_flat: Vec<$f> = confidences_flat.iter().map(|&v| v as $f).collect();
         let n_samples = close_pips.len();
         let n_genes = sl_pips.len();
         if n_samples == 0 || n_genes == 0 {
@@ -2939,12 +2950,12 @@ macro_rules! define_launch_backtest_kernel {
                     client,
                     device_key,
                     rc::SLOT_CLOSE,
-                    <$f>::as_bytes(close_pips),
+                    <$f>::as_bytes(&close_pips),
                 ),
-                rc::get_or_upload(client, device_key, rc::SLOT_HIGH, <$f>::as_bytes(high_pips)),
-                rc::get_or_upload(client, device_key, rc::SLOT_LOW, <$f>::as_bytes(low_pips)),
+                rc::get_or_upload(client, device_key, rc::SLOT_HIGH, <$f>::as_bytes(&high_pips)),
+                rc::get_or_upload(client, device_key, rc::SLOT_LOW, <$f>::as_bytes(&low_pips)),
                 client.create_from_slice(i32::as_bytes(signals_flat)),
-                client.create_from_slice(<$f>::as_bytes(confidences_flat)),
+                client.create_from_slice(<$f>::as_bytes(&confidences_flat)),
                 rc::get_or_upload(
                     client,
                     device_key,
@@ -2958,8 +2969,8 @@ macro_rules! define_launch_backtest_kernel {
                     i32::as_bytes(month_idx),
                 ),
                 rc::get_or_upload(client, device_key, rc::SLOT_DAY_IDX, i32::as_bytes(day_idx)),
-                client.create_from_slice(<$f>::as_bytes(sl_pips)),
-                client.create_from_slice(<$f>::as_bytes(tp_pips)),
+                client.create_from_slice(<$f>::as_bytes(&sl_pips)),
+                client.create_from_slice(<$f>::as_bytes(&tp_pips)),
                 client.empty(metrics_len.saturating_mul(std::mem::size_of::<$f>())),
                 client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
                 client.empty(monthly_len.saturating_mul(std::mem::size_of::<$f>())),
@@ -3106,6 +3117,72 @@ macro_rules! define_launch_backtest_kernel {
 define_launch_backtest_kernel!(launch_backtest_kernel, backtest_population_kernel, f32);
 define_launch_backtest_kernel!(launch_backtest_kernel_f64, backtest_population_kernel_f64, f64);
 
+/// Is the double-precision backtest lane selected?
+///
+/// Off by default: the f32 lane is the measured, shipped behaviour and must not
+/// change without a decision. Set `NEOETHOS_GPU_F64=1` to route the backtest
+/// through the f64 lane instead.
+///
+/// This exists to answer a question that was never asked. The finding that "the
+/// f32 lane is wrong" (54 % off over 200 000 bars) came from comparing this
+/// engine against a separate f64 CUDA engine — nobody ran *this* engine in
+/// double precision. That matters, because this engine already has every call
+/// site in the discovery pipeline: if precision alone fixes it, there is no
+/// integration work left to do.
+pub(crate) fn gpu_f64_backtest_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEOETHOS_GPU_F64")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Run the backtest on the selected precision lane.
+///
+/// Both lanes take the same arguments — the host now hands prices and stops over
+/// as f64 and each lane narrows to its own element type — so the choice is made
+/// here and nowhere else. Metrics come back as f32 either way: the accumulation
+/// is what needs the extra precision, and the host structures downstream are f32.
+#[allow(clippy::too_many_arguments)]
+fn launch_backtest_kernel_auto<R: Runtime>(
+    client: &ComputeClient<R>,
+    device_key: usize,
+    close_pips: &[f64],
+    high_pips: &[f64],
+    low_pips: &[f64],
+    signals_flat: &[i32],
+    confidences_flat: &[f32],
+    timestamp_deltas_ms: &[i32],
+    use_timestamps: bool,
+    month_idx: &[i32],
+    day_idx: &[i32],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
+    stop_vol_mult: &[f64],
+    settings: &BacktestSettings,
+    month_capacity: usize,
+) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>)> {
+    if gpu_f64_backtest_enabled() {
+        let (m, tc, mo, mc, mse, ftmo) = launch_backtest_kernel_f64(
+            client, device_key, close_pips, high_pips, low_pips, signals_flat,
+            confidences_flat, timestamp_deltas_ms, use_timestamps, month_idx, day_idx,
+            sl_pips, tp_pips, stop_vol_mult, settings, month_capacity,
+        )?;
+        let narrow = |v: Vec<f64>| v.into_iter().map(|x| x as f32).collect::<Vec<f32>>();
+        return Ok((narrow(m), tc, narrow(mo), mc, narrow(mse), narrow(ftmo)));
+    }
+    launch_backtest_kernel(
+        client, device_key, close_pips, high_pips, low_pips, signals_flat,
+        confidences_flat, timestamp_deltas_ms, use_timestamps, month_idx, day_idx,
+        sl_pips, tp_pips, stop_vol_mult, settings, month_capacity,
+    )
+}
+
+
 /// Device-side copy of one sample-WINDOW of synthesized signals/conf into the
 /// correct slice of the full-series PERSISTENT VRAM buffer — the mechanism that
 /// lets the fused path keep signals VRAM-resident even when the signal synth
@@ -3233,10 +3310,10 @@ fn fused_path_parity_holds<R: Runtime>(client: &ComputeClient<R>) -> Result<bool
     let (ts_deltas, use_ts) = timestamp_delta_ms(&timestamps, n_samples);
     let month_i32: Vec<i32> = month_idx.iter().map(|v| saturating_i32(*v)).collect();
     let day_i32: Vec<i32> = day_idx.iter().map(|v| saturating_i32(*v)).collect();
-    let sl_f32: Vec<f32> = sl_pips.iter().map(|v| *v as f32).collect();
-    let tp_f32: Vec<f32> = tp_pips.iter().map(|v| *v as f32).collect();
+    let sl_f32: Vec<f64> = sl_pips.to_vec();
+    let tp_f32: Vec<f64> = tp_pips.to_vec();
 
-    let (mw, tcw, mow, mcw, msew, _ftmo_w) = launch_backtest_kernel(
+    let (mw, tcw, mow, mcw, msew, _ftmo_w) = launch_backtest_kernel_auto(
         client,
         0,
         &close_pips,
@@ -3589,9 +3666,15 @@ pub(crate) fn upload_prototype_a_dataset<R: Runtime>(
     let window_workspace_len = workspace_gene_capacity.saturating_mul(window_size);
     Ok(PrototypeADatasetResident {
         windows,
-        close: client.create_from_slice(f32::as_bytes(&close)),
-        high: client.create_from_slice(f32::as_bytes(&high)),
-        low: client.create_from_slice(f32::as_bytes(&low)),
+        close: client.create_from_slice(f32::as_bytes(
+            &close.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+        )),
+        high: client.create_from_slice(f32::as_bytes(
+            &high.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+        )),
+        low: client.create_from_slice(f32::as_bytes(
+            &low.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+        )),
         timestamp_deltas: client.create_from_slice(i32::as_bytes(&timestamp_deltas)),
         months: client.create_from_slice(i32::as_bytes(&months)),
         days: client.create_from_slice(i32::as_bytes(&days)),
@@ -4129,15 +4212,15 @@ fn fused_signal_backtest_batch_resident<F, R: Runtime>(
     gene_smc_flags_flat: &[i32],
     smc_weights: &[F],
     gate_threshold: F,
-    close_pips: &[f32],
-    high_pips: &[f32],
-    low_pips: &[f32],
+    close_pips: &[f64],
+    high_pips: &[f64],
+    low_pips: &[f64],
     timestamp_deltas_ms: &[i32],
     use_timestamps: bool,
     month_idx: &[i32],
     day_idx: &[i32],
-    sl_pips: &[f32],
-    tp_pips: &[f32],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
     stop_vol_mult: &[f64],
     settings: &BacktestSettings,
     month_capacity: usize,
@@ -4342,14 +4425,14 @@ where
         ftmo_handle,
     ) = gpu_timing::upload(|| {
         (
-            client.create_from_slice(f32::as_bytes(close_pips)),
-            client.create_from_slice(f32::as_bytes(high_pips)),
-            client.create_from_slice(f32::as_bytes(low_pips)),
+            client.create_from_slice(f32::as_bytes(&close_pips.iter().map(|&v| v as f32).collect::<Vec<f32>>())),
+            client.create_from_slice(f32::as_bytes(&high_pips.iter().map(|&v| v as f32).collect::<Vec<f32>>())),
+            client.create_from_slice(f32::as_bytes(&low_pips.iter().map(|&v| v as f32).collect::<Vec<f32>>())),
             client.create_from_slice(i32::as_bytes(timestamp_deltas_ms)),
             client.create_from_slice(i32::as_bytes(month_idx)),
             client.create_from_slice(i32::as_bytes(day_idx)),
-            client.create_from_slice(f32::as_bytes(sl_pips)),
-            client.create_from_slice(f32::as_bytes(tp_pips)),
+            client.create_from_slice(f32::as_bytes(&sl_pips.iter().map(|&v| v as f32).collect::<Vec<f32>>())),
+            client.create_from_slice(f32::as_bytes(&tp_pips.iter().map(|&v| v as f32).collect::<Vec<f32>>())),
             client.empty(metrics_len.saturating_mul(std::mem::size_of::<f32>())),
             client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
             client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>())),
@@ -4475,15 +4558,15 @@ fn fused_signal_backtest_batch<F, R: Runtime>(
     gene_smc_flags_flat: &[i32],
     smc_weights: &[F],
     gate_threshold: F,
-    close_pips: &[f32],
-    high_pips: &[f32],
-    low_pips: &[f32],
+    close_pips: &[f64],
+    high_pips: &[f64],
+    low_pips: &[f64],
     timestamp_deltas_ms: &[i32],
     use_timestamps: bool,
     month_idx: &[i32],
     day_idx: &[i32],
-    sl_pips: &[f32],
-    tp_pips: &[f32],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
     stop_vol_mult: &[f64],
     settings: &BacktestSettings,
     month_capacity: usize,
@@ -4542,15 +4625,15 @@ fn fused_eval_batch_dispatch<R: Runtime>(
     gene_smc_flags_flat: &[i32],
     smc_weights: &[f32; SMC_WIDTH],
     gate_threshold: f32,
-    close_pips: &[f32],
-    high_pips: &[f32],
-    low_pips: &[f32],
+    close_pips: &[f64],
+    high_pips: &[f64],
+    low_pips: &[f64],
     timestamp_deltas_ms: &[i32],
     use_timestamps: bool,
     month_idx: &[i32],
     day_idx: &[i32],
-    sl_pips: &[f32],
-    tp_pips: &[f32],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
     stop_vol_mult: &[f64],
     settings: &BacktestSettings,
     month_capacity: usize,
@@ -4720,14 +4803,8 @@ pub(crate) fn try_evaluate_population_cuda(
         .iter()
         .map(|value| saturating_i32(*value))
         .collect::<Vec<_>>();
-    let sl_pips_all = sl_pips
-        .iter()
-        .map(|value| *value as f32)
-        .collect::<Vec<_>>();
-    let tp_pips_all = tp_pips
-        .iter()
-        .map(|value| *value as f32)
-        .collect::<Vec<_>>();
+    let sl_pips_all = sl_pips.to_vec();
+    let tp_pips_all = tp_pips.to_vec();
     let month_capacity = settings.month_capacity();
     // Attribute the constant per-sample conversions above to the host-prep phase
     // (no-op when timing is off).
@@ -4872,7 +4949,7 @@ pub(crate) fn try_evaluate_population_cuda(
                         let g1 = (g0 + batch).min(chunk_n);
                         // The metrics path ignores the new FTMO vec (last tuple slot);
                         // FTMO observables are surfaced via `try_evaluate_ftmo_population_cuda`.
-                        let (m, tc, mo, mc, mse, _ftmo) = launch_backtest_kernel(
+                        let (m, tc, mo, mc, mse, _ftmo) = launch_backtest_kernel_auto(
                             &client,
                             device_override.unwrap_or(0),
                             &close_pips,
@@ -5102,14 +5179,8 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
         .iter()
         .map(|value| saturating_i32(*value))
         .collect::<Vec<_>>();
-    let sl_pips_all = sl_pips
-        .iter()
-        .map(|value| *value as f32)
-        .collect::<Vec<_>>();
-    let tp_pips_all = tp_pips
-        .iter()
-        .map(|value| *value as f32)
-        .collect::<Vec<_>>();
+    let sl_pips_all = sl_pips.to_vec();
+    let tp_pips_all = tp_pips.to_vec();
     let month_capacity = settings.month_capacity();
 
     let mut ftmo_flat: Vec<f32> = Vec::with_capacity(n_genes * FTMO_WIDTH);
@@ -5151,7 +5222,7 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
                     let g1 = (g0 + batch).min(chunk_n);
                     // We keep ONLY the FTMO vec (last tuple slot); the metrics
                     // outputs are recomputed identically but discarded here.
-                    let (_m, _tc, _mo, _mc, _mse, ftmo) = launch_backtest_kernel(
+                    let (_m, _tc, _mo, _mc, _mse, ftmo) = launch_backtest_kernel_auto(
                         &client,
                         device_override.unwrap_or(0),
                         &close_pips,
