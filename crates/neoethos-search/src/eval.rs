@@ -1860,13 +1860,20 @@ pub fn evaluate_population_core(
                 devices.first().copied(),
             ) {
                 Ok(rows) if rows.len() == n_genes => {
-                    tracing::debug!(
+                    // INFO, not DEBUG: the app installs its own subscriber, so a
+                    // debug line here is invisible no matter what RUST_LOG says —
+                    // which defeated the entire point of logging the decision.
+                    // Logged once per process; the GA calls this every generation.
+                    static LOGGED: std::sync::Once = std::sync::Once::new();
+                    LOGGED.call_once(|| {
+                    tracing::info!(
                         target: "neoethos_search::eval",
                         n_genes,
                         n_samples,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "population evaluated on the GPU (whole population, no CPU lane)"
                     );
+                    });
                     return Ok(rows);
                 }
                 Ok(rows) => {
