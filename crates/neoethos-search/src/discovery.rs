@@ -4300,6 +4300,66 @@ where
             }
             out
         };
+
+        // ── Spread/slippage sensitivity, batched ──────────────────────────
+        //
+        // The stress test is the same backtest over the same bars with a wider
+        // spread and a higher commission, and its verdict is a single number:
+        // does net profit survive? That is metric slot 0, so there is nothing
+        // here the card cannot produce — it was running per candidate on the
+        // CPU only because it was written before the population path existed.
+        //
+        // One launch per chunk of candidates, exactly like the Monte-Carlo pass
+        // above. `None` marks a batch that failed to evaluate, which is
+        // rejected as an error rather than read as "did not survive".
+        let sensitivity_net_profit: Vec<Option<f64>> = {
+            let mut out: Vec<Option<f64>> = Vec::with_capacity(pairs.len());
+            for chunk in pairs.chunks(MC_CANDIDATES_PER_BATCH) {
+                let genes: Vec<Gene> = chunk.iter().map(|((_, gene), _)| gene.clone()).collect();
+                let mut settings = discovery_backtest_settings(
+                    config,
+                    &chunk[0].0.1,
+                    ohlcv.close.last().copied(),
+                );
+                settings.spread_pips = config.sensitivity_spread_pips;
+                settings.commission_per_trade = config.sensitivity_commission_per_lot;
+                let evaluated = {
+                    #[cfg(feature = "gpu")]
+                    let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                    crate::genetic::validation_genes_population(
+                        features,
+                        ohlcv,
+                        &genes,
+                        &eval_config_for_signals,
+                        &settings,
+                    )
+                };
+                match evaluated {
+                    Ok(metrics) if metrics.len() == genes.len() => {
+                        out.extend(metrics.iter().map(|m| Some(m[0])));
+                    }
+                    Ok(metrics) => {
+                        tracing::warn!(
+                            target: "neoethos_search::discovery",
+                            expected = genes.len(),
+                            returned = metrics.len(),
+                            "sensitivity batch returned the wrong number of rows — rejecting its candidates"
+                        );
+                        out.extend(std::iter::repeat_n(None, chunk.len()));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "neoethos_search::discovery",
+                            error = %error,
+                            candidates = chunk.len(),
+                            "sensitivity batched eval failed — rejecting its candidates"
+                        );
+                        out.extend(std::iter::repeat_n(None, chunk.len()));
+                    }
+                }
+            }
+            out
+        };
         let screened: Vec<Option<QualityCandidate>> = pairs
             .into_par_iter()
             .enumerate()
@@ -4371,19 +4431,10 @@ where
 
                 // Spread/Slippage Sensitivity Test — wired from Settings
                 // 2026-05-26 (dual-mode product).
-                let mut sensitive_settings =
-                    discovery_backtest_settings(config, &gene, ohlcv.close.last().copied());
-                sensitive_settings.spread_pips = config.sensitivity_spread_pips;
-                sensitive_settings.commission_per_trade = config.sensitivity_commission_per_lot;
-                let sens_trades = crate::eval::simulate_trades_core(
-                    &ohlcv.close,
-                    &ohlcv.high,
-                    &ohlcv.low,
-                    &features.timestamps,
-                    &sig,
-                    &sensitive_settings,
-                );
-                let sens_pnl: f64 = sens_trades.iter().map(|t| t.pnl).sum();
+                let Some(sens_pnl) = sensitivity_net_profit[position] else {
+                    rejected_mc_error.fetch_add(1, AtomicOrdering::Relaxed);
+                    return None;
+                };
                 if sens_pnl < 0.0 {
                     rejected_sensitivity.fetch_add(1, AtomicOrdering::Relaxed);
                     return None;
