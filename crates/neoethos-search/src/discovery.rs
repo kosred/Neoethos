@@ -4760,6 +4760,10 @@ where
             rejected_by_correlation,
         );
     }
+    // Where the time actually went, printed next to where the candidates went.
+    // The two together answer both halves of "why did this take ten hours and
+    // produce nothing" without a profiler or a rerun.
+    crate::eval_telemetry::log_summary("discovery");
     tracing::info!(
         target: "neoethos_search::funnel",
         ranked = ranked_total,

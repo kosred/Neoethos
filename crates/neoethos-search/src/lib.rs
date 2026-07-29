@@ -30,6 +30,7 @@ pub mod discovery_ledger;
 
 pub mod backend;
 pub mod eval;
+pub mod eval_telemetry;
 pub mod export_state;
 pub mod funnel_profile;
 pub mod gpu_fallback;

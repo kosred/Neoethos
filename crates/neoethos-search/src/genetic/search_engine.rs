@@ -376,6 +376,14 @@ pub fn evaluate_genes_cached(
     config: &EvaluationConfig,
     cache: &EvalDataCache,
 ) -> Result<Vec<[f64; 11]>> {
+    // Reports itself on first call — see `eval_telemetry`.
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard("search_engine::evaluate_genes_cached", genes.len(), std::time::Instant::now());
     if genes.is_empty() {
         return Ok(Vec::new());
     }
@@ -1040,6 +1048,14 @@ pub fn evaluate_genes(
     genes: &[Gene],
     config: &EvaluationConfig,
 ) -> Result<Vec<[f64; 11]>> {
+    // Reports itself on first call — see `eval_telemetry`.
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard("search_engine::evaluate_genes", genes.len(), std::time::Instant::now());
     if features.n_samples() == 0 || features.n_features() == 0 {
         bail!("empty feature matrix");
     }

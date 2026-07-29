@@ -750,6 +750,14 @@ pub fn fast_evaluate_strategy_core(
     timestamps: &[i64],
     settings: &BacktestSettings,
 ) -> [f64; 11] {
+    // Reports itself on first call — see `eval_telemetry`.
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard("eval::fast_evaluate_strategy_core", 1, std::time::Instant::now());
     let n = close.len();
     if n == 0 {
         return [0.0; 11];
@@ -1300,6 +1308,14 @@ pub fn simulate_trades_core(
     signals: &[i8],
     settings: &BacktestSettings,
 ) -> Vec<Trade> {
+    // Reports itself on first call — see `eval_telemetry`.
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard("eval::simulate_trades_core", 1, std::time::Instant::now());
     let n = close
         .len()
         .min(high.len())
@@ -1716,6 +1732,17 @@ pub(crate) fn normalized_stop_vol_mult(stop_vol_mult: &[f64], n_genes: usize) ->
 pub fn evaluate_population_core(
     inputs: PopulationEvalInputs<'_>,
 ) -> Result<Vec<[f64; 11]>, String> {
+    // Reports itself on first call, so "never used" is visible rather
+    // than inferred. See `eval_telemetry`.
+    let _telemetry_started = std::time::Instant::now();
+    let _telemetry_items = inputs.long_thr.len();
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard("eval::evaluate_population_core", _telemetry_items, _telemetry_started);
     let PopulationEvalInputs {
         close,
         high,
@@ -1950,6 +1977,17 @@ pub fn evaluate_population_core(
 /// `gpu_montecarlo_batch_matches_cpu` pins this to within ±1 run.
 #[cfg(feature = "gpu")]
 pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+    // Reports itself on first call, so "never used" is visible rather
+    // than inferred. See `eval_telemetry`.
+    let _telemetry_started = std::time::Instant::now();
+    let _telemetry_items = inputs.long_thr.len();
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard("eval::validation_backtest_population", _telemetry_items, _telemetry_started);
     let PopulationEvalInputs {
         close,
         high,
@@ -2110,6 +2148,17 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
 /// against. There is exactly one CPU population implementation, so the reference
 /// can never drift from what actually runs.
 pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+    // Reports itself on first call, so "never used" is visible rather
+    // than inferred. See `eval_telemetry`.
+    let _telemetry_started = std::time::Instant::now();
+    let _telemetry_items = inputs.long_thr.len();
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard("eval::validation_backtest_population_cpu", _telemetry_items, _telemetry_started);
     let PopulationEvalInputs {
         close,
         high,
