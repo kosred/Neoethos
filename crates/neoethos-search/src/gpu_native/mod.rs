@@ -12,6 +12,7 @@ pub mod prototype_a;
 mod prototype_a_engine;
 pub mod prototype_b_engine;
 pub mod prototype_b_mirror;
+pub mod trade_invariants;
 #[cfg(feature = "gpu-b-adapter")]
 pub mod prototype_b_population_eval;
 pub mod prototype_bc;
