@@ -2019,6 +2019,73 @@ pub fn evaluate_population_core(
             && n_genes >= 4
         {
             let devices = eval_gpu_devices();
+
+            // ── The whole population goes to the card ─────────────────────────
+            //
+            // A 2026-07-28 EURUSD M3 discovery measured the case for this
+            // directly: the GA spent 10 h 24 m on 128 CPU cores, while the
+            // validation tail — 15 walk-forward splits plus 28 CPCV combinations
+            // over the full series, not a lighter workload — took about 20
+            // minutes on the card at 100 % utilisation. The GA is ~97 % of the
+            // runtime and never touched the GPU, because the split below decides
+            // per-gene shares instead of sending the population to the device.
+            //
+            // Splitting also hid the problem for hours: a run that puts nothing
+            // on the card looks identical to a healthy one, only slower, and the
+            // decision point logged nothing. Hence the log line on both
+            // outcomes — "it ran on the GPU" must be a record, not an inference.
+            let started = std::time::Instant::now();
+            match try_evaluate_population_cuda(
+                close,
+                high,
+                low,
+                indicators,
+                gene_offsets,
+                gene_indices,
+                gene_weights,
+                long_thr,
+                short_thr,
+                month_idx,
+                day_idx,
+                timestamps,
+                sl_pips,
+                tp_pips,
+                stop_vol_mult,
+                smc_data,
+                gene_smc_flags,
+                gate_threshold,
+                weights,
+                settings,
+                devices.first().copied(),
+            ) {
+                Ok(rows) if rows.len() == n_genes => {
+                    tracing::debug!(
+                        target: "neoethos_search::eval",
+                        n_genes,
+                        n_samples,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "population evaluated on the GPU (whole population, no CPU lane)"
+                    );
+                    return Ok(rows);
+                }
+                Ok(rows) => {
+                    tracing::error!(
+                        target: "neoethos_search::eval",
+                        expected = n_genes,
+                        returned = rows.len(),
+                        "GPU returned the wrong number of metric rows — falling back to the CPU"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        target: "neoethos_search::eval",
+                        %error,
+                        n_genes,
+                        "GPU population evaluation failed — falling back to the CPU"
+                    );
+                }
+            }
+
             let gpu_count = hybrid_split::gpu_count(n_genes);
             if gpu_count > 0 && gpu_count < n_genes {
                 // ── Experimental multi-GPU sharding ──────────────────────
