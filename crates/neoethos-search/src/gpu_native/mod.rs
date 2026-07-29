@@ -11,6 +11,7 @@ pub mod prototype_a;
 #[cfg(feature = "gpu")]
 mod prototype_a_engine;
 pub mod prototype_b_engine;
+pub mod device_trades;
 pub mod prototype_b_mirror;
 pub mod trade_invariants;
 #[cfg(feature = "gpu-b-adapter")]
