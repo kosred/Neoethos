@@ -456,6 +456,12 @@ fn resolve_population_outcomes_unchecked(
             scenario_id: event.scenario_id,
             exit_bar: -1,
             exit_reason: POPULATION_EXIT_NONE,
+            entry_bar: event.entry_bar as i32,
+            _pad: 0,
+            mfe: 0.0,
+            mae: 0.0,
+            pnl: 0.0,
+            r_multiple: 0.0,
         })
         .collect::<Vec<_>>();
     let gap_bars = (0..bars)
@@ -794,6 +800,7 @@ fn emit_population_events_with_signals(
                 precedence: POPULATION_PRECEDENCE_STOP_FIRST,
                 stop_price,
                 target_price,
+                entry_price,
             });
         }
     }
@@ -2104,6 +2111,7 @@ mod tests {
                 precedence: POPULATION_PRECEDENCE_STOP_FIRST,
                 stop_price: 90.0,
                 target_price: 110.0,
+                entry_price: 100.0,
             },
             NeoPopulationEvent {
                 candidate_id: 101,
@@ -2114,6 +2122,7 @@ mod tests {
                 precedence: POPULATION_PRECEDENCE_STOP_FIRST,
                 stop_price: 90.0,
                 target_price: 110.0,
+                entry_price: 100.0,
             },
         ];
 

@@ -11,7 +11,7 @@ use neoethos_gpu_contracts::{
 
 #[test]
 fn population_abi_constants_are_numerically_pinned() {
-    assert_eq!(ABI_VERSION, 1);
+    assert_eq!(ABI_VERSION, 2);
     assert_eq!(POPULATION_SETTINGS_FLAG_RISK_BASED_SIZING, 1);
     assert_eq!(POPULATION_DIRECTION_LONG, 1);
     assert_eq!(POPULATION_DIRECTION_SHORT, -1);
@@ -27,6 +27,11 @@ fn population_abi_constants_are_numerically_pinned() {
 fn population_outcome_default_is_the_unresolved_sentinel() {
     let outcome = NeoPopulationOutcome::default();
     assert_eq!(outcome.exit_bar, -1);
+    assert_eq!(outcome.entry_bar, -1);
+    assert_eq!(outcome.mfe, 0.0);
+    assert_eq!(outcome.mae, 0.0);
+    assert_eq!(outcome.pnl, 0.0);
+    assert_eq!(outcome.r_multiple, 0.0);
     assert_eq!(outcome.exit_reason, POPULATION_EXIT_NONE);
 }
 
@@ -69,7 +74,7 @@ fn population_settings_has_stable_c_layout() {
 
 #[test]
 fn population_event_has_stable_c_layout() {
-    assert_eq!(size_of::<NeoPopulationEvent>(), 48);
+    assert_eq!(size_of::<NeoPopulationEvent>(), 56);
     assert_eq!(align_of::<NeoPopulationEvent>(), 8);
     assert_eq!(offset_of!(NeoPopulationEvent, candidate_id), 0);
     assert_eq!(offset_of!(NeoPopulationEvent, scenario_id), 8);
@@ -79,15 +84,21 @@ fn population_event_has_stable_c_layout() {
     assert_eq!(offset_of!(NeoPopulationEvent, precedence), 28);
     assert_eq!(offset_of!(NeoPopulationEvent, stop_price), 32);
     assert_eq!(offset_of!(NeoPopulationEvent, target_price), 40);
+    assert_eq!(offset_of!(NeoPopulationEvent, entry_price), 48);
 }
 
 #[test]
 fn population_outcome_has_stable_c_layout() {
-    assert_eq!(size_of::<NeoPopulationOutcome>(), 24);
+    assert_eq!(size_of::<NeoPopulationOutcome>(), 64);
     assert_eq!(align_of::<NeoPopulationOutcome>(), 8);
     assert_eq!(offset_of!(NeoPopulationOutcome, candidate_id), 0);
     assert_eq!(offset_of!(NeoPopulationOutcome, scenario_id), 8);
     assert_eq!(offset_of!(NeoPopulationOutcome, exit_bar), 16);
+    assert_eq!(offset_of!(NeoPopulationOutcome, entry_bar), 24);
+    assert_eq!(offset_of!(NeoPopulationOutcome, mfe), 32);
+    assert_eq!(offset_of!(NeoPopulationOutcome, mae), 40);
+    assert_eq!(offset_of!(NeoPopulationOutcome, pnl), 48);
+    assert_eq!(offset_of!(NeoPopulationOutcome, r_multiple), 56);
     assert_eq!(offset_of!(NeoPopulationOutcome, exit_reason), 20);
 }
 

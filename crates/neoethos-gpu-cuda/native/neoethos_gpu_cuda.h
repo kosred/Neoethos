@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#define NEOETHOS_GPU_ABI_VERSION 1u
+#define NEOETHOS_GPU_ABI_VERSION 2u
 
 extern "C" {
 
@@ -148,6 +148,7 @@ struct NeoPopulationEvent {
   std::uint32_t precedence;
   double stop_price;
   double target_price;
+  double entry_price;
 };
 
 struct NeoPopulationOutcome {
@@ -155,6 +156,12 @@ struct NeoPopulationOutcome {
   std::uint64_t scenario_id;
   std::int32_t exit_bar;
   std::int32_t exit_reason;
+  std::int32_t entry_bar;
+  std::int32_t pad;
+  double mfe;
+  double mae;
+  double pnl;
+  double r_multiple;
 };
 
 struct NeoPopulationMetricRow {

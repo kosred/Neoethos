@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 pub const POPULATION_SETTINGS_FLAG_RISK_BASED_SIZING: u32 = 1 << 0;
 pub const POPULATION_PRECEDENCE_STOP_FIRST: u32 = 0;
 pub const POPULATION_DIRECTION_LONG: i32 = 1;
@@ -214,16 +214,39 @@ pub mod device {
         pub precedence: u32,
         pub stop_price: f64,
         pub target_price: f64,
+        /// Fill price of the entry, spread already applied.
+        ///
+        /// The reducer recomputes this locally, but the first-hit walk needs it
+        /// too: excursion is measured against the entry, and that walk is the
+        /// only place that sees every bar the position was open.
+        pub entry_price: f64,
     }
 
     /// First-hit result positionally aligned with its input event.
     #[repr(C)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
     pub struct NeoPopulationOutcome {
         pub candidate_id: u64,
         pub scenario_id: u64,
         pub exit_bar: i32,
         pub exit_reason: i32,
+        /// Bar the position was opened on, so a host can rebuild the trade's
+        /// span without re-deriving it from the event stream.
+        pub entry_bar: i32,
+        pub _pad: i32,
+        /// Max favourable excursion, in account currency, per lot.
+        ///
+        /// Mirrors the CPU walk exactly: updated on every bar the position is
+        /// open — including the exit bar, and before any exit test — as
+        /// `max(0, (high - entry) / pip * pip_value_per_lot)` for a long and
+        /// the mirrored form for a short. Not scaled by position size.
+        pub mfe: f64,
+        /// Max adverse excursion, same convention, reported positive.
+        pub mae: f64,
+        /// Realised P&L in account currency, carry and conversion applied.
+        pub pnl: f64,
+        /// `pnl` over the trade's initial risk.
+        pub r_multiple: f64,
     }
 
     impl Default for NeoPopulationOutcome {
@@ -233,6 +256,12 @@ pub mod device {
                 scenario_id: 0,
                 exit_bar: -1,
                 exit_reason: POPULATION_EXIT_NONE,
+                entry_bar: -1,
+                _pad: 0,
+                mfe: 0.0,
+                mae: 0.0,
+                pnl: 0.0,
+                r_multiple: 0.0,
             }
         }
     }
@@ -293,12 +322,12 @@ pub mod device {
         assert!(offset_of!(NeoPopulationSettings, initial_equity) == 32);
         assert!(offset_of!(NeoPopulationSettings, adaptive_rr) == 120);
 
-        assert!(size_of::<NeoPopulationEvent>() == 48);
+        assert!(size_of::<NeoPopulationEvent>() == 56);
         assert!(align_of::<NeoPopulationEvent>() == 8);
         assert!(offset_of!(NeoPopulationEvent, direction) == 24);
         assert!(offset_of!(NeoPopulationEvent, stop_price) == 32);
 
-        assert!(size_of::<NeoPopulationOutcome>() == 24);
+        assert!(size_of::<NeoPopulationOutcome>() == 64);
         assert!(align_of::<NeoPopulationOutcome>() == 8);
         assert!(offset_of!(NeoPopulationOutcome, exit_bar) == 16);
 
@@ -384,7 +413,7 @@ mod tests {
             abi_version: ABI_VERSION,
             ..DatasetHeader::default()
         };
-        assert_eq!(header.abi_version, 1);
+        assert_eq!(header.abi_version, 2);
     }
 
     #[test]

@@ -348,6 +348,10 @@ __global__ void population_emit_events_kernel(DeviceDataset dataset,
         event.precedence = kPrecedenceStopFirst;
         event.stop_price = stop_price;
         event.target_price = target_price;
+        // Excursion is measured against the fill, and the first-hit walk is the
+        // only stage that sees every bar the position was open, so the entry
+        // travels with the event rather than being re-derived downstream.
+        event.entry_price = entry_price;
         events[slot] = event;
       }
     }
@@ -402,6 +406,12 @@ __global__ void population_first_hit_kernel(DeviceDataset dataset,
     outcome.scenario_id = event.scenario_id;
     outcome.exit_bar = -1;
     outcome.exit_reason = kExitNone;
+    outcome.entry_bar = static_cast<int>(event.entry_bar);
+    outcome.pad = 0;
+    outcome.mfe = 0.0;
+    outcome.mae = 0.0;
+    outcome.pnl = 0.0;
+    outcome.r_multiple = 0.0;
     outcomes[warp_index] = outcome;
   }
 
@@ -484,12 +494,67 @@ __global__ void population_first_hit_kernel(DeviceDataset dataset,
     }
   }
 
-  if (lane == 0u && best_bar != INT_MAX) {
+  // ── Excursion, bounded by the exit the warp just agreed on ──────────────
+  //
+  // Deliberately a second pass rather than accumulation during the search: the
+  // exit is not known until the reduction above completes, and excursion past
+  // the exit is not part of the trade. Every lane now knows `best_bar`, so the
+  // same stride re-walks only the bars the position was actually open.
+  //
+  // The CPU walk (eval.rs) updates these on every open bar *before* testing for
+  // an exit, so the exit bar itself counts, and the range is
+  // [entry_bar + 1, exit]. Both start at zero and only ever rise, so a trade
+  // that never moves favourably reports 0 rather than a negative excursion.
+  const int excursion_last = (best_bar == INT_MAX) ? last_bar : best_bar;
+  const double pip = guarded_pip(settings.pip_value);
+  double best_fav = 0.0;
+  double best_adv = 0.0;
+  for (int bar = entry_bar + 1 + static_cast<int>(lane); bar <= excursion_last;
+       bar += warpSize) {
+    const double high = dataset.high[bar];
+    const double low = dataset.low[bar];
+    double fav = 0.0;
+    double adv = 0.0;
+    if (event.direction == kDirectionLong) {
+      fav = high - event.entry_price;
+      adv = event.entry_price - low;
+    } else {
+      fav = event.entry_price - low;
+      adv = high - event.entry_price;
+    }
+    const double fav_money = fav / pip * settings.pip_value_per_lot;
+    const double adv_money = adv / pip * settings.pip_value_per_lot;
+    if (fav_money > best_fav) {
+      best_fav = fav_money;
+    }
+    if (adv_money > best_adv) {
+      best_adv = adv_money;
+    }
+  }
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    const double other_fav = __shfl_down_sync(mask, best_fav, offset);
+    const double other_adv = __shfl_down_sync(mask, best_adv, offset);
+    if (other_fav > best_fav) {
+      best_fav = other_fav;
+    }
+    if (other_adv > best_adv) {
+      best_adv = other_adv;
+    }
+  }
+
+  if (lane == 0u) {
     NeoPopulationOutcome outcome;
     outcome.candidate_id = event.candidate_id;
     outcome.scenario_id = event.scenario_id;
-    outcome.exit_bar = best_bar;
-    outcome.exit_reason = best_reason;
+    outcome.exit_bar = (best_bar == INT_MAX) ? -1 : best_bar;
+    outcome.exit_reason = (best_bar == INT_MAX) ? kExitNone : best_reason;
+    outcome.entry_bar = entry_bar;
+    outcome.pad = 0;
+    outcome.mfe = best_fav;
+    outcome.mae = best_adv;
+    // P&L is settled by the reducer, which owns position sizing and carry.
+    outcome.pnl = 0.0;
+    outcome.r_multiple = 0.0;
     outcomes[warp_index] = outcome;
   }
 }
