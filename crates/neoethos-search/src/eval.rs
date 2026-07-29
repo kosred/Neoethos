@@ -1682,191 +1682,6 @@ fn synthesize_signals_and_confidence_cpu(
     (signals, confidences)
 }
 
-/// Adaptive split state for the CPU+GPU hybrid evaluator. Tracks measured
-/// per-lane throughput (genes/sec) so each population eval routes the GPU the
-/// fraction of genes it can finish in the same wall-time the CPU finishes the
-/// rest — a weak iGPU converges to a small share, a fast discrete GPU to most.
-#[cfg(feature = "gpu")]
-mod hybrid_split {
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Duration;
-
-    struct Rates {
-        cpu_genes_per_s: f64,
-        gpu_genes_per_s: f64,
-        samples: u32,
-        /// Generations seen by `gpu_count` — drives the periodic GPU re-probe.
-        calls: u64,
-        /// Whether the "GPU share decayed to 0" notice has already fired, so the
-        /// fail-loud warning is emitted on the TRANSITION, not every generation.
-        zero_logged: bool,
-        /// Consecutive GPU-lane failures (reset on any success). Drives the
-        /// hard disable below — a device that fails every generation (e.g. an
-        /// integrated GPU that OOMs on the working set) must stop being retried.
-        gpu_failures: u32,
-        /// Latched off: the GPU failed `MAX_GPU_FAILURES` generations in a row,
-        /// so `gpu_count` now returns 0 (full-CPU) for the rest of the process.
-        gpu_disabled: bool,
-    }
-    static RATES: OnceLock<Mutex<Rates>> = OnceLock::new();
-    fn rates() -> &'static Mutex<Rates> {
-        RATES.get_or_init(|| {
-            Mutex::new(Rates {
-                cpu_genes_per_s: 0.0,
-                gpu_genes_per_s: 0.0,
-                samples: 0,
-                calls: 0,
-                zero_logged: false,
-                gpu_failures: 0,
-                gpu_disabled: false,
-            })
-        })
-    }
-
-    /// Consecutive GPU-lane failures after which the GPU is disabled for the
-    /// rest of the process. A single failure can be a transient warmup hiccup
-    /// (a cold kernel, a one-off pool panic); two IN A ROW means the device
-    /// genuinely can't run this eval — the canonical case is an integrated GPU
-    /// whose Vulkan device-local heap is far smaller than its advertised
-    /// per-buffer limit, so the population backtest OOMs (`wgpu error: Out of
-    /// Memory`) every single generation. Without the latch, `gpu_count` keeps
-    /// handing that device a share each generation, the same OOM panic + server
-    /// death repeats, and every generation wastes the GPU-lane attempt before
-    /// the CPU recompute. The re-probe machinery can't help (it only runs off
-    /// `update`, which the failure arm never reaches). Latching off routes all
-    /// genes to the CPU cleanly; restart to re-probe.
-    const MAX_GPU_FAILURES: u32 = 2;
-
-    /// Record a GPU-lane failure for this generation. After `MAX_GPU_FAILURES`
-    /// consecutive failures, latch the GPU off for the process (fail-loud once).
-    pub fn note_gpu_failure() {
-        let mut r = rates().lock().unwrap_or_else(|p| p.into_inner());
-        if r.gpu_disabled {
-            return;
-        }
-        r.gpu_failures = r.gpu_failures.saturating_add(1);
-        if r.gpu_failures >= MAX_GPU_FAILURES {
-            r.gpu_disabled = true;
-            tracing::warn!(
-                target: "neoethos_search::eval",
-                consecutive_failures = r.gpu_failures,
-                "GPU eval lane DISABLED for this process — it failed the GPU \
-                 backtest {MAX_GPU_FAILURES} generations in a row (see the wgpu \
-                 error above; the usual cause is an integrated GPU whose \
-                 device-local memory is too small for this workload). Every gene \
-                 now evaluates on the CPU — correctness is unaffected, only speed. \
-                 Restart the run to re-probe the GPU."
-            );
-        }
-    }
-
-    /// Record a successful GPU-lane generation — clears the consecutive-failure
-    /// streak so an isolated hiccup can never latch the GPU off.
-    pub fn note_gpu_success() {
-        let mut r = rates().lock().unwrap_or_else(|p| p.into_inner());
-        r.gpu_failures = 0;
-    }
-
-    /// Re-probe cadence. Even after the throughput EMA drives the GPU share to 0
-    /// (GPU measured slower than the CPU lane for some workload), force a small
-    /// GPU lane every this-many generations so a GPU that has since become
-    /// competitive — lighter generation, warmed kernels, the next combo, or a
-    /// kernel that was just made faster — gets RE-MEASURED and can recover.
-    /// Without this, `update()` runs only on the success arm, so once `gpu_count`
-    /// returns 0 the GPU lane is never entered again, no fresh measurement is ever
-    /// taken, and the GPU stays abandoned for the whole run (the death-spiral bug,
-    /// fixed 2026-06-09).
-    const REPROBE_EVERY: u64 = 32;
-
-    /// Genes handed to the GPU while (re-)probing.
-    ///
-    /// 2026-06-10: measure the GPU at SCALE — ~half the population. The old
-    /// `n_genes / 20` floor (~25 genes for pop 512) is a self-reinforcing trap:
-    /// per-LAUNCH overhead (client-get, the constant per-sample data upload, kernel
-    /// enqueue, readback sync) is FIXED per call and dominates a tiny chunk, so the
-    /// GPU's measured genes/s is crushed (~74/s observed on the A6000), the EMA
-    /// drives the GPU share to 0, and every re-probe re-measures the SAME tiny
-    /// overhead-dominated chunk → the GPU never recovers. Per-launch overhead only
-    /// amortizes over a LARGE batch (VectorAlpha's 350k pairs/s comes from big
-    /// batches, not small ones), so the re-probe must run the GPU on a big chunk —
-    /// the regime where the GPU/CPU genes/s comparison is actually fair. Half the
-    /// population is a large, representative batch while still leaving real work on
-    /// the CPU lane so the generation still completes if the GPU is genuinely slow.
-    fn probe_floor(n_genes: usize) -> usize {
-        (n_genes / 2).clamp(1, n_genes.saturating_sub(1))
-    }
-
-    /// Genes to route to the GPU lane for a population of `n_genes`. Before any
-    /// measurement, give the GPU a conservative 25 % so we learn its speed
-    /// without a big slowdown if it turns out weak. Once measured, the share is
-    /// proportional to the GPU's fraction of total genes/sec — but it is NEVER
-    /// left at an absorbing 0 (periodic re-probe above) and a much-faster GPU is
-    /// clamped to `n_genes - 1` rather than `n_genes` so the caller's
-    /// `gpu_count < n_genes` guard can't paradoxically disable a winning GPU.
-    pub fn gpu_count(n_genes: usize) -> usize {
-        let mut r = rates().lock().unwrap_or_else(|p| p.into_inner());
-        // Latched off after repeated GPU failures — never hand this device work
-        // again (no more per-generation OOM-panic-then-CPU-recompute churn).
-        if r.gpu_disabled {
-            return 0;
-        }
-        r.calls = r.calls.wrapping_add(1);
-        let due_reprobe = r.calls % REPROBE_EVERY == 0;
-        if r.samples == 0 || r.cpu_genes_per_s <= 0.0 || r.gpu_genes_per_s <= 0.0 {
-            return (n_genes / 4).clamp(1, n_genes.saturating_sub(1));
-        }
-        let frac = r.gpu_genes_per_s / (r.cpu_genes_per_s + r.gpu_genes_per_s);
-        let measured = ((n_genes as f64) * frac).round() as usize;
-        if measured == 0 {
-            if !r.zero_logged {
-                r.zero_logged = true;
-                tracing::warn!(
-                    target: "neoethos_search::eval",
-                    gpu_genes_per_s = r.gpu_genes_per_s,
-                    cpu_genes_per_s = r.cpu_genes_per_s,
-                    reprobe_every = REPROBE_EVERY,
-                    "hybrid GPU lane share decayed to 0 — GPU measured slower than \
-                     the CPU lane for this workload. Routing genes to CPU; will \
-                     re-probe the GPU periodically so it can recover (fail-loud)."
-                );
-            }
-            if due_reprobe {
-                return probe_floor(n_genes);
-            }
-            return 0;
-        }
-        if r.zero_logged {
-            r.zero_logged = false;
-            tracing::info!(
-                target: "neoethos_search::eval",
-                gpu_genes_per_s = r.gpu_genes_per_s,
-                cpu_genes_per_s = r.cpu_genes_per_s,
-                "hybrid GPU lane recovered — re-probe found the GPU competitive again."
-            );
-        }
-        measured.clamp(1, n_genes.saturating_sub(1))
-    }
-
-    /// Fold this generation's measured lane throughputs into the EMA.
-    pub fn update(gpu_genes: usize, gpu_t: Duration, cpu_genes: usize, cpu_t: Duration) {
-        let (gt, ct) = (gpu_t.as_secs_f64(), cpu_t.as_secs_f64());
-        if gt <= 0.0 || ct <= 0.0 || gpu_genes == 0 || cpu_genes == 0 {
-            return;
-        }
-        let gpu_gps = gpu_genes as f64 / gt;
-        let cpu_gps = cpu_genes as f64 / ct;
-        let mut r = rates().lock().unwrap_or_else(|p| p.into_inner());
-        if r.samples == 0 {
-            r.cpu_genes_per_s = cpu_gps;
-            r.gpu_genes_per_s = gpu_gps;
-        } else {
-            r.cpu_genes_per_s = 0.7 * r.cpu_genes_per_s + 0.3 * cpu_gps;
-            r.gpu_genes_per_s = 0.7 * r.gpu_genes_per_s + 0.3 * gpu_gps;
-        }
-        r.samples = r.samples.saturating_add(1);
-    }
-}
-
 /// GPU device ids the scheduler pinned for THIS process, from the plural
 /// `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES` (or CUDA twin), e.g. "0,1,2,3".
 /// Empty when unset (the supported scheduler path). The scheduler deliberately
@@ -1883,17 +1698,6 @@ fn eval_gpu_devices() -> Vec<usize> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Per-card gene cap from the scheduler's VRAM math
-/// (`NEOETHOS_BOT_SEARCH_EVAL_GENES_PER_CARD`). Unset => no cap (even split).
-#[cfg(feature = "gpu")]
-fn eval_genes_per_card_cap() -> usize {
-    std::env::var("NEOETHOS_BOT_SEARCH_EVAL_GENES_PER_CARD")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(usize::MAX)
 }
 
 /// Materialise the optional `stop_vol_mult` contract into a full-length slice.
@@ -1978,23 +1782,20 @@ pub fn evaluate_population_core(
         )
     };
 
-    // ── CPU + GPU hybrid ──────────────────────────────────────────────────
+    // ── Where the population is evaluated ─────────────────────────────────
     //
-    // Run a GPU prefix `[0..gpu_count]` (the cubecl wgpu/CUDA kernel) and the
-    // CPU remainder `[gpu_count..n_genes]` (rayon) CONCURRENTLY, so the GPU and
-    // the CPU cores both work at once. The split adapts to measured per-lane
-    // throughput (`hybrid_split`), so neither lane idles waiting for the other
-    // — a weak iGPU converges to a small share, a fast discrete GPU to most.
-    // Genes are independent, so the merged result equals a whole-population
-    // evaluation; the only difference is the GPU lane's f32 vs the CPU lane's
-    // f64 (bounded by the cpu↔gpu parity test; the GA's determinism policy
-    // already permits this level of noise).
-    // PHASE 1: GPU path disabled until kernel ports risk-based sizing (Phase 2).
-    // The cubecl kernel still uses fixed-1-lot sizing; routing any gene through
-    // it would make the GPU lane's metrics diverge from the new CPU sizing.
-    // Forcing `false` here keeps the unchanged kernel out of the hot path so
-    // the CPU lane handles ALL genes. Re-enable when the GPU kernel ports the
-    // risk-based, confidence-scaled sizing.
+    // A card is present or it is not. There is no third state, and in
+    // particular no per-gene split between the two: that split existed here
+    // until 2026-07-29 and its real effect was to produce a state nobody
+    // designed — a run that put *nothing* on the card while looking exactly
+    // like a healthy one, only slower. A EURUSD M3 discovery spent 10 h 24 m of
+    // its 10 h 44 m on CPU cores that way, and the decision point logged
+    // nothing at all, so it took sampling `nvidia-smi` to notice.
+    //
+    // So: GPU present → the whole population goes to the GPU, and a failure is
+    // returned as an error rather than quietly recomputed on the CPU. No GPU →
+    // the CPU path below. Both outcomes are logged, because "it ran on the
+    // card" has to be a record rather than an inference.
     #[cfg(feature = "gpu")]
     {
         // Phase 2 (2026-06-06): GPU lane ENABLED — the cubecl kernel now ports
@@ -2069,206 +1870,19 @@ pub fn evaluate_population_core(
                     return Ok(rows);
                 }
                 Ok(rows) => {
-                    tracing::error!(
-                        target: "neoethos_search::eval",
-                        expected = n_genes,
-                        returned = rows.len(),
-                        "GPU returned the wrong number of metric rows — falling back to the CPU"
-                    );
+                    return Err(format!(
+                        "GPU returned {} metric rows for {n_genes} candidates. Refusing to                          substitute CPU results: silent substitution is exactly what made a                          run that never touched the card look identical to a healthy one.",
+                        rows.len()
+                    ));
                 }
                 Err(error) => {
-                    tracing::error!(
-                        target: "neoethos_search::eval",
-                        %error,
-                        n_genes,
-                        "GPU population evaluation failed — falling back to the CPU"
-                    );
+                    return Err(format!(
+                        "GPU population evaluation failed on device {:?}: {error}. Refusing to                          fall back to the CPU — a card is present, so this is a fault to fix,                          not to work around.",
+                        devices.first()
+                    ));
                 }
             }
 
-            let gpu_count = hybrid_split::gpu_count(n_genes);
-            if gpu_count > 0 && gpu_count < n_genes {
-                // ── Experimental multi-GPU sharding ──────────────────────
-                // A manual plural-device override shards the GPU-assigned prefix
-                // across cards. The production scheduler does not enable this
-                // path until CubeCL multi-device client isolation is proven.
-                // Genes beyond the optional cap stay on the CPU lane and are
-                // never dropped (see lane_partition::placed_genes).
-                if devices.len() > 1 {
-                    let cap = eval_genes_per_card_cap();
-                    let lanes = crate::lane_partition::partition_gpu_lanes(
-                        gene_offsets,
-                        gpu_count,
-                        &devices,
-                        cap,
-                    );
-                    let placed = crate::lane_partition::placed_genes(&lanes);
-                    if placed > 0 {
-                        let (gpu_joined, cpu_lane, cpu_dt) = std::thread::scope(|scope| {
-                            let handles: Vec<_> = lanes
-                                .iter()
-                                .map(|lane| {
-                                    scope.spawn(move || {
-                                        let gs = lane.gene_start;
-                                        let ge = lane.gene_end;
-                                        let t = std::time::Instant::now();
-                                        let r = try_evaluate_population_cuda(
-                                            close,
-                                            high,
-                                            low,
-                                            indicators,
-                                            &lane.rebased_offsets,
-                                            &gene_indices[lane.idx_start..lane.idx_end],
-                                            &gene_weights[lane.idx_start..lane.idx_end],
-                                            &long_thr[gs..ge],
-                                            &short_thr[gs..ge],
-                                            month_idx,
-                                            day_idx,
-                                            timestamps,
-                                            &sl_pips[gs..ge],
-                                            &tp_pips[gs..ge],
-                                            &stop_vol_mult[gs..ge],
-                                            smc_data,
-                                            &gene_smc_flags[gs..ge],
-                                            gate_threshold,
-                                            weights,
-                                            settings,
-                                            Some(lane.device_id),
-                                        );
-                                        (r, t.elapsed())
-                                    })
-                                })
-                                .collect();
-                            let t = std::time::Instant::now();
-                            let cpu_lane: Vec<[f64; 11]> = (placed..n_genes)
-                                .into_par_iter()
-                                .map(&eval_gene_cpu)
-                                .collect();
-                            let cpu_dt = t.elapsed();
-                            let joined: Vec<_> = handles.into_iter().map(|h| h.join()).collect();
-                            (joined, cpu_lane, cpu_dt)
-                        });
-
-                        let mut gpu_out: Vec<[f64; 11]> = Vec::with_capacity(placed);
-                        let mut max_gpu_dt = std::time::Duration::ZERO;
-                        let mut all_ok = true;
-                        for (lane, joined) in lanes.iter().zip(gpu_joined.into_iter()) {
-                            match joined {
-                                Ok((Ok(part), dt)) if part.len() == lane.gene_count() => {
-                                    gpu_out.extend_from_slice(&part);
-                                    if dt > max_gpu_dt {
-                                        max_gpu_dt = dt;
-                                    }
-                                }
-                                Ok((Ok(_), _)) => {
-                                    tracing::warn!(
-                                        "multi-GPU lane returned the wrong gene count — CPU recompute"
-                                    );
-                                    all_ok = false;
-                                    break;
-                                }
-                                Ok((Err(e), _)) => {
-                                    tracing::warn!("multi-GPU lane failed ({e}) — CPU recompute");
-                                    all_ok = false;
-                                    break;
-                                }
-                                Err(_) => {
-                                    tracing::warn!("multi-GPU lane panicked — CPU recompute");
-                                    all_ok = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if all_ok && gpu_out.len() == placed {
-                            hybrid_split::update(placed, max_gpu_dt, n_genes - placed, cpu_dt);
-                            hybrid_split::note_gpu_success();
-                            let mut out = Vec::with_capacity(n_genes);
-                            out.extend_from_slice(&gpu_out);
-                            out.extend_from_slice(&cpu_lane);
-                            return Ok(out);
-                        }
-                        // Any lane unusable: record the failure (latches the GPU
-                        // off after repeated failures), recompute the GPU portion
-                        // on the CPU, keep the CPU lane we already have.
-                        hybrid_split::note_gpu_failure();
-                        let mut out: Vec<[f64; 11]> =
-                            (0..placed).into_par_iter().map(&eval_gene_cpu).collect();
-                        out.extend_from_slice(&cpu_lane);
-                        return Ok(out);
-                    }
-                }
-
-                // ── Single-device hybrid (default, or 0–1 pinned card) ────
-                let device_override = if devices.len() == 1 {
-                    devices.first().copied()
-                } else {
-                    None
-                };
-                let gpu_entry_end = gene_offsets[gpu_count] as usize;
-                let (gpu_outcome, cpu_lane, cpu_dt) = std::thread::scope(|scope| {
-                    let gpu_thread = scope.spawn(|| {
-                        let t = std::time::Instant::now();
-                        let r = try_evaluate_population_cuda(
-                            close,
-                            high,
-                            low,
-                            indicators,
-                            &gene_offsets[..=gpu_count],
-                            &gene_indices[..gpu_entry_end],
-                            &gene_weights[..gpu_entry_end],
-                            &long_thr[..gpu_count],
-                            &short_thr[..gpu_count],
-                            month_idx,
-                            day_idx,
-                            timestamps,
-                            &sl_pips[..gpu_count],
-                            &tp_pips[..gpu_count],
-                            &stop_vol_mult[..gpu_count],
-                            smc_data,
-                            &gene_smc_flags[..gpu_count],
-                            gate_threshold,
-                            weights,
-                            settings,
-                            device_override,
-                        );
-                        (r, t.elapsed())
-                    });
-                    let t = std::time::Instant::now();
-                    let cpu_lane: Vec<[f64; 11]> = (gpu_count..n_genes)
-                        .into_par_iter()
-                        .map(&eval_gene_cpu)
-                        .collect();
-                    let cpu_dt = t.elapsed();
-                    (gpu_thread.join(), cpu_lane, cpu_dt)
-                });
-
-                match gpu_outcome {
-                    Ok((Ok(gpu_lane), gpu_dt)) if gpu_lane.len() == gpu_count => {
-                        hybrid_split::update(gpu_count, gpu_dt, n_genes - gpu_count, cpu_dt);
-                        hybrid_split::note_gpu_success();
-                        let mut out = Vec::with_capacity(n_genes);
-                        out.extend_from_slice(&gpu_lane);
-                        out.extend_from_slice(&cpu_lane);
-                        return Ok(out);
-                    }
-                    Ok((Ok(_), _)) => tracing::warn!(
-                        "hybrid GPU lane returned the wrong gene count — recomputing on CPU"
-                    ),
-                    Ok((Err(e), _)) => {
-                        tracing::warn!("hybrid GPU lane failed ({e}) — recomputing on CPU")
-                    }
-                    Err(_) => tracing::warn!("hybrid GPU lane panicked — recomputing on CPU"),
-                }
-                // GPU lane unusable: record the failure (latches the GPU off
-                // after MAX_GPU_FAILURES in a row so we stop retrying a device
-                // that can't run it), keep the CPU lane we already computed, and
-                // only (re)evaluate the GPU-assigned prefix on the CPU.
-                hybrid_split::note_gpu_failure();
-                let mut out: Vec<[f64; 11]> =
-                    (0..gpu_count).into_par_iter().map(&eval_gene_cpu).collect();
-                out.extend_from_slice(&cpu_lane);
-                return Ok(out);
-            }
         }
     }
 

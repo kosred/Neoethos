@@ -21,7 +21,6 @@ mod cubecl_eval;
 // device-execution glue that consumes it lives in `eval.rs` behind `gpu`.
 pub mod discovery;
 pub mod discovery_ledger;
-mod lane_partition;
 // `mod scheduler_assignment;` — DELETED 2026-05-25 (verbose-build pass):
 // the file was a 19-LOC orphan with zero callers. The scheduler-driven
 // GPU routing it scaffolded is dispatched directly via `BackendKind`
