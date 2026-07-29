@@ -1663,6 +1663,7 @@ mod tests {
             trailing_enabled: false,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
+            trailing_min_lock_pips: 2.0,
             pip_value: 1.0,
             spread_pips: 0.0,
             commission_per_trade: 0.0,

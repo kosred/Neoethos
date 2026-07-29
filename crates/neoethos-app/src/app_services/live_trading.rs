@@ -853,10 +853,16 @@ async fn run(
                 let hi = base_ohlcv.high.last().copied().unwrap_or(pos_entry_px);
                 let lo = base_ohlcv.low.last().copied().unwrap_or(pos_entry_px);
                 let mut new_trail: Option<f64> = None;
+                // Same floor the backtest applies: once the trail engages it never
+                // sits closer to entry than the locked profit. Without it the live
+                // stop protects a different amount than the strategy was scored on,
+                // which is the parity break that made the backtest optimistic.
+                let locked_pips = neoethos_core::config::DEFAULT_TRAILING_MIN_LOCK_PIPS;
+                let locked = locked_pips * pip;
                 if pos_is_long {
                     pos_extreme = pos_extreme.max(hi);
                     if pos_extreme - pos_entry_px >= r_dist {
-                        let candidate = pos_extreme - r_dist;
+                        let candidate = (pos_extreme - r_dist).max(pos_entry_px + locked);
                         if pos_trail_px == 0.0 || candidate > pos_trail_px {
                             pos_trail_px = candidate;
                             new_trail = Some(candidate);
@@ -865,7 +871,7 @@ async fn run(
                 } else {
                     pos_extreme = if pos_extreme > 0.0 { pos_extreme.min(lo) } else { lo };
                     if pos_entry_px - pos_extreme >= r_dist {
-                        let candidate = pos_extreme + r_dist;
+                        let candidate = (pos_extreme + r_dist).min(pos_entry_px - locked);
                         if pos_trail_px == 0.0 || candidate < pos_trail_px {
                             pos_trail_px = candidate;
                             new_trail = Some(candidate);

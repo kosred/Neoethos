@@ -376,6 +376,15 @@ pub struct RiskConfig {
     pub trailing_enabled: bool,
     pub trailing_atr_multiplier: f64,
     pub trailing_be_trigger_r: f64,
+    /// Pips of profit the trail must lock once it engages, measured from the
+    /// entry.
+    ///
+    /// The other two knobs are multiples of the gene's stop distance, so the
+    /// same pair locks a different amount for every gene: with `trigger -
+    /// distance = 0.1`, a 20-pip stop protects 2 pips and a 10-pip stop only 1.
+    /// An account is not risked in multiples of R, so the floor is absolute —
+    /// once the trail is active the stop never sits closer to entry than this.
+    pub trailing_min_lock_pips: f64,
     pub slippage_pips: f64,
     pub commission_per_lot: f64,
     pub backtest_spread_pips: f64,
@@ -459,6 +468,7 @@ impl Default for RiskConfig {
             trailing_enabled: true,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
+            trailing_min_lock_pips: DEFAULT_TRAILING_MIN_LOCK_PIPS,
             slippage_pips: 0.5,
             commission_per_lot: 7.0,
             backtest_spread_pips: 1.5,
@@ -2350,3 +2360,10 @@ mod tests {
         assert!(settings.models.prop_search_async_wait);
     }
 }
+
+/// Profit the trail locks once it engages, in pips.
+///
+/// Shared so the backtest, the GPU kernel and live trading cannot drift apart:
+/// a live stop that protects a different amount than the strategy was scored on
+/// is the parity break that makes a backtest optimistic.
+pub const DEFAULT_TRAILING_MIN_LOCK_PIPS: f64 = 2.0;

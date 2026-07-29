@@ -1006,6 +1006,7 @@ macro_rules! define_backtest_population_kernel {
         trailing_enabled: i32,
         trailing_atr_multiplier: $f,
         trailing_be_trigger_r: $f,
+    trailing_min_lock_pips: $f,
         spread_pips: $f,
         commission_per_trade: $f,
         pip_value_per_lot: $f,
@@ -1397,7 +1398,12 @@ macro_rules! define_backtest_population_kernel {
                         if exit_cell.read() == 0 && trailing_enabled != 0 {
                             let mv = hi - entry_px_v;
                             if mv >= (trailing_be_trigger_r * sl_distance.read()) {
-                                let candidate = hi - (trailing_atr_multiplier * sl_distance.read());
+                                // Mirrors eval.rs: the trail never sits closer to
+                                // entry than the locked profit, which the R-based
+                                // multiplier alone cannot guarantee across genes.
+                                let locked = entry_px.read() + trailing_min_lock_pips;
+                                let raw = hi - (trailing_atr_multiplier * sl_distance.read());
+                                let candidate = if raw > locked { raw } else { locked };
                                 if trail_px.read() == 0.0 || candidate > trail_px.read() {
                                     trail_px.store(candidate);
                                 }
@@ -1424,7 +1430,9 @@ macro_rules! define_backtest_population_kernel {
                         if exit_cell.read() == 0 && trailing_enabled != 0 {
                             let mv = entry_px_v - lo;
                             if mv >= (trailing_be_trigger_r * sl_distance.read()) {
-                                let candidate = lo + (trailing_atr_multiplier * sl_distance.read());
+                                let locked = entry_px.read() - trailing_min_lock_pips;
+                                let raw = lo + (trailing_atr_multiplier * sl_distance.read());
+                                let candidate = if raw < locked { raw } else { locked };
                                 if trail_px.read() == 0.0 || candidate < trail_px.read() {
                                     trail_px.store(candidate);
                                 }
@@ -3053,6 +3061,7 @@ macro_rules! define_launch_backtest_kernel {
                 },
                 settings.trailing_atr_multiplier as $f,
                 settings.trailing_be_trigger_r as $f,
+                settings.trailing_min_lock_pips as $f,
                 settings.spread_pips as $f,
                 settings.commission_per_trade as $f,
                 settings.pip_value_per_lot as $f,
@@ -4027,6 +4036,7 @@ pub(crate) fn evaluate_prototype_a_resident<R: Runtime>(
             },
             dataset.settings.trailing_atr_multiplier as f32,
             dataset.settings.trailing_be_trigger_r as f32,
+            dataset.settings.trailing_min_lock_pips as f32,
             dataset.settings.spread_pips as f32,
             dataset.settings.commission_per_trade as f32,
             dataset.settings.pip_value_per_lot as f32,
@@ -4504,6 +4514,7 @@ where
             },
             settings.trailing_atr_multiplier as f32,
             settings.trailing_be_trigger_r as f32,
+            settings.trailing_min_lock_pips as f32,
             settings.spread_pips as f32,
             settings.commission_per_trade as f32,
             settings.pip_value_per_lot as f32,

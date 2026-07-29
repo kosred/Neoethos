@@ -129,6 +129,15 @@ pub struct BacktestSettings {
     pub trailing_enabled: bool,
     pub trailing_atr_multiplier: f64,
     pub trailing_be_trigger_r: f64,
+    /// Pips of profit the trail must lock once it engages, measured from the
+    /// entry.
+    ///
+    /// The other two knobs are multiples of the gene's stop distance, so the
+    /// same pair locks a different amount for every gene: with `trigger -
+    /// distance = 0.1`, a 20-pip stop protects 2 pips and a 10-pip stop only 1.
+    /// An account is not risked in multiples of R, so the floor is absolute —
+    /// once the trail is active the stop never sits closer to entry than this.
+    pub trailing_min_lock_pips: f64,
     pub pip_value: f64,
     pub spread_pips: f64,
     pub commission_per_trade: f64,
@@ -338,6 +347,7 @@ impl Default for BacktestSettings {
             trailing_enabled: false,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
+            trailing_min_lock_pips: 2.0,
             pip_value: f64::NAN,
             spread_pips: f64::NAN,
             commission_per_trade: f64::NAN,
@@ -1005,8 +1015,14 @@ pub fn fast_evaluate_strategy_core(
                     if !exit && settings.trailing_enabled {
                         let mv = hi - entry_px;
                         if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
+                            // Floor the trail at entry plus the locked profit. The
+                            // multiplier is a fraction of the gene's own stop, so
+                            // without this the amount protected varies per gene and
+                            // is often below the cost of the trade.
+                            let locked = entry_px + settings.trailing_min_lock_pips * pip;
                             let candidate =
-                                hi - (settings.trailing_atr_multiplier * pos_sl_pips * pip);
+                                (hi - (settings.trailing_atr_multiplier * pos_sl_pips * pip))
+                                    .max(locked);
                             if trail_px == 0.0 || candidate > trail_px {
                                 trail_px = candidate;
                             }
@@ -1032,8 +1048,12 @@ pub fn fast_evaluate_strategy_core(
                     if !exit && settings.trailing_enabled {
                         let mv = entry_px - lo;
                         if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
+                            // Mirror of the long floor: never closer to entry than
+                            // the locked profit.
+                            let locked = entry_px - settings.trailing_min_lock_pips * pip;
                             let candidate =
-                                lo + (settings.trailing_atr_multiplier * pos_sl_pips * pip);
+                                (lo + (settings.trailing_atr_multiplier * pos_sl_pips * pip))
+                                    .min(locked);
                             if trail_px == 0.0 || candidate < trail_px {
                                 trail_px = candidate;
                             }
@@ -1470,7 +1490,10 @@ pub fn simulate_trades_core(
                 if !exit && settings.trailing_enabled {
                     let mv = hi - entry_px;
                     if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
-                        let candidate = hi - (settings.trailing_atr_multiplier * pos_sl_pips * pip);
+                        let locked = entry_px + settings.trailing_min_lock_pips * pip;
+                        let candidate = (hi
+                            - (settings.trailing_atr_multiplier * pos_sl_pips * pip))
+                            .max(locked);
                         if trail_px == 0.0 || candidate > trail_px {
                             trail_px = candidate;
                         }
@@ -1493,7 +1516,10 @@ pub fn simulate_trades_core(
                 if !exit && settings.trailing_enabled {
                     let mv = entry_px - lo;
                     if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
-                        let candidate = lo + (settings.trailing_atr_multiplier * pos_sl_pips * pip);
+                        let locked = entry_px - settings.trailing_min_lock_pips * pip;
+                        let candidate = (lo
+                            + (settings.trailing_atr_multiplier * pos_sl_pips * pip))
+                            .min(locked);
                         if trail_px == 0.0 || candidate < trail_px {
                             trail_px = candidate;
                         }
