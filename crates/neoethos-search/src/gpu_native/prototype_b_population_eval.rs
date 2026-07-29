@@ -23,7 +23,7 @@
 use anyhow::{Result, anyhow, bail};
 use ndarray::ArrayView2;
 
-use neoethos_gpu_contracts::device::ScenarioDescriptor;
+use neoethos_gpu_contracts::device::{NeoPopulationEvent, ScenarioDescriptor};
 
 use crate::eval::{BacktestSettings, SmcRow};
 use crate::gpu_native::prototype_a::{PrototypeADatasetUpload, PrototypeAGeneUpload};
@@ -76,8 +76,16 @@ fn event_capacity(
         + population as u64 * per_candidate
         + 64 * 1024 * 1024;
     let room = budget.saturating_sub(fixed);
-    // Each event costs an event record plus an outcome record.
-    let capacity = room / 72;
+    // Each event costs an event record plus an outcome record. Taken from the
+    // types rather than written as a number: this was hardcoded at 72 bytes,
+    // and when the contract grew to carry per-trade P&L and excursion the real
+    // cost became 120 — so the session asked for two thirds more device memory
+    // than it had budgeted for and the allocation failed with a bare status
+    // code. A literal here is a silent trap the next time the contract changes.
+    let bytes_per_event = (std::mem::size_of::<NeoPopulationEvent>()
+        + std::mem::size_of::<neoethos_gpu_contracts::device::NeoPopulationOutcome>())
+        as u64;
+    let capacity = room / bytes_per_event;
     if capacity < 1_024 {
         bail!(
             "prototype B: {} candidates x {} bars leaves no room for events on this device \
