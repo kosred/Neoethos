@@ -647,7 +647,7 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
                                          NeoPopulationSettings settings,
                                          const float* signal_confidences,
                                          const NeoPopulationEvent* events,
-                                         const NeoPopulationOutcome* outcomes,
+                                         NeoPopulationOutcome* outcomes,
                                          const unsigned long long* event_offsets,
                                          const unsigned long long* scenario_ids,
                                          double* monthly_pnls,
@@ -697,6 +697,8 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   NeoPopulationOutcome position_outcome;
   double position_entry_price = 0.0;
   double position_lots = 0.0;
+  unsigned long long position_index = 0ull;
+  double position_stop_pips = 0.0;
 
   const double pip = guarded_pip(settings.pip_value);
   const double half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
@@ -754,6 +756,14 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
                                                       position_event.direction, entry_timestamp,
                                                       exit_timestamp, settings);
         equity += pnl;
+        // The per-trade record is completed here because this is the only place
+        // that knows position size, carry and the conversion fee. R-multiple
+        // mirrors eval.rs exactly — realised P&L over the entry stop distance,
+        // guarded against a zero denominator — so it stays comparable with the
+        // CPU trade list rather than merely plausible.
+        outcomes[position_index].pnl = pnl;
+        outcomes[position_index].r_multiple =
+            pnl / fmax(position_stop_pips * settings.pip_value_per_lot, 1.0e-9);
         current_month_pnl += pnl;
         trade_count += 1;
         if (pnl > 0.0) {
@@ -876,6 +886,9 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       position_outcome = outcome;
       position_entry_price = entry_price;
       position_lots = lots;
+      // `cursor` already advanced past this event.
+      position_index = cursor - 1ull;
+      position_stop_pips = stop_pips;
       has_position = true;
       day_trade_count += 1u;
       accepted_trades += 1ull;
