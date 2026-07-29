@@ -1809,6 +1809,27 @@ pub fn evaluate_population_core(
         // bit-parity with the CPU by the `..._adaptive_stops` parity test), so
         // adaptive genes run on the GPU lane exactly like fixed ones — the old
         // adaptive→CPU fail-safe is no longer needed.
+        // Report each condition separately, once. Two runs of over an hour each
+        // ended with the card at 0 % and no message explaining why, because a
+        // collapsed `&&` chain says nothing about which term was false. Naming
+        // them individually turns "the GPU did not run" into "this specific
+        // condition was false", which is the difference between a diagnosis and
+        // another hour of guessing.
+        {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::info!(
+                    target: "neoethos_search::eval",
+                    sizing_ported = PHASE1_GPU_SIZING_PORTED,
+                    signal_kernel = cuda_eval_signal_kernel_enabled(),
+                    backtest_kernel = cuda_eval_backtest_kernel_enabled(),
+                    integrated_gpu_disabled = integrated_gpu_eval_disabled(),
+                    n_genes,
+                    n_samples,
+                    "population evaluation lane gate"
+                );
+            });
+        }
         if PHASE1_GPU_SIZING_PORTED
             && cuda_eval_signal_kernel_enabled()
             && cuda_eval_backtest_kernel_enabled()
