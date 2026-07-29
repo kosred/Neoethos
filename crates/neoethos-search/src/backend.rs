@@ -230,6 +230,25 @@ pub fn evaluate_population_core_with_backend_and_audit(
     use crate::gpu_native::cpu_strategy::{self, CpuStrategyCategory};
 
     backend.validate().map_err(|error| error.to_string())?;
+    // Which arm ran, and what was actually in the backend slot.
+    //
+    // Telemetry showed the GA reaching `validation_backtest_population_cpu`
+    // while `evaluate_population_core` was never entered — which can only
+    // happen through the first arm, yet nothing in the tree installs a CPU
+    // backend. Rather than reason about which of those is wrong, the dispatch
+    // now states the value it dispatched on.
+    {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            tracing::info!(
+                target: "neoethos_search::backend",
+                device = ?backend.device,
+                fallback = ?backend.fallback,
+                accelerator = ?backend.accelerator_hint,
+                "population evaluation dispatched on this backend"
+            );
+        });
+    }
     match (backend.device, backend.fallback) {
         (DevicePreference::Cpu, _) => cpu_strategy::run(
             backend,
