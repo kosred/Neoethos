@@ -215,6 +215,24 @@ fn resident_slot() -> &'static std::sync::Mutex<Option<SendResident>> {
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Largest population known to have fitted the card's event budget.
+///
+/// Discovering the limit by failing costs the whole attempt: the kernel runs,
+/// exhausts capacity, and its work is discarded before the halves are retried.
+/// Paying that once is the price of not knowing how many trades a population
+/// emits; paying it every generation is waste. A 2026-07-29 M3 run spent 391 s
+/// on a single population evaluation that way, against a benchmark rate that
+/// would place it near 4 s.
+///
+/// So the size that worked is remembered and used as the starting point.
+/// `usize::MAX` means "not yet learned" — the first call tries the whole
+/// population, as it should.
+fn learned_batch_limit() -> &'static std::sync::atomic::AtomicUsize {
+    static LIMIT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    &LIMIT
+}
+
 /// Evaluate a population on Prototype B, splitting when the card cannot hold
 /// the trades it produces.
 ///
@@ -252,13 +270,28 @@ pub(crate) fn try_evaluate_population_b(
     settings: &BacktestSettings,
     device_override: Option<usize>,
 ) -> Result<Vec<[f64; 11]>> {
+    use std::sync::atomic::Ordering as AtomicOrd;
     let n_genes = long_thr.len();
+
+    // Start at the size already known to fit rather than rediscovering the
+    // limit by throwing away a full evaluation every generation.
+    let learned = learned_batch_limit().load(AtomicOrd::Relaxed);
+    if n_genes > learned && n_genes > 1 {
+        return split_and_evaluate(
+            close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
+            short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
+            gene_smc_flags, gate_threshold, smc_weights, settings, device_override,
+        );
+    }
+
     let attempt = evaluate_population_b_batch(
         close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
         short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
         gene_smc_flags, gate_threshold, smc_weights, settings, device_override,
     );
     let Err(error) = attempt else {
+        // This size fits; keep it as the starting point for the next call.
+        learned_batch_limit().fetch_max(n_genes, AtomicOrd::Relaxed);
         return attempt;
     };
     // Only a capacity exhaustion is worth retrying smaller. Anything else is a
@@ -266,13 +299,52 @@ pub(crate) fn try_evaluate_population_b(
     if !format!("{error}").contains("exceeded the session capacity") || n_genes < 2 {
         return Err(error);
     }
-    let half = n_genes / 2;
+    // Remember the ceiling so the next generation does not pay this again.
+    learned_batch_limit().fetch_min(n_genes / 2, AtomicOrd::Relaxed);
     tracing::info!(
         target: "neoethos_search::eval",
         n_genes,
-        half,
-        "population emitted more trades than the card can hold — splitting and retrying"
+        learned = learned_batch_limit().load(AtomicOrd::Relaxed),
+        "population emitted more trades than the card can hold — splitting, and          remembering the limit so later generations start there"
     );
+    return split_and_evaluate(
+        close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
+        short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
+        gene_smc_flags, gate_threshold, smc_weights, settings, device_override,
+    );
+}
+
+/// Halve the population and evaluate each side.
+///
+/// CSR arrays are sliced by gene with their term windows carried along, and the
+/// tail's offsets rebased so its first gene starts at zero — getting that wrong
+/// evaluates the wrong terms silently rather than erroring.
+#[allow(clippy::too_many_arguments)]
+fn split_and_evaluate(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    indicators: ArrayView2<'_, f32>,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f32],
+    long_thr: &[f32],
+    short_thr: &[f32],
+    month_idx: &[i64],
+    day_idx: &[i64],
+    timestamps: &[i64],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
+    stop_vol_mult: &[f64],
+    smc_data: &[SmcRow],
+    gene_smc_flags: &[SmcRow],
+    gate_threshold: f32,
+    smc_weights: &[f32; 11],
+    settings: &BacktestSettings,
+    device_override: Option<usize>,
+) -> Result<Vec<[f64; 11]>> {
+    let n_genes = long_thr.len();
+    let half = n_genes / 2;
 
     // CSR gene arrays are sliced by gene, and the term ranges follow the
     // offsets, so a split has to carry the right window of both.
