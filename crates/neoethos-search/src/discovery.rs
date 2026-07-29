@@ -4184,9 +4184,108 @@ where
         let mc_near_miss = AtomicUsize::new(0);
 
         let pairs: Vec<((usize, Gene), Vec<i8>)> = filtered.into_iter().zip(signals_map).collect();
+
+        // ── Monte-Carlo perturbations, batched ────────────────────────────
+        //
+        // The screen below used to call the evaluator once per candidate: a
+        // real AUDUSD H4 run made 7 793 separate launches of 100 perturbed
+        // genes each. Thousands of small launches waste a card however fast the
+        // kernel is — the fixed per-call cost dominates when each call carries
+        // so little work.
+        //
+        // The perturbations are seeded per (combo, candidate, run), so batching
+        // reproduces every candidate's result exactly; only the number of
+        // launches changes. Chunked by candidate so peak host memory is a
+        // function of the chunk rather than the population — cloning 7 793 x
+        // 100 genes at once would be a gigabyte-scale allocation for nothing.
+        //
+        // `None` marks a candidate whose batch failed to evaluate: a real bug,
+        // reported as such below, never silently counted as "zero profitable".
+        const MC_CANDIDATES_PER_BATCH: usize = 256;
+        let mc_profitable_runs: Vec<Option<usize>> = {
+            let mc_runs = config.mc_runs as usize;
+            let mut out: Vec<Option<usize>> = Vec::with_capacity(pairs.len());
+            for chunk in pairs.chunks(MC_CANDIDATES_PER_BATCH) {
+                let mut batch: Vec<Gene> = Vec::with_capacity(chunk.len() * mc_runs);
+                for ((candidate_idx, gene), _) in chunk {
+                    for run_idx in 0..mc_runs as u64 {
+                        use rand::Rng;
+                        use rand::SeedableRng;
+                        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
+                            combo_seed ^ ((*candidate_idx as u64) << 20) ^ run_idx,
+                        );
+                        let mut perturbed = gene.clone();
+                        perturbed.long_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
+                        perturbed.short_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
+                        for w in &mut perturbed.weights {
+                            *w *= 1.0 + rng.random_range(-0.20..=0.20);
+                        }
+                        if perturbed.sl_pips.is_finite() && perturbed.sl_pips > 0.0 {
+                            perturbed.sl_pips *= 1.0 + rng.random_range(-0.25..=0.25);
+                        }
+                        if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
+                            perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
+                        }
+                        batch.push(perturbed);
+                    }
+                }
+                // Cost/pip configuration is shared: the helper takes a gene only
+                // for the price hint, and each perturbed gene's own SL/TP is
+                // re-resolved inside `validation_genes_population`.
+                let settings = discovery_backtest_settings(
+                    config,
+                    &chunk[0].0.1,
+                    ohlcv.close.last().copied(),
+                );
+                let evaluated = {
+                    #[cfg(feature = "gpu")]
+                    let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                    crate::genetic::validation_genes_population(
+                        features,
+                        ohlcv,
+                        &batch,
+                        &eval_config_for_signals,
+                        &settings,
+                    )
+                };
+                match evaluated {
+                    Ok(metrics) if metrics.len() == batch.len() => {
+                        for candidate in 0..chunk.len() {
+                            let start = candidate * mc_runs;
+                            out.push(Some(
+                                metrics[start..start + mc_runs]
+                                    .iter()
+                                    .filter(|m| m[0] > 0.0)
+                                    .count(),
+                            ));
+                        }
+                    }
+                    Ok(metrics) => {
+                        tracing::warn!(
+                            target: "neoethos_search::discovery",
+                            expected = batch.len(),
+                            returned = metrics.len(),
+                            "Monte-Carlo batch returned the wrong number of rows — rejecting its candidates"
+                        );
+                        out.extend(std::iter::repeat_n(None, chunk.len()));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "neoethos_search::discovery",
+                            error = %error,
+                            candidates = chunk.len(),
+                            "Monte-Carlo batched eval failed — rejecting its candidates"
+                        );
+                        out.extend(std::iter::repeat_n(None, chunk.len()));
+                    }
+                }
+            }
+            out
+        };
         let screened: Vec<Option<QualityCandidate>> = pairs
             .into_par_iter()
-            .map(|((candidate_idx, gene), sig)| {
+            .enumerate()
+            .map(|(position, ((candidate_idx, gene), sig))| {
                 let trades = crate::eval::simulate_trades_core(
                     &ohlcv.close,
                     &ohlcv.high,
@@ -4236,69 +4335,9 @@ where
                 // `metrics[run][0] > 0.0` (net_profit) is the trade-pnl sum
                 // (fixed-1-lot, `risk_based_sizing == false`), semantically
                 // identical to the old `p_trades.iter().map(|t| t.pnl).sum() > 0.0`.
-                let mc_runs = config.mc_runs as usize;
-                let mut perturbed_genes: Vec<Gene> = Vec::with_capacity(mc_runs);
-                for run_idx in 0..mc_runs as u64 {
-                    use rand::Rng;
-                    use rand::SeedableRng;
-                    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
-                        combo_seed ^ ((candidate_idx as u64) << 20) ^ run_idx,
-                    );
-                    let mut perturbed = gene.clone();
-                    perturbed.long_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
-                    perturbed.short_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
-                    for w in &mut perturbed.weights {
-                        *w *= 1.0 + rng.random_range(-0.20..=0.20);
-                    }
-                    if perturbed.sl_pips.is_finite() && perturbed.sl_pips > 0.0 {
-                        perturbed.sl_pips *= 1.0 + rng.random_range(-0.25..=0.25);
-                    }
-                    if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
-                        perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
-                    }
-                    perturbed_genes.push(perturbed);
-                }
-
-                // Template settings = the SAME `discovery_backtest_settings`
-                // the serial loop fed `simulate_trades_core` (kill-zones on,
-                // gene-resolved SL/TP with 20/40 fallback). The price hint uses
-                // the BASE gene only to source the shared cost/pip config; the
-                // per-gene SL/TP is re-resolved inside `validation_genes_population`
-                // from each perturbed gene, matching the serial per-run settings.
-                // `risk_based_sizing` is forced false in the helper so sizing is
-                // fixed-1-lot — identical to `simulate_trades_core`.
-                let mc_settings =
-                    discovery_backtest_settings(config, &gene, ohlcv.close.last().copied());
-                let mc_metrics = {
-                    // Serialize the GPU launch across the candidate par_iter so
-                    // N rayon threads don't each spin up a GPU client → VRAM × N
-                    // → OOM. The CPU-bound screen work above/below still runs in
-                    // parallel; only the device launch is one-at-a-time.
-                    #[cfg(feature = "gpu")]
-                    let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                    crate::genetic::validation_genes_population(
-                        features,
-                        ohlcv,
-                        &perturbed_genes,
-                        &eval_config_for_signals,
-                        &mc_settings,
-                    )
-                };
-                let profitable_runs = match mc_metrics {
-                    Ok(metrics) => metrics.iter().filter(|m| m[0] > 0.0).count(),
-                    Err(e) => {
-                        // Fail-loud: a malformed population (empty features /
-                        // length mismatch) is a real bug, not a "0 profitable"
-                        // result. Reject the candidate but log the cause.
-                        tracing::warn!(
-                            target: "neoethos_search::discovery",
-                            error = %e,
-                            strategy_id = %gene.strategy_id,
-                            "Monte-Carlo batched eval failed — rejecting candidate"
-                        );
-                        rejected_mc_error.fetch_add(1, AtomicOrdering::Relaxed);
-                        return None;
-                    }
+                let Some(profitable_runs) = mc_profitable_runs[position] else {
+                    rejected_mc_error.fetch_add(1, AtomicOrdering::Relaxed);
+                    return None;
                 };
 
                 if (profitable_runs as u32) < config.mc_min_profitable {
