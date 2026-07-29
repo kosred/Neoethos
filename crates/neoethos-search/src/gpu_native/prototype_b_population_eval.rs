@@ -215,13 +215,96 @@ fn resident_slot() -> &'static std::sync::Mutex<Option<SendResident>> {
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Evaluate a population on Prototype B, splitting when the card cannot hold
+/// the trades it produces.
+///
+/// Event capacity is bounded by VRAM, but how many entries a population emits
+/// is not knowable before running it — a dense set of signals over 351 518 bars
+/// can exceed any budget. The engine reports that distinctly
+/// (`is_capacity_exhausted`) rather than as a generic failure, so the answer is
+/// to give it less work rather than to give up: the population is halved and
+/// each half evaluated in turn.
+///
+/// Genes are independent, so a split result equals the whole-population one.
+/// This is the never-OOM rule applied as intended — peak memory follows the
+/// hardware, and an oversized workload gets slower instead of failing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_evaluate_population_b(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    indicators: ArrayView2<'_, f32>,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f32],
+    long_thr: &[f32],
+    short_thr: &[f32],
+    month_idx: &[i64],
+    day_idx: &[i64],
+    timestamps: &[i64],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
+    stop_vol_mult: &[f64],
+    smc_data: &[SmcRow],
+    gene_smc_flags: &[SmcRow],
+    gate_threshold: f32,
+    smc_weights: &[f32; 11],
+    settings: &BacktestSettings,
+    device_override: Option<usize>,
+) -> Result<Vec<[f64; 11]>> {
+    let n_genes = long_thr.len();
+    let attempt = evaluate_population_b_batch(
+        close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
+        short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
+        gene_smc_flags, gate_threshold, smc_weights, settings, device_override,
+    );
+    let Err(error) = attempt else {
+        return attempt;
+    };
+    // Only a capacity exhaustion is worth retrying smaller. Anything else is a
+    // fault, and halving the work would just hide it behind a slower failure.
+    if !format!("{error}").contains("exceeded the session capacity") || n_genes < 2 {
+        return Err(error);
+    }
+    let half = n_genes / 2;
+    tracing::info!(
+        target: "neoethos_search::eval",
+        n_genes,
+        half,
+        "population emitted more trades than the card can hold — splitting and retrying"
+    );
+
+    // CSR gene arrays are sliced by gene, and the term ranges follow the
+    // offsets, so a split has to carry the right window of both.
+    let split_end = gene_offsets[half] as usize;
+    let mut head = try_evaluate_population_b(
+        close, high, low, indicators, &gene_offsets[..=half], &gene_indices[..split_end],
+        &gene_weights[..split_end], &long_thr[..half], &short_thr[..half], month_idx, day_idx,
+        timestamps, &sl_pips[..half], &tp_pips[..half], &stop_vol_mult[..half], smc_data,
+        &gene_smc_flags[..half], gate_threshold, smc_weights, settings, device_override,
+    )?;
+    // The tail's offsets must be rebased so its first gene starts at zero.
+    let tail_offsets: Vec<i32> = gene_offsets[half..]
+        .iter()
+        .map(|offset| offset - gene_offsets[half])
+        .collect();
+    let tail = try_evaluate_population_b(
+        close, high, low, indicators, &tail_offsets, &gene_indices[split_end..],
+        &gene_weights[split_end..], &long_thr[half..], &short_thr[half..], month_idx, day_idx,
+        timestamps, &sl_pips[half..], &tp_pips[half..], &stop_vol_mult[half..], smc_data,
+        &gene_smc_flags[half..], gate_threshold, smc_weights, settings, device_override,
+    )?;
+    head.extend(tail);
+    Ok(head)
+}
+
 /// Evaluate a population on Prototype B.
 ///
 /// Mirrors `cubecl_eval::try_evaluate_population_cuda` argument for argument so
 /// the two are interchangeable at the call site, and returns the same
 /// `[f64; 11]` rows in candidate order.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_evaluate_population_b(
+fn evaluate_population_b_batch(
     close: &[f64],
     high: &[f64],
     low: &[f64],
