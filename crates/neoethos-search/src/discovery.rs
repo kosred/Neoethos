@@ -4206,29 +4206,47 @@ where
             let mc_runs = config.mc_runs as usize;
             let mut out: Vec<Option<usize>> = Vec::with_capacity(pairs.len());
             for chunk in pairs.chunks(MC_CANDIDATES_PER_BATCH) {
-                let mut batch: Vec<Gene> = Vec::with_capacity(chunk.len() * mc_runs);
-                for ((candidate_idx, gene), _) in chunk {
-                    for run_idx in 0..mc_runs as u64 {
+                // Building the perturbed clones is CPU work — every core does
+                // it while the device is busy with the previous chunk. Only the
+                // launch itself is serialized, because there is one card.
+                //
+                // `map` over an indexed parallel iterator collects in order, so
+                // the batch stays candidate-major with runs ascending, which is
+                // what the per-candidate slicing below relies on. The RNG is
+                // seeded per (combo, candidate, run) and never shared, so
+                // parallel construction is bit-identical to the serial one.
+                let batch: Vec<Gene> = chunk
+                    .par_iter()
+                    .map(|((candidate_idx, gene), _)| {
                         use rand::Rng;
                         use rand::SeedableRng;
-                        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
-                            combo_seed ^ ((*candidate_idx as u64) << 20) ^ run_idx,
-                        );
-                        let mut perturbed = gene.clone();
-                        perturbed.long_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
-                        perturbed.short_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
-                        for w in &mut perturbed.weights {
-                            *w *= 1.0 + rng.random_range(-0.20..=0.20);
-                        }
-                        if perturbed.sl_pips.is_finite() && perturbed.sl_pips > 0.0 {
-                            perturbed.sl_pips *= 1.0 + rng.random_range(-0.25..=0.25);
-                        }
-                        if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
-                            perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
-                        }
-                        batch.push(perturbed);
-                    }
-                }
+                        (0..mc_runs as u64)
+                            .map(|run_idx| {
+                                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
+                                    combo_seed ^ ((*candidate_idx as u64) << 20) ^ run_idx,
+                                );
+                                let mut perturbed = gene.clone();
+                                perturbed.long_threshold *=
+                                    1.0 + rng.random_range(-0.15..=0.15);
+                                perturbed.short_threshold *=
+                                    1.0 + rng.random_range(-0.15..=0.15);
+                                for w in &mut perturbed.weights {
+                                    *w *= 1.0 + rng.random_range(-0.20..=0.20);
+                                }
+                                if perturbed.sl_pips.is_finite() && perturbed.sl_pips > 0.0 {
+                                    perturbed.sl_pips *= 1.0 + rng.random_range(-0.25..=0.25);
+                                }
+                                if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
+                                    perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
+                                }
+                                perturbed
+                            })
+                            .collect::<Vec<Gene>>()
+                    })
+                    .reduce(Vec::new, |mut acc, mut part| {
+                        acc.append(&mut part);
+                        acc
+                    });
                 // Cost/pip configuration is shared: the helper takes a gene only
                 // for the price hint, and each perturbed gene's own SL/TP is
                 // re-resolved inside `validation_genes_population`.
