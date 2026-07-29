@@ -136,22 +136,42 @@ where
     }
 }
 
-fn dataset_key(dataset: &PrototypeADatasetUpload, smc_rows: &[i8]) -> u64 {
+#[allow(clippy::too_many_arguments)]
+fn dataset_key(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    indicators: &ArrayView2<'_, f32>,
+    feature_count: usize,
+    months: &[i64],
+    days: &[i64],
+    timestamps: &[i64],
+    smc_data: &[SmcRow],
+    settings: &BacktestSettings,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for slice in [&dataset.close, &dataset.high, &dataset.low] {
+    for slice in [close, high, low] {
         sample_hash(slice, |v| v.to_bits(), &mut hasher);
     }
-    sample_hash(&dataset.indicators, |v| v.to_bits() as u64, &mut hasher);
-    dataset.feature_count.hash(&mut hasher);
-    for slice in [&dataset.months, &dataset.days, &dataset.timestamps] {
+    // The view is sampled through its iterator so a non-contiguous layout does
+    // not have to be flattened just to decide whether it is the same data.
+    indicators.len().hash(&mut hasher);
+    let stride = (indicators.len() / 256).max(1);
+    for (i, v) in indicators.iter().enumerate() {
+        if i % stride == 0 {
+            v.to_bits().hash(&mut hasher);
+        }
+    }
+    feature_count.hash(&mut hasher);
+    for slice in [months, days, timestamps] {
         sample_hash(slice, |v| *v as u64, &mut hasher);
     }
-    sample_hash(smc_rows, |v| *v as u64, &mut hasher);
+    sample_hash(smc_data, |row| row.iter().map(|v| *v as u64).sum(), &mut hasher);
     // Settings participate because `adaptive_base_pips` is uploaded with the
     // dataset: two runs over identical bars but different adaptive stops are
     // different datasets on the device.
-    format!("{:?}", dataset.settings).hash(&mut hasher);
+    format!("{settings:?}").hash(&mut hasher);
     hasher.finish()
 }
 
@@ -160,6 +180,16 @@ struct ResidentSession {
     key: u64,
     device: i32,
     capacity: usize,
+    /// The host-side dataset, staged once and kept.
+    ///
+    /// Building it copies every bar of close/high/low and the whole
+    /// feature-major indicator matrix — for M3 that is ~1.75 M bars against 64
+    /// features. Rebuilding that per call, while the device copy sat resident
+    /// and unchanged, was pure waste: the bars do not change between
+    /// generations, only the genes do. It stays in RAM, ready.
+    dataset: PrototypeADatasetUpload,
+    smc_rows: Vec<i8>,
+    native_settings: neoethos_gpu_contracts::device::NeoPopulationSettings,
 }
 
 /// The session holds a raw device handle, which is why it is not `Send` by
@@ -217,59 +247,29 @@ pub(crate) fn try_evaluate_population_b(
     let stop_vol_fallback = crate::eval::normalized_stop_vol_mult(stop_vol_mult, n_genes);
     let stop_vol_mult = stop_vol_fallback.as_deref().unwrap_or(stop_vol_mult);
 
-    // Indicators arrive as a `[feature][bar]` view; B wants that same layout
-    // contiguous. `as_slice` succeeds when the view is already standard layout
-    // and the copy is only paid when it is not.
+    // Identity is decided from the caller's slices, before anything is copied,
+    // so a repeat call over the same bars costs a sampled hash instead of a
+    // full rebuild of the dataset.
     let feature_count = indicators.nrows();
-    let indicators_flat: Vec<f32> = match indicators.as_slice() {
-        Some(flat) => flat.to_vec(),
-        None => indicators.iter().copied().collect(),
-    };
-
-    let dataset = PrototypeADatasetUpload {
-        close: close.to_vec(),
-        high: high.to_vec(),
-        low: low.to_vec(),
-        indicators: indicators_flat,
+    let key = dataset_key(
+        close,
+        high,
+        low,
+        &indicators,
         feature_count,
-        months: month_idx.to_vec(),
-        days: day_idx.to_vec(),
-        timestamps: timestamps.to_vec(),
-        smc_data: smc_data.to_vec(),
-        settings: SnapshotSettingsDto::from_settings(settings),
-    };
-    let genes = PrototypeAGeneUpload {
-        candidate_ids: (0..n_genes as u64).collect(),
-        offsets: gene_offsets.to_vec(),
-        indices: gene_indices.to_vec(),
-        weights: gene_weights.to_vec(),
-        long_thresholds: long_thr.to_vec(),
-        short_thresholds: short_thr.to_vec(),
-        stop_pips: sl_pips.to_vec(),
-        target_pips: tp_pips.to_vec(),
-        stop_vol_multipliers: stop_vol_mult.to_vec(),
-        smc_flags: gene_smc_flags.to_vec(),
-        smc_weights: *smc_weights,
-        gate_threshold,
-    };
-
-    let inputs = PrototypeBPopulationInputs::from_uploads(&dataset, &genes)
-        .map_err(|error| anyhow!("prototype B: {error}"))?;
-    let native_settings = population_settings_for_dataset(&dataset)
-        .map_err(|error| anyhow!("prototype B settings: {error}"))?;
-
-    let smc_rows: Vec<i8> = dataset.smc_data.iter().flatten().copied().collect();
-    let adaptive_base = dataset.settings.to_settings().adaptive_base_pips.clone();
-
+        month_idx,
+        day_idx,
+        timestamps,
+        smc_data,
+        settings,
+    );
     let device = device_override.unwrap_or(0) as i32;
     let capacity = event_capacity(device as usize, n_genes, bars, feature_count)?;
-    let key = dataset_key(&dataset, &smc_rows);
 
     // Hold the slot for the whole evaluation. That serializes device access the
-    // way the CubeCL lane's launch lock does, which is deliberate: the quality
-    // screen calls this from a rayon `par_iter`, and one session per worker
-    // thread would multiply VRAM by the thread count and reintroduce the OOM
-    // this design exists to avoid.
+    // way the CubeCL launch lock does, which is deliberate: the quality screen
+    // calls this from a rayon `par_iter`, and one session per worker thread
+    // would multiply VRAM by the thread count.
     let mut slot = resident_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -277,10 +277,33 @@ pub(crate) fn try_evaluate_population_b(
     let reusable = slot
         .as_ref()
         .is_some_and(|r| r.0.key == key && r.0.device == device && r.0.capacity >= capacity);
+
     if !reusable {
-        // Drop the old session before creating the new one so the two never
+        // Drop the old session before building the new one so the two never
         // hold device memory at the same time.
         *slot = None;
+
+        let indicators_flat: Vec<f32> = match indicators.as_slice() {
+            Some(flat) => flat.to_vec(),
+            None => indicators.iter().copied().collect(),
+        };
+        let dataset = PrototypeADatasetUpload {
+            close: close.to_vec(),
+            high: high.to_vec(),
+            low: low.to_vec(),
+            indicators: indicators_flat,
+            feature_count,
+            months: month_idx.to_vec(),
+            days: day_idx.to_vec(),
+            timestamps: timestamps.to_vec(),
+            smc_data: smc_data.to_vec(),
+            settings: SnapshotSettingsDto::from_settings(settings),
+        };
+        let native_settings = population_settings_for_dataset(&dataset)
+            .map_err(|error| anyhow!("prototype B settings: {error}"))?;
+        let smc_rows: Vec<i8> = dataset.smc_data.iter().flatten().copied().collect();
+        let adaptive_base = dataset.settings.to_settings().adaptive_base_pips.clone();
+
         let mut session = PopulationSession::create(device, capacity)
             .map_err(|error| anyhow!("prototype B session: {error}"))?;
         session
@@ -297,18 +320,43 @@ pub(crate) fn try_evaluate_population_b(
                 adaptive_base_pips: adaptive_base.as_deref(),
             })
             .map_err(|error| anyhow!("prototype B dataset upload: {error}"))?;
+
         *slot = Some(SendResident(ResidentSession {
             session,
             key,
             device,
             capacity,
+            dataset,
+            smc_rows,
+            native_settings,
         }));
     }
-    let session = &mut slot
+
+    let resident = &mut slot
         .as_mut()
         .expect("resident session was just installed")
-        .0
-        .session;
+        .0;
+    let native_settings = resident.native_settings;
+
+    // Genes and scenarios are what actually change between calls, so they are
+    // the only things rebuilt and re-uploaded.
+    let genes = PrototypeAGeneUpload {
+        candidate_ids: (0..n_genes as u64).collect(),
+        offsets: gene_offsets.to_vec(),
+        indices: gene_indices.to_vec(),
+        weights: gene_weights.to_vec(),
+        long_thresholds: long_thr.to_vec(),
+        short_thresholds: short_thr.to_vec(),
+        stop_pips: sl_pips.to_vec(),
+        target_pips: tp_pips.to_vec(),
+        stop_vol_multipliers: stop_vol_mult.to_vec(),
+        smc_flags: gene_smc_flags.to_vec(),
+        smc_weights: *smc_weights,
+        gate_threshold,
+    };
+    let inputs = PrototypeBPopulationInputs::from_uploads(&resident.dataset, &genes)
+        .map_err(|error| anyhow!("prototype B: {error}"))?;
+    let session = &mut resident.session;
 
     session
         .upload_genes(PopulationGeneView {
