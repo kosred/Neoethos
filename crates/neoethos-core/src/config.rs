@@ -1025,7 +1025,15 @@ impl Default for EvalRuntimeConfig {
             pip_value_per_lot: None,
             spread_pips: None,
             commission_per_trade: None,
-            reject_pip_fallback: false,
+            // Refuse a pip value that cannot be converted into the account
+            // currency, rather than booking a foreign-currency amount as if it
+            // were account currency. That fallback inflated every JPY-quoted
+            // result about 192-fold on a GBP account and every USD-quoted one by
+            // 27 %, and since the search ranks on profit, the inflated
+            // candidates won selection and reached live trading — where they
+            // earned what they were actually worth. Nothing in the reported
+            // numbers revealed it. Set to `false` only to reproduce an old run.
+            reject_pip_fallback: true,
             smc_gate_threshold: 0.75,
             smc_w_ob: 1.0,
             smc_w_fvg: 1.0,

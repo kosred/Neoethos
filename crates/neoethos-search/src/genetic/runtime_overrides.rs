@@ -467,7 +467,7 @@ impl GeneticSearchRuntimeOverrides {
 /// quote-currency pip value. Previously read inline inside
 /// `reject_cross_pair_fallback()` (strategy_gene.rs); now consolidated
 /// at this typed boundary so the env is hit at most once per process.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CostProfileRuntimeOverrides {
     pub symbol: Option<String>,
     pub account_currency: Option<String>,
@@ -477,6 +477,28 @@ pub struct CostProfileRuntimeOverrides {
     pub spread_pips: Option<f64>,
     pub commission_per_trade: Option<f64>,
     pub reject_pip_fallback: bool,
+}
+
+impl Default for CostProfileRuntimeOverrides {
+    /// Hand-written rather than derived for one field: `reject_pip_fallback`
+    /// defaults to `true`, so an unconfigured process refuses a pip value it
+    /// cannot express in the account currency instead of booking a foreign
+    /// amount as if it were account currency. The derived `false` matched the
+    /// old lenient behaviour, and the equality gate against
+    /// `from_settings(&Settings::default())` is what keeps the two boundaries
+    /// from drifting apart again.
+    fn default() -> Self {
+        Self {
+            symbol: None,
+            account_currency: None,
+            pip_value: None,
+            quote_to_account_rate: None,
+            pip_value_per_lot: None,
+            spread_pips: None,
+            commission_per_trade: None,
+            reject_pip_fallback: true,
+        }
+    }
 }
 
 impl CostProfileRuntimeOverrides {

@@ -457,6 +457,12 @@ impl Default for DiscoveryConfig {
 
 impl DiscoveryConfig {
     pub fn from_settings(settings: &neoethos_core::Settings) -> Self {
+        // The cost model converts a pip value into the account currency, which
+        // for a cross pair needs the bridging pair's price. This is the one
+        // place every discovery path passes through holding the full Settings,
+        // so it is where the store gets pointed at. A CLI `--root` / `--data-path`
+        // override reinstalls it later and wins.
+        crate::fx_rates::set_store_root(settings.system.data_dir.clone());
         let model_settings = &settings.models;
         let filtering = crate::genetic::FilteringConfig {
             min_trades: model_settings.prop_min_trades.max(1) as f64,

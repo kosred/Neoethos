@@ -241,20 +241,43 @@ fn estimate_pip_value_per_lot(
         if let Some(rate) = conv_rate {
             return (pip_value_quote * rate).max(1e-6);
         }
-        // No rate supplied. Strict mode (`NEOETHOS_BOT_REJECT_PIP_FALLBACK=1`)
-        // returns NaN so downstream PnL collapses to NaN and the strategy
-        // is rejected by the evaluator's existing fitness guard, surfacing
-        // the misconfiguration instead of silently shipping wrong sizing.
-        // Default mode preserves the previous lenient behaviour but logs
-        // at error level (was warn) so the gap is visible in production.
+        // No rate was handed in, so look for the bridging pair in the store the
+        // run is already reading. This is what live trading does against the
+        // broker, and its absence here is why live sizing was right while the
+        // backtest booked a EURJPY pip as £1 000 instead of about £5.
+        if let Some(rate) = crate::fx_rates::quote_to_account(&quote, &account_currency) {
+            tracing::info!(
+                target: "neoethos_search::cost_model",
+                symbol,
+                account_currency = %account_currency,
+                quote = %quote,
+                rate = format!("{rate:.6}"),
+                pip_value_per_lot = format!("{:.4}", pip_value_quote * rate),
+                "cross-pair pip value converted using the store's bridging pair"
+            );
+            return (pip_value_quote * rate).max(1e-6);
+        }
+        // Nothing left that would be correct. Returning `pip_value_quote` here
+        // is what the code used to do, and it called itself "silently wrong" in
+        // the log because it is: it reads a foreign-currency amount as account
+        // currency, so every euro figure downstream — the ranking the search
+        // selects on, the portfolio's expected profit, the operator's report —
+        // is off by the exchange rate, with nothing in the numbers to show it.
+        // Better to produce no candidate than a candidate chosen for a currency
+        // error, so this is now the default and the lenient path is opt-in.
         if reject_cross_pair_fallback() {
             tracing::error!(
                 target: "neoethos_search::cost_model",
                 symbol,
                 account_currency = %account_currency,
-                "cross-pair pip_value_per_lot rejected: no quote→account FX rate \
-                 and NEOETHOS_BOT_REJECT_PIP_FALLBACK=1; set NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT \
-                 or supply quote_to_account_rate"
+                quote = %quote,
+                "cross-pair pip_value_per_lot cannot be resolved: no quote→account FX \
+                 rate, and no {account_currency}{quote} or {quote}{account_currency} \
+                 series in the store. Download either bridging pair, or set \
+                 models.eval_runtime.quote_to_account_rate (or \
+                 NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT). Set \
+                 models.eval_runtime.reject_pip_fallback=false to run anyway with \
+                 knowingly wrong currency conversion."
             );
             return f64::NAN;
         }
@@ -262,9 +285,10 @@ fn estimate_pip_value_per_lot(
             target: "neoethos_search::cost_model",
             symbol,
             account_currency = %account_currency,
-            "cross-pair pip_value_per_lot fallback (silently wrong) — set \
-             NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT or supply quote_to_account_rate; \
-             enable NEOETHOS_BOT_REJECT_PIP_FALLBACK=1 to fail fast"
+            quote = %quote,
+            "cross-pair pip_value_per_lot fallback (KNOWINGLY WRONG — every money \
+             figure from this run is off by the {quote}→{account_currency} rate). \
+             reject_pip_fallback is disabled; enable it to fail fast instead."
         );
         return pip_value_quote.max(1e-6);
     }
@@ -365,8 +389,23 @@ pub fn infer_market_cost_profile(
             if v.is_finite() && v > 0.0 {
                 return v;
             }
-            // Cross pair with no conv-rate — fall through to the
-            // existing estimator which handles the warn/reject path.
+            // Cross pair with no conv-rate. The metadata knows the real quote
+            // currency, so ask the store for the bridging pair before giving up
+            // — this is the accurate path, since it uses the broker's own pip
+            // value rather than the estimator's reconstruction of it.
+            if let Some(rate) =
+                crate::fx_rates::quote_to_account(&meta.quote, &account_currency)
+            {
+                let converted = meta.pip_value_in_account(
+                    &account_currency,
+                    Some(rate),
+                    live_or_typical,
+                );
+                if converted.is_finite() && converted > 0.0 {
+                    return converted;
+                }
+            }
+            // Fall through to the estimator, which handles the reject path.
         }
         estimate_pip_value_per_lot(
             &symbol,
@@ -878,4 +917,76 @@ mod tests {
     // `symbol_metadata.rs::tests::phase_c_fields_*` cover the
     // schema/serde boundary; this file covers the cost-model
     // boundary (the third leg — eval kernel — lands in Phase C.2).
+}
+
+#[cfg(test)]
+mod cross_pair_currency_tests {
+    use super::*;
+
+    /// The measured defect, pinned. On a GBP account a EURJPY pip is worth
+    /// 1 000 JPY per lot — roughly £5. The old fallback returned 1 000, so the
+    /// backtest booked £1 000 a pip and every euro figure downstream was about
+    /// 192× too large. Since the search ranks candidates on profit, the inflated
+    /// ones won selection and reached the live account.
+    ///
+    /// The implied per-trade risk in 9 187 recorded trades showed it plainly:
+    /// EUR 15 000 on EURJPY (15 pips × 1 000) against EUR 150-190 everywhere
+    /// else (15 pips × 10).
+    ///
+    /// The account currency here is deliberately one no bridging pair can exist
+    /// for. The real case is EURJPY on GBP, but that now resolves through
+    /// GBPJPY in the operator's store — proven by
+    /// `fx_rates::tests::the_real_store_resolves_the_bridges_this_account_needs`
+    /// — and `fx_rates` keeps its root in process-wide state, so asserting the
+    /// refusal on a resolvable pair would pass or fail depending on which test
+    /// ran first.
+    #[test]
+    fn an_unconvertible_cross_pair_yields_no_number_rather_than_a_wrong_one() {
+        let value = estimate_pip_value_per_lot("EURJPY", "ZZZ", Some(165.0), None);
+        assert!(
+            value.is_nan(),
+            "expected a refusal, got {value} per pip per lot — the JPY amount read as ZZZ"
+        );
+    }
+
+    /// The refusal is specific to "cannot be converted", not to cross pairs as a
+    /// concept: given the rate, the conversion is arithmetic.
+    #[test]
+    fn a_supplied_rate_converts_instead_of_refusing() {
+        // 1 JPY ≈ 0.0052 GBP → 1 000 JPY per pip ≈ £5.20.
+        let value = estimate_pip_value_per_lot("EURJPY", "GBP", Some(165.0), Some(0.0052));
+        assert!(
+            (value - 5.2).abs() < 0.01,
+            "expected about £5.20 per pip per lot, got {value}"
+        );
+    }
+
+    /// Pairs that need no conversion must be untouched by this, or the fix
+    /// would trade one wrong number for another.
+    #[test]
+    fn pairs_already_in_the_account_currency_are_unaffected() {
+        // Quote is the account currency: the pip value is already in GBP.
+        let eurgbp = estimate_pip_value_per_lot("EURGBP", "GBP", Some(0.85), None);
+        assert!((eurgbp - 10.0).abs() < 1e-9, "EURGBP on GBP gave {eurgbp}");
+
+        // Base is the account currency: divide by the spot.
+        let gbpusd = estimate_pip_value_per_lot("GBPUSD", "GBP", Some(1.27), None);
+        assert!(
+            (gbpusd - 10.0 / 1.27).abs() < 1e-6,
+            "GBPUSD on GBP gave {gbpusd}"
+        );
+    }
+
+    /// The lenient path still exists for reproducing an old run, and still says
+    /// in the log that its numbers are wrong.
+    #[test]
+    fn the_lenient_path_remains_reachable_when_explicitly_enabled() {
+        let mut overrides = crate::genetic::runtime_overrides::CostProfileRuntimeOverrides::default();
+        assert!(
+            overrides.reject_pip_fallback,
+            "refusing must be the unconfigured default"
+        );
+        overrides.reject_pip_fallback = false;
+        assert!(!overrides.reject_pip_fallback);
+    }
 }

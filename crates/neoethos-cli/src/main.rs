@@ -2273,6 +2273,15 @@ fn setup_news_template() -> Result<()> {
 }
 
 fn parse_root(args: &[String], settings: Option<&neoethos_core::Settings>) -> String {
+    let root = resolve_root(args, settings);
+    // Point the FX resolver at whatever store this command decided on, so a
+    // `--root` run converts cross-pair pip values against that store rather
+    // than the one named in config.yaml.
+    neoethos_search::fx_rates::set_store_root(&root);
+    root
+}
+
+fn resolve_root(args: &[String], settings: Option<&neoethos_core::Settings>) -> String {
     // `--data-path` is the operator-facing flag added 2026-05-14 for
     // folder-browsing workflows; `--root` remains for backwards
     // compatibility with existing scripts. `--data-path` wins when
