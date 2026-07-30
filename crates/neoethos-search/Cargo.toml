@@ -85,3 +85,7 @@ gpu-b-native = ["gpu-b-adapter", "neoethos-gpu-cuda/cuda"]
 gpu-vulkan = ["gpu", "cubecl/wgpu", "neoethos-core/gpu-wgpu"]
 gpu-rocm = ["gpu", "cubecl/hip", "neoethos-core/gpu-rocm"]
 strategy-db = ["dep:duckdb"]
+
+[dev-dependencies]
+# The probe example needs a subscriber to surface the engine's own diagnostics.
+tracing-subscriber = { workspace = true }

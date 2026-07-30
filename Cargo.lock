@@ -7568,6 +7568,7 @@ dependencies = [
  "statrs",
  "tch",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
