@@ -1972,7 +1972,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
                                          "scan_offsets", "emit+first_hit", "reduce"};
     std::fprintf(stderr, "[gpu-stage-timing] population=%lld bars=%lld events=%llu\n",
                  static_cast<long long>(population), static_cast<long long>(bars),
-                 static_cast<unsigned long long>(emitted));
+                 static_cast<unsigned long long>(trade_slots));
     for (int i = 1; i < stage_mark; ++i) {
       float ms = 0.0f;
       cudaEventElapsedTime(&ms, stage_marks[i - 1], stage_marks[i]);
@@ -2003,7 +2003,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
 
   if (counters != nullptr) {
     std::memset(counters, 0, sizeof(NeoPopulationCounters));
-    counters->event_count = emitted;
+    counters->event_count = trade_slots;
     counters->kernel_submissions = session->kernel_submissions;
     counters->synchronization_events = session->synchronization_events;
     counters->dataset_upload_bytes = session->dataset_upload_bytes;
