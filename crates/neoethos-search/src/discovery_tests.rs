@@ -1916,3 +1916,53 @@ fn risky_mode_keeps_the_operators_activity_floor() {
         "expected ~one per weekday, got {required}"
     );
 }
+
+#[test]
+fn the_target_profile_separates_win_rate_from_payoff() {
+    use super::TargetProfile;
+    use crate::quality::empty_metrics;
+
+    // The operator's stated target: 57-65 % of trades win, each winner worth
+    // about 2.2 losers.
+    let profile = TargetProfile {
+        min_win_rate: 0.57,
+        min_payoff_ratio: 2.2,
+        max_in_market: 0.35,
+    };
+
+    let mut wanted = empty_metrics("wanted");
+    wanted.win_rate = 0.60;
+    wanted.payoff_ratio = 2.21;
+    wanted.in_market_pct = 0.20;
+    assert!(profile.accepts(&wanted));
+
+    // A trend follower: excellent payoff, far too few winners. A perfectly good
+    // system — just not this one, which is the whole reason the two are stated
+    // separately instead of through profit factor.
+    let mut trend = wanted.clone();
+    trend.win_rate = 0.32;
+    trend.payoff_ratio = 5.0;
+    assert!(!profile.accepts(&trend));
+
+    // A scalper: wins constantly, gives it all back on the losers.
+    let mut scalper = wanted.clone();
+    scalper.win_rate = 0.82;
+    scalper.payoff_ratio = 0.4;
+    assert!(!profile.accepts(&scalper));
+
+    // In the market 78 % of the time — the figure a real GPU run reported —
+    // is not selecting entries, whatever the other numbers say.
+    let mut always_in = wanted.clone();
+    always_in.in_market_pct = 0.78;
+    assert!(!profile.accepts(&always_in));
+
+    // Unmeasurable exposure must not be read as "never in the market", or the
+    // candidates with no exit times sail through the one gate meant for them.
+    let mut unknown_exposure = wanted.clone();
+    unknown_exposure.in_market_pct = 0.0;
+    assert!(profile.accepts(&unknown_exposure));
+
+    // And an empty profile is the default: no preference, no rejection.
+    assert!(TargetProfile::default().accepts(&trend));
+    assert!(TargetProfile::default().accepts(&scalper));
+}

@@ -235,6 +235,7 @@ pub struct DiscoveryConfig {
     pub max_hours: f64,
     pub corr_threshold: f64,
     pub min_trades_per_day: f64,
+    pub target_profile: TargetProfile,
     pub walkforward_splits: usize,
     pub embargo_minutes: usize,
     pub enable_cpcv: bool,
@@ -397,6 +398,7 @@ impl Default for DiscoveryConfig {
             max_hours: 0.0,
             corr_threshold: 0.85,
             min_trades_per_day: 0.2,
+            target_profile: TargetProfile::default(),
             walkforward_splits: 20,
             embargo_minutes: 120,
             enable_cpcv: true,
@@ -542,6 +544,11 @@ impl DiscoveryConfig {
             // (the previous hardcoded value) when the config key is absent.
             corr_threshold: model_settings.prop_search_corr_threshold.clamp(0.0, 1.0),
             min_trades_per_day: model_settings.prop_search_val_min_trades_per_day.max(0.2),
+            target_profile: TargetProfile {
+                min_win_rate: model_settings.prop_search_min_win_rate.clamp(0.0, 1.0),
+                min_payoff_ratio: model_settings.prop_search_min_payoff_ratio.max(0.0),
+                max_in_market: model_settings.prop_search_max_in_market.max(0.0),
+            },
             walkforward_splits: model_settings.walkforward_splits.max(2),
             embargo_minutes: model_settings.embargo_minutes,
             enable_cpcv: model_settings.enable_cpcv,
@@ -1538,6 +1545,55 @@ fn min_trades_per_month_scale_for_tf(tf: &str) -> f64 {
 /// This is not a threshold to tune alongside `max_dd`; it is the boundary of
 /// what the numbers can mean, so it is checked separately and unconditionally.
 /// Anything at or beyond total loss is rejected whatever else it scores.
+/// The shape of strategy the operator is willing to trade.
+///
+/// Separate from the quality floors because it is a *preference*, not a
+/// correctness bound: a 40 %-win-rate trend follower is a perfectly good system,
+/// it is just not the one being looked for. Every field `0.0` means "no
+/// preference", which is the default, so a run says nothing about shape unless
+/// the operator asked it to.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TargetProfile {
+    /// Lowest acceptable win rate, as a fraction.
+    pub min_win_rate: f64,
+    /// Lowest acceptable average-win over average-loss.
+    ///
+    /// Stated separately from the win rate because `profit_factor` folds the two
+    /// together: 30 % of trades at 5:1 and 70 % at 0.6:1 both give about 2.1, and
+    /// they are completely different systems to hold through a losing run.
+    pub min_payoff_ratio: f64,
+    /// Most of the span a candidate may spend holding a position.
+    ///
+    /// A strategy in the market almost always is not selecting entries, and its
+    /// win rate converges on the market's base rate however the entry rule is
+    /// written.
+    pub max_in_market: f64,
+}
+
+impl TargetProfile {
+    /// Whether `metrics` has the shape asked for. Vacuously true when nothing
+    /// was asked, which is the default.
+    pub fn accepts(&self, metrics: &StrategyMetrics) -> bool {
+        if self.min_win_rate > 0.0 && metrics.win_rate < self.min_win_rate {
+            return false;
+        }
+        if self.min_payoff_ratio > 0.0 && metrics.payoff_ratio < self.min_payoff_ratio {
+            return false;
+        }
+        // Exposure rejects only when it was measurable. A candidate whose trades
+        // carry no exit times reports 0.0, and reading that as "never in the
+        // market" would admit exactly the ones this is meant to catch.
+        if self.max_in_market > 0.0
+            && metrics.in_market_pct > 0.0
+            && metrics.in_market_pct > self.max_in_market
+        {
+            return false;
+        }
+        true
+    }
+}
+
+
 fn survived_the_backtest(metrics: &StrategyMetrics) -> bool {
     // `max_drawdown_pct` is a fraction despite the name — `(peak - equity) / peak`
     // in quality.rs — so total loss is 1.0, and the 403.1 % in that log line is
@@ -4423,9 +4479,13 @@ where
                 );
                 let metrics =
                     analyzer.analyze_strategy(&gene.strategy_id, &trades, initial_balance);
-                let strict_quality = passes_strict_quality(&metrics, &config.filtering);
+                let profile_ok = config.target_profile.accepts(&metrics);
+                let strict_quality =
+                    profile_ok && passes_strict_quality(&metrics, &config.filtering);
                 let opportunistic_quality =
-                    !strict_quality && passes_opportunistic_quality(&metrics, &config.filtering);
+                    profile_ok
+                        && !strict_quality
+                        && passes_opportunistic_quality(&metrics, &config.filtering);
 
                 if !(strict_quality || opportunistic_quality) {
                     rejected_base_quality.fetch_add(1, AtomicOrdering::Relaxed);

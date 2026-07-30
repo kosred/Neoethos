@@ -548,6 +548,23 @@ pub struct ModelsConfig {
     pub prop_search_val_min_positive_months: usize,
     pub prop_search_val_min_trades_per_month: usize,
     pub prop_search_val_min_trades_per_day: f64,
+    /// Target profile: the lowest win rate a candidate may have, as a fraction.
+    ///
+    /// Stated separately from `prop_search_min_payoff_ratio` because
+    /// `profit_factor` folds the two together — 30 % of trades at 5:1 and 70 %
+    /// at 0.6:1 both give about 2.1, and they are completely different systems
+    /// to hold. `0.0` disables the gate.
+    pub prop_search_min_win_rate: f64,
+    /// Target profile: the lowest average-win over average-loss a candidate may
+    /// have. `0.0` disables the gate.
+    pub prop_search_min_payoff_ratio: f64,
+    /// Target profile: the most of the evaluated span a candidate may spend
+    /// holding a position, as a fraction.
+    ///
+    /// A strategy in the market almost always is not selecting entries, and its
+    /// win rate converges on the market's base rate however the entry rule is
+    /// written. `0.0` disables the gate.
+    pub prop_search_max_in_market: f64,
     pub prop_search_val_min_monthly_profit_pct: f64,
     pub prop_search_val_log_trades: bool,
     pub prop_search_val_trade_log_max: usize,
@@ -1389,6 +1406,11 @@ impl Default for ModelsConfig {
             prop_search_val_min_positive_months: 0,
             prop_search_val_min_trades_per_month: 0,
             prop_search_val_min_trades_per_day: 0.0,
+            // Off by default: these express one operator's target, not a
+            // universal truth about what a good strategy looks like.
+            prop_search_min_win_rate: 0.0,
+            prop_search_min_payoff_ratio: 0.0,
+            prop_search_max_in_market: 0.0,
             prop_search_val_min_monthly_profit_pct: 0.0,
             prop_search_val_log_trades: false,
             prop_search_val_trade_log_max: 20,

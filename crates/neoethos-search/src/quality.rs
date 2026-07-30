@@ -136,6 +136,20 @@ pub struct StrategyMetrics {
     pub total_return_pct: f64,
     pub avg_win_pct: f64,
     pub avg_loss_pct: f64,
+    /// Average win over average loss — the "2.2 to 1" half of a target profile,
+    /// which `profit_factor` cannot express because it folds win rate and payoff
+    /// into one number: 30 % of trades at 5:1 and 70 % at 0.6:1 both give 2.1.
+    /// Separating them is what makes "57-65 % at 2.2:1" a thing the search can
+    /// be pointed at. `0.0` when nothing has lost yet — undefined, not infinite.
+    pub payoff_ratio: f64,
+    /// Share of the evaluated span spent holding a position.
+    ///
+    /// A strategy in the market almost always is not selecting entries, it is
+    /// participating, and its win rate converges on the base rate of the market
+    /// no matter what the entry rule says. Measured because a GPU run showed
+    /// candidates emitting a position event on 78 % of all bars — the same
+    /// number, read as a strategy property rather than a memory problem.
+    pub in_market_pct: f64,
     pub largest_win_pct: f64,
     pub largest_loss_pct: f64,
     pub max_drawdown_pct: f64,
@@ -535,6 +549,12 @@ impl StrategyQualityAnalyzer {
             total_return_pct,
             avg_win_pct,
             avg_loss_pct,
+            payoff_ratio: if avg_loss_mag > 1e-12 {
+                avg_win_pct / avg_loss_mag
+            } else {
+                0.0
+            },
+            in_market_pct: time_in_market(trades),
             largest_win_pct: returns.iter().cloned().fold(0.0, f64::max),
             largest_loss_pct: returns.iter().cloned().fold(0.0, f64::min),
             max_drawdown_pct: max_dd,
@@ -741,6 +761,35 @@ fn longest_streak(pnls: &[f64], win: bool) -> usize {
     max_streak
 }
 
+/// Share of the evaluated span spent holding a position.
+///
+/// Summed holding time over the span from the first entry to the last exit.
+/// Overlapping positions are counted once each, so a strategy running several
+/// at a time can exceed 1.0 — that is information, not an error: it is more
+/// exposed than the timeline, and clamping would hide exactly the case worth
+/// seeing.
+///
+/// `0.0` when the trades carry no usable times, so a missing timestamp reads as
+/// "unknown" rather than "never in the market".
+fn time_in_market(trades: &[Trade]) -> f64 {
+    let spans: Vec<(i64, i64)> = trades
+        .iter()
+        .filter_map(|t| t.exit_time.map(|exit| (t.entry_time, exit)))
+        .filter(|(entry, exit)| exit > entry)
+        .collect();
+    if spans.is_empty() {
+        return 0.0;
+    }
+    let first = spans.iter().map(|(entry, _)| *entry).min().unwrap_or(0);
+    let last = spans.iter().map(|(_, exit)| *exit).max().unwrap_or(0);
+    let total = (last - first) as f64;
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let held: f64 = spans.iter().map(|(entry, exit)| (exit - entry) as f64).sum();
+    held / total
+}
+
 fn calculate_kelly(win_rate: f64, avg_win: f64, avg_loss: f64) -> f64 {
     if avg_loss < 1e-6 || win_rate <= 0.0 || win_rate >= 1.0 {
         return 0.0;
@@ -908,6 +957,8 @@ pub(crate) fn empty_metrics(strategy_id: &str) -> StrategyMetrics {
         avg_mfe: 0.0,
         avg_mae: 0.0,
         avg_r_multiple: 0.0,
+        payoff_ratio: 0.0,
+        in_market_pct: 0.0,
         mfe_capture_ratio: 0.0,
     }
 }
