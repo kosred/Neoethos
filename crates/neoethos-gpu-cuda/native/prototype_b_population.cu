@@ -1992,7 +1992,10 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
     return NEO_POPULATION_STATUS_LAUNCH_FAILED;
   }
 
-  session->emitted_events = emitted;
+  // No events are emitted any more. The diagnostic keeps its meaning — how much
+  // work the population generated — by reporting the trade slots it could use,
+  // rather than a count of candidate entries that no longer exist.
+  session->emitted_events = trade_slots;
   session->pending_event_id = session->next_event_id;
   session->next_event_id += 1ull;
   session->metrics_ready = false;
