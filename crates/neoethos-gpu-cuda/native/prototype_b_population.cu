@@ -1809,7 +1809,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
     const unsigned int warps_per_block = 8u;
     const unsigned int block_threads = warps_per_block * 32u;
     const unsigned long long events_per_block =
-        settings.trailing_enabled != 0u ? block_threads : warps_per_block;
+        settings->trailing_enabled != 0u ? block_threads : warps_per_block;
     const unsigned long long blocks = (emitted + events_per_block - 1ull) / events_per_block;
     population_first_hit_kernel<<<static_cast<unsigned int>(blocks), block_threads, 0,
                                   session->stream>>>(dataset, *settings, session->events,
