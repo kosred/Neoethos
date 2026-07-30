@@ -407,6 +407,7 @@ pub fn router(state: AppApiState) -> Router {
         // (myfxbook-style). Reads the JSONL store under <data_dir>/journal/.
         .route("/journal/trades", get(journal::trades))
         .route("/journal/stats", get(journal::stats))
+        .route("/journal/analytics", get(journal::analytics))
         .route("/diagnostics/report", post(diagnostics::report))
         // ── Trade-management confirmation flow (#136) ──────────
         .route("/actions/pending", get(pending_actions::list))
