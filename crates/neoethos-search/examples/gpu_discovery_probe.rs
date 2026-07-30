@@ -121,5 +121,62 @@ fn main() -> Result<()> {
          the `event budget usage` lines: candidate-bars is n_genes x bars there, \
          over the interval between consecutive population evaluations."
     );
+    report_profile_distribution(&result);
     Ok(())
+}
+
+/// What shape of strategy the search actually produced.
+///
+/// The operator's target is 57-65 % of trades winning at about 2.2:1. Gating on
+/// that is one line; knowing whether the search can *reach* it is the question,
+/// and a gate that rejects everything answers it only by silence. So the
+/// distribution is printed with no gate applied — quantiles rather than a mean,
+/// because a handful of extreme candidates would otherwise decide the answer.
+fn report_profile_distribution(result: &neoethos_search::DiscoveryResult) {
+    let metrics = &result.quality_metrics;
+    if metrics.is_empty() {
+        tracing::info!(
+            target: "gpu_discovery_probe",
+            "no candidates were scored, so there is no distribution to report"
+        );
+        return;
+    }
+    let quantiles = |mut values: Vec<f64>| -> (f64, f64, f64, f64) {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let at = |q: f64| values[((values.len() as f64 * q) as usize).min(values.len() - 1)];
+        (at(0.10), at(0.50), at(0.90), at(0.99))
+    };
+    let (wr10, wr50, wr90, wr99) = quantiles(metrics.iter().map(|m| m.win_rate).collect());
+    let (pr10, pr50, pr90, pr99) = quantiles(metrics.iter().map(|m| m.payoff_ratio).collect());
+    let (im10, im50, im90, im99) = quantiles(metrics.iter().map(|m| m.in_market_pct).collect());
+
+    tracing::info!(
+        target: "gpu_discovery_probe",
+        candidates = metrics.len(),
+        "PROFILE DISTRIBUTION — what the search actually produces"
+    );
+    tracing::info!(target: "gpu_discovery_probe",
+        "  win rate      p10 {:.0}%  p50 {:.0}%  p90 {:.0}%  p99 {:.0}%",
+        wr10 * 100.0, wr50 * 100.0, wr90 * 100.0, wr99 * 100.0);
+    tracing::info!(target: "gpu_discovery_probe",
+        "  payoff        p10 {pr10:.2}  p50 {pr50:.2}  p90 {pr90:.2}  p99 {pr99:.2}");
+    tracing::info!(target: "gpu_discovery_probe",
+        "  in market     p10 {:.0}%  p50 {:.0}%  p90 {:.0}%  p99 {:.0}%",
+        im10 * 100.0, im50 * 100.0, im90 * 100.0, im99 * 100.0);
+
+    // The joint condition is the real question: plenty of candidates clear each
+    // bar separately while none clears both, and only the pair is the target.
+    let wins_enough = metrics.iter().filter(|m| m.win_rate >= 0.57).count();
+    let pays_enough = metrics.iter().filter(|m| m.payoff_ratio >= 2.2).count();
+    let both = metrics
+        .iter()
+        .filter(|m| m.win_rate >= 0.57 && m.payoff_ratio >= 2.2)
+        .count();
+    let selective = metrics
+        .iter()
+        .filter(|m| m.win_rate >= 0.57 && m.payoff_ratio >= 2.2 && m.in_market_pct <= 0.35)
+        .count();
+    tracing::info!(target: "gpu_discovery_probe",
+        "  meeting the target: win>=57% {wins_enough} | payoff>=2.2 {pays_enough} |          BOTH {both} | both + under 35% exposure {selective}  (of {} scored)",
+        metrics.len());
 }
