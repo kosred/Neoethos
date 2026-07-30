@@ -1882,3 +1882,37 @@ fn a_wiped_out_account_is_rejected_however_well_it_scores() {
     ruined.max_drawdown_pct = 0.438; // the 43.8 % seen on a real survivor
     assert!(super::survived_the_backtest(&ruined));
 }
+
+#[test]
+fn risky_mode_keeps_the_operators_activity_floor() {
+    // This used to be pinned to 0.001 for risky mode, so
+    // `models.prop_search_val_min_trades_per_day` was set, resolved, passed in —
+    // and discarded — in the one mode actually used. A strategy trading twice a
+    // decade cannot compound a small balance to a large one, so the floor has to
+    // reach the search.
+    let mut config = DiscoveryConfig::default();
+    config.min_trades_per_day = 1.0;
+    config.mode = DiscoveryMode::Risky;
+    let risky = config.apply_mode_overrides();
+    assert!(
+        (risky.min_trades_per_day - 1.0).abs() < 1e-9,
+        "risky rewrote the activity floor to {}",
+        risky.min_trades_per_day
+    );
+
+    // The quality floors around it are still deliberately loosened — this test
+    // must not be read as risky having become strict.
+    assert!(risky.filtering.min_profit_factor <= 0.0);
+    assert!(risky.filtering.min_win_rate <= 0.0);
+
+    // One trade a day over a year of weekdays is roughly a year of weekdays'
+    // worth of in-market bars, not one trade in total.
+    let year_of_weekdays: Vec<i64> = (0..365)
+        .map(|d| (1_700_000_000_i64 + d * 86_400) * 1000)
+        .collect();
+    let required = super::min_trades_required(&year_of_weekdays, 1.0, year_of_weekdays.len());
+    assert!(
+        required > 200 && required < 366,
+        "expected ~one per weekday, got {required}"
+    );
+}

@@ -735,7 +735,25 @@ impl DiscoveryConfig {
             self.filtering.min_profit_factor = 0.0;
             self.filtering.anomaly_guard = false;
             self.cpcv_min_phi = 0.0;
-            self.min_trades_per_day = 0.001;
+            // Activity is NOT a quality floor, so it is not loosened with the
+            // others. Compounding a small balance to a large one needs a certain
+            // number of winning trades — around 25 at 1.3× each — and a strategy
+            // that trades twice a decade cannot deliver them however good each
+            // trade is. This used to be pinned to 0.001 here, which silently
+            // discarded `models.prop_search_val_min_trades_per_day` in the one
+            // mode the operator actually runs: the knob existed, was set, and did
+            // nothing. The permissive value now applies only when the operator
+            // nothing. The value the operator set now survives into risky mode;
+            // its upstream `.max(0.2)` already keeps a never-trading gene out, so
+            // no local floor is needed here.
+            //
+            // Logged unconditionally, because an activity floor that is silently
+            // rewritten is exactly the class of bug this line used to be.
+            tracing::info!(
+                target: "neoethos_search::discovery",
+                min_trades_per_day = format!("{:.3}", self.min_trades_per_day),
+                "risky mode: keeping the operator's activity floor"
+            );
             // No TF-scaling of trade-frequency floors and NO prop_firm_gate:
             // Risky is judged purely on growth, not challenge-passing.
         }
@@ -5394,9 +5412,20 @@ pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult
     // Flags likely-overfit candidates (in-sample Sharpe > 3.0) at a glance — the
     // operator's "Sharpe 3 = wrong / overfit" rule.
     if !result.quality_metrics.is_empty() {
+        // Which of these rows actually made it out. `quality_metrics` is the
+        // full screened-candidate record — a superset of the portfolio — so
+        // without this the question "what do the ones that survived earn?"
+        // cannot be answered from the log at all: the exported rows and the
+        // rejected ones are printed identically.
+        let exported: std::collections::HashSet<&str> = result
+            .portfolio
+            .iter()
+            .map(|gene| gene.strategy_id.as_str())
+            .collect();
         tracing::info!(
             target: "neoethos_search::discovery",
             count = result.quality_metrics.len(),
+            exported = exported.len(),
             "CANDIDATE METRICS — id | trades(/mo,/day) | hold | WR | PF | Sharpe | maxDD | verdict"
         );
         for q in &result.quality_metrics {
@@ -5405,9 +5434,15 @@ pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult
             } else {
                 ""
             };
+            let export_tag = if exported.contains(q.strategy_id.as_str()) {
+                "[EXPORTED] "
+            } else {
+                ""
+            };
             tracing::info!(
                 target: "neoethos_search::discovery",
-                "  {} | {} trades ({:.1}/mo, {:.2}/day) | {:.1}h hold | WR {:.0}% | PF {:.2} | Sharpe {:.2}{} | maxDD {:.1}% | {}",
+                "  {}{} | {} trades ({:.1}/mo, {:.2}/day) | {:.1}h hold | WR {:.0}% | PF {:.2} | Sharpe {:.2}{} | maxDD {:.1}% | {}",
+                export_tag,
                 q.strategy_id,
                 q.total_trades,
                 q.trades_per_month,
@@ -5451,8 +5486,111 @@ pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult
                 q.mfe_capture_ratio * 100.0,
             );
         }
+        log_exported_money_summary(result, &exported);
     }
     write_json_atomic(path, &result.quality_metrics)
+}
+
+/// What the strategies that survived validation actually earn.
+///
+/// The per-candidate rows answer this one strategy at a time, across a set that
+/// is mostly rejects — so the question needed reading dozens of lines while
+/// knowing which ids were exported. This answers it directly, over the exported
+/// subset only.
+///
+/// The figures are deliberately NOT summed into a single euro total. Each
+/// strategy is analysed alone on the full starting balance, so adding thirty
+/// net-profit figures would describe thirty separate accounts rather than one
+/// portfolio, overstating the result by roughly the portfolio size. Returns are
+/// therefore reported as a distribution, and only trade frequency is aggregated,
+/// because the strategies really do trade in parallel on one account.
+fn log_exported_money_summary(
+    result: &DiscoveryResult,
+    exported: &std::collections::HashSet<&str>,
+) {
+    let survivors: Vec<&StrategyMetrics> = result
+        .quality_metrics
+        .iter()
+        .filter(|q| exported.contains(q.strategy_id.as_str()))
+        .collect();
+    if survivors.is_empty() {
+        // An empty portfolio is already reported by the funnel, so this is not
+        // worth a warning — but saying it beats printing a table of zeros that
+        // reads like a measurement.
+        tracing::info!(
+            target: "neoethos_search::discovery",
+            "EXPORTED MONEY VIEW — nothing was exported, so there is nothing to earn"
+        );
+        return;
+    }
+
+    let mut returns_pct: Vec<f64> = survivors
+        .iter()
+        .map(|q| q.total_return_pct * 100.0)
+        .collect();
+    returns_pct.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_return = returns_pct[returns_pct.len() / 2];
+    let profitable = returns_pct.iter().filter(|r| **r > 0.0).count();
+    let n = survivors.len() as f64;
+    let mean = |f: &dyn Fn(&StrategyMetrics) -> f64| -> f64 {
+        survivors.iter().map(|q| f(q)).sum::<f64>() / n
+    };
+
+    // Additive across strategies, unlike the euro figures: they hold positions
+    // at the same time on the one account.
+    let trades_per_day: f64 = survivors.iter().map(|q| q.trades_per_month / 21.0).sum();
+    let worst_dd = survivors
+        .iter()
+        .map(|q| q.max_drawdown_pct)
+        .fold(0.0_f64, f64::max);
+    let months = mean(&|q| q.period_days) / 30.44;
+
+    tracing::info!(
+        target: "neoethos_search::discovery",
+        "EXPORTED MONEY VIEW — {} strategies survived validation, {} profitable, over {:.1} months",
+        survivors.len(),
+        profitable,
+        months,
+    );
+    tracing::info!(
+        target: "neoethos_search::discovery",
+        "  per strategy on EUR {:.0} alone: return {:+.1}% worst / {:+.1}% median / {:+.1}% best \
+         (median net EUR {:+.0}) — NOT additive, one account splits capital across all {}",
+        mean(&|q| q.initial_capital),
+        returns_pct[0],
+        median_return,
+        returns_pct[returns_pct.len() - 1],
+        mean(&|q| q.net_profit),
+        survivors.len(),
+    );
+    tracing::info!(
+        target: "neoethos_search::discovery",
+        "  portfolio activity: {:.2} trades/day combined | mean hold {:.1}h | worst maxDD {:.1}%",
+        trades_per_day,
+        mean(&|q| q.avg_trade_duration_hours),
+        worst_dd * 100.0,
+    );
+    // The "money that disappears": the trade reached this much profit and gave
+    // most of it back. Averaged over survivors it says whether the exits, not
+    // the entries, are where the money is being left behind.
+    tracing::info!(
+        target: "neoethos_search::discovery",
+        "  exit quality: mean MFE EUR {:.0} per trade, {:.0}% captured | mean R {:+.2}",
+        mean(&|q| q.avg_mfe),
+        mean(&|q| q.mfe_capture_ratio) * 100.0,
+        mean(&|q| q.avg_r_multiple),
+    );
+    // One trade a day is the operator's stated floor for risky mode: below it
+    // the account cannot compound often enough to reach the target, however
+    // good each individual trade is.
+    if trades_per_day < 1.0 {
+        tracing::warn!(
+            target: "neoethos_search::discovery",
+            trades_per_day = format!("{trades_per_day:.2}"),
+            "the exported portfolio trades less than once a day — too few \
+             compounding events for the risky-mode target"
+        );
+    }
 }
 
 /// 2026-05-26 operator directive (dual-mode product): save the 16-stage
