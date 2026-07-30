@@ -160,6 +160,9 @@ struct NeoPopulationOutcome {
   std::int32_t pad;
   double mfe;
   double mae;
+  // Price the position actually closed at. Rebuilding it from the exit reason
+  // works only while the levels are fixed at entry; a trailing stop moves.
+  double exit_price;
   double pnl;
   double r_multiple;
 };

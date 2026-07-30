@@ -575,6 +575,16 @@ __global__ void population_first_hit_kernel(DeviceDataset dataset,
     outcome.pad = 0;
     outcome.mfe = best_fav;
     outcome.mae = best_adv;
+    // Reported rather than left for the reducer to rebuild. With fixed levels
+    // the two agree; with a trailing stop only the kernel knows where the stop
+    // had ratcheted to, so the field has to exist for either path to be right.
+    outcome.exit_price =
+        (best_bar == INT_MAX)
+            ? 0.0
+            : ((best_reason == kExitStop)
+                   ? event.stop_price
+                   : ((best_reason == kExitTarget) ? event.target_price
+                                                   : dataset.close[best_bar]));
     // P&L is settled by the reducer, which owns position sizing and carry.
     outcome.pnl = 0.0;
     outcome.r_multiple = 0.0;
@@ -831,22 +841,33 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
         }
 
         if (position_outcome.exit_bar == bar && position_outcome.exit_reason != kExitNone) {
-          double exit_price = 0.0;
-          bool realizable = true;
-          switch (position_outcome.exit_reason) {
-            case kExitStop:
-              exit_price = position_event.stop_price;
-              break;
-            case kExitTarget:
-              exit_price = position_event.target_price;
-              break;
-            case kExitMaxHold:
-            case kExitGap:
-              exit_price = dataset.close[bar];
-              break;
-            default:
-              realizable = false;
-              break;
+          // The kernel reports where the position actually closed. A trailing
+          // stop moves, so rebuilding this from `position_event.stop_price`
+          // would price every trailed exit at the original stop and understate
+          // the win. Zero means "not reported" — outcomes from before the field
+          // existed — and those fall back to the levels below.
+          double exit_price = position_outcome.exit_price;
+          // `realizable` still comes from the reason: a reported price says
+          // where the position closed, not whether it closed at all.
+          bool realizable = position_outcome.exit_reason == kExitStop ||
+                            position_outcome.exit_reason == kExitTarget ||
+                            position_outcome.exit_reason == kExitMaxHold ||
+                            position_outcome.exit_reason == kExitGap;
+          if (realizable && exit_price <= 0.0) {
+            // Not reported — rebuild from the levels, which is exact while they
+            // are fixed at entry and is what every outcome written before this
+            // field existed relies on.
+            switch (position_outcome.exit_reason) {
+              case kExitStop:
+                exit_price = position_event.stop_price;
+                break;
+              case kExitTarget:
+                exit_price = position_event.target_price;
+                break;
+              default:
+                exit_price = dataset.close[bar];
+                break;
+            }
           }
           if (realizable) {
             double price_pnl = 0.0;

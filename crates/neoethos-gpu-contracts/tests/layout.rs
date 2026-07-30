@@ -89,7 +89,7 @@ fn population_event_has_stable_c_layout() {
 
 #[test]
 fn population_outcome_has_stable_c_layout() {
-    assert_eq!(size_of::<NeoPopulationOutcome>(), 64);
+    assert_eq!(size_of::<NeoPopulationOutcome>(), 72);
     assert_eq!(align_of::<NeoPopulationOutcome>(), 8);
     assert_eq!(offset_of!(NeoPopulationOutcome, candidate_id), 0);
     assert_eq!(offset_of!(NeoPopulationOutcome, scenario_id), 8);
@@ -97,8 +97,9 @@ fn population_outcome_has_stable_c_layout() {
     assert_eq!(offset_of!(NeoPopulationOutcome, entry_bar), 24);
     assert_eq!(offset_of!(NeoPopulationOutcome, mfe), 32);
     assert_eq!(offset_of!(NeoPopulationOutcome, mae), 40);
-    assert_eq!(offset_of!(NeoPopulationOutcome, pnl), 48);
-    assert_eq!(offset_of!(NeoPopulationOutcome, r_multiple), 56);
+    assert_eq!(offset_of!(NeoPopulationOutcome, exit_price), 48);
+    assert_eq!(offset_of!(NeoPopulationOutcome, pnl), 56);
+    assert_eq!(offset_of!(NeoPopulationOutcome, r_multiple), 64);
     assert_eq!(offset_of!(NeoPopulationOutcome, exit_reason), 20);
 }
 

@@ -243,6 +243,18 @@ pub mod device {
         pub mfe: f64,
         /// Max adverse excursion, same convention, reported positive.
         pub mae: f64,
+        /// Price the position actually closed at.
+        ///
+        /// The reducer used to rebuild this from the exit reason —
+        /// `event.stop_price` for a stop, `event.target_price` for a target.
+        /// That works only while the levels are fixed at entry. A trailing stop
+        /// moves, so the closing price is whatever the trail had ratcheted to,
+        /// and rebuilding it from the original stop would understate every
+        /// trailed win. The kernel that knows the level now reports it.
+        ///
+        /// `0.0` when there was no exit, which the `exit_bar < 0` case already
+        /// signals.
+        pub exit_price: f64,
         /// Realised P&L in account currency, carry and conversion applied.
         pub pnl: f64,
         /// `pnl` over the trade's initial risk.
@@ -260,6 +272,7 @@ pub mod device {
                 _pad: 0,
                 mfe: 0.0,
                 mae: 0.0,
+                exit_price: 0.0,
                 pnl: 0.0,
                 r_multiple: 0.0,
             }
@@ -327,7 +340,7 @@ pub mod device {
         assert!(offset_of!(NeoPopulationEvent, direction) == 24);
         assert!(offset_of!(NeoPopulationEvent, stop_price) == 32);
 
-        assert!(size_of::<NeoPopulationOutcome>() == 64);
+        assert!(size_of::<NeoPopulationOutcome>() == 72);
         assert!(align_of::<NeoPopulationOutcome>() == 8);
         assert!(offset_of!(NeoPopulationOutcome, exit_bar) == 16);
 

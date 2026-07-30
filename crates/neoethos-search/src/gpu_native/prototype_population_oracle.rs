@@ -460,6 +460,7 @@ fn resolve_population_outcomes_unchecked(
             _pad: 0,
             mfe: 0.0,
             mae: 0.0,
+            exit_price: 0.0,
             pnl: 0.0,
             r_multiple: 0.0,
         })
