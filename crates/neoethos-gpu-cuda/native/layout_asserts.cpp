@@ -24,7 +24,9 @@ static_assert(alignof(NeoFirstHitEvent) == 4);
 static_assert(offsetof(NeoFirstHitEvent, stop_price) == 16);
 static_assert(sizeof(NeoFirstHitResult) == 8);
 
-static_assert(sizeof(NeoPopulationSettings) == 128);
+static_assert(sizeof(NeoPopulationSettings) == 160);
+static_assert(offsetof(NeoPopulationSettings, trailing_enabled) == 128);
+static_assert(offsetof(NeoPopulationSettings, trailing_min_lock_pips) == 152);
 static_assert(alignof(NeoPopulationSettings) == 8);
 static_assert(offsetof(NeoPopulationSettings, gap_threshold_ms) == 24);
 static_assert(offsetof(NeoPopulationSettings, initial_equity) == 32);

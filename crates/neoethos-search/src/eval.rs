@@ -4325,3 +4325,106 @@ mod gpu_cpu_parity_tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "gpu-b-adapter"))]
+mod trailing_parity_tests {
+    use super::*;
+
+    /// The case that had no test at all.
+    ///
+    /// Every parity fixture ran with `trailing_enabled: false`, so the kernel's
+    /// complete absence of a trailing stop — while the CPU engine applies one by
+    /// default — passed every check for as long as the suite existed. This is
+    /// the same workload with it on.
+    ///
+    /// It compares the money, not just the exits: a trailing stop closes at a
+    /// level that moved, and rebuilding the exit price from the original stop
+    /// gives the right bar and the wrong profit, which only a P&L comparison
+    /// catches.
+    #[test]
+    fn gpu_matches_cpu_with_a_trailing_stop() {
+        let n_samples = 1_200usize;
+        let n_genes = 4usize;
+        // A series with sustained runs, so the trail actually arms and ratchets
+        // rather than every trade dying on the initial stop.
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| {
+                let t = i as f64;
+                1.1000 + (t / 220.0).sin() * 0.0090 + (t / 37.0).sin() * 0.0016
+            })
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0006).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0006).collect();
+        let indicators = ndarray::Array2::from_shape_fn((4, n_samples), |(f, i)| {
+            let t = i as f64;
+            ((t / (18.0 + 11.0 * f as f64)).sin()) as f32
+        });
+        let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
+        let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 0];
+        let gene_weights: Vec<f32> = vec![1.0; 8];
+        let long_thr: Vec<f32> = vec![0.25; n_genes];
+        let short_thr: Vec<f32> = vec![-0.25; n_genes];
+        let sl_pips: Vec<f64> = vec![20.0; n_genes];
+        let tp_pips: Vec<f64> = vec![60.0; n_genes];
+        let stop_vol_mult: Vec<f64> = vec![0.0; n_genes];
+        let months: Vec<i64> = (0..n_samples).map(|i| (i / 200) as i64).collect();
+        let days: Vec<i64> = (0..n_samples).map(|i| (i / 24) as i64).collect();
+        let timestamps: Vec<i64> = (0..n_samples)
+            .map(|i| 1_600_000_000_000 + (i as i64) * 3_600_000)
+            .collect();
+        let smc: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
+        let gene_smc: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
+
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = false;
+        // The operator's own configuration, which is what production runs.
+        settings.trailing_enabled = true;
+        settings.trailing_atr_multiplier = 0.4;
+        settings.trailing_be_trigger_r = 0.1;
+        settings.trailing_min_lock_pips = 2.0;
+
+        let gpu = match crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
+            &close, &high, &low, indicators.view(), &gene_offsets, &gene_indices, &gene_weights,
+            &long_thr, &short_thr, &months, &days, &timestamps, &sl_pips, &tp_pips,
+            &stop_vol_mult, &smc, &gene_smc, 0.0, &[1.0f32; 11], &settings, None,
+        ) {
+            Ok(rows) => rows,
+            // No card here: the assertion is worth nothing without one, and a
+            // skip that says so beats a green test that checked nothing.
+            Err(err) => {
+                eprintln!("skipping trailing parity — no usable device: {err}");
+                return;
+            }
+        };
+
+        let cpu = validation_backtest_population_cpu(PopulationEvalInputs {
+            close: &close, high: &high, low: &low, indicators: indicators.view(),
+            gene_offsets: &gene_offsets, gene_indices: &gene_indices,
+            gene_weights: &gene_weights, long_thr: &long_thr, short_thr: &short_thr,
+            month_idx: &months, day_idx: &days, timestamps: &timestamps,
+            sl_pips: &sl_pips, tp_pips: &tp_pips, stop_vol_mult: &stop_vol_mult,
+            smc_data: &smc, gene_smc_flags: &gene_smc, gate_threshold: 0.0,
+            weights: &[1.0f32; 11], settings: &settings,
+        });
+
+        assert_eq!(gpu.len(), cpu.len());
+        for (gene, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            for slot in 0..11 {
+                let (a, b) = (g[slot], c[slot]);
+                if !a.is_finite() && !b.is_finite() {
+                    continue;
+                }
+                assert!(
+                    (a - b).abs() <= 1e-6 * b.abs().max(1.0),
+                    "gene {gene} slot {slot}: gpu {a} vs cpu {b} — the kernel and the \
+                     CPU disagree about a trailing stop"
+                );
+            }
+        }
+    }
+}

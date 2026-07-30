@@ -338,6 +338,14 @@ pub fn population_settings_for_dataset(
             .map_err(|_| PopulationOracleError::FixedWidthOverflow("max_trades_per_day"))?,
         month_capacity: u32::try_from(runtime.month_capacity)
             .map_err(|_| PopulationOracleError::FixedWidthOverflow("month_capacity"))?,
+        // Carried so the kernel simulates the same strategy as the CPU. The
+        // conversion is total on purpose: a settings field that silently stops
+        // travelling is how the trailing stop went missing to begin with.
+        trailing_enabled: u32::from(source.trailing_enabled),
+        _trailing_pad: 0,
+        trailing_atr_multiplier: source.trailing_atr_multiplier,
+        trailing_be_trigger_r: source.trailing_be_trigger_r,
+        trailing_min_lock_pips: source.trailing_min_lock_pips,
         gap_threshold_ms: source.gap_threshold_ms,
         initial_equity: runtime.initial_equity,
         pip_value: source.pip_value,

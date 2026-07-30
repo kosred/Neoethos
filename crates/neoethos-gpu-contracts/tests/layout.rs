@@ -37,7 +37,11 @@ fn population_outcome_default_is_the_unresolved_sentinel() {
 
 #[test]
 fn population_settings_has_stable_c_layout() {
-    assert_eq!(size_of::<NeoPopulationSettings>(), 128);
+    assert_eq!(size_of::<NeoPopulationSettings>(), 160);
+    assert_eq!(offset_of!(NeoPopulationSettings, trailing_enabled), 128);
+    assert_eq!(offset_of!(NeoPopulationSettings, trailing_atr_multiplier), 136);
+    assert_eq!(offset_of!(NeoPopulationSettings, trailing_be_trigger_r), 144);
+    assert_eq!(offset_of!(NeoPopulationSettings, trailing_min_lock_pips), 152);
     assert_eq!(align_of::<NeoPopulationSettings>(), 8);
     assert_eq!(offset_of!(NeoPopulationSettings, abi_version), 0);
     assert_eq!(offset_of!(NeoPopulationSettings, flags), 4);

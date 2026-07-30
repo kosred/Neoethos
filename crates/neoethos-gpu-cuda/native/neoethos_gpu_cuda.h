@@ -137,6 +137,12 @@ struct NeoPopulationSettings {
   double risk_per_trade_max;
   double high_quality_confidence;
   double adaptive_rr;
+  // Trailing stop, so the kernel simulates the strategy the CPU does.
+  std::uint32_t trailing_enabled;
+  std::uint32_t _trailing_pad;
+  double trailing_atr_multiplier;
+  double trailing_be_trigger_r;
+  double trailing_min_lock_pips;
 };
 
 struct NeoPopulationEvent {

@@ -200,6 +200,21 @@ pub mod device {
         pub risk_per_trade_max: f64,
         pub high_quality_confidence: f64,
         pub adaptive_rr: f64,
+        /// Trailing stop. The kernel had none while the CPU engine applied one,
+        /// so any run with trailing on was comparing two different strategies.
+        ///
+        /// Kept as its own `u32` rather than a bit in `flags` so the four values
+        /// travel together and a run cannot half-configure the feature.
+        pub trailing_enabled: u32,
+        pub _trailing_pad: u32,
+        /// How far behind the best price seen the trail sits, as a fraction of
+        /// the position's own stop distance.
+        pub trailing_atr_multiplier: f64,
+        /// Profit, in units of the stop distance, before the trail arms at all.
+        pub trailing_be_trigger_r: f64,
+        /// Floor for the trail, in pips above entry, so what is protected does
+        /// not vary per gene and fall below the cost of the trade.
+        pub trailing_min_lock_pips: f64,
     }
 
     /// Canonical causal entry emitted from a signal observed on the prior bar.
@@ -329,7 +344,9 @@ pub mod device {
         assert!(size_of::<Metrics>() == 80);
         assert!(size_of::<PropFirmState>() == 56);
 
-        assert!(size_of::<NeoPopulationSettings>() == 128);
+        assert!(size_of::<NeoPopulationSettings>() == 160);
+        assert!(offset_of!(NeoPopulationSettings, trailing_enabled) == 128);
+        assert!(offset_of!(NeoPopulationSettings, trailing_min_lock_pips) == 152);
         assert!(align_of::<NeoPopulationSettings>() == 8);
         assert!(offset_of!(NeoPopulationSettings, gap_threshold_ms) == 24);
         assert!(offset_of!(NeoPopulationSettings, initial_equity) == 32);

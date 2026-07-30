@@ -438,6 +438,109 @@ __global__ void population_first_hit_kernel(DeviceDataset dataset,
     }
   }
 
+  // ── Trailing stop: one lane, walking forward ────────────────────────────
+  //
+  // The parallel search below examines bars independently, which a trailing
+  // stop makes impossible: the level a bar is tested against depends on every
+  // bar before it. So the kernel had no trailing at all while the CPU engine
+  // has it on by default, and the two lanes were evaluating different
+  // strategies — invisible, because the parity fixtures set it off.
+  //
+  // Lane 0 walks in order, exactly as eval.rs does; the rest idle. That wastes
+  // 31/32 of the warp, and is still the cheaper shape: a trailing stop closes
+  // trades in a bar or two instead of running thousands of bars toward a
+  // distant target, so this walk is short where the parallel search was long.
+  //
+  // The order is load-bearing and mirrors the CPU: apply the trail set by
+  // PRIOR bars, test this bar against it, and only then let this bar's extreme
+  // ratchet the trail for future bars. Letting a bar's own high move the stop
+  // its own low is checked against is what the CPU comment calls reward-
+  // hackable — the GA found it and produced never-lose genes.
+  if (settings.trailing_enabled != 0u) {
+    int exit_bar = -1;
+    int exit_reason = kExitNone;
+    double exit_price = 0.0;
+    double fav = 0.0;
+    double adv = 0.0;
+    if (lane == 0u) {
+      const double pip_seq = guarded_pip(settings.pip_value);
+      const bool is_long = (event.direction == kDirectionLong);
+      const double stop_distance = fabs(event.entry_price - event.stop_price);
+      const double arm_at = settings.trailing_be_trigger_r * stop_distance;
+      const double give_back = settings.trailing_atr_multiplier * stop_distance;
+      const double lock = settings.trailing_min_lock_pips * pip_seq;
+      double trail = 0.0;  // 0.0 is the unset sentinel, as on the CPU
+      for (int bar = entry_bar + 1; bar <= last_bar; ++bar) {
+        const double high = dataset.high[bar];
+        const double low = dataset.low[bar];
+        const double moved =
+            is_long ? (high - event.entry_price) : (event.entry_price - low);
+        const double against =
+            is_long ? (event.entry_price - low) : (high - event.entry_price);
+        if (moved > fav) { fav = moved; }
+        if (against > adv) { adv = against; }
+
+        if (gap_flags[bar] != 0u) {
+          exit_bar = bar;
+          exit_reason = kExitGap;
+          exit_price = dataset.close[bar];
+          break;
+        }
+        double stop = event.stop_price;
+        if (trail > 0.0 &&
+            ((is_long && trail > stop) || (!is_long && trail < stop))) {
+          stop = trail;
+        }
+        if (bar >= static_cast<int>(level_activation)) {
+          if (is_long ? (low <= stop) : (high >= stop)) {
+            exit_bar = bar;
+            exit_reason = kExitStop;
+            exit_price = stop;
+            break;
+          }
+          if (is_long ? (high >= event.target_price)
+                      : (low <= event.target_price)) {
+            exit_bar = bar;
+            exit_reason = kExitTarget;
+            exit_price = event.target_price;
+            break;
+          }
+        }
+        if (max_hold_exit >= 0 && bar == max_hold_exit) {
+          exit_bar = bar;
+          exit_reason = kExitMaxHold;
+          exit_price = dataset.close[bar];
+          break;
+        }
+        if (moved >= arm_at) {
+          const double candidate =
+              is_long ? fmax(high - give_back, event.entry_price + lock)
+                      : fmin(low + give_back, event.entry_price - lock);
+          if (trail == 0.0 ||
+              (is_long ? candidate > trail : candidate < trail)) {
+            trail = candidate;
+          }
+        }
+      }
+      NeoPopulationOutcome outcome;
+      outcome.candidate_id = event.candidate_id;
+      outcome.scenario_id = event.scenario_id;
+      outcome.exit_bar = exit_bar;
+      outcome.exit_reason = (exit_bar < 0) ? kExitNone : exit_reason;
+      outcome.entry_bar = entry_bar;
+      outcome.pad = 0;
+      // Excursion in the same units the parallel path reports: money per lot.
+      outcome.mfe = (fav > 0.0) ? fav / pip_seq * settings.pip_value_per_lot : 0.0;
+      outcome.mae = (adv > 0.0) ? adv / pip_seq * settings.pip_value_per_lot : 0.0;
+      outcome.exit_price = exit_price;
+      // P&L is the reducer's, which owns sizing and carry.
+      outcome.pnl = 0.0;
+      outcome.r_multiple = 0.0;
+      outcomes[warp_index] = outcome;
+    }
+    return;
+  }
+
   int best_bar = INT_MAX;
   int best_priority = INT_MAX;
   int best_reason = kExitNone;
