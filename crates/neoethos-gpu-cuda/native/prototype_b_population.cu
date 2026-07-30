@@ -393,13 +393,22 @@ __global__ void population_first_hit_kernel(DeviceDataset dataset,
   const unsigned int warps_per_block = blockDim.x / warpSize;
   const unsigned int warp_in_block = threadIdx.x / warpSize;
   const unsigned int lane = threadIdx.x % warpSize;
-  const unsigned long long warp_index =
-      static_cast<unsigned long long>(blockIdx.x) * warps_per_block + warp_in_block;
-  if (warp_index >= event_count) {
+  // One warp per event for the parallel search, one THREAD per event for the
+  // trailing walk.
+  //
+  // The trailing walk is sequential — the level a bar is tested against depends
+  // on every bar before it — so it uses no warp cooperation at all. Mapping it a
+  // warp each left 31 of 32 lanes idle, throwing away 32x of the machine on the
+  // path production actually takes. The launcher sizes the grid to match.
+  const bool sequential = (settings.trailing_enabled != 0u);
+  const unsigned long long event_index =
+      sequential ? (static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x)
+                 : (static_cast<unsigned long long>(blockIdx.x) * warps_per_block + warp_in_block);
+  if (event_index >= event_count) {
     return;
   }
 
-  const NeoPopulationEvent event = events[warp_index];
+  const NeoPopulationEvent event = events[event_index];
   if (lane == 0u) {
     NeoPopulationOutcome outcome;
     outcome.candidate_id = event.candidate_id;
@@ -410,9 +419,12 @@ __global__ void population_first_hit_kernel(DeviceDataset dataset,
     outcome.pad = 0;
     outcome.mfe = 0.0;
     outcome.mae = 0.0;
+    // Was left unset when the field was added — uninitialised device memory
+    // written straight into the reducer's exit-price fallback.
+    outcome.exit_price = 0.0;
     outcome.pnl = 0.0;
     outcome.r_multiple = 0.0;
-    outcomes[warp_index] = outcome;
+    outcomes[event_index] = outcome;
   }
 
   const int entry_bar = static_cast<int>(event.entry_bar);
@@ -456,13 +468,13 @@ __global__ void population_first_hit_kernel(DeviceDataset dataset,
   // ratchet the trail for future bars. Letting a bar's own high move the stop
   // its own low is checked against is what the CPU comment calls reward-
   // hackable — the GA found it and produced never-lose genes.
-  if (settings.trailing_enabled != 0u) {
+  if (sequential) {
     int exit_bar = -1;
     int exit_reason = kExitNone;
     double exit_price = 0.0;
     double fav = 0.0;
     double adv = 0.0;
-    if (lane == 0u) {
+    {
       const double pip_seq = guarded_pip(settings.pip_value);
       const bool is_long = (event.direction == kDirectionLong);
       const double stop_distance = fabs(event.entry_price - event.stop_price);
@@ -536,7 +548,7 @@ __global__ void population_first_hit_kernel(DeviceDataset dataset,
       // P&L is the reducer's, which owns sizing and carry.
       outcome.pnl = 0.0;
       outcome.r_multiple = 0.0;
-      outcomes[warp_index] = outcome;
+      outcomes[event_index] = outcome;
     }
     return;
   }
@@ -691,7 +703,7 @@ __global__ void population_first_hit_kernel(DeviceDataset dataset,
     // P&L is settled by the reducer, which owns position sizing and carry.
     outcome.pnl = 0.0;
     outcome.r_multiple = 0.0;
-    outcomes[warp_index] = outcome;
+    outcomes[event_index] = outcome;
   }
 }
 
@@ -1762,9 +1774,14 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
   }
 
   if (emitted > 0ull) {
+    // The trailing walk takes a thread per event, the parallel search a warp,
+    // so the grid has to be sized for whichever the kernel will run. Launching
+    // the warp geometry for a sequential walk is what left 31 of 32 lanes idle.
     const unsigned int warps_per_block = 8u;
     const unsigned int block_threads = warps_per_block * 32u;
-    const unsigned long long blocks = (emitted + warps_per_block - 1ull) / warps_per_block;
+    const unsigned long long events_per_block =
+        settings.trailing_enabled != 0u ? block_threads : warps_per_block;
+    const unsigned long long blocks = (emitted + events_per_block - 1ull) / events_per_block;
     population_first_hit_kernel<<<static_cast<unsigned int>(blocks), block_threads, 0,
                                   session->stream>>>(dataset, *settings, session->events,
                                                      session->gap_flags, session->outcomes,
