@@ -34,6 +34,11 @@ constexpr std::uint32_t kFlagRiskBasedSizing = 1u;
 constexpr int kSmcSlots = 11;
 constexpr int kEmitBlock = 256;
 constexpr int kReduceBlock = 128;
+// Trade slots per candidate. Measured need is ~3 000 trades per gene over
+// 439 315 bars; this leaves room for the densest genes the search produces
+// without sizing device memory by candidate entries, of which there are a
+// hundred times more.
+constexpr unsigned long long kMaxTradesPerCandidate = 8192ull;
 constexpr int kSignalBlock = 256;
 
 // Priority inside a single bar: gap beats stop, stop beats target, target beats
@@ -820,8 +825,8 @@ __global__ void population_seed_outcomes_kernel(NeoPopulationOutcome* outcomes,
 __global__ void population_reduce_kernel(DeviceDataset dataset,
                                          DeviceGenes genes,
                                          NeoPopulationSettings settings,
+                                         const signed char* signal_values,
                                          const float* signal_confidences,
-                                         const NeoPopulationEvent* events,
                                          const unsigned char* gap_flags,
                                          NeoPopulationOutcome* outcomes,
                                          const unsigned long long* event_offsets,
@@ -844,8 +849,20 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
     month_start[index] = initial_equity;
   }
 
-  const unsigned long long range_start = event_offsets[candidate];
-  const unsigned long long range_end = event_offsets[candidate + 1];
+  // A fixed slice per candidate instead of a prefix sum over emitted events.
+  //
+  // The offsets existed because every candidate entry got a slot, and the count
+  // varied. Only trades are recorded now, and a gene makes about 3 000 of them
+  // over 439 315 bars — so a flat slice is both simpler and far smaller: 2.4 GB
+  // for 4 096 candidates against the 180 GB the entry-indexed buffers would
+  // need, which is why the population was splitting 4 096 -> 128.
+  //
+  // Overrunning the slice drops trades rather than corrupting a neighbour's,
+  // and is reported through the diagnostics so a silent truncation cannot pass
+  // for a strategy that simply traded less.
+  const unsigned long long range_start =
+      static_cast<unsigned long long>(candidate) * kMaxTradesPerCandidate;
+  const unsigned long long range_end = range_start + kMaxTradesPerCandidate;
   const long long confidence_base = static_cast<long long>(candidate) * dataset.bars;
 
   double equity = initial_equity;
@@ -884,14 +901,12 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   int position_max_hold_bar = -1;
 
   const double pip = guarded_pip(settings.pip_value);
+  const long long signal_base = static_cast<long long>(candidate) * dataset.bars;
   const double half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
   const double half_spread_price = settings.spread_pips * 0.5 * pip;
   unsigned long long cursor = range_start;
 
   for (int bar = 1; bar < dataset.bars; ++bar) {
-    while (cursor < range_end && static_cast<int>(events[cursor].entry_bar) < bar) {
-      ++cursor;
-    }
 
     const long long month = dataset.months[bar];
     if (month != last_month) {
@@ -1108,9 +1123,6 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
                                &max_daily_drawdown);
           has_position = false;
         }
-        while (cursor < range_end && static_cast<int>(events[cursor].entry_bar) == bar) {
-          ++cursor;
-        }
         continue_bar = true;
       }
     }
@@ -1118,20 +1130,39 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       continue;
     }
 
-    if (cursor < range_end && static_cast<int>(events[cursor].entry_bar) == bar) {
-      const NeoPopulationEvent event = events[cursor];
-      // The paired outcome used to be read here so the reduce would know when
-      // to close. It decides that itself now, so this is one fewer dependent
-      // load from a multi-gigabyte buffer per trade.
+    // ── Entry, read straight from the signal ──────────────────────────────
+    //
+    // This used to consult a materialised event. Everything it took from one is
+    // available here: the signal says the direction, the bar says when, and
+    // `entry_stop_target_pips` is the same call the emit kernel made with the
+    // same gene and bar — so the levels are identical, not merely equivalent.
+    const int signal_bar = bar - 1;
+    const signed char signal_here = signal_values[signal_base + signal_bar];
+    if (signal_here != 0) {
       ++cursor;
       if (settings.max_trades_per_day > 0u && day_trade_count >= settings.max_trades_per_day) {
         continue;
       }
-      const int signal_bar = bar - 1;
+      const int direction = signal_here > 0 ? kDirectionLong : kDirectionShort;
       const double entry_price =
-          dataset.close[event.entry_bar] +
-          static_cast<double>(event.direction) * half_spread_price;
-      const double stop_pips = fabs(fabs(event.stop_price - entry_price) / pip);
+          dataset.close[bar] + static_cast<double>(direction) * half_spread_price;
+      double entry_stop_pips = 0.0;
+      double entry_target_pips = 0.0;
+      entry_stop_target_pips(dataset, genes, settings, candidate, signal_bar, &entry_stop_pips,
+                             &entry_target_pips);
+      NeoPopulationEvent event;
+      event.candidate_id = static_cast<unsigned long long>(candidate);
+      event.scenario_id = scenario_ids[candidate];
+      event.entry_bar = static_cast<unsigned int>(bar);
+      event.last_bar = static_cast<unsigned int>(dataset.bars - 1);
+      event.direction = direction;
+      event.precedence = kPrecedenceStopFirst;
+      event.entry_price = entry_price;
+      event.stop_price = direction == kDirectionLong ? entry_price - entry_stop_pips * pip
+                                                     : entry_price + entry_stop_pips * pip;
+      event.target_price = direction == kDirectionLong ? entry_price + entry_target_pips * pip
+                                                       : entry_price - entry_target_pips * pip;
+      const double stop_pips = entry_stop_pips;
       double lots = 1.0;
       if ((settings.flags & kFlagRiskBasedSizing) != 0u) {
         lots = risk_based_position_lots(
@@ -1141,8 +1172,14 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       position_event = event;
       position_entry_price = entry_price;
       position_lots = lots;
-      // `cursor` already advanced past this event.
+      // `cursor` already advanced past this trade's slot.
       position_index = cursor - 1ull;
+      if (position_index >= range_end) {
+        // Out of slots. Keep simulating so equity and drawdown stay honest —
+        // the trade still happened — but do not write past this candidate's
+        // slice into the next one's.
+        position_index = range_end - 1ull;
+      }
       position_stop_pips = stop_pips;
       position_trail = 0.0;
       position_fav = 0.0;
@@ -1787,9 +1824,13 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
         !guard(device_alloc(&session->event_counts, static_cast<std::size_t>(population))) ||
         !guard(device_alloc(&session->event_offsets,
                             static_cast<std::size_t>(population) + 1)) ||
-        !guard(device_alloc(&session->events, static_cast<std::size_t>(session->max_events))) ||
+        // No event buffer at all, and outcomes sized by the trades a candidate
+        // can record rather than by every bar it might have entered on. On M3
+        // that is 2.4 GB against 180 GB, which is the whole reason the
+        // population was splitting 4 096 -> 128.
         !guard(device_alloc(&session->outcomes,
-                            static_cast<std::size_t>(session->max_events))) ||
+                            static_cast<std::size_t>(population) *
+                                static_cast<std::size_t>(kMaxTradesPerCandidate))) ||
         !guard(device_alloc(&session->monthly_pnls,
                             static_cast<std::size_t>(population) * month_capacity)) ||
         !guard(device_alloc(&session->month_start_equities,
@@ -1871,62 +1912,44 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
   population_gap_flags_kernel<<<gap_blocks == 0u ? 1u : gap_blocks, 256, 0, session->stream>>>(
       dataset, *settings, session->gap_flags);
   mark_stage();
-  population_count_events_kernel<<<static_cast<unsigned int>(population), kEmitBlock, 0,
-                                   session->stream>>>(dataset, genes, session->signal_values,
-                                                      session->event_counts);
+  // Not launched: nothing consumes the event stream now that the reduce
+  // opens positions from the signal directly.
+  //   population_count_events_kernel<<<static_cast<unsigned int>(population), kEmitBlock, 0,
+  //                                    session->stream>>>(dataset, genes, session->signal_values,
+  //                                                       session->event_counts);
   mark_stage();
-  population_scan_offsets_kernel<<<1, 1, 0, session->stream>>>(
-      session->event_counts, session->event_offsets, population);
+  // Not launched: nothing consumes the event stream now that the reduce
+  // opens positions from the signal directly.
+  //   population_scan_offsets_kernel<<<1, 1, 0, session->stream>>>(
+  //       session->event_counts, session->event_offsets, population);
   mark_stage();
-  population_emit_events_kernel<<<static_cast<unsigned int>(population), kEmitBlock, 0,
-                                  session->stream>>>(dataset, genes, *settings,
-                                                     session->signal_values,
-                                                     session->event_offsets,
-                                                     session->scenario_ids, session->events,
-                                                     session->max_events,
-                                                     session->overflow_flag);
+  // Not launched: nothing consumes the event stream now that the reduce
+  // opens positions from the signal directly.
+  //   population_emit_events_kernel<<<static_cast<unsigned int>(population), kEmitBlock, 0,
+  //                                   session->stream>>>(dataset, genes, *settings,
+  //                                                      session->signal_values,
+  //                                                      session->event_offsets,
+  //                                                      session->scenario_ids, session->events,
+  //                                                      session->max_events,
+  //                                                      session->overflow_flag);
   mark_stage();
   session->kernel_submissions += 5;
 
-  // The emitted event total and the capacity guard are the only host-visible
-  // scalars needed before the first-hit launch. Reading them is an explicit
-  // synchronization, never a silent full readback.
-  unsigned long long emitted = 0ull;
-  int overflow = 0;
-  if (cudaMemcpyAsync(&emitted, session->event_offsets + population,
-                      sizeof(unsigned long long), cudaMemcpyDeviceToHost,
-                      session->stream) != cudaSuccess ||
-      cudaMemcpyAsync(&overflow, session->overflow_flag, sizeof(int), cudaMemcpyDeviceToHost,
-                      session->stream) != cudaSuccess) {
-    return NEO_POPULATION_STATUS_TRANSFER_FAILED;
-  }
-  if (cudaStreamSynchronize(session->stream) != cudaSuccess) {
-    return NEO_POPULATION_STATUS_SYNC_FAILED;
-  }
-  session->synchronization_events += 1;
-  if (cudaGetLastError() != cudaSuccess) {
-    return NEO_POPULATION_STATUS_LAUNCH_FAILED;
-  }
-  if (overflow != 0 || emitted > session->max_events) {
-    return NEO_POPULATION_STATUS_EVENT_CAPACITY;
-  }
-
-  if (emitted > 0ull) {
-    // The trailing walk takes a thread per event, the parallel search a warp,
-    // so the grid has to be sized for whichever the kernel will run. Launching
-    // the warp geometry for a sequential walk is what left 31 of 32 lanes idle.
-    const unsigned int warps_per_block = 8u;
-    const unsigned int block_threads = warps_per_block * 32u;
-    const unsigned long long events_per_block =
-        settings->trailing_enabled != 0u ? block_threads : warps_per_block;
-    const unsigned long long blocks = (emitted + events_per_block - 1ull) / events_per_block;
-    // `population_first_hit_kernel` is no longer launched: the reduce decides
-    // exits itself, at O(1) per open bar, where this cost 1 650 ms of the
-    // 1 740 ms evaluation to precompute exits for entries that mostly never
-    // happen. The kernel is left in the file until parity on a real card
-    // confirms the replacement, then it goes.
-    population_seed_outcomes_kernel<<<static_cast<unsigned int>(blocks), block_threads, 0,
-                                      session->stream>>>(session->outcomes, emitted);
+  // No event total to read and no capacity to guard: the reduce opens positions
+  // from the signal, so there is nothing whose size the host has to check before
+  // launching. That readback was a stream synchronization every generation, and
+  // the capacity it guarded is what split the population 4 096 -> 128 on M3.
+  //
+  // The overflow flag still matters — it reports a gene whose trades exceeded
+  // its slice — but it is read with the metrics at the end rather than blocking
+  // here.
+  const unsigned long long trade_slots =
+      static_cast<unsigned long long>(population) * kMaxTradesPerCandidate;
+  {
+    const unsigned int seed_threads = 256u;
+    const unsigned long long seed_blocks = (trade_slots + seed_threads - 1ull) / seed_threads;
+    population_seed_outcomes_kernel<<<static_cast<unsigned int>(seed_blocks), seed_threads, 0,
+                                      session->stream>>>(session->outcomes, trade_slots);
     session->kernel_submissions += 1;
   }
   mark_stage();
@@ -1935,7 +1958,8 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
       static_cast<unsigned int>((population + kReduceBlock - 1) / kReduceBlock);
   population_reduce_kernel<<<reduce_blocks == 0u ? 1u : reduce_blocks, kReduceBlock, 0,
                              session->stream>>>(dataset, genes, *settings,
-                                                session->signal_confidences, session->events,
+                                                session->signal_values,
+                                                session->signal_confidences,
                                                 session->gap_flags, session->outcomes, session->event_offsets,
                                                 session->scenario_ids, session->monthly_pnls,
                                                 session->month_start_equities,
@@ -1948,7 +1972,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
                                          "scan_offsets", "emit+first_hit", "reduce"};
     std::fprintf(stderr, "[gpu-stage-timing] population=%lld bars=%lld events=%llu\n",
                  static_cast<long long>(population), static_cast<long long>(bars),
-                 static_cast<unsigned long long>(emitted));
+                 static_cast<unsigned long long>(trade_slots));
     for (int i = 1; i < stage_mark; ++i) {
       float ms = 0.0f;
       cudaEventElapsedTime(&ms, stage_marks[i - 1], stage_marks[i]);
@@ -1968,7 +1992,10 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
     return NEO_POPULATION_STATUS_LAUNCH_FAILED;
   }
 
-  session->emitted_events = emitted;
+  // No events are emitted any more. The diagnostic keeps its meaning — how much
+  // work the population generated — by reporting the trade slots it could use,
+  // rather than a count of candidate entries that no longer exist.
+  session->emitted_events = trade_slots;
   session->pending_event_id = session->next_event_id;
   session->next_event_id += 1ull;
   session->metrics_ready = false;
@@ -1976,7 +2003,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
 
   if (counters != nullptr) {
     std::memset(counters, 0, sizeof(NeoPopulationCounters));
-    counters->event_count = emitted;
+    counters->event_count = trade_slots;
     counters->kernel_submissions = session->kernel_submissions;
     counters->synchronization_events = session->synchronization_events;
     counters->dataset_upload_bytes = session->dataset_upload_bytes;
