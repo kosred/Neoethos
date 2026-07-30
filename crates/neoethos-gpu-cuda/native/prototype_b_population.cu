@@ -441,10 +441,31 @@ __global__ void population_first_hit_kernel(DeviceDataset dataset,
   int best_bar = INT_MAX;
   int best_priority = INT_MAX;
   int best_reason = kExitNone;
-  for (int bar = entry_bar + 1 + static_cast<int>(lane); bar <= last_bar;
-       bar += warpSize) {
+  // ── Stop at the first tile that contains an exit ─────────────────────────
+  //
+  // This loop used to run to `last_bar` for every event, keeping the minimum.
+  // With no holding cap `last_bar` is the end of the series, so an event
+  // entering early scanned hundreds of thousands of bars to find an exit
+  // twenty bars away — and every in-signal bar emits an event. That makes the
+  // search quadratic in bars where the CPU walk is linear, which is why a 3090
+  // measured 0.39 M candidate-bars/s against 21 M/s on a CPU, and why the bench
+  // hits 47 M/s on the same kernel: `gpu_bench_prepare` hardcodes
+  // `max_hold_bars: 12`, so its scans are twelve bars long.
+  //
+  // Each iteration has the warp cover one contiguous tile of `warpSize` bars,
+  // so if any lane finds an exit in this tile, every earlier bar has already
+  // been examined and found clean — the earliest exit in the whole range is in
+  // this tile. Finishing the tile and stopping therefore returns exactly what
+  // scanning to the end returned.
+  //
+  // The bound is uniform across the warp and every lane reaches the vote, so
+  // the ballot is not reading from exited threads.
+  for (int base = entry_bar + 1; base <= last_bar; base += warpSize) {
+    const int bar = base + static_cast<int>(lane);
     int reason = kExitNone;
-    if (gap_flags[bar] != 0u) {
+    if (bar > last_bar) {
+      // Past the end: this lane contributes nothing, but still votes.
+    } else if (gap_flags[bar] != 0u) {
       reason = kExitGap;
     } else {
       bool stop_hit = false;
@@ -470,14 +491,16 @@ __global__ void population_first_hit_kernel(DeviceDataset dataset,
         reason = kExitMaxHold;
       }
     }
-    if (reason == kExitNone) {
-      continue;
+    if (reason != kExitNone) {
+      const int priority = exit_priority(reason);
+      if (bar < best_bar || (bar == best_bar && priority < best_priority)) {
+        best_bar = bar;
+        best_priority = priority;
+        best_reason = reason;
+      }
     }
-    const int priority = exit_priority(reason);
-    if (bar < best_bar || (bar == best_bar && priority < best_priority)) {
-      best_bar = bar;
-      best_priority = priority;
-      best_reason = reason;
+    if (__any_sync(0xffffffffu, reason != kExitNone)) {
+      break;
     }
   }
 
