@@ -173,16 +173,25 @@ impl journal_analytics::PriceWindow for StorePrices {
 /// lost money; these say which hour, which symbol, and whether the profit was
 /// ever there to begin with.
 pub async fn analytics(
-    State(_state): State<AppApiState>,
+    State(state): State<AppApiState>,
     Query(q): Query<JournalQuery>,
 ) -> Response {
     let data_dir = match resolve_data_dir() {
         Ok(d) => d,
         Err(resp) => return resp,
     };
+    let names = state.symbol_catalog_snapshot().await;
     let mut trades = journal_store::query_closed_trades(&data_dir, q.from_ms, q.to_ms);
     if let Some(active) = journal_store::active_account_id() {
         trades.retain(|r| r.account_id.as_deref() == Some(active.as_str()));
+    }
+    // Same healing `/journal/trades` applies. Without it the per-symbol
+    // breakdown splits one instrument across a name and a placeholder id — 97
+    // of the operator's 238 trades are stored as `#1`, `#5`, `#41` from before
+    // the catalog populated, so the grouping this endpoint exists for would be
+    // wrong in exactly the rows that matter most.
+    for row in &mut trades {
+        heal_row(row, &names);
     }
     // Excursion needs the price store. When it is absent the analytics still
     // return — with the excursion fields empty rather than zeroed, so a missing

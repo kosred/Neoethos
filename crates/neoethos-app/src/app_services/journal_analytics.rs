@@ -104,14 +104,24 @@ pub trait PriceWindow {
 /// The risk a stop represents, per lot, inferred from the trades themselves.
 ///
 /// A broker fill carries no stop distance, so R cannot be read off a record.
-/// But a strategy that stops out repeatedly pays the same amount each time,
-/// scaled by size — so the median loss per lot across losing trades estimates
-/// the risk without needing the strategy's parameters. The median rather than
-/// the mean because a trade closed early for other reasons should not move it.
+/// What can be recovered is what a stop-out costs: the strategy pays roughly the
+/// same each time, scaled by size, so a high quantile of loss-per-lot lands in
+/// that cluster.
 ///
-/// `None` when there are no losses to learn from; R is then reported as `None`
-/// rather than guessed, since an R computed against a made-up denominator is
-/// worse than no R at all.
+/// It has to be a high quantile, not the middle. The operator's own 238 demand
+/// trades have a median loss-per-lot of 0.00 — most losers close early, well
+/// inside the stop — and dividing by that produced R values in the hundreds of
+/// thousands. A number that large is obviously wrong; one merely ten times off
+/// would not have been, which is why the statistic is chosen against real data
+/// rather than by what reads well.
+///
+/// This is an estimate of a *typical* stop, and volatility-scaled stops move
+/// per trade, so R here compares trades within a strategy rather than measuring
+/// each one's own risk exactly.
+///
+/// `None` when there is nothing to learn from — no losses, or a cluster that
+/// rounds to zero. An R computed against a denominator near zero is worse than
+/// no R at all.
 pub fn estimate_risk_per_lot(trades: &[ClosedTrade]) -> Option<f64> {
     let mut losses: Vec<f64> = trades
         .iter()
@@ -123,7 +133,14 @@ pub fn estimate_risk_per_lot(trades: &[ClosedTrade]) -> Option<f64> {
         return None;
     }
     losses.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    Some(losses[losses.len() / 2])
+    // Nine in ten losses were no worse than this — close to the stop without
+    // being the single worst fill, which slippage or a gap can distort.
+    let index = ((losses.len() as f64 * 0.9).ceil() as usize)
+        .saturating_sub(1)
+        .min(losses.len() - 1);
+    let estimate = losses[index];
+    // A stop that rounds to nothing is not a stop; refuse rather than divide.
+    (estimate > 1e-6).then_some(estimate)
 }
 
 fn is_long(side: &str) -> bool {
@@ -385,15 +402,43 @@ mod tests {
     }
 
     #[test]
-    fn risk_per_lot_is_the_median_loss_and_ignores_the_winners() {
+    fn risk_per_lot_finds_the_stop_and_ignores_the_winners() {
         let trades = vec![
             trade(1, "BUY", 1.1, 1.1, -200.0, 0),
             trade(2, "BUY", 1.1, 1.1, -190.0, 0),
             trade(3, "BUY", 1.1, 1.1, -210.0, 0),
             trade(4, "BUY", 1.1, 1.1, 5000.0, 0),
         ];
-        assert_eq!(estimate_risk_per_lot(&trades), Some(200.0));
+        let estimate = estimate_risk_per_lot(&trades).expect("three losses to learn from");
+        assert!(
+            (190.0..=210.0).contains(&estimate),
+            "expected the stop cluster, got {estimate}"
+        );
         assert_eq!(estimate_risk_per_lot(&[]), None);
+    }
+
+    /// The shape of the operator's real journal: most losers close early, well
+    /// inside the stop, and only a minority actually pay it. Taking the middle
+    /// of that distribution gives ~0 and turns every R into a number in the
+    /// hundreds of thousands — which is how this was caught.
+    #[test]
+    fn early_exits_do_not_drag_the_stop_estimate_to_zero() {
+        let mut trades: Vec<ClosedTrade> = (0..70)
+            .map(|i| trade(i, "BUY", 1.1, 1.1, -0.01, 0))
+            .collect();
+        trades.extend((70..100).map(|i| trade(i, "BUY", 1.1, 1.1, -150.0, 0)));
+        let estimate = estimate_risk_per_lot(&trades).expect("a stop cluster exists");
+        assert!(
+            estimate > 100.0,
+            "the stop cluster is 150 per lot; estimate came out {estimate}"
+        );
+
+        // With nothing but near-zero losses there is no stop to find, and R must
+        // be withheld rather than computed against a denominator of ~0.
+        let all_tiny: Vec<ClosedTrade> = (0..50)
+            .map(|i| trade(i, "BUY", 1.1, 1.1, -1e-9, 0))
+            .collect();
+        assert_eq!(estimate_risk_per_lot(&all_tiny), None);
     }
 
     /// The London-session question, answered by counting rather than reasoning.
