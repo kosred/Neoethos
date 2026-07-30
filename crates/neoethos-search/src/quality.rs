@@ -863,7 +863,7 @@ fn score_strategy(analyzer: &StrategyQualityAnalyzer, metrics: &mut StrategyMetr
     .to_string();
 }
 
-fn empty_metrics(strategy_id: &str) -> StrategyMetrics {
+pub(crate) fn empty_metrics(strategy_id: &str) -> StrategyMetrics {
     StrategyMetrics {
         strategy_id: strategy_id.to_string(),
         total_trades: 0,

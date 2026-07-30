@@ -1856,3 +1856,29 @@ fn mode_band_rejects_nonsense_and_orders_itself() {
     .apply_mode_overrides();
     assert_eq!(c.risk_per_trade_max, 1.0, "capped at 100% of the account");
 }
+
+#[test]
+fn a_wiped_out_account_is_rejected_however_well_it_scores() {
+    use crate::quality::empty_metrics;
+    // The candidate that motivated this gate: 4 917 trades, profit factor 2.85,
+    // graded EXCELLENT — on an account whose equity curve bottomed at
+    // -30 596 EUR. A drawdown past 100 % is not a bad score, it is a state that
+    // cannot exist, so no other metric may compensate for it.
+    let mut ruined = empty_metrics("gene_332618_18");
+    ruined.profit_factor = 2.85;
+    ruined.win_rate = 0.38;
+    ruined.trades_per_month = 40.0;
+    ruined.positive_months = 100;
+    ruined.avg_monthly_return_pct = 65.0;
+    ruined.max_drawdown_pct = 4.031; // 403.1 % — a fraction, despite the name
+    assert!(!super::survived_the_backtest(&ruined));
+
+    // Exactly total loss is still ruin.
+    ruined.max_drawdown_pct = 1.0;
+    assert!(!super::survived_the_backtest(&ruined));
+
+    // A severe but survivable drawdown stays eligible: this gate decides
+    // possibility, not quality.
+    ruined.max_drawdown_pct = 0.438; // the 43.8 % seen on a real survivor
+    assert!(super::survived_the_backtest(&ruined));
+}

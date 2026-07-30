@@ -1503,7 +1503,29 @@ fn min_trades_per_month_scale_for_tf(tf: &str) -> f64 {
     }
 }
 
+/// A drawdown of 100 % means the account reached zero.
+///
+/// Past that the simulation is describing a state that cannot exist: a real
+/// account is closed out, not carried into negative equity to keep compounding.
+/// A 2026-07-29 AUDUSD H4 candidate reported `maxDD 403.1%` with an equity
+/// curve minimum of -30 596 EUR and was still scored as EXCELLENT on profit
+/// factor — 4 917 trades on an account that had been wiped several times over.
+///
+/// This is not a threshold to tune alongside `max_dd`; it is the boundary of
+/// what the numbers can mean, so it is checked separately and unconditionally.
+/// Anything at or beyond total loss is rejected whatever else it scores.
+fn survived_the_backtest(metrics: &StrategyMetrics) -> bool {
+    // `max_drawdown_pct` is a fraction despite the name — `(peak - equity) / peak`
+    // in quality.rs — so total loss is 1.0, and the 403.1 % in that log line is
+    // stored as 4.031. Reading it as a percentage would let every ruined
+    // candidate through.
+    metrics.max_drawdown_pct < 1.0
+}
+
 fn passes_strict_quality(metrics: &StrategyMetrics, cfg: &crate::genetic::FilteringConfig) -> bool {
+    if !survived_the_backtest(metrics) {
+        return false;
+    }
     if cfg.min_positive_months > 0 && metrics.positive_months < cfg.min_positive_months {
         return false;
     }
@@ -1522,6 +1544,9 @@ fn passes_opportunistic_quality(
     metrics: &StrategyMetrics,
     cfg: &crate::genetic::FilteringConfig,
 ) -> bool {
+    if !survived_the_backtest(metrics) {
+        return false;
+    }
     if !cfg.opportunistic_enabled || !cfg.use_opportunistic_candidates {
         return false;
     }
