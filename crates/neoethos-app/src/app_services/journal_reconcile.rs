@@ -29,10 +29,38 @@ fn data_dir() -> Option<PathBuf> {
 /// Build a [`ClosedTrade`] from a deal — but only for REALIZED (closing)
 /// deals, which are the ones that carry `net_profit`. Opening fills
 /// (`net_profit == None`) are not closed trades and are skipped.
+/// When each position was opened, from the data already in hand.
+///
+/// A closing deal reports the exit and the entry *price*, never the entry
+/// *time*, so `entry_ts_ms` was written as `None` — and stayed `None` for all
+/// 238 trades in the operator's journal. Without it there is no holding time,
+/// no entry-hour breakdown, and no window to replay prices over for excursion:
+/// three of the questions a journal exists to answer, unanswerable.
+///
+/// Two sources, both already fetched. A position still open carries
+/// `open_timestamp_ms` directly. For one already closed, its opening deal is in
+/// the same deal history — the earliest execution stamped with that position id.
+fn position_open_times(runtime: &CTraderAccountRuntimeSnapshot) -> HashMap<i64, i64> {
+    let mut opened: HashMap<i64, i64> = HashMap::new();
+    for deal in &runtime.recent_deals {
+        opened
+            .entry(deal.position_id)
+            .and_modify(|first| *first = (*first).min(deal.execution_timestamp_ms))
+            .or_insert(deal.execution_timestamp_ms);
+    }
+    for position in &runtime.reconcile.positions {
+        if let Some(ts) = position.open_timestamp_ms {
+            opened.insert(position.position_id, ts);
+        }
+    }
+    opened
+}
+
 fn closed_trade_from_deal(
     d: &CTraderDealSnapshot,
     names: &HashMap<i64, String>,
     account_id: &str,
+    opened_at: &HashMap<i64, i64>,
 ) -> Option<ClosedTrade> {
     let net = d.net_profit?;
     // Resolve the broker symbol NAME from the catalog the bridge threads in.
@@ -67,7 +95,13 @@ fn closed_trade_from_deal(
         // Per-account scoping (2026-07-02): the journal serves ONE account's
         // history at a time — stamp every row with its owner.
         account_id: Some(account_id.to_string()),
-        entry_ts_ms: None,
+        // Only when it is genuinely earlier than the close. An opening deal that
+        // arrived in the same batch as its closing one would otherwise stamp a
+        // zero-length trade, which reads as a measurement rather than a gap.
+        entry_ts_ms: opened_at
+            .get(&d.position_id)
+            .copied()
+            .filter(|ts| *ts < d.execution_timestamp_ms),
         entry_price: d.entry_price,
         exit_ts_ms: Some(d.execution_timestamp_ms),
         exit_price: d.execution_price,
@@ -91,8 +125,9 @@ pub fn reconcile_best_effort(
 
     let account_id = runtime.reconcile.account_id.to_string();
     let mut recorded_any = false;
+    let opened_at = position_open_times(runtime);
     for deal in &runtime.recent_deals {
-        let Some(trade) = closed_trade_from_deal(deal, names, &account_id) else {
+        let Some(trade) = closed_trade_from_deal(deal, names, &account_id, &opened_at) else {
             continue;
         };
         match journal_store::record_closed_trade(&dir, &trade) {
@@ -122,6 +157,76 @@ pub fn reconcile_best_effort(
                 equity: balance,
                 account_id: Some(account_id.clone()),
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod entry_time_tests {
+    use super::*;
+
+    /// A populated catalog. An empty one makes `closed_trade_from_deal` defer
+    /// on purpose — cold-start race — so passing one would test that instead.
+    fn catalog() -> HashMap<i64, String> {
+        HashMap::from([(1i64, "EURUSD".to_string())])
+    }
+
+    fn deal(position_id: i64, ts: i64) -> CTraderDealSnapshot {
+        CTraderDealSnapshot {
+            deal_id: ts,
+            order_id: ts,
+            position_id,
+            symbol_id: 1,
+            trade_side: "BUY".to_string(),
+            deal_status: "FILLED".to_string(),
+            volume: 100_000.0,
+            filled_volume: 100_000.0,
+            execution_timestamp_ms: ts,
+            execution_price: Some(1.1),
+            entry_price: Some(1.1),
+            gross_profit: Some(1.0),
+            fee: Some(0.0),
+            swap: Some(0.0),
+            pnl_conversion_fee: Some(0.0),
+            net_profit: Some(1.0),
+        }
+    }
+
+    /// The opening deal is in the same history as the closing one, so the entry
+    /// time never needed a new request — it was being discarded.
+    #[test]
+    fn the_opening_deal_supplies_the_entry_time() {
+        let deals = vec![deal(500, 1_700_000_000_000), deal(500, 1_700_003_600_000)];
+        let mut opened: HashMap<i64, i64> = HashMap::new();
+        for d in &deals {
+            opened
+                .entry(d.position_id)
+                .and_modify(|first| *first = (*first).min(d.execution_timestamp_ms))
+                .or_insert(d.execution_timestamp_ms);
+        }
+        assert_eq!(opened.get(&500), Some(&1_700_000_000_000));
+
+        let closing = &deals[1];
+        let trade = closed_trade_from_deal(closing, &catalog(), "acct", &opened)
+            .expect("a closing deal with a net figure is a closed trade");
+        assert_eq!(trade.entry_ts_ms, Some(1_700_000_000_000));
+        assert_eq!(trade.exit_ts_ms, Some(1_700_003_600_000));
+    }
+
+    /// A position whose opening deal is not in the window must report no entry
+    /// time rather than borrowing the close's — a zero-length trade would read
+    /// as a measurement, and every derived figure would inherit the lie.
+    #[test]
+    fn an_absent_opening_deal_leaves_the_entry_time_unknown() {
+        let closing = deal(501, 1_700_003_600_000);
+        let mut opened: HashMap<i64, i64> = HashMap::new();
+        opened.insert(501, 1_700_003_600_000); // only the close is known
+
+        let trade = closed_trade_from_deal(&closing, &catalog(), "acct", &opened)
+            .expect("still a closed trade");
+        assert_eq!(
+            trade.entry_ts_ms, None,
+            "an entry stamped at the exit is not an entry time"
         );
     }
 }
