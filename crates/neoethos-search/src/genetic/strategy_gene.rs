@@ -402,6 +402,18 @@ pub fn infer_market_cost_profile(
                     live_or_typical,
                 );
                 if converted.is_finite() && converted > 0.0 {
+                    // Said out loud, because a silent success is how the
+                    // original defect stayed hidden: nothing in a result made
+                    // from a wrong pip value looks wrong.
+                    tracing::info!(
+                        target: "neoethos_search::cost_model",
+                        symbol = %symbol,
+                        account_currency = %account_currency,
+                        quote = %meta.quote,
+                        rate = format!("{rate:.6}"),
+                        pip_value_per_lot = format!("{converted:.4}"),
+                        "cross-pair pip value converted using the store's bridging pair"
+                    );
                     return converted;
                 }
             }
