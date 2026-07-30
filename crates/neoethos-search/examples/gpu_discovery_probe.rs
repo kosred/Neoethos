@@ -98,20 +98,28 @@ fn main() -> Result<()> {
     let result = neoethos_search::run_discovery_cycle(&features, base_ohlcv, &config)?;
     let elapsed = started.elapsed().as_secs_f64();
 
-    // Candidate-bars is the unit the bench and the scaling sweep report, so the
-    // two numbers can be put side by side. One generation evaluates the whole
-    // population against every bar.
-    let candidate_bars = population as f64 * bars as f64 * generations.max(1) as f64;
+    // Deliberately NOT a throughput figure comparable to the bench.
+    //
+    // The first version divided candidate-bars by this elapsed time and printed
+    // 1.49 M/s. Wrong twice over: it used the feature frame's 1 757 261 bars
+    // while discovery had capped the run to 439 315, and it divided by dataset
+    // load, feature build, validation and Monte-Carlo as well as the evaluation
+    // the bench actually times. Both errors inflate, and the result still read
+    // like a measurement.
+    //
+    // The comparable number is already in this log — `eval`'s own per-population
+    // line carries the genes and bars it really evaluated. What belongs here is
+    // the shape of the run.
     tracing::info!(
         population,
         generations,
-        bars,
-        seconds = format!("{elapsed:.1}"),
-        throughput_m_cand_bars_per_s = format!("{:.2}", candidate_bars / elapsed / 1.0e6),
+        feature_frame_bars = bars,
+        total_seconds = format!("{elapsed:.1}"),
         portfolio = result.portfolio.len(),
         candidates = result.candidates.len(),
-        "PROBE RESULT — compare against 47-50 M/s in gpu_eval_bench and 966 M/s \
-         at population 131 072 in the scaling sweep"
+        "PROBE RESULT — whole-cycle timing, not throughput. For throughput read \
+         the `event budget usage` lines: candidate-bars is n_genes x bars there, \
+         over the interval between consecutive population evaluations."
     );
     Ok(())
 }
