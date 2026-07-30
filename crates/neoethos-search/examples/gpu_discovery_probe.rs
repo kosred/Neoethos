@@ -65,8 +65,14 @@ fn main() -> Result<()> {
 
     tracing::info!(root, symbol, base, higher, "loading dataset");
     let loaded = Instant::now();
-    let dataset = neoethos_data::load_symbol_dataset(&root, &symbol)
-        .with_context(|| format!("loading {symbol} from {root}"))?;
+    // Only the timeframes this run uses. The unrestricted loader pulls every
+    // series in the store, and M1 alone is 5.27 M bars — minutes of load time
+    // and gigabytes of RAM for data the probe never reads.
+    let wanted: Vec<&str> = std::iter::once(base.as_str())
+        .chain(higher_refs.iter().copied())
+        .collect();
+    let dataset = neoethos_data::load_symbol_dataset_with_timeframes(&root, &symbol, &wanted)
+        .with_context(|| format!("loading {symbol} {wanted:?} from {root}"))?;
     let features = neoethos_data::prepare_multitimeframe_features(
         &dataset,
         &base,
