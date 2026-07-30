@@ -820,8 +820,8 @@ __global__ void population_seed_outcomes_kernel(NeoPopulationOutcome* outcomes,
 __global__ void population_reduce_kernel(DeviceDataset dataset,
                                          DeviceGenes genes,
                                          NeoPopulationSettings settings,
+                                         const signed char* signal_values,
                                          const float* signal_confidences,
-                                         const NeoPopulationEvent* events,
                                          NeoPopulationOutcome* outcomes,
                                          const unsigned long long* event_offsets,
                                          const unsigned long long* scenario_ids,
@@ -883,14 +883,12 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   int position_max_hold_bar = -1;
 
   const double pip = guarded_pip(settings.pip_value);
+  const long long signal_base = static_cast<long long>(candidate) * dataset.bars;
   const double half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
   const double half_spread_price = settings.spread_pips * 0.5 * pip;
   unsigned long long cursor = range_start;
 
   for (int bar = 1; bar < dataset.bars; ++bar) {
-    while (cursor < range_end && static_cast<int>(events[cursor].entry_bar) < bar) {
-      ++cursor;
-    }
 
     const long long month = dataset.months[bar];
     if (month != last_month) {
@@ -1107,9 +1105,6 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
                                &max_daily_drawdown);
           has_position = false;
         }
-        while (cursor < range_end && static_cast<int>(events[cursor].entry_bar) == bar) {
-          ++cursor;
-        }
         continue_bar = true;
       }
     }
@@ -1117,20 +1112,39 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       continue;
     }
 
-    if (cursor < range_end && static_cast<int>(events[cursor].entry_bar) == bar) {
-      const NeoPopulationEvent event = events[cursor];
-      // The paired outcome used to be read here so the reduce would know when
-      // to close. It decides that itself now, so this is one fewer dependent
-      // load from a multi-gigabyte buffer per trade.
+    // ── Entry, read straight from the signal ──────────────────────────────
+    //
+    // This used to consult a materialised event. Everything it took from one is
+    // available here: the signal says the direction, the bar says when, and
+    // `entry_stop_target_pips` is the same call the emit kernel made with the
+    // same gene and bar — so the levels are identical, not merely equivalent.
+    const int signal_bar = bar - 1;
+    const signed char signal_here = signal_values[signal_base + signal_bar];
+    if (signal_here != 0) {
       ++cursor;
       if (settings.max_trades_per_day > 0u && day_trade_count >= settings.max_trades_per_day) {
         continue;
       }
-      const int signal_bar = bar - 1;
+      const int direction = signal_here > 0 ? kDirectionLong : kDirectionShort;
       const double entry_price =
-          dataset.close[event.entry_bar] +
-          static_cast<double>(event.direction) * half_spread_price;
-      const double stop_pips = fabs(fabs(event.stop_price - entry_price) / pip);
+          dataset.close[bar] + static_cast<double>(direction) * half_spread_price;
+      double entry_stop_pips = 0.0;
+      double entry_target_pips = 0.0;
+      entry_stop_target_pips(dataset, genes, settings, candidate, signal_bar, &entry_stop_pips,
+                             &entry_target_pips);
+      NeoPopulationEvent event;
+      event.candidate_id = static_cast<unsigned long long>(candidate);
+      event.scenario_id = scenario_ids[candidate];
+      event.entry_bar = static_cast<unsigned int>(bar);
+      event.last_bar = static_cast<unsigned int>(dataset.bars - 1);
+      event.direction = direction;
+      event.precedence = kPrecedenceStopFirst;
+      event.entry_price = entry_price;
+      event.stop_price = direction == kDirectionLong ? entry_price - entry_stop_pips * pip
+                                                     : entry_price + entry_stop_pips * pip;
+      event.target_price = direction == kDirectionLong ? entry_price + entry_target_pips * pip
+                                                       : entry_price - entry_target_pips * pip;
+      const double stop_pips = entry_stop_pips;
       double lots = 1.0;
       if ((settings.flags & kFlagRiskBasedSizing) != 0u) {
         lots = risk_based_position_lots(
@@ -1934,7 +1948,8 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
       static_cast<unsigned int>((population + kReduceBlock - 1) / kReduceBlock);
   population_reduce_kernel<<<reduce_blocks == 0u ? 1u : reduce_blocks, kReduceBlock, 0,
                              session->stream>>>(dataset, genes, *settings,
-                                                session->signal_confidences, session->events,
+                                                session->signal_values,
+                                                session->signal_confidences,
                                                 session->outcomes, session->event_offsets,
                                                 session->scenario_ids, session->monthly_pnls,
                                                 session->month_start_equities,
