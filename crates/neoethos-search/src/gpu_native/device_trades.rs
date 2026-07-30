@@ -75,6 +75,7 @@ mod tests {
             _pad: 0,
             mfe: 12.0,
             mae: 4.0,
+            exit_price: 0.0,
             pnl,
             r_multiple: pnl / 10.0,
         }

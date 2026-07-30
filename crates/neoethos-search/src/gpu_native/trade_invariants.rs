@@ -222,6 +222,7 @@ mod tests {
             _pad: 0,
             mfe,
             mae,
+            exit_price: 0.0,
             pnl,
             r_multiple,
         }
