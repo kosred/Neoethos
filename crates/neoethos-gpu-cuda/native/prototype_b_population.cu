@@ -792,6 +792,31 @@ __device__ inline double apply_carry_and_conversion(double gross_pnl_scaled,
   return with_carry;
 }
 
+// Every outcome starts defined. The reduce fills in the ones that become
+// trades, and a candidate entry that never opens a position must still read as
+// "no exit" rather than as whatever the buffer held last generation.
+__global__ void population_seed_outcomes_kernel(NeoPopulationOutcome* outcomes,
+                                                unsigned long long event_count) {
+  const unsigned long long index =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= event_count) {
+    return;
+  }
+  NeoPopulationOutcome outcome;
+  outcome.candidate_id = 0ull;
+  outcome.scenario_id = 0ull;
+  outcome.exit_bar = -1;
+  outcome.exit_reason = kExitNone;
+  outcome.entry_bar = -1;
+  outcome.pad = 0;
+  outcome.mfe = 0.0;
+  outcome.mae = 0.0;
+  outcome.exit_price = 0.0;
+  outcome.pnl = 0.0;
+  outcome.r_multiple = 0.0;
+  outcomes[index] = outcome;
+}
+
 __global__ void population_reduce_kernel(DeviceDataset dataset,
                                          DeviceGenes genes,
                                          NeoPopulationSettings settings,
@@ -849,6 +874,14 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   double position_lots = 0.0;
   unsigned long long position_index = 0ull;
   double position_stop_pips = 0.0;
+  // Exit detection moved here from the first-hit kernel, so the state it used
+  // to carry per event now lives with the position: where the trail has
+  // ratcheted to, and how far the trade has run either way.
+  double position_trail = 0.0;
+  double position_fav = 0.0;
+  double position_adv = 0.0;
+  int position_min_hold_bar = 0;
+  int position_max_hold_bar = -1;
 
   const double pip = guarded_pip(settings.pip_value);
   const double half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
@@ -887,8 +920,9 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
 
     bool continue_bar = false;
     if (has_position) {
-      const bool exited_on_gap = position_outcome.exit_bar == bar &&
-                                 position_outcome.exit_reason == kExitGap;
+      // Straight from the flag. Asking whether a precomputed outcome happened
+      // to name this bar was only ever a proxy for reading it.
+      const bool exited_on_gap = gap_flags[bar] != 0u;
       if (exited_on_gap) {
         double exit_price = dataset.close[bar];
         double price_pnl = 0.0;
@@ -911,6 +945,14 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
         // mirrors eval.rs exactly — realised P&L over the entry stop distance,
         // guarded against a zero denominator — so it stays comparable with the
         // CPU trade list rather than merely plausible.
+        outcomes[position_index].exit_bar = bar;
+        outcomes[position_index].exit_reason = kExitGap;
+        outcomes[position_index].entry_bar = position_event.entry_bar;
+        outcomes[position_index].exit_price = exit_price;
+        outcomes[position_index].mfe =
+            position_fav > 0.0 ? position_fav / pip * settings.pip_value_per_lot : 0.0;
+        outcomes[position_index].mae =
+            position_adv > 0.0 ? position_adv / pip * settings.pip_value_per_lot : 0.0;
         outcomes[position_index].pnl = pnl;
         outcomes[position_index].r_multiple =
             pnl / fmax(position_stop_pips * settings.pip_value_per_lot, 1.0e-9);
@@ -957,36 +999,74 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
           }
         }
 
-        if (position_outcome.exit_bar == bar && position_outcome.exit_reason != kExitNone) {
+        // ── Exit, decided on this bar ────────────────────────────────────
+        //
+        // Same order as the CPU walk in eval.rs: the trail set by PRIOR bars is
+        // what this bar is tested against, and only after the test does this
+        // bar's extreme move it. Letting a bar's own high move the stop its own
+        // low is checked against is reward-hackable — the GA found it once and
+        // produced never-lose genes.
+        const bool is_long_pos = position_event.direction == kDirectionLong;
+        double active_stop = position_event.stop_price;
+        if (position_trail > 0.0 && ((is_long_pos && position_trail > active_stop) ||
+                                     (!is_long_pos && position_trail < active_stop))) {
+          active_stop = position_trail;
+        }
+        int exit_reason_now = kExitNone;
+        double exit_price_now = 0.0;
+        if (bar >= position_min_hold_bar) {
+          if (is_long_pos ? (low <= active_stop) : (high >= active_stop)) {
+            exit_reason_now = kExitStop;
+            exit_price_now = active_stop;
+          } else if (is_long_pos ? (high >= position_event.target_price)
+                                 : (low <= position_event.target_price)) {
+            exit_reason_now = kExitTarget;
+            exit_price_now = position_event.target_price;
+          }
+        }
+        if (exit_reason_now == kExitNone && position_max_hold_bar >= 0 &&
+            bar >= position_max_hold_bar) {
+          exit_reason_now = kExitMaxHold;
+          exit_price_now = dataset.close[bar];
+        }
+        // Excursion accumulates on every open bar including this one, matching
+        // the CPU, which updates before testing for an exit.
+        {
+          const double moved = is_long_pos ? (high - position_entry_price)
+                                           : (position_entry_price - low);
+          const double against = is_long_pos ? (position_entry_price - low)
+                                             : (high - position_entry_price);
+          if (moved > position_fav) {
+            position_fav = moved;
+          }
+          if (against > position_adv) {
+            position_adv = against;
+          }
+        }
+        if (exit_reason_now == kExitNone && settings.trailing_enabled != 0u) {
+          const double stop_distance = fabs(position_entry_price - position_event.stop_price);
+          const double moved = is_long_pos ? (high - position_entry_price)
+                                           : (position_entry_price - low);
+          if (moved >= settings.trailing_be_trigger_r * stop_distance) {
+            const double give_back = settings.trailing_atr_multiplier * stop_distance;
+            const double lock = settings.trailing_min_lock_pips * pip;
+            const double candidate =
+                is_long_pos ? fmax(high - give_back, position_entry_price + lock)
+                            : fmin(low + give_back, position_entry_price - lock);
+            if (position_trail == 0.0 ||
+                (is_long_pos ? candidate > position_trail : candidate < position_trail)) {
+              position_trail = candidate;
+            }
+          }
+        }
+        if (exit_reason_now != kExitNone) {
           // The kernel reports where the position actually closed. A trailing
           // stop moves, so rebuilding this from `position_event.stop_price`
           // would price every trailed exit at the original stop and understate
           // the win. Zero means "not reported" — outcomes from before the field
           // existed — and those fall back to the levels below.
-          double exit_price = position_outcome.exit_price;
-          // `realizable` still comes from the reason: a reported price says
-          // where the position closed, not whether it closed at all.
-          bool realizable = position_outcome.exit_reason == kExitStop ||
-                            position_outcome.exit_reason == kExitTarget ||
-                            position_outcome.exit_reason == kExitMaxHold ||
-                            position_outcome.exit_reason == kExitGap;
-          if (realizable && exit_price <= 0.0) {
-            // Not reported — rebuild from the levels, which is exact while they
-            // are fixed at entry and is what every outcome written before this
-            // field existed relies on.
-            switch (position_outcome.exit_reason) {
-              case kExitStop:
-                exit_price = position_event.stop_price;
-                break;
-              case kExitTarget:
-                exit_price = position_event.target_price;
-                break;
-              default:
-                exit_price = dataset.close[bar];
-                break;
-            }
-          }
-          if (realizable) {
+          const double exit_price = exit_price_now;
+          {
             double price_pnl = 0.0;
             if (position_event.direction == kDirectionLong) {
               price_pnl = (exit_price - position_entry_price) / pip * settings.pip_value_per_lot;
@@ -1010,6 +1090,19 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
             } else {
               gross_loss += fabs(pnl);
             }
+            // The whole trade record is written here now. Nothing upstream knows
+            // the exit any more, so nothing upstream can fill this in.
+            outcomes[position_index].exit_bar = bar;
+            outcomes[position_index].exit_reason = exit_reason_now;
+            outcomes[position_index].entry_bar = position_event.entry_bar;
+            outcomes[position_index].exit_price = exit_price;
+            outcomes[position_index].mfe =
+                position_fav > 0.0 ? position_fav / pip * settings.pip_value_per_lot : 0.0;
+            outcomes[position_index].mae =
+                position_adv > 0.0 ? position_adv / pip * settings.pip_value_per_lot : 0.0;
+            outcomes[position_index].pnl = pnl;
+            outcomes[position_index].r_multiple =
+                pnl / fmax(position_stop_pips * settings.pip_value_per_lot, 1.0e-9);
           }
           update_realized_risk(equity, &peak_equity, &day_peak, &day_low, &max_drawdown,
                                &max_daily_drawdown);
@@ -1050,6 +1143,21 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       // `cursor` already advanced past this event.
       position_index = cursor - 1ull;
       position_stop_pips = stop_pips;
+      position_trail = 0.0;
+      position_fav = 0.0;
+      position_adv = 0.0;
+      {
+        const unsigned int min_hold = settings.min_hold_bars > 0u ? settings.min_hold_bars : 1u;
+        position_min_hold_bar = static_cast<int>(event.entry_bar) + static_cast<int>(min_hold);
+        if (settings.max_hold_bars > 0u) {
+          const unsigned int hold = settings.max_hold_bars > settings.min_hold_bars
+                                        ? settings.max_hold_bars
+                                        : settings.min_hold_bars;
+          position_max_hold_bar = static_cast<int>(event.entry_bar) + static_cast<int>(hold);
+        } else {
+          position_max_hold_bar = -1;
+        }
+      }
       has_position = true;
       day_trade_count += 1u;
       accepted_trades += 1ull;
@@ -1811,10 +1919,13 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
     const unsigned long long events_per_block =
         settings->trailing_enabled != 0u ? block_threads : warps_per_block;
     const unsigned long long blocks = (emitted + events_per_block - 1ull) / events_per_block;
-    population_first_hit_kernel<<<static_cast<unsigned int>(blocks), block_threads, 0,
-                                  session->stream>>>(dataset, *settings, session->events,
-                                                     session->gap_flags, session->outcomes,
-                                                     emitted);
+    // `population_first_hit_kernel` is no longer launched: the reduce decides
+    // exits itself, at O(1) per open bar, where this cost 1 650 ms of the
+    // 1 740 ms evaluation to precompute exits for entries that mostly never
+    // happen. The kernel is left in the file until parity on a real card
+    // confirms the replacement, then it goes.
+    population_seed_outcomes_kernel<<<static_cast<unsigned int>(blocks), block_threads, 0,
+                                      session->stream>>>(session->outcomes, emitted);
     session->kernel_submissions += 1;
   }
   mark_stage();
