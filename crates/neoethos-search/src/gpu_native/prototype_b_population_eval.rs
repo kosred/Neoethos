@@ -571,6 +571,39 @@ fn evaluate_population_b_batch(
         .read_metrics()
         .map_err(|error| anyhow!("prototype B readback: {error}"))?;
 
+    // How much of the event budget the population actually needed.
+    //
+    // This is the number that decides three open questions at once. The kernel
+    // benchmarks at 47-50 M candidate-bars/s; inside discovery it managed 0.46 M,
+    // which is slower than the 128-core CPU. The suspected cause is that the
+    // population overruns the event budget and gets split into many small
+    // launches, so fixed per-launch cost dominates. The same overrun would mean
+    // each gene opens a position every few bars — which would also explain an
+    // MFE capture of 18 % and a walk-forward gate that never passes.
+    //
+    // Logged once per process: it is a property of the data, not of the call.
+    {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        let emitted = session.emitted_events();
+        LOGGED.call_once(|| {
+            let per_candidate = emitted as f64 / n_genes.max(1) as f64;
+            tracing::info!(
+                target: "neoethos_search::eval",
+                n_genes,
+                bars,
+                event_capacity = capacity,
+                emitted_events = emitted,
+                events_per_candidate = format!("{per_candidate:.0}"),
+                bars_per_trade = format!("{:.1}", bars as f64 / per_candidate.max(1e-9)),
+                capacity_used_pct = format!(
+                    "{:.1}",
+                    100.0 * emitted as f64 / capacity.max(1) as f64
+                ),
+                "event budget usage for this population"
+            );
+        });
+    }
+
     if rows.len() != n_genes {
         bail!(
             "prototype B returned {} metric rows for {} candidates",
