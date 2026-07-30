@@ -271,6 +271,28 @@ pub(crate) fn try_evaluate_population_b(
     device_override: Option<usize>,
 ) -> Result<Vec<[f64; 11]>> {
     use std::sync::atomic::Ordering as AtomicOrd;
+
+    // The kernel has no trailing stop. Not "an approximate one" — the string
+    // "trail" does not appear in prototype_b_population.cu, and the device ABI
+    // carries no field for it, while the CPU engine mentions it 74 times.
+    //
+    // So with `trailing_enabled` the two lanes simulate different strategies:
+    // the CPU ratchets the stop and closes trades within a bar or two, the card
+    // holds to a stop and target fixed at entry. The parity suite never caught
+    // it because its fixtures set `trailing_enabled: false`, and the CPU oracle
+    // is honest enough to refuse this case (`UnsupportedTrailingState`) — but
+    // nothing stopped production from dispatching here anyway.
+    //
+    // Refusing is not a limitation being papered over; running would produce
+    // strategies selected for behaviour they will not reproduce live, which is
+    // the backtest-to-live divergence this project has been chasing. The caller
+    // falls back to the CPU lane, which is slower and correct.
+    if settings.trailing_enabled {
+        anyhow::bail!(
+            "GPU population evaluation refused: risk.trailing_enabled is on and the              native kernel does not model a trailing stop, so it would evaluate a              different strategy than the CPU and than live trading. Either set              risk.trailing_enabled=false to search fixed-bracket strategies, or run              this search on the CPU."
+        );
+    }
+
     let n_genes = long_thr.len();
 
     // Start at the size already known to fit rather than rediscovering the
