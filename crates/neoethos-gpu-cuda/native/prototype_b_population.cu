@@ -10,6 +10,8 @@
 // validation oracle in `prototype_population_oracle.rs`. Any divergence is a
 // correctness failure, not a tuning opportunity.
 
+#include <cstdio>
+#include <cstdlib>
 #include "neoethos_gpu_cuda.h"
 
 #include <cuda_runtime.h>
@@ -1730,17 +1732,43 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
 
   const unsigned int signal_blocks = static_cast<unsigned int>(
       (signal_slots + kSignalBlock - 1) / kSignalBlock);
+  // ── Per-stage timing ────────────────────────────────────────────────────
+  //
+  // Three times today a bottleneck was named from reading the code and twice it
+  // was the wrong one. Wall-clock for the whole evaluation cannot tell signal
+  // from emit from first-hit from reduce, so every guess costs a rebuild and a
+  // rented card. This costs one env var and a handful of events.
+  //
+  // Off unless NEOETHOS_GPU_STAGE_TIMING is set: the syncs it needs would
+  // serialise the stream, which is exactly what you do not want in production
+  // and exactly what you do want when measuring.
+  const bool stage_timing = (std::getenv("NEOETHOS_GPU_STAGE_TIMING") != nullptr);
+  cudaEvent_t stage_marks[7];
+  int stage_mark = 0;
+  auto mark_stage = [&]() {
+    if (!stage_timing || stage_mark >= 7) {
+      return;
+    }
+    cudaEventCreate(&stage_marks[stage_mark]);
+    cudaEventRecord(stage_marks[stage_mark], session->stream);
+    stage_mark += 1;
+  };
+  mark_stage();
+
   population_signal_kernel<<<signal_blocks == 0u ? 1u : signal_blocks, kSignalBlock, 0,
                              session->stream>>>(dataset, genes, session->signal_values,
                                                 session->signal_confidences);
   const unsigned int gap_blocks = static_cast<unsigned int>((bars + 255) / 256);
   population_gap_flags_kernel<<<gap_blocks == 0u ? 1u : gap_blocks, 256, 0, session->stream>>>(
       dataset, *settings, session->gap_flags);
+  mark_stage();
   population_count_events_kernel<<<static_cast<unsigned int>(population), kEmitBlock, 0,
                                    session->stream>>>(dataset, genes, session->signal_values,
                                                       session->event_counts);
+  mark_stage();
   population_scan_offsets_kernel<<<1, 1, 0, session->stream>>>(
       session->event_counts, session->event_offsets, population);
+  mark_stage();
   population_emit_events_kernel<<<static_cast<unsigned int>(population), kEmitBlock, 0,
                                   session->stream>>>(dataset, genes, *settings,
                                                      session->signal_values,
@@ -1748,6 +1776,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
                                                      session->scenario_ids, session->events,
                                                      session->max_events,
                                                      session->overflow_flag);
+  mark_stage();
   session->kernel_submissions += 5;
 
   // The emitted event total and the capacity guard are the only host-visible
@@ -1788,6 +1817,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
                                                      emitted);
     session->kernel_submissions += 1;
   }
+  mark_stage();
 
   const unsigned int reduce_blocks =
       static_cast<unsigned int>((population + kReduceBlock - 1) / kReduceBlock);
@@ -1799,6 +1829,24 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
                                                 session->month_start_equities,
                                                 session->metric_rows,
                                                 session->accepted_trade_total);
+  mark_stage();
+  if (stage_timing) {
+    cudaStreamSynchronize(session->stream);
+    static const char* kStageNames[6] = {"signal", "gap_flags", "count_events",
+                                         "scan_offsets", "emit+first_hit", "reduce"};
+    std::fprintf(stderr, "[gpu-stage-timing] population=%lld bars=%lld events=%llu\n",
+                 static_cast<long long>(population), static_cast<long long>(bars),
+                 static_cast<unsigned long long>(emitted));
+    for (int i = 1; i < stage_mark; ++i) {
+      float ms = 0.0f;
+      cudaEventElapsedTime(&ms, stage_marks[i - 1], stage_marks[i]);
+      std::fprintf(stderr, "[gpu-stage-timing]   %-14s %8.1f ms\n",
+                   (i - 1) < 6 ? kStageNames[i - 1] : "?", ms);
+    }
+    for (int i = 0; i < stage_mark; ++i) {
+      cudaEventDestroy(stage_marks[i]);
+    }
+  }
   session->kernel_submissions += 1;
 
   if (cudaEventRecord(session->event, session->stream) != cudaSuccess) {
