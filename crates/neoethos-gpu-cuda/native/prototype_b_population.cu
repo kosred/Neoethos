@@ -869,7 +869,6 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
 
   bool has_position = false;
   NeoPopulationEvent position_event;
-  NeoPopulationOutcome position_outcome;
   double position_entry_price = 0.0;
   double position_lots = 0.0;
   unsigned long long position_index = 0ull;
@@ -1120,7 +1119,9 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
 
     if (cursor < range_end && static_cast<int>(events[cursor].entry_bar) == bar) {
       const NeoPopulationEvent event = events[cursor];
-      const NeoPopulationOutcome outcome = outcomes[cursor];
+      // The paired outcome used to be read here so the reduce would know when
+      // to close. It decides that itself now, so this is one fewer dependent
+      // load from a multi-gigabyte buffer per trade.
       ++cursor;
       if (settings.max_trades_per_day > 0u && day_trade_count >= settings.max_trades_per_day) {
         continue;
@@ -1137,7 +1138,6 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
             stop_pips, settings);
       }
       position_event = event;
-      position_outcome = outcome;
       position_entry_price = entry_price;
       position_lots = lots;
       // `cursor` already advanced past this event.
