@@ -615,6 +615,18 @@ impl DiscoveryConfig {
             discovery_ledger_cache_dir: model_settings.discovery_ledger.cache_dir.clone(),
             discovery_ledger_archive_top_n: model_settings.discovery_ledger.archive_top_n,
         }
+        // The mode's own floors, which production never applied.
+        //
+        // `apply_mode_overrides` was called from tests and nowhere else, so
+        // every real run used the struct defaults — max_dd 0.15, min_win_rate
+        // 0.50, min_profit_factor 1.20 — no matter what `trading_mode` said.
+        // Risky's 0.60 cap and PropFirm's 0.50 existed and never took effect.
+        //
+        // It shows up as a search that finds nothing: 2 211 candidates ranked,
+        // 1 713 of them rejected for exceeding a 15 % drawdown cap that the
+        // selected mode had raised. Choosing a mode has to change what the mode
+        // says it changes.
+        .apply_mode_overrides()
     }
 
     /// Resolve runtime knobs. The system prefers self-tuning over

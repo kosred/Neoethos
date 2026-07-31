@@ -1966,3 +1966,45 @@ fn the_target_profile_separates_win_rate_from_payoff() {
     assert!(TargetProfile::default().accepts(&trend));
     assert!(TargetProfile::default().accepts(&scalper));
 }
+
+#[test]
+fn choosing_a_mode_changes_what_the_mode_says_it_changes() {
+    // `apply_mode_overrides` was called from tests and nowhere else, so every
+    // real run used the struct defaults regardless of `trading_mode`: max_dd
+    // 0.15, min_win_rate 0.50, min_profit_factor 1.20. Risky's 0.60 cap and
+    // PropFirm's 0.50 existed and never took effect, and the search found
+    // nothing in any mode — 1 713 of 2 211 candidates rejected against a
+    // drawdown cap the selected mode had raised.
+    let mut settings = neoethos_core::Settings::default();
+
+    settings.system.trading_mode = "risky".to_string();
+    settings.models.discovery_mode = "prop_firm".to_string();
+    let risky = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(risky.mode, DiscoveryMode::Risky);
+    assert!(
+        risky.filtering.max_dd > 0.5,
+        "risky kept the default cap: {}",
+        risky.filtering.max_dd
+    );
+
+    settings.system.trading_mode = "prop_firm".to_string();
+    let prop = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(prop.mode, DiscoveryMode::PropFirm);
+    assert!(
+        prop.filtering.max_dd > 0.3,
+        "prop_firm kept the default cap: {}",
+        prop.filtering.max_dd
+    );
+
+    // Strict is the one mode whose floors ARE the defaults, so it is the
+    // control: if this loosened too, the overrides would be firing for
+    // everyone rather than per mode.
+    settings.models.discovery_mode = "strict".to_string();
+    let strict = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(strict.mode, DiscoveryMode::Strict);
+    assert!(
+        strict.filtering.max_dd <= 0.2,
+        "strict should stay tight: {}",
+        strict.filtering.max_dd
+    );
+}
