@@ -1033,6 +1033,7 @@ fn walkforward_risk_diagnostics(
 pub fn embargoed_walkforward_backtest(
     input: WalkforwardBacktestInput<'_>,
 ) -> Result<WalkforwardSummary> {
+    let _scope = crate::eval_telemetry::CallerScope::enter("walkforward");
     let WalkforwardBacktestInput {
         close,
         high,

@@ -28,6 +28,23 @@ struct Tally {
     items: u64,
 }
 
+/// `name @ caller`, leaked once per distinct pair.
+///
+/// The registry is keyed by `&'static str` and the pairs are bounded by the
+/// number of call sites, so leaking them is cheaper and simpler than making the
+/// whole map own its keys.
+fn interned(name: &'static str, caller: &'static str) -> &'static str {
+    static TABLE: OnceLock<Mutex<BTreeMap<(&'static str, &'static str), &'static str>>> =
+        OnceLock::new();
+    let table = TABLE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let Ok(mut table) = table.lock() else {
+        return name;
+    };
+    table
+        .entry((name, caller))
+        .or_insert_with(|| Box::leak(format!("{name} @ {caller}").into_boxed_str()))
+}
+
 fn registry() -> &'static Mutex<BTreeMap<&'static str, Tally>> {
     static REGISTRY: OnceLock<Mutex<BTreeMap<&'static str, Tally>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -47,8 +64,16 @@ pub fn measure<T>(name: &'static str, items: usize, body: impl FnOnce() -> T) ->
 /// Attribute an already-measured duration to `name`.
 pub fn record(name: &'static str, items: usize, elapsed: Duration) {
     let mut first_call = false;
+    // Split by caller when one claimed this region, so a shared evaluator does
+    // not report five different jobs as one line.
+    let caller = current_caller();
+    let key: &'static str = if caller.is_empty() {
+        name
+    } else {
+        interned(name, caller)
+    };
     if let Ok(mut registry) = registry().lock() {
-        let tally = registry.entry(name).or_default();
+        let tally = registry.entry(key).or_default();
         first_call = tally.calls == 0;
         tally.calls += 1;
         tally.nanos += elapsed.as_nanos();
@@ -96,6 +121,42 @@ pub fn log_summary(context: &str) {
             "evaluator totals"
         );
     }
+}
+
+/// Which caller is on the stack, for the evaluators several code paths share.
+///
+/// `fast_evaluate_strategy_core` is called from five places and reported 210 500
+/// times for 340 seconds — 44 % of a real run — as one number, which says the
+/// per-gene screen is expensive and nothing about which screen. Optimising the
+/// wrong one is a day spent for nothing, and yesterday that happened three
+/// times over.
+///
+/// The caller sets this around the region it owns; the evaluator appends it to
+/// its own name. Thread-local because the screens run under rayon, and a global
+/// would attribute one thread's work to another's caller.
+pub struct CallerScope;
+
+thread_local! {
+    static CALLER: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
+}
+
+impl CallerScope {
+    /// Attribute everything measured on this thread until the guard drops.
+    pub fn enter(name: &'static str) -> Self {
+        CALLER.with(|c| *c.borrow_mut() = Some(name));
+        Self
+    }
+}
+
+impl Drop for CallerScope {
+    fn drop(&mut self) {
+        CALLER.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// The active caller, or `""` when nothing claimed the work.
+pub fn current_caller() -> &'static str {
+    CALLER.with(|c| c.borrow().unwrap_or(""))
 }
 
 /// Forget everything recorded so far, so one work unit's totals cannot be read

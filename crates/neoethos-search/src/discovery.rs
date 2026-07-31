@@ -1389,6 +1389,7 @@ pub fn faithful_oos_eval(
     portfolio_path: &std::path::Path,
     oos_start_ts_ms: i64,
 ) -> anyhow::Result<Vec<GeneOosResult>> {
+    let _scope = crate::eval_telemetry::CallerScope::enter("faithful_oos");
     let artifact = crate::load_live_portfolio_json(portfolio_path)?;
     if artifact.genes.is_empty() {
         anyhow::bail!("portfolio {} has no genes", portfolio_path.display());
@@ -2182,6 +2183,7 @@ fn build_discovery_validation_artifacts(
     Vec<WalkforwardValidationArtifactFile>,
     Vec<bool>,
 )> {
+    let _scope = crate::eval_telemetry::CallerScope::enter("validation_artifacts");
     if portfolio.is_empty() {
         return Ok((
             DiscoveryValidationGates::pending(),
@@ -3576,6 +3578,7 @@ fn validate_regime_robustness(
     initial_balance: f64,
     max_regime_loss_pct: f64,
 ) -> bool {
+    let _scope = crate::eval_telemetry::CallerScope::enter("regime_robustness");
     let trend_idx = features
         .names
         .iter()
