@@ -20,7 +20,7 @@
 //! CPU at 4 096, 20 000 and 200 000 bars on real EURUSD data. It changes which
 //! engine computes it.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use ndarray::ArrayView2;
 
 use neoethos_gpu_contracts::device::{NeoPopulationEvent, ScenarioDescriptor};
@@ -329,6 +329,11 @@ pub(crate) fn try_evaluate_population_b(
 /// Asking the error what it is removes that coupling. The capacity check in
 /// `event_capacity_for` raises a plain `anyhow` error rather than a native one,
 /// so it is matched separately and by a phrase it owns.
+///
+/// This only works because the call sites attach context rather than formatting
+/// the error into a new one — `anyhow!("...: {error}")` renders the source and
+/// throws the value away, which left this check unable to find anything and
+/// made it dead code the moment it was written.
 fn is_capacity_exhaustion(error: &anyhow::Error) -> bool {
     if error
         .downcast_ref::<CudaPopulationError>()
@@ -337,6 +342,53 @@ fn is_capacity_exhaustion(error: &anyhow::Error) -> bool {
         return true;
     }
     format!("{error}").contains("leaves no room for events on this device")
+}
+
+#[cfg(test)]
+mod capacity_detection_tests {
+    use super::*;
+
+    /// Built exactly as the engine builds it, so the test exercises the real
+    /// shape rather than a convenient stand-in.
+    fn native_error(status: i32) -> CudaPopulationError {
+        CudaPopulationError::Native {
+            operation: "evaluate",
+            status,
+            message: neoethos_gpu_cuda::population_status_message(status),
+        }
+    }
+
+    /// The call sites attach context; this proves the typed error survives it.
+    ///
+    /// It did not: every site formatted the error into a fresh `anyhow!`, so
+    /// the retry-smaller check could never find it. The population that could
+    /// not fit went to the CPU instead of being halved, and a measured run put
+    /// 770 500 of 778 205 validation items there with the card idle.
+    #[test]
+    fn out_of_memory_survives_the_context_the_call_sites_attach() {
+        let native: Result<()> = Err(native_error(neoethos_gpu_cuda::STATUS_ALLOCATION_FAILED))
+            .map_err(anyhow::Error::new)
+            .context("prototype B evaluate");
+        let error = native.expect_err("constructed as an error");
+        assert!(
+            is_capacity_exhaustion(&error),
+            "an out-of-memory has to stay recognisable through the context: {error:#}"
+        );
+
+        // The rendering the log uses must still name the cause, or the next
+        // investigation starts blind again.
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("prototype B evaluate"), "{rendered}");
+        assert!(rendered.contains("device allocation failed"), "{rendered}");
+    }
+
+    /// A launch failure is a fault, not a size problem.
+    #[test]
+    fn a_launch_failure_is_not_retried_smaller() {
+        let error = anyhow::Error::new(native_error(neoethos_gpu_cuda::STATUS_LAUNCH_FAILED))
+            .context("prototype B evaluate");
+        assert!(!is_capacity_exhaustion(&error));
+    }
 }
 
 /// Halve the population and evaluate each side.
@@ -488,12 +540,14 @@ fn evaluate_population_b_batch(
             settings: SnapshotSettingsDto::from_settings(settings),
         };
         let native_settings = population_settings_for_dataset(&dataset)
-            .map_err(|error| anyhow!("prototype B settings: {error}"))?;
+            .map_err(anyhow::Error::new)
+        .context("prototype B settings")?;
         let smc_rows: Vec<i8> = dataset.smc_data.iter().flatten().copied().collect();
         let adaptive_base = dataset.settings.to_settings().adaptive_base_pips.clone();
 
         let mut session = PopulationSession::create(device, capacity)
-            .map_err(|error| anyhow!("prototype B session: {error}"))?;
+            .map_err(anyhow::Error::new)
+        .context("prototype B session")?;
         session
             .upload_dataset(PopulationDatasetView {
                 close: &dataset.close,
@@ -507,7 +561,8 @@ fn evaluate_population_b_batch(
                 smc_rows: &smc_rows,
                 adaptive_base_pips: adaptive_base.as_deref(),
             })
-            .map_err(|error| anyhow!("prototype B dataset upload: {error}"))?;
+            .map_err(anyhow::Error::new)
+        .context("prototype B dataset upload")?;
 
         *slot = Some(SendResident(ResidentSession {
             session,
@@ -543,7 +598,8 @@ fn evaluate_population_b_batch(
         gate_threshold,
     };
     let inputs = PrototypeBPopulationInputs::from_uploads(&resident.dataset, &genes)
-        .map_err(|error| anyhow!("prototype B: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("prototype B")?;
     let session = &mut resident.session;
 
     session
@@ -560,7 +616,8 @@ fn evaluate_population_b_batch(
             gate_threshold: genes.gate_threshold,
             smc_gate_disabled: crate::genetic::smc_gate_disabled(),
         })
-        .map_err(|error| anyhow!("prototype B gene upload: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("prototype B gene upload")?;
 
     // One full-window scenario per candidate. Costs, spread and slippage are
     // carried by the settings, not the scenario, so every per-scenario knob
@@ -584,17 +641,21 @@ fn evaluate_population_b_batch(
         .collect();
     session
         .upload_scenarios(&scenarios)
-        .map_err(|error| anyhow!("prototype B scenario upload: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("prototype B scenario upload")?;
 
     let (event_id, _counters) = session
         .evaluate(&native_settings)
-        .map_err(|error| anyhow!("prototype B evaluate: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("prototype B evaluate")?;
     session
         .wait(event_id)
-        .map_err(|error| anyhow!("prototype B wait: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("prototype B wait")?;
     let rows = session
         .read_metrics()
-        .map_err(|error| anyhow!("prototype B readback: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("prototype B readback")?;
 
     // How much of the event budget the population actually needed.
     //

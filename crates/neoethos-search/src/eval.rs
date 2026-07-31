@@ -2207,7 +2207,7 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
                 tracing::warn!(
                     target: "neoethos_search::eval",
                     genes = n_genes,
-                    error = %error,
+                    error = format!("{error:#}"),
                     "validation GPU lane refused the work — this is why it is on the CPU"
                 );
                 GpuFailure::AllocationPressure

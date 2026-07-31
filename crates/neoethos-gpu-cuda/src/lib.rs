@@ -13,6 +13,10 @@ pub use population::{
     CudaPopulationError, PopulationDatasetView, PopulationDiagnostics, PopulationGeneView,
     PopulationSession, population_status_message,
 };
+// Callers that decide what to do about a failure need to name the failure.
+// Without these, the only handle on a status was its rendered message, and a
+// caller matching on that text silently stopped working when the wording moved.
+pub use population::{STATUS_ALLOCATION_FAILED, STATUS_EVENT_CAPACITY, STATUS_LAUNCH_FAILED};
 
 /// Number of SMC slots carried by one row of the canonical SMC contract.
 pub const SMC_SLOTS: usize = 11;
