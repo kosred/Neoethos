@@ -249,6 +249,20 @@ struct ResidentSession {
     key: u64,
     device: i32,
     capacity: usize,
+    /// The population the device workspace was actually allocated for.
+    ///
+    /// The signal, confidence and outcome arrays are sized `population * bars`
+    /// when the workspace is built, and the kernel indexes them by the CURRENT
+    /// population — which `upload_genes` overwrites on every call. Reusing a
+    /// session for a larger population therefore writes past the end of every
+    /// one of those arrays, into whatever the allocator placed next.
+    ///
+    /// Nothing stopped that. The reuse test was `capacity >= capacity`, and
+    /// `event_capacity` SUBTRACTS `population * bars * 5`, so a larger
+    /// population asks for LESS capacity and passes more easily — the check
+    /// was not merely silent about population, it was inverted with respect
+    /// to it. A session built for 256 candidates was reused for 25 600.
+    workspace_population: usize,
     /// The host-side dataset, staged once and kept.
     ///
     /// Building it copies every bar of close/high/low and the whole
@@ -471,6 +485,35 @@ mod capacity_detection_tests {
         );
     }
 
+    /// The reuse test was inverted with respect to population.
+    ///
+    /// `event_capacity` subtracts `population * bars * 5 + population * 3944`
+    /// from the budget, so asking for MORE candidates yields a SMALLER required
+    /// capacity — and `capacity >= capacity` therefore passed exactly when it
+    /// should have failed. This pins the arithmetic that made the old check
+    /// unsafe, so a future edit to the budget cannot quietly restore it.
+    #[test]
+    fn a_bigger_population_demands_less_capacity_which_is_why_that_test_was_unsafe() {
+        const BARS: usize = 87_715;
+        const FEATURES: usize = 81;
+        const FREE: u64 = 24 * 1024 * 1024 * 1024;
+
+        // Same shape as `event_capacity`, without the device query.
+        let capacity_for = |population: u64| -> u64 {
+            let budget = (FREE / 10) * 7;
+            let dataset = BARS as u64 * (3 * 8 + 3 * 8 + 11 + FEATURES as u64 * 4);
+            let fixed = dataset + population * BARS as u64 * 5 + population * 3_944 + 64 * 1024 * 1024;
+            budget.saturating_sub(fixed) / 128
+        };
+
+        let small = capacity_for(256);
+        let large = capacity_for(25_600);
+        assert!(
+            large < small,
+            "25 600 candidates asked for {large} and 256 asked for {small} — if this ever              reverses, re-read why the population check exists"
+        );
+    }
+
     /// A blind moment must not approve everything.
     ///
     /// The unreadable-memory branch used to yield `usize::MAX`. That single
@@ -684,9 +727,13 @@ fn evaluate_population_b_batch(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let reusable = slot
-        .as_ref()
-        .is_some_and(|r| r.0.key == key && r.0.device == device && r.0.capacity >= capacity);
+    let reusable = slot.as_ref().is_some_and(|r| {
+        r.0.key == key
+            && r.0.device == device
+            && r.0.capacity >= capacity
+            // Never hand the kernel more candidates than the workspace holds.
+            && r.0.workspace_population >= n_genes
+    });
 
     if !reusable {
         // Drop the old session before building the new one so the two never
@@ -739,6 +786,7 @@ fn evaluate_population_b_batch(
             key,
             device,
             capacity,
+            workspace_population: n_genes,
             dataset,
             smc_rows,
             native_settings,

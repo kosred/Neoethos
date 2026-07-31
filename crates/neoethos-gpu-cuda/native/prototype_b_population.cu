@@ -1345,6 +1345,18 @@ struct NeoCudaPopulationSession {
   int feature_count = 0;
   int population = 0;
   int month_capacity = 0;
+  // What the workspace was actually built for.
+  //
+  // The signal, confidence and outcome arrays are sized population * bars at
+  // allocation, and every kernel indexes them by the CURRENT population, which
+  // `upload_genes` overwrites on each call. The reuse test compared only
+  // `signal_values == nullptr` and `month_capacity`, so a session built for a
+  // small population and reused for a large one wrote past the end of all
+  // three — into `monthly_pnls` and `month_start_equities`, which are the
+  // arrays sharpe and consistency are computed from, and `sanitize()` then
+  // turns any non-finite consequence into 0.0.
+  int workspace_population = 0;
+  int workspace_bars = 0;
   unsigned long long emitted_events = 0ull;
   unsigned long long accepted_trades = 0ull;
   std::uint64_t dataset_upload_bytes = 0ull;
@@ -1810,7 +1822,8 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
   const std::size_t signal_slots =
       static_cast<std::size_t>(population) * static_cast<std::size_t>(bars);
 
-  if (session->signal_values == nullptr || session->month_capacity != month_capacity) {
+  if (session->signal_values == nullptr || session->month_capacity != month_capacity ||
+      session->workspace_population != population || session->workspace_bars != bars) {
     session->release_workspace();
     std::int32_t status = NEO_POPULATION_STATUS_OK;
     const auto guard = [&](std::int32_t code) {
@@ -1842,6 +1855,8 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
       return status;
     }
     session->month_capacity = month_capacity;
+    session->workspace_population = population;
+    session->workspace_bars = bars;
   }
 
   if (cudaMemsetAsync(session->accepted_trade_total, 0, sizeof(unsigned long long),
