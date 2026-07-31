@@ -4145,7 +4145,13 @@ where
     // did it is the whole question — "all 49 344 exceeded the drawdown cap" and
     // "all 49 344 had too few trades" call for opposite responses, and telling
     // them apart should not need a second run.
-    if post_passes_filter == 0 && ranked_total > 0 {
+    // Fires on "almost none", not only on "none".
+    //
+    // A measured M3 run had ranked=22 486 -> post_passes_filter=2, and this
+    // stayed silent because two is not zero. Two survivors out of 22 486 is the
+    // same diagnosis as none and needs the same answer — which floor did it —
+    // and the run then reported an empty portfolio with nothing said about why.
+    if post_passes_filter * 100 <= ranked_total && ranked_total > 0 {
         tracing::warn!(
             target: "neoethos_search::funnel",
             ranked = ranked_total,
