@@ -30,6 +30,20 @@ pub const STATUS_SYNC_FAILED: i32 = -40;
 pub const STATUS_UNKNOWN_EVENT: i32 = -41;
 pub const STATUS_DATASET_REUPLOAD: i32 = -42;
 
+/// Trade slots the kernel reserves per candidate.
+///
+/// The outcome array is `population * MAX_TRADES_PER_CANDIDATE` records, so at
+/// 72 bytes each this is ~590 KB per candidate and it is what the card runs out
+/// of. A caller that does not know the number cannot know how many candidates
+/// fit, and the session's own budget still sizes an event buffer that no longer
+/// exists — so peak memory became a function of the requested population, which
+/// is exactly what the never-OOM invariant forbids.
+///
+/// `trade_slots_match_the_kernel` keeps this equal to the kernel's own
+/// constant. Two languages agreeing by convention is how the retry-smaller path
+/// silently stopped working; this one is checked.
+pub const MAX_TRADES_PER_CANDIDATE: u64 = 8192;
+
 pub fn population_status_message(status: i32) -> &'static str {
     match status {
         STATUS_OK => "ok",
@@ -682,6 +696,28 @@ mod tests {
             PopulationSession::create(-1, 8),
             Err(CudaPopulationError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn trade_slots_match_the_kernel() {
+        // Read from the source the kernel actually compiles, so the two cannot
+        // drift. A mismatch means the host budgets for a different array than
+        // the device allocates — undersize and it splits for no reason,
+        // oversize and it runs the card out of memory.
+        const KERNEL: &str = include_str!("../native/prototype_b_population.cu");
+        let declaration = KERNEL
+            .lines()
+            .find(|line| line.contains("constexpr unsigned long long kMaxTradesPerCandidate"))
+            .expect("the kernel declares its trade slots");
+        let value: u64 = declaration
+            .rsplit('=')
+            .next()
+            .and_then(|tail| tail.trim().trim_end_matches(&[';', 'u', 'l'][..]).parse().ok())
+            .unwrap_or_else(|| panic!("cannot read the slot count from: {declaration}"));
+        assert_eq!(
+            value, MAX_TRADES_PER_CANDIDATE,
+            "the kernel reserves {value} trade slots per candidate but the host budgets for {MAX_TRADES_PER_CANDIDATE}"
+        );
     }
 
     #[test]

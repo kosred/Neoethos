@@ -43,6 +43,51 @@ pub(crate) fn prototype_b_available() -> bool {
     neoethos_gpu_cuda::runtime_available() && neoethos_gpu_cuda::device_count() > 0
 }
 
+/// Candidates the card can host at once, from free VRAM rather than from the
+/// caller's population.
+///
+/// `event_capacity` below budgets for an event buffer the kernel no longer
+/// allocates. What it allocates instead is `population * MAX_TRADES_PER_
+/// CANDIDATE` outcome records — ~590 KB per candidate — so peak memory became a
+/// function of the requested population. That is the never-OOM invariant
+/// inverted, and removing the event buffer is what inverted it.
+///
+/// Measured: validation asks for ~25 000 candidates in one call (250 folds x
+/// 100 Monte-Carlo runs). At 1.03 MB each over 87 715 bars that is ~25 GB on a
+/// 24 GB card — it failed, the retry halved it, the halves failed too because
+/// the first failure had already left the context unusable, and 25 000 of
+/// 25 250 items ran on the CPU after 30 s of wasted attempts.
+///
+/// Deciding the size up front costs one query and removes the failure entirely.
+fn candidates_that_fit(device: usize, bars: usize, feature_count: usize) -> Option<usize> {
+    candidates_for_free_memory(
+        neoethos_gpu_cuda::device_free_memory_bytes(device)?,
+        bars,
+        feature_count,
+    )
+}
+
+/// The arithmetic, separated from the device query so it can be checked without
+/// a card. The numbers it produces decide whether a run uses the GPU at all.
+fn candidates_for_free_memory(free: u64, bars: usize, feature_count: usize) -> Option<usize> {
+    // Same headroom convention as `event_capacity`: leave three tenths for
+    // context, fragmentation and the allocator's own bookkeeping.
+    let budget = (free / 10) * 7;
+    let dataset = bars as u64 * (3 * 8 + 3 * 8 + 11 + feature_count as u64 * 4);
+    let room = budget
+        .saturating_sub(dataset)
+        .saturating_sub(64 * 1024 * 1024);
+    // Per candidate: its trade slots, its signal and confidence columns, and
+    // the monthly buckets plus metric row already accounted for elsewhere.
+    let outcome = std::mem::size_of::<neoethos_gpu_contracts::device::NeoPopulationOutcome>() as u64;
+    let per_candidate =
+        neoethos_gpu_cuda::MAX_TRADES_PER_CANDIDATE * outcome + bars as u64 * 5 + 3_944;
+    let fits = room / per_candidate.max(1);
+    // Below this the card cannot do useful work and the CPU lane is the honest
+    // answer; `None` leaves the decision where it already is.
+    (fits >= 16).then_some(fits as usize)
+}
+
 /// Event capacity for a session, sized from the hardware rather than from the
 /// caller's parameters.
 ///
@@ -279,6 +324,25 @@ pub(crate) fn try_evaluate_population_b(
     // Start at the size already known to fit rather than rediscovering the
     // limit by throwing away a full evaluation every generation.
     let learned = learned_batch_limit().load(AtomicOrd::Relaxed);
+    // What the card can hold is knowable before asking it, so ask first. The
+    // retry below still exists for what cannot be predicted — how many trades a
+    // population actually emits — but it should never be reached for a size
+    // that was arithmetic all along.
+    let fits = candidates_that_fit(
+        device_override.unwrap_or(0),
+        close.len(),
+        indicators.nrows(),
+    )
+    .unwrap_or(usize::MAX);
+    if fits < n_genes {
+        tracing::debug!(
+            target: "neoethos_search::eval",
+            n_genes,
+            fits,
+            "population exceeds what the card can host — splitting before asking"
+        );
+    }
+    let learned = learned.min(fits);
     if n_genes > learned && n_genes > 1 {
         return split_and_evaluate(
             close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
@@ -347,6 +411,44 @@ fn is_capacity_exhaustion(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod capacity_detection_tests {
     use super::*;
+
+    /// The measured case: an RTX 3090 and the population validation asks for.
+    ///
+    /// 250 folds x 100 Monte-Carlo runs is ~25 000 candidates, and at these
+    /// dimensions that does not fit. It has to come back short of the request
+    /// — that is the whole point — and it has to leave room to work.
+    #[test]
+    fn the_population_validation_asks_for_does_not_fit_a_24gb_card() {
+        const BARS: usize = 87_715;
+        const FEATURES: usize = 257;
+        let fits = candidates_for_free_memory(24 * 1024 * 1024 * 1024, BARS, FEATURES)
+            .expect("a 24 GB card can host a useful batch");
+        assert!(
+            fits < 25_000,
+            "the request that ran the card out of memory must not be approved: {fits}"
+        );
+        assert!(
+            fits > 4_000,
+            "a 24 GB card should still host a large batch, not trickle: {fits}"
+        );
+    }
+
+    /// Peak memory must follow the hardware, never the request.
+    #[test]
+    fn a_smaller_card_approves_a_smaller_batch() {
+        const BARS: usize = 87_715;
+        const FEATURES: usize = 257;
+        let big = candidates_for_free_memory(24 * 1024 * 1024 * 1024, BARS, FEATURES).unwrap();
+        let small = candidates_for_free_memory(8 * 1024 * 1024 * 1024, BARS, FEATURES).unwrap();
+        assert!(small < big, "8 GB approved {small}, 24 GB approved {big}");
+
+        // A card with no room to work says so rather than approving a batch it
+        // cannot host — the CPU lane is the honest answer there.
+        assert_eq!(
+            candidates_for_free_memory(64 * 1024 * 1024, BARS, FEATURES),
+            None
+        );
+    }
 
     /// Built exactly as the engine builds it, so the test exercises the real
     /// shape rather than a convenient stand-in.
