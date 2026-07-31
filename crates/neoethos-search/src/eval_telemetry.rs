@@ -136,27 +136,46 @@ pub fn log_summary(context: &str) {
 /// would attribute one thread's work to another's caller.
 pub struct CallerScope;
 
-thread_local! {
-    static CALLER: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
-}
+/// Process-wide, not thread-local.
+///
+/// Thread-local was the first attempt and measured nothing: these screens run
+/// under rayon, the guard is taken on the calling thread, and the workers that
+/// do the evaluating never see it. A global works because the phases it labels
+/// are sequential — the quality screen finishes before validation starts — so
+/// there is no window where two of them are active at once. If that ever stops
+/// being true the totals will blur rather than lie, and the fix is to pass the
+/// label down explicitly.
+static CALLER: std::sync::atomic::AtomicPtr<u8> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 impl CallerScope {
-    /// Attribute everything measured on this thread until the guard drops.
+    /// Attribute everything measured until the guard drops.
     pub fn enter(name: &'static str) -> Self {
-        CALLER.with(|c| *c.borrow_mut() = Some(name));
+        CALLER.store(name.as_ptr() as *mut u8, std::sync::atomic::Ordering::Relaxed);
+        LEN.store(name.len(), std::sync::atomic::Ordering::Relaxed);
         Self
     }
 }
 
+static LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl Drop for CallerScope {
     fn drop(&mut self) {
-        CALLER.with(|c| *c.borrow_mut() = None);
+        CALLER.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+        LEN.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 /// The active caller, or `""` when nothing claimed the work.
 pub fn current_caller() -> &'static str {
-    CALLER.with(|c| c.borrow().unwrap_or(""))
+    let ptr = CALLER.load(std::sync::atomic::Ordering::Relaxed);
+    if ptr.is_null() {
+        return "";
+    }
+    let len = LEN.load(std::sync::atomic::Ordering::Relaxed);
+    // Safe: the pointer only ever comes from a `&'static str` handed to
+    // `enter`, and the length is stored with it.
+    unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
 }
 
 /// Forget everything recorded so far, so one work unit's totals cannot be read
