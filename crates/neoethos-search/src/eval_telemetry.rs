@@ -23,6 +23,16 @@ use std::time::{Duration, Instant};
 struct Tally {
     calls: u64,
     nanos: u128,
+    /// When this evaluator was first entered and last left, as offsets from the
+    /// first record of the run.
+    ///
+    /// `nanos` is summed across threads, so a rayon-parallel evaluator can report
+    /// more seconds than the run took. Reading those as wall time is how a stage
+    /// that costs seconds gets mistaken for the bottleneck: one measurement had
+    /// 413.6 s and 340.0 s inside a 452.4 s run, and only one of them was
+    /// sequential. The span says which.
+    first_ns: u128,
+    last_ns: u128,
     /// Candidates (or genes) seen, so a slow path can be told apart from a
     /// merely popular one.
     items: u64,
@@ -43,6 +53,12 @@ fn interned(name: &'static str, caller: &'static str) -> &'static str {
     table
         .entry((name, caller))
         .or_insert_with(|| Box::leak(format!("{name} @ {caller}").into_boxed_str()))
+}
+
+/// When the run's first measurement happened, so spans share an origin.
+fn run_start() -> &'static Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now)
 }
 
 fn registry() -> &'static Mutex<BTreeMap<&'static str, Tally>> {
@@ -78,6 +94,11 @@ pub fn record(name: &'static str, items: usize, elapsed: Duration) {
         tally.calls += 1;
         tally.nanos += elapsed.as_nanos();
         tally.items += items as u64;
+        let now = run_start().elapsed().as_nanos();
+        if first_call {
+            tally.first_ns = now.saturating_sub(elapsed.as_nanos());
+        }
+        tally.last_ns = now;
     }
     if first_call {
         // The single most useful line: it distinguishes "cold" from "never
@@ -110,6 +131,13 @@ pub fn log_summary(context: &str) {
     let total: u128 = rows.iter().map(|(_, tally)| tally.nanos).sum();
     for (name, tally) in rows {
         let seconds = tally.nanos as f64 / 1e9;
+        // The span is the wall-clock window this evaluator occupied. Compared
+        // against `seconds` it says whether the work was spread over threads: a
+        // parallel stage sums to far more than its span, a sequential one to
+        // about the same. Deciding what to optimise needs the span; deciding
+        // where CPU went needs the sum.
+        let span_seconds = tally.last_ns.saturating_sub(tally.first_ns) as f64 / 1e9;
+        let parallelism = if span_seconds > 0.001 { seconds / span_seconds } else { 1.0 };
         tracing::info!(
             target: "neoethos_search::eval_telemetry",
             context,
@@ -117,8 +145,10 @@ pub fn log_summary(context: &str) {
             calls = tally.calls,
             items = tally.items,
             seconds = format!("{seconds:.1}"),
+            wall_span_s = format!("{span_seconds:.1}"),
+            effective_threads = format!("{parallelism:.1}"),
             share_pct = format!("{:.1}", if total > 0 { 100.0 * tally.nanos as f64 / total as f64 } else { 0.0 }),
-            "evaluator totals"
+            "evaluator totals — share_pct is of SUMMED time; compare seconds against wall_span_s"
         );
     }
 }
