@@ -2123,8 +2123,20 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         // sound here: on a panic we discard every partial GPU result and
         // recompute the WHOLE population on the CPU, so no observer sees a
         // torn intermediate.
+        // Prototype B, the same engine the GA uses.
+        //
+        // Validation went through the cubecl path while the GA went through
+        // prototype B, and the two were never compared because nothing measured
+        // them together. Prototype B is now the one that decides exits in the
+        // reduce, needs no event buffer, and evaluates a population 8.7x faster
+        // with P&L parity against the CPU proven on a real card.
+        //
+        // The split mattered more than it looks: validation is 99.9 % of a run
+        // — 1 231 s of which the GA is 1.2 s — so every kernel improvement so
+        // far applied to a tenth of a percent of the work. The argument lists
+        // are identical, which is why this had gone unnoticed.
         let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            try_evaluate_population_cuda(
+            crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
                 close,
                 high,
                 low,
