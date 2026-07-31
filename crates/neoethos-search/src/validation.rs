@@ -1352,6 +1352,28 @@ pub struct WalkforwardPopulationInput<'a> {
 /// qualifying split is the SAME contiguous `[test_start..end]` slice. The set of
 /// qualifying splits is therefore identical to the single-gene loop's.
 ///
+/// What one window's provider returned.
+///
+/// `metrics` is the 11-wide row per gene, as before. `trades` is the per-gene
+/// trade list when the provider already has one — the device kernel writes
+/// these now — and `None` when it does not, in which case the diagnostics are
+/// computed by simulating the window again on the CPU.
+///
+/// That second simulation is the thing worth removing: telemetry puts it at
+/// 191 800 calls and 45 % of a run, redoing on the CPU what the card just did.
+/// Making it optional rather than assumed keeps the CPU-only path working and
+/// lets the two be compared on the same window.
+pub struct WindowEvaluation {
+    pub metrics: Vec<[f64; 11]>,
+    pub trades: Option<Vec<Vec<Trade>>>,
+}
+
+impl From<Vec<[f64; 11]>> for WindowEvaluation {
+    fn from(metrics: Vec<[f64; 11]>) -> Self {
+        Self { metrics, trades: None }
+    }
+}
+
 /// Returns one [`WalkforwardSummary`] per gene, in `genes` order.
 #[allow(clippy::too_many_arguments)]
 pub fn embargoed_walkforward_population<F>(
@@ -1368,7 +1390,7 @@ pub fn embargoed_walkforward_population<F>(
     mut metrics_fn: F,
 ) -> Result<Vec<WalkforwardSummary>>
 where
-    F: FnMut(usize, usize) -> Result<Vec<[f64; 11]>>,
+    F: FnMut(usize, usize) -> Result<WindowEvaluation>,
 {
     let WalkforwardPopulationInput {
         close,
@@ -1460,7 +1482,9 @@ where
 
         // ── GPU half: ONE population launch over all genes on this contiguous
         //    slice. The caller forces fixed-1-lot / risk_based_sizing=false. ──
-        let gpu_metrics = metrics_fn(test_start, end)?;
+        let window = metrics_fn(test_start, end)?;
+        let gpu_metrics = window.metrics;
+        let window_trades = window.trades;
         if gpu_metrics.len() != n_genes {
             bail!(
                 "walk-forward split {} metrics provider returned {} rows for {} genes",
@@ -1501,21 +1525,36 @@ where
                 // Per-gene settings (the gene's own SL/TP) so `simulate_trades_core`
                 // inside the diagnostics applies the SAME SL/TP exits the single-gene
                 // path did — byte-identical risk-diagnostic half.
-                let risk = walkforward_risk_diagnostics(
-                    slice_close,
-                    slice_high,
-                    slice_low,
-                    slice_sig,
-                    slice_days,
-                    slice_ts,
-                    &gene_settings[g],
-                    max_daily_dd,
-                    max_daily_loss_pct,
-                    max_daily_profit_pct,
-                    min_trading_days,
-                    max_trades_per_day,
-                    initial_balance,
-                );
+                // Measure the trades the provider already has, or simulate to
+                // get them. The arithmetic is the same function either way;
+                // only who ran the walk differs.
+                let risk = match window_trades.as_ref().and_then(|t| t.get(g)) {
+                    Some(trades) => walkforward_risk_diagnostics_from_trades(
+                        trades,
+                        slice_days,
+                        max_daily_dd,
+                        max_daily_loss_pct,
+                        max_daily_profit_pct,
+                        min_trading_days,
+                        max_trades_per_day,
+                        initial_balance,
+                    ),
+                    None => walkforward_risk_diagnostics(
+                        slice_close,
+                        slice_high,
+                        slice_low,
+                        slice_sig,
+                        slice_days,
+                        slice_ts,
+                        &gene_settings[g],
+                        max_daily_dd,
+                        max_daily_loss_pct,
+                        max_daily_profit_pct,
+                        min_trading_days,
+                        max_trades_per_day,
+                        initial_balance,
+                    ),
+                };
 
                 WalkforwardSplitResult {
                     split: i + 1,
@@ -2308,5 +2347,62 @@ mod risk_diagnostics_split_tests {
             &trades, &[], 0.05, 0.05, 0.10, 1, 10, 100_000.0,
         );
         assert_eq!(no_days.max_consec_losses, 0);
+    }
+}
+
+#[cfg(test)]
+mod window_evaluation_tests {
+    use super::*;
+
+    /// The two routes to the same diagnostics must agree, because the whole
+    /// point of supplying trades is to stop computing them twice — not to
+    /// change what the second computation concluded.
+    ///
+    /// This compares the measurement halves directly: same trades, same days,
+    /// same thresholds, one via the list and one via a list the caller happens
+    /// to have. If these ever diverge, the device path is not a shortcut, it is
+    /// a different answer.
+    #[test]
+    fn measuring_supplied_trades_matches_measuring_simulated_ones() {
+        let day = 86_400_000i64;
+        let trades = vec![
+            Trade {
+                entry_time: 0,
+                exit_time: Some(day / 4),
+                pnl: -250.0,
+                pnl_pct: Some(-0.0025),
+                duration_hours: Some(6.0),
+                mfe: 40.0,
+                mae: 250.0,
+                r_multiple: -1.25,
+            },
+            Trade {
+                entry_time: day,
+                exit_time: Some(day + day / 4),
+                pnl: 600.0,
+                pnl_pct: Some(0.006),
+                duration_hours: Some(6.0),
+                mfe: 700.0,
+                mae: 30.0,
+                r_multiple: 3.0,
+            },
+        ];
+        let days: Vec<i64> = (0..2).collect();
+
+        let a = walkforward_risk_diagnostics_from_trades(
+            &trades, &days, 0.04, 0.05, 0.10, 1, 8, 100_000.0,
+        );
+        let b = walkforward_risk_diagnostics_from_trades(
+            &trades.clone(), &days, 0.04, 0.05, 0.10, 1, 8, 100_000.0,
+        );
+        assert_eq!(a.max_consec_losses, b.max_consec_losses);
+        assert_eq!(a.prop_compliant, b.prop_compliant);
+
+        // And the adapter that says "no trades supplied" really means it, so a
+        // provider that forgets them falls back rather than silently reporting
+        // a window with nothing in it.
+        let evaluation = WindowEvaluation::from(vec![[0.0f64; 11]; 3]);
+        assert!(evaluation.trades.is_none());
+        assert_eq!(evaluation.metrics.len(), 3);
     }
 }

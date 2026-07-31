@@ -2320,6 +2320,11 @@ fn build_discovery_validation_artifacts(
                 test_start,
                 end,
             )
+            // Metrics only for now: the device writes a trade list but nothing
+            // reads it back yet, so the diagnostics still simulate this window
+            // a second time on the CPU. Supplying `trades` here is what turns
+            // that off — see `WindowEvaluation`.
+            .map(crate::validation::WindowEvaluation::from)
         },
     )?;
     if walkforward_summaries.len() != portfolio.len() {
