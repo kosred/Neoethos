@@ -843,6 +843,23 @@ mod tests {
     /// non-execution, and it is announced explicitly.
     #[cfg(feature = "gpu-b-native")]
     #[test]
+    // Ignored, not deleted, and not because it is inconvenient.
+    //
+    // The oracle is a second implementation of the event pipeline: it resolves
+    // an outcome per candidate entry and expects the kernel to have done the
+    // same. The kernel no longer emits events at all — it opens positions from
+    // the signal and decides exits as it walks — so this compares against a
+    // design that is gone, and a failure here says nothing about correctness.
+    //
+    // What replaces it is stronger, not weaker:
+    // `eval::trailing_parity_tests::gpu_matches_cpu_with_a_trailing_stop`
+    // compares the kernel against the CPU engine live trading actually uses,
+    // on P&L rather than exit bars, and passes on a real card.
+    //
+    // Un-ignore by porting the oracle to the walk-based model. Until then this
+    // is dead reference code, and pretending otherwise is how the missing
+    // trailing stop survived a full parity suite for months.
+    #[ignore = "models the retired event pipeline; superseded by gpu_matches_cpu_with_a_trailing_stop"]
     fn cuda_population_metrics_match_the_canonical_oracle() {
         use crate::gpu_native::engine::{BacktestEngine, DeviceFilterPolicy};
         use crate::gpu_native::prototype_population_oracle::evaluate_population_oracle;
