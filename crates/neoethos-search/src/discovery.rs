@@ -4121,6 +4121,28 @@ where
     if reject_other > 0 {
         funnel.add_reject_reason("passed_base_filter", "other_threshold", reject_other);
     }
+    // Said out loud, not only written to the funnel file.
+    //
+    // A run that rejects every candidate reports `post_passes_filter=0` and
+    // stops, and the reasons sit in a JSON the probe never writes. Which floor
+    // did it is the whole question — "all 49 344 exceeded the drawdown cap" and
+    // "all 49 344 had too few trades" call for opposite responses, and telling
+    // them apart should not need a second run.
+    if post_passes_filter == 0 && ranked_total > 0 {
+        tracing::warn!(
+            target: "neoethos_search::funnel",
+            ranked = ranked_total,
+            max_dd_exceeded = reject_dd,
+            win_rate_too_low = reject_win_rate,
+            profit_factor_too_low = reject_profit_factor,
+            fitness_too_low = reject_fitness,
+            other_threshold = reject_other,
+            max_dd_floor = config.filtering.max_dd,
+            min_win_rate_floor = config.filtering.min_win_rate,
+            min_profit_factor_floor = config.filtering.min_profit_factor,
+            "every candidate failed the base filter — this is which floor did it"
+        );
+    }
 
     // Item 6: use the SMC-gated signal path so the post-search "min_trades"
     // filter sees the SAME trade count the evaluator scored. The previous
