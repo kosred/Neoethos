@@ -89,10 +89,36 @@ fn main() -> Result<()> {
     {
         config.min_trades_per_day = min_trades;
     }
+    // The base filter, which is where the candidates actually go.
+    //
+    // Measured on M3: ranked=22 486 -> post_passes_filter=2. The archive was
+    // already open (`--archive-mode active`); it is these floors that reject
+    // 99.99 %, and with two survivors the pipeline never reaches validation —
+    // so a timing taken there measures the GA alone and nothing said so.
+    //
+    // `apply_mode_overrides` runs inside `from_settings`, so these are applied
+    // after it: a flag the mode could silently overwrite would be worse than no
+    // flag at all.
+    if let Some(v) = flag(&args, "--min-win-rate").and_then(|v| v.parse::<f64>().ok()) {
+        config.filtering.min_win_rate = v;
+    }
+    if let Some(v) = flag(&args, "--max-dd").and_then(|v| v.parse::<f64>().ok()) {
+        config.filtering.max_dd = v;
+    }
+    if let Some(v) = flag(&args, "--min-profit-factor").and_then(|v| v.parse::<f64>().ok()) {
+        config.filtering.min_profit_factor = v;
+    }
+    if let Some(v) = flag(&args, "--min-sharpe").and_then(|v| v.parse::<f64>().ok()) {
+        config.filtering.min_sharpe = v;
+    }
     tracing::info!(
         archive_mode = %settings.models.search_runtime.archive_mode,
         archive_min_net = settings.models.search_runtime.archive_min_net,
         min_trades_per_day = config.min_trades_per_day,
+        min_win_rate = config.filtering.min_win_rate,
+        max_dd = config.filtering.max_dd,
+        min_profit_factor = config.filtering.min_profit_factor,
+        min_sharpe = config.filtering.min_sharpe,
         "probe knobs in effect"
     );
     config.evaluation_symbol = symbol.clone();
