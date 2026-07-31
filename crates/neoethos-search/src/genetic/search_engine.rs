@@ -1748,21 +1748,39 @@ where
             stagnant_gens += 1;
         }
 
+        // Why a generation archived nothing.
+        //
+        // Four separate rules reject here and none of them said so, which left
+        // "the GA produced 4 genes out of 2048" with no way to tell whether the
+        // strategies were unprofitable, silent, or merely duplicates of each
+        // other. Measured on M3 (1 757 261 bars): 4 archived from a population
+        // of 2 048, and the run finished in 77 s with an empty portfolio
+        // because there was nothing to validate.
+        let mut rejected_non_finite = 0usize;
+        let mut rejected_no_trades = 0usize;
+        let mut rejected_threshold = 0usize;
+        let mut rejected_duplicate = 0usize;
         for (_score, _, gene, m) in scored.iter() {
             if profitable_archive.len() >= archive_cap {
                 break;
             }
             let (net, sharpe, pf, trades) = (m[0], m[1], m[5], m[8]);
             if !net.is_finite() || !sharpe.is_finite() || !pf.is_finite() || !trades.is_finite() {
+                rejected_non_finite += 1;
+                continue;
+            }
+            if !(trades > 0.0) {
+                rejected_no_trades += 1;
                 continue;
             }
             let keep = match archive_mode.as_str() {
-                "active" => trades > 0.0,
-                "pf" | "profit_factor" => trades > 0.0 && pf > archive_min_pf,
-                "sharpe" => trades > 0.0 && sharpe > archive_min_sharpe,
-                _ => trades > 0.0 && net > archive_min_net,
+                "active" => true,
+                "pf" | "profit_factor" => pf > archive_min_pf,
+                "sharpe" => sharpe > archive_min_sharpe,
+                _ => net > archive_min_net,
             };
             if !keep {
+                rejected_threshold += 1;
                 continue;
             }
             // Hash the canonical genome (after `Gene::normalize`) so two
@@ -1772,10 +1790,30 @@ where
             canonical.normalize(features.n_features(), 1);
             let hash = gene_signature_hash(&canonical);
             if !seen_gene_hashes.insert(hash) {
+                rejected_duplicate += 1;
                 continue;
             }
             profitable_archive.push((gene.clone(), *m, archive_seq));
             archive_seq += 1;
+        }
+        // Say which rule emptied the generation, and only when it matters —
+        // a healthy archive does not need narrating every generation.
+        if profitable_archive.len() < scored.len() / 8 {
+            tracing::info!(
+                target: "neoethos_search::funnel",
+                generation = generation + 1,
+                scored = scored.len(),
+                archived = profitable_archive.len(),
+                mode = %archive_mode,
+                rejected_non_finite,
+                rejected_no_trades,
+                rejected_threshold,
+                rejected_duplicate,
+                min_net = archive_min_net,
+                min_pf = archive_min_pf,
+                min_sharpe = archive_min_sharpe,
+                "GA archive is nearly empty — this is which rule rejected the rest"
+            );
         }
 
         progress_fn(
