@@ -955,6 +955,24 @@ pub fn validation_genes_population_window(
     a: usize,
     b: usize,
 ) -> Result<Vec<[f64; 11]>> {
+    // Where a validation window's time actually goes.
+    //
+    // Eighteen of these calls take 413.6 s of a 452.4 s run — 23 s each — while
+    // the device stage timing inside one adds up to 0.30 s. So 98.7 % of a
+    // window is host-side, and which part is not a thing to guess at: slicing,
+    // uploading and evaluating are three different fixes.
+    let window_started = std::time::Instant::now();
+    struct WindowTiming(std::time::Instant, usize);
+    impl Drop for WindowTiming {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(
+                "search_engine::wf_window_total",
+                self.1,
+                self.0.elapsed(),
+            );
+        }
+    }
+    let _window_timing = WindowTiming(window_started, pack.n_genes);
     if pack.n_genes == 0 {
         return Ok(Vec::new());
     }
@@ -1016,6 +1034,11 @@ pub fn validation_genes_population_window(
         }
     }
 
+    crate::eval_telemetry::record(
+        "search_engine::wf_window_slice_prep",
+        pack.n_genes,
+        window_started.elapsed(),
+    );
     Ok(crate::eval::validation_backtest_population(
         crate::eval::PopulationEvalInputs {
             close: win_close,
