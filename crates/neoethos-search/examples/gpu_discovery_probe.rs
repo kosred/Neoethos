@@ -70,6 +70,20 @@ fn main() -> Result<()> {
     if let Some(min_net) = flag(&args, "--archive-min-net").and_then(|v| v.parse::<f64>().ok()) {
         settings.models.search_runtime.archive_min_net = min_net;
     }
+    // What the CLI does at startup, and what this probe never did.
+    //
+    // `neoethos-cli` calls this once after loading Settings; without it the
+    // genetic knobs fall back to `unwrap_or_default()`, so archive mode,
+    // selection policy, SMC gate and immigrant ratio all silently ignored
+    // config.yaml. The probe reported `archive_mode=active` from its own flag
+    // while the GA ran `mode=net` — the flag was read, applied to Settings, and
+    // then never installed.
+    //
+    // Every timing taken with this probe before now used GA defaults rather
+    // than the configured search. The comparisons between them still hold; a
+    // comparison against a CLI run would not have.
+    neoethos_search::install_search_runtime_overrides_from_settings(&settings);
+
     let mut config = neoethos_search::DiscoveryConfig::from_settings(&settings);
     if let Some(min_trades) = flag(&args, "--min-trades-per-day").and_then(|v| v.parse::<f64>().ok())
     {
