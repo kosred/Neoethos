@@ -2167,9 +2167,37 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         use crate::gpu_fallback::{FallbackDecision, GpuFailure, decide_env};
         let failure = match gpu {
             Ok(Ok(v)) if v.len() == n_genes => return v,
-            Ok(Ok(_)) => GpuFailure::WrongShape,
-            Ok(Err(_)) => GpuFailure::AllocationPressure,
-            Err(_) => GpuFailure::AllocationPressure, // cubecl#243 pool panic
+            Ok(Ok(rows)) => {
+                tracing::warn!(
+                    target: "neoethos_search::eval",
+                    expected = n_genes,
+                    returned = rows.len(),
+                    "validation GPU returned the wrong number of rows"
+                );
+                GpuFailure::WrongShape
+            }
+            // The error was discarded and every failure reported as allocation
+            // pressure, which sent every investigation looking at memory. A
+            // measured run had 648 600 of 655 086 items take this branch — the
+            // card doing almost none of the validation — and the reason never
+            // reached the log.
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: "neoethos_search::eval",
+                    genes = n_genes,
+                    error = %error,
+                    "validation GPU lane refused the work — this is why it is on the CPU"
+                );
+                GpuFailure::AllocationPressure
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "neoethos_search::eval",
+                    genes = n_genes,
+                    "validation GPU lane panicked (cubecl #243 pool) — falling back"
+                );
+                GpuFailure::AllocationPressure
+            }
         };
         match decide_env(failure) {
             FallbackDecision::FailLoud => panic!(
