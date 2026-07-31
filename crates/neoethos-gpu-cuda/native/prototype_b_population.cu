@@ -2089,9 +2089,12 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_read_diagnostics(
     return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
   }
   if (count > 0) {
-    if (cudaMemcpy(readback->events, session->events, count * sizeof(NeoPopulationEvent),
-                   cudaMemcpyDeviceToHost) != cudaSuccess ||
-        cudaMemcpy(readback->outcomes, session->outcomes, count * sizeof(NeoPopulationOutcome),
+    // There is no event stream any more — the reduce opens positions from the
+    // signal — so the events half is zeroed rather than copied from a buffer
+    // that is not allocated. Callers that want entries read them from the
+    // outcomes, which now carry `entry_bar` for exactly this reason.
+    std::memset(readback->events, 0, count * sizeof(NeoPopulationEvent));
+    if (cudaMemcpy(readback->outcomes, session->outcomes, count * sizeof(NeoPopulationOutcome),
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
       return NEO_POPULATION_STATUS_TRANSFER_FAILED;
     }
