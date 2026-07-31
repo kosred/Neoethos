@@ -2113,10 +2113,32 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
     // only thing that holds the never-OOM invariant — peak memory must be a
     // function of the available hardware, and a run may be slow but must not
     // crash.
-    if cuda_eval_signal_kernel_enabled()
-        && cuda_eval_backtest_kernel_enabled()
-        && !integrated_gpu_eval_disabled()
-    {
+    // Report the verdict once. When this gate is false the code below is never
+    // reached, so the card is skipped WITHOUT a single line in the log — the
+    // failure mode that hid `prop_search_device: cpu` for eight months. A
+    // measured run had 770 500 of 778 205 validation items on the CPU with
+    // nothing said about why; whichever branch is responsible, it now says so.
+    let signal_ok = cuda_eval_signal_kernel_enabled();
+    let backtest_ok = cuda_eval_backtest_kernel_enabled();
+    let integrated = integrated_gpu_eval_disabled();
+    static GATE_REPORTED: std::sync::Once = std::sync::Once::new();
+    GATE_REPORTED.call_once(|| {
+        if signal_ok && backtest_ok && !integrated {
+            tracing::info!(
+                target: "neoethos_search::eval",
+                "validation GPU gate OPEN — populations dispatch to the card"
+            );
+        } else {
+            tracing::warn!(
+                target: "neoethos_search::eval",
+                signal_kernel_enabled = signal_ok,
+                backtest_kernel_enabled = backtest_ok,
+                integrated_gpu_skip = integrated,
+                "validation GPU gate CLOSED — every population runs on the CPU"
+            );
+        }
+    });
+    if signal_ok && backtest_ok && !integrated {
         let device_override = eval_gpu_devices().first().copied();
         // catch_unwind is the ONLY mitigation for cubecl #243 pool-panics
         // (no Result-returning launch in cubecl 0.10). `AssertUnwindSafe` is
