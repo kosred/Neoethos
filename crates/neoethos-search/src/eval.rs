@@ -343,7 +343,18 @@ impl Default for BacktestSettings {
             max_hold_bars: 0,
             min_hold_bars: 0,
             max_trades_per_day: 0,
-            gap_threshold_ms: 0,
+            // Four days. Long enough to sit through an FX weekend, which is
+            // about two and a half and is a normal thing to hold through; short
+            // enough to catch a hole in the data.
+            //
+            // This was 0 — detection off — so a position open before a hole was
+            // carried across it as if the market had not moved, and its stop
+            // and target were then tested against prices from the far side.
+            // That mattered before anything was dropped (any missing history
+            // does it) and matters more now that non-positive bars are removed
+            // on read: December 2014 is missing from every series in this
+            // store, twelve days of it on H1.
+            gap_threshold_ms: 4 * 24 * 60 * 60 * 1000,
             trailing_enabled: false,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
@@ -4426,5 +4437,37 @@ mod trailing_parity_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod gap_threshold_tests {
+    use super::*;
+
+    /// A weekend is normal to hold through; a hole in the data is not.
+    ///
+    /// The default was 0, which switches detection off entirely, so a position
+    /// open before a missing stretch was carried across it and then tested
+    /// against prices from the far side. December 2014 is absent from every
+    /// series in the operator's store — twelve days of it on H1 — so this is
+    /// not hypothetical.
+    #[test]
+    fn the_default_sits_between_a_weekend_and_a_hole() {
+        let day = 24 * 60 * 60 * 1000i64;
+        let threshold = BacktestSettings::default().gap_threshold_ms;
+        assert!(threshold > 0, "detection must not be off by default");
+
+        // An FX weekend is about two and a half days, Friday close to Sunday
+        // open. Flagging those would close every position every week.
+        assert!(
+            threshold > 5 * day / 2,
+            "a weekend would be treated as a gap: {threshold} ms"
+        );
+
+        // The December 2014 hole is twelve days on H1 and far more on D1.
+        assert!(
+            threshold < 12 * day,
+            "the known hole would not be caught: {threshold} ms"
+        );
     }
 }
