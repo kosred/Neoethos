@@ -31,7 +31,9 @@ use crate::gpu_native::prototype_b_engine::PrototypeBPopulationInputs;
 use crate::gpu_native::prototype_population_oracle::population_settings_for_dataset;
 use crate::gpu_native::snapshot_fixture::SnapshotSettingsDto;
 
-use neoethos_gpu_cuda::{PopulationDatasetView, PopulationGeneView, PopulationSession};
+use neoethos_gpu_cuda::{
+    CudaPopulationError, PopulationDatasetView, PopulationGeneView, PopulationSession,
+};
 
 /// Metric row shape shared with the CPU and CubeCL lanes.
 const ZERO_METRICS: [f64; 11] = [0.0; 11];
@@ -297,7 +299,7 @@ pub(crate) fn try_evaluate_population_b(
     };
     // Only a capacity exhaustion is worth retrying smaller. Anything else is a
     // fault, and halving the work would just hide it behind a slower failure.
-    if !format!("{error}").contains("exceeded the session capacity") || n_genes < 2 {
+    if !is_capacity_exhaustion(&error) || n_genes < 2 {
         return Err(error);
     }
     // Remember the ceiling so the next generation does not pay this again.
@@ -313,6 +315,28 @@ pub(crate) fn try_evaluate_population_b(
         short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
         gene_smc_flags, gate_threshold, smc_weights, settings, device_override,
     );
+}
+
+/// Whether the card ran out of room, so halving the work is worth a retry.
+///
+/// This compared the message text against `"exceeded the session capacity"`,
+/// which is the event buffer's wording. Removing the event buffer moved the
+/// first allocation to fail to the outcome array, which says `"device
+/// allocation failed"` — so the retry stopped firing and every oversized
+/// population went to the CPU. The optimisation disabled its own safety net,
+/// quietly, because the two agreed on a string rather than a type.
+///
+/// Asking the error what it is removes that coupling. The capacity check in
+/// `event_capacity_for` raises a plain `anyhow` error rather than a native one,
+/// so it is matched separately and by a phrase it owns.
+fn is_capacity_exhaustion(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<CudaPopulationError>()
+        .is_some_and(CudaPopulationError::is_capacity_exhausted)
+    {
+        return true;
+    }
+    format!("{error}").contains("leaves no room for events on this device")
 }
 
 /// Halve the population and evaluate each side.

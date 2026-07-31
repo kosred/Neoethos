@@ -81,11 +81,23 @@ impl CudaPopulationError {
         matches!(self, Self::RuntimeUnavailable)
     }
 
+    /// Whether the card ran out of room, so the same work would succeed in
+    /// smaller pieces.
+    ///
+    /// This matched only `STATUS_EVENT_CAPACITY` — the event buffer's own
+    /// message. Once the reduce stopped materialising events that buffer was
+    /// gone, and the allocation that now runs out first is the outcome array,
+    /// which reports `STATUS_ALLOCATION_FAILED`. The caller kept asking about a
+    /// buffer that no longer existed, so a plain out-of-memory read as a fault
+    /// and the whole population went to the CPU instead of being halved.
+    ///
+    /// Measured cost of that gap: 770 500 of 778 205 validation items on the
+    /// CPU, the card idle for 99 % of a run.
     pub fn is_capacity_exhausted(&self) -> bool {
         matches!(
             self,
             Self::Native {
-                status: STATUS_EVENT_CAPACITY,
+                status: STATUS_EVENT_CAPACITY | STATUS_ALLOCATION_FAILED,
                 ..
             }
         )
@@ -670,6 +682,24 @@ mod tests {
             PopulationSession::create(-1, 8),
             Err(CudaPopulationError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn out_of_memory_counts_as_capacity_so_the_caller_retries_smaller() {
+        // The whole point of the flag is "this would fit in pieces". A device
+        // allocation failure is exactly that, and treating it as a fault sent
+        // 99 % of a validation run to the CPU.
+        let oom = CudaPopulationError::native("evaluate", STATUS_ALLOCATION_FAILED);
+        assert!(oom.is_capacity_exhausted());
+        let events = CudaPopulationError::native("evaluate", STATUS_EVENT_CAPACITY);
+        assert!(events.is_capacity_exhausted());
+
+        // A launch failure is a real fault: halving the work would hide it
+        // behind a slower failure rather than fixing anything.
+        let launch = CudaPopulationError::native("evaluate", STATUS_LAUNCH_FAILED);
+        assert!(!launch.is_capacity_exhausted());
+        let abi = CudaPopulationError::native("evaluate", STATUS_ABI_MISMATCH);
+        assert!(!abi.is_capacity_exhausted());
     }
 
     #[test]
