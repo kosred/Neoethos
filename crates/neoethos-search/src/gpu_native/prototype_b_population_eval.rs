@@ -827,6 +827,35 @@ fn evaluate_population_b_batch(
         .map_err(anyhow::Error::new)
         .context("prototype B readback")?;
 
+    // How full the trade slots actually are.
+    //
+    // Every candidate reserves MAX_TRADES_PER_CANDIDATE slots — 590 KB of the
+    // ~1.03 MB it costs — so over half the device memory per candidate is this
+    // one array, and the reservation is a constant while what a candidate
+    // records is not. Nothing measured the difference, so nothing could tell
+    // whether the card was full of trades or of empty space.
+    //
+    // `accepted_trade_count` in the counters looks like the answer and is
+    // always zero: the kernel never fills that field, it only stores the total
+    // on the session after `wait`. Slot 8 of a metric row is the same fact per
+    // candidate, already read back.
+    let trade_counts = rows.iter().map(|row| row.values[8]).filter(|count| count.is_finite());
+    let (peak, total) = trade_counts.fold((0.0f64, 0.0f64), |(peak, total), count| {
+        (peak.max(count), total + count)
+    });
+    tracing::info!(
+        target: "neoethos_search::eval",
+        n_genes,
+        reserved_slots = neoethos_gpu_cuda::MAX_TRADES_PER_CANDIDATE,
+        busiest_candidate = peak as u64,
+        mean_trades = (total / (rows.len() as f64).max(1.0)) as u64,
+        peak_fill_pct = format!(
+            "{:.2}",
+            peak * 100.0 / neoethos_gpu_cuda::MAX_TRADES_PER_CANDIDATE as f64
+        ),
+        "trade slot usage — what was reserved per candidate against what was recorded"
+    );
+
     // How much of the event budget the population actually needed.
     //
     // This is the number that decides three open questions at once. The kernel
