@@ -59,6 +59,20 @@ pub(crate) fn prototype_b_available() -> bool {
 /// 25 250 items ran on the CPU after 30 s of wasted attempts.
 ///
 /// Deciding the size up front costs one query and removes the failure entirely.
+/// The batch to use when free memory cannot be read and nothing has worked yet.
+///
+/// At ~1 MB per candidate this is around a gigabyte — small enough for any
+/// discrete card, large enough to keep the reduce busy. It is a floor for a
+/// blind moment, not a target.
+const CONSERVATIVE_BATCH: usize = 1_024;
+
+/// The last size the card was known to accept, for when the query stops
+/// answering. Better evidence than a constant, and it costs one atomic.
+fn last_known_fit() -> &'static std::sync::atomic::AtomicUsize {
+    static LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &LAST
+}
+
 fn candidates_that_fit(device: usize, bars: usize, feature_count: usize) -> Option<usize> {
     candidates_for_free_memory(
         neoethos_gpu_cuda::device_free_memory_bytes(device)?,
@@ -328,14 +342,38 @@ pub(crate) fn try_evaluate_population_b(
     // retry below still exists for what cannot be predicted — how many trades a
     // population actually emits — but it should never be reached for a size
     // that was arithmetic all along.
-    let fits = candidates_that_fit(
+    let fits = match candidates_that_fit(
         device_override.unwrap_or(0),
         close.len(),
         indicators.nrows(),
-    )
-    .unwrap_or(usize::MAX);
+    ) {
+        Some(fits) => {
+            last_known_fit().store(fits, AtomicOrd::Relaxed);
+            fits
+        }
+        // Not knowing how much room there is is a reason to ask for less, not
+        // for everything. This read `unwrap_or(usize::MAX)` — unknown meant
+        // unlimited — and a measured run launched 24 700 candidates against a
+        // card that holds ~16 300, died with a stream synchronization failure,
+        // and left the CUDA context unusable: the 27 evaluations after it could
+        // not even read free memory, so 31 859 items went to the CPU from one
+        // bad guess.
+        None => {
+            let fallback = match last_known_fit().load(AtomicOrd::Relaxed) {
+                0 => CONSERVATIVE_BATCH,
+                known => known,
+            };
+            tracing::warn!(
+                target: "neoethos_search::eval",
+                n_genes,
+                fallback,
+                "cannot read free device memory — sizing the batch conservatively"
+            );
+            fallback
+        }
+    };
     if fits < n_genes {
-        tracing::debug!(
+        tracing::info!(
             target: "neoethos_search::eval",
             n_genes,
             fits,
@@ -431,6 +469,27 @@ mod capacity_detection_tests {
             fits > 4_000,
             "a 24 GB card should still host a large batch, not trickle: {fits}"
         );
+    }
+
+    /// A blind moment must not approve everything.
+    ///
+    /// The unreadable-memory branch used to yield `usize::MAX`. That single
+    /// default launched 24 700 candidates at a card holding ~16 300, which
+    /// failed mid-stream and left the CUDA context unusable for the rest of the
+    /// run. Whatever it yields, it has to be a batch the smallest sensible card
+    /// could host.
+    #[test]
+    fn the_blind_batch_is_small_enough_for_any_card() {
+        const BARS: usize = 87_715;
+        let per_candidate =
+            neoethos_gpu_cuda::MAX_TRADES_PER_CANDIDATE * 72 + BARS as u64 * 5 + 3_944;
+        let blind = CONSERVATIVE_BATCH as u64 * per_candidate;
+        assert!(
+            blind < 2 * 1024 * 1024 * 1024,
+            "a blind batch wants {} MiB, which is not safe on a small card",
+            blind / (1024 * 1024)
+        );
+        assert!(CONSERVATIVE_BATCH >= 256, "and it still has to keep the card busy");
     }
 
     /// Peak memory must follow the hardware, never the request.
