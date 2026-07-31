@@ -385,7 +385,7 @@ pub(crate) fn try_evaluate_population_b(
         return split_and_evaluate(
             close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
             short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
-            gene_smc_flags, gate_threshold, smc_weights, settings, device_override,
+            gene_smc_flags, gate_threshold, smc_weights, settings, device_override, learned,
         );
     }
 
@@ -415,7 +415,7 @@ pub(crate) fn try_evaluate_population_b(
     return split_and_evaluate(
         close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
         short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
-        gene_smc_flags, gate_threshold, smc_weights, settings, device_override,
+        gene_smc_flags, gate_threshold, smc_weights, settings, device_override, n_genes / 2,
     );
 }
 
@@ -580,9 +580,18 @@ fn split_and_evaluate(
     smc_weights: &[f32; 11],
     settings: &BacktestSettings,
     device_override: Option<usize>,
+    head_len: usize,
 ) -> Result<Vec<[f64; 11]>> {
     let n_genes = long_thr.len();
-    let half = n_genes / 2;
+    // Cut at the size that fits rather than in half.
+    //
+    // Halving overshoots whenever the population is a little over the limit: a
+    // measured run had 25 600 candidates against a card holding 12 334, halved
+    // to 12 800, halved again to 6 400 — four launches each using half the
+    // card, where three full ones would do. The caller knows the limit when the
+    // split is pre-emptive; after a capacity failure it does not, and passes
+    // half.
+    let half = head_len.clamp(1, n_genes.saturating_sub(1));
 
     // CSR gene arrays are sliced by gene, and the term ranges follow the
     // offsets, so a split has to carry the right window of both.
