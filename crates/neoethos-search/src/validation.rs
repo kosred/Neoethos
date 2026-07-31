@@ -2,6 +2,7 @@ use crate::artifact_io::{read_json, stable_json_hash, write_json_atomic};
 use crate::eval::{
     BacktestMetrics, BacktestSettings, fast_evaluate_strategy_core, simulate_trades_core,
 };
+use crate::quality::Trade;
 use anyhow::{Result, bail};
 use itertools::Itertools;
 use rayon::prelude::*;
@@ -905,6 +906,14 @@ fn normalized_pct_threshold(value: f64) -> f64 {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Simulate the slice, then measure it.
+///
+/// Kept as the CPU entry point. The measurement half is
+/// [`walkforward_risk_diagnostics_from_trades`], which takes the trade list
+/// directly — the device kernel now writes one, and this pass exists only
+/// because it used not to. Splitting them is what lets the second, duplicate
+/// simulation go away without moving the arithmetic.
+#[allow(clippy::too_many_arguments)]
 fn walkforward_risk_diagnostics(
     close: &[f64],
     high: &[f64],
@@ -921,6 +930,46 @@ fn walkforward_risk_diagnostics(
     initial_balance: f64,
 ) -> WalkforwardRiskDiagnostics {
     if close.is_empty() || days.is_empty() {
+        return WalkforwardRiskDiagnostics::default();
+    }
+    // Use real timestamps so the simulator applies the right gap, session and
+    // kill-zone logic — same as before this was split out.
+    let ts: &[i64] = if timestamps.len() == close.len() {
+        timestamps
+    } else {
+        days
+    };
+    let trades = simulate_trades_core(close, high, low, ts, signals, settings);
+    walkforward_risk_diagnostics_from_trades(
+        &trades,
+        days,
+        evaluator_max_daily_dd,
+        max_daily_loss_pct,
+        max_daily_profit_pct,
+        min_trading_days,
+        max_trades_per_day,
+        initial_balance,
+    )
+}
+
+/// The measurement, over a trade list that already exists.
+///
+/// Every field here is derived from the trades and the day index — consecutive
+/// runs, per-day P&L and counts, the prop-firm compliance checks. None of it
+/// needs the price series, which is why the simulation that produced the trades
+/// does not have to happen twice.
+#[allow(clippy::too_many_arguments)]
+fn walkforward_risk_diagnostics_from_trades(
+    trades: &[Trade],
+    days: &[i64],
+    evaluator_max_daily_dd: f64,
+    max_daily_loss_pct: f64,
+    max_daily_profit_pct: f64,
+    min_trading_days: usize,
+    max_trades_per_day: usize,
+    initial_balance: f64,
+) -> WalkforwardRiskDiagnostics {
+    if days.is_empty() {
         return WalkforwardRiskDiagnostics::default();
     }
     let initial_balance = if initial_balance.is_finite() && initial_balance > 0.0 {
@@ -941,17 +990,10 @@ fn walkforward_risk_diagnostics(
         });
     }
 
-    // Use real timestamps so simulate_trades_core applies correct gap/session/kill-zone logic.
-    let ts = if timestamps.len() == close.len() {
-        timestamps
-    } else {
-        days
-    };
-    let trades = simulate_trades_core(close, high, low, ts, signals, settings);
     let mut max_consec_losses = 0usize;
     let mut current_consec_losses = 0usize;
 
-    for trade in &trades {
+    for trade in trades {
         if trade.pnl < 0.0 {
             current_consec_losses += 1;
             max_consec_losses = max_consec_losses.max(current_consec_losses);
@@ -2209,5 +2251,62 @@ mod tests {
             .validate_for_temporal_contract(&contract)
             .expect_err("unsupported schema must reject the prop-firm load");
         assert!(err.to_string().contains("prop-firm risk validation schema"));
+    }
+}
+
+#[cfg(test)]
+mod risk_diagnostics_split_tests {
+    use super::*;
+
+    fn trade(entry: i64, exit: i64, pnl: f64) -> Trade {
+        Trade {
+            entry_time: entry,
+            exit_time: Some(exit),
+            pnl,
+            pnl_pct: Some(pnl / 100_000.0),
+            duration_hours: Some(1.0),
+            mfe: pnl.max(0.0),
+            mae: (-pnl).max(0.0),
+            r_multiple: pnl / 200.0,
+        }
+    }
+
+    /// Splitting simulate-then-measure has to leave the measurement identical,
+    /// because the point is to stop simulating twice — not to change what the
+    /// second pass concluded.
+    ///
+    /// Consecutive runs and per-day buckets come only from the trades and the
+    /// day index; nothing here needs the price series, which is the whole
+    /// argument for the device being able to supply the list.
+    #[test]
+    fn the_measurement_half_needs_only_trades_and_days() {
+        let day = 86_400_000i64;
+        let trades = vec![
+            trade(0, day / 2, -300.0),
+            trade(day / 2, day - 1, -200.0),
+            trade(day, day + 10, 900.0),
+            trade(2 * day, 2 * day + 10, -100.0),
+        ];
+        let days: Vec<i64> = (0..3).collect();
+
+        let d = walkforward_risk_diagnostics_from_trades(
+            &trades, &days, 0.05, 0.05, 0.10, 1, 10, 100_000.0,
+        );
+
+        // Two losses back to back, then a win, then one more loss.
+        assert_eq!(d.max_consec_losses, 2, "{d:?}");
+
+        // An empty list is "nothing measured", not "a perfect run".
+        let empty = walkforward_risk_diagnostics_from_trades(
+            &[], &days, 0.05, 0.05, 0.10, 1, 10, 100_000.0,
+        );
+        assert_eq!(empty.max_consec_losses, 0);
+
+        // And no day index means there is nothing to bucket by, so the result
+        // is the default rather than an invented one.
+        let no_days = walkforward_risk_diagnostics_from_trades(
+            &trades, &[], 0.05, 0.05, 0.10, 1, 10, 100_000.0,
+        );
+        assert_eq!(no_days.max_consec_losses, 0);
     }
 }
