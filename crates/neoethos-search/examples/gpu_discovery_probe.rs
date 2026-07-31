@@ -49,9 +49,38 @@ fn main() -> Result<()> {
         .collect();
     let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
 
-    let settings = neoethos_core::Settings::load()
+    let mut settings = neoethos_core::Settings::load()
         .context("loading config.yaml — the probe uses the same settings as a real run")?;
+
+    // Knobs that decide whether the pipeline has anything to do.
+    //
+    // Measured on M3: 2 046 of 2 048 genes per generation are rejected by the
+    // archive's profit threshold, so the quality screen and validation — half
+    // the run on H1 — never execute, and a "75 s M3 run" measures an empty
+    // pipeline. Reaching those knobs meant editing config.yaml and rebuilding,
+    // which is not something you do a hundred times.
+    //
+    // `--archive-mode active` keeps every gene that trades regardless of
+    // profit. That is the right setting for timing a full pipeline and the
+    // wrong one for judging strategies; it is a flag precisely so the two
+    // cannot be confused.
+    if let Some(mode) = flag(&args, "--archive-mode") {
+        settings.models.search_runtime.archive_mode = mode;
+    }
+    if let Some(min_net) = flag(&args, "--archive-min-net").and_then(|v| v.parse::<f64>().ok()) {
+        settings.models.search_runtime.archive_min_net = min_net;
+    }
     let mut config = neoethos_search::DiscoveryConfig::from_settings(&settings);
+    if let Some(min_trades) = flag(&args, "--min-trades-per-day").and_then(|v| v.parse::<f64>().ok())
+    {
+        config.min_trades_per_day = min_trades;
+    }
+    tracing::info!(
+        archive_mode = %settings.models.search_runtime.archive_mode,
+        archive_min_net = settings.models.search_runtime.archive_min_net,
+        min_trades_per_day = config.min_trades_per_day,
+        "probe knobs in effect"
+    );
     config.evaluation_symbol = symbol.clone();
     if let Some(population) = flag(&args, "--population").and_then(|v| v.parse::<usize>().ok()) {
         config.population = population;
