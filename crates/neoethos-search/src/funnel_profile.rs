@@ -34,6 +34,16 @@ pub struct FunnelStage {
     /// Top reject reasons with their counts. Empty when the stage
     /// either lets everything through or doesn't track reasons.
     pub top_reasons: Vec<(String, usize)>,
+    /// Wall time from the previous stage to this one.
+    ///
+    /// The funnel already named every stage; it never said how long any took,
+    /// so finding where a run spends its time meant reading log timestamps by
+    /// hand and guessing at the silent stretches. One such stretch was 25.9 s
+    /// of a 136.5 s run with nothing logged inside it.
+    ///
+    /// `default` so profiles written before this existed still deserialize.
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
 impl FunnelStage {
@@ -44,6 +54,7 @@ impl FunnelStage {
             count_out: 0,
             rejected: 0,
             top_reasons: Vec::new(),
+            elapsed_ms: 0,
         }
     }
 
@@ -54,6 +65,7 @@ impl FunnelStage {
             count_out: count,
             rejected: 0,
             top_reasons: Vec::new(),
+            elapsed_ms: 0,
         }
     }
 
@@ -85,6 +97,10 @@ pub struct FunnelProfile {
     pub bottleneck_rejected: usize,
     /// Final outcome state per P10.
     pub outcome: String,
+    /// When the previous stage finished, so each stage can report its own cost.
+    /// Not persisted — it only has meaning during the run that set it.
+    #[serde(skip)]
+    last_mark: Option<std::time::Instant>,
 }
 
 impl FunnelProfile {
@@ -99,6 +115,7 @@ impl FunnelProfile {
             bottleneck_stage: String::new(),
             bottleneck_rejected: 0,
             outcome: "pending".to_string(),
+            last_mark: Some(std::time::Instant::now()),
         }
     }
 
@@ -112,8 +129,14 @@ impl FunnelProfile {
     }
 
     pub fn record_stage(&mut self, name: &str, count_in: usize, count_out: usize) {
+        let elapsed = self
+            .last_mark
+            .replace(std::time::Instant::now())
+            .map(|mark| mark.elapsed().as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
         if let Some(s) = self.stages.iter_mut().find(|s| s.name == name) {
             s.record(count_in, count_out);
+            s.elapsed_ms = elapsed;
         }
     }
 
@@ -132,6 +155,27 @@ impl FunnelProfile {
     pub fn finalize(&mut self, outcome: &str) {
         self.finished_at = now_iso8601();
         self.outcome = outcome.to_string();
+        // Where the run actually went. Counts alone say which stage rejects the
+        // most, never which one costs the most — and those are rarely the same
+        // stage.
+        let mut by_cost: Vec<&FunnelStage> =
+            self.stages.iter().filter(|s| s.elapsed_ms > 0).collect();
+        by_cost.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
+        let total_ms: u64 = by_cost.iter().map(|s| s.elapsed_ms).sum();
+        for stage in by_cost.iter().take(6) {
+            tracing::info!(
+                target: "neoethos_search::funnel",
+                stage = %stage.name,
+                elapsed_ms = stage.elapsed_ms,
+                share_pct = format!(
+                    "{:.1}",
+                    stage.elapsed_ms as f64 * 100.0 / total_ms.max(1) as f64
+                ),
+                count_in = stage.count_in,
+                count_out = stage.count_out,
+                "stage cost — the six most expensive, wall time since the previous stage"
+            );
+        }
         // Recompute bottleneck.
         if let Some(b) = self.stages.iter().max_by_key(|s| s.rejected) {
             self.bottleneck_stage = b.name.clone();
@@ -206,6 +250,39 @@ mod tests {
             funnel_path_for(&p),
             PathBuf::from("/tmp/EURUSD_M30_funnel.json")
         );
+    }
+
+    #[test]
+    fn a_stage_reports_what_it_cost_not_only_what_it_rejected() {
+        let mut profile = FunnelProfile::new("EURUSD", "H1");
+        let first = profile
+            .stages
+            .first()
+            .map(|s| s.name.clone())
+            .expect("canonical stages exist");
+        std::thread::sleep(std::time::Duration::from_millis(12));
+        profile.record_stage(&first, 100, 40);
+        let stage = profile
+            .stages
+            .iter()
+            .find(|s| s.name == first)
+            .expect("the stage was recorded");
+        assert!(
+            stage.elapsed_ms >= 10,
+            "a stage that took 12 ms reported {} ms",
+            stage.elapsed_ms
+        );
+        assert_eq!(stage.rejected, 60, "counts still work");
+    }
+
+    #[test]
+    fn a_profile_written_before_stages_were_timed_still_loads() {
+        // The field is additive; an older artifact must not fail to parse.
+        let older = r#"{"name":"stage1_candidates_generated","count_in":9,
+            "count_out":4,"rejected":5,"top_reasons":[]}"#;
+        let stage: FunnelStage = serde_json::from_str(older).expect("older profiles still load");
+        assert_eq!(stage.elapsed_ms, 0);
+        assert_eq!(stage.count_out, 4);
     }
 
     #[test]
