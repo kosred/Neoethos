@@ -232,6 +232,23 @@ impl XGBoostExpert {
         }
     }
 
+    /// `cuda` or `cpu` for XGBoost's `device` parameter.
+    ///
+    /// XGBoost 2.0 replaced `tree_method = gpu_hist` with `tree_method = hist`
+    /// plus `device = cuda`, and 3.0 warns on every booster built the old way:
+    /// "The tree method `gpu_hist` is deprecated since 2.0.0." The old spelling
+    /// still resolves today, but it is a name the library has already announced
+    /// it will stop honouring, and the warning is one line in a training log
+    /// nobody reads to the end.
+    #[cfg(feature = "xgboost")]
+    fn device_param(&self) -> &'static str {
+        let gpu_available = xgboost_cuda_runtime_available();
+        match self.config.device_pref {
+            DevicePreference::Gpu | DevicePreference::Auto if gpu_available => "cuda",
+            _ => "cpu",
+        }
+    }
+
     #[cfg(feature = "xgboost")]
     fn predictor(&self) -> Predictor {
         let gpu_available = xgboost_cuda_runtime_available();
@@ -771,6 +788,19 @@ impl XGBoostExpert {
 
             let mut model = xgb::Booster::new_with_cached_dmats(&booster_params, &[&dtrain])
                 .context("create XGBoost booster")?;
+            // Stated explicitly rather than inferred from the tree method, so a
+            // run says which device it trained on instead of leaving it to a
+            // deprecated alias. Reported at info because "which device" is the
+            // question this file exists to answer.
+            let device = self.device_param();
+            model
+                .set_param("device", device)
+                .map_err(|error| anyhow::anyhow!("set XGBoost device={device}: {error}"))?;
+            tracing::info!(
+                target: "neoethos_models::tree_models::xgboost",
+                device,
+                "XGBoost booster device"
+            );
             self.apply_variant_params(&mut model)?;
             self.feature_columns = feature_columns_from_dataframe(x);
             self.set_runtime_attributes(&mut model)?;

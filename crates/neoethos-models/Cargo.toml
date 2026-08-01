@@ -22,7 +22,20 @@ seq-macro = "0.3.6"
 
 # Tree model FFI bindings
 lightgbm3 = { version = "1.0.8", optional = true }
-xgb = { version = "3.0.5", optional = true }
+# Built from the official XGBoost source, not downloaded.
+#
+# The crate's default feature is `use_prebuilt_xgb`, which fetches a .so from a
+# third-party GitHub mirror — and that binary is CPU-only. The runtime probe in
+# tree_models/xgboost.rs then failed with "linked libxgboost is CPU-only" and
+# every XGBoost-family model trained on `hist` instead of `gpu_hist`, reported
+# once at WARN in the middle of a two-hour log.
+#
+# `local_build` compiles the vendored official source with cmake + ninja; the
+# `cuda` feature adds USE_CUDA=ON. The cost is a long first build; the
+# alternative is a GPU feature that silently is not one.
+xgb = { version = "3.0.5", optional = true, default-features = false, features = [
+    "local_build",
+] }
 catboost-rust = { version = "0.3.6", optional = true, features = ["gpu"] }
 sklears = { version = "0.1.1", optional = true, features = ["tree"] }
 candle-core = { version = "0.9.1", optional = true }
@@ -176,6 +189,10 @@ gpu-cuda = [
     "lightgbm",
     "reinforcement-learning",
     "rlkit/cuda",
+    # XGBoost on the card. Without this the local build is still CPU-only and
+    # the probe still fails — `local_build` alone only changes WHERE the library
+    # comes from, not what it supports.
+    "xgb/cuda",
     "candle-core/cuda",
 ]
 gpu-vulkan = ["burn-wgpu-backend", "neoethos-core/gpu-wgpu"]
