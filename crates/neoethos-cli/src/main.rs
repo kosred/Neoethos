@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use neoethos_core::logging::{setup_logging, write_subsystem_record};
 use neoethos_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod gpu_bench;
@@ -2392,22 +2391,29 @@ fn print_dataset_discovery_summary(root: &str) -> Result<neoethos_data::DatasetD
     Ok(report)
 }
 
-fn parse_config_path(args: &[String]) -> String {
-    parse_flag(args, "--config").unwrap_or_else(|| "config.yaml".to_string())
-}
-
 fn resolve_cli_settings(args: &[String]) -> Result<Option<neoethos_core::Settings>> {
     if let Some(config_path) = parse_flag(args, "--config") {
         return neoethos_core::Settings::from_yaml(&config_path).map(Some);
     }
 
-    let default_config_path = parse_config_path(args);
-    let default_path = Path::new(&default_config_path);
-    if default_path.exists() {
-        return neoethos_core::Settings::from_yaml(default_path).map(Some);
-    }
-
-    Ok(None)
+    // Without --config, resolve the way the rest of the process does.
+    //
+    // This checked the working directory for `config.yaml` and stopped there,
+    // while `Settings::load()` — which installs the runtime overrides at
+    // startup, main.rs:18 — prefers the user config under %LOCALAPPDATA% and
+    // only falls back to the relative path. Run from the repo and the two
+    // disagreed inside one process.
+    //
+    // They are not variants of each other. Measured on this machine
+    // (2026-08-01): the user config says trading_mode prop_firm, preset ftmo,
+    // prop_search_device auto; the repo template, last touched two weeks
+    // earlier, says risky, none, and `cpu` — the line recorded as the cause of
+    // eight months of discovery never reaching the card. Which one a run got
+    // depended on the directory it was started from.
+    //
+    // `load()` still ends at the relative path, so a workspace checkout with no
+    // user config behaves exactly as before.
+    neoethos_core::Settings::load().map(Some)
 }
 
 fn default_symbol(settings: Option<&neoethos_core::Settings>) -> String {
