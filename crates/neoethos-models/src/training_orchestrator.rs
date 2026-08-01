@@ -317,7 +317,7 @@ impl TrainingOrchestrator {
         };
         let frame = prepare_multitimeframe_features_with_options(&dataset, base_tf, &opts, None)?;
         let base_ohlcv = dataset.frames.get(base_tf).context("base tf missing")?;
-        let labels = self.derive_labels(base_ohlcv)?;
+        let labels = self.derive_labels(base_ohlcv, symbol)?;
 
         // hmm_regime trains UNSUPERVISED on a `(log_return, log_volatility)`
         // matrix derived from the RAW base OHLCV — not on the feature frame
@@ -2215,7 +2215,7 @@ impl TrainingOrchestrator {
         }
     }
 
-    fn derive_labels(&self, ohlcv: &Ohlcv) -> Result<Vec<i32>> {
+    fn derive_labels(&self, ohlcv: &Ohlcv, symbol: &str) -> Result<Vec<i32>> {
         let n = ohlcv.close.len();
         if n == 0 {
             return Ok(Vec::new());
@@ -2246,6 +2246,38 @@ impl TrainingOrchestrator {
         let hold_bars = self.effective_label_horizon_bars();
         let atr_period = self.settings.risk.atr_period.max(2);
         let min_distance = self.settings.risk.meta_label_min_dist.max(1e-6);
+        // What a round trip costs, in price.
+        //
+        // The barriers sat at `close +/- distance` and charged nothing, so a
+        // label said "price moved" where the gene side asks "did the trade make
+        // money". Discovery charges `backtest_spread_pips + slippage_pips`
+        // (2.0 today) on every trade — see DiscoveryConfig::evaluation_spread_pips
+        // — while `grep -c spread` in this file returned zero. The two halves of
+        // the system were optimising different objectives, and on EURUSD M15
+        // every directional model collapsed to a constant: three unrelated
+        // architectures reporting accuracy identical to sixteen significant
+        // figures, which is what a correct answer to a question about costless
+        // price movement looks like.
+        //
+        // A long enters at the ask and leaves at the bid, so it is behind by the
+        // full spread from the first tick: profit needs `move > cost`. Both
+        // barriers therefore shift UP by the cost — the target gets further
+        // away and the stop gets nearer, which is what the trade actually faces.
+        let round_trip_cost = (self.settings.risk.backtest_spread_pips.max(0.0)
+            + self.settings.risk.slippage_pips.max(0.0))
+            * neoethos_search::default_pip_size(symbol);
+        let round_trip_cost = if round_trip_cost.is_finite() {
+            round_trip_cost
+        } else {
+            // An unknown symbol yields NaN rather than a wrong pip size. Charge
+            // nothing and say so, instead of poisoning every barrier.
+            tracing::warn!(
+                target: "neoethos_models::training_orchestrator",
+                symbol,
+                "no pip size for this symbol — labels will not charge spread, so they                  answer a different question from the one discovery scores"
+            );
+            0.0
+        };
         let atr_stop_multiplier = self
             .settings
             .models
@@ -2279,8 +2311,8 @@ impl TrainingOrchestrator {
             let take_profit_distance = fixed_tp.max(stop_distance * base_rr).max(min_distance);
             let horizon_end = (i + hold_bars).min(n - 1);
             if use_triple_barrier {
-                let upper_barrier = entry + take_profit_distance;
-                let lower_barrier = entry - stop_distance;
+                let upper_barrier = entry + take_profit_distance + round_trip_cost;
+                let lower_barrier = entry - stop_distance + round_trip_cost;
 
                 for forward_idx in (i + 1)..=horizon_end {
                     let high = ohlcv.high[forward_idx];
@@ -2320,12 +2352,23 @@ impl TrainingOrchestrator {
                 continue;
             }
 
+            // The horizon fallback pays the round trip too.
+            //
+            // It compared the raw move against the band, so a drift smaller
+            // than the spread was labelled a direction. That is the second
+            // cost-free path into the same labels: shifting the barriers alone
+            // left this one still answering "did price move" while the gene
+            // side asks "did the trade clear its costs".
+            //
+            // Charged symmetrically — a short pays the same round trip a long
+            // does — which widens the neutral zone by twice the cost rather
+            // than sliding it in one direction.
             let terminal_close = ohlcv.close[horizon_end];
             let terminal_move = terminal_close - entry;
             let neutral_band = min_distance.max(atr * neutral_band_fraction);
-            if terminal_move >= neutral_band {
+            if terminal_move - round_trip_cost >= neutral_band {
                 *slot = 1;
-            } else if terminal_move <= -neutral_band {
+            } else if -terminal_move - round_trip_cost >= neutral_band {
                 *slot = -1;
             }
         }
@@ -5044,9 +5087,67 @@ mod tests {
         };
 
         let labels = orchestrator
-            .derive_labels(&ohlcv)
+            .derive_labels(&ohlcv, "EURUSD")
             .expect("aligned OHLCV should derive labels");
         assert_eq!(labels[0], 1);
+    }
+
+    /// A move that clears the target but not the target plus the spread.
+    ///
+    /// The barriers used to sit at `close +/- distance` and charge nothing, so
+    /// this rose exactly to the target and was labelled a win — a win the gene
+    /// side, which charges 2.0 pips on every trade, would have booked as a loss.
+    /// Training on that label is what taught the ensemble to answer a question
+    /// nobody asks.
+    ///
+    /// Sizes are explicit rather than derived so the arithmetic is checkable:
+    /// EURUSD pip is 0.0001, spread 1.5 + slippage 0.5 = 2.0 pips = 0.0002 in
+    /// price, and the target sits 0.0010 above entry. The series peaks at
+    /// +0.0011 — past the bare target, short of target-plus-cost at 0.0012.
+    #[test]
+    fn a_move_that_does_not_clear_the_spread_is_not_a_win() {
+        let mut orchestrator = orchestrator_with_models(&["lightgbm"]);
+        orchestrator.settings.models.label_use_triple_barrier = true;
+        orchestrator.settings.models.label_horizon_bars = 4;
+        orchestrator.settings.risk.meta_label_min_dist = 0.0010;
+        orchestrator.settings.risk.meta_label_fixed_sl = 0.0010;
+        orchestrator.settings.risk.meta_label_fixed_tp = 0.0010;
+        orchestrator.settings.risk.backtest_spread_pips = 1.5;
+        orchestrator.settings.risk.slippage_pips = 0.5;
+
+        let entry = 1.1000;
+        // Rises to +0.0011 and stays there: past the bare target, short of the
+        // target once the round trip is paid.
+        let close = vec![entry, entry + 0.0005, entry + 0.0011, entry + 0.0011, entry + 0.0011];
+        let ohlcv = Ohlcv {
+            timestamp: Some(vec![0, 1, 2, 3, 4]),
+            open: close.clone(),
+            high: close.clone(),
+            low: close.clone(),
+            close: close.clone(),
+            volume: None,
+        };
+
+        let labels = orchestrator
+            .derive_labels(&ohlcv, "EURUSD")
+            .expect("aligned OHLCV should derive labels");
+        assert_ne!(
+            labels[0], 1,
+            "a move of 11 pips against a 10-pip target and a 2-pip round trip is not a              win — the label is charging nothing and the gene side is charging 2.0"
+        );
+
+        // Guard the guard: with the cost removed the same series IS a win, so
+        // this fixture genuinely exercises the shift rather than failing for
+        // some unrelated reason.
+        orchestrator.settings.risk.backtest_spread_pips = 0.0;
+        orchestrator.settings.risk.slippage_pips = 0.0;
+        let costless = orchestrator
+            .derive_labels(&ohlcv, "EURUSD")
+            .expect("aligned OHLCV should derive labels");
+        assert_eq!(
+            costless[0], 1,
+            "without a spread this move does clear the target — if it does not, the              fixture is wrong and the assertion above proves nothing"
+        );
     }
 
     #[test]
@@ -5071,7 +5172,7 @@ mod tests {
         };
 
         let err = orchestrator
-            .derive_labels(&ohlcv)
+            .derive_labels(&ohlcv, "EURUSD")
             .expect_err("misaligned OHLCV should fail");
         assert!(err.to_string().contains("aligned OHLCV series"));
     }
