@@ -347,6 +347,7 @@ fn build_snapshot_dto(
         gene_smc_flags: vec![[0_i8; SMC_WIDTH]; options.population],
         smc_weights: [0.0_f32; SMC_WIDTH],
         settings: SnapshotSettingsDto {
+            session_spread_profile: None,
             max_hold_bars: options.max_hold_bars,
             min_hold_bars: 0,
             max_trades_per_day: options.max_trades_per_day,
