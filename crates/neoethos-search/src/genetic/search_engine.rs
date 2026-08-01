@@ -232,8 +232,16 @@ pub fn signals_and_confidence_for_gene_with_config(
 /// against byte-identical arrays. The per-gene signal path nevertheless
 /// rebuilt them from scratch each time — the ~90-op/bar `derive_smc_arrays`
 /// scan plus eleven full-series heap allocations, per gene, all producing the
-/// same numbers. Across a post-search candidate pool that rebuild costs more
-/// than the signal synthesis it feeds.
+/// same numbers.
+///
+/// MEASURED, EURUSD H1 on a 192-thread host, population 2048 x 12 generations:
+/// the `nonzero_signals` stage went from 23.4-23.8 s to 15.6-19.2 s — about a
+/// quarter off the stage, roughly 5 % of a ~120 s run. A microbenchmark over
+/// the same loops had predicted the gene-independent share at 69.5-91.5 %, so
+/// the real saving is a third of what the isolated timing suggested; whatever
+/// remains in that stage is not this rebuild. Recorded here rather than the
+/// prediction, because a comment that names an unmeasured number is how a
+/// wrong figure outlives the change that produced it.
 ///
 /// Stored row-major (one `[i8; 11]` per bar) because the gate reads all
 /// eleven slots of a single bar together; eleven separate vectors touch
