@@ -61,9 +61,11 @@ pub(crate) fn prototype_b_available() -> bool {
 /// Deciding the size up front costs one query and removes the failure entirely.
 /// The batch to use when free memory cannot be read and nothing has worked yet.
 ///
-/// At ~1 MB per candidate this is around a gigabyte — small enough for any
-/// discrete card, large enough to keep the reduce busy. It is a floor for a
-/// blind moment, not a target.
+/// At ~0.68 MB per candidate over 87 715 bars this is around 700 MB — small
+/// enough for any discrete card, large enough to keep the reduce busy. It is a
+/// floor for a blind moment, not a target, and
+/// `the_blind_batch_is_small_enough_for_any_card` holds it to that whatever a
+/// candidate comes to cost.
 const CONSERVATIVE_BATCH: usize = 1_024;
 
 /// The last size the card was known to accept, for when the query stops
@@ -81,22 +83,82 @@ fn candidates_that_fit(device: usize, bars: usize, feature_count: usize) -> Opti
     )
 }
 
+/// Device bytes the resident dataset occupies, in one place.
+///
+/// `upload_dataset` allocates, per bar: `close`/`high`/`low` as `double`,
+/// `months`/`days`/`timestamps` as `long long`, `SMC_SLOTS` signed bytes,
+/// `gap_flags` as one unsigned byte, `adaptive_base_pips` as a `double` when
+/// the settings carry one, and `feature_count` `float` indicators.
+///
+/// Both budgets below wrote this expression out separately and both stopped at
+/// 59 + 4F — the gap flags and the adaptive base column were missing. That is
+/// 9 B a bar, which is nothing on H1 and 47 MB on M1's 5.27 M bars, against a
+/// fixed reserve of 64 MB. The adaptive column is charged unconditionally
+/// because over-charging shrinks a batch while under-charging fails an
+/// allocation, and adaptive stops are on by default.
+fn dataset_device_bytes(bars: usize, feature_count: usize) -> u64 {
+    const PRICES: u64 = 3 * 8;
+    const CALENDAR: u64 = 3 * 8;
+    const SMC_ROW: u64 = neoethos_gpu_cuda::SMC_SLOTS as u64;
+    const GAP_FLAG: u64 = 1;
+    const ADAPTIVE_BASE: u64 = 8;
+    bars as u64
+        * (PRICES + CALENDAR + SMC_ROW + GAP_FLAG + ADAPTIVE_BASE + feature_count as u64 * 4)
+}
+
+/// Monthly buckets a candidate is budgeted for.
+///
+/// `NeoPopulationSettings::month_capacity` is a runtime value, but every
+/// production path resolves it to this — `population_settings_for_dataset`
+/// takes it from the backtest runtime overrides, whose default is pinned at 240
+/// by `prototype_population_oracle`. Budgeting for the default is deliberate:
+/// two `f64` arrays of 240 is 3 840 B against the ~590 KB of trade slots beside
+/// it, so a wrong month capacity moves the answer by well under a percent while
+/// querying the settings here would need the dataset the caller has not staged
+/// yet.
+const MONTH_BUCKETS_BUDGETED: u64 = 240;
+
+/// Device bytes one candidate occupies over `bars`, in one place.
+///
+/// There were two copies of this and both charged 5 bytes per candidate-bar —
+/// one for the `signed char` signal column and four for a `float` confidence
+/// column. The kernel stopped allocating the confidence column and recomputes
+/// the value at the entry bar instead, but nothing here noticed: `fits` never
+/// grew, the batch never changed, and a measured H1 run moved 127.8 s -> 127.5 s
+/// for a kernel that had just given up four of the five bytes it held per
+/// candidate-bar. The cheaper kernel was never asked for more work.
+///
+/// So the per-candidate-bar figure now comes from
+/// `WORKSPACE_BYTES_PER_CANDIDATE_BAR`, which
+/// `workspace_bytes_per_candidate_bar_match_the_kernel` reads out of the `.cu`
+/// the device actually compiles. Host and device can no longer disagree
+/// silently about what a candidate costs.
+fn per_candidate_device_bytes(bars: usize) -> u64 {
+    use neoethos_gpu_contracts::device::{NeoPopulationMetricRow, NeoPopulationOutcome};
+    // The trade slots: `population * MAX_TRADES_PER_CANDIDATE` outcome records,
+    // and by far the largest term — ~590 KB of the 0.68 MB an H1 candidate
+    // costs once the confidence column is gone.
+    let trade_slots = neoethos_gpu_cuda::MAX_TRADES_PER_CANDIDATE
+        * std::mem::size_of::<NeoPopulationOutcome>() as u64;
+    // The bar-indexed columns, priced by the kernel rather than by convention.
+    let bar_columns = bars as u64 * neoethos_gpu_cuda::WORKSPACE_BYTES_PER_CANDIDATE_BAR;
+    // `monthly_pnls` and `month_start_equities`, plus the one metric row read
+    // back per candidate.
+    let monthly = 2 * MONTH_BUCKETS_BUDGETED * std::mem::size_of::<f64>() as u64;
+    trade_slots + bar_columns + monthly + std::mem::size_of::<NeoPopulationMetricRow>() as u64
+}
+
 /// The arithmetic, separated from the device query so it can be checked without
 /// a card. The numbers it produces decide whether a run uses the GPU at all.
 fn candidates_for_free_memory(free: u64, bars: usize, feature_count: usize) -> Option<usize> {
     // Same headroom convention as `event_capacity`: leave three tenths for
     // context, fragmentation and the allocator's own bookkeeping.
     let budget = (free / 10) * 7;
-    let dataset = bars as u64 * (3 * 8 + 3 * 8 + 11 + feature_count as u64 * 4);
+    let dataset = dataset_device_bytes(bars, feature_count);
     let room = budget
         .saturating_sub(dataset)
         .saturating_sub(64 * 1024 * 1024);
-    // Per candidate: its trade slots, its signal and confidence columns, and
-    // the monthly buckets plus metric row already accounted for elsewhere.
-    let outcome = std::mem::size_of::<neoethos_gpu_contracts::device::NeoPopulationOutcome>() as u64;
-    let per_candidate =
-        neoethos_gpu_cuda::MAX_TRADES_PER_CANDIDATE * outcome + bars as u64 * 5 + 3_944;
-    let fits = room / per_candidate.max(1);
+    let fits = room / per_candidate_device_bytes(bars).max(1);
     // Below this the card cannot do useful work and the CPU lane is the honest
     // answer; `None` leaves the decision where it already is.
     (fits >= 16).then_some(fits as usize)
@@ -125,13 +187,28 @@ fn event_capacity(
     // which is ~5.4 GB of indicators alone. Sizing that ignored the dataset
     // would hand back an event capacity the card cannot host and turn the
     // never-OOM invariant into a crash at exactly the workload it exists for.
-    //   close/high/low f64, months/days/timestamps i64, SMC_SLOTS bytes per bar,
-    //   plus feature-major f32 indicators.
-    let dataset = bars as u64 * (3 * 8 + 3 * 8 + 11 + feature_count as u64 * 4);
-    // signals (1 B) + confidences (4 B) per candidate-bar, monthly buckets and
-    // metric rows per candidate, plus a fixed reserve.
-    let per_candidate_bar = 5u64;
-    let per_candidate = 3_840u64 + 104;
+    // `dataset_device_bytes` carries the enumeration; a second copy of it here
+    // is how the gap-flag and adaptive-base columns came to be missing from
+    // both.
+    let dataset = dataset_device_bytes(bars, feature_count);
+    // The bar-indexed columns, priced from the kernel's own allocation list
+    // rather than written here as a number. This said 5 — one byte of signal
+    // plus four of confidence — and went on saying it after the kernel stopped
+    // allocating the confidence column, which is why removing that column
+    // bought nothing.
+    let per_candidate_bar = neoethos_gpu_cuda::WORKSPACE_BYTES_PER_CANDIDATE_BAR;
+    // Deliberately NOT the whole of `per_candidate_device_bytes`: the trade
+    // slots are excluded here. What this function sizes is `max_events`, whose
+    // only consumer is a kernel that is no longer launched, and its live effect
+    // is the `bail!` below acting as a coarse "this population has no room at
+    // all" gate. Charging the ~590 KB of trade slots as well would make that
+    // gate fire on exactly the batch `candidates_for_free_memory` just approved
+    // — it approves the largest population whose slots fit, leaving a remainder
+    // smaller than one candidate — and turn a correct batch into a spurious
+    // split. The trade-slot reservation is where this wants to end up, and it
+    // gets there when the reservation stops being a compile-time constant.
+    let per_candidate = 2 * MONTH_BUCKETS_BUDGETED * std::mem::size_of::<f64>() as u64
+        + std::mem::size_of::<neoethos_gpu_contracts::device::NeoPopulationMetricRow>() as u64;
     let fixed = dataset
         + population as u64 * bars as u64 * per_candidate_bar
         + population as u64 * per_candidate
@@ -258,7 +335,7 @@ struct ResidentSession {
     /// one of those arrays, into whatever the allocator placed next.
     ///
     /// Nothing stopped that. The reuse test was `capacity >= capacity`, and
-    /// `event_capacity` SUBTRACTS `population * bars * 5`, so a larger
+    /// `event_capacity` SUBTRACTS the per-candidate workspaces, so a larger
     /// population asks for LESS capacity and passes more easily — the check
     /// was not merely silent about population, it was inverted with respect
     /// to it. A session built for 256 candidates was reused for 25 600.
@@ -464,34 +541,56 @@ fn is_capacity_exhaustion(error: &anyhow::Error) -> bool {
 mod capacity_detection_tests {
     use super::*;
 
-    /// The measured case: an RTX 3090 and the population validation asks for.
+    /// Whatever it approves has to fit in the budget it was given.
     ///
-    /// 250 folds x 100 Monte-Carlo runs is ~25 000 candidates, and at these
-    /// dimensions that does not fit. It has to come back short of the request
-    /// — that is the whole point — and it has to leave room to work.
+    /// This used to assert `fits < 25_000` on a 24 GB card, because the measured
+    /// failure was validation asking for ~25 000 candidates at 1.03 MB each —
+    /// ~25 GB on a 24 GB card. That number was a consequence of what a candidate
+    /// cost, not an invariant: with the confidence column gone a candidate costs
+    /// 0.68 MB at these dimensions and 25 000 of them genuinely do fit, so the
+    /// old assertion would now forbid a batch that is correct.
+    ///
+    /// The durable statement is the one that number stood in for: the approved
+    /// batch, priced at what the device actually allocates, must sit inside the
+    /// same seven tenths of free memory the function budgeted with, and one more
+    /// candidate must not.
     #[test]
-    fn the_population_validation_asks_for_does_not_fit_a_24gb_card() {
-        const BARS: usize = 87_715;
-        const FEATURES: usize = 257;
-        let fits = candidates_for_free_memory(24 * 1024 * 1024 * 1024, BARS, FEATURES)
-            .expect("a 24 GB card can host a useful batch");
-        assert!(
-            fits < 25_000,
-            "the request that ran the card out of memory must not be approved: {fits}"
-        );
-        assert!(
-            fits > 4_000,
-            "a 24 GB card should still host a large batch, not trickle: {fits}"
-        );
+    fn whatever_it_approves_fits_inside_the_budget_it_was_given() {
+        for (free, bars, features) in [
+            (24u64 * 1024 * 1024 * 1024, 87_715usize, 257usize),
+            (24 * 1024 * 1024 * 1024, 1_757_261, 64),
+            (24 * 1024 * 1024 * 1024, 5_270_000, 64),
+            (8 * 1024 * 1024 * 1024, 87_715, 257),
+        ] {
+            let fits = candidates_for_free_memory(free, bars, features)
+                .unwrap_or_else(|| panic!("{bars} bars on {free} B should host a batch"));
+            let budget = (free / 10) * 7;
+            let dataset = dataset_device_bytes(bars, features);
+            const RESERVE: u64 = 64 * 1024 * 1024;
+            let footprint = fits as u64 * per_candidate_device_bytes(bars) + dataset + RESERVE;
+            assert!(
+                footprint <= budget,
+                "{bars} bars: approved {fits} candidates costing {footprint} B (with the \
+                 reserve) against a budget of {budget} B"
+            );
+            // And it is not leaving the card half empty either: one more
+            // candidate has to breach that same budget.
+            let one_more = (fits as u64 + 1) * per_candidate_device_bytes(bars) + dataset + RESERVE;
+            assert!(
+                one_more > budget,
+                "{bars} bars: approved {fits}, but {} would also have fitted",
+                fits + 1
+            );
+        }
     }
 
     /// The reuse test was inverted with respect to population.
     ///
-    /// `event_capacity` subtracts `population * bars * 5 + population * 3944`
-    /// from the budget, so asking for MORE candidates yields a SMALLER required
-    /// capacity — and `capacity >= capacity` therefore passed exactly when it
-    /// should have failed. This pins the arithmetic that made the old check
-    /// unsafe, so a future edit to the budget cannot quietly restore it.
+    /// `event_capacity` subtracts the per-candidate-bar columns and the monthly
+    /// buckets from the budget, so asking for MORE candidates yields a SMALLER
+    /// required capacity — and `capacity >= capacity` therefore passed exactly
+    /// when it should have failed. This pins the arithmetic that made the old
+    /// check unsafe, so a future edit to the budget cannot quietly restore it.
     #[test]
     fn a_bigger_population_demands_less_capacity_which_is_why_that_test_was_unsafe() {
         const BARS: usize = 87_715;
@@ -501,8 +600,12 @@ mod capacity_detection_tests {
         // Same shape as `event_capacity`, without the device query.
         let capacity_for = |population: u64| -> u64 {
             let budget = (FREE / 10) * 7;
-            let dataset = BARS as u64 * (3 * 8 + 3 * 8 + 11 + FEATURES as u64 * 4);
-            let fixed = dataset + population * BARS as u64 * 5 + population * 3_944 + 64 * 1024 * 1024;
+            let dataset = dataset_device_bytes(BARS, FEATURES);
+            let per_candidate = 2 * MONTH_BUCKETS_BUDGETED * 8 + 104;
+            let fixed = dataset
+                + population * BARS as u64 * neoethos_gpu_cuda::WORKSPACE_BYTES_PER_CANDIDATE_BAR
+                + population * per_candidate
+                + 64 * 1024 * 1024;
             budget.saturating_sub(fixed) / 128
         };
 
@@ -524,15 +627,80 @@ mod capacity_detection_tests {
     #[test]
     fn the_blind_batch_is_small_enough_for_any_card() {
         const BARS: usize = 87_715;
-        let per_candidate =
-            neoethos_gpu_cuda::MAX_TRADES_PER_CANDIDATE * 72 + BARS as u64 * 5 + 3_944;
-        let blind = CONSERVATIVE_BATCH as u64 * per_candidate;
+        let blind = CONSERVATIVE_BATCH as u64 * per_candidate_device_bytes(BARS);
         assert!(
             blind < 2 * 1024 * 1024 * 1024,
             "a blind batch wants {} MiB, which is not safe on a small card",
             blind / (1024 * 1024)
         );
         assert!(CONSERVATIVE_BATCH >= 256, "and it still has to keep the card busy");
+    }
+
+    /// The host must charge exactly what the kernel allocates per candidate-bar.
+    ///
+    /// This is the defect the whole change is about. `signal_confidences` was
+    /// removed from the `.cu` and the host went on charging for it, so `fits`
+    /// never moved and the batch never grew — the kernel got cheaper and nothing
+    /// asked for more work. `neoethos_gpu_cuda`'s own
+    /// `workspace_bytes_per_candidate_bar_match_the_kernel` pins the constant to
+    /// the kernel source; this pins the host's use of it, so the two halves of
+    /// the fix cannot come apart again.
+    #[test]
+    fn the_bar_proportional_charge_is_what_the_kernel_allocates() {
+        let near = per_candidate_device_bytes(1_000);
+        let far = per_candidate_device_bytes(1_001_000);
+        assert_eq!(
+            far - near,
+            1_000_000 * neoethos_gpu_cuda::WORKSPACE_BYTES_PER_CANDIDATE_BAR,
+            "a million more bars must cost a million times what the kernel allocates per \
+             candidate-bar, and nothing else"
+        );
+        // 5 B was one byte of signal plus four of confidence. If this ever holds
+        // again, either the column is back or the host is paying for one the
+        // device does not allocate — and the second is what happened.
+        assert_ne!(
+            neoethos_gpu_cuda::WORKSPACE_BYTES_PER_CANDIDATE_BAR,
+            5,
+            "the confidence column is gone from the kernel"
+        );
+    }
+
+    /// Dropping the confidence column has to show up as a bigger batch.
+    ///
+    /// Measured before this landed: 12 702-16 709 candidates per launch on H1,
+    /// ~13 % of an RTX 3090's 125 952 resident threads, with the reduce running
+    /// one thread per candidate. The kernel change on its own moved none of it,
+    /// because the host kept charging for the column the kernel had stopped
+    /// allocating. This is what proves that half is in place.
+    #[test]
+    fn removing_the_confidence_column_raises_the_batch() {
+        const FREE: u64 = 24 * 1024 * 1024 * 1024;
+        // What the host used to charge: today's price plus the 4 B/candidate-bar
+        // confidence column.
+        let fits_when_confidence_was_charged = |bars: usize, features: usize| -> u64 {
+            let budget = (FREE / 10) * 7;
+            let dataset = dataset_device_bytes(bars, features);
+            let room = budget
+                .saturating_sub(dataset)
+                .saturating_sub(64 * 1024 * 1024);
+            room / (per_candidate_device_bytes(bars) + bars as u64 * 4).max(1)
+        };
+        for (bars, features, least) in [
+            (87_715usize, 257usize, 1.4f64),
+            (1_757_261, 64, 3.0),
+            (5_270_000, 64, 4.0),
+        ] {
+            let before = fits_when_confidence_was_charged(bars, features);
+            let after = candidates_for_free_memory(FREE, bars, features)
+                .unwrap_or_else(|| panic!("{bars} bars should host a batch"))
+                as u64;
+            let ratio = after as f64 / before.max(1) as f64;
+            assert!(
+                ratio >= least,
+                "{bars} bars: {before} -> {after} candidates is {ratio:.2}x, and the column \
+                 that went away was worth at least {least:.1}x here"
+            );
+        }
     }
 
     /// Peak memory must follow the hardware, never the request.
@@ -878,10 +1046,11 @@ fn evaluate_population_b_batch(
     // How full the trade slots actually are.
     //
     // Every candidate reserves MAX_TRADES_PER_CANDIDATE slots — 590 KB of the
-    // ~1.03 MB it costs — so over half the device memory per candidate is this
-    // one array, and the reservation is a constant while what a candidate
-    // records is not. Nothing measured the difference, so nothing could tell
-    // whether the card was full of trades or of empty space.
+    // 0.68 MB an H1 candidate now costs, so with the confidence column gone this
+    // one array is 87 % of a candidate's device memory. The reservation is a
+    // compile-time constant while what a candidate records is not, and nothing
+    // measured the difference, so nothing could tell whether the card was full
+    // of trades or of empty space.
     //
     // `accepted_trade_count` in the counters looks like the answer and is
     // always zero: the kernel never fills that field, it only stores the total

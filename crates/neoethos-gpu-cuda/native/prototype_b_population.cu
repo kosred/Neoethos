@@ -217,8 +217,57 @@ __global__ void population_signal_kernel(DeviceDataset dataset,
     }
 
     signal_values[flat] = emitted;
-    signal_confidences[flat] = confidence;
+    // Written only when a caller still wants the column. The reduce computes
+    // what it needs at the entry bar, so production passes nullptr and the
+    // allocation never happens.
+    if (signal_confidences != nullptr) {
+      signal_confidences[flat] = confidence;
+    }
   }
+}
+
+/// Confidence for one candidate at one bar, computed rather than remembered.
+///
+/// This was materialised for EVERY bar of EVERY candidate as a float, and read
+/// at exactly one place: sizing a position when it opens. Entries are a few
+/// percent of bars — 3 611 of 87 715 on H1 — so the array spent its life
+/// holding numbers nobody would ask for.
+///
+/// What that cost is the whole batch size. Per candidate the float column is
+/// 4 bytes a bar: 0.35 MB on H1 but 21.08 MB on M1, where it is 78% of what a
+/// candidate occupies. The reduce is one thread per candidate, so a card that
+/// holds 150 000 threads was being given 670.
+///
+/// The arithmetic below is copied from `population_signal_kernel`, term for
+/// term and in the same ascending CSR order, because that kernel's own comment
+/// promises f32 accumulation order bit for bit. Recomputing has to produce the
+/// identical float, not a close one — position size feeds P&L, and a parity
+/// test comparing P&L is what proves it.
+///
+/// Only reached when the signal is non-zero, which means the SMC gate already
+/// passed; the gate's `confidence = 0` branch is unreachable from here.
+__device__ inline float confidence_at_bar(const DeviceDataset& dataset,
+                                          const DeviceGenes& genes,
+                                          int candidate,
+                                          int bar,
+                                          int signal) {
+  float combined = 0.0f;
+  const int start = genes.offsets[candidate];
+  const int end = genes.offsets[candidate + 1];
+  for (int term = start; term < end; ++term) {
+    const int feature = genes.indices[term];
+    combined += genes.weights[term] *
+                dataset.indicators[static_cast<long long>(feature) * dataset.bars + bar];
+  }
+  const float long_threshold = genes.long_thresholds[candidate];
+  const float short_threshold = genes.short_thresholds[candidate];
+  float gap = fabsf(long_threshold - short_threshold);
+  if (!(gap > 1.0e-6f)) {
+    gap = 1.0e-6f;
+  }
+  const float margin =
+      (signal == 1) ? (combined - long_threshold) : (short_threshold - combined);
+  return fminf(fmaxf(margin / gap, 0.0f), 1.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -856,7 +905,6 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
                                          DeviceGenes genes,
                                          NeoPopulationSettings settings,
                                          const signed char* signal_values,
-                                         const float* signal_confidences,
                                          const unsigned char* gap_flags,
                                          NeoPopulationOutcome* outcomes,
                                          const unsigned long long* event_offsets,
@@ -893,7 +941,6 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   const unsigned long long range_start =
       static_cast<unsigned long long>(candidate) * kMaxTradesPerCandidate;
   const unsigned long long range_end = range_start + kMaxTradesPerCandidate;
-  const long long confidence_base = static_cast<long long>(candidate) * dataset.bars;
 
   double equity = initial_equity;
   double peak_equity = initial_equity;
@@ -1205,7 +1252,9 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       double lots = 1.0;
       if ((settings.flags & kFlagRiskBasedSizing) != 0u) {
         lots = risk_based_position_lots(
-            static_cast<double>(signal_confidences[confidence_base + signal_bar]), equity,
+            static_cast<double>(
+                confidence_at_bar(dataset, genes, candidate, signal_bar, direction)),
+            equity,
             stop_pips, settings);
       }
       position_event = event;
@@ -1871,8 +1920,13 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
       }
       return status == NEO_POPULATION_STATUS_OK;
     };
+    // `signal_confidences` is deliberately NOT allocated. It held a float per
+    // candidate-bar to be read at the few percent of bars where a trade opens,
+    // and on M1 that was 21.08 MB of a candidate's 26.94 MB — the reason a card
+    // holding 150 000 threads was handed 670. The reduce computes the value at
+    // the entry bar instead; `session->signal_confidences` stays nullptr and
+    // both kernels take it as such.
     if (!guard(device_alloc(&session->signal_values, signal_slots)) ||
-        !guard(device_alloc(&session->signal_confidences, signal_slots)) ||
         !guard(device_alloc(&session->event_counts, static_cast<std::size_t>(population))) ||
         !guard(device_alloc(&session->event_offsets,
                             static_cast<std::size_t>(population) + 1)) ||
@@ -2013,7 +2067,6 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
   population_reduce_kernel<<<reduce_blocks == 0u ? 1u : reduce_blocks, kReduceBlock, 0,
                              session->stream>>>(dataset, genes, *settings,
                                                 session->signal_values,
-                                                session->signal_confidences,
                                                 session->gap_flags, session->outcomes, session->event_offsets,
                                                 session->scenario_ids, session->monthly_pnls,
                                                 session->month_start_equities,

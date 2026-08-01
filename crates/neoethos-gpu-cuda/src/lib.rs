@@ -18,7 +18,7 @@ pub use population::{
 // caller matching on that text silently stopped working when the wording moved.
 pub use population::{STATUS_ALLOCATION_FAILED, STATUS_EVENT_CAPACITY, STATUS_LAUNCH_FAILED};
 // A caller sizing a batch has to know what the kernel reserves per candidate.
-pub use population::MAX_TRADES_PER_CANDIDATE;
+pub use population::{MAX_TRADES_PER_CANDIDATE, WORKSPACE_BYTES_PER_CANDIDATE_BAR};
 
 /// Number of SMC slots carried by one row of the canonical SMC contract.
 pub const SMC_SLOTS: usize = 11;

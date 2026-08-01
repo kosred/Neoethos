@@ -44,6 +44,24 @@ pub const STATUS_DATASET_REUPLOAD: i32 = -42;
 /// silently stopped working; this one is checked.
 pub const MAX_TRADES_PER_CANDIDATE: u64 = 8192;
 
+/// Device bytes the evaluation workspace allocates per candidate-bar.
+///
+/// The workspace has exactly one array sized `population * bars`:
+/// `signal_values`, a `signed char`. It used to have two — `signal_confidences`
+/// was a `float` for every bar of every candidate, read at the few percent of
+/// bars where a position opens — and the reduce now recomputes that value at the
+/// entry bar instead.
+///
+/// This constant exists because removing the array from the kernel bought
+/// nothing on its own. The host's own budget still charged 5 bytes a
+/// candidate-bar, so the number of candidates it approved never moved and the
+/// cheaper kernel was never asked for more work: measured 127.8 s -> 127.5 s.
+/// A device that allocates one thing and a host that budgets for another is the
+/// entire defect, so the two are pinned together by
+/// `workspace_bytes_per_candidate_bar_match_the_kernel` rather than left to
+/// agree by convention.
+pub const WORKSPACE_BYTES_PER_CANDIDATE_BAR: u64 = 1;
+
 pub fn population_status_message(status: i32) -> &'static str {
     match status {
         STATUS_OK => "ok",
@@ -718,6 +736,166 @@ mod tests {
             value, MAX_TRADES_PER_CANDIDATE,
             "the kernel reserves {value} trade slots per candidate but the host budgets for {MAX_TRADES_PER_CANDIDATE}"
         );
+    }
+
+    /// The kernel with its `//` comments removed.
+    ///
+    /// The scanners below flatten the source onto one line, and a line comment
+    /// that survived that would run into the declaration after it.
+    fn without_line_comments(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Bytes one element of `session-><name>` costs, from its declaration in the
+    /// session struct.
+    ///
+    /// An unknown type is a panic rather than a guess: a new pointer type in the
+    /// workspace is exactly the moment somebody has to decide what the host
+    /// should charge for it.
+    fn element_bytes(flat: &str, name: &str) -> u64 {
+        let declaration = format!("* {name} = nullptr;");
+        let end = flat
+            .find(&declaration)
+            .unwrap_or_else(|| panic!("the session struct declares no member `{name}`"));
+        let start = flat[..end]
+            .rfind([';', '{'])
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let declared = flat[start..end].trim();
+        match declared {
+            "char" | "signed char" | "unsigned char" => 1,
+            "short" | "unsigned short" => 2,
+            "int" | "unsigned int" | "float" => 4,
+            "long long" | "unsigned long long" | "double" => 8,
+            "NeoPopulationEvent" => std::mem::size_of::<NeoPopulationEvent>() as u64,
+            "NeoPopulationOutcome" => std::mem::size_of::<NeoPopulationOutcome>() as u64,
+            "NeoPopulationMetricRow" => std::mem::size_of::<NeoPopulationMetricRow>() as u64,
+            other => panic!(
+                "`{name}` is a `{other}*` and nothing here knows what one costs — price it \
+                 before the host budgets for candidates that hold it"
+            ),
+        }
+    }
+
+    /// Every workspace array the kernel sizes `population * bars`, with what one
+    /// element of it costs.
+    ///
+    /// `signal_slots` is the kernel's own name for that product, so the count
+    /// argument identifies the arrays without this test having to know their
+    /// names in advance — which is the point. An array added later is found,
+    /// priced, and made to fail this test until the host charges for it.
+    ///
+    /// It recognises the bare identifier only. An allocation sized by an
+    /// expression over `signal_slots` panics rather than being skipped, because
+    /// a scanner that silently ignored `signal_slots * 2` would be worse than no
+    /// scanner. What it genuinely cannot see is a `population * bars` product
+    /// spelled out longhand instead of through `signal_slots`; keeping that name
+    /// as the one way to say it is what makes this readable.
+    fn per_candidate_bar_allocations(flat: &str) -> Vec<(String, u64)> {
+        const CALL: &str = "device_alloc(&session->";
+        let mut found = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(hit) = flat[cursor..].find(CALL) {
+            let after = cursor + hit + CALL.len();
+            cursor = after;
+            let Some(comma) = flat[after..].find(',') else {
+                break;
+            };
+            let name = flat[after..after + comma].trim().to_string();
+            let argument = flat[after + comma + 1..].trim_start();
+            if argument.starts_with("signal_slots)") {
+                let bytes = element_bytes(flat, &name);
+                found.push((name, bytes));
+            } else {
+                // Only the part of the argument belonging to this call.
+                let extent = argument.find(';').unwrap_or(argument.len());
+                assert!(
+                    !argument[..extent].contains("signal_slots"),
+                    "`{name}` is sized by an expression over `signal_slots` and this scanner \
+                     reads only the bare identifier — price it into \
+                     WORKSPACE_BYTES_PER_CANDIDATE_BAR by hand and teach the scanner, do not \
+                     let it be skipped"
+                );
+            }
+        }
+        found
+    }
+
+    /// The host's per-candidate-bar budget must equal what the device allocates.
+    ///
+    /// Removing `signal_confidences` from the kernel bought zero wall time
+    /// because only the kernel changed: the host still charged 5 bytes per
+    /// candidate-bar, so the batch it approved never grew and the cheaper kernel
+    /// was never handed more work. Two languages agreeing by convention is how
+    /// that happened; this makes them agree by test.
+    #[test]
+    fn workspace_bytes_per_candidate_bar_match_the_kernel() {
+        const KERNEL: &str = include_str!("../native/prototype_b_population.cu");
+        let stripped = without_line_comments(KERNEL);
+        let flat = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+        let allocations = per_candidate_bar_allocations(&flat);
+        assert!(
+            !allocations.is_empty(),
+            "no `population * bars` workspace allocation was found in the kernel — either it \
+             changed shape or this test stopped reading it, and both leave the host budget \
+             unchecked"
+        );
+        let total: u64 = allocations.iter().map(|(_, bytes)| *bytes).sum();
+        assert_eq!(
+            total, WORKSPACE_BYTES_PER_CANDIDATE_BAR,
+            "the kernel allocates {allocations:?} = {total} B per candidate-bar; the host \
+             budgets {WORKSPACE_BYTES_PER_CANDIDATE_BAR} B. Undercharging runs the card out of \
+             memory, overcharging shrinks the batch for nothing — which is what a removed \
+             array the host still paid for did"
+        );
+    }
+
+    /// The parser has to notice an array being added back, or it proves nothing.
+    #[test]
+    fn the_scanner_would_catch_a_second_per_candidate_bar_array() {
+        let source = "\
+struct NeoCudaPopulationSession {
+  signed char* signal_values = nullptr;
+  float* signal_confidences = nullptr;
+};
+  device_alloc(&session->signal_values, signal_slots);
+  device_alloc(&session->signal_confidences, signal_slots);
+  device_alloc(&session->metric_rows, static_cast<std::size_t>(population));
+";
+        let stripped = without_line_comments(source);
+        let flat = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+        let allocations = per_candidate_bar_allocations(&flat);
+        assert_eq!(
+            allocations,
+            vec![
+                ("signal_values".to_string(), 1),
+                ("signal_confidences".to_string(), 4)
+            ],
+            "the per-candidate-bar arrays must be found by their count argument, and the \
+             per-candidate one must not be"
+        );
+    }
+
+    /// And it must refuse what it cannot read rather than skip it.
+    #[test]
+    #[should_panic(expected = "expression over `signal_slots`")]
+    fn a_scaled_signal_slots_allocation_is_refused_not_ignored() {
+        let source = "\
+struct NeoCudaPopulationSession {
+  float* signal_pairs = nullptr;
+};
+  device_alloc(&session->signal_pairs, signal_slots * 2);
+";
+        let stripped = without_line_comments(source);
+        let flat = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+        let _ = per_candidate_bar_allocations(&flat);
     }
 
     #[test]
