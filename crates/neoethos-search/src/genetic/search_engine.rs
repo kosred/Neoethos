@@ -225,6 +225,62 @@ pub fn signals_and_confidence_for_gene_with_config(
     (signals, confidences)
 }
 
+/// The eleven SMC gate arrays for one series, shareable across genes.
+///
+/// `build_smc_arrays` takes no [`Gene`]: its output is a pure function of the
+/// feature frame and the OHLCV, so every gene screened over one series votes
+/// against byte-identical arrays. The per-gene signal path nevertheless
+/// rebuilt them from scratch each time — the ~90-op/bar `derive_smc_arrays`
+/// scan plus eleven full-series heap allocations, per gene, all producing the
+/// same numbers. Across a post-search candidate pool that rebuild costs more
+/// than the signal synthesis it feeds.
+///
+/// Stored row-major (one `[i8; 11]` per bar) because the gate reads all
+/// eleven slots of a single bar together; eleven separate vectors touch
+/// eleven cache lines per gated bar. This is the layout
+/// [`EvalDataCache::smc_data`] has always handed the population evaluator,
+/// so the two paths now agree on shape as well as on values.
+pub struct SmcGateArrays {
+    rows: Vec<crate::eval::SmcRow>,
+}
+
+impl SmcGateArrays {
+    /// Build the gate arrays for `(features, ohlcv)`. Cost is one
+    /// `build_smc_arrays` call regardless of how many genes later consume it.
+    pub fn build(features: &FeatureFrame, ohlcv: &Ohlcv) -> Self {
+        let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
+            build_smc_arrays(features, ohlcv);
+        let rows = (0..ob.len())
+            .map(|i| {
+                [
+                    ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i],
+                    eql[i], disp[i],
+                ]
+            })
+            .collect();
+        Self { rows }
+    }
+
+    /// Bars covered — `ohlcv.close.len()`, which is what `build_smc_arrays`
+    /// sizes its output from (it may exceed the frame's sample count).
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Slot order is the `SmcSignalTuple` order — ob, fvg, liq, trend,
+    /// premium, inducement, bos, choch, eqh, eql, displacement — matching the
+    /// gene flag order in [`signals_and_confidence_for_gene_full`]. The two
+    /// must not drift: a permuted row silently swaps which indicator each
+    /// gene flag votes on.
+    pub fn rows(&self) -> &[crate::eval::SmcRow] {
+        &self.rows
+    }
+}
+
 /// SMC-gated variant that mirrors `eval::synthesize_signals_cpu` exactly.
 /// Use this in post-search filtering / MC perturbation so the trade count
 /// matches what the evaluator actually scored.
@@ -236,6 +292,17 @@ pub fn signals_for_gene_full(
 ) -> Vec<i8> {
     // Behaviour-identical thin wrapper: drop the confidence vector.
     signals_and_confidence_for_gene_full(features, ohlcv, gene, config).0
+}
+
+/// [`signals_for_gene_full`] against gate arrays the caller already built.
+/// For loops that screen many genes over one series; see [`SmcGateArrays`].
+pub fn signals_for_gene_full_with_smc(
+    features: &FeatureFrame,
+    gene: &Gene,
+    config: &EvaluationConfig,
+    smc: &SmcGateArrays,
+) -> Vec<i8> {
+    signals_and_confidence_for_gene_full_with_smc(features, gene, config, smc).0
 }
 
 /// Confidence-emitting variant of [`signals_for_gene_full`]. Returns the
@@ -254,6 +321,19 @@ pub fn signals_and_confidence_for_gene_full(
     ohlcv: &Ohlcv,
     gene: &Gene,
     config: &EvaluationConfig,
+) -> (Vec<i8>, Vec<f32>) {
+    let smc = SmcGateArrays::build(features, ohlcv);
+    signals_and_confidence_for_gene_full_with_smc(features, gene, config, &smc)
+}
+
+/// [`signals_and_confidence_for_gene_full`] against gate arrays the caller
+/// already built. Identical arithmetic in identical order — the only
+/// difference is who paid for `build_smc_arrays`.
+pub fn signals_and_confidence_for_gene_full_with_smc(
+    features: &FeatureFrame,
+    gene: &Gene,
+    config: &EvaluationConfig,
+    smc: &SmcGateArrays,
 ) -> (Vec<i8>, Vec<f32>) {
     let n_samples = features.n_samples();
     let mut combined = vec![0.0_f32; n_samples];
@@ -314,9 +394,26 @@ pub fn signals_and_confidence_for_gene_full(
     let active_sum = if smc_bypass { 0.0 } else { active_sum };
     let gate = config.smc_gate_threshold.min(active_sum);
 
-    let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
-        super::smc_indicators::build_smc_arrays(features, ohlcv);
-
+    let smc_rows = smc.rows();
+    // Only the gated path reads the arrays, so only the gated path can be hurt
+    // by arrays that don't cover the frame — checked here rather than on entry
+    // so a bypassed gate keeps behaving exactly as before.
+    //
+    // A frame longer than its own bar series is a broken invariant, and one
+    // bad build now poisons every candidate sharing it rather than one gene,
+    // so it is worth stopping on. That does widen the trip condition: this
+    // fires whenever the gate is live, where indexing alone only blew up once
+    // some bar actually crossed a threshold. A flag-carrying gene that fired
+    // on no bar used to return all-zeros off arrays too short to gate it —
+    // silently ungated, then dropped by min_trades for the wrong reason.
+    if active_sum > 0.0 {
+        assert!(
+            smc_rows.len() >= n_samples,
+            "SMC gate arrays cover {} bars but the feature frame has {n_samples} — \
+             the arrays were built from a different series",
+            smc_rows.len()
+        );
+    }
     let mut signals = vec![0_i8; n_samples];
     let mut confidences = vec![0.0_f32; n_samples];
     let gap = (gene.long_threshold - gene.short_threshold).abs().max(1e-6);
@@ -344,10 +441,7 @@ pub fn signals_and_confidence_for_gene_full(
             confidences[i] = conf;
             continue;
         }
-        let smc_row = [
-            ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i], eql[i],
-            disp[i],
-        ];
+        let smc_row = smc_rows[i];
         let mut score = 0.0_f32;
         for j in 0..11 {
             if flags[j] != 0 {
@@ -2315,6 +2409,369 @@ mod adaptive_wiring_tests {
         assert!(
             settings2.adaptive_base_pips.is_none(),
             "no base series installed when every gene is fixed"
+        );
+    }
+}
+
+/// Pins the two things sharing SMC gate arrays across genes can break:
+/// the row packing (which indicator each gene flag votes on) and *whose*
+/// arrays the gate actually reads.
+///
+/// These run on the 100-bar EURUSD M1 fixture. That is enough to pin the
+/// arithmetic, and nothing more — it says nothing about the wall-clock or
+/// memory behaviour of the full-series screen this hoist exists for. Those
+/// only show up on a real cube.
+///
+/// One property deliberately has no test: that the screen builds the arrays
+/// ONCE for the pool. Every honest way to assert it needs either a global
+/// build counter — which races with the rest of this suite, since half of it
+/// reaches `build_smc_arrays` through the single-gene wrapper — or a timing
+/// bound, which at fixture size measures nothing. So moving the build back
+/// inside the loop would keep all of these green and silently give the cost
+/// back. It is a review invariant, not a tested one.
+#[cfg(test)]
+mod smc_gate_arrays_tests {
+    use super::*;
+    use neoethos_data::test_fixtures::ctrader_sample_ohlcv;
+
+    /// Real EURUSD M1 bars plus two directional feature columns derived from
+    /// them. The names are chosen so `detect_smc_columns` — which matches by
+    /// substring — cannot mistake either for an SMC input, leaving the gate
+    /// arrays fully bar-derived.
+    fn plain_frame(ohlcv: &Ohlcv) -> FeatureFrame {
+        frame_with(ohlcv, &[], |_, _| 0.0)
+    }
+
+    /// The same bars with all eleven SMC columns present, which is what a real
+    /// discovery cube looks like: `build_smc_arrays` then runs its whole
+    /// column-override ladder rather than only the derived scan. Each column
+    /// gets its own period so no two gate arrays coincide — otherwise a
+    /// permuted row would be invisible.
+    fn smc_frame(ohlcv: &Ohlcv) -> FeatureFrame {
+        const SMC_NAMES: [&str; 11] = [
+            "smc_ob",
+            "smc_fvg",
+            "smc_liq",
+            "smc_trend",
+            "smc_premium",
+            "smc_inducement",
+            "smc_bos",
+            "smc_choch",
+            "smc_eqh",
+            "smc_eql",
+            "smc_displacement",
+        ];
+        const PERIODS: [usize; 11] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 17];
+        frame_with(ohlcv, &SMC_NAMES, |i, col| match (i + col) % PERIODS[col] {
+            0 => 1.0,
+            1 => -1.0,
+            _ => 0.0,
+        })
+    }
+
+    /// The same bars with a single, permanently bullish `smc_ob` column, so
+    /// the OB gate array is all `+1` — nothing a real bar series would derive.
+    fn forced_bullish_ob_frame(ohlcv: &Ohlcv) -> FeatureFrame {
+        frame_with(ohlcv, &["smc_ob"], |_, _| 1.0)
+    }
+
+    fn frame_with(
+        ohlcv: &Ohlcv,
+        extra_names: &[&str],
+        extra: impl Fn(usize, usize) -> f32,
+    ) -> FeatureFrame {
+        let n = ohlcv.close.len();
+        let mut names = vec!["signal_a".to_string(), "signal_b".to_string()];
+        names.extend(extra_names.iter().map(|s| s.to_string()));
+        let mut data = Array2::<f32>::zeros((n, names.len()));
+        for i in 0..n {
+            data[(i, 0)] = ((ohlcv.close[i] - ohlcv.open[i]) * 1e4) as f32;
+            data[(i, 1)] = ((ohlcv.high[i] - ohlcv.low[i]) * 1e4) as f32;
+            for col in 0..extra_names.len() {
+                data[(i, 2 + col)] = extra(i, col);
+            }
+        }
+        FeatureFrame {
+            timestamps: ohlcv.timestamp.clone().unwrap_or_default(),
+            names,
+            data: neoethos_data::FeatureData::InMemory(data),
+        }
+    }
+
+    /// Explicit SMC weights so the gate arithmetic does not depend on whatever
+    /// another test happened to install into the process-global overrides.
+    fn gate_config() -> EvaluationConfig {
+        EvaluationConfig {
+            smc_gate_threshold: 0.75,
+            smc_weight_ob: 1.0,
+            smc_weight_fvg: 1.0,
+            smc_weight_liq: 1.0,
+            smc_weight_mtf: 1.0,
+            smc_weight_premium: 1.0,
+            smc_weight_inducement: 1.0,
+            smc_weight_bos: 1.0,
+            smc_weight_choch: 1.0,
+            smc_weight_eqh: 1.0,
+            smc_weight_eql: 1.0,
+            smc_weight_displacement: 1.0,
+            ..EvaluationConfig::for_symbol("EURUSD", "USD", Some(1.10), None, None)
+        }
+    }
+
+    fn gate_genes() -> Vec<Gene> {
+        let base = Gene {
+            indices: vec![0, 1],
+            weights: vec![1.0, 0.25],
+            long_threshold: 0.6,
+            short_threshold: -0.6,
+            ..Gene::default()
+        };
+        vec![
+            Gene {
+                strategy_id: "no-flags".to_string(),
+                ..base.clone()
+            },
+            Gene {
+                strategy_id: "ob-only".to_string(),
+                use_ob: true,
+                ..base.clone()
+            },
+            Gene {
+                strategy_id: "inducement-only".to_string(),
+                use_inducement: true,
+                ..base.clone()
+            },
+            Gene {
+                strategy_id: "tail-flags".to_string(),
+                use_eqh: true,
+                use_eql: true,
+                use_displacement: true,
+                ..base.clone()
+            },
+            Gene {
+                strategy_id: "every-flag".to_string(),
+                use_ob: true,
+                use_fvg: true,
+                use_liq_sweep: true,
+                mtf_confirmation: true,
+                use_premium_discount: true,
+                use_inducement: true,
+                use_bos: true,
+                use_choch: true,
+                use_eqh: true,
+                use_eql: true,
+                use_displacement: true,
+                ..base
+            },
+        ]
+    }
+
+    /// Independent re-implementation of the documented gate, reading the
+    /// eleven arrays as separate vectors. Deliberately does NOT go through
+    /// `SmcGateArrays`, so it can disagree with the production path.
+    fn reference_signals(
+        features: &FeatureFrame,
+        ohlcv: &Ohlcv,
+        gene: &Gene,
+        config: &EvaluationConfig,
+    ) -> Vec<i8> {
+        let n = features.n_samples();
+        let mut combined = vec![0.0_f32; n];
+        for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
+            if *idx >= features.n_features() {
+                continue;
+            }
+            for (i, v) in features.feature_column(*idx).iter().enumerate() {
+                combined[i] += *weight * *v;
+            }
+        }
+        let flags: [i8; 11] = [
+            gene.use_ob as i8,
+            gene.use_fvg as i8,
+            gene.use_liq_sweep as i8,
+            gene.mtf_confirmation as i8,
+            gene.use_premium_discount as i8,
+            gene.use_inducement as i8,
+            gene.use_bos as i8,
+            gene.use_choch as i8,
+            gene.use_eqh as i8,
+            gene.use_eql as i8,
+            gene.use_displacement as i8,
+        ];
+        let weights = [
+            config.smc_weight_ob,
+            config.smc_weight_fvg,
+            config.smc_weight_liq,
+            config.smc_weight_mtf,
+            config.smc_weight_premium,
+            config.smc_weight_inducement,
+            config.smc_weight_bos,
+            config.smc_weight_choch,
+            config.smc_weight_eqh,
+            config.smc_weight_eql,
+            config.smc_weight_displacement,
+        ];
+        let active_sum: f32 = flags
+            .iter()
+            .enumerate()
+            .map(|(i, &f)| if f != 0 { weights[i] } else { 0.0 })
+            .sum();
+        let active_sum = if crate::genetic::smc_gate_disabled() {
+            0.0
+        } else {
+            active_sum
+        };
+        let gate = config.smc_gate_threshold.min(active_sum);
+        let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
+            build_smc_arrays(features, ohlcv);
+        let mut out = vec![0_i8; n];
+        for i in 0..n {
+            let v = combined[i];
+            let raw = if v >= gene.long_threshold {
+                1
+            } else if v <= gene.short_threshold {
+                -1
+            } else {
+                0
+            };
+            if raw == 0 {
+                continue;
+            }
+            if active_sum <= 0.0 {
+                out[i] = raw;
+                continue;
+            }
+            let row = [
+                ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i], eql[i],
+                disp[i],
+            ];
+            let mut score = 0.0_f32;
+            for j in 0..11 {
+                if flags[j] != 0 {
+                    if j == 5 {
+                        if row[j] == 1 {
+                            score += weights[j];
+                        }
+                    } else if row[j] == raw {
+                        score += weights[j];
+                    }
+                }
+            }
+            if score >= gate {
+                out[i] = raw;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn packed_rows_carry_the_tuple_in_gene_flag_order() {
+        let ohlcv = ctrader_sample_ohlcv();
+        let frame = smc_frame(&ohlcv);
+        let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
+            build_smc_arrays(&frame, &ohlcv);
+        let packed = SmcGateArrays::build(&frame, &ohlcv);
+        assert_eq!(packed.len(), ob.len());
+
+        // Guard the guard: if the arrays coincided, a permuted row would pass.
+        let arrays = [
+            &ob, &fvg, &liq, &trend, &prem, &ind, &bos, &choch, &eqh, &eql, &disp,
+        ];
+        let mut differing = 0usize;
+        for a in 0..arrays.len() {
+            for b in (a + 1)..arrays.len() {
+                if arrays[a] != arrays[b] {
+                    differing += 1;
+                }
+            }
+        }
+        assert!(
+            differing >= 40,
+            "fixture must produce distinct SMC arrays, only {differing}/55 pairs differ"
+        );
+
+        for i in 0..ob.len() {
+            assert_eq!(
+                packed.rows()[i],
+                [
+                    ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i],
+                    eql[i], disp[i]
+                ],
+                "packed row {i} does not match the SmcSignalTuple order"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_arrays_reproduce_the_per_gene_rebuild() {
+        let ohlcv = ctrader_sample_ohlcv();
+        let config = gate_config();
+        for (label, frame) in [
+            ("derived", plain_frame(&ohlcv)),
+            ("column-backed", smc_frame(&ohlcv)),
+        ] {
+            let shared = SmcGateArrays::build(&frame, &ohlcv);
+            let mut fired = 0usize;
+            for gene in gate_genes() {
+                let expected = reference_signals(&frame, &ohlcv, &gene, &config);
+                let (hoisted, hoisted_conf) =
+                    signals_and_confidence_for_gene_full_with_smc(&frame, &gene, &config, &shared);
+                let (rebuilt, rebuilt_conf) =
+                    signals_and_confidence_for_gene_full(&frame, &ohlcv, &gene, &config);
+                assert_eq!(hoisted, expected, "{label}/{}", gene.strategy_id);
+                assert_eq!(rebuilt, expected, "{label}/{}", gene.strategy_id);
+                assert_eq!(hoisted_conf, rebuilt_conf, "{label}/{}", gene.strategy_id);
+                fired += expected.iter().filter(|v| **v != 0).count();
+            }
+            assert!(
+                fired > 0,
+                "{label}: no gene fired, the comparison is vacuous"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gate_votes_on_the_arrays_it_was_handed() {
+        assert!(
+            !crate::genetic::smc_gate_disabled(),
+            "this test asserts gate behaviour; the SMC gate bypass must be off"
+        );
+        let ohlcv = ctrader_sample_ohlcv();
+        let frame = plain_frame(&ohlcv);
+        let config = gate_config();
+        let gene = Gene {
+            indices: vec![0],
+            weights: vec![1.0],
+            long_threshold: 0.2,
+            short_threshold: -0.2,
+            use_ob: true,
+            strategy_id: "ob-only".to_string(),
+            ..Gene::default()
+        };
+        let ungated = Gene {
+            use_ob: false,
+            ..gene.clone()
+        };
+        let raw = reference_signals(&frame, &ohlcv, &ungated, &config);
+        assert!(
+            raw.iter().any(|&s| s == 1) && raw.iter().any(|&s| s == -1),
+            "fixture must fire in both directions or the assertion below is empty"
+        );
+
+        // `use_ob` alone means gate == w_ob and score == w_ob exactly when the
+        // OB array agrees with the bar's direction: an all-bullish OB array
+        // passes every long and drops every short. Only reachable if the gate
+        // reads the arrays it was handed rather than rebuilding its own.
+        let forced = SmcGateArrays::build(&forced_bullish_ob_frame(&ohlcv), &ohlcv);
+        let out = signals_for_gene_full_with_smc(&frame, &gene, &config, &forced);
+        for (i, &r) in raw.iter().enumerate() {
+            assert_eq!(out[i], if r == 1 { 1 } else { 0 }, "bar {i}");
+        }
+
+        let honest = signals_for_gene_full(&frame, &ohlcv, &gene, &config);
+        assert_ne!(
+            honest, out,
+            "the bar-derived OB array must differ from the forced one, or this test cannot fail"
         );
     }
 }

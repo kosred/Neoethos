@@ -2,9 +2,9 @@ use crate::artifact_io::{stable_json_hash, write_json_atomic};
 use crate::eval::{BacktestMetrics, fast_evaluate_strategy_core, simulate_trades_core};
 use crate::genetic::strategy_gene::EvaluationConfig;
 use crate::genetic::{
-    Gene, build_smc_arrays, evolve_search_with_progress_and_limits, month_day_indices,
-    signals_and_confidence_for_gene_full, signals_for_gene_full,
-    validation_genes_population_gathered,
+    Gene, SmcGateArrays, build_smc_arrays, evolve_search_with_progress_and_limits,
+    month_day_indices, signals_and_confidence_for_gene_full, signals_for_gene_full,
+    signals_for_gene_full_with_smc, validation_genes_population_gathered,
 };
 use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use crate::validation::{
@@ -3830,6 +3830,56 @@ fn compute_prop_firm_pass_rate(
 #[cfg(feature = "gpu")]
 static GPU_LAUNCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Synthesise each prefiltered candidate's full-series signal vector and keep
+/// the ones that fire often enough, returning
+/// `(survivors, candidates_that_fired_at_all)`.
+///
+/// The second value is diagnostic counter #2: how many genes generated ANY
+/// non-zero signal? A gene whose `long_threshold` exceeds the largest possible
+/// combined signal never fires. It is tracked separately from the `min_trades`
+/// gate so the funnel can tell "the SMC gate killed everything" — the common
+/// empty-portfolio root cause — apart from "fired, but too rarely".
+///
+/// `min_trades` is compared against BARS THAT FIRE, not against executed
+/// trades; that has always been this gate's meaning and the funnel's
+/// `passed_min_trades` count is calibrated on it.
+///
+/// The SMC gate arrays are gene-independent — `build_smc_arrays` takes no
+/// `Gene`, and `features`/`ohlcv` are fixed for the whole screen — so they are
+/// built once here instead of once per candidate. On a full series that
+/// rebuild dominated the stage: eleven fresh full-series arrays plus the
+/// `derive_smc_arrays` scan, repeated for every candidate, all producing
+/// byte-identical output. Each survivor's signal vector is unchanged.
+fn screen_candidates_by_signal_count(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    prefiltered: Vec<(usize, Gene)>,
+    eval_config: &EvaluationConfig,
+    min_trades: usize,
+) -> (Vec<(usize, Gene, Vec<i8>)>, usize) {
+    let smc = SmcGateArrays::build(features, ohlcv);
+    let nonzero_signal_count = std::sync::atomic::AtomicUsize::new(0);
+    let survivors: Vec<(usize, Gene, Vec<i8>)> = prefiltered
+        .into_par_iter()
+        .filter_map(|(candidate_idx, gene)| {
+            let sig = signals_for_gene_full_with_smc(features, &gene, eval_config, &smc);
+            let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
+            if trade_count > 0.0 {
+                nonzero_signal_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if trade_count >= min_trades as f64 {
+                Some((candidate_idx, gene, sig))
+            } else {
+                None
+            }
+        })
+        .collect();
+    (
+        survivors,
+        nonzero_signal_count.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 fn finalize_candidates_with_progress<F>(
     candidates: Vec<Gene>,
     features: &FeatureFrame,
@@ -4175,29 +4225,14 @@ where
     let eval_config_for_signals = config
         .evaluation_config_with_smc_gate(ohlcv.close.last().copied(), effective_smc_gate_threshold);
 
-    // Diagnostic counter #2: how many genes generated ANY non-zero
-    // signal at all? A gene with `long_threshold > max possible
-    // combined signal` never fires. We track this separately from
-    // the min_trades gate so we can tell "no signal" from "too few
-    // trades".
-    let nonzero_signal_count = std::sync::atomic::AtomicUsize::new(0);
-    let signals_with_idx: Vec<(usize, Gene, Vec<i8>)> = prefiltered
-        .into_par_iter()
-        .filter_map(|(candidate_idx, gene)| {
-            let sig = signals_for_gene_full(features, ohlcv, &gene, &eval_config_for_signals);
-            let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
-            if trade_count > 0.0 {
-                nonzero_signal_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            if trade_count >= min_trades as f64 {
-                Some((candidate_idx, gene, sig))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let (signals_with_idx, post_nonzero_signal) = screen_candidates_by_signal_count(
+        features,
+        ohlcv,
+        prefiltered,
+        &eval_config_for_signals,
+        min_trades,
+    );
     let post_min_trades = signals_with_idx.len();
-    let post_nonzero_signal = nonzero_signal_count.load(std::sync::atomic::Ordering::Relaxed);
     // 2026-05-26: record "any signal at all" + "passed min-trades" as separate
     // stages so the funnel can tell "SMC gate killed everything" (the common
     // empty-portfolio root cause) apart from "had signals but too few".

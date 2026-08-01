@@ -2008,3 +2008,121 @@ fn choosing_a_mode_changes_what_the_mode_says_it_changes() {
         strict.filtering.max_dd
     );
 }
+
+
+/// The "nonzero_signals" stage builds the SMC gate arrays once for the whole
+/// candidate pool instead of once per candidate. Pins that the pool-wide build
+/// changes nothing the funnel reads: same survivors, same order, same signal
+/// vectors, same "fired at all" count as screening each candidate on its own.
+///
+/// The fixture is 100 bars, so this pins arithmetic only. The stage exists as
+/// a hoist because the rebuild is a full-series cost repeated per candidate —
+/// that is not observable at this size and is not claimed here.
+#[test]
+fn signal_count_screen_matches_screening_each_candidate_alone() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let eval_config =
+        EvaluationConfig::for_symbol("EURUSD", "USD", ohlcv.close.last().copied(), None, None);
+
+    let base = Gene {
+        indices: vec![0, 1],
+        weights: vec![1.0, 0.5],
+        long_threshold: 0.4,
+        short_threshold: -0.4,
+        ..Gene::default()
+    };
+    let candidates: Vec<(usize, Gene)> = vec![
+        (
+            7,
+            Gene {
+                strategy_id: "no-flags".to_string(),
+                ..base.clone()
+            },
+        ),
+        (
+            2,
+            Gene {
+                strategy_id: "ob".to_string(),
+                use_ob: true,
+                ..base.clone()
+            },
+        ),
+        (
+            11,
+            Gene {
+                strategy_id: "structure".to_string(),
+                use_bos: true,
+                use_choch: true,
+                ..base.clone()
+            },
+        ),
+        // Never crosses its long threshold: exercises the zero-signal branch
+        // the funnel reports as "zero_signals_after_smc_gate".
+        (
+            3,
+            Gene {
+                strategy_id: "silent".to_string(),
+                long_threshold: 1e9,
+                short_threshold: -1e9,
+                ..base.clone()
+            },
+        ),
+        (
+            5,
+            Gene {
+                strategy_id: "all-flags".to_string(),
+                use_ob: true,
+                use_fvg: true,
+                use_liq_sweep: true,
+                mtf_confirmation: true,
+                use_premium_discount: true,
+                use_inducement: true,
+                use_bos: true,
+                use_choch: true,
+                use_eqh: true,
+                use_eql: true,
+                use_displacement: true,
+                ..base
+            },
+        ),
+    ];
+    let min_trades = 3usize;
+
+    let expected: Vec<(usize, Gene, Vec<i8>)> = candidates
+        .iter()
+        .filter_map(|(idx, gene)| {
+            let sig = signals_for_gene_full(&features, &ohlcv, gene, &eval_config);
+            let firing = sig.iter().filter(|v| **v != 0).count();
+            (firing >= min_trades).then(|| (*idx, gene.clone(), sig))
+        })
+        .collect();
+    let expected_nonzero = candidates
+        .iter()
+        .filter(|(_, gene)| {
+            signals_for_gene_full(&features, &ohlcv, gene, &eval_config)
+                .iter()
+                .any(|v| *v != 0)
+        })
+        .count();
+
+    // Both branches of the funnel's two counters must be exercised, otherwise
+    // the comparison below cannot catch a regression in either.
+    assert!(
+        !expected.is_empty() && expected.len() < candidates.len(),
+        "fixture must both keep and drop candidates (kept {} of {})",
+        expected.len(),
+        candidates.len()
+    );
+    assert!(expected_nonzero > 0 && expected_nonzero < candidates.len());
+
+    let (survivors, nonzero) =
+        screen_candidates_by_signal_count(&features, &ohlcv, candidates, &eval_config, min_trades);
+    assert_eq!(nonzero, expected_nonzero, "'fired at all' count");
+    assert_eq!(survivors.len(), expected.len(), "survivor count");
+    for (got, want) in survivors.iter().zip(expected.iter()) {
+        assert_eq!(got.0, want.0, "candidate index (order must be preserved)");
+        assert_eq!(got.1, want.1, "gene");
+        assert_eq!(got.2, want.2, "signal vector for candidate {}", want.0);
+    }
+}
