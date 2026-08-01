@@ -416,9 +416,9 @@ pub fn signals_and_confidence_for_gene_full_with_smc(
     // silently ungated, then dropped by min_trades for the wrong reason.
     if active_sum > 0.0 {
         assert!(
-            smc_rows.len() >= n_samples,
+            smc_rows.len() == n_samples,
             "SMC gate arrays cover {} bars but the feature frame has {n_samples} — \
-             the arrays were built from a different series",
+             the arrays were built from a different series. Equality, not `>=`: a              LONGER array is the dangerous case, because a tail-window caller              (discovery.rs:2536, :2676 pass tail_features/tail_ohlcv) would read gates              aligned to the HEAD of the full series and get a plausible, silently              wrong signal vector. Rebuilding per gene made that impossible; sharing              one build makes provenance the caller's responsibility.",
             smc_rows.len()
         );
     }
