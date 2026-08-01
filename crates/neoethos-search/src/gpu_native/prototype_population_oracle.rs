@@ -1699,6 +1699,7 @@ mod tests {
     fn canonical_cost_fixture() -> PrototypePopulationWorkload {
         let start = 1_700_000_000_000_i64;
         let settings = SnapshotSettingsDto {
+            session_spread_profile: None,
             max_hold_bars: 0,
             min_hold_bars: 0,
             max_trades_per_day: 0,

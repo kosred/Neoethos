@@ -90,7 +90,7 @@ fn mean_std(values: &[f64]) -> (f64, f64) {
 /// Real broker data is finer-grained but the 3-bucket approximation
 /// already cuts the live-vs-backtest gap meaningfully because the
 /// London/NY-overlap spread is typically 30-50% of the Asian spread.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SessionSpreadProfile {
     pub asian_pips: f64,
     pub overlap_pips: f64,
@@ -4498,6 +4498,95 @@ mod trailing_parity_tests {
                      CPU disagree about a trailing stop"
                 );
             }
+        }
+    }
+
+    /// Splits the failure in two: plumbing, or hour boundaries.
+    ///
+    /// All three buckets hold the same non-zero value, so the hour lookup
+    /// cannot matter — every bar resolves to 2.0 whichever branch it takes.
+    /// If this passes and the varied-bucket test fails, the bug is in the hour
+    /// arithmetic. If this fails too, the value is not reaching the kernel at
+    /// all and the buckets are a red herring.
+    #[test]
+    fn uniform_buckets_are_a_scalar_by_another_name() {
+        let n_samples = 1_200usize;
+        let n_genes = 4usize;
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| {
+                let t = i as f64;
+                1.1000 + (t / 220.0).sin() * 0.0090 + (t / 37.0).sin() * 0.0016
+            })
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0006).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0006).collect();
+        let indicators = ndarray::Array2::from_shape_fn((4, n_samples), |(f, i)| {
+            let t = i as f64;
+            ((t / (18.0 + 11.0 * f as f64)).sin()) as f32
+        });
+        let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
+        let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 0];
+        let gene_weights: Vec<f32> = vec![1.0; 8];
+        let long_thr: Vec<f32> = vec![0.25; n_genes];
+        let short_thr: Vec<f32> = vec![-0.25; n_genes];
+        let sl_pips: Vec<f64> = vec![20.0; n_genes];
+        let tp_pips: Vec<f64> = vec![60.0; n_genes];
+        let stop_vol_mult: Vec<f64> = vec![0.0; n_genes];
+        let months: Vec<i64> = (0..n_samples).map(|i| (i / 200) as i64).collect();
+        let days: Vec<i64> = (0..n_samples).map(|i| (i / 24) as i64).collect();
+        let timestamps: Vec<i64> = (0..n_samples)
+            .map(|i| 1_600_000_000_000 + (i as i64) * 3_600_000)
+            .collect();
+        let smc: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
+        let gene_smc: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
+
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = false;
+        settings.trailing_enabled = false;
+        settings.session_spread_profile = Some(SessionSpreadProfile {
+            asian_pips: 2.0,
+            overlap_pips: 2.0,
+            late_ny_pips: 2.0,
+        });
+
+        let gpu = match crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
+            &close, &high, &low, indicators.view(), &gene_offsets, &gene_indices, &gene_weights,
+            &long_thr, &short_thr, &months, &days, &timestamps, &sl_pips, &tp_pips,
+            &stop_vol_mult, &smc, &gene_smc, 0.0, &[1.0f32; 11], &settings, None,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                eprintln!("skipping uniform-bucket parity — no usable device: {err}");
+                return;
+            }
+        };
+
+        let cpu = validation_backtest_population_cpu(PopulationEvalInputs {
+            close: &close, high: &high, low: &low, indicators: indicators.view(),
+            gene_offsets: &gene_offsets, gene_indices: &gene_indices,
+            gene_weights: &gene_weights, long_thr: &long_thr, short_thr: &short_thr,
+            month_idx: &months, day_idx: &days, timestamps: &timestamps,
+            sl_pips: &sl_pips, tp_pips: &tp_pips, stop_vol_mult: &stop_vol_mult,
+            smc_data: &smc, gene_smc_flags: &gene_smc, gate_threshold: 0.0,
+            weights: &[1.0f32; 11], settings: &settings,
+        });
+
+        for (gene, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            eprintln!(
+                "gene {gene}: gpu net {:.4} trades {:.0} | cpu net {:.4} trades {:.0}",
+                g[0], g[8], c[0], c[8]
+            );
+        }
+        for (gene, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            assert!(
+                (g[0] - c[0]).abs() <= 1e-6 * c[0].abs().max(1.0),
+                "gene {gene}: uniform buckets still disagree — the value is not reaching                  the kernel, so the hour arithmetic is not the cause"
+            );
         }
     }
 

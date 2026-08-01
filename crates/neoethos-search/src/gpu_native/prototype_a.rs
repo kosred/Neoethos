@@ -447,6 +447,7 @@ mod tests {
 
     fn settings() -> SnapshotSettingsDto {
         SnapshotSettingsDto {
+            session_spread_profile: None,
             max_hold_bars: 12,
             min_hold_bars: 0,
             max_trades_per_day: 20,

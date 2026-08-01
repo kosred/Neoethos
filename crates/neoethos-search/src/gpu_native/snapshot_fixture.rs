@@ -31,6 +31,15 @@ pub struct SnapshotSettingsDto {
     pub trailing_be_trigger_r: f64,
     pub pip_value: f64,
     pub spread_pips: f64,
+    /// The three session buckets, or `None` for a flat spread.
+    ///
+    /// This DTO is the only thing the device settings are built from, and it
+    /// used to overwrite the profile with `None` on the way through — so a run
+    /// configured with per-session spread reached the card as a flat charge,
+    /// whatever the ABI could express. The CPU meanwhile resolved per bar. The
+    /// two lanes priced the same trade differently and no fixture noticed,
+    /// because every fixture leaves the profile unset.
+    pub session_spread_profile: Option<crate::eval::SessionSpreadProfile>,
     pub commission_per_trade: f64,
     pub pip_value_per_lot: f64,
     pub swap_long_pips_per_day: f64,
@@ -56,6 +65,7 @@ impl SnapshotSettingsDto {
             trailing_be_trigger_r: settings.trailing_be_trigger_r,
             pip_value: settings.pip_value,
             spread_pips: settings.spread_pips,
+            session_spread_profile: settings.session_spread_profile,
             commission_per_trade: settings.commission_per_trade,
             pip_value_per_lot: settings.pip_value_per_lot,
             swap_long_pips_per_day: settings.swap_long_pips_per_day,
@@ -87,7 +97,7 @@ impl SnapshotSettingsDto {
         settings.commission_per_trade = self.commission_per_trade;
         settings.pip_value_per_lot = self.pip_value_per_lot;
         settings.kill_zones_enabled = false;
-        settings.session_spread_profile = None;
+        settings.session_spread_profile = self.session_spread_profile;
         settings.swap_long_pips_per_day = self.swap_long_pips_per_day;
         settings.swap_short_pips_per_day = self.swap_short_pips_per_day;
         settings.pnl_conversion_fee_rate = self.pnl_conversion_fee_rate;
@@ -434,6 +444,7 @@ mod tests {
                 trailing_be_trigger_r: 0.0,
                 pip_value: 0.0001,
                 spread_pips: 0.0,
+                session_spread_profile: None,
                 commission_per_trade: 0.0,
                 pip_value_per_lot: 10.0,
                 swap_long_pips_per_day: 0.0,
