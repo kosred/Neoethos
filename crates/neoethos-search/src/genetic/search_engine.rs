@@ -259,16 +259,23 @@ pub struct SmcGateArrays {
 /// strictly worse than the code before the hoist, since it also pays the
 /// row-pack per candidate — leaves the whole suite green and hands the entire
 /// saving back with no signal. A reviewer ran exactly that mutant.
+///
+/// Thread-local, not a global atomic: five other tests in this binary build gate
+/// arrays, so a process-wide before/after delta measured them too and the
+/// assertion failed in the suite while passing alone. The screen runs inside a
+/// single-worker pool in the test so every build it triggers lands on the
+/// counting thread.
 #[cfg(test)]
-pub(crate) static SMC_GATE_BUILD_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    pub(crate) static SMC_GATE_BUILD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 impl SmcGateArrays {
     /// Build the gate arrays for `(features, ohlcv)`. Cost is one
     /// `build_smc_arrays` call regardless of how many genes later consume it.
     pub fn build(features: &FeatureFrame, ohlcv: &Ohlcv) -> Self {
         #[cfg(test)]
-        SMC_GATE_BUILD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SMC_GATE_BUILD_CALLS.with(|c| c.set(c.get() + 1));
         let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
             build_smc_arrays(features, ohlcv);
         let rows = (0..ob.len())

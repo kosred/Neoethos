@@ -236,7 +236,23 @@ fn dataset_key(
     for slice in [months, days, timestamps] {
         sample_hash(slice, |v| *v as u64, &mut hasher);
     }
-    sample_hash(smc_data, |row| row.iter().map(|v| *v as u64).sum(), &mut hasher);
+    // SMC flags are -1/0/+1, and `-1i8 as u64` is 18 446 744 073 709 551 615:
+    // two of them overflow the sum. Release wrapped it silently and every parity
+    // run passed; a debug build panics, which is how it surfaced — after the 18
+    // parity tests had been reported green three times from release runs.
+    //
+    // Summing also threw position away — [1, -1] and [-1, 1] hashed the same.
+    // Folding fixes both. `wrapping_*` is the intent here, not an oversight:
+    // this is a hash and mixing is what it is for.
+    sample_hash(
+        smc_data,
+        |row| {
+            row.iter().fold(0u64, |acc, v| {
+                acc.wrapping_mul(31).wrapping_add(*v as i64 as u64)
+            })
+        },
+        &mut hasher,
+    );
     // Settings participate because `adaptive_base_pips` is uploaded with the
     // dataset: two runs over identical bars but different adaptive stops are
     // different datasets on the device.

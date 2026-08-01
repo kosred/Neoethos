@@ -2136,7 +2136,6 @@ fn signal_count_screen_matches_screening_each_candidate_alone() {
 #[test]
 fn the_screen_builds_the_gate_arrays_once_for_the_whole_pool() {
     use crate::genetic::search_engine::SMC_GATE_BUILD_CALLS;
-    use std::sync::atomic::Ordering;
 
     let features = sample_feature_frame();
     let ohlcv = sample_ohlcv();
@@ -2161,9 +2160,19 @@ fn the_screen_builds_the_gate_arrays_once_for_the_whole_pool() {
         })
         .collect();
 
-    let before = SMC_GATE_BUILD_CALLS.load(Ordering::Relaxed);
-    let _ = super::screen_candidates_by_signal_count(&features, &ohlcv, genes, &eval_config, 0);
-    let built = SMC_GATE_BUILD_CALLS.load(Ordering::Relaxed) - before;
+    // One rayon worker, so every build the screen triggers is counted on the
+    // thread doing the counting. With the default pool the work is stolen
+    // across threads and a thread-local counter sees a fraction of the truth —
+    // which is the same class of mistake as the process-global it replaced.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("single-worker pool");
+    let built = pool.install(|| {
+        let before = SMC_GATE_BUILD_CALLS.with(|c| c.get());
+        let _ = super::screen_candidates_by_signal_count(&features, &ohlcv, genes, &eval_config, 0);
+        SMC_GATE_BUILD_CALLS.with(|c| c.get()) - before
+    });
 
     assert_eq!(
         built, 1,
