@@ -3857,6 +3857,13 @@ fn screen_candidates_by_signal_count(
     eval_config: &EvaluationConfig,
     min_trades: usize,
 ) -> (Vec<(usize, Gene, Vec<i8>)>, usize) {
+    // An empty pool pays nothing. `build_smc_arrays` scans every bar of the
+    // series (~90 f64 ops each) before it knows there is no gene to gate, and
+    // an empty prefilter is the normal outcome of a run that found nothing —
+    // which is most M3 runs today.
+    if prefiltered.is_empty() {
+        return (Vec::new(), 0);
+    }
     let smc = SmcGateArrays::build(features, ohlcv);
     let nonzero_signal_count = std::sync::atomic::AtomicUsize::new(0);
     let survivors: Vec<(usize, Gene, Vec<i8>)> = prefiltered

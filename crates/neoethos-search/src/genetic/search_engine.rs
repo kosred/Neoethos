@@ -252,10 +252,23 @@ pub struct SmcGateArrays {
     rows: Vec<crate::eval::SmcRow>,
 }
 
+/// Counts `SmcGateArrays::build` calls so a test can pin that the pool-wide
+/// build happens ONCE per screen.
+///
+/// Without it, moving the build back inside the screen's `filter_map` —
+/// strictly worse than the code before the hoist, since it also pays the
+/// row-pack per candidate — leaves the whole suite green and hands the entire
+/// saving back with no signal. A reviewer ran exactly that mutant.
+#[cfg(test)]
+pub(crate) static SMC_GATE_BUILD_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl SmcGateArrays {
     /// Build the gate arrays for `(features, ohlcv)`. Cost is one
     /// `build_smc_arrays` call regardless of how many genes later consume it.
     pub fn build(features: &FeatureFrame, ohlcv: &Ohlcv) -> Self {
+        #[cfg(test)]
+        SMC_GATE_BUILD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
             build_smc_arrays(features, ohlcv);
         let rows = (0..ob.len())

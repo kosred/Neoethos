@@ -2126,3 +2126,47 @@ fn signal_count_screen_matches_screening_each_candidate_alone() {
         assert_eq!(got.2, want.2, "signal vector for candidate {}", want.0);
     }
 }
+
+/// Pins that the screen builds the SMC gate arrays ONCE for the whole pool.
+///
+/// A reviewer moved the build back inside the `filter_map` — strictly worse
+/// than the code before the hoist, since it also pays the row-pack per
+/// candidate — and all 379 tests stayed green. The saving could be handed back
+/// with no signal at all, which makes this the only assertion that defends it.
+#[test]
+fn the_screen_builds_the_gate_arrays_once_for_the_whole_pool() {
+    use crate::genetic::search_engine::SMC_GATE_BUILD_CALLS;
+    use std::sync::atomic::Ordering;
+
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let eval_config =
+        EvaluationConfig::for_symbol("EURUSD", "USD", ohlcv.close.last().copied(), None, None);
+    let base = Gene {
+        indices: vec![0, 1],
+        weights: vec![1.0, 0.5],
+        long_threshold: 0.4,
+        short_threshold: -0.4,
+        ..Gene::default()
+    };
+    let genes: Vec<(usize, Gene)> = (0..6)
+        .map(|i| {
+            (
+                i,
+                Gene {
+                    strategy_id: format!("g{i}"),
+                    ..base.clone()
+                },
+            )
+        })
+        .collect();
+
+    let before = SMC_GATE_BUILD_CALLS.load(Ordering::Relaxed);
+    let _ = super::screen_candidates_by_signal_count(&features, &ohlcv, genes, &eval_config, 0);
+    let built = SMC_GATE_BUILD_CALLS.load(Ordering::Relaxed) - before;
+
+    assert_eq!(
+        built, 1,
+        "screening six candidates built the gate arrays {built} times — the whole point          of the hoist is that it is one, whatever the pool size"
+    );
+}
