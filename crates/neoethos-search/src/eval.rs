@@ -4500,6 +4500,114 @@ mod trailing_parity_tests {
             }
         }
     }
+
+    /// The case every fixture leaves off, exactly like the trailing stop did.
+    ///
+    /// `SessionSpreadProfile` has existed on the CPU since the type was
+    /// written, and the device settings had no field to receive it — so a run
+    /// with a profile would have priced trades one way on the CPU and another
+    /// on the card, with nothing to notice. Every parity fixture sets
+    /// `session_spread_profile: None`, which is precisely the value that hides
+    /// it.
+    ///
+    /// The buckets here are deliberately far apart (0.6 / 3.5 / 1.4) and the
+    /// series spans four full days at hourly bars, so every bucket is entered
+    /// many times and a kernel that charged one flat number cannot match.
+    #[test]
+    fn gpu_matches_cpu_with_a_session_spread_profile() {
+        let n_samples = 1_200usize;
+        let n_genes = 4usize;
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| {
+                let t = i as f64;
+                1.1000 + (t / 220.0).sin() * 0.0090 + (t / 37.0).sin() * 0.0016
+            })
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0006).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0006).collect();
+        let indicators = ndarray::Array2::from_shape_fn((4, n_samples), |(f, i)| {
+            let t = i as f64;
+            ((t / (18.0 + 11.0 * f as f64)).sin()) as f32
+        });
+        let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
+        let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 0];
+        let gene_weights: Vec<f32> = vec![1.0; 8];
+        let long_thr: Vec<f32> = vec![0.25; n_genes];
+        let short_thr: Vec<f32> = vec![-0.25; n_genes];
+        let sl_pips: Vec<f64> = vec![20.0; n_genes];
+        let tp_pips: Vec<f64> = vec![60.0; n_genes];
+        let stop_vol_mult: Vec<f64> = vec![0.0; n_genes];
+        let months: Vec<i64> = (0..n_samples).map(|i| (i / 200) as i64).collect();
+        let days: Vec<i64> = (0..n_samples).map(|i| (i / 24) as i64).collect();
+        // Hourly bars from a UTC midnight, so the hour-of-day walks all three
+        // buckets repeatedly rather than sitting in one.
+        let timestamps: Vec<i64> = (0..n_samples)
+            .map(|i| 1_600_000_000_000 + (i as i64) * 3_600_000)
+            .collect();
+        let smc: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
+        let gene_smc: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
+
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        // Deliberately NOT the mean of the buckets: if the kernel ignored the
+        // profile and charged this, the P&L would differ and the test fails.
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = false;
+        settings.trailing_enabled = false;
+        settings.session_spread_profile = Some(SessionSpreadProfile {
+            asian_pips: 3.5,
+            overlap_pips: 0.6,
+            late_ny_pips: 1.4,
+        });
+
+        let gpu = match crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
+            &close, &high, &low, indicators.view(), &gene_offsets, &gene_indices, &gene_weights,
+            &long_thr, &short_thr, &months, &days, &timestamps, &sl_pips, &tp_pips,
+            &stop_vol_mult, &smc, &gene_smc, 0.0, &[1.0f32; 11], &settings, None,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                eprintln!("skipping session-spread parity — no usable device: {err}");
+                return;
+            }
+        };
+
+        let cpu = validation_backtest_population_cpu(PopulationEvalInputs {
+            close: &close, high: &high, low: &low, indicators: indicators.view(),
+            gene_offsets: &gene_offsets, gene_indices: &gene_indices,
+            gene_weights: &gene_weights, long_thr: &long_thr, short_thr: &short_thr,
+            month_idx: &months, day_idx: &days, timestamps: &timestamps,
+            sl_pips: &sl_pips, tp_pips: &tp_pips, stop_vol_mult: &stop_vol_mult,
+            smc_data: &smc, gene_smc_flags: &gene_smc, gate_threshold: 0.0,
+            weights: &[1.0f32; 11], settings: &settings,
+        });
+
+        // Guard the guard: with a flat 0.0 scalar and these buckets, a kernel
+        // that ignored the profile would report a different net profit. If the
+        // fixture ever stops trading, this catches it before the parity loop
+        // passes vacuously.
+        assert!(
+            cpu.iter().any(|row| row[8] > 0.0),
+            "fixture produced no trades — the parity assertion below would be empty"
+        );
+
+        assert_eq!(gpu.len(), cpu.len());
+        for (gene, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            for slot in 0..11 {
+                let (a, b) = (g[slot], c[slot]);
+                if !a.is_finite() && !b.is_finite() {
+                    continue;
+                }
+                assert!(
+                    (a - b).abs() <= 1e-6 * b.abs().max(1.0),
+                    "gene {gene} slot {slot}: gpu {a} vs cpu {b} — the kernel and the                      CPU disagree about the session spread"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

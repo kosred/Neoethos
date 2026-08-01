@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#define NEOETHOS_GPU_ABI_VERSION 2u
+#define NEOETHOS_GPU_ABI_VERSION 3u
 
 extern "C" {
 
@@ -143,6 +143,13 @@ struct NeoPopulationSettings {
   double trailing_atr_multiplier;
   double trailing_be_trigger_r;
   double trailing_min_lock_pips;
+  /* Spread in pips per liquidity window, resolved from the entry bar's UTC
+     hour. When no session profile is configured the host writes spread_pips
+     into all three, so the lookup returns the scalar and the arithmetic is
+     bit-identical to the single-value form. */
+  double spread_pips_asian;
+  double spread_pips_overlap;
+  double spread_pips_late_ny;
 };
 
 struct NeoPopulationEvent {

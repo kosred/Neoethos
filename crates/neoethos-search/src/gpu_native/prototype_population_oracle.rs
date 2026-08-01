@@ -346,6 +346,24 @@ pub fn population_settings_for_dataset(
         trailing_atr_multiplier: source.trailing_atr_multiplier,
         trailing_be_trigger_r: source.trailing_be_trigger_r,
         trailing_min_lock_pips: source.trailing_min_lock_pips,
+        // The session buckets travel whole, or they collapse to the scalar.
+        //
+        // `None` writes `spread_pips` into all three, so the kernel's hour
+        // lookup returns exactly what the old single-value form charged — no
+        // flag, no branch, and a run without a profile is bit-identical. The
+        // alternative, leaving the device on a scalar while the CPU resolved
+        // per bar, would have made the two lanes price the same trade
+        // differently with every parity fixture blind to it, since they all
+        // leave the profile unset.
+        spread_pips_asian: source
+            .session_spread_profile
+            .map_or(source.spread_pips, |p| p.asian_pips),
+        spread_pips_overlap: source
+            .session_spread_profile
+            .map_or(source.spread_pips, |p| p.overlap_pips),
+        spread_pips_late_ny: source
+            .session_spread_profile
+            .map_or(source.spread_pips, |p| p.late_ny_pips),
         gap_threshold_ms: source.gap_threshold_ms,
         initial_equity: runtime.initial_equity,
         pip_value: source.pip_value,

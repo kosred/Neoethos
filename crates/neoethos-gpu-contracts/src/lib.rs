@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 pub const POPULATION_SETTINGS_FLAG_RISK_BASED_SIZING: u32 = 1 << 0;
 pub const POPULATION_PRECEDENCE_STOP_FIRST: u32 = 0;
 pub const POPULATION_DIRECTION_LONG: i32 = 1;
@@ -215,6 +215,24 @@ pub mod device {
         /// Floor for the trail, in pips above entry, so what is protected does
         /// not vary per gene and fall below the cost of the trade.
         pub trailing_min_lock_pips: f64,
+        /// Spread in pips per liquidity window, resolved from the entry bar's
+        /// UTC hour exactly as `BacktestSettings::spread_pips_for_bar` does.
+        ///
+        /// The scalar `spread_pips` charged one number at every hour. Real
+        /// spread is not one number: the London/NY overlap is typically 30-50 %
+        /// of the Asian session's, so a flat charge over-pays the liquid hours
+        /// and under-pays the thin ones — and a search that under-pays the thin
+        /// hours will prefer strategies that trade in them. The CPU has
+        /// resolved per bar since the profile type existed; the device had no
+        /// field to receive it, so enabling it would have made the two lanes
+        /// disagree with nothing to catch it.
+        ///
+        /// When no profile is configured the host writes `spread_pips` into all
+        /// three, so the bucket lookup returns the scalar and the result is
+        /// bit-identical to before. There is no flag and no branch to get wrong.
+        pub spread_pips_asian: f64,
+        pub spread_pips_overlap: f64,
+        pub spread_pips_late_ny: f64,
     }
 
     /// Canonical causal entry emitted from a signal observed on the prior bar.
@@ -344,7 +362,9 @@ pub mod device {
         assert!(size_of::<Metrics>() == 80);
         assert!(size_of::<PropFirmState>() == 56);
 
-        assert!(size_of::<NeoPopulationSettings>() == 160);
+        assert!(size_of::<NeoPopulationSettings>() == 184);
+        assert!(offset_of!(NeoPopulationSettings, spread_pips_asian) == 160);
+        assert!(offset_of!(NeoPopulationSettings, spread_pips_late_ny) == 176);
         assert!(offset_of!(NeoPopulationSettings, trailing_enabled) == 128);
         assert!(offset_of!(NeoPopulationSettings, trailing_min_lock_pips) == 152);
         assert!(align_of::<NeoPopulationSettings>() == 8);
@@ -443,7 +463,7 @@ mod tests {
             abi_version: ABI_VERSION,
             ..DatasetHeader::default()
         };
-        assert_eq!(header.abi_version, 2);
+        assert_eq!(header.abi_version, 3);
     }
 
     #[test]

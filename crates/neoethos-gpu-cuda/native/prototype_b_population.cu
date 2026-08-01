@@ -22,6 +22,36 @@
 
 namespace {
 
+/// Spread in pips for one bar, from its UTC hour.
+///
+/// Mirrors `SessionSpreadProfile::spread_pips_at` and
+/// `BacktestSettings::spread_pips_for_bar` term for term: the same hour
+/// arithmetic, the same half-open ranges, and the same `timestamp_ms > 0`
+/// guard that makes a missing timestamp fall back to the scalar. The CPU has
+/// resolved spread per bar since the profile type existed; the device charged
+/// one number at every hour, so turning the profile on would have made the two
+/// lanes disagree with no test to catch it — every parity fixture leaves the
+/// profile unset.
+///
+/// With no profile the host writes `spread_pips` into all three buckets, so
+/// this returns the scalar and the result is bit-identical.
+__device__ inline double spread_pips_for_bar(const NeoPopulationSettings& settings,
+                                             long long timestamp_ms) {
+  if (timestamp_ms <= 0) {
+    return settings.spread_pips;
+  }
+  const long long secs = timestamp_ms / 1000LL - (timestamp_ms % 1000LL < 0 ? 1LL : 0LL);
+  long long hour = secs / 3600LL - (secs % 3600LL < 0 ? 1LL : 0LL);
+  hour = ((hour % 24LL) + 24LL) % 24LL;
+  if (hour >= 7 && hour < 16) {
+    return settings.spread_pips_overlap;
+  }
+  if (hour >= 16 && hour < 22) {
+    return settings.spread_pips_late_ny;
+  }
+  return settings.spread_pips_asian;
+}
+
 constexpr int kDirectionLong = 1;
 constexpr int kDirectionShort = -1;
 constexpr int kExitNone = 0;
@@ -902,11 +932,20 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
 
   const double pip = guarded_pip(settings.pip_value);
   const long long signal_base = static_cast<long long>(candidate) * dataset.bars;
-  const double half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
-  const double half_spread_price = settings.spread_pips * 0.5 * pip;
+  // Resolved per entry bar below, not hoisted: the value depends on the bar's
+  // hour once a session profile is in play.
   unsigned long long cursor = range_start;
 
   for (int bar = 1; bar < dataset.bars; ++bar) {
+    // Per-bar spread, resolved where the CPU resolves it — at the top of the
+    // bar loop, from this bar's timestamp. An entry therefore pays the spread
+    // of the bar it opens on and an exit pays the spread of the bar it closes
+    // on, which is what `fast_evaluate_strategy_core` does and what a broker
+    // does. With no session profile all three buckets hold `spread_pips`, so
+    // both values equal the old hoisted scalar exactly.
+    const double bar_spread_pips = spread_pips_for_bar(settings, dataset.timestamps[bar]);
+    const double half_spread_price = bar_spread_pips * 0.5 * pip;
+    const double half_spread_cost = bar_spread_pips * 0.5 * settings.pip_value_per_lot;
 
     const long long month = dataset.months[bar];
     if (month != last_month) {
