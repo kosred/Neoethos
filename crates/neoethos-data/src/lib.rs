@@ -1078,13 +1078,12 @@ pub fn prepare_multitimeframe_features(
     ds: &SymbolDataset,
     base_tf: &str,
     higher_tfs: &[&str],
-    cache: Option<&FeatureCache>,
 ) -> Result<FeatureFrame> {
     let opts = FeatureBuildOptions {
         higher_tfs: higher_tfs.iter().map(|s| s.to_string()).collect(),
         ..Default::default()
     };
-    prepare_multitimeframe_features_with_options(ds, base_tf, &opts, cache)
+    prepare_multitimeframe_features_with_options(ds, base_tf, &opts)
 }
 
 /// Temp path for a discovery feature-store, unique per (symbol, base_tf,
@@ -1434,11 +1433,18 @@ fn try_assemble_cube_in_ram(
     }))
 }
 
+/// Build the multi-timeframe feature cube.
+///
+/// This used to take a fourth argument, `_cache: Option<&FeatureCache>`. The
+/// underscore was accurate — nothing in the body read it — while four call
+/// sites constructed a `FeatureCache` and passed it in. Both the parameter and
+/// the type are gone; see the note at the top of `core/loader.rs` for why the
+/// cache could not have been wired as designed, and what a correct one would
+/// have to key on.
 pub fn prepare_multitimeframe_features_with_options(
     ds: &SymbolDataset,
     base_tf: &str,
     opts: &FeatureBuildOptions,
-    _cache: Option<&FeatureCache>,
 ) -> Result<FeatureFrame> {
     let base_ohlcv = ds
         .frames
@@ -1914,10 +1920,10 @@ mod cube_assembly_tests {
         // SAFETY: single-threaded test setup; the env var is read inside
         // `should_build_cube_in_ram` on this same thread.
         unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "ram") };
-        let ram = prepare_multitimeframe_features_with_options(&ds, "M1", &opts, None)
+        let ram = prepare_multitimeframe_features_with_options(&ds, "M1", &opts)
             .expect("in-RAM cube");
         unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "disk") };
-        let disk = prepare_multitimeframe_features_with_options(&ds, "M1", &opts, None)
+        let disk = prepare_multitimeframe_features_with_options(&ds, "M1", &opts)
             .expect("disk cube");
         unsafe { std::env::remove_var("NEOETHOS_FEATURE_CUBE_MODE") };
 

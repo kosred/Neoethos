@@ -11,7 +11,7 @@ use neoethos_core::{
     sectioned_log::{SectionedRunRecord, SubsystemSection},
 };
 use neoethos_data::{
-    FeatureCache, MANDATORY_TFS, ensure_timeframes_with_resample, load_symbol_dataset,
+    MANDATORY_TFS, ensure_timeframes_with_resample, load_symbol_dataset,
     prepare_multitimeframe_features,
 };
 // `DiscoveryValidationGates` is used by the sibling tests file
@@ -911,12 +911,8 @@ pub fn start_discovery_job(
                 .iter()
                 .map(|tf| tf.as_str())
                 .collect();
-            let features = prepare_multitimeframe_features(
-                &dataset,
-                &feature_request.base_tf,
-                &higher_refs,
-                Some(&FeatureCache::new("cache/features", 60, true)),
-            )?;
+            let features =
+                prepare_multitimeframe_features(&dataset, &feature_request.base_tf, &higher_refs)?;
             let base_ohlcv = dataset
                 .frames
                 .get(&feature_request.base_tf)

@@ -142,13 +142,8 @@ fn main() -> Result<()> {
         .collect();
     let dataset = neoethos_data::load_symbol_dataset_with_timeframes(&root, &symbol, &wanted)
         .with_context(|| format!("loading {symbol} {wanted:?} from {root}"))?;
-    let features = neoethos_data::prepare_multitimeframe_features(
-        &dataset,
-        &base,
-        &higher_refs,
-        None,
-    )
-    .context("building multi-timeframe features")?;
+    let features = neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)
+        .context("building multi-timeframe features")?;
     let base_ohlcv = dataset
         .frames
         .get(&base)

@@ -65,13 +65,9 @@ fn signals_for_frames(
         frames,
     };
     let higher_refs: Vec<&str> = artifact.higher_tfs.iter().map(|s| s.as_str()).collect();
-    let raw = neoethos_data::prepare_multitimeframe_features(
-        &dataset,
-        &artifact.base_tf,
-        &higher_refs,
-        None,
-    )
-    .context("feature computation")?;
+    let raw =
+        neoethos_data::prepare_multitimeframe_features(&dataset, &artifact.base_tf, &higher_refs)
+            .context("feature computation")?;
     let aligned =
         neoethos_search::project_features_to_effective(&raw, &artifact.effective_feature_names)
             .context("feature projection (effective_names mismatch?)")?;

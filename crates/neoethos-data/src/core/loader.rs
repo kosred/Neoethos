@@ -1,188 +1,43 @@
-use super::super::FeatureFrame;
+// REMOVED 2026-08-02: `FeatureCache`, plus the `feature_frame_to_vortex` /
+// `vortex_to_feature_frame` codec that existed only to serve it.
+//
+// `FeatureCache::load` and `::store` had ZERO callers. Meanwhile FOUR sites
+// constructed one — neoethos-cli/src/main.rs (three) and
+// app_services/discovery.rs — and passed it into a parameter that
+// `prepare_multitimeframe_features_with_options` had literally named
+// `_cache`. Four call sites believed features were being cached; the
+// underscore says the author knew they were not.
+//
+// It was not wired up, because as designed it could not be wired up safely:
+//
+//   FRESHNESS BY WALL CLOCK. `is_fresh` compared the entry's mtime against a
+//   60-minute TTL and nothing else. Not the source data, not the timeframe
+//   set, not the feature profile, not `normalize_features`, not the
+//   indicator registry version. Two runs with identical inputs an hour apart
+//   would see different features, and — the case that matters — the
+//   re-import that fixed the 14 240 corrupt zero-price bars would have been
+//   shadowed by stale cached features for an hour after it landed.
+//
+//   PEAK MEMORY AS A FUNCTION OF USER PARAMS. `store` calls
+//   `feature_frame_to_vortex`, which materialises every column into a Vec
+//   and then a StructArray. The frame it would be handed is often a
+//   `FeatureData::Mmap` — the streaming sink that exists precisely so the
+//   ~13 GB M1 cube never lands in RAM at once. Caching it would have
+//   re-materialised the whole thing, which is the NEVER-OOM invariant
+//   inverted.
+//
+// A correctly-keyed feature-cube cache is still worth having. It must key on
+// the INPUTS (source path + mtime + size per timeframe, base/higher TF set,
+// FeatureBuildOptions, indicator registry version) rather than on the clock,
+// and stream rather than materialise. `resolve_path_to_vortex` below is the
+// model: same crate, same file, keyed on canonical path + mtime + size, and
+// actually called.
+
 use super::discover::DataFormat;
 use super::to_vortex::{IngestionSchema, cache_dir_for, cache_path_for, convert_to_vortex};
-use super::vortex_io::{read_vortex_array, write_vortex_array};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-use vortex_array::IntoArray;
-use vortex_array::ToCanonical;
-use vortex_array::arrays::{PrimitiveArray, StructArray};
-use vortex_array::dtype::{FieldName, NativePType};
-
-pub struct FeatureCache {
-    pub dir: PathBuf,
-    pub ttl_minutes: u64,
-    pub enabled: bool,
-}
-
-impl FeatureCache {
-    pub fn new(dir: &str, ttl_minutes: u64, enabled: bool) -> Self {
-        Self {
-            dir: PathBuf::from(dir),
-            ttl_minutes,
-            enabled,
-        }
-    }
-
-    fn is_fresh(&self, path: &Path) -> bool {
-        let Ok(meta) = std::fs::metadata(path) else {
-            return false;
-        };
-        let Ok(mod_time) = meta.modified() else {
-            return false;
-        };
-        let Ok(elapsed) = SystemTime::now().duration_since(mod_time) else {
-            return false;
-        };
-        elapsed.as_secs() <= self.ttl_minutes * 60
-    }
-
-    pub fn load(&self, key: &str) -> Result<Option<FeatureFrame>> {
-        if !self.enabled {
-            return Ok(None);
-        }
-        let path = self.dir.join(format!("{key}.vortex"));
-        if !path.exists() || !self.is_fresh(&path) {
-            return Ok(None);
-        }
-
-        match read_vortex_array(&path).and_then(vortex_to_feature_frame) {
-            Ok(frame) => Ok(Some(frame)),
-            Err(err) => {
-                // Cache corruption: log so we can correlate frequency with
-                // upstream writer bugs, then delete and re-derive. Don't
-                // bubble up; the caller treats `None` as cache-miss.
-                tracing::warn!(
-                    target: "neoethos_data::loader",
-                    path = %path.display(),
-                    error = %err,
-                    "feature cache entry failed to decode; deleting and re-deriving"
-                );
-                if let Err(rm_err) = fs::remove_file(&path) {
-                    tracing::warn!(
-                        target: "neoethos_data::loader",
-                        path = %path.display(),
-                        error = %rm_err,
-                        "feature cache: failed to delete corrupt entry"
-                    );
-                }
-                Ok(None)
-            }
-        }
-    }
-
-    pub fn store(&self, key: &str, frame: &FeatureFrame) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-        std::fs::create_dir_all(&self.dir)?;
-        let path = self.dir.join(format!("{key}.vortex"));
-        let array = feature_frame_to_vortex(frame)?;
-        write_vortex_array(&path, array)?;
-        Ok(())
-    }
-}
-
-pub fn feature_frame_to_vortex(frame: &FeatureFrame) -> Result<vortex_array::ArrayRef> {
-    let n_rows = frame.n_samples();
-    if frame.timestamps.len() != n_rows {
-        bail!(
-            "Feature frame timestamp/data row mismatch: timestamps={} data_rows={} — \
-             the feature cache is corrupt; delete cache/features/ and re-run to rebuild.",
-            frame.timestamps.len(), n_rows
-        );
-    }
-    if frame.names.len() != frame.n_features() {
-        bail!("feature frame name/data column mismatch");
-    }
-
-    let mut names: Vec<FieldName> = Vec::with_capacity(frame.names.len() + 1);
-    let mut arrays = Vec::with_capacity(frame.names.len() + 1);
-
-    names.push("timestamp".into());
-    arrays.push(PrimitiveArray::from_iter(frame.timestamps.iter().copied()).into_array());
-
-    for (idx, name) in frame.names.iter().enumerate() {
-        let column = frame.feature_column(idx).iter().copied().collect::<Vec<_>>();
-        names.push(name.clone().into());
-        arrays.push(PrimitiveArray::from_iter(column).into_array());
-    }
-
-    Ok(StructArray::try_new(
-        names.into(),
-        arrays,
-        n_rows,
-        vortex_array::validity::Validity::NonNullable,
-    )
-    .context("failed to build feature vortex struct array")?
-    .into_array())
-}
-
-pub fn vortex_to_feature_frame(array: vortex_array::ArrayRef) -> Result<FeatureFrame> {
-    let struct_array = array.to_struct();
-
-    let timestamp_field = struct_array
-        .unmasked_field_by_name("timestamp")
-        .context("missing timestamp field")?;
-    let timestamps = extract_non_null_primitive_vec::<i64>(timestamp_field, "timestamp")?;
-    let n_rows = timestamps.len();
-
-    let mut names = Vec::with_capacity(struct_array.names().len().saturating_sub(1));
-    let mut columns = Vec::with_capacity(struct_array.names().len().saturating_sub(1));
-
-    for name in struct_array.names().iter() {
-        let field_name = name.to_string();
-        if field_name == "timestamp" {
-            continue;
-        }
-        let field = struct_array
-            .unmasked_field_by_name(&field_name)
-            .with_context(|| format!("missing feature field {field_name}"))?;
-        let values = extract_non_null_primitive_vec::<f32>(field, &field_name)?;
-        if values.len() != n_rows {
-            bail!(
-                "Feature field '{}' has {} rows but expected {} — \
-                 the feature cache is corrupt; delete cache/features/ and re-run to rebuild.",
-                field_name, values.len(), n_rows
-            );
-        }
-        names.push(field_name);
-        columns.push(values);
-    }
-
-    let n_cols = names.len();
-    let mut data = ndarray::Array2::<f32>::zeros((n_rows, n_cols));
-    for (col_idx, values) in columns.iter().enumerate() {
-        for (row_idx, value) in values.iter().copied().enumerate() {
-            data[(row_idx, col_idx)] = value;
-        }
-    }
-
-    Ok(FeatureFrame {
-        timestamps,
-        names,
-        data: crate::core::features::FeatureData::InMemory(data),
-    })
-}
-
-fn extract_non_null_primitive_vec<T: NativePType>(
-    array: &vortex_array::ArrayRef,
-    label: &str,
-) -> Result<Vec<T>> {
-    if !array
-        .all_valid()
-        .with_context(|| format!("failed to inspect {label} validity"))?
-    {
-        bail!(
-            "Column '{label}' has null values — the source data has gaps; \
-             re-import after filling/trimming them."
-        );
-    }
-
-    Ok(array.to_primitive().as_slice::<T>().to_vec())
-}
 
 // ─── Auto-conversion entry point ───────────────────────────────────────
 

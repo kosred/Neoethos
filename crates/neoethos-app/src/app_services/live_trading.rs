@@ -922,7 +922,7 @@ async fn run(
         // ── Feature computation ───────────────────────────────────────────────
         let higher_refs: Vec<&str> = higher_tfs.iter().map(|s| s.as_str()).collect();
         let raw_features =
-            match neoethos_data::prepare_multitimeframe_features(&dataset, &base_tf, &higher_refs, None) {
+            match neoethos_data::prepare_multitimeframe_features(&dataset, &base_tf, &higher_refs) {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::warn!(

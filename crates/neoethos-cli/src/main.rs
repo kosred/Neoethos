@@ -372,13 +372,8 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
         .collect();
     let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
     let dataset = neoethos_data::load_symbol_dataset(&root, &symbol)?;
-    let cache = neoethos_data::FeatureCache::new("cache/features", 60, true);
-    let features = neoethos_data::prepare_multitimeframe_features(
-        &dataset,
-        &base,
-        &higher_refs,
-        Some(&cache),
-    )?;
+    let features =
+        neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
     println!(
         "Prepared {} base={} rows={} cols={}",
         symbol,
@@ -949,16 +944,8 @@ fn cmd_search(args: &[String]) -> Result<()> {
         &base,
         neoethos_data::MANDATORY_TFS,
     )?;
-    let features = neoethos_data::prepare_multitimeframe_features(
-        &dataset,
-        &base,
-        &higher_refs,
-        Some(&neoethos_data::FeatureCache::new(
-            "cache/features",
-            60,
-            true,
-        )),
-    )?;
+    let features =
+        neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
     let base_ohlcv = dataset
         .frames
         .get(&base)
@@ -1085,16 +1072,8 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             &base,
             neoethos_data::MANDATORY_TFS,
         )?;
-        let features = neoethos_data::prepare_multitimeframe_features(
-            &dataset,
-            &base,
-            &higher_refs,
-            Some(&neoethos_data::FeatureCache::new(
-                "cache/features",
-                60,
-                true,
-            )),
-        )?;
+        let features =
+            neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
         let base_ohlcv = dataset
             .frames
             .get(&base)
