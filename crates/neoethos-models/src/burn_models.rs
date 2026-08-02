@@ -31,8 +31,12 @@ use burn::module::{Module, ModuleMapper, Param};
 use burn::nn;
 use burn::prelude::*;
 use burn::tensor::{DType, Device, FloatDType, TensorData};
-#[cfg(any(feature = "burn-cuda-backend", feature = "burn-wgpu-backend"))]
+// `DeviceType` is only used to ENUMERATE, which only the CUDA lane does; the
+// wgpu lane maps a policy onto a `DeviceKind` instead.
+#[cfg(feature = "burn-cuda-backend")]
 use burn::tensor::DeviceType;
+#[cfg(feature = "burn-wgpu-backend")]
+use burn::tensor::DeviceKind;
 
 use crate::hardware::HardwareInfo;
 use crate::runtime::capabilities::{
@@ -253,7 +257,7 @@ fn cpu_device() -> (Device, String, String) {
 }
 
 /// Ask the MACHINE which accelerators exist, and take the one the policy
-/// names — or the first one, for `auto`/`gpu`.
+/// names — or the first one, for `gpu`. See the note on `auto` below.
 ///
 /// Returns `None` when this binary has no accelerator device variant compiled
 /// in (`burn-cuda-backend` / `burn-wgpu-backend` both off) or when the runtime
@@ -261,37 +265,160 @@ fn cpu_device() -> (Device, String, String) {
 /// whose driver is missing. Before 0.22 that case could not be represented:
 /// the backend was a type, so the binary claimed CUDA whether or not a card
 /// answered.
+///
+/// ## Why `auto` does not take a CUDA device
+///
+/// `burn-cuda-backend` is now on in the `gpu-cuda` aggregate, so
+/// `Device::enumerate(DeviceType::Cuda)` answers on any host with a working
+/// driver. If `auto` took that answer, enabling the feature would by itself
+/// move EVERY burn model onto the card, because `auto` is the default
+/// everywhere: `deep_models.rs:783` falls back to `string_param("device",
+/// "auto")`, and `ExitAgent::with_hidden_dim` / `SoftActorCritic::with_hidden_dim`
+/// pass `"auto"` literally.
+///
+/// That is a change to what the system SELECTS, and it is a change the one
+/// measurement we have argues against: on an A6000, 2026-06-10, burn-cuda was
+/// pathological for these tiny nets — 338 autotune passes against 14 real
+/// epochs in 74 minutes on one combo, versus ~17 minutes TOTAL on the CPU.
+/// That measurement is from burn 0.21 / cubecl 0.10 and has NOT been repeated
+/// on 0.22 / cubecl 0.11, so it is an open question rather than a settled
+/// objection — but an open question is not a reason to flip the default for
+/// every model at once, silently, inside a dependency bump.
+///
+/// So the capability is fully built and one existing config value reaches it:
+/// the model's `device` param (or `with_device_policy`) set to `gpu`,
+/// `cuda`, or `gpu:N`. `auto` keeps meaning what it means today.
+///
+/// The wgpu lane deliberately does NOT get this gate: on a `gpu-vulkan` build
+/// `auto` already selected the wgpu device before this change, and matching
+/// today's behaviour is the whole point of the gate.
 #[allow(unused_variables)]
 fn enumerate_accelerator(normalized: &str) -> Option<(Device, String, String)> {
     let index = parse_accelerator_index(normalized);
 
     #[cfg(feature = "burn-cuda-backend")]
     {
-        let devices: Vec<Device> = Device::enumerate(DeviceType::Cuda).into_iter().collect();
-        if !devices.is_empty() {
-            let ordinal = index.unwrap_or(0).min(devices.len() - 1);
-            return Some((
-                devices[ordinal].clone(),
-                format!("gpu:{ordinal}"),
-                "cuda".to_string(),
-            ));
+        // `auto` must be asked for explicitly before it lands on CUDA — see
+        // the "Why `auto` does not take a CUDA device" note above.
+        if normalized != "auto" {
+            let devices: Vec<Device> = Device::enumerate(DeviceType::Cuda).into_iter().collect();
+            if !devices.is_empty() {
+                let ordinal = index.unwrap_or(0).min(devices.len() - 1);
+                return Some((
+                    devices[ordinal].clone(),
+                    format!("gpu:{ordinal}"),
+                    "cuda".to_string(),
+                ));
+            }
         }
     }
 
     #[cfg(feature = "burn-wgpu-backend")]
     {
-        let devices: Vec<Device> = Device::enumerate(DeviceType::Wgpu).into_iter().collect();
-        if !devices.is_empty() {
-            let ordinal = index.unwrap_or(0).min(devices.len() - 1);
-            return Some((
-                devices[ordinal].clone(),
-                format!("gpu:{ordinal}"),
-                "wgpu_discrete_gpu".to_string(),
-            ));
-        }
+        return Some(resolve_wgpu_device_policy(normalized));
     }
 
+    #[cfg(not(feature = "burn-wgpu-backend"))]
     None
+}
+
+/// Turn a normalized policy into a wgpu ADAPTER CLASS.
+///
+/// ## Why this exists again
+///
+/// 0.21 had `resolve_wgpu_device_policy` + `parse_wgpu_device_selector`, which
+/// understood `gpu:integrated:0`, `gpu:virtual:1`, `gpu:discrete:0` and
+/// `gpu:default`. The 0.22 migration replaced both with a flat
+/// `Device::enumerate(DeviceType::Wgpu)` that always reported
+/// `"wgpu_discrete_gpu"`. That silently deleted a capability while leaving
+/// every trace of it in place:
+///
+///   - `validate_burn_device_selection` (this file) still accepts
+///     `wgpu_integrated_gpu`, `wgpu_virtual_gpu` and `wgpu_default`;
+///   - `resolve_burn_training_precision_for_backend` still branches on all
+///     four wgpu backend names when deciding bf16;
+///   - `wgpu_policy_preserves_integrated_adapter_class` still tested it.
+///
+/// Three of those four names had become unreachable — a validator arm, a
+/// precision branch and a test guarding behaviour no caller could produce.
+/// `DeviceKind` in 0.22 carries exactly the variants `WgpuDevice` carried in
+/// 0.21 (`DiscreteGpu`/`IntegratedGpu`/`VirtualGpu`/`Cpu`/`DefaultDevice`), so
+/// nothing about the framework forced the loss; it was collateral.
+///
+/// The mapping below is the 0.21 one, unchanged, retargeted at `DeviceKind`.
+/// That keeps `gpu-vulkan` builds selecting exactly what they select today.
+#[cfg(feature = "burn-wgpu-backend")]
+fn resolve_wgpu_device_policy(normalized: &str) -> (Device, String, String) {
+    fn wgpu_default() -> (DeviceKind, String, String) {
+        (
+            DeviceKind::DefaultDevice,
+            "default".to_string(),
+            "wgpu_default".to_string(),
+        )
+    }
+
+    let (kind, effective_policy, execution_backend) = match normalized {
+        "cpu" => (
+            DeviceKind::Cpu,
+            "cpu".to_string(),
+            "wgpu_cpu".to_string(),
+        ),
+        "auto" | "gpu" | "cuda" | "wgpu" | "default" | "rocm" | "metal" | "vulkan" => wgpu_default(),
+        other => parse_wgpu_device_selector(other).unwrap_or_else(wgpu_default),
+    };
+
+    (Device::wgpu(kind), effective_policy, execution_backend)
+}
+
+/// Parse the `<class>:<index>` adapter selector out of a normalized policy.
+///
+/// Accepts the vendor prefixes the policy normalizer can leave in place, then
+/// either a bare ordinal (`gpu:1` — discrete, matching 0.21) or an explicit
+/// class (`gpu:integrated:0`). Returns `None` for anything unrecognized so the
+/// caller can fall back to the default adapter rather than guessing.
+#[cfg(feature = "burn-wgpu-backend")]
+fn parse_wgpu_device_selector(normalized: &str) -> Option<(DeviceKind, String, String)> {
+    let selector = normalized
+        .strip_prefix("cuda:")
+        .or_else(|| normalized.strip_prefix("gpu:"))
+        .or_else(|| normalized.strip_prefix("wgpu:"))
+        .or_else(|| normalized.strip_prefix("rocm:"))
+        .or_else(|| normalized.strip_prefix("metal:"))
+        .or_else(|| normalized.strip_prefix("vulkan:"))?;
+
+    if let Ok(index) = selector.parse::<usize>() {
+        return Some((
+            DeviceKind::DiscreteGpu(index),
+            format!("gpu:{index}"),
+            "wgpu_discrete_gpu".to_string(),
+        ));
+    }
+
+    let (device_class, raw_index) = selector.split_once(':')?;
+    let index = raw_index.parse::<usize>().ok()?;
+    match device_class {
+        "discrete" | "dgpu" => Some((
+            DeviceKind::DiscreteGpu(index),
+            format!("gpu:discrete:{index}"),
+            "wgpu_discrete_gpu".to_string(),
+        )),
+        "integrated" | "igpu" => Some((
+            DeviceKind::IntegratedGpu(index),
+            format!("gpu:integrated:{index}"),
+            "wgpu_integrated_gpu".to_string(),
+        )),
+        "virtual" | "vgpu" => Some((
+            DeviceKind::VirtualGpu(index),
+            format!("gpu:virtual:{index}"),
+            "wgpu_virtual_gpu".to_string(),
+        )),
+        "default" => Some((
+            DeviceKind::DefaultDevice,
+            "default".to_string(),
+            "wgpu_default".to_string(),
+        )),
+        _ => None,
+    }
 }
 
 /// Turn a policy string into a real device, reporting honestly what was
@@ -2901,15 +3028,72 @@ mod tests {
         assert_eq!(normalize_burn_device_policy("wgpu"), "gpu");
     }
 
+    /// The adapter CLASS must survive policy normalization.
+    ///
+    /// Asserts on `parse_wgpu_device_selector` rather than on
+    /// `resolve_wgpu_device_policy`: in 0.22 the returned `Device` is an
+    /// opaque handle whose construction initializes a real wgpu adapter, so
+    /// comparing it to an expected value is both impossible (no public
+    /// equality against a `DeviceKind`) and hostile to a CI box with no GPU.
+    /// The `DeviceKind` the policy maps to is the part that carries the
+    /// meaning, and it is checked exactly.
     #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
     #[test]
     fn wgpu_policy_preserves_integrated_adapter_class() {
         let normalized = normalize_burn_device_policy("vulkan:integrated:0");
-        let (device, effective_policy, execution_backend) = resolve_wgpu_device_policy(&normalized);
+        let (kind, effective_policy, execution_backend) =
+            parse_wgpu_device_selector(&normalized).expect("integrated selector must parse");
 
-        assert_eq!(device, WgpuDevice::IntegratedGpu(0));
+        assert_eq!(kind, DeviceKind::IntegratedGpu(0));
         assert_eq!(effective_policy, "gpu:integrated:0");
         assert_eq!(execution_backend, "wgpu_integrated_gpu");
+    }
+
+    /// The other three adapter classes the validator accepts must also be
+    /// reachable from a policy string. This is the regression guard for the
+    /// gap described on `resolve_wgpu_device_policy`: before it was restored,
+    /// `wgpu_virtual_gpu` and `wgpu_default` were names that
+    /// `validate_burn_device_selection` accepted but nothing could produce.
+    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+    #[test]
+    fn wgpu_policy_reaches_every_adapter_class_the_validator_accepts() {
+        for (policy, expected_kind, expected_effective, expected_backend) in [
+            (
+                "vulkan:virtual:1",
+                DeviceKind::VirtualGpu(1),
+                "gpu:virtual:1",
+                "wgpu_virtual_gpu",
+            ),
+            (
+                "vulkan:discrete:2",
+                DeviceKind::DiscreteGpu(2),
+                "gpu:discrete:2",
+                "wgpu_discrete_gpu",
+            ),
+            (
+                "vulkan:default:0",
+                DeviceKind::DefaultDevice,
+                "default",
+                "wgpu_default",
+            ),
+        ] {
+            let normalized = normalize_burn_device_policy(policy);
+            let (kind, effective_policy, execution_backend) =
+                parse_wgpu_device_selector(&normalized)
+                    .unwrap_or_else(|| panic!("{policy} must parse to an adapter class"));
+            assert_eq!(kind, expected_kind, "kind for {policy}");
+            assert_eq!(effective_policy, expected_effective, "effective for {policy}");
+            assert_eq!(execution_backend, expected_backend, "backend for {policy}");
+
+            // Whatever the mapping produces must be a pair the validator
+            // accepts, or the run would fail its own provenance check.
+            validate_burn_device_selection(&BurnDeviceSelection {
+                requested_policy: normalized,
+                effective_policy,
+                execution_backend,
+            })
+            .unwrap_or_else(|err| panic!("{policy} produced a selection the validator rejects: {err}"));
+        }
     }
 
     #[test]
@@ -3035,15 +3219,64 @@ mod tests {
         Ok(())
     }
 
+    /// An explicit `cpu` request lands on the ndarray floor on EVERY build.
+    ///
+    /// DELIBERATE CHANGE from 0.21, called out because it is a behaviour
+    /// change and not a mechanical port: under 0.21 a `gpu-vulkan` build
+    /// resolved `cpu` to `WgpuDevice::Cpu` and recorded `"wgpu_cpu"`, i.e. it
+    /// ran training through wgpu's CPU adapter — a software rasterizer —
+    /// rather than through `burn/ndarray`. `resolve_device_policy` now routes
+    /// `cpu` straight to `cpu_device()` on all builds, which is why
+    /// `burn/ndarray` is non-optional in the manifest. The only externally
+    /// visible difference is the `execution_backend` string recorded in the
+    /// artifact, and `validate_burn_device_selection` accepts
+    /// `("cpu", "ndarray_cpu")` on every build.
+    ///
+    /// `wgpu_cpu` therefore no longer appears in any selection. Its arm is
+    /// kept in the validator so artifacts written before this change still
+    /// pass provenance validation when they are read back.
     #[test]
     fn resolve_train_device_cpu_policy_reports_consistent_backend() {
         let (_device, selection) = resolve_train_device("cpu");
         assert_eq!(selection.requested_policy, "cpu");
         assert_eq!(selection.effective_policy, "cpu");
-        #[cfg(feature = "burn-wgpu-backend")]
-        assert_eq!(selection.execution_backend, "wgpu_cpu");
-        #[cfg(not(feature = "burn-wgpu-backend"))]
         assert_eq!(selection.execution_backend, "ndarray_cpu");
+    }
+
+    /// Pins the selection contract that lets `burn-cuda-backend` be enabled
+    /// without changing what a default run does.
+    ///
+    /// On a CUDA-only build, `auto` must stay on the CPU floor even when a
+    /// card is present and answering enumeration, while an EXPLICIT `gpu`
+    /// request is free to take it. Without this, turning the feature on would
+    /// silently move every burn model onto the card, because `auto` is the
+    /// default for all of them.
+    ///
+    /// Runs on any host: with no CUDA device present both arms land on the CPU
+    /// and the `auto` assertion still holds, which is the half that guards the
+    /// default. The `gpu` arm asserts only that an explicit request is not
+    /// forced onto the CPU floor BY THIS GATE — it is allowed to report `cpu`
+    /// when the machine genuinely has no card.
+    #[cfg(all(feature = "burn-cuda-backend", not(feature = "burn-wgpu-backend")))]
+    #[test]
+    fn auto_policy_stays_on_cpu_while_explicit_gpu_may_take_cuda() {
+        let (_device, auto_selection) = resolve_infer_device("auto");
+        assert_eq!(
+            auto_selection.effective_policy, "cpu",
+            "`auto` must not select CUDA — enabling burn-cuda-backend must not \
+             change what a default run does; flip the model `device` param to \
+             `gpu` to opt in"
+        );
+        assert_eq!(auto_selection.execution_backend, "ndarray_cpu");
+
+        let (_device, gpu_selection) = resolve_infer_device("gpu");
+        assert!(
+            gpu_selection.execution_backend == "cuda"
+                || gpu_selection.execution_backend == "ndarray_cpu",
+            "an explicit `gpu` request must resolve to CUDA when a card answers \
+             and fall back honestly to the CPU floor when none does, got {}",
+            gpu_selection.execution_backend
+        );
     }
 
     #[cfg(feature = "burn-wgpu-backend")]
