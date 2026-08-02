@@ -765,6 +765,26 @@ pub struct ModelsConfig {
     /// Tree-model training knobs (config-driven replacement for the
     /// `NEOETHOS_BOT_EARLY_STOP_*` env vars). See [`TreeRuntimeConfig`].
     pub tree_runtime: TreeRuntimeConfig,
+    /// Device policy for the statistical models (ElasticNet / Logistic —
+    /// `statistical/linear_impl.rs`). One of:
+    ///
+    /// - `"cpu"` (default) — always the CPU path. This is what every build
+    ///   has done to date, because the CUDA softmax kernel behind it was
+    ///   compiled by no shipped feature combination.
+    /// - `"auto"` — the CUDA kernel when a CUDA device is present, else CPU.
+    /// - `"gpu"` / `"cuda"` / `"gpu:N"` / `"cuda:N"` — the CUDA kernel,
+    ///   optionally pinned to device N.
+    ///
+    /// The default is `"cpu"` rather than `"auto"` because the two backends
+    /// are not bit-identical: the kernel optimises with subgradient-L1 SGD,
+    /// so it is only used when `l1_ratio == 0` in the first place, and even
+    /// then f32 GPU reductions accumulate differently from the CPU path. That
+    /// changes fitted weights, which changes predictions, which changes
+    /// selection. Flipping this is the operator's call.
+    ///
+    /// `NEOETHOS_BOT_<MODEL>_DEVICE` and `NEOETHOS_BOT_META_DEVICE` still
+    /// override this, as they always have.
+    pub statistical_device: String,
     pub prop_metric_weight: f64,
     pub prop_accuracy_weight: f64,
     pub prop_min_trades: usize,
@@ -1560,6 +1580,7 @@ impl Default for ModelsConfig {
             smc_search_runtime: SmcSearchRuntimeConfig::default(),
             data_runtime: DataRuntimeConfig::default(),
             tree_runtime: TreeRuntimeConfig::default(),
+            statistical_device: "cpu".to_string(),
             prop_metric_weight: 1.0,
             prop_accuracy_weight: 0.1,
             prop_min_trades: 0,

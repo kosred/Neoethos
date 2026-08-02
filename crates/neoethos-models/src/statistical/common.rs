@@ -23,17 +23,55 @@ pub fn normalize_statistical_device_policy(policy: &str) -> String {
     crate::common::normalize_vendor_device_policy(policy, &[])
 }
 
-pub fn runtime_backend_with_gpu_fallback(
-    model_name: &str,
-    cpu_backend: &str,
-) -> (Option<String>, Option<String>) {
+/// Process-wide device policy for the statistical models, installed once at
+/// startup from `models.statistical_device`.
+///
+/// Until 2026-08-02 the fallback here was the hard-coded literal `"auto"`,
+/// which `cuda_kernel_enabled` treats as NOT-gpu — so the CUDA softmax kernel
+/// could only ever be reached by setting an env var by hand. That was
+/// consistent with the build, in which `statistical-gpu` was enabled by
+/// nothing and `linear_gpu.rs` was not compiled at all. Now that the feature
+/// is in the CUDA aggregate, the policy needs a real home in config.
+static STATISTICAL_DEVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Install the statistical device policy from `Settings`. Call once at
+/// startup, before any model training; the first install wins. Called from
+/// `neoethos_app::install_runtime_overrides_from_settings` (app + desktop)
+/// and from the CLI's `main`.
+pub fn install_statistical_runtime_from_settings(settings: &neoethos_core::Settings) {
+    let configured = settings.models.statistical_device.trim();
+    let _ = STATISTICAL_DEVICE.set(if configured.is_empty() {
+        "cpu".to_string()
+    } else {
+        configured.to_string()
+    });
+}
+
+/// The configured policy (defaults to `"cpu"` when never installed — e.g. in
+/// unit tests — which is the behaviour every build has had to date).
+pub fn configured_statistical_device() -> &'static str {
+    STATISTICAL_DEVICE.get_or_init(|| "cpu".to_string())
+}
+
+/// Resolve the device policy for one model: the per-model env var, then the
+/// subsystem env var, then config. The env vars keep priority they have
+/// always had; config replaces the literal `"auto"` that used to sit at the
+/// bottom of this chain.
+pub fn statistical_device_policy(model_name: &str) -> String {
     let model_key = format!(
         "NEOETHOS_BOT_{}_DEVICE",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
-    let requested = std::env::var(&model_key)
+    std::env::var(&model_key)
         .or_else(|_| std::env::var("NEOETHOS_BOT_META_DEVICE"))
-        .unwrap_or_else(|_| "auto".to_string());
+        .unwrap_or_else(|_| configured_statistical_device().to_string())
+}
+
+pub fn runtime_backend_with_gpu_fallback(
+    model_name: &str,
+    cpu_backend: &str,
+) -> (Option<String>, Option<String>) {
+    let requested = statistical_device_policy(model_name);
     let normalized = normalize_statistical_device_policy(&requested);
     let degraded_reason = if normalized == "gpu" || normalized.starts_with("gpu:") {
         Some(format!(
@@ -245,7 +283,25 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_statistical_device_policy, runtime_backend_with_gpu_fallback};
+    use super::{
+        configured_statistical_device, install_statistical_runtime_from_settings,
+        normalize_statistical_device_policy, runtime_backend_with_gpu_fallback,
+    };
+
+    /// The default keeps the statistical models on the CPU.
+    ///
+    /// Compiling `statistical/linear_gpu.rs` is a capability change and is
+    /// unconditional in a CUDA build; letting a run USE it changes the fitted
+    /// weights, so it waits for `models.statistical_device`. A fresh
+    /// `Settings` must reproduce the uninstalled default, or the shipped
+    /// config and the code would disagree about what "unset" means.
+    #[test]
+    fn statistical_device_defaults_to_cpu() {
+        let settings = neoethos_core::Settings::default();
+        assert_eq!(settings.models.statistical_device, "cpu");
+        install_statistical_runtime_from_settings(&settings);
+        assert_eq!(configured_statistical_device(), "cpu");
+    }
 
     #[test]
     fn normalize_statistical_device_policy_accepts_vendor_aliases() {

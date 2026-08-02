@@ -514,6 +514,13 @@ models:
     # trees differ from a CPU run on identical data — compare one run before
     # leaving it on. Inert on a build without --features gpu-cuda.
     lightgbm_gpu: false
+  # Device policy for the statistical models (ElasticNet / Logistic).
+  #   cpu   — always the CPU path (default; what every build has done so far)
+  #   auto  — the CUDA softmax kernel when a card is present, else CPU
+  #   gpu / cuda / gpu:N — the CUDA kernel, optionally pinned to device N
+  # The two backends are not bit-identical (f32 GPU reductions accumulate
+  # differently), so this changes fitted weights and therefore selection.
+  statistical_device: cpu
   prop_metric_weight: 1.0
   prop_accuracy_weight: 0.1
   prop_min_trades: 0

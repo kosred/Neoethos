@@ -155,7 +155,12 @@ reinforcement-learning-cuda = ["reinforcement-learning", "rlkit/cuda", "candle-c
 adaptive-models = ["dep:irithyll"]
 swarm-forecasting = ["dep:ruv-swarm-ml"]
 statistical-models = ["dep:linfa", "dep:linfa-linear", "dep:linfa-logistic", "dep:linfa-clustering", "dep:variational-regression"]
-statistical-gpu = ["statistical-models", "dep:cubecl"]
+# `statistical/linear_gpu.rs` — the CUDA softmax kernel behind ElasticNet /
+# Logistic. It writes `cubecl::cuda::{CudaDevice, CudaRuntime}`, so `dep:cubecl`
+# alone was never enough to compile it: the runtime feature has to be on too.
+# That, plus the fact that no aggregate enabled `statistical-gpu` at all, is
+# why the file was dead in every shipped configuration.
+statistical-gpu = ["statistical-models", "dep:cubecl", "cubecl/cuda"]
 anomaly-detection = ["dep:extended-isolation-forest"]
 
 # Burn pure-Rust deep learning (production backend)
@@ -197,7 +202,11 @@ gpu-cuda = [
     # belong on the CPU. The dep + `burn-cuda-backend` feature are kept so a
     # future build with genuinely large models can opt in via
     # `--features gpu-cuda,burn-cuda-backend`.
-    "statistical-models",
+    # Was plain `statistical-models`, so `statistical/linear_gpu.rs` — a
+    # complete CUDA softmax train + predict kernel — was compiled by nothing
+    # and shipped in no binary. Whether a run USES it is config:
+    # `models.statistical_device`, default `cpu`.
+    "statistical-gpu",
     # LightGBM's CUDA tree learner. The old comment here said `lightgbm3/cuda`
     # "does NOT actually build a GPU tree learner", and pointed at the runtime
     # "[LightGBM] [Fatal] GPU Tree Learner was not enabled in this build".
