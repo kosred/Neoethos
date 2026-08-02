@@ -69,31 +69,7 @@ linfa-clustering = { version = "0.7.0", optional = true }
 variational-regression = { version = "0.1.0", optional = true }
 extended-isolation-forest = { version = "0.2.0", optional = true, features = ["serde"] }
 
-# Burn framework — Vulkan Tier-1 perf push (2026-05-25).
-#
-# burn 0.20→0.21 + cubecl 0.9→0.10, with FULL default features
-# preserved across all three crates so we don't accidentally drop
-# performance-critical defaults like `autotune` (the kernel
-# auto-selector that gives 1.5-3× matmul speedups), `fusion`
-# (element-wise + reduction op fusion, 70×+ on fusable subgraphs),
-# or the cubecl kernel variants that autotune picks between.
-#
-# `vulkan` is added on top of the defaults — it pulls cubecl-spirv
-# for direct Naga→SPIR-V compilation (~5-15% kernel-launch win) and
-# is the only path to AMD/Intel GPUs since cuda is NVIDIA-only.
-# `autodiff` on `burn` is needed because we use Autodiff<Wgpu> in
-# the training pipeline.
-# burn / burn-ndarray / burn-wgpu — PURE defaults.
-#
-# burn-wgpu defaults = [std, autotune, fusion, burn-cubecl/default,
-# cubecl/default]. Autotune + fusion (the perf features we want) are
-# IN the defaults. NO need to override anything. Adding `vulkan` or
-# `cubecl-spirv` would force the SPIR-V shader path which crashes the
-# AMD Vulkan Windows driver on Naga-generated shaders. Leaving the
-# defaults lets wgpu pick the safer WGSL path on AMD.
-#
-# `autodiff` on burn is the only explicit feature — we use Autodiff<Wgpu>
-# in the training pipeline.
+# ── Burn framework ───────────────────────────────────────────────────────────
 #
 # ── 0.21 → 0.22.0-pre.1 (2026-08-02) ────────────────────────────────────────
 # Live-verified against https://crates.io/api/v1/crates/burn on 2026-08-02:
@@ -107,18 +83,33 @@ extended-isolation-forest = { version = "0.2.0", optional = true, features = ["s
 # were produced by a system with known defects — so no migration tooling is
 # built here. Models get retrained.
 #
-# `ndarray` is a burn FEATURE in 0.22 as it was in 0.21, but we depend on
-# burn-ndarray directly (below) rather than through burn's re-export.
-burn = { version = "0.22.0-pre.1", features = ["autodiff"] }
-burn-ndarray = { version = "0.22.0-pre.1" }
-burn-wgpu = { version = "0.22.0-pre.1", optional = true }
-# Native CUDA backend for the Burn neural models (TabNet/KAN/N-BEATS/TiDE/
-# TimesNet/transformer). Reuses the SAME cubecl 0.11.0-pre.1 + cubecl-cuda
-# stack the discovery kernels already build, so there is no version split.
-# Enabled by the `gpu-cuda` aggregate so the NVIDIA build trains neural nets
-# on the card in f32 (Ampere-native) instead of falling back to burn-ndarray
-# (CPU).
-burn-cuda = { version = "0.22.0-pre.1", optional = true }
+# ── WHY THE THREE SEPARATE burn-* DEPS ARE GONE ─────────────────────────────
+# 0.21 selected the backend at COMPILE time through the type system: you
+# depended on `burn-ndarray` / `burn-wgpu` / `burn-cuda` directly, named
+# `NdArray` / `Wgpu` / `Cuda` in a `type InferBackend = …` alias, and every
+# tensor and module in the crate carried a `<B: Backend>` parameter.
+#
+# 0.22 deleted that parameter (burn #4717). `Tensor<D>` and `Module` are no
+# longer generic; there is ONE `burn::tensor::Device` and the backend is
+# resolved at RUNTIME by `burn_dispatch`. Which devices that runtime can
+# hand out is decided by which FEATURES are on `burn`:
+#
+#   burn/ndarray  → Device::ndarray(), DeviceType::NdArray
+#   burn/cuda     → Device::cuda(i),   DeviceType::Cuda
+#   burn/wgpu     → Device::wgpu(k),   DeviceType::Wgpu
+#
+# and `Device::enumerate(DeviceType::Cuda)` asks the machine what is actually
+# present. That is exactly the operator's standing instruction — "the backend
+# must be chosen at RUNTIME from the hardware present" — and in 0.22 it is the
+# only way the framework works, so it stops being something we have to wire.
+#
+# `ndarray` is unconditional: it is the floor. Even a `gpu-cuda` binary on a
+# machine whose driver has gone missing must still have a device to fall back
+# to, and that decision is now made per-run instead of per-build.
+#
+# `autodiff` stays: training wraps the device with `.autodiff()` (0.22 makes
+# autodiff a property of the device, not an `Autodiff<B>` type wrapper).
+burn = { version = "0.22.0-pre.1", features = ["autodiff", "ndarray"] }
 
 num_cpus = "1.17.0"
 rand = "0.9.2"
@@ -162,9 +153,17 @@ statistical-models = ["dep:linfa", "dep:linfa-linear", "dep:linfa-logistic", "de
 statistical-gpu = ["statistical-models", "dep:cubecl"]
 anomaly-detection = ["dep:extended-isolation-forest"]
 
-# Burn pure-Rust deep learning (production backend)
-burn-wgpu-backend = ["dep:burn-wgpu"]
-burn-cuda-backend = ["dep:burn-cuda"]
+# Burn pure-Rust deep learning (production backend).
+#
+# These two used to be `dep:burn-wgpu` / `dep:burn-cuda` — a compile-time
+# choice of backend TYPE. In 0.22 there is no backend type to choose; the
+# feature's only job is to make the corresponding device VARIANT exist in
+# `burn::tensor::Device`, so the runtime can offer it if the hardware is
+# there. The feature names are kept so the release workflows, docs and CI
+# matrices that already say `--features gpu-cuda,burn-cuda-backend` keep
+# meaning what they say.
+burn-wgpu-backend = ["burn/wgpu"]
+burn-cuda-backend = ["burn/cuda"]
 burn-backend = []
 pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", "swarm-forecasting", "burn-backend", "statistical-models", "anomaly-detection"]
 

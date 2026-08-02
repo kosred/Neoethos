@@ -1206,6 +1206,8 @@ checksum = "615172b3fa52168938077c76ac389a3095951abb8a5d74eb25b98dddf89422b9"
 dependencies = [
  "burn-autodiff",
  "burn-core",
+ "burn-cuda",
+ "burn-ndarray",
  "burn-nn",
  "burn-optim",
  "burn-rl",
@@ -1213,6 +1215,7 @@ dependencies = [
  "burn-store",
  "burn-train",
  "burn-vision",
+ "burn-wgpu",
 ]
 
 [[package]]
@@ -7521,9 +7524,6 @@ version = "0.5.6"
 dependencies = [
  "anyhow",
  "burn",
- "burn-cuda",
- "burn-ndarray",
- "burn-wgpu",
  "candle-core",
  "catboost-rust",
  "chrono",
