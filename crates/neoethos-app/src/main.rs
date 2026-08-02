@@ -178,6 +178,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     setup_logging(true)?;
+    // F-005: say which env-var overrides are live before anything acts on
+    // them. Built 2026-05-25, called by nothing until 2026-08-02 — so the one
+    // mechanism whose entire purpose was to make silent overrides visible was
+    // itself invisible.
+    neoethos_core::env_overrides::log_active_overrides_at_startup();
 
     // #101 follow-up + #179: the help dialog must fire BEFORE the
     // config-load step below, otherwise an orphaned double-click whose

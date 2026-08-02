@@ -50,6 +50,12 @@ mod backend {
             // Mirror main.rs bootstrap, minus the Flutter-supervisor bits.
             // Same default config path the CLI/main.rs use when no override.
             server::state::install_config_path("config.yaml");
+            // F-005: say which env-var overrides are live before anything
+            // acts on them. The desktop shell reads the same env as the
+            // headless binary — NEOETHOS_USER_DATA_DIR in particular, which
+            // relocates the whole data root — so it needs the same line in
+            // its log.
+            neoethos_core::env_overrides::log_active_overrides_at_startup();
             // Audit S05: install EVERY runtime override from settings, exactly
             // as the headless main.rs does, via the one shared installer. The
             // desktop previously installed NONE, so config.yaml runtime knobs
