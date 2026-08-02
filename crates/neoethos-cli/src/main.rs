@@ -29,6 +29,7 @@ fn main() -> Result<()> {
     neoethos_models::statistical::common::install_statistical_runtime_from_settings(
         &startup_settings,
     );
+    neoethos_models::genetic::install_genetic_runtime_from_settings(&startup_settings);
     neoethos_core::system::install_hardware_runtime_overrides_from_settings(&startup_settings);
     neoethos_data::install_data_runtime_overrides(
         startup_settings.models.data_runtime.normalize_features,

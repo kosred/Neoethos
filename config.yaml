@@ -437,6 +437,18 @@ models:
     stage1_window: earliest
     min_history_years: 0
     adaptive_thresholds: false
+    # Apply the 20% out-of-sample holdout to the GeneticStrategyExpert
+    # training path too. The desktop app, the CLI and the batch orchestrator
+    # have gone through the holdout wrapper since audit B02/B03 (2026-07-13);
+    # that pass missed this call site, so when the TRAINING orchestrator
+    # trains the genetic expert it still searches the FULL series and its
+    # fitness is entirely in-sample.
+    #
+    # false = that behaviour, unchanged. Setting true changes which genes the
+    # expert produces (the GA now sees 80% of the rows) AND makes the run fail
+    # loudly on datasets whose in-sample half is under 64 rows — folds that
+    # quietly "succeed" today. Both are improvements; both are changes.
+    genetic_expert_holdout: false
     prop_firm_gate:
       max_daily_loss_pct: null
       max_overall_drawdown_pct: null

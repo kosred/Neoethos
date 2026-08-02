@@ -29,6 +29,7 @@ pub fn install_runtime_overrides_from_settings(settings: &neoethos_core::Setting
     neoethos_search::install_search_runtime_overrides_from_settings(settings);
     neoethos_models::tree_models::config::install_tree_runtime_from_settings(settings);
     neoethos_models::statistical::common::install_statistical_runtime_from_settings(settings);
+    neoethos_models::genetic::install_genetic_runtime_from_settings(settings);
     neoethos_core::system::install_hardware_runtime_overrides_from_settings(settings);
     neoethos_data::install_data_runtime_overrides(
         settings.models.data_runtime.normalize_features,

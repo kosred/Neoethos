@@ -955,6 +955,28 @@ pub struct DiscoveryRuntimeConfig {
     /// See [`PropFirmGateConfig`]. (was the
     /// `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` env overrides)
     pub prop_firm_gate: PropFirmGateConfig,
+    /// Apply the 20% out-of-sample holdout to the `GeneticStrategyExpert`
+    /// training path (`neoethos-models`), the way the desktop app, the CLI and
+    /// the batch orchestrator already do.
+    ///
+    /// `run_discovery_cycle_with_holdout` documents itself as the single
+    /// source of truth for "discovery never sees the tail" and says every
+    /// production caller must go through it. Audit B02/B03 (2026-07-13) routed
+    /// the CLI and the orchestrator through it. `GeneticStrategyExpert::train_with_discovery`
+    /// was not part of that pass and still calls the unwrapped
+    /// `run_discovery_cycle` with the FULL series — so when the training
+    /// orchestrator trains that expert, its genes are selected on 100% of the
+    /// data and its reported fitness is entirely in-sample.
+    ///
+    /// Default `false` = exactly that behaviour, because turning it on is a
+    /// selection change in both directions: the GA searches 80% of the rows
+    /// (different genes), and the holdout wrapper REFUSES datasets whose
+    /// in-sample half would be under 64 rows, which turns some short-fold
+    /// trainings that "succeed" today into a loud error. Set `true` once you
+    /// are ready for the expert's numbers to become out-of-sample — and to
+    /// find out which folds were too short to be meaningful in the first
+    /// place.
+    pub genetic_expert_holdout: bool,
 }
 
 impl Default for DiscoveryRuntimeConfig {
@@ -968,6 +990,9 @@ impl Default for DiscoveryRuntimeConfig {
             min_history_years: 0,
             adaptive_thresholds: false,
             prop_firm_gate: PropFirmGateConfig::default(),
+            // false = today: the GeneticStrategyExpert searches the full
+            // series. See the field docs for why this is not simply `true`.
+            genetic_expert_holdout: false,
         }
     }
 }
@@ -2316,6 +2341,26 @@ mod tests {
         );
         assert_eq!(settings.risk.initial_balance, 10_000.0);
         assert!(!settings.models.ml_models.is_empty());
+    }
+
+    /// The genetic expert's OOS holdout must stay OFF by default. Turning it
+    /// on changes which genes that expert produces (the GA sees 80% of the
+    /// rows instead of all of them) and makes short folds fail loudly rather
+    /// than quietly succeed. Both are the right end state; neither should
+    /// arrive as a side effect of picking up a new build.
+    #[test]
+    fn genetic_expert_holdout_defaults_to_todays_behaviour() {
+        assert!(
+            !DiscoveryRuntimeConfig::default().genetic_expert_holdout,
+            "default must reproduce the full-series search this path has always done"
+        );
+        assert!(
+            !Settings::default()
+                .models
+                .discovery_runtime
+                .genetic_expert_holdout,
+            "a default Settings must not silently enable the holdout"
+        );
     }
 
     /// The promotion gate now reads `models.promotion_gate` instead of using
