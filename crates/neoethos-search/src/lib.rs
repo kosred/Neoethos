@@ -29,6 +29,10 @@ pub mod discovery_ledger;
 // lands later, reintroduce a fresh helper at that time.
 
 pub mod backend;
+// Which arithmetic actually evaluated a population. Not GPU-gated: the CPU lane
+// records itself too, and the discovery profile has to be able to name the
+// engine on every build.
+pub mod engine_identity;
 pub mod eval;
 pub mod eval_telemetry;
 // SLICE 5 (2026-08-08): ambient execution-environment snapshot for the
@@ -87,6 +91,11 @@ pub use backend::{
     current_evaluation_backend, evaluate_population_core_with_backend,
     evaluate_population_core_with_backend_and_audit, install_evaluation_backend,
     install_evaluation_backend_from_settings,
+};
+pub use engine_identity::{
+    PopulationEvalEngine, PrototypeBReadiness, accelerator_hint_is_compiled,
+    compiled_accelerators, observed_population_engines, prototype_b_readiness,
+    record_population_engine, reset_observed_population_engines, strict_engine_preflight,
 };
 // `pub use challenge::{ChallengeOptimizer, ChallengeTarget};` — DELETED 2026-05-26.
 pub use discovery::{

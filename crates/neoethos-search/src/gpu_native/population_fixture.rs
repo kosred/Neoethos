@@ -461,6 +461,33 @@ mod tests {
         assert!(TinyPopulationFixture::integration_trace(&metrics, &unknown_survivor).is_err());
     }
 
+    /// `ForbidCpu` is the promise, not `device == Gpu`.
+    ///
+    /// The dispatch matched on `(Gpu, ForbidCpu)`, so `{ device: Auto, fallback:
+    /// ForbidCpu }` — a value `EvaluationBackend::validate()` accepts, and which
+    /// `install_evaluation_backend` therefore installs without complaint — fell
+    /// into the catch-all arm and ran `evaluate_population_core`, which is free
+    /// to evaluate the entire population on the CPU. A backend whose
+    /// `cpu_fallback_allowed()` is false must never reach a CPU lane.
+    #[cfg(not(feature = "gpu"))]
+    #[test]
+    fn a_forbid_cpu_backend_is_strict_even_when_its_device_is_auto() {
+        let fixture = TinyPopulationFixture::new(4, 128, 4);
+        let audit = CpuStrategyAuditContext::production(5);
+        let backend = EvaluationBackend {
+            device: crate::backend::DevicePreference::Auto,
+            fallback: crate::backend::FallbackPolicy::ForbidCpu,
+            accelerator_hint: crate::backend::AcceleratorHint::Any,
+        };
+        assert!(!backend.cpu_fallback_allowed());
+        let error = fixture.evaluate(backend, &audit).unwrap_err();
+        assert!(
+            error.contains("compiled without a GPU backend"),
+            "a ForbidCpu backend must fail closed, not run on the CPU: {error}"
+        );
+        audit.snapshot().assert_zero_executed().unwrap();
+    }
+
     #[cfg(not(feature = "gpu"))]
     #[test]
     fn strict_fixture_fails_without_executing_cpu_when_gpu_is_not_compiled() {

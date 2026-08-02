@@ -4837,6 +4837,12 @@ pub(crate) fn try_evaluate_population_cuda(
     {
         use crate::gpu_native::prototype_b_population_eval as prototype_b;
         if prototype_b::prototype_b_available() {
+            // Which engine ran is a record, not an inference: the two lanes
+            // below this line disagree by 54 % at production series length, and
+            // nothing downstream could previously tell them apart.
+            crate::engine_identity::record_population_engine(
+                crate::engine_identity::PopulationEvalEngine::CudaNativeF64,
+            );
             return prototype_b::try_evaluate_population_b(
                 close, high, low, indicators, gene_offsets, gene_indices, gene_weights,
                 long_thr, short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips,
@@ -4866,6 +4872,16 @@ pub(crate) fn try_evaluate_population_cuda(
     {
         bail!("cuda population evaluate path received inconsistent dimensions");
     }
+
+    // Past this point the CubeCL lane is what evaluates the population — either
+    // because prototype B is not part of this build (gpu-vulkan / gpu-rocm) or
+    // because its runtime probe failed. Record the exact lane, precision
+    // included: the f32 and f64 kernels do not produce the same trades.
+    crate::engine_identity::record_population_engine(if gpu_f64_backtest_enabled() {
+        crate::engine_identity::PopulationEvalEngine::CubeclF64
+    } else {
+        crate::engine_identity::PopulationEvalEngine::CubeclF32
+    });
 
     transfer_telemetry::record_call();
 
@@ -5259,6 +5275,16 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
     {
         bail!("cuda ftmo population evaluate path received inconsistent dimensions");
     }
+
+    // The FTMO/prop-firm window lane has no prototype-B short-circuit at all —
+    // it is always CubeCL — so the engine record here is unconditional. It
+    // matters for the same reason as the main lane: a prop-firm verdict decided
+    // by f32 arithmetic is not the verdict the canonical engine would give.
+    crate::engine_identity::record_population_engine(if gpu_f64_backtest_enabled() {
+        crate::engine_identity::PopulationEvalEngine::CubeclF64
+    } else {
+        crate::engine_identity::PopulationEvalEngine::CubeclF32
+    });
 
     let client = create_gpu_client(device_override)?;
     // Per-SAMPLE host vecs — shared across every gene (data-sized, not population-sized).

@@ -2433,6 +2433,32 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
                 device_override,
             )
         }));
+        #[cfg(not(feature = "gpu-b-adapter"))]
+        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::cubecl_eval::try_evaluate_population_cuda(
+                close,
+                high,
+                low,
+                indicators,
+                gene_offsets,
+                gene_indices,
+                gene_weights,
+                long_thr,
+                short_thr,
+                month_idx,
+                day_idx,
+                timestamps,
+                sl_pips,
+                tp_pips,
+                stop_vol_mult,
+                smc_data,
+                gene_smc_flags,
+                gate_threshold,
+                weights,
+                settings,
+                device_override,
+            )
+        }));
         // Classify the outcome, then let the shared policy decide. The default
         // (NEOETHOS_REQUIRE_GPU unset) always recomputes on the CPU — identical
         // to the historical behaviour. With it set, an availability fault fails
@@ -2561,6 +2587,10 @@ pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> V
     if n_genes == 0 {
         return Vec::new();
     }
+    // Same record as every other lane — see `engine_identity`.
+    crate::engine_identity::record_population_engine(
+        crate::engine_identity::PopulationEvalEngine::Cpu,
+    );
     let eval_gene_cpu = |g: usize| -> [f64; 11] {
         let (signals, confidences) = synthesize_signals_and_confidence_cpu(
             indicators,

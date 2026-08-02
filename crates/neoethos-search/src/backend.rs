@@ -406,7 +406,17 @@ pub fn evaluate_population_core_with_backend_and_audit(
             );
             out
         }
-        (DevicePreference::Gpu, FallbackPolicy::ForbidCpu) => {
+        // Match on the FALLBACK, not on the device.
+        //
+        // This arm was `(DevicePreference::Gpu, FallbackPolicy::ForbidCpu)`, so
+        // `{ device: Auto, fallback: ForbidCpu }` — a value `validate()` accepts
+        // and `install_evaluation_backend` therefore installs — fell into the
+        // catch-all below and ran `evaluate_population_core`, which is free to
+        // evaluate the whole population on the CPU. A backend whose
+        // `cpu_fallback_allowed()` is `false` would have run on the CPU, which
+        // is the type promising one thing and the dispatch doing another.
+        // `(Cpu, ForbidCpu)` cannot reach here: `validate()` above rejects it.
+        (_, FallbackPolicy::ForbidCpu) => {
             let out = evaluate_gpu_required_population(inputs, backend, audit);
             if out.is_ok() {
                 crate::eval_telemetry::record_device(
@@ -449,7 +459,70 @@ fn evaluate_gpu_required_population(
     };
     use crate::gpu_fallback::{GpuAction, GpuAttempt, GpuFailure, GpuRetryPolicy, decide_action};
 
-    if !cuda_eval_signal_kernel_enabled() || !cuda_eval_backtest_kernel_enabled() {
+    // ── Which engine is this call about to reach? ─────────────────────────────
+    //
+    // `try_evaluate_population_cuda` is not one engine. On a `gpu-cuda` build it
+    // short-circuits to the native CUDA engine (prototype B, f64, proven
+    // bit-exact against the CPU) *only* while `runtime_available() &&
+    // device_count() > 0`; when that probe fails it continues into the CubeCL
+    // lane, which in f32 is measured 54 % wrong at 200 000 bars — 129-430 extra
+    // trades, because rounding flips stop/target comparisons and changes which
+    // trades happen at all.
+    //
+    // Strict mode is the operator's GPU-exclusive directive: "a card is present,
+    // so a failure here is a fault to fix, not to work around". Responding to a
+    // missing card by silently ranking strategies with different arithmetic is
+    // the opposite of that contract, so this arm refuses instead.
+    //
+    // The distinction that makes this safe is compiled-in vs available:
+    // `gpu-vulkan` and `gpu-rocm` do not contain prototype B at all, so CubeCL
+    // *is* their production engine and strict mode there is legitimate.
+    let readiness = crate::engine_identity::prototype_b_readiness();
+    let expected_engine =
+        match crate::engine_identity::strict_engine_preflight(backend, readiness) {
+            Ok(engine) => engine,
+            Err(message) => {
+                // Nothing may have run on the CPU on the way to this refusal —
+                // the strict contract is about arithmetic, and a CPU lane that
+                // executed before the refusal would be the same substitution by
+                // another name.
+                audit
+                    .snapshot()
+                    .assert_zero_executed()
+                    .map_err(|error| error.to_string())?;
+                tracing::error!(
+                    target: "neoethos_search::backend",
+                    ?readiness,
+                    accelerator_hint = ?backend.accelerator_hint,
+                    "gpu_required failed closed rather than substituting a different engine"
+                );
+                return Err(message);
+            }
+        };
+
+    // Name the engine before the work starts, so a log that ends in a crash
+    // still says what arithmetic was in use.
+    {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            tracing::info!(
+                target: "neoethos_search::backend",
+                ?readiness,
+                accelerator_hint = ?backend.accelerator_hint,
+                expected_engine = expected_engine.as_str(),
+                reproduces_canonical_cpu = expected_engine.reproduces_canonical_cpu(),
+                "gpu_required population evaluation resolved its engine"
+            );
+        });
+    }
+
+    // This precondition is about the CubeCL kernels, so it only applies when
+    // CubeCL is what will actually run. Applying it to a prototype-B run would
+    // block the native engine on a toggle it does not use — the same
+    // "arm believes it reached one engine" mistake in the opposite direction.
+    if readiness != crate::engine_identity::PrototypeBReadiness::Ready
+        && (!cuda_eval_signal_kernel_enabled() || !cuda_eval_backtest_kernel_enabled())
+    {
         return Err("gpu_required population evaluation cannot start because a required CubeCL signal/backtest kernel is disabled".to_string());
     }
 

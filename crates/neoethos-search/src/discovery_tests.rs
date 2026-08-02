@@ -1582,6 +1582,35 @@ fn discovery_run_profile_records_typed_determinism_policy() {
     }
 }
 
+/// A run that cannot name its own arithmetic is not evidence.
+///
+/// The four population engines disagree — the CubeCL f32 lane is 54 % off the
+/// canonical CPU at 200 000 bars and takes 129-430 more trades — so two runs
+/// that used different engines ranked different strategies. Until this field
+/// existed nothing in the artifacts said which one had run, which is exactly
+/// how the f32/f64 confusion survived being measured twice.
+#[test]
+fn discovery_run_profile_names_the_engines_that_evaluated_the_population() {
+    crate::engine_identity::record_population_engine(
+        crate::engine_identity::PopulationEvalEngine::Cpu,
+    );
+    let profile = build_discovery_profile(
+        &DiscoveryConfig::default(),
+        &populated_discovery_result(0, 0, 0, 0),
+    );
+    assert!(
+        profile
+            .population_eval_engines
+            .contains(&crate::engine_identity::PopulationEvalEngine::Cpu),
+        "the profile must carry the engine that evaluated the population: {:?}",
+        profile.population_eval_engines
+    );
+    // And it has to survive serialisation, because the profile is read from
+    // disk long after the process that produced it is gone.
+    let json = serde_json::to_string(&profile).unwrap();
+    assert!(json.contains("cpu_f64_canonical"), "{json}");
+}
+
 #[test]
 fn discovery_run_profile_exposes_validation_evidence_hashes_and_missing_kinds() {
     let config = DiscoveryConfig::default();
