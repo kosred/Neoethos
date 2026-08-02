@@ -658,7 +658,58 @@ pub fn current_hardware_runtime_overrides() -> &'static HardwareRuntimeOverrides
     HARDWARE_RUNTIME_OVERRIDES.get_or_init(HardwareRuntimeOverrides::default)
 }
 
-/// Currently-available physical RAM in bytes (a fresh point-in-time probe).
+/// Clamp host RAM figures to this process's cgroup limit when one exists.
+///
+/// `System::total_memory()` and `available_memory()` report the HOST's RAM.
+/// Inside a container they are not what this process may actually use — and
+/// every rented vast.ai box is a Docker container, so on exactly the hardware
+/// the NEVER-OOM invariant was written for ("peak memory is a function of the
+/// AVAILABLE hardware, never of user parameters") the numbers feeding it were
+/// the wrong machine's.
+///
+/// `cgroup_limits()` returns `None` off Linux and on an unconstrained host, and
+/// a limit is only applied when it is non-zero and actually smaller than the
+/// host figure, so this is a no-op everywhere it should be.
+///
+/// One function, because the decision must be made in one place: two readers of
+/// the same setting drifting apart is how `apply_mode_overrides` and the search
+/// runtime overrides each ended up meaning something different from what they
+/// claimed.
+/// The whole decision, in a form a test can reach. A cgroup limit of 0 means
+/// "unset", and a limit at or above the host figure means "unconstrained" —
+/// both must yield the host value untouched, or an ordinary machine starts
+/// sizing itself against a phantom limit.
+fn tighter_of(host: u64, limit: u64) -> u64 {
+    if limit > 0 && limit < host { limit } else { host }
+}
+
+fn clamp_to_cgroup(sys: &System, host_total: u64, host_available: u64) -> (u64, u64) {
+    let Some(limits) = sys.cgroup_limits() else {
+        return (host_total, host_available);
+    };
+
+    let total = tighter_of(host_total, limits.total_memory);
+    let available = tighter_of(host_available, limits.free_memory);
+
+    if total < host_total || available < host_available {
+        static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+        ANNOUNCED.call_once(|| {
+            tracing::info!(
+                target: "neoethos_core::system",
+                host_total_mb = host_total / 1024 / 1024,
+                cgroup_total_mb = total / 1024 / 1024,
+                host_available_mb = host_available / 1024 / 1024,
+                cgroup_available_mb = available / 1024 / 1024,
+                "running under a cgroup memory limit; sizing against the container, not the host"
+            );
+        });
+    }
+
+    (total, available)
+}
+
+/// Currently-available RAM in bytes (a fresh point-in-time probe), honouring a
+/// container memory limit when one is in force.
 ///
 /// Cheap enough to call before each feature-cube build so the builder can
 /// decide RAM-resident vs disk-mmap assembly based on the machine's actual
@@ -667,16 +718,17 @@ pub fn current_hardware_runtime_overrides() -> &'static HardwareRuntimeOverrides
 pub fn available_memory_bytes() -> u64 {
     let mut sys = System::new();
     sys.refresh_memory();
-    sys.available_memory()
+    clamp_to_cgroup(&sys, sys.total_memory(), sys.available_memory()).1
 }
 
-/// Total installed physical RAM in bytes. Pairs with
+/// Total RAM in bytes available to this process. Pairs with
 /// [`available_memory_bytes`] so callers (and the UI resource strip) can show
-/// a "X of Y GB free" readout.
+/// a "X of Y GB free" readout — and inside a container both report the
+/// container's budget rather than the host's.
 pub fn total_memory_bytes() -> u64 {
     let mut sys = System::new();
     sys.refresh_memory();
-    sys.total_memory()
+    clamp_to_cgroup(&sys, sys.total_memory(), sys.available_memory()).0
 }
 
 impl HardwareProbe {
@@ -697,8 +749,15 @@ impl HardwareProbe {
         self.sys.refresh_all();
 
         let cpu_cores = self.sys.cpus().len().max(1);
-        let total_ram_gb = self.sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-        let available_ram_gb = self.sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+        // Same clamp as the free functions above — the probe that drives every
+        // sizing decision must not see a different machine from them.
+        let (total_bytes, available_bytes) = clamp_to_cgroup(
+            &self.sys,
+            self.sys.total_memory(),
+            self.sys.available_memory(),
+        );
+        let total_ram_gb = total_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+        let available_ram_gb = available_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
 
         let accelerator_devices = self.detect_accelerator_devices();
         let gpu_names = accelerator_devices
@@ -1844,5 +1903,32 @@ mod tests {
             plan.workload(WorkloadKind::StrategySearch).unwrap().backend,
             AcceleratorBackend::Cpu
         );
+    }
+
+    /// A container limit must win, and a non-limit must not.
+    ///
+    /// This existed as an inline closure and had no test, which is how the
+    /// system spent every rented vast.ai run sizing itself against the HOST's
+    /// RAM instead of the container's — `available_memory()` answers for the
+    /// machine, not for the process. Invert the comparison here and the bug
+    /// comes back silently, with the run merely meaning something weaker than
+    /// it claims.
+    #[test]
+    fn a_cgroup_limit_tightens_but_an_absent_one_does_not() {
+        const HOST: u64 = 64 * 1024 * 1024 * 1024;
+        const CONTAINER: u64 = 12 * 1024 * 1024 * 1024;
+
+        // The case that matters: a real container budget below the host.
+        assert_eq!(tighter_of(HOST, CONTAINER), CONTAINER);
+
+        // 0 means the cgroup did not report a limit — not "no memory".
+        assert_eq!(tighter_of(HOST, 0), HOST);
+
+        // An unconstrained cgroup reports the host figure, or more.
+        assert_eq!(tighter_of(HOST, HOST), HOST);
+        assert_eq!(tighter_of(HOST, HOST * 2), HOST);
+
+        // And it never invents memory the host does not have.
+        assert!(tighter_of(HOST, CONTAINER) <= HOST);
     }
 }
