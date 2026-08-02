@@ -122,8 +122,25 @@ nalgebra = "0.33.0"
 default = ["tree-models", "pure-rust-ml"]
 onnx = ["dep:ort"]
 tch = ["dep:tch"]
-lightgbm = ["dep:lightgbm3"]
-lightgbm-gpu = ["lightgbm", "lightgbm3/gpu", "lightgbm3/cuda"]
+# `openmp` is not an optimisation flag — it is the difference between a
+# multi-threaded and a SINGLE-THREADED LightGBM. lightgbm3-sys' build.rs
+# passes `USE_OPENMP=OFF` to cmake unless this feature is on, so every build
+# we have ever shipped trained gradient boosting on one core while
+# `num_threads` in build_training_params asked for the whole CPU budget.
+# It is also a hard prerequisite for the CUDA learner: LightGBM's own
+# CMakeLists forces `USE_OPENMP ON` under `USE_CUDA`, so without it the
+# archive would need libgomp that nothing links.
+lightgbm = ["dep:lightgbm3", "lightgbm3/openmp"]
+# The CUDA tree learner, NOT the OpenCL one.
+#
+# This used to be `lightgbm3/gpu` + `lightgbm3/cuda`. Those are two different
+# learners: `gpu` is `device_type=gpu`, the OpenCL learner, which needs Boost
+# + an OpenCL ICD we do not build and fails to link; `cuda` is
+# `device_type=cuda`, the CUDA learner (tree_learner.cpp -> CUDASingleGPUTreeLearner),
+# which is the one that works. Requesting both got the OpenCL half's link
+# failure, which is why this feature was believed to be a dead end and why
+# the aggregate below settled for plain `lightgbm`.
+lightgbm-gpu = ["lightgbm", "lightgbm3/cuda"]
 xgboost = ["dep:xgb"]
 catboost = ["dep:catboost-rust"]
 sklears-tree = ["dep:sklears"]
@@ -181,12 +198,18 @@ gpu-cuda = [
     # future build with genuinely large models can opt in via
     # `--features gpu-cuda,burn-cuda-backend`.
     "statistical-models",
-    # LightGBM is CPU-only by design: `lightgbm3/cuda` does NOT actually build a
-    # GPU tree learner (runtime dies with "[LightGBM] [Fatal] GPU Tree Learner
-    # was not enabled in this build") and the OpenCL path fails to link. Gradient
-    # boosting on our 10^4-10^5 row folds is seconds on CPU, so the GPU buys
-    # nothing here — see effective_device_type() in tree_models/lightgbm.rs.
-    "lightgbm",
+    # LightGBM's CUDA tree learner. The old comment here said `lightgbm3/cuda`
+    # "does NOT actually build a GPU tree learner", and pointed at the runtime
+    # "[LightGBM] [Fatal] GPU Tree Learner was not enabled in this build".
+    # That Fatal was real but it was a diagnosis of the wrong cause: the
+    # aggregate never enabled the cuda feature at all, so cmake ran with
+    # `USE_CUDA` unset, AND fit_internal asked for `device_type=gpu` — the
+    # OpenCL learner — which is what the Fatal names. With the cuda feature on
+    # (Linux; see the vendored build.rs for why upstream makes it Linux-only)
+    # the archive carries CUDASingleGPUTreeLearner and `device_type=cuda`
+    # resolves. Whether a run USES it is a config decision, not a build one:
+    # see `models.tree_runtime.lightgbm_gpu`.
+    "lightgbm-gpu",
     "reinforcement-learning",
     "rlkit/cuda",
     # XGBoost on the card. Without this the local build is still CPU-only and

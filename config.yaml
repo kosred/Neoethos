@@ -507,6 +507,13 @@ models:
     gpu_count: null
     early_stop_patience: null
     early_stop_min_delta: null
+    # Let LightGBM use the CUDA tree learner when the build has it and the
+    # host has a card. false = LightGBM always trains on the CPU, whatever
+    # `device` above says. Flipping this to true changes the arithmetic that
+    # trains the model (CUDA histograms sum in a different order), so the
+    # trees differ from a CPU run on identical data — compare one run before
+    # leaving it on. Inert on a build without --features gpu-cuda.
+    lightgbm_gpu: false
   prop_metric_weight: 1.0
   prop_accuracy_weight: 0.1
   prop_min_trades: 0

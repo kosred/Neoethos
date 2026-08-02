@@ -1294,6 +1294,23 @@ pub struct TreeRuntimeConfig {
     /// Early-stop min-delta override; `None` = use the model's default.
     /// Was `NEOETHOS_BOT_EARLY_STOP_MIN_DELTA`.
     pub early_stop_min_delta: Option<f64>,
+    /// Let LightGBM train on the CUDA tree learner when the build has it and
+    /// the host has a card. `false` (the default) pins LightGBM to the CPU
+    /// regardless of `device`.
+    ///
+    /// This is deliberately a separate knob from `device` and not a new
+    /// spelling of it. `device` is what the operator WANTS across all tree
+    /// models; this says whether LightGBM in particular is allowed to act on
+    /// it. It defaults to `false` because flipping it changes which
+    /// arithmetic trains the model — CUDA histogram construction sums in a
+    /// different order than the CPU learner, so the same data and the same
+    /// hyper-parameters produce a slightly different tree. That is a
+    /// selection change, and selection changes are the operator's to make.
+    ///
+    /// Set `true` once a run on this host has been compared against a CPU
+    /// run. On a build without the CUDA learner, or a host with no card,
+    /// `true` is simply inert — it never silently degrades.
+    pub lightgbm_gpu: bool,
 }
 
 impl Default for TreeRuntimeConfig {
@@ -1304,6 +1321,7 @@ impl Default for TreeRuntimeConfig {
             gpu_count: None,
             early_stop_patience: None,
             early_stop_min_delta: None,
+            lightgbm_gpu: false,
         }
     }
 }
