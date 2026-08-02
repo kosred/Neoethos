@@ -38,7 +38,17 @@ xgb = { version = "3.0.5", optional = true, default-features = false, features =
 ] }
 catboost-rust = { version = "0.3.6", optional = true, features = ["gpu"] }
 sklears = { version = "0.1.1", optional = true, features = ["tree"] }
-candle-core = { version = "0.9.1", optional = true }
+# 2026-08-02: 0.9.1 -> 0.10.2. NOT 0.11.0, and the reason matters: burn-candle
+# 0.21.0 and 0.22.0-pre.1 both declare `candle-core ^0.10.2` (checked live on
+# crates.io), so 0.10.2 is the one value that makes the whole workspace agree on
+# a single candle-core. Asking for 0.11.0 would leave burn-candle on 0.10.2 and
+# give us TWO candle-cores plus two of everything under them (cudarc, gemm*,
+# safetensors, float8, ug-cuda). Revisit 0.11 when burn's candle backend moves.
+# Must stay in lockstep with vendor/rlkit/Cargo.toml.
+# WARNING — GPU NUMERIC PATH: `reinforcement-learning-cuda` turns on
+# candle-core/cuda and rlkit/cuda, so this bump changes the kernels behind the
+# DQN/RL models. Compile parity is not sufficient; needs a card run.
+candle-core = { version = "0.10.2", optional = true }
 # cubecl 0.10 — pure defaults. Defaults already include cubecl-core,
 # cubecl-cuda?, cubecl-cpu?, cubecl-hip?, cubecl-wgpu? (all optional —
 # only activated when something else turns them on). NO explicit
