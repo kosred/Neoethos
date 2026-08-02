@@ -39,27 +39,37 @@ neoethos-core = { path = "../neoethos-core" }
 neoethos-gpu-contracts = { path = "../neoethos-gpu-contracts" }
 neoethos-gpu-cuda = { path = "../neoethos-gpu-cuda", optional = true }
 duckdb = { version = "1.1.1", optional = true, features = ["bundled"] }
-tch = { version = "0.22.0", optional = true }
+# REMOVED 2026-08-02: `tch = { version = "0.22.0", optional = true }`.
+# No feature in this crate ever listed `dep:tch`, and no file under src/
+# mentions `tch::` — it was already unreachable. Its stated purpose (CUDA
+# device enumeration) is served by neoethos-gpu-cuda / cudarc, which query
+# the driver directly.
 
 [features]
 default = []
 # Profiler builds link NVIDIA's NVTX C API. Ordinary builds retain a no-op
 # instrumentation API and never require the NVIDIA toolkit/library.
 nvtx = []
-# `gpu`: pulls in the GPU dep chain — cubecl 0.9 for the SL/TP-faithful
-# eval/backtest kernel (`cubecl_eval.rs`) and tch 0.22 for CUDA device
-# enumeration. After audit 2026-05-24 the legacy `discovery_gpu` +
-# `hpc_gpu_discovery` + `hpc` modules were removed (~3132 LOC of orphan
-# code targeting Hyperstack-N3 specifically); generic multi-GPU support
-# now lives inside `cubecl_eval.rs` itself and scales 1→N devices via
-# `tch::Cuda::device_count()`. The concrete runtime is now selected by the
-# vendor aliases below; `gpu` itself binds NO runtime (so a Vulkan build never
-# compiles cubecl-cuda), and `tch` (CUDA device enumeration) moved to `gpu-cuda`.
+# `gpu`: pulls in the GPU dep chain — cubecl for the SL/TP-faithful
+# eval/backtest kernel (`cubecl_eval.rs`). After audit 2026-05-24 the legacy
+# `discovery_gpu` + `hpc_gpu_discovery` + `hpc` modules were removed (~3132 LOC
+# of orphan code targeting Hyperstack-N3 specifically). The concrete runtime is
+# selected by the vendor aliases below; `gpu` itself binds NO runtime, so a
+# Vulkan build never compiles cubecl-cuda.
+#
+# CORRECTED 2026-08-02. This comment used to claim that "generic multi-GPU
+# support now lives inside `cubecl_eval.rs` itself and scales 1→N devices via
+# `tch::Cuda::device_count()`". No shipped build did anything of the kind:
+# `tch` was an optional dependency that no feature enabled, `tch::` appears
+# nowhere under src/, and `cubecl_eval.rs` binds one client. Every run has
+# been single-device. Multi-GPU is unbuilt work, not a feature to be
+# rediscovered — the claim is deleted rather than softened so nobody plans
+# against it again.
 gpu = ["dep:cubecl", "dep:half", "dep:cubecl-runtime"]
 # #205: vendor-aware aliases so the top-level binary can pick a backend
 # without knowing the internals. The `cubecl_eval.rs` GA kernels are generic
 # over `R: Runtime`, so each alias just selects the cubecl runtime:
-# - gpu-cuda   → CUDA (NVIDIA) + `tch` for device enumeration.
+# - gpu-cuda   → CUDA (NVIDIA), plus the native `neoethos-gpu-cuda` engine.
 # - gpu-vulkan → cubecl-wgpu via the naga→SPIR-V path (`wgpu`, NOT `wgpu-spirv`:
 #   the direct-SPIR-V passthrough crashes AMD's Vulkan driver). Runs on the
 #   integrated AMD GPU here and on any wgpu adapter (Vulkan/DX12/Metal).

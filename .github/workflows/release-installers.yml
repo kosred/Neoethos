@@ -9,7 +9,7 @@
 # artefact families that do not collide:
 #
 #   release.yml            → NeoEthos-<ver>-windows-x64-gpu.zip / .tar.gz / .deb
-#                            (GPU build with libtorch/CUDA bundled)
+#                            (GPU build with the CUDA runtime bundled)
 #   release-installers.yml → neoethos_<ver>_amd64.deb       (cargo-deb)
 #                            neoethos-<ver>-1.x86_64.rpm     (cargo-generate-rpm)
 #                            neoethos-app-<ver>-x86_64.AppImage (appimagetool)

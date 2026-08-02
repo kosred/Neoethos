@@ -5,7 +5,6 @@ fn main() {
     assert_at_most_one_gpu_feature();
     assert_gpu_toolkit_available();
     emit_embedded_credentials();
-    force_link_libtorch_cuda();
 
     let protoc_path = protoc_bin_vendored::protoc_bin_path().unwrap();
     let protoc_dir = protoc_path.parent().unwrap();
@@ -351,45 +350,22 @@ fn assert_gpu_toolkit_available() {
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
 }
 
-/// Force the linker to keep `libtorch_cuda` so `tch::Cuda::device_count()`
-/// actually returns the hardware GPU count at runtime. tch-rs only emits a
-/// plain `cargo:rustc-link-lib=torch_cuda`, which the linker strips because
-/// no symbols from it are referenced directly.
-///
-/// 2026-07-18 deep-audit fixes:
-/// - GATE: the old check looked only at the `gpu` ALIAS env, so a direct
-///   `--features gpu-nvidia` build silently skipped the force-link and CUDA
-///   was invisible at runtime. Both spellings now count.
-/// - MSVC: the old code emitted GNU-ld syntax (`-Wl,--no-as-needed`,
-///   `-l…`) unconditionally — link.exe does not understand those flags, so
-///   every Windows GPU link would have FAILED. Windows now uses the
-///   documented tch-rs MSVC trick: `/INCLUDE:` an exported torch_cuda
-///   symbol (`at::cuda::warp_size()`) so the library cannot be stripped.
-fn force_link_libtorch_cuda() {
-    let gpu_on = std::env::var("CARGO_FEATURE_GPU").is_ok()
-        || std::env::var("CARGO_FEATURE_GPU_NVIDIA").is_ok();
-    if !gpu_on {
-        return;
-    }
-    let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
-    if let Ok(libtorch) = std::env::var("LIBTORCH") {
-        if msvc {
-            println!("cargo:rustc-link-arg-bins=/LIBPATH:{libtorch}/lib");
-            println!("cargo:rustc-link-arg-bins=/INCLUDE:?warp_size@cuda@at@@YAHXZ");
-        } else {
-            println!("cargo:rustc-link-arg-bins=-Wl,--no-as-needed");
-            println!("cargo:rustc-link-arg-bins=-L{libtorch}/lib");
-            println!("cargo:rustc-link-arg-bins=-ltorch_cuda");
-            println!("cargo:rustc-link-arg-bins=-Wl,--as-needed");
-        }
-        println!("cargo:rerun-if-env-changed=LIBTORCH");
-    } else {
-        println!(
-            "cargo:warning=neoethos-app built with a CUDA GPU feature but LIBTORCH env not \
-             set; libtorch_cuda will not be force-linked and tch::Cuda::device_count() may \
-             return 0"
-        );
-    }
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GPU");
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GPU_NVIDIA");
-}
+// REMOVED 2026-08-02: `force_link_libtorch_cuda()`.
+//
+// It emitted, for every `--features gpu`/`gpu-nvidia` build with LIBTORCH set:
+//     /INCLUDE:?warp_size@cuda@at@@YAHXZ      (MSVC)
+//     -Wl,--no-as-needed -ltorch_cuda         (GNU)
+// to stop the linker stripping a library nothing referenced. That was correct
+// while `tch` was linked. It is not any more: `tch` is optional in
+// neoethos-models and enabled by NO feature, every call site is
+// `#[cfg(feature = "tch")]`, and d4df966a dropped the `dep:tch` that
+// neoethos-search once had.
+//
+// So on MSVC `/INCLUDE:` was asking link.exe to resolve a symbol from a
+// library that was never on the link line — LNK2001 unresolved external,
+// then LNK1120, i.e. the next Windows GPU release build would have failed at
+// the link step. Deleting this is a FIX, not a loss of capability: there is
+// no tch to keep.
+//
+// If tch ever comes back, this belongs in tch-rs's own build script, not
+// here.
