@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use burn::module::AutodiffModule;
 use burn::nn;
-use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+// burn 0.22: `OptimizerAdaptor<AdamW, M, B>` collapsed into the non-generic
+// `ModuleOptimizer`, and `burn::record` was replaced by `burn::store` (the
+// burnpack format). `Recorder`/`DefaultFileRecorder`/`FullPrecisionSettings`
+// no longer exist — `Module::save_file`/`try_load_file` do the same job with
+// no recorder to carry around.
+use burn::optim::{AdamWConfig, GradientsParams, ModuleOptimizer, OptimizerRecord};
 use burn::prelude::*;
-use burn::tensor::backend::BackendTypes;
-use burn::record::{DefaultFileRecorder, FullPrecisionSettings, Recorder};
 
 use polars::prelude::{DataFrame, DataType, Series};
 use rand::Rng;
@@ -25,7 +27,7 @@ use crate::base::{
     dataframe_to_float32_array, feature_columns_from_dataframe, three_class_runtime_confidence,
     try_build_runtime_artifact_metadata,
 };
-use crate::burn_models::{TrainBackend, resolve_train_device};
+use crate::burn_models::resolve_train_device;
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::RuntimePrediction;
@@ -35,10 +37,10 @@ use crate::statistical::common::{METADATA_FILE_NAME, read_json, write_json};
 // ============================================================================
 
 #[derive(Module, Debug)]
-pub struct ExitAgentNet<B: Backend> {
-    fc1: nn::Linear<B>,
-    fc2: nn::Linear<B>,
-    output: nn::Linear<B>,
+pub struct ExitAgentNet {
+    fc1: nn::Linear,
+    fc2: nn::Linear,
+    output: nn::Linear,
 }
 
 #[derive(Config, Debug)]
@@ -50,7 +52,7 @@ pub struct ExitAgentNetConfig {
 }
 
 impl ExitAgentNetConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> ExitAgentNet<B> {
+    pub fn init(&self, device: &Device) -> ExitAgentNet {
         ExitAgentNet {
             fc1: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
             fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
@@ -59,8 +61,8 @@ impl ExitAgentNetConfig {
     }
 }
 
-impl<B: Backend> ExitAgentNet<B> {
-    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+impl ExitAgentNet {
+    pub fn forward(&self, x: Tensor<2>) -> Tensor<2> {
         let x = burn::tensor::activation::relu(self.fc1.forward(x));
         let x = burn::tensor::activation::relu(self.fc2.forward(x));
         self.output.forward(x)
@@ -518,9 +520,9 @@ pub struct ExitAgentTrainingReport {
 
 /// Pure-Rust Burn ExitAgent
 pub struct ExitAgent {
-    model: ExitAgentNet<TrainBackend>,
-    target_model: ExitAgentNet<TrainBackend>,
-    optim: OptimizerAdaptor<burn::optim::AdamW, ExitAgentNet<TrainBackend>, TrainBackend>,
+    model: ExitAgentNet,
+    target_model: ExitAgentNet,
+    optim: ModuleOptimizer,
     memory: VecDeque<Experience>,
     pending_regret: HashMap<i32, PendingRegret>,
     memory_capacity: usize,
@@ -539,7 +541,7 @@ pub struct ExitAgent {
     training_report: Option<ExitAgentTrainingReport>,
     trained_checkpoint_ready: bool,
     train_step_count: usize,
-    device: <TrainBackend as BackendTypes>::Device,
+    device: Device,
     requested_device_policy: String,
     effective_device_policy: String,
     execution_backend: String,
@@ -749,7 +751,7 @@ impl ExitAgent {
         }
 
         // Forward pass
-        let state_tensor = Tensor::<TrainBackend, 1>::from_data(
+        let state_tensor = Tensor::<1>::from_data(
             TensorData::new(state.to_vec(), [state.len()]),
             &self.device,
         )
@@ -768,7 +770,7 @@ impl ExitAgent {
         if state.len() != self.input_dim || state.iter().any(|value| !value.is_finite()) {
             return None;
         }
-        let state_tensor = Tensor::<TrainBackend, 1>::from_data(
+        let state_tensor = Tensor::<1>::from_data(
             TensorData::new(state.to_vec(), [self.input_dim]),
             &self.device,
         )
@@ -872,13 +874,13 @@ impl ExitAgent {
 
         let effective_batch = actions.len();
 
-        let states_tensor: Tensor<TrainBackend, 2> = Tensor::from_data(
+        let states_tensor: Tensor<2> = Tensor::from_data(
             TensorData::new(states_flat, [effective_batch, self.input_dim]),
             &self.device,
         );
-        let actions_tensor: Tensor<TrainBackend, 1, Int> =
+        let actions_tensor: Tensor<1, Int> =
             Tensor::from_data(TensorData::new(actions, [effective_batch]), &self.device);
-        let target_tensor: Tensor<TrainBackend, 1> =
+        let target_tensor: Tensor<1> =
             Tensor::from_data(TensorData::new(targets, [effective_batch]), &self.device);
 
         let q_values = self.model.forward(states_tensor);
@@ -894,7 +896,7 @@ impl ExitAgent {
 
         let grads = loss.backward();
         let grads_params = GradientsParams::from_grads(grads, &self.model);
-        self.model = self.optim.step(1e-4, self.model.clone(), grads_params);
+        self.model = self.optim.step(1e-4_f64.into(), self.model.clone(), grads_params);
         self.train_step_count = self.train_step_count.saturating_add(1);
         if self.train_step_count.is_multiple_of(32) {
             self.target_model = self.model.clone();
@@ -1279,7 +1281,7 @@ impl ExitAgent {
         let mut predictions = Vec::with_capacity(features.nrows());
         for row_idx in 0..features.nrows() {
             let state = features.row(row_idx).iter().copied().collect::<Vec<_>>();
-            let state_tensor = Tensor::<TrainBackend, 1>::from_data(
+            let state_tensor = Tensor::<1>::from_data(
                 TensorData::new(state, [self.input_dim]),
                 &self.device,
             )
@@ -1386,6 +1388,12 @@ impl ExitAgent {
         path.join("weights")
     }
 
+    /// The actual file. burn 0.22 does not append an extension, so the
+    /// extension is part of the path we hand to `save_file`/`try_load_file`.
+    fn record_file_path(path: &Path) -> std::path::PathBuf {
+        Self::record_base_path(path).with_extension(crate::deep_models::RECORD_EXTENSION)
+    }
+
     fn artifact_path(path: &Path) -> std::path::PathBuf {
         path.join("config.json")
     }
@@ -1395,9 +1403,8 @@ impl ExitAgent {
     }
 
     fn optimizer_record_file_path(path: &Path) -> std::path::PathBuf {
-        let mut record_path = Self::optimizer_record_base_path(path);
-        record_path.set_extension("mpk");
-        record_path
+        Self::optimizer_record_base_path(path)
+            .with_extension(crate::deep_models::RECORD_EXTENSION)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -1413,19 +1420,18 @@ impl ExitAgent {
             )
         })?;
         if let Err(error) = (|| -> Result<()> {
-            let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
             self.model
                 .clone()
                 .valid()
-                .save_file(Self::record_base_path(&staged_path), &recorder)
+                .save_file(Self::record_file_path(&staged_path))
+                .map_err(|error| anyhow::anyhow!("{error}"))
                 .with_context(|| {
                     format!("persist exit-agent record to {}", staged_path.display())
                 })?;
-            recorder
-                .record(
-                    self.optim.to_record(),
-                    Self::optimizer_record_base_path(&staged_path),
-                )
+            self.optim
+                .to_record()
+                .save(Self::optimizer_record_file_path(&staged_path))
+                .map_err(|error| anyhow::anyhow!("{error}"))
                 .with_context(|| {
                     format!("persist exit-agent optimizer to {}", staged_path.display())
                 })?;
@@ -1498,18 +1504,18 @@ impl ExitAgent {
                 path.display()
             );
         }
-        let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
         let model = ExitAgentNetConfig::new()
             .with_input_dim(artifact.input_dim)
             .with_hidden_dim(artifact.hidden_dim)
             .init(&device)
-            .load_file(Self::record_base_path(path), &recorder, &device)
+            .try_load_file(Self::record_file_path(path))
+            .map_err(|error| anyhow::anyhow!("{error}"))
             .with_context(|| format!("load exit-agent record from {}", path.display()))?;
 
         let optim = AdamWConfig::new().with_weight_decay(1e-4).init();
         let optim = if Self::optimizer_record_file_path(path).exists() {
-            let optimizer_record = recorder
-                .load(Self::optimizer_record_base_path(path), &device)
+            let optimizer_record = OptimizerRecord::load(Self::optimizer_record_file_path(path))
+                .map_err(|error| anyhow::anyhow!("{error}"))
                 .with_context(|| format!("load exit-agent optimizer from {}", path.display()))?;
             optim.load_record(optimizer_record)
         } else {

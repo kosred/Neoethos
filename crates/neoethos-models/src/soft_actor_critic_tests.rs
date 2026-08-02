@@ -88,13 +88,13 @@ fn trained_agent(rows: usize) -> SoftActorCritic {
 fn actor_policy_is_a_valid_probability_simplex_inferbackend() {
     // Pure-tensor test on InferBackend (no autodiff) — proves the
     // softmax head always emits a normalized, non-negative 3-simplex.
-    let device = <InferBackend as burn::tensor::backend::BackendTypes>::Device::default();
+    let device = Device::default();
     let actor = SacNetConfig::new()
         .with_input_dim(4)
         .with_hidden_dim(16)
-        .init_actor::<InferBackend>(&device);
+        .init_actor(&device);
 
-    let states = Tensor::<InferBackend, 2>::from_data(
+    let states = Tensor::<2>::from_data(
         TensorData::new(
             vec![
                 0.5_f32, -1.0, 2.0, 0.3, //

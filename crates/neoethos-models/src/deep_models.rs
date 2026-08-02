@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use burn::module::{AutodiffModule, Module};
-use burn::record::{DefaultFileRecorder, FullPrecisionSettings};
-use burn::tensor::DType;
+// burn 0.22 replaced `burn::record` with `burn::store`; `Module::save_file` /
+// `try_load_file` carry no recorder and write the burnpack format.
+use burn::tensor::{DType, Device};
 use ndarray::Array2;
 use neoethos_core::storage::json::{
     JsonBackupWriteConfig, read_json as read_json_artifact,
@@ -21,8 +22,8 @@ use crate::burn_models::{
     BurnDeviceSelection, BurnKAN, BurnKANConfig, BurnMLP, BurnMLPConfig, BurnNBeats,
     BurnNBeatsConfig, BurnNBeatsx, BurnNBeatsxConfig, BurnPatchTST, BurnPatchTSTConfig, BurnTabNet,
     BurnTabNetConfig, BurnTiDE, BurnTiDEConfig, BurnTiDENf, BurnTiDENfConfig, BurnTimesNet,
-    BurnTimesNetConfig, BurnTrainingReport, BurnTransformer, BurnTransformerConfig, InferBackend,
-    TrainBackend, TrainConfig, cast_module_float_tensors, normalize_burn_device_policy,
+    BurnTimesNetConfig, BurnTrainingReport, BurnTransformer, BurnTransformerConfig,
+    TrainConfig, cast_module_float_tensors, normalize_burn_device_policy,
     predict_proba_on_device as burn_predict_proba_on_device, resolve_infer_device,
     resolve_train_device,
     train_model_with_report_with_external_val as burn_train_model_with_report_with_external_val,
@@ -82,42 +83,54 @@ struct DeepArtifactConfig {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 enum RuntimeDeepModel {
-    Mlp(BurnMLP<InferBackend>),
-    NBeats(BurnNBeats<InferBackend>),
-    NBeatsxNf(BurnNBeatsx<InferBackend>),
-    TiDE(BurnTiDE<InferBackend>),
-    TiDENf(BurnTiDENf<InferBackend>),
-    TabNet(BurnTabNet<InferBackend>),
-    Kan(BurnKAN<InferBackend>),
-    Transformer(BurnTransformer<InferBackend>),
-    PatchTst(BurnPatchTST<InferBackend>),
-    TimesNet(BurnTimesNet<InferBackend>),
+    Mlp(BurnMLP),
+    NBeats(BurnNBeats),
+    NBeatsxNf(BurnNBeatsx),
+    TiDE(BurnTiDE),
+    TiDENf(BurnTiDENf),
+    TabNet(BurnTabNet),
+    Kan(BurnKAN),
+    Transformer(BurnTransformer),
+    PatchTst(BurnPatchTST),
+    TimesNet(BurnTimesNet),
 }
+
+/// On-disk extension of a Burn parameter record.
+///
+/// 0.21 wrote MessagePack (`.mpk`) through `DefaultFileRecorder`. 0.22 writes
+/// burnpack, and nothing appends the extension for us, so it is named here
+/// once and used by every save/load site.
+pub(crate) const RECORD_EXTENSION: &str = "bpk";
 
 impl RuntimeDeepModel {
     fn save_to(&self, base_path: &Path) -> Result<()> {
-        let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
+        // burn 0.22: `save_file` takes no recorder and does NOT append an
+        // extension of its own — the path it is handed is the file it writes.
+        // 0.21's `DefaultFileRecorder` appended `.mpk` (MessagePack); the
+        // format is now burnpack, so the artifact is `.bpk` and the temp/target
+        // rotation names it explicitly instead of relying on the recorder.
         let base_name = base_path
             .file_name()
             .and_then(|name| name.to_str())
             .context("deep-model record base path is missing a file name")?;
         let temp_base_path = base_path.with_file_name(format!("{base_name}_tmp"));
-        let target_record_path = base_path.with_extension("mpk");
-        let temp_record_path = temp_base_path.with_extension("mpk");
+        let target_record_path = base_path.with_extension(RECORD_EXTENSION);
+        let temp_record_path = temp_base_path.with_extension(RECORD_EXTENSION);
 
         match self {
-            Self::Mlp(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
-            Self::NBeats(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
-            Self::NBeatsxNf(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
-            Self::TiDE(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
-            Self::TiDENf(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
-            Self::TabNet(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
-            Self::Kan(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
-            Self::Transformer(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
-            Self::PatchTst(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
-            Self::TimesNet(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
+            Self::Mlp(model) => model.clone().save_file(&temp_record_path),
+            Self::NBeats(model) => model.clone().save_file(&temp_record_path),
+            Self::NBeatsxNf(model) => model.clone().save_file(&temp_record_path),
+            Self::TiDE(model) => model.clone().save_file(&temp_record_path),
+            Self::TiDENf(model) => model.clone().save_file(&temp_record_path),
+            Self::TabNet(model) => model.clone().save_file(&temp_record_path),
+            Self::Kan(model) => model.clone().save_file(&temp_record_path),
+            Self::Transformer(model) => model.clone().save_file(&temp_record_path),
+            Self::PatchTst(model) => model.clone().save_file(&temp_record_path),
+            Self::TimesNet(model) => model.clone().save_file(&temp_record_path),
         }
-        .with_context(|| format!("persist Burn model record to {}", temp_base_path.display()))?;
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .with_context(|| format!("persist Burn model record to {}", temp_record_path.display()))?;
 
         if target_record_path.exists() {
             std::fs::remove_file(&target_record_path).with_context(|| {
@@ -140,38 +153,38 @@ impl RuntimeDeepModel {
         &self,
         features: &Array2<f32>,
         batch_size: usize,
-        device: &<InferBackend as burn::tensor::backend::BackendTypes>::Device,
+        device: &Device,
     ) -> Result<Array2<f32>> {
         match self {
             Self::Mlp(model) => {
-                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+                burn_predict_proba_on_device::<_>(model, features, batch_size, device)
             }
             Self::NBeats(model) => {
-                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+                burn_predict_proba_on_device::<_>(model, features, batch_size, device)
             }
             Self::NBeatsxNf(model) => {
-                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+                burn_predict_proba_on_device::<_>(model, features, batch_size, device)
             }
             Self::TiDE(model) => {
-                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+                burn_predict_proba_on_device::<_>(model, features, batch_size, device)
             }
             Self::TiDENf(model) => {
-                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+                burn_predict_proba_on_device::<_>(model, features, batch_size, device)
             }
             Self::TabNet(model) => {
-                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+                burn_predict_proba_on_device::<_>(model, features, batch_size, device)
             }
             Self::Kan(model) => {
-                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+                burn_predict_proba_on_device::<_>(model, features, batch_size, device)
             }
             Self::Transformer(model) => {
-                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+                burn_predict_proba_on_device::<_>(model, features, batch_size, device)
             }
             Self::PatchTst(model) => {
-                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+                burn_predict_proba_on_device::<_>(model, features, batch_size, device)
             }
             Self::TimesNet(model) => {
-                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+                burn_predict_proba_on_device::<_>(model, features, batch_size, device)
             }
         }
     }
@@ -779,7 +792,7 @@ impl BurnDeepExpert {
     fn resolve_runtime_infer_device(
         &self,
     ) -> (
-        <InferBackend as burn::tensor::backend::BackendTypes>::Device,
+        Device,
         BurnDeviceSelection,
     ) {
         let requested_device = self.configured_requested_device_policy();
@@ -788,7 +801,7 @@ impl BurnDeepExpert {
 
     fn runtime_model_dtype(
         &self,
-        device: &<InferBackend as burn::tensor::backend::BackendTypes>::Device,
+        device: &Device,
     ) -> Result<DType> {
         match self
             .configured_requested_training_precision()
@@ -796,10 +809,10 @@ impl BurnDeepExpert {
             .as_str()
         {
             "bf16" => {
-                if <InferBackend as burn::tensor::backend::Backend>::supports_dtype(
-                    device,
-                    DType::BF16,
-                ) {
+                // burn 0.22: dtype support is asked of the DEVICE, not of a
+                // backend type — the device is the thing that knows what
+                // hardware answered.
+                if device.supports_dtype(DType::BF16) {
                     Ok(DType::BF16)
                 } else {
                     bail!(
@@ -822,49 +835,49 @@ impl BurnDeepExpert {
         let runtime_dtype = self.runtime_model_dtype(&device)?;
         match self.kind {
             DeepModelKind::Mlp => Ok(RuntimeDeepModel::Mlp(cast_module_float_tensors(
-                self.mlp_config(input_dim).init::<InferBackend>(&device),
+                self.mlp_config(input_dim).init(&device),
                 runtime_dtype,
             ))),
             DeepModelKind::NBeats => Ok(RuntimeDeepModel::NBeats(cast_module_float_tensors(
-                self.nbeats_config(input_dim).init::<InferBackend>(&device),
+                self.nbeats_config(input_dim).init(&device),
                 runtime_dtype,
             ))),
             DeepModelKind::NBeatsxNf => Ok(RuntimeDeepModel::NBeatsxNf(cast_module_float_tensors(
                 self.nbeatsx_nf_config(input_dim)
-                    .init::<InferBackend>(&device),
+                    .init(&device),
                 runtime_dtype,
             ))),
             DeepModelKind::TiDE => Ok(RuntimeDeepModel::TiDE(cast_module_float_tensors(
-                self.tide_config(input_dim).init::<InferBackend>(&device),
+                self.tide_config(input_dim).init(&device),
                 runtime_dtype,
             ))),
             DeepModelKind::TiDENf => Ok(RuntimeDeepModel::TiDENf(cast_module_float_tensors(
-                self.tide_nf_config(input_dim).init::<InferBackend>(&device),
+                self.tide_nf_config(input_dim).init(&device),
                 runtime_dtype,
             ))),
             DeepModelKind::TabNet => Ok(RuntimeDeepModel::TabNet(cast_module_float_tensors(
-                self.tabnet_config(input_dim).init::<InferBackend>(&device),
+                self.tabnet_config(input_dim).init(&device),
                 runtime_dtype,
             ))),
             DeepModelKind::Kan => Ok(RuntimeDeepModel::Kan(cast_module_float_tensors(
-                self.kan_config(input_dim).init::<InferBackend>(&device),
+                self.kan_config(input_dim).init(&device),
                 runtime_dtype,
             ))),
             DeepModelKind::Transformer => {
                 Ok(RuntimeDeepModel::Transformer(cast_module_float_tensors(
                     self.transformer_config(input_dim)
-                        .init::<InferBackend>(&device),
+                        .init(&device),
                     runtime_dtype,
                 )))
             }
             DeepModelKind::PatchTst => Ok(RuntimeDeepModel::PatchTst(cast_module_float_tensors(
                 self.patchtst_config(input_dim)
-                    .init::<InferBackend>(&device),
+                    .init(&device),
                 runtime_dtype,
             ))),
             DeepModelKind::TimesNet => Ok(RuntimeDeepModel::TimesNet(cast_module_float_tensors(
                 self.timesnet_config(input_dim)
-                    .init::<InferBackend>(&device),
+                    .init(&device),
                 runtime_dtype,
             ))),
         }
@@ -902,9 +915,9 @@ impl BurnDeepExpert {
         let (device, device_selection) = resolve_train_device(&requested_device);
         match self.kind {
             DeepModelKind::Mlp => {
-                let model = self.mlp_config(input_dim).init::<TrainBackend>(&device);
+                let model = self.mlp_config(input_dim).init(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<_>(
                         model,
                         features,
                         labels,
@@ -923,9 +936,9 @@ impl BurnDeepExpert {
                 ))
             }
             DeepModelKind::NBeats => {
-                let model = self.nbeats_config(input_dim).init::<TrainBackend>(&device);
+                let model = self.nbeats_config(input_dim).init(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<_>(
                         model,
                         features,
                         labels,
@@ -946,9 +959,9 @@ impl BurnDeepExpert {
             DeepModelKind::NBeatsxNf => {
                 let model = self
                     .nbeatsx_nf_config(input_dim)
-                    .init::<TrainBackend>(&device);
+                    .init(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<_>(
                         model,
                         features,
                         labels,
@@ -967,9 +980,9 @@ impl BurnDeepExpert {
                 ))
             }
             DeepModelKind::TiDE => {
-                let model = self.tide_config(input_dim).init::<TrainBackend>(&device);
+                let model = self.tide_config(input_dim).init(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<_>(
                         model,
                         features,
                         labels,
@@ -988,9 +1001,9 @@ impl BurnDeepExpert {
                 ))
             }
             DeepModelKind::TiDENf => {
-                let model = self.tide_nf_config(input_dim).init::<TrainBackend>(&device);
+                let model = self.tide_nf_config(input_dim).init(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<_>(
                         model,
                         features,
                         labels,
@@ -1009,9 +1022,9 @@ impl BurnDeepExpert {
                 ))
             }
             DeepModelKind::TabNet => {
-                let model = self.tabnet_config(input_dim).init::<TrainBackend>(&device);
+                let model = self.tabnet_config(input_dim).init(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<_>(
                         model,
                         features,
                         labels,
@@ -1030,9 +1043,9 @@ impl BurnDeepExpert {
                 ))
             }
             DeepModelKind::Kan => {
-                let model = self.kan_config(input_dim).init::<TrainBackend>(&device);
+                let model = self.kan_config(input_dim).init(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<_>(
                         model,
                         features,
                         labels,
@@ -1053,9 +1066,9 @@ impl BurnDeepExpert {
             DeepModelKind::Transformer => {
                 let model = self
                     .transformer_config(input_dim)
-                    .init::<TrainBackend>(&device);
+                    .init(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<_>(
                         model,
                         features,
                         labels,
@@ -1076,9 +1089,9 @@ impl BurnDeepExpert {
             DeepModelKind::PatchTst => {
                 let model = self
                     .patchtst_config(input_dim)
-                    .init::<TrainBackend>(&device);
+                    .init(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<_>(
                         model,
                         features,
                         labels,
@@ -1099,9 +1112,9 @@ impl BurnDeepExpert {
             DeepModelKind::TimesNet => {
                 let model = self
                     .timesnet_config(input_dim)
-                    .init::<TrainBackend>(&device);
+                    .init(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<_>(
                         model,
                         features,
                         labels,
@@ -1606,9 +1619,14 @@ impl ExpertModel for BurnDeepExpert {
         next_state.validate_model_params()?;
         let next_model = next_state.init_runtime_model(next_feature_columns.len())?;
 
-        let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
-        let base_path = Self::model_record_path(path);
-        let (device, host_runtime_selection) = next_state.resolve_runtime_infer_device();
+        // burn 0.22: `try_load_file` is the fallible loader; it takes neither a
+        // recorder nor a device (the module already knows the device it was
+        // initialised on), and the path is the file, extension included.
+        let base_path = Self::model_record_path(path).with_extension(RECORD_EXTENSION);
+        // The device no longer participates in loading (0.22 records carry the
+        // dtype and the module already sits on its device); it is resolved here
+        // solely to produce `host_runtime_selection` for the drift check below.
+        let (_device, host_runtime_selection) = next_state.resolve_runtime_infer_device();
         if let Some(persisted_runtime_selection) = next_state.persisted_runtime_selection.as_ref()
             && (persisted_runtime_selection.requested_policy
                 != host_runtime_selection.requested_policy
@@ -1627,52 +1645,62 @@ impl ExpertModel for BurnDeepExpert {
         let loaded = match next_model {
             RuntimeDeepModel::Mlp(model) => RuntimeDeepModel::Mlp(
                 model
-                    .load_file(base_path.clone(), &recorder, &device)
+                    .try_load_file(base_path.clone())
+                    .map_err(|error| anyhow::anyhow!("{error}"))
                     .with_context(|| format!("load {} Burn record", self.model_name()))?,
             ),
             RuntimeDeepModel::NBeats(model) => RuntimeDeepModel::NBeats(
                 model
-                    .load_file(base_path.clone(), &recorder, &device)
+                    .try_load_file(base_path.clone())
+                    .map_err(|error| anyhow::anyhow!("{error}"))
                     .with_context(|| format!("load {} Burn record", self.model_name()))?,
             ),
             RuntimeDeepModel::NBeatsxNf(model) => RuntimeDeepModel::NBeatsxNf(
                 model
-                    .load_file(base_path.clone(), &recorder, &device)
+                    .try_load_file(base_path.clone())
+                    .map_err(|error| anyhow::anyhow!("{error}"))
                     .with_context(|| format!("load {} Burn record", self.model_name()))?,
             ),
             RuntimeDeepModel::TiDE(model) => RuntimeDeepModel::TiDE(
                 model
-                    .load_file(base_path.clone(), &recorder, &device)
+                    .try_load_file(base_path.clone())
+                    .map_err(|error| anyhow::anyhow!("{error}"))
                     .with_context(|| format!("load {} Burn record", self.model_name()))?,
             ),
             RuntimeDeepModel::TiDENf(model) => RuntimeDeepModel::TiDENf(
                 model
-                    .load_file(base_path.clone(), &recorder, &device)
+                    .try_load_file(base_path.clone())
+                    .map_err(|error| anyhow::anyhow!("{error}"))
                     .with_context(|| format!("load {} Burn record", self.model_name()))?,
             ),
             RuntimeDeepModel::TabNet(model) => RuntimeDeepModel::TabNet(
                 model
-                    .load_file(base_path.clone(), &recorder, &device)
+                    .try_load_file(base_path.clone())
+                    .map_err(|error| anyhow::anyhow!("{error}"))
                     .with_context(|| format!("load {} Burn record", self.model_name()))?,
             ),
             RuntimeDeepModel::Kan(model) => RuntimeDeepModel::Kan(
                 model
-                    .load_file(base_path.clone(), &recorder, &device)
+                    .try_load_file(base_path.clone())
+                    .map_err(|error| anyhow::anyhow!("{error}"))
                     .with_context(|| format!("load {} Burn record", self.model_name()))?,
             ),
             RuntimeDeepModel::Transformer(model) => RuntimeDeepModel::Transformer(
                 model
-                    .load_file(base_path, &recorder, &device)
+                    .try_load_file(&base_path)
+                    .map_err(|error| anyhow::anyhow!("{error}"))
                     .with_context(|| format!("load {} Burn record", self.model_name()))?,
             ),
             RuntimeDeepModel::PatchTst(model) => RuntimeDeepModel::PatchTst(
                 model
-                    .load_file(base_path.clone(), &recorder, &device)
+                    .try_load_file(base_path.clone())
+                    .map_err(|error| anyhow::anyhow!("{error}"))
                     .with_context(|| format!("load {} Burn record", self.model_name()))?,
             ),
             RuntimeDeepModel::TimesNet(model) => RuntimeDeepModel::TimesNet(
                 model
-                    .load_file(base_path, &recorder, &device)
+                    .try_load_file(&base_path)
+                    .map_err(|error| anyhow::anyhow!("{error}"))
                     .with_context(|| format!("load {} Burn record", self.model_name()))?,
             ),
         };

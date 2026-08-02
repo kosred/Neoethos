@@ -58,11 +58,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use burn::module::AutodiffModule;
 use burn::nn;
-use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+// burn 0.22: see the note in exit_agent.rs — `OptimizerAdaptor` became
+// `ModuleOptimizer` and `burn::record` became `burn::store`.
+use burn::optim::{AdamWConfig, GradientsParams, ModuleOptimizer};
 use burn::prelude::*;
-use burn::record::{DefaultFileRecorder, FullPrecisionSettings};
-use burn::tensor::backend::BackendTypes;
 
 use polars::prelude::{DataFrame, Series};
 use serde::{Deserialize, Serialize};
@@ -72,7 +71,7 @@ use crate::base::{
     build_runtime_prediction_with_details, canonical_three_class_label_mapping,
     three_class_runtime_confidence, try_build_runtime_artifact_metadata,
 };
-use crate::burn_models::{TrainBackend, resolve_train_device};
+use crate::burn_models::resolve_train_device;
 use crate::rl::{TradingEpisode, build_training_episodes_public};
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
@@ -91,18 +90,18 @@ const NUM_ACTIONS: usize = 3;
 
 /// Actor π(·|s): emits 3 logits → categorical policy over actions.
 #[derive(Module, Debug)]
-pub struct SacActorNet<B: Backend> {
-    fc1: nn::Linear<B>,
-    fc2: nn::Linear<B>,
-    head: nn::Linear<B>,
+pub struct SacActorNet {
+    fc1: nn::Linear,
+    fc2: nn::Linear,
+    head: nn::Linear,
 }
 
 /// Critic Q(s): emits a length-3 vector of action-values.
 #[derive(Module, Debug)]
-pub struct SacCriticNet<B: Backend> {
-    fc1: nn::Linear<B>,
-    fc2: nn::Linear<B>,
-    head: nn::Linear<B>,
+pub struct SacCriticNet {
+    fc1: nn::Linear,
+    fc2: nn::Linear,
+    head: nn::Linear,
 }
 
 /// Learnable log-temperature `log_alpha` (single scalar parameter).
@@ -110,8 +109,8 @@ pub struct SacCriticNet<B: Backend> {
 /// Wrapped in a [`Module`] so AdamW can optimize it through the same
 /// `GradientsParams` pattern used for the networks.
 #[derive(Module, Debug)]
-pub struct SacTemperature<B: Backend> {
-    log_alpha: nn::Linear<B>,
+pub struct SacTemperature {
+    log_alpha: nn::Linear,
 }
 
 #[derive(Config, Debug)]
@@ -123,7 +122,7 @@ pub struct SacNetConfig {
 }
 
 impl SacNetConfig {
-    pub fn init_actor<B: Backend>(&self, device: &B::Device) -> SacActorNet<B> {
+    pub fn init_actor(&self, device: &Device) -> SacActorNet {
         SacActorNet {
             fc1: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
             fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
@@ -131,7 +130,7 @@ impl SacNetConfig {
         }
     }
 
-    pub fn init_critic<B: Backend>(&self, device: &B::Device) -> SacCriticNet<B> {
+    pub fn init_critic(&self, device: &Device) -> SacCriticNet {
         SacCriticNet {
             fc1: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
             fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
@@ -140,31 +139,31 @@ impl SacNetConfig {
     }
 }
 
-impl<B: Backend> SacActorNet<B> {
+impl SacActorNet {
     /// Raw actor logits, shape `[batch, 3]`.
-    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward(&self, x: Tensor<2>) -> Tensor<2> {
         let h = burn::tensor::activation::relu(self.fc1.forward(x));
         let h = burn::tensor::activation::relu(self.fc2.forward(h));
         self.head.forward(h)
     }
 
     /// Policy probabilities `softmax(logits)`, shape `[batch, 3]`.
-    pub fn policy(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn policy(&self, x: Tensor<2>) -> Tensor<2> {
         burn::tensor::activation::softmax(self.forward(x), 1)
     }
 }
 
-impl<B: Backend> SacCriticNet<B> {
+impl SacCriticNet {
     /// Action-value vector `Q(s, ·)`, shape `[batch, 3]`.
-    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward(&self, x: Tensor<2>) -> Tensor<2> {
         let h = burn::tensor::activation::relu(self.fc1.forward(x));
         let h = burn::tensor::activation::relu(self.fc2.forward(h));
         self.head.forward(h)
     }
 }
 
-impl<B: Backend> SacTemperature<B> {
-    fn init(device: &B::Device, init_log_alpha: f32) -> Self {
+impl SacTemperature {
+    fn init(device: &Device, init_log_alpha: f32) -> Self {
         // A 1->1 Linear with zero weight is a trainable scalar bias.
         // Seed the bias to the requested initial log_alpha and freeze
         // the weight at zero so the only learnable degree of freedom is
@@ -186,13 +185,13 @@ impl<B: Backend> SacTemperature<B> {
 
     /// `log_alpha` as a `[1, 1]` tensor evaluated at the constant input
     /// `1.0` (weight is zero so this is exactly the trainable bias).
-    fn log_alpha(&self, device: &B::Device) -> Tensor<B, 2> {
-        let one = Tensor::<B, 2>::ones([1, 1], device);
+    fn log_alpha(&self, device: &Device) -> Tensor<2> {
+        let one = Tensor::<2>::ones([1, 1], device);
         self.log_alpha.forward(one)
     }
 
     /// Scalar `alpha = exp(log_alpha)` value (read off the graph).
-    fn alpha_value(&self, device: &B::Device) -> Result<f32> {
+    fn alpha_value(&self, device: &Device) -> Result<f32> {
         let log_alpha = self
             .log_alpha(device)
             .into_data()
@@ -617,20 +616,23 @@ fn resolve_sac_runtime_metadata(
 // SOFT ACTOR-CRITIC
 // ============================================================================
 
-type SacOptim<M> = OptimizerAdaptor<burn::optim::AdamW, M, TrainBackend>;
+// burn 0.22: the optimizer no longer carries the module or the backend in
+// its type. `AdamWConfig::init()` returns a `ModuleOptimizer` that steps any
+// `AutodiffModule`, so the `<M>` parameter has nothing left to bind.
+type SacOptim = ModuleOptimizer;
 
 /// Pure-Rust Burn discrete Soft Actor-Critic agent.
 pub struct SoftActorCritic {
-    actor: SacActorNet<TrainBackend>,
-    critic1: SacCriticNet<TrainBackend>,
-    critic2: SacCriticNet<TrainBackend>,
-    target_critic1: SacCriticNet<TrainBackend>,
-    target_critic2: SacCriticNet<TrainBackend>,
-    temperature: SacTemperature<TrainBackend>,
-    actor_optim: SacOptim<SacActorNet<TrainBackend>>,
-    critic1_optim: SacOptim<SacCriticNet<TrainBackend>>,
-    critic2_optim: SacOptim<SacCriticNet<TrainBackend>>,
-    alpha_optim: SacOptim<SacTemperature<TrainBackend>>,
+    actor: SacActorNet,
+    critic1: SacCriticNet,
+    critic2: SacCriticNet,
+    target_critic1: SacCriticNet,
+    target_critic2: SacCriticNet,
+    temperature: SacTemperature,
+    actor_optim: SacOptim,
+    critic1_optim: SacOptim,
+    critic2_optim: SacOptim,
+    alpha_optim: SacOptim,
 
     state_dim: usize,
     hidden_dim: usize,
@@ -654,7 +656,7 @@ pub struct SoftActorCritic {
     training_report: Option<SacTrainingReport>,
     trained_checkpoint_ready: bool,
 
-    device: <TrainBackend as BackendTypes>::Device,
+    device: Device,
     requested_device_policy: String,
     effective_device_policy: String,
     execution_backend: String,
@@ -818,19 +820,19 @@ impl SoftActorCritic {
             }
         }
 
-        let states: Tensor<TrainBackend, 2> = Tensor::from_data(
+        let states: Tensor<2> = Tensor::from_data(
             TensorData::new(states_flat, [batch_size, self.state_dim]),
             &device,
         );
-        let next_states: Tensor<TrainBackend, 2> = Tensor::from_data(
+        let next_states: Tensor<2> = Tensor::from_data(
             TensorData::new(next_states_flat, [batch_size, self.state_dim]),
             &device,
         );
-        let rewards: Tensor<TrainBackend, 2> = Tensor::from_data(
+        let rewards: Tensor<2> = Tensor::from_data(
             TensorData::new(rewards_flat, [batch_size, NUM_ACTIONS]),
             &device,
         );
-        let not_done: Tensor<TrainBackend, 2> = Tensor::from_data(
+        let not_done: Tensor<2> = Tensor::from_data(
             TensorData::new(not_done_flat, [batch_size, NUM_ACTIONS]),
             &device,
         );
@@ -871,7 +873,7 @@ impl SoftActorCritic {
         let grads_params = GradientsParams::from_grads(grads, &self.critic1);
         self.critic1 = self
             .critic1_optim
-            .step(self.learning_rate, self.critic1.clone(), grads_params);
+            .step(self.learning_rate.into(), self.critic1.clone(), grads_params);
 
         let q2_pred = self.critic2.forward(states.clone());
         let critic2_loss = burn::nn::loss::MseLoss::new().forward(
@@ -885,7 +887,7 @@ impl SoftActorCritic {
         let grads_params = GradientsParams::from_grads(grads, &self.critic2);
         self.critic2 = self
             .critic2_optim
-            .step(self.learning_rate, self.critic2.clone(), grads_params);
+            .step(self.learning_rate.into(), self.critic2.clone(), grads_params);
 
         // ---- Actor loss & update ----
         // L_π = Σ_a p(a)·[ α·logp(a) − min(Q1,Q2)(s,a) ]  (Q detached)
@@ -904,7 +906,7 @@ impl SoftActorCritic {
         let grads_params = GradientsParams::from_grads(grads, &self.actor);
         self.actor = self
             .actor_optim
-            .step(self.learning_rate, self.actor.clone(), grads_params);
+            .step(self.learning_rate.into(), self.actor.clone(), grads_params);
 
         // ---- Temperature (entropy) loss & update ----
         // L_α = − Σ_a p(a)·log_alpha·( logp(a).detach + H )
@@ -923,7 +925,7 @@ impl SoftActorCritic {
         let grads_params = GradientsParams::from_grads(grads, &self.temperature);
         self.temperature =
             self.alpha_optim
-                .step(self.learning_rate, self.temperature.clone(), grads_params);
+                .step(self.learning_rate.into(), self.temperature.clone(), grads_params);
 
         // ---- Polyak target update ----
         self.soft_update_targets();
@@ -1129,7 +1131,7 @@ impl SoftActorCritic {
             );
         }
         let scaled = self.preprocess_state(state)?;
-        let state_tensor = Tensor::<TrainBackend, 1>::from_data(
+        let state_tensor = Tensor::<1>::from_data(
             TensorData::new(scaled, [self.state_dim]),
             &self.device,
         )
@@ -1296,6 +1298,24 @@ impl SoftActorCritic {
         path.join("temperature")
     }
 
+    // burn 0.22 writes exactly the path it is given — `DefaultFileRecorder`
+    // used to append `.mpk` for us. These four name the real files.
+    fn actor_record_path(path: &Path) -> PathBuf {
+        Self::actor_record_base(path).with_extension(crate::deep_models::RECORD_EXTENSION)
+    }
+
+    fn critic1_record_path(path: &Path) -> PathBuf {
+        Self::critic1_record_base(path).with_extension(crate::deep_models::RECORD_EXTENSION)
+    }
+
+    fn critic2_record_path(path: &Path) -> PathBuf {
+        Self::critic2_record_base(path).with_extension(crate::deep_models::RECORD_EXTENSION)
+    }
+
+    fn temperature_record_path(path: &Path) -> PathBuf {
+        Self::temperature_record_base(path).with_extension(crate::deep_models::RECORD_EXTENSION)
+    }
+
     fn artifact_path(path: &Path) -> PathBuf {
         path.join("config.json")
     }
@@ -1312,26 +1332,29 @@ impl SoftActorCritic {
             .with_context(|| format!("create staged sac directory {}", staged_path.display()))?;
 
         if let Err(error) = (|| -> Result<()> {
-            let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
             self.actor
                 .clone()
                 .valid()
-                .save_file(Self::actor_record_base(&staged_path), &recorder)
+                .save_file(Self::actor_record_path(&staged_path))
+                .map_err(|error| anyhow::anyhow!("{error}"))
                 .with_context(|| format!("persist sac actor to {}", staged_path.display()))?;
             self.critic1
                 .clone()
                 .valid()
-                .save_file(Self::critic1_record_base(&staged_path), &recorder)
+                .save_file(Self::critic1_record_path(&staged_path))
+                .map_err(|error| anyhow::anyhow!("{error}"))
                 .with_context(|| format!("persist sac critic1 to {}", staged_path.display()))?;
             self.critic2
                 .clone()
                 .valid()
-                .save_file(Self::critic2_record_base(&staged_path), &recorder)
+                .save_file(Self::critic2_record_path(&staged_path))
+                .map_err(|error| anyhow::anyhow!("{error}"))
                 .with_context(|| format!("persist sac critic2 to {}", staged_path.display()))?;
             self.temperature
                 .clone()
                 .valid()
-                .save_file(Self::temperature_record_base(&staged_path), &recorder)
+                .save_file(Self::temperature_record_path(&staged_path))
+                .map_err(|error| anyhow::anyhow!("{error}"))
                 .with_context(|| {
                     format!("persist sac temperature to {}", staged_path.display())
                 })?;
@@ -1382,24 +1405,27 @@ impl SoftActorCritic {
             );
         }
 
-        let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
         let cfg = SacNetConfig::new()
             .with_input_dim(artifact.state_dim)
             .with_hidden_dim(artifact.hidden_dim);
         let actor = cfg
             .init_actor(&device)
-            .load_file(Self::actor_record_base(path), &recorder, &device)
+            .try_load_file(Self::actor_record_path(path))
+            .map_err(|error| anyhow::anyhow!("{error}"))
             .with_context(|| format!("load sac actor from {}", path.display()))?;
         let critic1 = cfg
             .init_critic(&device)
-            .load_file(Self::critic1_record_base(path), &recorder, &device)
+            .try_load_file(Self::critic1_record_path(path))
+            .map_err(|error| anyhow::anyhow!("{error}"))
             .with_context(|| format!("load sac critic1 from {}", path.display()))?;
         let critic2 = cfg
             .init_critic(&device)
-            .load_file(Self::critic2_record_base(path), &recorder, &device)
+            .try_load_file(Self::critic2_record_path(path))
+            .map_err(|error| anyhow::anyhow!("{error}"))
             .with_context(|| format!("load sac critic2 from {}", path.display()))?;
         let temperature = SacTemperature::init(&device, artifact.init_log_alpha)
-            .load_file(Self::temperature_record_base(path), &recorder, &device)
+            .try_load_file(Self::temperature_record_path(path))
+            .map_err(|error| anyhow::anyhow!("{error}"))
             .with_context(|| format!("load sac temperature from {}", path.display()))?;
 
         Ok(Self {
@@ -1448,7 +1474,7 @@ impl SoftActorCritic {
 // ============================================================================
 
 /// Elementwise `min(a, b)` for two same-shape tensors.
-fn tensor_min<B: Backend>(a: Tensor<B, 2>, b: Tensor<B, 2>) -> Tensor<B, 2> {
+fn tensor_min(a: Tensor<2>, b: Tensor<2>) -> Tensor<2> {
     // min(a,b) = a − relu(a − b)
     let diff = a.clone() - b;
     a - burn::tensor::activation::relu(diff)
@@ -1456,11 +1482,11 @@ fn tensor_min<B: Backend>(a: Tensor<B, 2>, b: Tensor<B, 2>) -> Tensor<B, 2> {
 
 /// Polyak (soft) update: `dst ← τ·src + (1−τ)·dst`, applied to every
 /// float parameter tensor of the critic module.
-fn polyak_update<B: Backend>(
-    dst: SacCriticNet<B>,
-    src: &SacCriticNet<B>,
+fn polyak_update(
+    dst: SacCriticNet,
+    src: &SacCriticNet,
     tau: f32,
-) -> SacCriticNet<B> {
+) -> SacCriticNet {
     let SacCriticNet { fc1, fc2, head } = dst;
     SacCriticNet {
         fc1: blend_linear(fc1, &src.fc1, tau),
@@ -1469,7 +1495,7 @@ fn polyak_update<B: Backend>(
     }
 }
 
-fn blend_linear<B: Backend>(dst: nn::Linear<B>, src: &nn::Linear<B>, tau: f32) -> nn::Linear<B> {
+fn blend_linear(dst: nn::Linear, src: &nn::Linear, tau: f32) -> nn::Linear {
     let mut out = dst;
     // detach so the target network is a non-differentiable copy.
     let new_weight =
@@ -1482,8 +1508,8 @@ fn blend_linear<B: Backend>(dst: nn::Linear<B>, src: &nn::Linear<B>, tau: f32) -
     out
 }
 
-fn scalar_from_tensor<B: Backend, const D: usize>(
-    tensor: Tensor<B, D>,
+fn scalar_from_tensor<const D: usize>(
+    tensor: Tensor<D>,
     context: &str,
 ) -> Result<f32> {
     let values = tensor

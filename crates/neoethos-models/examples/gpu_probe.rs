@@ -31,14 +31,12 @@
 use std::time::Instant;
 
 use burn::tensor::{Distribution, Tensor};
-use neoethos_models::burn_models::{
-    InferBackend, active_burn_backend_name, default_infer_device,
-};
+use neoethos_models::burn_models::{active_burn_backend_name, default_infer_device};
 
 fn main() {
-    // Backend identity — the easy half. Either "vulkan_wgpu" (or
-    // "wgpu" depending on the burn version) or "ndarray_cpu". Picked
-    // by Cargo features at compile time.
+    // Which accelerator family this binary is ABLE to use (a compile-time
+    // property since burn 0.22). What it actually GOT is the device printed
+    // below, which the runtime resolved by asking the machine.
     println!("backend       = {}", active_burn_backend_name());
 
     // Device handle. Under wgpu this prints a `WgpuDevice` enum that
@@ -63,8 +61,8 @@ fn main() {
     // hot path anyway.
     const N: usize = 256;
     let shape = [N, N];
-    let a: Tensor<InferBackend, 2> = Tensor::random(shape, Distribution::Default, &device);
-    let b: Tensor<InferBackend, 2> = Tensor::random(shape, Distribution::Default, &device);
+    let a: Tensor<2> = Tensor::random(shape, Distribution::Default, &device);
+    let b: Tensor<2> = Tensor::random(shape, Distribution::Default, &device);
 
     // Warm-up pass. First wgpu kernel call triggers shader compile
     // (SPIR-V codegen + driver upload) which can take 500ms-2s on a
