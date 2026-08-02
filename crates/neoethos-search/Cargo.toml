@@ -7,18 +7,24 @@ license.workspace = true
 [dependencies]
 anyhow = "1.0.100"
 chrono = "0.4.44"
-# cubecl 0.10 — pure defaults; runtime selection happens downstream.
+# cubecl 0.11 — pure defaults; runtime selection happens downstream.
 # See neoethos-models/Cargo.toml for the full reasoning (AMD Vulkan
 # SPIR-V driver crash avoidance).
-cubecl = { version = "0.10.0", optional = true }
+#
+# Moved 0.10.0 → 0.11.0-pre.1 in lockstep with the burn 0.22.0-pre.1 bump.
+# This is NOT optional: burn-cuda/burn-wgpu 0.22.0-pre.1 pin `=0.11.0-pre.1`,
+# and leaving this crate on 0.10 would put TWO semver-incompatible cubecl
+# runtimes in one process — two kernel compilers, two memory pools, two
+# device registries on the same card.
+cubecl = { version = "0.11.0-pre.1", optional = true }
 # AREA 1 (2026-06-09): direct handle on the cubecl memory-management types
 # (`MemoryConfiguration::Custom` / `MemoryPoolOptions` / `PoolType`) used to inject
 # a BOUNDED wgpu pool in `create_gpu_client`. cubecl/cubecl-wgpu only re-export
 # `MemoryConfiguration` (cubecl-wgpu runtime.rs:15) — the pool-option structs are
 # NOT re-exported, so we name `cubecl_runtime` directly. Version pinned to the same
-# 0.10.0 the cubecl umbrella resolves (Cargo.lock) so there is one copy in the graph.
-# Optional + gated to `gpu` so the non-GPU build never pulls it.
-cubecl-runtime = { version = "0.10.0", optional = true }
+# 0.11.0-pre.1 the cubecl umbrella resolves (Cargo.lock) so there is one copy in the
+# graph. Optional + gated to `gpu` so the non-GPU build never pulls it.
+cubecl-runtime = { version = "0.11.0-pre.1", optional = true }
 ndarray = { version = "0.17.2", features = ["rayon"] }
 half = { version = "2.5", optional = true, default-features = true, features = ["alloc", "num-traits"] }
 itertools = "0.14.0"
