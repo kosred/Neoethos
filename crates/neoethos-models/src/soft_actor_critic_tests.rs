@@ -11,7 +11,6 @@ use super::{
     NUM_ACTIONS, SacNetConfig, SacTuple, SoftActorCritic, average_rewards, default_target_entropy,
     tuples_from_episodes,
 };
-use crate::burn_models::InferBackend;
 use crate::rl::TradingTransition;
 use anyhow::Result;
 use burn::prelude::*;
@@ -85,8 +84,11 @@ fn trained_agent(rows: usize) -> SoftActorCritic {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn actor_policy_is_a_valid_probability_simplex_inferbackend() {
-    // Pure-tensor test on InferBackend (no autodiff) — proves the
+fn actor_policy_is_a_valid_probability_simplex_on_plain_device() {
+    // Pure-tensor test on a PLAIN device — one that has not had
+    // `.autodiff()` applied. In 0.21 this was the `InferBackend` type; in
+    // 0.22 autodiff is a property of the device, so "inference backend"
+    // is just `Device::default()` without the autodiff wrapper. Proves the
     // softmax head always emits a normalized, non-negative 3-simplex.
     let device = Device::default();
     let actor = SacNetConfig::new()
@@ -216,7 +218,7 @@ fn q_values_move_toward_observed_rewards() -> Result<()> {
     }
 
     let device = agent.device.clone();
-    let state_tensor = Tensor::<crate::burn_models::TrainBackend, 1>::from_data(
+    let state_tensor = Tensor::<1>::from_data(
         TensorData::new(state.clone(), [4]),
         &device,
     )

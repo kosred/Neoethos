@@ -48,7 +48,9 @@
 //!
 //! ## Conventions mirrored from [`crate::exit_agent`]
 //!
-//! `TrainBackend`/`InferBackend` aliases, AdamW via `OptimizerAdaptor`,
+//! runtime device selection (burn 0.22 removed the `TrainBackend`/
+//! `InferBackend` compile-time aliases — autodiff is now a property of the
+//! device, applied with `.autodiff()`), AdamW via `OptimizerAdaptor`,
 //! `GradientsParams` update pattern, deterministic seeded init, atomic
 //! staged artifact save + `load`, fail-loud `bail!`/`Context`, runtime
 //! metadata via `try_build_runtime_artifact_metadata`.

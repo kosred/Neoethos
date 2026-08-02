@@ -2961,7 +2961,10 @@ mod tests {
             &device,
             Some("bf16"),
         );
-        if <TrainBackend as Backend>::supports_dtype(&device, DType::BF16) {
+        // 0.22: dtype support is a property of the DEVICE, not of a backend
+        // type. This is the same call the resolver under test makes, so the
+        // assertion tracks the resolver instead of a separate hardcoded guess.
+        if device.supports_dtype(DType::BF16) {
             assert_eq!(precision, BurnExecutionPrecision::Bf16);
             assert!(reason.is_none());
         } else {
