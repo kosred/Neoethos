@@ -190,16 +190,50 @@ gpu-cuda = [
     "neoethos-core/gpu-cuda",
     "neuro-evolution",
     "dep:cubecl",
-    # NOTE: `burn-cuda-backend` is deliberately NOT enabled here. Empirically
-    # (2026-06-10, A6000) burn-cuda 0.21 is pathological for our TINY neural
-    # models: cubecl re-autotunes every distinct matmul shape (338 autotune
-    # passes vs 14 real epochs in 74 min on one combo) and hits burn-tensor
-    # dtype panics. These models train in ~17 min TOTAL on burn-ndarray (CPU)
-    # and are stable. The GPU's job in this system is DISCOVERY (large batched
-    # backtests); the tiny per-model matmuls are launch/autotune-bound and
-    # belong on the CPU. The dep + `burn-cuda-backend` feature are kept so a
-    # future build with genuinely large models can opt in via
-    # `--features gpu-cuda,burn-cuda-backend`.
+    # `burn-cuda-backend` IS enabled here now. Operator instruction: the
+    # backend must be chosen at RUNTIME from the hardware present, not frozen
+    # at build time.
+    #
+    # What this feature meant BEFORE and what it means NOW are different
+    # things, and the old comment (kept below, because the measurement in it
+    # is real) was arguing against the old meaning.
+    #
+    #   BEFORE (burn 0.21): enabling it made `Cuda<f32,i32>` THE backend type
+    #   for every burn model in the binary. There was no fallback. On the
+    #   A6000, 2026-06-10, that was measured to be pathological for our tiny
+    #   nets — cubecl re-autotuned every distinct matmul shape (338 autotune
+    #   passes against 14 real epochs in 74 minutes on one combo) and hit
+    #   burn-tensor dtype panics, while the same models finished in ~17 min
+    #   TOTAL on burn-ndarray. So it was correctly left off.
+    #
+    #   NOW (burn 0.22): it only makes `Device::cuda()` EXIST. Which device a
+    #   run uses is decided by `resolve_device_policy` in burn_models.rs from
+    #   the device policy plus what `Device::enumerate` actually finds.
+    #
+    # CAREFUL — the shipped default IS `auto`, not `cpu`. `deep_models.rs:783`
+    # falls back to `string_param("device", "auto")`, and
+    # `ExitAgent::with_hidden_dim` / `SoftActorCritic::with_hidden_dim` pass
+    # `"auto"` literally. So "the default resolves to CPU" is NOT something
+    # this feature gets for free — `enumerate_accelerator` answers for `auto`
+    # too, and on any host with a working driver `auto` would have taken the
+    # card the moment this feature went on.
+    #
+    # It is made true on purpose instead: `enumerate_accelerator` skips the
+    # CUDA branch when the policy is `auto`. The capability is fully built and
+    # reachable; it just has to be ASKED for. See the "Why `auto` does not take
+    # a CUDA device" note on that function, and the test
+    # `auto_policy_stays_on_cpu_while_explicit_gpu_may_take_cuda` which pins it.
+    #
+    # THE FLIP, stated plainly: the config value that changes what runs where
+    # is the burn device policy — the per-model `device` param (equivalently
+    # `with_device_policy`), "auto" | "cpu" | "gpu" | "cuda" | "gpu:N".
+    # Setting it to `gpu` on a gpu-cuda build is what puts burn training on
+    # the card. Today's behaviour is unchanged because the default is `auto`
+    # and `auto` is gated.
+    #
+    # The autotune cost above has NOT been re-measured on burn 0.22 /
+    # cubecl 0.11. Treat it as an open question, not as a settled objection.
+    "burn-cuda-backend",
     "statistical-models",
     # LightGBM is CPU-only by design: `lightgbm3/cuda` does NOT actually build a
     # GPU tree learner (runtime dies with "[LightGBM] [Fatal] GPU Tree Learner
