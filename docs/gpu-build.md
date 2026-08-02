@@ -32,7 +32,7 @@ This combination is deliberate (see "Why this exact feature combo"):
 | On GPU (A6000) | On CPU |
 |---|---|
 | Discovery GA kernel (Vulkan/cubecl-wgpu) | xgboost / xgboost_rf / xgboost_dart (the `xgb` crate has no GPU build wired here) |
-| burn deep models: mlp, kan, tabnet, nbeats, nbeatsx_nf, tide, tide_nf, transformer, patchtst, timesnet (Vulkan/burn-wgpu) | sklears_tree |
+| burn deep models: mlp, kan, tabnet, nbeats, nbeatsx_nf, tide, tide_nf, transformer, patchtst, timesnet (Vulkan/burn-wgpu) — on a CUDA-only build these stay on CPU **until the device policy says `gpu`**, see gotcha 1 | sklears_tree |
 | lightgbm, catboost, catboost_alt (CUDA) | a few custom CPU-only: online_pa/hoeffding, meta_blender/stack, probability_calibrator, conformal_gate |
 | dqn / candle / rlkit (CUDA) | |
 | neat, statistical (cubecl) | |
@@ -48,10 +48,38 @@ This combination is deliberate (see "Why this exact feature combo"):
 
 ## Why this exact feature combo (the gotchas)
 
-1. **`burn` deep models only GPU via `burn-wgpu` (= `gpu-vulkan`).** There is no
-   wired burn-CUDA/burn-tch backend in this repo (`burn_models.rs` gates the GPU
-   backend on `#[cfg(feature = "burn-wgpu-backend")]` only). So **`gpu-cuda`
-   alone leaves every deep model on CPU.** You need `gpu-vulkan` for them.
+1. **`burn` deep models now reach CUDA too — but only when ASKED.**
+   *(Changed 2026-08-02 with the burn 0.22 bump. What this item used to say —
+   "there is no wired burn-CUDA backend in this repo, so `gpu-cuda` alone
+   leaves every deep model on CPU" — was true until then and is why the TL;DR
+   recipe pairs `gpu-vulkan` with `neoethos-models/gpu-cuda`.)*
+
+   `gpu-cuda` now enables `burn-cuda-backend`, so a CUDA build has a
+   `Device::cuda()` to offer. Two things follow, and both matter:
+
+   - **The device is chosen at RUNTIME, not by the build.** In 0.21 the
+     backend was a TYPE, so a `gpu-cuda` binary claimed CUDA whether or not a
+     card answered. In 0.22 `resolve_device_policy` asks the machine
+     (`Device::enumerate`) and falls back to the ndarray CPU floor, recording
+     `("cpu", "ndarray_cpu")` honestly, when nothing answers.
+   - **The default is still CPU.** The shipped device policy is `auto`, and
+     `auto` is deliberately gated out of the CUDA lane
+     (`enumerate_accelerator` in `burn_models.rs`). To put burn training on
+     the card set the per-model `device` param — equivalently
+     `with_device_policy` — to `gpu`, `cuda` or `gpu:N`.
+
+   **Re-measure before you flip it.** The one measurement on record (A6000,
+   2026-06-10) found burn-cuda pathological for these tiny nets: 338 autotune
+   passes against 14 real epochs in 74 minutes on one combo, versus ~17
+   minutes TOTAL on CPU. That is burn 0.21 / cubecl 0.10 and has NOT been
+   repeated on 0.22 / cubecl 0.11. Also watch peak VRAM across the whole run
+   (`nvidia-smi --query-gpu=memory.used --format=csv,noheader -l 1`, take the
+   maximum): `cubecl.toml` no longer pins `max_streams = 1`, and burn #4991 —
+   the real fix for the multi-pool VRAM leak — landed two days after the
+   0.22.0-pre.1 cut, so it is not in this version.
+
+   `gpu-vulkan` remains the path for non-NVIDIA cards, and still drives the
+   burn models via `burn-wgpu`.
 
 2. **Keep `search` on Vulkan to avoid libtorch.** `neoethos-search/gpu-cuda`
    pulls `dep:tch` (libtorch, for CUDA device enumeration) — a ~2 GB dependency
