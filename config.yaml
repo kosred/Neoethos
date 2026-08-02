@@ -521,6 +521,25 @@ models:
   # The two backends are not bit-identical (f32 GPU reductions accumulate
   # differently), so this changes fitted weights and therefore selection.
   statistical_device: cpu
+  # The bar a discovered portfolio must clear before /strategy_lab/promotion
+  # reports it as promotable. These five numbers were HARD-CODED until
+  # 2026-08-02: the loader took Settings and ignored it, so editing config.yaml
+  # could not move the gate no matter what the docs said. The values below are
+  # exactly the ones that were compiled in, so leaving this block alone keeps
+  # today's verdicts identical.
+  #
+  # Raising any floor (or lowering max_drawdown_pct) rejects portfolios that
+  # were promoted before. Mind the units: min_win_rate is a FRACTION (0.45 =
+  # 45%), max_drawdown_pct is a PERCENTAGE (25.0 = 25%).
+  promotion_gate:
+    # false = pass-through, promote whatever discovery finds. Demo only.
+    enabled: true
+    min_sharpe: 1.0
+    min_win_rate: 0.45
+    min_profit_factor: 1.2
+    max_drawdown_pct: 25.0
+    # A stellar Sharpe over 4 trades is noise, not signal.
+    min_trades: 30
   prop_metric_weight: 1.0
   prop_accuracy_weight: 0.1
   prop_min_trades: 0

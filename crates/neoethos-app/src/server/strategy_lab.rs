@@ -88,12 +88,33 @@ pub async fn promotion_status(
     }
 }
 
-/// Load the gate config from Settings (falls back to the moderate
-/// defaults). Currently the defaults are used directly — a future
-/// `ModelsConfig.promotion_gate` field can override them here without
-/// touching the endpoint.
-fn load_gate_config(_settings: &Settings) -> PromotionGateConfig {
-    PromotionGateConfig::default()
+/// Load the gate config from Settings.
+///
+/// This used to take `_settings` and ignore it, returning
+/// `PromotionGateConfig::default()`. The comment above it said a future
+/// `ModelsConfig.promotion_gate` field "can override them here without
+/// touching the endpoint" — that field now exists, so this reads it.
+///
+/// Until then the gate's own documentation ("Operator-tunable thresholds",
+/// "the operator via Settings can tighten them") described a capability
+/// nothing could reach: `PromotionGateConfig` was constructed exactly once in
+/// the whole workspace, here, from `::default()`. Every portfolio the
+/// operator has ever seen judged was judged against the hard-coded 1.0 / 0.45
+/// / 1.2 / 25.0 / 30, whatever config.yaml said.
+///
+/// The defaults of `PromotionGateRuntimeConfig` are those same five numbers,
+/// so this is behaviour-preserving until the operator edits
+/// `models.promotion_gate`.
+fn load_gate_config(settings: &Settings) -> PromotionGateConfig {
+    let c = &settings.models.promotion_gate;
+    PromotionGateConfig {
+        enabled: c.enabled,
+        min_sharpe: c.min_sharpe,
+        min_win_rate: c.min_win_rate,
+        min_profit_factor: c.min_profit_factor,
+        max_drawdown_pct: c.max_drawdown_pct,
+        min_trades: c.min_trades,
+    }
 }
 
 fn evaluate_promotion_for(symbol: &str, base_tf: &str) -> anyhow::Result<PromotionResponseDto> {

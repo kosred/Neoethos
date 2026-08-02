@@ -785,6 +785,10 @@ pub struct ModelsConfig {
     /// `NEOETHOS_BOT_<MODEL>_DEVICE` and `NEOETHOS_BOT_META_DEVICE` still
     /// override this, as they always have.
     pub statistical_device: String,
+    /// Thresholds for the promotion gate — the bar a discovered portfolio
+    /// must clear before it is reported as promotable. See
+    /// [`PromotionGateRuntimeConfig`].
+    pub promotion_gate: PromotionGateRuntimeConfig,
     pub prop_metric_weight: f64,
     pub prop_accuracy_weight: f64,
     pub prop_min_trades: usize,
@@ -1346,6 +1350,64 @@ impl Default for TreeRuntimeConfig {
     }
 }
 
+/// Operator-tunable thresholds for the promotion gate.
+///
+/// [`crate::domain::PromotionGateConfig`] has always documented itself as
+/// "Operator-tunable" and said "the operator via Settings can tighten them".
+/// Settings had no such field, and the single production construction was
+/// `PromotionGateConfig::default()` — so the sentence was aspirational and
+/// every portfolio was judged against hard-coded numbers. This is the field
+/// that sentence promised.
+///
+/// The two types stay separate on purpose. `PromotionGateConfig` is
+/// `camelCase` because it is echoed back to the UI as part of the promotion
+/// response DTO (so the operator sees "Sharpe 1.4 ≥ 1.0 ✓" without a second
+/// round-trip). Config keys in this file are `snake_case`. Merging them would
+/// force one of the two surfaces to change its spelling; mapping between them
+/// costs six lines in `load_gate_config` and keeps both honest.
+///
+/// **Every default here equals `PromotionGateConfig::default()`**, so a
+/// config that omits the section — or predates it — is judged by exactly the
+/// numbers it was judged by before. A `promotion_gate_config_default_matches_domain_default`
+/// test pins that, so the two cannot drift apart silently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PromotionGateRuntimeConfig {
+    /// When false the gate is a pass-through: every portfolio promotes
+    /// regardless of metrics. For demo-only experimentation.
+    pub enabled: bool,
+    /// Minimum acceptable Sharpe ratio.
+    pub min_sharpe: f64,
+    /// Minimum win rate as a FRACTION in `[0,1]` — `0.45` is 45%, not 45.
+    pub min_win_rate: f64,
+    /// Minimum profit factor (gross profit / gross loss). 1.0 is break-even
+    /// before costs, so the default asks for a margin above it.
+    pub min_profit_factor: f64,
+    /// Maximum tolerated peak-to-trough drawdown as a PERCENTAGE — `25.0` is
+    /// 25%, not 0.25. Note the unit differs from `min_win_rate` above; that
+    /// asymmetry is inherited from the domain type and its metrics, which are
+    /// produced in these units.
+    pub max_drawdown_pct: f64,
+    /// Minimum number of trades the metrics must rest on. A stellar Sharpe
+    /// over 4 trades is noise.
+    pub min_trades: u64,
+}
+
+impl Default for PromotionGateRuntimeConfig {
+    fn default() -> Self {
+        // Mirrors `PromotionGateConfig::default()` field for field. The test
+        // named in the struct docs fails if these drift.
+        Self {
+            enabled: true,
+            min_sharpe: 1.0,
+            min_win_rate: 0.45,
+            min_profit_factor: 1.2,
+            max_drawdown_pct: 25.0,
+            min_trades: 30,
+        }
+    }
+}
+
 impl Default for ModelsConfig {
     fn default() -> Self {
         let mut hpo_trials_by_model = HashMap::new();
@@ -1581,6 +1643,7 @@ impl Default for ModelsConfig {
             data_runtime: DataRuntimeConfig::default(),
             tree_runtime: TreeRuntimeConfig::default(),
             statistical_device: "cpu".to_string(),
+            promotion_gate: PromotionGateRuntimeConfig::default(),
             prop_metric_weight: 1.0,
             prop_accuracy_weight: 0.1,
             prop_min_trades: 0,
@@ -2253,6 +2316,51 @@ mod tests {
         );
         assert_eq!(settings.risk.initial_balance, 10_000.0);
         assert!(!settings.models.ml_models.is_empty());
+    }
+
+    /// The promotion gate now reads `models.promotion_gate` instead of using
+    /// the compiled-in `PromotionGateConfig::default()`. That is only
+    /// behaviour-preserving while the two defaults agree, and they live in
+    /// different modules with no compiler link between them — exactly the
+    /// shape that drifts silently. This fails the moment one side is edited
+    /// and the other is not.
+    #[test]
+    fn promotion_gate_config_default_matches_domain_default() {
+        let cfg = PromotionGateRuntimeConfig::default();
+        let domain = crate::domain::PromotionGateConfig::default();
+
+        assert_eq!(cfg.enabled, domain.enabled, "enabled drifted");
+        assert_eq!(cfg.min_sharpe, domain.min_sharpe, "min_sharpe drifted");
+        assert_eq!(cfg.min_win_rate, domain.min_win_rate, "min_win_rate drifted");
+        assert_eq!(
+            cfg.min_profit_factor, domain.min_profit_factor,
+            "min_profit_factor drifted"
+        );
+        assert_eq!(
+            cfg.max_drawdown_pct, domain.max_drawdown_pct,
+            "max_drawdown_pct drifted"
+        );
+        assert_eq!(cfg.min_trades, domain.min_trades, "min_trades drifted");
+    }
+
+    /// A config.yaml that predates `models.promotion_gate` (or omits it) must
+    /// still be judged by the numbers it was judged by before, not by
+    /// `f64::default()` = 0.0, which would promote everything. `#[serde(default)]`
+    /// on the struct is what makes that true; this pins it.
+    #[test]
+    fn promotion_gate_absent_from_yaml_keeps_the_compiled_in_bar() {
+        let models: ModelsConfig =
+            serde_yaml_ng::from_str("prop_metric_weight: 1.0").expect("minimal models config parses");
+
+        assert_eq!(
+            models.promotion_gate,
+            PromotionGateRuntimeConfig::default(),
+            "omitting the section must not zero the thresholds"
+        );
+        assert_eq!(
+            models.promotion_gate.min_trades, 30,
+            "an absent section must not let a 4-trade portfolio promote"
+        );
     }
 
     // ─── UI↔CLI parity: the shared timeframe/symbol resolvers ───────────────
