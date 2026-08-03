@@ -795,11 +795,27 @@ fn bounded_wgpu_pools(
     }
     max_sizes.reverse();
     page_sizes.reverse();
+    // cubecl-runtime 0.11 added a third field to `PoolType::SlicedPages`:
+    // `max_pool_size: Option<u64>`, a hard cap on total page bytes. Upstream
+    // documents `None` as "the previous behavior ... unbounded growth"
+    // (cubecl-runtime-0.11.0-pre.1/src/memory_management/mod.rs:30-42), so
+    // `None` is the behaviour-PRESERVING port of the 0.10 code and is what is
+    // used here — this commit is a mechanical API port and must not change how
+    // much VRAM the pools may take.
+    //
+    // NOT A PORT DECISION, BUT WORTH A LOOK: `Some(cap)` makes an over-budget
+    // reserve fail with `IoError::PoolCapacityExceeded` instead of growing.
+    // Given this fn is named `bounded_wgpu_pools` and the project holds a
+    // NEVER-OOM invariant, 0.11 has just supplied the knob that invariant
+    // wants. Wiring it is a deliberate behaviour change and belongs in its own
+    // commit with its own measurement, not here. Note the cap is applied PER
+    // STREAM on CUDA/HIP (ibid. :40-41).
     for i in 0..max_sizes.len() {
         pools.push(MemoryPoolOptions {
             pool_type: PoolType::SlicedPages {
                 page_size: page_sizes[i],
                 max_slice_size: max_sizes[i].max(alignment),
+                max_pool_size: None,
             },
             dealloc_period: Some(DEALLOC_PERIOD),
         });
@@ -810,6 +826,7 @@ fn bounded_wgpu_pools(
         pool_type: PoolType::SlicedPages {
             page_size: big.max(alignment),
             max_slice_size: big.max(alignment),
+            max_pool_size: None,
         },
         dealloc_period: Some(DEALLOC_PERIOD),
     });
@@ -817,22 +834,28 @@ fn bounded_wgpu_pools(
 }
 
 #[cube(launch)]
-fn synthesize_signals_kernel<F: Float + CubeElement>(
-    indicators: &Array<F>,
-    gene_offsets: &Array<i32>,
-    gene_indices: &Array<i32>,
-    gene_weights: &Array<F>,
-    long_thr: &Array<F>,
-    short_thr: &Array<F>,
-    smc_data: &Array<i32>,
-    gene_smc_flags: &Array<i32>,
-    smc_weights: &Array<F>,
-    output: &mut Array<i32>,
+// cubecl 0.11 (2026-08): `gate_threshold: F` is a GENERIC scalar parameter, and
+// 0.11 replaced 0.10's blanket `impl<T: ScalarArgSettings> LaunchArg for T`
+// (frontend/element/numeric.rs:129) with a macro that implements `LaunchArg` for
+// concrete scalar types only (0.11 numeric.rs:123-138). A generic scalar param
+// therefore needs the bound spelled out; the launch geometry and the arithmetic
+// are unchanged.
+fn synthesize_signals_kernel<F: Float + CubeElement + LaunchArg>(
+    indicators: &[F],
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[F],
+    long_thr: &[F],
+    short_thr: &[F],
+    smc_data: &[i32],
+    gene_smc_flags: &[i32],
+    smc_weights: &[F],
+    output: &mut [i32],
     // Phase 2 (2026-06-06): per-bar confidence of the raw threshold crossing,
     // mirrors `synthesize_signals_and_confidence_cpu` (eval.rs:1543-1544).
     // f32 regardless of `F` so the backtest kernel's risk-sizing reads the same
     // precision the CPU uses; written only where the final signal survives.
-    confidences_out: &mut Array<f32>,
+    confidences_out: &mut [f32],
     n_samples: u32,
     gene_start: u32,
     gate_threshold: F,
@@ -980,19 +1003,19 @@ macro_rules! define_backtest_population_kernel {
     ($name:ident, $f:ty) => {
     #[cube(launch)]
     fn $name(
-        close_pips: &Array<$f>,
-        high_pips: &Array<$f>,
-        low_pips: &Array<$f>,
-        signals_flat: &Array<i32>,
-        timestamp_deltas_ms: &Array<i32>,
-        month_idx: &Array<i32>,
-        day_idx: &Array<i32>,
-        sl_pips: &Array<$f>,
-        tp_pips: &Array<$f>,
-        metrics_out: &mut Array<$f>,
-        trade_counts_out: &mut Array<i32>,
-        monthly_pnls_out: &mut Array<$f>,
-        month_counts_out: &mut Array<i32>,
+        close_pips: &[$f],
+        high_pips: &[$f],
+        low_pips: &[$f],
+        signals_flat: &[i32],
+        timestamp_deltas_ms: &[i32],
+        month_idx: &[i32],
+        day_idx: &[i32],
+        sl_pips: &[$f],
+        tp_pips: &[$f],
+        metrics_out: &mut [$f],
+        trade_counts_out: &mut [i32],
+        monthly_pnls_out: &mut [$f],
+        month_counts_out: &mut [i32],
         n_samples: u32,
         gene_start: u32,
         gene_count: u32,
@@ -1025,7 +1048,7 @@ macro_rules! define_backtest_population_kernel {
         // (eval.rs:657-685, 1049-1054, 809/865-880/979/627). `confidences_flat` is
         // per-gene-per-bar (same layout as `signals_flat`). When `risk_based_sizing`
         // is 0 the kernel forces pos_lots = 1.0 (legacy fixed-1-lot parity).
-        confidences_flat: &Array<$f>,
+        confidences_flat: &[$f],
         risk_based_sizing: i32,
         risk_per_trade_min: $f,
         risk_per_trade_max: $f,
@@ -1037,17 +1060,17 @@ macro_rules! define_backtest_population_kernel {
         // (see the entry block) — otherwise the scalar `sl_pips`/`tp_pips` path, so a
         // fixed-stop population is byte-identical. `base_pips` has `n_samples`
         // elements; a fixed-only launch passes a 1-element dummy (never read).
-        base_pips: &Array<$f>,
-        stop_vol_mult: &Array<$f>,
+        base_pips: &[$f],
+        stop_vol_mult: &[$f],
         adaptive_rr: $f,
         // Per-month STARTING equity (sibling of monthly_pnls_out); the host divides
         // monthly_pnls_out / month_start_equities_out to get monthly_target_hit_rate
         // (metric slot 7), matching eval.rs:1110-1131.
-        month_start_equities_out: &mut Array<$f>,
+        month_start_equities_out: &mut [$f],
         // FTMO prop-firm observables, `n_genes * FTMO_WIDTH` laid out per gene
         // (see `FTMO_WIDTH`). MUST be the LAST kernel parameter so `launch_backtest_kernel`
-        // appends its `ArrayArg` after all the existing args.
-        ftmo_out: &mut Array<$f>,
+        // appends its `BufferArg` after all the existing args.
+        ftmo_out: &mut [$f],
     ) {
         // cubecl 0.9: index arithmetic is usize; coerce u32 params at the top.
         // Every scalar accumulator that gets reassigned must use RuntimeCell —
@@ -2380,7 +2403,7 @@ fn windowed_signal_synth<F, R: Runtime>(
     gate_threshold: F,
 ) -> Result<(Vec<i32>, Vec<f32>)>
 where
-    F: Float + CubeElement,
+    F: Float + CubeElement + LaunchArg<RuntimeArg<R> = F>,
 {
     let w = signal_window_size(n_indicators, n_genes, n_samples);
     let mut signals = vec![0i32; n_genes.saturating_mul(n_samples)];
@@ -2543,7 +2566,7 @@ fn launch_signal_kernel<F, R: Runtime>(
     gate_threshold: F,
 ) -> Result<(Vec<i32>, Vec<f32>)>
 where
-    F: Float + CubeElement,
+    F: Float + CubeElement + LaunchArg<RuntimeArg<R> = F>,
 {
     let total = n_genes.saturating_mul(n_samples);
     if total == 0 {
@@ -2628,19 +2651,19 @@ where
             client,
             CubeCount::Static(cubes, 1, 1),
             CubeDim::new_1d(units),
-            unsafe { ArrayArg::from_raw_parts(indicators_handle.clone(), indicators_flat.len()) },
-            unsafe { ArrayArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len()) },
-            unsafe { ArrayArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len()) },
-            unsafe { ArrayArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len()) },
-            unsafe { ArrayArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
-            unsafe { ArrayArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
-            unsafe { ArrayArg::from_raw_parts(smc_data_handle.clone(), smc_data.len()) },
+            unsafe { BufferArg::from_raw_parts(indicators_handle.clone(), indicators_flat.len()) },
+            unsafe { BufferArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len()) },
+            unsafe { BufferArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len()) },
+            unsafe { BufferArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len()) },
+            unsafe { BufferArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
+            unsafe { BufferArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
+            unsafe { BufferArg::from_raw_parts(smc_data_handle.clone(), smc_data.len()) },
             unsafe {
-                ArrayArg::from_raw_parts(gene_smc_flags_handle.clone(), gene_smc_flags.len())
+                BufferArg::from_raw_parts(gene_smc_flags_handle.clone(), gene_smc_flags.len())
             },
-            unsafe { ArrayArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
-            unsafe { ArrayArg::from_raw_parts(output_handle.clone(), total) },
-            unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
+            unsafe { BufferArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
+            unsafe { BufferArg::from_raw_parts(output_handle.clone(), total) },
+            unsafe { BufferArg::from_raw_parts(conf_handle.clone(), total) },
             n_samples as u32,
             0,
             gate_threshold,
@@ -3031,19 +3054,19 @@ macro_rules! define_launch_backtest_kernel {
                 client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(units),
-                unsafe { ArrayArg::from_raw_parts(close_handle.clone(), n_samples) },
-                unsafe { ArrayArg::from_raw_parts(high_handle.clone(), n_samples) },
-                unsafe { ArrayArg::from_raw_parts(low_handle.clone(), n_samples) },
-                unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), signals_flat.len()) },
-                unsafe { ArrayArg::from_raw_parts(timestamp_delta_handle.clone(), n_samples) },
-                unsafe { ArrayArg::from_raw_parts(month_handle.clone(), month_idx.len()) },
-                unsafe { ArrayArg::from_raw_parts(day_handle.clone(), day_idx.len()) },
-                unsafe { ArrayArg::from_raw_parts(sl_handle.clone(), sl_pips.len()) },
-                unsafe { ArrayArg::from_raw_parts(tp_handle.clone(), tp_pips.len()) },
-                unsafe { ArrayArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
-                unsafe { ArrayArg::from_raw_parts(trade_counts_handle.clone(), n_genes) },
-                unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
-                unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
+                unsafe { BufferArg::from_raw_parts(close_handle.clone(), n_samples) },
+                unsafe { BufferArg::from_raw_parts(high_handle.clone(), n_samples) },
+                unsafe { BufferArg::from_raw_parts(low_handle.clone(), n_samples) },
+                unsafe { BufferArg::from_raw_parts(signals_handle.clone(), signals_flat.len()) },
+                unsafe { BufferArg::from_raw_parts(timestamp_delta_handle.clone(), n_samples) },
+                unsafe { BufferArg::from_raw_parts(month_handle.clone(), month_idx.len()) },
+                unsafe { BufferArg::from_raw_parts(day_handle.clone(), day_idx.len()) },
+                unsafe { BufferArg::from_raw_parts(sl_handle.clone(), sl_pips.len()) },
+                unsafe { BufferArg::from_raw_parts(tp_handle.clone(), tp_pips.len()) },
+                unsafe { BufferArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
+                unsafe { BufferArg::from_raw_parts(trade_counts_handle.clone(), n_genes) },
+                unsafe { BufferArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
+                unsafe { BufferArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
                 n_samples as u32,
                 0,
                 n_genes as u32,
@@ -3072,7 +3095,7 @@ macro_rules! define_launch_backtest_kernel {
                 // Phase 2 (2026-06-06) — confidence-scaled risk-based sizing knobs +
                 // per-month start-equity output for slot-7. ORDER MUST MATCH the kernel
                 // signature appended after pnl_conversion_fee_rate.
-                unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), confidences_flat.len()) },
+                unsafe { BufferArg::from_raw_parts(conf_handle.clone(), confidences_flat.len()) },
                 if settings.risk_based_sizing {
                     1i32
                 } else {
@@ -3081,13 +3104,13 @@ macro_rules! define_launch_backtest_kernel {
                 settings.risk_per_trade_min as $f,
                 settings.risk_per_trade_max as $f,
                 settings.high_quality_confidence as $f,
-                unsafe { ArrayArg::from_raw_parts(base_pips_dummy.clone(), base_len) },
-                unsafe { ArrayArg::from_raw_parts(stop_vol_mult_dummy.clone(), n_genes) },
+                unsafe { BufferArg::from_raw_parts(base_pips_dummy.clone(), base_len) },
+                unsafe { BufferArg::from_raw_parts(stop_vol_mult_dummy.clone(), n_genes) },
                 adaptive_rr_val,
-                unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
+                unsafe { BufferArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
                 // FTMO prop-firm observables — LAST kernel argument (matches the kernel
                 // signature). `n_genes * FTMO_WIDTH` values laid out per gene.
-                unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
+                unsafe { BufferArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
             );
         }); // end gpu_timing::kernel
 
@@ -3201,8 +3224,8 @@ fn launch_backtest_kernel_auto<R: Runtime>(
 /// and f32 confidences. **2026-06-10 — M1/general fused path.**
 #[cube(launch)]
 fn copy_window_into_persistent<T: CubePrimitive>(
-    src: &Array<T>,
-    dst: &mut Array<T>,
+    src: &[T],
+    dst: &mut [T],
     wlen: u32,
     full_samples: u32,
     s0: u32,
@@ -3918,41 +3941,41 @@ pub(crate) fn evaluate_prototype_a_resident<R: Runtime>(
                 CubeCount::Static(signal_cubes, 1, 1),
                 CubeDim::new_1d(signal_units),
                 unsafe {
-                    ArrayArg::from_raw_parts(
+                    BufferArg::from_raw_parts(
                         window.indicators.clone(),
                         dataset.n_indicators.saturating_mul(window.sample_len),
                     )
                 },
-                unsafe { ArrayArg::from_raw_parts(genes.offsets.clone(), genes.n_genes + 1) },
+                unsafe { BufferArg::from_raw_parts(genes.offsets.clone(), genes.n_genes + 1) },
                 unsafe {
-                    ArrayArg::from_raw_parts(
+                    BufferArg::from_raw_parts(
                         genes.indices.clone(),
                         genes.indices.size_in_used() as usize / std::mem::size_of::<i32>(),
                     )
                 },
                 unsafe {
-                    ArrayArg::from_raw_parts(
+                    BufferArg::from_raw_parts(
                         genes.weights.clone(),
                         genes.weights.size_in_used() as usize / std::mem::size_of::<f32>(),
                     )
                 },
-                unsafe { ArrayArg::from_raw_parts(genes.long_thresholds.clone(), genes.n_genes) },
-                unsafe { ArrayArg::from_raw_parts(genes.short_thresholds.clone(), genes.n_genes) },
+                unsafe { BufferArg::from_raw_parts(genes.long_thresholds.clone(), genes.n_genes) },
+                unsafe { BufferArg::from_raw_parts(genes.short_thresholds.clone(), genes.n_genes) },
                 unsafe {
-                    ArrayArg::from_raw_parts(
+                    BufferArg::from_raw_parts(
                         window.smc_data.clone(),
                         window.sample_len.saturating_mul(SMC_WIDTH),
                     )
                 },
                 unsafe {
-                    ArrayArg::from_raw_parts(
+                    BufferArg::from_raw_parts(
                         genes.smc_flags.clone(),
                         genes.n_genes.saturating_mul(SMC_WIDTH),
                     )
                 },
-                unsafe { ArrayArg::from_raw_parts(genes.smc_weights.clone(), SMC_WIDTH) },
-                unsafe { ArrayArg::from_raw_parts(window_signals.clone(), window_total) },
-                unsafe { ArrayArg::from_raw_parts(window_confidences.clone(), window_total) },
+                unsafe { BufferArg::from_raw_parts(genes.smc_weights.clone(), SMC_WIDTH) },
+                unsafe { BufferArg::from_raw_parts(window_signals.clone(), window_total) },
+                unsafe { BufferArg::from_raw_parts(window_confidences.clone(), window_total) },
                 window.sample_len as u32,
                 gene_start as u32,
                 genes.gate_threshold,
@@ -3966,8 +3989,8 @@ pub(crate) fn evaluate_prototype_a_resident<R: Runtime>(
                 client,
                 CubeCount::Static(copy_cubes, 1, 1),
                 CubeDim::new_1d(signal_units),
-                unsafe { ArrayArg::from_raw_parts(window_signals, window_total) },
-                unsafe { ArrayArg::from_raw_parts(signals.clone(), total) },
+                unsafe { BufferArg::from_raw_parts(window_signals, window_total) },
+                unsafe { BufferArg::from_raw_parts(signals.clone(), total) },
                 window.sample_len as u32,
                 dataset.n_samples as u32,
                 window.sample_start as u32,
@@ -3977,8 +4000,8 @@ pub(crate) fn evaluate_prototype_a_resident<R: Runtime>(
                 client,
                 CubeCount::Static(copy_cubes, 1, 1),
                 CubeDim::new_1d(signal_units),
-                unsafe { ArrayArg::from_raw_parts(window_confidences, window_total) },
-                unsafe { ArrayArg::from_raw_parts(confidences.clone(), total) },
+                unsafe { BufferArg::from_raw_parts(window_confidences, window_total) },
+                unsafe { BufferArg::from_raw_parts(confidences.clone(), total) },
                 window.sample_len as u32,
                 dataset.n_samples as u32,
                 window.sample_start as u32,
@@ -4000,24 +4023,24 @@ pub(crate) fn evaluate_prototype_a_resident<R: Runtime>(
             client,
             CubeCount::Static(backtest_cubes, 1, 1),
             CubeDim::new_1d(backtest_units),
-            unsafe { ArrayArg::from_raw_parts(dataset.close.clone(), dataset.n_samples) },
-            unsafe { ArrayArg::from_raw_parts(dataset.high.clone(), dataset.n_samples) },
-            unsafe { ArrayArg::from_raw_parts(dataset.low.clone(), dataset.n_samples) },
-            unsafe { ArrayArg::from_raw_parts(signals, total) },
+            unsafe { BufferArg::from_raw_parts(dataset.close.clone(), dataset.n_samples) },
+            unsafe { BufferArg::from_raw_parts(dataset.high.clone(), dataset.n_samples) },
+            unsafe { BufferArg::from_raw_parts(dataset.low.clone(), dataset.n_samples) },
+            unsafe { BufferArg::from_raw_parts(signals, total) },
             unsafe {
-                ArrayArg::from_raw_parts(dataset.timestamp_deltas.clone(), dataset.n_samples)
+                BufferArg::from_raw_parts(dataset.timestamp_deltas.clone(), dataset.n_samples)
             },
-            unsafe { ArrayArg::from_raw_parts(dataset.months.clone(), dataset.n_samples) },
-            unsafe { ArrayArg::from_raw_parts(dataset.days.clone(), dataset.n_samples) },
-            unsafe { ArrayArg::from_raw_parts(genes.stop_pips.clone(), genes.n_genes) },
-            unsafe { ArrayArg::from_raw_parts(genes.target_pips.clone(), genes.n_genes) },
-            unsafe { ArrayArg::from_raw_parts(genes.metrics_workspace.clone(), metrics_len) },
+            unsafe { BufferArg::from_raw_parts(dataset.months.clone(), dataset.n_samples) },
+            unsafe { BufferArg::from_raw_parts(dataset.days.clone(), dataset.n_samples) },
+            unsafe { BufferArg::from_raw_parts(genes.stop_pips.clone(), genes.n_genes) },
+            unsafe { BufferArg::from_raw_parts(genes.target_pips.clone(), genes.n_genes) },
+            unsafe { BufferArg::from_raw_parts(genes.metrics_workspace.clone(), metrics_len) },
             unsafe {
-                ArrayArg::from_raw_parts(genes.trade_counts_workspace.clone(), genes.n_genes)
+                BufferArg::from_raw_parts(genes.trade_counts_workspace.clone(), genes.n_genes)
             },
-            unsafe { ArrayArg::from_raw_parts(genes.monthly_workspace.clone(), monthly_len) },
+            unsafe { BufferArg::from_raw_parts(genes.monthly_workspace.clone(), monthly_len) },
             unsafe {
-                ArrayArg::from_raw_parts(genes.month_counts_workspace.clone(), genes.n_genes)
+                BufferArg::from_raw_parts(genes.month_counts_workspace.clone(), genes.n_genes)
             },
             dataset.n_samples as u32,
             gene_start as u32,
@@ -4043,7 +4066,7 @@ pub(crate) fn evaluate_prototype_a_resident<R: Runtime>(
             dataset.settings.swap_long_pips_per_day as f32,
             dataset.settings.swap_short_pips_per_day as f32,
             dataset.settings.pnl_conversion_fee_rate as f32,
-            unsafe { ArrayArg::from_raw_parts(confidences, total) },
+            unsafe { BufferArg::from_raw_parts(confidences, total) },
             if dataset.settings.risk_based_sizing {
                 1
             } else {
@@ -4053,18 +4076,18 @@ pub(crate) fn evaluate_prototype_a_resident<R: Runtime>(
             dataset.settings.risk_per_trade_max as f32,
             dataset.settings.high_quality_confidence as f32,
             unsafe {
-                ArrayArg::from_raw_parts(dataset.adaptive_base.clone(), dataset.adaptive_base_len)
+                BufferArg::from_raw_parts(dataset.adaptive_base.clone(), dataset.adaptive_base_len)
             },
-            unsafe { ArrayArg::from_raw_parts(genes.stop_vol_multipliers.clone(), genes.n_genes) },
+            unsafe { BufferArg::from_raw_parts(genes.stop_vol_multipliers.clone(), genes.n_genes) },
             if adaptive_on {
                 dataset.settings.adaptive_rr as f32
             } else {
                 2.0
             },
             unsafe {
-                ArrayArg::from_raw_parts(genes.month_start_eq_workspace.clone(), monthly_len)
+                BufferArg::from_raw_parts(genes.month_start_eq_workspace.clone(), monthly_len)
             },
-            unsafe { ArrayArg::from_raw_parts(genes.ftmo_workspace.clone(), ftmo_len) },
+            unsafe { BufferArg::from_raw_parts(genes.ftmo_workspace.clone(), ftmo_len) },
         );
         gene_start = gene_end;
     }
@@ -4238,7 +4261,7 @@ fn fused_signal_backtest_batch_resident<F, R: Runtime>(
     n_samples: usize,
 ) -> Result<FusedResidentMetrics<R>>
 where
-    F: Float + CubeElement,
+    F: Float + CubeElement + LaunchArg<RuntimeArg<R> = F>,
 {
     let total = n_genes.saturating_mul(n_samples);
     if total == 0 {
@@ -4339,28 +4362,28 @@ where
                 client,
                 CubeCount::Static(sig_cubes, 1, 1),
                 CubeDim::new_1d(sig_units),
-                unsafe { ArrayArg::from_raw_parts(indicators_handle.clone(), ind_window.len()) },
+                unsafe { BufferArg::from_raw_parts(indicators_handle.clone(), ind_window.len()) },
                 unsafe {
-                    ArrayArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len())
+                    BufferArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len())
                 },
                 unsafe {
-                    ArrayArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len())
+                    BufferArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len())
                 },
                 unsafe {
-                    ArrayArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len())
+                    BufferArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len())
                 },
-                unsafe { ArrayArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
-                unsafe { ArrayArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
-                unsafe { ArrayArg::from_raw_parts(smc_data_handle.clone(), smc_window.len()) },
+                unsafe { BufferArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
+                unsafe { BufferArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
+                unsafe { BufferArg::from_raw_parts(smc_data_handle.clone(), smc_window.len()) },
                 unsafe {
-                    ArrayArg::from_raw_parts(
+                    BufferArg::from_raw_parts(
                         gene_smc_flags_handle.clone(),
                         gene_smc_flags_flat.len(),
                     )
                 },
-                unsafe { ArrayArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
-                unsafe { ArrayArg::from_raw_parts(sig_w.clone(), win_total) },
-                unsafe { ArrayArg::from_raw_parts(conf_w.clone(), win_total) },
+                unsafe { BufferArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
+                unsafe { BufferArg::from_raw_parts(sig_w.clone(), win_total) },
+                unsafe { BufferArg::from_raw_parts(conf_w.clone(), win_total) },
                 wlen as u32,
                 0,
                 gate_threshold,
@@ -4378,8 +4401,8 @@ where
                 client,
                 CubeCount::Static(copy_cubes, 1, 1),
                 CubeDim::new_1d(sig_units),
-                unsafe { ArrayArg::from_raw_parts(sig_w.clone(), win_total) },
-                unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), total) },
+                unsafe { BufferArg::from_raw_parts(sig_w.clone(), win_total) },
+                unsafe { BufferArg::from_raw_parts(signals_handle.clone(), total) },
                 wlen as u32,
                 n_samples as u32,
                 s0 as u32,
@@ -4389,8 +4412,8 @@ where
                 client,
                 CubeCount::Static(copy_cubes, 1, 1),
                 CubeDim::new_1d(sig_units),
-                unsafe { ArrayArg::from_raw_parts(conf_w.clone(), win_total) },
-                unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
+                unsafe { BufferArg::from_raw_parts(conf_w.clone(), win_total) },
+                unsafe { BufferArg::from_raw_parts(conf_handle.clone(), total) },
                 wlen as u32,
                 n_samples as u32,
                 s0 as u32,
@@ -4484,19 +4507,19 @@ where
             client,
             CubeCount::Static(bt_cubes, 1, 1),
             CubeDim::new_1d(bt_units),
-            unsafe { ArrayArg::from_raw_parts(close_handle.clone(), n_samples) },
-            unsafe { ArrayArg::from_raw_parts(high_handle.clone(), n_samples) },
-            unsafe { ArrayArg::from_raw_parts(low_handle.clone(), n_samples) },
-            unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), total) },
-            unsafe { ArrayArg::from_raw_parts(timestamp_delta_handle.clone(), n_samples) },
-            unsafe { ArrayArg::from_raw_parts(month_handle.clone(), month_idx.len()) },
-            unsafe { ArrayArg::from_raw_parts(day_handle.clone(), day_idx.len()) },
-            unsafe { ArrayArg::from_raw_parts(sl_handle.clone(), sl_pips.len()) },
-            unsafe { ArrayArg::from_raw_parts(tp_handle.clone(), tp_pips.len()) },
-            unsafe { ArrayArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
-            unsafe { ArrayArg::from_raw_parts(trade_counts_handle.clone(), n_genes) },
-            unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
-            unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
+            unsafe { BufferArg::from_raw_parts(close_handle.clone(), n_samples) },
+            unsafe { BufferArg::from_raw_parts(high_handle.clone(), n_samples) },
+            unsafe { BufferArg::from_raw_parts(low_handle.clone(), n_samples) },
+            unsafe { BufferArg::from_raw_parts(signals_handle.clone(), total) },
+            unsafe { BufferArg::from_raw_parts(timestamp_delta_handle.clone(), n_samples) },
+            unsafe { BufferArg::from_raw_parts(month_handle.clone(), month_idx.len()) },
+            unsafe { BufferArg::from_raw_parts(day_handle.clone(), day_idx.len()) },
+            unsafe { BufferArg::from_raw_parts(sl_handle.clone(), sl_pips.len()) },
+            unsafe { BufferArg::from_raw_parts(tp_handle.clone(), tp_pips.len()) },
+            unsafe { BufferArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
+            unsafe { BufferArg::from_raw_parts(trade_counts_handle.clone(), n_genes) },
+            unsafe { BufferArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
+            unsafe { BufferArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
             n_samples as u32,
             0,
             n_genes as u32,
@@ -4521,7 +4544,7 @@ where
             settings.swap_long_pips_per_day as f32,
             settings.swap_short_pips_per_day as f32,
             settings.pnl_conversion_fee_rate as f32,
-            unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
+            unsafe { BufferArg::from_raw_parts(conf_handle.clone(), total) },
             if settings.risk_based_sizing {
                 1i32
             } else {
@@ -4530,11 +4553,11 @@ where
             settings.risk_per_trade_min as f32,
             settings.risk_per_trade_max as f32,
             settings.high_quality_confidence as f32,
-            unsafe { ArrayArg::from_raw_parts(base_pips_dummy.clone(), base_len) },
-            unsafe { ArrayArg::from_raw_parts(stop_vol_mult_dummy.clone(), n_genes) },
+            unsafe { BufferArg::from_raw_parts(base_pips_dummy.clone(), base_len) },
+            unsafe { BufferArg::from_raw_parts(stop_vol_mult_dummy.clone(), n_genes) },
             adaptive_rr_f32,
-            unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
-            unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
+            unsafe { BufferArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
+            unsafe { BufferArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
         );
     });
 
@@ -4585,7 +4608,7 @@ fn fused_signal_backtest_batch<F, R: Runtime>(
     n_samples: usize,
 ) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>)>
 where
-    F: Float + CubeElement,
+    F: Float + CubeElement + LaunchArg<RuntimeArg<R> = F>,
 {
     let resident = fused_signal_backtest_batch_resident(
         client,

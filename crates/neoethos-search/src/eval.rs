@@ -2138,6 +2138,24 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
             );
         }
     });
+    // Prototype B is a native-CUDA engine behind `gpu-b-adapter`; its module does
+    // not exist in a build without that feature (`gpu_native/mod.rs:17`). The call
+    // below was added ungated by `3e72c380`, which broke
+    // `cargo check -p neoethos-search --features gpu-vulkan` — the exact command
+    // CI runs (ci.yml:248) — with E0433. This is the same gate the sibling call
+    // site already uses for the same module (`cubecl_eval.rs:4802`): the B block
+    // compiles in where B exists, and the CPU fallback below catches the rest.
+    //
+    // `gpu-cuda` implies `gpu-b-native` implies `gpu-b-adapter`, so the CUDA lane
+    // is byte-identical to before. Only `gpu-vulkan`/`gpu-rocm` change, and those
+    // did not compile at all until now.
+    //
+    // CAVEAT, deliberately left for the operator: with the feature off, the
+    // `NEOETHOS_REQUIRE_GPU` fail-loud arm below disappears with the block, so a
+    // `gpu-vulkan` build runs validation on the CPU without announcing it. That
+    // is a policy question (the standing GPU-exclusive directive says no silent
+    // fallback), not a mechanical one, so it is reported rather than decided.
+    #[cfg(feature = "gpu-b-adapter")]
     if signal_ok && backtest_ok && !integrated {
         let device_override = eval_gpu_devices().first().copied();
         // catch_unwind is the ONLY mitigation for cubecl #243 pool-panics
