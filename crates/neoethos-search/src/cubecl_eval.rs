@@ -579,6 +579,37 @@ fn read_cuda_device_id_from_env() -> usize {
 /// wgpu/Vulkan under `gpu-vulkan` — so every downstream kernel launch stays
 /// generic over `R: Runtime` and runs unchanged on whichever backend was built.
 /// (When both features are on, CUDA wins.)
+///
+/// 🔴 `gpu-rocm` DOES NOT COMPILE, and this function is why.
+///
+/// There are exactly two definitions below: `#[cfg(feature = "gpu-cuda")]` and
+/// `#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]`. The string
+/// `feature = "gpu-rocm"` appears NOWHERE in neoethos-search/src. But
+/// Cargo.toml defines `gpu-rocm = ["gpu", "cubecl/hip", ...]`, which enables
+/// neither of those two, so every call site here fails to resolve:
+///
+///     error[E0432]: unresolved import `crate::cubecl_eval::create_gpu_client`
+///     error[E0425]: cannot find function `create_gpu_client` in this scope   (×4)
+///     error[E0425]: cannot find type `PrototypeAActiveRuntime` in this scope
+///     error[E0425]: cannot find function `active_backend_id` in this scope
+///
+/// 8 errors, measured 2026-08-03 with `cargo check -p neoethos-search
+/// --features gpu-rocm`. CI runs this lane at ci.yml:205 and :210, so it has
+/// been red. Bare `gpu` fails the same way with 7 — that one is by design, as
+/// `gpu` binds no runtime.
+///
+/// CORRECTION TO THE RECORD: commit 4e6f0aad is titled "the Vulkan and ROCm
+/// builds did not compile" and fixed only Vulkan. Its own verification section
+/// listed `--features gpu-vulkan` and `--features gpu-b-adapter` and never ran
+/// gpu-rocm — the claim outran the evidence, which is the failure mode this
+/// branch has spent two days correcting in other people's work.
+///
+/// THE FIX, when someone has an AMD card to test on: add a third arm returning
+/// `ComputeClient<HipRuntime>` (cubecl-hip), mirroring the Vulkan arm, plus
+/// `PrototypeAActiveRuntime` and `active_backend_id` for it. Deliberately not
+/// written blind here: an untested HIP arm would turn a loud compile error into
+/// a runtime one on hardware nobody in this project owns, which is strictly
+/// worse than a build that refuses.
 #[cfg(feature = "gpu-cuda")]
 pub(crate) fn create_gpu_client(
     device_override: Option<usize>,
