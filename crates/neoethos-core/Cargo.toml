@@ -37,11 +37,38 @@ dirs = "5.0.1"
 sysinfo = "0.37.2"
 anyhow = "1.0.100"
 thiserror = "2.0.16"
-# Pinned to 0.37 to share libsqlite3-sys 0.35 with burn-dataset (transitively
-# pulled via burn 0.21's default `burn-core/default` set). Cargo refuses to
-# link two different native `sqlite3` libs (libsqlite3-sys 0.35 vs 0.36 in
-# rusqlite 0.38). Our usage (Connection::open + params! + query — see
-# storage.rs) is stable across both, so 0.37 is a clean choice.
+# PINNED. Current is 0.40.1 (crates.io, 2026-06-06); we are three minors back.
+#
+# REPRODUCED 2026-08-03, not argued: setting 0.40.1 here makes the resolver
+# refuse outright —
+#   package `libsqlite3-sys` links to the native library `sqlite3`, but it
+#   conflicts with a previous package which links to `sqlite3` as well:
+#     libsqlite3-sys v0.38.1  <- rusqlite v0.40.1  <- neoethos-core
+#     libsqlite3-sys v0.35.0  <- rusqlite v0.37.0  <- burn-dataset v0.21.0
+#
+# THE COUNTER-ARGUMENT THAT LOOKS RIGHT AND IS NOT — recorded because it was
+# made twice and cost a round trip both times. `cargo tree -i burn-dataset`
+# prints "nothing to print": burn-core's default set is
+# ["std","burn-std/default","burn-dataset?/default","burn-tensor/default"], and
+# the `?` means burn-dataset is never ACTIVATED. True, and irrelevant. `links`
+# uniqueness is enforced on the RESOLVE graph, which contains unactivated
+# optional dependencies; `cargo tree` shows the BUILD graph, which does not. So
+# we pay a version pin for a crate we never compile, and `default-features =
+# false` on burn cannot buy it back.
+#
+# 0.37.0 is the LAST rusqlite on libsqlite3-sys ^0.35 — 0.38.0 already moved to
+# ^0.36 — so there is no intermediate hop to take.
+#
+# TRIGGER CONDITION, check this and nothing else: a published `burn-dataset`
+# that requires rusqlite > ^0.37. Verify LIVE at
+# https://crates.io/api/v1/crates/burn-dataset — the local cargo index is stale
+# and has given wrong answers. As of 2026-08-03, burn-dataset 0.22.0-pre.1 STILL
+# declares rusqlite ^0.37.0, so this is chained to a burn-dataset release that
+# has not happened — NOT to burn 0.22, which is a different and commonly
+# repeated mistake.
+#
+# Our usage is Connection::open + params! + query (storage.rs, 15 call sites),
+# stable across all these versions, so the day the pin lifts the move is free.
 rusqlite = { version = "0.37.0", features = ["bundled", "chrono"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.19.0", features = ["v4", "serde"] }
