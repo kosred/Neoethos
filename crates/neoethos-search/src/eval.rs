@@ -2157,30 +2157,72 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         // — 1 231 s of which the GA is 1.2 s — so every kernel improvement so
         // far applied to a tenth of a percent of the work. The argument lists
         // are identical, which is why this had gone unnoticed.
+        // `gpu-cuda` links prototype B, so call it directly — that is the
+        // routing 3e72c380 landed. But `gpu-vulkan` and `gpu-rocm` enable `gpu`
+        // WITHOUT `gpu-b-adapter`, and the module below is gated on it
+        // (gpu_native/mod.rs:17-18), so naming it unconditionally inside a
+        // `gpu`-only function made both of those builds fail to compile:
+        //   error[E0433]: cannot find `prototype_b_population_eval` in `gpu_native`
+        // CI builds and parity-tests exactly those two (ci.yml:205/210/248), so
+        // this was a red pipeline, not a theoretical gap. Found by two
+        // independent reviews that ran the check rather than reading the code.
+        //
+        // The argument lists are identical — the same property that let the
+        // original split hide — so the non-CUDA arm is a swap, not a rewrite.
+        // On `gpu-cuda` nothing changes: the direct call is preserved verbatim.
         let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
-                close,
-                high,
-                low,
-                indicators,
-                gene_offsets,
-                gene_indices,
-                gene_weights,
-                long_thr,
-                short_thr,
-                month_idx,
-                day_idx,
-                timestamps,
-                sl_pips,
-                tp_pips,
-                stop_vol_mult,
-                smc_data,
-                gene_smc_flags,
-                gate_threshold,
-                weights,
-                settings,
-                device_override,
-            )
+            #[cfg(feature = "gpu-b-adapter")]
+            {
+                crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
+                    close,
+                    high,
+                    low,
+                    indicators,
+                    gene_offsets,
+                    gene_indices,
+                    gene_weights,
+                    long_thr,
+                    short_thr,
+                    month_idx,
+                    day_idx,
+                    timestamps,
+                    sl_pips,
+                    tp_pips,
+                    stop_vol_mult,
+                    smc_data,
+                    gene_smc_flags,
+                    gate_threshold,
+                    weights,
+                    settings,
+                    device_override,
+                )
+            }
+            #[cfg(not(feature = "gpu-b-adapter"))]
+            {
+                crate::cubecl_eval::try_evaluate_population_cuda(
+                    close,
+                    high,
+                    low,
+                    indicators,
+                    gene_offsets,
+                    gene_indices,
+                    gene_weights,
+                    long_thr,
+                    short_thr,
+                    month_idx,
+                    day_idx,
+                    timestamps,
+                    sl_pips,
+                    tp_pips,
+                    stop_vol_mult,
+                    smc_data,
+                    gene_smc_flags,
+                    gate_threshold,
+                    weights,
+                    settings,
+                    device_override,
+                )
+            }
         }));
         // Classify the outcome, then let the shared policy decide. The default
         // (NEOETHOS_REQUIRE_GPU unset) always recomputes on the CPU — identical
