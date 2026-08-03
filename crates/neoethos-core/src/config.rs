@@ -159,19 +159,29 @@ pub struct SystemConfig {
     pub smc_atr_displacement: f64,
     pub smc_max_levels: usize,
     pub smc_use_cuda: bool,
-    /// Hardware / accelerator runtime knobs (config-driven replacement for the
-    /// env vars read by `HardwareRuntimeOverrides::from_env`). See
-    /// [`HardwareConfig`].
+    /// Hardware / accelerator runtime knobs. See [`HardwareConfig`].
     #[serde(default)]
     pub hardware: HardwareConfig,
 }
 
-/// Hardware / accelerator runtime knobs — config-driven replacement for the env
-/// vars read by [`crate::system::HardwareRuntimeOverrides::from_env`]:
-/// `NEOETHOS_BOT_CPU_BUDGET`, `NEOETHOS_BOT_TRAIN_PRECISION` (+ the legacy
-/// `FOREX_TRAIN_PRECISION` remnant), `NEOETHOS_BOT_{CUDA,ROCM,WGPU}_PRECISIONS`,
-/// `NEOETHOS_BOT_WGPU_DEVICES`. All-`None`/empty defaults reproduce the
-/// historical env-absent behaviour.
+/// Hardware / accelerator runtime knobs — the ONLY source for these settings.
+///
+/// These replace six env vars that used to be read by
+/// `HardwareRuntimeOverrides::from_env`: `NEOETHOS_BOT_CPU_BUDGET`,
+/// `NEOETHOS_BOT_TRAIN_PRECISION` (plus a legacy `FOREX_TRAIN_PRECISION`
+/// alias), `NEOETHOS_BOT_{CUDA,ROCM,WGPU}_PRECISIONS` and
+/// `NEOETHOS_BOT_WGPU_DEVICES`. That function was deleted on 2026-08-03 because
+/// it had zero callers — so those env vars had already stopped doing anything
+/// long before, while these doc comments went on pointing readers at them.
+/// Setting one and watching nothing change was the intended experience of a
+/// function nobody called.
+///
+/// All-`None`/empty defaults reproduce the historical env-absent behaviour.
+///
+/// ⚠ `NEOETHOS_BOT_CPU_BUDGET` is a partial exception: neoethos-cli still reads
+/// it directly in `main()` and passes it to `apply_process_cpu_assignment`. One
+/// name, two readers, one of them dead — which is precisely the argument for a
+/// single resolution point rather than simply relocating the variables.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HardwareConfig {
@@ -376,6 +386,15 @@ pub struct RiskConfig {
     pub trailing_enabled: bool,
     pub trailing_atr_multiplier: f64,
     pub trailing_be_trigger_r: f64,
+    /// Pips of profit the trail must lock once it engages, measured from the
+    /// entry.
+    ///
+    /// The other two knobs are multiples of the gene's stop distance, so the
+    /// same pair locks a different amount for every gene: with `trigger -
+    /// distance = 0.1`, a 20-pip stop protects 2 pips and a 10-pip stop only 1.
+    /// An account is not risked in multiples of R, so the floor is absolute —
+    /// once the trail is active the stop never sits closer to entry than this.
+    pub trailing_min_lock_pips: f64,
     pub slippage_pips: f64,
     pub commission_per_lot: f64,
     pub backtest_spread_pips: f64,
@@ -459,6 +478,7 @@ impl Default for RiskConfig {
             trailing_enabled: true,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
+            trailing_min_lock_pips: DEFAULT_TRAILING_MIN_LOCK_PIPS,
             slippage_pips: 0.5,
             commission_per_lot: 7.0,
             backtest_spread_pips: 1.5,
@@ -538,6 +558,23 @@ pub struct ModelsConfig {
     pub prop_search_val_min_positive_months: usize,
     pub prop_search_val_min_trades_per_month: usize,
     pub prop_search_val_min_trades_per_day: f64,
+    /// Target profile: the lowest win rate a candidate may have, as a fraction.
+    ///
+    /// Stated separately from `prop_search_min_payoff_ratio` because
+    /// `profit_factor` folds the two together — 30 % of trades at 5:1 and 70 %
+    /// at 0.6:1 both give about 2.1, and they are completely different systems
+    /// to hold. `0.0` disables the gate.
+    pub prop_search_min_win_rate: f64,
+    /// Target profile: the lowest average-win over average-loss a candidate may
+    /// have. `0.0` disables the gate.
+    pub prop_search_min_payoff_ratio: f64,
+    /// Target profile: the most of the evaluated span a candidate may spend
+    /// holding a position, as a fraction.
+    ///
+    /// A strategy in the market almost always is not selecting entries, and its
+    /// win rate converges on the market's base rate however the entry rule is
+    /// written. `0.0` disables the gate.
+    pub prop_search_max_in_market: f64,
     pub prop_search_val_min_monthly_profit_pct: f64,
     pub prop_search_val_log_trades: bool,
     pub prop_search_val_trade_log_max: usize,
@@ -1015,7 +1052,15 @@ impl Default for EvalRuntimeConfig {
             pip_value_per_lot: None,
             spread_pips: None,
             commission_per_trade: None,
-            reject_pip_fallback: false,
+            // Refuse a pip value that cannot be converted into the account
+            // currency, rather than booking a foreign-currency amount as if it
+            // were account currency. That fallback inflated every JPY-quoted
+            // result about 192-fold on a GBP account and every USD-quoted one by
+            // 27 %, and since the search ranks on profit, the inflated
+            // candidates won selection and reached live trading — where they
+            // earned what they were actually worth. Nothing in the reported
+            // numbers revealed it. Set to `false` only to reproduce an old run.
+            reject_pip_fallback: true,
             smc_gate_threshold: 0.75,
             smc_w_ob: 1.0,
             smc_w_fvg: 1.0,
@@ -1371,6 +1416,11 @@ impl Default for ModelsConfig {
             prop_search_val_min_positive_months: 0,
             prop_search_val_min_trades_per_month: 0,
             prop_search_val_min_trades_per_day: 0.0,
+            // Off by default: these express one operator's target, not a
+            // universal truth about what a good strategy looks like.
+            prop_search_min_win_rate: 0.0,
+            prop_search_min_payoff_ratio: 0.0,
+            prop_search_max_in_market: 0.0,
             prop_search_val_min_monthly_profit_pct: 0.0,
             prop_search_val_log_trades: false,
             prop_search_val_trade_log_max: 20,
@@ -2350,3 +2400,10 @@ mod tests {
         assert!(settings.models.prop_search_async_wait);
     }
 }
+
+/// Profit the trail locks once it engages, in pips.
+///
+/// Shared so the backtest, the GPU kernel and live trading cannot drift apart:
+/// a live stop that protects a different amount than the strategy was scored on
+/// is the parity break that makes a backtest optimistic.
+pub const DEFAULT_TRAILING_MIN_LOCK_PIPS: f64 = 2.0;

@@ -43,7 +43,12 @@ gpu-rocm = [
 # work on Apple Silicon to wire in. Kept as an alias for parity in
 # build matrices; behaves as gpu-vulkan via MoltenVK.
 gpu-apple = ["gpu-vulkan"]
-native-tree-models = ["neoethos-models/tree-models"]
+# REMOVED 2026-08-03: `native-tree-models = ["neoethos-models/tree-models"]`.
+# It had zero `cfg` sites and, more to the point, was a NO-OP: the dependency at
+# line 175 already sets `features = ["pure-rust-ml", "tree-models"]`
+# unconditionally, so the native tree models are in every build whether this
+# feature is passed or not. Nothing in CI, no script and no doc ever passed it.
+# The packaging comment further down claimed the opposite; corrected there.
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
@@ -239,10 +244,20 @@ identifier = "com.neoethos.app"
 authors = ["Konstantinos Red"]
 description = "neoethos - a disciplined multi-model ML engine for FX strategy research and risk-aware execution."
 formats = ["nsis"]
-# Paths are resolved relative to this Cargo.toml. The default GUI build
-# intentionally ships without native tree-model DLLs; those are gated behind
-# the `native-tree-models` feature so a clean Windows install is not blocked by
-# Visual C++ debug/runtime DLLs at process startup.
+# Paths are resolved relative to this Cargo.toml.
+#
+# CORRECTED 2026-08-03. This block used to claim: "The default GUI build
+# intentionally ships without native tree-model DLLs; those are gated behind the
+# `native-tree-models` feature so a clean Windows install is not blocked by
+# Visual C++ debug/runtime DLLs at process startup."
+#
+# That was false in both halves. The dependency at line 175 sets
+# `features = ["pure-rust-ml", "tree-models"]` unconditionally, so the native
+# tree models — LightGBM, XGBoost, CatBoost — are in EVERY build, default
+# included. And `native-tree-models` gated nothing: zero cfg sites, and nothing
+# ever passed it. So the shipped installer does carry those native
+# dependencies, and anyone sizing the VC++ risk from this comment was reading
+# the opposite of the truth. The feature has been removed; see line 46.
 #
 # VC++ Redistributable note: the Rust MSVC binaries depend on
 # VCRUNTIME140.dll (Visual C++ 2015-2022 redistributable). Every

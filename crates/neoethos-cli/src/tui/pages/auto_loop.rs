@@ -200,17 +200,16 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
             // jobs (FIX D), mirroring how Discover's K stops a run. Behind the
             // FIX-A Y/N confirmation since it changes a long-running pipeline.
             if std::path::Path::new(STOP_FLAG_PATH).exists() {
-                shared.status = "Stop flag already present — loop will stop after current job"
-                    .to_string();
+                shared.status =
+                    "Stop flag already present — loop will stop after current job".to_string();
             } else if shared.jobs.has_running(JOB_LABEL_PREFIX) {
-                shared.pending_confirmation =
-                    Some(crate::tui::app::PendingAction::AutoLoopStop);
-                shared.status = "Confirm graceful stop (create stop flag)? [Y]es / [N]o".to_string();
+                shared.pending_confirmation = Some(crate::tui::app::PendingAction::AutoLoopStop);
+                shared.status =
+                    "Confirm graceful stop (create stop flag)? [Y]es / [N]o".to_string();
             } else {
                 // No live job, but still let the operator pre-arm the flag so a
                 // resumed loop stops; confirm anyway for consistency.
-                shared.pending_confirmation =
-                    Some(crate::tui::app::PendingAction::AutoLoopStop);
+                shared.pending_confirmation = Some(crate::tui::app::PendingAction::AutoLoopStop);
                 shared.status = "Confirm create stop flag? [Y]es / [N]o".to_string();
             }
             true

@@ -36,11 +36,16 @@ statrs = "0.18.0"
 tracing = "0.1.42"  # aligned with workspace.dependencies (2026-05-26)
 neoethos-data = { path = "../neoethos-data" }
 neoethos-core = { path = "../neoethos-core" }
+neoethos-gpu-contracts = { path = "../neoethos-gpu-contracts" }
+neoethos-gpu-cuda = { path = "../neoethos-gpu-cuda", optional = true }
 duckdb = { version = "1.1.1", optional = true, features = ["bundled"] }
 tch = { version = "0.22.0", optional = true }
 
 [features]
 default = []
+# Profiler builds link NVIDIA's NVTX C API. Ordinary builds retain a no-op
+# instrumentation API and never require the NVIDIA toolkit/library.
+nvtx = []
 # `gpu`: pulls in the GPU dep chain — cubecl 0.9 for the SL/TP-faithful
 # eval/backtest kernel (`cubecl_eval.rs`) and tch 0.22 for CUDA device
 # enumeration. After audit 2026-05-24 the legacy `discovery_gpu` +
@@ -59,7 +64,28 @@ gpu = ["dep:cubecl", "dep:half", "dep:cubecl-runtime"]
 #   the direct-SPIR-V passthrough crashes AMD's Vulkan driver). Runs on the
 #   integrated AMD GPU here and on any wgpu adapter (Vulkan/DX12/Metal).
 # - gpu-rocm   → cubecl HIP (AMD discrete, Linux).
-gpu-cuda = ["gpu", "dep:tch", "cubecl/cuda", "neoethos-core/gpu-cuda"]
+gpu-cuda = [
+    "gpu",
+    "gpu-b-native",
+    "cubecl/cuda",
+    "neoethos-core/gpu-cuda",
+]
+# Prototype B is a native-CUDA engine: it links the `neoethos-gpu-cuda` C ABI
+# and needs neither CubeCL nor libtorch. This feature exists on its own so a
+# rented GPU box can prove the B kernel with nothing but rustc, a C++ compiler
+# and nvcc, instead of provisioning the entire GPU dependency chain first.
+# `gpu-cuda` implies it, so a full build is unchanged.
+# The B adapter's types and control flow, without requiring nvcc. The native
+# crate has an honest no-CUDA stub, so this lets the discovery-side adapter be
+# type-checked on a developer machine and in CI, where the full `gpu-b-native`
+# build cannot even start. It reports no devices at runtime, so nothing routes
+# to the GPU under this feature alone.
+gpu-b-adapter = ["dep:neoethos-gpu-cuda"]
+gpu-b-native = ["gpu-b-adapter", "neoethos-gpu-cuda/cuda"]
 gpu-vulkan = ["gpu", "cubecl/wgpu", "neoethos-core/gpu-wgpu"]
 gpu-rocm = ["gpu", "cubecl/hip", "neoethos-core/gpu-rocm"]
 strategy-db = ["dep:duckdb"]
+
+[dev-dependencies]
+# The probe example needs a subscriber to surface the engine's own diagnostics.
+tracing-subscriber = { workspace = true }

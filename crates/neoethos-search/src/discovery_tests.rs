@@ -66,6 +66,8 @@ fn empty_portfolio_is_an_explicit_error() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let err = ensure_non_empty_portfolio(&result, "EURUSD M1")
@@ -92,6 +94,8 @@ fn non_empty_portfolio_is_accepted() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     ensure_non_empty_portfolio(&result, "EURUSD M1").expect("expected non-empty portfolio to pass");
@@ -153,6 +157,7 @@ fn finalize_candidates_with_progress_emits_filter_and_portfolio_milestones() {
         &features,
         &ohlcv,
         &config,
+        0.75,
         features.names.clone(),
         &mut funnel,
         |event| progress_events.push(event),
@@ -210,6 +215,8 @@ fn portfolio_export_requires_validation_gates() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
     let path = temp_path("portfolio-gates");
 
@@ -237,6 +244,8 @@ fn portfolio_export_blocked_when_only_prop_firm_window_passed() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
     result.validation_gates.prop_firm_window_passed = true;
     result.validation_gates.prop_firm_window_count = 50;
@@ -360,6 +369,8 @@ fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
     result.validation_gates.walkforward_passed = true;
     result.validation_gates.cpcv_passed = true;
@@ -387,6 +398,8 @@ fn discovery_profile_exports_validation_gate_status() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
     result.validation_gates.walkforward_passed = true;
     result.validation_gates.cpcv_passed = true;
@@ -468,6 +481,8 @@ fn save_canonical_backtest_artifacts_writes_one_file_per_strategy() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let written = save_canonical_backtest_artifacts(&dir, &result)
@@ -505,6 +520,8 @@ fn save_walkforward_validation_artifacts_writes_one_file_per_strategy() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let written = save_walkforward_validation_artifacts(&dir, &result)
@@ -537,6 +554,8 @@ fn save_canonical_backtest_artifacts_skips_when_empty() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let written = save_canonical_backtest_artifacts(&dir, &result)
@@ -628,6 +647,8 @@ fn discovery_profile_exports_runtime_override_resolution() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let profile = build_discovery_profile(&config, &result);
@@ -723,7 +744,14 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
         quota.names
     );
     // The base top-K survivors are preserved (additive, no regression).
-    assert!(quota.names.iter().filter(|n| n.starts_with("base_")).count() >= 3);
+    assert!(
+        quota
+            .names
+            .iter()
+            .filter(|n| n.starts_with("base_"))
+            .count()
+            >= 3
+    );
 }
 
 #[test]
@@ -808,6 +836,8 @@ fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
         forward_test_validation_artifacts: artifacts,
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let written = save_forward_test_validation_artifacts(&dir, &result)
@@ -850,6 +880,8 @@ fn discovery_profile_exports_forward_test_artifact_count() {
         )],
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
     result.validation_gates.walkforward_passed = true;
     result.validation_gates.cpcv_passed = true;
@@ -897,6 +929,8 @@ fn empty_discovery_result_with_gates(
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     }
 }
 
@@ -1079,6 +1113,8 @@ fn save_prop_firm_validation_artifacts_writes_one_file_per_strategy() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: vec![prop_firm_artifact_with_pass_flag("fnv64:abc", true)],
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     };
 
     let written = save_prop_firm_validation_artifacts(&dir, &result)
@@ -1122,6 +1158,8 @@ fn populated_discovery_result(
             .map(|idx| prop_firm_artifact_with_pass_flag(&format!("prop-{idx}"), true))
             .collect(),
         funnel_profile: None,
+
+        effective_smc_gate_threshold: f32::NAN,
     }
 }
 
@@ -1344,8 +1382,7 @@ fn run_discovery_cycle_bails_on_empty_evaluation_symbol() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_symbol = String::new();
-    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
-        .expect_err("empty symbol must bail");
+    let err = run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("empty symbol must bail");
     let msg = err.to_string();
     assert!(
         msg.contains("evaluation_symbol is empty"),
@@ -1359,8 +1396,8 @@ fn run_discovery_cycle_bails_on_empty_account_currency() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_account_currency = String::new();
-    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
-        .expect_err("empty account_currency must bail");
+    let err =
+        run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("empty account_currency must bail");
     let msg = err.to_string();
     assert!(
         msg.contains("evaluation_account_currency"),
@@ -1374,8 +1411,7 @@ fn run_discovery_cycle_bails_on_nan_spread() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_spread_pips = f64::NAN;
-    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
-        .expect_err("NaN spread must bail");
+    let err = run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("NaN spread must bail");
     assert!(
         err.to_string().contains("evaluation_spread_pips"),
         "expected spread diagnostic, got: {err}"
@@ -1388,8 +1424,7 @@ fn run_discovery_cycle_bails_on_nan_commission() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_commission_per_trade = f64::NAN;
-    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
-        .expect_err("NaN commission must bail");
+    let err = run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("NaN commission must bail");
     assert!(
         err.to_string().contains("evaluation_commission_per_trade"),
         "expected commission diagnostic, got: {err}"
@@ -1459,7 +1494,11 @@ fn min_trades_per_month_scale_drops_for_higher_tfs() {
     // Sanity: for operator's default 15 trades/month, D1 must produce
     // a sane floor (e.g. ≤ 3 trades/month so realistic swing
     // strategies aren't auto-rejected).
-    assert!(15.0 * d1 <= 3.0, "D1 floor at base=15 must be ≤ 3, got {}", 15.0 * d1);
+    assert!(
+        15.0 * d1 <= 3.0,
+        "D1 floor at base=15 must be ≤ 3, got {}",
+        15.0 * d1
+    );
 }
 
 #[test]
@@ -1582,7 +1621,10 @@ fn empty_portfolio_diagnosis_falls_back_when_no_bottleneck_set() {
     funnel.bottleneck_stage = String::new();
 
     let msg = describe_empty_portfolio_funnel(&funnel);
-    assert!(msg.contains("passed_base_filter"), "infers bottleneck: {msg}");
+    assert!(
+        msg.contains("passed_base_filter"),
+        "infers bottleneck: {msg}"
+    );
     assert!(msg.contains("max-drawdown") || msg.contains("min-profit"));
 }
 
@@ -1763,7 +1805,11 @@ fn unset_mode_band_inherits_the_shared_one() {
     settings.risk.max_risk_per_trade = 0.05;
     assert_eq!(settings.risk.risky_max_risk_per_trade, None);
 
-    for mode in [DiscoveryMode::Risky, DiscoveryMode::PropFirm, DiscoveryMode::Strict] {
+    for mode in [
+        DiscoveryMode::Risky,
+        DiscoveryMode::PropFirm,
+        DiscoveryMode::Strict,
+    ] {
         let c = DiscoveryConfig {
             mode,
             ..DiscoveryConfig::from_settings(&settings)
@@ -1809,4 +1855,327 @@ fn mode_band_rejects_nonsense_and_orders_itself() {
     }
     .apply_mode_overrides();
     assert_eq!(c.risk_per_trade_max, 1.0, "capped at 100% of the account");
+}
+
+#[test]
+fn a_wiped_out_account_is_rejected_however_well_it_scores() {
+    use crate::quality::empty_metrics;
+    // The candidate that motivated this gate: 4 917 trades, profit factor 2.85,
+    // graded EXCELLENT — on an account whose equity curve bottomed at
+    // -30 596 EUR. A drawdown past 100 % is not a bad score, it is a state that
+    // cannot exist, so no other metric may compensate for it.
+    let mut ruined = empty_metrics("gene_332618_18");
+    ruined.profit_factor = 2.85;
+    ruined.win_rate = 0.38;
+    ruined.trades_per_month = 40.0;
+    ruined.positive_months = 100;
+    ruined.avg_monthly_return_pct = 65.0;
+    ruined.max_drawdown_pct = 4.031; // 403.1 % — a fraction, despite the name
+    assert!(!super::survived_the_backtest(&ruined));
+
+    // Exactly total loss is still ruin.
+    ruined.max_drawdown_pct = 1.0;
+    assert!(!super::survived_the_backtest(&ruined));
+
+    // A severe but survivable drawdown stays eligible: this gate decides
+    // possibility, not quality.
+    ruined.max_drawdown_pct = 0.438; // the 43.8 % seen on a real survivor
+    assert!(super::survived_the_backtest(&ruined));
+}
+
+#[test]
+fn risky_mode_keeps_the_operators_activity_floor() {
+    // This used to be pinned to 0.001 for risky mode, so
+    // `models.prop_search_val_min_trades_per_day` was set, resolved, passed in —
+    // and discarded — in the one mode actually used. A strategy trading twice a
+    // decade cannot compound a small balance to a large one, so the floor has to
+    // reach the search.
+    let mut config = DiscoveryConfig::default();
+    config.min_trades_per_day = 1.0;
+    config.mode = DiscoveryMode::Risky;
+    let risky = config.apply_mode_overrides();
+    assert!(
+        (risky.min_trades_per_day - 1.0).abs() < 1e-9,
+        "risky rewrote the activity floor to {}",
+        risky.min_trades_per_day
+    );
+
+    // The quality floors around it are still deliberately loosened — this test
+    // must not be read as risky having become strict.
+    assert!(risky.filtering.min_profit_factor <= 0.0);
+    assert!(risky.filtering.min_win_rate <= 0.0);
+
+    // One trade a day over a year of weekdays is roughly a year of weekdays'
+    // worth of in-market bars, not one trade in total.
+    let year_of_weekdays: Vec<i64> = (0..365)
+        .map(|d| (1_700_000_000_i64 + d * 86_400) * 1000)
+        .collect();
+    let required = super::min_trades_required(&year_of_weekdays, 1.0, year_of_weekdays.len());
+    assert!(
+        required > 200 && required < 366,
+        "expected ~one per weekday, got {required}"
+    );
+}
+
+#[test]
+fn the_target_profile_separates_win_rate_from_payoff() {
+    use super::TargetProfile;
+    use crate::quality::empty_metrics;
+
+    // The operator's stated target: 57-65 % of trades win, each winner worth
+    // about 2.2 losers.
+    let profile = TargetProfile {
+        min_win_rate: 0.57,
+        min_payoff_ratio: 2.2,
+        max_in_market: 0.35,
+    };
+
+    let mut wanted = empty_metrics("wanted");
+    wanted.win_rate = 0.60;
+    wanted.payoff_ratio = 2.21;
+    wanted.in_market_pct = 0.20;
+    assert!(profile.accepts(&wanted));
+
+    // A trend follower: excellent payoff, far too few winners. A perfectly good
+    // system — just not this one, which is the whole reason the two are stated
+    // separately instead of through profit factor.
+    let mut trend = wanted.clone();
+    trend.win_rate = 0.32;
+    trend.payoff_ratio = 5.0;
+    assert!(!profile.accepts(&trend));
+
+    // A scalper: wins constantly, gives it all back on the losers.
+    let mut scalper = wanted.clone();
+    scalper.win_rate = 0.82;
+    scalper.payoff_ratio = 0.4;
+    assert!(!profile.accepts(&scalper));
+
+    // In the market 78 % of the time — the figure a real GPU run reported —
+    // is not selecting entries, whatever the other numbers say.
+    let mut always_in = wanted.clone();
+    always_in.in_market_pct = 0.78;
+    assert!(!profile.accepts(&always_in));
+
+    // Unmeasurable exposure must not be read as "never in the market", or the
+    // candidates with no exit times sail through the one gate meant for them.
+    let mut unknown_exposure = wanted.clone();
+    unknown_exposure.in_market_pct = 0.0;
+    assert!(profile.accepts(&unknown_exposure));
+
+    // And an empty profile is the default: no preference, no rejection.
+    assert!(TargetProfile::default().accepts(&trend));
+    assert!(TargetProfile::default().accepts(&scalper));
+}
+
+#[test]
+fn choosing_a_mode_changes_what_the_mode_says_it_changes() {
+    // `apply_mode_overrides` was called from tests and nowhere else, so every
+    // real run used the struct defaults regardless of `trading_mode`: max_dd
+    // 0.15, min_win_rate 0.50, min_profit_factor 1.20. Risky's 0.60 cap and
+    // PropFirm's 0.50 existed and never took effect, and the search found
+    // nothing in any mode — 1 713 of 2 211 candidates rejected against a
+    // drawdown cap the selected mode had raised.
+    let mut settings = neoethos_core::Settings::default();
+
+    settings.system.trading_mode = "risky".to_string();
+    settings.models.discovery_mode = "prop_firm".to_string();
+    let risky = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(risky.mode, DiscoveryMode::Risky);
+    assert!(
+        risky.filtering.max_dd > 0.5,
+        "risky kept the default cap: {}",
+        risky.filtering.max_dd
+    );
+
+    settings.system.trading_mode = "prop_firm".to_string();
+    let prop = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(prop.mode, DiscoveryMode::PropFirm);
+    assert!(
+        prop.filtering.max_dd > 0.3,
+        "prop_firm kept the default cap: {}",
+        prop.filtering.max_dd
+    );
+
+    // Strict is the one mode whose floors ARE the defaults, so it is the
+    // control: if this loosened too, the overrides would be firing for
+    // everyone rather than per mode.
+    settings.models.discovery_mode = "strict".to_string();
+    let strict = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(strict.mode, DiscoveryMode::Strict);
+    assert!(
+        strict.filtering.max_dd <= 0.2,
+        "strict should stay tight: {}",
+        strict.filtering.max_dd
+    );
+}
+
+
+/// The "nonzero_signals" stage builds the SMC gate arrays once for the whole
+/// candidate pool instead of once per candidate. Pins that the pool-wide build
+/// changes nothing the funnel reads: same survivors, same order, same signal
+/// vectors, same "fired at all" count as screening each candidate on its own.
+///
+/// The fixture is 100 bars, so this pins arithmetic only. The stage exists as
+/// a hoist because the rebuild is a full-series cost repeated per candidate —
+/// that is not observable at this size and is not claimed here.
+#[test]
+fn signal_count_screen_matches_screening_each_candidate_alone() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let eval_config =
+        EvaluationConfig::for_symbol("EURUSD", "USD", ohlcv.close.last().copied(), None, None);
+
+    let base = Gene {
+        indices: vec![0, 1],
+        weights: vec![1.0, 0.5],
+        long_threshold: 0.4,
+        short_threshold: -0.4,
+        ..Gene::default()
+    };
+    let candidates: Vec<(usize, Gene)> = vec![
+        (
+            7,
+            Gene {
+                strategy_id: "no-flags".to_string(),
+                ..base.clone()
+            },
+        ),
+        (
+            2,
+            Gene {
+                strategy_id: "ob".to_string(),
+                use_ob: true,
+                ..base.clone()
+            },
+        ),
+        (
+            11,
+            Gene {
+                strategy_id: "structure".to_string(),
+                use_bos: true,
+                use_choch: true,
+                ..base.clone()
+            },
+        ),
+        // Never crosses its long threshold: exercises the zero-signal branch
+        // the funnel reports as "zero_signals_after_smc_gate".
+        (
+            3,
+            Gene {
+                strategy_id: "silent".to_string(),
+                long_threshold: 1e9,
+                short_threshold: -1e9,
+                ..base.clone()
+            },
+        ),
+        (
+            5,
+            Gene {
+                strategy_id: "all-flags".to_string(),
+                use_ob: true,
+                use_fvg: true,
+                use_liq_sweep: true,
+                mtf_confirmation: true,
+                use_premium_discount: true,
+                use_inducement: true,
+                use_bos: true,
+                use_choch: true,
+                use_eqh: true,
+                use_eql: true,
+                use_displacement: true,
+                ..base
+            },
+        ),
+    ];
+    let min_trades = 3usize;
+
+    let expected: Vec<(usize, Gene, Vec<i8>)> = candidates
+        .iter()
+        .filter_map(|(idx, gene)| {
+            let sig = signals_for_gene_full(&features, &ohlcv, gene, &eval_config);
+            let firing = sig.iter().filter(|v| **v != 0).count();
+            (firing >= min_trades).then(|| (*idx, gene.clone(), sig))
+        })
+        .collect();
+    let expected_nonzero = candidates
+        .iter()
+        .filter(|(_, gene)| {
+            signals_for_gene_full(&features, &ohlcv, gene, &eval_config)
+                .iter()
+                .any(|v| *v != 0)
+        })
+        .count();
+
+    // Both branches of the funnel's two counters must be exercised, otherwise
+    // the comparison below cannot catch a regression in either.
+    assert!(
+        !expected.is_empty() && expected.len() < candidates.len(),
+        "fixture must both keep and drop candidates (kept {} of {})",
+        expected.len(),
+        candidates.len()
+    );
+    assert!(expected_nonzero > 0 && expected_nonzero < candidates.len());
+
+    let (survivors, nonzero) =
+        screen_candidates_by_signal_count(&features, &ohlcv, candidates, &eval_config, min_trades);
+    assert_eq!(nonzero, expected_nonzero, "'fired at all' count");
+    assert_eq!(survivors.len(), expected.len(), "survivor count");
+    for (got, want) in survivors.iter().zip(expected.iter()) {
+        assert_eq!(got.0, want.0, "candidate index (order must be preserved)");
+        assert_eq!(got.1, want.1, "gene");
+        assert_eq!(got.2, want.2, "signal vector for candidate {}", want.0);
+    }
+}
+
+/// Pins that the screen builds the SMC gate arrays ONCE for the whole pool.
+///
+/// A reviewer moved the build back inside the `filter_map` — strictly worse
+/// than the code before the hoist, since it also pays the row-pack per
+/// candidate — and all 379 tests stayed green. The saving could be handed back
+/// with no signal at all, which makes this the only assertion that defends it.
+#[test]
+fn the_screen_builds_the_gate_arrays_once_for_the_whole_pool() {
+    use crate::genetic::search_engine::SMC_GATE_BUILD_CALLS;
+
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let eval_config =
+        EvaluationConfig::for_symbol("EURUSD", "USD", ohlcv.close.last().copied(), None, None);
+    let base = Gene {
+        indices: vec![0, 1],
+        weights: vec![1.0, 0.5],
+        long_threshold: 0.4,
+        short_threshold: -0.4,
+        ..Gene::default()
+    };
+    let genes: Vec<(usize, Gene)> = (0..6)
+        .map(|i| {
+            (
+                i,
+                Gene {
+                    strategy_id: format!("g{i}"),
+                    ..base.clone()
+                },
+            )
+        })
+        .collect();
+
+    // One rayon worker, so every build the screen triggers is counted on the
+    // thread doing the counting. With the default pool the work is stolen
+    // across threads and a thread-local counter sees a fraction of the truth —
+    // which is the same class of mistake as the process-global it replaced.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("single-worker pool");
+    let built = pool.install(|| {
+        let before = SMC_GATE_BUILD_CALLS.with(|c| c.get());
+        let _ = super::screen_candidates_by_signal_count(&features, &ohlcv, genes, &eval_config, 0);
+        SMC_GATE_BUILD_CALLS.with(|c| c.get()) - before
+    });
+
+    assert_eq!(
+        built, 1,
+        "screening six candidates built the gate arrays {built} times — the whole point          of the hoist is that it is one, whatever the pool size"
+    );
 }

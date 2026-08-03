@@ -73,6 +73,7 @@ mod gpu {
         timestamps: Vec<i64>,
         sl_pips: Vec<f64>,
         tp_pips: Vec<f64>,
+        stop_vol_mult: Vec<f64>,
         smc_data: Vec<SmcRow>,
         gene_smc_flags: Vec<SmcRow>,
         smc_weights: [f32; 11],
@@ -134,6 +135,9 @@ mod gpu {
             timestamps: (0..n_samples as i64).map(|i| i * 60_000).collect(),
             sl_pips: vec![25.0; n_genes],
             tp_pips: vec![50.0; n_genes],
+            // Fixed stops: a zero multiplier selects the scalar sl/tp path, so
+            // the harness keeps measuring the shape it has always measured.
+            stop_vol_mult: vec![0.0; n_genes],
             smc_data: vec![[0i8; 11]; n_samples],
             gene_smc_flags: vec![[0i8; 11]; n_genes],
             smc_weights: [0.0f32; 11],
@@ -157,6 +161,7 @@ mod gpu {
             timestamps: &o.timestamps,
             sl_pips: &o.sl_pips,
             tp_pips: &o.tp_pips,
+            stop_vol_mult: &o.stop_vol_mult,
             smc_data: &o.smc_data,
             gene_smc_flags: &o.gene_smc_flags,
             gate_threshold: 0.0,

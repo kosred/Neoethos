@@ -179,15 +179,30 @@ impl ResolvedConfig {
             if mode == "prop_firm" {
                 (0.0_f64, 1.0_f64, 0.50_f64, -10.0_f64, 0.0_f64, 0.0_f64)
             } else {
-                // Strict mode uses crate::genetic::FilteringConfig::default()
-                // values; we mirror them here for display (the actual values
-                // are still applied in neoethos-search).
+                // Strict/Risky: no mode override fires (apply_mode_overrides
+                // only rewrites the floors for PropFirm), so what the engine
+                // enforces is `FilteringConfig::default()` in
+                // neoethos-search/src/genetic/strategy_gene.rs:101-117.
+                //
+                // CORRECTED 2026-08-03. Three of these six had drifted from the
+                // values actually enforced, so `neoethos-cli config` and the UI
+                // were reporting a system that does not exist:
+                //     max_drawdown  0.20 -> 0.15   (engine is STRICTER by 5 pts)
+                //     min_sharpe    0.5  -> 0.3    (engine is LOOSER)
+                //     min_win_rate  0.45 -> 0.50   (engine is STRICTER)
+                // Only min_profit_factor (1.2) was right. Nothing enforced
+                // changes here — this is the display catching up to the engine.
+                //
+                // The comment above admits the equality test was "a Phase-C
+                // task"; it is now written, in neoethos-search where both
+                // crates are visible: `display_floors_match_the_enforced_ones`.
+                // That is why the drift is fixed rather than merely noticed.
                 (
                     0.0_f64,
                     s.models.prop_min_trades.max(1) as f64,
-                    0.20_f64,
-                    0.5_f64,
-                    0.45_f64,
+                    0.15_f64,
+                    0.3_f64,
+                    0.50_f64,
                     1.2_f64,
                 )
             };

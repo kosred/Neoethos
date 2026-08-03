@@ -1,13 +1,27 @@
 use anyhow::{Context, Result};
 use neoethos_core::logging::{setup_logging, write_subsystem_record};
 use neoethos_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod gpu_bench;
+mod gpu_bench_population;
+mod gpu_bench_prepare;
+mod gpu_bench_snapshot;
 mod tui;
 
 fn main() -> Result<()> {
     setup_logging(false)?;
+    // Say out loud what the environment is changing underneath this run.
+    //
+    // This function was written for exactly this call and had ZERO callers — its
+    // own doc says "Designed to be called once in the binary's main() after
+    // setup_logging". Meanwhile the workspace carries 215 distinct NEOETHOS_*
+    // names across 183 `env::var` sites, and an env var that silently alters a
+    // run is how `apply_mode_overrides`, the search runtime overrides and the
+    // OOS holdout each spent months meaning something weaker than they claimed.
+    // Nothing here changes behaviour; it makes the behaviour visible, which is
+    // the precondition for retiring these in favour of the single config.
+    neoethos_core::env_overrides::log_active_overrides_at_startup();
     // Config-consolidation: search runtime overrides come from the single
     // config (canonical user config.yaml), not the environment. Falls back
     // to defaults if it can't be loaded. (S2a: genetic search; rest staged.)
@@ -91,6 +105,11 @@ fn main() -> Result<()> {
         "forward-test" => cmd_forward_test(&args[2..]),
         "blend-test" => cmd_blend_test(&args[2..]),
         "batch-discover" => cmd_batch_discover(&args[2..]),
+        "bench" => gpu_bench::run(&args[2..]),
+        "bench-prepare" => gpu_bench_prepare::run_prepare(&args[2..]),
+        "bench-matrix" => gpu_bench_prepare::run_matrix(&args[2..]),
+        "bench-collate" => gpu_bench_prepare::run_collate(&args[2..]),
+        "bench-preflight-report" => gpu_bench_prepare::run_preflight_report(&args[2..]),
         "migrate-data" => cmd_migrate_data(&args[2..]),
         "slice-dataset" => cmd_slice_dataset(&args[2..]),
         "import" => cmd_import(&args[2..]),
@@ -2264,6 +2283,15 @@ fn setup_news_template() -> Result<()> {
 }
 
 fn parse_root(args: &[String], settings: Option<&neoethos_core::Settings>) -> String {
+    let root = resolve_root(args, settings);
+    // Point the FX resolver at whatever store this command decided on, so a
+    // `--root` run converts cross-pair pip values against that store rather
+    // than the one named in config.yaml.
+    neoethos_search::fx_rates::set_store_root(&root);
+    root
+}
+
+fn resolve_root(args: &[String], settings: Option<&neoethos_core::Settings>) -> String {
     // `--data-path` is the operator-facing flag added 2026-05-14 for
     // folder-browsing workflows; `--root` remains for backwards
     // compatibility with existing scripts. `--data-path` wins when
@@ -2374,22 +2402,29 @@ fn print_dataset_discovery_summary(root: &str) -> Result<neoethos_data::DatasetD
     Ok(report)
 }
 
-fn parse_config_path(args: &[String]) -> String {
-    parse_flag(args, "--config").unwrap_or_else(|| "config.yaml".to_string())
-}
-
 fn resolve_cli_settings(args: &[String]) -> Result<Option<neoethos_core::Settings>> {
     if let Some(config_path) = parse_flag(args, "--config") {
         return neoethos_core::Settings::from_yaml(&config_path).map(Some);
     }
 
-    let default_config_path = parse_config_path(args);
-    let default_path = Path::new(&default_config_path);
-    if default_path.exists() {
-        return neoethos_core::Settings::from_yaml(default_path).map(Some);
-    }
-
-    Ok(None)
+    // Without --config, resolve the way the rest of the process does.
+    //
+    // This checked the working directory for `config.yaml` and stopped there,
+    // while `Settings::load()` — which installs the runtime overrides at
+    // startup, main.rs:18 — prefers the user config under %LOCALAPPDATA% and
+    // only falls back to the relative path. Run from the repo and the two
+    // disagreed inside one process.
+    //
+    // They are not variants of each other. Measured on this machine
+    // (2026-08-01): the user config says trading_mode prop_firm, preset ftmo,
+    // prop_search_device auto; the repo template, last touched two weeks
+    // earlier, says risky, none, and `cpu` — the line recorded as the cause of
+    // eight months of discovery never reaching the card. Which one a run got
+    // depended on the directory it was started from.
+    //
+    // `load()` still ends at the relative path, so a workspace checkout with no
+    // user config behaves exactly as before.
+    neoethos_core::Settings::load().map(Some)
 }
 
 fn default_symbol(settings: Option<&neoethos_core::Settings>) -> String {
@@ -2683,6 +2718,9 @@ fn print_help() {
     println!("  features --symbol EURUSD --timeframe M1 --root data");
     println!("  prepare --symbol EURUSD --base M1 --higher H1,H4 --root data");
     println!("  resample --symbol EURUSD --base M1 --target H1 --root data");
+    println!(
+        "  bench --dry-run --fixture tiny --prototype a --backend cuda --out cache/gpu-bench/plan.json"
+    );
     println!("  train --symbol EURUSD --base M1 --higher H1,H4 --horizon 1 --root data");
     println!(
         "  search --symbol EURUSD --base M1 --higher H1,H4 --genes 64 --generations 5 --max-indicators 12 --root data"

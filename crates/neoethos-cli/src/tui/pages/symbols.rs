@@ -171,8 +171,7 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
             } else if shared.jobs.has_running("import") {
                 shared.status = "import already running".to_string();
             } else {
-                shared.pending_confirmation =
-                    Some(crate::tui::app::PendingAction::SymbolsImport);
+                shared.pending_confirmation = Some(crate::tui::app::PendingAction::SymbolsImport);
                 shared.status = "Confirm data import? [Y]es / [N]o".to_string();
             }
             true
@@ -217,7 +216,11 @@ fn collect_inventory(root: &std::path::Path) -> Vec<(String, String, usize, u64)
     // on import timescales, not frame timescales.
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
-    type InventoryCache = Option<(Instant, std::path::PathBuf, Vec<(String, String, usize, u64)>)>;
+    type InventoryCache = Option<(
+        Instant,
+        std::path::PathBuf,
+        Vec<(String, String, usize, u64)>,
+    )>;
     static CACHE: Mutex<InventoryCache> = Mutex::new(None);
     {
         let guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());

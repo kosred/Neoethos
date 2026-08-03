@@ -22,7 +22,20 @@ seq-macro = "0.3.6"
 
 # Tree model FFI bindings
 lightgbm3 = { version = "1.0.8", optional = true }
-xgb = { version = "3.0.5", optional = true }
+# Built from the official XGBoost source, not downloaded.
+#
+# The crate's default feature is `use_prebuilt_xgb`, which fetches a .so from a
+# third-party GitHub mirror — and that binary is CPU-only. The runtime probe in
+# tree_models/xgboost.rs then failed with "linked libxgboost is CPU-only" and
+# every XGBoost-family model trained on `hist` instead of `gpu_hist`, reported
+# once at WARN in the middle of a two-hour log.
+#
+# `local_build` compiles the vendored official source with cmake + ninja; the
+# `cuda` feature adds USE_CUDA=ON. The cost is a long first build; the
+# alternative is a GPU feature that silently is not one.
+xgb = { version = "3.0.5", optional = true, default-features = false, features = [
+    "local_build",
+] }
 catboost-rust = { version = "0.3.6", optional = true, features = ["gpu"] }
 sklears = { version = "0.1.1", optional = true, features = ["tree"] }
 candle-core = { version = "0.9.1", optional = true }
@@ -131,8 +144,15 @@ anomaly-detection = ["dep:extended-isolation-forest"]
 # Burn pure-Rust deep learning (production backend)
 burn-wgpu-backend = ["dep:burn-wgpu"]
 burn-cuda-backend = ["dep:burn-cuda"]
-burn-backend = []
-pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", "swarm-forecasting", "burn-backend", "statistical-models", "anomaly-detection"]
+# REMOVED 2026-08-03: `burn-backend = []`. An empty feature with zero
+# `cfg(feature = "burn-backend")` sites anywhere in crates/ or desktop/ — it
+# enabled nothing, gated nothing, and was carried in `pure-rust-ml` below. A
+# feature name that does nothing is worse than none: it reads as a switch, so
+# nobody checks whether it is wired, which is the same shape as the five other
+# "mechanism exists, caller never reaches it" defects in this workspace.
+# (Not to be confused with the upstream `burn-backend` crate in Cargo.lock —
+# that is burn's own and is unaffected.)
+pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", "swarm-forecasting", "statistical-models", "anomaly-detection"]
 
 # #205 vendor-aware GPU aggregates. Each maps the per-library GPU flags
 # above to a single feature the top-level binary can enable. Picking
@@ -176,6 +196,10 @@ gpu-cuda = [
     "lightgbm",
     "reinforcement-learning",
     "rlkit/cuda",
+    # XGBoost on the card. Without this the local build is still CPU-only and
+    # the probe still fails — `local_build` alone only changes WHERE the library
+    # comes from, not what it supports.
+    "xgb/cuda",
     "candle-core/cuda",
 ]
 gpu-vulkan = ["burn-wgpu-backend", "neoethos-core/gpu-wgpu"]

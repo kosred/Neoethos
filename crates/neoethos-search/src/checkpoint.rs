@@ -10,7 +10,7 @@ use std::path::Path;
 
 pub const SEARCH_CHECKPOINT_ARTIFACT_KIND: &str = "search_checkpoint_artifact";
 pub const PORTFOLIO_SELECTION_ARTIFACT_KIND: &str = "portfolio_selection_artifact";
-const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 const PORTFOLIO_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -210,6 +210,7 @@ pub struct SearchCheckpointArtifactFile {
     pub ledger: EvaluatedCandidateLedger,
     pub genes: Vec<Gene>,
     pub metrics: Vec<[f64; 11]>,
+    pub effective_smc_gate_threshold: f32,
 }
 
 impl SearchCheckpointArtifactFile {
@@ -229,6 +230,7 @@ impl SearchCheckpointArtifactFile {
             ledger,
             genes: result.genes,
             metrics: result.metrics,
+            effective_smc_gate_threshold: result.effective_smc_gate_threshold,
         }
     }
 
@@ -236,6 +238,8 @@ impl SearchCheckpointArtifactFile {
         SearchResult {
             genes: self.genes.clone(),
             metrics: self.metrics.clone(),
+
+            effective_smc_gate_threshold: self.effective_smc_gate_threshold,
         }
     }
 
@@ -366,6 +370,8 @@ mod tests {
             SearchResult {
                 genes: vec![gene],
                 metrics: vec![[1.0; 11]],
+
+                effective_smc_gate_threshold: 0.75,
             },
         )
     }

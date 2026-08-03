@@ -9,8 +9,12 @@ use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 use half::bf16;
 use ndarray::ArrayView2;
 use neoethos_core::TrainingPrecision;
+use neoethos_gpu_contracts::device::ScenarioDescriptor;
 
 use crate::eval::{BacktestSettings, SmcRow};
+use crate::gpu_native::prototype_a::{
+    PrototypeADatasetUpload, PrototypeAGeneUpload, PrototypeAScenarioUpload,
+};
 
 const SMC_WIDTH: usize = 11;
 const BACKTEST_CORE_METRIC_WIDTH: usize = 7;
@@ -25,6 +29,176 @@ const BACKTEST_CORE_METRIC_WIDTH: usize = 7;
 //   [4] max_trades_per_day      = max day trade count (as f32)
 //   [5] trading_days            = count of days with >=1 trade (as f32)
 const FTMO_WIDTH: usize = 6;
+
+#[cfg(test)]
+fn cubecl_daily_drawdown_from_extrema(day_peak: f64, day_low: f64) -> f64 {
+    if day_peak > 0.0 {
+        (day_peak - day_low) / day_peak
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+fn cubecl_daily_drawdown_after_peak_transition(
+    max_daily_dd: f64,
+    day_peak: f64,
+    day_low: f64,
+    new_peak: f64,
+    new_low: f64,
+) -> f64 {
+    max_daily_dd
+        .max(cubecl_daily_drawdown_from_extrema(day_peak, day_low))
+        .max(cubecl_daily_drawdown_from_extrema(new_peak, new_low))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CubeClTransferTelemetry {
+    pub gpu_calls: u64,
+    pub resident_cache_hits: u64,
+    pub resident_cache_misses: u64,
+    pub resident_upload_bytes: u64,
+    pub streamed_dataset_upload_bytes: u64,
+    pub gene_uploads: u64,
+    pub gene_upload_bytes: u64,
+    pub full_readbacks: u64,
+    pub full_readback_bytes: u64,
+    pub compact_readbacks: u64,
+    pub compact_readback_bytes: u64,
+    pub chained_reuploads: u64,
+    pub synchronization_events: u64,
+}
+
+mod transfer_telemetry {
+    use super::CubeClTransferTelemetry;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static GPU_CALLS: AtomicU64 = AtomicU64::new(0);
+    static RESIDENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+    static RESIDENT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+    static RESIDENT_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static STREAMED_DATASET_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static GENE_UPLOADS: AtomicU64 = AtomicU64::new(0);
+    static GENE_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static FULL_READBACKS: AtomicU64 = AtomicU64::new(0);
+    static FULL_READBACK_BYTES: AtomicU64 = AtomicU64::new(0);
+    static COMPACT_READBACKS: AtomicU64 = AtomicU64::new(0);
+    static COMPACT_READBACK_BYTES: AtomicU64 = AtomicU64::new(0);
+    static CHAINED_REUPLOADS: AtomicU64 = AtomicU64::new(0);
+    static SYNCHRONIZATION_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn reset() {
+        ENABLED.store(true, Ordering::Relaxed);
+        clear();
+    }
+
+    pub(super) fn disable() {
+        ENABLED.store(false, Ordering::Relaxed);
+        clear();
+    }
+
+    fn clear() {
+        for counter in [
+            &GPU_CALLS,
+            &RESIDENT_CACHE_HITS,
+            &RESIDENT_CACHE_MISSES,
+            &RESIDENT_UPLOAD_BYTES,
+            &STREAMED_DATASET_UPLOAD_BYTES,
+            &GENE_UPLOADS,
+            &GENE_UPLOAD_BYTES,
+            &FULL_READBACKS,
+            &FULL_READBACK_BYTES,
+            &COMPACT_READBACKS,
+            &COMPACT_READBACK_BYTES,
+            &CHAINED_REUPLOADS,
+            &SYNCHRONIZATION_EVENTS,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn snapshot() -> CubeClTransferTelemetry {
+        CubeClTransferTelemetry {
+            gpu_calls: GPU_CALLS.load(Ordering::Relaxed),
+            resident_cache_hits: RESIDENT_CACHE_HITS.load(Ordering::Relaxed),
+            resident_cache_misses: RESIDENT_CACHE_MISSES.load(Ordering::Relaxed),
+            resident_upload_bytes: RESIDENT_UPLOAD_BYTES.load(Ordering::Relaxed),
+            streamed_dataset_upload_bytes: STREAMED_DATASET_UPLOAD_BYTES.load(Ordering::Relaxed),
+            gene_uploads: GENE_UPLOADS.load(Ordering::Relaxed),
+            gene_upload_bytes: GENE_UPLOAD_BYTES.load(Ordering::Relaxed),
+            full_readbacks: FULL_READBACKS.load(Ordering::Relaxed),
+            full_readback_bytes: FULL_READBACK_BYTES.load(Ordering::Relaxed),
+            compact_readbacks: COMPACT_READBACKS.load(Ordering::Relaxed),
+            compact_readback_bytes: COMPACT_READBACK_BYTES.load(Ordering::Relaxed),
+            chained_reuploads: CHAINED_REUPLOADS.load(Ordering::Relaxed),
+            synchronization_events: SYNCHRONIZATION_EVENTS.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(super) fn record_call() {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        GPU_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_streamed_dataset_upload(bytes: usize) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        STREAMED_DATASET_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_gene_upload(bytes: usize) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        GENE_UPLOADS.fetch_add(1, Ordering::Relaxed);
+        GENE_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_resident_hit() {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        RESIDENT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_resident_miss(bytes: usize) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        RESIDENT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        RESIDENT_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_readback(use_fused: bool, compact_bytes: usize, dense_bytes: usize) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        COMPACT_READBACKS.fetch_add(1, Ordering::Relaxed);
+        COMPACT_READBACK_BYTES.fetch_add(compact_bytes as u64, Ordering::Relaxed);
+        SYNCHRONIZATION_EVENTS.fetch_add(1, Ordering::Relaxed);
+        if !use_fused && dense_bytes > 0 {
+            FULL_READBACKS.fetch_add(1, Ordering::Relaxed);
+            FULL_READBACK_BYTES.fetch_add(dense_bytes as u64, Ordering::Relaxed);
+            CHAINED_REUPLOADS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) fn reset_cubecl_transfer_telemetry() {
+    transfer_telemetry::reset();
+}
+
+pub(crate) fn disable_cubecl_transfer_telemetry() {
+    transfer_telemetry::disable();
+}
+
+pub(crate) fn cubecl_transfer_telemetry_snapshot() -> CubeClTransferTelemetry {
+    transfer_telemetry::snapshot()
+}
 
 // ─── F-CORE3 consolidation — CUDA env-var registry ──────────────────
 //
@@ -309,9 +483,11 @@ mod resident_device_cache {
         );
         {
             let Ok(mut st) = state().lock() else {
+                super::transfer_telemetry::record_resident_miss(bytes.len());
                 return client.create_from_slice(bytes);
             };
             if let Some((_, handle)) = st.map.get(&key) {
+                super::transfer_telemetry::record_resident_hit();
                 return handle.clone();
             }
             // Evict oldest until the NEW entry fits the budget.
@@ -327,6 +503,7 @@ mod resident_device_cache {
         }
         // Upload OUTSIDE the lock (can take milliseconds for GB-scale buffers).
         let handle = client.create_from_slice(bytes);
+        super::transfer_telemetry::record_resident_miss(bytes.len());
         if let Ok(mut st) = state().lock() {
             st.map.insert(key, (bytes.len(), handle.clone()));
             st.order.push_back(key);
@@ -402,11 +579,48 @@ fn read_cuda_device_id_from_env() -> usize {
 /// wgpu/Vulkan under `gpu-vulkan` — so every downstream kernel launch stays
 /// generic over `R: Runtime` and runs unchanged on whichever backend was built.
 /// (When both features are on, CUDA wins.)
+///
+/// 🔴 `gpu-rocm` DOES NOT COMPILE, and this function is why.
+///
+/// There are exactly two definitions below: `#[cfg(feature = "gpu-cuda")]` and
+/// `#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]`. The string
+/// `feature = "gpu-rocm"` appears NOWHERE in neoethos-search/src. But
+/// Cargo.toml defines `gpu-rocm = ["gpu", "cubecl/hip", ...]`, which enables
+/// neither of those two, so every call site here fails to resolve:
+///
+///     error[E0432]: unresolved import `crate::cubecl_eval::create_gpu_client`
+///     error[E0425]: cannot find function `create_gpu_client` in this scope   (×4)
+///     error[E0425]: cannot find type `PrototypeAActiveRuntime` in this scope
+///     error[E0425]: cannot find function `active_backend_id` in this scope
+///
+/// 8 errors, measured 2026-08-03 with `cargo check -p neoethos-search
+/// --features gpu-rocm`. CI runs this lane at ci.yml:205 and :210, so it has
+/// been red. Bare `gpu` fails the same way with 7 — that one is by design, as
+/// `gpu` binds no runtime.
+///
+/// CORRECTION TO THE RECORD: commit 4e6f0aad is titled "the Vulkan and ROCm
+/// builds did not compile" and fixed only Vulkan. Its own verification section
+/// listed `--features gpu-vulkan` and `--features gpu-b-adapter` and never ran
+/// gpu-rocm — the claim outran the evidence, which is the failure mode this
+/// branch has spent two days correcting in other people's work.
+///
+/// THE FIX, when someone has an AMD card to test on: add a third arm returning
+/// `ComputeClient<HipRuntime>` (cubecl-hip), mirroring the Vulkan arm, plus
+/// `PrototypeAActiveRuntime` and `active_backend_id` for it. Deliberately not
+/// written blind here: an untested HIP arm would turn a loud compile error into
+/// a runtime one on hardware nobody in this project owns, which is strictly
+/// worse than a build that refuses.
 #[cfg(feature = "gpu-cuda")]
-fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<CudaRuntime>> {
+pub(crate) fn create_gpu_client(
+    device_override: Option<usize>,
+) -> Result<ComputeClient<CudaRuntime>> {
     let device_id = device_override.unwrap_or_else(cuda_device_id);
-    let device_count = tch::Cuda::device_count();
-    if device_count <= device_id as i64 {
+    // Device enumeration goes through our own C ABI rather than `tch`: the only
+    // thing that was ever needed from libtorch here is a device count, and
+    // dragging a multi-gigabyte install onto every CUDA machine to obtain it is
+    // not a trade worth making.
+    let device_count = neoethos_gpu_cuda::device_count();
+    if device_count <= device_id {
         bail!(
             "GPU evaluator requested CUDA device {} but only {} CUDA devices are available",
             device_id,
@@ -450,7 +664,9 @@ fn parse_wgpu_device_selector(raw: &str) -> Option<WgpuDevice> {
 }
 
 #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
-fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<WgpuRuntime>> {
+pub(crate) fn create_gpu_client(
+    device_override: Option<usize>,
+) -> Result<ComputeClient<WgpuRuntime>> {
     // `WgpuDevice`/`WgpuRuntime` come from the module-level import (line ~7).
     // The pool-option structs (`MemoryPoolOptions`/`PoolType`) are used inside
     // `bounded_wgpu_pools` below, which imports them itself.
@@ -502,7 +718,7 @@ fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<Wgp
     let mut seen = initialized
         .lock()
         .map_err(|_| anyhow::anyhow!("wgpu device-init registry mutex poisoned"))?;
-    if seen.insert(key) {
+    if seen.insert(key.clone()) {
         // We can't read the device limits without registering, so the bounded pool
         // is built from a CONSERVATIVE `max_page` = the cap ceiling (2GiB), which is
         // >= the largest single buffer the windowing machinery ever builds
@@ -518,7 +734,25 @@ fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<Wgp
                 pool_options: bounded_wgpu_pools(POOL_MAX_PAGE, POOL_ALIGNMENT),
             },
         };
-        let setup = init_setup::<Vulkan>(&base_device, runtime_options);
+        // CubeCL reports missing/default or class-pinned adapters by panicking.
+        // Catch that panic while this registry guard is still live so the
+        // once-per-device key can be removed and the mutex is not poisoned for
+        // every later GPU test in the same process. Unknown panics still fail
+        // after the guard is released.
+        let setup = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            init_setup::<Vulkan>(&base_device, runtime_options)
+        })) {
+            Ok(setup) => setup,
+            Err(payload) => {
+                seen.remove(&key);
+                let message = panic_payload_message(payload.as_ref());
+                drop(seen);
+                if crate::gpu_native::prototype_a::is_known_no_adapter_error(&message) {
+                    bail!("wgpu adapter unavailable: {message}");
+                }
+                std::panic::resume_unwind(payload);
+            }
+        };
         let binding_limit = setup.device.limits().max_storage_buffer_binding_size as u64;
         let buffer_limit = setup.adapter.limits().max_buffer_size;
         let real_cap = binding_limit.min(buffer_limit);
@@ -535,6 +769,17 @@ fn create_gpu_client(device_override: Option<usize>) -> Result<ComputeClient<Wgp
     drop(seen); // release the registry lock before building the (cheap) client
 
     Ok(WgpuRuntime::client(&base_device))
+}
+
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else {
+        "non-string panic during wgpu adapter initialization".to_string()
+    }
 }
 
 /// Build a GRADUATED set of sliced memory pools (mirroring cubecl's default
@@ -620,6 +865,7 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
     // precision the CPU uses; written only where the final signal survives.
     confidences_out: &mut Array<f32>,
     n_samples: u32,
+    gene_start: u32,
     gate_threshold: F,
 ) {
     // cubecl 0.9: ABSOLUTE_POS and Array::len() are `usize`, and array
@@ -633,7 +879,7 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
     let pos = ABSOLUTE_POS;
     if pos < output.len() {
         let n_samples = n_samples as usize;
-        let gene = pos / n_samples;
+        let gene = (pos / n_samples) + gene_start as usize;
         let sample = pos % n_samples;
 
         let start = gene_offsets[gene] as usize;
@@ -745,468 +991,319 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
     }
 }
 
-#[cube(launch)]
-fn backtest_population_kernel(
-    close_pips: &Array<f32>,
-    high_pips: &Array<f32>,
-    low_pips: &Array<f32>,
-    signals_flat: &Array<i32>,
-    timestamp_deltas_ms: &Array<i32>,
-    month_idx: &Array<i32>,
-    day_idx: &Array<i32>,
-    sl_pips: &Array<f32>,
-    tp_pips: &Array<f32>,
-    metrics_out: &mut Array<f32>,
-    trade_counts_out: &mut Array<i32>,
-    monthly_pnls_out: &mut Array<f32>,
-    month_counts_out: &mut Array<i32>,
-    n_samples: u32,
-    month_capacity: u32,
-    initial_equity: f32,
-    max_hold_bars: u32,
-    min_hold_bars: u32,
-    max_trades_per_day: u32,
-    gap_threshold_ms: i32,
-    use_timestamps: i32,
-    trailing_enabled: i32,
-    trailing_atr_multiplier: f32,
-    trailing_be_trigger_r: f32,
-    spread_pips: f32,
-    commission_per_trade: f32,
-    pip_value_per_lot: f32,
-    // Phase C.3 (2026-05-28) — broker-supplied carry costs mirrored
-    // from the CPU `apply_carry_and_fee` helper. Sign convention
-    // matches the broker: positive = credit, negative = charge per
-    // overnight day. `pnl_conversion_fee_rate` is a fraction (0.005
-    // = 0.5%); skipped if non-finite / out-of-range so a missing-
-    // broker-data run still produces a backtest, matching the CPU
-    // kernel's fail-safe default behaviour.
-    swap_long_pips_per_day: f32,
-    swap_short_pips_per_day: f32,
-    pnl_conversion_fee_rate: f32,
-    // Phase 2 (2026-06-06): risk-based, confidence-scaled position sizing —
-    // mirrors `risk_based_pos_lots` + the pos_lots multiply sites on the CPU
-    // (eval.rs:657-685, 1049-1054, 809/865-880/979/627). `confidences_flat` is
-    // per-gene-per-bar (same layout as `signals_flat`). When `risk_based_sizing`
-    // is 0 the kernel forces pos_lots = 1.0 (legacy fixed-1-lot parity).
-    confidences_flat: &Array<f32>,
-    risk_based_sizing: i32,
-    risk_per_trade_min: f32,
-    risk_per_trade_max: f32,
-    high_quality_confidence: f32,
-    // Adaptive stops (2026-07-24): per-BAR base stop distance in pips
-    // (`base_pips`, shared across genes), per-GENE volatility multiplier
-    // (`stop_vol_mult`), and the reward:risk. When `stop_vol_mult[gene] > 0` an
-    // entry captures `sl = mult × base_pips[signal_bar]`, `tp = adaptive_rr × sl`
-    // (see the entry block) — otherwise the scalar `sl_pips`/`tp_pips` path, so a
-    // fixed-stop population is byte-identical. `base_pips` has `n_samples`
-    // elements; a fixed-only launch passes a 1-element dummy (never read).
-    base_pips: &Array<f32>,
-    stop_vol_mult: &Array<f32>,
-    adaptive_rr: f32,
-    // Per-month STARTING equity (sibling of monthly_pnls_out); the host divides
-    // monthly_pnls_out / month_start_equities_out to get monthly_target_hit_rate
-    // (metric slot 7), matching eval.rs:1110-1131.
-    month_start_equities_out: &mut Array<f32>,
-    // FTMO prop-firm observables, `n_genes * FTMO_WIDTH` laid out per gene
-    // (see `FTMO_WIDTH`). MUST be the LAST kernel parameter so `launch_backtest_kernel`
-    // appends its `ArrayArg` after all the existing args.
-    ftmo_out: &mut Array<f32>,
-) {
-    // cubecl 0.9: index arithmetic is usize; coerce u32 params at the top.
-    // Every scalar accumulator that gets reassigned must use RuntimeCell —
-    // `let mut x = literal;` and `let mut x = param;` both produce
-    // immutable bindings in cubecl 0.9, and any later `=`/`+=` panics.
-    if ABSOLUTE_POS < trade_counts_out.len() {
-        let gene = ABSOLUTE_POS;
-        let n_samples = n_samples as usize;
-        let month_capacity = month_capacity as usize;
-        let max_hold_bars = max_hold_bars as usize;
-        let min_hold_bars = min_hold_bars as usize;
-        let max_trades_per_day = max_trades_per_day as usize;
-        let signal_base = gene * n_samples;
-        let month_base = gene * month_capacity;
-        let metric_base = gene * BACKTEST_CORE_METRIC_WIDTH;
-        let ftmo_base = gene * FTMO_WIDTH;
+// The backtest kernel, emitted once per floating-point precision.
+//
+// The accumulation in this kernel is where precision actually decides the
+// result: a 2026-07-27 measurement on an RTX A6000 had the f32 lane report a
+// net profit of +3 940 against the canonical +8 506 over 200 000 real EURUSD M5
+// bars — 54 % wrong — while an f64 engine reproduced the CPU exactly. The error
+// is not drift alone; the f32 lane took 129-430 more trades, so rounding was
+// flipping stop/target comparisons and changing which trades happen at all.
+//
+// Emitting both precisions from one body keeps them honestly comparable: there
+// is no second implementation that could differ for some reason other than the
+// element type. Literals stay untyped and adopt whichever type is passed, which
+// is why this is a macro over a concrete type rather than a `F: Float` generic —
+// the generic form would need every `0.0` rewritten as `F::new(0.0)`, i.e. a
+// hand edit at ~97 sites, each one an opportunity to change behaviour by
+// accident.
+macro_rules! define_backtest_population_kernel {
+    ($name:ident, $f:ty) => {
+    #[cube(launch)]
+    fn $name(
+        close_pips: &Array<$f>,
+        high_pips: &Array<$f>,
+        low_pips: &Array<$f>,
+        signals_flat: &Array<i32>,
+        timestamp_deltas_ms: &Array<i32>,
+        month_idx: &Array<i32>,
+        day_idx: &Array<i32>,
+        sl_pips: &Array<$f>,
+        tp_pips: &Array<$f>,
+        metrics_out: &mut Array<$f>,
+        trade_counts_out: &mut Array<i32>,
+        monthly_pnls_out: &mut Array<$f>,
+        month_counts_out: &mut Array<i32>,
+        n_samples: u32,
+        gene_start: u32,
+        gene_count: u32,
+        month_capacity: u32,
+        initial_equity: $f,
+        max_hold_bars: u32,
+        min_hold_bars: u32,
+        max_trades_per_day: u32,
+        gap_threshold_ms: i32,
+        use_timestamps: i32,
+        trailing_enabled: i32,
+        trailing_atr_multiplier: $f,
+        trailing_be_trigger_r: $f,
+    trailing_min_lock_pips: $f,
+        spread_pips: $f,
+        commission_per_trade: $f,
+        pip_value_per_lot: $f,
+        // Phase C.3 (2026-05-28) — broker-supplied carry costs mirrored
+        // from the CPU `apply_carry_and_fee` helper. Sign convention
+        // matches the broker: positive = credit, negative = charge per
+        // overnight day. `pnl_conversion_fee_rate` is a fraction (0.005
+        // = 0.5%); skipped if non-finite / out-of-range so a missing-
+        // broker-data run still produces a backtest, matching the CPU
+        // kernel's fail-safe default behaviour.
+        swap_long_pips_per_day: $f,
+        swap_short_pips_per_day: $f,
+        pnl_conversion_fee_rate: $f,
+        // Phase 2 (2026-06-06): risk-based, confidence-scaled position sizing —
+        // mirrors `risk_based_pos_lots` + the pos_lots multiply sites on the CPU
+        // (eval.rs:657-685, 1049-1054, 809/865-880/979/627). `confidences_flat` is
+        // per-gene-per-bar (same layout as `signals_flat`). When `risk_based_sizing`
+        // is 0 the kernel forces pos_lots = 1.0 (legacy fixed-1-lot parity).
+        confidences_flat: &Array<$f>,
+        risk_based_sizing: i32,
+        risk_per_trade_min: $f,
+        risk_per_trade_max: $f,
+        high_quality_confidence: $f,
+        // Adaptive stops (2026-07-24): per-BAR base stop distance in pips
+        // (`base_pips`, shared across genes), per-GENE volatility multiplier
+        // (`stop_vol_mult`), and the reward:risk. When `stop_vol_mult[gene] > 0` an
+        // entry captures `sl = mult × base_pips[signal_bar]`, `tp = adaptive_rr × sl`
+        // (see the entry block) — otherwise the scalar `sl_pips`/`tp_pips` path, so a
+        // fixed-stop population is byte-identical. `base_pips` has `n_samples`
+        // elements; a fixed-only launch passes a 1-element dummy (never read).
+        base_pips: &Array<$f>,
+        stop_vol_mult: &Array<$f>,
+        adaptive_rr: $f,
+        // Per-month STARTING equity (sibling of monthly_pnls_out); the host divides
+        // monthly_pnls_out / month_start_equities_out to get monthly_target_hit_rate
+        // (metric slot 7), matching eval.rs:1110-1131.
+        month_start_equities_out: &mut Array<$f>,
+        // FTMO prop-firm observables, `n_genes * FTMO_WIDTH` laid out per gene
+        // (see `FTMO_WIDTH`). MUST be the LAST kernel parameter so `launch_backtest_kernel`
+        // appends its `ArrayArg` after all the existing args.
+        ftmo_out: &mut Array<$f>,
+    ) {
+        // cubecl 0.9: index arithmetic is usize; coerce u32 params at the top.
+        // Every scalar accumulator that gets reassigned must use RuntimeCell —
+        // `let mut x = literal;` and `let mut x = param;` both produce
+        // immutable bindings in cubecl 0.9, and any later `=`/`+=` panics.
+        if ABSOLUTE_POS < gene_count as usize {
+            let local_gene = ABSOLUTE_POS;
+            let gene = local_gene + gene_start as usize;
+            let n_samples = n_samples as usize;
+            let month_capacity = month_capacity as usize;
+            let max_hold_bars = max_hold_bars as usize;
+            let min_hold_bars = min_hold_bars as usize;
+            let max_trades_per_day = max_trades_per_day as usize;
+            let signal_base = local_gene * n_samples;
+            let month_base = gene * month_capacity;
+            let metric_base = gene * BACKTEST_CORE_METRIC_WIDTH;
+            let ftmo_base = gene * FTMO_WIDTH;
 
-        for zero_idx in 0..month_capacity {
-            monthly_pnls_out[month_base + zero_idx] = 0.0;
-            month_start_equities_out[month_base + zero_idx] = initial_equity;
-        }
-        month_counts_out[gene] = 0;
-        trade_counts_out[gene] = 0;
-        for fj in 0..FTMO_WIDTH {
-            ftmo_out[ftmo_base + fj] = 0.0;
-        }
-
-        if n_samples == 0 {
-            for j in 0..BACKTEST_CORE_METRIC_WIDTH {
-                metrics_out[metric_base + j] = 0.0;
+            for zero_idx in 0..month_capacity {
+                monthly_pnls_out[month_base + zero_idx] = 0.0;
+                month_start_equities_out[month_base + zero_idx] = initial_equity;
             }
-            terminate!();
-        }
-
-        // Per-entry SL/TP distance in pips. For a fixed-stop gene these stay at
-        // the scalar sl_pips[gene]/tp_pips[gene] (byte-identical); for an adaptive
-        // gene (stop_vol_mult[gene] > 0) they are RE-CAPTURED at each entry from
-        // the signal-bar volatility (below), mirroring the CPU `entry_sl_tp_pips`.
-        // RuntimeCell because cubecl 0.9 forbids reassigning a `let` binding.
-        let sl_distance = RuntimeCell::<f32>::new(sl_pips[gene]);
-        let tp_distance = RuntimeCell::<f32>::new(tp_pips[gene]);
-
-        let equity = RuntimeCell::<f32>::new(initial_equity);
-        let peak_equity = RuntimeCell::<f32>::new(initial_equity);
-        let max_dd = RuntimeCell::<f32>::new(0.0);
-        let trade_count = RuntimeCell::<i32>::new(0);
-        let wins = RuntimeCell::<i32>::new(0);
-        let gross_profit = RuntimeCell::<f32>::new(0.0);
-        let gross_loss = RuntimeCell::<f32>::new(0.0);
-
-        let last_month = RuntimeCell::<i32>::new(-1);
-        let current_month_pnl = RuntimeCell::<f32>::new(0.0);
-        let month_ptr = RuntimeCell::<i32>::new(-1);
-        // Per-month starting equity (slot-7 monthly_target_hit_rate). Mirrors the
-        // CPU `current_month_start_equity` carried at each month boundary (eval.rs:732/778).
-        let current_month_start_equity = RuntimeCell::<f32>::new(initial_equity);
-        // Confidence-scaled lot size, captured ONCE at entry, held for the trade
-        // (eval.rs:1049-1054). 1.0 = legacy fixed-1-lot.
-        let pos_lots = RuntimeCell::<f32>::new(1.0);
-
-        let last_day = RuntimeCell::<i32>::new(-1);
-        let day_peak = RuntimeCell::<f32>::new(initial_equity);
-        let day_low = RuntimeCell::<f32>::new(initial_equity);
-        let max_daily_dd = RuntimeCell::<f32>::new(0.0);
-        let day_trade_count = RuntimeCell::<u32>::new(0);
-
-        // ── FTMO prop-firm observables (mirror validation.rs::compute_prop_firm_risk_summary) ──
-        // Trades bucket by integer DAY == day_idx[i] (same key the CPU derives from
-        // trade.exit_time / 86_400_000). `current_day_pnl` accumulates realized pnl of
-        // the day in progress; finalized at each day boundary and once more after the loop.
-        let current_day_pnl = RuntimeCell::<f32>::new(0.0);
-        let max_daily_loss = RuntimeCell::<f32>::new(0.0);
-        // END-OF-DAY equity curve drawdown: equity at a day boundary already equals
-        // initial + sum(all prior days' realized pnl), i.e. exactly the CPU's per-day
-        // equity point (equity += day_pnl iterated in day order). No-trade boundary days
-        // repeat the prior point → never create a new peak or a larger DD → harmless.
-        let eod_peak = RuntimeCell::<f32>::new(initial_equity);
-        let max_eod_dd = RuntimeCell::<f32>::new(0.0);
-        let positive_day_sum = RuntimeCell::<f32>::new(0.0);
-        let largest_positive_day = RuntimeCell::<f32>::new(0.0);
-        let max_trades_day = RuntimeCell::<u32>::new(0);
-        let trading_days = RuntimeCell::<i32>::new(0);
-        // FTMO trade-DAY counting must bucket by the CLOSE day (= trade.exit_time/day),
-        // because the CPU `compute_prop_firm_risk_summary` keys `day_trade_count` on
-        // `trade.exit_time/86_400_000`. The existing `day_trade_count` increments at
-        // ENTRY (it gates `max_trades_per_day` on the entry side) and would diverge for
-        // overnight holds, so we keep a SEPARATE close-bucketed counter here.
-        let current_day_closes = RuntimeCell::<u32>::new(0);
-
-        let in_pos = RuntimeCell::<i32>::new(0);
-        let entry_px = RuntimeCell::<f32>::new(0.0);
-        let entry_idx = RuntimeCell::<i32>::new(-1);
-        let trail_px = RuntimeCell::<f32>::new(0.0);
-        // Phase C.3: accumulated days in position. Resets to 0 at entry,
-        // each in-position bar adds `timestamp_deltas_ms[i] / 86_400_000`.
-        // f32 precision loss on the cast is bounded by ~5 ms per bar
-        // (cast of values up to 86.4M ms into 24-bit mantissa); over
-        // a year of D1 bars this accumulates to <$0.001 of swap error
-        // at typical EURUSD pip values — negligible vs the $122/year
-        // swap charge being modelled.
-        let position_days = RuntimeCell::<f32>::new(0.0);
-
-        for i in 1..n_samples {
-            // Phase C.3: accumulate carry duration while in position.
-            // Runs BEFORE any exit logic so the close branches use the
-            // total time held, INCLUDING the delta into the current bar.
-            if in_pos.read() != 0 && use_timestamps != 0 && timestamp_deltas_ms[i] > 0 {
-                let delta_days = timestamp_deltas_ms[i] as f32 / 86_400_000.0;
-                position_days.store(position_days.read() + delta_days);
+            month_counts_out[gene] = 0;
+            trade_counts_out[gene] = 0;
+            for fj in 0..FTMO_WIDTH {
+                ftmo_out[ftmo_base + fj] = 0.0;
             }
 
-            let m_val = month_idx[i];
-            let last_month_v = last_month.read();
-            if m_val != last_month_v {
-                if last_month_v != -1 {
-                    let next_ptr = month_ptr.read() + 1;
-                    month_ptr.store(next_ptr);
-                    if next_ptr >= 0 && next_ptr < month_capacity as i32 {
-                        monthly_pnls_out[month_base + next_ptr as usize] = current_month_pnl.read();
-                        month_start_equities_out[month_base + next_ptr as usize] =
-                            current_month_start_equity.read();
-                    }
+            if n_samples == 0 {
+                for j in 0..BACKTEST_CORE_METRIC_WIDTH {
+                    metrics_out[metric_base + j] = 0.0;
                 }
-                current_month_pnl.store(0.0);
-                // New month starts at the equity carried in (eval.rs:778). Runs
-                // BEFORE this bar's exits mutate equity — preserve the ordering.
-                current_month_start_equity.store(equity.read());
-                last_month.store(m_val);
+                terminate!();
             }
 
-            let d_val = day_idx[i];
-            let last_day_v = last_day.read();
-            if d_val != last_day_v {
-                if last_day_v != -1 && day_peak.read() > 0.0 {
-                    let dd = (day_peak.read() - day_low.read()) / day_peak.read();
-                    if dd > max_daily_dd.read() {
-                        max_daily_dd.store(dd);
-                    }
+            // Per-entry SL/TP distance in pips. For a fixed-stop gene these stay at
+            // the scalar sl_pips[gene]/tp_pips[gene] (byte-identical); for an adaptive
+            // gene (stop_vol_mult[gene] > 0) they are RE-CAPTURED at each entry from
+            // the signal-bar volatility (below), mirroring the CPU `entry_sl_tp_pips`.
+            // RuntimeCell because cubecl 0.9 forbids reassigning a `let` binding.
+            let sl_distance = RuntimeCell::<$f>::new(sl_pips[gene]);
+            let tp_distance = RuntimeCell::<$f>::new(tp_pips[gene]);
+
+            let equity = RuntimeCell::<$f>::new(initial_equity);
+            let peak_equity = RuntimeCell::<$f>::new(initial_equity);
+            let max_dd = RuntimeCell::<$f>::new(0.0);
+            let trade_count = RuntimeCell::<i32>::new(0);
+            let wins = RuntimeCell::<i32>::new(0);
+            let gross_profit = RuntimeCell::<$f>::new(0.0);
+            let gross_loss = RuntimeCell::<$f>::new(0.0);
+
+            let last_month = RuntimeCell::<i32>::new(-1);
+            let current_month_pnl = RuntimeCell::<$f>::new(0.0);
+            let month_ptr = RuntimeCell::<i32>::new(-1);
+            // Per-month starting equity (slot-7 monthly_target_hit_rate). Mirrors the
+            // CPU `current_month_start_equity` carried at each month boundary (eval.rs:732/778).
+            let current_month_start_equity = RuntimeCell::<$f>::new(initial_equity);
+            // Confidence-scaled lot size, captured ONCE at entry, held for the trade
+            // (eval.rs:1049-1054). 1.0 = legacy fixed-1-lot.
+            let pos_lots = RuntimeCell::<$f>::new(1.0);
+
+            let last_day = RuntimeCell::<i32>::new(-1);
+            let day_peak = RuntimeCell::<$f>::new(initial_equity);
+            let day_low = RuntimeCell::<$f>::new(initial_equity);
+            let max_daily_dd = RuntimeCell::<$f>::new(0.0);
+            let day_trade_count = RuntimeCell::<u32>::new(0);
+
+            // ── FTMO prop-firm observables (mirror validation.rs::compute_prop_firm_risk_summary) ──
+            // Trades bucket by integer DAY == day_idx[i] (same key the CPU derives from
+            // trade.exit_time / 86_400_000). `current_day_pnl` accumulates realized pnl of
+            // the day in progress; finalized at each day boundary and once more after the loop.
+            let current_day_pnl = RuntimeCell::<$f>::new(0.0);
+            let max_daily_loss = RuntimeCell::<$f>::new(0.0);
+            // END-OF-DAY equity curve drawdown: equity at a day boundary already equals
+            // initial + sum(all prior days' realized pnl), i.e. exactly the CPU's per-day
+            // equity point (equity += day_pnl iterated in day order). No-trade boundary days
+            // repeat the prior point → never create a new peak or a larger DD → harmless.
+            let eod_peak = RuntimeCell::<$f>::new(initial_equity);
+            let max_eod_dd = RuntimeCell::<$f>::new(0.0);
+            let positive_day_sum = RuntimeCell::<$f>::new(0.0);
+            let largest_positive_day = RuntimeCell::<$f>::new(0.0);
+            let max_trades_day = RuntimeCell::<u32>::new(0);
+            let trading_days = RuntimeCell::<i32>::new(0);
+            // FTMO trade-DAY counting must bucket by the CLOSE day (= trade.exit_time/day),
+            // because the CPU `compute_prop_firm_risk_summary` keys `day_trade_count` on
+            // `trade.exit_time/86_400_000`. The existing `day_trade_count` increments at
+            // ENTRY (it gates `max_trades_per_day` on the entry side) and would diverge for
+            // overnight holds, so we keep a SEPARATE close-bucketed counter here.
+            let current_day_closes = RuntimeCell::<u32>::new(0);
+
+            let in_pos = RuntimeCell::<i32>::new(0);
+            let entry_px = RuntimeCell::<$f>::new(0.0);
+            let entry_idx = RuntimeCell::<i32>::new(-1);
+            let trail_px = RuntimeCell::<$f>::new(0.0);
+            // Phase C.3: accumulated days in position. Resets to 0 at entry,
+            // each in-position bar adds `timestamp_deltas_ms[i] / 86_400_000`.
+            // $f precision loss on the cast is bounded by ~5 ms per bar
+            // (cast of values up to 86.4M ms into 24-bit mantissa); over
+            // a year of D1 bars this accumulates to <$0.001 of swap error
+            // at typical EURUSD pip values — negligible vs the $122/year
+            // swap charge being modelled.
+            let position_days = RuntimeCell::<$f>::new(0.0);
+
+            for i in 1..n_samples {
+                // Phase C.3: accumulate carry duration while in position.
+                // Runs BEFORE any exit logic so the close branches use the
+                // total time held, INCLUDING the delta into the current bar.
+                if in_pos.read() != 0 && use_timestamps != 0 && timestamp_deltas_ms[i] > 0 {
+                    let delta_days = timestamp_deltas_ms[i] as $f / 86_400_000.0;
+                    position_days.store(position_days.read() + delta_days);
                 }
-                // ── FTMO: finalize the PREVIOUS day before resetting day state ──
-                // Runs AFTER the prior day's exits have already mutated `equity`
-                // (the entry for THIS bar happens later in the loop), so `equity`
-                // and `current_day_pnl` here hold the just-finished day's totals.
-                if last_day_v != -1 {
-                    let dp = current_day_pnl.read();
-                    // max_daily_loss = max over days of |negative day pnl|.
-                    if dp < 0.0 {
-                        let neg = -dp;
-                        if neg > max_daily_loss.read() {
-                            max_daily_loss.store(neg);
+
+                let m_val = month_idx[i];
+                let last_month_v = last_month.read();
+                if m_val != last_month_v {
+                    if last_month_v != -1 {
+                        let next_ptr = month_ptr.read() + 1;
+                        month_ptr.store(next_ptr);
+                        if next_ptr >= 0 && next_ptr < month_capacity as i32 {
+                            monthly_pnls_out[month_base + next_ptr as usize] = current_month_pnl.read();
+                            month_start_equities_out[month_base + next_ptr as usize] =
+                                current_month_start_equity.read();
                         }
                     }
-                    // largest_profit_share inputs: sum + max of POSITIVE day pnls.
-                    if dp > 0.0 {
-                        positive_day_sum.store(positive_day_sum.read() + dp);
-                        if dp > largest_positive_day.read() {
-                            largest_positive_day.store(dp);
+                    current_month_pnl.store(0.0);
+                    // New month starts at the equity carried in (eval.rs:778). Runs
+                    // BEFORE this bar's exits mutate equity — preserve the ordering.
+                    current_month_start_equity.store(equity.read());
+                    last_month.store(m_val);
+                }
+
+                let d_val = day_idx[i];
+                let last_day_v = last_day.read();
+                if d_val != last_day_v {
+                    if last_day_v != -1 && day_peak.read() > 0.0 {
+                        let dd = (day_peak.read() - day_low.read()) / day_peak.read();
+                        if dd > max_daily_dd.read() {
+                            max_daily_dd.store(dd);
                         }
                     }
-                    // END-OF-DAY equity drawdown: `equity` == initial + sum(all prior
-                    // days' pnl) == the CPU's per-day equity point.
-                    let eod_eq = equity.read();
-                    if eod_eq > eod_peak.read() {
-                        eod_peak.store(eod_eq);
-                    }
-                    let ep = eod_peak.read();
-                    let eod_dd = RuntimeCell::<f32>::new(0.0);
-                    if ep > 0.0 {
-                        eod_dd.store((ep - eod_eq) / ep);
-                    }
-                    if eod_dd.read() > max_eod_dd.read() {
-                        max_eod_dd.store(eod_dd.read());
-                    }
-                    // trading_days + max_trades_per_day from the finished day —
-                    // counted by CLOSES (exit-day bucketed) to match the CPU.
-                    let dtc = current_day_closes.read();
-                    if dtc > 0 {
-                        trading_days.store(trading_days.read() + 1);
-                    }
-                    if dtc > max_trades_day.read() {
-                        max_trades_day.store(dtc);
-                    }
-                    current_day_pnl.store(0.0);
-                    current_day_closes.store(0);
-                }
-                last_day.store(d_val);
-                day_peak.store(equity.read());
-                day_low.store(equity.read());
-                day_trade_count.store(0);
-            }
-
-            let in_pos_v = in_pos.read();
-            if in_pos_v != 0
-                && use_timestamps != 0
-                && gap_threshold_ms > 0
-                && timestamp_deltas_ms[i] >= gap_threshold_ms
-            {
-                let entry_px_v = entry_px.read();
-                let pnl_cell = RuntimeCell::<f32>::new(0.0);
-                if in_pos_v == 1 {
-                    pnl_cell.store((close_pips[i] - entry_px_v) * pip_value_per_lot);
-                } else {
-                    pnl_cell.store((entry_px_v - close_pips[i]) * pip_value_per_lot);
-                }
-                pnl_cell.store(
-                    pnl_cell.read()
-                        - commission_per_trade
-                        - (spread_pips * 0.5 * pip_value_per_lot),
-                );
-                // Phase 2: scale (gross - commission - half_spread) by pos_lots
-                // BEFORE swap (swap scaled in its own term). Matches eval.rs:809.
-                pnl_cell.store(pnl_cell.read() * pos_lots.read());
-                // Phase C.3: broker swap (signed: + = credit, − = charge).
-                // #1375 workaround: long => swap_long, short => swap_short.
-                let swap_per_day_gap = RuntimeCell::<f32>::new(swap_short_pips_per_day);
-                if in_pos_v == 1 {
-                    swap_per_day_gap.store(swap_long_pips_per_day);
-                }
-                let swap_credit_gap = swap_per_day_gap.read()
-                    * position_days.read()
-                    * pip_value_per_lot
-                    * pos_lots.read();
-                pnl_cell.store(pnl_cell.read() + swap_credit_gap);
-                // PnL conversion fee applied last; skip if out-of-range.
-                if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
-                    pnl_cell.store(pnl_cell.read() * (1.0 - pnl_conversion_fee_rate));
-                }
-                let pnl = pnl_cell.read();
-                equity.store(equity.read() + pnl);
-                current_month_pnl.store(current_month_pnl.read() + pnl);
-                // FTMO: attribute this realized pnl + closed-trade to the CURRENT
-                // (close) day's bucket — matches the CPU's exit-day bucketing.
-                current_day_pnl.store(current_day_pnl.read() + pnl);
-                current_day_closes.store(current_day_closes.read() + 1);
-                trade_count.store(trade_count.read() + 1);
-                if pnl > 0.0 {
-                    wins.store(wins.read() + 1);
-                    gross_profit.store(gross_profit.read() + pnl);
-                } else {
-                    gross_loss.store(gross_loss.read() - pnl);
-                }
-                in_pos.store(0);
-                let eq = equity.read();
-                if eq > peak_equity.read() {
-                    peak_equity.store(eq);
-                }
-                if eq < day_low.read() {
-                    day_low.store(eq);
-                }
-                let pe = peak_equity.read();
-                let current_dd = RuntimeCell::<f32>::new(0.0);
-                if pe > 0.0 {
-                    current_dd.store((pe - eq) / pe);
-                }
-                if current_dd.read() > max_dd.read() {
-                    max_dd.store(current_dd.read());
-                }
-            }
-
-            let in_pos_v2 = in_pos.read();
-            if in_pos_v2 != 0 {
-                let lo = low_pips[i];
-                let hi = high_pips[i];
-                let entry_px_v = entry_px.read();
-
-                // Phase 2: float PnL scaled by pos_lots (eval.rs:865-880) so the
-                // equity-based DD tracks the sized position.
-                // #1375 workaround: long worst-case intrabar = low-entry, short = entry-high.
-                // The expr form gave longs the SHORT formula on Vulkan → wrong max_dd.
-                let worst_base = RuntimeCell::<f32>::new((entry_px_v - hi) * pip_value_per_lot);
-                if in_pos_v2 == 1 {
-                    worst_base.store((lo - entry_px_v) * pip_value_per_lot);
-                }
-                let worst_float_pnl = worst_base.read() * pos_lots.read();
-                let eq = equity.read();
-                if (eq + worst_float_pnl) < day_low.read() {
-                    day_low.store(eq + worst_float_pnl);
-                }
-
-                // #1375 workaround: long best-case intrabar = high-entry, short = entry-low.
-                let best_base = RuntimeCell::<f32>::new((entry_px_v - lo) * pip_value_per_lot);
-                if in_pos_v2 == 1 {
-                    best_base.store((hi - entry_px_v) * pip_value_per_lot);
-                }
-                let best_float_pnl = best_base.read() * pos_lots.read();
-                if (eq + best_float_pnl) > peak_equity.read() {
-                    peak_equity.store(eq + best_float_pnl);
-                }
-
-                let pe = peak_equity.read();
-                let current_dd = RuntimeCell::<f32>::new(0.0);
-                if pe > 0.0 {
-                    current_dd.store((pe - (eq + worst_float_pnl)) / pe);
-                }
-                if current_dd.read() > max_dd.read() {
-                    max_dd.store(current_dd.read());
-                }
-
-                let pnl_cell = RuntimeCell::<f32>::new(0.0);
-                let exit_cell = RuntimeCell::<u32>::new(0);
-                let bars_held = i as i32 - entry_idx.read();
-                let past_min_hold = min_hold_bars == 0 || bars_held >= min_hold_bars as i32;
-
-                if past_min_hold && in_pos_v2 == 1 {
-                    let sl_cell = RuntimeCell::<f32>::new(entry_px_v - sl_distance.read());
-                    let tp = entry_px_v + tp_distance.read();
-                    // Apply only the trail from PRIOR bars (no intra-bar look-ahead — must
-                    // match the CPU eval: this bar's high can't move the stop its own low is
-                    // checked against). `trail_px == 0.0` is the unset sentinel.
-                    if trailing_enabled != 0
-                        && trail_px.read() > 0.0
-                        && trail_px.read() > sl_cell.read()
-                    {
-                        sl_cell.store(trail_px.read());
-                    }
-                    let sl_v = sl_cell.read();
-                    if lo <= sl_v {
-                        pnl_cell.store((sl_v - entry_px_v) * pip_value_per_lot);
-                        exit_cell.store(1);
-                    } else if hi >= tp {
-                        pnl_cell.store((tp - entry_px_v) * pip_value_per_lot);
-                        exit_cell.store(1);
-                    }
-                    // AFTER the exit check: ratchet the trail up from THIS bar's high.
-                    if exit_cell.read() == 0 && trailing_enabled != 0 {
-                        let mv = hi - entry_px_v;
-                        if mv >= (trailing_be_trigger_r * sl_distance.read()) {
-                            let candidate = hi - (trailing_atr_multiplier * sl_distance.read());
-                            if trail_px.read() == 0.0 || candidate > trail_px.read() {
-                                trail_px.store(candidate);
+                    // ── FTMO: finalize the PREVIOUS day before resetting day state ──
+                    // Runs AFTER the prior day's exits have already mutated `equity`
+                    // (the entry for THIS bar happens later in the loop), so `equity`
+                    // and `current_day_pnl` here hold the just-finished day's totals.
+                    if last_day_v != -1 {
+                        let dp = current_day_pnl.read();
+                        // max_daily_loss = max over days of |negative day pnl|.
+                        if dp < 0.0 {
+                            let neg = -dp;
+                            if neg > max_daily_loss.read() {
+                                max_daily_loss.store(neg);
                             }
                         }
-                    }
-                } else if past_min_hold {
-                    let sl_cell = RuntimeCell::<f32>::new(entry_px_v + sl_distance.read());
-                    let tp = entry_px_v - tp_distance.read();
-                    if trailing_enabled != 0
-                        && trail_px.read() > 0.0
-                        && trail_px.read() < sl_cell.read()
-                    {
-                        sl_cell.store(trail_px.read());
-                    }
-                    let sl_v = sl_cell.read();
-                    if hi >= sl_v {
-                        pnl_cell.store((entry_px_v - sl_v) * pip_value_per_lot);
-                        exit_cell.store(1);
-                    } else if lo <= tp {
-                        pnl_cell.store((entry_px_v - tp) * pip_value_per_lot);
-                        exit_cell.store(1);
-                    }
-                    // AFTER the exit check: ratchet the trail down from THIS bar's low.
-                    if exit_cell.read() == 0 && trailing_enabled != 0 {
-                        let mv = entry_px_v - lo;
-                        if mv >= (trailing_be_trigger_r * sl_distance.read()) {
-                            let candidate = lo + (trailing_atr_multiplier * sl_distance.read());
-                            if trail_px.read() == 0.0 || candidate < trail_px.read() {
-                                trail_px.store(candidate);
+                        // largest_profit_share inputs: sum + max of POSITIVE day pnls.
+                        if dp > 0.0 {
+                            positive_day_sum.store(positive_day_sum.read() + dp);
+                            if dp > largest_positive_day.read() {
+                                largest_positive_day.store(dp);
                             }
                         }
+                        // END-OF-DAY equity drawdown: `equity` == initial + sum(all prior
+                        // days' pnl) == the CPU's per-day equity point.
+                        let eod_eq = equity.read();
+                        if eod_eq > eod_peak.read() {
+                            eod_peak.store(eod_eq);
+                        }
+                        let ep = eod_peak.read();
+                        let eod_dd = RuntimeCell::<$f>::new(0.0);
+                        if ep > 0.0 {
+                            eod_dd.store((ep - eod_eq) / ep);
+                        }
+                        if eod_dd.read() > max_eod_dd.read() {
+                            max_eod_dd.store(eod_dd.read());
+                        }
+                        // trading_days + max_trades_per_day from the finished day —
+                        // counted by CLOSES (exit-day bucketed) to match the CPU.
+                        let dtc = current_day_closes.read();
+                        if dtc > 0 {
+                            trading_days.store(trading_days.read() + 1);
+                        }
+                        if dtc > max_trades_day.read() {
+                            max_trades_day.store(dtc);
+                        }
+                        current_day_pnl.store(0.0);
+                        current_day_closes.store(0);
                     }
+                    last_day.store(d_val);
+                    day_peak.store(equity.read());
+                    day_low.store(equity.read());
+                    day_trade_count.store(0);
                 }
 
-                if exit_cell.read() == 0
-                    && past_min_hold
-                    && max_hold_bars > 0
-                    && bars_held >= max_hold_bars as i32
+                let in_pos_v = in_pos.read();
+                if in_pos_v != 0
+                    && use_timestamps != 0
+                    && gap_threshold_ms > 0
+                    && timestamp_deltas_ms[i] >= gap_threshold_ms
                 {
-                    if in_pos_v2 == 1 {
+                    let entry_px_v = entry_px.read();
+                    let pnl_cell = RuntimeCell::<$f>::new(0.0);
+                    if in_pos_v == 1 {
                         pnl_cell.store((close_pips[i] - entry_px_v) * pip_value_per_lot);
                     } else {
                         pnl_cell.store((entry_px_v - close_pips[i]) * pip_value_per_lot);
                     }
-                    exit_cell.store(1);
-                }
-
-                if exit_cell.read() != 0 {
                     pnl_cell.store(
                         pnl_cell.read()
                             - commission_per_trade
                             - (spread_pips * 0.5 * pip_value_per_lot),
                     );
                     // Phase 2: scale (gross - commission - half_spread) by pos_lots
-                    // BEFORE swap. Matches eval.rs:979.
+                    // BEFORE swap (swap scaled in its own term). Matches eval.rs:809.
                     pnl_cell.store(pnl_cell.read() * pos_lots.read());
                     // Phase C.3: broker swap (signed: + = credit, − = charge).
                     // #1375 workaround: long => swap_long, short => swap_short.
-                    let swap_per_day = RuntimeCell::<f32>::new(swap_short_pips_per_day);
-                    if in_pos_v2 == 1 {
-                        swap_per_day.store(swap_long_pips_per_day);
+                    let swap_per_day_gap = RuntimeCell::<$f>::new(swap_short_pips_per_day);
+                    if in_pos_v == 1 {
+                        swap_per_day_gap.store(swap_long_pips_per_day);
                     }
-                    let swap_credit = swap_per_day.read()
+                    let swap_credit_gap = swap_per_day_gap.read()
                         * position_days.read()
                         * pip_value_per_lot
                         * pos_lots.read();
-                    pnl_cell.store(pnl_cell.read() + swap_credit);
+                    pnl_cell.store(pnl_cell.read() + swap_credit_gap);
+                    // PnL conversion fee applied last; skip if out-of-range.
                     if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
                         pnl_cell.store(pnl_cell.read() * (1.0 - pnl_conversion_fee_rate));
                     }
@@ -1225,213 +1322,435 @@ fn backtest_population_kernel(
                         gross_loss.store(gross_loss.read() - pnl);
                     }
                     in_pos.store(0);
-                    let eq2 = equity.read();
-                    if eq2 > peak_equity.read() {
-                        peak_equity.store(eq2);
+                    let eq = equity.read();
+                    if eq > peak_equity.read() {
+                        peak_equity.store(eq);
                     }
-                    if eq2 < day_low.read() {
-                        day_low.store(eq2);
+                    if eq > day_peak.read() {
+                        let previous_day_peak = day_peak.read();
+                        if previous_day_peak > 0.0 {
+                            let previous_dd = (previous_day_peak - day_low.read()) / previous_day_peak;
+                            if previous_dd > max_daily_dd.read() {
+                                max_daily_dd.store(previous_dd);
+                            }
+                        }
+                        day_peak.store(eq);
+                        day_low.store(eq);
+                    } else if eq < day_low.read() {
+                        day_low.store(eq);
                     }
-                    let pe2 = peak_equity.read();
-                    let current_dd = RuntimeCell::<f32>::new(0.0);
-                    if pe2 > 0.0 {
-                        current_dd.store((pe2 - eq2) / pe2);
+                    let pe = peak_equity.read();
+                    let current_dd = RuntimeCell::<$f>::new(0.0);
+                    if pe > 0.0 {
+                        current_dd.store((pe - eq) / pe);
                     }
                     if current_dd.read() > max_dd.read() {
                         max_dd.store(current_dd.read());
                     }
                 }
-            } else {
-                // Causal entry: read PRIOR-bar signal, fill at CURRENT-bar close.
-                let s = signals_flat[signal_base + i - 1];
-                if s != 0 {
-                    if !(max_trades_per_day > 0
-                        && (day_trade_count.read() as usize) >= max_trades_per_day)
-                    {
-                        in_pos.store(s);
-                        entry_px.store(close_pips[i] + (s as f32) * spread_pips * 0.5);
-                        entry_idx.store(i as i32);
-                        trail_px.store(0.0);
-                        // Phase C.3: reset carry accumulator at new entry.
-                        position_days.store(0.0);
-                        // Adaptive stops: re-capture the per-entry SL/TP. An
-                        // adaptive gene (stop_vol_mult>0) scales the SIGNAL-bar
-                        // (i-1) base vol distance — the same causally-available bar
-                        // the signal/confidence use — and sets TP = rr × SL,
-                        // mirroring the CPU `entry_sl_tp_pips`. A fixed gene leaves
-                        // sl_distance/tp_distance at the scalar sl_pips/tp_pips.
-                        // Captured BEFORE the sizing below so eff_sl uses it.
-                        if stop_vol_mult[gene] > 0.0 {
-                            let sl_a = stop_vol_mult[gene] * base_pips[i - 1];
-                            sl_distance.store(sl_a);
-                            tp_distance.store(adaptive_rr * sl_a);
+
+                let in_pos_v2 = in_pos.read();
+                if in_pos_v2 != 0 {
+                    let lo = low_pips[i];
+                    let hi = high_pips[i];
+                    let entry_px_v = entry_px.read();
+
+                    // Phase 2: float PnL scaled by pos_lots (eval.rs:865-880) so the
+                    // equity-based DD tracks the sized position.
+                    // #1375 workaround: long worst-case intrabar = low-entry, short = entry-high.
+                    // The expr form gave longs the SHORT formula on Vulkan → wrong max_dd.
+                    let worst_base = RuntimeCell::<$f>::new((entry_px_v - hi) * pip_value_per_lot);
+                    if in_pos_v2 == 1 {
+                        worst_base.store((lo - entry_px_v) * pip_value_per_lot);
+                    }
+                    let worst_float_pnl = worst_base.read() * pos_lots.read();
+                    let eq = equity.read();
+
+                    // #1375 workaround: long best-case intrabar = high-entry, short = entry-low.
+                    let best_base = RuntimeCell::<$f>::new((entry_px_v - lo) * pip_value_per_lot);
+                    if in_pos_v2 == 1 {
+                        best_base.store((hi - entry_px_v) * pip_value_per_lot);
+                    }
+                    let best_float_pnl = best_base.read() * pos_lots.read();
+                    if (eq + best_float_pnl) > peak_equity.read() {
+                        peak_equity.store(eq + best_float_pnl);
+                    }
+                    if (eq + best_float_pnl) > day_peak.read() {
+                        let previous_day_peak = day_peak.read();
+                        if previous_day_peak > 0.0 {
+                            let previous_dd = (previous_day_peak - day_low.read()) / previous_day_peak;
+                            if previous_dd > max_daily_dd.read() {
+                                max_daily_dd.store(previous_dd);
+                            }
                         }
-                        // Phase 2: risk-based, confidence-scaled lot size, captured
-                        // at entry from running equity + the prior-bar confidence
-                        // (causal i-1, same shift as the signal read). Mirrors
-                        // risk_based_pos_lots (eval.rs:657-685) term-for-term.
-                        if risk_based_sizing != 0 {
-                            // RuntimeCell idiom (cubecl rejects if-as-value that mixes
-                            // array-read cube values with bare literals).
-                            let conf_c =
-                                RuntimeCell::<f32>::new(confidences_flat[signal_base + i - 1]);
-                            if conf_c.read() < 0.0 {
-                                conf_c.store(0.0);
-                            }
-                            if conf_c.read() > 1.0 {
-                                conf_c.store(1.0);
-                            }
-                            // conf_scale = (conf/hq).min(1.0), guarded for hq<=0 (=> 1.0).
-                            let conf_scale = RuntimeCell::<f32>::new(1.0);
-                            if high_quality_confidence > 0.0 {
-                                let r = conf_c.read() / high_quality_confidence;
-                                if r < 1.0 {
-                                    conf_scale.store(r);
+                        day_peak.store(eq + best_float_pnl);
+                        // Start a new causal same-day drawdown segment at the new
+                        // peak, retaining this bar's worst excursion.
+                        day_low.store(eq + worst_float_pnl);
+                    } else if (eq + worst_float_pnl) < day_low.read() {
+                        day_low.store(eq + worst_float_pnl);
+                    }
+
+                    let pe = peak_equity.read();
+                    let current_dd = RuntimeCell::<$f>::new(0.0);
+                    if pe > 0.0 {
+                        current_dd.store((pe - (eq + worst_float_pnl)) / pe);
+                    }
+                    if current_dd.read() > max_dd.read() {
+                        max_dd.store(current_dd.read());
+                    }
+
+                    let pnl_cell = RuntimeCell::<$f>::new(0.0);
+                    let exit_cell = RuntimeCell::<u32>::new(0);
+                    let bars_held = i as i32 - entry_idx.read();
+                    let past_min_hold = min_hold_bars == 0 || bars_held >= min_hold_bars as i32;
+
+                    if past_min_hold && in_pos_v2 == 1 {
+                        let sl_cell = RuntimeCell::<$f>::new(entry_px_v - sl_distance.read());
+                        let tp = entry_px_v + tp_distance.read();
+                        // Apply only the trail from PRIOR bars (no intra-bar look-ahead — must
+                        // match the CPU eval: this bar's high can't move the stop its own low is
+                        // checked against). `trail_px == 0.0` is the unset sentinel.
+                        if trailing_enabled != 0
+                            && trail_px.read() > 0.0
+                            && trail_px.read() > sl_cell.read()
+                        {
+                            sl_cell.store(trail_px.read());
+                        }
+                        let sl_v = sl_cell.read();
+                        if lo <= sl_v {
+                            pnl_cell.store((sl_v - entry_px_v) * pip_value_per_lot);
+                            exit_cell.store(1);
+                        } else if hi >= tp {
+                            pnl_cell.store((tp - entry_px_v) * pip_value_per_lot);
+                            exit_cell.store(1);
+                        }
+                        // AFTER the exit check: ratchet the trail up from THIS bar's high.
+                        if exit_cell.read() == 0 && trailing_enabled != 0 {
+                            let mv = hi - entry_px_v;
+                            if mv >= (trailing_be_trigger_r * sl_distance.read()) {
+                                // Mirrors eval.rs: the trail never sits closer to
+                                // entry than the locked profit, which the R-based
+                                // multiplier alone cannot guarantee across genes.
+                                let locked = entry_px.read() + trailing_min_lock_pips;
+                                let raw = hi - (trailing_atr_multiplier * sl_distance.read());
+                                let candidate = if raw > locked { raw } else { locked };
+                                if trail_px.read() == 0.0 || candidate > trail_px.read() {
+                                    trail_px.store(candidate);
                                 }
                             }
-                            let risk_pct = risk_per_trade_min
-                                + (risk_per_trade_max - risk_per_trade_min) * conf_scale.read();
-                            // eff_sl = sl_distance.max(1.0)
-                            let eff_sl = RuntimeCell::<f32>::new(1.0);
-                            if sl_distance.read() > 1.0 {
-                                eff_sl.store(sl_distance.read());
-                            }
-                            let denom = eff_sl.read() * pip_value_per_lot;
-                            let eq_now = equity.read();
-                            // lots = (risk_pct*equity)/denom if valid, else 0; clamp [0,100].
-                            let lots = RuntimeCell::<f32>::new(0.0);
-                            if eq_now > 0.0 && denom > 1e-12 {
-                                lots.store((risk_pct * eq_now) / denom);
-                            }
-                            if lots.read() > 100.0 {
-                                lots.store(100.0);
-                            }
-                            if lots.read() < 0.0 {
-                                lots.store(0.0);
-                            }
-                            pos_lots.store(lots.read());
-                        } else {
-                            pos_lots.store(1.0);
                         }
-                        day_trade_count.store(day_trade_count.read() + 1);
+                    } else if past_min_hold {
+                        let sl_cell = RuntimeCell::<$f>::new(entry_px_v + sl_distance.read());
+                        let tp = entry_px_v - tp_distance.read();
+                        if trailing_enabled != 0
+                            && trail_px.read() > 0.0
+                            && trail_px.read() < sl_cell.read()
+                        {
+                            sl_cell.store(trail_px.read());
+                        }
+                        let sl_v = sl_cell.read();
+                        if hi >= sl_v {
+                            pnl_cell.store((entry_px_v - sl_v) * pip_value_per_lot);
+                            exit_cell.store(1);
+                        } else if lo <= tp {
+                            pnl_cell.store((entry_px_v - tp) * pip_value_per_lot);
+                            exit_cell.store(1);
+                        }
+                        // AFTER the exit check: ratchet the trail down from THIS bar's low.
+                        if exit_cell.read() == 0 && trailing_enabled != 0 {
+                            let mv = entry_px_v - lo;
+                            if mv >= (trailing_be_trigger_r * sl_distance.read()) {
+                                let locked = entry_px.read() - trailing_min_lock_pips;
+                                let raw = lo + (trailing_atr_multiplier * sl_distance.read());
+                                let candidate = if raw < locked { raw } else { locked };
+                                if trail_px.read() == 0.0 || candidate < trail_px.read() {
+                                    trail_px.store(candidate);
+                                }
+                            }
+                        }
+                    }
+
+                    if exit_cell.read() == 0
+                        && past_min_hold
+                        && max_hold_bars > 0
+                        && bars_held >= max_hold_bars as i32
+                    {
+                        if in_pos_v2 == 1 {
+                            pnl_cell.store((close_pips[i] - entry_px_v) * pip_value_per_lot);
+                        } else {
+                            pnl_cell.store((entry_px_v - close_pips[i]) * pip_value_per_lot);
+                        }
+                        exit_cell.store(1);
+                    }
+
+                    if exit_cell.read() != 0 {
+                        pnl_cell.store(
+                            pnl_cell.read()
+                                - commission_per_trade
+                                - (spread_pips * 0.5 * pip_value_per_lot),
+                        );
+                        // Phase 2: scale (gross - commission - half_spread) by pos_lots
+                        // BEFORE swap. Matches eval.rs:979.
+                        pnl_cell.store(pnl_cell.read() * pos_lots.read());
+                        // Phase C.3: broker swap (signed: + = credit, − = charge).
+                        // #1375 workaround: long => swap_long, short => swap_short.
+                        let swap_per_day = RuntimeCell::<$f>::new(swap_short_pips_per_day);
+                        if in_pos_v2 == 1 {
+                            swap_per_day.store(swap_long_pips_per_day);
+                        }
+                        let swap_credit = swap_per_day.read()
+                            * position_days.read()
+                            * pip_value_per_lot
+                            * pos_lots.read();
+                        pnl_cell.store(pnl_cell.read() + swap_credit);
+                        if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
+                            pnl_cell.store(pnl_cell.read() * (1.0 - pnl_conversion_fee_rate));
+                        }
+                        let pnl = pnl_cell.read();
+                        equity.store(equity.read() + pnl);
+                        current_month_pnl.store(current_month_pnl.read() + pnl);
+                        // FTMO: attribute this realized pnl + closed-trade to the CURRENT
+                        // (close) day's bucket — matches the CPU's exit-day bucketing.
+                        current_day_pnl.store(current_day_pnl.read() + pnl);
+                        current_day_closes.store(current_day_closes.read() + 1);
+                        trade_count.store(trade_count.read() + 1);
+                        if pnl > 0.0 {
+                            wins.store(wins.read() + 1);
+                            gross_profit.store(gross_profit.read() + pnl);
+                        } else {
+                            gross_loss.store(gross_loss.read() - pnl);
+                        }
+                        in_pos.store(0);
+                        let eq2 = equity.read();
+                        if eq2 > peak_equity.read() {
+                            peak_equity.store(eq2);
+                        }
+                        if eq2 > day_peak.read() {
+                            let previous_day_peak = day_peak.read();
+                            if previous_day_peak > 0.0 {
+                                let previous_dd =
+                                    (previous_day_peak - day_low.read()) / previous_day_peak;
+                                if previous_dd > max_daily_dd.read() {
+                                    max_daily_dd.store(previous_dd);
+                                }
+                            }
+                            day_peak.store(eq2);
+                            day_low.store(eq2);
+                        } else if eq2 < day_low.read() {
+                            day_low.store(eq2);
+                        }
+                        let pe2 = peak_equity.read();
+                        let current_dd = RuntimeCell::<$f>::new(0.0);
+                        if pe2 > 0.0 {
+                            current_dd.store((pe2 - eq2) / pe2);
+                        }
+                        if current_dd.read() > max_dd.read() {
+                            max_dd.store(current_dd.read());
+                        }
+                    }
+                } else {
+                    // Causal entry: read PRIOR-bar signal, fill at CURRENT-bar close.
+                    let s = signals_flat[signal_base + i - 1];
+                    if s != 0 {
+                        if !(max_trades_per_day > 0
+                            && (day_trade_count.read() as usize) >= max_trades_per_day)
+                        {
+                            in_pos.store(s);
+                            entry_px.store(close_pips[i] + (s as $f) * spread_pips * 0.5);
+                            entry_idx.store(i as i32);
+                            trail_px.store(0.0);
+                            // Phase C.3: reset carry accumulator at new entry.
+                            position_days.store(0.0);
+                            // Adaptive stops: re-capture the per-entry SL/TP. An
+                            // adaptive gene (stop_vol_mult>0) scales the SIGNAL-bar
+                            // (i-1) base vol distance — the same causally-available bar
+                            // the signal/confidence use — and sets TP = rr × SL,
+                            // mirroring the CPU `entry_sl_tp_pips`. A fixed gene leaves
+                            // sl_distance/tp_distance at the scalar sl_pips/tp_pips.
+                            // Captured BEFORE the sizing below so eff_sl uses it.
+                            if stop_vol_mult[gene] > 0.0 {
+                                let sl_a = stop_vol_mult[gene] * base_pips[i - 1];
+                                sl_distance.store(sl_a);
+                                tp_distance.store(adaptive_rr * sl_a);
+                            }
+                            // Phase 2: risk-based, confidence-scaled lot size, captured
+                            // at entry from running equity + the prior-bar confidence
+                            // (causal i-1, same shift as the signal read). Mirrors
+                            // risk_based_pos_lots (eval.rs:657-685) term-for-term.
+                            if risk_based_sizing != 0 {
+                                // RuntimeCell idiom (cubecl rejects if-as-value that mixes
+                                // array-read cube values with bare literals).
+                                let conf_c =
+                                    RuntimeCell::<$f>::new(confidences_flat[signal_base + i - 1]);
+                                if conf_c.read() < 0.0 {
+                                    conf_c.store(0.0);
+                                }
+                                if conf_c.read() > 1.0 {
+                                    conf_c.store(1.0);
+                                }
+                                // conf_scale = (conf/hq).min(1.0), guarded for hq<=0 (=> 1.0).
+                                let conf_scale = RuntimeCell::<$f>::new(1.0);
+                                if high_quality_confidence > 0.0 {
+                                    let r = conf_c.read() / high_quality_confidence;
+                                    if r < 1.0 {
+                                        conf_scale.store(r);
+                                    }
+                                }
+                                let risk_pct = risk_per_trade_min
+                                    + (risk_per_trade_max - risk_per_trade_min) * conf_scale.read();
+                                // eff_sl = sl_distance.max(1.0)
+                                let eff_sl = RuntimeCell::<$f>::new(1.0);
+                                if sl_distance.read() > 1.0 {
+                                    eff_sl.store(sl_distance.read());
+                                }
+                                let denom = eff_sl.read() * pip_value_per_lot;
+                                let eq_now = equity.read();
+                                // lots = (risk_pct*equity)/denom if valid, else 0; clamp [0,100].
+                                let lots = RuntimeCell::<$f>::new(0.0);
+                                if eq_now > 0.0 && denom > 1e-12 {
+                                    lots.store((risk_pct * eq_now) / denom);
+                                }
+                                if lots.read() > 100.0 {
+                                    lots.store(100.0);
+                                }
+                                if lots.read() < 0.0 {
+                                    lots.store(0.0);
+                                }
+                                pos_lots.store(lots.read());
+                            } else {
+                                pos_lots.store(1.0);
+                            }
+                            day_trade_count.store(day_trade_count.read() + 1);
+                        }
                     }
                 }
             }
-        }
 
-        // ── FTMO: FLUSH THE FINAL DAY ──────────────────────────────────────
-        // The boundary block only fires on a CHANGE of day_idx, so the LAST day
-        // in the series is never finalized there. Repeat the same finalize using
-        // the final `current_day_pnl` / `equity` / `day_trade_count`, but only if
-        // at least one bar was processed (last_day != -1). This exactly mirrors
-        // the CPU iterating its last BTreeMap day.
-        if last_day.read() != -1 {
-            let dp = current_day_pnl.read();
-            if dp < 0.0 {
-                let neg = -dp;
-                if neg > max_daily_loss.read() {
-                    max_daily_loss.store(neg);
+            // ── FTMO: FLUSH THE FINAL DAY ──────────────────────────────────────
+            // The boundary block only fires on a CHANGE of day_idx, so the LAST day
+            // in the series is never finalized there. Repeat the same finalize using
+            // the final `current_day_pnl` / `equity` / `day_trade_count`, but only if
+            // at least one bar was processed (last_day != -1). This exactly mirrors
+            // the CPU iterating its last BTreeMap day.
+            if last_day.read() != -1 {
+                if day_peak.read() > 0.0 {
+                    let dd = (day_peak.read() - day_low.read()) / day_peak.read();
+                    if dd > max_daily_dd.read() {
+                        max_daily_dd.store(dd);
+                    }
+                }
+                let dp = current_day_pnl.read();
+                if dp < 0.0 {
+                    let neg = -dp;
+                    if neg > max_daily_loss.read() {
+                        max_daily_loss.store(neg);
+                    }
+                }
+                if dp > 0.0 {
+                    positive_day_sum.store(positive_day_sum.read() + dp);
+                    if dp > largest_positive_day.read() {
+                        largest_positive_day.store(dp);
+                    }
+                }
+                let eod_eq = equity.read();
+                if eod_eq > eod_peak.read() {
+                    eod_peak.store(eod_eq);
+                }
+                let ep = eod_peak.read();
+                let eod_dd = RuntimeCell::<$f>::new(0.0);
+                if ep > 0.0 {
+                    eod_dd.store((ep - eod_eq) / ep);
+                }
+                if eod_dd.read() > max_eod_dd.read() {
+                    max_eod_dd.store(eod_dd.read());
+                }
+                // Count by CLOSES (exit-day bucketed) to match the CPU.
+                let dtc = current_day_closes.read();
+                if dtc > 0 {
+                    trading_days.store(trading_days.read() + 1);
+                }
+                if dtc > max_trades_day.read() {
+                    max_trades_day.store(dtc);
                 }
             }
-            if dp > 0.0 {
-                positive_day_sum.store(positive_day_sum.read() + dp);
-                if dp > largest_positive_day.read() {
-                    largest_positive_day.store(dp);
+
+            let final_equity = equity.read();
+            let final_peak = peak_equity.read();
+            let final_max_dd = max_dd.read();
+            let final_trade_count = trade_count.read();
+            let final_wins = wins.read();
+            let final_gp = gross_profit.read();
+            let final_gl = gross_loss.read();
+            let final_max_daily_dd = max_daily_dd.read();
+            let final_month_ptr = month_ptr.read();
+
+            let net_profit = final_equity - initial_equity;
+            let win_rate_cell = RuntimeCell::<$f>::new(0.0);
+            if final_trade_count > 0 {
+                win_rate_cell.store(final_wins as $f / final_trade_count as $f);
+            }
+            let pf_cell = RuntimeCell::<$f>::new(0.0);
+            if final_gl > 0.0 {
+                pf_cell.store((final_gp / final_gl).min(10.0));
+            } else if final_gp > 0.0 {
+                pf_cell.store(10.0);
+            }
+            let expectancy_cell = RuntimeCell::<$f>::new(0.0);
+            if final_trade_count > 0 {
+                expectancy_cell.store(net_profit / final_trade_count as $f);
+            }
+            let filled_months_cell = RuntimeCell::<i32>::new(0);
+            if final_month_ptr >= 0 {
+                let raw = final_month_ptr + 1;
+                if raw < month_capacity as i32 {
+                    filled_months_cell.store(raw);
+                } else {
+                    filled_months_cell.store(month_capacity as i32);
                 }
             }
-            let eod_eq = equity.read();
-            if eod_eq > eod_peak.read() {
-                eod_peak.store(eod_eq);
-            }
-            let ep = eod_peak.read();
-            let eod_dd = RuntimeCell::<f32>::new(0.0);
-            if ep > 0.0 {
-                eod_dd.store((ep - eod_eq) / ep);
-            }
-            if eod_dd.read() > max_eod_dd.read() {
-                max_eod_dd.store(eod_dd.read());
-            }
-            // Count by CLOSES (exit-day bucketed) to match the CPU.
-            let dtc = current_day_closes.read();
-            if dtc > 0 {
-                trading_days.store(trading_days.read() + 1);
-            }
-            if dtc > max_trades_day.read() {
-                max_trades_day.store(dtc);
-            }
-        }
 
-        let final_equity = equity.read();
-        let final_peak = peak_equity.read();
-        let final_max_dd = max_dd.read();
-        let final_trade_count = trade_count.read();
-        let final_wins = wins.read();
-        let final_gp = gross_profit.read();
-        let final_gl = gross_loss.read();
-        let final_max_daily_dd = max_daily_dd.read();
-        let final_month_ptr = month_ptr.read();
+            metrics_out[metric_base] = net_profit;
+            metrics_out[metric_base + 1] = final_peak;
+            metrics_out[metric_base + 2] = final_max_dd;
+            metrics_out[metric_base + 3] = win_rate_cell.read();
+            metrics_out[metric_base + 4] = pf_cell.read();
+            metrics_out[metric_base + 5] = expectancy_cell.read();
+            metrics_out[metric_base + 6] = final_max_daily_dd;
+            trade_counts_out[gene] = final_trade_count;
+            month_counts_out[gene] = filled_months_cell.read();
 
-        let net_profit = final_equity - initial_equity;
-        let win_rate_cell = RuntimeCell::<f32>::new(0.0);
-        if final_trade_count > 0 {
-            win_rate_cell.store(final_wins as f32 / final_trade_count as f32);
-        }
-        let pf_cell = RuntimeCell::<f32>::new(0.0);
-        if final_gl > 0.0 {
-            pf_cell.store((final_gp / final_gl).min(10.0));
-        } else if final_gp > 0.0 {
-            pf_cell.store(10.0);
-        }
-        let expectancy_cell = RuntimeCell::<f32>::new(0.0);
-        if final_trade_count > 0 {
-            expectancy_cell.store(net_profit / final_trade_count as f32);
-        }
-        let filled_months_cell = RuntimeCell::<i32>::new(0);
-        if final_month_ptr >= 0 {
-            let raw = final_month_ptr + 1;
-            if raw < month_capacity as i32 {
-                filled_months_cell.store(raw);
-            } else {
-                filled_months_cell.store(month_capacity as i32);
+            // ── FTMO observables emit (mirrors validation.rs::compute_prop_firm_risk_summary) ──
+            // net_return_pct = net_profit / initial_equity (guard initial_equity>0).
+            let net_return_pct = RuntimeCell::<$f>::new(0.0);
+            if initial_equity > 0.0 {
+                net_return_pct.store(net_profit / initial_equity);
             }
-        }
+            // max_daily_loss_pct = max|neg day pnl| / initial_equity.
+            let max_daily_loss_pct = RuntimeCell::<$f>::new(0.0);
+            if initial_equity > 0.0 {
+                max_daily_loss_pct.store(max_daily_loss.read() / initial_equity);
+            }
+            // largest_profit_share = largest_positive_day / sum_positive_days (0 if none).
+            // Statement-if guard (cubecl#1375: NEVER expression-if mixing runtime values).
+            let largest_profit_share = RuntimeCell::<$f>::new(0.0);
+            if positive_day_sum.read() > 1e-9 {
+                largest_profit_share.store(largest_positive_day.read() / positive_day_sum.read());
+            }
 
-        metrics_out[metric_base] = net_profit;
-        metrics_out[metric_base + 1] = final_peak;
-        metrics_out[metric_base + 2] = final_max_dd;
-        metrics_out[metric_base + 3] = win_rate_cell.read();
-        metrics_out[metric_base + 4] = pf_cell.read();
-        metrics_out[metric_base + 5] = expectancy_cell.read();
-        metrics_out[metric_base + 6] = final_max_daily_dd;
-        trade_counts_out[gene] = final_trade_count;
-        month_counts_out[gene] = filled_months_cell.read();
-
-        // ── FTMO observables emit (mirrors validation.rs::compute_prop_firm_risk_summary) ──
-        // net_return_pct = net_profit / initial_equity (guard initial_equity>0).
-        let net_return_pct = RuntimeCell::<f32>::new(0.0);
-        if initial_equity > 0.0 {
-            net_return_pct.store(net_profit / initial_equity);
+            ftmo_out[ftmo_base] = net_return_pct.read();
+            ftmo_out[ftmo_base + 1] = max_daily_loss_pct.read();
+            ftmo_out[ftmo_base + 2] = max_eod_dd.read();
+            ftmo_out[ftmo_base + 3] = largest_profit_share.read();
+            ftmo_out[ftmo_base + 4] = max_trades_day.read() as $f;
+            ftmo_out[ftmo_base + 5] = trading_days.read() as $f;
         }
-        // max_daily_loss_pct = max|neg day pnl| / initial_equity.
-        let max_daily_loss_pct = RuntimeCell::<f32>::new(0.0);
-        if initial_equity > 0.0 {
-            max_daily_loss_pct.store(max_daily_loss.read() / initial_equity);
-        }
-        // largest_profit_share = largest_positive_day / sum_positive_days (0 if none).
-        // Statement-if guard (cubecl#1375: NEVER expression-if mixing runtime values).
-        let largest_profit_share = RuntimeCell::<f32>::new(0.0);
-        if positive_day_sum.read() > 1e-9 {
-            largest_profit_share.store(largest_positive_day.read() / positive_day_sum.read());
-        }
-
-        ftmo_out[ftmo_base] = net_return_pct.read();
-        ftmo_out[ftmo_base + 1] = max_daily_loss_pct.read();
-        ftmo_out[ftmo_base + 2] = max_eod_dd.read();
-        ftmo_out[ftmo_base + 3] = largest_profit_share.read();
-        ftmo_out[ftmo_base + 4] = max_trades_day.read() as f32;
-        ftmo_out[ftmo_base + 5] = trading_days.read() as f32;
     }
+    };
 }
+
+define_backtest_population_kernel!(backtest_population_kernel, f32);
+define_backtest_population_kernel!(backtest_population_kernel_f64, f64);
 
 fn mean_std(values: &[f64]) -> (f64, f64) {
     // Phase 64 — both CPU and GPU paths now share the canonical
@@ -2103,6 +2422,10 @@ where
         let wlen = s1 - s0;
         let ind_window = gather_indicator_window(indicators_flat, n_indicators, n_samples, s0, s1);
         let smc_window = &smc_data_flat[s0 * SMC_WIDTH..s1 * SMC_WIDTH];
+        transfer_telemetry::record_streamed_dataset_upload(
+            ind_window.len().saturating_mul(std::mem::size_of::<F>())
+                + smc_window.len().saturating_mul(std::mem::size_of::<i32>()),
+        );
         let (sig_w, conf_w) = launch_signal_kernel::<F, R>(
             client,
             device_key,
@@ -2137,8 +2460,28 @@ where
 #[cfg(test)]
 mod window_tests {
     use super::{
-        backtest_gene_batch, gather_indicator_window, gene_chunk_size, signal_window_size,
+        backtest_gene_batch, cubecl_daily_drawdown_after_peak_transition,
+        cubecl_daily_drawdown_from_extrema, gather_indicator_window, gene_chunk_size,
+        signal_window_size,
     };
+
+    #[test]
+    fn cubecl_daily_drawdown_arithmetic_uses_same_day_peak_and_low() {
+        let observed = cubecl_daily_drawdown_from_extrema(110_000.0, 105_000.0);
+        let expected = 5_000.0 / 110_000.0;
+        assert!((observed - expected).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn cubecl_daily_drawdown_finalizes_the_previous_segment_before_a_new_peak() {
+        let observed = cubecl_daily_drawdown_after_peak_transition(
+            0.0, 100_000.0, 90_000.0, 110_000.0, 110_000.0,
+        );
+        assert!(
+            (observed - 0.10).abs() < 1.0e-12,
+            "the device arithmetic must retain the 100k -> 90k segment before resetting at 110k, got {observed}"
+        );
+    }
 
     #[test]
     fn gene_chunk_size_bounds_host_buffer_and_never_zero() {
@@ -2330,6 +2673,7 @@ where
             unsafe { ArrayArg::from_raw_parts(output_handle.clone(), total) },
             unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
             n_samples as u32,
+            0,
             gate_threshold,
         );
     }); // end gpu_timing::kernel
@@ -2534,7 +2878,7 @@ fn timestamp_delta_ms(timestamps: &[i64], n_samples: usize) -> (Vec<i32>, bool) 
     (deltas, true)
 }
 
-fn normalize_prices_to_pips(prices: &[f64], pip_value: f64) -> Vec<f32> {
+fn normalize_prices_to_pips(prices: &[f64], pip_value: f64) -> Vec<f64> {
     let safe_pip = if pip_value.abs() < 1e-12 {
         1e-12
     } else {
@@ -2542,243 +2886,342 @@ fn normalize_prices_to_pips(prices: &[f64], pip_value: f64) -> Vec<f32> {
     };
     prices
         .iter()
-        .map(|price| (*price / safe_pip) as f32)
+        .map(|price| *price / safe_pip)
         .collect()
 }
 
-fn launch_backtest_kernel<R: Runtime>(
+// Host side of the backtest kernel, emitted once per precision alongside the
+// kernel itself.
+//
+// Note on the resident buffer cache used below: its key carries both the byte
+// fingerprint and the byte length, so an f64 upload of N bars can never be
+// served an f32 entry of the same N — the lengths differ by a factor of two.
+// The two precisions therefore share the cache safely, and the slot constants
+// must NOT be split per precision.
+macro_rules! define_launch_backtest_kernel {
+    ($name:ident, $kernel:ident, $f:ty) => {
+    fn $name<R: Runtime>(
+        client: &ComputeClient<R>,
+        device_key: usize,
+        close_pips: &[f64],
+        high_pips: &[f64],
+        low_pips: &[f64],
+        signals_flat: &[i32],
+        confidences_flat: &[f32],
+        timestamp_deltas_ms: &[i32],
+        use_timestamps: bool,
+        month_idx: &[i32],
+        day_idx: &[i32],
+        sl_pips: &[f64],
+        tp_pips: &[f64],
+        // Per-gene adaptive volatility multiplier (empty / all-zero ⇒ fixed-stop
+        // path). Pairs with `settings.adaptive_base_pips` + `settings.adaptive_rr`.
+        stop_vol_mult: &[f64],
+        settings: &BacktestSettings,
+        month_capacity: usize,
+    ) -> Result<(Vec<$f>, Vec<i32>, Vec<$f>, Vec<i32>, Vec<$f>, Vec<$f>)> {
+        // Narrow once, here, so the element type is the ONLY difference between
+        // the lanes: the f32 lane reproduces exactly the rounding it always did
+        // (it simply happens one step later), and the f64 lane carries the
+        // host's full precision into VRAM instead of receiving values that were
+        // already rounded on the way in.
+        let close_pips: Vec<$f> = close_pips.iter().map(|&v| v as $f).collect();
+        let high_pips: Vec<$f> = high_pips.iter().map(|&v| v as $f).collect();
+        let low_pips: Vec<$f> = low_pips.iter().map(|&v| v as $f).collect();
+        let sl_pips: Vec<$f> = sl_pips.iter().map(|&v| v as $f).collect();
+        let tp_pips: Vec<$f> = tp_pips.iter().map(|&v| v as $f).collect();
+        let confidences_flat: Vec<$f> = confidences_flat.iter().map(|&v| v as $f).collect();
+        let n_samples = close_pips.len();
+        let n_genes = sl_pips.len();
+        if n_samples == 0 || n_genes == 0 {
+            return Ok((
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        if high_pips.len() != n_samples
+            || low_pips.len() != n_samples
+            || timestamp_deltas_ms.len() != n_samples
+            || month_idx.len() != n_samples
+            || day_idx.len() != n_samples
+            || tp_pips.len() != n_genes
+            || signals_flat.len() != n_genes.saturating_mul(n_samples)
+            || confidences_flat.len() != n_genes.saturating_mul(n_samples)
+        {
+            bail!("cuda evaluator backtest kernel received inconsistent dimensions");
+        }
+
+        // Device UPLOAD phase (timed under NEOETHOS_GPU_TIMING; runs unchanged
+        // otherwise). All `create_from_slice` (host→VRAM copies) + `empty` (output
+        // allocations) are the per-launch device-buffer setup the breakdown isolates.
+        let metrics_len = n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+        let monthly_len = n_genes.saturating_mul(month_capacity);
+        let ftmo_len = n_genes.saturating_mul(FTMO_WIDTH);
+        let (
+            close_handle,
+            high_handle,
+            low_handle,
+            signals_handle,
+            conf_handle,
+            timestamp_delta_handle,
+            month_handle,
+            day_handle,
+            sl_handle,
+            tp_handle,
+            metrics_handle,
+            trade_counts_handle,
+            monthly_handle,
+            month_start_eq_handle,
+            month_counts_handle,
+            ftmo_handle,
+        ) = gpu_timing::upload(|| {
+            use resident_device_cache as rc;
+            (
+                // Per-unit-CONSTANT series (prices/time indices): resident across
+                // launches — uploaded once, reused every generation/batch. The
+                // per-generation payloads (signals/confidences — they change each
+                // call) still upload fresh.
+                rc::get_or_upload(
+                    client,
+                    device_key,
+                    rc::SLOT_CLOSE,
+                    <$f>::as_bytes(&close_pips),
+                ),
+                rc::get_or_upload(client, device_key, rc::SLOT_HIGH, <$f>::as_bytes(&high_pips)),
+                rc::get_or_upload(client, device_key, rc::SLOT_LOW, <$f>::as_bytes(&low_pips)),
+                client.create_from_slice(i32::as_bytes(signals_flat)),
+                client.create_from_slice(<$f>::as_bytes(&confidences_flat)),
+                rc::get_or_upload(
+                    client,
+                    device_key,
+                    rc::SLOT_TS_DELTAS,
+                    i32::as_bytes(timestamp_deltas_ms),
+                ),
+                rc::get_or_upload(
+                    client,
+                    device_key,
+                    rc::SLOT_MONTH_IDX,
+                    i32::as_bytes(month_idx),
+                ),
+                rc::get_or_upload(client, device_key, rc::SLOT_DAY_IDX, i32::as_bytes(day_idx)),
+                client.create_from_slice(<$f>::as_bytes(&sl_pips)),
+                client.create_from_slice(<$f>::as_bytes(&tp_pips)),
+                client.empty(metrics_len.saturating_mul(std::mem::size_of::<$f>())),
+                client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+                client.empty(monthly_len.saturating_mul(std::mem::size_of::<$f>())),
+                client.empty(monthly_len.saturating_mul(std::mem::size_of::<$f>())),
+                client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+                client.empty(ftmo_len.saturating_mul(std::mem::size_of::<$f>())),
+            )
+        });
+
+        let units = backtest_kernel_units(client);
+        let cubes = (n_genes as u32).div_ceil(units);
+        // Adaptive-stop kernel args. When the settings carry a per-bar base vol
+        // series aligned to n_samples AND some gene has a positive multiplier, upload
+        // the REAL base ($f) + per-gene multiplier and use settings.adaptive_rr;
+        // otherwise inert dummies (all-zero multiplier ⇒ the kernel's
+        // `stop_vol_mult[gene] > 0` check is always false ⇒ the scalar sl/tp path,
+        // byte-identical). base + rr ride on `settings` (already threaded); the length
+        // guard keeps a windowed slice from mis-indexing the full-series base.
+        let adaptive_on = stop_vol_mult.iter().any(|&m| m > 0.0)
+            && settings
+                .adaptive_base_pips
+                .as_ref()
+                .map(|b| b.len() == n_samples)
+                .unwrap_or(false);
+        let (base_vals, mult_vals): (Vec<$f>, Vec<$f>) = if adaptive_on {
+            let base = settings.adaptive_base_pips.as_ref().unwrap();
+            (
+                base.iter().map(|&d| d as $f).collect(),
+                stop_vol_mult.iter().map(|&m| m as $f).collect(),
+            )
+        } else {
+            (vec![0.0], vec![0.0; n_genes])
+        };
+        let base_len = base_vals.len();
+        let adaptive_rr_val = if adaptive_on {
+            settings.adaptive_rr as $f
+        } else {
+            2.0
+        };
+        let base_pips_dummy = client.create_from_slice(<$f>::as_bytes(&base_vals));
+        let stop_vol_mult_dummy = client.create_from_slice(<$f>::as_bytes(&mult_vals));
+        // cubecl 0.10 migration: Handle-by-value `from_raw_parts(handle, len)`
+        // (clone to keep originals for read-back), raw-value scalars (no
+        // `ScalarArg::new`), infallible `launch` (no `.context()?`).
+        // KERNEL phase (timed). Note: cubecl launches are ASYNC enqueues, so most of
+        // the real GPU time is realized at the readback sync below — the split still
+        // tells the operator whether launch-enqueue itself is a bottleneck.
+        gpu_timing::kernel(|| {
+            $kernel::launch::<R>(
+                client,
+                CubeCount::Static(cubes, 1, 1),
+                CubeDim::new_1d(units),
+                unsafe { ArrayArg::from_raw_parts(close_handle.clone(), n_samples) },
+                unsafe { ArrayArg::from_raw_parts(high_handle.clone(), n_samples) },
+                unsafe { ArrayArg::from_raw_parts(low_handle.clone(), n_samples) },
+                unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), signals_flat.len()) },
+                unsafe { ArrayArg::from_raw_parts(timestamp_delta_handle.clone(), n_samples) },
+                unsafe { ArrayArg::from_raw_parts(month_handle.clone(), month_idx.len()) },
+                unsafe { ArrayArg::from_raw_parts(day_handle.clone(), day_idx.len()) },
+                unsafe { ArrayArg::from_raw_parts(sl_handle.clone(), sl_pips.len()) },
+                unsafe { ArrayArg::from_raw_parts(tp_handle.clone(), tp_pips.len()) },
+                unsafe { ArrayArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
+                unsafe { ArrayArg::from_raw_parts(trade_counts_handle.clone(), n_genes) },
+                unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
+                unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
+                n_samples as u32,
+                0,
+                n_genes as u32,
+                month_capacity as u32,
+                settings.initial_equity() as $f,
+                settings.max_hold_bars as u32,
+                settings.min_hold_bars as u32,
+                settings.max_trades_per_day as u32,
+                saturating_i32(settings.gap_threshold_ms),
+                if use_timestamps { 1i32 } else { 0i32 },
+                if settings.trailing_enabled {
+                    1i32
+                } else {
+                    0i32
+                },
+                settings.trailing_atr_multiplier as $f,
+                settings.trailing_be_trigger_r as $f,
+                settings.trailing_min_lock_pips as $f,
+                settings.spread_pips as $f,
+                settings.commission_per_trade as $f,
+                settings.pip_value_per_lot as $f,
+                // Phase C.3 (2026-05-28) — broker-supplied carry costs.
+                settings.swap_long_pips_per_day as $f,
+                settings.swap_short_pips_per_day as $f,
+                settings.pnl_conversion_fee_rate as $f,
+                // Phase 2 (2026-06-06) — confidence-scaled risk-based sizing knobs +
+                // per-month start-equity output for slot-7. ORDER MUST MATCH the kernel
+                // signature appended after pnl_conversion_fee_rate.
+                unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), confidences_flat.len()) },
+                if settings.risk_based_sizing {
+                    1i32
+                } else {
+                    0i32
+                },
+                settings.risk_per_trade_min as $f,
+                settings.risk_per_trade_max as $f,
+                settings.high_quality_confidence as $f,
+                unsafe { ArrayArg::from_raw_parts(base_pips_dummy.clone(), base_len) },
+                unsafe { ArrayArg::from_raw_parts(stop_vol_mult_dummy.clone(), n_genes) },
+                adaptive_rr_val,
+                unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
+                // FTMO prop-firm observables — LAST kernel argument (matches the kernel
+                // signature). `n_genes * FTMO_WIDTH` values laid out per gene.
+                unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
+            );
+        }); // end gpu_timing::kernel
+
+        // READBACK phase (timed). `read_one_unchecked` is the blocking VRAM→host copy
+        // that also SYNCS the queued kernel, so this is where async GPU time is realized.
+        let (
+            metrics_bytes,
+            trade_counts_bytes,
+            monthly_bytes,
+            month_counts_bytes,
+            month_start_eq_bytes,
+            ftmo_bytes,
+        ) = gpu_timing::readback(|| {
+            (
+                client.read_one_unchecked(metrics_handle),
+                client.read_one_unchecked(trade_counts_handle),
+                client.read_one_unchecked(monthly_handle),
+                client.read_one_unchecked(month_counts_handle),
+                client.read_one_unchecked(month_start_eq_handle),
+                client.read_one_unchecked(ftmo_handle),
+            )
+        });
+
+        Ok((
+            <$f>::from_bytes(&metrics_bytes).to_vec(),
+            i32::from_bytes(&trade_counts_bytes).to_vec(),
+            <$f>::from_bytes(&monthly_bytes).to_vec(),
+            i32::from_bytes(&month_counts_bytes).to_vec(),
+            <$f>::from_bytes(&month_start_eq_bytes).to_vec(),
+            <$f>::from_bytes(&ftmo_bytes).to_vec(),
+        ))
+    }
+    };
+}
+
+define_launch_backtest_kernel!(launch_backtest_kernel, backtest_population_kernel, f32);
+define_launch_backtest_kernel!(launch_backtest_kernel_f64, backtest_population_kernel_f64, f64);
+
+/// Is the double-precision backtest lane selected?
+///
+/// Off by default: the f32 lane is the measured, shipped behaviour and must not
+/// change without a decision. Set `NEOETHOS_GPU_F64=1` to route the backtest
+/// through the f64 lane instead.
+///
+/// This exists to answer a question that was never asked. The finding that "the
+/// f32 lane is wrong" (54 % off over 200 000 bars) came from comparing this
+/// engine against a separate f64 CUDA engine — nobody ran *this* engine in
+/// double precision. That matters, because this engine already has every call
+/// site in the discovery pipeline: if precision alone fixes it, there is no
+/// integration work left to do.
+pub(crate) fn gpu_f64_backtest_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEOETHOS_GPU_F64")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Run the backtest on the selected precision lane.
+///
+/// Both lanes take the same arguments — the host now hands prices and stops over
+/// as f64 and each lane narrows to its own element type — so the choice is made
+/// here and nowhere else. Metrics come back as f32 either way: the accumulation
+/// is what needs the extra precision, and the host structures downstream are f32.
+#[allow(clippy::too_many_arguments)]
+fn launch_backtest_kernel_auto<R: Runtime>(
     client: &ComputeClient<R>,
     device_key: usize,
-    close_pips: &[f32],
-    high_pips: &[f32],
-    low_pips: &[f32],
+    close_pips: &[f64],
+    high_pips: &[f64],
+    low_pips: &[f64],
     signals_flat: &[i32],
     confidences_flat: &[f32],
     timestamp_deltas_ms: &[i32],
     use_timestamps: bool,
     month_idx: &[i32],
     day_idx: &[i32],
-    sl_pips: &[f32],
-    tp_pips: &[f32],
-    // Per-gene adaptive volatility multiplier (empty / all-zero ⇒ fixed-stop
-    // path). Pairs with `settings.adaptive_base_pips` + `settings.adaptive_rr`.
+    sl_pips: &[f64],
+    tp_pips: &[f64],
     stop_vol_mult: &[f64],
     settings: &BacktestSettings,
     month_capacity: usize,
 ) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>)> {
-    let n_samples = close_pips.len();
-    let n_genes = sl_pips.len();
-    if n_samples == 0 || n_genes == 0 {
-        return Ok((
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ));
+    if gpu_f64_backtest_enabled() {
+        let (m, tc, mo, mc, mse, ftmo) = launch_backtest_kernel_f64(
+            client, device_key, close_pips, high_pips, low_pips, signals_flat,
+            confidences_flat, timestamp_deltas_ms, use_timestamps, month_idx, day_idx,
+            sl_pips, tp_pips, stop_vol_mult, settings, month_capacity,
+        )?;
+        let narrow = |v: Vec<f64>| v.into_iter().map(|x| x as f32).collect::<Vec<f32>>();
+        return Ok((narrow(m), tc, narrow(mo), mc, narrow(mse), narrow(ftmo)));
     }
-    if high_pips.len() != n_samples
-        || low_pips.len() != n_samples
-        || timestamp_deltas_ms.len() != n_samples
-        || month_idx.len() != n_samples
-        || day_idx.len() != n_samples
-        || tp_pips.len() != n_genes
-        || signals_flat.len() != n_genes.saturating_mul(n_samples)
-        || confidences_flat.len() != n_genes.saturating_mul(n_samples)
-    {
-        bail!("cuda evaluator backtest kernel received inconsistent dimensions");
-    }
-
-    // Device UPLOAD phase (timed under NEOETHOS_GPU_TIMING; runs unchanged
-    // otherwise). All `create_from_slice` (host→VRAM copies) + `empty` (output
-    // allocations) are the per-launch device-buffer setup the breakdown isolates.
-    let metrics_len = n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
-    let monthly_len = n_genes.saturating_mul(month_capacity);
-    let ftmo_len = n_genes.saturating_mul(FTMO_WIDTH);
-    let (
-        close_handle,
-        high_handle,
-        low_handle,
-        signals_handle,
-        conf_handle,
-        timestamp_delta_handle,
-        month_handle,
-        day_handle,
-        sl_handle,
-        tp_handle,
-        metrics_handle,
-        trade_counts_handle,
-        monthly_handle,
-        month_start_eq_handle,
-        month_counts_handle,
-        ftmo_handle,
-    ) = gpu_timing::upload(|| {
-        use resident_device_cache as rc;
-        (
-            // Per-unit-CONSTANT series (prices/time indices): resident across
-            // launches — uploaded once, reused every generation/batch. The
-            // per-generation payloads (signals/confidences — they change each
-            // call) still upload fresh.
-            rc::get_or_upload(
-                client,
-                device_key,
-                rc::SLOT_CLOSE,
-                f32::as_bytes(close_pips),
-            ),
-            rc::get_or_upload(client, device_key, rc::SLOT_HIGH, f32::as_bytes(high_pips)),
-            rc::get_or_upload(client, device_key, rc::SLOT_LOW, f32::as_bytes(low_pips)),
-            client.create_from_slice(i32::as_bytes(signals_flat)),
-            client.create_from_slice(f32::as_bytes(confidences_flat)),
-            rc::get_or_upload(
-                client,
-                device_key,
-                rc::SLOT_TS_DELTAS,
-                i32::as_bytes(timestamp_deltas_ms),
-            ),
-            rc::get_or_upload(
-                client,
-                device_key,
-                rc::SLOT_MONTH_IDX,
-                i32::as_bytes(month_idx),
-            ),
-            rc::get_or_upload(client, device_key, rc::SLOT_DAY_IDX, i32::as_bytes(day_idx)),
-            client.create_from_slice(f32::as_bytes(sl_pips)),
-            client.create_from_slice(f32::as_bytes(tp_pips)),
-            client.empty(metrics_len.saturating_mul(std::mem::size_of::<f32>())),
-            client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
-            client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>())),
-            client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>())),
-            client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
-            client.empty(ftmo_len.saturating_mul(std::mem::size_of::<f32>())),
-        )
-    });
-
-    let units = backtest_kernel_units(client);
-    let cubes = (n_genes as u32).div_ceil(units);
-    // Adaptive-stop kernel args. When the settings carry a per-bar base vol
-    // series aligned to n_samples AND some gene has a positive multiplier, upload
-    // the REAL base (f32) + per-gene multiplier and use settings.adaptive_rr;
-    // otherwise inert dummies (all-zero multiplier ⇒ the kernel's
-    // `stop_vol_mult[gene] > 0` check is always false ⇒ the scalar sl/tp path,
-    // byte-identical). base + rr ride on `settings` (already threaded); the length
-    // guard keeps a windowed slice from mis-indexing the full-series base.
-    let adaptive_on = stop_vol_mult.iter().any(|&m| m > 0.0)
-        && settings
-            .adaptive_base_pips
-            .as_ref()
-            .map(|b| b.len() == n_samples)
-            .unwrap_or(false);
-    let (base_f32, mult_f32): (Vec<f32>, Vec<f32>) = if adaptive_on {
-        let base = settings.adaptive_base_pips.as_ref().unwrap();
-        (
-            base.iter().map(|&d| d as f32).collect(),
-            stop_vol_mult.iter().map(|&m| m as f32).collect(),
-        )
-    } else {
-        (vec![0.0f32], vec![0.0f32; n_genes])
-    };
-    let base_len = base_f32.len();
-    let adaptive_rr_f32 = if adaptive_on { settings.adaptive_rr as f32 } else { 2.0 };
-    let base_pips_dummy = client.create_from_slice(f32::as_bytes(&base_f32));
-    let stop_vol_mult_dummy = client.create_from_slice(f32::as_bytes(&mult_f32));
-    // cubecl 0.10 migration: Handle-by-value `from_raw_parts(handle, len)`
-    // (clone to keep originals for read-back), raw-value scalars (no
-    // `ScalarArg::new`), infallible `launch` (no `.context()?`).
-    // KERNEL phase (timed). Note: cubecl launches are ASYNC enqueues, so most of
-    // the real GPU time is realized at the readback sync below — the split still
-    // tells the operator whether launch-enqueue itself is a bottleneck.
-    gpu_timing::kernel(|| {
-        backtest_population_kernel::launch::<R>(
-            client,
-            CubeCount::Static(cubes, 1, 1),
-            CubeDim::new_1d(units),
-            unsafe { ArrayArg::from_raw_parts(close_handle.clone(), n_samples) },
-            unsafe { ArrayArg::from_raw_parts(high_handle.clone(), n_samples) },
-            unsafe { ArrayArg::from_raw_parts(low_handle.clone(), n_samples) },
-            unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), signals_flat.len()) },
-            unsafe { ArrayArg::from_raw_parts(timestamp_delta_handle.clone(), n_samples) },
-            unsafe { ArrayArg::from_raw_parts(month_handle.clone(), month_idx.len()) },
-            unsafe { ArrayArg::from_raw_parts(day_handle.clone(), day_idx.len()) },
-            unsafe { ArrayArg::from_raw_parts(sl_handle.clone(), sl_pips.len()) },
-            unsafe { ArrayArg::from_raw_parts(tp_handle.clone(), tp_pips.len()) },
-            unsafe { ArrayArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
-            unsafe { ArrayArg::from_raw_parts(trade_counts_handle.clone(), n_genes) },
-            unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
-            unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
-            n_samples as u32,
-            month_capacity as u32,
-            settings.initial_equity() as f32,
-            settings.max_hold_bars as u32,
-            settings.min_hold_bars as u32,
-            settings.max_trades_per_day as u32,
-            saturating_i32(settings.gap_threshold_ms),
-            if use_timestamps { 1i32 } else { 0i32 },
-            if settings.trailing_enabled {
-                1i32
-            } else {
-                0i32
-            },
-            settings.trailing_atr_multiplier as f32,
-            settings.trailing_be_trigger_r as f32,
-            settings.spread_pips as f32,
-            settings.commission_per_trade as f32,
-            settings.pip_value_per_lot as f32,
-            // Phase C.3 (2026-05-28) — broker-supplied carry costs.
-            settings.swap_long_pips_per_day as f32,
-            settings.swap_short_pips_per_day as f32,
-            settings.pnl_conversion_fee_rate as f32,
-            // Phase 2 (2026-06-06) — confidence-scaled risk-based sizing knobs +
-            // per-month start-equity output for slot-7. ORDER MUST MATCH the kernel
-            // signature appended after pnl_conversion_fee_rate.
-            unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), confidences_flat.len()) },
-            if settings.risk_based_sizing {
-                1i32
-            } else {
-                0i32
-            },
-            settings.risk_per_trade_min as f32,
-            settings.risk_per_trade_max as f32,
-            settings.high_quality_confidence as f32,
-            unsafe { ArrayArg::from_raw_parts(base_pips_dummy.clone(), base_len) },
-            unsafe { ArrayArg::from_raw_parts(stop_vol_mult_dummy.clone(), n_genes) },
-            adaptive_rr_f32,
-            unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
-            // FTMO prop-firm observables — LAST kernel argument (matches the kernel
-            // signature). `n_genes * FTMO_WIDTH` f32s laid out per gene.
-            unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
-        );
-    }); // end gpu_timing::kernel
-
-    // READBACK phase (timed). `read_one_unchecked` is the blocking VRAM→host copy
-    // that also SYNCS the queued kernel, so this is where async GPU time is realized.
-    let (
-        metrics_bytes,
-        trade_counts_bytes,
-        monthly_bytes,
-        month_counts_bytes,
-        month_start_eq_bytes,
-        ftmo_bytes,
-    ) = gpu_timing::readback(|| {
-        (
-            client.read_one_unchecked(metrics_handle),
-            client.read_one_unchecked(trade_counts_handle),
-            client.read_one_unchecked(monthly_handle),
-            client.read_one_unchecked(month_counts_handle),
-            client.read_one_unchecked(month_start_eq_handle),
-            client.read_one_unchecked(ftmo_handle),
-        )
-    });
-
-    Ok((
-        f32::from_bytes(&metrics_bytes).to_vec(),
-        i32::from_bytes(&trade_counts_bytes).to_vec(),
-        f32::from_bytes(&monthly_bytes).to_vec(),
-        i32::from_bytes(&month_counts_bytes).to_vec(),
-        f32::from_bytes(&month_start_eq_bytes).to_vec(),
-        f32::from_bytes(&ftmo_bytes).to_vec(),
-    ))
+    launch_backtest_kernel(
+        client, device_key, close_pips, high_pips, low_pips, signals_flat,
+        confidences_flat, timestamp_deltas_ms, use_timestamps, month_idx, day_idx,
+        sl_pips, tp_pips, stop_vol_mult, settings, month_capacity,
+    )
 }
+
 
 /// Device-side copy of one sample-WINDOW of synthesized signals/conf into the
 /// correct slice of the full-series PERSISTENT VRAM buffer — the mechanism that
@@ -2907,10 +3350,10 @@ fn fused_path_parity_holds<R: Runtime>(client: &ComputeClient<R>) -> Result<bool
     let (ts_deltas, use_ts) = timestamp_delta_ms(&timestamps, n_samples);
     let month_i32: Vec<i32> = month_idx.iter().map(|v| saturating_i32(*v)).collect();
     let day_i32: Vec<i32> = day_idx.iter().map(|v| saturating_i32(*v)).collect();
-    let sl_f32: Vec<f32> = sl_pips.iter().map(|v| *v as f32).collect();
-    let tp_f32: Vec<f32> = tp_pips.iter().map(|v| *v as f32).collect();
+    let sl_f32: Vec<f64> = sl_pips.to_vec();
+    let tp_f32: Vec<f64> = tp_pips.to_vec();
 
-    let (mw, tcw, mow, mcw, msew, _ftmo_w) = launch_backtest_kernel(
+    let (mw, tcw, mow, mcw, msew, _ftmo_w) = launch_backtest_kernel_auto(
         client,
         0,
         &close_pips,
@@ -3119,17 +3562,683 @@ pub fn ensure_fused_eval_decided() {
     let _ = fused_eval_enabled();
 }
 
-/// FUSED windowed signal-synth + backtest for ONE gene-batch. The signal kernel
+pub(crate) struct PrototypeADatasetWindow {
+    sample_start: usize,
+    sample_len: usize,
+    indicators: cubecl::server::Handle,
+    smc_data: cubecl::server::Handle,
+}
+
+pub(crate) struct PrototypeADatasetResident {
+    windows: Vec<PrototypeADatasetWindow>,
+    close: cubecl::server::Handle,
+    high: cubecl::server::Handle,
+    low: cubecl::server::Handle,
+    timestamp_deltas: cubecl::server::Handle,
+    months: cubecl::server::Handle,
+    days: cubecl::server::Handle,
+    adaptive_base: cubecl::server::Handle,
+    adaptive_base_len: usize,
+    signals_workspace: cubecl::server::Handle,
+    confidences_workspace: cubecl::server::Handle,
+    window_signals_workspace: cubecl::server::Handle,
+    window_confidences_workspace: cubecl::server::Handle,
+    workspace_gene_capacity: usize,
+    pub(crate) n_samples: usize,
+    pub(crate) n_indicators: usize,
+    use_timestamps: bool,
+    pub(crate) month_capacity: usize,
+    settings: BacktestSettings,
+    pub(crate) upload_bytes: usize,
+    pub(crate) workspace_allocations: u64,
+}
+
+pub(crate) struct PrototypeAGenesResident {
+    _candidate_ids: cubecl::server::Handle,
+    offsets: cubecl::server::Handle,
+    indices: cubecl::server::Handle,
+    weights: cubecl::server::Handle,
+    long_thresholds: cubecl::server::Handle,
+    short_thresholds: cubecl::server::Handle,
+    stop_pips: cubecl::server::Handle,
+    target_pips: cubecl::server::Handle,
+    stop_vol_multipliers: cubecl::server::Handle,
+    smc_flags: cubecl::server::Handle,
+    smc_weights: cubecl::server::Handle,
+    metrics_workspace: cubecl::server::Handle,
+    trade_counts_workspace: cubecl::server::Handle,
+    monthly_workspace: cubecl::server::Handle,
+    month_counts_workspace: cubecl::server::Handle,
+    month_start_eq_workspace: cubecl::server::Handle,
+    ftmo_workspace: cubecl::server::Handle,
+    month_capacity: usize,
+    gate_threshold: f32,
+    any_adaptive: bool,
+    pub(crate) canonical_candidate_ids: Vec<u64>,
+    pub(crate) n_genes: usize,
+    pub(crate) upload_bytes: usize,
+    pub(crate) workspace_allocations: u64,
+}
+
+pub(crate) struct PrototypeAScenariosResident {
+    #[allow(dead_code)]
+    descriptors: cubecl::server::Handle,
+    pub(crate) canonical_descriptors: Vec<ScenarioDescriptor>,
+    pub(crate) upload_bytes: usize,
+}
+
+pub(crate) fn upload_prototype_a_dataset<R: Runtime>(
+    client: &ComputeClient<R>,
+    upload: &PrototypeADatasetUpload,
+    max_gene_batch: usize,
+) -> Result<PrototypeADatasetResident> {
+    let n_samples = upload.close.len();
+    let n_indicators = upload.feature_count;
+    if n_samples == 0
+        || n_indicators == 0
+        || upload.indicators.len() != n_samples.saturating_mul(n_indicators)
+    {
+        bail!("Prototype A dataset upload has inconsistent dimensions");
+    }
+    let settings = upload.settings.to_settings();
+    let close = normalize_prices_to_pips(&upload.close, settings.pip_value);
+    let high = normalize_prices_to_pips(&upload.high, settings.pip_value);
+    let low = normalize_prices_to_pips(&upload.low, settings.pip_value);
+    let (timestamp_deltas, use_timestamps) = timestamp_delta_ms(&upload.timestamps, n_samples);
+    let months = upload
+        .months
+        .iter()
+        .map(|value| saturating_i32(*value))
+        .collect::<Vec<_>>();
+    let days = upload
+        .days
+        .iter()
+        .map(|value| saturating_i32(*value))
+        .collect::<Vec<_>>();
+    let smc_data = flatten_i32_rows(&upload.smc_data);
+    let adaptive_base = settings
+        .adaptive_base_pips
+        .as_ref()
+        .filter(|values| values.len() == n_samples)
+        .map(|values| values.iter().map(|value| *value as f32).collect::<Vec<_>>())
+        .unwrap_or_else(|| vec![0.0]);
+    let adaptive_base_len = adaptive_base.len();
+
+    let workspace_gene_capacity =
+        backtest_gene_batch(max_gene_batch.max(1), n_samples).min(max_gene_batch.max(1));
+    let window_size = signal_window_size(n_indicators, workspace_gene_capacity, n_samples);
+    let mut windows = Vec::new();
+    let mut sample_start = 0usize;
+    while sample_start < n_samples {
+        let sample_end = (sample_start + window_size).min(n_samples);
+        let indicators = gather_indicator_window(
+            &upload.indicators,
+            n_indicators,
+            n_samples,
+            sample_start,
+            sample_end,
+        );
+        let smc_start = sample_start.saturating_mul(SMC_WIDTH);
+        let smc_end = sample_end.saturating_mul(SMC_WIDTH);
+        windows.push(PrototypeADatasetWindow {
+            sample_start,
+            sample_len: sample_end - sample_start,
+            indicators: client.create_from_slice(f32::as_bytes(&indicators)),
+            smc_data: client.create_from_slice(i32::as_bytes(&smc_data[smc_start..smc_end])),
+        });
+        sample_start = sample_end;
+    }
+
+    let upload_bytes = upload
+        .indicators
+        .len()
+        .saturating_mul(std::mem::size_of::<f32>())
+        .saturating_add(smc_data.len().saturating_mul(std::mem::size_of::<i32>()))
+        .saturating_add(
+            (close.len() + high.len() + low.len() + adaptive_base.len())
+                .saturating_mul(std::mem::size_of::<f32>()),
+        )
+        .saturating_add(
+            (timestamp_deltas.len() + months.len() + days.len())
+                .saturating_mul(std::mem::size_of::<i32>()),
+        );
+    let signal_workspace_len = workspace_gene_capacity.saturating_mul(n_samples);
+    let window_workspace_len = workspace_gene_capacity.saturating_mul(window_size);
+    Ok(PrototypeADatasetResident {
+        windows,
+        close: client.create_from_slice(f32::as_bytes(
+            &close.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+        )),
+        high: client.create_from_slice(f32::as_bytes(
+            &high.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+        )),
+        low: client.create_from_slice(f32::as_bytes(
+            &low.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+        )),
+        timestamp_deltas: client.create_from_slice(i32::as_bytes(&timestamp_deltas)),
+        months: client.create_from_slice(i32::as_bytes(&months)),
+        days: client.create_from_slice(i32::as_bytes(&days)),
+        adaptive_base: client.create_from_slice(f32::as_bytes(&adaptive_base)),
+        adaptive_base_len,
+        signals_workspace: client
+            .empty(signal_workspace_len.saturating_mul(std::mem::size_of::<i32>())),
+        confidences_workspace: client
+            .empty(signal_workspace_len.saturating_mul(std::mem::size_of::<f32>())),
+        window_signals_workspace: client
+            .empty(window_workspace_len.saturating_mul(std::mem::size_of::<i32>())),
+        window_confidences_workspace: client
+            .empty(window_workspace_len.saturating_mul(std::mem::size_of::<f32>())),
+        workspace_gene_capacity,
+        n_samples,
+        n_indicators,
+        use_timestamps,
+        month_capacity: settings.month_capacity(),
+        settings,
+        upload_bytes,
+        workspace_allocations: 4,
+    })
+}
+
+pub(crate) fn upload_prototype_a_genes<R: Runtime>(
+    client: &ComputeClient<R>,
+    upload: &PrototypeAGeneUpload,
+    month_capacity: usize,
+) -> Result<PrototypeAGenesResident> {
+    let n_genes = upload.candidate_ids.len();
+    if n_genes == 0 || upload.offsets.len() != n_genes + 1 {
+        bail!("Prototype A gene upload has inconsistent dimensions");
+    }
+    let smc_flags = flatten_i32_flags(&upload.smc_flags);
+    let stop_pips = upload
+        .stop_pips
+        .iter()
+        .map(|value| *value as f32)
+        .collect::<Vec<_>>();
+    let target_pips = upload
+        .target_pips
+        .iter()
+        .map(|value| *value as f32)
+        .collect::<Vec<_>>();
+    let stop_vol_multipliers = upload
+        .stop_vol_multipliers
+        .iter()
+        .map(|value| *value as f32)
+        .collect::<Vec<_>>();
+    let upload_bytes = upload
+        .candidate_ids
+        .len()
+        .saturating_mul(std::mem::size_of::<u64>())
+        .saturating_add(
+            (upload.offsets.len() + upload.indices.len() + smc_flags.len())
+                .saturating_mul(std::mem::size_of::<i32>()),
+        )
+        .saturating_add(
+            (upload.weights.len()
+                + upload.long_thresholds.len()
+                + upload.short_thresholds.len()
+                + stop_pips.len()
+                + target_pips.len()
+                + stop_vol_multipliers.len()
+                + upload.smc_weights.len())
+            .saturating_mul(std::mem::size_of::<f32>()),
+        );
+    let metrics_len = n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+    let monthly_len = n_genes.saturating_mul(month_capacity);
+    let ftmo_len = n_genes.saturating_mul(FTMO_WIDTH);
+    Ok(PrototypeAGenesResident {
+        _candidate_ids: client.create_from_slice(u64::as_bytes(&upload.candidate_ids)),
+        offsets: client.create_from_slice(i32::as_bytes(&upload.offsets)),
+        indices: client.create_from_slice(i32::as_bytes(&upload.indices)),
+        weights: client.create_from_slice(f32::as_bytes(&upload.weights)),
+        long_thresholds: client.create_from_slice(f32::as_bytes(&upload.long_thresholds)),
+        short_thresholds: client.create_from_slice(f32::as_bytes(&upload.short_thresholds)),
+        stop_pips: client.create_from_slice(f32::as_bytes(&stop_pips)),
+        target_pips: client.create_from_slice(f32::as_bytes(&target_pips)),
+        stop_vol_multipliers: client.create_from_slice(f32::as_bytes(&stop_vol_multipliers)),
+        smc_flags: client.create_from_slice(i32::as_bytes(&smc_flags)),
+        smc_weights: client.create_from_slice(f32::as_bytes(&upload.smc_weights)),
+        metrics_workspace: client.empty(metrics_len.saturating_mul(std::mem::size_of::<f32>())),
+        trade_counts_workspace: client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+        monthly_workspace: client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>())),
+        month_counts_workspace: client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+        month_start_eq_workspace: client
+            .empty(monthly_len.saturating_mul(std::mem::size_of::<f32>())),
+        ftmo_workspace: client.empty(ftmo_len.saturating_mul(std::mem::size_of::<f32>())),
+        month_capacity,
+        gate_threshold: upload.gate_threshold,
+        any_adaptive: upload.stop_vol_multipliers.iter().any(|value| *value > 0.0),
+        canonical_candidate_ids: upload.candidate_ids.clone(),
+        n_genes,
+        upload_bytes,
+        workspace_allocations: 6,
+    })
+}
+
+pub(crate) fn upload_prototype_a_scenarios<R: Runtime>(
+    client: &ComputeClient<R>,
+    upload: &PrototypeAScenarioUpload,
+) -> Result<PrototypeAScenariosResident> {
+    if upload.scenarios.is_empty() {
+        bail!("Prototype A scenario upload is empty");
+    }
+    let bytes = encode_scenario_descriptors(&upload.scenarios);
+    Ok(PrototypeAScenariosResident {
+        descriptors: client.create_from_slice(&bytes),
+        canonical_descriptors: upload.scenarios.clone(),
+        upload_bytes: bytes.len(),
+    })
+}
+
+fn encode_scenario_descriptors(scenarios: &[ScenarioDescriptor]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(
+        scenarios
+            .len()
+            .saturating_mul(std::mem::size_of::<ScenarioDescriptor>()),
+    );
+    for scenario in scenarios {
+        bytes.extend_from_slice(&scenario.base_candidate_id.to_le_bytes());
+        bytes.extend_from_slice(&scenario.scenario_id.to_le_bytes());
+        bytes.extend_from_slice(&scenario.rng_counter.to_le_bytes());
+        bytes.extend_from_slice(&scenario.window_offset.to_le_bytes());
+        bytes.extend_from_slice(&scenario.window_len.to_le_bytes());
+        bytes.extend_from_slice(&scenario.scenario_type.to_le_bytes());
+        bytes.extend_from_slice(&scenario.spread_ticks.to_le_bytes());
+        bytes.extend_from_slice(&scenario.slippage_ticks.to_le_bytes());
+        bytes.extend_from_slice(&scenario.commission_micros.to_le_bytes());
+        bytes.extend_from_slice(&scenario.perturbation_offset.to_le_bytes());
+        bytes.extend_from_slice(&scenario.perturbation_count.to_le_bytes());
+        bytes.extend_from_slice(&scenario.reserved.to_le_bytes());
+    }
+    bytes
+}
+
+/// Device-resident output of a fused gene-batch backtest: the six per-gene metric
+/// buffers stay ON THE GPU (a cheap Arc-backed `ComputeClient` clone keeps the
+/// server alive) and are read to host exactly ONCE, later, by
+/// [`read_fused_resident_metrics`]. This is the honest device-residency boundary
+/// the `BacktestEngine` contract needs — nothing dense is read back and the compact
+/// metrics are not materialised on the host until that single explicit readback.
+/// `n_genes`/`month_capacity` carry the layout the reader/engine slices by.
+pub(crate) struct FusedResidentMetrics<R: Runtime> {
+    client: ComputeClient<R>,
+    metrics: cubecl::server::Handle,
+    trade_counts: cubecl::server::Handle,
+    monthly: cubecl::server::Handle,
+    month_counts: cubecl::server::Handle,
+    month_start_eq: cubecl::server::Handle,
+    ftmo: cubecl::server::Handle,
+    pub(crate) n_genes: usize,
+    pub(crate) month_capacity: usize,
+}
+
+/// Read the retained device metrics of a fused gene-batch to host — the single
+/// intended compact readback boundary. Consumes the handles. Byte-identical to
+/// the readback that `fused_signal_backtest_batch` used to do inline.
+pub(crate) fn read_fused_resident_metrics<R: Runtime>(
+    resident: FusedResidentMetrics<R>,
+) -> (Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>) {
+    let FusedResidentMetrics {
+        client,
+        metrics,
+        trade_counts,
+        monthly,
+        month_counts,
+        month_start_eq,
+        ftmo,
+        ..
+    } = resident;
+    let (
+        metrics_bytes,
+        trade_counts_bytes,
+        monthly_bytes,
+        month_counts_bytes,
+        month_start_eq_bytes,
+        ftmo_bytes,
+    ) = gpu_timing::readback(|| {
+        (
+            client.read_one_unchecked(metrics),
+            client.read_one_unchecked(trade_counts),
+            client.read_one_unchecked(monthly),
+            client.read_one_unchecked(month_counts),
+            client.read_one_unchecked(month_start_eq),
+            client.read_one_unchecked(ftmo),
+        )
+    });
+    (
+        f32::from_bytes(&metrics_bytes).to_vec(),
+        i32::from_bytes(&trade_counts_bytes).to_vec(),
+        f32::from_bytes(&monthly_bytes).to_vec(),
+        i32::from_bytes(&month_counts_bytes).to_vec(),
+        f32::from_bytes(&month_start_eq_bytes).to_vec(),
+        f32::from_bytes(&ftmo_bytes).to_vec(),
+    )
+}
+
+pub(crate) fn evaluate_prototype_a_resident<R: Runtime>(
+    client: &ComputeClient<R>,
+    dataset: &PrototypeADatasetResident,
+    genes: &PrototypeAGenesResident,
+    max_gene_batch: usize,
+) -> Result<(Vec<FusedResidentMetrics<R>>, u64)> {
+    if dataset.n_samples == 0 || genes.n_genes == 0 || max_gene_batch == 0 {
+        bail!("Prototype A resident evaluation requires non-empty bounded inputs");
+    }
+    let batch_size = dataset
+        .workspace_gene_capacity
+        .min(max_gene_batch)
+        .min(genes.n_genes)
+        .max(1);
+    let mut synchronization_events = 0u64;
+    let signal_units = signal_kernel_units(client);
+
+    let mut gene_start = 0usize;
+    while gene_start < genes.n_genes {
+        let gene_end = (gene_start + batch_size).min(genes.n_genes);
+        let batch_genes = gene_end - gene_start;
+        let total = batch_genes.saturating_mul(dataset.n_samples);
+        let signals = dataset.signals_workspace.clone();
+        let confidences = dataset.confidences_workspace.clone();
+
+        for window in &dataset.windows {
+            let window_total = batch_genes.saturating_mul(window.sample_len);
+            let window_signals = dataset.window_signals_workspace.clone();
+            let window_confidences = dataset.window_confidences_workspace.clone();
+            let signal_cubes = (window_total as u32).div_ceil(signal_units);
+            synthesize_signals_kernel::launch::<f32, R>(
+                client,
+                CubeCount::Static(signal_cubes, 1, 1),
+                CubeDim::new_1d(signal_units),
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        window.indicators.clone(),
+                        dataset.n_indicators.saturating_mul(window.sample_len),
+                    )
+                },
+                unsafe { ArrayArg::from_raw_parts(genes.offsets.clone(), genes.n_genes + 1) },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        genes.indices.clone(),
+                        genes.indices.size_in_used() as usize / std::mem::size_of::<i32>(),
+                    )
+                },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        genes.weights.clone(),
+                        genes.weights.size_in_used() as usize / std::mem::size_of::<f32>(),
+                    )
+                },
+                unsafe { ArrayArg::from_raw_parts(genes.long_thresholds.clone(), genes.n_genes) },
+                unsafe { ArrayArg::from_raw_parts(genes.short_thresholds.clone(), genes.n_genes) },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        window.smc_data.clone(),
+                        window.sample_len.saturating_mul(SMC_WIDTH),
+                    )
+                },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        genes.smc_flags.clone(),
+                        genes.n_genes.saturating_mul(SMC_WIDTH),
+                    )
+                },
+                unsafe { ArrayArg::from_raw_parts(genes.smc_weights.clone(), SMC_WIDTH) },
+                unsafe { ArrayArg::from_raw_parts(window_signals.clone(), window_total) },
+                unsafe { ArrayArg::from_raw_parts(window_confidences.clone(), window_total) },
+                window.sample_len as u32,
+                gene_start as u32,
+                genes.gate_threshold,
+            );
+            cubecl::future::block_on(client.sync())
+                .map_err(|error| anyhow::anyhow!("Prototype A signal event failed: {error:?}"))?;
+            synchronization_events = synchronization_events.saturating_add(1);
+
+            let copy_cubes = (window_total as u32).div_ceil(signal_units);
+            copy_window_into_persistent::launch::<i32, R>(
+                client,
+                CubeCount::Static(copy_cubes, 1, 1),
+                CubeDim::new_1d(signal_units),
+                unsafe { ArrayArg::from_raw_parts(window_signals, window_total) },
+                unsafe { ArrayArg::from_raw_parts(signals.clone(), total) },
+                window.sample_len as u32,
+                dataset.n_samples as u32,
+                window.sample_start as u32,
+                window_total as u32,
+            );
+            copy_window_into_persistent::launch::<f32, R>(
+                client,
+                CubeCount::Static(copy_cubes, 1, 1),
+                CubeDim::new_1d(signal_units),
+                unsafe { ArrayArg::from_raw_parts(window_confidences, window_total) },
+                unsafe { ArrayArg::from_raw_parts(confidences.clone(), total) },
+                window.sample_len as u32,
+                dataset.n_samples as u32,
+                window.sample_start as u32,
+                window_total as u32,
+            );
+        }
+
+        cubecl::future::block_on(client.sync())
+            .map_err(|error| anyhow::anyhow!("Prototype A signal-copy event failed: {error:?}"))?;
+        synchronization_events = synchronization_events.saturating_add(1);
+
+        let metrics_len = genes.n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+        let monthly_len = genes.n_genes.saturating_mul(dataset.month_capacity);
+        let ftmo_len = genes.n_genes.saturating_mul(FTMO_WIDTH);
+        let adaptive_on = genes.any_adaptive && dataset.adaptive_base_len == dataset.n_samples;
+        let backtest_units = backtest_kernel_units(client);
+        let backtest_cubes = (batch_genes as u32).div_ceil(backtest_units);
+        backtest_population_kernel::launch::<R>(
+            client,
+            CubeCount::Static(backtest_cubes, 1, 1),
+            CubeDim::new_1d(backtest_units),
+            unsafe { ArrayArg::from_raw_parts(dataset.close.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(dataset.high.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(dataset.low.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(signals, total) },
+            unsafe {
+                ArrayArg::from_raw_parts(dataset.timestamp_deltas.clone(), dataset.n_samples)
+            },
+            unsafe { ArrayArg::from_raw_parts(dataset.months.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(dataset.days.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(genes.stop_pips.clone(), genes.n_genes) },
+            unsafe { ArrayArg::from_raw_parts(genes.target_pips.clone(), genes.n_genes) },
+            unsafe { ArrayArg::from_raw_parts(genes.metrics_workspace.clone(), metrics_len) },
+            unsafe {
+                ArrayArg::from_raw_parts(genes.trade_counts_workspace.clone(), genes.n_genes)
+            },
+            unsafe { ArrayArg::from_raw_parts(genes.monthly_workspace.clone(), monthly_len) },
+            unsafe {
+                ArrayArg::from_raw_parts(genes.month_counts_workspace.clone(), genes.n_genes)
+            },
+            dataset.n_samples as u32,
+            gene_start as u32,
+            batch_genes as u32,
+            dataset.month_capacity as u32,
+            dataset.settings.initial_equity() as f32,
+            dataset.settings.max_hold_bars as u32,
+            dataset.settings.min_hold_bars as u32,
+            dataset.settings.max_trades_per_day as u32,
+            saturating_i32(dataset.settings.gap_threshold_ms),
+            if dataset.use_timestamps { 1 } else { 0 },
+            if dataset.settings.trailing_enabled {
+                1
+            } else {
+                0
+            },
+            dataset.settings.trailing_atr_multiplier as f32,
+            dataset.settings.trailing_be_trigger_r as f32,
+            dataset.settings.trailing_min_lock_pips as f32,
+            dataset.settings.spread_pips as f32,
+            dataset.settings.commission_per_trade as f32,
+            dataset.settings.pip_value_per_lot as f32,
+            dataset.settings.swap_long_pips_per_day as f32,
+            dataset.settings.swap_short_pips_per_day as f32,
+            dataset.settings.pnl_conversion_fee_rate as f32,
+            unsafe { ArrayArg::from_raw_parts(confidences, total) },
+            if dataset.settings.risk_based_sizing {
+                1
+            } else {
+                0
+            },
+            dataset.settings.risk_per_trade_min as f32,
+            dataset.settings.risk_per_trade_max as f32,
+            dataset.settings.high_quality_confidence as f32,
+            unsafe {
+                ArrayArg::from_raw_parts(dataset.adaptive_base.clone(), dataset.adaptive_base_len)
+            },
+            unsafe { ArrayArg::from_raw_parts(genes.stop_vol_multipliers.clone(), genes.n_genes) },
+            if adaptive_on {
+                dataset.settings.adaptive_rr as f32
+            } else {
+                2.0
+            },
+            unsafe {
+                ArrayArg::from_raw_parts(genes.month_start_eq_workspace.clone(), monthly_len)
+            },
+            unsafe { ArrayArg::from_raw_parts(genes.ftmo_workspace.clone(), ftmo_len) },
+        );
+        gene_start = gene_end;
+    }
+    Ok((
+        vec![FusedResidentMetrics {
+            client: client.clone(),
+            metrics: genes.metrics_workspace.clone(),
+            trade_counts: genes.trade_counts_workspace.clone(),
+            monthly: genes.monthly_workspace.clone(),
+            month_counts: genes.month_counts_workspace.clone(),
+            month_start_eq: genes.month_start_eq_workspace.clone(),
+            ftmo: genes.ftmo_workspace.clone(),
+            n_genes: genes.n_genes,
+            month_capacity: genes.month_capacity,
+        }],
+        synchronization_events,
+    ))
+}
+
+pub(crate) fn read_prototype_a_resident_metrics<R: Runtime>(
+    outputs: Vec<FusedResidentMetrics<R>>,
+) -> Result<(Vec<[f64; 11]>, usize)> {
+    let mut rows = Vec::new();
+    let mut readback_bytes = 0usize;
+    for output in outputs {
+        let n_genes = output.n_genes;
+        let month_capacity = output.month_capacity;
+        readback_bytes = readback_bytes.saturating_add(
+            n_genes
+                .saturating_mul(
+                    BACKTEST_CORE_METRIC_WIDTH
+                        .saturating_add(FTMO_WIDTH)
+                        .saturating_mul(std::mem::size_of::<f32>())
+                        .saturating_add(2usize.saturating_mul(std::mem::size_of::<i32>())),
+                )
+                .saturating_add(
+                    n_genes
+                        .saturating_mul(month_capacity)
+                        .saturating_mul(2)
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                ),
+        );
+        let (metrics, trade_counts, monthly, month_counts, month_start_eq, _ftmo) =
+            read_fused_resident_metrics(output);
+        rows.extend(assemble_metric_rows(
+            &metrics,
+            &trade_counts,
+            &monthly,
+            &month_counts,
+            &month_start_eq,
+            month_capacity,
+            n_genes,
+        )?);
+    }
+    Ok((rows, readback_bytes))
+}
+
+fn assemble_metric_rows(
+    metrics_flat: &[f32],
+    trade_counts: &[i32],
+    monthly_flat: &[f32],
+    month_counts: &[i32],
+    month_start_eq_flat: &[f32],
+    month_capacity: usize,
+    n_genes: usize,
+) -> Result<Vec<[f64; 11]>> {
+    if metrics_flat.len() != n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH)
+        || trade_counts.len() != n_genes
+        || monthly_flat.len() != n_genes.saturating_mul(month_capacity)
+        || month_counts.len() != n_genes
+        || month_start_eq_flat.len() != n_genes.saturating_mul(month_capacity)
+    {
+        bail!("Prototype A compact metric readback returned an invalid shape");
+    }
+    let mut rows = Vec::with_capacity(n_genes);
+    for gene in 0..n_genes {
+        let metric_base = gene.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+        let month_base = gene.saturating_mul(month_capacity);
+        let month_count = month_counts[gene].max(0) as usize;
+        let month_limit = month_count.min(month_capacity);
+        let month_returns = monthly_flat[month_base..month_base + month_limit]
+            .iter()
+            .map(|value| *value as f64)
+            .collect::<Vec<_>>();
+        let (average_month, month_stddev) = mean_std(&month_returns);
+        let sharpe = if month_stddev > 0.0 {
+            (average_month / month_stddev) * 3.4641
+        } else {
+            0.0
+        };
+        let consistency = if month_stddev > 0.0 {
+            (average_month / month_stddev).clamp(0.0, 1.0)
+        } else if average_month > 0.0 && month_returns.len() < 2 {
+            1.0
+        } else {
+            0.0
+        };
+        const MONTHLY_RETURN_TARGET: f64 = 0.04;
+        let mut hit = 0usize;
+        let mut counted = 0usize;
+        for month in 0..month_limit {
+            let base = month_start_eq_flat[month_base + month] as f64;
+            if base > 0.0 {
+                counted += 1;
+                if (monthly_flat[month_base + month] as f64) / base >= MONTHLY_RETURN_TARGET {
+                    hit += 1;
+                }
+            }
+        }
+        let monthly_hit = if counted > 0 {
+            hit as f64 / counted as f64
+        } else {
+            0.0
+        };
+        rows.push([
+            metrics_flat[metric_base] as f64,
+            sharpe,
+            metrics_flat[metric_base + 1] as f64,
+            metrics_flat[metric_base + 2] as f64,
+            metrics_flat[metric_base + 3] as f64,
+            metrics_flat[metric_base + 4] as f64,
+            metrics_flat[metric_base + 5] as f64,
+            monthly_hit,
+            trade_counts[gene] as f64,
+            consistency,
+            metrics_flat[metric_base + 6] as f64,
+        ]);
+    }
+    Ok(rows)
+}
+
+/// FUSED windowed signal-synth + backtest for ONE gene-batch, leaving the per-gene
+/// metric scalars DEVICE-RESIDENT (see [`FusedResidentMetrics`]). The signal kernel
 /// writes each sample-window's signals(i32)/conf(f32) into a PERSISTENT VRAM
 /// buffer (via a GPU-side copy — no host roundtrip) that the backtest kernel
 /// then reads DIRECTLY — no readback of the genes×samples matrix, no re-upload.
-/// Only the per-gene metric scalars are read back. Handles all timeframes
-/// (1 window for light TFs, many for M1). Both handles stay local (inferred
-/// type), so no `Handle` type crosses a signature. Numerically identical to the
-/// windowed host path: same kernels, same inputs, same f32/bf16 precision — the
-/// bytes are simply not round-tripped through host RAM.
+/// Handles all timeframes (1 window for light TFs, many for M1). Numerically
+/// identical to the windowed host path: same kernels, same inputs, same f32/bf16
+/// precision — the bytes are simply not round-tripped through host RAM. The thin
+/// [`fused_signal_backtest_batch`] wrapper adds the compact readback for the
+/// existing host-returning callers (byte-identical). Callers guarantee `total > 0`.
 #[allow(clippy::too_many_arguments)]
-fn fused_signal_backtest_batch<F, R: Runtime>(
+fn fused_signal_backtest_batch_resident<F, R: Runtime>(
     client: &ComputeClient<R>,
     indicators_flat: &[F],
     // The signal kernel derives the indicator count from `indicators_flat.len() /
@@ -3144,34 +4253,27 @@ fn fused_signal_backtest_batch<F, R: Runtime>(
     gene_smc_flags_flat: &[i32],
     smc_weights: &[F],
     gate_threshold: F,
-    close_pips: &[f32],
-    high_pips: &[f32],
-    low_pips: &[f32],
+    close_pips: &[f64],
+    high_pips: &[f64],
+    low_pips: &[f64],
     timestamp_deltas_ms: &[i32],
     use_timestamps: bool,
     month_idx: &[i32],
     day_idx: &[i32],
-    sl_pips: &[f32],
-    tp_pips: &[f32],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
     stop_vol_mult: &[f64],
     settings: &BacktestSettings,
     month_capacity: usize,
     n_genes: usize,
     n_samples: usize,
-) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>)>
+) -> Result<FusedResidentMetrics<R>>
 where
     F: Float + CubeElement,
 {
     let total = n_genes.saturating_mul(n_samples);
     if total == 0 {
-        return Ok((
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ));
+        bail!("fused resident backtest requires at least one gene and one sample");
     }
     // Same input validation the non-fused signal kernel runs — a bad GA gene
     // index must fail LOUD, not read garbage VRAM (real-money path).
@@ -3202,6 +4304,25 @@ where
     let signals_handle = client.empty(total.saturating_mul(std::mem::size_of::<i32>()));
     let conf_handle = client.empty(total.saturating_mul(std::mem::size_of::<f32>()));
     // Gene-independent inputs are identical every window — upload ONCE.
+    let gene_upload_bytes = gene_offsets
+        .len()
+        .saturating_mul(std::mem::size_of::<i32>())
+        + gene_indices
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
+        + gene_weights.len().saturating_mul(std::mem::size_of::<F>())
+        + long_thr.len().saturating_mul(std::mem::size_of::<F>())
+        + short_thr.len().saturating_mul(std::mem::size_of::<F>())
+        + gene_smc_flags_flat
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
+        + smc_weights.len().saturating_mul(std::mem::size_of::<F>())
+        + sl_pips.len().saturating_mul(std::mem::size_of::<f32>())
+        + tp_pips.len().saturating_mul(std::mem::size_of::<f32>())
+        + stop_vol_mult
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>());
+    transfer_telemetry::record_gene_upload(gene_upload_bytes);
     let (
         gene_offsets_handle,
         gene_indices_handle,
@@ -3230,6 +4351,10 @@ where
         let win_total = n_genes.saturating_mul(wlen);
         let ind_window = gather_indicator_window(indicators_flat, n_indicators, n_samples, s0, s1);
         let smc_window = &smc_data_flat[s0 * SMC_WIDTH..s1 * SMC_WIDTH];
+        transfer_telemetry::record_streamed_dataset_upload(
+            ind_window.len().saturating_mul(std::mem::size_of::<F>())
+                + smc_window.len().saturating_mul(std::mem::size_of::<i32>()),
+        );
         // Per-window inputs + transient window output buffers (freed each pass).
         let (indicators_handle, smc_data_handle, sig_w, conf_w) = gpu_timing::upload(|| {
             (
@@ -3268,6 +4393,7 @@ where
                 unsafe { ArrayArg::from_raw_parts(sig_w.clone(), win_total) },
                 unsafe { ArrayArg::from_raw_parts(conf_w.clone(), win_total) },
                 wlen as u32,
+                0,
                 gate_threshold,
             );
         });
@@ -3340,14 +4466,14 @@ where
         ftmo_handle,
     ) = gpu_timing::upload(|| {
         (
-            client.create_from_slice(f32::as_bytes(close_pips)),
-            client.create_from_slice(f32::as_bytes(high_pips)),
-            client.create_from_slice(f32::as_bytes(low_pips)),
+            client.create_from_slice(f32::as_bytes(&close_pips.iter().map(|&v| v as f32).collect::<Vec<f32>>())),
+            client.create_from_slice(f32::as_bytes(&high_pips.iter().map(|&v| v as f32).collect::<Vec<f32>>())),
+            client.create_from_slice(f32::as_bytes(&low_pips.iter().map(|&v| v as f32).collect::<Vec<f32>>())),
             client.create_from_slice(i32::as_bytes(timestamp_deltas_ms)),
             client.create_from_slice(i32::as_bytes(month_idx)),
             client.create_from_slice(i32::as_bytes(day_idx)),
-            client.create_from_slice(f32::as_bytes(sl_pips)),
-            client.create_from_slice(f32::as_bytes(tp_pips)),
+            client.create_from_slice(f32::as_bytes(&sl_pips.iter().map(|&v| v as f32).collect::<Vec<f32>>())),
+            client.create_from_slice(f32::as_bytes(&tp_pips.iter().map(|&v| v as f32).collect::<Vec<f32>>())),
             client.empty(metrics_len.saturating_mul(std::mem::size_of::<f32>())),
             client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
             client.empty(monthly_len.saturating_mul(std::mem::size_of::<f32>())),
@@ -3375,7 +4501,11 @@ where
         (vec![0.0f32], vec![0.0f32; n_genes])
     };
     let base_len = base_f32.len();
-    let adaptive_rr_f32 = if adaptive_on { settings.adaptive_rr as f32 } else { 2.0 };
+    let adaptive_rr_f32 = if adaptive_on {
+        settings.adaptive_rr as f32
+    } else {
+        2.0
+    };
     let base_pips_dummy = client.create_from_slice(f32::as_bytes(&base_f32));
     let stop_vol_mult_dummy = client.create_from_slice(f32::as_bytes(&mult_f32));
     let bt_units = backtest_kernel_units(client);
@@ -3399,6 +4529,8 @@ where
             unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
             unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
             n_samples as u32,
+            0,
+            n_genes as u32,
             month_capacity as u32,
             settings.initial_equity() as f32,
             settings.max_hold_bars as u32,
@@ -3413,6 +4545,7 @@ where
             },
             settings.trailing_atr_multiplier as f32,
             settings.trailing_be_trigger_r as f32,
+            settings.trailing_min_lock_pips as f32,
             settings.spread_pips as f32,
             settings.commission_per_trade as f32,
             settings.pip_value_per_lot as f32,
@@ -3436,32 +4569,84 @@ where
         );
     });
 
-    // READBACK: only the per-gene metric scalars (NOT the genes×samples matrix).
-    let (
-        metrics_bytes,
-        trade_counts_bytes,
-        monthly_bytes,
-        month_counts_bytes,
-        month_start_eq_bytes,
-        ftmo_bytes,
-    ) = gpu_timing::readback(|| {
-        (
-            client.read_one_unchecked(metrics_handle),
-            client.read_one_unchecked(trade_counts_handle),
-            client.read_one_unchecked(monthly_handle),
-            client.read_one_unchecked(month_counts_handle),
-            client.read_one_unchecked(month_start_eq_handle),
-            client.read_one_unchecked(ftmo_handle),
-        )
-    });
-    Ok((
-        f32::from_bytes(&metrics_bytes).to_vec(),
-        i32::from_bytes(&trade_counts_bytes).to_vec(),
-        f32::from_bytes(&monthly_bytes).to_vec(),
-        i32::from_bytes(&month_counts_bytes).to_vec(),
-        f32::from_bytes(&month_start_eq_bytes).to_vec(),
-        f32::from_bytes(&ftmo_bytes).to_vec(),
-    ))
+    Ok(FusedResidentMetrics {
+        client: client.clone(),
+        metrics: metrics_handle,
+        trade_counts: trade_counts_handle,
+        monthly: monthly_handle,
+        month_counts: month_counts_handle,
+        month_start_eq: month_start_eq_handle,
+        ftmo: ftmo_handle,
+        n_genes,
+        month_capacity,
+    })
+}
+
+/// Compatibility boundary for the existing population evaluator. New
+/// device-chained callers retain the result of
+/// [`fused_signal_backtest_batch_resident`] and defer this compact readback until
+/// `BacktestEngine::readback_compact`.
+#[allow(clippy::too_many_arguments)]
+fn fused_signal_backtest_batch<F, R: Runtime>(
+    client: &ComputeClient<R>,
+    indicators_flat: &[F],
+    n_indicators: usize,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[F],
+    long_thr: &[F],
+    short_thr: &[F],
+    smc_data_flat: &[i32],
+    gene_smc_flags_flat: &[i32],
+    smc_weights: &[F],
+    gate_threshold: F,
+    close_pips: &[f64],
+    high_pips: &[f64],
+    low_pips: &[f64],
+    timestamp_deltas_ms: &[i32],
+    use_timestamps: bool,
+    month_idx: &[i32],
+    day_idx: &[i32],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
+    stop_vol_mult: &[f64],
+    settings: &BacktestSettings,
+    month_capacity: usize,
+    n_genes: usize,
+    n_samples: usize,
+) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>)>
+where
+    F: Float + CubeElement,
+{
+    let resident = fused_signal_backtest_batch_resident(
+        client,
+        indicators_flat,
+        n_indicators,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        smc_data_flat,
+        gene_smc_flags_flat,
+        smc_weights,
+        gate_threshold,
+        close_pips,
+        high_pips,
+        low_pips,
+        timestamp_deltas_ms,
+        use_timestamps,
+        month_idx,
+        day_idx,
+        sl_pips,
+        tp_pips,
+        stop_vol_mult,
+        settings,
+        month_capacity,
+        n_genes,
+        n_samples,
+    )?;
+    Ok(read_fused_resident_metrics(resident))
 }
 
 /// Precision-dispatching wrapper for [`fused_signal_backtest_batch`] mirroring
@@ -3482,15 +4667,15 @@ fn fused_eval_batch_dispatch<R: Runtime>(
     gene_smc_flags_flat: &[i32],
     smc_weights: &[f32; SMC_WIDTH],
     gate_threshold: f32,
-    close_pips: &[f32],
-    high_pips: &[f32],
-    low_pips: &[f32],
+    close_pips: &[f64],
+    high_pips: &[f64],
+    low_pips: &[f64],
     timestamp_deltas_ms: &[i32],
     use_timestamps: bool,
     month_idx: &[i32],
     day_idx: &[i32],
-    sl_pips: &[f32],
-    tp_pips: &[f32],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
     stop_vol_mult: &[f64],
     settings: &BacktestSettings,
     month_capacity: usize,
@@ -3607,6 +4792,40 @@ pub(crate) fn try_evaluate_population_cuda(
     device_override: Option<usize>,
 ) -> Result<Vec<[f64; 11]>> {
     let n_genes = long_thr.len();
+    // ── Prototype B first, wherever it is available ───────────────────────────
+    // Every discovery lane funnels through this function — GA scoring, the
+    // Monte-Carlo quality screen, walk-forward and CPCV — so routing here routes
+    // all of them at once.
+    //
+    // A 2026-07-28 measurement on one RTX 2080 Ti, three real EURUSD snapshots:
+    // this CubeCL lane in f32 is 54 % wrong at 200 000 bars (net profit 3 940.88
+    // against the canonical 8 506.33, and that is the first candidate's headline
+    // metric). Given double precision it becomes approximately right but still
+    // not exact, and drops to 11.5 M candidate-bars/s. Prototype B reproduces
+    // the CPU exactly at 4 096 / 20 000 / 200 000 bars and sustains ~47 M — it is
+    // both the only correct GPU lane and the fastest correct one.
+    //
+    // The fallback below is the CPU, never the f32 lane: an engine that is half
+    // wrong at production series length must not silently rank strategies.
+    #[cfg(feature = "gpu-b-adapter")]
+    {
+        use crate::gpu_native::prototype_b_population_eval as prototype_b;
+        if prototype_b::prototype_b_available() {
+            return prototype_b::try_evaluate_population_b(
+                close, high, low, indicators, gene_offsets, gene_indices, gene_weights,
+                long_thr, short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips,
+                stop_vol_mult, smc_data, gene_smc_flags, gate_threshold, smc_weights,
+                settings, device_override,
+            );
+        }
+    }
+    // Last line of defence for the optional `stop_vol_mult` contract: an empty
+    // slice means "no adaptive stops", and every batch slice below would panic
+    // on it. That panic is caught upstream and retried on the CPU, which turns
+    // a contract violation into a silent CPU fallback — exactly what a
+    // GPU-required run must never do.
+    let stop_vol_mult_fallback = crate::eval::normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
     let n_samples = close.len();
     if n_genes == 0 || n_samples == 0 {
         return Ok(vec![ZERO_METRICS; n_genes]);
@@ -3621,6 +4840,8 @@ pub(crate) fn try_evaluate_population_cuda(
     {
         bail!("cuda population evaluate path received inconsistent dimensions");
     }
+
+    transfer_telemetry::record_call();
 
     // NEOETHOS_GPU_TIMING: open a per-call measurement frame (no-op when unset).
     // The total is timed from here; the inner phases (client-get/host-prep/upload/
@@ -3651,14 +4872,8 @@ pub(crate) fn try_evaluate_population_cuda(
         .iter()
         .map(|value| saturating_i32(*value))
         .collect::<Vec<_>>();
-    let sl_pips_all = sl_pips
-        .iter()
-        .map(|value| *value as f32)
-        .collect::<Vec<_>>();
-    let tp_pips_all = tp_pips
-        .iter()
-        .map(|value| *value as f32)
-        .collect::<Vec<_>>();
+    let sl_pips_all = sl_pips.to_vec();
+    let tp_pips_all = tp_pips.to_vec();
     let month_capacity = settings.month_capacity();
     // Attribute the constant per-sample conversions above to the host-prep phase
     // (no-op when timing is off).
@@ -3803,7 +5018,7 @@ pub(crate) fn try_evaluate_population_cuda(
                         let g1 = (g0 + batch).min(chunk_n);
                         // The metrics path ignores the new FTMO vec (last tuple slot);
                         // FTMO observables are surfaced via `try_evaluate_ftmo_population_cuda`.
-                        let (m, tc, mo, mc, mse, _ftmo) = launch_backtest_kernel(
+                        let (m, tc, mo, mc, mse, _ftmo) = launch_backtest_kernel_auto(
                             &client,
                             device_override.unwrap_or(0),
                             &close_pips,
@@ -3850,6 +5065,26 @@ pub(crate) fn try_evaluate_population_cuda(
         }
     } // end `else` (windowed host path); the `if use_fused` branch filled the
     // same metric vecs above.
+
+    let compact_readback_bytes = metrics_flat
+        .len()
+        .saturating_mul(std::mem::size_of::<f32>())
+        + trade_counts
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
+        + monthly_flat
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>())
+        + month_counts
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
+        + month_start_eq_flat
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>());
+    let dense_readback_bytes = n_genes
+        .saturating_mul(n_samples)
+        .saturating_mul(std::mem::size_of::<i32>() + std::mem::size_of::<f32>());
+    transfer_telemetry::record_readback(use_fused, compact_readback_bytes, dense_readback_bytes);
 
     let mut results = Vec::with_capacity(n_genes);
     for g in 0..n_genes {
@@ -3977,6 +5212,13 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
     device_override: Option<usize>,
 ) -> Result<Vec<[f32; FTMO_WIDTH]>> {
     let n_genes = long_thr.len();
+    // Last line of defence for the optional `stop_vol_mult` contract: an empty
+    // slice means "no adaptive stops", and every batch slice below would panic
+    // on it. That panic is caught upstream and retried on the CPU, which turns
+    // a contract violation into a silent CPU fallback — exactly what a
+    // GPU-required run must never do.
+    let stop_vol_mult_fallback = crate::eval::normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
     let n_samples = close.len();
     if n_genes == 0 || n_samples == 0 {
         return Ok(vec![[0.0f32; FTMO_WIDTH]; n_genes]);
@@ -4006,14 +5248,8 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
         .iter()
         .map(|value| saturating_i32(*value))
         .collect::<Vec<_>>();
-    let sl_pips_all = sl_pips
-        .iter()
-        .map(|value| *value as f32)
-        .collect::<Vec<_>>();
-    let tp_pips_all = tp_pips
-        .iter()
-        .map(|value| *value as f32)
-        .collect::<Vec<_>>();
+    let sl_pips_all = sl_pips.to_vec();
+    let tp_pips_all = tp_pips.to_vec();
     let month_capacity = settings.month_capacity();
 
     let mut ftmo_flat: Vec<f32> = Vec::with_capacity(n_genes * FTMO_WIDTH);
@@ -4055,7 +5291,7 @@ pub(crate) fn try_evaluate_ftmo_population_cuda(
                     let g1 = (g0 + batch).min(chunk_n);
                     // We keep ONLY the FTMO vec (last tuple slot); the metrics
                     // outputs are recomputed identically but discarded here.
-                    let (_m, _tc, _mo, _mc, _mse, ftmo) = launch_backtest_kernel(
+                    let (_m, _tc, _mo, _mc, _mse, ftmo) = launch_backtest_kernel_auto(
                         &client,
                         device_override.unwrap_or(0),
                         &close_pips,

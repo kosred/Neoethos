@@ -19,7 +19,6 @@ mod cubecl_eval;
 // Pure CSR population partitioning for multi-GPU sharding (Stage 2). Not GPU-
 // gated: it is plain slice math, so it compiles + unit-tests on any build. The
 // device-execution glue that consumes it lives in `eval.rs` behind `gpu`.
-mod lane_partition;
 pub mod discovery;
 pub mod discovery_ledger;
 // `mod scheduler_assignment;` — DELETED 2026-05-25 (verbose-build pass):
@@ -29,10 +28,14 @@ pub mod discovery_ledger;
 // module shipped was never wired. If the scheduler-driven routing
 // lands later, reintroduce a fresh helper at that time.
 
+pub mod backend;
 pub mod eval;
+pub mod eval_telemetry;
 pub mod export_state;
+pub mod fx_rates;
 pub mod funnel_profile;
 pub mod gpu_fallback;
+pub mod gpu_native;
 // `pub mod gauntlet;` — DELETED 2026-05-26 (operator directive: dual-mode product).
 // `StrategyGauntlet` had zero callers in the workspace; the quality floors
 // (win-rate, profit-factor, drawdown caps) it scaffolded are now enforced by
@@ -64,29 +67,38 @@ pub mod stop_target;
 pub mod strategy_db;
 pub mod validation;
 
+pub use backend::{
+    AcceleratorHint, BackendConfigError, DevicePreference, EvaluationBackend, FallbackPolicy,
+    current_evaluation_backend, evaluate_population_core_with_backend,
+    evaluate_population_core_with_backend_and_audit, install_evaluation_backend,
+    install_evaluation_backend_from_settings,
+};
 // `pub use challenge::{ChallengeOptimizer, ChallengeTarget};` — DELETED 2026-05-26.
 pub use discovery::{
-    DiscoveryConfig, DiscoveryPerKindEvidenceHashes, DiscoveryProgress, DiscoveryResult,
-    DiscoveryRunProfile, DiscoveryRuntimeOverrides, DiscoveryValidationGates, LoggedStrategyTrades,
-    GeneOosResult, Stage1Window, build_discovery_profile, compute_discovery_forward_test_artifacts,
-    faithful_oos_eval,
+    DEFAULT_OOS_HOLDOUT_FRACTION, DiscoveryConfig, DiscoveryPerKindEvidenceHashes,
+    DiscoveryProgress, DiscoveryResult, DiscoveryRunProfile, DiscoveryRuntimeOverrides,
+    DiscoveryValidationGates, GeneOosResult, LoggedStrategyTrades, Stage1Window,
+    build_discovery_profile, compute_discovery_forward_test_artifacts,
     compute_discovery_prop_firm_artifacts, discovery_per_kind_evidence_hashes,
     discovery_validation_evidence_manifest,
     discovery_validation_evidence_manifest_excluding_live_sim, ensure_non_empty_portfolio,
-    ensure_portfolio_export_ready, live_validation_evidence_from_discovery, run_discovery_cycle,
-    run_discovery_cycle_with_holdout, run_discovery_cycle_with_holdout_and_progress,
-    DEFAULT_OOS_HOLDOUT_FRACTION,
-    run_discovery_cycle_with_progress, save_canonical_backtest_artifacts,
-    save_discovery_profile_json, save_forward_test_validation_artifacts, save_funnel_json,
-    save_portfolio_json, save_promotion_summary_json, save_prop_firm_validation_artifacts,
-    save_quality_report_json, save_trade_log_json, save_walkforward_validation_artifacts,
+    ensure_portfolio_export_ready, faithful_oos_eval, live_validation_evidence_from_discovery,
+    run_discovery_cycle, run_discovery_cycle_with_holdout,
+    run_discovery_cycle_with_holdout_and_progress, run_discovery_cycle_with_progress,
+    save_canonical_backtest_artifacts, save_discovery_profile_json,
+    save_forward_test_validation_artifacts, save_funnel_json, save_portfolio_json,
+    save_promotion_summary_json, save_prop_firm_validation_artifacts, save_quality_report_json,
+    save_trade_log_json, save_walkforward_validation_artifacts,
+};
+pub use discovery_ledger::{
+    DiscoverySearchLedger, GeneRecord, SearchMetadata, ledger_path, load_prior_ledger,
+    save_discovery_ledger, seed_seen_from_ledger,
 };
 pub use eval::{
     BacktestMetrics, BacktestRuntimeOverrides, BacktestSettings,
     current_backtest_runtime_overrides, evaluate_population_core, fast_evaluate_strategy_core,
     install_backtest_runtime_overrides, install_backtest_runtime_overrides_from_env,
-    install_backtest_runtime_overrides_from_settings,
-    simulate_trades_core,
+    install_backtest_runtime_overrides_from_settings, simulate_trades_core,
 };
 // `pub use gauntlet::{GauntletConfig, StrategyGauntlet};` — DELETED 2026-05-26.
 pub use genetic::{
@@ -94,25 +106,21 @@ pub use genetic::{
     FilteringConfig, Gene, GeneticSearchRuntimeOverrides, ParentSelectionPolicy, SearchResult,
     SeenSignatureMemoryRuntimeOverrides, SelectionPolicyOverrides, SmcGateOverrides,
     SmcWeightRuntimeOverrides, StrategyEvaluationRuntimeOverrides, SurvivorSelectionPolicy,
-    current_determinism_policy, current_genetic_search_runtime_overrides, default_pip_size,
+    current_determinism_policy, current_genetic_search_runtime_overrides,
     current_seen_signature_memory_runtime_overrides, current_strategy_evaluation_runtime_overrides,
-    evaluate_genes, evolve_search, evolve_search_with_progress,
+    default_pip_size, evaluate_genes, evolve_search, evolve_search_with_progress,
     evolve_search_with_progress_and_limits, install_genetic_search_runtime_overrides,
     install_genetic_search_runtime_overrides_from_env,
     install_genetic_search_runtime_overrides_from_settings,
     install_seen_signature_memory_runtime_overrides,
     install_seen_signature_memory_runtime_overrides_from_env,
-    install_seen_signature_memory_runtime_overrides_from_settings, install_smc_search_config_from_env,
-    install_smc_search_config_from_settings,
+    install_seen_signature_memory_runtime_overrides_from_settings,
+    install_smc_search_config_from_env, install_smc_search_config_from_settings,
     install_strategy_evaluation_runtime_overrides,
     install_strategy_evaluation_runtime_overrides_from_env,
     install_strategy_evaluation_runtime_overrides_from_settings, migration_enabled,
     month_day_indices, push_migrants, random_search, set_migration_enabled, set_search_cancel,
     signals_for_gene, signals_for_gene_full, take_elites,
-};
-pub use discovery_ledger::{
-    DiscoverySearchLedger, GeneRecord, SearchMetadata, ledger_path, load_prior_ledger,
-    save_discovery_ledger, seed_seen_from_ledger,
 };
 pub use live_portfolio::{
     LIVE_PORTFOLIO_SCHEMA_VERSION, LivePortfolioArtifact, load_live_portfolio_json,
@@ -124,12 +132,12 @@ pub use portfolio::{AllocationResult, PortfolioOptimizer, SymbolMetrics};
 pub use quality::{
     QualityRuntimeOverrides, StrategyMetrics, StrategyQualityAnalyzer, StrategyRanker, Trade,
     current_quality_runtime_overrides, install_quality_runtime_overrides,
-    install_quality_runtime_overrides_from_env,
-    install_quality_runtime_overrides_from_settings,
+    install_quality_runtime_overrides_from_env, install_quality_runtime_overrides_from_settings,
 };
 pub use stop_target::{
     StopTargetSettings, adaptive_base_pips_series, adaptive_sl_tp_pips_series,
-    adaptive_stops_enabled, adaptive_stops_rr, compute_stop_distance_series, infer_stop_target_pips,
+    adaptive_stops_enabled, adaptive_stops_rr, compute_stop_distance_series,
+    infer_stop_target_pips,
 };
 pub use validation::{
     CANONICAL_BACKTEST_ARTIFACT_KIND, CANONICAL_BACKTEST_SCHEMA_VERSION,
@@ -153,26 +161,39 @@ pub use validation::{
     write_prop_firm_risk_validation_artifact_atomic, write_walkforward_validation_artifact_atomic,
 };
 
-/// Convenience entry point that installs every typed runtime-override
-/// boundary from the legacy `NEOETHOS_BOT_*` env vars in a single call.
-/// Production binaries (`neoethos-cli`, `neoethos-app`) invoke this once at
-/// startup so the search crate itself never reads `std::env` during a run.
-pub fn install_search_runtime_overrides_from_env() {
-    install_backtest_runtime_overrides_from_env();
-    install_quality_runtime_overrides_from_env();
-    install_genetic_search_runtime_overrides_from_env();
-    install_strategy_evaluation_runtime_overrides_from_env();
-    install_smc_search_config_from_env();
-    install_seen_signature_memory_runtime_overrides_from_env();
-}
+// REMOVED 2026-08-03: `install_search_runtime_overrides_from_env()`.
+//
+// Its doc claimed "Production binaries (`neoethos-cli`, `neoethos-app`) invoke
+// this once at startup". They never did — it had ZERO callers, while
+// `knob_catalog.rs` went on advertising ~35 `NEOETHOS_BOT_*` switches to the UI
+// as "still honoured for backward compatibility". Setting any of them did
+// nothing, and the operator was told otherwise by his own program.
+//
+// `install_search_runtime_overrides_from_settings` below strictly supersedes it:
+// it covers all six boundaries (each marked ✓ config) and additionally installs
+// the evaluation backend, which the env version never did. It IS called —
+// neoethos-app/src/lib.rs:29, neoethos-cli/src/main.rs:33, and the discovery
+// probe. The six `*_from_env` children remain; they are still reachable from
+// tests, and retiring them belongs with the wider env→config migration.
+//
+// This is the sixth "mechanism exists, no production caller" defect closed on
+// this branch. The pattern never crashes; the run just quietly means less than
+// it claims.
 
-/// Config-driven entry point — installs the typed runtime-override
-/// boundaries from the single [`neoethos_core::Settings`] instead of the
-/// environment. **Config-consolidation S2 (in progress):** the
-/// genetic-search boundary now reads config (`models.search_runtime`);
-/// the remaining five still read env until their migration lands.
-/// Production binaries call this once at startup after loading `Settings`.
+/// Config-driven entry point — installs every typed runtime-override boundary
+/// from the single [`neoethos_core::Settings`], plus the evaluation backend.
+///
+/// All six boundaries read config; the ✓ markers below are the record of that
+/// migration completing. (This doc previously said "the remaining five still
+/// read env until their migration lands", which the ✓ markers two lines down
+/// already contradicted — corrected 2026-08-03.)
+///
+/// Production binaries call this once at startup after loading `Settings`, and
+/// it is now the ONLY way these boundaries get installed.
 pub fn install_search_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
+    install_evaluation_backend_from_settings(s).unwrap_or_else(|error| {
+        panic!("invalid discovery evaluation backend configuration: {error}")
+    });
     install_backtest_runtime_overrides_from_settings(s); // ✓ S2d config
     install_quality_runtime_overrides_from_settings(s); // ✓ S2c config
     install_genetic_search_runtime_overrides_from_settings(s); // ✓ S2a config

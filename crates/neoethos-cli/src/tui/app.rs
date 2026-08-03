@@ -88,7 +88,9 @@ impl PendingAction {
             PendingAction::ConfigSave => crate::tui::pages::config_view::do_save(shared),
             PendingAction::SymbolsImport => crate::tui::pages::symbols::launch_import(shared),
             PendingAction::DiscoverStop => crate::tui::pages::discover::do_stop(shared),
-            PendingAction::AutoLoopStop => crate::tui::pages::auto_loop::do_create_stop_flag(shared),
+            PendingAction::AutoLoopStop => {
+                crate::tui::pages::auto_loop::do_create_stop_flag(shared)
+            }
         }
     }
 }
@@ -327,10 +329,8 @@ impl App {
                 self.shared.last_refresh = Instant::now();
                 // Re-read the editable config from disk too, so external edits
                 // to config.yaml show up on the Config page after a refresh.
-                self.shared.config_form =
-                    crate::tui::pages::config_view::make_config_form();
-                self.shared.status =
-                    "Refreshed dataset inventory + config.".to_string();
+                self.shared.config_form = crate::tui::pages::config_view::make_config_form();
+                self.shared.status = "Refreshed dataset inventory + config.".to_string();
             }
             other => {
                 // Page-local: Up/Down focus, Enter to edit/launch, etc.
@@ -452,9 +452,7 @@ fn render(area: Rect, buf: &mut ratatui::buffer::Buffer, app: &mut App) {
 /// next keypress is routed by `App::handle_key` (Y runs, N/Esc cancels).
 fn render_confirm_overlay(area: Rect, buf: &mut ratatui::buffer::Buffer, label: &str) {
     let title = format!("Confirm {label}?");
-    let w = ((title.chars().count() as u16) + 8)
-        .max(34)
-        .min(area.width);
+    let w = ((title.chars().count() as u16) + 8).max(34).min(area.width);
     let h = 5u16.min(area.height);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;

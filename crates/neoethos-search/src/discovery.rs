@@ -2,9 +2,9 @@ use crate::artifact_io::{stable_json_hash, write_json_atomic};
 use crate::eval::{BacktestMetrics, fast_evaluate_strategy_core, simulate_trades_core};
 use crate::genetic::strategy_gene::EvaluationConfig;
 use crate::genetic::{
-    Gene, build_smc_arrays, evolve_search_with_progress_and_limits, month_day_indices,
-    signals_and_confidence_for_gene_full, signals_for_gene_full,
-    validation_genes_population_gathered,
+    Gene, SmcGateArrays, build_smc_arrays, evolve_search_with_progress_and_limits,
+    month_day_indices, signals_and_confidence_for_gene_full, signals_for_gene_full,
+    signals_for_gene_full_with_smc, validation_genes_population_gathered,
 };
 use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use crate::validation::{
@@ -235,6 +235,7 @@ pub struct DiscoveryConfig {
     pub max_hours: f64,
     pub corr_threshold: f64,
     pub min_trades_per_day: f64,
+    pub target_profile: TargetProfile,
     pub walkforward_splits: usize,
     pub embargo_minutes: usize,
     pub enable_cpcv: bool,
@@ -397,6 +398,7 @@ impl Default for DiscoveryConfig {
             max_hours: 0.0,
             corr_threshold: 0.85,
             min_trades_per_day: 0.2,
+            target_profile: TargetProfile::default(),
             walkforward_splits: 20,
             embargo_minutes: 120,
             enable_cpcv: true,
@@ -457,6 +459,12 @@ impl Default for DiscoveryConfig {
 
 impl DiscoveryConfig {
     pub fn from_settings(settings: &neoethos_core::Settings) -> Self {
+        // The cost model converts a pip value into the account currency, which
+        // for a cross pair needs the bridging pair's price. This is the one
+        // place every discovery path passes through holding the full Settings,
+        // so it is where the store gets pointed at. A CLI `--root` / `--data-path`
+        // override reinstalls it later and wins.
+        crate::fx_rates::set_store_root(settings.system.data_dir.clone());
         let model_settings = &settings.models;
         let filtering = crate::genetic::FilteringConfig {
             min_trades: model_settings.prop_min_trades.max(1) as f64,
@@ -536,6 +544,11 @@ impl DiscoveryConfig {
             // (the previous hardcoded value) when the config key is absent.
             corr_threshold: model_settings.prop_search_corr_threshold.clamp(0.0, 1.0),
             min_trades_per_day: model_settings.prop_search_val_min_trades_per_day.max(0.2),
+            target_profile: TargetProfile {
+                min_win_rate: model_settings.prop_search_min_win_rate.clamp(0.0, 1.0),
+                min_payoff_ratio: model_settings.prop_search_min_payoff_ratio.max(0.0),
+                max_in_market: model_settings.prop_search_max_in_market.max(0.0),
+            },
             walkforward_splits: model_settings.walkforward_splits.max(2),
             embargo_minutes: model_settings.embargo_minutes,
             enable_cpcv: model_settings.enable_cpcv,
@@ -579,9 +592,7 @@ impl DiscoveryConfig {
             mc_min_profitable: model_settings
                 .prop_search_mc_min_profitable
                 .min(model_settings.prop_search_mc_runs.max(1)),
-            sensitivity_spread_pips: model_settings
-                .prop_search_sensitivity_spread_pips
-                .max(0.0),
+            sensitivity_spread_pips: model_settings.prop_search_sensitivity_spread_pips.max(0.0),
             sensitivity_commission_per_lot: model_settings
                 .prop_search_sensitivity_commission_per_lot
                 .max(0.0),
@@ -604,6 +615,18 @@ impl DiscoveryConfig {
             discovery_ledger_cache_dir: model_settings.discovery_ledger.cache_dir.clone(),
             discovery_ledger_archive_top_n: model_settings.discovery_ledger.archive_top_n,
         }
+        // The mode's own floors, which production never applied.
+        //
+        // `apply_mode_overrides` was called from tests and nowhere else, so
+        // every real run used the struct defaults — max_dd 0.15, min_win_rate
+        // 0.50, min_profit_factor 1.20 — no matter what `trading_mode` said.
+        // Risky's 0.60 cap and PropFirm's 0.50 existed and never took effect.
+        //
+        // It shows up as a search that finds nothing: 2 211 candidates ranked,
+        // 1 713 of them rejected for exceeding a 15 % drawdown cap that the
+        // selected mode had raised. Choosing a mode has to change what the mode
+        // says it changes.
+        .apply_mode_overrides()
     }
 
     /// Resolve runtime knobs. The system prefers self-tuning over
@@ -737,7 +760,25 @@ impl DiscoveryConfig {
             self.filtering.min_profit_factor = 0.0;
             self.filtering.anomaly_guard = false;
             self.cpcv_min_phi = 0.0;
-            self.min_trades_per_day = 0.001;
+            // Activity is NOT a quality floor, so it is not loosened with the
+            // others. Compounding a small balance to a large one needs a certain
+            // number of winning trades — around 25 at 1.3× each — and a strategy
+            // that trades twice a decade cannot deliver them however good each
+            // trade is. This used to be pinned to 0.001 here, which silently
+            // discarded `models.prop_search_val_min_trades_per_day` in the one
+            // mode the operator actually runs: the knob existed, was set, and did
+            // nothing. The permissive value now applies only when the operator
+            // nothing. The value the operator set now survives into risky mode;
+            // its upstream `.max(0.2)` already keeps a never-trading gene out, so
+            // no local floor is needed here.
+            //
+            // Logged unconditionally, because an activity floor that is silently
+            // rewritten is exactly the class of bug this line used to be.
+            tracing::info!(
+                target: "neoethos_search::discovery",
+                min_trades_per_day = format!("{:.3}", self.min_trades_per_day),
+                "risky mode: keeping the operator's activity floor"
+            );
             // No TF-scaling of trade-frequency floors and NO prop_firm_gate:
             // Risky is judged purely on growth, not challenge-passing.
         }
@@ -814,6 +855,16 @@ impl DiscoveryConfig {
         cfg.growth_objective = matches!(self.mode, DiscoveryMode::Risky);
         cfg
     }
+
+    pub fn evaluation_config_with_smc_gate(
+        &self,
+        price_hint: Option<f64>,
+        effective_smc_gate_threshold: f32,
+    ) -> EvaluationConfig {
+        let mut cfg = self.evaluation_config(price_hint);
+        cfg.smc_gate_threshold = effective_smc_gate_threshold;
+        cfg
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -825,6 +876,8 @@ pub struct DiscoveryResult {
     /// Feature names as they existed *after* prefiltering inside discovery.
     /// Gene indices refer to columns in this list, not the caller's original names.
     pub effective_feature_names: Vec<String>,
+    /// Final annealed SMC gate used by the GA and every post-search replay.
+    pub effective_smc_gate_threshold: f32,
     pub validation_gates: DiscoveryValidationGates,
     pub canonical_backtest_artifacts: Vec<CanonicalBacktestArtifactFile>,
     pub walkforward_validation_artifacts: Vec<WalkforwardValidationArtifactFile>,
@@ -1056,10 +1109,7 @@ pub enum DiscoveryProgress {
     /// otherwise freeze on the last milestone — which operators read as a
     /// hang (observed live 2026-07-20: a healthy EURCAD M3 run was killed at
     /// 95.5% because "it looked stuck").
-    StageAdvanced {
-        stage: &'static str,
-        detail: String,
-    },
+    StageAdvanced { stage: &'static str, detail: String },
     Completed {
         candidate_count: usize,
         filtered_count: usize,
@@ -1193,8 +1243,10 @@ fn remedy_for_stage(stage: &str) -> &'static str {
             "candidates passed every gate but failed final export-readiness — check the \
              validation-gate configuration."
         }
-        _ => "review the saved funnel JSON (cache/discovery/<symbol>_<tf>.json) for the full \
-              stage-by-stage breakdown.",
+        _ => {
+            "review the saved funnel JSON (cache/discovery/<symbol>_<tf>.json) for the full \
+              stage-by-stage breakdown."
+        }
     }
 }
 
@@ -1224,7 +1276,8 @@ fn trim_recent_history(
         anyhow::bail!(
             "Cannot run discovery on empty history for {} {} — \
              import at least the minimum bars (run `neoethos-cli import`) then retry.",
-            config.evaluation_symbol, config.timeframe_label
+            config.evaluation_symbol,
+            config.timeframe_label
         );
     }
 
@@ -1348,6 +1401,7 @@ pub fn faithful_oos_eval(
     portfolio_path: &std::path::Path,
     oos_start_ts_ms: i64,
 ) -> anyhow::Result<Vec<GeneOosResult>> {
+    let _scope = crate::eval_telemetry::CallerScope::enter("faithful_oos");
     let artifact = crate::load_live_portfolio_json(portfolio_path)?;
     if artifact.genes.is_empty() {
         anyhow::bail!("portfolio {} has no genes", portfolio_path.display());
@@ -1364,7 +1418,8 @@ pub fn faithful_oos_eval(
     let higher_refs: Vec<&str> = artifact.higher_tfs.iter().map(|s| s.as_str()).collect();
     let raw_features =
         neoethos_data::prepare_multitimeframe_features(&dataset, &base_tf, &higher_refs, None)?;
-    let features = crate::project_features_to_effective(&raw_features, &artifact.effective_feature_names)?;
+    let features =
+        crate::project_features_to_effective(&raw_features, &artifact.effective_feature_names)?;
     if features.n_samples() != base_ohlcv.len() {
         anyhow::bail!(
             "feature/bar length mismatch {symbol} {base_tf}: {} vs {}",
@@ -1431,8 +1486,16 @@ pub fn faithful_oos_eval(
             is_max_drawdown: gene.max_drawdown,
             is_trades: gene.trades_count,
             oos_monthly_hit_rate,
-            wfe_sharpe: if is_sharpe.abs() > 1e-9 { oos.sharpe / is_sharpe } else { 0.0 },
-            wfe_pf: if is_pf.abs() > 1e-9 { oos.profit_factor / is_pf } else { 0.0 },
+            wfe_sharpe: if is_sharpe.abs() > 1e-9 {
+                oos.sharpe / is_sharpe
+            } else {
+                0.0
+            },
+            wfe_pf: if is_pf.abs() > 1e-9 {
+                oos.profit_factor / is_pf
+            } else {
+                0.0
+            },
             oos,
         });
     }
@@ -1484,7 +1547,78 @@ fn min_trades_per_month_scale_for_tf(tf: &str) -> f64 {
     }
 }
 
+/// A drawdown of 100 % means the account reached zero.
+///
+/// Past that the simulation is describing a state that cannot exist: a real
+/// account is closed out, not carried into negative equity to keep compounding.
+/// A 2026-07-29 AUDUSD H4 candidate reported `maxDD 403.1%` with an equity
+/// curve minimum of -30 596 EUR and was still scored as EXCELLENT on profit
+/// factor — 4 917 trades on an account that had been wiped several times over.
+///
+/// This is not a threshold to tune alongside `max_dd`; it is the boundary of
+/// what the numbers can mean, so it is checked separately and unconditionally.
+/// Anything at or beyond total loss is rejected whatever else it scores.
+/// The shape of strategy the operator is willing to trade.
+///
+/// Separate from the quality floors because it is a *preference*, not a
+/// correctness bound: a 40 %-win-rate trend follower is a perfectly good system,
+/// it is just not the one being looked for. Every field `0.0` means "no
+/// preference", which is the default, so a run says nothing about shape unless
+/// the operator asked it to.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TargetProfile {
+    /// Lowest acceptable win rate, as a fraction.
+    pub min_win_rate: f64,
+    /// Lowest acceptable average-win over average-loss.
+    ///
+    /// Stated separately from the win rate because `profit_factor` folds the two
+    /// together: 30 % of trades at 5:1 and 70 % at 0.6:1 both give about 2.1, and
+    /// they are completely different systems to hold through a losing run.
+    pub min_payoff_ratio: f64,
+    /// Most of the span a candidate may spend holding a position.
+    ///
+    /// A strategy in the market almost always is not selecting entries, and its
+    /// win rate converges on the market's base rate however the entry rule is
+    /// written.
+    pub max_in_market: f64,
+}
+
+impl TargetProfile {
+    /// Whether `metrics` has the shape asked for. Vacuously true when nothing
+    /// was asked, which is the default.
+    pub fn accepts(&self, metrics: &StrategyMetrics) -> bool {
+        if self.min_win_rate > 0.0 && metrics.win_rate < self.min_win_rate {
+            return false;
+        }
+        if self.min_payoff_ratio > 0.0 && metrics.payoff_ratio < self.min_payoff_ratio {
+            return false;
+        }
+        // Exposure rejects only when it was measurable. A candidate whose trades
+        // carry no exit times reports 0.0, and reading that as "never in the
+        // market" would admit exactly the ones this is meant to catch.
+        if self.max_in_market > 0.0
+            && metrics.in_market_pct > 0.0
+            && metrics.in_market_pct > self.max_in_market
+        {
+            return false;
+        }
+        true
+    }
+}
+
+
+fn survived_the_backtest(metrics: &StrategyMetrics) -> bool {
+    // `max_drawdown_pct` is a fraction despite the name — `(peak - equity) / peak`
+    // in quality.rs — so total loss is 1.0, and the 403.1 % in that log line is
+    // stored as 4.031. Reading it as a percentage would let every ruined
+    // candidate through.
+    metrics.max_drawdown_pct < 1.0
+}
+
 fn passes_strict_quality(metrics: &StrategyMetrics, cfg: &crate::genetic::FilteringConfig) -> bool {
+    if !survived_the_backtest(metrics) {
+        return false;
+    }
     if cfg.min_positive_months > 0 && metrics.positive_months < cfg.min_positive_months {
         return false;
     }
@@ -1503,6 +1637,9 @@ fn passes_opportunistic_quality(
     metrics: &StrategyMetrics,
     cfg: &crate::genetic::FilteringConfig,
 ) -> bool {
+    if !survived_the_backtest(metrics) {
+        return false;
+    }
     if !cfg.opportunistic_enabled || !cfg.use_opportunistic_candidates {
         return false;
     }
@@ -1749,6 +1886,7 @@ fn evaluate_cpcv_gate(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+    effective_smc_gate_threshold: f32,
     months: &[i64],
     days: &[i64],
     pbo_candidates: &[Gene],
@@ -1822,7 +1960,8 @@ fn evaluate_cpcv_gate(
 
     let mut fold_count = 0usize;
     let mut profitable_folds = 0usize;
-    let eval_config = config.evaluation_config(ohlcv.close.last().copied());
+    let eval_config = config
+        .evaluation_config_with_smc_gate(ohlcv.close.last().copied(), effective_smc_gate_threshold);
 
     // AREA 2 / Stage B (2026-06-09) — GPU-route the CPCV gate.
     //
@@ -2047,6 +2186,7 @@ fn build_discovery_validation_artifacts(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+    effective_smc_gate_threshold: f32,
     pbo_candidates: &[Gene],
     trials_tested: usize,
 ) -> Result<(
@@ -2055,6 +2195,7 @@ fn build_discovery_validation_artifacts(
     Vec<WalkforwardValidationArtifactFile>,
     Vec<bool>,
 )> {
+    let _scope = crate::eval_telemetry::CallerScope::enter("validation_artifacts");
     if portfolio.is_empty() {
         return Ok((
             DiscoveryValidationGates::pending(),
@@ -2074,7 +2215,8 @@ fn build_discovery_validation_artifacts(
         anyhow::bail!(
             "Internal bug: discovery validation requires portfolio signals aligned to feature rows \
              (expected {} rows, {}). Please report this with config.yaml and the discovery log.",
-            n, mismatched
+            n,
+            mismatched
         );
     }
 
@@ -2119,7 +2261,8 @@ fn build_discovery_validation_artifacts(
         .iter()
         .map(|gene| discovery_backtest_settings(config, gene, ohlcv.close.last().copied()))
         .collect();
-    let wf_eval_config = config.evaluation_config(ohlcv.close.last().copied());
+    let wf_eval_config = config
+        .evaluation_config_with_smc_gate(ohlcv.close.last().copied(), effective_smc_gate_threshold);
     let wf_full_indicators = features.as_indicators_view();
     let (wob, wfvg, wliq, wtrend, wprem, wind, wbos, wchoch, weqh, weql, wdisp) =
         build_smc_arrays(features, ohlcv);
@@ -2177,6 +2320,11 @@ fn build_discovery_validation_artifacts(
                 test_start,
                 end,
             )
+            // Metrics only for now: the device writes a trade list but nothing
+            // reads it back yet, so the diagnostics still simulate this window
+            // a second time on the CPU. Supplying `trades` here is what turns
+            // that off — see `WindowEvaluation`.
+            .map(crate::validation::WindowEvaluation::from)
         },
     )?;
     if walkforward_summaries.len() != portfolio.len() {
@@ -2244,6 +2392,7 @@ fn build_discovery_validation_artifacts(
             features,
             ohlcv,
             config,
+            effective_smc_gate_threshold,
             &months,
             &days,
             pbo_candidates,
@@ -2293,6 +2442,27 @@ pub fn compute_discovery_forward_test_artifacts(
     tail_features: &FeatureFrame,
     tail_ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+) -> Result<Vec<ForwardTestValidationArtifactFile>> {
+    let effective_smc_gate_threshold = config
+        .evaluation_config(tail_ohlcv.close.last().copied())
+        .smc_gate_threshold;
+    compute_discovery_forward_test_artifacts_with_smc_gate(
+        portfolio,
+        effective_feature_names,
+        tail_features,
+        tail_ohlcv,
+        config,
+        effective_smc_gate_threshold,
+    )
+}
+
+pub fn compute_discovery_forward_test_artifacts_with_smc_gate(
+    portfolio: &[Gene],
+    effective_feature_names: &[String],
+    tail_features: &FeatureFrame,
+    tail_ohlcv: &Ohlcv,
+    config: &DiscoveryConfig,
+    effective_smc_gate_threshold: f32,
 ) -> Result<Vec<ForwardTestValidationArtifactFile>> {
     if portfolio.is_empty() {
         return Ok(Vec::new());
@@ -2345,40 +2515,6 @@ pub fn compute_discovery_forward_test_artifacts(
     let (months, days) = month_day_indices(&tail_features.timestamps);
     let timestamps = &tail_features.timestamps[..n];
 
-    // **F-315 (2026-05-29) — partial diagnostic, full fix deferred to F-315b**.
-    //
-    // The stage-1 GA in `search_engine.rs:818` anneals the SMC gate
-    // from `gate_start` (default 0.75) down to `gate_end` (default
-    // 0.35) across generations. The forward-test pass below
-    // re-evaluates each survivor with the STATIC
-    // `runtime.smc_weights.gate_threshold` from
-    // `current_strategy_evaluation_runtime_overrides()` (default 0.75
-    // per `runtime_overrides.rs:417`). Candidates that survived the
-    // last generation under e.g. 0.35 may fail forward-test with 0.75
-    // — the asymmetry the F-315 ticket flagged. The proper fix is to
-    // forward the stage-1 final gate value through `SearchResult` and
-    // override the forward-test runtime gate to match; that touches
-    // 7 SearchResult construction sites in search_engine.rs plus the
-    // discovery + forward-test plumbing. **F-315b** tracks the
-    // architectural follow-up. For this ticket, we emit a warn at
-    // the top of `current_strategy_evaluation_runtime_overrides()`
-    // when the operator's static gate exceeds 0.5 (i.e. clearly above
-    // the GA's typical `gate_end` of 0.35) so the asymmetry surfaces
-    // in the discovery log instead of staying invisible.
-    {
-        use crate::genetic::runtime_overrides::current_strategy_evaluation_runtime_overrides;
-        let static_gate = current_strategy_evaluation_runtime_overrides()
-            .smc_weights
-            .gate_threshold;
-        if static_gate > 0.5 {
-            tracing::warn!(
-                target: "neoethos_search::discovery",
-                forward_test_smc_gate = static_gate,
-                "F-315 mismatch: forward-test SMC gate ({static_gate:.2}) is well above the GA stage-1 typical end (0.35). Survivors of the final generation may fail forward-test for a threshold they never passed in stage-1. Lower the runtime override (`smc_weights.gate_threshold`) toward 0.35 to align, or wait for F-315b to plumb the GA's final gate through SearchResult."
-            );
-        }
-    }
-
     // Each portfolio gene's forward-test replay is fully independent, so run
     // them across the rayon pool instead of one-at-a-time. `par_iter()` on a
     // slice is an INDEXED parallel iterator, so `collect::<Result<Vec<_>>>()`
@@ -2392,7 +2528,10 @@ pub fn compute_discovery_forward_test_artifacts(
                 discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
             let strategy_hash = stable_json_hash(gene)?;
             let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
-            let evaluation_config = config.evaluation_config(tail_ohlcv.close.last().copied());
+            let evaluation_config = config.evaluation_config_with_smc_gate(
+                tail_ohlcv.close.last().copied(),
+                effective_smc_gate_threshold,
+            );
             let signals =
                 signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
             if signals.len() != n {
@@ -2446,6 +2585,29 @@ pub fn compute_discovery_prop_firm_artifacts(
     tail_features: &FeatureFrame,
     tail_ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+    rules: PropFirmRiskRules,
+) -> Result<Vec<PropFirmRiskValidationArtifactFile>> {
+    let effective_smc_gate_threshold = config
+        .evaluation_config(tail_ohlcv.close.last().copied())
+        .smc_gate_threshold;
+    compute_discovery_prop_firm_artifacts_with_smc_gate(
+        portfolio,
+        effective_feature_names,
+        tail_features,
+        tail_ohlcv,
+        config,
+        effective_smc_gate_threshold,
+        rules,
+    )
+}
+
+pub fn compute_discovery_prop_firm_artifacts_with_smc_gate(
+    portfolio: &[Gene],
+    effective_feature_names: &[String],
+    tail_features: &FeatureFrame,
+    tail_ohlcv: &Ohlcv,
+    config: &DiscoveryConfig,
+    effective_smc_gate_threshold: f32,
     rules: PropFirmRiskRules,
 ) -> Result<Vec<PropFirmRiskValidationArtifactFile>> {
     if portfolio.is_empty() {
@@ -2506,7 +2668,10 @@ pub fn compute_discovery_prop_firm_artifacts(
                 discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
             let strategy_hash = stable_json_hash(gene)?;
             let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
-            let evaluation_config = config.evaluation_config(tail_ohlcv.close.last().copied());
+            let evaluation_config = config.evaluation_config_with_smc_gate(
+                tail_ohlcv.close.last().copied(),
+                effective_smc_gate_threshold,
+            );
             let signals =
                 signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
             if signals.len() != n {
@@ -2631,6 +2796,37 @@ pub fn approx_bars_per_year(tf: &str) -> usize {
     }
 }
 
+/// Which gate inside the quality screen rejected how many candidates.
+///
+/// The screen is four independent tests chained with `&&`, and it is routinely
+/// the funnel's bottleneck, so a single collapsed "rejected 7 792" number is
+/// not actionable: widening the Monte-Carlo floor and widening the regime check
+/// are different decisions with different risks, and only the split says which
+/// one is even relevant.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct QualityScreenRejects {
+    /// Failed both the strict and the opportunistic metric bars.
+    base_quality: usize,
+    /// Lost more than `max_regime_loss_pct` in some market regime.
+    regime: usize,
+    /// The batched Monte-Carlo evaluation itself failed (a real bug, not a
+    /// verdict on the candidate).
+    mc_error: usize,
+    /// Fewer than `mc_min_profitable` of `mc_runs` perturbations stayed
+    /// profitable.
+    mc_floor: usize,
+    /// Subset of `mc_floor` that came within 10 runs of the floor.
+    mc_near_miss: usize,
+    /// Went unprofitable once the stress spread/commission were applied.
+    sensitivity: usize,
+}
+
+impl QualityScreenRejects {
+    fn total(&self) -> usize {
+        self.base_quality + self.regime + self.mc_error + self.mc_floor + self.sensitivity
+    }
+}
+
 pub fn run_discovery_cycle(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
@@ -2679,6 +2875,13 @@ pub fn run_discovery_cycle_with_holdout_and_progress<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
+    crate::gpu_native::capability::gpu_pipeline_preflight(
+        crate::backend::current_evaluation_backend(),
+        &crate::gpu_native::capability::GpuCapabilityManifest::stage1_baseline(),
+        &crate::gpu_native::capability::PipelineStage::FULL_DISCOVERY,
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
     // Align both inputs to the same row count before splitting so the
     // in-sample and tail windows stay index-consistent even when the
     // caller's OHLCV and feature cube disagree by a few rows.
@@ -2743,12 +2946,13 @@ where
     // feature columns it actually needs.
     let tail_features = features.row_window(is_end, n_rows);
 
-    match compute_discovery_forward_test_artifacts(
+    match compute_discovery_forward_test_artifacts_with_smc_gate(
         &result.portfolio,
         &result.effective_feature_names,
         &tail_features,
         &tail_ohlcv,
         config,
+        result.effective_smc_gate_threshold,
     ) {
         Ok(artifacts) => result.forward_test_validation_artifacts = artifacts,
         Err(err) => tracing::warn!(
@@ -2759,12 +2963,13 @@ where
              and the live-portfolio OOS gate will keep all members)"
         ),
     }
-    match compute_discovery_prop_firm_artifacts(
+    match compute_discovery_prop_firm_artifacts_with_smc_gate(
         &result.portfolio,
         &result.effective_feature_names,
         &tail_features,
         &tail_ohlcv,
         config,
+        result.effective_smc_gate_threshold,
         prop_firm_rules,
     ) {
         Ok(artifacts) => result.prop_firm_validation_artifacts = artifacts,
@@ -3005,7 +3210,8 @@ where
     // `cols=N`. base = unprefixed/regime; each higher TF shows its survivor
     // count. A higher TF reading 0 here means the warm-start can't use it.
     {
-        let mut by_tf: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut by_tf: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
         for name in &effective_feature_names {
             let key = timeframe_group(name)
                 .map(|g| g.to_string())
@@ -3127,6 +3333,7 @@ where
         },
     )?;
 
+    let effective_smc_gate_threshold = search.effective_smc_gate_threshold;
     let stage1_count = search.genes.len();
     funnel.record_stage("stage1_candidates_generated", 0, stage1_count);
     // The archive that survived the GA is what we hand the IS evaluator. The
@@ -3143,6 +3350,7 @@ where
         &features,
         &ohlcv,
         config,
+        effective_smc_gate_threshold,
         effective_feature_names,
         &mut funnel,
         progress_fn,
@@ -3387,6 +3595,7 @@ fn validate_regime_robustness(
     initial_balance: f64,
     max_regime_loss_pct: f64,
 ) -> bool {
+    let _scope = crate::eval_telemetry::CallerScope::enter("regime_robustness");
     let trend_idx = features
         .names
         .iter()
@@ -3621,11 +3830,69 @@ fn compute_prop_firm_pass_rate(
 #[cfg(feature = "gpu")]
 static GPU_LAUNCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Synthesise each prefiltered candidate's full-series signal vector and keep
+/// the ones that fire often enough, returning
+/// `(survivors, candidates_that_fired_at_all)`.
+///
+/// The second value is diagnostic counter #2: how many genes generated ANY
+/// non-zero signal? A gene whose `long_threshold` exceeds the largest possible
+/// combined signal never fires. It is tracked separately from the `min_trades`
+/// gate so the funnel can tell "the SMC gate killed everything" — the common
+/// empty-portfolio root cause — apart from "fired, but too rarely".
+///
+/// `min_trades` is compared against BARS THAT FIRE, not against executed
+/// trades; that has always been this gate's meaning and the funnel's
+/// `passed_min_trades` count is calibrated on it.
+///
+/// The SMC gate arrays are gene-independent — `build_smc_arrays` takes no
+/// `Gene`, and `features`/`ohlcv` are fixed for the whole screen — so they are
+/// built once here instead of once per candidate. On a full series that
+/// rebuild dominated the stage: eleven fresh full-series arrays plus the
+/// `derive_smc_arrays` scan, repeated for every candidate, all producing
+/// byte-identical output. Each survivor's signal vector is unchanged.
+fn screen_candidates_by_signal_count(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    prefiltered: Vec<(usize, Gene)>,
+    eval_config: &EvaluationConfig,
+    min_trades: usize,
+) -> (Vec<(usize, Gene, Vec<i8>)>, usize) {
+    // An empty pool pays nothing. `build_smc_arrays` scans every bar of the
+    // series (~90 f64 ops each) before it knows there is no gene to gate, and
+    // an empty prefilter is the normal outcome of a run that found nothing —
+    // which is most M3 runs today.
+    if prefiltered.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let smc = SmcGateArrays::build(features, ohlcv);
+    let nonzero_signal_count = std::sync::atomic::AtomicUsize::new(0);
+    let survivors: Vec<(usize, Gene, Vec<i8>)> = prefiltered
+        .into_par_iter()
+        .filter_map(|(candidate_idx, gene)| {
+            let sig = signals_for_gene_full_with_smc(features, &gene, eval_config, &smc);
+            let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
+            if trade_count > 0.0 {
+                nonzero_signal_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if trade_count >= min_trades as f64 {
+                Some((candidate_idx, gene, sig))
+            } else {
+                None
+            }
+        })
+        .collect();
+    (
+        survivors,
+        nonzero_signal_count.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 fn finalize_candidates_with_progress<F>(
     candidates: Vec<Gene>,
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+    effective_smc_gate_threshold: f32,
     effective_feature_names: Vec<String>,
     funnel: &mut crate::funnel_profile::FunnelProfile,
     mut progress_fn: F,
@@ -3719,9 +3986,7 @@ where
                     && (col_max - col_min).abs() < 1e-9
                 {
                     zero_var_cols += 1;
-                    if named_examples.len() < 5
-                        && c < features.names.len()
-                    {
+                    if named_examples.len() < 5 && c < features.names.len() {
                         named_examples.push(features.names[c].clone());
                     }
                 }
@@ -3930,37 +4195,51 @@ where
     if reject_other > 0 {
         funnel.add_reject_reason("passed_base_filter", "other_threshold", reject_other);
     }
+    // Said out loud, not only written to the funnel file.
+    //
+    // A run that rejects every candidate reports `post_passes_filter=0` and
+    // stops, and the reasons sit in a JSON the probe never writes. Which floor
+    // did it is the whole question — "all 49 344 exceeded the drawdown cap" and
+    // "all 49 344 had too few trades" call for opposite responses, and telling
+    // them apart should not need a second run.
+    // Fires on "almost none", not only on "none".
+    //
+    // A measured M3 run had ranked=22 486 -> post_passes_filter=2, and this
+    // stayed silent because two is not zero. Two survivors out of 22 486 is the
+    // same diagnosis as none and needs the same answer — which floor did it —
+    // and the run then reported an empty portfolio with nothing said about why.
+    if post_passes_filter * 100 <= ranked_total && ranked_total > 0 {
+        tracing::warn!(
+            target: "neoethos_search::funnel",
+            ranked = ranked_total,
+            max_dd_exceeded = reject_dd,
+            win_rate_too_low = reject_win_rate,
+            profit_factor_too_low = reject_profit_factor,
+            fitness_too_low = reject_fitness,
+            other_threshold = reject_other,
+            max_dd_floor = config.filtering.max_dd,
+            min_win_rate_floor = config.filtering.min_win_rate,
+            min_profit_factor_floor = config.filtering.min_profit_factor,
+            "every candidate failed the base filter — this is which floor did it"
+        );
+    }
 
     // Item 6: use the SMC-gated signal path so the post-search "min_trades"
     // filter sees the SAME trade count the evaluator scored. The previous
     // `signals_for_gene` ignored gene SMC flags; some candidates passed the
     // search archive (with their SMC-gated trade count) but were then pruned
     // here because the un-gated count was higher than min_trades.
-    let eval_config_for_signals = config.evaluation_config(ohlcv.close.last().copied());
+    let eval_config_for_signals = config
+        .evaluation_config_with_smc_gate(ohlcv.close.last().copied(), effective_smc_gate_threshold);
 
-    // Diagnostic counter #2: how many genes generated ANY non-zero
-    // signal at all? A gene with `long_threshold > max possible
-    // combined signal` never fires. We track this separately from
-    // the min_trades gate so we can tell "no signal" from "too few
-    // trades".
-    let nonzero_signal_count = std::sync::atomic::AtomicUsize::new(0);
-    let signals_with_idx: Vec<(usize, Gene, Vec<i8>)> = prefiltered
-        .into_par_iter()
-        .filter_map(|(candidate_idx, gene)| {
-            let sig = signals_for_gene_full(features, ohlcv, &gene, &eval_config_for_signals);
-            let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
-            if trade_count > 0.0 {
-                nonzero_signal_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            if trade_count >= min_trades as f64 {
-                Some((candidate_idx, gene, sig))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let (signals_with_idx, post_nonzero_signal) = screen_candidates_by_signal_count(
+        features,
+        ohlcv,
+        prefiltered,
+        &eval_config_for_signals,
+        min_trades,
+    );
     let post_min_trades = signals_with_idx.len();
-    let post_nonzero_signal = nonzero_signal_count.load(std::sync::atomic::Ordering::Relaxed);
     // 2026-05-26: record "any signal at all" + "passed min-trades" as separate
     // stages so the funnel can tell "SMC gate killed everything" (the common
     // empty-portfolio root cause) apart from "had signals but too few".
@@ -4027,6 +4306,9 @@ where
 
     let filtered_count = filtered.len();
     let mut quality_metrics = Vec::new();
+    // Filled by the quality screen below; stays all-zero when the screen is
+    // skipped, so the funnel never reports invented rejections.
+    let mut quality_rejects = QualityScreenRejects::default();
     let mut logged_trades = Vec::new();
     if Gene::requires_quality_screen(&config.filtering) {
         progress_fn(DiscoveryProgress::StageAdvanced {
@@ -4071,10 +4353,212 @@ where
         // ONE batched GPU population launch (CPU fallback) per candidate via
         // `validation_genes_population`, replacing the per-run serial
         // `signals_for_gene_full` + `simulate_trades_core`.
+        // Per-reason rejection counters for the quality screen. This stage is
+        // routinely the funnel's bottleneck — a real AUDUSD H4 run took 7 793
+        // candidates to 1 here — and until now it reported a single collapsed
+        // number, so there was no way to tell whether the survivors were being
+        // killed by the base metrics, the regime check, the Monte-Carlo
+        // perturbation floor or the spread sensitivity test. Answering "which
+        // gate costs us the candidates" is the prerequisite for any decision
+        // about widening one, and it cannot be answered by staring at a total.
+        //
+        // These are the atomics the 2026-05-26 note above said a follow-up
+        // would need. They are pure instrumentation: every counter sits next to
+        // a `return None` that already existed, so the surviving set is
+        // unchanged.
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let rejected_base_quality = AtomicUsize::new(0);
+        let rejected_regime = AtomicUsize::new(0);
+        let rejected_mc_error = AtomicUsize::new(0);
+        let rejected_mc_floor = AtomicUsize::new(0);
+        let rejected_sensitivity = AtomicUsize::new(0);
+        // Monte-Carlo pass counts of the candidates the floor rejected, so the
+        // floor can be judged against the distribution it is cutting rather
+        // than in the abstract: "7 000 rejects that scored 68/100" and "7 000
+        // that scored 4/100" call for opposite decisions.
+        let mc_near_miss = AtomicUsize::new(0);
+
         let pairs: Vec<((usize, Gene), Vec<i8>)> = filtered.into_iter().zip(signals_map).collect();
+
+        // ── Monte-Carlo perturbations, batched ────────────────────────────
+        //
+        // The screen below used to call the evaluator once per candidate: a
+        // real AUDUSD H4 run made 7 793 separate launches of 100 perturbed
+        // genes each. Thousands of small launches waste a card however fast the
+        // kernel is — the fixed per-call cost dominates when each call carries
+        // so little work.
+        //
+        // The perturbations are seeded per (combo, candidate, run), so batching
+        // reproduces every candidate's result exactly; only the number of
+        // launches changes. Chunked by candidate so peak host memory is a
+        // function of the chunk rather than the population — cloning 7 793 x
+        // 100 genes at once would be a gigabyte-scale allocation for nothing.
+        //
+        // `None` marks a candidate whose batch failed to evaluate: a real bug,
+        // reported as such below, never silently counted as "zero profitable".
+        const MC_CANDIDATES_PER_BATCH: usize = 256;
+        let mc_profitable_runs: Vec<Option<usize>> = {
+            let mc_runs = config.mc_runs as usize;
+            let mut out: Vec<Option<usize>> = Vec::with_capacity(pairs.len());
+            for chunk in pairs.chunks(MC_CANDIDATES_PER_BATCH) {
+                // Building the perturbed clones is CPU work — every core does
+                // it while the device is busy with the previous chunk. Only the
+                // launch itself is serialized, because there is one card.
+                //
+                // `map` over an indexed parallel iterator collects in order, so
+                // the batch stays candidate-major with runs ascending, which is
+                // what the per-candidate slicing below relies on. The RNG is
+                // seeded per (combo, candidate, run) and never shared, so
+                // parallel construction is bit-identical to the serial one.
+                let batch: Vec<Gene> = chunk
+                    .par_iter()
+                    .map(|((candidate_idx, gene), _)| {
+                        use rand::Rng;
+                        use rand::SeedableRng;
+                        (0..mc_runs as u64)
+                            .map(|run_idx| {
+                                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
+                                    combo_seed ^ ((*candidate_idx as u64) << 20) ^ run_idx,
+                                );
+                                let mut perturbed = gene.clone();
+                                perturbed.long_threshold *=
+                                    1.0 + rng.random_range(-0.15..=0.15);
+                                perturbed.short_threshold *=
+                                    1.0 + rng.random_range(-0.15..=0.15);
+                                for w in &mut perturbed.weights {
+                                    *w *= 1.0 + rng.random_range(-0.20..=0.20);
+                                }
+                                if perturbed.sl_pips.is_finite() && perturbed.sl_pips > 0.0 {
+                                    perturbed.sl_pips *= 1.0 + rng.random_range(-0.25..=0.25);
+                                }
+                                if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
+                                    perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
+                                }
+                                perturbed
+                            })
+                            .collect::<Vec<Gene>>()
+                    })
+                    .reduce(Vec::new, |mut acc, mut part| {
+                        acc.append(&mut part);
+                        acc
+                    });
+                // Cost/pip configuration is shared: the helper takes a gene only
+                // for the price hint, and each perturbed gene's own SL/TP is
+                // re-resolved inside `validation_genes_population`.
+                let settings = discovery_backtest_settings(
+                    config,
+                    &chunk[0].0.1,
+                    ohlcv.close.last().copied(),
+                );
+                let evaluated = {
+                    #[cfg(feature = "gpu")]
+                    let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                    crate::genetic::validation_genes_population(
+                        features,
+                        ohlcv,
+                        &batch,
+                        &eval_config_for_signals,
+                        &settings,
+                    )
+                };
+                match evaluated {
+                    Ok(metrics) if metrics.len() == batch.len() => {
+                        for candidate in 0..chunk.len() {
+                            let start = candidate * mc_runs;
+                            out.push(Some(
+                                metrics[start..start + mc_runs]
+                                    .iter()
+                                    .filter(|m| m[0] > 0.0)
+                                    .count(),
+                            ));
+                        }
+                    }
+                    Ok(metrics) => {
+                        tracing::warn!(
+                            target: "neoethos_search::discovery",
+                            expected = batch.len(),
+                            returned = metrics.len(),
+                            "Monte-Carlo batch returned the wrong number of rows — rejecting its candidates"
+                        );
+                        out.extend(std::iter::repeat_n(None, chunk.len()));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "neoethos_search::discovery",
+                            error = %error,
+                            candidates = chunk.len(),
+                            "Monte-Carlo batched eval failed — rejecting its candidates"
+                        );
+                        out.extend(std::iter::repeat_n(None, chunk.len()));
+                    }
+                }
+            }
+            out
+        };
+
+        // ── Spread/slippage sensitivity, batched ──────────────────────────
+        //
+        // The stress test is the same backtest over the same bars with a wider
+        // spread and a higher commission, and its verdict is a single number:
+        // does net profit survive? That is metric slot 0, so there is nothing
+        // here the card cannot produce — it was running per candidate on the
+        // CPU only because it was written before the population path existed.
+        //
+        // One launch per chunk of candidates, exactly like the Monte-Carlo pass
+        // above. `None` marks a batch that failed to evaluate, which is
+        // rejected as an error rather than read as "did not survive".
+        let sensitivity_net_profit: Vec<Option<f64>> = {
+            let mut out: Vec<Option<f64>> = Vec::with_capacity(pairs.len());
+            for chunk in pairs.chunks(MC_CANDIDATES_PER_BATCH) {
+                let genes: Vec<Gene> = chunk.iter().map(|((_, gene), _)| gene.clone()).collect();
+                let mut settings = discovery_backtest_settings(
+                    config,
+                    &chunk[0].0.1,
+                    ohlcv.close.last().copied(),
+                );
+                settings.spread_pips = config.sensitivity_spread_pips;
+                settings.commission_per_trade = config.sensitivity_commission_per_lot;
+                let evaluated = {
+                    #[cfg(feature = "gpu")]
+                    let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                    crate::genetic::validation_genes_population(
+                        features,
+                        ohlcv,
+                        &genes,
+                        &eval_config_for_signals,
+                        &settings,
+                    )
+                };
+                match evaluated {
+                    Ok(metrics) if metrics.len() == genes.len() => {
+                        out.extend(metrics.iter().map(|m| Some(m[0])));
+                    }
+                    Ok(metrics) => {
+                        tracing::warn!(
+                            target: "neoethos_search::discovery",
+                            expected = genes.len(),
+                            returned = metrics.len(),
+                            "sensitivity batch returned the wrong number of rows — rejecting its candidates"
+                        );
+                        out.extend(std::iter::repeat_n(None, chunk.len()));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "neoethos_search::discovery",
+                            error = %error,
+                            candidates = chunk.len(),
+                            "sensitivity batched eval failed — rejecting its candidates"
+                        );
+                        out.extend(std::iter::repeat_n(None, chunk.len()));
+                    }
+                }
+            }
+            out
+        };
         let screened: Vec<Option<QualityCandidate>> = pairs
             .into_par_iter()
-            .map(|((candidate_idx, gene), sig)| {
+            .enumerate()
+            .map(|(position, ((candidate_idx, gene), sig))| {
                 let trades = crate::eval::simulate_trades_core(
                     &ohlcv.close,
                     &ohlcv.high,
@@ -4085,11 +4569,16 @@ where
                 );
                 let metrics =
                     analyzer.analyze_strategy(&gene.strategy_id, &trades, initial_balance);
-                let strict_quality = passes_strict_quality(&metrics, &config.filtering);
+                let profile_ok = config.target_profile.accepts(&metrics);
+                let strict_quality =
+                    profile_ok && passes_strict_quality(&metrics, &config.filtering);
                 let opportunistic_quality =
-                    !strict_quality && passes_opportunistic_quality(&metrics, &config.filtering);
+                    profile_ok
+                        && !strict_quality
+                        && passes_opportunistic_quality(&metrics, &config.filtering);
 
                 if !(strict_quality || opportunistic_quality) {
+                    rejected_base_quality.fetch_add(1, AtomicOrdering::Relaxed);
                     return None;
                 }
 
@@ -4101,6 +4590,7 @@ where
                     config.max_regime_loss_pct,
                 );
                 if !regime_robust {
+                    rejected_regime.fetch_add(1, AtomicOrdering::Relaxed);
                     return None;
                 }
 
@@ -4122,90 +4612,30 @@ where
                 // `metrics[run][0] > 0.0` (net_profit) is the trade-pnl sum
                 // (fixed-1-lot, `risk_based_sizing == false`), semantically
                 // identical to the old `p_trades.iter().map(|t| t.pnl).sum() > 0.0`.
-                let mc_runs = config.mc_runs as usize;
-                let mut perturbed_genes: Vec<Gene> = Vec::with_capacity(mc_runs);
-                for run_idx in 0..mc_runs as u64 {
-                    use rand::Rng;
-                    use rand::SeedableRng;
-                    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
-                        combo_seed ^ ((candidate_idx as u64) << 20) ^ run_idx,
-                    );
-                    let mut perturbed = gene.clone();
-                    perturbed.long_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
-                    perturbed.short_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
-                    for w in &mut perturbed.weights {
-                        *w *= 1.0 + rng.random_range(-0.20..=0.20);
-                    }
-                    if perturbed.sl_pips.is_finite() && perturbed.sl_pips > 0.0 {
-                        perturbed.sl_pips *= 1.0 + rng.random_range(-0.25..=0.25);
-                    }
-                    if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
-                        perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
-                    }
-                    perturbed_genes.push(perturbed);
-                }
-
-                // Template settings = the SAME `discovery_backtest_settings`
-                // the serial loop fed `simulate_trades_core` (kill-zones on,
-                // gene-resolved SL/TP with 20/40 fallback). The price hint uses
-                // the BASE gene only to source the shared cost/pip config; the
-                // per-gene SL/TP is re-resolved inside `validation_genes_population`
-                // from each perturbed gene, matching the serial per-run settings.
-                // `risk_based_sizing` is forced false in the helper so sizing is
-                // fixed-1-lot — identical to `simulate_trades_core`.
-                let mc_settings =
-                    discovery_backtest_settings(config, &gene, ohlcv.close.last().copied());
-                let mc_metrics = {
-                    // Serialize the GPU launch across the candidate par_iter so
-                    // N rayon threads don't each spin up a GPU client → VRAM × N
-                    // → OOM. The CPU-bound screen work above/below still runs in
-                    // parallel; only the device launch is one-at-a-time.
-                    #[cfg(feature = "gpu")]
-                    let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                    crate::genetic::validation_genes_population(
-                        features,
-                        ohlcv,
-                        &perturbed_genes,
-                        &eval_config_for_signals,
-                        &mc_settings,
-                    )
-                };
-                let profitable_runs = match mc_metrics {
-                    Ok(metrics) => metrics.iter().filter(|m| m[0] > 0.0).count(),
-                    Err(e) => {
-                        // Fail-loud: a malformed population (empty features /
-                        // length mismatch) is a real bug, not a "0 profitable"
-                        // result. Reject the candidate but log the cause.
-                        tracing::warn!(
-                            target: "neoethos_search::discovery",
-                            error = %e,
-                            strategy_id = %gene.strategy_id,
-                            "Monte-Carlo batched eval failed — rejecting candidate"
-                        );
-                        return None;
-                    }
+                let Some(profitable_runs) = mc_profitable_runs[position] else {
+                    rejected_mc_error.fetch_add(1, AtomicOrdering::Relaxed);
+                    return None;
                 };
 
                 if (profitable_runs as u32) < config.mc_min_profitable {
+                    rejected_mc_floor.fetch_add(1, AtomicOrdering::Relaxed);
+                    // Within 10 points of the floor: the candidate is robust on
+                    // most perturbations and lost on a minority, which is a very
+                    // different signal from one that collapses outright.
+                    if profitable_runs as u32 + 10 >= config.mc_min_profitable {
+                        mc_near_miss.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
                     return None;
                 }
 
                 // Spread/Slippage Sensitivity Test — wired from Settings
                 // 2026-05-26 (dual-mode product).
-                let mut sensitive_settings =
-                    discovery_backtest_settings(config, &gene, ohlcv.close.last().copied());
-                sensitive_settings.spread_pips = config.sensitivity_spread_pips;
-                sensitive_settings.commission_per_trade = config.sensitivity_commission_per_lot;
-                let sens_trades = crate::eval::simulate_trades_core(
-                    &ohlcv.close,
-                    &ohlcv.high,
-                    &ohlcv.low,
-                    &features.timestamps,
-                    &sig,
-                    &sensitive_settings,
-                );
-                let sens_pnl: f64 = sens_trades.iter().map(|t| t.pnl).sum();
+                let Some(sens_pnl) = sensitivity_net_profit[position] else {
+                    rejected_mc_error.fetch_add(1, AtomicOrdering::Relaxed);
+                    return None;
+                };
                 if sens_pnl < 0.0 {
+                    rejected_sensitivity.fetch_add(1, AtomicOrdering::Relaxed);
                     return None;
                 }
 
@@ -4219,6 +4649,27 @@ where
                 ))
             })
             .collect();
+
+        quality_rejects = QualityScreenRejects {
+            base_quality: rejected_base_quality.load(AtomicOrdering::Relaxed),
+            regime: rejected_regime.load(AtomicOrdering::Relaxed),
+            mc_error: rejected_mc_error.load(AtomicOrdering::Relaxed),
+            mc_floor: rejected_mc_floor.load(AtomicOrdering::Relaxed),
+            mc_near_miss: mc_near_miss.load(AtomicOrdering::Relaxed),
+            sensitivity: rejected_sensitivity.load(AtomicOrdering::Relaxed),
+        };
+        tracing::info!(
+            target: "neoethos_search::funnel",
+            rejected_base_quality = quality_rejects.base_quality,
+            rejected_regime = quality_rejects.regime,
+            rejected_monte_carlo = quality_rejects.mc_floor,
+            monte_carlo_near_miss = quality_rejects.mc_near_miss,
+            monte_carlo_floor = config.mc_min_profitable,
+            monte_carlo_runs = config.mc_runs,
+            rejected_monte_carlo_error = quality_rejects.mc_error,
+            rejected_spread_sensitivity = quality_rejects.sensitivity,
+            "quality screen — which gate rejected the candidates"
+        );
 
         let mut strict_passed: Vec<QualityCandidate> = Vec::new();
         let mut opportunistic_passed = 0usize;
@@ -4293,6 +4744,22 @@ where
     // par_iter closure above. If operators report this stage is the
     // bottleneck, follow-up adds those atomics.
     funnel.record_stage("passed_quality", post_min_trades, filtered.len());
+    // Per-gate breakdown, so the persisted funnel answers "which test cost us
+    // the candidates" without needing the run's logs. Only non-zero reasons are
+    // recorded; a skipped screen therefore adds nothing.
+    if quality_rejects.total() > 0 {
+        for (reason, count) in [
+            ("base_quality_metrics", quality_rejects.base_quality),
+            ("regime_robustness", quality_rejects.regime),
+            ("monte_carlo_perturbation", quality_rejects.mc_floor),
+            ("monte_carlo_eval_error", quality_rejects.mc_error),
+            ("spread_slippage_sensitivity", quality_rejects.sensitivity),
+        ] {
+            if count > 0 {
+                funnel.add_reject_reason("passed_quality", reason, count);
+            }
+        }
+    }
 
     // Prop-firm window-pass gate. Default behavior in `PropFirm` mode.
     // For each surviving candidate, simulate trades on N 60-day windows
@@ -4414,13 +4881,13 @@ where
         // reject reasons (counted_zero = the window-pass simulation produced
         // zero windows for this gene, e.g. dataset too short or all windows
         // crashed; below_pass_rate = some windows ran but pass-rate < floor).
-        funnel.record_stage("passed_prop_firm_window", pre_prop_firm, next_filtered.len());
+        funnel.record_stage(
+            "passed_prop_firm_window",
+            pre_prop_firm,
+            next_filtered.len(),
+        );
         if dbg_counted_zero > 0 {
-            funnel.add_reject_reason(
-                "passed_prop_firm_window",
-                "counted_zero",
-                dbg_counted_zero,
-            );
+            funnel.add_reject_reason("passed_prop_firm_window", "counted_zero", dbg_counted_zero);
         }
         if dbg_below_pass_rate > 0 {
             funnel.add_reject_reason(
@@ -4492,6 +4959,10 @@ where
             rejected_by_correlation,
         );
     }
+    // Where the time actually went, printed next to where the candidates went.
+    // The two together answer both halves of "why did this take ten hours and
+    // produce nothing" without a profiler or a rerun.
+    crate::eval_telemetry::log_summary("discovery");
     tracing::info!(
         target: "neoethos_search::funnel",
         ranked = ranked_total,
@@ -4525,71 +4996,76 @@ where
             ),
         });
     }
-    let (mut validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts, mut per_gene_wf) =
-        if portfolio.is_empty() && !best_effort_fallback.is_empty() {
-            fallback_mode = true;
-            let fallback_reason = funnel
-                .stages
-                .iter()
-                .filter(|s| s.count_in > 0)
-                .max_by_key(|s| s.rejected)
-                .map(|s| s.name.clone())
-                .unwrap_or_else(|| "strict_gates".to_string());
-            let analyzer = quality_analyzer_for_config(config);
-            for ((_, gene), sig) in best_effort_fallback {
-                if portfolio.len() >= FALLBACK_PORTFOLIO_MAX {
+    let (
+        mut validation_gates,
+        canonical_backtest_artifacts,
+        walkforward_validation_artifacts,
+        mut per_gene_wf,
+    ) = if portfolio.is_empty() && !best_effort_fallback.is_empty() {
+        fallback_mode = true;
+        let fallback_reason = funnel
+            .stages
+            .iter()
+            .filter(|s| s.count_in > 0)
+            .max_by_key(|s| s.rejected)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "strict_gates".to_string());
+        let analyzer = quality_analyzer_for_config(config);
+        for ((_, gene), sig) in best_effort_fallback {
+            if portfolio.len() >= FALLBACK_PORTFOLIO_MAX {
+                break;
+            }
+            let mut ok = true;
+            for existing in &portfolio_signals {
+                if pearson_corr_i8(&sig, existing).abs() >= config.corr_threshold {
+                    ok = false;
                     break;
                 }
-                let mut ok = true;
-                for existing in &portfolio_signals {
-                    if pearson_corr_i8(&sig, existing).abs() >= config.corr_threshold {
-                        ok = false;
-                        break;
-                    }
-                }
-                if !ok {
-                    continue;
-                }
-                let trades = crate::eval::simulate_trades_core(
-                    &ohlcv.close,
-                    &ohlcv.high,
-                    &ohlcv.low,
-                    &features.timestamps,
-                    &sig,
-                    &discovery_backtest_settings(config, &gene, ohlcv.close.last().copied()),
-                );
-                quality_metrics.push(analyzer.analyze_strategy(
-                    &gene.strategy_id,
-                    &trades,
-                    config.initial_balance,
-                ));
-                portfolio_signals.push(sig);
-                portfolio.push(gene);
             }
-            funnel.record_stage("fallback_best_effort", 0, portfolio.len());
-            tracing::warn!(
-                target: "neoethos_search::discovery",
-                promoted = portfolio.len(),
-                reason = %fallback_reason,
-                "NEVER-ZERO: the strict funnel emptied the portfolio — promoting the \
-                 best-found genes (did NOT pass the prop bar) so the run is not empty. \
-                 Flagged fallback_mode + not-export-ready."
+            if !ok {
+                continue;
+            }
+            let trades = crate::eval::simulate_trades_core(
+                &ohlcv.close,
+                &ohlcv.high,
+                &ohlcv.low,
+                &features.timestamps,
+                &sig,
+                &discovery_backtest_settings(config, &gene, ohlcv.close.last().copied()),
             );
-            let mut gates = DiscoveryValidationGates::pending();
-            gates.fallback_mode = true;
-            gates.fallback_reason = fallback_reason;
-            (gates, Vec::new(), Vec::new(), Vec::new())
-        } else {
-            build_discovery_validation_artifacts(
-                &portfolio,
-                &portfolio_signals,
-                features,
-                ohlcv,
-                config,
-                &pbo_candidates,
-                ranked_total,
-            )?
-        };
+            quality_metrics.push(analyzer.analyze_strategy(
+                &gene.strategy_id,
+                &trades,
+                config.initial_balance,
+            ));
+            portfolio_signals.push(sig);
+            portfolio.push(gene);
+        }
+        funnel.record_stage("fallback_best_effort", 0, portfolio.len());
+        tracing::warn!(
+            target: "neoethos_search::discovery",
+            promoted = portfolio.len(),
+            reason = %fallback_reason,
+            "NEVER-ZERO: the strict funnel emptied the portfolio — promoting the \
+             best-found genes (did NOT pass the prop bar) so the run is not empty. \
+             Flagged fallback_mode + not-export-ready."
+        );
+        let mut gates = DiscoveryValidationGates::pending();
+        gates.fallback_mode = true;
+        gates.fallback_reason = fallback_reason;
+        (gates, Vec::new(), Vec::new(), Vec::new())
+    } else {
+        build_discovery_validation_artifacts(
+            &portfolio,
+            &portfolio_signals,
+            features,
+            ohlcv,
+            config,
+            effective_smc_gate_threshold,
+            &pbo_candidates,
+            ranked_total,
+        )?
+    };
 
     // ── Robustness filters (2026-07-02): permutation + plateau, parallel ────
     // Two per-gene tests on the final portfolio, rayon-parallel across genes,
@@ -4627,8 +5103,15 @@ where
         let n_all = ohlcv.close.len();
         let w0 = n_all.saturating_sub(ROBUST_WINDOW);
         let ts_all: &[i64] = ohlcv.timestamp.as_deref().unwrap_or(&[]);
-        let ts_win: &[i64] = if ts_all.len() == n_all { &ts_all[w0..] } else { &[] };
-        let eval_cfg_rb = config.evaluation_config(ohlcv.close.last().copied());
+        let ts_win: &[i64] = if ts_all.len() == n_all {
+            &ts_all[w0..]
+        } else {
+            &[]
+        };
+        let eval_cfg_rb = config.evaluation_config_with_smc_gate(
+            ohlcv.close.last().copied(),
+            effective_smc_gate_threshold,
+        );
 
         let verdicts: Vec<(bool, String)> = portfolio
             .par_iter()
@@ -4663,8 +5146,8 @@ where
                 }
 
                 // #10 permutation p-value — deterministic seed per gene.
-                let seed = 0x4E45_4F45_5448_4F53u64
-                    ^ (gi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let seed =
+                    0x4E45_4F45_5448_4F53u64 ^ (gi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
                 let mut beats = 0usize;
                 let mut shuffled: Vec<i8> = sig_win.to_vec();
@@ -4875,6 +5358,8 @@ where
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: Some(funnel.clone()),
+
+        effective_smc_gate_threshold,
     })
 }
 
@@ -5083,16 +5568,37 @@ pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult
     // Flags likely-overfit candidates (in-sample Sharpe > 3.0) at a glance — the
     // operator's "Sharpe 3 = wrong / overfit" rule.
     if !result.quality_metrics.is_empty() {
+        // Which of these rows actually made it out. `quality_metrics` is the
+        // full screened-candidate record — a superset of the portfolio — so
+        // without this the question "what do the ones that survived earn?"
+        // cannot be answered from the log at all: the exported rows and the
+        // rejected ones are printed identically.
+        let exported: std::collections::HashSet<&str> = result
+            .portfolio
+            .iter()
+            .map(|gene| gene.strategy_id.as_str())
+            .collect();
         tracing::info!(
             target: "neoethos_search::discovery",
             count = result.quality_metrics.len(),
+            exported = exported.len(),
             "CANDIDATE METRICS — id | trades(/mo,/day) | hold | WR | PF | Sharpe | maxDD | verdict"
         );
         for q in &result.quality_metrics {
-            let flag = if q.sharpe_ratio > 3.0 { " [!] OVERFIT?" } else { "" };
+            let flag = if q.sharpe_ratio > 3.0 {
+                " [!] OVERFIT?"
+            } else {
+                ""
+            };
+            let export_tag = if exported.contains(q.strategy_id.as_str()) {
+                "[EXPORTED] "
+            } else {
+                ""
+            };
             tracing::info!(
                 target: "neoethos_search::discovery",
-                "  {} | {} trades ({:.1}/mo, {:.2}/day) | {:.1}h hold | WR {:.0}% | PF {:.2} | Sharpe {:.2}{} | maxDD {:.1}% | {}",
+                "  {}{} | {} trades ({:.1}/mo, {:.2}/day) | {:.1}h hold | WR {:.0}% | PF {:.2} | Sharpe {:.2}{} | maxDD {:.1}% | {}",
+                export_tag,
                 q.strategy_id,
                 q.total_trades,
                 q.trades_per_month,
@@ -5107,11 +5613,7 @@ pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult
             );
             // Pro money-view (2026-06-06): "how much € in how long, with what curve" —
             // ratios alone (Sharpe 7) hide that a strategy made ~5% over 9 months (useless).
-            let curve_min = q
-                .equity_curve
-                .iter()
-                .cloned()
-                .fold(f64::INFINITY, f64::min);
+            let curve_min = q.equity_curve.iter().cloned().fold(f64::INFINITY, f64::min);
             tracing::info!(
                 target: "neoethos_search::discovery",
                 "      money: EUR {:.0} -> {:.0} (net {:+.0}, {:.1} months, {:.2}%/mo) | recovery {:.2} | curve min EUR {:.0} | maxDD EUR {:.0}",
@@ -5140,8 +5642,111 @@ pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult
                 q.mfe_capture_ratio * 100.0,
             );
         }
+        log_exported_money_summary(result, &exported);
     }
     write_json_atomic(path, &result.quality_metrics)
+}
+
+/// What the strategies that survived validation actually earn.
+///
+/// The per-candidate rows answer this one strategy at a time, across a set that
+/// is mostly rejects — so the question needed reading dozens of lines while
+/// knowing which ids were exported. This answers it directly, over the exported
+/// subset only.
+///
+/// The figures are deliberately NOT summed into a single euro total. Each
+/// strategy is analysed alone on the full starting balance, so adding thirty
+/// net-profit figures would describe thirty separate accounts rather than one
+/// portfolio, overstating the result by roughly the portfolio size. Returns are
+/// therefore reported as a distribution, and only trade frequency is aggregated,
+/// because the strategies really do trade in parallel on one account.
+fn log_exported_money_summary(
+    result: &DiscoveryResult,
+    exported: &std::collections::HashSet<&str>,
+) {
+    let survivors: Vec<&StrategyMetrics> = result
+        .quality_metrics
+        .iter()
+        .filter(|q| exported.contains(q.strategy_id.as_str()))
+        .collect();
+    if survivors.is_empty() {
+        // An empty portfolio is already reported by the funnel, so this is not
+        // worth a warning — but saying it beats printing a table of zeros that
+        // reads like a measurement.
+        tracing::info!(
+            target: "neoethos_search::discovery",
+            "EXPORTED MONEY VIEW — nothing was exported, so there is nothing to earn"
+        );
+        return;
+    }
+
+    let mut returns_pct: Vec<f64> = survivors
+        .iter()
+        .map(|q| q.total_return_pct * 100.0)
+        .collect();
+    returns_pct.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_return = returns_pct[returns_pct.len() / 2];
+    let profitable = returns_pct.iter().filter(|r| **r > 0.0).count();
+    let n = survivors.len() as f64;
+    let mean = |f: &dyn Fn(&StrategyMetrics) -> f64| -> f64 {
+        survivors.iter().map(|q| f(q)).sum::<f64>() / n
+    };
+
+    // Additive across strategies, unlike the euro figures: they hold positions
+    // at the same time on the one account.
+    let trades_per_day: f64 = survivors.iter().map(|q| q.trades_per_month / 21.0).sum();
+    let worst_dd = survivors
+        .iter()
+        .map(|q| q.max_drawdown_pct)
+        .fold(0.0_f64, f64::max);
+    let months = mean(&|q| q.period_days) / 30.44;
+
+    tracing::info!(
+        target: "neoethos_search::discovery",
+        "EXPORTED MONEY VIEW — {} strategies survived validation, {} profitable, over {:.1} months",
+        survivors.len(),
+        profitable,
+        months,
+    );
+    tracing::info!(
+        target: "neoethos_search::discovery",
+        "  per strategy on EUR {:.0} alone: return {:+.1}% worst / {:+.1}% median / {:+.1}% best \
+         (median net EUR {:+.0}) — NOT additive, one account splits capital across all {}",
+        mean(&|q| q.initial_capital),
+        returns_pct[0],
+        median_return,
+        returns_pct[returns_pct.len() - 1],
+        mean(&|q| q.net_profit),
+        survivors.len(),
+    );
+    tracing::info!(
+        target: "neoethos_search::discovery",
+        "  portfolio activity: {:.2} trades/day combined | mean hold {:.1}h | worst maxDD {:.1}%",
+        trades_per_day,
+        mean(&|q| q.avg_trade_duration_hours),
+        worst_dd * 100.0,
+    );
+    // The "money that disappears": the trade reached this much profit and gave
+    // most of it back. Averaged over survivors it says whether the exits, not
+    // the entries, are where the money is being left behind.
+    tracing::info!(
+        target: "neoethos_search::discovery",
+        "  exit quality: mean MFE EUR {:.0} per trade, {:.0}% captured | mean R {:+.2}",
+        mean(&|q| q.avg_mfe),
+        mean(&|q| q.mfe_capture_ratio) * 100.0,
+        mean(&|q| q.avg_r_multiple),
+    );
+    // One trade a day is the operator's stated floor for risky mode: below it
+    // the account cannot compound often enough to reach the target, however
+    // good each individual trade is.
+    if trades_per_day < 1.0 {
+        tracing::warn!(
+            target: "neoethos_search::discovery",
+            trades_per_day = format!("{trades_per_day:.2}"),
+            "the exported portfolio trades less than once a day — too few \
+             compounding events for the risky-mode target"
+        );
+    }
 }
 
 /// 2026-05-26 operator directive (dual-mode product): save the 16-stage

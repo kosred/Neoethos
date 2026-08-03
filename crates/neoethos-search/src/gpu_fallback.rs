@@ -1,197 +1,327 @@
-//! GPU failure classification and the fallback/fail decision.
+//! GPU failure classification and typed fallback/retry decisions.
 //!
-//! Task 5 of the GPU remediation (2026-07-22): the codebase read
-//! `NEOETHOS_REQUIRE_GPU` inline in five places and treated every GPU failure
-//! the same way — warn, then recompute on the CPU. That is correct for an
-//! *availability* failure (no device, an allocation that could not be served, a
-//! driver that lost the device): the CPU evaluator is the canonical reference,
-//! so a slow-but-correct recompute preserves the never-OOM invariant.
-//!
-//! It is NOT correct for a *correctness* failure. If a GPU launch returned a
-//! number that disagrees with the CPU reference beyond tolerance, that number
-//! is already wrong; silently swapping in a CPU recompute would hide a real
-//! kernel bug, and accepting the GPU number would corrupt output. Such a result
-//! must fail loud, regardless of any environment flag.
-//!
-//! This module is the single source of truth for both decisions. It is pure
-//! logic with no GPU dependency, so every branch is unit-tested on any machine.
+//! Stage 1 / Commit 0.2 of the GPU-native discovery redesign.  Availability,
+//! correctness and allocation-pressure failures are intentionally distinct:
+//! strict GPU execution forbids CPU fallback, but it still permits bounded,
+//! deterministic GPU rebatching when an allocation is too large.
+
+use crate::backend::{EvaluationBackend, FallbackPolicy};
 
 /// Why a GPU evaluation attempt did not yield a usable result.
-///
-/// The split is the whole point: `Availability` is a reason the GPU *could not
-/// run*, `Correctness` is a reason its output *cannot be trusted*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuFailure {
     /// No usable adapter/device was found for the requested backend.
     NoAdapter,
-    /// The compiled backend cannot execute on this machine (e.g. a CUDA build
-    /// on a box with no CUDA driver, or an unsupported wgpu backend).
+    /// The compiled backend cannot execute on this machine.
     UnsupportedBackend,
-    /// A device allocation could not be served (VRAM pressure, pool
-    /// exhaustion — including the cubecl#243 pool panic surfaced as a failure).
+    /// A device allocation could not be served.
     AllocationPressure,
-    /// The device was lost mid-execution (driver reset, timeout, unplug).
+    /// The device was lost mid-execution.
     DeviceLost,
-    /// The GPU launch produced the wrong SHAPE (e.g. a gene-count mismatch).
-    /// The lane malfunctioned; a CPU recompute yields the correct result, so
-    /// this is an availability-class fault, not a trusted-but-wrong number.
+    /// The GPU returned a result with an invalid shape.  This is an internal
+    /// backend/kernel malfunction, not an availability fault.
     WrongShape,
-    /// The GPU produced a plausibly-shaped result that disagrees with the CPU
-    /// reference beyond tolerance. The output is wrong and there is no safe
-    /// fallback — the GPU already "succeeded" with a bad number.
+    /// The GPU returned plausibly-shaped values that violate canonical parity.
     ParityViolation,
 }
 
 impl GpuFailure {
-    /// True when the failure means the GPU could not run (so a CPU recompute is
-    /// a valid substitute), as opposed to running and producing a wrong answer.
     pub fn is_availability(self) -> bool {
         matches!(
             self,
-            GpuFailure::NoAdapter
-                | GpuFailure::UnsupportedBackend
-                | GpuFailure::AllocationPressure
-                | GpuFailure::DeviceLost
-                | GpuFailure::WrongShape
+            GpuFailure::NoAdapter | GpuFailure::UnsupportedBackend | GpuFailure::DeviceLost
         )
+    }
+
+    pub fn is_correctness(self) -> bool {
+        matches!(self, GpuFailure::WrongShape | GpuFailure::ParityViolation)
     }
 }
 
-/// What the caller should do about a [`GpuFailure`].
+/// Action selected by the typed GPU failure policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FallbackDecision {
-    /// Recompute this work on the CPU. Slow but correct; the never-OOM path.
-    RecomputeOnCpu,
-    /// Fail loud. Either the operator required a GPU and an availability fault
-    /// must not be hidden behind a silent CPU run, or the GPU returned a
-    /// number that cannot be trusted.
+pub enum GpuAction {
+    /// Retry the exact same logical work on the GPU with a smaller physical
+    /// batch. IDs, ordering and RNG counters must remain unchanged.
+    RetryOnGpu { next_batch_size: usize },
+    /// Recompute on the CPU. Legal only when the resolved backend allows it.
+    FallbackToCpu,
+    /// Stop the work unit and surface the failure.
     FailLoud,
 }
 
-/// The operator's assertion that a GPU MUST be used for this process.
-///
-/// Set `NEOETHOS_REQUIRE_GPU=1` on a real GPU box so a device/driver misconfig
-/// fails loud instead of silently running the whole search on the CPU (which
-/// looks like "it works, just slowly" and wastes rented card-hours). Any
-/// non-empty value counts as set, matching the historical `is_ok()` check.
-pub fn require_gpu() -> bool {
-    std::env::var("NEOETHOS_REQUIRE_GPU")
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuRetryPolicy {
+    pub max_retries: u32,
+    pub min_batch_size: usize,
 }
 
-/// Decide what to do about a GPU failure.
-///
-/// - A correctness failure (parity violation) ALWAYS fails loud: a wrong number
-///   is never safe to accept, and hiding it behind a CPU recompute would mask a
-///   kernel bug.
-/// - An availability failure falls back to the CPU UNLESS the operator required
-///   a GPU, in which case it fails loud so a misconfigured box does not run the
-///   whole workload slowly on the CPU without anyone noticing.
-pub fn decide(failure: GpuFailure, require_gpu: bool) -> FallbackDecision {
-    if !failure.is_availability() {
-        // Correctness fault: never fall back, never accept.
-        return FallbackDecision::FailLoud;
+impl Default for GpuRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            min_batch_size: 1,
+        }
     }
-    if require_gpu {
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuAttempt {
+    /// Zero-based retry count. `0` is the first failed attempt.
+    pub retry_index: u32,
+    pub batch_size: usize,
+}
+
+impl GpuAttempt {
+    pub fn first(batch_size: usize) -> Self {
+        Self {
+            retry_index: 0,
+            batch_size: batch_size.max(1),
+        }
+    }
+}
+
+/// Decide what a caller must do after a GPU failure.
+///
+/// Correctness failures always fail closed. Allocation pressure retries on the
+/// same GPU while the bounded retry policy can still reduce the batch. Only
+/// after GPU retries are exhausted may an optional-GPU run fall back to CPU.
+pub fn decide_action(
+    failure: GpuFailure,
+    backend: EvaluationBackend,
+    attempt: GpuAttempt,
+    retry_policy: GpuRetryPolicy,
+) -> GpuAction {
+    if failure.is_correctness() {
+        return GpuAction::FailLoud;
+    }
+
+    if failure == GpuFailure::AllocationPressure {
+        let min_batch_size = retry_policy.min_batch_size.max(1);
+        let retries_remain = attempt.retry_index < retry_policy.max_retries;
+        let can_shrink = attempt.batch_size > min_batch_size;
+        if retries_remain && can_shrink {
+            let halved = attempt.batch_size.div_ceil(2);
+            return GpuAction::RetryOnGpu {
+                next_batch_size: halved.max(min_batch_size),
+            };
+        }
+    }
+
+    if backend.fallback == FallbackPolicy::AllowCpu {
+        GpuAction::FallbackToCpu
+    } else {
+        GpuAction::FailLoud
+    }
+}
+
+/// Legacy two-way decision retained while existing call sites migrate to
+/// [`GpuAction`]. New code must use [`decide_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackDecision {
+    RecomputeOnCpu,
+    FailLoud,
+}
+
+/// Legacy compatibility wrapper. It has no batch context, so allocation
+/// pressure cannot retry here; migrated call sites use [`decide_action`].
+pub fn decide(failure: GpuFailure, require_gpu: bool) -> FallbackDecision {
+    if failure.is_correctness() || require_gpu {
         FallbackDecision::FailLoud
     } else {
         FallbackDecision::RecomputeOnCpu
     }
 }
 
-/// Convenience: classify + decide against the live `NEOETHOS_REQUIRE_GPU` env.
+/// Legacy process-env reader. Unlike the old `is_ok()` behaviour, `0`,
+/// `false`, `no`, `off`, empty and unset are all false.
+pub fn require_gpu() -> bool {
+    std::env::var("NEOETHOS_REQUIRE_GPU")
+        .ok()
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false)
+}
+
 pub fn decide_env(failure: GpuFailure) -> FallbackDecision {
     decide(failure, require_gpu())
+}
+
+fn parse_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "" | "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::EvaluationBackend;
 
     #[test]
-    fn availability_faults_fall_back_when_gpu_is_optional() {
-        for f in [
-            GpuFailure::NoAdapter,
-            GpuFailure::UnsupportedBackend,
-            GpuFailure::AllocationPressure,
-            GpuFailure::DeviceLost,
-            GpuFailure::WrongShape,
-        ] {
-            assert_eq!(
-                decide(f, false),
-                FallbackDecision::RecomputeOnCpu,
-                "{f:?} should recompute on CPU when GPU is optional"
-            );
-        }
-    }
-
-    #[test]
-    fn availability_faults_fail_loud_when_gpu_is_required() {
-        // A rented card sitting idle while the run silently uses the CPU is the
-        // exact waste NEOETHOS_REQUIRE_GPU exists to prevent.
-        for f in [
-            GpuFailure::NoAdapter,
-            GpuFailure::UnsupportedBackend,
-            GpuFailure::AllocationPressure,
-            GpuFailure::DeviceLost,
-            GpuFailure::WrongShape,
-        ] {
-            assert_eq!(
-                decide(f, true),
-                FallbackDecision::FailLoud,
-                "{f:?} must fail loud when a GPU is required"
-            );
-        }
-    }
-
-    #[test]
-    fn parity_violation_always_fails_loud() {
-        // A wrong-but-plausible number is never safe: fail closed whether or not
-        // a GPU was required, and whatever the env says.
-        assert_eq!(
-            decide(GpuFailure::ParityViolation, false),
-            FallbackDecision::FailLoud
-        );
-        assert_eq!(
-            decide(GpuFailure::ParityViolation, true),
-            FallbackDecision::FailLoud
-        );
-        assert!(!GpuFailure::ParityViolation.is_availability());
-    }
-
-    #[test]
-    fn wrong_shape_is_availability_not_correctness() {
-        // A gene-count mismatch means the lane malfunctioned; the CPU recompute
-        // is correct, so it is availability-class, not a trusted-wrong number.
-        assert!(GpuFailure::WrongShape.is_availability());
-        assert_eq!(
-            decide(GpuFailure::WrongShape, false),
-            FallbackDecision::RecomputeOnCpu
-        );
-    }
-
-    #[test]
-    fn require_gpu_reads_any_nonempty_value() {
-        // The historical check was `is_ok()`, so any set value counted. Keep an
-        // empty string as "not required" (a common accidental unset shape).
-        // SAFETY: single-threaded test; serialized by the #[serial]-free
-        // convention of this file — no other test in this module reads the env.
-        let key = "NEOETHOS_REQUIRE_GPU";
-        let prev = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, "1");
-            assert!(require_gpu());
-            std::env::set_var(key, "0");
-            assert!(require_gpu(), "any non-empty value counts as required");
-            std::env::set_var(key, "");
-            assert!(!require_gpu(), "empty string is not required");
-            std::env::remove_var(key);
-            assert!(!require_gpu(), "unset is not required");
-            match prev {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
+    fn correctness_faults_always_fail_loud() {
+        for failure in [GpuFailure::WrongShape, GpuFailure::ParityViolation] {
+            for backend in [
+                EvaluationBackend::AUTO,
+                EvaluationBackend::GPU_PREFERRED,
+                EvaluationBackend::GPU_REQUIRED,
+            ] {
+                assert_eq!(
+                    decide_action(
+                        failure,
+                        backend,
+                        GpuAttempt::first(128),
+                        GpuRetryPolicy::default(),
+                    ),
+                    GpuAction::FailLoud
+                );
             }
         }
+        assert!(!GpuFailure::WrongShape.is_availability());
+        assert!(GpuFailure::WrongShape.is_correctness());
+    }
+
+    #[test]
+    fn optional_gpu_availability_fault_falls_back() {
+        for failure in [
+            GpuFailure::NoAdapter,
+            GpuFailure::UnsupportedBackend,
+            GpuFailure::DeviceLost,
+        ] {
+            assert_eq!(
+                decide_action(
+                    failure,
+                    EvaluationBackend::GPU_PREFERRED,
+                    GpuAttempt::first(64),
+                    GpuRetryPolicy::default(),
+                ),
+                GpuAction::FallbackToCpu
+            );
+        }
+    }
+
+    #[test]
+    fn required_gpu_availability_fault_fails_loud() {
+        for failure in [
+            GpuFailure::NoAdapter,
+            GpuFailure::UnsupportedBackend,
+            GpuFailure::DeviceLost,
+        ] {
+            assert_eq!(
+                decide_action(
+                    failure,
+                    EvaluationBackend::GPU_REQUIRED,
+                    GpuAttempt::first(64),
+                    GpuRetryPolicy::default(),
+                ),
+                GpuAction::FailLoud
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_pressure_rebatches_before_fallback() {
+        let action = decide_action(
+            GpuFailure::AllocationPressure,
+            EvaluationBackend::GPU_REQUIRED,
+            GpuAttempt::first(101),
+            GpuRetryPolicy {
+                max_retries: 3,
+                min_batch_size: 8,
+            },
+        );
+        assert_eq!(
+            action,
+            GpuAction::RetryOnGpu {
+                next_batch_size: 51
+            }
+        );
+    }
+
+    #[test]
+    fn required_gpu_fails_after_retries_are_exhausted() {
+        let action = decide_action(
+            GpuFailure::AllocationPressure,
+            EvaluationBackend::GPU_REQUIRED,
+            GpuAttempt {
+                retry_index: 3,
+                batch_size: 8,
+            },
+            GpuRetryPolicy {
+                max_retries: 3,
+                min_batch_size: 8,
+            },
+        );
+        assert_eq!(action, GpuAction::FailLoud);
+    }
+
+    #[test]
+    fn optional_gpu_may_fallback_after_retries_are_exhausted() {
+        let action = decide_action(
+            GpuFailure::AllocationPressure,
+            EvaluationBackend::GPU_PREFERRED,
+            GpuAttempt {
+                retry_index: 3,
+                batch_size: 8,
+            },
+            GpuRetryPolicy {
+                max_retries: 3,
+                min_batch_size: 8,
+            },
+        );
+        assert_eq!(action, GpuAction::FallbackToCpu);
+    }
+
+    #[test]
+    fn retry_sequence_is_deterministic() {
+        let policy = GpuRetryPolicy {
+            max_retries: 8,
+            min_batch_size: 4,
+        };
+        let mut batch = 100;
+        let mut sequence = Vec::new();
+        for retry_index in 0..8 {
+            match decide_action(
+                GpuFailure::AllocationPressure,
+                EvaluationBackend::GPU_REQUIRED,
+                GpuAttempt {
+                    retry_index,
+                    batch_size: batch,
+                },
+                policy,
+            ) {
+                GpuAction::RetryOnGpu { next_batch_size } => {
+                    sequence.push(next_batch_size);
+                    batch = next_batch_size;
+                }
+                GpuAction::FailLoud => break,
+                GpuAction::FallbackToCpu => panic!("strict GPU mode must never fall back"),
+            }
+        }
+        assert_eq!(sequence, vec![50, 25, 13, 7, 4]);
+    }
+
+    #[test]
+    fn legacy_env_parser_handles_false_values() {
+        for value in ["", "0", "false", "NO", "off"] {
+            assert_eq!(parse_bool(value), Some(false));
+        }
+        for value in ["1", "true", "YES", "on"] {
+            assert_eq!(parse_bool(value), Some(true));
+        }
+        assert_eq!(parse_bool("maybe"), None);
+    }
+
+    #[test]
+    fn legacy_wrong_shape_is_never_hidden() {
+        assert_eq!(
+            decide(GpuFailure::WrongShape, false),
+            FallbackDecision::FailLoud
+        );
+        assert_eq!(
+            decide(GpuFailure::WrongShape, true),
+            FallbackDecision::FailLoud
+        );
     }
 }

@@ -1,0 +1,9 @@
+RESULT A-f32-4k parity=False gpu=0.0110s 95.0 M cand-bars/s wall=2s metric[0][2] expected=-37844.88881460508 actual=-40586.1171875
+RESULT A-f64-4k parity=False gpu=0.0780s 13.5 M cand-bars/s wall=2s metric[0][102] expected=-1833.6527321231115 actual=-1682.3885498046875
+RESULT B-4k parity=True gpu=0.0211s 49.7 M cand-bars/s wall=1s 
+RESULT A-f32-20k parity=False gpu=0.0375s 136.4 M cand-bars/s wall=2s metric[0][0] expected=-72927.26994412486 actual=-74265.015625
+RESULT A-f64-20k parity=False gpu=0.3315s 15.4 M cand-bars/s wall=3s metric[0][102] expected=-19812.38913651246 actual=-19688.828125
+RESULT B-20k parity=True gpu=0.1072s 47.8 M cand-bars/s wall=5s 
+RESULT A-f32-200k parity=False gpu=0.3685s 138.9 M cand-bars/s wall=3s metric[0][0] expected=8506.325800504375 actual=3940.875
+RESULT A-f64-200k parity=False gpu=4.4428s 11.5 M cand-bars/s wall=21s metric[0][102] expected=20876.08894538063 actual=20916.228515625
+RESULT B-200k parity=True gpu=1.0802s 47.4 M cand-bars/s wall=44s 

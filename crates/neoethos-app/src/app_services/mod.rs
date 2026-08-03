@@ -37,6 +37,7 @@ pub mod embedded_credentials;
 pub mod jobs;
 pub mod journal_reconcile;
 pub mod journal_store;
+pub mod journal_analytics;
 pub mod journal_stats;
 pub mod live_journal;
 pub mod live_gate;

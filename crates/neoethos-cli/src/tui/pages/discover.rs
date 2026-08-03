@@ -350,8 +350,7 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
             // confirmation rather than killing immediately (FIX A). Only prompt
             // if there's actually a running job to stop.
             if shared.jobs.has_running(JOB_LABEL_PREFIX) {
-                shared.pending_confirmation =
-                    Some(crate::tui::app::PendingAction::DiscoverStop);
+                shared.pending_confirmation = Some(crate::tui::app::PendingAction::DiscoverStop);
                 shared.status = "Confirm stop discovery? [Y]es / [N]o".to_string();
             } else {
                 shared.status = "No running discovery to stop".to_string();
@@ -453,7 +452,10 @@ mod tests {
 
     #[test]
     fn strip_ansi_preserves_multibyte_utf8() {
-        assert_eq!(strip_ansi("gen 5 → 6 · ολοκληρώθηκε"), "gen 5 → 6 · ολοκληρώθηκε");
+        assert_eq!(
+            strip_ansi("gen 5 → 6 · ολοκληρώθηκε"),
+            "gen 5 → 6 · ολοκληρώθηκε"
+        );
     }
 
     #[test]

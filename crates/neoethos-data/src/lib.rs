@@ -574,8 +574,101 @@ pub fn write_ohlcv_vortex(path: impl AsRef<Path>, ohlcv: &Ohlcv) -> Result<()> {
 }
 
 pub fn load_vortex(path: impl AsRef<Path>) -> Result<Ohlcv> {
+    let path = path.as_ref();
     let array = read_vortex_array(path)?;
-    vortex_array_to_ohlcv(array)
+    let ohlcv = vortex_array_to_ohlcv(array)?;
+    Ok(drop_impossible_prices(ohlcv, &path.display().to_string()))
+}
+
+/// Share of a series that may be dropped as impossible before the series itself
+/// is considered broken. Well under the ~0.3 % seen in practice; a file past
+/// this is not a few bad ticks, it is the wrong file.
+const MAX_IMPOSSIBLE_PRICE_SHARE: f64 = 0.02;
+
+/// Remove bars whose prices are not positive.
+///
+/// A price of zero is not a cheap price, it is the absence of one. The row
+/// validator accepts them today because it only checks for NaN/Inf and for
+/// `low ≤ open, close ≤ high` — and `open=0, high=0.837, low=0, close=0.834`
+/// satisfies every one of those. What it does not survive is contact with a
+/// backtest: entering at zero and exiting at the real price booked £77 211 of
+/// profit on a single AUDUSD H4 bar at one lot, about 9 800 pips, on a pair
+/// whose entire ten-year range is 5 500. Several unrelated genes reported that
+/// identical figure, which is what gave the shared bad bar away.
+///
+/// That matters beyond one wrong number. The search ranks candidates on profit,
+/// so the strategies that found these bars outranked every honest one and were
+/// the ones exported. 14 240 such bars sit in this store, across every symbol
+/// and timeframe, all dating from 2014-12-08.
+///
+/// Dropping is the conservative repair: the bar carries no usable information,
+/// and the alternative — refusing to load — would block every run on data that
+/// is otherwise sound. Silence is not an option either, so the count and the
+/// affected range are logged at warn, and a file past
+/// `MAX_IMPOSSIBLE_PRICE_SHARE` is refused rather than quietly rewritten.
+fn drop_impossible_prices(ohlcv: Ohlcv, source: &str) -> Ohlcv {
+    let total = ohlcv.close.len();
+    if total == 0 {
+        return ohlcv;
+    }
+    let usable = |index: usize| -> bool {
+        let open = ohlcv.open[index];
+        let high = ohlcv.high[index];
+        let low = ohlcv.low[index];
+        let close = ohlcv.close[index];
+        open > 0.0 && high > 0.0 && low > 0.0 && close > 0.0
+    };
+    let bad = (0..total).filter(|index| !usable(*index)).count();
+    if bad == 0 {
+        return ohlcv;
+    }
+    let share = bad as f64 / total as f64;
+    let first_bad = (0..total).find(|index| !usable(*index));
+    let bad_timestamp = first_bad
+        .and_then(|index| ohlcv.timestamp.as_ref().and_then(|ts| ts.get(index).copied()));
+    if share > MAX_IMPOSSIBLE_PRICE_SHARE {
+        tracing::error!(
+            target: "neoethos_data::integrity",
+            source,
+            bad,
+            total,
+            share_pct = format!("{:.2}", share * 100.0),
+            first_bad_timestamp_ms = bad_timestamp,
+            "more than 2% of this series has non-positive prices — dropping them would              change the series rather than clean it. Re-import this symbol/timeframe."
+        );
+    } else {
+        tracing::warn!(
+            target: "neoethos_data::integrity",
+            source,
+            bad,
+            total,
+            share_pct = format!("{:.3}", share * 100.0),
+            first_bad_timestamp_ms = bad_timestamp,
+            "dropped bars with non-positive prices — a zero price is the absence of a              price, and a backtest that trades one books impossible profit. Re-import              this symbol/timeframe to recover the bars."
+        );
+    }
+
+    let keep: Vec<bool> = (0..total).map(usable).collect();
+    let filter = |values: Vec<f64>| -> Vec<f64> {
+        values
+            .into_iter()
+            .zip(keep.iter())
+            .filter_map(|(value, keep)| keep.then_some(value))
+            .collect()
+    };
+    Ohlcv {
+        timestamp: ohlcv.timestamp.map(|ts| {
+            ts.into_iter()
+                .zip(keep.iter())
+                .filter_map(|(value, keep)| keep.then_some(value))
+                .collect()
+        }),
+        open: filter(ohlcv.open),
+        high: filter(ohlcv.high),
+        low: filter(ohlcv.low),
+        close: filter(ohlcv.close),
+        volume: ohlcv.volume.map(filter),
+    }
 }
 
 pub fn normalize_ohlcv(ohlcv: &Ohlcv) -> Result<Ohlcv> {
@@ -813,6 +906,17 @@ fn validate_ohlcv_row(row: &OhlcvRow) -> Result<()> {
         bail!(
             "NaN/Inf in OHLCV at timestamp {} (open={} high={} low={} close={}) — \
              re-import and verify the price data is clean.",
+            row.timestamp, row.open, row.high, row.low, row.close
+        );
+    }
+    // A zero or negative price passes every structural check below —
+    // `open=0, high=0.837, low=0, close=0.834` has high ≥ low and both open and
+    // close inside the range — while being economically impossible. Rejecting it
+    // here keeps new imports clean; `drop_impossible_prices` handles the bars
+    // already on disk.
+    if row.open <= 0.0 || row.high <= 0.0 || row.low <= 0.0 || row.close <= 0.0 {
+        bail!(
+            "non-positive price in OHLCV at timestamp {} (open={} high={} low={} close={})              — a zero price is the absence of a price, not a cheap one; re-import from a              source that has this bar.",
             row.timestamp, row.open, row.high, row.low, row.close
         );
     }
@@ -1865,5 +1969,79 @@ mod cube_assembly_tests {
         unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "ram") };
         assert!(should_build_cube_in_ram(u64::MAX / 4), "explicit ram wins");
         unsafe { std::env::remove_var("NEOETHOS_FEATURE_CUBE_MODE") };
+    }
+}
+
+#[cfg(test)]
+mod impossible_price_tests {
+    use super::*;
+
+    fn series(open: Vec<f64>, high: Vec<f64>, low: Vec<f64>, close: Vec<f64>) -> Ohlcv {
+        let n = close.len();
+        Ohlcv {
+            timestamp: Some((0..n as i64).map(|i| 1_700_000_000_000 + i * 60_000).collect()),
+            open,
+            high,
+            low,
+            close,
+            volume: Some(vec![1.0; n]),
+        }
+    }
+
+    /// The exact shape found in the store: open and low at zero, high and close
+    /// real. It satisfies `low ≤ open`, `open ≤ high`, `low ≤ close ≤ high` — so
+    /// every structural check passes and only positivity catches it.
+    #[test]
+    fn a_zero_priced_bar_is_removed_and_the_series_stays_aligned() {
+        let cleaned = drop_impossible_prices(
+            series(
+                vec![0.83, 0.0, 0.84],
+                vec![0.84, 0.83762, 0.85],
+                vec![0.82, 0.0, 0.83],
+                vec![0.835, 0.83417, 0.845],
+            ),
+            "test",
+        );
+        assert_eq!(cleaned.close, vec![0.835, 0.845]);
+        assert_eq!(cleaned.open, vec![0.83, 0.84]);
+        assert_eq!(cleaned.high, vec![0.84, 0.85]);
+        assert_eq!(cleaned.low, vec![0.82, 0.83]);
+        // Timestamps and volume must lose the same row, or every later bar is
+        // attributed to the wrong moment.
+        let ts = cleaned.timestamp.expect("timestamps kept");
+        assert_eq!(ts, vec![1_700_000_000_000, 1_700_000_120_000]);
+        assert_eq!(cleaned.volume.expect("volume kept").len(), 2);
+    }
+
+    #[test]
+    fn a_clean_series_is_returned_untouched() {
+        let original = series(
+            vec![0.83, 0.84],
+            vec![0.84, 0.85],
+            vec![0.82, 0.83],
+            vec![0.835, 0.845],
+        );
+        let cleaned = drop_impossible_prices(original.clone(), "test");
+        assert_eq!(cleaned.close, original.close);
+        assert_eq!(cleaned.timestamp, original.timestamp);
+    }
+
+    /// The write path must refuse what the read path has to clean up, or the
+    /// store keeps refilling with bars that cannot be traded.
+    #[test]
+    fn the_row_validator_now_rejects_a_zero_price() {
+        let row = OhlcvRow {
+            timestamp: 1_700_000_000_000,
+            open: 0.0,
+            high: 0.83762,
+            low: 0.0,
+            close: 0.83417,
+            volume: Some(1.0),
+        };
+        let err = validate_ohlcv_row(&row).expect_err("a zero price must not validate");
+        assert!(
+            err.to_string().contains("non-positive"),
+            "unexpected message: {err}"
+        );
     }
 }

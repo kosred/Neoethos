@@ -90,7 +90,7 @@ fn mean_std(values: &[f64]) -> (f64, f64) {
 /// Real broker data is finer-grained but the 3-bucket approximation
 /// already cuts the live-vs-backtest gap meaningfully because the
 /// London/NY-overlap spread is typically 30-50% of the Asian spread.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SessionSpreadProfile {
     pub asian_pips: f64,
     pub overlap_pips: f64,
@@ -129,6 +129,15 @@ pub struct BacktestSettings {
     pub trailing_enabled: bool,
     pub trailing_atr_multiplier: f64,
     pub trailing_be_trigger_r: f64,
+    /// Pips of profit the trail must lock once it engages, measured from the
+    /// entry.
+    ///
+    /// The other two knobs are multiples of the gene's stop distance, so the
+    /// same pair locks a different amount for every gene: with `trigger -
+    /// distance = 0.1`, a 20-pip stop protects 2 pips and a 10-pip stop only 1.
+    /// An account is not risked in multiples of R, so the floor is absolute —
+    /// once the trail is active the stop never sits closer to entry than this.
+    pub trailing_min_lock_pips: f64,
     pub pip_value: f64,
     pub spread_pips: f64,
     pub commission_per_trade: f64,
@@ -334,10 +343,22 @@ impl Default for BacktestSettings {
             max_hold_bars: 0,
             min_hold_bars: 0,
             max_trades_per_day: 0,
-            gap_threshold_ms: 0,
+            // Four days. Long enough to sit through an FX weekend, which is
+            // about two and a half and is a normal thing to hold through; short
+            // enough to catch a hole in the data.
+            //
+            // This was 0 — detection off — so a position open before a hole was
+            // carried across it as if the market had not moved, and its stop
+            // and target were then tested against prices from the far side.
+            // That mattered before anything was dropped (any missing history
+            // does it) and matters more now that non-positive bars are removed
+            // on read: December 2014 is missing from every series in this
+            // store, twelve days of it on H1.
+            gap_threshold_ms: 4 * 24 * 60 * 60 * 1000,
             trailing_enabled: false,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
+            trailing_min_lock_pips: 2.0,
             pip_value: f64::NAN,
             spread_pips: f64::NAN,
             commission_per_trade: f64::NAN,
@@ -701,7 +722,12 @@ fn entry_sl_tp_pips(settings: &BacktestSettings, i: usize) -> (f64, f64) {
 /// Net effect: a full-SL loss ≈ `risk_pct × equity`, a TP win ≈
 /// `risk_pct × equity × (tp/sl)`.
 #[inline]
-fn risk_based_pos_lots(conf: f64, equity: f64, eff_sl_pips: f64, settings: &BacktestSettings) -> f64 {
+fn risk_based_pos_lots(
+    conf: f64,
+    equity: f64,
+    eff_sl_pips: f64,
+    settings: &BacktestSettings,
+) -> f64 {
     let conf = conf.clamp(0.0, 1.0);
     let risk_min = settings.risk_per_trade_min;
     let risk_max = settings.risk_per_trade_max;
@@ -745,6 +771,14 @@ pub fn fast_evaluate_strategy_core(
     timestamps: &[i64],
     settings: &BacktestSettings,
 ) -> [f64; 11] {
+    // Reports itself on first call — see `eval_telemetry`.
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard("eval::fast_evaluate_strategy_core", 1, std::time::Instant::now());
     let n = close.len();
     if n == 0 {
         return [0.0; 11];
@@ -836,11 +870,8 @@ pub fn fast_evaluate_strategy_core(
 
         let d_val = *day_idx.get(i).unwrap_or(&last_day);
         if d_val != last_day {
-            if last_day != -1 && day_peak > 0.0 {
-                let dd = (day_peak - day_low) / day_peak;
-                if dd > max_daily_dd {
-                    max_daily_dd = dd;
-                }
+            if last_day != -1 {
+                finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
             }
             last_day = d_val;
             day_peak = equity;
@@ -861,7 +892,8 @@ pub fn fast_evaluate_strategy_core(
                 } else {
                     (entry_px - close[i]) / pip * settings.pip_value_per_lot
                 };
-                let pnl = pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
+                let pnl =
+                    pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
                 // Phase C.2: apply broker swap + conversion fee. The swap
                 // term inside also scales with size; pass a per-lot-scaled
                 // pnl AND scale the returned delta so the swap (which uses
@@ -881,7 +913,12 @@ pub fn fast_evaluate_strategy_core(
                     0
                 };
                 let pnl = apply_carry_and_fee_scaled(
-                    pnl, pos_lots, in_pos, entry_ts_ms, exit_ts_ms, settings,
+                    pnl,
+                    pos_lots,
+                    in_pos,
+                    entry_ts_ms,
+                    exit_ts_ms,
+                    settings,
                 );
                 equity += pnl;
                 current_month_pnl += pnl;
@@ -896,7 +933,11 @@ pub fn fast_evaluate_strategy_core(
                 if equity > peak_equity {
                     peak_equity = equity;
                 }
-                if equity < day_low {
+                if equity > day_peak {
+                    finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
+                    day_peak = equity;
+                    day_low = equity;
+                } else if equity < day_low {
                     day_low = equity;
                 }
                 let current_dd = if peak_equity > 0.0 {
@@ -923,10 +964,6 @@ pub fn fast_evaluate_strategy_core(
                 } else {
                     (entry_px - hi) / pip * settings.pip_value_per_lot
                 };
-            if (equity + worst_float_pnl) < day_low {
-                day_low = equity + worst_float_pnl;
-            }
-
             let best_float_pnl = pos_lots
                 * if in_pos == 1 {
                     (hi - entry_px) / pip * settings.pip_value_per_lot
@@ -935,6 +972,17 @@ pub fn fast_evaluate_strategy_core(
                 };
             if (equity + best_float_pnl) > peak_equity {
                 peak_equity = equity + best_float_pnl;
+            }
+            if (equity + best_float_pnl) > day_peak {
+                finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
+                day_peak = equity + best_float_pnl;
+                // A new same-day peak starts a new causal drawdown segment.
+                // Preserve this bar's worst excursion (the canonical
+                // best-before-worst intrabar convention) but discard troughs
+                // that occurred before the new peak.
+                day_low = equity + worst_float_pnl;
+            } else if (equity + worst_float_pnl) < day_low {
+                day_low = equity + worst_float_pnl;
             }
 
             let current_dd = if peak_equity > 0.0 {
@@ -978,8 +1026,14 @@ pub fn fast_evaluate_strategy_core(
                     if !exit && settings.trailing_enabled {
                         let mv = hi - entry_px;
                         if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
+                            // Floor the trail at entry plus the locked profit. The
+                            // multiplier is a fraction of the gene's own stop, so
+                            // without this the amount protected varies per gene and
+                            // is often below the cost of the trade.
+                            let locked = entry_px + settings.trailing_min_lock_pips * pip;
                             let candidate =
-                                hi - (settings.trailing_atr_multiplier * pos_sl_pips * pip);
+                                (hi - (settings.trailing_atr_multiplier * pos_sl_pips * pip))
+                                    .max(locked);
                             if trail_px == 0.0 || candidate > trail_px {
                                 trail_px = candidate;
                             }
@@ -1005,8 +1059,12 @@ pub fn fast_evaluate_strategy_core(
                     if !exit && settings.trailing_enabled {
                         let mv = entry_px - lo;
                         if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
+                            // Mirror of the long floor: never closer to entry than
+                            // the locked profit.
+                            let locked = entry_px - settings.trailing_min_lock_pips * pip;
                             let candidate =
-                                lo + (settings.trailing_atr_multiplier * pos_sl_pips * pip);
+                                (lo + (settings.trailing_atr_multiplier * pos_sl_pips * pip))
+                                    .min(locked);
                             if trail_px == 0.0 || candidate < trail_px {
                                 trail_px = candidate;
                             }
@@ -1031,7 +1089,8 @@ pub fn fast_evaluate_strategy_core(
                 // half-spread cost both scale by the entry-captured
                 // `pos_lots`. (Half-spread was already paid at entry via the
                 // adjusted entry_px; this is the exit-side half + commission.)
-                let pnl = pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
+                let pnl =
+                    pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
                 // Phase C.2: apply broker swap + conversion fee (size-aware).
                 let entry_ts_ms = if use_timestamps && entry_idx >= 0 {
                     timestamps.get(entry_idx as usize).copied().unwrap_or(0)
@@ -1044,7 +1103,12 @@ pub fn fast_evaluate_strategy_core(
                     0
                 };
                 let pnl = apply_carry_and_fee_scaled(
-                    pnl, pos_lots, in_pos, entry_ts_ms, exit_ts_ms, settings,
+                    pnl,
+                    pos_lots,
+                    in_pos,
+                    entry_ts_ms,
+                    exit_ts_ms,
+                    settings,
                 );
                 equity += pnl;
                 current_month_pnl += pnl;
@@ -1059,7 +1123,11 @@ pub fn fast_evaluate_strategy_core(
                 if equity > peak_equity {
                     peak_equity = equity;
                 }
-                if equity < day_low {
+                if equity > day_peak {
+                    finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
+                    day_peak = equity;
+                    day_low = equity;
+                } else if equity < day_low {
                     day_low = equity;
                 }
 
@@ -1117,6 +1185,12 @@ pub fn fast_evaluate_strategy_core(
                 }
             }
         }
+    }
+
+    // The boundary block finalizes only completed days. Include the current
+    // final day so a terminal same-day peak-to-trough move is never dropped.
+    if last_day != -1 {
+        finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
     }
 
     let net_profit = equity - initial_equity;
@@ -1248,6 +1322,15 @@ pub fn fast_evaluate_strategy_core(
     ]
 }
 
+fn finalize_daily_drawdown_segment(day_peak: f64, day_low: f64, max_daily_dd: &mut f64) {
+    if day_peak > 0.0 {
+        let drawdown = (day_peak - day_low) / day_peak;
+        if drawdown > *max_daily_dd {
+            *max_daily_dd = drawdown;
+        }
+    }
+}
+
 pub fn simulate_trades_core(
     close: &[f64],
     high: &[f64],
@@ -1256,6 +1339,14 @@ pub fn simulate_trades_core(
     signals: &[i8],
     settings: &BacktestSettings,
 ) -> Vec<Trade> {
+    // Reports itself on first call — see `eval_telemetry`.
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard("eval::simulate_trades_core", 1, std::time::Instant::now());
     let n = close
         .len()
         .min(high.len())
@@ -1358,8 +1449,7 @@ pub fn simulate_trades_core(
                         duration_hours,
                         mfe: mfe_money,
                         mae: mae_money,
-                        r_multiple: pnl
-                            / (pos_sl_pips * settings.pip_value_per_lot).max(1e-9),
+                        r_multiple: pnl / (pos_sl_pips * settings.pip_value_per_lot).max(1e-9),
                     });
                     in_pos = 0;
                     continue;
@@ -1411,8 +1501,10 @@ pub fn simulate_trades_core(
                 if !exit && settings.trailing_enabled {
                     let mv = hi - entry_px;
                     if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
-                        let candidate =
-                            hi - (settings.trailing_atr_multiplier * pos_sl_pips * pip);
+                        let locked = entry_px + settings.trailing_min_lock_pips * pip;
+                        let candidate = (hi
+                            - (settings.trailing_atr_multiplier * pos_sl_pips * pip))
+                            .max(locked);
                         if trail_px == 0.0 || candidate > trail_px {
                             trail_px = candidate;
                         }
@@ -1435,8 +1527,10 @@ pub fn simulate_trades_core(
                 if !exit && settings.trailing_enabled {
                     let mv = entry_px - lo;
                     if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
-                        let candidate =
-                            lo + (settings.trailing_atr_multiplier * pos_sl_pips * pip);
+                        let locked = entry_px - settings.trailing_min_lock_pips * pip;
+                        let candidate = (lo
+                            + (settings.trailing_atr_multiplier * pos_sl_pips * pip))
+                            .min(locked);
                         if trail_px == 0.0 || candidate < trail_px {
                             trail_px = candidate;
                         }
@@ -1476,8 +1570,7 @@ pub fn simulate_trades_core(
                     duration_hours,
                     mfe: mfe_money,
                     mae: mae_money,
-                    r_multiple: pnl
-                        / (pos_sl_pips * settings.pip_value_per_lot).max(1e-9),
+                    r_multiple: pnl / (pos_sl_pips * settings.pip_value_per_lot).max(1e-9),
                 });
                 in_pos = 0;
             }
@@ -1642,191 +1735,6 @@ fn synthesize_signals_and_confidence_cpu(
     (signals, confidences)
 }
 
-/// Adaptive split state for the CPU+GPU hybrid evaluator. Tracks measured
-/// per-lane throughput (genes/sec) so each population eval routes the GPU the
-/// fraction of genes it can finish in the same wall-time the CPU finishes the
-/// rest — a weak iGPU converges to a small share, a fast discrete GPU to most.
-#[cfg(feature = "gpu")]
-mod hybrid_split {
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Duration;
-
-    struct Rates {
-        cpu_genes_per_s: f64,
-        gpu_genes_per_s: f64,
-        samples: u32,
-        /// Generations seen by `gpu_count` — drives the periodic GPU re-probe.
-        calls: u64,
-        /// Whether the "GPU share decayed to 0" notice has already fired, so the
-        /// fail-loud warning is emitted on the TRANSITION, not every generation.
-        zero_logged: bool,
-        /// Consecutive GPU-lane failures (reset on any success). Drives the
-        /// hard disable below — a device that fails every generation (e.g. an
-        /// integrated GPU that OOMs on the working set) must stop being retried.
-        gpu_failures: u32,
-        /// Latched off: the GPU failed `MAX_GPU_FAILURES` generations in a row,
-        /// so `gpu_count` now returns 0 (full-CPU) for the rest of the process.
-        gpu_disabled: bool,
-    }
-    static RATES: OnceLock<Mutex<Rates>> = OnceLock::new();
-    fn rates() -> &'static Mutex<Rates> {
-        RATES.get_or_init(|| {
-            Mutex::new(Rates {
-                cpu_genes_per_s: 0.0,
-                gpu_genes_per_s: 0.0,
-                samples: 0,
-                calls: 0,
-                zero_logged: false,
-                gpu_failures: 0,
-                gpu_disabled: false,
-            })
-        })
-    }
-
-    /// Consecutive GPU-lane failures after which the GPU is disabled for the
-    /// rest of the process. A single failure can be a transient warmup hiccup
-    /// (a cold kernel, a one-off pool panic); two IN A ROW means the device
-    /// genuinely can't run this eval — the canonical case is an integrated GPU
-    /// whose Vulkan device-local heap is far smaller than its advertised
-    /// per-buffer limit, so the population backtest OOMs (`wgpu error: Out of
-    /// Memory`) every single generation. Without the latch, `gpu_count` keeps
-    /// handing that device a share each generation, the same OOM panic + server
-    /// death repeats, and every generation wastes the GPU-lane attempt before
-    /// the CPU recompute. The re-probe machinery can't help (it only runs off
-    /// `update`, which the failure arm never reaches). Latching off routes all
-    /// genes to the CPU cleanly; restart to re-probe.
-    const MAX_GPU_FAILURES: u32 = 2;
-
-    /// Record a GPU-lane failure for this generation. After `MAX_GPU_FAILURES`
-    /// consecutive failures, latch the GPU off for the process (fail-loud once).
-    pub fn note_gpu_failure() {
-        let mut r = rates().lock().unwrap_or_else(|p| p.into_inner());
-        if r.gpu_disabled {
-            return;
-        }
-        r.gpu_failures = r.gpu_failures.saturating_add(1);
-        if r.gpu_failures >= MAX_GPU_FAILURES {
-            r.gpu_disabled = true;
-            tracing::warn!(
-                target: "neoethos_search::eval",
-                consecutive_failures = r.gpu_failures,
-                "GPU eval lane DISABLED for this process — it failed the GPU \
-                 backtest {MAX_GPU_FAILURES} generations in a row (see the wgpu \
-                 error above; the usual cause is an integrated GPU whose \
-                 device-local memory is too small for this workload). Every gene \
-                 now evaluates on the CPU — correctness is unaffected, only speed. \
-                 Restart the run to re-probe the GPU."
-            );
-        }
-    }
-
-    /// Record a successful GPU-lane generation — clears the consecutive-failure
-    /// streak so an isolated hiccup can never latch the GPU off.
-    pub fn note_gpu_success() {
-        let mut r = rates().lock().unwrap_or_else(|p| p.into_inner());
-        r.gpu_failures = 0;
-    }
-
-    /// Re-probe cadence. Even after the throughput EMA drives the GPU share to 0
-    /// (GPU measured slower than the CPU lane for some workload), force a small
-    /// GPU lane every this-many generations so a GPU that has since become
-    /// competitive — lighter generation, warmed kernels, the next combo, or a
-    /// kernel that was just made faster — gets RE-MEASURED and can recover.
-    /// Without this, `update()` runs only on the success arm, so once `gpu_count`
-    /// returns 0 the GPU lane is never entered again, no fresh measurement is ever
-    /// taken, and the GPU stays abandoned for the whole run (the death-spiral bug,
-    /// fixed 2026-06-09).
-    const REPROBE_EVERY: u64 = 32;
-
-    /// Genes handed to the GPU while (re-)probing.
-    ///
-    /// 2026-06-10: measure the GPU at SCALE — ~half the population. The old
-    /// `n_genes / 20` floor (~25 genes for pop 512) is a self-reinforcing trap:
-    /// per-LAUNCH overhead (client-get, the constant per-sample data upload, kernel
-    /// enqueue, readback sync) is FIXED per call and dominates a tiny chunk, so the
-    /// GPU's measured genes/s is crushed (~74/s observed on the A6000), the EMA
-    /// drives the GPU share to 0, and every re-probe re-measures the SAME tiny
-    /// overhead-dominated chunk → the GPU never recovers. Per-launch overhead only
-    /// amortizes over a LARGE batch (VectorAlpha's 350k pairs/s comes from big
-    /// batches, not small ones), so the re-probe must run the GPU on a big chunk —
-    /// the regime where the GPU/CPU genes/s comparison is actually fair. Half the
-    /// population is a large, representative batch while still leaving real work on
-    /// the CPU lane so the generation still completes if the GPU is genuinely slow.
-    fn probe_floor(n_genes: usize) -> usize {
-        (n_genes / 2).clamp(1, n_genes.saturating_sub(1))
-    }
-
-    /// Genes to route to the GPU lane for a population of `n_genes`. Before any
-    /// measurement, give the GPU a conservative 25 % so we learn its speed
-    /// without a big slowdown if it turns out weak. Once measured, the share is
-    /// proportional to the GPU's fraction of total genes/sec — but it is NEVER
-    /// left at an absorbing 0 (periodic re-probe above) and a much-faster GPU is
-    /// clamped to `n_genes - 1` rather than `n_genes` so the caller's
-    /// `gpu_count < n_genes` guard can't paradoxically disable a winning GPU.
-    pub fn gpu_count(n_genes: usize) -> usize {
-        let mut r = rates().lock().unwrap_or_else(|p| p.into_inner());
-        // Latched off after repeated GPU failures — never hand this device work
-        // again (no more per-generation OOM-panic-then-CPU-recompute churn).
-        if r.gpu_disabled {
-            return 0;
-        }
-        r.calls = r.calls.wrapping_add(1);
-        let due_reprobe = r.calls % REPROBE_EVERY == 0;
-        if r.samples == 0 || r.cpu_genes_per_s <= 0.0 || r.gpu_genes_per_s <= 0.0 {
-            return (n_genes / 4).clamp(1, n_genes.saturating_sub(1));
-        }
-        let frac = r.gpu_genes_per_s / (r.cpu_genes_per_s + r.gpu_genes_per_s);
-        let measured = ((n_genes as f64) * frac).round() as usize;
-        if measured == 0 {
-            if !r.zero_logged {
-                r.zero_logged = true;
-                tracing::warn!(
-                    target: "neoethos_search::eval",
-                    gpu_genes_per_s = r.gpu_genes_per_s,
-                    cpu_genes_per_s = r.cpu_genes_per_s,
-                    reprobe_every = REPROBE_EVERY,
-                    "hybrid GPU lane share decayed to 0 — GPU measured slower than \
-                     the CPU lane for this workload. Routing genes to CPU; will \
-                     re-probe the GPU periodically so it can recover (fail-loud)."
-                );
-            }
-            if due_reprobe {
-                return probe_floor(n_genes);
-            }
-            return 0;
-        }
-        if r.zero_logged {
-            r.zero_logged = false;
-            tracing::info!(
-                target: "neoethos_search::eval",
-                gpu_genes_per_s = r.gpu_genes_per_s,
-                cpu_genes_per_s = r.cpu_genes_per_s,
-                "hybrid GPU lane recovered — re-probe found the GPU competitive again."
-            );
-        }
-        measured.clamp(1, n_genes.saturating_sub(1))
-    }
-
-    /// Fold this generation's measured lane throughputs into the EMA.
-    pub fn update(gpu_genes: usize, gpu_t: Duration, cpu_genes: usize, cpu_t: Duration) {
-        let (gt, ct) = (gpu_t.as_secs_f64(), cpu_t.as_secs_f64());
-        if gt <= 0.0 || ct <= 0.0 || gpu_genes == 0 || cpu_genes == 0 {
-            return;
-        }
-        let gpu_gps = gpu_genes as f64 / gt;
-        let cpu_gps = cpu_genes as f64 / ct;
-        let mut r = rates().lock().unwrap_or_else(|p| p.into_inner());
-        if r.samples == 0 {
-            r.cpu_genes_per_s = cpu_gps;
-            r.gpu_genes_per_s = gpu_gps;
-        } else {
-            r.cpu_genes_per_s = 0.7 * r.cpu_genes_per_s + 0.3 * cpu_gps;
-            r.gpu_genes_per_s = 0.7 * r.gpu_genes_per_s + 0.3 * gpu_gps;
-        }
-        r.samples = r.samples.saturating_add(1);
-    }
-}
-
 /// GPU device ids the scheduler pinned for THIS process, from the plural
 /// `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES` (or CUDA twin), e.g. "0,1,2,3".
 /// Empty when unset (the supported scheduler path). The scheduler deliberately
@@ -1845,20 +1753,33 @@ fn eval_gpu_devices() -> Vec<usize> {
         .unwrap_or_default()
 }
 
-/// Per-card gene cap from the scheduler's VRAM math
-/// (`NEOETHOS_BOT_SEARCH_EVAL_GENES_PER_CARD`). Unset => no cap (even split).
-#[cfg(feature = "gpu")]
-fn eval_genes_per_card_cap() -> usize {
-    std::env::var("NEOETHOS_BOT_SEARCH_EVAL_GENES_PER_CARD")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(usize::MAX)
+/// Materialise the optional `stop_vol_mult` contract into a full-length slice.
+///
+/// The field is documented as optional: an empty slice means every gene uses
+/// its fixed stops. The CPU walk honours that with `.get(g).unwrap_or(0.0)`,
+/// but the GPU dispatch slices it per batch and panics on an empty input. That
+/// panic is caught and retried on the CPU, so the violation surfaced as a
+/// *silent fallback* — a GPU-required run quietly producing CPU numbers, and a
+/// CPU/GPU parity test comparing the CPU against itself and passing. Both lanes
+/// must see identical input, so normalise once at every entry point.
+pub(crate) fn normalized_stop_vol_mult(stop_vol_mult: &[f64], n_genes: usize) -> Option<Vec<f64>> {
+    stop_vol_mult.is_empty().then(|| vec![0.0; n_genes])
 }
 
 pub fn evaluate_population_core(
     inputs: PopulationEvalInputs<'_>,
 ) -> Result<Vec<[f64; 11]>, String> {
+    // Reports itself on first call, so "never used" is visible rather
+    // than inferred. See `eval_telemetry`.
+    let _telemetry_started = std::time::Instant::now();
+    let _telemetry_items = inputs.long_thr.len();
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard("eval::evaluate_population_core", _telemetry_items, _telemetry_started);
     let PopulationEvalInputs {
         close,
         high,
@@ -1884,6 +1805,8 @@ pub fn evaluate_population_core(
     init_rayon();
     let n_genes = long_thr.len();
     let n_samples = close.len();
+    let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
 
     // Per-gene CPU evaluation (signal synthesis + SL/TP backtest). Shared by
     // the full-CPU path and the CPU lane of the CPU+GPU hybrid below.
@@ -1911,28 +1834,32 @@ pub fn evaluate_population_core(
         // Risk-based sizing uses the per-bar confidence; with
         // `risk_based_sizing == false` the slice is ignored (legacy).
         fast_evaluate_strategy_core(
-            close, high, low, &signals, &confidences, month_idx, day_idx, timestamps,
+            close,
+            high,
+            low,
+            &signals,
+            &confidences,
+            month_idx,
+            day_idx,
+            timestamps,
             &gene_settings,
         )
     };
 
-    // ── CPU + GPU hybrid ──────────────────────────────────────────────────
+    // ── Where the population is evaluated ─────────────────────────────────
     //
-    // Run a GPU prefix `[0..gpu_count]` (the cubecl wgpu/CUDA kernel) and the
-    // CPU remainder `[gpu_count..n_genes]` (rayon) CONCURRENTLY, so the GPU and
-    // the CPU cores both work at once. The split adapts to measured per-lane
-    // throughput (`hybrid_split`), so neither lane idles waiting for the other
-    // — a weak iGPU converges to a small share, a fast discrete GPU to most.
-    // Genes are independent, so the merged result equals a whole-population
-    // evaluation; the only difference is the GPU lane's f32 vs the CPU lane's
-    // f64 (bounded by the cpu↔gpu parity test; the GA's determinism policy
-    // already permits this level of noise).
-    // PHASE 1: GPU path disabled until kernel ports risk-based sizing (Phase 2).
-    // The cubecl kernel still uses fixed-1-lot sizing; routing any gene through
-    // it would make the GPU lane's metrics diverge from the new CPU sizing.
-    // Forcing `false` here keeps the unchanged kernel out of the hot path so
-    // the CPU lane handles ALL genes. Re-enable when the GPU kernel ports the
-    // risk-based, confidence-scaled sizing.
+    // A card is present or it is not. There is no third state, and in
+    // particular no per-gene split between the two: that split existed here
+    // until 2026-07-29 and its real effect was to produce a state nobody
+    // designed — a run that put *nothing* on the card while looking exactly
+    // like a healthy one, only slower. A EURUSD M3 discovery spent 10 h 24 m of
+    // its 10 h 44 m on CPU cores that way, and the decision point logged
+    // nothing at all, so it took sampling `nvidia-smi` to notice.
+    //
+    // So: GPU present → the whole population goes to the GPU, and a failure is
+    // returned as an error rather than quietly recomputed on the CPU. No GPU →
+    // the CPU path below. Both outcomes are logged, because "it ran on the
+    // card" has to be a record rather than an inference.
     #[cfg(feature = "gpu")]
     {
         // Phase 2 (2026-06-06): GPU lane ENABLED — the cubecl kernel now ports
@@ -1946,6 +1873,27 @@ pub fn evaluate_population_core(
         // bit-parity with the CPU by the `..._adaptive_stops` parity test), so
         // adaptive genes run on the GPU lane exactly like fixed ones — the old
         // adaptive→CPU fail-safe is no longer needed.
+        // Report each condition separately, once. Two runs of over an hour each
+        // ended with the card at 0 % and no message explaining why, because a
+        // collapsed `&&` chain says nothing about which term was false. Naming
+        // them individually turns "the GPU did not run" into "this specific
+        // condition was false", which is the difference between a diagnosis and
+        // another hour of guessing.
+        {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::info!(
+                    target: "neoethos_search::eval",
+                    sizing_ported = PHASE1_GPU_SIZING_PORTED,
+                    signal_kernel = cuda_eval_signal_kernel_enabled(),
+                    backtest_kernel = cuda_eval_backtest_kernel_enabled(),
+                    integrated_gpu_disabled = integrated_gpu_eval_disabled(),
+                    n_genes,
+                    n_samples,
+                    "population evaluation lane gate"
+                );
+            });
+        }
         if PHASE1_GPU_SIZING_PORTED
             && cuda_eval_signal_kernel_enabled()
             && cuda_eval_backtest_kernel_enabled()
@@ -1957,188 +1905,76 @@ pub fn evaluate_population_core(
             && n_genes >= 4
         {
             let devices = eval_gpu_devices();
-            let gpu_count = hybrid_split::gpu_count(n_genes);
-            if gpu_count > 0 && gpu_count < n_genes {
-                // ── Experimental multi-GPU sharding ──────────────────────
-                // A manual plural-device override shards the GPU-assigned prefix
-                // across cards. The production scheduler does not enable this
-                // path until CubeCL multi-device client isolation is proven.
-                // Genes beyond the optional cap stay on the CPU lane and are
-                // never dropped (see lane_partition::placed_genes).
-                if devices.len() > 1 {
-                    let cap = eval_genes_per_card_cap();
-                    let lanes = crate::lane_partition::partition_gpu_lanes(
-                        gene_offsets,
-                        gpu_count,
-                        &devices,
-                        cap,
+
+            // ── The whole population goes to the card ─────────────────────────
+            //
+            // A 2026-07-28 EURUSD M3 discovery measured the case for this
+            // directly: the GA spent 10 h 24 m on 128 CPU cores, while the
+            // validation tail — 15 walk-forward splits plus 28 CPCV combinations
+            // over the full series, not a lighter workload — took about 20
+            // minutes on the card at 100 % utilisation. The GA is ~97 % of the
+            // runtime and never touched the GPU, because the split below decides
+            // per-gene shares instead of sending the population to the device.
+            //
+            // Splitting also hid the problem for hours: a run that puts nothing
+            // on the card looks identical to a healthy one, only slower, and the
+            // decision point logged nothing. Hence the log line on both
+            // outcomes — "it ran on the GPU" must be a record, not an inference.
+            let started = std::time::Instant::now();
+            match try_evaluate_population_cuda(
+                close,
+                high,
+                low,
+                indicators,
+                gene_offsets,
+                gene_indices,
+                gene_weights,
+                long_thr,
+                short_thr,
+                month_idx,
+                day_idx,
+                timestamps,
+                sl_pips,
+                tp_pips,
+                stop_vol_mult,
+                smc_data,
+                gene_smc_flags,
+                gate_threshold,
+                weights,
+                settings,
+                devices.first().copied(),
+            ) {
+                Ok(rows) if rows.len() == n_genes => {
+                    // INFO, not DEBUG: the app installs its own subscriber, so a
+                    // debug line here is invisible no matter what RUST_LOG says —
+                    // which defeated the entire point of logging the decision.
+                    // Logged once per process; the GA calls this every generation.
+                    static LOGGED: std::sync::Once = std::sync::Once::new();
+                    LOGGED.call_once(|| {
+                    tracing::info!(
+                        target: "neoethos_search::eval",
+                        n_genes,
+                        n_samples,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "population evaluated on the GPU (whole population, no CPU lane)"
                     );
-                    let placed = crate::lane_partition::placed_genes(&lanes);
-                    if placed > 0 {
-                        let (gpu_joined, cpu_lane, cpu_dt) = std::thread::scope(|scope| {
-                            let handles: Vec<_> = lanes
-                                .iter()
-                                .map(|lane| {
-                                    scope.spawn(move || {
-                                        let gs = lane.gene_start;
-                                        let ge = lane.gene_end;
-                                        let t = std::time::Instant::now();
-                                        let r = try_evaluate_population_cuda(
-                                            close,
-                                            high,
-                                            low,
-                                            indicators,
-                                            &lane.rebased_offsets,
-                                            &gene_indices[lane.idx_start..lane.idx_end],
-                                            &gene_weights[lane.idx_start..lane.idx_end],
-                                            &long_thr[gs..ge],
-                                            &short_thr[gs..ge],
-                                            month_idx,
-                                            day_idx,
-                                            timestamps,
-                                            &sl_pips[gs..ge],
-                                            &tp_pips[gs..ge],
-                                            &stop_vol_mult[gs..ge],
-                                            smc_data,
-                                            &gene_smc_flags[gs..ge],
-                                            gate_threshold,
-                                            weights,
-                                            settings,
-                                            Some(lane.device_id),
-                                        );
-                                        (r, t.elapsed())
-                                    })
-                                })
-                                .collect();
-                            let t = std::time::Instant::now();
-                            let cpu_lane: Vec<[f64; 11]> = (placed..n_genes)
-                                .into_par_iter()
-                                .map(&eval_gene_cpu)
-                                .collect();
-                            let cpu_dt = t.elapsed();
-                            let joined: Vec<_> =
-                                handles.into_iter().map(|h| h.join()).collect();
-                            (joined, cpu_lane, cpu_dt)
-                        });
-
-                        let mut gpu_out: Vec<[f64; 11]> = Vec::with_capacity(placed);
-                        let mut max_gpu_dt = std::time::Duration::ZERO;
-                        let mut all_ok = true;
-                        for (lane, joined) in lanes.iter().zip(gpu_joined.into_iter()) {
-                            match joined {
-                                Ok((Ok(part), dt)) if part.len() == lane.gene_count() => {
-                                    gpu_out.extend_from_slice(&part);
-                                    if dt > max_gpu_dt {
-                                        max_gpu_dt = dt;
-                                    }
-                                }
-                                Ok((Ok(_), _)) => {
-                                    tracing::warn!(
-                                        "multi-GPU lane returned the wrong gene count — CPU recompute"
-                                    );
-                                    all_ok = false;
-                                    break;
-                                }
-                                Ok((Err(e), _)) => {
-                                    tracing::warn!("multi-GPU lane failed ({e}) — CPU recompute");
-                                    all_ok = false;
-                                    break;
-                                }
-                                Err(_) => {
-                                    tracing::warn!("multi-GPU lane panicked — CPU recompute");
-                                    all_ok = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if all_ok && gpu_out.len() == placed {
-                            hybrid_split::update(placed, max_gpu_dt, n_genes - placed, cpu_dt);
-                            hybrid_split::note_gpu_success();
-                            let mut out = Vec::with_capacity(n_genes);
-                            out.extend_from_slice(&gpu_out);
-                            out.extend_from_slice(&cpu_lane);
-                            return Ok(out);
-                        }
-                        // Any lane unusable: record the failure (latches the GPU
-                        // off after repeated failures), recompute the GPU portion
-                        // on the CPU, keep the CPU lane we already have.
-                        hybrid_split::note_gpu_failure();
-                        let mut out: Vec<[f64; 11]> =
-                            (0..placed).into_par_iter().map(&eval_gene_cpu).collect();
-                        out.extend_from_slice(&cpu_lane);
-                        return Ok(out);
-                    }
-                }
-
-                // ── Single-device hybrid (default, or 0–1 pinned card) ────
-                let device_override = if devices.len() == 1 {
-                    devices.first().copied()
-                } else {
-                    None
-                };
-                let gpu_entry_end = gene_offsets[gpu_count] as usize;
-                let (gpu_outcome, cpu_lane, cpu_dt) = std::thread::scope(|scope| {
-                    let gpu_thread = scope.spawn(|| {
-                        let t = std::time::Instant::now();
-                        let r = try_evaluate_population_cuda(
-                            close,
-                            high,
-                            low,
-                            indicators,
-                            &gene_offsets[..=gpu_count],
-                            &gene_indices[..gpu_entry_end],
-                            &gene_weights[..gpu_entry_end],
-                            &long_thr[..gpu_count],
-                            &short_thr[..gpu_count],
-                            month_idx,
-                            day_idx,
-                            timestamps,
-                            &sl_pips[..gpu_count],
-                            &tp_pips[..gpu_count],
-                            &stop_vol_mult[..gpu_count],
-                            smc_data,
-                            &gene_smc_flags[..gpu_count],
-                            gate_threshold,
-                            weights,
-                            settings,
-                            device_override,
-                        );
-                        (r, t.elapsed())
                     });
-                    let t = std::time::Instant::now();
-                    let cpu_lane: Vec<[f64; 11]> =
-                        (gpu_count..n_genes).into_par_iter().map(&eval_gene_cpu).collect();
-                    let cpu_dt = t.elapsed();
-                    (gpu_thread.join(), cpu_lane, cpu_dt)
-                });
-
-                match gpu_outcome {
-                    Ok((Ok(gpu_lane), gpu_dt)) if gpu_lane.len() == gpu_count => {
-                        hybrid_split::update(gpu_count, gpu_dt, n_genes - gpu_count, cpu_dt);
-                        hybrid_split::note_gpu_success();
-                        let mut out = Vec::with_capacity(n_genes);
-                        out.extend_from_slice(&gpu_lane);
-                        out.extend_from_slice(&cpu_lane);
-                        return Ok(out);
-                    }
-                    Ok((Ok(_), _)) => tracing::warn!(
-                        "hybrid GPU lane returned the wrong gene count — recomputing on CPU"
-                    ),
-                    Ok((Err(e), _)) => {
-                        tracing::warn!("hybrid GPU lane failed ({e}) — recomputing on CPU")
-                    }
-                    Err(_) => tracing::warn!("hybrid GPU lane panicked — recomputing on CPU"),
+                    return Ok(rows);
                 }
-                // GPU lane unusable: record the failure (latches the GPU off
-                // after MAX_GPU_FAILURES in a row so we stop retrying a device
-                // that can't run it), keep the CPU lane we already computed, and
-                // only (re)evaluate the GPU-assigned prefix on the CPU.
-                hybrid_split::note_gpu_failure();
-                let mut out: Vec<[f64; 11]> =
-                    (0..gpu_count).into_par_iter().map(&eval_gene_cpu).collect();
-                out.extend_from_slice(&cpu_lane);
-                return Ok(out);
+                Ok(rows) => {
+                    return Err(format!(
+                        "GPU returned {} metric rows for {n_genes} candidates. Refusing to                          substitute CPU results: silent substitution is exactly what made a                          run that never touched the card look identical to a healthy one.",
+                        rows.len()
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "GPU population evaluation failed on device {:?}: {error}. Refusing to                          fall back to the CPU — a card is present, so this is a fault to fix,                          not to work around.",
+                        devices.first()
+                    ));
+                }
             }
+
         }
     }
 
@@ -2178,6 +2014,17 @@ pub fn evaluate_population_core(
 /// `gpu_montecarlo_batch_matches_cpu` pins this to within ±1 run.
 #[cfg(feature = "gpu")]
 pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+    // Reports itself on first call, so "never used" is visible rather
+    // than inferred. See `eval_telemetry`.
+    let _telemetry_started = std::time::Instant::now();
+    let _telemetry_items = inputs.long_thr.len();
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard("eval::validation_backtest_population", _telemetry_items, _telemetry_started);
     let PopulationEvalInputs {
         close,
         high,
@@ -2203,6 +2050,8 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
     init_rayon();
     let n_genes = long_thr.len();
     let n_samples = close.len();
+    let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
     if n_genes == 0 {
         return Vec::new();
     }
@@ -2233,7 +2082,14 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         // Pairs with the shared `adaptive_base_pips` on the cloned settings.
         gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
         fast_evaluate_strategy_core(
-            close, high, low, &signals, &confidences, month_idx, day_idx, timestamps,
+            close,
+            high,
+            low,
+            &signals,
+            &confidences,
+            month_idx,
+            day_idx,
+            timestamps,
             &gene_settings,
         )
     };
@@ -2242,37 +2098,131 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
     // disabled, go straight to CPU. Adaptive per-entry stops are now computed by
     // the cubecl kernel (bit-parity proven), so an adaptive population no longer
     // needs to be forced onto the CPU lane.
-    if cuda_eval_signal_kernel_enabled() && cuda_eval_backtest_kernel_enabled() {
+    //
+    // The integrated-GPU gate belongs here too, and its absence was a real
+    // crash: a 2026-07-28 AUDUSD H1 discovery (88 032 bars) died with
+    // `wgpu error: Out of Memory` after ~9 minutes. The GA lane had correctly
+    // logged "discovery GPU lane SKIPPED — only an integrated/shared-memory GPU
+    // is present" and run on the CPU, but this validation lane never consulted
+    // that gate, so the Monte-Carlo screen kept dispatching populations to the
+    // iGPU's tiny device-local heap until one exhausted it.
+    //
+    // The `catch_unwind` below cannot save it: wgpu reports allocation failure
+    // as a *fatal* error on its own internal thread, which unwinds that thread
+    // rather than the caller. A guard that keeps the work off the device is the
+    // only thing that holds the never-OOM invariant — peak memory must be a
+    // function of the available hardware, and a run may be slow but must not
+    // crash.
+    // Report the verdict once. When this gate is false the code below is never
+    // reached, so the card is skipped WITHOUT a single line in the log — the
+    // failure mode that hid `prop_search_device: cpu` for eight months. A
+    // measured run had 770 500 of 778 205 validation items on the CPU with
+    // nothing said about why; whichever branch is responsible, it now says so.
+    let signal_ok = cuda_eval_signal_kernel_enabled();
+    let backtest_ok = cuda_eval_backtest_kernel_enabled();
+    let integrated = integrated_gpu_eval_disabled();
+    static GATE_REPORTED: std::sync::Once = std::sync::Once::new();
+    GATE_REPORTED.call_once(|| {
+        if signal_ok && backtest_ok && !integrated {
+            tracing::info!(
+                target: "neoethos_search::eval",
+                "validation GPU gate OPEN — populations dispatch to the card"
+            );
+        } else {
+            tracing::warn!(
+                target: "neoethos_search::eval",
+                signal_kernel_enabled = signal_ok,
+                backtest_kernel_enabled = backtest_ok,
+                integrated_gpu_skip = integrated,
+                "validation GPU gate CLOSED — every population runs on the CPU"
+            );
+        }
+    });
+    if signal_ok && backtest_ok && !integrated {
         let device_override = eval_gpu_devices().first().copied();
         // catch_unwind is the ONLY mitigation for cubecl #243 pool-panics
         // (no Result-returning launch in cubecl 0.10). `AssertUnwindSafe` is
         // sound here: on a panic we discard every partial GPU result and
         // recompute the WHOLE population on the CPU, so no observer sees a
         // torn intermediate.
+        // Prototype B, the same engine the GA uses.
+        //
+        // Validation went through the cubecl path while the GA went through
+        // prototype B, and the two were never compared because nothing measured
+        // them together. Prototype B is now the one that decides exits in the
+        // reduce, needs no event buffer, and evaluates a population 8.7x faster
+        // with P&L parity against the CPU proven on a real card.
+        //
+        // The split mattered more than it looks: validation is 99.9 % of a run
+        // — 1 231 s of which the GA is 1.2 s — so every kernel improvement so
+        // far applied to a tenth of a percent of the work. The argument lists
+        // are identical, which is why this had gone unnoticed.
+        // `gpu-cuda` links prototype B, so call it directly — that is the
+        // routing 3e72c380 landed. But `gpu-vulkan` and `gpu-rocm` enable `gpu`
+        // WITHOUT `gpu-b-adapter`, and the module below is gated on it
+        // (gpu_native/mod.rs:17-18), so naming it unconditionally inside a
+        // `gpu`-only function made both of those builds fail to compile:
+        //   error[E0433]: cannot find `prototype_b_population_eval` in `gpu_native`
+        // CI builds and parity-tests exactly those two (ci.yml:205/210/248), so
+        // this was a red pipeline, not a theoretical gap. Found by two
+        // independent reviews that ran the check rather than reading the code.
+        //
+        // The argument lists are identical — the same property that let the
+        // original split hide — so the non-CUDA arm is a swap, not a rewrite.
+        // On `gpu-cuda` nothing changes: the direct call is preserved verbatim.
         let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            try_evaluate_population_cuda(
-                close,
-                high,
-                low,
-                indicators,
-                gene_offsets,
-                gene_indices,
-                gene_weights,
-                long_thr,
-                short_thr,
-                month_idx,
-                day_idx,
-                timestamps,
-                sl_pips,
-                tp_pips,
-                stop_vol_mult,
-                smc_data,
-                gene_smc_flags,
-                gate_threshold,
-                weights,
-                settings,
-                device_override,
-            )
+            #[cfg(feature = "gpu-b-adapter")]
+            {
+                crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
+                    close,
+                    high,
+                    low,
+                    indicators,
+                    gene_offsets,
+                    gene_indices,
+                    gene_weights,
+                    long_thr,
+                    short_thr,
+                    month_idx,
+                    day_idx,
+                    timestamps,
+                    sl_pips,
+                    tp_pips,
+                    stop_vol_mult,
+                    smc_data,
+                    gene_smc_flags,
+                    gate_threshold,
+                    weights,
+                    settings,
+                    device_override,
+                )
+            }
+            #[cfg(not(feature = "gpu-b-adapter"))]
+            {
+                crate::cubecl_eval::try_evaluate_population_cuda(
+                    close,
+                    high,
+                    low,
+                    indicators,
+                    gene_offsets,
+                    gene_indices,
+                    gene_weights,
+                    long_thr,
+                    short_thr,
+                    month_idx,
+                    day_idx,
+                    timestamps,
+                    sl_pips,
+                    tp_pips,
+                    stop_vol_mult,
+                    smc_data,
+                    gene_smc_flags,
+                    gate_threshold,
+                    weights,
+                    settings,
+                    device_override,
+                )
+            }
         }));
         // Classify the outcome, then let the shared policy decide. The default
         // (NEOETHOS_REQUIRE_GPU unset) always recomputes on the CPU — identical
@@ -2281,9 +2231,37 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         use crate::gpu_fallback::{FallbackDecision, GpuFailure, decide_env};
         let failure = match gpu {
             Ok(Ok(v)) if v.len() == n_genes => return v,
-            Ok(Ok(_)) => GpuFailure::WrongShape,
-            Ok(Err(_)) => GpuFailure::AllocationPressure,
-            Err(_) => GpuFailure::AllocationPressure, // cubecl#243 pool panic
+            Ok(Ok(rows)) => {
+                tracing::warn!(
+                    target: "neoethos_search::eval",
+                    expected = n_genes,
+                    returned = rows.len(),
+                    "validation GPU returned the wrong number of rows"
+                );
+                GpuFailure::WrongShape
+            }
+            // The error was discarded and every failure reported as allocation
+            // pressure, which sent every investigation looking at memory. A
+            // measured run had 648 600 of 655 086 items take this branch — the
+            // card doing almost none of the validation — and the reason never
+            // reached the log.
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: "neoethos_search::eval",
+                    genes = n_genes,
+                    error = format!("{error:#}"),
+                    "validation GPU lane refused the work — this is why it is on the CPU"
+                );
+                GpuFailure::AllocationPressure
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "neoethos_search::eval",
+                    genes = n_genes,
+                    "validation GPU lane panicked (cubecl #243 pool) — falling back"
+                );
+                GpuFailure::AllocationPressure
+            }
         };
         match decide_env(failure) {
             FallbackDecision::FailLoud => panic!(
@@ -2311,6 +2289,17 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
 /// against. There is exactly one CPU population implementation, so the reference
 /// can never drift from what actually runs.
 pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+    // Reports itself on first call, so "never used" is visible rather
+    // than inferred. See `eval_telemetry`.
+    let _telemetry_started = std::time::Instant::now();
+    let _telemetry_items = inputs.long_thr.len();
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard("eval::validation_backtest_population_cpu", _telemetry_items, _telemetry_started);
     let PopulationEvalInputs {
         close,
         high,
@@ -2336,6 +2325,8 @@ pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> V
     init_rayon();
     let n_genes = long_thr.len();
     let n_samples = close.len();
+    let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
     if n_genes == 0 {
         return Vec::new();
     }
@@ -2361,7 +2352,14 @@ pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> V
         // Pairs with the shared `adaptive_base_pips` on the cloned settings.
         gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
         fast_evaluate_strategy_core(
-            close, high, low, &signals, &confidences, month_idx, day_idx, timestamps,
+            close,
+            high,
+            low,
+            &signals,
+            &confidences,
+            month_idx,
+            day_idx,
+            timestamps,
             &gene_settings,
         )
     };
@@ -2464,6 +2462,88 @@ mod overrides_tests {
         assert!(observed.month_capacity > 0);
     }
 
+    #[test]
+    fn daily_drawdown_tracks_intraday_peak_and_finalizes_at_day_boundary() {
+        let close = [100.0, 100.0, 10_100.0, 100.0, -4_900.0, -4_900.0];
+        let high = [100.0, 100.0, 10_100.0, 100.0, 100.0, -4_900.0];
+        let low = [100.0, 100.0, 10_100.0, 100.0, -4_900.0, -4_900.0];
+        // First long: +10k target on bar 2. Second long: -5k stop on bar 4.
+        let signals = [1_i8, 0, 1, 0, 0, 0];
+        let months = [0_i64; 6];
+        let days = [0_i64, 0, 0, 0, 0, 1];
+        let mut settings = BacktestSettings::default();
+        settings.sl_pips = 5_000.0;
+        settings.tp_pips = 10_000.0;
+        settings.pip_value = 1.0;
+        settings.pip_value_per_lot = 1.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.risk_based_sizing = false;
+
+        let metrics = fast_evaluate_strategy_core(
+            &close,
+            &high,
+            &low,
+            &signals,
+            &[],
+            &months,
+            &days,
+            &[],
+            &settings,
+        );
+        let expected = 5_000.0 / 110_000.0;
+        assert_eq!(metrics[8], 2.0);
+        assert!(
+            (metrics[10] - expected).abs() < 1.0e-12,
+            "daily DD must be (110k-105k)/110k={expected}, got {}",
+            metrics[10]
+        );
+    }
+
+    #[test]
+    fn daily_drawdown_preserves_a_trough_before_a_later_same_day_peak() {
+        let close = [100.0, 100.0, -9_900.0, 100.0, 20_100.0, 20_100.0];
+        let high = [100.0, 100.0, 100.0, 100.0, 20_100.0, 20_100.0];
+        let low = [100.0, 100.0, -9_900.0, 100.0, 20_100.0, 20_100.0];
+        // Realized equity path: 100k -> 90k -> 110k -> 110k, all on day zero.
+        let signals = [1_i8, 0, 1, 0, 0, 0];
+        let months = [0_i64; 6];
+        let days = [0_i64, 0, 0, 0, 0, 1];
+        let mut settings = BacktestSettings::default();
+        settings.sl_pips = 10_000.0;
+        settings.tp_pips = 20_000.0;
+        settings.pip_value = 1.0;
+        settings.pip_value_per_lot = 1.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.risk_based_sizing = false;
+
+        let metrics = fast_evaluate_strategy_core(
+            &close,
+            &high,
+            &low,
+            &signals,
+            &[],
+            &months,
+            &days,
+            &[],
+            &settings,
+        );
+
+        assert_eq!(metrics[8], 2.0);
+        assert!(
+            (metrics[10] - 0.10).abs() < 1.0e-12,
+            "the 100k -> 90k segment must remain a 10% daily drawdown after the 110k peak, got {}",
+            metrics[10]
+        );
+    }
+
     // ─── Phase C.2 carry-cost + conversion-fee helper ────────────────
     //
     // These tests pin the math used by every trade-close branch of the
@@ -2542,7 +2622,10 @@ mod overrides_tests {
         // entry_ts = 0 means "no timestamp data": skip swap entirely.
         let s = settings_with_carry(-100.0, -100.0, 0.0, 10.0);
         let net = apply_carry_and_fee(50.0, 1, 0, 1_700_000_000_000, &s);
-        assert!((net - 50.0).abs() < 1e-9, "expected 50.0 (no swap), got {net}");
+        assert!(
+            (net - 50.0).abs() < 1e-9,
+            "expected 50.0 (no swap), got {net}"
+        );
     }
 
     #[test]
@@ -2619,7 +2702,15 @@ mod overrides_tests {
         settings.high_quality_confidence = 0.65;
 
         fast_evaluate_strategy_core(
-            &close, &high, &low, &signals, confidences, &months, &days, &[], &settings,
+            &close,
+            &high,
+            &low,
+            &signals,
+            confidences,
+            &months,
+            &days,
+            &[],
+            &settings,
         )
     }
 
@@ -2637,7 +2728,10 @@ mod overrides_tests {
             let m = run_single_sl_trade(sl_pips, true, risk, risk, &conf);
             let net_profit = m[0];
             let trade_count = m[8];
-            assert_eq!(trade_count, 1.0, "expected exactly one trade (sl={sl_pips})");
+            assert_eq!(
+                trade_count, 1.0,
+                "expected exactly one trade (sl={sl_pips})"
+            );
             assert!(
                 (net_profit - expected_loss).abs() < 1e-6,
                 "sl={sl_pips}: full-SL loss should be {expected_loss} (1% of {initial_equity}), got {net_profit}"
@@ -2701,14 +2795,15 @@ mod overrides_tests {
         base.risk_based_sizing = false; // fixed 1 lot → deterministic PnL
 
         let run = |s: &BacktestSettings| {
-            fast_evaluate_strategy_core(
-                &close, &high, &low, &signals, &[], &months, &days, &[], s,
-            )
+            fast_evaluate_strategy_core(&close, &high, &low, &signals, &[], &months, &days, &[], s)
         };
 
         // (1) fixed scalar path.
         let fixed = run(&base);
-        assert_eq!(fixed[8], 1.0, "the 15-pip scalar stop should produce one trade");
+        assert_eq!(
+            fixed[8], 1.0,
+            "the 15-pip scalar stop should produce one trade"
+        );
 
         // (2) an adaptive series IDENTICAL to the scalar must be byte-identical.
         let mut same = base.clone();
@@ -2774,9 +2869,7 @@ mod overrides_tests {
         base.trailing_atr_multiplier = 1.0;
 
         let run = |s: &BacktestSettings| {
-            fast_evaluate_strategy_core(
-                &close, &high, &low, &signals, &[], &months, &days, &[], s,
-            )
+            fast_evaluate_strategy_core(&close, &high, &low, &signals, &[], &months, &days, &[], s)
         };
 
         let mut off = base.clone();
@@ -2904,7 +2997,15 @@ mod gpu_cpu_parity_tests {
                 // sizing; the GPU kernel recomputes confidence on-device, so this
                 // asserts both lanes agree on sizing AND slot-7.
                 fast_evaluate_strategy_core(
-                    &close, &high, &low, &signals, &conf, &month_idx, &day_idx, &timestamps, &s,
+                    &close,
+                    &high,
+                    &low,
+                    &signals,
+                    &conf,
+                    &month_idx,
+                    &day_idx,
+                    &timestamps,
+                    &s,
                 )
             })
             .collect();
@@ -3111,8 +3212,7 @@ mod gpu_cpu_parity_tests {
                 let mut s = settings.clone();
                 s.sl_pips = sl_pips[g];
                 s.tp_pips = tp_pips[g];
-                let trades =
-                    simulate_trades_core(&close, &high, &low, &timestamps, &signals, &s);
+                let trades = simulate_trades_core(&close, &high, &low, &timestamps, &signals, &s);
                 let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
                     trades: &trades,
                     initial_balance,
@@ -3244,7 +3344,11 @@ mod gpu_cpu_parity_tests {
         let base =
             crate::stop_target::adaptive_base_pips_series(&high, &low, &close, settings.pip_value)
                 .expect("base vol series builds on 800 bars");
-        assert_eq!(base.len(), n_samples, "base series must align with n_samples");
+        assert_eq!(
+            base.len(),
+            n_samples,
+            "base series must align with n_samples"
+        );
         settings.adaptive_base_pips = Some(base.into());
         settings.adaptive_rr = 2.0;
 
@@ -3270,7 +3374,15 @@ mod gpu_cpu_parity_tests {
                 s.tp_pips = tp_pips[g];
                 s.adaptive_vol_mult = stop_vol_mult[g];
                 fast_evaluate_strategy_core(
-                    &close, &high, &low, &signals, &conf, &month_idx, &day_idx, &timestamps, &s,
+                    &close,
+                    &high,
+                    &low,
+                    &signals,
+                    &conf,
+                    &month_idx,
+                    &day_idx,
+                    &timestamps,
+                    &s,
                 )
             })
             .collect();
@@ -3453,7 +3565,15 @@ mod gpu_cpu_parity_tests {
                 s.sl_pips = sl_pips[g];
                 s.tp_pips = tp_pips[g];
                 fast_evaluate_strategy_core(
-                    &close, &high, &low, &signals, &conf, &month_idx, &day_idx, &timestamps, &s,
+                    &close,
+                    &high,
+                    &low,
+                    &signals,
+                    &conf,
+                    &month_idx,
+                    &day_idx,
+                    &timestamps,
+                    &s,
                 )
             })
             .collect();
@@ -3514,8 +3634,8 @@ mod gpu_cpu_parity_tests {
                 return;
             }
         };
-        let gpu_b = run_gpu_with_cap("16")
-            .expect("second-granularity GPU eval after the first succeeded");
+        let gpu_b =
+            run_gpu_with_cap("16").expect("second-granularity GPU eval after the first succeeded");
 
         assert_eq!(gpu_a.len(), n_genes, "gpu(cap=8) wrong gene count");
         assert_eq!(gpu_b.len(), n_genes, "gpu(cap=16) wrong gene count");
@@ -3699,8 +3819,7 @@ mod gpu_cpu_parity_tests {
             let mut s = settings.clone();
             s.sl_pips = sl_pips[run];
             s.tp_pips = tp_pips[run];
-            let trades =
-                simulate_trades_core(&close, &high, &low, &timestamps, &signals, &s);
+            let trades = simulate_trades_core(&close, &high, &low, &timestamps, &signals, &s);
             let net: f64 = trades.iter().map(|t| t.pnl).sum();
             cpu_net.push(net);
             if net > 0.0 {
@@ -3865,9 +3984,7 @@ mod gpu_cpu_parity_tests {
                 row
             })
             .collect();
-        let smc_weights = [
-            0.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-        ];
+        let smc_weights = [0.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
         let gate_threshold = 1.0f32;
 
         // Full-series month/day buckets (gathered per fold below).
@@ -3930,7 +4047,15 @@ mod gpu_cpu_parity_tests {
                 s.sl_pips = sl_pips[g];
                 s.tp_pips = tp_pips[g];
                 fast_evaluate_strategy_core(
-                    &g_close, &g_high, &g_low, &g_sig, &g_conf, &g_month, &g_day, &[], &s,
+                    &g_close,
+                    &g_high,
+                    &g_low,
+                    &g_sig,
+                    &g_conf,
+                    &g_month,
+                    &g_day,
+                    &[],
+                    &s,
                 )
             })
             .collect();
@@ -4199,7 +4324,9 @@ mod gpu_cpu_parity_tests {
 
         // ── GPU PATH — contiguous slice of the indicators/SMC; the kernel
         // re-synthesizes signals on the slice and backtests (or CPU-falls-back). ──
-        let win_ind = indicators.slice(ndarray::s![.., test_start..end]).to_owned();
+        let win_ind = indicators
+            .slice(ndarray::s![.., test_start..end])
+            .to_owned();
         let win_smc: Vec<SmcRow> = full_smc[test_start..end].to_vec();
 
         // Half (1): the re-synthesized window signals must equal the precomputed
@@ -4285,7 +4412,11 @@ mod gpu_cpu_parity_tests {
             weights: &smc_weights,
             settings: &settings,
         });
-        assert_eq!(gpu.len(), n_genes, "gpu walk-forward returned wrong gene count");
+        assert_eq!(
+            gpu.len(),
+            n_genes,
+            "gpu walk-forward returned wrong gene count"
+        );
 
         // The WF path consumes metric slots 0 (net_profit), 3 (max_dd), 4
         // (win_rate), 8 (trade_count); slot 10 (max_daily_dd) feeds the risk
@@ -4307,5 +4438,337 @@ mod gpu_cpu_parity_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "gpu-b-adapter"))]
+mod trailing_parity_tests {
+    use super::*;
+
+    /// The case that had no test at all.
+    ///
+    /// Every parity fixture ran with `trailing_enabled: false`, so the kernel's
+    /// complete absence of a trailing stop — while the CPU engine applies one by
+    /// default — passed every check for as long as the suite existed. This is
+    /// the same workload with it on.
+    ///
+    /// It compares the money, not just the exits: a trailing stop closes at a
+    /// level that moved, and rebuilding the exit price from the original stop
+    /// gives the right bar and the wrong profit, which only a P&L comparison
+    /// catches.
+    #[test]
+    fn gpu_matches_cpu_with_a_trailing_stop() {
+        let n_samples = 1_200usize;
+        let n_genes = 4usize;
+        // A series with sustained runs, so the trail actually arms and ratchets
+        // rather than every trade dying on the initial stop.
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| {
+                let t = i as f64;
+                1.1000 + (t / 220.0).sin() * 0.0090 + (t / 37.0).sin() * 0.0016
+            })
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0006).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0006).collect();
+        let indicators = ndarray::Array2::from_shape_fn((4, n_samples), |(f, i)| {
+            let t = i as f64;
+            ((t / (18.0 + 11.0 * f as f64)).sin()) as f32
+        });
+        let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
+        let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 0];
+        let gene_weights: Vec<f32> = vec![1.0; 8];
+        let long_thr: Vec<f32> = vec![0.25; n_genes];
+        let short_thr: Vec<f32> = vec![-0.25; n_genes];
+        let sl_pips: Vec<f64> = vec![20.0; n_genes];
+        let tp_pips: Vec<f64> = vec![60.0; n_genes];
+        let stop_vol_mult: Vec<f64> = vec![0.0; n_genes];
+        let months: Vec<i64> = (0..n_samples).map(|i| (i / 200) as i64).collect();
+        let days: Vec<i64> = (0..n_samples).map(|i| (i / 24) as i64).collect();
+        let timestamps: Vec<i64> = (0..n_samples)
+            .map(|i| 1_600_000_000_000 + (i as i64) * 3_600_000)
+            .collect();
+        let smc: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
+        let gene_smc: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
+
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = false;
+        // The operator's own configuration, which is what production runs.
+        settings.trailing_enabled = true;
+        settings.trailing_atr_multiplier = 0.4;
+        settings.trailing_be_trigger_r = 0.1;
+        settings.trailing_min_lock_pips = 2.0;
+
+        let gpu = match crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
+            &close, &high, &low, indicators.view(), &gene_offsets, &gene_indices, &gene_weights,
+            &long_thr, &short_thr, &months, &days, &timestamps, &sl_pips, &tp_pips,
+            &stop_vol_mult, &smc, &gene_smc, 0.0, &[1.0f32; 11], &settings, None,
+        ) {
+            Ok(rows) => rows,
+            // No card here: the assertion is worth nothing without one, and a
+            // skip that says so beats a green test that checked nothing.
+            Err(err) => {
+                eprintln!("skipping trailing parity — no usable device: {err}");
+                return;
+            }
+        };
+
+        let cpu = validation_backtest_population_cpu(PopulationEvalInputs {
+            close: &close, high: &high, low: &low, indicators: indicators.view(),
+            gene_offsets: &gene_offsets, gene_indices: &gene_indices,
+            gene_weights: &gene_weights, long_thr: &long_thr, short_thr: &short_thr,
+            month_idx: &months, day_idx: &days, timestamps: &timestamps,
+            sl_pips: &sl_pips, tp_pips: &tp_pips, stop_vol_mult: &stop_vol_mult,
+            smc_data: &smc, gene_smc_flags: &gene_smc, gate_threshold: 0.0,
+            weights: &[1.0f32; 11], settings: &settings,
+        });
+
+        assert_eq!(gpu.len(), cpu.len());
+        for (gene, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            for slot in 0..11 {
+                let (a, b) = (g[slot], c[slot]);
+                if !a.is_finite() && !b.is_finite() {
+                    continue;
+                }
+                assert!(
+                    (a - b).abs() <= 1e-6 * b.abs().max(1.0),
+                    "gene {gene} slot {slot}: gpu {a} vs cpu {b} — the kernel and the \
+                     CPU disagree about a trailing stop"
+                );
+            }
+        }
+    }
+
+    /// Splits the failure in two: plumbing, or hour boundaries.
+    ///
+    /// All three buckets hold the same non-zero value, so the hour lookup
+    /// cannot matter — every bar resolves to 2.0 whichever branch it takes.
+    /// If this passes and the varied-bucket test fails, the bug is in the hour
+    /// arithmetic. If this fails too, the value is not reaching the kernel at
+    /// all and the buckets are a red herring.
+    #[test]
+    fn uniform_buckets_are_a_scalar_by_another_name() {
+        let n_samples = 1_200usize;
+        let n_genes = 4usize;
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| {
+                let t = i as f64;
+                1.1000 + (t / 220.0).sin() * 0.0090 + (t / 37.0).sin() * 0.0016
+            })
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0006).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0006).collect();
+        let indicators = ndarray::Array2::from_shape_fn((4, n_samples), |(f, i)| {
+            let t = i as f64;
+            ((t / (18.0 + 11.0 * f as f64)).sin()) as f32
+        });
+        let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
+        let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 0];
+        let gene_weights: Vec<f32> = vec![1.0; 8];
+        let long_thr: Vec<f32> = vec![0.25; n_genes];
+        let short_thr: Vec<f32> = vec![-0.25; n_genes];
+        let sl_pips: Vec<f64> = vec![20.0; n_genes];
+        let tp_pips: Vec<f64> = vec![60.0; n_genes];
+        let stop_vol_mult: Vec<f64> = vec![0.0; n_genes];
+        let months: Vec<i64> = (0..n_samples).map(|i| (i / 200) as i64).collect();
+        let days: Vec<i64> = (0..n_samples).map(|i| (i / 24) as i64).collect();
+        let timestamps: Vec<i64> = (0..n_samples)
+            .map(|i| 1_600_000_000_000 + (i as i64) * 3_600_000)
+            .collect();
+        let smc: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
+        let gene_smc: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
+
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = false;
+        settings.trailing_enabled = false;
+        settings.session_spread_profile = Some(SessionSpreadProfile {
+            asian_pips: 2.0,
+            overlap_pips: 2.0,
+            late_ny_pips: 2.0,
+        });
+
+        let gpu = match crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
+            &close, &high, &low, indicators.view(), &gene_offsets, &gene_indices, &gene_weights,
+            &long_thr, &short_thr, &months, &days, &timestamps, &sl_pips, &tp_pips,
+            &stop_vol_mult, &smc, &gene_smc, 0.0, &[1.0f32; 11], &settings, None,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                eprintln!("skipping uniform-bucket parity — no usable device: {err}");
+                return;
+            }
+        };
+
+        let cpu = validation_backtest_population_cpu(PopulationEvalInputs {
+            close: &close, high: &high, low: &low, indicators: indicators.view(),
+            gene_offsets: &gene_offsets, gene_indices: &gene_indices,
+            gene_weights: &gene_weights, long_thr: &long_thr, short_thr: &short_thr,
+            month_idx: &months, day_idx: &days, timestamps: &timestamps,
+            sl_pips: &sl_pips, tp_pips: &tp_pips, stop_vol_mult: &stop_vol_mult,
+            smc_data: &smc, gene_smc_flags: &gene_smc, gate_threshold: 0.0,
+            weights: &[1.0f32; 11], settings: &settings,
+        });
+
+        for (gene, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            eprintln!(
+                "gene {gene}: gpu net {:.4} trades {:.0} | cpu net {:.4} trades {:.0}",
+                g[0], g[8], c[0], c[8]
+            );
+        }
+        for (gene, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            assert!(
+                (g[0] - c[0]).abs() <= 1e-6 * c[0].abs().max(1.0),
+                "gene {gene}: uniform buckets still disagree — the value is not reaching                  the kernel, so the hour arithmetic is not the cause"
+            );
+        }
+    }
+
+    /// The case every fixture leaves off, exactly like the trailing stop did.
+    ///
+    /// `SessionSpreadProfile` has existed on the CPU since the type was
+    /// written, and the device settings had no field to receive it — so a run
+    /// with a profile would have priced trades one way on the CPU and another
+    /// on the card, with nothing to notice. Every parity fixture sets
+    /// `session_spread_profile: None`, which is precisely the value that hides
+    /// it.
+    ///
+    /// The buckets here are deliberately far apart (0.6 / 3.5 / 1.4) and the
+    /// series spans four full days at hourly bars, so every bucket is entered
+    /// many times and a kernel that charged one flat number cannot match.
+    #[test]
+    fn gpu_matches_cpu_with_a_session_spread_profile() {
+        let n_samples = 1_200usize;
+        let n_genes = 4usize;
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| {
+                let t = i as f64;
+                1.1000 + (t / 220.0).sin() * 0.0090 + (t / 37.0).sin() * 0.0016
+            })
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0006).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0006).collect();
+        let indicators = ndarray::Array2::from_shape_fn((4, n_samples), |(f, i)| {
+            let t = i as f64;
+            ((t / (18.0 + 11.0 * f as f64)).sin()) as f32
+        });
+        let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
+        let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 0];
+        let gene_weights: Vec<f32> = vec![1.0; 8];
+        let long_thr: Vec<f32> = vec![0.25; n_genes];
+        let short_thr: Vec<f32> = vec![-0.25; n_genes];
+        let sl_pips: Vec<f64> = vec![20.0; n_genes];
+        let tp_pips: Vec<f64> = vec![60.0; n_genes];
+        let stop_vol_mult: Vec<f64> = vec![0.0; n_genes];
+        let months: Vec<i64> = (0..n_samples).map(|i| (i / 200) as i64).collect();
+        let days: Vec<i64> = (0..n_samples).map(|i| (i / 24) as i64).collect();
+        // Hourly bars from a UTC midnight, so the hour-of-day walks all three
+        // buckets repeatedly rather than sitting in one.
+        let timestamps: Vec<i64> = (0..n_samples)
+            .map(|i| 1_600_000_000_000 + (i as i64) * 3_600_000)
+            .collect();
+        let smc: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
+        let gene_smc: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
+
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        // Deliberately NOT the mean of the buckets: if the kernel ignored the
+        // profile and charged this, the P&L would differ and the test fails.
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = false;
+        settings.trailing_enabled = false;
+        settings.session_spread_profile = Some(SessionSpreadProfile {
+            asian_pips: 3.5,
+            overlap_pips: 0.6,
+            late_ny_pips: 1.4,
+        });
+
+        let gpu = match crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
+            &close, &high, &low, indicators.view(), &gene_offsets, &gene_indices, &gene_weights,
+            &long_thr, &short_thr, &months, &days, &timestamps, &sl_pips, &tp_pips,
+            &stop_vol_mult, &smc, &gene_smc, 0.0, &[1.0f32; 11], &settings, None,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                eprintln!("skipping session-spread parity — no usable device: {err}");
+                return;
+            }
+        };
+
+        let cpu = validation_backtest_population_cpu(PopulationEvalInputs {
+            close: &close, high: &high, low: &low, indicators: indicators.view(),
+            gene_offsets: &gene_offsets, gene_indices: &gene_indices,
+            gene_weights: &gene_weights, long_thr: &long_thr, short_thr: &short_thr,
+            month_idx: &months, day_idx: &days, timestamps: &timestamps,
+            sl_pips: &sl_pips, tp_pips: &tp_pips, stop_vol_mult: &stop_vol_mult,
+            smc_data: &smc, gene_smc_flags: &gene_smc, gate_threshold: 0.0,
+            weights: &[1.0f32; 11], settings: &settings,
+        });
+
+        // Guard the guard: with a flat 0.0 scalar and these buckets, a kernel
+        // that ignored the profile would report a different net profit. If the
+        // fixture ever stops trading, this catches it before the parity loop
+        // passes vacuously.
+        assert!(
+            cpu.iter().any(|row| row[8] > 0.0),
+            "fixture produced no trades — the parity assertion below would be empty"
+        );
+
+        assert_eq!(gpu.len(), cpu.len());
+        for (gene, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            for slot in 0..11 {
+                let (a, b) = (g[slot], c[slot]);
+                if !a.is_finite() && !b.is_finite() {
+                    continue;
+                }
+                assert!(
+                    (a - b).abs() <= 1e-6 * b.abs().max(1.0),
+                    "gene {gene} slot {slot}: gpu {a} vs cpu {b} — the kernel and the                      CPU disagree about the session spread"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gap_threshold_tests {
+    use super::*;
+
+    /// A weekend is normal to hold through; a hole in the data is not.
+    ///
+    /// The default was 0, which switches detection off entirely, so a position
+    /// open before a missing stretch was carried across it and then tested
+    /// against prices from the far side. December 2014 is absent from every
+    /// series in the operator's store — twelve days of it on H1 — so this is
+    /// not hypothetical.
+    #[test]
+    fn the_default_sits_between_a_weekend_and_a_hole() {
+        let day = 24 * 60 * 60 * 1000i64;
+        let threshold = BacktestSettings::default().gap_threshold_ms;
+        assert!(threshold > 0, "detection must not be off by default");
+
+        // An FX weekend is about two and a half days, Friday close to Sunday
+        // open. Flagging those would close every position every week.
+        assert!(
+            threshold > 5 * day / 2,
+            "a weekend would be treated as a gap: {threshold} ms"
+        );
+
+        // The December 2014 hole is twelve days on H1 and far more on D1.
+        assert!(
+            threshold < 12 * day,
+            "the known hole would not be caught: {threshold} ms"
+        );
     }
 }

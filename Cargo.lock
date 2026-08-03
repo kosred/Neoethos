@@ -7387,6 +7387,7 @@ dependencies = [
  "ratatui 0.29.0",
  "serde",
  "serde_json",
+ "sha2",
  "tracing",
 ]
 
@@ -7480,6 +7481,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "neoethos-gpu-contracts"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "neoethos-gpu-cuda"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "neoethos-gpu-contracts",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "neoethos-models"
 version = "0.5.6"
 dependencies = [
@@ -7541,6 +7558,8 @@ dependencies = [
  "ndarray 0.17.2",
  "neoethos-core",
  "neoethos-data",
+ "neoethos-gpu-contracts",
+ "neoethos-gpu-cuda",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "rayon",
@@ -7549,6 +7568,7 @@ dependencies = [
  "statrs",
  "tch",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -16013,6 +16033,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8aa7895696b47dfeb6d3b493152f421fe5f79eb8daf4fb567bcdd70795eb5842"
 dependencies = [
  "bindgen 0.71.1",
+ "cmake",
  "dunce",
  "libc",
  "reqwest 0.12.28",

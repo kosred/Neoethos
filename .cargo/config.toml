@@ -32,4 +32,20 @@ rustflags = ["-C", "target-cpu=x86-64-v3", "-Z", "threads=8"]
 # AVX2 + mold linker (parallel, ~5-10x faster link of the 100MB+ binary) +
 # -Zthreads=8 (parallel rustc frontend across cores). mold needs `apt install
 # mold`; -Zthreads needs the nightly toolchain pinned in rust-toolchain.toml.
+#
+# WARNING: never use mold for a build that links native CUDA device code.
+# Measured on a rented RTX 3060 Ti (2026-07-27, mold 1.0.3, CUDA 12.2): mold
+# emits TWO `.init_array` sections while the `DT_INIT_ARRAYSZ` dynamic tag
+# covers only 8 bytes of them, so nvcc's `__sti____cudaRegisterAllv`
+# constructors never run. The fatbin is present in the binary, the build and
+# the link both succeed, and then every kernel launch fails at runtime with
+# "invalid device function". The same build passes unchanged with the default
+# linker.
+#
+# Any `--features gpu-cuda` / `gpu-b-native` build must override the linker,
+# exactly as scripts/gpu-bench/remote_bootstrap.sh does:
+#
+#   RUSTFLAGS="-C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=bfd"
+#
+# RUSTFLAGS replaces this whole list, so restate target-cpu when you use it.
 rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "link-arg=-fuse-ld=mold", "-Z", "threads=8"]

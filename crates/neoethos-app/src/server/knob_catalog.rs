@@ -58,8 +58,35 @@ pub struct KnobEntry {
     /// Human-readable display name for the Settings card.
     pub label: &'static str,
 
-    /// Legacy env-var name (still honoured for backward compat).
-    /// `None` when the knob has no env-var equivalent.
+    /// Historical env-var name for this knob. `None` when it never had one.
+    ///
+    /// ⚠ THIS IS NOT A PROMISE THAT SETTING IT DOES ANYTHING. The previous
+    /// wording — "still honoured for backward compat" — was untrue for a large
+    /// share of these entries and it was being shown to the operator in the
+    /// Settings UI.
+    ///
+    /// Concretely: the ~35 `NEOETHOS_BOT_PROP_*` / `_SEARCH_SEED` /
+    /// `_NOVELTY_WEIGHT` entries are read only by the `*_from_env` constructors
+    /// in `neoethos-search/src/genetic/runtime_overrides.rs`, whose sole entry
+    /// point `install_search_runtime_overrides_from_env` had ZERO production
+    /// callers and was deleted on 2026-08-03. Production installs the config
+    /// path (`install_search_runtime_overrides_from_settings`, called from
+    /// app/src/lib.rs:29 and cli/src/main.rs:33), which reads
+    /// `models.search_runtime`. So for those knobs the CONFIG is authoritative
+    /// and the env var is inert. `config.rs` even records that
+    /// `NEOETHOS_PROP_FIRM_PRESET` "was retired in v0.4.36" while this catalog
+    /// still lists it.
+    ///
+    /// NOT YET AUDITED PER ENTRY. Two attempts to classify all 49 by grep gave
+    /// contradictory answers — the readers use helper functions rather than a
+    /// literal `env::var("NAME")`, so a naive pattern misses them, and that
+    /// exact mistake has produced two wrong findings on this branch already.
+    /// Until each entry is traced from catalog → reader → production caller,
+    /// treat this field as PROVENANCE, not behaviour.
+    ///
+    /// The direction is one config for everything and no env vars, so the end
+    /// state for this field is removal — after the migration, not before, and
+    /// with the UI updated in the same change since it keys on `id`.
     pub env_var: Option<&'static str>,
 
     /// What kind of widget the UI should render. **2026-05-26**: this
