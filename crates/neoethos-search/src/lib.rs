@@ -161,25 +161,35 @@ pub use validation::{
     write_prop_firm_risk_validation_artifact_atomic, write_walkforward_validation_artifact_atomic,
 };
 
-/// Convenience entry point that installs every typed runtime-override
-/// boundary from the legacy `NEOETHOS_BOT_*` env vars in a single call.
-/// Production binaries (`neoethos-cli`, `neoethos-app`) invoke this once at
-/// startup so the search crate itself never reads `std::env` during a run.
-pub fn install_search_runtime_overrides_from_env() {
-    install_backtest_runtime_overrides_from_env();
-    install_quality_runtime_overrides_from_env();
-    install_genetic_search_runtime_overrides_from_env();
-    install_strategy_evaluation_runtime_overrides_from_env();
-    install_smc_search_config_from_env();
-    install_seen_signature_memory_runtime_overrides_from_env();
-}
+// REMOVED 2026-08-03: `install_search_runtime_overrides_from_env()`.
+//
+// Its doc claimed "Production binaries (`neoethos-cli`, `neoethos-app`) invoke
+// this once at startup". They never did — it had ZERO callers, while
+// `knob_catalog.rs` went on advertising ~35 `NEOETHOS_BOT_*` switches to the UI
+// as "still honoured for backward compatibility". Setting any of them did
+// nothing, and the operator was told otherwise by his own program.
+//
+// `install_search_runtime_overrides_from_settings` below strictly supersedes it:
+// it covers all six boundaries (each marked ✓ config) and additionally installs
+// the evaluation backend, which the env version never did. It IS called —
+// neoethos-app/src/lib.rs:29, neoethos-cli/src/main.rs:33, and the discovery
+// probe. The six `*_from_env` children remain; they are still reachable from
+// tests, and retiring them belongs with the wider env→config migration.
+//
+// This is the sixth "mechanism exists, no production caller" defect closed on
+// this branch. The pattern never crashes; the run just quietly means less than
+// it claims.
 
-/// Config-driven entry point — installs the typed runtime-override
-/// boundaries from the single [`neoethos_core::Settings`] instead of the
-/// environment. **Config-consolidation S2 (in progress):** the
-/// genetic-search boundary now reads config (`models.search_runtime`);
-/// the remaining five still read env until their migration lands.
-/// Production binaries call this once at startup after loading `Settings`.
+/// Config-driven entry point — installs every typed runtime-override boundary
+/// from the single [`neoethos_core::Settings`], plus the evaluation backend.
+///
+/// All six boundaries read config; the ✓ markers below are the record of that
+/// migration completing. (This doc previously said "the remaining five still
+/// read env until their migration lands", which the ✓ markers two lines down
+/// already contradicted — corrected 2026-08-03.)
+///
+/// Production binaries call this once at startup after loading `Settings`, and
+/// it is now the ONLY way these boundaries get installed.
 pub fn install_search_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
     install_evaluation_backend_from_settings(s).unwrap_or_else(|error| {
         panic!("invalid discovery evaluation backend configuration: {error}")
