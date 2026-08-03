@@ -159,19 +159,29 @@ pub struct SystemConfig {
     pub smc_atr_displacement: f64,
     pub smc_max_levels: usize,
     pub smc_use_cuda: bool,
-    /// Hardware / accelerator runtime knobs (config-driven replacement for the
-    /// env vars read by `HardwareRuntimeOverrides::from_env`). See
-    /// [`HardwareConfig`].
+    /// Hardware / accelerator runtime knobs. See [`HardwareConfig`].
     #[serde(default)]
     pub hardware: HardwareConfig,
 }
 
-/// Hardware / accelerator runtime knobs — config-driven replacement for the env
-/// vars read by [`crate::system::HardwareRuntimeOverrides::from_env`]:
-/// `NEOETHOS_BOT_CPU_BUDGET`, `NEOETHOS_BOT_TRAIN_PRECISION` (+ the legacy
-/// `FOREX_TRAIN_PRECISION` remnant), `NEOETHOS_BOT_{CUDA,ROCM,WGPU}_PRECISIONS`,
-/// `NEOETHOS_BOT_WGPU_DEVICES`. All-`None`/empty defaults reproduce the
-/// historical env-absent behaviour.
+/// Hardware / accelerator runtime knobs — the ONLY source for these settings.
+///
+/// These replace six env vars that used to be read by
+/// `HardwareRuntimeOverrides::from_env`: `NEOETHOS_BOT_CPU_BUDGET`,
+/// `NEOETHOS_BOT_TRAIN_PRECISION` (plus a legacy `FOREX_TRAIN_PRECISION`
+/// alias), `NEOETHOS_BOT_{CUDA,ROCM,WGPU}_PRECISIONS` and
+/// `NEOETHOS_BOT_WGPU_DEVICES`. That function was deleted on 2026-08-03 because
+/// it had zero callers — so those env vars had already stopped doing anything
+/// long before, while these doc comments went on pointing readers at them.
+/// Setting one and watching nothing change was the intended experience of a
+/// function nobody called.
+///
+/// All-`None`/empty defaults reproduce the historical env-absent behaviour.
+///
+/// ⚠ `NEOETHOS_BOT_CPU_BUDGET` is a partial exception: neoethos-cli still reads
+/// it directly in `main()` and passes it to `apply_process_cpu_assignment`. One
+/// name, two readers, one of them dead — which is precisely the argument for a
+/// single resolution point rather than simply relocating the variables.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HardwareConfig {

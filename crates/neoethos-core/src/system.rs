@@ -60,32 +60,22 @@ pub struct HardwareRuntimeOverrides {
 }
 
 impl HardwareRuntimeOverrides {
-    pub fn from_env() -> Self {
-        Self {
-            cpu_budget: parse_env_usize("NEOETHOS_BOT_CPU_BUDGET"),
-            training_precision: ["NEOETHOS_BOT_TRAIN_PRECISION", "FOREX_TRAIN_PRECISION"]
-                .iter()
-                .find_map(|key| env::var(key).ok())
-                .and_then(|value| parse_training_precision(&value)),
-            cuda_precisions: parse_env_precisions("NEOETHOS_BOT_CUDA_PRECISIONS"),
-            rocm_precisions: parse_env_precisions("NEOETHOS_BOT_ROCM_PRECISIONS"),
-            wgpu_precisions: parse_env_precisions("NEOETHOS_BOT_WGPU_PRECISIONS"),
-            wgpu_device_names: env::var("NEOETHOS_BOT_WGPU_DEVICES")
-                .ok()
-                .map(|raw| {
-                    raw.split(',')
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
-        }
-    }
+    // REMOVED 2026-08-03: `from_env()`. Zero callers — `from_settings` below is
+    // what production installs (system.rs:311 and :651). It read six env vars
+    // that therefore did nothing: NEOETHOS_BOT_CPU_BUDGET,
+    // NEOETHOS_BOT_TRAIN_PRECISION (plus a FOREX_TRAIN_PRECISION alias),
+    // NEOETHOS_BOT_CUDA_PRECISIONS, _ROCM_PRECISIONS, _WGPU_PRECISIONS and
+    // _WGPU_DEVICES. Every one has a config field on `system.hardware`, so
+    // nothing is lost — but anyone who set one and watched precision not change
+    // was fighting a function with no caller.
+    //
+    // NOTE: NEOETHOS_BOT_CPU_BUDGET is NOT dead overall — neoethos-cli reads it
+    // directly in main() and feeds it to apply_process_cpu_assignment. Only this
+    // path was dead. That asymmetry is exactly why a single resolution point
+    // matters more than moving the vars around.
 
-    /// Config-driven constructor (was [`Self::from_env`]). A
-    /// `hardware_from_settings_default_matches_default` test guarantees a fresh
-    /// `Settings` reproduces [`Self::default`] (= the env-absent `from_env`).
+    /// Config-driven constructor. A `hardware_from_settings_default_matches_default`
+    /// test guarantees a fresh `Settings` reproduces [`Self::default`].
     pub fn from_settings(s: &crate::config::Settings) -> Self {
         let c = &s.system.hardware;
         Self {
@@ -1397,32 +1387,18 @@ fn choose_training_precision(
     }
 }
 
-fn parse_env_usize(key: &str) -> Option<usize> {
-    env::var(key)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-}
-
-fn parse_env_precisions(key: &str) -> Option<Vec<TrainingPrecision>> {
-    let values = env::var(key)
-        .ok()?
-        .split(',')
-        .filter_map(parse_training_precision)
-        .collect::<Vec<_>>();
-    (!values.is_empty()).then_some(values)
-}
-
-fn parse_training_precision(value: &str) -> Option<TrainingPrecision> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "fp32" | "f32" | "float32" => Some(TrainingPrecision::Fp32),
-        "fp16" | "f16" | "float16" | "half" => Some(TrainingPrecision::Fp16),
-        "bf16" | "bfloat16" => Some(TrainingPrecision::Bf16),
-        "fp8" | "float8" => Some(TrainingPrecision::Fp8),
-        "bf4" => Some(TrainingPrecision::Bf4),
-        "auto" | "" => None,
-        _ => None,
-    }
-}
+// REMOVED 2026-08-03 with `HardwareRuntimeOverrides::from_env`, which was their
+// only caller: `parse_env_usize`, `parse_env_precisions` and
+// `parse_training_precision`. The compiler named all three the moment the dead
+// parent went — dead code hides behind a dead caller, so a deletion should
+// always be followed by re-reading the warnings rather than stopping at the
+// first thing removed.
+//
+// Note for whoever migrates precision to config: `parse_training_precision` was
+// DUPLICATED in neoethos-search/src/cubecl_eval.rs:1735, which is still live.
+// Two independent parsers for one string vocabulary, in two crates, is the
+// familiar shape — the copy that survives is now the only one, so any future
+// vocabulary change has exactly one place to land.
 
 #[cfg(feature = "gpu-cuda")]
 fn parse_compute_capability(value: &str) -> Option<(i64, i64)> {
