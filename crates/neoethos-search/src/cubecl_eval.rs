@@ -869,9 +869,19 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
         // gap = |lt - st| guarded >= 1e-6; margin = (combined-lt) long / (st-combined) short;
         // conf = (margin/gap).clamp(0,1). Written only where the final signal survives.
         let gap_raw = lt - st;
-        // #1375 WORKAROUND (tracel-ai/cubecl#1375, open): an expression-position
+        // #1375 WORKAROUND (tracel-ai/cubecl#1375): an expression-position
         // `let x = if <runtime cond> { a } else { b }` returns the ELSE branch
         // UNCONDITIONALLY on the wgpu/Vulkan backend (CPU & CUDA are correct).
+        //
+        // STILL OPEN as of 2026-08-02, checked live against the issue, and it is
+        // open at the version this workspace pins (Cargo.lock: cubecl 0.10.0).
+        // Do NOT delete these workarounds on the strength of the issue thread:
+        // wingertge believes PR tracel-ai/cubecl#1355 fixed it, but that PR
+        // merged 2026-05-26 and 0.10.0 shipped 2026-05-07, so the earliest
+        // release that could contain the fix is 0.11.0 (0.11.0-pre.1 is the only
+        // 0.11 on crates.io as of this writing) — and the maintainer's own words
+        // were "I'll try to reproduce", not "fixed". Remove the workarounds only
+        // after the bump to 0.11 AND a device parity run that stays green.
         // Statement-if + RuntimeCell is correct on ALL backends, so this both
         // preserves CPU/CUDA behaviour and FIXES the Vulkan eval — and matches the
         // RuntimeCell idiom used throughout this kernel. gap = |lt - st|, floored 1e-6.
@@ -1388,9 +1398,23 @@ macro_rules! define_backtest_population_kernel {
                                 // multiplier alone cannot guarantee across genes.
                                 let locked = entry_px.read() + trailing_min_lock_pips;
                                 let raw = hi - (trailing_atr_multiplier * sl_distance.read());
-                                let candidate = if raw > locked { raw } else { locked };
-                                if trail_px.read() == 0.0 || candidate > trail_px.read() {
-                                    trail_px.store(candidate);
+                                // #1375 workaround: candidate = max(raw, locked). The
+                                // expression form returned `locked` unconditionally on
+                                // the wgpu backend, so the ATR trail never ratcheted past
+                                // the min-lock floor and every long exited at a stop the
+                                // CPU had already moved. The CPU reference is literally
+                                // `.max(locked)` (eval.rs:1505-1507), so the two engines
+                                // disagreed on the exit price of every trailing trade.
+                                // Statement-if + RuntimeCell is correct
+                                // on all backends — same idiom as the `gap_abs` and
+                                // `gate` workarounds in the signal kernel above.
+                                let candidate = RuntimeCell::<$f>::new(locked);
+                                if raw > locked {
+                                    candidate.store(raw);
+                                }
+                                let candidate_v = candidate.read();
+                                if trail_px.read() == 0.0 || candidate_v > trail_px.read() {
+                                    trail_px.store(candidate_v);
                                 }
                             }
                         }
@@ -1417,9 +1441,15 @@ macro_rules! define_backtest_population_kernel {
                             if mv >= (trailing_be_trigger_r * sl_distance.read()) {
                                 let locked = entry_px.read() - trailing_min_lock_pips;
                                 let raw = lo + (trailing_atr_multiplier * sl_distance.read());
-                                let candidate = if raw < locked { raw } else { locked };
-                                if trail_px.read() == 0.0 || candidate < trail_px.read() {
-                                    trail_px.store(candidate);
+                                // #1375 workaround: candidate = min(raw, locked) — the
+                                // short mirror of the long branch above.
+                                let candidate = RuntimeCell::<$f>::new(locked);
+                                if raw < locked {
+                                    candidate.store(raw);
+                                }
+                                let candidate_v = candidate.read();
+                                if trail_px.read() == 0.0 || candidate_v < trail_px.read() {
+                                    trail_px.store(candidate_v);
                                 }
                             }
                         }

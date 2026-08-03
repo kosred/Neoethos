@@ -2407,6 +2407,32 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
                 )
             }
         }));
+        #[cfg(not(feature = "gpu-b-adapter"))]
+        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            try_evaluate_population_cuda(
+                close,
+                high,
+                low,
+                indicators,
+                gene_offsets,
+                gene_indices,
+                gene_weights,
+                long_thr,
+                short_thr,
+                month_idx,
+                day_idx,
+                timestamps,
+                sl_pips,
+                tp_pips,
+                stop_vol_mult,
+                smc_data,
+                gene_smc_flags,
+                gate_threshold,
+                weights,
+                settings,
+                device_override,
+            )
+        }));
         // Classify the outcome, then let the shared policy decide. The default
         // (NEOETHOS_REQUIRE_GPU unset) always recomputes on the CPU — identical
         // to the historical behaviour. With it set, an availability fault fails
@@ -5249,6 +5275,396 @@ mod gpu_cpu_parity_tests {
                     "WF gene {g} metric[{m}] mismatch: cpu={c} gpu={v} tol={tol} \
                      (contiguous window not bit-faithful to the kernel)"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cubecl_trailing_parity_tests {
+    //! The CubeCL lane's trailing stop, at the settings production actually runs.
+    //!
+    //! `EvaluationConfig::for_symbol` (genetic/strategy_gene.rs:851) HARDCODES
+    //! `trailing_enabled: true`, and both production settings builders copy it —
+    //! `discovery_backtest_settings` (discovery.rs:1358) and the GA's
+    //! `b_settings` (genetic/search_engine.rs:547). Every discovery run trails.
+    //!
+    //! Not one fixture in `gpu_cpu_parity_tests` sets the flag. All seven
+    //! inherit `BacktestSettings::default()`'s `trailing_enabled: false`
+    //! (eval.rs:358), so the CubeCL kernel's trailing arithmetic had never been
+    //! compared against the CPU on any backend. That is how tracel-ai/cubecl#1375
+    //! survived in the trail-ratchet arms of
+    //! `define_backtest_population_kernel` (cubecl_eval.rs), where
+    //! `let candidate = if raw > locked { raw } else { locked }` returned the
+    //! ELSE branch unconditionally on the wgpu backend (upstream reproduced it on
+    //! Metal; this file's existing workarounds cite Vulkan — CPU and CUDA are
+    //! correct, and no one has characterised HIP): the ATR trail never ratcheted
+    //! past the min-lock floor, exits landed on a different bar at a different
+    //! price, and selection changed.
+    //!
+    //! `trailing_parity_tests` below covers the same ground for prototype B, but
+    //! it is gated on `gpu-b-adapter` and calls `try_evaluate_population_b`
+    //! directly — it can never reach this kernel. `gpu-vulkan` and `gpu-rocm`
+    //! (neoethos-search/Cargo.toml:85-86) pull neither `gpu-cuda` nor
+    //! `gpu-b-adapter`, so on those shipped build configurations this kernel IS
+    //! production discovery — and `gpu-apple` is `gpu-vulkan`
+    //! (neoethos-app/Cargo.toml:45), i.e. the very backend upstream reproduced
+    //! the miscompilation on.
+    use super::*;
+
+    struct TrailingFixture {
+        close: Vec<f64>,
+        high: Vec<f64>,
+        low: Vec<f64>,
+        indicators: ndarray::Array2<f32>,
+        gene_offsets: Vec<i32>,
+        gene_indices: Vec<i32>,
+        gene_weights: Vec<f32>,
+        long_thr: Vec<f32>,
+        short_thr: Vec<f32>,
+        sl_pips: Vec<f64>,
+        tp_pips: Vec<f64>,
+        stop_vol_mult: Vec<f64>,
+        month_idx: Vec<i64>,
+        day_idx: Vec<i64>,
+        timestamps: Vec<i64>,
+        smc_data: Vec<SmcRow>,
+        gene_smc_flags: Vec<SmcRow>,
+        settings: BacktestSettings,
+    }
+
+    /// One workload, built once, so the sensitivity check below and the parity
+    /// check are provably about the same trades.
+    ///
+    /// The price series carries sustained runs (a 90-pip slow component) because
+    /// the production trail only reaches its interesting branch on a long one:
+    /// with `be_trigger_r = 1.0` it arms at +1R = +20 pips, and
+    /// `raw = high - 1.0 * 20 pips` only exceeds `locked = entry + 2 pips` once
+    /// the trade is more than 22 pips in profit. A gentle series would leave
+    /// `candidate == locked` on every bar — which is exactly the value the
+    /// miscompiled else-branch produced, i.e. a fixture that cannot fail.
+    fn trailing_fixture(trailing_enabled: bool) -> TrailingFixture {
+        let n_samples = 1_200usize;
+        let n_genes = 4usize;
+        let close: Vec<f64> = (0..n_samples)
+            .map(|i| {
+                let t = i as f64;
+                1.1000 + (t / 220.0).sin() * 0.0090 + (t / 37.0).sin() * 0.0016
+            })
+            .collect();
+        let high: Vec<f64> = close.iter().map(|c| c + 0.0006).collect();
+        let low: Vec<f64> = close.iter().map(|c| c - 0.0006).collect();
+        let indicators = ndarray::Array2::from_shape_fn((4, n_samples), |(f, i)| {
+            let t = i as f64;
+            ((t / (18.0 + 11.0 * f as f64)).sin()) as f32
+        });
+
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = false;
+        // The production trailing triple, verbatim: `EvaluationConfig::for_symbol`
+        // sets enabled/be_trigger_r/atr_multiplier, and neither settings builder
+        // touches `trailing_min_lock_pips`, so it stays at the eval default 2.0.
+        settings.trailing_enabled = trailing_enabled;
+        settings.trailing_atr_multiplier = 1.0;
+        settings.trailing_be_trigger_r = 1.0;
+        settings.trailing_min_lock_pips = 2.0;
+
+        TrailingFixture {
+            close,
+            high,
+            low,
+            indicators,
+            gene_offsets: vec![0, 2, 4, 6, 8],
+            gene_indices: vec![0, 1, 1, 2, 2, 3, 3, 0],
+            gene_weights: vec![1.0; 8],
+            long_thr: vec![0.25; n_genes],
+            short_thr: vec![-0.25; n_genes],
+            sl_pips: vec![20.0; n_genes],
+            tp_pips: vec![60.0; n_genes],
+            stop_vol_mult: vec![0.0; n_genes],
+            month_idx: (0..n_samples).map(|i| (i / 200) as i64).collect(),
+            day_idx: (0..n_samples).map(|i| (i / 24) as i64).collect(),
+            timestamps: (0..n_samples)
+                .map(|i| 1_600_000_000_000 + (i as i64) * 3_600_000)
+                .collect(),
+            smc_data: vec![[0i8; 11]; n_samples],
+            gene_smc_flags: vec![[0i8; 11]; n_genes],
+            settings,
+        }
+    }
+
+    impl TrailingFixture {
+        /// The other half of what production actually runs.
+        ///
+        /// Genes carry a `stop_vol_mult` and `resolve_adaptive_stops`
+        /// (genetic/search_engine.rs:1361-1386) installs the shared per-bar base
+        /// series whenever ANY gene's multiplier is positive — which is the
+        /// default since adaptive volatility-scaled stops were turned on. So the
+        /// live configuration is trailing AND adaptive, and neither existing
+        /// fixture is it: `gpu_population_eval_matches_cpu_adaptive_stops`
+        /// (eval.rs:3295) runs adaptive with the trail off, and the plain
+        /// fixture above runs the trail with `stop_vol_mult` all zero.
+        ///
+        /// The combination is not merely the sum of the two. Under adaptive
+        /// stops `sl_distance` is derived from the base series at the entry bar
+        /// instead of the gene's scalar `sl_pips`, and the trail is built out of
+        /// `sl_distance` three times over — the arming test
+        /// (`mv >= be_trigger_r * sl_distance`), the ratchet
+        /// (`hi - atr_multiplier * sl_distance`) and the stop it replaces. A
+        /// disagreement about the adaptive distance therefore reaches the exit
+        /// price through the trail, on a path no fixture walked.
+        fn with_adaptive_stops(mut self) -> Self {
+            let base = crate::stop_target::adaptive_base_pips_series(
+                &self.high,
+                &self.low,
+                &self.close,
+                self.settings.pip_value,
+            )
+            .expect("adaptive base vol series builds on 1 200 bars");
+            assert_eq!(
+                base.len(),
+                self.close.len(),
+                "base series must align with the price series"
+            );
+            self.settings.adaptive_base_pips = Some(base.into());
+            // The production builder, not a hand-picked number.
+            self.settings.adaptive_rr = crate::stop_target::adaptive_stops_rr();
+            // All > 0, so every gene runs adaptive — same shape as the existing
+            // adaptive fixture's per-gene spread.
+            self.stop_vol_mult = vec![1.2, 2.0, 0.8, 1.5];
+            self
+        }
+
+        fn inputs(&self) -> PopulationEvalInputs<'_> {
+            PopulationEvalInputs {
+                close: &self.close,
+                high: &self.high,
+                low: &self.low,
+                indicators: self.indicators.view(),
+                gene_offsets: &self.gene_offsets,
+                gene_indices: &self.gene_indices,
+                gene_weights: &self.gene_weights,
+                long_thr: &self.long_thr,
+                short_thr: &self.short_thr,
+                month_idx: &self.month_idx,
+                day_idx: &self.day_idx,
+                timestamps: &self.timestamps,
+                sl_pips: &self.sl_pips,
+                tp_pips: &self.tp_pips,
+                stop_vol_mult: &self.stop_vol_mult,
+                smc_data: &self.smc_data,
+                gene_smc_flags: &self.gene_smc_flags,
+                gate_threshold: 0.0,
+                weights: &[1.0f32; 11],
+                settings: &self.settings,
+            }
+        }
+    }
+
+    /// Proves the fixture can fail — no GPU required.
+    ///
+    /// A parity fixture whose trail never engages passes whether or not the
+    /// kernel implements one, which is precisely the hole the whole suite had.
+    /// This asserts on the CPU alone that turning the production trail on
+    /// changes the answer, so the parity test below cannot quietly decay into
+    /// comparing two identical no-ops if the series or the thresholds are ever
+    /// retuned.
+    #[test]
+    fn trailing_fixture_actually_changes_the_result() {
+        let off = trailing_fixture(false);
+        let on = trailing_fixture(true);
+        let m_off = validation_backtest_population_cpu(off.inputs());
+        let m_on = validation_backtest_population_cpu(on.inputs());
+        assert_eq!(m_off.len(), m_on.len());
+
+        let traded: f64 = m_off.iter().map(|m| m[8]).sum();
+        assert!(
+            traded > 0.0,
+            "fixture took no trades at all — it tests nothing"
+        );
+
+        let differs = |a: &[[f64; 11]], b: &[[f64; 11]]| {
+            a.iter()
+                .zip(b.iter())
+                .any(|(x, y)| (x[0] - y[0]).abs() > 1e-9 || (x[8] - y[8]).abs() > 0.5)
+        };
+
+        assert!(
+            differs(&m_off, &m_on),
+            "the production trailing triple (enabled / atr 1.0 / trigger 1.0 / \
+             2.0 min-lock) left every gene's net profit and trade count \
+             unchanged — this fixture cannot detect a missing trail"
+        );
+
+        // Stronger: prove the `max(raw, locked)` branch itself fires.
+        //
+        // A fixture where the trail arms but `raw` never exceeds `locked` would
+        // pass the check above and still be blind to cubecl#1375, because the
+        // miscompiled kernel returns `locked` — the same value the correct one
+        // would. Reproduce that state on the CPU: an ATR multiplier large enough
+        // that `raw = high - mult * sl_distance` can never rise above
+        // `locked = entry + min_lock` pins `candidate` to `locked` on every
+        // armed bar, which is exactly what the else-branch-always-wins bug
+        // produced. If production (multiplier 1.0) is indistinguishable from
+        // that, the parity test below cannot see the defect it exists for.
+        let mut pinned = trailing_fixture(true);
+        pinned.settings.trailing_atr_multiplier = 50.0;
+        let m_pinned = validation_backtest_population_cpu(pinned.inputs());
+        assert!(
+            differs(&m_on, &m_pinned),
+            "production settings produced the same result as a trail pinned to \
+             the min-lock floor — `raw` never exceeds `locked` in this fixture, \
+             so it cannot distinguish a correct ATR ratchet from cubecl#1375's \
+             unconditional else branch"
+        );
+
+        // Same two proofs for the adaptive variant, because it is a different
+        // trail: `sl_distance` comes from the base vol series, so the arming
+        // threshold and the ratchet distance are per-entry values the fixed-stop
+        // case never produces. A blind adaptive fixture would be the same defect
+        // one layer down.
+        let ad_off = trailing_fixture(false).with_adaptive_stops();
+        let ad_on = trailing_fixture(true).with_adaptive_stops();
+        let m_ad_off = validation_backtest_population_cpu(ad_off.inputs());
+        let m_ad_on = validation_backtest_population_cpu(ad_on.inputs());
+        let ad_traded: f64 = m_ad_off.iter().map(|m| m[8]).sum();
+        assert!(
+            ad_traded > 0.0,
+            "adaptive variant took no trades at all — it tests nothing"
+        );
+        assert!(
+            differs(&m_ad_off, &m_ad_on),
+            "with adaptive stops the production trail changed nothing — the \
+             adaptive parity case cannot detect a missing trail"
+        );
+        let mut ad_pinned = trailing_fixture(true).with_adaptive_stops();
+        ad_pinned.settings.trailing_atr_multiplier = 50.0;
+        let m_ad_pinned = validation_backtest_population_cpu(ad_pinned.inputs());
+        assert!(
+            differs(&m_ad_on, &m_ad_pinned),
+            "adaptive + production trail is indistinguishable from a trail \
+             pinned to the min-lock floor — the adaptive case cannot see \
+             cubecl#1375's unconditional else branch"
+        );
+    }
+
+    /// CubeCL kernel vs CPU with the trail ON.
+    ///
+    /// Named with a `gpu_` prefix because both GPU CI jobs filter on it
+    /// (`.github/workflows/ci.yml:155` for gpu-cuda, `:210` for gpu-rocm run
+    /// `cargo test -p neoethos-search --release --features <f> gpu_`). The ROCm
+    /// job is the one that matters here: `gpu-rocm` does not pull
+    /// `gpu-b-adapter`, so `try_evaluate_population_cuda` runs this kernel
+    /// rather than short-circuiting into prototype B.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_cubecl_trailing_stop_matches_cpu() {
+        // Say so rather than claim coverage we did not get: on a `gpu-cuda`
+        // build with a live card, `try_evaluate_population_cuda` returns from
+        // the prototype-B short-circuit (cubecl_eval.rs:4777-4791) and never
+        // reaches the CubeCL kernel. `trailing_parity_tests` is the B lane's
+        // equivalent; this one is only meaningful where B is absent.
+        #[cfg(feature = "gpu-b-adapter")]
+        {
+            if crate::gpu_native::prototype_b_population_eval::prototype_b_available() {
+                eprintln!(
+                    "SKIPPED gpu_cubecl_trailing_stop_matches_cpu — prototype B intercepts \
+                     try_evaluate_population_cuda on this build; the CubeCL trailing path is \
+                     covered by the gpu-vulkan / gpu-rocm jobs"
+                );
+                return;
+            }
+        }
+
+        // Both shapes production runs: the gene's scalar stop, and the adaptive
+        // per-bar stop the trail is built out of.
+        for (label, fx) in [
+            ("fixed stops", trailing_fixture(true)),
+            ("adaptive stops", trailing_fixture(true).with_adaptive_stops()),
+        ] {
+            let gpu = match crate::cubecl_eval::try_evaluate_population_cuda(
+                &fx.close,
+                &fx.high,
+                &fx.low,
+                fx.indicators.view(),
+                &fx.gene_offsets,
+                &fx.gene_indices,
+                &fx.gene_weights,
+                &fx.long_thr,
+                &fx.short_thr,
+                &fx.month_idx,
+                &fx.day_idx,
+                &fx.timestamps,
+                &fx.sl_pips,
+                &fx.tp_pips,
+                &fx.stop_vol_mult,
+                &fx.smc_data,
+                &fx.gene_smc_flags,
+                0.0,
+                &[1.0f32; 11],
+                &fx.settings,
+                None,
+            ) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    if crate::gpu_fallback::require_gpu() {
+                        panic!(
+                            "NEOETHOS_REQUIRE_GPU set but CubeCL trailing eval failed \
+                             ({label}): {e}"
+                        );
+                    }
+                    eprintln!("CubeCL trailing parity SKIPPED ({label}, no usable GPU device): {e}");
+                    return;
+                }
+            };
+
+            let cpu = validation_backtest_population_cpu(fx.inputs());
+            assert_eq!(gpu.len(), cpu.len(), "gene count mismatch ({label})");
+
+            // Compares the money, not just the exits. A trail closes at a level
+            // that moved: reconstructing the exit from the original stop gives
+            // the right bar and the wrong profit, and only net profit catches
+            // that.
+            for (gene, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+                // Trade count is the sharpest signal for a trail that does not
+                // ratchet: a stop stuck at the min-lock floor survives bars the
+                // moved stop would have closed on, so the counts separate long
+                // before the money does.
+                //
+                // This lane is f32 by default (`gpu_f64_backtest_enabled`), so
+                // if this ever fires, re-run with NEOETHOS_GPU_F64=1 before
+                // blaming the trail: equal counts under f64 mean precision, not
+                // arithmetic. The fixture is deliberately small (1 200 smooth
+                // bars, 20/60-pip barriers, zero spread) so no comparison sits
+                // near a tie and f32 rounding cannot decide an exit on its own.
+                assert!(
+                    (g[8] - c[8]).abs() <= 0.5,
+                    "{label} gene {gene} trade count: gpu {} vs cpu {} — the kernel and \
+                     the CPU disagree about when a trailing stop fires (re-check under \
+                     NEOETHOS_GPU_F64=1 to rule out f32 drift)",
+                    g[8],
+                    c[8]
+                );
+                for slot in [0usize, 1, 2, 3, 4, 5, 6, 9, 10] {
+                    let (a, b) = (g[slot], c[slot]);
+                    if !a.is_finite() && !b.is_finite() {
+                        continue;
+                    }
+                    let tol = 1e-2 * b.abs().max(1.0) + 1e-3;
+                    assert!(
+                        (a - b).abs() <= tol,
+                        "{label} gene {gene} slot {slot}: gpu {a} vs cpu {b} (tol {tol}) \
+                         — the CubeCL kernel and the CPU disagree about a trailing stop"
+                    );
+                }
             }
         }
     }
