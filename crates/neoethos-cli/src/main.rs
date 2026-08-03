@@ -11,6 +11,17 @@ mod tui;
 
 fn main() -> Result<()> {
     setup_logging(false)?;
+    // Say out loud what the environment is changing underneath this run.
+    //
+    // This function was written for exactly this call and had ZERO callers — its
+    // own doc says "Designed to be called once in the binary's main() after
+    // setup_logging". Meanwhile the workspace carries 215 distinct NEOETHOS_*
+    // names across 183 `env::var` sites, and an env var that silently alters a
+    // run is how `apply_mode_overrides`, the search runtime overrides and the
+    // OOS holdout each spent months meaning something weaker than they claimed.
+    // Nothing here changes behaviour; it makes the behaviour visible, which is
+    // the precondition for retiring these in favour of the single config.
+    neoethos_core::env_overrides::log_active_overrides_at_startup();
     // Config-consolidation: search runtime overrides come from the single
     // config (canonical user config.yaml), not the environment. Falls back
     // to defaults if it can't be loaded. (S2a: genetic search; rest staged.)

@@ -179,6 +179,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     setup_logging(true)?;
 
+    // Say out loud what the environment is changing underneath this run. See
+    // the same call in neoethos-cli's main: written for this, called by nothing,
+    // while 215 NEOETHOS_* names can silently redirect a run. Observability
+    // only — it changes no behaviour, and it is what makes retiring them for
+    // the single config possible.
+    neoethos_core::env_overrides::log_active_overrides_at_startup();
+
     // #101 follow-up + #179: the help dialog must fire BEFORE the
     // config-load step below, otherwise an orphaned double-click whose
     // CWD lacks `config.yaml` exits silently with `windows_subsystem =
