@@ -2,6 +2,7 @@ pub mod artifacts;
 pub mod capabilities;
 pub mod dispatch;
 pub mod exports;
+pub mod gpu_capability;
 pub mod hpo;
 #[cfg(feature = "onnx")]
 pub mod onnx;

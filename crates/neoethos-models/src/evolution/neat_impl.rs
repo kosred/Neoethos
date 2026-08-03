@@ -38,8 +38,18 @@ const NEAT_RUNTIME_BACKEND: &str = "symbios_neat_cpu";
 const NEAT_CUDA_FITNESS_BACKEND: &str = "symbios_neat_cuda_fitness";
 const DEFAULT_NEAT_SPECIES_ELITISM: usize = 0;
 
+/// Device policy a NEAT expert starts with when the caller does not name one.
+///
+/// Reads `models.gpu_runtime.neuro_evolution_device`, which defaults to
+/// `"auto"` — and `auto` never reaches the CubeCL fitness kernel (it fires only
+/// on an explicit `gpu` / `gpu:N`). So wiring `neuro-evolution-gpu` into
+/// `gpu-cuda` compiles the kernel in without changing a single fitness value;
+/// setting the knob to `"gpu"` is what turns it on. Before this, the ONLY way
+/// to reach the kernel was `NEOETHOS_BOT_*` env vars the operator has banned.
 fn default_neat_requested_device_policy() -> String {
-    "auto".to_string()
+    normalize_runtime_device_policy(
+        &crate::runtime::gpu_capability::current_model_gpu_runtime().neuro_evolution_device,
+    )
 }
 
 fn neat_cpu_fallback_reason(policy: &str, runtime_backend: Option<&str>) -> Option<String> {

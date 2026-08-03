@@ -507,6 +507,22 @@ models:
     gpu_count: null
     early_stop_patience: null
     early_stop_min_delta: null
+  # Device policy for the accelerated families that are NOT tree models.
+  # `tree_runtime.device` above covers xgboost/catboost/lightgbm; these three
+  # cover the CUDA paths a `gpu-cuda` build links for RL, the CubeCL
+  # statistical fits and the CubeCL neuro-evolution fitness kernels.
+  # Vocabulary: cpu | auto | gpu | gpu:N  (cuda/rocm/metal/vulkan normalize to gpu).
+  #
+  # Defaults keep today's behaviour: compiling a kernel in never changes what a
+  # model produces — these values decide whether it runs.
+  # Run `neoethos-cli gpu-capabilities` to see what this binary can do here.
+  gpu_runtime:
+    # `cpu`, not `auto`: the RL resolver reads `auto` as "take CUDA device 0",
+    # and a CUDA-trained DQN policy is a DIFFERENT policy.
+    rl_device: cpu
+    # `auto` means CPU — the CubeCL kernel only fires on an explicit gpu/gpu:N.
+    statistical_device: auto
+    neuro_evolution_device: auto
   prop_metric_weight: 1.0
   prop_accuracy_weight: 0.1
   prop_min_trades: 0

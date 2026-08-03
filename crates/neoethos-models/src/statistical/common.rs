@@ -23,10 +23,22 @@ pub fn normalize_statistical_device_policy(policy: &str) -> String {
     crate::common::normalize_vendor_device_policy(policy, &[])
 }
 
-pub fn runtime_backend_with_gpu_fallback(
-    model_name: &str,
-    cpu_backend: &str,
-) -> (Option<String>, Option<String>) {
+/// Device policy for the statistical family (`elasticnet`, `logistic`).
+///
+/// `models.gpu_runtime.statistical_device` is the authoritative knob — it is
+/// the only way to reach the CubeCL kernels that does not require an
+/// environment variable, and the operator has ruled that config is the single
+/// source. The legacy `NEOETHOS_BOT_{MODEL}_DEVICE` / `NEOETHOS_BOT_META_DEVICE`
+/// variables are still honoured while the config still holds its `auto`
+/// default, so a machine part-way through the env sweep is not silently
+/// ignored; a configured value always wins.
+pub fn requested_statistical_device_policy(model_name: &str) -> String {
+    let configured = normalize_statistical_device_policy(
+        &crate::runtime::gpu_capability::current_model_gpu_runtime().statistical_device,
+    );
+    if configured != "auto" {
+        return configured;
+    }
     let model_key = format!(
         "NEOETHOS_BOT_{}_DEVICE",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
@@ -34,7 +46,14 @@ pub fn runtime_backend_with_gpu_fallback(
     let requested = std::env::var(&model_key)
         .or_else(|_| std::env::var("NEOETHOS_BOT_META_DEVICE"))
         .unwrap_or_else(|_| "auto".to_string());
-    let normalized = normalize_statistical_device_policy(&requested);
+    normalize_statistical_device_policy(&requested)
+}
+
+pub fn runtime_backend_with_gpu_fallback(
+    model_name: &str,
+    cpu_backend: &str,
+) -> (Option<String>, Option<String>) {
+    let normalized = requested_statistical_device_policy(model_name);
     let degraded_reason = if normalized == "gpu" || normalized.starts_with("gpu:") {
         Some(format!(
             "requested device policy `{normalized}`; statistical backend currently executes on CPU"

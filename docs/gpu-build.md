@@ -29,13 +29,34 @@ This combination is deliberate (see "Why this exact feature combo"):
   (neat, statistical) on **CUDA**.
 
 ### What runs where with this build
+
+**Do not read this table off the page — ask the binary.** It answers for the
+features it was actually built with and the hardware actually present:
+
+```bash
+neoethos-cli gpu-capabilities
+```
+
+Four columns, because there are four different reasons a model lands on the CPU
+and each needs a different fix: `declared` (no GPU implementation exists at
+all), `compiled` (wrong `--features`), `device` (wrong machine), `opt-in` (the
+config value has not been set). The table below is the expected shape.
+
 | On GPU (A6000) | On CPU |
 |---|---|
-| Discovery GA kernel (Vulkan/cubecl-wgpu) | xgboost / xgboost_rf / xgboost_dart (the `xgb` crate has no GPU build wired here) |
-| burn deep models: mlp, kan, tabnet, nbeats, nbeatsx_nf, tide, tide_nf, transformer, patchtst, timesnet (Vulkan/burn-wgpu) | sklears_tree |
-| lightgbm, catboost, catboost_alt (CUDA) | a few custom CPU-only: online_pa/hoeffding, meta_blender/stack, probability_calibrator, conformal_gate |
-| dqn / candle / rlkit (CUDA) | |
-| neat, statistical (cubecl) | |
+| Discovery GA kernel (Vulkan/cubecl-wgpu) | **lightgbm** — CPU-only *by design*. `lightgbm3/cuda` does not build a GPU tree learner ("[LightGBM] [Fatal] GPU Tree Learner was not enabled in this build") and the OpenCL path does not link. There is no `lightgbm-gpu` feature any more; the one that existed was enabled by nothing and could not have worked. |
+| burn deep models: mlp, kan, tabnet, nbeats, nbeatsx_nf, tide, tide_nf, transformer, patchtst, timesnet, exit_agent, sac (Vulkan/burn-wgpu) | sklears_tree, bayes_logit, online_pa, online_hoeffding, isolation_forest, swarm_forecaster, hmm_regime |
+| xgboost / xgboost_rf / xgboost_dart **and** meta_blender / probability_calibrator / conformal_gate / meta_stack — all six train through the SAME XGBoost expert, so `xgboost-gpu` (`xgb/cuda`) accelerates all six at once (CUDA) | |
+| catboost, catboost_alt (CUDA) | |
+| dqn / candle / rlkit (CUDA) — **needs `models.gpu_runtime.rl_device: gpu`** | |
+| neat, neuro_evo (cubecl) — **needs `models.gpu_runtime.neuro_evolution_device: gpu`** | |
+| elasticnet, logistic (cubecl) — **needs `models.gpu_runtime.statistical_device: gpu`** | |
+
+The three `models.gpu_runtime.*` knobs default to CPU/`auto` on purpose:
+compiling a CUDA kernel in must never change what a model produces. The CUDA
+paths are linked by `gpu-cuda`; these values decide whether they run. (RL
+defaults to `cpu` rather than `auto` because the RL resolver reads `auto` as
+"take CUDA device 0", and a CUDA-trained policy is a different policy.)
 
 ## Prerequisites
 
@@ -48,10 +69,16 @@ This combination is deliberate (see "Why this exact feature combo"):
 
 ## Why this exact feature combo (the gotchas)
 
-1. **`burn` deep models only GPU via `burn-wgpu` (= `gpu-vulkan`).** There is no
-   wired burn-CUDA/burn-tch backend in this repo (`burn_models.rs` gates the GPU
-   backend on `#[cfg(feature = "burn-wgpu-backend")]` only). So **`gpu-cuda`
-   alone leaves every deep model on CPU.** You need `gpu-vulkan` for them.
+1. **`burn` deep models reach the GPU via `burn-wgpu` (= `gpu-vulkan`).**
+   `burn_models.rs` also has a `burn-cuda-backend` alias, and it wins over wgpu
+   when both are on — but `gpu-cuda` deliberately does NOT enable it (measured
+   2026-06-10 on an A6000: burn-cuda 0.21 re-autotunes every distinct matmul
+   shape, 338 autotune passes against 14 real epochs, plus burn-tensor dtype
+   panics; the same models take ~17 min total on burn-ndarray). So **`gpu-cuda`
+   alone leaves every deep model on CPU** — that is a decision, not an
+   oversight, and `gpu-capabilities` reports it as `compiled: false`. Use
+   `gpu-vulkan` for the deep models, or `--features gpu-cuda,burn-cuda-backend`
+   once the models are big enough to pay for the autotune.
 
 2. **Keep `search` on Vulkan to avoid libtorch.** `neoethos-search/gpu-cuda`
    pulls `dep:tch` (libtorch, for CUDA device enumeration) — a ~2 GB dependency
@@ -62,14 +89,26 @@ This combination is deliberate (see "Why this exact feature combo"):
    pull `tch`) for the CUDA boosters. Hence `--features
    "gpu-vulkan,neoethos-models/gpu-cuda"` rather than the bundled cli `gpu-cuda`.
 
-3. **Drop lightgbm's OpenCL path — keep CUDA.** `neoethos-models/gpu-cuda`
-   originally pulled BOTH `lightgbm3/gpu` (OpenCL) and `lightgbm3/cuda`. The
-   OpenCL path fails to LINK (`mold: undefined symbol: clReleaseProgram`) because
-   `-lOpenCL` isn't emitted. We want CUDA anyway, so `lightgbm3/gpu` is removed
-   from the `gpu-cuda` feature in `crates/neoethos-models/Cargo.toml` (keep
-   `lightgbm3/cuda`). If you re-add OpenCL, you must also link `-lOpenCL`.
+3. **LightGBM has no GPU path at all.** `neoethos-models/gpu-cuda` originally
+   pulled BOTH `lightgbm3/gpu` (OpenCL) and `lightgbm3/cuda`. OpenCL fails to
+   LINK (`mold: undefined symbol: clReleaseProgram` — `-lOpenCL` isn't emitted)
+   and `lightgbm3/cuda` does not actually produce a GPU tree learner, so
+   `effective_device_type()` returns `"cpu"` unconditionally. Both are gone, and
+   with them the `lightgbm-gpu` feature that used to key LightGBM's *advertised*
+   GPU support on a capability the library does not have.
 
-4. **Runtime env.** At RUN time (not just build) the process needs
+4. **One feature name per capability.** `gpu-cuda` names
+   `reinforcement-learning-cuda`, `neuro-evolution-gpu`, `statistical-gpu` and
+   `xgboost-gpu` instead of spelling out `rlkit/cuda` + `candle-core/cuda` +
+   `dep:cubecl` + `xgb/cuda` inline. The dependency graph is the same either
+   way — but the `#[cfg(feature = …)]` blocks those aggregates guard were
+   compiled OUT on every CUDA build, and `registry.rs` (which asks
+   `cfg!(feature = "reinforcement-learning-cuda")`) answered "no GPU" for the
+   RL, neuro-evolution and statistical families on an RTX 3090. A test
+   (`tests/gpu_capability_reachability.rs`) now fails the build when a model
+   advertises a capability behind a feature no shipped aggregate can reach.
+
+5. **Runtime env.** At RUN time (not just build) the process needs
    `LD_LIBRARY_PATH` to include `target/release/deps` (the LightGBM `.so`
    sidecar) and `/usr/local/cuda-12.2/lib64`. The `cli` reads
    `enable_gpu_preference: auto` + `tree_device_preference: gpu` from

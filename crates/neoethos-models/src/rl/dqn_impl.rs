@@ -902,9 +902,32 @@ fn requested_cuda_ordinal(policy: &str) -> Option<usize> {
         .and_then(|value| value.parse::<usize>().ok())
 }
 
+/// Resolve `auto` through the operator's single config knob.
+///
+/// Under `reinforcement-learning-cuda` the resolvers below read `auto` as
+/// "take CUDA device 0 if it initializes". That feature is now part of the
+/// `gpu-cuda` aggregate (it used to be enabled by nothing, which is why
+/// `registry.rs` reported "no GPU" for `dqn` on an RTX 3090), so leaving `auto`
+/// alone would have moved DQN training onto the card the moment the wiring
+/// landed — and a CUDA-trained policy is a DIFFERENT policy.
+///
+/// `models.gpu_runtime.rl_device` defaults to `cpu`, so linking the CUDA path
+/// in changes nothing until the operator asks for it. An explicit policy from
+/// the caller or the artifact (`gpu`, `gpu:1`, `cpu`) still wins.
+#[cfg(feature = "reinforcement-learning")]
+fn effective_rl_device_policy(policy: &str) -> String {
+    let normalized = normalize_rl_device_policy(policy);
+    if normalized != "auto" {
+        return normalized;
+    }
+    normalize_rl_device_policy(
+        &crate::runtime::gpu_capability::current_model_gpu_runtime().rl_device,
+    )
+}
+
 #[cfg(feature = "reinforcement-learning")]
 fn resolve_rl_training_device(policy: &str) -> Result<(Device, String, String)> {
-    let normalized = normalize_rl_device_policy(policy);
+    let normalized = effective_rl_device_policy(policy);
     let explicit_gpu = requested_gpu_device_policy(&normalized);
 
     #[cfg(feature = "reinforcement-learning-cuda")]
@@ -943,7 +966,10 @@ fn resolve_rl_training_device(policy: &str) -> Result<(Device, String, String)> 
 fn resolve_rl_inference_device(policy: &str) -> (Device, String, String) {
     #[cfg(feature = "reinforcement-learning-cuda")]
     {
-        let normalized = normalize_rl_device_policy(policy);
+        // Same knob as training. An artifact recorded before the CUDA path was
+        // wired in carries `auto`; without this it would start predicting on
+        // the card against weights fitted on the CPU.
+        let normalized = effective_rl_device_policy(policy);
         let ordinal = requested_cuda_ordinal(&normalized).unwrap_or(0);
         if matches!(normalized.as_str(), "auto" | "gpu") || normalized.starts_with("gpu:") {
             if let Ok(device) = Device::new_cuda(ordinal) {

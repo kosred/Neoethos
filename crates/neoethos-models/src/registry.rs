@@ -11,6 +11,7 @@ use tracing::warn;
 use crate::runtime::capabilities::{
     CapabilityState, KNOWN_MODEL_NAMES, ModelCapability, ModelFamily, model_capability,
 };
+use crate::runtime::gpu_capability::{self, ModelGpuCapability};
 use neoethos_core::{HardwareExecutionPlan, TrainingPrecision, WorkloadKind};
 
 fn dynamic_registry() -> &'static Mutex<HashMap<String, ModelCapability>> {
@@ -123,8 +124,15 @@ pub struct ModelInfo {
     pub name: String,
     pub capability: ModelCapability,
     pub category: ModelCategory,
+    /// A GPU code path for this model is LINKED INTO THIS BINARY.
     pub supports_gpu: bool,
+    /// Linked AND a matching device is attached to this machine.
     pub prefers_gpu: bool,
+    /// The full picture the two booleans above flatten: whether a GPU path
+    /// exists at all, whether this build has it, whether the hardware is here,
+    /// which accelerator family, which Cargo feature, and the config value the
+    /// operator must set to take the path.
+    pub gpu: ModelGpuCapability,
     pub description: String,
 }
 
@@ -147,55 +155,50 @@ fn description_for_capability(capability: &ModelCapability) -> String {
     )
 }
 
+/// Does THIS binary contain a GPU code path for this model?
+///
+/// Delegates to [`crate::runtime::gpu_capability`], which owns the single
+/// model→feature table. It used to be three hand-written `cfg!` calls naming
+/// features no shipped build enables — `lightgbm-gpu` (enabled by nothing, and
+/// the linked library has no GPU tree learner), `reinforcement-learning-cuda`
+/// (bypassed by `gpu-cuda`), and `burn-wgpu-backend` (the VULKAN backend, used
+/// as the key for the whole Deep/Exit family). A `--features gpu-cuda` build on
+/// an RTX 3090 therefore advertised GPU support for XGBoost and CatBoost alone.
 fn supports_gpu_for_model(name: &str, family: ModelFamily) -> bool {
-    match name {
-        "lightgbm" => cfg!(feature = "lightgbm-gpu"),
-        "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
-        "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
-        "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
-        // SAC runs on the Burn backend (like Deep/Exit), not rlkit/CUDA.
-        "sac" => cfg!(feature = "burn-wgpu-backend"),
-        _ => match family {
-            ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
-            _ => false,
-        },
-    }
+    gpu_capability::compiled_gpu_path(name, family).is_some()
 }
 
+/// Should this model be SENT to the GPU here?
+///
+/// Compiled path AND a device of the matching family attached to this machine.
+/// The distinction matters: a CUDA path on an AMD box is not a capability, and
+/// reporting it as one is how the operator ends up debugging "GPU utilisation"
+/// on a build that was never going to use the card.
 fn prefers_gpu_for_model(name: &str, family: ModelFamily) -> bool {
-    match name {
-        "lightgbm" => cfg!(feature = "lightgbm-gpu"),
-        "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
-        "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
-        "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
-        // SAC runs on the Burn backend (like Deep/Exit), not rlkit/CUDA.
-        "sac" => cfg!(feature = "burn-wgpu-backend"),
-        _ => match family {
-            ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
-            _ => false,
-        },
-    }
+    gpu_capability::model_gpu_capability(name, family).usable()
 }
 
 fn default_gpu_device_for_capability(capability: &ModelCapability) -> &'static str {
-    match capability.family {
-        ModelFamily::Tree | ModelFamily::Rl => "cuda:0",
-        ModelFamily::Deep | ModelFamily::Exit => {
-            if cfg!(feature = "burn-wgpu-backend") {
-                "wgpu"
-            } else {
-                "cpu"
-            }
-        }
-        _ => "cpu",
+    // Name the device the COMPILED path actually binds. `cuda:0` for a CUDA
+    // path, `wgpu` for a wgpu-family one — previously this keyed off the
+    // family, so a `gpu-cuda` build with `burn-cuda-backend` was told to send
+    // deep models to `cpu` because `burn-wgpu-backend` was off.
+    match gpu_capability::compiled_gpu_path(&capability.name, capability.family) {
+        Some(spec) => match spec.accelerator {
+            gpu_capability::GpuAccelerator::Cuda => match capability.family {
+                // Burn's CUDA backend takes a burn device, not a `cuda:N`
+                // string; the burn model layer resolves the ordinal itself.
+                ModelFamily::Deep | ModelFamily::Exit => "gpu:0",
+                _ => "cuda:0",
+            },
+            gpu_capability::GpuAccelerator::Wgpu => "wgpu",
+        },
+        None => "cpu",
     }
 }
 
 fn gpu_runtime_available_for_capability(capability: &ModelCapability) -> bool {
-    match capability.family {
-        ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
-        _ => crate::tree_models::config::gpu_count() > 0,
-    }
+    gpu_capability::model_gpu_capability(&capability.name, capability.family).usable()
 }
 
 fn training_workload_for_family(family: ModelFamily) -> WorkloadKind {
@@ -264,8 +267,9 @@ fn normalize_recommended_gpu_device(
 pub fn get_model_info(name: &str) -> Option<ModelInfo> {
     let capability = get_model_capability(name)?;
     let category = capability.family.into();
-    let supports_gpu = supports_gpu_for_model(&capability.name, capability.family);
-    let prefers_gpu = prefers_gpu_for_model(&capability.name, capability.family);
+    let gpu = gpu_capability::model_gpu_capability(&capability.name, capability.family);
+    let supports_gpu = gpu.compiled;
+    let prefers_gpu = gpu.usable();
     let description = description_for_capability(&capability);
 
     Some(ModelInfo {
@@ -274,6 +278,7 @@ pub fn get_model_info(name: &str) -> Option<ModelInfo> {
         category,
         supports_gpu,
         prefers_gpu,
+        gpu,
         description,
     })
 }

@@ -237,14 +237,13 @@ pub(crate) fn statistical_cuda_kernel_enabled(model_name: &str) -> bool {
         && !crate::common::is_kernel_disabled_env(&model_env)
 }
 
+/// The kernel gate and the reported backend must agree on ONE policy, so both
+/// go through `statistical::common`, which reads `models.gpu_runtime.
+/// statistical_device` first. Previously this function had its own copy of the
+/// env lookup, which is how a config-only operator had no way at all to reach
+/// the kernel.
 fn requested_policy(model_name: &str) -> String {
-    let model_key = format!(
-        "NEOETHOS_BOT_{}_DEVICE",
-        model_name.trim().to_ascii_uppercase().replace('-', "_")
-    );
-    std::env::var(&model_key)
-        .or_else(|_| std::env::var("NEOETHOS_BOT_META_DEVICE"))
-        .unwrap_or_else(|_| "auto".to_string())
+    super::common::requested_statistical_device_policy(model_name)
 }
 
 fn cuda_device_id(model_name: &str) -> usize {

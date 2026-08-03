@@ -765,6 +765,10 @@ pub struct ModelsConfig {
     /// Tree-model training knobs (config-driven replacement for the
     /// `NEOETHOS_BOT_EARLY_STOP_*` env vars). See [`TreeRuntimeConfig`].
     pub tree_runtime: TreeRuntimeConfig,
+    /// Device policy for the NON-tree accelerated model families (RL,
+    /// CubeCL statistical fits, CubeCL neuro-evolution fitness). See
+    /// [`ModelGpuRuntimeConfig`].
+    pub gpu_runtime: ModelGpuRuntimeConfig,
     pub prop_metric_weight: f64,
     pub prop_accuracy_weight: f64,
     pub prop_min_trades: usize,
@@ -1308,6 +1312,51 @@ impl Default for TreeRuntimeConfig {
     }
 }
 
+/// Device policy for the accelerated model families that are NOT tree models.
+///
+/// `TreeRuntimeConfig::device` covers XGBoost/CatBoost/LightGBM. The three
+/// families below each have their own compiled GPU path, and until this struct
+/// existed the ONLY way to reach any of them was a `NEOETHOS_BOT_*` environment
+/// variable — which the operator has banned in favour of one config file. Every
+/// value takes the same vocabulary as the tree knob: `"cpu"` | `"auto"` |
+/// `"gpu"` | `"gpu:N"` (the `cuda`/`rocm`/`metal`/`vulkan` spellings normalize
+/// to `gpu`).
+///
+/// Defaults are chosen so that COMPILING a GPU path in never changes what the
+/// models produce. `gpu-cuda` links the CUDA kernels; these values decide
+/// whether they run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ModelGpuRuntimeConfig {
+    /// Device policy for the DQN reinforcement-learning trainer and its
+    /// inference path (candle / rlkit).
+    ///
+    /// Default `"cpu"`, NOT `"auto"`: under `--features gpu-cuda` the RL
+    /// resolver treats `"auto"` as "take CUDA device 0 if it initializes", so
+    /// an `"auto"` default would silently move DQN training onto the card and
+    /// change the trained policy the first time the feature was wired in. Set
+    /// to `"gpu"` (or `"gpu:N"`) to train the RL agent on the card.
+    pub rl_device: String,
+    /// Device policy for the CubeCL statistical fits (`elasticnet`,
+    /// `logistic`). The kernel only runs when this asks for a GPU explicitly;
+    /// `"auto"` means CPU. Note the CUDA softmax kernel uses subgradient-L1
+    /// SGD, so an active L1 penalty stays on the CPU proximal path regardless.
+    pub statistical_device: String,
+    /// Device policy for the CubeCL neuro-evolution fitness kernels
+    /// (`neat`, `neuro_evo`). `"auto"` means CPU.
+    pub neuro_evolution_device: String,
+}
+
+impl Default for ModelGpuRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            rl_device: "cpu".to_string(),
+            statistical_device: "auto".to_string(),
+            neuro_evolution_device: "auto".to_string(),
+        }
+    }
+}
+
 impl Default for ModelsConfig {
     fn default() -> Self {
         let mut hpo_trials_by_model = HashMap::new();
@@ -1542,6 +1591,7 @@ impl Default for ModelsConfig {
             smc_search_runtime: SmcSearchRuntimeConfig::default(),
             data_runtime: DataRuntimeConfig::default(),
             tree_runtime: TreeRuntimeConfig::default(),
+            gpu_runtime: ModelGpuRuntimeConfig::default(),
             prop_metric_weight: 1.0,
             prop_accuracy_weight: 0.1,
             prop_min_trades: 0,

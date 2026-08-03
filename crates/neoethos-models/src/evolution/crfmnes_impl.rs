@@ -42,8 +42,13 @@ const DEFAULT_MAX_NEURO_EVO_EVALUATIONS: usize = 30_000;
 
 type NeuroEvoParams = (Array2<f32>, Vec<f32>, Array2<f32>, Vec<f32>);
 
+/// See `neat_impl::default_neat_requested_device_policy` — same knob, same
+/// `"auto"` default, so compiling `neuro-evolution-gpu` in changes nothing
+/// until `models.gpu_runtime.neuro_evolution_device` says `"gpu"`.
 fn default_neuro_evo_requested_device_policy() -> String {
-    "auto".to_string()
+    normalize_runtime_device_policy(
+        &crate::runtime::gpu_capability::current_model_gpu_runtime().neuro_evolution_device,
+    )
 }
 
 fn neuro_evo_cpu_fallback_reason(policy: &str, runtime_backend: Option<&str>) -> Option<String> {

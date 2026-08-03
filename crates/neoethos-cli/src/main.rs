@@ -21,6 +21,9 @@ fn main() -> Result<()> {
     startup_settings.apply_process_cpu_assignment(process_cpu_assignment);
     neoethos_search::install_search_runtime_overrides_from_settings(&startup_settings);
     neoethos_models::tree_models::config::install_tree_runtime_from_settings(&startup_settings);
+    neoethos_models::runtime::gpu_capability::install_model_gpu_runtime_from_settings(
+        &startup_settings,
+    );
     neoethos_core::system::install_hardware_runtime_overrides_from_settings(&startup_settings);
     neoethos_data::install_data_runtime_overrides(
         startup_settings.models.data_runtime.normalize_features,
@@ -109,6 +112,7 @@ fn main() -> Result<()> {
         "wizard" => cmd_wizard(&args[2..]),
         "setup" => cmd_setup(&args[2..]),
         "credentials" => cmd_credentials(&args[2..]),
+        "gpu-capabilities" => cmd_gpu_capabilities(),
         _ => {
             print_help();
             Ok(())
@@ -2699,8 +2703,59 @@ fn maybe_blank(s: &str) -> &str {
     if s.is_empty() { "(blank)" } else { s }
 }
 
+/// Print the per-model GPU capability matrix for THIS binary on THIS machine.
+///
+/// The report the operator could not get before: `registry.rs` collapsed the
+/// answer into one boolean keyed on features no shipped build enabled, so a
+/// `--features gpu-nvidia` binary on an RTX 3090 claimed GPU support for
+/// XGBoost and CatBoost alone. Four columns because there are four distinct
+/// reasons a model runs on the CPU, and they need different fixes:
+///
+/// * `declared`  — a GPU implementation exists in the tree at all.
+/// * `compiled`  — this binary linked it (wrong `--features` if not).
+/// * `device`    — a matching accelerator is attached (wrong machine if not).
+/// * `opt-in`    — the config value still to set (operator has not asked).
+fn cmd_gpu_capabilities() -> Result<()> {
+    use neoethos_models::runtime::gpu_capability::gpu_capability_matrix;
+
+    let rows = gpu_capability_matrix();
+    println!(
+        "{:<24} {:<9} {:<9} {:<8} {:<8} {:<28} {}",
+        "model", "declared", "compiled", "device", "usable", "feature", "opt-in / notes"
+    );
+    println!("{}", "-".repeat(120));
+    for row in &rows {
+        println!(
+            "{:<24} {:<9} {:<9} {:<8} {:<8} {:<28} {}",
+            row.model,
+            row.declared,
+            row.compiled,
+            row.device_present,
+            row.usable(),
+            row.feature.unwrap_or("-"),
+            row.opt_in.unwrap_or(if row.declared {
+                "runs automatically"
+            } else {
+                "CPU-only by design"
+            }),
+        );
+    }
+    let usable = rows.iter().filter(|row| row.usable()).count();
+    println!(
+        "\n{usable} of {} models can run on the GPU in this binary on this machine.",
+        rows.len()
+    );
+    Ok(())
+}
+
 fn print_help() {
     println!("neoethos-cli");
+    println!(
+        "  gpu-capabilities             Per-model GPU capability matrix for THIS binary on THIS"
+    );
+    println!(
+        "                               machine: declared / compiled / device present / opt-in."
+    );
     println!("  symbols --root data");
     println!("  timeframes --symbol EURUSD --root data");
     println!("  load --symbol EURUSD --timeframe M1 --root data");

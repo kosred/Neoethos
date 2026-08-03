@@ -123,8 +123,18 @@ default = ["tree-models", "pure-rust-ml"]
 onnx = ["dep:ort"]
 tch = ["dep:tch"]
 lightgbm = ["dep:lightgbm3"]
-lightgbm-gpu = ["lightgbm", "lightgbm3/gpu", "lightgbm3/cuda"]
+# NO `lightgbm-gpu`. It used to exist, was enabled by nothing, and could not
+# have worked: `lightgbm3/cuda` does not produce a GPU-capable liblightgbm
+# (runtime dies with "[LightGBM] [Fatal] GPU Tree Learner was not enabled in
+# this build") and the OpenCL path fails to link. `effective_device_type()` in
+# tree_models/lightgbm.rs returns "cpu" unconditionally because of it. The
+# registry keyed LightGBM's advertised GPU support on that dead feature, which
+# is the only reason it ever looked like a capability.
 xgboost = ["dep:xgb"]
+# XGBoost on the card. `xgboost` alone links a CPU-only libxgboost, so this is
+# a SEPARATE capability and needs its own name — `cfg!(feature = "xgboost")`
+# cannot see whether the `xgb` dependency was built with CUDA.
+xgboost-gpu = ["xgboost", "xgb/cuda"]
 catboost = ["dep:catboost-rust"]
 sklears-tree = ["dep:sklears"]
 tree-models-core = ["lightgbm", "xgboost", "sklears-tree"]
@@ -132,13 +142,22 @@ tree-models = ["tree-models-core", "catboost"]
 
 # Pure Rust ML features
 neuro-evolution = ["dep:crfmnes", "dep:rand08"]
-neuro-evolution-gpu = ["neuro-evolution", "dep:cubecl"]
+# CubeCL CUDA fitness kernels for `neat` + `neuro_evo` (evolution/neat_gpu.rs,
+# evolution/crfmnes_gpu.rs). Both `use cubecl::cuda::{CudaDevice, CudaRuntime}`,
+# so `dep:cubecl` alone does NOT compile: the runtime has to be selected too.
+# It only appeared to work because `neoethos-search/gpu-cuda` happened to turn
+# `cubecl/cuda` on in the same build, which is a coincidence of feature
+# unification, not a declaration.
+neuro-evolution-gpu = ["neuro-evolution", "dep:cubecl", "cubecl/cuda"]
 reinforcement-learning = ["dep:rlkit", "dep:candle-core"]
 reinforcement-learning-cuda = ["reinforcement-learning", "rlkit/cuda", "candle-core/cuda"]
 adaptive-models = ["dep:irithyll"]
 swarm-forecasting = ["dep:ruv-swarm-ml"]
 statistical-models = ["dep:linfa", "dep:linfa-linear", "dep:linfa-logistic", "dep:linfa-clustering", "dep:variational-regression"]
-statistical-gpu = ["statistical-models", "dep:cubecl"]
+# CubeCL CUDA elasticnet/logistic fit + predict (statistical/linear_gpu.rs).
+# Same story as `neuro-evolution-gpu`: the file imports `cubecl::cuda`, so the
+# runtime belongs in the feature that claims to provide it.
+statistical-gpu = ["statistical-models", "dep:cubecl", "cubecl/cuda"]
 anomaly-detection = ["dep:extended-isolation-forest"]
 
 # Burn pure-Rust deep learning (production backend)
@@ -168,8 +187,19 @@ pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", 
 #                  upstream blocker.
 gpu-cuda = [
     "neoethos-core/gpu-cuda",
-    "neuro-evolution",
-    "dep:cubecl",
+    # ONE name per capability. This aggregate used to spell out
+    # `rlkit/cuda` + `candle-core/cuda` inline instead of naming
+    # `reinforcement-learning-cuda`, and to enable `dep:cubecl` instead of
+    # naming `neuro-evolution-gpu` / `statistical-gpu`. The dependency graph
+    # came out the same, so nothing failed — but the three `cfg(feature = …)`
+    # blocks those aggregates guard stayed compiled OUT on every CUDA build,
+    # and `registry.rs` (which asks `cfg!(feature = "reinforcement-learning-cuda")`)
+    # answered "no GPU" on an RTX 3090. Naming the capability is what makes the
+    # code and the report agree.
+    "neuro-evolution-gpu",
+    "statistical-gpu",
+    "reinforcement-learning-cuda",
+    "xgboost-gpu",
     # NOTE: `burn-cuda-backend` is deliberately NOT enabled here. Empirically
     # (2026-06-10, A6000) burn-cuda 0.21 is pathological for our TINY neural
     # models: cubecl re-autotunes every distinct matmul shape (338 autotune
@@ -180,20 +210,14 @@ gpu-cuda = [
     # belong on the CPU. The dep + `burn-cuda-backend` feature are kept so a
     # future build with genuinely large models can opt in via
     # `--features gpu-cuda,burn-cuda-backend`.
-    "statistical-models",
     # LightGBM is CPU-only by design: `lightgbm3/cuda` does NOT actually build a
     # GPU tree learner (runtime dies with "[LightGBM] [Fatal] GPU Tree Learner
     # was not enabled in this build") and the OpenCL path fails to link. Gradient
     # boosting on our 10^4-10^5 row folds is seconds on CPU, so the GPU buys
     # nothing here — see effective_device_type() in tree_models/lightgbm.rs.
+    # There is no `lightgbm-gpu` to name, and the registry no longer pretends
+    # otherwise.
     "lightgbm",
-    "reinforcement-learning",
-    "rlkit/cuda",
-    # XGBoost on the card. Without this the local build is still CPU-only and
-    # the probe still fails — `local_build` alone only changes WHERE the library
-    # comes from, not what it supports.
-    "xgb/cuda",
-    "candle-core/cuda",
 ]
 gpu-vulkan = ["burn-wgpu-backend", "neoethos-core/gpu-wgpu"]
 gpu-rocm = ["burn-wgpu-backend", "neoethos-core/gpu-rocm"]
