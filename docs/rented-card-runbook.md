@@ -91,8 +91,8 @@ its results are expected to differ.
 
 ## Phase 4 — model training with the fixed libraries (1-2 h)
 
-Requires `wf/switch-everything-on` merged (LightGBM CUDA learner + OpenMP;
-XGBoost CUDA is already on master). Then:
+Everything is on master now — LightGBM CUDA learner + OpenMP,
+XGBoost CUDA, and the stop/gate/kill-zone fixes. No branch-hopping needed. Then:
 
 ```bash
 ./target/release/neoethos-cli train --symbol EURUSD 2>&1 | tee ~/logs/train.log
