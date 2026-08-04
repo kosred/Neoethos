@@ -175,13 +175,45 @@ impl ResolvedConfig {
         // -10.0, 0.0, 0.0)` are intentional — discovery in challenge
         // mode runs with weaker quality filters so the gauntlet does
         // the heavy lifting (operator directive 2026-05-15).
+        // The engine has THREE floor sets, not two — `apply_mode_overrides`
+        // (discovery.rs:643) rewrites the filter floors for PropFirm AND for
+        // Risky, and leaves Strict on `FilteringConfig::default()`.
+        //
+        // CORRECTED 2026-08-04. This was a two-branch `if mode == "prop_firm"
+        // { .. } else { .. }` whose else-branch comment read:
+        //
+        //     "Strict/Risky: no mode override fires (apply_mode_overrides only
+        //      rewrites the floors for PropFirm), so what the engine enforces
+        //      is `FilteringConfig::default()`"
+        //
+        // That sentence is false about Risky: discovery.rs:746-760 rewrites all
+        // six floors for Risky (max_dd 0.60, sharpe -5.0, the rest wide open).
+        // It went unnoticed because `resolve_discovery_mode` above could not
+        // return "risky" either, so Risky reached the PropFirm display branch
+        // and the false sentence described a branch nothing took. Two mistakes
+        // that hid each other: the 2026-08-03 pass then carefully corrected
+        // three literals inside the unreachable branch.
+        //
+        // Net effect for the operator, who runs Risky: the report announced
+        // PropFirm's floors (maxDD 0.50, sharpe -10.0) for a search running
+        // Risky's (maxDD 0.60, sharpe -5.0), and labelled the mode "prop_firm".
+        //
+        // These literals still MIRROR rather than import — core cannot depend
+        // on neoethos-search without a cycle (F-148, 2026-05-25). What is new
+        // is that the mirror is now checked from the search side, where both
+        // crates are visible, for every mode:
+        // `display_floors_match_the_enforced_ones`.
         let (min_fitness_score, min_trades, max_drawdown, min_sharpe, min_win_rate, min_pf) =
-            if mode == "prop_firm" {
-                (0.0_f64, 1.0_f64, 0.50_f64, -10.0_f64, 0.0_f64, 0.0_f64)
-            } else {
-                // Strict/Risky: no mode override fires (apply_mode_overrides
-                // only rewrites the floors for PropFirm), so what the engine
-                // enforces is `FilteringConfig::default()` in
+            match mode {
+                // discovery.rs:682-690 — permissive; the FTMO window-pass gate
+                // downstream does the real filtering (operator directive
+                // 2026-05-15).
+                "prop_firm" => (0.0_f64, 1.0_f64, 0.50_f64, -10.0_f64, 0.0_f64, 0.0_f64),
+                // discovery.rs:755-760 — loose-but-sane; growth-tilted ranking
+                // picks the fastest compounders, deep drawdown is accepted.
+                "risky" => (0.0_f64, 1.0_f64, 0.60_f64, -5.0_f64, 0.0_f64, 0.0_f64),
+                // Strict is the one mode `apply_mode_overrides` leaves alone, so
+                // the engine enforces `FilteringConfig::default()` in
                 // neoethos-search/src/genetic/strategy_gene.rs:101-117.
                 //
                 // CORRECTED 2026-08-03. Three of these six had drifted from the
@@ -190,21 +222,15 @@ impl ResolvedConfig {
                 //     max_drawdown  0.20 -> 0.15   (engine is STRICTER by 5 pts)
                 //     min_sharpe    0.5  -> 0.3    (engine is LOOSER)
                 //     min_win_rate  0.45 -> 0.50   (engine is STRICTER)
-                // Only min_profit_factor (1.2) was right. Nothing enforced
-                // changes here — this is the display catching up to the engine.
-                //
-                // The comment above admits the equality test was "a Phase-C
-                // task"; it is now written, in neoethos-search where both
-                // crates are visible: `display_floors_match_the_enforced_ones`.
-                // That is why the drift is fixed rather than merely noticed.
-                (
+                // Only min_profit_factor (1.2) was right.
+                _ => (
                     0.0_f64,
                     s.models.prop_min_trades.max(1) as f64,
                     0.15_f64,
                     0.3_f64,
                     0.50_f64,
                     1.2_f64,
-                )
+                ),
             };
 
         // Timeframes section -----------------------------------------------
@@ -456,11 +482,56 @@ fn env_truthy(name: &str) -> bool {
     )
 }
 
+/// Resolve the mode this report DESCRIBES. Must agree, for every `Settings`,
+/// with the mode the engine RUNS — `neoethos_search::discovery::
+/// resolve_discovery_mode` (discovery.rs:3706).
+///
+/// CORRECTED 2026-08-04. What this function used to be:
+///
+/// ```ignore
+/// match s.models.discovery_mode.trim().to_ascii_lowercase().as_str() {
+///     "strict" => "strict",
+///     _ => "prop_firm",
+/// }
+/// ```
+///
+/// Two crates, one function name, different inputs. The engine reads BOTH
+/// `system.trading_mode` (the operator's master switch, per config.rs:91-102)
+/// and `models.discovery_mode` (the power-user escape hatch); this copy read
+/// only the escape hatch. So it could never return "risky" at all, and every
+/// Risky run was reported as `prop_firm`:
+///
+///   - `system.trading_mode = "risky"` → engine runs `DiscoveryMode::Risky`,
+///     where `apply_mode_overrides` does NOT rewrite the filter floors
+///     (discovery.rs:682 gates that rewrite on PropFirm alone), so the engine
+///     enforces `FilteringConfig::default()` — maxDD 0.15, sharpe 0.3, win
+///     rate 0.50, PF 1.2. The report took the PropFirm display branch and
+///     announced maxDD 0.50, sharpe -10.0, win rate 0.0, PF 0.0: a system
+///     with essentially no quality filter, which is not the one running.
+///   - `models.discovery_mode = "legacy"` → engine `Strict`
+///     (`discovery_mode_from_config` accepts "strict" | "legacy"); this copy
+///     matched "strict" only and reported `prop_firm`.
+///   - The `min_trades_per_day` 0.001 sentinel below is likewise PropFirm-only
+///     in the engine, and was being applied to Risky runs in the report.
+///
+/// The irony is on the record: the 2026-08-03 pass corrected three drifted
+/// floor literals in the non-PropFirm branch and wrote "Strict/Risky: no mode
+/// override fires" above them — correct values, in a branch Risky could not
+/// reach. Fixing the numbers in an unreachable branch is why the mode resolver
+/// itself, not just the literals, now has a test:
+/// `display_mode_matches_the_engine_mode` in neoethos-search, where both
+/// crates are visible.
 fn resolve_discovery_mode(s: &Settings) -> &'static str {
-    // Config-driven (was env-only `NEOETHOS_BOT_DISCOVERY_MODE`): the
-    // operator sets `models.discovery_mode` in config / UI / TUI.
-    match s.models.discovery_mode.trim().to_ascii_lowercase().as_str() {
-        "strict" => "strict",
+    // Precedence MIRRORS the engine: the "strict"/"legacy" escape hatch wins,
+    // otherwise the top-level trading mode decides.
+    if matches!(
+        s.models.discovery_mode.trim().to_ascii_lowercase().as_str(),
+        "strict" | "legacy"
+    ) {
+        return "strict";
+    }
+    match s.system.trading_mode.trim().to_ascii_lowercase().as_str() {
+        "risky" | "growth" => "risky",
         _ => "prop_firm",
     }
 }

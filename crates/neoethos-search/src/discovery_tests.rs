@@ -1967,6 +1967,123 @@ fn the_target_profile_separates_win_rate_from_payoff() {
     assert!(TargetProfile::default().accepts(&scalper));
 }
 
+/// The report must name the mode the engine actually runs.
+///
+/// `neoethos-core`'s `resolved_config::resolve_discovery_mode` and
+/// `neoethos_search::discovery::resolve_discovery_mode` are two functions with
+/// the SAME NAME in two crates, and until 2026-08-04 they read different
+/// inputs: the engine read `system.trading_mode` + `models.discovery_mode`, the
+/// display read only `models.discovery_mode` and could never return "risky".
+/// Every Risky run — the mode the operator actually uses — was reported as
+/// `prop_firm`, and `models.discovery_mode = "legacy"` (which the engine
+/// accepts as Strict) was reported as `prop_firm` too.
+///
+/// This test lives in neoethos-search because search depends on core and can
+/// therefore see both sides. That is exactly why the two drifted: neither
+/// crate could check it alone.
+#[test]
+fn display_mode_matches_the_engine_mode() {
+    // (trading_mode, discovery_mode) -> the mode string the report must print.
+    let cases: &[(&str, &str, &str, DiscoveryMode)] = &[
+        ("prop_firm", "prop_firm", "prop_firm", DiscoveryMode::PropFirm),
+        ("risky", "prop_firm", "risky", DiscoveryMode::Risky),
+        ("growth", "prop_firm", "risky", DiscoveryMode::Risky),
+        // The escape hatch wins over the master switch, in both vocabularies.
+        ("risky", "strict", "strict", DiscoveryMode::Strict),
+        ("prop_firm", "strict", "strict", DiscoveryMode::Strict),
+        ("risky", "legacy", "strict", DiscoveryMode::Strict),
+        // Unknown trading modes fall back to prop_firm on both sides.
+        ("", "prop_firm", "prop_firm", DiscoveryMode::PropFirm),
+        ("nonsense", "prop_firm", "prop_firm", DiscoveryMode::PropFirm),
+    ];
+
+    for (trading_mode, discovery_mode, expected_label, expected_engine) in cases {
+        let mut settings = neoethos_core::Settings::default();
+        settings.system.trading_mode = (*trading_mode).to_string();
+        settings.models.discovery_mode = (*discovery_mode).to_string();
+
+        let engine = DiscoveryConfig::from_settings(&settings);
+        assert_eq!(
+            engine.mode, *expected_engine,
+            "engine mode changed for trading_mode={trading_mode:?} \
+             discovery_mode={discovery_mode:?}"
+        );
+
+        let displayed = neoethos_core::resolved_config::ResolvedConfig::from_settings(&settings);
+        assert_eq!(
+            displayed.search.mode, *expected_label,
+            "the report says mode {:?} but the engine runs {:?} \
+             (trading_mode={trading_mode:?}, discovery_mode={discovery_mode:?}). \
+             Change both resolvers or neither.",
+            displayed.search.mode, engine.mode
+        );
+    }
+}
+
+/// The report must describe the engine it reports on — for EVERY mode, and by
+/// reading what the report ACTUALLY prints.
+///
+/// Supersedes the 2026-08-03 version of this test, which asserted against
+/// display literals RETYPED into the test body:
+///
+/// ```ignore
+/// let displayed_max_drawdown = 0.15_f64;   // <- a third copy, not the display
+/// assert_eq!(enforced.max_dd, displayed_max_drawdown, ...);
+/// ```
+///
+/// That guards one edge of a triangle. Measured 2026-08-04: with
+/// `resolved_config.rs`'s floors edited to 0.20 / 0.9 / 0.99 / 9.9, the old
+/// test still reported `ok` — it could not fail for display drift, which is
+/// the only drift it was written to catch. It now calls
+/// `ResolvedConfig::from_settings` and compares the real thing.
+///
+/// `min_fitness_score` and `min_trades` are still excluded: both are
+/// config-driven on the display side rather than mode-derived.
+#[test]
+fn display_floors_match_the_enforced_ones() {
+    for (trading_mode, discovery_mode) in [
+        ("prop_firm", "prop_firm"),
+        ("risky", "prop_firm"),
+        ("prop_firm", "strict"),
+    ] {
+        let mut settings = neoethos_core::Settings::default();
+        settings.system.trading_mode = trading_mode.to_string();
+        settings.models.discovery_mode = discovery_mode.to_string();
+
+        // What the engine will enforce: `from_settings` applies the mode
+        // overrides, so this is the post-override floor set.
+        let enforced = DiscoveryConfig::from_settings(&settings).filtering;
+        // What `neoethos-cli config` and the Settings UI will print.
+        let shown = neoethos_core::resolved_config::ResolvedConfig::from_settings(&settings).filters;
+
+        let ctx = format!("trading_mode={trading_mode:?} discovery_mode={discovery_mode:?}");
+        assert_eq!(
+            shown.max_drawdown, enforced.max_dd,
+            "[{ctx}] report shows max drawdown {} but the engine enforces {}. \
+             Change both or neither.",
+            shown.max_drawdown, enforced.max_dd
+        );
+        assert_eq!(
+            shown.min_sharpe, enforced.min_sharpe,
+            "[{ctx}] report shows min sharpe {} but the engine enforces {}. \
+             Change both or neither.",
+            shown.min_sharpe, enforced.min_sharpe
+        );
+        assert_eq!(
+            shown.min_win_rate, enforced.min_win_rate,
+            "[{ctx}] report shows min win rate {} but the engine enforces {}. \
+             Change both or neither.",
+            shown.min_win_rate, enforced.min_win_rate
+        );
+        assert_eq!(
+            shown.min_profit_factor, enforced.min_profit_factor,
+            "[{ctx}] report shows min profit factor {} but the engine enforces {}. \
+             Change both or neither.",
+            shown.min_profit_factor, enforced.min_profit_factor
+        );
+    }
+}
+
 #[test]
 fn choosing_a_mode_changes_what_the_mode_says_it_changes() {
     // `apply_mode_overrides` was called from tests and nowhere else, so every

@@ -956,7 +956,44 @@ pub struct WalkforwardPopulationGenePack {
     /// fixed-1-lot semantics the single-gene walk-forward uses (`&[]` confidence
     /// at validation.rs:1129-1130).
     settings: BacktestSettings,
+    /// Pip size used to convert this window's adaptive base vol-distance into
+    /// pips. Resolved ONCE here, by the same rule the scoring path uses
+    /// (`resolve_adaptive_stops`), so the two cannot disagree — see
+    /// [`adaptive_pip_size`].
+    adaptive_pip: f64,
     n_genes: usize,
+}
+
+/// The pip size the adaptive-stop base series is denominated in.
+///
+/// Single rule, so that `resolve_adaptive_stops` (GA scoring) and
+/// [`WalkforwardPopulationGenePack`] (walk-forward) cannot resolve it
+/// differently. They previously did:
+///
+/// | path | fallback when `config.pip_value` is non-finite / <= 0 |
+/// |---|---|
+/// | scoring, search_engine.rs:1371 | `default_pip_size(&config.symbol)` |
+/// | walk-forward, search_engine.rs:1146 | `0.0001`, hardcoded |
+///
+/// `0.0001` is the literal that `resolve_stop_target_arrays` removed as a bug
+/// in 2026-05-25 (F-761), whose comment 340 lines below still reads: "was
+/// previously `else { 0.0001 }` — a hardcoded EURUSD-pip fallback that
+/// silently wrongs JPY pairs (pip = 0.01) and metals (pip = 0.01)". The fix
+/// landed on the scoring path and never on the walk-forward path, under a doc
+/// comment asserting the two "compute the IDENTICAL per-bar stop".
+///
+/// Since `base_pips = dist / pip_size`, a JPY pair resolving 0.0001 instead of
+/// 0.01 makes the walk-forward base stop 100x LARGER in pips than the stop the
+/// gene was scored on. For an empty symbol the divergence is not even numeric:
+/// `default_pip_size("")` is NaN, so `adaptive_base_pips_series` returns None
+/// and scoring silently falls back to FIXED stops while walk-forward, at
+/// 0.0001, runs ADAPTIVE ones — two different strategies, one gene, no error.
+pub(crate) fn adaptive_pip_size(pip_value: f64, symbol: &str) -> f64 {
+    if pip_value.is_finite() && pip_value > 0.0 {
+        pip_value
+    } else {
+        super::strategy_gene::default_pip_size(symbol)
+    }
 }
 
 impl WalkforwardPopulationGenePack {
@@ -1031,6 +1068,9 @@ impl WalkforwardPopulationGenePack {
             smc_weights,
             gate_threshold: config.smc_gate_threshold,
             settings,
+            // Same rule as the scoring path, resolved from the SAME
+            // `EvaluationConfig` the scoring path saw.
+            adaptive_pip: adaptive_pip_size(config.pip_value, &config.symbol),
             n_genes: genes.len(),
         }
     }
@@ -1143,11 +1183,15 @@ pub fn validation_genes_population_window(
     // is adaptive (byte-identical). Same reward:risk the scoring path uses.
     let mut win_settings = pack.settings.clone();
     if pack.stop_vol_mult.iter().any(|&m| m > 0.0) {
-        let pip = if pack.settings.pip_value.is_finite() && pack.settings.pip_value > 0.0 {
-            pack.settings.pip_value
-        } else {
-            0.0001
-        };
+        // CORRECTED 2026-08-04. This block used to resolve its own pip:
+        //     let pip = if pack.settings.pip_value.is_finite()
+        //         && pack.settings.pip_value > 0.0
+        //     { pack.settings.pip_value } else { 0.0001 };
+        // The `0.0001` was the JPY/metals bug F-761 removed from the scoring
+        // path in 2026-05-25; it survived here, 230 lines from a doc comment
+        // claiming both paths compute the IDENTICAL per-bar stop. The pack now
+        // carries the pip the scoring path resolved. See `adaptive_pip_size`.
+        let pip = pack.adaptive_pip;
         if let Some(base) =
             crate::stop_target::adaptive_base_pips_series(win_high, win_low, win_close, pip)
         {
@@ -1368,13 +1412,34 @@ fn resolve_adaptive_stops(
 ) -> Vec<f64> {
     let mults: Vec<f64> = genes.iter().map(|g| g.stop_vol_mult).collect();
     if mults.iter().any(|&m| m > 0.0) {
-        let pip = if config.pip_value.is_finite() && config.pip_value > 0.0 {
-            config.pip_value
-        } else {
-            super::strategy_gene::default_pip_size(&config.symbol)
-        };
-        // Open-independent base series so scoring and every validation path (some
-        // of which lack an `open` column) compute the IDENTICAL per-bar stop.
+        let pip = adaptive_pip_size(config.pip_value, &config.symbol);
+        // Open-independent base series, so a validation path that lacks an
+        // `open` column still reads the same estimator input.
+        //
+        // CORRECTED 2026-08-04. This comment used to claim more than the code
+        // delivered: "so scoring and every validation path ... compute the
+        // IDENTICAL per-bar stop". Open-independence buys agreement on the
+        // ESTIMATOR, not on the RESULT — the result also depends on the pip
+        // size and on the LENGTH of the series each caller passes, and the
+        // three production callers agreed on neither:
+        //
+        //  - pip: this path used `default_pip_size(symbol)`, the walk-forward
+        //    path a hardcoded `0.0001` (100x apart on JPY/metals). FIXED —
+        //    both now go through `adaptive_pip_size`.
+        //
+        //  - length: STILL DIVERGENT, tracked separately. `tail_max_bars`
+        //    (stop_target.rs:78, hardcoded 300_000, absent from config.yaml)
+        //    makes `estimate_expected_shortfall_series` return None past
+        //    300k bars, and compute_stop_distance_series then substitutes
+        //    `tail_dist = 0` (stop_target.rs:843) instead of failing — so the
+        //    1.25x tail term silently vanishes. This call site passes the FULL
+        //    series (~1.05M bars on EURUSD M5 → tail term OFF); the
+        //    walk-forward window slice and the live rolling buffer are both
+        //    under 300k → tail term ON. Measured on the operator's own bars:
+        //    median base stop 18.09 pips at 299k, 5.82 pips at 301k.
+        //
+        // Until the length divergence is closed, do not read this function as
+        // a guarantee of a shared stop. It guarantees a shared FORMULA.
         if let Some(base_pips) =
             crate::stop_target::adaptive_base_pips_series(high, low, close, pip)
         {
@@ -2801,5 +2866,105 @@ mod smc_gate_arrays_tests {
             honest, out,
             "the bar-derived OB array must differ from the forced one, or this test cannot fail"
         );
+    }
+}
+
+#[cfg(test)]
+mod adaptive_stop_parity_tests {
+    use super::*;
+
+    /// Both adaptive-stop call sites must resolve the pip size the same way.
+    ///
+    /// Until 2026-08-04 they did not: the GA scoring path
+    /// (`resolve_adaptive_stops`) fell back to `default_pip_size(&symbol)`,
+    /// while the walk-forward window path fell back to a hardcoded `0.0001` —
+    /// the exact literal `resolve_stop_target_arrays` removed as a bug in
+    /// 2026-05-25 (F-761) for "silently wrong[ing] JPY pairs (pip = 0.01) and
+    /// metals (pip = 0.01)". The fix landed on one path and not the other,
+    /// under a doc comment asserting both compute the IDENTICAL per-bar stop.
+    ///
+    /// This pins the RULE rather than the two call sites, because a rule
+    /// stated in one place is the only kind that cannot drift.
+    #[test]
+    fn adaptive_pip_size_is_symbol_aware_for_every_quote_convention() {
+        // Happy path: a resolved pip_value is used verbatim.
+        assert_eq!(adaptive_pip_size(0.01, "EURUSD"), 0.01);
+
+        // Fallback path — this is where the two call sites disagreed. A
+        // hardcoded 0.0001 is wrong by 100x on both of these.
+        assert_eq!(
+            adaptive_pip_size(f64::NAN, "USDJPY"),
+            0.01,
+            "JPY quote: a 0.0001 fallback makes base_pips = dist/pip 100x too large"
+        );
+        assert_eq!(
+            adaptive_pip_size(0.0, "XAUUSD"),
+            0.01,
+            "metals: same 100x error as JPY"
+        );
+        assert_eq!(adaptive_pip_size(f64::NAN, "EURUSD"), 0.0001);
+
+        // Empty symbol is the case where the old divergence was not even
+        // numeric. `default_pip_size("")` is NaN by design, so
+        // `adaptive_base_pips_series` returns None and the caller keeps FIXED
+        // stops. The walk-forward path, at 0.0001, would have built a base
+        // series and run ADAPTIVE stops instead — one gene, two different
+        // strategies, no error anywhere.
+        assert!(
+            adaptive_pip_size(f64::NAN, "").is_nan(),
+            "an unresolvable pip must stay unresolvable, not become 0.0001"
+        );
+        assert!(
+            crate::stop_target::adaptive_base_pips_series(
+                &[1.0; 8],
+                &[1.0; 8],
+                &[1.0; 8],
+                adaptive_pip_size(f64::NAN, ""),
+            )
+            .is_none(),
+            "a NaN pip must refuse to produce a base series"
+        );
+    }
+
+    /// The 100x is a real number, not a rounding difference: `base_pips =
+    /// dist / pip_size`, so resolving 0.0001 where 0.01 is correct scales
+    /// every stop in the series by exactly 100.
+    #[test]
+    fn a_wrong_pip_scales_the_whole_adaptive_stop_series() {
+        let ohlcv = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
+        let correct = crate::stop_target::adaptive_base_pips_series(
+            &ohlcv.high,
+            &ohlcv.low,
+            &ohlcv.close,
+            0.01,
+        );
+        let wrong = crate::stop_target::adaptive_base_pips_series(
+            &ohlcv.high,
+            &ohlcv.low,
+            &ohlcv.close,
+            0.0001,
+        );
+        let (correct, wrong) = match (correct, wrong) {
+            (Some(c), Some(w)) => (c, w),
+            _ => panic!("the fixture bars must produce a base series or this test proves nothing"),
+        };
+
+        assert_eq!(correct.len(), wrong.len());
+        let ratios: Vec<f64> = correct
+            .iter()
+            .zip(wrong.iter())
+            .filter(|(c, w)| c.is_finite() && w.is_finite() && **c > 1e-6)
+            .map(|(c, w)| w / c)
+            .collect();
+        assert!(
+            !ratios.is_empty(),
+            "no usable bars in the base series — this test would pass vacuously"
+        );
+        for r in &ratios {
+            assert!(
+                (r - 100.0).abs() < 1e-6,
+                "expected a clean 100x from the pip error, got {r}"
+            );
+        }
     }
 }

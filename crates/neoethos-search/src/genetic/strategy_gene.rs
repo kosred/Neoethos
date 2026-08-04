@@ -1002,62 +1002,12 @@ mod cross_pair_currency_tests {
         assert!(!overrides.reject_pip_fallback);
     }
 
-    /// The report must describe the engine it reports on.
-    ///
-    /// `neoethos-core`'s `resolved_config.rs` holds a DISPLAY copy of the
-    /// strict-mode filter floors, deliberately mirrored rather than imported
-    /// because core cannot depend on search without a cycle. Its own comment
-    /// said the two "have to stay in sync" and that asserting it was "a Phase-C
-    /// task" — never written. By 2026-08-03 three of the six had drifted:
-    /// max drawdown was displayed as 0.20 while 0.15 was enforced, min sharpe
-    /// as 0.5 against 0.3, min win rate as 0.45 against 0.50. So
-    /// `neoethos-cli config` and the Settings UI described a system that did
-    /// not exist, in the direction that matters most — a operator reading 20 %
-    /// drawdown tolerance was actually getting 15 %.
-    ///
-    /// This test lives HERE, not in core, precisely because search depends on
-    /// core and can therefore see both sides. That is the whole reason the
-    /// mirror was allowed to drift: neither crate could check it alone.
-    ///
-    /// Only the non-PropFirm branch is asserted. PropFirm floors are rewritten
-    /// by `apply_mode_overrides` (discovery.rs:682-689) to
-    /// (0.50, 0.0, 1.0, -10.0, 0.0, 0.0) and the display already matches those.
-    #[test]
-    fn display_floors_match_the_enforced_ones() {
-        let enforced = FilteringConfig::default();
-
-        // The tuple resolved_config.rs builds for the non-PropFirm branch is
-        // (min_fitness_score, min_trades, max_drawdown, min_sharpe,
-        //  min_win_rate, min_pf). min_trades is config-driven on the display
-        // side (models.prop_min_trades), so it is deliberately not compared.
-        let displayed_max_drawdown = 0.15_f64;
-        let displayed_min_sharpe = 0.3_f64;
-        let displayed_min_win_rate = 0.50_f64;
-        let displayed_min_pf = 1.2_f64;
-
-        assert_eq!(
-            enforced.max_dd, displayed_max_drawdown,
-            "resolved_config.rs displays max drawdown {displayed_max_drawdown} \
-             but the engine enforces {}. Change both or neither.",
-            enforced.max_dd
-        );
-        assert_eq!(
-            enforced.min_sharpe, displayed_min_sharpe,
-            "resolved_config.rs displays min sharpe {displayed_min_sharpe} \
-             but the engine enforces {}. Change both or neither.",
-            enforced.min_sharpe
-        );
-        assert_eq!(
-            enforced.min_win_rate, displayed_min_win_rate,
-            "resolved_config.rs displays min win rate {displayed_min_win_rate} \
-             but the engine enforces {}. Change both or neither.",
-            enforced.min_win_rate
-        );
-        assert_eq!(
-            enforced.min_profit_factor, displayed_min_pf,
-            "resolved_config.rs displays min profit factor {displayed_min_pf} \
-             but the engine enforces {}. Change both or neither.",
-            enforced.min_profit_factor
-        );
-    }
+    // `display_floors_match_the_enforced_ones` MOVED 2026-08-04 to
+    // `discovery_tests.rs`. The version that lived here compared the enforced
+    // floors against display literals RETYPED into the test body, so it could
+    // not fail when `resolved_config.rs` drifted — measured: with the display
+    // floors edited to 0.20/0.9/0.99/9.9 it still reported `ok`. The
+    // replacement calls `ResolvedConfig::from_settings` and covers all three
+    // modes, which needs `DiscoveryConfig::from_settings` to apply the mode
+    // overrides first — hence the move to the discovery tests.
 }
