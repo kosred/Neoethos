@@ -470,10 +470,31 @@ async fn run(
         .map(|s| s.risk.max_portfolio_risk)
         .unwrap_or(0.0)
         .clamp(0.0, 1.0);
-    // Weekend kill zones — PARITY with the backtest (eval.rs): discovery runs
-    // with kill_zones_enabled from the SAME config flag, force-closing before
-    // the weekend and blocking Fri-late/Mon-open entries. Live must match or
-    // positions ride weekend gaps no validated strategy ever held through.
+    // Weekend kill zones — force-close before the weekend, block Fri-late /
+    // Mon-open entries.
+    //
+    // CORRECTED 2026-08-04. This comment used to read:
+    //
+    //   "PARITY with the backtest (eval.rs): discovery runs with
+    //    kill_zones_enabled from the SAME config flag ... Live must match or
+    //    positions ride weekend gaps no validated strategy ever held through."
+    //
+    // Discovery does NOT read that flag. `discovery_backtest_settings`
+    // (neoethos-search/src/discovery.rs:1365) hardcodes
+    // `kill_zones_enabled: true`, so every backtest that ever validated a
+    // strategy ran WITH kill zones, unconditionally. Only this live path
+    // consults `risk.kill_zones_enabled` (neoethos-core/src/config.rs:378,
+    // default true).
+    //
+    // So the flag is not a shared switch, it is a one-sided one, and the
+    // failure it creates is exactly the one the old comment warned about:
+    // setting `risk.kill_zones_enabled = false` makes live hold through
+    // weekend gaps that no backtest in the artifact history ever held
+    // through. Defaults agree (both true), which is why this went unseen.
+    //
+    // Do not "restore parity" by wiring the flag into discovery without
+    // deciding which side is authoritative — that would silently re-score
+    // every strategy in the library against a different simulator.
     let kill_zones_enabled = sizing
         .as_ref()
         .map(|s| s.risk.kill_zones_enabled)
