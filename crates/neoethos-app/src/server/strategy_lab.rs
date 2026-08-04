@@ -88,12 +88,27 @@ pub async fn promotion_status(
     }
 }
 
-/// Load the gate config from Settings (falls back to the moderate
-/// defaults). Currently the defaults are used directly — a future
-/// `ModelsConfig.promotion_gate` field can override them here without
-/// touching the endpoint.
-fn load_gate_config(_settings: &Settings) -> PromotionGateConfig {
-    PromotionGateConfig::default()
+/// Load the gate config the operator actually configured.
+///
+/// **2026-08-04 fix — the gate ran, but with thresholds nobody could
+/// reach.** This function used to be
+/// `fn load_gate_config(_settings: &Settings) -> PromotionGateConfig {
+/// PromotionGateConfig::default() }`: it took the operator's `Settings`,
+/// discarded it, and returned the hardcoded moderate defaults. Both the
+/// read-only `GET /strategy_lab/promotion` and the authoritative
+/// `POST /strategy_lab/promote` route through here, so no portfolio had
+/// ever been judged against an operator-set bar — the endpoint even
+/// echoed the hardcoded config back to the UI as "the thresholds in
+/// effect", which made the wrong thresholds look confirmed.
+///
+/// The old doc comment said "a future `ModelsConfig.promotion_gate`
+/// field can override them here without touching the endpoint". That
+/// field now exists and this is the read. `models.promotion_gate` is
+/// `#[serde(default)]`, so a `config.yaml` without the key still yields
+/// exactly the previous thresholds — see
+/// `a_settings_without_the_key_reproduces_the_previous_thresholds`.
+fn load_gate_config(settings: &Settings) -> PromotionGateConfig {
+    settings.models.promotion_gate.clone()
 }
 
 fn evaluate_promotion_for(symbol: &str, base_tf: &str) -> anyhow::Result<PromotionResponseDto> {
@@ -306,4 +321,68 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<usize> {
         }
     }
     Ok(copied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for the 2026-08-04 "no final recipient" fix. Before it,
+    /// `load_gate_config` was
+    /// `fn load_gate_config(_settings: &Settings) -> PromotionGateConfig {
+    /// PromotionGateConfig::default() }` and this test could not fail no
+    /// matter what the operator configured.
+    #[test]
+    fn load_gate_config_honours_the_operator_threshold() {
+        let mut settings = Settings::default();
+        settings.models.promotion_gate.min_sharpe = 2.5;
+        settings.models.promotion_gate.min_trades = 500;
+        settings.models.promotion_gate.max_drawdown_pct = 8.0;
+
+        let cfg = load_gate_config(&settings);
+        assert_eq!(cfg.min_sharpe, 2.5, "the gate must read the operator's file");
+        assert_eq!(cfg.min_trades, 500);
+        assert_eq!(cfg.max_drawdown_pct, 8.0);
+    }
+
+    /// A portfolio that clears the shipped default bar must be REJECTED
+    /// once the operator tightens it — the decision, not just the echoed
+    /// config, has to change. `POST /strategy_lab/promote` re-runs this
+    /// same path server-side, so this is the copy-to-`live_models/` guard.
+    #[test]
+    fn a_tightened_gate_changes_the_promotion_decision() {
+        let portfolio = PromotionMetrics {
+            sharpe: 1.8,
+            win_rate: 0.56,
+            profit_factor: 1.6,
+            max_drawdown_pct: 12.0,
+            trades: 240,
+        };
+
+        let shipped = load_gate_config(&Settings::default());
+        assert!(
+            evaluate_promotion(&portfolio, &shipped).promoted,
+            "this portfolio clears the shipped default bar"
+        );
+
+        let mut settings = Settings::default();
+        settings.models.promotion_gate.min_sharpe = 2.5;
+        let decision = evaluate_promotion(&portfolio, &load_gate_config(&settings));
+        assert!(
+            !decision.promoted,
+            "an operator min_sharpe of 2.5 must block a 1.8-Sharpe portfolio: {}",
+            decision.summary
+        );
+    }
+
+    /// A `config.yaml` written before the knob existed must promote
+    /// exactly what it promoted yesterday.
+    #[test]
+    fn a_settings_without_the_key_reproduces_the_previous_thresholds() {
+        assert_eq!(
+            load_gate_config(&Settings::default()),
+            PromotionGateConfig::default(),
+            "adding the knob must not move the bar for existing installs"
+        );
+    }
 }
