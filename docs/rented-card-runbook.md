@@ -100,9 +100,10 @@ XGBoost CUDA, and the stop/gate/kill-zone fixes. No branch-hopping needed. Then:
 
 Watch for:
 - XGBoost logs `device = cuda` (not the deprecated gpu_hist),
-- LightGBM does NOT Fatal at fit (the device_type="gpu" OpenCL bug is fixed
-  on that branch; if training on master, LightGBM will still Fatal on a GPU
-  host — known, skip it),
+- LightGBM does NOT Fatal at fit — the device_type="gpu" OpenCL bug is fixed
+  on master (fit_internal now consults effective_device_type, and the vendored
+  build enables the CUDA learner + OpenMP). If it Fatals anyway, that is a NEW
+  bug: capture the log,
 - the artifact records which device each model trained on.
 
 Label sanity: with the current asymmetric label geometry the class prior is
