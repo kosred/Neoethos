@@ -1,0 +1,26 @@
+# Copyright (c) 2024, NVIDIA CORPORATION.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+  - repo: https://github.com/cpplint/cpplint
+    rev: 1.6.1
+    hooks:
+      - id: cpplint
+        args: ["--recursive"]
+  - repo: https://github.com/rapidsai/pre-commit-hooks
+    rev: v0.0.3
+    hooks:
+      - id: verify-copyright
+        args: ["--fix", "--main-branch", "main"]
+  - repo: https://github.com/rapidsai/dependency-file-generator
+    rev: v1.13.11
+    hooks:
+      - id: rapids-dependency-file-generator
+        args: ["--clean"]
+
+default_language_version:
+      python: python3

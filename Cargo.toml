@@ -121,6 +121,16 @@ codegen-units = 16
 
 [patch.crates-io]
 lightgbm3-sys = { path = "vendor/lightgbm3-sys" }
+# VENDORED 2026-08-04 for one line: upstream build.rs canonicalizes the CMake
+# source dir with std::fs::canonicalize, whose Windows `\\?\` prefix empties
+# CMake's file(GLOB) — configure dies with "No SOURCES given to target:
+# xgboost" on every Windows host. The vendored copy swaps that call to
+# dunce::canonicalize (which upstream already uses for its deps path — the
+# hazard was known, the line was missed). Linux is unaffected either way.
+# TRIGGER TO UNVENDOR: an xgboost_lib-sys > 3.0.4 whose build.rs line ~10 uses
+# dunce; check LIVE at https://crates.io/api/v1/crates/xgboost_lib-sys — the
+# local index is stale and has misreported versions before.
+xgboost_lib-sys = { path = "vendor/xgboost_lib-sys" }
 # sklears-core RE-VENDORED 2026-07-12 at v0.1.1. Upstream 0.1.1 calls
 # the linux-only `read_perf_counters()` unconditionally on x86_64, so it
 # does not COMPILE on Windows/macOS (E0599 — caught by the first real CI
