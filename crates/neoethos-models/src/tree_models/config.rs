@@ -40,6 +40,7 @@ pub struct TreeRuntimeOverrides {
     pub gpu_count: Option<usize>,
     pub early_stop_patience: Option<usize>,
     pub early_stop_min_delta: Option<f64>,
+    pub lightgbm_gpu: bool,
 }
 
 impl Default for TreeRuntimeOverrides {
@@ -50,6 +51,7 @@ impl Default for TreeRuntimeOverrides {
             gpu_count: None,
             early_stop_patience: None,
             early_stop_min_delta: None,
+            lightgbm_gpu: false,
         }
     }
 }
@@ -70,6 +72,7 @@ impl TreeRuntimeOverrides {
             gpu_count: c.gpu_count,
             early_stop_patience: c.early_stop_patience,
             early_stop_min_delta: c.early_stop_min_delta,
+            lightgbm_gpu: c.lightgbm_gpu,
         }
     }
 }
@@ -148,6 +151,17 @@ pub fn parse_device_preference(value: &str) -> DevicePreference {
 
 pub fn gpu_only_mode() -> bool {
     gpu_only_mode_for("tree")
+}
+
+/// Whether LightGBM may resolve `device_type=cuda`. Config-driven
+/// (`models.tree_runtime.lightgbm_gpu`), default `false`.
+///
+/// Separate from [`tree_device_preference`] on purpose: `device` states the
+/// operator's intent for tree models generally, this states whether LightGBM
+/// is permitted to act on it. See `TreeRuntimeConfig::lightgbm_gpu` for why
+/// the default is off.
+pub fn lightgbm_gpu_allowed() -> bool {
+    current_tree_runtime().lightgbm_gpu
 }
 
 pub fn gpu_only_mode_for(_model_name: &str) -> bool {

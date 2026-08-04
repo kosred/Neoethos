@@ -780,6 +780,28 @@ pub struct ModelsConfig {
     /// Tree-model training knobs (config-driven replacement for the
     /// `NEOETHOS_BOT_EARLY_STOP_*` env vars). See [`TreeRuntimeConfig`].
     pub tree_runtime: TreeRuntimeConfig,
+    /// Device policy for the statistical models (ElasticNet / Logistic —
+    /// `statistical/linear_impl.rs`). One of:
+    ///
+    /// - `"cpu"` (default) — always the CPU path. This is what every build
+    ///   has done to date, because the CUDA softmax kernel behind it was
+    ///   compiled by no shipped feature combination.
+    /// - `"auto"` — the CUDA kernel when a CUDA device is present, else CPU.
+    /// - `"gpu"` / `"cuda"` / `"gpu:N"` / `"cuda:N"` — the CUDA kernel,
+    ///   optionally pinned to device N.
+    ///
+    /// The default is `"cpu"` rather than `"auto"` because the two backends
+    /// are not bit-identical: the kernel optimises with subgradient-L1 SGD,
+    /// so it is only used when `l1_ratio == 0` in the first place, and even
+    /// then f32 GPU reductions accumulate differently from the CPU path. That
+    /// changes fitted weights, which changes predictions, which changes
+    /// selection. Flipping this is the operator's call.
+    ///
+    /// `NEOETHOS_BOT_<MODEL>_DEVICE` and `NEOETHOS_BOT_META_DEVICE` still
+    /// override this, as they always have.
+    pub statistical_device: String,
+    /// Thresholds for the promotion gate — the bar a discovered portfolio
+    /// must clear before it is reported as promotable. See
     pub prop_metric_weight: f64,
     pub prop_accuracy_weight: f64,
     pub prop_min_trades: usize,
@@ -979,6 +1001,28 @@ pub struct DiscoveryRuntimeConfig {
     /// See [`PropFirmGateConfig`]. (was the
     /// `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` env overrides)
     pub prop_firm_gate: PropFirmGateConfig,
+    /// Apply the 20% out-of-sample holdout to the `GeneticStrategyExpert`
+    /// training path (`neoethos-models`), the way the desktop app, the CLI and
+    /// the batch orchestrator already do.
+    ///
+    /// `run_discovery_cycle_with_holdout` documents itself as the single
+    /// source of truth for "discovery never sees the tail" and says every
+    /// production caller must go through it. Audit B02/B03 (2026-07-13) routed
+    /// the CLI and the orchestrator through it. `GeneticStrategyExpert::train_with_discovery`
+    /// was not part of that pass and still calls the unwrapped
+    /// `run_discovery_cycle` with the FULL series — so when the training
+    /// orchestrator trains that expert, its genes are selected on 100% of the
+    /// data and its reported fitness is entirely in-sample.
+    ///
+    /// Default `false` = exactly that behaviour, because turning it on is a
+    /// selection change in both directions: the GA searches 80% of the rows
+    /// (different genes), and the holdout wrapper REFUSES datasets whose
+    /// in-sample half would be under 64 rows, which turns some short-fold
+    /// trainings that "succeed" today into a loud error. Set `true` once you
+    /// are ready for the expert's numbers to become out-of-sample — and to
+    /// find out which folds were too short to be meaningful in the first
+    /// place.
+    pub genetic_expert_holdout: bool,
 }
 
 impl Default for DiscoveryRuntimeConfig {
@@ -992,6 +1036,9 @@ impl Default for DiscoveryRuntimeConfig {
             min_history_years: 0,
             adaptive_thresholds: false,
             prop_firm_gate: PropFirmGateConfig::default(),
+            // false = today: the GeneticStrategyExpert searches the full
+            // series. See the field docs for why this is not simply `true`.
+            genetic_expert_holdout: false,
         }
     }
 }
@@ -1398,6 +1445,23 @@ pub struct TreeRuntimeConfig {
     /// Early-stop min-delta override; `None` = use the model's default.
     /// Was `NEOETHOS_BOT_EARLY_STOP_MIN_DELTA`.
     pub early_stop_min_delta: Option<f64>,
+    /// Let LightGBM train on the CUDA tree learner when the build has it and
+    /// the host has a card. `false` (the default) pins LightGBM to the CPU
+    /// regardless of `device`.
+    ///
+    /// This is deliberately a separate knob from `device` and not a new
+    /// spelling of it. `device` is what the operator WANTS across all tree
+    /// models; this says whether LightGBM in particular is allowed to act on
+    /// it. It defaults to `false` because flipping it changes which
+    /// arithmetic trains the model — CUDA histogram construction sums in a
+    /// different order than the CPU learner, so the same data and the same
+    /// hyper-parameters produce a slightly different tree. That is a
+    /// selection change, and selection changes are the operator's to make.
+    ///
+    /// Set `true` once a run on this host has been compared against a CPU
+    /// run. On a build without the CUDA learner, or a host with no card,
+    /// `true` is simply inert — it never silently degrades.
+    pub lightgbm_gpu: bool,
 }
 
 impl Default for TreeRuntimeConfig {
@@ -1408,6 +1472,7 @@ impl Default for TreeRuntimeConfig {
             gpu_count: None,
             early_stop_patience: None,
             early_stop_min_delta: None,
+            lightgbm_gpu: false,
         }
     }
 }
@@ -1647,6 +1712,7 @@ impl Default for ModelsConfig {
             smc_search_runtime: SmcSearchRuntimeConfig::default(),
             data_runtime: DataRuntimeConfig::default(),
             tree_runtime: TreeRuntimeConfig::default(),
+            statistical_device: "cpu".to_string(),
             prop_metric_weight: 1.0,
             prop_accuracy_weight: 0.1,
             prop_min_trades: 0,
@@ -2287,6 +2353,26 @@ mod tests {
         );
         assert_eq!(settings.risk.initial_balance, 10_000.0);
         assert!(!settings.models.ml_models.is_empty());
+    }
+
+    /// The genetic expert's OOS holdout must stay OFF by default. Turning it
+    /// on changes which genes that expert produces (the GA sees 80% of the
+    /// rows instead of all of them) and makes short folds fail loudly rather
+    /// than quietly succeed. Both are the right end state; neither should
+    /// arrive as a side effect of picking up a new build.
+    #[test]
+    fn genetic_expert_holdout_defaults_to_todays_behaviour() {
+        assert!(
+            !DiscoveryRuntimeConfig::default().genetic_expert_holdout,
+            "default must reproduce the full-series search this path has always done"
+        );
+        assert!(
+            !Settings::default()
+                .models
+                .discovery_runtime
+                .genetic_expert_holdout,
+            "a default Settings must not silently enable the holdout"
+        );
     }
 
     // ─── UI↔CLI parity: the shared timeframe/symbol resolvers ───────────────

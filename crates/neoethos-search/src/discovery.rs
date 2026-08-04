@@ -1417,7 +1417,7 @@ pub fn faithful_oos_eval(
     let dataset = neoethos_data::load_symbol_dataset(data_dir, &symbol)?;
     let higher_refs: Vec<&str> = artifact.higher_tfs.iter().map(|s| s.as_str()).collect();
     let raw_features =
-        neoethos_data::prepare_multitimeframe_features(&dataset, &base_tf, &higher_refs, None)?;
+        neoethos_data::prepare_multitimeframe_features(&dataset, &base_tf, &higher_refs)?;
     let features =
         crate::project_features_to_effective(&raw_features, &artifact.effective_feature_names)?;
     if features.n_samples() != base_ohlcv.len() {

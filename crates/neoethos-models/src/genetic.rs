@@ -21,7 +21,10 @@ use neoethos_search::genetic::{
     crossover, generate_random_genes, mutate, select_parent_index, select_survivor_indices,
     signals_for_gene, unique_candidate_or_retry,
 };
-use neoethos_search::{DiscoveryConfig, FilteringConfig, run_discovery_cycle};
+use neoethos_search::{
+    DiscoveryConfig, FilteringConfig, PropFirmRiskRules, run_discovery_cycle,
+    run_discovery_cycle_with_holdout,
+};
 use polars::prelude::*;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -34,6 +37,27 @@ const METADATA_FILE_NAME: &str = "metadata.json";
 const MODEL_NAME: &str = "genetic";
 const DEFAULT_MAX_LABEL_EVALUATIONS: usize = 25_000;
 const DEFAULT_MAX_DISCOVERY_CANDIDATES: usize = 25_000;
+
+/// Whether `train_with_discovery` runs behind the 20% OOS holdout, installed
+/// once at startup from `models.discovery_runtime.genetic_expert_holdout`.
+///
+/// `false` (the default, and the value when never installed — e.g. unit
+/// tests) reproduces the behaviour this path has always had: the full series.
+static GENETIC_EXPERT_HOLDOUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the genetic-expert holdout policy from `Settings`. Call once at
+/// startup, before any training; the first install wins. Called from
+/// `neoethos_app::install_runtime_overrides_from_settings` (app + desktop)
+/// and from the CLI's `main`.
+pub fn install_genetic_runtime_from_settings(settings: &neoethos_core::Settings) {
+    let _ = GENETIC_EXPERT_HOLDOUT.set(settings.models.discovery_runtime.genetic_expert_holdout);
+}
+
+/// Whether the genetic expert should hold out the tail. Defaults to `false`
+/// when never installed, which is what every run to date has done.
+pub fn genetic_expert_holdout_enabled() -> bool {
+    *GENETIC_EXPERT_HOLDOUT.get_or_init(|| false)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum GeneticBackendMode {
@@ -507,8 +531,47 @@ impl GeneticStrategyExpert {
             ?determinism_policy,
             "running Rust-native genetic discovery"
         );
-        let result = run_discovery_cycle(features, ohlcv, &resolved_config)
-            .context("run Rust-native discovery-backed genetic search")?;
+        // THE HOLDOUT. `run_discovery_cycle_with_holdout` calls itself "the
+        // single source of truth for 'discovery never sees the tail'" and
+        // states that every production caller must go through it. Audit
+        // B02/B03 (2026-07-13) routed the desktop app, the CLI and the batch
+        // orchestrator through it — and missed this call site, which is the
+        // one the TRAINING orchestrator uses. So `GeneticStrategyExpert` has
+        // gone on searching the full series: its genes are selected on 100%
+        // of the rows and its reported fitness is entirely in-sample, while
+        // three other entry points hold back 20%.
+        //
+        // Fixing that outright would change which genes this expert produces,
+        // so it is behind `models.discovery_runtime.genetic_expert_holdout`,
+        // default false = the full series, exactly as before. See that field's
+        // docs for the second reason it is not simply flipped: the wrapper
+        // REFUSES a dataset whose in-sample half is under 64 rows, so short
+        // folds that quietly "succeed" today would start erroring — which is
+        // correct, but it is a change the operator should make deliberately.
+        let holdout = genetic_expert_holdout_enabled();
+        tracing::info!(
+            target: "neoethos_models::genetic",
+            oos_holdout = holdout,
+            "genetic expert discovery window: {}",
+            if holdout {
+                "first 80% (tail withheld)"
+            } else {
+                "FULL series — fitness is in-sample; set \
+                 models.discovery_runtime.genetic_expert_holdout=true to hold out the tail"
+            }
+        );
+        let result = if holdout {
+            run_discovery_cycle_with_holdout(
+                features,
+                ohlcv,
+                &resolved_config,
+                PropFirmRiskRules::default(),
+            )
+            .context("run Rust-native discovery-backed genetic search behind the OOS holdout")?
+        } else {
+            run_discovery_cycle(features, ohlcv, &resolved_config)
+                .context("run Rust-native discovery-backed genetic search")?
+        };
         if !result.portfolio.is_empty() {
             return Ok(result.portfolio);
         }

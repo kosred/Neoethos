@@ -404,6 +404,18 @@ models:
     stage1_window: earliest
     min_history_years: 0
     adaptive_thresholds: false
+    # Apply the 20% out-of-sample holdout to the GeneticStrategyExpert
+    # training path too. The desktop app, the CLI and the batch orchestrator
+    # have gone through the holdout wrapper since audit B02/B03 (2026-07-13);
+    # that pass missed this call site, so when the TRAINING orchestrator
+    # trains the genetic expert it still searches the FULL series and its
+    # fitness is entirely in-sample.
+    #
+    # false = that behaviour, unchanged. Setting true changes which genes the
+    # expert produces (the GA now sees 80% of the rows) AND makes the run fail
+    # loudly on datasets whose in-sample half is under 64 rows — folds that
+    # quietly "succeed" today. Both are improvements; both are changes.
+    genetic_expert_holdout: false
     prop_firm_gate:
       max_daily_loss_pct: null
       max_overall_drawdown_pct: null
@@ -488,6 +500,39 @@ models:
     gpu_count: null
     early_stop_patience: null
     early_stop_min_delta: null
+    # Let LightGBM use the CUDA tree learner when the build has it and the
+    # host has a card. false = LightGBM always trains on the CPU, whatever
+    # `device` above says. Flipping this to true changes the arithmetic that
+    # trains the model (CUDA histograms sum in a different order), so the
+    # trees differ from a CPU run on identical data — compare one run before
+    # leaving it on. Inert on a build without --features gpu-cuda.
+    lightgbm_gpu: false
+  # Device policy for the statistical models (ElasticNet / Logistic).
+  #   cpu   — always the CPU path (default; what every build has done so far)
+  #   auto  — the CUDA softmax kernel when a card is present, else CPU
+  #   gpu / cuda / gpu:N — the CUDA kernel, optionally pinned to device N
+  # The two backends are not bit-identical (f32 GPU reductions accumulate
+  # differently), so this changes fitted weights and therefore selection.
+  statistical_device: cpu
+  # The bar a discovered portfolio must clear before /strategy_lab/promotion
+  # reports it as promotable. These five numbers were HARD-CODED until
+  # 2026-08-02: the loader took Settings and ignored it, so editing config.yaml
+  # could not move the gate no matter what the docs said. The values below are
+  # exactly the ones that were compiled in, so leaving this block alone keeps
+  # today's verdicts identical.
+  #
+  # Raising any floor (or lowering max_drawdown_pct) rejects portfolios that
+  # were promoted before. Mind the units: min_win_rate is a FRACTION (0.45 =
+  # 45%), max_drawdown_pct is a PERCENTAGE (25.0 = 25%).
+  promotion_gate:
+    # false = pass-through, promote whatever discovery finds. Demo only.
+    enabled: true
+    min_sharpe: 1.0
+    min_win_rate: 0.45
+    min_profit_factor: 1.2
+    max_drawdown_pct: 25.0
+    # A stellar Sharpe over 4 trades is noise, not signal.
+    min_trades: 30
   prop_metric_weight: 1.0
   prop_accuracy_weight: 0.1
   prop_min_trades: 0

@@ -32,14 +32,15 @@ use super::common::{
 #[cfg(feature = "lightgbm")]
 use super::config::{
     DevicePreference, ParamValue, TreeModelConfig, cpu_threads_from_params, cpu_threads_hint_for,
-    device_preference_from_params, gpu_count, gpu_only_from_params, gpu_only_mode_for, param_bool,
-    param_float, param_int, param_string, tree_device_preference_for,
+    device_preference_from_params, gpu_count, gpu_only_from_params, gpu_only_mode_for,
+    lightgbm_gpu_allowed, param_bool, param_float, param_int, param_string,
+    tree_device_preference_for,
 };
 #[cfg(not(feature = "lightgbm"))]
 use super::config::{
     DevicePreference, ParamValue, TreeModelConfig, cpu_threads_from_params, cpu_threads_hint_for,
-    device_preference_from_params, gpu_count, gpu_only_from_params, gpu_only_mode_for, param_float,
-    param_string, tree_device_preference_for,
+    device_preference_from_params, gpu_count, gpu_only_from_params, gpu_only_mode_for,
+    lightgbm_gpu_allowed, param_float, param_string, tree_device_preference_for,
 };
 use std::collections::HashMap;
 
@@ -145,14 +146,51 @@ impl LightGBMExpert {
         }
     }
 
+    /// The device LightGBM will actually be handed — and therefore the one
+    /// recorded in the artifact.
+    ///
+    /// This function is the single answer to "which device did this train
+    /// on". It used to be the constant `"cpu"`, while `fit_internal`
+    /// separately wrote `device_type=gpu` into the training params whenever a
+    /// card was visible. Both could not be right: on any `nvidia-smi` host the
+    /// run asked LightGBM for the OpenCL learner (which is not in our build,
+    /// so it Fatal'd at fit) and the artifact recorded `cpu` for a model that
+    /// never trained. `fit_internal` now calls this instead of deciding for
+    /// itself, so there is one decision with one record of it.
+    ///
+    /// Four things must all hold before this returns `cuda`:
+    ///   1. the operator opted in (`models.tree_runtime.lightgbm_gpu`);
+    ///   2. the build linked the CUDA learner (`lightgbm-gpu` feature);
+    ///   3. the operator's device preference is not an explicit `cpu`;
+    ///   4. a GPU is actually visible.
+    /// Otherwise `cpu` — which is the whole of today's behaviour, because (1)
+    /// defaults to false.
+    ///
+    /// Note the vocabulary: `cuda`, never `gpu`. In LightGBM those name two
+    /// different tree learners, and `gpu` is the OpenCL one we do not build.
     fn effective_device_type(&self) -> String {
-        // LightGBM's GPU/CUDA tree learner is NOT enabled in our built lib —
-        // empirically (2026-06-10, A6000) `device_type=cuda` dies with
-        // "[LightGBM] [Fatal] GPU Tree Learner was not enabled in this build."
-        // (`lightgbm3/cuda` does not actually produce a GPU-capable liblightgbm;
-        // the OpenCL path also fails to link). CPU is correct AND fast at our
-        // row counts (gradient boosting on 10^4-10^5 rows is seconds on CPU).
-        "cpu".to_string()
+        if !lightgbm_gpu_allowed() {
+            return "cpu".to_string();
+        }
+        if !cfg!(feature = "lightgbm-gpu") {
+            // Opted in on a build without the learner. Say so rather than
+            // silently returning cpu: the operator set a knob that this
+            // binary cannot honour, and that is worth one line in the log.
+            tracing::warn!(
+                target: "neoethos_models::lightgbm",
+                "models.tree_runtime.lightgbm_gpu is on, but this binary was built \
+                 without the `lightgbm-gpu` feature, so no CUDA tree learner is linked. \
+                 Training on CPU. Rebuild with --features gpu-cuda to honour the knob."
+            );
+            return "cpu".to_string();
+        }
+        if matches!(self.config.device_pref, DevicePreference::Cpu) {
+            return "cpu".to_string();
+        }
+        if gpu_count() == 0 {
+            return "cpu".to_string();
+        }
+        "cuda".to_string()
     }
 
     fn resolved_params(&self) -> HashMap<String, ParamValue> {
@@ -419,9 +457,16 @@ impl LightGBMExpert {
         if artifact.boosting_type.trim().is_empty() {
             bail!("LightGBM runtime artifact boosting_type must not be blank");
         }
-        if !matches!(artifact.effective_device_type.as_str(), "cpu" | "gpu") {
+        // `cuda` = the CUDA tree learner (the one we build). `gpu` = the
+        // OpenCL learner; still accepted so artifacts written before
+        // 2026-08-02 load, but nothing produces it any more.
+        if !matches!(
+            artifact.effective_device_type.as_str(),
+            "cpu" | "gpu" | "cuda"
+        ) {
             bail!(
-                "LightGBM runtime artifact effective_device_type must be 'cpu' or 'gpu', got {}",
+                "LightGBM runtime artifact effective_device_type must be 'cpu', 'cuda' or \
+                 (legacy) 'gpu', got {}",
                 artifact.effective_device_type
             );
         }
@@ -542,16 +587,31 @@ impl LightGBMExpert {
 
             let mut params = self.build_training_params();
 
-            if matches!(
-                self.config.device_pref,
-                DevicePreference::Gpu | DevicePreference::Auto
-            ) && gpu_count() > 0
-                && !matches!(self.config.device_pref, DevicePreference::Cpu)
-            {
-                params["device_type"] = serde_json::json!("gpu");
-            } else {
-                params["device_type"] = serde_json::json!("cpu");
+            // ONE device decision, made by effective_device_type() and used
+            // both here and in the artifact. The block that used to live here
+            // wrote "gpu" — LightGBM's OpenCL learner — whenever a card was
+            // visible, without ever consulting effective_device_type(), which
+            // was simultaneously reporting "cpu" into the runtime artifact.
+            let device_type = self.effective_device_type();
+            if self.config.gpu_only && device_type != "cuda" {
+                // gpu_only means "no silent CPU fallback". Resolving to cpu
+                // here IS that fallback, so say why instead of doing it.
+                anyhow::bail!(
+                    "LightGBM gpu-only mode is set but the resolved device is `{device_type}`. \
+                     Check, in this order: models.tree_runtime.lightgbm_gpu (must be true), \
+                     that this binary was built with --features gpu-cuda (the CUDA tree \
+                     learner), models.tree_runtime.device (must not be `cpu`), and that a \
+                     GPU is visible to this process."
+                );
             }
+            params["device_type"] = serde_json::json!(device_type.clone());
+            tracing::info!(
+                target: "neoethos_models::lightgbm",
+                idx = self.idx,
+                device_type = %device_type,
+                num_threads = self.config.cpu_threads.unwrap_or(1).max(1),
+                "LightGBM training device resolved"
+            );
 
             let valid_dataset = match (val_x, val_y) {
                 (Some(vx), Some(vy)) => {
@@ -1107,6 +1167,71 @@ mod tests {
             .predict_proba(&x)
             .expect("prediction should succeed after runtime reconstruction");
         assert_eq!(probabilities.dim(), (x.height(), 3));
+    }
+
+    /// The default config keeps LightGBM on the CPU, whatever the host has.
+    ///
+    /// This is the guard on the SELECTION half of the 2026-08-02 device fix.
+    /// Enabling the CUDA tree learner in the build is a capability change and
+    /// is unconditional; letting a run USE it changes which trees get grown,
+    /// so it waits for `models.tree_runtime.lightgbm_gpu`. If someone later
+    /// flips that default, this test is what tells them they did.
+    #[test]
+    fn lightgbm_device_stays_cpu_until_the_operator_opts_in() {
+        // `Auto` is the shipped default device preference — the case that
+        // would resolve to `cuda` if the config gate were open.
+        let mut expert = LightGBMExpert::new(0, None);
+        expert.config.device_pref = DevicePreference::Auto;
+        assert!(
+            !crate::tree_models::config::lightgbm_gpu_allowed(),
+            "models.tree_runtime.lightgbm_gpu must default to false"
+        );
+        assert_eq!(
+            expert.effective_device_type(),
+            "cpu",
+            "default config must resolve LightGBM to the CPU learner"
+        );
+        // And the artifact must record the same string the trainer was given
+        // — the two disagreeing is the defect this replaced.
+        assert_eq!(
+            expert.runtime_artifact().effective_device_type,
+            "cpu",
+            "artifact device must match the resolved training device"
+        );
+    }
+
+    /// `gpu` was LightGBM's OpenCL learner and we never built it; `cuda` is
+    /// the learner we do build. Artifacts written before the fix carry `gpu`,
+    /// so loading them must still work.
+    #[test]
+    fn lightgbm_runtime_artifact_accepts_cuda_and_legacy_gpu() {
+        let make = |device: &str| super::LightGBMRuntimeArtifact {
+            configured_params: HashMap::from([(
+                "boosting_type".into(),
+                ParamValue::String("gbdt".into()),
+            )]),
+            resolved_params: HashMap::from([(
+                "device_type".into(),
+                ParamValue::String(device.into()),
+            )]),
+            feature_columns: vec!["momentum".into(), "trend".into()],
+            training_summary: TrainingSummaryMetadata::new(9, 9, 0),
+            device_pref: DevicePreference::Auto,
+            effective_device_type: device.into(),
+            boosting_type: "gbdt".into(),
+            probability_temperature: 1.0,
+            gpu_only: false,
+            cpu_threads: 4,
+        };
+        let columns = ["momentum".to_string(), "trend".to_string()];
+        let summary = TrainingSummaryMetadata::new(9, 9, 0);
+        for device in ["cpu", "cuda", "gpu"] {
+            LightGBMExpert::validate_runtime_artifact(&make(device), &columns, &summary)
+                .unwrap_or_else(|err| panic!("device `{device}` should validate: {err}"));
+        }
+        let err = LightGBMExpert::validate_runtime_artifact(&make("opencl"), &columns, &summary)
+            .expect_err("an unknown device name must not validate");
+        assert!(err.to_string().contains("effective_device_type"));
     }
 
     #[test]

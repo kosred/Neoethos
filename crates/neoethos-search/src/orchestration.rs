@@ -107,7 +107,7 @@ impl DiscoveryOrchestrator {
                     .iter()
                     .map(|s| s.as_str())
                     .collect();
-                let features = match prepare_multitimeframe_features(&ds_ready, tf, &htfs, None) {
+                let features = match prepare_multitimeframe_features(&ds_ready, tf, &htfs) {
                     Ok(f) => f,
                     Err(e) => {
                         summary.feature_failures += 1;

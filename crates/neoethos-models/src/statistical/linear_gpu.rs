@@ -225,8 +225,7 @@ fn softmax_predict_kernel(
 }
 
 pub(crate) fn statistical_cuda_kernel_enabled(model_name: &str) -> bool {
-    let requested = requested_policy(model_name);
-    let normalized = normalize_statistical_device_policy(&requested);
+    let normalized = resolved_policy(model_name);
     let model_env = format!(
         "NEOETHOS_BOT_{}_CUDA_KERNEL",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
@@ -237,14 +236,47 @@ pub(crate) fn statistical_cuda_kernel_enabled(model_name: &str) -> bool {
         && !crate::common::is_kernel_disabled_env(&model_env)
 }
 
-fn requested_policy(model_name: &str) -> String {
-    let model_key = format!(
-        "NEOETHOS_BOT_{}_DEVICE",
-        model_name.trim().to_ascii_uppercase().replace('-', "_")
-    );
-    std::env::var(&model_key)
-        .or_else(|_| std::env::var("NEOETHOS_BOT_META_DEVICE"))
-        .unwrap_or_else(|_| "auto".to_string())
+/// The normalised device policy, with `auto` resolved against the hardware.
+///
+/// `cuda_kernel_enabled` only recognises `gpu` / `gpu:N`, so `auto` has always
+/// meant CPU here. That was harmless while this file was compiled by no
+/// shipped feature; now that `statistical-gpu` is in the `gpu-cuda` aggregate,
+/// a policy that says "decide for me" has to actually decide. `auto` now asks
+/// the CUDA runtime whether there is a device and resolves to `gpu` when there
+/// is — which is the ONLY path by which a caller selects this kernel without
+/// naming a device explicitly.
+///
+/// This is reachable only when the operator sets `models.statistical_device`
+/// to `auto` (or an env var to the same); the shipped default is `cpu`.
+fn resolved_policy(model_name: &str) -> String {
+    let normalized = normalize_statistical_device_policy(&super::common::statistical_device_policy(
+        model_name,
+    ));
+    if normalized != "auto" {
+        return normalized;
+    }
+    // Same probe the tree models use (CUDA_VISIBLE_DEVICES, then a
+    // timeout-guarded `nvidia-smi`), so "is there a card" has ONE answer
+    // across this crate instead of a second, subtly different one here.
+    match crate::tree_models::config::gpu_count() {
+        0 => {
+            tracing::debug!(
+                target: "neoethos_models::statistical",
+                model = model_name,
+                "statistical device policy `auto` found no CUDA device; using the CPU path"
+            );
+            "cpu".to_string()
+        }
+        count => {
+            tracing::info!(
+                target: "neoethos_models::statistical",
+                model = model_name,
+                cuda_devices = count,
+                "statistical device policy `auto` resolved to the CUDA softmax kernel"
+            );
+            "gpu".to_string()
+        }
+    }
 }
 
 fn cuda_device_id(model_name: &str) -> usize {
@@ -252,7 +284,7 @@ fn cuda_device_id(model_name: &str) -> usize {
         "NEOETHOS_BOT_{}_CUDA_DEVICE",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
-    let normalized = normalize_statistical_device_policy(&requested_policy(model_name));
+    let normalized = resolved_policy(model_name);
     crate::common::cuda_device_id_from_policy(
         &normalized,
         &model_key,

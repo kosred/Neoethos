@@ -7323,7 +7323,6 @@ dependencies = [
  "serde",
  "serde_json",
  "statrs",
- "tch",
  "tracing",
  "tracing-subscriber",
 ]

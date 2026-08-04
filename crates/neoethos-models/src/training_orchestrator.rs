@@ -315,7 +315,7 @@ impl TrainingOrchestrator {
             prefix_base_features: self.settings.system.multi_resolution_prefix_base,
             ..FeatureBuildOptions::default()
         };
-        let frame = prepare_multitimeframe_features_with_options(&dataset, base_tf, &opts, None)?;
+        let frame = prepare_multitimeframe_features_with_options(&dataset, base_tf, &opts)?;
         let base_ohlcv = dataset.frames.get(base_tf).context("base tf missing")?;
         let labels = self.derive_labels(base_ohlcv, symbol)?;
 

@@ -1,10 +1,18 @@
 name: Release (GPU)
 
 # Builds the GPU-enabled release for Windows + Linux as a single artifact
-# per platform. Uses libtorch (PyTorch C++) with CUDA, bundled inside the
-# installer/tarball. End-users need a matching NVIDIA driver + CUDA
-# toolkit installed on their machine; libtorch DLLs/.so are shipped
-# in-tree so no extra Python install is needed.
+# per platform. End-users need only an NVIDIA driver; the CUDA runtime
+# libraries the binary loads are bundled inside the installer/tarball.
+#
+# 2026-08-02: libtorch is no longer downloaded or bundled. Nothing in a
+# shipped build links it — `tch` is optional in neoethos-models and enabled
+# by no feature, and d4df966a dropped the `dep:tch` that neoethos-search
+# once had. What the ~2 GB libtorch bundle was actually delivering was the
+# CUDA REDISTRIBUTABLES that happen to sit in its lib/ directory, and those
+# are still required: cudarc dlopens nvrtc + cudart for CubeCL's JIT,
+# neoethos-gpu-cuda links cudart, and candle needs cublas/curand. They now
+# come from the CUDA toolkit this workflow already installs, which is both
+# the honest source and a far smaller bundle.
 
 on:
   push:
@@ -22,16 +30,11 @@ env:
   RUST_BACKTRACE: 1
   BINDGEN_EXTRA_CLANG_ARGS: "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 
-  # libtorch / CUDA target. tch-rs 0.22 (our pinned version) requires
-  # libtorch 2.9.0; PyTorch 2.9 was the first release to ship CUDA 13
-  # binaries (cu130). The cu130 build is binary-compatible with any
-  # CUDA 13.x runtime — including the user-installed CUDA 13.2 the
-  # release is targeted at. Bump LIBTORCH_VERSION when tch-rs is
-  # bumped (0.23 → libtorch 2.11; 0.24 → 2.12; etc.).
-  LIBTORCH_VERSION: "2.9.0"
-  LIBTORCH_CUDA: "cu130"
   # CUDA toolkit version installed on the build runner via Jimver/cuda-toolkit.
-  # Must be >= the libtorch CUDA target above. Default: latest CUDA 13.x.
+  # This is now the single CUDA version in the workflow: it supplies nvcc for
+  # the .cu compiles AND the redistributable runtime libraries that get
+  # bundled. Minor-version compatibility means a 13.x runtime works against
+  # any 13.x driver.
   CUDA_TOOLKIT_VERSION: "13.2.0"
 
   # Cargo features enabled in the release. Keep in sync with the
@@ -43,7 +46,7 @@ env:
   # CI runners have no GPU, so the probe panics unless this is set.
   # 80 = Ampere baseline: bf16 kernels compile natively and the PTX
   # forward-JITs onto 8.6/8.9/9.0/12.0 cards. Turing (sm_75) users still
-  # get libtorch CUDA + the Vulkan path; only candle RL kernels need 8.0+.
+  # get the Vulkan path; only candle RL kernels need 8.0+.
   CUDA_COMPUTE_CAP: "80"
 
 jobs:
@@ -73,9 +76,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: windows-cargo-gpu-${{ env.LIBTORCH_VERSION }}-${{ env.LIBTORCH_CUDA }}-${{ hashFiles('**/Cargo.lock') }}
+          key: windows-cargo-gpu-cuda${{ env.CUDA_TOOLKIT_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            windows-cargo-gpu-${{ env.LIBTORCH_VERSION }}-${{ env.LIBTORCH_CUDA }}-
+            windows-cargo-gpu-cuda${{ env.CUDA_TOOLKIT_VERSION }}-
             windows-cargo-gpu-
 
       # candle-kernels compiles .cu → PTX via nvcc, and nvcc on Windows
@@ -91,34 +94,16 @@ jobs:
         with:
           cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
           method: 'network'
-          sub-packages: '["nvcc", "cudart", "thrust", "cublas", "cusparse", "cusolver", "curand"]'
-
-      - name: Download libtorch (Windows, CUDA)
-        shell: pwsh
-        run: |
-          $url = "https://download.pytorch.org/libtorch/${env:LIBTORCH_CUDA}/libtorch-win-shared-with-deps-${env:LIBTORCH_VERSION}%2B${env:LIBTORCH_CUDA}.zip"
-          Write-Host "Downloading $url"
-          Invoke-WebRequest -Uri $url -OutFile "libtorch.zip" -UseBasicParsing
-          Expand-Archive -Path "libtorch.zip" -DestinationPath "$env:GITHUB_WORKSPACE" -Force
-          Remove-Item "libtorch.zip"
-          $libtorchPath = Join-Path $env:GITHUB_WORKSPACE "libtorch"
-          # torch-sys appends include/ and lib/ ITSELF to LIBTORCH_INCLUDE/
-          # LIBTORCH_LIB — setting them to .../include produced the doubled
-          # "include\include" path (fatal C1083). LIBTORCH alone is correct.
-          echo "LIBTORCH=$libtorchPath" >> $env:GITHUB_ENV
-          echo "$libtorchPath/lib" >> $env:GITHUB_PATH
+          # `nvrtc` added 2026-08-02: cudarc dlopens nvrtc at runtime to JIT
+          # CubeCL kernels. It used to arrive by accident inside the libtorch
+          # bundle; with libtorch gone it has to be asked for.
+          sub-packages: '["nvcc", "cudart", "nvrtc", "thrust", "cublas", "cusparse", "cusolver", "curand"]'
 
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked --version "^0.11"
 
       - name: Build release binary (GPU)
-        # TORCH_CUDA_VERSION tells tch-rs's build.rs to look for the
-        # CUDA-enabled libtorch we just downloaded; the build.rs in
-        # crates/neoethos-app then emits the linker flags needed to keep
-        # `libtorch_cuda` in the final binary so `tch::Cuda` sees the GPU.
         shell: pwsh
-        env:
-          TORCH_CUDA_VERSION: cu130
         run: |
           cargo build -p neoethos-app --release --no-default-features --features "${env:RELEASE_FEATURES}"
 
@@ -126,7 +111,12 @@ jobs:
         # Stages every native runtime dependency next to the binary so the
         # NSIS packager and the portable zip both pick them up:
         #  - xgboost.dll / catboostmodel.dll: tree-model native bindings
-        #  - libtorch *.dll: tch-rs runtime (CUDA + cuDNN bundled)
+        #  - CUDA redistributables: cudart (neoethos-gpu-cuda links it, and
+        #    cudarc loads it), nvrtc + its builtins (CubeCL JIT), cublas /
+        #    cublasLt / curand (candle), cusparse / cusolver / nvJitLink
+        #    (pulled in by cublasLt on 13.x). Explicitly named rather than
+        #    globbed: a glob of the toolkit bin/ would also drag in nvcc,
+        #    cuobjdump and the rest of the developer tooling.
         shell: pwsh
         run: |
           $release = "target\release"
@@ -138,19 +128,42 @@ jobs:
           if (Test-Path "$release\xgboost.dll") {
               Copy-Item "$release\xgboost.dll" "crates\neoethos-app\xgboost.dll" -Force
           }
-          # libtorch DLLs
-          New-Item -ItemType Directory -Path "$release\libtorch" -Force | Out-Null
-          Copy-Item "${env:LIBTORCH}\lib\*.dll" "$release\" -Force
-          Copy-Item "${env:LIBTORCH}\lib\*.dll" "crates\neoethos-app\" -Force
+          # CUDA runtime redistributables from the toolkit installed above.
+          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+          if (-not (Test-Path $cudaBin)) {
+              throw "CUDA_PATH\bin not found ($cudaBin); the toolkit step did not export CUDA_PATH."
+          }
+          $patterns = @(
+              "cudart64_*.dll",
+              "nvrtc64_*.dll", "nvrtc-builtins64_*.dll",
+              "cublas64_*.dll", "cublasLt64_*.dll",
+              "curand64_*.dll",
+              "cusparse64_*.dll", "cusolver64_*.dll",
+              "nvJitLink_*.dll"
+          )
+          $staged = @()
+          foreach ($pattern in $patterns) {
+              $staged += Get-ChildItem -Path $cudaBin -Filter $pattern -ErrorAction SilentlyContinue
+          }
+          if ($staged.Count -eq 0) {
+              throw "No CUDA runtime DLLs matched under $cudaBin — the bundle would ship without a CUDA runtime."
+          }
+          foreach ($dll in $staged) {
+              Write-Host "staging $($dll.Name)"
+              Copy-Item $dll.FullName "$release\"              -Force
+              Copy-Item $dll.FullName "crates\neoethos-app\"   -Force
+          }
 
-      - name: Update packager resources to include libtorch
+      - name: Update packager resources to include the CUDA runtime
         shell: pwsh
         run: |
           $cargoToml = "crates\neoethos-app\Cargo.toml"
           $content = Get-Content $cargoToml -Raw
-          # Replace the `resources = [...]` line to bundle every libtorch DLL too
-          $libtorchDlls = (Get-ChildItem "${env:LIBTORCH}\lib\*.dll" | ForEach-Object { "`"$($_.Name)`"" }) -join ", "
-          $newResources = "resources = [`"config.yaml`", `"catboostmodel.dll`", `"xgboost.dll`", $libtorchDlls]"
+          # Bundle whatever the staging step actually placed in the crate root.
+          $cudaDlls = (Get-ChildItem "crates\neoethos-app\*.dll" |
+              Where-Object { $_.Name -notin @("catboostmodel.dll", "xgboost.dll") } |
+              ForEach-Object { "`"$($_.Name)`"" }) -join ", "
+          $newResources = "resources = [`"config.yaml`", `"catboostmodel.dll`", `"xgboost.dll`", $cudaDlls]"
           $content = [regex]::Replace($content, 'resources = \[[^\]]*\]', $newResources)
           Set-Content $cargoToml $content -NoNewline
 
@@ -187,14 +200,13 @@ jobs:
           Runtime requirements:
             - NVIDIA driver supporting CUDA 13.0 or newer (CUDA 13.2 recommended)
               -> verify with: nvidia-smi
-            - The CUDA runtime DLLs bundled here cover libtorch; you do NOT
-              need to install the CUDA toolkit separately.
+            - The CUDA runtime DLLs bundled here are everything the binary
+              loads; you do NOT need to install the CUDA toolkit separately.
 
           To run: just double-click NeoEthos.exe (or run from a terminal
           for log output).
 
-          Bundled libtorch: $(${env:LIBTORCH_VERSION})
-          Bundled CUDA target: $(${env:LIBTORCH_CUDA})
+          Bundled CUDA runtime: $(${env:CUDA_TOOLKIT_VERSION})
           "@ | Set-Content "$outDir\README.txt"
           Compress-Archive -Path $outDir -DestinationPath "dist\NeoEthos-$version-windows-x64-gpu.zip" -Force
 
@@ -253,9 +265,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: linux-cargo-gpu-${{ env.LIBTORCH_VERSION }}-${{ env.LIBTORCH_CUDA }}-${{ hashFiles('**/Cargo.lock') }}
+          key: linux-cargo-gpu-cuda${{ env.CUDA_TOOLKIT_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            linux-cargo-gpu-${{ env.LIBTORCH_VERSION }}-${{ env.LIBTORCH_CUDA }}-
+            linux-cargo-gpu-cuda${{ env.CUDA_TOOLKIT_VERSION }}-
             linux-cargo-gpu-
 
       - name: Install CUDA toolkit (Linux)
@@ -270,36 +282,21 @@ jobs:
           # repo ships the math libs WITHOUT that prefix (libcublas-dev-13-2,
           # not cuda-libcublas-dev-13-2) → "Unable to locate package". The
           # unprefixed ones go in non-cuda-sub-packages (Linux-only input).
-          sub-packages: '["nvcc", "cudart-dev", "thrust"]'
+          # `nvrtc-dev` added 2026-08-02: cudarc dlopens libnvrtc to JIT
+          # CubeCL kernels. It used to arrive by accident inside the libtorch
+          # bundle; with libtorch gone it has to be asked for.
+          sub-packages: '["nvcc", "cudart-dev", "nvrtc-dev", "thrust"]'
           non-cuda-sub-packages: '["libcublas-dev", "libcusparse-dev", "libcusolver-dev", "libcurand-dev"]'
-
-      - name: Download libtorch (Linux, CUDA)
-        # PyTorch dropped the cxx11-abi-prefixed Linux libtorch starting
-        # with the cu130 builds — the unprefixed file ships both ABIs
-        # internally. Use plain `libtorch-shared-with-deps-...`.
-        run: |
-          URL="https://download.pytorch.org/libtorch/${LIBTORCH_CUDA}/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2B${LIBTORCH_CUDA}.zip"
-          echo "Downloading $URL"
-          curl -fsSL "$URL" -o libtorch.zip
-          unzip -q libtorch.zip
-          rm libtorch.zip
-          echo "LIBTORCH=$GITHUB_WORKSPACE/libtorch" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/libtorch/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked --version "^0.11"
 
       - name: Build release binary (GPU)
-        # TORCH_CUDA_VERSION tells tch-rs's build.rs to look for the
-        # CUDA-enabled libtorch we just downloaded. neoethos-app/build.rs
-        # then emits the `--no-as-needed -ltorch_cuda` linker args so
-        # `tch::Cuda::device_count()` actually sees the GPU at runtime.
-        env:
-          TORCH_CUDA_VERSION: cu130
         run: cargo build -p neoethos-app --release --no-default-features --features "${RELEASE_FEATURES}"
 
-      - name: Create portable tar.gz with libtorch
+      - name: Create portable tar.gz with the CUDA runtime
         run: |
+          set -euo pipefail
           VERSION="${{ github.ref_name || inputs.version }}"
           OUTDIR="dist/NeoEthos-${VERSION}-linux-x64-gpu"
           mkdir -p "$OUTDIR/lib"
@@ -308,14 +305,36 @@ jobs:
           cp target/release/neoethos-app "$OUTDIR/NeoEthos"
           chmod +x "$OUTDIR/NeoEthos"
 
-          # Bundle libtorch shared libraries
-          cp -P "$LIBTORCH"/lib/*.so* "$OUTDIR/lib/" 2>/dev/null || true
+          # CUDA runtime redistributables. Explicitly named, not globbed: a
+          # glob of the toolkit lib64/ would also pull the static archives and
+          # the developer-only libraries. libcuda itself is NOT bundled — that
+          # is the driver, and it must come from the user's NVIDIA install.
+          CUDA_LIB="${CUDA_PATH:-/usr/local/cuda}/lib64"
+          if [ ! -d "$CUDA_LIB" ]; then
+            echo "::error::CUDA lib dir not found ($CUDA_LIB); the toolkit step did not export CUDA_PATH." >&2
+            exit 1
+          fi
+          staged=0
+          for pattern in libcudart.so libnvrtc.so libnvrtc-builtins.so \
+                         libcublas.so libcublasLt.so libcurand.so \
+                         libcusparse.so libcusolver.so libnvJitLink.so; do
+            for lib in "$CUDA_LIB/$pattern"*; do
+              [ -e "$lib" ] || continue
+              cp -P "$lib" "$OUTDIR/lib/"
+              staged=$((staged + 1))
+            done
+          done
+          if [ "$staged" -eq 0 ]; then
+            echo "::error::No CUDA runtime libraries matched under $CUDA_LIB — the bundle would ship without a CUDA runtime." >&2
+            exit 1
+          fi
+          echo "staged $staged CUDA runtime libraries"
 
           # Config + launcher
           cp config.yaml "$OUTDIR/config.yaml"
           cat > "$OUTDIR/run-neoethos.sh" <<'SH'
           #!/usr/bin/env bash
-          # Launcher that points the dynamic linker at the bundled libtorch
+          # Launcher that points the dynamic linker at the bundled CUDA runtime
           DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
           export LD_LIBRARY_PATH="$DIR/lib:${LD_LIBRARY_PATH:-}"
           exec "$DIR/NeoEthos" "$@"
@@ -330,23 +349,22 @@ jobs:
           Runtime requirements:
             - NVIDIA driver supporting CUDA 13.0 or newer (CUDA 13.2 recommended)
               -> verify with: nvidia-smi
-            - The CUDA runtime libs bundled in lib/ cover libtorch; you do
-              NOT need to install the CUDA toolkit separately.
+            - The CUDA runtime libs bundled in lib/ are everything the binary
+              loads; you do NOT need to install the CUDA toolkit separately.
 
           To run: ./run-neoethos.sh   (the wrapper sets LD_LIBRARY_PATH)
           Or run directly with:
               LD_LIBRARY_PATH=\$(pwd)/lib ./NeoEthos
 
-          Bundled libtorch: ${LIBTORCH_VERSION}
-          Bundled CUDA target: ${LIBTORCH_CUDA}
+          Bundled CUDA runtime: ${CUDA_TOOLKIT_VERSION}
           EOF
 
           tar -czf "dist/NeoEthos-${VERSION}-linux-x64-gpu.tar.gz" -C dist "NeoEthos-${VERSION}-linux-x64-gpu"
 
-      - name: Package .deb (optional, CPU layout)
-        # The .deb does not bundle libtorch (would push it past the
-        # ~50 MB Debian package threshold). It depends on the system
-        # libtorch install — useful for ops that prefer apt/dpkg.
+      - name: Package .deb (optional, no bundled CUDA runtime)
+        # The .deb does not bundle the CUDA runtime (it would push the package
+        # past the ~50 MB Debian threshold). It depends on the system CUDA
+        # install — useful for ops that prefer apt/dpkg.
         run: cargo packager --release -p neoethos-app --formats deb || true
 
       - name: Upload Linux artifacts
@@ -389,18 +407,18 @@ jobs:
             ### Downloads
             | Platform | File | Notes |
             |----------|------|-------|
-            | Windows installer | `NeoEthos-*-setup.exe` | NSIS installer; libtorch + tree-model DLLs bundled |
+            | Windows installer | `NeoEthos-*-setup.exe` | NSIS installer; CUDA runtime + tree-model DLLs bundled |
             | Windows portable  | `NeoEthos-*-windows-x64-gpu.zip` | Unzip and run `NeoEthos.exe` |
             | Linux portable    | `NeoEthos-*-linux-x64-gpu.tar.gz` | Untar and run `./run-neoethos.sh` |
-            | Linux .deb        | `*.deb` | System libtorch required (apt install) |
+            | Linux .deb        | `*.deb` | System CUDA runtime required (apt install) |
 
             ### Runtime requirements
             - **Windows / Linux**: NVIDIA driver supporting **CUDA 13.0+** (CUDA 13.2 recommended)
-            - libtorch CUDA runtime DLLs/.so are bundled inside the archive — no separate PyTorch / Python install required
+            - CUDA runtime DLLs/.so are bundled inside the archive — no separate CUDA toolkit install required
             - cTrader Open API credentials for live trading (Demo or Live)
 
             ### What's included
-            - GPU-accelerated genetic strategy search (cubecl + tch-rs)
+            - GPU-accelerated genetic strategy search (native CUDA kernels + CubeCL)
             - GPU-accelerated statistical / neuro-evolution backends
             - cTrader broker integration via Open API (OAuth, WebSocket)
             - TradingView-style chart with bid/ask + volume
