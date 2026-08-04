@@ -139,10 +139,12 @@ rustls = { version = "0.23", default-features = true, features = ["ring", "std",
 # `trace` (request/response logs piped through our existing tracing setup).
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
-# CPU / RAM probe for the `/hardware` HTTP endpoint. Same version
-# neoethos-core already pulls in transitively so the workspace
-# resolves to a single sysinfo build.
-sysinfo = "0.37.2"
+# CPU / RAM probe for the `/hardware` HTTP endpoint. MUST stay byte-identical
+# to the requirement in neoethos-core/Cargo.toml — if the two drift apart the
+# workspace resolves two sysinfo builds and `/hardware` and `HardwareProbe`
+# start reporting numbers from different code. See the long note there for why
+# 0.39 (windows 0.62 family + the Windows refresh_cpu_specifics perf fix).
+sysinfo = "0.39.6"
 
 
 

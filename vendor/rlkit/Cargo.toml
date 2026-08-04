@@ -19,7 +19,16 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1.0.100"
-candle-core = "0.9.1"
-candle-nn = "0.9.1"
+# 2026-08-02: 0.9.1 -> 0.10.2. This is a VENDORED fork, so the bump is ours to
+# make. It must move in lockstep with neoethos-models/Cargo.toml's candle-core
+# requirement, and 0.10.2 specifically is the version burn-candle 0.21.0 AND
+# 0.22.0-pre.1 both declare (`candle-core ^0.10.2`, checked live) — matching it
+# is what collapses the candle-core duplicate instead of adding a third copy,
+# which is what jumping straight to 0.11.0 would have done.
+# API used here (DType, Device, Module, Tensor, Result, Error, Shape::from_dims,
+# safetensors::save, candle_nn::{VarBuilder, VarMap, AdamW, Optimizer, ops,
+# optim}) is present and unchanged in 0.10.2 — verified against the 0.10.2 tag.
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
 indicatif = "0.18.0"
 rand = "0.9"
