@@ -41,8 +41,6 @@ fn config_path() -> std::path::PathBuf {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsDto {
     pub data_dir: String,
-    /// UI language code (`"en"` | `"el"`) — see `SystemConfig::ui_locale`.
-    pub ui_locale: String,
     /// Top-level trading mode (`"risky"` | `"prop_firm"`) — see
     /// `SystemConfig::trading_mode`. Drives discovery + risk orientation.
     pub trading_mode: String,
@@ -100,9 +98,6 @@ pub struct SettingsDto {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsUpdateDto {
     pub data_dir: Option<String>,
-    /// `"en"` | `"el"`. Unknown values are rejected (400) so a stale UI can't
-    /// wedge an unsupported locale into config.yaml.
-    pub ui_locale: Option<String>,
     /// `"risky"` | `"prop_firm"`. Unknown values are rejected (400).
     pub trading_mode: Option<String>,
     /// `"auto"` | `"cpu"` | `"gpu"`. Unknown values are rejected (400).
@@ -394,23 +389,6 @@ pub async fn update_settings(
         }
         settings.system.data_dir = PathBuf::from(trimmed);
     }
-    if let Some(raw) = payload.ui_locale {
-        let code = raw.trim().to_ascii_lowercase();
-        if code != "en" && code != "el" {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "unknown ui_locale `{}`. Expected one of: en, el.",
-                        raw
-                    ),
-                    "code": "invalid_ui_locale",
-                })),
-            )
-                .into_response();
-        }
-        settings.system.ui_locale = code;
-    }
     if let Some(raw) = payload.trading_mode {
         let mode = raw.trim().to_ascii_lowercase();
         if mode != "risky" && mode != "prop_firm" {
@@ -480,18 +458,25 @@ pub async fn update_settings(
         settings.news.news_calendar_enabled = b;
     }
     if let Some(raw) = payload.news_calendar_source {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "news_calendar_source cannot be blank",
-                    "code": "invalid_news_source",
-                })),
-            )
-                .into_response();
+        // Only accept a provider the calendar fetcher can actually serve.
+        // Previously ANY non-blank string was accepted, persisted and echoed
+        // back while `news_calendar::fetch_calendar` fetched ForexFactory
+        // regardless — so the operator could "switch provider", see it saved,
+        // and receive ForexFactory data forever.
+        match neoethos_core::config::validate_news_calendar_source(&raw) {
+            Ok(id) => settings.news.news_calendar_source = id,
+            Err(message) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": message,
+                        "code": "invalid_news_source",
+                        "supported": neoethos_core::config::SUPPORTED_NEWS_CALENDAR_SOURCES,
+                    })),
+                )
+                    .into_response();
+            }
         }
-        settings.news.news_calendar_source = trimmed.to_string();
     }
     if let Some(raw) = payload.news_trading_mode {
         let parsed = NewsTradingMode::parse(&raw).ok_or(()).map_err(|_| {
@@ -588,7 +573,6 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
     let mode = settings.news.news_trading_mode;
     SettingsDto {
         data_dir: settings.system.data_dir.display().to_string(),
-        ui_locale: settings.system.ui_locale.clone(),
         trading_mode: settings.system.trading_mode.clone(),
         compute_mode: settings.system.enable_gpu_preference.clone(),
         risky_start_balance: settings.system.risky_start_balance_usd,

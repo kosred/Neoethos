@@ -233,15 +233,18 @@ const GROUPS: Group[] = [
     title: "News gate",
     fields: [
       { key: "newsCalendarEnabled", label: "Calendar enabled", kind: "bool", help: "Pull the economic calendar to gate trading around high-impact events." },
-      { key: "newsCalendarSource", label: "Calendar source", kind: "text", help: "Calendar provider id (e.g. forexfactory)." },
+      { key: "newsCalendarSource", label: "Calendar source", kind: "enum", options: [{ v: "forexfactory", l: "ForexFactory" }], help: "Economic-calendar provider. ForexFactory is the only one this build implements; the backend rejects anything else rather than silently serving ForexFactory under another name." },
       { key: "newsTradingMode", label: "Around news", kind: "enum", options: [{ v: "block_on_news", l: "Pause on news" }, { v: "allow_always", l: "Always allow" }, { v: "warn_only", l: "Warn only" }], help: "What automated trading does around high-impact events." },
     ],
   },
   {
-    title: "Data & locale",
+    title: "Data",
     fields: [
       { key: "dataDir", label: "Data directory", kind: "text", help: "Where local price history + models live." },
-      { key: "uiLocale", label: "Language", kind: "enum", options: [{ v: "en", l: "English" }, { v: "el", l: "Ελληνικά" }], help: "UI language." },
+      // The "Language" picker that used to sit here was removed: this app ships
+      // no i18n layer, so `uiLocale` was validated, persisted and echoed back
+      // while every string stayed English. A control that moves nothing is
+      // worse than a missing one — it is indistinguishable from working.
     ],
   },
 ];
