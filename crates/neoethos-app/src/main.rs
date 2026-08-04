@@ -178,17 +178,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     setup_logging(true)?;
-    // F-005: say which env-var overrides are live before anything acts on
-    // them. Built 2026-05-25, called by nothing until 2026-08-02 — so the one
-    // mechanism whose entire purpose was to make silent overrides visible was
-    // itself invisible.
-    neoethos_core::env_overrides::log_active_overrides_at_startup();
-
-    // Say out loud what the environment is changing underneath this run. See
-    // the same call in neoethos-cli's main: written for this, called by nothing,
-    // while 215 NEOETHOS_* names can silently redirect a run. Observability
-    // only — it changes no behaviour, and it is what makes retiring them for
-    // the single config possible.
+    // Say out loud what the environment is changing underneath this run.
+    // Built 2026-05-25 with the sole purpose of making silent overrides
+    // visible — and called by nothing until 2026-08-02, so the visibility
+    // mechanism was itself invisible. 215 NEOETHOS_* names can redirect a
+    // run; this makes them show up in the log, which is the precondition for
+    // retiring them in favour of the single config. Observability only.
+    //
+    // (Two independent fixes added this call in two spots and the merge kept
+    // both — each run logged every override twice. One call now.)
     neoethos_core::env_overrides::log_active_overrides_at_startup();
 
     // #101 follow-up + #179: the help dialog must fire BEFORE the

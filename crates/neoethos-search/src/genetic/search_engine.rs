@@ -2946,7 +2946,7 @@ mod adaptive_stop_parity_tests {
                 &[1.0; 8],
                 adaptive_pip_size(f64::NAN, ""),
             )
-            .is_none(),
+            .is_err(),
             "a NaN pip must refuse to produce a base series"
         );
     }
@@ -2956,21 +2956,30 @@ mod adaptive_stop_parity_tests {
     /// every stop in the series by exactly 100.
     #[test]
     fn a_wrong_pip_scales_the_whole_adaptive_stop_series() {
-        let ohlcv = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
-        let correct = crate::stop_target::adaptive_base_pips_series(
-            &ohlcv.high,
-            &ohlcv.low,
-            &ohlcv.close,
-            0.01,
-        );
-        let wrong = crate::stop_target::adaptive_base_pips_series(
-            &ohlcv.high,
-            &ohlcv.low,
-            &ohlcv.close,
-            0.0001,
-        );
+        // The embedded cTrader fixture is 100 bars, and the base series now
+        // (correctly) refuses below tail_window + 1 = 101 — the old code
+        // silently dropped the tail term there, the same hole as the 300k
+        // cliff, one bar wide. Synthetic bars instead: deterministic, no RNG,
+        // enough length, and genuine high/low spread so the estimators have
+        // volatility to measure.
+        let n = 256usize;
+        let close: Vec<f64> = (0..n)
+            .map(|i| 1.10 + 0.004 * ((i as f64) * 0.37).sin() + 0.0009 * ((i as f64) * 1.13).cos())
+            .collect();
+        let high: Vec<f64> = close
+            .iter()
+            .enumerate()
+            .map(|(i, c)| c + 0.0006 + 0.0004 * ((i as f64) * 0.71).sin().abs())
+            .collect();
+        let low: Vec<f64> = close
+            .iter()
+            .enumerate()
+            .map(|(i, c)| c - 0.0006 - 0.0004 * ((i as f64) * 0.53).cos().abs())
+            .collect();
+        let correct = crate::stop_target::adaptive_base_pips_series(&high, &low, &close, 0.01);
+        let wrong = crate::stop_target::adaptive_base_pips_series(&high, &low, &close, 0.0001);
         let (correct, wrong) = match (correct, wrong) {
-            (Some(c), Some(w)) => (c, w),
+            (Ok(c), Ok(w)) => (c, w),
             _ => panic!("the fixture bars must produce a base series or this test proves nothing"),
         };
 
