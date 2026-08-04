@@ -135,9 +135,10 @@ pub use quality::{
     install_quality_runtime_overrides_from_env, install_quality_runtime_overrides_from_settings,
 };
 pub use stop_target::{
-    StopTargetSettings, adaptive_base_pips_series, adaptive_sl_tp_pips_series,
-    adaptive_stops_enabled, adaptive_stops_rr, compute_stop_distance_series,
-    infer_stop_target_pips,
+    StopDistanceError, StopTargetRuntimeOverrides, StopTargetSettings, adaptive_base_pips_series,
+    adaptive_sl_tp_pips_series, adaptive_stops_enabled, adaptive_stops_rr,
+    compute_stop_distance_series, current_stop_target_runtime_overrides, infer_stop_target_pips,
+    install_stop_target_runtime_overrides, install_stop_target_runtime_overrides_from_settings,
 };
 pub use validation::{
     CANONICAL_BACKTEST_ARTIFACT_KIND, CANONICAL_BACKTEST_SCHEMA_VERSION,
@@ -200,4 +201,5 @@ pub fn install_search_runtime_overrides_from_settings(s: &neoethos_core::Setting
     install_strategy_evaluation_runtime_overrides_from_settings(s); // ✓ S2b config
     install_smc_search_config_from_settings(s); // ✓ S2e config
     install_seen_signature_memory_runtime_overrides_from_settings(s); // ✓ S2f config
+    install_stop_target_runtime_overrides_from_settings(s); // ✓ S2g config (2026-08-04)
 }

@@ -473,6 +473,20 @@ models:
     initial_equity: 100000.0
     month_capacity: 240
     rayon_threads: null
+  stop_target_runtime:
+    # Cap on the bars the adaptive-stop tail (expected-shortfall) term is
+    # computed over. 0 = no cap. Above a non-zero cap the run now FAILS with
+    # both numbers named; it used to silently drop the tail term, which on
+    # EURUSD M5 changed the median base stop from 18.09 pips (300 000 bars)
+    # to 5.81 pips (300 001 bars).
+    tail_max_bars: 0
+    # Sample the tail every N bars. 1 = every bar. The sampling grid is
+    # anchored at the START of whatever slice it is given, so N > 1 makes the
+    # stop depend on where the caller's series begins: at the old default of 5,
+    # the base over the trailing 300 001 EURUSD M5 bars differed from the same
+    # bars of the full-series base by up to 86% PER BAR while the medians
+    # agreed to 0.006%. 1 costs 574 ms instead of 206 ms per combo.
+    tail_step: 1
   seen_signature_runtime:
     flush_every: 4096
     load_max: 3000000

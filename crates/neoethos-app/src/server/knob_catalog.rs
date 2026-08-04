@@ -911,6 +911,45 @@ fn build_catalog() -> Vec<KnobEntry> {
             preset_aggressive: "",
         },
 
+        KnobEntry {
+            id: "stop_target.tail_max_bars",
+            section: "Backtest runtime",
+            label: "Adaptive-stop tail cap (bars)",
+            // Never had an env var. It had no recipient at all: the value was
+            // hardcoded at `stop_target.rs:78` and the config key was deleted
+            // in 48abfc90 for being dead. Listing it with an invented env var
+            // would repeat the sin this catalog's own doc comment warns about.
+            env_var: None,
+            kind: KnobKind::Int { min: Some(0), max: Some(100_000_000) },
+            default: "0",
+            current: format!(
+                "{}",
+                neoethos_search::current_stop_target_runtime_overrides().tail_max_bars
+            ),
+            help_short: "0 = no cap. Bars the adaptive stop's tail (expected-shortfall) term is computed over.",
+            help_long: "The adaptive stop is max(1.0 x volatility, 1.25 x tail). Until 2026-08-04 this was hardcoded at 300 000 and a longer series silently dropped the tail term: on EURUSD M5, 300 000 bars gave a median base stop of 18.09 pips and 300 001 gave 5.81 pips. Discovery scoring passes the full series and walk-forward and live pass windows, so a gene was ranked on one stop and traded on another. 0 (no cap) makes all three agree. A non-zero cap now FAILS the run by name instead of quietly changing the stop.",
+            preset_conservative: "0",
+            preset_balanced: "0",
+            preset_aggressive: "0",
+        },
+        KnobEntry {
+            id: "stop_target.tail_step",
+            section: "Backtest runtime",
+            label: "Adaptive-stop tail sampling stride",
+            env_var: None,
+            kind: KnobKind::Int { min: Some(1), max: Some(1_000) },
+            default: "1",
+            current: format!(
+                "{}",
+                neoethos_search::current_stop_target_runtime_overrides().tail_step
+            ),
+            help_short: "1 = recompute the stop's tail term on every bar. Higher values make the stop depend on where the series starts.",
+            help_long: "The tail sampling grid is anchored at the START of whatever slice it is given, so a stride above 1 makes the same bar get a different stop depending on which caller asked. At the old default of 5, the base over the trailing 300 001 EURUSD M5 bars differed from the same bars of the full-series base by up to 86% PER BAR while the medians agreed to 0.006%. The live loop's rolling buffer moves its start every bar, so that fired constantly. 1 costs 574 ms instead of 206 ms per combo and moves every median by under 0.02%.",
+            preset_conservative: "1",
+            preset_balanced: "1",
+            preset_aggressive: "1",
+        },
+
         // ── Section 7 — Logging / server ─────────────────────────────
         KnobEntry {
             id: "log.rust_log",

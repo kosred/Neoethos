@@ -560,7 +560,7 @@ pub fn evaluate_genes_cached(
         &ohlcv.close,
         config,
         &mut b_settings,
-    );
+    )?;
 
     crate::backend::evaluate_population_core_with_backend(
         crate::eval::PopulationEvalInputs {
@@ -706,7 +706,7 @@ pub fn validation_genes_population(
         &ohlcv.close,
         config,
         &mut settings,
-    );
+    )?;
 
     Ok(crate::eval::validation_backtest_population(
         crate::eval::PopulationEvalInputs {
@@ -902,7 +902,7 @@ pub fn validation_genes_population_gathered(
         gathered_close,
         config,
         &mut settings,
-    );
+    )?;
     Ok(crate::eval::validation_backtest_population(
         crate::eval::PopulationEvalInputs {
             close: gathered_close,
@@ -1148,11 +1148,24 @@ pub fn validation_genes_population_window(
         } else {
             0.0001
         };
-        if let Some(base) =
-            crate::stop_target::adaptive_base_pips_series(win_high, win_low, win_close, pip)
-        {
-            win_settings.adaptive_base_pips = Some(base.into());
-            win_settings.adaptive_rr = crate::stop_target::adaptive_stops_rr();
+        match crate::stop_target::adaptive_base_pips_series(win_high, win_low, win_close, pip) {
+            Ok(base) => {
+                win_settings.adaptive_base_pips = Some(base.into());
+                win_settings.adaptive_rr = crate::stop_target::adaptive_stops_rr();
+            }
+            Err(e @ crate::stop_target::StopDistanceError::TooShort { .. }) => {
+                tracing::debug!(
+                    target: "neoethos_search::adaptive_stops",
+                    bars = win_close.len(), error = %e,
+                    "walk-forward window too short for an adaptive base — fixed pips"
+                );
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "adaptive stop base series failed on a {}-bar walk-forward window: {e}",
+                    win_close.len()
+                ));
+            }
         }
     }
 
@@ -1272,7 +1285,7 @@ pub fn evaluate_genes(
         &ohlcv.close,
         config,
         &mut b_settings,
-    );
+    )?;
 
     crate::eval::evaluate_population_core(crate::eval::PopulationEvalInputs {
         close: &ohlcv.close,
@@ -1365,7 +1378,7 @@ fn resolve_adaptive_stops(
     close: &[f64],
     config: &EvaluationConfig,
     settings: &mut BacktestSettings,
-) -> Vec<f64> {
+) -> Result<Vec<f64>> {
     let mults: Vec<f64> = genes.iter().map(|g| g.stop_vol_mult).collect();
     if mults.iter().any(|&m| m > 0.0) {
         let pip = if config.pip_value.is_finite() && config.pip_value > 0.0 {
@@ -1375,14 +1388,32 @@ fn resolve_adaptive_stops(
         };
         // Open-independent base series so scoring and every validation path (some
         // of which lack an `open` column) compute the IDENTICAL per-bar stop.
-        if let Some(base_pips) =
-            crate::stop_target::adaptive_base_pips_series(high, low, close, pip)
-        {
-            settings.adaptive_base_pips = Some(base_pips.into());
-            settings.adaptive_rr = crate::stop_target::adaptive_stops_rr();
+        match crate::stop_target::adaptive_base_pips_series(high, low, close, pip) {
+            Ok(base_pips) => {
+                settings.adaptive_base_pips = Some(base_pips.into());
+                settings.adaptive_rr = crate::stop_target::adaptive_stops_rr();
+            }
+            // The one benign case: a slice shorter than the estimator windows
+            // genuinely has no volatility stop, so the gene's fixed pips stand.
+            Err(e @ crate::stop_target::StopDistanceError::TooShort { .. }) => {
+                tracing::debug!(
+                    target: "neoethos_search::adaptive_stops",
+                    bars = close.len(), error = %e,
+                    "adaptive base series unavailable on this slice — fixed pips"
+                );
+            }
+            // Everything else means the base series EXISTS but we refused to
+            // build it. Silently continuing here is what let one gene be scored
+            // on a 5.8-pip stop and validated on an 18.1-pip one.
+            Err(e) => {
+                return Err(anyhow!(
+                    "adaptive stop base series failed on {} bars: {e}",
+                    close.len()
+                ));
+            }
         }
     }
-    mults
+    Ok(mults)
 }
 
 pub fn random_search(
@@ -2409,7 +2440,8 @@ mod adaptive_wiring_tests {
 
         // Some genes adaptive → base series + reward:risk installed.
         let mut settings = crate::eval::BacktestSettings::default();
-        let mults = resolve_adaptive_stops(&genes, &high, &low, &close, &config, &mut settings);
+        let mults = resolve_adaptive_stops(&genes, &high, &low, &close, &config, &mut settings)
+            .expect("adaptive stops resolve on a 200-bar series");
         assert_eq!(
             mults,
             vec![1.5, 0.0, 3.0],
@@ -2432,7 +2464,8 @@ mod adaptive_wiring_tests {
             g.stop_vol_mult = 0.0;
         }
         let mut settings2 = crate::eval::BacktestSettings::default();
-        let mults2 = resolve_adaptive_stops(&fixed, &high, &low, &close, &config, &mut settings2);
+        let mults2 = resolve_adaptive_stops(&fixed, &high, &low, &close, &config, &mut settings2)
+            .expect("all-fixed genes resolve without touching the stop series");
         assert_eq!(mults2, vec![0.0, 0.0, 0.0]);
         assert!(
             settings2.adaptive_base_pips.is_none(),

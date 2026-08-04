@@ -94,12 +94,27 @@ pub fn combine_gene_signals_with_brackets(
     // so a promoted adaptive gene places the exact volatility-scaled bracket it
     // was scored on. `stop_vol_mult == 0` genes keep their fixed pips.
     let adaptive_base: Option<Vec<f64>> = if genes.iter().any(|g| g.stop_vol_mult > 0.0) {
-        neoethos_search::adaptive_base_pips_series(
+        match neoethos_search::adaptive_base_pips_series(
             &base_ohlcv.high,
             &base_ohlcv.low,
             &base_ohlcv.close,
             pip_size,
-        )
+        ) {
+            Ok(base) => Some(base),
+            // The live loop must not abort on a bad bar, so this is loud rather
+            // than fatal — but it is LOUD. Falling through to the gene's fixed
+            // `sl_pips` places a bracket the gene was never scored on, and the
+            // old code did that with no message at all.
+            Err(e) => {
+                tracing::error!(
+                    target: "neoethos_trader::gene_signal",
+                    bars = base_ohlcv.close.len(), error = %e,
+                    "adaptive stop base series unavailable — LIVE brackets fall back to each \
+                     gene's fixed sl_pips, which is NOT the stop it was scored on"
+                );
+                None
+            }
+        }
     } else {
         None
     };

@@ -1,4 +1,109 @@
 use std::f64::consts::LN_2;
+use std::sync::OnceLock;
+
+/// Why a per-bar stop-distance series could not be built.
+///
+/// This is deliberately NOT an `Option`. The old `Option` collapsed two
+/// unrelated answers into one `None`: "this series is too short to have a
+/// stop" (legitimate — fall back to the gene's fixed pips) and "I declined to
+/// compute the tail term on a series this long" (not legitimate — the tail
+/// term IS part of the stop, so dropping it evaluates a different strategy).
+/// The second one was then turned into `tail_dist = 0` by the caller and
+/// nothing anywhere said so. Naming the cases is what makes the second one
+/// impossible to absorb by accident.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StopDistanceError {
+    /// Fewer bars than the volatility / tail windows need.
+    TooShort { bars: usize, needed: usize },
+    /// The series is longer than the configured `tail_max_bars`.
+    TailCapExceeded { bars: usize, cap: usize },
+    /// A caller-supplied scalar was non-finite or non-positive.
+    InvalidScalar { name: &'static str, value: f64 },
+    /// Every distance came out non-finite / non-positive.
+    Degenerate { median: f64 },
+}
+
+impl std::fmt::Display for StopDistanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort { bars, needed } => write!(
+                f,
+                "stop-distance series needs at least {needed} bars, got {bars}"
+            ),
+            Self::TailCapExceeded { bars, cap } => write!(
+                f,
+                "stop-distance series refused: {bars} bars exceeds the configured \
+                 models.stop_target_runtime.tail_max_bars = {cap}. The expected-shortfall \
+                 tail term is part of the stop — skipping it would score this dataset on a \
+                 DIFFERENT stop than the walk-forward and live paths compute. Raise the cap \
+                 (0 = no cap, the default) or shorten the series"
+            ),
+            Self::InvalidScalar { name, value } => {
+                write!(f, "stop-distance series got a non-usable {name} = {value}")
+            }
+            Self::Degenerate { median } => write!(
+                f,
+                "stop-distance series is degenerate: median distance = {median}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StopDistanceError {}
+
+/// Process-wide adaptive-stop cost caps — the typed mirror of
+/// `neoethos_core::config::StopTargetRuntimeConfig`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopTargetRuntimeOverrides {
+    /// `0` = no cap. See [`StopDistanceError::TailCapExceeded`].
+    pub tail_max_bars: usize,
+    /// `1` = sample the tail every bar (position-invariant). See
+    /// [`StopTargetSettings::tail_step`].
+    pub tail_step: usize,
+}
+
+impl Default for StopTargetRuntimeOverrides {
+    fn default() -> Self {
+        Self {
+            tail_max_bars: 0,
+            tail_step: 1,
+        }
+    }
+}
+
+impl StopTargetRuntimeOverrides {
+    /// Config-driven constructor. A
+    /// `stop_target_from_settings_default_matches_default` test guarantees a
+    /// fresh `Settings` reproduces [`Self::default`].
+    pub fn from_settings(s: &neoethos_core::Settings) -> Self {
+        Self {
+            tail_max_bars: s.models.stop_target_runtime.tail_max_bars,
+            // `0` is meaningless for a stride; fall back to the exact default
+            // rather than silently dividing by zero downstream.
+            tail_step: s.models.stop_target_runtime.tail_step.max(1),
+        }
+    }
+}
+
+static STOP_TARGET_RUNTIME_OVERRIDES: OnceLock<StopTargetRuntimeOverrides> = OnceLock::new();
+
+/// Install process-wide adaptive-stop caps. First install wins.
+pub fn install_stop_target_runtime_overrides(
+    overrides: StopTargetRuntimeOverrides,
+) -> Result<(), StopTargetRuntimeOverrides> {
+    STOP_TARGET_RUNTIME_OVERRIDES.set(overrides)
+}
+
+/// Config-driven install. Idempotent — called once at startup from
+/// `install_search_runtime_overrides_from_settings`.
+pub fn install_stop_target_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
+    let _ = STOP_TARGET_RUNTIME_OVERRIDES.set(StopTargetRuntimeOverrides::from_settings(s));
+}
+
+/// The installed caps, or the deterministic defaults when nothing installed.
+pub fn current_stop_target_runtime_overrides() -> StopTargetRuntimeOverrides {
+    STOP_TARGET_RUNTIME_OVERRIDES.get().copied().unwrap_or_default()
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct VolEnsembleWeights {
@@ -35,7 +140,32 @@ pub struct StopTargetSettings {
     pub vol_horizon_bars: usize,
     pub tail_window: usize,
     pub tail_alpha: f64,
+    /// Sample the rolling expected shortfall every `tail_step` bars and carry
+    /// the value forward between samples. `1` = every bar (the default).
+    ///
+    /// This is NOT only a speed knob. The sampling grid is anchored at the
+    /// START of the series (`i = window - 1`, then `+= step`), so with
+    /// `step > 1` two callers whose slices differ by an offset that is not a
+    /// multiple of `step` sample DIFFERENT bars. Measured on EURUSD M5 with
+    /// the old default of 5: the base series over the trailing 300 001 bars
+    /// differs from the same bars of the full-series base by up to **86 %**
+    /// per bar, while the medians agree to 0.006 % — which is why nothing
+    /// noticed. The live loop's rolling buffer shifts its start every bar, so
+    /// that divergence fires continuously, not rarely.
+    ///
+    /// `1` is position-invariant by construction. It cost 574 ms instead of
+    /// 206 ms over 1 054 320 bars (once per combo) and moved every median by
+    /// under 0.02 %. Raise it only to buy that time back, knowing what it
+    /// costs in agreement between the scoring, walk-forward and live paths.
     pub tail_step: usize,
+    /// Cost cap on the rolling expected-shortfall series. `0` = no cap.
+    ///
+    /// Was a hardcoded `300_000` here with no config recipient until
+    /// 2026-08-04. See [`neoethos_core::config::StopTargetRuntimeConfig`] for
+    /// what that cost: 300 000 bars gave a median EURUSD M5 base stop of
+    /// 18.09 pips and 300 001 bars gave 5.81 pips, because the caller turned
+    /// "cap hit" into "the tail term is zero". Exceeding the cap is now a
+    /// [`StopDistanceError::TailCapExceeded`], never a silent zero.
     pub tail_max_bars: usize,
     pub stop_k_vol: f64,
     pub stop_k_tail: f64,
@@ -74,8 +204,11 @@ impl Default for StopTargetSettings {
             vol_horizon_bars: 5,
             tail_window: 100,
             tail_alpha: 0.975,
-            tail_step: 5,
-            tail_max_bars: 300_000,
+            // Every bar. The old `5` made the tail term depend on where the
+            // caller's slice happened to start (see the field doc).
+            tail_step: 1,
+            // No cap. The old `300_000` silently dropped the tail term above it.
+            tail_max_bars: 0,
             stop_k_vol: 1.0,
             stop_k_tail: 1.25,
             meta_label_min_dist: 0.0,
@@ -394,14 +527,19 @@ pub fn estimate_expected_shortfall(close: &[f64], window: usize, alpha: f64) -> 
     Some(losses.iter().map(|v| v.abs()).sum::<f64>() / losses.len() as f64)
 }
 
+/// Rolling expected shortfall, sampled every `step` bars and carried forward.
+///
+/// `None` means only "there is not enough data here" — it no longer also means
+/// "I declined". The length cap that used to live in this signature moved to
+/// [`compute_stop_distance_series`], where it can be reported as a named error
+/// instead of being flattened into a zero tail distance by the caller.
 pub fn estimate_expected_shortfall_series(
     close: &[f64],
     window: usize,
     alpha: f64,
     step: usize,
-    max_bars: usize,
 ) -> Option<Vec<f64>> {
-    if window <= 2 || close.len() <= 2 || close.len() > max_bars {
+    if window <= 2 || close.len() <= 2 {
         return None;
     }
     let mut r = Vec::with_capacity(close.len() - 1);
@@ -792,15 +930,45 @@ fn structure_distances(
     Some((sl, tp, rr))
 }
 
+/// Per-bar stop distance (price units) = `max(k_vol × vol, k_tail × tail)`.
+///
+/// Returns a typed [`StopDistanceError`] rather than `None` so a caller cannot
+/// treat "too long to compute" the same way it treats "too short to have a
+/// stop". Both used to arrive as `None`; only one of them is a reason to fall
+/// back to fixed pips.
 pub fn compute_stop_distance_series(
     open: &[f64],
     high: &[f64],
     low: &[f64],
     close: &[f64],
     settings: &StopTargetSettings,
-) -> Option<Vec<f64>> {
-    if close.len() < settings.vol_window.max(settings.tail_window).max(5) {
-        return None;
+) -> Result<Vec<f64>, StopDistanceError> {
+    // `tail_window + 1`: the tail estimator consumes RETURNS, so it needs one
+    // bar more than its window. The old guard used `tail_window`, which let a
+    // series of exactly `tail_window` bars past the length check and into the
+    // `es_series == None` branch — where the caller then substituted a zero
+    // tail and returned a vol-only stop. Same hole as the 300 000-bar cliff,
+    // one bar wide. `infer_stop_target_pips` already refused at that length,
+    // so this also makes the scalar and series paths agree.
+    let needed = settings
+        .vol_window
+        .max(settings.tail_window.saturating_add(1))
+        .max(5);
+    if close.len() < needed {
+        return Err(StopDistanceError::TooShort {
+            bars: close.len(),
+            needed,
+        });
+    }
+    // The cap is a COST knob. It is checked HERE, before any work, and it
+    // refuses by name — it never silently changes the formula. Turning "I
+    // cannot compute this" into "the answer is zero" is how the 300 000-bar
+    // cliff survived from v0.4.19 to 2026-08-04.
+    if settings.tail_max_bars > 0 && close.len() > settings.tail_max_bars {
+        return Err(StopDistanceError::TailCapExceeded {
+            bars: close.len(),
+            cap: settings.tail_max_bars,
+        });
     }
 
     let regime = infer_regime(open, high, low, close, settings);
@@ -827,22 +995,27 @@ pub fn compute_stop_distance_series(
         .map(|(c, s)| c * s * scale)
         .collect();
 
-    let es_series = estimate_expected_shortfall_series(
+    // No `else { vec![0.0; ...] }`. A missing tail term is a missing INPUT,
+    // not a tail of zero — the `stop_k_tail = 1.25` branch would then never
+    // win the `max`, which is exactly the 3.11× stop change measured at the
+    // old 300 000-bar boundary. The only remaining reason this can be `None`
+    // is too few returns, which the length guard above already rejects, so it
+    // reports as `TooShort` rather than being absorbed.
+    let es = estimate_expected_shortfall_series(
         close,
         settings.tail_window,
         settings.tail_alpha,
         settings.tail_step,
-        settings.tail_max_bars,
-    );
-    let tail_dist = if let Some(es) = es_series {
-        close
-            .iter()
-            .zip(es.iter())
-            .map(|(c, s)| c * s * scale)
-            .collect::<Vec<_>>()
-    } else {
-        vec![0.0; close.len()]
-    };
+    )
+    .ok_or(StopDistanceError::TooShort {
+        bars: close.len(),
+        needed,
+    })?;
+    let tail_dist: Vec<f64> = close
+        .iter()
+        .zip(es.iter())
+        .map(|(c, s)| c * s * scale)
+        .collect();
 
     let mut dist = Vec::with_capacity(close.len());
     for i in 0..close.len() {
@@ -852,7 +1025,7 @@ pub fn compute_stop_distance_series(
 
     let med = median_ignore_nan(&dist);
     if !med.is_finite() || med <= 0.0 {
-        return None;
+        return Err(StopDistanceError::Degenerate { median: med });
     }
     for v in &mut dist {
         if !v.is_finite() {
@@ -860,7 +1033,7 @@ pub fn compute_stop_distance_series(
         }
     }
 
-    Some(dist)
+    Ok(dist)
 }
 
 pub fn infer_stop_target_pips(
@@ -967,9 +1140,10 @@ pub fn infer_stop_target_pips(
 ///
 /// `vol_mult` is the gene's searchable knob (how many vol-units the stop sits
 /// at); `rr` is the reward:risk multiple kept OUT of the stop so profit stays a
-/// fixed multiple of the risk (the operator wants ~2R). Returns `None` when the
-/// series can't be built or a scalar is non-finite/non-positive, so the caller
-/// falls back to the gene's fixed `sl_pips`/`tp_pips`.
+/// fixed multiple of the risk (the operator wants ~2R). Returns a typed
+/// [`StopDistanceError`] when the series can't be built or a scalar is
+/// non-finite/non-positive; only [`StopDistanceError::TooShort`] means "fall
+/// back to the gene's fixed `sl_pips`/`tp_pips`".
 ///
 /// Deterministic and allocation-simple on purpose: the same inputs MUST yield
 /// the same series on the CPU backtest and (Stage 3) the GPU kernel and (Stage
@@ -983,12 +1157,11 @@ pub fn adaptive_sl_tp_pips_series(
     pip_size: f64,
     vol_mult: f64,
     rr: f64,
-) -> Option<(Vec<f64>, Vec<f64>)> {
-    if !(pip_size.is_finite() && pip_size > 0.0)
-        || !(vol_mult.is_finite() && vol_mult > 0.0)
-        || !(rr.is_finite() && rr > 0.0)
-    {
-        return None;
+) -> Result<(Vec<f64>, Vec<f64>), StopDistanceError> {
+    for (name, value) in [("pip_size", pip_size), ("vol_mult", vol_mult), ("rr", rr)] {
+        if !(value.is_finite() && value > 0.0) {
+            return Err(StopDistanceError::InvalidScalar { name, value });
+        }
     }
     let dist = compute_stop_distance_series(open, high, low, close, settings)?;
     let mut sl_pips = Vec::with_capacity(dist.len());
@@ -998,7 +1171,7 @@ pub fn adaptive_sl_tp_pips_series(
         sl_pips.push(sl);
         tp_pips.push((sl * rr).max(1e-9));
     }
-    Some((sl_pips, tp_pips))
+    Ok((sl_pips, tp_pips))
 }
 
 /// The per-bar base stop distance in PIPS (multiplier 1) for adaptive stops,
@@ -1009,17 +1182,34 @@ pub fn adaptive_sl_tp_pips_series(
 /// make the validation base series differ from the scoring one and evaluate a
 /// different strategy. Parkinson depends only on high/low/close, which every
 /// path has, so the base is identical everywhere. A gene's `stop_vol_mult` then
-/// scales this shared series. `None` when the series can't be built.
-pub fn adaptive_base_pips_series(high: &[f64], low: &[f64], close: &[f64], pip_size: f64) -> Option<Vec<f64>> {
+/// scales this shared series.
+///
+/// This is the ONE production entry point for the shared base, so it is also
+/// where the process-wide cost cap is read — every caller therefore sees the
+/// same `tail_max_bars`. That is precisely the property the old hardcoded
+/// `300_000` broke: the cap fired for the scoring path (full series) and not
+/// for the walk-forward or live paths (windows), silently.
+pub fn adaptive_base_pips_series(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    pip_size: f64,
+) -> Result<Vec<f64>, StopDistanceError> {
     if !(pip_size.is_finite() && pip_size > 0.0) {
-        return None;
+        return Err(StopDistanceError::InvalidScalar {
+            name: "pip_size",
+            value: pip_size,
+        });
     }
+    let overrides = current_stop_target_runtime_overrides();
     let mut settings = StopTargetSettings::default();
     settings.vol_estimator = "parkinson".to_string();
+    settings.tail_max_bars = overrides.tail_max_bars;
+    settings.tail_step = overrides.tail_step;
     // `open` is unused by the Parkinson estimator — pass `close` as a harmless
     // placeholder so callers without an open series get the identical result.
     let dist = compute_stop_distance_series(close, high, low, close, &settings)?;
-    Some(dist.iter().map(|d| (d / pip_size).max(1e-9)).collect())
+    Ok(dist.iter().map(|d| (d / pip_size).max(1e-9)).collect())
 }
 
 /// Whether adaptive volatility-scaled stops are enabled for this process — the
@@ -1099,13 +1289,310 @@ mod adaptive_stop_tests {
         let (sl2, _) =
             adaptive_sl_tp_pips_series(&open, &high, &low, &close, &s, 0.0001, 2.0, 2.0).unwrap();
         assert!((sl2[300] - 2.0 * sl[300]).abs() < 1e-6, "2x vol_mult => 2x stop");
-        // Bad scalars → None so the caller falls back to the gene's fixed pips.
+        // Bad scalars → a NAMED error, so the caller can tell "no stop here"
+        // apart from "I declined to compute the stop".
+        assert_eq!(
+            adaptive_sl_tp_pips_series(&open, &high, &low, &close, &s, 0.0, 1.0, 2.0),
+            Err(StopDistanceError::InvalidScalar {
+                name: "pip_size",
+                value: 0.0
+            })
+        );
+        assert_eq!(
+            adaptive_sl_tp_pips_series(&open, &high, &low, &close, &s, 0.0001, -1.0, 2.0),
+            Err(StopDistanceError::InvalidScalar {
+                name: "vol_mult",
+                value: -1.0
+            })
+        );
+    }
+
+    /// Deterministic bar generator — a fixed LCG so the 301 000-bar series is
+    /// reproducible without a data file and without an RNG dependency.
+    ///
+    /// Calibrated so the TAIL term dominates the stop, which is what real bars
+    /// do: on EURUSD M5 the measured base stop is 18.09 pips with the tail term
+    /// and 5.81 pips without it. A series where the Parkinson range term always
+    /// won the `max()` would make the regression test below pass whether or not
+    /// the tail term was computed — i.e. a test with no teeth. Narrow bar ranges
+    /// (~0.2-0.4 pip) with fat-tailed close-to-close steps (up to ~4 pips)
+    /// reproduce the real ordering.
+    fn synthetic_bars(n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let (mut high, mut low, mut close) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        let mut state: u64 = 0x2026_08_04;
+        let mut px = 1.1000_f64;
+        for _ in 0..n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // [-1, 1)
+            let u = ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0;
+            // Cubing keeps most steps tiny and makes a few of them large — the
+            // fat tail the expected-shortfall term exists to measure.
+            px = (px + 0.0004 * u * u * u).clamp(0.5, 2.0);
+            let rng_amp = 0.00002 * (1.0 + u.abs());
+            close.push(px);
+            high.push(px + rng_amp);
+            low.push(px - rng_amp);
+        }
+        (high, low, close)
+    }
+
+    /// Median of a slice, for the assertions below.
+    fn median_of(v: &[f64]) -> f64 {
+        let mut w = v.to_vec();
+        w.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        w[w.len() / 2]
+    }
+
+    /// The base series with an EXPLICIT cap — used to reproduce the pre-fix
+    /// behaviour inside a test so the regression test can prove it has teeth.
+    fn base_pips_with_cap(
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        pip: f64,
+        tail_max_bars: usize,
+    ) -> Result<Vec<f64>, StopDistanceError> {
+        let mut settings = StopTargetSettings::default();
+        settings.vol_estimator = "parkinson".to_string();
+        settings.tail_max_bars = tail_max_bars;
+        let dist = compute_stop_distance_series(close, high, low, close, &settings)?;
+        Ok(dist.iter().map(|d| (d / pip).max(1e-9)).collect())
+    }
+
+    /// THE regression test for the 300 000-bar expected-shortfall cliff.
+    ///
+    /// The same bars, read as a 301 000-bar series and as the trailing
+    /// 299 000-bar slice of it, must produce the SAME per-bar base stop on the
+    /// overlap. Before 2026-08-04 they did not: `tail_max_bars = 300_000`
+    /// switched the 1.25× tail term off for the longer series and the caller
+    /// substituted zero, so on real EURUSD M5 bars the median base stop went
+    /// from 18.09 pips at 300 000 bars to 5.81 pips at 300 001 — a 3.11×
+    /// change from one extra bar, with the run's own doc comment promising
+    /// "scoring and every validation path compute the IDENTICAL per-bar stop".
+    ///
+    /// TOLERANCE: exact to 1e-9 relative. Both estimators are rolling, so with
+    /// `tail_step = 1` the overlap is bit-identical arithmetic at ANY offset.
+    /// Anything above 1e-9 means a position-dependent branch has come back.
+    ///
+    /// The offset here is deliberately 2 001, NOT 2 000. At the old
+    /// `tail_step = 5` the expected-shortfall grid was anchored at the series
+    /// start, so a 2 000-bar offset (a multiple of 5) lined up and hid the
+    /// problem, while 2 001 did not — on real EURUSD M5 bars that misalignment
+    /// showed up as an 86 % per-bar difference against the full-series base
+    /// with the medians still agreeing to 0.006 %. A test that only used
+    /// aligned offsets would have passed over it.
+    #[test]
+    fn base_stop_is_length_invariant_across_the_old_300k_cliff() {
+        const LONG: usize = 301_000;
+        const OFFSET: usize = 2_001; // deliberately NOT a multiple of the old step 5
+        const SHORT: usize = LONG - OFFSET;
+
+        let (high, low, close) = synthetic_bars(LONG);
+        let pip = 0.0001_f64;
+
+        let long_base = adaptive_base_pips_series(&high, &low, &close, pip)
+            .expect("301 000-bar base series must build");
+        let short_base = adaptive_base_pips_series(
+            &high[OFFSET..],
+            &low[OFFSET..],
+            &close[OFFSET..],
+            pip,
+        )
+        .expect("299 000-bar base series must build");
+
+        assert_eq!(long_base.len(), LONG);
+        assert_eq!(short_base.len(), SHORT);
+
+        // Skip the short series' own warmup (vol_window 50 / tail_window 100),
+        // then every remaining overlapping bar must agree.
+        let warmup = 200usize;
+        let mut worst_rel = 0.0_f64;
+        let mut worst_at = 0usize;
+        for i in warmup..SHORT {
+            let a = long_base[i + OFFSET];
+            let b = short_base[i];
+            let rel = (a - b).abs() / a.abs().max(b.abs()).max(1e-12);
+            if rel > worst_rel {
+                worst_rel = rel;
+                worst_at = i;
+            }
+        }
         assert!(
-            adaptive_sl_tp_pips_series(&open, &high, &low, &close, &s, 0.0, 1.0, 2.0).is_none()
+            worst_rel < 1e-9,
+            "base stop is NOT length-invariant: worst relative difference {worst_rel:.6e} at \
+             overlap index {worst_at} ({} pips over {LONG} bars vs {} pips over {SHORT} bars). \
+             A length-dependent branch is back in the stop-distance path.",
+            long_base[worst_at + OFFSET],
+            short_base[worst_at]
+        );
+
+        // And the medians — the number the operator actually reads — agree too.
+        let m_long = median_of(&long_base[OFFSET + warmup..]);
+        let m_short = median_of(&short_base[warmup..]);
+        assert!(
+            (m_long - m_short).abs() / m_long.max(m_short) < 1e-9,
+            "median base stop diverges across the old cliff: {m_long} vs {m_short}"
+        );
+
+        // ── This test has teeth ────────────────────────────────────────────
+        // Everything above would pass on a series where the tail term never
+        // wins the `max()`, whether or not the tail term was computed. Pin the
+        // pre-fix behaviour explicitly: with the old hardcoded cap of 300 000,
+        // the SAME two calls must diverge, and by a lot. If this half ever
+        // stops failing-under-the-old-cap, the half above has become vacuous.
+        let capped_long = base_pips_with_cap(&high, &low, &close, pip, 300_000);
+        assert_eq!(
+            capped_long,
+            Err(StopDistanceError::TailCapExceeded {
+                bars: LONG,
+                cap: 300_000
+            }),
+            "the old cap must now REFUSE the long series rather than silently \
+             dropping the tail term"
+        );
+        let capped_short =
+            base_pips_with_cap(&high[OFFSET..], &low[OFFSET..], &close[OFFSET..], pip, 300_000)
+                .expect("299 000 bars sit under the old cap");
+        let m_capped_short = median_of(&capped_short[warmup..]);
+        assert!(
+            (m_capped_short - m_short).abs() / m_short < 1e-9,
+            "under the cap the short series must be unchanged: {m_capped_short} vs {m_short}"
+        );
+        // The tail term is worth this much: dropping it (what the old code did
+        // above the cap) shrinks the stop by more than 2x on this series, the
+        // same direction and order of magnitude as the 18.09 -> 5.81 pips
+        // measured on EURUSD M5.
+        let mut no_tail = StopTargetSettings::default();
+        no_tail.vol_estimator = "parkinson".to_string();
+        no_tail.stop_k_tail = 0.0;
+        let vol_only = compute_stop_distance_series(&close, &high, &low, &close, &no_tail)
+            .expect("vol-only series builds");
+        let m_vol_only = median_of(
+            &vol_only[OFFSET + warmup..]
+                .iter()
+                .map(|d| d / pip)
+                .collect::<Vec<_>>(),
         );
         assert!(
-            adaptive_sl_tp_pips_series(&open, &high, &low, &close, &s, 0.0001, -1.0, 2.0)
-                .is_none()
+            m_long > m_vol_only * 2.0,
+            "the tail term must dominate for this regression test to mean anything: \
+             with tail {m_long:.4} pips, vol-only {m_vol_only:.4} pips"
         );
+
+        // ── And the second half of the same defect ─────────────────────────
+        // At `tail_step = 5` the expected-shortfall grid is anchored at the
+        // slice start, so this misaligned offset makes the SAME bars disagree.
+        // Pin that, so the `tail_step = 1` default is understood as load-bearing
+        // and not mistaken for a speed setting somebody can turn back up.
+        let stepped = |h: &[f64], l: &[f64], c: &[f64]| -> Vec<f64> {
+            let mut s = StopTargetSettings::default();
+            s.vol_estimator = "parkinson".to_string();
+            s.tail_step = 5;
+            compute_stop_distance_series(c, h, l, c, &s)
+                .expect("stepped series builds")
+                .iter()
+                .map(|d| d / pip)
+                .collect()
+        };
+        let stepped_long = stepped(&high, &low, &close);
+        let stepped_short = stepped(&high[OFFSET..], &low[OFFSET..], &close[OFFSET..]);
+        let stepped_worst = (warmup..SHORT)
+            .map(|i| {
+                let (a, b) = (stepped_long[i + OFFSET], stepped_short[i]);
+                (a - b).abs() / a.abs().max(b.abs()).max(1e-12)
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(
+            stepped_worst > 1e-6,
+            "expected `tail_step = 5` to reintroduce a position-dependent tail at a \
+             misaligned offset (worst relative difference {stepped_worst:.3e}). If this \
+             stopped happening, the grid was made position-invariant and the \
+             `tail_step = 1` default can be revisited"
+        );
+    }
+
+    /// A cap that IS configured must refuse by name, never by returning a
+    /// stop built from a zero tail term.
+    #[test]
+    fn a_configured_tail_cap_fails_loudly_instead_of_zeroing_the_tail() {
+        let (high, low, close) = synthetic_bars(2_000);
+        let mut settings = StopTargetSettings::default();
+        settings.vol_estimator = "parkinson".to_string();
+
+        // Default: no cap, series builds.
+        assert_eq!(settings.tail_max_bars, 0, "the default must be NO cap");
+        let uncapped = compute_stop_distance_series(&close, &high, &low, &close, &settings)
+            .expect("uncapped series builds");
+
+        // Cap below the series length: a named error carrying both numbers.
+        settings.tail_max_bars = 1_000;
+        assert_eq!(
+            compute_stop_distance_series(&close, &high, &low, &close, &settings),
+            Err(StopDistanceError::TailCapExceeded {
+                bars: 2_000,
+                cap: 1_000
+            })
+        );
+
+        // Cap at or above the length: identical to uncapped, bit for bit.
+        settings.tail_max_bars = 2_000;
+        let capped_at_len = compute_stop_distance_series(&close, &high, &low, &close, &settings)
+            .expect("a cap at the series length must not bite");
+        assert_eq!(capped_at_len, uncapped);
+    }
+
+    /// The tail term is not decoration: proving it moves the stop is what makes
+    /// the old silent `tail_dist = 0` substitution a behaviour change rather
+    /// than a rounding detail.
+    #[test]
+    fn dropping_the_tail_term_materially_changes_the_stop() {
+        let (high, low, close) = synthetic_bars(4_000);
+        let mut settings = StopTargetSettings::default();
+        settings.vol_estimator = "parkinson".to_string();
+        let with_tail = compute_stop_distance_series(&close, &high, &low, &close, &settings)
+            .expect("series builds");
+
+        // `stop_k_tail = 0` is the honest way to express "no tail term" — the
+        // same arithmetic the old cap silently performed.
+        settings.stop_k_tail = 0.0;
+        let without_tail = compute_stop_distance_series(&close, &high, &low, &close, &settings)
+            .expect("series builds");
+
+        let m_with = median_of(&with_tail[200..]);
+        let m_without = median_of(&without_tail[200..]);
+        assert!(
+            m_with > m_without * 1.5,
+            "the tail term must dominate the stop for it to be worth guarding: \
+             with tail {m_with}, without {m_without}"
+        );
+    }
+
+    #[test]
+    fn stop_target_from_settings_default_matches_default() {
+        let s = neoethos_core::Settings::default();
+        assert_eq!(
+            StopTargetRuntimeOverrides::from_settings(&s),
+            StopTargetRuntimeOverrides::default()
+        );
+        assert_eq!(
+            StopTargetRuntimeOverrides::default().tail_max_bars,
+            StopTargetSettings::default().tail_max_bars,
+            "the config mirror and the settings struct must agree on the cap"
+        );
+        assert_eq!(
+            StopTargetRuntimeOverrides::default().tail_step,
+            StopTargetSettings::default().tail_step,
+            "the config mirror and the settings struct must agree on the stride"
+        );
+        // A `0` stride is meaningless; it must not reach the estimator.
+        let mut zeroed = neoethos_core::Settings::default();
+        zeroed.models.stop_target_runtime.tail_step = 0;
+        assert_eq!(StopTargetRuntimeOverrides::from_settings(&zeroed).tail_step, 1);
     }
 }

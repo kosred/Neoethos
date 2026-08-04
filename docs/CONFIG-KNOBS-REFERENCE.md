@@ -397,6 +397,42 @@ at the bottom.
 - **Balanced:** all cores
 - **Aggressive:** all cores + lower OS process priority
 
+### `models.stop_target_runtime.tail_max_bars` (config only — no env var)
+- **Type:** `usize`
+- **Default:** `0` = no cap
+- **Effect:** how many bars the adaptive stop's tail
+  (expected-shortfall) term is computed over. The adaptive stop is
+  `max(1.0 x volatility, 1.25 x tail)`.
+- **History:** this was hardcoded at `300_000` in `stop_target.rs`
+  from v0.4.19 until 2026-08-04, and a series longer than the cap did
+  not merely skip the tail term — the caller substituted a tail
+  distance of **zero**. Measured on EURUSD M5 (`data.vortex`,
+  1 054 320 bars): **300 000 bars gives a median base stop of 18.09
+  pips; 300 001 bars gives 5.81 pips.** One extra bar, 3.11x.
+  Discovery scoring passes the full series (over the cap), while
+  walk-forward passes ~70 k-bar windows and the live loop a 1 000-bar
+  buffer (both under it) — so a gene was ranked on one stop and
+  traded on another.
+- **Now:** a series longer than a non-zero cap is a **hard, named
+  error** carrying both numbers. It is never silently a zero tail.
+  Leave at `0` unless you are deliberately bounding cost.
+
+### `models.stop_target_runtime.tail_step` (config only — no env var)
+- **Type:** `usize`, `>= 1`
+- **Default:** `1` (sample the tail on every bar)
+- **Effect:** how often the rolling expected shortfall is recomputed;
+  the value is carried forward between samples.
+- **Why it is not just a speed knob:** the sampling grid is anchored at
+  the **start of whatever slice it is handed**, so `> 1` makes the tail
+  term depend on where the caller's series begins. Measured on EURUSD
+  M5 at the old default of `5`: the base series over the trailing
+  300 001 bars differs from **the same bars** of the full-series base by
+  up to **86 % per bar**, while the two medians agree to 0.006 % — which
+  is why it went unnoticed. The live loop's rolling buffer shifts its
+  start on every bar, so this fired continuously rather than rarely.
+- **Cost of `1`:** 574 ms instead of 206 ms over 1 054 320 bars, paid
+  once per combo, and every median moved by under 0.02 %.
+
 ### `NEOETHOS_BOT_SEARCH_EVAL_PRECISION` / `NEOETHOS_BOT_TRAIN_PRECISION`
 - **Type:** enum `fp32` | `bf16` | `fp16` | `bf4` | `fp8`
 - **Default:** `fp32`

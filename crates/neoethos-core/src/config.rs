@@ -756,6 +756,9 @@ pub struct ModelsConfig {
     /// Backtest-evaluation runtime knobs (config-driven replacement for
     /// the `NEOETHOS_BOT_BACKTEST_*` env vars). See [`BacktestRuntimeConfig`].
     pub backtest_runtime: BacktestRuntimeConfig,
+    /// Adaptive-stop cost caps. See [`StopTargetRuntimeConfig`] — the
+    /// recipient the hardcoded `tail_max_bars = 300_000` never had.
+    pub stop_target_runtime: StopTargetRuntimeConfig,
     /// Seen-signature dedup-memory knobs (config-driven replacement for
     /// the `NEOETHOS_BOT_PROP_SEEN_*` env vars). See
     /// [`SeenSignatureRuntimeConfig`].
@@ -1099,6 +1102,62 @@ impl Default for QualityRuntimeConfig {
         Self {
             min_trades_per_month: 4,
             trading_days_per_month: 21.0,
+        }
+    }
+}
+
+/// Adaptive-stop (stop-target) runtime knobs. Mirrors
+/// `neoethos_search::stop_target::StopTargetRuntimeOverrides`; a
+/// `stop_target_from_settings_default_matches_default` test enforces the
+/// matching defaults.
+///
+/// HISTORY — why this key exists again. `tail_max_bars` was a config key from
+/// v0.4.19 until commit `48abfc90` (2026-06-06) removed it, correctly, as
+/// "dead in config": the value never reached `StopTargetSettings`, which used
+/// a hardcoded `300_000`. What the removal did not notice is that the
+/// hardcoded number was not inert. Above it the rolling expected-shortfall
+/// series was skipped and the caller substituted a tail distance of ZERO, so
+/// the `1.25 ×` tail term silently vanished from the stop. Measured on EURUSD
+/// M5 (`data.vortex`, 1 054 320 bars): 300 000 bars ⇒ median base stop
+/// 18.09 pips, 300 001 bars ⇒ 5.81 pips. One extra bar, 3.11×.
+///
+/// That made the three production callers of the same function disagree:
+/// discovery scoring passes the full series (over the cap ⇒ no tail term),
+/// while walk-forward passes ~70 k-bar windows and the live loop a 1 000-bar
+/// buffer (both under it ⇒ tail term present). A gene was ranked on one stop
+/// and traded on another, under a doc comment promising they were identical.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StopTargetRuntimeConfig {
+    /// Hard cap on how many bars the rolling expected-shortfall series will
+    /// process. `0` (the default) means NO cap — every series gets the tail
+    /// term, so scoring, walk-forward and live compute the same base stop.
+    ///
+    /// A non-zero value no longer degrades silently: a series longer than the
+    /// cap is a named error carrying both numbers, never a zero tail term.
+    /// Set one only to bound cost, and expect to be told when it bites.
+    pub tail_max_bars: usize,
+    /// Sample the rolling expected shortfall every `tail_step` bars, carrying
+    /// the value forward in between. `1` (the default) = every bar.
+    ///
+    /// Also a correctness knob, not only a speed one. The sampling grid is
+    /// anchored at the START of whatever slice it is handed, so `> 1` makes
+    /// the tail term depend on where the caller's series begins. Measured on
+    /// EURUSD M5 at the old default of 5: the base over the trailing 300 001
+    /// bars differs from the same bars of the full-series base by up to 86 %
+    /// per bar while the medians agree to 0.006 %. The live loop's rolling
+    /// buffer shifts its start every bar, so that fires continuously.
+    ///
+    /// `1` costs 574 ms instead of 206 ms over 1 054 320 bars, once per combo,
+    /// and moves every median by under 0.02 %.
+    pub tail_step: usize,
+}
+
+impl Default for StopTargetRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            tail_max_bars: 0,
+            tail_step: 1,
         }
     }
 }
@@ -1547,6 +1606,7 @@ impl Default for ModelsConfig {
             eval_runtime: EvalRuntimeConfig::default(),
             quality_runtime: QualityRuntimeConfig::default(),
             backtest_runtime: BacktestRuntimeConfig::default(),
+            stop_target_runtime: StopTargetRuntimeConfig::default(),
             seen_signature_runtime: SeenSignatureRuntimeConfig::default(),
             discovery_ledger: DiscoveryLedgerConfig::default(),
             smc_search_runtime: SmcSearchRuntimeConfig::default(),
