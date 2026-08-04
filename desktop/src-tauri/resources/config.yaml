@@ -12,7 +12,6 @@ system:
   multi_resolution_enabled: false  # agent 2026-06-05: top-down MTF (base + strictly-HIGHER TFs only). When true, resolve_higher_timeframes returned ALL canonical TFs except the base (incl M1's 5.27M rows) as "higher" → every combo serially reloaded M1 (the pre-GA wall that stopped combos completing on laptop AND VPS) AND fed M1 noise into coarse-TF strategies. false = base+higher only → the cmd_discover base+higher load-fix actually helps + cleaner features.
   multi_resolution_timeframes: [M1, M3, M5, M15, M30, H1, H2, H4, D1, W1, MN1]
   multi_resolution_prefix_base: false
-  use_volume_features: true
   higher_timeframes: [M3, M5, M15, M30, H1, H2, H4, D1, W1, MN1]
   poll_interval_seconds: 60
   metrics_db_path: metrics.sqlite
@@ -50,8 +49,6 @@ risk:
   conformal_enabled: true
   conformal_alpha: 0.10
   conformal_abstain_min_set_size: 3
-  meta_label_tp_pips: null
-  meta_label_sl_pips: null
   meta_label_max_hold_bars: 100
   meta_label_min_dist: 0.0005
   meta_label_fixed_sl: 0.0020
@@ -257,23 +254,11 @@ models:
   cpcv_max_rows: 200000  # agent 2026-06-05: was 0 (=full rows) → CPCV (combinatorial purged CV, the single heaviest serial validation) ran on 1.05M rows. 200k bounds it on every TF; CPCV stays enabled (López de Prado overfitting check, kept per "stats are the authority") but capped. Informational in PropFirm mode.
 
 news:
-  news_decay_minutes: 120
   news_kill_window_min: 30
-  news_confidence_threshold: 0.65
   news_calendar_enabled: true
   news_calendar_source: forexfactory
   news_lookahead_minutes: 60
-  news_trade_on_event: true
-  news_trade_confidence_threshold: 0.90
-  news_event_risk_pct: 0.001  # minimal risk per event (0.1%)
-  enable_news: true
-  news_sources: [rss] 
   rss_feeds:
     - https://www.investing.com/rss/news.rss
     - https://www.fxstreet.com/rss/news
     - https://www.cnbc.com/id/100003114/device/rss/rss.html
-  news_local_glob: ""
-  news_backfill_enabled: true
-  news_backfill_days: 0  # 0 = full data span
-  enable_llm_helper: true
-  llm_helper_enabled: true

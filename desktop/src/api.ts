@@ -466,7 +466,6 @@ export const settings = () => apiGet<any>("/settings");
 
 export type SettingsUpdate = {
   dataDir?: string;
-  uiLocale?: "en" | "el";
   tradingMode?: "risky" | "prop_firm";
   computeMode?: "auto" | "cpu" | "gpu";
   riskPerTrade?: number;

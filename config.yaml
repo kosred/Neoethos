@@ -95,7 +95,6 @@ system:
   - XPTUSD
   account_currency: GBP
   data_dir: data
-  ui_locale: en
   trading_mode: risky
   risky_start_balance_usd: 100.0
   risky_target_balance_usd: 50000.0
@@ -115,10 +114,7 @@ system:
   - W1
   - MN1
   multi_resolution_prefix_base: false
-  indices_path: ''
-  use_online_indices: false
   base_timeframe: M1
-  use_volume_features: true
   higher_timeframes:
   - M3
   - M5
@@ -130,21 +126,6 @@ system:
   - D1
   - W1
   - MN1
-  required_timeframes:
-  - M1
-  - M3
-  - M5
-  - M15
-  - M30
-  - H1
-  - H4
-  - H12
-  - D1
-  - W1
-  - MN1
-  enable_level2: false
-  level2_depth_levels: 10
-  broker_timezone: ''
   poll_interval_seconds: 60
   metrics_db_path: metrics.sqlite
   cache_dir: cache
@@ -153,16 +134,7 @@ system:
   enable_gpu: false
   num_gpus: 0
   device: cpu
-  evo_multiproc_per_gpu: true
-  cache_training_frames: false
-  training_cache_max_bytes: 2000000000
   max_training_rows_per_tf: 0
-  downcast_training_float32: true
-  vortex_memory_map: true
-  smc_freshness_limit: 0
-  smc_atr_displacement: 0.0
-  smc_max_levels: 0
-  smc_use_cuda: false
   hardware:
     cpu_budget: null
     training_precision: null
@@ -203,15 +175,10 @@ risk:
   conformal_enabled: true
   conformal_alpha: 0.1
   conformal_abstain_min_set_size: 3
-  meta_label_tp_pips: null
-  meta_label_sl_pips: null
   meta_label_max_hold_bars: 100
   meta_label_min_dist: 0.0005
   meta_label_fixed_sl: 0.002
   meta_label_fixed_tp: 0.004
-  vol_ensemble_weights_trend: null
-  vol_ensemble_weights_range: null
-  vol_ensemble_weights_neutral: null
   vol_horizon_bars: 5
 models:
   ml_models:
@@ -539,40 +506,15 @@ models:
   - kan
 news:
   news_trading_mode: block_on_news
-  news_decay_minutes: 120
   news_kill_window_min: 30
-  news_confidence_threshold: 0.65
   news_calendar_enabled: true
   news_calendar_source: forexfactory
   news_lookahead_minutes: 60
-  news_trade_on_event: true
-  news_trade_confidence_threshold: 0.9
-  news_event_risk_pct: 0.001
-  enable_news: true
-  news_sources:
-  - rss
   rss_feeds:
   - https://www.investing.com/rss/news.rss
   - https://www.fxstreet.com/rss/news
   - https://www.cnbc.com/id/100003114/device/rss/rss.html
-  enable_llm_helper: true
-  llm_helper_enabled: true
-  llm_sentiment_positive_threshold: 0.2
-  llm_sentiment_negative_threshold: -0.2
-  news_backfill_enabled: true
-  news_backfill_days: 0
-  news_local_glob: ''
   perplexity_enabled: true
-  perplexity_api_key_env: PPLX_API_KEY
-  perplexity_model: sonar
-  perplexity_num_results: 10
-  perplexity_timeframe_hours: 24
-  strategist_enabled: false
-  strategist_interval_minutes: 30
-  auto_rescore_enabled: false
-  auto_rescore_days: 30
-  auto_rescore_max_events: 200
-  auto_rescore_only_missing: true
 app_runtime:
   server_bind: 127.0.0.1:7423
   ctrader_read_timeout_secs: 30
@@ -584,4 +526,3 @@ app_runtime:
   chart_merge_side: ''
   pnl_audit_drift_fraction: 0.001
   pnl_circuit_breaker_fraction: 0.01
-secrets_file: keys.txt

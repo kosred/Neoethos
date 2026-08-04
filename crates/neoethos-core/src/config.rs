@@ -48,6 +48,41 @@ pub fn default_news_rss_feeds() -> Vec<String> {
     ]
 }
 
+/// The one economic-calendar provider that is actually implemented
+/// (`app_services::news_calendar` fetches ForexFactory's `ff_calendar` JSON).
+///
+/// `news_calendar_source` used to be validated for non-emptiness, persisted,
+/// echoed back by `GET /settings`, and offered as a free-text box in
+/// Advanced → News — while the fetcher hardcoded the ForexFactory URL and
+/// never read the field. Typing `investing` there saved successfully and
+/// changed nothing. Both the write path and the fetch path now check against
+/// this list, so an unsupported provider fails loudly instead of pretending.
+pub const NEWS_CALENDAR_FOREXFACTORY: &str = "forexfactory";
+
+/// Every calendar provider id the runtime can actually serve.
+pub const SUPPORTED_NEWS_CALENDAR_SOURCES: &[&str] = &[NEWS_CALENDAR_FOREXFACTORY];
+
+/// Normalise + validate an economic-calendar provider id.
+///
+/// `Ok(canonical_id)` when the runtime has an implementation for it;
+/// `Err(message)` — phrased for direct display to the operator — otherwise.
+pub fn validate_news_calendar_source(raw: &str) -> Result<String, String> {
+    let id = raw.trim().to_ascii_lowercase();
+    if id.is_empty() {
+        return Err("news_calendar_source cannot be blank".to_string());
+    }
+    if SUPPORTED_NEWS_CALENDAR_SOURCES.contains(&id.as_str()) {
+        Ok(id)
+    } else {
+        Err(format!(
+            "unknown news_calendar_source `{raw}`. This build implements only: {}. \
+             Setting any other value would be ignored — the calendar fetcher has no \
+             implementation for it — so it is rejected instead of silently accepted.",
+            SUPPORTED_NEWS_CALENDAR_SOURCES.join(", ")
+        ))
+    }
+}
+
 /// System-level configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -82,12 +117,6 @@ pub struct SystemConfig {
     #[serde(default)]
     pub account_currency: String,
     pub data_dir: PathBuf,
-    /// UI language for the Flutter front-end: `"en"` (default) or `"el"`
-    /// (Greek). Persisted here so the choice survives restarts and travels
-    /// with config.yaml — the app's single source of truth — rather than a
-    /// separate Flutter store. The backend does not consume it; it is surfaced
-    /// via GET / POST `/settings` for the Settings language picker.
-    pub ui_locale: String,
     /// Top-level **trading mode** — the single master switch the operator picks
     /// in the Risk screen. Two mutually-exclusive values:
     ///   - `"risky"`     → aggressive capital multiplication (small balance →
@@ -120,21 +149,8 @@ pub struct SystemConfig {
     pub multi_resolution_enabled: bool,
     pub multi_resolution_timeframes: Vec<String>,
     pub multi_resolution_prefix_base: bool,
-    pub indices_path: String,
-    pub use_online_indices: bool,
     pub base_timeframe: String,
-    pub use_volume_features: bool,
     pub higher_timeframes: Vec<String>,
-    pub required_timeframes: Vec<String>,
-    pub enable_level2: bool,
-    pub level2_depth_levels: usize,
-    /// Broker time zone used for prop-firm calendar-day boundaries (e.g.
-    /// daily-DD reset). Most cTrader prop firms run on EET ("Europe/Athens",
-    /// UTC+2/+3); some run pure UTC. When set, the trading runtime computes
-    /// `day_id` against this offset instead of the local clock. Empty string
-    /// falls back to UTC. M12 in the audit.
-    #[serde(default)]
-    pub broker_timezone: String,
     pub poll_interval_seconds: u64,
     pub metrics_db_path: PathBuf,
     pub cache_dir: PathBuf,
@@ -149,16 +165,7 @@ pub struct SystemConfig {
     pub enable_gpu: bool,
     pub num_gpus: usize,
     pub device: String,
-    pub evo_multiproc_per_gpu: bool,
-    pub cache_training_frames: bool,
-    pub training_cache_max_bytes: usize,
     pub max_training_rows_per_tf: usize,
-    pub downcast_training_float32: bool,
-    pub vortex_memory_map: bool,
-    pub smc_freshness_limit: usize,
-    pub smc_atr_displacement: f64,
-    pub smc_max_levels: usize,
-    pub smc_use_cuda: bool,
     /// Hardware / accelerator runtime knobs. See [`HardwareConfig`].
     #[serde(default)]
     pub hardware: HardwareConfig,
@@ -224,7 +231,6 @@ impl Default for SystemConfig {
             // value.
             account_currency: String::new(),
             data_dir: PathBuf::from("data"),
-            ui_locale: "en".to_string(),
             trading_mode: "prop_firm".to_string(),
             risky_start_balance_usd: 100.0,
             risky_target_balance_usd: 50000.0,
@@ -236,21 +242,11 @@ impl Default for SystemConfig {
                 .map(|tf| (*tf).to_string())
                 .collect(),
             multi_resolution_prefix_base: false,
-            indices_path: String::new(),
-            use_online_indices: false,
             base_timeframe: "M1".to_string(),
-            use_volume_features: true,
             higher_timeframes: CANONICAL_TIMEFRAMES
                 .iter()
                 .map(|tf| (*tf).to_string())
                 .collect(),
-            required_timeframes: CANONICAL_TIMEFRAMES
-                .iter()
-                .map(|tf| (*tf).to_string())
-                .collect(),
-            enable_level2: false,
-            level2_depth_levels: 10,
-            broker_timezone: String::new(), // empty = fall back to UTC
             poll_interval_seconds: 60,
             metrics_db_path: PathBuf::from("metrics.sqlite"),
             cache_dir: PathBuf::from("cache"),
@@ -261,16 +257,7 @@ impl Default for SystemConfig {
             enable_gpu: false,
             num_gpus: 0,
             device: "cpu".to_string(),
-            evo_multiproc_per_gpu: true,
-            cache_training_frames: false,
-            training_cache_max_bytes: 2_000_000_000,
             max_training_rows_per_tf: 0,
-            downcast_training_float32: true,
-            vortex_memory_map: true,
-            smc_freshness_limit: 0,
-            smc_atr_displacement: 0.0,
-            smc_max_levels: 0,
-            smc_use_cuda: false,
             hardware: HardwareConfig::default(),
         }
     }
@@ -373,10 +360,28 @@ pub struct RiskConfig {
     pub max_lot_size: f64,
     pub require_stop_loss: bool,
     pub challenge_mode: bool,
+    /// ⚠ UNWIRED — nothing reads this field.
+    ///
+    /// The mechanism it was written for exists:
+    /// `PropFirmPhaseRiskDefaults::for_preset(preset, challenge_phase)` in
+    /// `domain/prop_firm.rs` takes exactly this string and returns per-phase
+    /// risk defaults. Its only callers are that module's own `#[cfg(test)]`
+    /// block. Wiring the two together would change live sizing, so it is NOT
+    /// done silently here — see `tests/config_has_recipient.rs::UNWIRED`.
     pub challenge_phase: String,
     pub prop_firm_rules: bool,
     pub kill_zones_enabled: bool,
     pub max_trades_per_day: usize,
+    /// ⚠ UNWIRED — nothing reads this field; setting it `false` does NOT
+    /// disable recovery mode.
+    ///
+    /// `RiskManager::update_recovery_state` (domain/risk.rs) flips
+    /// `RiskManager.recovery_mode` purely from the drawdown vs
+    /// `daily_dd_warning_pct`, consulting no operator toggle. `RiskManager`
+    /// has no production constructor at all — every `RiskManager::new` call
+    /// in the workspace is inside its own test module — so there is no live
+    /// call site to wire this into. See
+    /// `tests/config_has_recipient.rs::UNWIRED`.
     pub recovery_mode_enabled: bool,
     pub feature_drift_threshold: f64,
     pub high_quality_confidence: f64,
@@ -401,15 +406,10 @@ pub struct RiskConfig {
     pub conformal_enabled: bool,
     pub conformal_alpha: f64,
     pub conformal_abstain_min_set_size: usize,
-    pub meta_label_tp_pips: Option<f64>,
-    pub meta_label_sl_pips: Option<f64>,
     pub meta_label_max_hold_bars: usize,
     pub meta_label_min_dist: f64,
     pub meta_label_fixed_sl: f64,
     pub meta_label_fixed_tp: f64,
-    pub vol_ensemble_weights_trend: Option<HashMap<String, f64>>,
-    pub vol_ensemble_weights_range: Option<HashMap<String, f64>>,
-    pub vol_ensemble_weights_neutral: Option<HashMap<String, f64>>,
     pub vol_horizon_bars: usize,
 }
 
@@ -485,15 +485,10 @@ impl Default for RiskConfig {
             conformal_enabled: true,
             conformal_alpha: 0.10,
             conformal_abstain_min_set_size: 3,
-            meta_label_tp_pips: None,
-            meta_label_sl_pips: None,
             meta_label_max_hold_bars: 100,
             meta_label_min_dist: 0.0005,
             meta_label_fixed_sl: 0.0020,
             meta_label_fixed_tp: 0.0040,
-            vol_ensemble_weights_trend: None,
-            vol_ensemble_weights_range: None,
-            vol_ensemble_weights_neutral: None,
             vol_horizon_bars: 5,
         }
     }
@@ -510,6 +505,13 @@ pub struct ModelsConfig {
     pub rllib_num_workers: usize,
     pub auto_enable_rllib: bool,
     pub use_neuroevolution: bool,
+    /// ⚠ UNWIRED — nothing reads this field.
+    ///
+    /// `NeatTrainer` has a `population_size`, but it is hardcoded (96 in
+    /// `NeatConfig::default`, floored at 24 in `with_config`) and never
+    /// sourced from config. Connecting this field's default of 5 to it would
+    /// collapse the NEAT population 19-fold, so it is NOT wired silently —
+    /// see `tests/config_has_recipient.rs::UNWIRED`.
     pub rl_population_size: usize,
     pub rl_timesteps: usize,
     pub rl_eval_episodes: usize,
@@ -1645,53 +1647,35 @@ pub struct NewsConfig {
     /// pre-#117 safe behaviour. See [`NewsTradingMode`].
     #[serde(default)]
     pub news_trading_mode: NewsTradingMode,
-    pub news_decay_minutes: usize,
+    /// Minutes AHEAD of a high-impact event the blackout begins.
+    ///
+    /// ⚠ Reaches only `AppState::new`, which is `#[cfg(test)]`-only scaffolding
+    /// (`app_state.rs` — "the legacy egui state struct retained as the wide
+    /// test fixture"). No production code constructs a `NewsFilter`, so
+    /// changing this changes nothing a live run does. Listed in
+    /// `tests/config_has_recipient.rs::TEST_FIXTURE_ONLY`.
     pub news_kill_window_min: usize,
-    pub news_confidence_threshold: f64,
     pub news_calendar_enabled: bool,
+    /// Economic-calendar provider id. The ONLY implemented provider is
+    /// `forexfactory`; `news_calendar::fetch_calendar` rejects anything else
+    /// with an actionable error rather than silently fetching ForexFactory
+    /// while the operator believes another source is live.
     pub news_calendar_source: String,
+    /// See `news_kill_window_min` — same test-fixture-only caveat.
     pub news_lookahead_minutes: usize,
-    pub news_trade_on_event: bool,
-    pub news_trade_confidence_threshold: f64,
-    pub news_event_risk_pct: f64,
-    pub enable_news: bool,
-    pub news_sources: Vec<String>,
     pub rss_feeds: Vec<String>,
-    pub enable_llm_helper: bool,
-    pub llm_helper_enabled: bool,
-    pub llm_sentiment_positive_threshold: f64,
-    pub llm_sentiment_negative_threshold: f64,
-    pub news_backfill_enabled: bool,
-    pub news_backfill_days: usize,
-    pub news_local_glob: String,
+    /// See `news_kill_window_min` — same test-fixture-only caveat.
     pub perplexity_enabled: bool,
-    pub perplexity_api_key_env: String,
-    pub perplexity_model: String,
-    pub perplexity_num_results: usize,
-    pub perplexity_timeframe_hours: usize,
-    pub strategist_enabled: bool,
-    pub strategist_interval_minutes: usize,
-    pub auto_rescore_enabled: bool,
-    pub auto_rescore_days: usize,
-    pub auto_rescore_max_events: usize,
-    pub auto_rescore_only_missing: bool,
 }
 
 impl Default for NewsConfig {
     fn default() -> Self {
         Self {
             news_trading_mode: NewsTradingMode::default(),
-            news_decay_minutes: 120,
             news_kill_window_min: 30,
-            news_confidence_threshold: 0.65,
             news_calendar_enabled: true,
-            news_calendar_source: "forexfactory".to_string(),
+            news_calendar_source: NEWS_CALENDAR_FOREXFACTORY.to_string(),
             news_lookahead_minutes: 60,
-            news_trade_on_event: false,
-            news_trade_confidence_threshold: 0.90,
-            news_event_risk_pct: 0.001,
-            enable_news: true,
-            news_sources: vec!["rss".to_string()],
             // Public, no-API-key financial NEWS feeds for the AI news
             // desk (GET /news/feed). Operator-editable in Settings → News.
             // NB: the economic *calendar* lives in `news_calendar_source`
@@ -1702,24 +1686,7 @@ impl Default for NewsConfig {
             // calendar, not RSS (see `news_calendar_source`). Reused as the
             // runtime fallback when a user's configured feeds all fail.
             rss_feeds: default_news_rss_feeds(),
-            enable_llm_helper: true,
-            llm_helper_enabled: true,
-            llm_sentiment_positive_threshold: 0.2,
-            llm_sentiment_negative_threshold: -0.2,
-            news_backfill_enabled: true,
-            news_backfill_days: 30,
-            news_local_glob: String::new(),
             perplexity_enabled: true,
-            perplexity_api_key_env: "PPLX_API_KEY".to_string(),
-            perplexity_model: "sonar".to_string(),
-            perplexity_num_results: 10,
-            perplexity_timeframe_hours: 24,
-            strategist_enabled: false,
-            strategist_interval_minutes: 30,
-            auto_rescore_enabled: false,
-            auto_rescore_days: 30,
-            auto_rescore_max_events: 200,
-            auto_rescore_only_missing: true,
         }
     }
 }
@@ -1784,7 +1751,6 @@ pub struct Settings {
     /// App / server / trading-runtime knobs (config-driven replacement for
     /// the `neoethos-app` env_overrides registry). See [`AppRuntimeConfig`].
     pub app_runtime: AppRuntimeConfig,
-    pub secrets_file: PathBuf,
 }
 
 impl Default for Settings {
@@ -1795,7 +1761,6 @@ impl Default for Settings {
             models: ModelsConfig::default(),
             news: NewsConfig::default(),
             app_runtime: AppRuntimeConfig::default(),
-            secrets_file: PathBuf::from("keys.txt"),
         }
     }
 }

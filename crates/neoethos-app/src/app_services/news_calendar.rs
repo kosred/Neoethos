@@ -97,16 +97,35 @@ fn fetch_high_impact_events() -> anyhow::Result<Vec<CalendarEvent>> {
 }
 
 /// Refresh the cache when stale/empty. Fail-soft: on error keep what we have.
-fn refresh_if_stale() {
+///
+/// `source` is the operator's `news.news_calendar_source`. It used to be
+/// ignored entirely — this module fetched [`FF_CALENDAR_URL`] no matter what
+/// the operator had configured, while `/settings` happily accepted, persisted
+/// and echoed back any non-blank string. A mismatch now disables the gate and
+/// says so, instead of serving ForexFactory data under another provider's name.
+fn refresh_if_stale(source: &str) -> bool {
+    if let Err(message) = neoethos_core::config::validate_news_calendar_source(source) {
+        tracing::error!(
+            target: "neoethos_app::news_calendar",
+            configured = %source,
+            reason = %message,
+            "unsupported news_calendar_source — the news gate is INACTIVE until \
+             it names a provider this build implements"
+        );
+        return false;
+    }
     let stale = {
-        let Ok(c) = cache().lock() else { return };
+        // A poisoned cache lock is transient and unrelated to the provider —
+        // keep the gate ACTIVE (the read below is lock-guarded too) rather
+        // than silently switching news filtering off.
+        let Ok(c) = cache().lock() else { return true };
         match c.fetched_at {
             None => true,
             Some(t) => t.elapsed() >= REFRESH_EVERY,
         }
     };
     if !stale {
-        return;
+        return true;
     }
     match fetch_high_impact_events() {
         Ok(events) => {
@@ -133,6 +152,7 @@ fn refresh_if_stale() {
             }
         }
     }
+    true
 }
 
 /// The two currencies a symbol exposes to news risk. Metadata first
@@ -168,7 +188,9 @@ pub fn entry_blackout_for(symbol: &str, now_ms: i64) -> Option<String> {
         return None;
     }
 
-    refresh_if_stale();
+    if !refresh_if_stale(&settings.news.news_calendar_source) {
+        return None;
+    }
 
     let (base, quote) = symbol_currencies(symbol);
     let hit = {
