@@ -803,6 +803,39 @@ pub struct ModelsConfig {
     pub tabnet_hidden_dim: usize,
     pub phase5_filter_meta_blender: bool,
     pub phase5_core_models: Vec<String>,
+    /// Promotion-gate thresholds — the quality bar a discovered +
+    /// trained portfolio must clear before `POST /strategy_lab/promote`
+    /// copies it into `live_models/`.
+    ///
+    /// **2026-08-04 — "mechanism exists, no final recipient".** The gate
+    /// itself has always run, but the thresholds it ran with were
+    /// unreachable: `neoethos_app::server::strategy_lab::load_gate_config`
+    /// took a `&Settings`, ignored it (`_settings`), and returned
+    /// `PromotionGateConfig::default()`. Its own doc comment promised
+    /// "a future `ModelsConfig.promotion_gate` field can override them
+    /// here" — this is that field, and the function now reads it. Until
+    /// today no portfolio had ever been judged against an operator-set
+    /// bar; every promotion decision used the hardcoded moderate
+    /// defaults regardless of what the operator configured.
+    ///
+    /// This is deliberately the SAME struct the gate evaluates and the
+    /// same struct the endpoint echoes to the UI — not a mirror with its
+    /// own `Default`. A mirror would be free to drift from the enforced
+    /// copy, which is exactly the failure this field exists to close.
+    /// `promotion_gate_config_default_matches_the_gates_own_default`
+    /// pins the values so adding the knob shifted no decision today.
+    pub promotion_gate: crate::domain::promotion_gate::PromotionGateConfig,
+    /// Demo forward-test gate — the bar a promoted strategy must clear on
+    /// REAL demo fills before the operator may move it to real money.
+    ///
+    /// **2026-08-04 — the same "no final recipient" shape as
+    /// [`Self::promotion_gate`], one stage further down the pipeline.**
+    /// `neoethos_app::app_services::live_gate::evaluate_for_portfolio`
+    /// loaded a `Settings` at its top and then passed
+    /// `&DemoForwardGateConfig::default()` to the gate twenty-three lines
+    /// later. `min_demo_trades: 100` and `forward_tolerance: 0.20` were
+    /// unreachable literals on the last gate before real money.
+    pub demo_forward_gate: crate::domain::demo_gate::DemoForwardGateConfig,
 }
 
 /// Genetic-search runtime knobs — the config-driven replacement for the
@@ -1640,6 +1673,11 @@ impl Default for ModelsConfig {
                 .into_iter()
                 .map(String::from)
                 .collect(),
+            // Delegated to the gate's own Default so there is exactly one
+            // place these five thresholds are written down. A test asserts
+            // the literal values, so a silent change here fails loudly.
+            promotion_gate: crate::domain::promotion_gate::PromotionGateConfig::default(),
+            demo_forward_gate: crate::domain::demo_gate::DemoForwardGateConfig::default(),
         }
     }
 }

@@ -23,8 +23,26 @@ use super::promotion_gate::{CriterionResult, PromotionMetrics};
 use serde::{Deserialize, Serialize};
 
 /// Config for the demo forward-test gate. Units match [`PromotionMetrics`].
+///
+/// **2026-08-04 — the second gate with no final recipient.** The only
+/// production construction of this struct was
+/// `&DemoForwardGateConfig::default()` in
+/// `neoethos_app::app_services::live_gate::evaluate_for_portfolio` —
+/// twenty-three lines below a `Settings` that function had already
+/// loaded. The gate ran on every call and always ran on the shipped
+/// literals; the operator had no way to reach the three thresholds that
+/// decide whether a strategy may move from demo to real money. It is now
+/// [`crate::config::ModelsConfig::demo_forward_gate`], read through the
+/// `Settings` that was already in scope, with the same
+/// single-struct/no-mirror discipline as
+/// [`super::promotion_gate::PromotionGateConfig`]: this struct is the
+/// config, the enforced value, and the DTO all at once.
+///
+/// Serialisation stays camelCase for the HTTP DTO; each field also
+/// accepts its snake_case spelling so `config.yaml` reads like the rest
+/// of the file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct DemoForwardGateConfig {
     /// When false, the gate is a no-op pass (the operator can still gate
     /// manually). Default true.
@@ -32,11 +50,13 @@ pub struct DemoForwardGateConfig {
     /// Minimum number of REAL demo fills before the live metrics are
     /// statistically meaningful. Default 100 — a great live Sharpe over 6
     /// trades is noise, exactly as `min_trades` guards the backtest gate.
+    #[serde(alias = "min_demo_trades")]
     pub min_demo_trades: u64,
     /// Allowed degradation of live-vs-backtest, as a fraction. 0.20 = the live
     /// metric may be up to 20% worse than backtest and still pass. Applied as a
     /// FLOOR for higher-is-better metrics (`live >= backtest * (1 - tol)`) and a
     /// CAP for lower-is-better metrics (`live <= backtest * (1 + tol)`).
+    #[serde(alias = "forward_tolerance")]
     pub forward_tolerance: f64,
 }
 
@@ -233,5 +253,80 @@ mod tests {
         let d = evaluate_demo_forward_gate(0, &backtest(), &backtest(), &cfg);
         assert!(d.eligible);
         assert!(d.criteria.is_empty());
+    }
+
+    // ─── 2026-08-04: the last gate before real money now has a recipient ──
+
+    #[test]
+    fn demo_forward_gate_default_matches_the_previously_hardcoded_literals() {
+        // `live_gate.rs` passed `&DemoForwardGateConfig::default()`. Pin the
+        // literals so routing the gate through config shifted no verdict.
+        let d = DemoForwardGateConfig::default();
+        assert!(d.enabled);
+        assert_eq!(d.min_demo_trades, 100);
+        assert_eq!(d.forward_tolerance, 0.20);
+    }
+
+    #[test]
+    fn models_config_demo_forward_gate_default_equals_the_gates_own_default() {
+        assert_eq!(
+            crate::config::ModelsConfig::default().demo_forward_gate,
+            DemoForwardGateConfig::default(),
+            "the config field must delegate to the gate's own Default, not mirror it"
+        );
+    }
+
+    #[test]
+    fn a_config_without_the_key_keeps_the_previous_thresholds() {
+        let models: crate::config::ModelsConfig =
+            serde_yaml_ng::from_str("ml_models: [lightgbm]\n").expect("legacy config deserialises");
+        assert_eq!(models.demo_forward_gate, DemoForwardGateConfig::default());
+    }
+
+    #[test]
+    fn an_operator_set_demo_bar_reaches_the_gate_and_changes_the_verdict() {
+        let yaml = "\
+ml_models: [lightgbm]
+demo_forward_gate:
+  min_demo_trades: 400
+";
+        let models: crate::config::ModelsConfig =
+            serde_yaml_ng::from_str(yaml).expect("operator config deserialises");
+        assert_eq!(models.demo_forward_gate.min_demo_trades, 400);
+        // Untouched fields keep the documented default rather than 0/false.
+        assert!(models.demo_forward_gate.enabled);
+        assert_eq!(models.demo_forward_gate.forward_tolerance, 0.20);
+
+        // 200 demo fills clears the shipped floor of 100 but not the
+        // operator's 400 — the verdict has to move, not just the echo.
+        let live = backtest();
+        assert!(
+            evaluate_demo_forward_gate(200, &live, &backtest(), &DemoForwardGateConfig::default())
+                .eligible
+        );
+        let d = evaluate_demo_forward_gate(200, &live, &backtest(), &models.demo_forward_gate);
+        assert!(
+            !d.eligible,
+            "operator's min_demo_trades 400 must block a 200-fill sample: {}",
+            d.summary
+        );
+    }
+
+    #[test]
+    fn snake_case_and_camel_case_yaml_deserialise_identically() {
+        let snake: DemoForwardGateConfig =
+            serde_yaml_ng::from_str("min_demo_trades: 250\nforward_tolerance: 0.05\n")
+                .expect("snake_case deserialises");
+        let camel: DemoForwardGateConfig =
+            serde_yaml_ng::from_str("minDemoTrades: 250\nforwardTolerance: 0.05\n")
+                .expect("camelCase deserialises");
+        assert_eq!(snake, camel);
+        assert_eq!(snake.min_demo_trades, 250);
+        assert_eq!(snake.forward_tolerance, 0.05);
+
+        // The wire format the DTO already uses is unchanged.
+        let json = serde_json::to_string(&DemoForwardGateConfig::default()).expect("serialises");
+        assert!(json.contains("\"minDemoTrades\""), "{json}");
+        assert!(json.contains("\"forwardTolerance\""), "{json}");
     }
 }

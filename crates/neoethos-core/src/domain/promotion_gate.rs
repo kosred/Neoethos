@@ -34,24 +34,45 @@ use serde::{Deserialize, Serialize};
 /// `enabled: false` makes the gate a no-op pass-through, for operators
 /// who want the pipeline to promote whatever it finds (e.g. demo-only
 /// experimentation).
+///
+/// **This struct is the single recipient of those five thresholds.** It
+/// is simultaneously (a) the operator's config — it is embedded in
+/// [`crate::config::ModelsConfig::promotion_gate`] and deserialised from
+/// `config.yaml`, (b) the value [`evaluate_promotion`] enforces, and
+/// (c) the value the `/strategy_lab/promotion` endpoint echoes to the
+/// UI. There is deliberately no mirror struct with its own `Default`:
+/// a mirror is free to drift from the enforced copy, and a drifted
+/// display copy is indistinguishable from a correct one in every
+/// artifact the operator can see.
+///
+/// Serialisation is camelCase because the HTTP DTO is camelCase, but
+/// every field also accepts its snake_case spelling so the operator's
+/// `config.yaml` reads like the rest of the file. Both spellings
+/// deserialise to the same field — see
+/// `snake_case_and_camel_case_yaml_deserialise_identically`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct PromotionGateConfig {
     /// When false, every portfolio promotes regardless of metrics.
     pub enabled: bool,
     /// Minimum acceptable Sharpe ratio (out-of-sample preferred).
+    #[serde(alias = "min_sharpe")]
     pub min_sharpe: f64,
     /// Minimum win rate as a fraction in `[0, 1]` (0.45 = 45%).
+    #[serde(alias = "min_win_rate")]
     pub min_win_rate: f64,
     /// Minimum profit factor (gross profit / gross loss). 1.0 = break
     /// even before costs; we want a margin above that.
+    #[serde(alias = "min_profit_factor")]
     pub min_profit_factor: f64,
     /// Maximum tolerated peak-to-trough drawdown, as a percentage
     /// (25.0 = 25%). Strategies that bled more than this in backtest
     /// are rejected even if other metrics look good.
+    #[serde(alias = "max_drawdown_pct")]
     pub max_drawdown_pct: f64,
     /// Minimum number of trades the metrics must be based on. A
     /// stellar Sharpe over 4 trades is noise, not signal.
+    #[serde(alias = "min_trades")]
     pub min_trades: u64,
 }
 
@@ -397,5 +418,115 @@ mod tests {
     #[test]
     fn aggregate_empty_portfolio_is_none() {
         assert!(aggregate_portfolio(&[]).is_none());
+    }
+
+    // ─── 2026-08-04: "the gate ran, but read nobody's settings" ──────────
+    //
+    // `neoethos_app::server::strategy_lab::load_gate_config` took a
+    // `&Settings`, ignored it, and returned `PromotionGateConfig::default()`.
+    // The thresholds are now a real config field. These tests pin the two
+    // properties that make that safe: the values did not move today, and
+    // the operator's file is actually read.
+
+    #[test]
+    fn promotion_gate_config_default_matches_the_gates_own_default() {
+        // The literal bar, spelled out. Adding the config knob must not
+        // shift a single decision on any existing install; if someone
+        // retunes these, this test makes it a deliberate, visible act
+        // rather than a silent change to what "promoted" means.
+        let d = PromotionGateConfig::default();
+        assert!(d.enabled, "gate must stay ON by default");
+        assert_eq!(d.min_sharpe, 1.0);
+        assert_eq!(d.min_win_rate, 0.45);
+        assert_eq!(d.min_profit_factor, 1.2);
+        assert_eq!(d.max_drawdown_pct, 25.0);
+        assert_eq!(d.min_trades, 30);
+    }
+
+    #[test]
+    fn models_config_promotion_gate_default_equals_the_gates_own_default() {
+        // The config field must not become a mirror with its own drifting
+        // Default — that is precisely the failure this field closes.
+        assert_eq!(
+            crate::config::ModelsConfig::default().promotion_gate,
+            PromotionGateConfig::default(),
+            "ModelsConfig.promotion_gate must delegate to the gate's own Default"
+        );
+    }
+
+    #[test]
+    fn a_config_without_the_promotion_gate_key_keeps_the_previous_thresholds() {
+        // Every existing config.yaml on disk predates this field. Loading
+        // one must reproduce the exact pre-fix behaviour — otherwise the
+        // fix silently re-gates the operator's already-promoted portfolios.
+        let models: crate::config::ModelsConfig =
+            serde_yaml_ng::from_str("ml_models: [lightgbm]\n").expect("legacy config deserialises");
+        assert_eq!(models.promotion_gate, PromotionGateConfig::default());
+    }
+
+    #[test]
+    fn an_operator_set_threshold_survives_a_yaml_round_trip() {
+        // The whole point: a value the operator writes must reach the gate.
+        let yaml = "\
+ml_models: [lightgbm]
+promotion_gate:
+  min_sharpe: 2.5
+  min_trades: 500
+";
+        let models: crate::config::ModelsConfig =
+            serde_yaml_ng::from_str(yaml).expect("operator config deserialises");
+        assert_eq!(models.promotion_gate.min_sharpe, 2.5);
+        assert_eq!(models.promotion_gate.min_trades, 500);
+        // Unspecified fields keep the documented default rather than 0.
+        assert_eq!(models.promotion_gate.min_profit_factor, 1.2);
+        assert!(models.promotion_gate.enabled);
+
+        // And the gate enforces what was read — a portfolio that clears the
+        // default bar must be REJECTED against the operator's tighter one.
+        let m = strong(); // sharpe 1.8, 240 trades
+        assert!(evaluate_promotion(&m, &PromotionGateConfig::default()).promoted);
+        let d = evaluate_promotion(&m, &models.promotion_gate);
+        assert!(
+            !d.promoted,
+            "operator's min_sharpe 2.5 / min_trades 500 must block sharpe 1.8 / 240 trades: {}",
+            d.summary
+        );
+        assert!(d.summary.contains("Sharpe ratio"), "{}", d.summary);
+        assert!(d.summary.contains("Trade count"), "{}", d.summary);
+    }
+
+    #[test]
+    fn snake_case_and_camel_case_yaml_deserialise_identically() {
+        // Serialisation is camelCase (the HTTP DTO the UI receives), but
+        // config.yaml is snake_case everywhere else. Both must land on the
+        // same field — a spelling that silently no-ops would recreate the
+        // exact bug this field fixes: a knob the operator sets and nothing
+        // reads.
+        let snake: PromotionGateConfig =
+            serde_yaml_ng::from_str("min_sharpe: 1.7\nmax_drawdown_pct: 8.0\nmin_win_rate: 0.6\n")
+                .expect("snake_case deserialises");
+        let camel: PromotionGateConfig =
+            serde_yaml_ng::from_str("minSharpe: 1.7\nmaxDrawdownPct: 8.0\nminWinRate: 0.6\n")
+                .expect("camelCase deserialises");
+        assert_eq!(snake, camel);
+        assert_eq!(snake.min_sharpe, 1.7);
+        assert_eq!(snake.max_drawdown_pct, 8.0);
+        assert_eq!(snake.min_win_rate, 0.6);
+
+        // The wire format the UI already consumes is unchanged.
+        let json = serde_json::to_string(&PromotionGateConfig::default()).expect("serialises");
+        assert!(json.contains("\"minSharpe\""), "{json}");
+        assert!(json.contains("\"maxDrawdownPct\""), "{json}");
+    }
+
+    #[test]
+    fn a_disabled_gate_set_from_config_actually_disables_the_gate() {
+        // `enabled: false` was reachable in the struct but not from disk.
+        let models: crate::config::ModelsConfig =
+            serde_yaml_ng::from_str("promotion_gate:\n  enabled: false\n").expect("deserialises");
+        let mut catastrophic = strong();
+        catastrophic.sharpe = -3.0;
+        let d = evaluate_promotion(&catastrophic, &models.promotion_gate);
+        assert!(d.promoted, "operator's `enabled: false` must reach the gate");
     }
 }

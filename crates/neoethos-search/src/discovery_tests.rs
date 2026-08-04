@@ -2179,3 +2179,299 @@ fn the_screen_builds_the_gate_arrays_once_for_the_whole_pool() {
         "screening six candidates built the gate arrays {built} times — the whole point          of the hoist is that it is one, whatever the pool size"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// 2026-08-04 — "one computation, several call sites, each passing something
+// different, while a comment claims they agree".
+//
+// `DiscoveryConfig` has TWO production constructors:
+//
+//   * `DiscoveryConfig::from_settings(&settings)` — the normal path.
+//   * `DiscoveryConfig::default()` — the fallback taken when the settings
+//     file cannot be read. `neoethos_app::server::engines_control` does
+//     exactly this:
+//         Some(settings) => DiscoveryConfig::from_settings(settings),
+//         None           => DiscoveryConfig::default(),
+//     and `neoethos_app::main`'s headless loop constructs one directly.
+//
+// `default()` hand-writes ~50 literals and its comments assert they match
+// the config side ("these defaults match ModelsConfig::default", "Search-
+// memory ledger defaults mirror DiscoveryLedgerConfig::default"). Nothing
+// checked that claim. A hand-copied literal that drifts from the config
+// default does not fail to compile, does not warn, and produces a run that
+// looks completely normal — the filter floors drifted five points exactly
+// this way.
+//
+// These tests make the claim executable. The first compares the whole
+// `Debug` rendering rather than a hand-maintained field list, because a
+// hand-maintained list would need the same discipline it is meant to
+// enforce: add a field to `DiscoveryConfig`, forget to wire it into
+// `from_settings`, and this fails.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Fields `default()` deliberately leaves as "unset" sentinels which
+/// `from_settings` fills from the operator's config. These are the
+/// documented, intentional differences — everything else must agree.
+fn discovery_config_intentional_divergences() -> &'static [&'static str] {
+    &[
+        // GROUP C sentinels: `default()` uses empty / NaN so a config that
+        // skipped `for_symbol` cannot silently backtest EURUSD/USD.
+        "symbol",
+        "timeframe_label",
+        "evaluation_symbol",
+        "evaluation_account_currency",
+        "evaluation_spread_pips",
+        "evaluation_commission_per_trade",
+    ]
+}
+
+/// The fields on which the two production constructors are KNOWN to
+/// disagree, as measured on 2026-08-04. This list is a **defect record,
+/// not a specification** — every entry is a parameter whose value depends
+/// on whether `config.yaml` could be read, with nothing in the resulting
+/// artifact saying which branch ran.
+///
+/// The two that change reported NUMBERS rather than just search effort:
+///   * `initial_balance` — 100 000 vs 10 000. It is the denominator of
+///     every drawdown-% and PnL-% the run reports, so the same trades
+///     produce different headline figures on the two branches.
+///   * `higher_timeframes` — empty vs eleven. The fallback searches
+///     single-timeframe while the configured path is multi-resolution.
+///
+/// The test below fails if this list GROWS. Shrinking it (by making the
+/// two constructors agree, or by deleting `Default` and forcing the
+/// fallback to fail loud) is the fix; the list is here so the debt is
+/// counted rather than rediscovered.
+fn discovery_config_known_default_vs_settings_divergences() -> &'static [&'static str] {
+    &[
+        "population",
+        "generations",
+        "max_indicators",
+        "portfolio_size",
+        "max_hours",
+        "walkforward_splits",
+        "cpcv_max_rows",
+        "initial_balance",
+        "risk_per_trade_min",
+        "higher_timeframes",
+        // `filtering.*` — the opportunistic-candidate lane is entirely OFF
+        // on the fallback branch and entirely ON on the configured one.
+        "opportunistic_enabled",
+        "use_opportunistic_candidates",
+        "opportunistic_min_positive_months",
+        "opportunistic_min_trades_per_month",
+        "opportunistic_min_trade_return_pct",
+        "opportunistic_max_dd",
+    ]
+}
+
+/// Replace every named field's rendered VALUE with a placeholder, keeping
+/// the field itself in place. Block-aware: a value that opens `[`, `{` or
+/// `(` is collapsed together with all of its nested lines, so a field that
+/// renders across many lines on one side and one line on the other cannot
+/// desynchronise the comparison that follows.
+fn redact_fields(rendered: &str, fields: &[&str]) -> String {
+    let lines: Vec<&str> = rendered.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let line = lines[idx];
+        let indent = line.len() - line.trim_start().len();
+        let name = line.trim().split(':').next().unwrap_or("").trim();
+        if line.contains(':') && fields.contains(&name) {
+            out.push(format!("{}{}: <redacted>", " ".repeat(indent), name));
+            let opens = line.trim_end().ends_with('[')
+                || line.trim_end().ends_with('{')
+                || line.trim_end().ends_with('(');
+            idx += 1;
+            if opens {
+                // Consume until the closer sitting at the field's own indent.
+                while idx < lines.len() {
+                    let cur = lines[idx];
+                    let cur_indent = cur.len() - cur.trim_start().len();
+                    idx += 1;
+                    if cur_indent == indent {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(line.trim_end().to_string());
+        idx += 1;
+    }
+    out.join("\n")
+}
+
+#[test]
+fn discovery_config_default_vs_from_settings_divergence_does_not_grow() {
+    // Apples to apples: `from_settings` ENDS with `.apply_mode_overrides()`,
+    // so the bare `default()` gets exactly one application too. Comparing
+    // raw `default()` against `from_settings` would compare zero
+    // applications against one and report a difference that is not drift.
+    let settings = neoethos_core::Settings::default();
+
+    let mut redacted: Vec<&str> = Vec::new();
+    redacted.extend_from_slice(discovery_config_intentional_divergences());
+    redacted.extend_from_slice(discovery_config_known_default_vs_settings_divergences());
+
+    let from_defaults = redact_fields(
+        &format!("{:#?}", DiscoveryConfig::from_settings(&settings)),
+        &redacted,
+    );
+    let bare_default = redact_fields(
+        &format!("{:#?}", DiscoveryConfig::default().apply_mode_overrides()),
+        &redacted,
+    );
+
+    assert_eq!(
+        bare_default, from_defaults,
+        "A NEW field diverges between DiscoveryConfig::default() and \
+         DiscoveryConfig::from_settings(&Settings::default()).\n\
+         \n\
+         Both are PRODUCTION constructors. `engines_control` falls back to `default()` \
+         whenever config.yaml fails to load, so a discovery run searches with different \
+         parameters depending on whether the file could be read — and the artifact does not \
+         record which branch ran. Either wire the new field into `from_settings`, or add it \
+         to `discovery_config_known_default_vs_settings_divergences` with a reason."
+    );
+}
+
+/// The redaction list must stay honest: every field named in it has to
+/// ACTUALLY diverge. A stale entry would silently widen the hole the test
+/// above is guarding.
+#[test]
+fn every_known_divergence_is_still_a_real_divergence() {
+    let settings = neoethos_core::Settings::default();
+    let from_defaults = format!("{:#?}", DiscoveryConfig::from_settings(&settings));
+    let bare_default = format!("{:#?}", DiscoveryConfig::default().apply_mode_overrides());
+
+    for field in discovery_config_known_default_vs_settings_divergences() {
+        let a = redact_fields(&bare_default, &[field]);
+        let b = redact_fields(&from_defaults, &[field]);
+        // Redacting a field that genuinely differs must remove a difference;
+        // if the renderings were already equal on it, the entry is stale.
+        assert_ne!(
+            (bare_default.clone(), from_defaults.clone()),
+            (a, b),
+            "`{field}` is listed as a known divergence but the two constructors agree on it \
+             — remove it from discovery_config_known_default_vs_settings_divergences"
+        );
+    }
+}
+
+/// `apply_mode_overrides` MULTIPLIES `min_trades_per_month` by a
+/// per-timeframe scale factor. Multiplication is not idempotent, and
+/// `DiscoveryConfig::from_settings` already ends with
+/// `.apply_mode_overrides()` — so every caller that applies it again
+/// squares the scale factor and searches with a floor several times
+/// looser than the one the code's own comment documents
+/// ("H4: 0.20× (15 → 3/month)").
+///
+/// The counts differ per entry point, traced 2026-08-04:
+///
+/// * **UI Discovery — 3 applications.**
+///   `engines_control::start_discovery` builds the config with
+///   `DiscoveryConfig::from_settings(settings)` (1st, inside
+///   `from_settings`), applies `config = config.apply_mode_overrides()`
+///   before assembling the request (2nd), and the resulting
+///   `DiscoveryRequest.config` reaches
+///   `app_services::discovery`'s
+///   `search_request.config.clone().apply_mode_overrides()` (3rd).
+/// * **CLI — 2 applications.** `from_settings` (1st) then the
+///   `DiscoveryConfig { .., ..defaults.clone() }.apply_mode_overrides()`
+///   in `neoethos-cli` (2nd).
+/// * **The code comment describes 1.**
+///
+/// On H4 with the operator's `prop_search_val_min_trades_per_month: 15`
+/// that is 3.0 documented, 0.6 on the CLI, 0.5 (the `.max(0.5)` clamp)
+/// on the UI — three answers to one knob, none of them announced.
+/// Intra-day timeframes have scale 1.0 and are unaffected; see
+/// `intraday_timeframes_are_immune_to_the_repeated_mode_override`.
+///
+/// This test states the arithmetic. It does not assert which call count
+/// is correct — that is the operator's call — it asserts that the count
+/// CHANGES THE ANSWER, which is what makes "how many times did this run"
+/// a silent correctness question instead of a no-op.
+#[test]
+fn apply_mode_overrides_is_not_idempotent_for_the_timeframe_scaled_floor() {
+    // The operator's own config.yaml sets
+    // `models.prop_search_val_min_trades_per_month: 15`.
+    let mut settings = neoethos_core::Settings::default();
+    settings.models.prop_search_val_min_trades_per_month = 15;
+    settings.models.discovery_mode = "prop_firm".to_string();
+    settings.system.trading_mode = "prop_firm".to_string();
+
+    // H4: the documented factor is 0.20 → 15 becomes 3 trades/month.
+    let mut once = DiscoveryConfig::from_settings(&settings);
+    once.timeframe_label = "H4".to_string();
+    let once = once.apply_mode_overrides();
+    let twice = once.clone().apply_mode_overrides();
+    let thrice = twice.clone().apply_mode_overrides();
+
+    assert_eq!(
+        once.filtering.min_trades_per_month, 3.0,
+        "one application must reproduce the documented H4 factor (15 × 0.20)"
+    );
+    assert!(
+        (twice.filtering.min_trades_per_month - 0.6).abs() < 1e-9,
+        "a second application squares the factor: got {}",
+        twice.filtering.min_trades_per_month
+    );
+    assert!(
+        (thrice.filtering.min_trades_per_month - 0.5).abs() < 1e-9,
+        "a third cubes it and lands on the .max(0.5) clamp: got {}",
+        thrice.filtering.min_trades_per_month
+    );
+    assert_ne!(
+        once.filtering.min_trades_per_month, twice.filtering.min_trades_per_month,
+        "if this ever becomes equal the hazard is gone and this test can go"
+    );
+}
+
+/// The intra-day timeframes the operator actually runs are UNAFFECTED,
+/// because their scale factor is exactly 1.0 and the block is guarded by
+/// `scale < 1.0`. Pinning this keeps the blast radius of the hazard above
+/// honest and stops it being over-claimed.
+#[test]
+fn intraday_timeframes_are_immune_to_the_repeated_mode_override() {
+    let mut settings = neoethos_core::Settings::default();
+    settings.models.prop_search_val_min_trades_per_month = 15;
+    settings.models.discovery_mode = "prop_firm".to_string();
+    settings.system.trading_mode = "prop_firm".to_string();
+
+    for tf in ["M1", "M3", "M5", "M15"] {
+        let mut cfg = DiscoveryConfig::from_settings(&settings);
+        cfg.timeframe_label = tf.to_string();
+        let once = cfg.apply_mode_overrides();
+        let twice = once.clone().apply_mode_overrides();
+        assert_eq!(
+            once.filtering.min_trades_per_month, twice.filtering.min_trades_per_month,
+            "{tf} has scale 1.0, so repeated application must be a no-op"
+        );
+    }
+}
+
+#[test]
+fn discovery_ledger_defaults_are_not_a_hand_copy_that_can_drift() {
+    // `DiscoveryConfig::default()` writes these three literals under the
+    // comment "Search-memory ledger defaults mirror DiscoveryLedgerConfig::
+    // default". Make the mirror executable.
+    let cfg = DiscoveryConfig::default();
+    let ledger = neoethos_core::config::DiscoveryLedgerConfig::default();
+    assert_eq!(cfg.discovery_ledger_enabled, ledger.enabled);
+    assert_eq!(cfg.discovery_ledger_cache_dir, ledger.cache_dir);
+    assert_eq!(cfg.discovery_ledger_archive_top_n, ledger.archive_top_n);
+}
+
+#[test]
+fn walkforward_export_defaults_are_not_a_hand_copy_that_can_drift() {
+    // Same for the two the comment claims "match ModelsConfig::default".
+    let cfg = DiscoveryConfig::default();
+    let models = neoethos_core::config::ModelsConfig::default();
+    assert_eq!(
+        cfg.require_walkforward_for_export,
+        models.require_walkforward_for_export
+    );
+    assert_eq!(cfg.prop_firm_min_pass_rate, models.prop_firm_min_pass_rate);
+}

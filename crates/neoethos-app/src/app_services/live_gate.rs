@@ -86,9 +86,23 @@ pub fn evaluate_for_portfolio(portfolio_path: &str) -> Result<DemoForwardDecisio
     let symbol = artifact.symbol;
     let backtest = backtest_metrics_for(portfolio_path)?;
 
-    let data_dir = Settings::load()
-        .map(|s| s.system.data_dir)
-        .unwrap_or_else(|_| std::path::PathBuf::from("data"));
+    // 2026-08-04: ONE load, used for BOTH the data root and the gate
+    // thresholds. This function used to load a `Settings` here, take only
+    // `system.data_dir` from it, and then hand
+    // `&DemoForwardGateConfig::default()` to the gate twenty-three lines
+    // below — so the last gate before real money ran on literals the
+    // operator could not reach. `models.demo_forward_gate` is
+    // `#[serde(default)]`, so a config without the key yields exactly the
+    // previous thresholds.
+    let settings = Settings::load().ok();
+    let data_dir = settings
+        .as_ref()
+        .map(|s| s.system.data_dir.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("data"));
+    let gate_config: DemoForwardGateConfig = settings
+        .as_ref()
+        .map(|s| s.models.demo_forward_gate.clone())
+        .unwrap_or_default();
     let trades: Vec<_> = query_closed_trades(&data_dir, None, None)
         .into_iter()
         .filter(|t| t.symbol.eq_ignore_ascii_case(&symbol))
@@ -109,7 +123,7 @@ pub fn evaluate_for_portfolio(portfolio_path: &str) -> Result<DemoForwardDecisio
         stats.total_trades as u64,
         &live,
         &backtest,
-        &DemoForwardGateConfig::default(),
+        &gate_config,
     ))
 }
 
