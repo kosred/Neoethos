@@ -1721,13 +1721,115 @@ fn operator_risk_band_reaches_the_discovery_backtest() {
         tp_pips: 40.0,
         ..Default::default()
     };
-    let settings_out = discovery_backtest_settings(&config, &gene, Some(1.25));
+    let settings_out = PopulationTemplateResolver::new(&config, Some(1.25)).template(&gene);
     assert!(
         (settings_out.risk_per_trade_max - 0.30).abs() < 1e-12,
         "the backtest must size at the operator's 30%, got {}",
         settings_out.risk_per_trade_max
     );
     assert!((settings_out.risk_per_trade_min - 0.05).abs() < 1e-12);
+}
+
+/// SLICE-2 GUARD (2026-08-08). The raw builder `discovery_backtest_settings`
+/// leaves the adaptive-stop fields at fixed defaults; 9 of its 13 former call
+/// sites — including the quality screen — therefore backtested adaptive genes
+/// on their unused fixed pips while GA scoring ran `sl = stop_vol_mult ×
+/// base[i]` (measured on one signal: 30 331 vs 1 727 trades, 17.6×). Every
+/// call now routes through `GeneEvalSettingsResolver` (serial per-gene eval)
+/// or `PopulationTemplateResolver` (templates for the population helpers).
+/// The function is private to the `discovery` module, so the compiler already
+/// blocks the rest of the crate; this test blocks NEW call sites inside
+/// discovery.rs / discovery_tests.rs themselves.
+#[test]
+fn discovery_backtest_settings_has_no_callers_outside_the_resolvers() {
+    // Built from two halves so this test's own source can never match itself.
+    let needle = format!("{}{}", "discovery_backtest_", "settings(");
+    let discovery_src = include_str!("discovery.rs");
+    let call_sites = discovery_src.matches(needle.as_str()).count();
+    assert_eq!(
+        call_sites, 3,
+        "expected exactly 3 occurrences of `{needle}` in discovery.rs \
+         (1 definition + 1 in PopulationTemplateResolver::template + 1 in \
+         GeneEvalSettingsResolver::settings_for_gene), found {call_sites}. \
+         A new direct call bypasses the ONE resolver and reintroduces the \
+         fixed-stop divergence: route serial per-gene evaluation through \
+         GeneEvalSettingsResolver::settings_for_gene and population-helper \
+         templates through PopulationTemplateResolver::template."
+    );
+    let tests_src = include_str!("discovery_tests.rs");
+    assert_eq!(
+        tests_src.matches(needle.as_str()).count(),
+        0,
+        "discovery_tests.rs must call the resolvers, not the raw builder"
+    );
+}
+
+/// The resolver installs the SCORED stop regime: an adaptive gene gets its own
+/// `stop_vol_mult`, the shared slice base series and the reward:risk; a fixed
+/// gene keeps the scalar-pips path untouched. This is the property every
+/// selection-bearing serial stage now inherits by construction.
+#[test]
+fn gene_eval_settings_resolver_installs_the_scored_stop_regime() {
+    let mut config = DiscoveryConfig::from_settings(&neoethos_core::Settings::default());
+    config.evaluation_symbol = "EURUSD".to_string();
+
+    // Deterministic bars with real high/low spread so the base estimator has
+    // volatility to measure (mirrors search_engine's synthetic_hlc).
+    let n = 200usize;
+    let mut high = Vec::with_capacity(n);
+    let mut low = Vec::with_capacity(n);
+    let mut close = Vec::with_capacity(n);
+    for i in 0..n {
+        let c = 1.10 + 0.002 * ((i as f64) * 0.1).sin();
+        let amp = 0.001 + 0.001 * (((i as f64) * 0.05).cos().abs());
+        close.push(c);
+        high.push(c + amp);
+        low.push(c - amp);
+    }
+
+    let adaptive_gene = Gene {
+        sl_pips: 13.0,
+        tp_pips: 26.0,
+        stop_vol_mult: 1.75,
+        ..Default::default()
+    };
+    let fixed_gene = Gene {
+        sl_pips: 13.0,
+        tp_pips: 26.0,
+        stop_vol_mult: 0.0,
+        ..Default::default()
+    };
+
+    let resolver = GeneEvalSettingsResolver::for_slice(
+        &config,
+        [&adaptive_gene, &fixed_gene],
+        &high,
+        &low,
+        &close,
+    )
+    .expect("resolver builds on a 200-bar slice");
+
+    let adaptive = resolver.settings_for_gene(&adaptive_gene);
+    assert_eq!(
+        adaptive.adaptive_vol_mult, 1.75,
+        "the gene's scored stop_vol_mult must reach the serial backtest"
+    );
+    let base = adaptive
+        .adaptive_base_pips
+        .as_ref()
+        .expect("adaptive gene gets the slice base series");
+    assert_eq!(base.len(), n, "base series indexed to the resolver's slice");
+    assert!(base.iter().all(|&b| b.is_finite() && b > 0.0));
+    assert!(adaptive.adaptive_rr > 0.0);
+
+    let fixed = resolver.settings_for_gene(&fixed_gene);
+    assert_eq!(fixed.adaptive_vol_mult, 0.0);
+    assert!(
+        fixed.adaptive_base_pips.is_none(),
+        "a fixed gene keeps the byte-identical scalar-pips path"
+    );
+    assert_eq!(fixed.sl_pips, 13.0);
+    assert_eq!(fixed.tp_pips, 26.0);
 }
 
 #[test]

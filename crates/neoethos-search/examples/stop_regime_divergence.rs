@@ -1,15 +1,22 @@
 //! Quantifies the SECOND divergence found while fixing the 300 000-bar cliff:
-//! the discovery pipeline evaluates the same gene under TWO different stop
-//! regimes depending on which call site is running.
+//! the discovery pipeline evaluated the same gene under TWO different stop
+//! regimes depending on which call site was running.
 //!
-//! `search_engine.rs::resolve_adaptive_stops` installs a per-bar
-//! volatility-scaled stop (`sl = stop_vol_mult × base[i]`) for scoring, the
-//! walk-forward metric half and the CPCV half. `discovery.rs` never sets
-//! `adaptive_base_pips` / `adaptive_vol_mult` anywhere (grep: zero hits), so
-//! every path that goes through `discovery_backtest_settings` —
-//! `faithful_oos_eval`, the walk-forward RISK diagnostics, the forward-test and
-//! prop-firm artifacts, the permutation/plateau robustness filters — runs the
-//! gene's unused FIXED `sl_pips`/`tp_pips` instead.
+//! **FIXED 2026-08-08 (slice 2):** every serial discovery stage now routes
+//! through `discovery.rs::GeneEvalSettingsResolver`, which installs the same
+//! `sl = stop_vol_mult × base[i]` regime scoring uses; the guard test
+//! `discovery_backtest_settings_has_no_callers_outside_the_resolvers` keeps it
+//! that way. The measurement companion is `stage_stop_agreement.rs`. This
+//! example is kept as the minimal reproduction of the divergence itself.
+//!
+//! History: `search_engine.rs::resolve_adaptive_stops` installed the per-bar
+//! volatility-scaled stop for scoring, the walk-forward metric half and the
+//! CPCV half, while `discovery.rs` never set `adaptive_base_pips` /
+//! `adaptive_vol_mult` anywhere, so every path that went through
+//! `discovery_backtest_settings` — `faithful_oos_eval`, the walk-forward RISK
+//! diagnostics, the forward-test and prop-firm artifacts, the
+//! permutation/plateau robustness filters — ran the gene's unused FIXED
+//! `sl_pips`/`tp_pips` instead.
 //!
 //! This holds the SIGNAL constant and varies only the stop regime, so the
 //! difference reported here is exactly the divergence, nothing else.

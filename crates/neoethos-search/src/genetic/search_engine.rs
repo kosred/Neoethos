@@ -69,13 +69,26 @@ impl EvalDataCache {
     }
 }
 
+/// YYYYMMDD calendar key for an epoch-ms timestamp — THE day-bucket key the
+/// walk-forward calendar arrays carry. One derivation, shared by
+/// [`month_day_indices`] and the walk-forward risk diagnostics, so a bucket
+/// map built from the day array and a key derived from a trade's exit
+/// timestamp can never disagree about what "the same day" means.
+pub(crate) fn calendar_day_key_ms(ts_ms: i64) -> Option<i64> {
+    Utc.timestamp_millis_opt(ts_ms)
+        .single()
+        .map(|dt| (dt.year() as i64) * 10000 + (dt.month() as i64) * 100 + dt.day() as i64)
+}
+
 pub fn month_day_indices(timestamps: &[i64]) -> (Vec<i64>, Vec<i64>) {
     let mut months = Vec::with_capacity(timestamps.len());
     let mut days = Vec::with_capacity(timestamps.len());
     for ts in timestamps {
-        if let Some(dt) = Utc.timestamp_millis_opt(*ts).single() {
+        if let (Some(dt), Some(day_key)) = (
+            Utc.timestamp_millis_opt(*ts).single(),
+            calendar_day_key_ms(*ts),
+        ) {
             let month_key = (dt.year() as i64) * 12 + dt.month() as i64;
-            let day_key = (dt.year() as i64) * 10000 + (dt.month() as i64) * 100 + dt.day() as i64;
             months.push(month_key);
             days.push(day_key);
         } else {
@@ -1077,6 +1090,15 @@ impl WalkforwardPopulationGenePack {
 
     pub fn n_genes(&self) -> usize {
         self.n_genes
+    }
+
+    /// The pip size this pack's per-window adaptive base is denominated in.
+    /// Hand it to `WalkforwardPopulationInput::adaptive_pip` so the CPU
+    /// risk-diagnostic half scales the SAME base the metrics half scales —
+    /// two resolutions of the pip is exactly the class of bug this crate
+    /// keeps re-finding, so there is one and it lives here.
+    pub fn adaptive_pip(&self) -> f64 {
+        self.adaptive_pip
     }
 }
 

@@ -1337,6 +1337,19 @@ fn quality_analyzer_for_config(config: &DiscoveryConfig) -> StrategyQualityAnaly
     }
 }
 
+/// RAW settings builder — the shared cost/exit template every discovery stage
+/// starts from. **Do not call this directly from a new site.** It leaves the
+/// adaptive-stop fields at their defaults (`adaptive_vol_mult = 0`), which is
+/// the fixed-stop regime — while GA scoring evaluates adaptive genes with
+/// `sl = stop_vol_mult × base[i]`. A site that calls this raw builder and then
+/// backtests with the result is screening a DIFFERENT strategy from the one
+/// that was scored (measured on one signal: fixed 13p ⇒ 30 331 trades,
+/// adaptive ×1.75 ⇒ 1 727 — a 17.6× divergence). Route through
+/// [`GeneEvalSettingsResolver`] (serial per-gene evaluation) or
+/// [`PopulationTemplateResolver`] (templates for the population helpers, which
+/// resolve adaptive stops themselves). The
+/// `discovery_backtest_settings_has_no_callers_outside_the_resolvers` test
+/// counts the call sites of this function and fails on any new one.
 fn discovery_backtest_settings(
     config: &DiscoveryConfig,
     gene: &Gene,
@@ -1366,6 +1379,162 @@ fn discovery_backtest_settings(
         risk_per_trade_min: config.risk_per_trade_min,
         risk_per_trade_max: config.risk_per_trade_max,
         ..crate::eval::BacktestSettings::default()
+    }
+}
+
+/// Settings template source for the POPULATION evaluation helpers
+/// (`validation_genes_population`, `validation_genes_population_gathered`,
+/// `validation_genes_population_window` via `WalkforwardPopulationGenePack`).
+///
+/// Those helpers take a gene-independent template and resolve BOTH the
+/// per-gene SL/TP arrays AND the adaptive stop regime (per-gene
+/// `stop_vol_mult` + a base vol series computed on exactly the slice they
+/// evaluate) themselves — so the template deliberately carries NO adaptive
+/// fields. Handing this template to a serial evaluator
+/// (`simulate_trades_core` / `fast_evaluate_strategy_core`) would run fixed
+/// stops on an adaptive gene; use [`GeneEvalSettingsResolver`] for that.
+pub(crate) struct PopulationTemplateResolver<'c> {
+    config: &'c DiscoveryConfig,
+    price_hint: Option<f64>,
+}
+
+impl<'c> PopulationTemplateResolver<'c> {
+    pub(crate) fn new(config: &'c DiscoveryConfig, price_hint: Option<f64>) -> Self {
+        Self { config, price_hint }
+    }
+
+    /// Gene-independent template (the gene argument only supplies the SL/TP
+    /// scalars the population helpers overwrite per gene anyway).
+    pub(crate) fn template(&self, gene: &Gene) -> crate::eval::BacktestSettings {
+        discovery_backtest_settings(self.config, gene, self.price_hint)
+    }
+}
+
+/// THE single source of per-gene `BacktestSettings` for every SERIAL
+/// (single-gene) evaluation in discovery — the quality screen's base
+/// backtest, the canonical backtest artifacts, the forward-test and
+/// prop-firm tails, the prop-firm window gate, faithful OOS, the
+/// permutation/plateau robustness filters, and the walk-forward risk
+/// diagnostics' per-gene settings.
+///
+/// It exists because of a measured divergence: GA scoring (and the
+/// population validation helpers) evaluate adaptive genes with
+/// `sl = stop_vol_mult × base[i]` (volatility-scaled per entry), while 9 of
+/// the 13 former `discovery_backtest_settings` call sites left
+/// `adaptive_vol_mult = 0` and ran the gene's unused FIXED pips — including
+/// the quality screen, so a candidate was screened as a different strategy
+/// from the one that was scored and the one that will trade (17.6× trade
+/// count on one measured signal).
+///
+/// Construction is per evaluation SLICE: `high`/`low`/`close` MUST be exactly
+/// the arrays the produced settings will be backtested against, because the
+/// adaptive base series is per-bar and indexed into them. This matches the
+/// established convention of the population paths (`resolve_adaptive_stops`,
+/// `validation_genes_population_window`) and of live trading: the base is
+/// computed on the data the evaluation actually sees.
+pub(crate) struct GeneEvalSettingsResolver<'c> {
+    config: &'c DiscoveryConfig,
+    price_hint: Option<f64>,
+    adaptive_pip: f64,
+    adaptive_rr: f64,
+    /// Shared per-bar base stop distance (pips) for THIS resolver's slice.
+    /// `None` when no gene is adaptive or the slice is too short for the
+    /// estimator (fixed-pip fallback, logged) — same policy as
+    /// `resolve_adaptive_stops`.
+    base: Option<std::sync::Arc<[f64]>>,
+}
+
+impl<'c> GeneEvalSettingsResolver<'c> {
+    /// Build the resolver for ONE evaluation slice. Computes the shared
+    /// adaptive base series once (gene-independent) when any gene in `genes`
+    /// is adaptive; fail-loud on every base-series error except the benign
+    /// too-short slice.
+    pub(crate) fn for_slice<'g>(
+        config: &'c DiscoveryConfig,
+        genes: impl IntoIterator<Item = &'g Gene>,
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+    ) -> anyhow::Result<Self> {
+        let price_hint = close.last().copied();
+        let evaluation = config.evaluation_config(price_hint);
+        let adaptive_pip =
+            crate::genetic::adaptive_pip_size(evaluation.pip_value, &evaluation.symbol);
+        let any_adaptive = genes
+            .into_iter()
+            .any(|g| g.stop_vol_mult.is_finite() && g.stop_vol_mult > 0.0);
+        let base = if any_adaptive {
+            match crate::stop_target::adaptive_base_pips_series(high, low, close, adaptive_pip) {
+                Ok(base) => Some(std::sync::Arc::from(base)),
+                Err(e @ crate::stop_target::StopDistanceError::TooShort { .. }) => {
+                    tracing::debug!(
+                        target: "neoethos_search::adaptive_stops",
+                        bars = close.len(), error = %e,
+                        "adaptive base series unavailable on this slice — fixed pips"
+                    );
+                    None
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "adaptive stop base series failed on {} bars: {e}",
+                        close.len()
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            config,
+            price_hint,
+            adaptive_pip,
+            adaptive_rr: crate::stop_target::adaptive_stops_rr(),
+            base,
+        })
+    }
+
+    /// Per-gene settings for a serial evaluation on this resolver's slice —
+    /// the SAME stop regime GA scoring scored the gene under: the gene's
+    /// `stop_vol_mult` scaling the shared base series, or its fixed pips when
+    /// it is not adaptive (or the slice was too short for a base).
+    pub(crate) fn settings_for_gene(&self, gene: &Gene) -> crate::eval::BacktestSettings {
+        let mut settings = discovery_backtest_settings(self.config, gene, self.price_hint);
+        if gene.stop_vol_mult.is_finite() && gene.stop_vol_mult > 0.0 {
+            settings.adaptive_vol_mult = gene.stop_vol_mult;
+            settings.adaptive_base_pips = self.base.clone();
+            settings.adaptive_rr = self.adaptive_rr;
+        }
+        settings
+    }
+
+    /// Base series recomputed on a SUB-window of bars, with this resolver's
+    /// pip. For stages that evaluate window slices (the prop-firm window
+    /// gate): the base must be computed on exactly the slice being simulated,
+    /// both for index alignment and to match the population walk-forward
+    /// convention (`validation_genes_population_window` recomputes per
+    /// window). Returns `Ok(None)` when the window is too short (fixed-pip
+    /// fallback) and an error for every other base-series failure.
+    pub(crate) fn base_for_window(
+        &self,
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+    ) -> anyhow::Result<Option<std::sync::Arc<[f64]>>> {
+        match crate::stop_target::adaptive_base_pips_series(high, low, close, self.adaptive_pip) {
+            Ok(base) => Ok(Some(std::sync::Arc::from(base))),
+            Err(e @ crate::stop_target::StopDistanceError::TooShort { .. }) => {
+                tracing::debug!(
+                    target: "neoethos_search::adaptive_stops",
+                    bars = close.len(), error = %e,
+                    "window too short for an adaptive base — fixed pips"
+                );
+                Ok(None)
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "adaptive stop base series failed on a {}-bar window: {e}",
+                close.len()
+            )),
+        }
     }
 }
 
@@ -1443,9 +1612,19 @@ pub fn faithful_oos_eval(
     let eval_config = config.evaluation_config(base_ohlcv.close.last().copied());
     const MONTHLY_RETURN_TARGET_IDX: usize = 7; // slot-7 monthly_target_hit_rate
 
+    // ONE resolver, constructed over the OOS slice the backtest below actually
+    // runs on — adaptive genes are replayed under the SAME stop regime they
+    // were scored under (base series indexed to `[oos_start..]`).
+    let oos_resolver = GeneEvalSettingsResolver::for_slice(
+        config,
+        artifact.genes.iter(),
+        &base_ohlcv.high[oos_start..],
+        &base_ohlcv.low[oos_start..],
+        &base_ohlcv.close[oos_start..],
+    )?;
     let mut out = Vec::with_capacity(artifact.genes.len());
     for gene in &artifact.genes {
-        let settings = discovery_backtest_settings(config, gene, base_ohlcv.close.last().copied());
+        let settings = oos_resolver.settings_for_gene(gene);
         let (signals, confidences) =
             signals_and_confidence_for_gene_full(&features, &base_ohlcv, gene, &eval_config);
         // Slice everything to the OOS window (features already warm).
@@ -1730,6 +1909,13 @@ struct DiscoveryBacktestPolicy {
     commission_per_trade: f64,
     pip_value_per_lot: f64,
     kill_zones_enabled: bool,
+    /// Stop regime (2026-08-08): an adaptive gene's artifact is produced under
+    /// `sl = adaptive_vol_mult × base[i]`, a DIFFERENT policy from the fixed
+    /// `sl_pips`/`tp_pips` above — the hash must not conflate the two. The
+    /// base series itself is deterministic from the dataset (covered by the
+    /// dataset hash).
+    adaptive_vol_mult: f64,
+    adaptive_rr: f64,
 }
 
 fn discovery_temporal_contract(
@@ -1826,6 +2012,8 @@ fn discovery_backtest_policy_hash(
         commission_per_trade: settings.commission_per_trade,
         pip_value_per_lot: settings.pip_value_per_lot,
         kill_zones_enabled: settings.kill_zones_enabled,
+        adaptive_vol_mult: settings.adaptive_vol_mult,
+        adaptive_rr: settings.adaptive_rr,
     })
     .with_context(|| format!("hashing backtest policy for {}", gene.strategy_id))
 }
@@ -1990,7 +2178,7 @@ fn evaluate_cpcv_gate(
     // 20/40 fallback, so one template + the helper's per-gene SL/TP arrays
     // reproduce the per-gene settings the serial loop built.
     let settings_template = if let Some(gene) = portfolio.first() {
-        discovery_backtest_settings(config, gene, ohlcv.close.last().copied())
+        PopulationTemplateResolver::new(config, ohlcv.close.last().copied()).template(gene)
     } else {
         return Ok((false, 0, 0.0, None, true));
     };
@@ -2252,14 +2440,25 @@ fn build_discovery_validation_artifacts(
     // fallback `discovery_backtest_settings` applies), so one template built
     // from `portfolio[0]` + the pack reproduces every gene's WF metrics.
     let wf_settings_template =
-        discovery_backtest_settings(config, &portfolio[0], ohlcv.close.last().copied());
-    // The CPU risk-diagnostic half needs each gene's OWN settings (its SL/TP
-    // drives `simulate_trades_core`'s exits), exactly as the single-gene path's
-    // per-gene `discovery_backtest_settings` did — so build the full per-gene
-    // settings vector.
+        PopulationTemplateResolver::new(config, ohlcv.close.last().copied())
+            .template(&portfolio[0]);
+    // ONE resolver over the full series: per-gene settings for the CPU
+    // risk-diagnostic half (its SL/TP + adaptive mult drive
+    // `simulate_trades_core`'s exits) and for the canonical full-series
+    // backtest below. The walk-forward diagnostics re-base the adaptive series
+    // per split window (see `embargoed_walkforward_population`), so what
+    // matters here is that the gene's `stop_vol_mult` and reward:risk are
+    // carried — the same regime the GPU metrics half runs.
+    let wf_resolver = GeneEvalSettingsResolver::for_slice(
+        config,
+        portfolio.iter(),
+        &ohlcv.high,
+        &ohlcv.low,
+        &ohlcv.close,
+    )?;
     let wf_gene_settings: Vec<crate::eval::BacktestSettings> = portfolio
         .iter()
-        .map(|gene| discovery_backtest_settings(config, gene, ohlcv.close.last().copied()))
+        .map(|gene| wf_resolver.settings_for_gene(gene))
         .collect();
     let wf_eval_config = config
         .evaluation_config_with_smc_gate(ohlcv.close.last().copied(), effective_smc_gate_threshold);
@@ -2292,6 +2491,11 @@ fn build_discovery_validation_artifacts(
             n_splits: config.walkforward_splits.max(1),
             embargo_bars,
             gene_settings: &wf_gene_settings,
+            // THE pip the GPU metrics half scales its window base with — taken
+            // from the pack itself (not re-resolved), so the CPU
+            // risk-diagnostic half CANNOT run a different stop than the
+            // metrics beside it.
+            adaptive_pip: wf_gene_pack.adaptive_pip(),
             max_daily_loss_pct: config.max_regime_loss_pct,
             max_daily_profit_pct: 0.0,
             min_trading_days: 0,
@@ -2340,7 +2544,7 @@ fn build_discovery_validation_artifacts(
         .zip(portfolio_signals)
         .zip(walkforward_summaries)
     {
-        let settings = discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
+        let settings = wf_resolver.settings_for_gene(gene);
         let strategy_hash = stable_json_hash(gene)?;
         let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
         // Regenerate per-bar confidence for risk-based, confidence-scaled
@@ -2521,11 +2725,20 @@ pub fn compute_discovery_forward_test_artifacts_with_smc_gate(
     // preserves gene order and short-circuits on the first error exactly like
     // the serial `?` did — byte-identical artifacts, but no single-core stall
     // on this silent validation-tail stage.
+    //
+    // ONE resolver over the tail slice the replay runs on: adaptive genes are
+    // forward-tested under the stop regime they were scored under.
+    let tail_resolver = GeneEvalSettingsResolver::for_slice(
+        config,
+        portfolio.iter(),
+        &tail_ohlcv.high[..n],
+        &tail_ohlcv.low[..n],
+        &tail_ohlcv.close[..n],
+    )?;
     let artifacts = portfolio
         .par_iter()
         .map(|gene| -> Result<ForwardTestValidationArtifactFile> {
-            let settings =
-                discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
+            let settings = tail_resolver.settings_for_gene(gene);
             let strategy_hash = stable_json_hash(gene)?;
             let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
             let evaluation_config = config.evaluation_config_with_smc_gate(
@@ -2661,11 +2874,20 @@ pub fn compute_discovery_prop_firm_artifacts_with_smc_gate(
     // artifact order and first-error semantics identical to the serial loop —
     // the prop-firm risk numbers are unchanged, the machine just stops idling
     // on 1 core through this stage.
+    //
+    // ONE resolver over the tail slice — the prop-firm verdict is measured on
+    // the SAME stop regime the gene was scored under, not its unused fixed pips.
+    let tail_resolver = GeneEvalSettingsResolver::for_slice(
+        config,
+        portfolio.iter(),
+        &tail_ohlcv.high[..n],
+        &tail_ohlcv.low[..n],
+        &tail_ohlcv.close[..n],
+    )?;
     let artifacts = portfolio
         .par_iter()
         .map(|gene| -> Result<PropFirmRiskValidationArtifactFile> {
-            let settings =
-                discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
+            let settings = tail_resolver.settings_for_gene(gene);
             let strategy_hash = stable_json_hash(gene)?;
             let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
             let evaluation_config = config.evaluation_config_with_smc_gate(
@@ -3735,36 +3957,35 @@ fn auto_tune_n_windows(timestamps: &[i64], window_days: usize) -> usize {
     (full_spans * 3).clamp(20, 200)
 }
 
-/// Sample roughly evenly-spaced 30-day (configurable) windows from the
-/// dataset history; for each window simulate trades and check the strategy
-/// against `compute_prop_firm_risk_summary`. Return the fraction of
-/// windows whose `all_rules_passed` flag is true.
-///
-/// This measures what an actual prop-firm challenge measures (one
-/// 30-day window, FTMO rules) — much more directly relevant than the
-/// "every walkforward split must be profitable" gate.
-fn compute_prop_firm_pass_rate(
-    gene: &Gene,
-    signals: &[i8],
+/// A sampled prop-firm challenge window: `[start_idx, end_idx)` plus the
+/// window-local adaptive base series (`None` ⇒ fixed pips on this window).
+type PropFirmWindow = (usize, usize, Option<std::sync::Arc<[f64]>>);
+
+/// Plan the gate's evenly-spaced windows ONCE — the geometry and the
+/// window-local adaptive bases are gene-INDEPENDENT, so they are computed here
+/// and shared across every candidate instead of once per candidate. The base
+/// is computed on exactly the window slice being simulated (index alignment +
+/// the same convention as `validation_genes_population_window`).
+fn plan_prop_firm_windows(
     ohlcv: &Ohlcv,
     timestamps: &[i64],
-    config: &DiscoveryConfig,
     overrides: &PropFirmGateOverrides,
-) -> (f64, usize) {
-    let n = signals
+    resolver: &GeneEvalSettingsResolver<'_>,
+    any_adaptive: bool,
+) -> Result<Vec<PropFirmWindow>> {
+    let n = timestamps
         .len()
-        .min(timestamps.len())
         .min(ohlcv.close.len())
         .min(ohlcv.high.len())
         .min(ohlcv.low.len());
     if n == 0 || overrides.window_days == 0 || overrides.n_windows == 0 {
-        return (0.0, 0);
+        return Ok(Vec::new());
     }
     let window_ms: i64 = (overrides.window_days as i64) * 86_400_000;
     let first_ts = timestamps[0];
     let last_ts = timestamps[n - 1];
     if last_ts - first_ts < window_ms {
-        return (0.0, 0);
+        return Ok(Vec::new());
     }
     let max_start_ts = last_ts - window_ms;
     let span = (max_start_ts - first_ts).max(1) as f64;
@@ -3774,12 +3995,7 @@ fn compute_prop_firm_pass_rate(
     } else {
         span / (n_windows as f64 - 1.0)
     };
-
-    let settings = discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
-    let initial_balance = config.initial_balance.max(1.0);
-
-    let mut passes = 0usize;
-    let mut counted = 0usize;
+    let mut windows = Vec::with_capacity(n_windows);
     for i in 0..n_windows {
         let start_ts = if n_windows == 1 {
             first_ts
@@ -3791,6 +4007,62 @@ fn compute_prop_firm_pass_rate(
         let end_idx = timestamps.partition_point(|&t| t < end_ts).min(n);
         if end_idx <= start_idx + 1 {
             continue;
+        }
+        let base = if any_adaptive {
+            resolver.base_for_window(
+                &ohlcv.high[start_idx..end_idx],
+                &ohlcv.low[start_idx..end_idx],
+                &ohlcv.close[start_idx..end_idx],
+            )?
+        } else {
+            None
+        };
+        windows.push((start_idx, end_idx, base));
+    }
+    Ok(windows)
+}
+
+/// Simulate the candidate on the pre-planned prop-firm windows and check each
+/// against `compute_prop_firm_risk_summary`. Returns the fraction of windows
+/// whose `all_rules_passed` flag is true.
+///
+/// This measures what an actual prop-firm challenge measures (one
+/// 30-day window, FTMO rules) — much more directly relevant than the
+/// "every walkforward split must be profitable" gate. The settings come from
+/// the ONE resolver, so an adaptive candidate is challenged under the SAME
+/// volatility-scaled stop it was scored under — with the base re-derived per
+/// window, as live trading derives it from its own recent buffer.
+fn compute_prop_firm_pass_rate(
+    gene: &Gene,
+    signals: &[i8],
+    ohlcv: &Ohlcv,
+    timestamps: &[i64],
+    config: &DiscoveryConfig,
+    overrides: &PropFirmGateOverrides,
+    resolver: &GeneEvalSettingsResolver<'_>,
+    windows: &[PropFirmWindow],
+) -> (f64, usize) {
+    if windows.is_empty() {
+        return (0.0, 0);
+    }
+    let mut settings = resolver.settings_for_gene(gene);
+    let initial_balance = config.initial_balance.max(1.0);
+
+    let mut passes = 0usize;
+    let mut counted = 0usize;
+    for (start_idx, end_idx, window_base) in windows {
+        let (start_idx, end_idx) = (*start_idx, *end_idx);
+        if end_idx > signals.len() {
+            // Defensive: a signal vector shorter than the planned series would
+            // mis-align the window — skip rather than read out of range.
+            continue;
+        }
+        if settings.adaptive_vol_mult > 0.0 {
+            // The base series is indexed per bar of the simulated slice, so
+            // each window uses ITS OWN base (planned above); `None` here means
+            // the window was too short for the estimator ⇒ fixed-pip fallback,
+            // the same policy every other adaptive path applies.
+            settings.adaptive_base_pips = window_base.clone();
         }
         let close = &ohlcv.close[start_idx..end_idx];
         let high = &ohlcv.high[start_idx..end_idx];
@@ -4380,6 +4652,21 @@ where
 
         let pairs: Vec<((usize, Gene), Vec<i8>)> = filtered.into_iter().zip(signals_map).collect();
 
+        // ONE resolver for every serial backtest in this screen (built over
+        // the full series the screen simulates) and ONE template source for
+        // the population launches (which resolve adaptive stops themselves).
+        // This is THE fix for the screen's measured 17.6x divergence: the
+        // base-quality backtest below previously ran adaptive genes on their
+        // unused fixed pips while GA scoring ran them volatility-scaled.
+        let screen_resolver = GeneEvalSettingsResolver::for_slice(
+            config,
+            pairs.iter().map(|((_, gene), _)| gene),
+            &ohlcv.high,
+            &ohlcv.low,
+            &ohlcv.close,
+        )?;
+        let screen_templates = PopulationTemplateResolver::new(config, ohlcv.close.last().copied());
+
         // ── Monte-Carlo perturbations, batched ────────────────────────────
         //
         // The screen below used to call the evaluator once per candidate: a
@@ -4443,13 +4730,10 @@ where
                         acc
                     });
                 // Cost/pip configuration is shared: the helper takes a gene only
-                // for the price hint, and each perturbed gene's own SL/TP is
-                // re-resolved inside `validation_genes_population`.
-                let settings = discovery_backtest_settings(
-                    config,
-                    &chunk[0].0.1,
-                    ohlcv.close.last().copied(),
-                );
+                // for the price hint, and each perturbed gene's own SL/TP AND
+                // adaptive stop regime are re-resolved inside
+                // `validation_genes_population`.
+                let settings = screen_templates.template(&chunk[0].0.1);
                 let evaluated = {
                     #[cfg(feature = "gpu")]
                     let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -4511,11 +4795,7 @@ where
             let mut out: Vec<Option<f64>> = Vec::with_capacity(pairs.len());
             for chunk in pairs.chunks(MC_CANDIDATES_PER_BATCH) {
                 let genes: Vec<Gene> = chunk.iter().map(|((_, gene), _)| gene.clone()).collect();
-                let mut settings = discovery_backtest_settings(
-                    config,
-                    &chunk[0].0.1,
-                    ohlcv.close.last().copied(),
-                );
+                let mut settings = screen_templates.template(&chunk[0].0.1);
                 settings.spread_pips = config.sensitivity_spread_pips;
                 settings.commission_per_trade = config.sensitivity_commission_per_lot;
                 let evaluated = {
@@ -4565,7 +4845,7 @@ where
                     &ohlcv.low,
                     &features.timestamps,
                     &sig,
-                    &discovery_backtest_settings(config, &gene, ohlcv.close.last().copied()),
+                    &screen_resolver.settings_for_gene(&gene),
                 );
                 let metrics =
                     analyzer.analyze_strategy(&gene.strategy_id, &trades, initial_balance);
@@ -4788,6 +5068,21 @@ where
         let timestamps_owned = features.timestamps.clone();
         let candidates_in_count = candidates_in.len();
         let pf_pass_rate_floor = pf.pass_rate;
+        // ONE resolver + ONE window plan for the whole gate: the window
+        // geometry and the window-local adaptive bases are gene-independent,
+        // so they are computed once and shared across candidates.
+        let pf_resolver = GeneEvalSettingsResolver::for_slice(
+            config,
+            candidates_in.iter().map(|((_, gene), _)| gene),
+            &ohlcv.high,
+            &ohlcv.low,
+            &ohlcv.close,
+        )?;
+        let pf_any_adaptive = candidates_in
+            .iter()
+            .any(|((_, g), _)| g.stop_vol_mult.is_finite() && g.stop_vol_mult > 0.0);
+        let pf_windows =
+            plan_prop_firm_windows(ohlcv, &timestamps_owned, &pf, &pf_resolver, pf_any_adaptive)?;
         let scored_all: Vec<(((usize, Gene), Vec<i8>), f64, usize)> = candidates_in
             .into_par_iter()
             .map(|(pair, sig)| {
@@ -4798,6 +5093,8 @@ where
                     &timestamps_owned,
                     config,
                     &pf,
+                    &pf_resolver,
+                    &pf_windows,
                 );
                 ((pair, sig), rate, counted)
             })
@@ -5011,6 +5308,16 @@ where
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "strict_gates".to_string());
         let analyzer = quality_analyzer_for_config(config);
+        // Even the honesty-flagged fallback genes are DESCRIBED with the stop
+        // regime they were scored under — their exported metrics must not come
+        // from a strategy they never were.
+        let fallback_resolver = GeneEvalSettingsResolver::for_slice(
+            config,
+            best_effort_fallback.iter().map(|((_, gene), _)| gene),
+            &ohlcv.high,
+            &ohlcv.low,
+            &ohlcv.close,
+        )?;
         for ((_, gene), sig) in best_effort_fallback {
             if portfolio.len() >= FALLBACK_PORTFOLIO_MAX {
                 break;
@@ -5031,7 +5338,7 @@ where
                 &ohlcv.low,
                 &features.timestamps,
                 &sig,
-                &discovery_backtest_settings(config, &gene, ohlcv.close.last().copied()),
+                &fallback_resolver.settings_for_gene(&gene),
             );
             quality_metrics.push(analyzer.analyze_strategy(
                 &gene.strategy_id,
@@ -5112,13 +5419,23 @@ where
             ohlcv.close.last().copied(),
             effective_smc_gate_threshold,
         );
+        // ONE resolver over the trailing robustness window — `net_of` below
+        // simulates `[w0..]` slices, so the adaptive base is built on exactly
+        // that slice and each gene is permutation/plateau-tested under the
+        // stop regime it was scored under.
+        let robust_resolver = GeneEvalSettingsResolver::for_slice(
+            config,
+            portfolio.iter(),
+            &ohlcv.high[w0..],
+            &ohlcv.low[w0..],
+            &ohlcv.close[w0..],
+        )?;
 
         let verdicts: Vec<(bool, String)> = portfolio
             .par_iter()
             .enumerate()
             .map(|(gi, gene)| {
-                let settings =
-                    discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
+                let settings = robust_resolver.settings_for_gene(gene);
                 let sig_full = &portfolio_signals[gi];
                 if sig_full.len() != n_all {
                     return (true, "skipped (signal length mismatch)".to_string());

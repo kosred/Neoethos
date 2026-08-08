@@ -1001,7 +1001,21 @@ fn walkforward_risk_diagnostics_from_trades(
             current_consec_losses = 0;
         }
 
-        let exit_day = trade.exit_time.unwrap_or(trade.entry_time);
+        // `days` carries YYYYMMDD calendar keys (`month_day_indices`), while
+        // the simulator stamps trades with epoch-ms — or, on the
+        // timestamps-missing fallback, with the day key itself. Before
+        // 2026-08-08 the raw ms value was used as the bucket key: it never
+        // matched a YYYYMMDD key, so EVERY trade opened its own synthetic
+        // "day" and the daily-loss / consistency / trades-per-day checks
+        // measured per-TRADE numbers under a per-DAY name — same-day losses
+        // never accumulated into a breach. Epoch-ms values are >= 1e11 for
+        // any modern date; YYYYMMDD keys are < 1e8 — disjoint ranges.
+        let exit_raw = trade.exit_time.unwrap_or(trade.entry_time);
+        let exit_day = if exit_raw >= 100_000_000 {
+            crate::genetic::calendar_day_key_ms(exit_raw).unwrap_or(exit_raw)
+        } else {
+            exit_raw
+        };
         let offset = if let Some(&offset) = day_offsets.get(&exit_day) {
             offset
         } else {
@@ -1304,6 +1318,12 @@ pub struct WalkforwardPopulationInput<'a> {
     /// `embargoed_walkforward_backtest`. (The GPU **metrics** half gets the
     /// gene's SL/TP separately via the metrics provider's own per-gene arrays.)
     pub gene_settings: &'a [BacktestSettings],
+    /// Pip size the adaptive-stop base series is denominated in — MUST be the
+    /// same pip the GPU metrics provider resolves
+    /// (`WalkforwardPopulationGenePack::adaptive_pip`), so the CPU
+    /// risk-diagnostic half scales the SAME per-window base the metrics half
+    /// scaled. Ignored when no gene is adaptive.
+    pub adaptive_pip: f64,
     pub max_daily_loss_pct: f64,
     pub max_daily_profit_pct: f64,
     pub min_trading_days: usize,
@@ -1403,6 +1423,7 @@ where
         n_splits,
         embargo_bars,
         gene_settings,
+        adaptive_pip,
         max_daily_loss_pct,
         max_daily_profit_pct,
         min_trading_days,
@@ -1468,6 +1489,23 @@ where
     let mut per_gene_splits: Vec<Vec<WalkforwardSplitResult>> =
         (0..n_genes).map(|_| Vec::new()).collect();
 
+    // Whether ANY gene runs adaptive (volatility-scaled) stops. When true,
+    // each split window below derives ITS OWN base series — the same series
+    // the GPU metrics provider derives for that window
+    // (`validation_genes_population_window` recomputes per window) — so the
+    // risk-diagnostic simulation and the metrics beside it evaluate the SAME
+    // strategy. Before 2026-08-08 the diagnostics ran the caller's settings
+    // verbatim, which carried no base: `daily_loss_breach` and
+    // `consistency_violation` gated the prop-firm verdict on FIXED stops the
+    // gene was never scored on.
+    let any_adaptive = gene_settings.iter().any(|s| s.adaptive_vol_mult > 0.0);
+    if any_adaptive && !(adaptive_pip.is_finite() && adaptive_pip > 0.0) {
+        bail!(
+            "walk-forward population: adaptive genes present but adaptive_pip = {adaptive_pip} \
+             — the caller must pass the pack's resolved pip so both halves scale the same base"
+        );
+    }
+
     for i in 0..n_splits {
         let start = i * window;
         let end = ((i + 1) * window).min(n);
@@ -1505,6 +1543,38 @@ where
             slice_days
         };
 
+        // Window-local adaptive base, indexed to the slice above — identical
+        // derivation (estimator, pip, slice) to the metrics provider's. `None`
+        // ⇒ window too short for the estimator ⇒ fixed-pip fallback, the same
+        // policy `validation_genes_population_window` applies to this window.
+        let window_base: Option<std::sync::Arc<[f64]>> = if any_adaptive {
+            match crate::stop_target::adaptive_base_pips_series(
+                slice_high,
+                slice_low,
+                slice_close,
+                adaptive_pip,
+            ) {
+                Ok(base) => Some(std::sync::Arc::from(base)),
+                Err(e @ crate::stop_target::StopDistanceError::TooShort { .. }) => {
+                    tracing::debug!(
+                        target: "neoethos_search::adaptive_stops",
+                        bars = slice_close.len(), error = %e,
+                        "walk-forward diagnostics window too short for an adaptive base — fixed pips"
+                    );
+                    None
+                }
+                Err(e) => {
+                    bail!(
+                        "adaptive stop base series failed on a {}-bar walk-forward \
+                         diagnostics window: {e}",
+                        slice_close.len()
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
         // ── CPU half (per gene): risk diagnostics on the sliced precomputed
         //    signals — IDENTICAL to the single-gene path. ────────────────────
         let split_results: Vec<WalkforwardSplitResult> = (0..n_genes)
@@ -1522,9 +1592,12 @@ where
                 let max_daily_dd = m[10];
 
                 let slice_sig = &signals_per_gene[g][test_start..end];
-                // Per-gene settings (the gene's own SL/TP) so `simulate_trades_core`
-                // inside the diagnostics applies the SAME SL/TP exits the single-gene
-                // path did — byte-identical risk-diagnostic half.
+                // Per-gene settings (the gene's own SL/TP + adaptive regime) so
+                // `simulate_trades_core` inside the diagnostics applies the SAME
+                // exits the metrics half ran. For an adaptive gene the base is
+                // REPLACED with this window's base: whatever the caller
+                // installed was indexed to a different slice, and the window
+                // base is what the metrics provider scaled.
                 // Measure the trades the provider already has, or simulate to
                 // get them. The arithmetic is the same function either way;
                 // only who ran the walk differs.
@@ -1539,21 +1612,33 @@ where
                         max_trades_per_day,
                         initial_balance,
                     ),
-                    None => walkforward_risk_diagnostics(
-                        slice_close,
-                        slice_high,
-                        slice_low,
-                        slice_sig,
-                        slice_days,
-                        slice_ts,
-                        &gene_settings[g],
-                        max_daily_dd,
-                        max_daily_loss_pct,
-                        max_daily_profit_pct,
-                        min_trading_days,
-                        max_trades_per_day,
-                        initial_balance,
-                    ),
+                    None => {
+                        let window_settings;
+                        let settings_ref = if gene_settings[g].adaptive_vol_mult > 0.0 {
+                            window_settings = BacktestSettings {
+                                adaptive_base_pips: window_base.clone(),
+                                ..gene_settings[g].clone()
+                            };
+                            &window_settings
+                        } else {
+                            &gene_settings[g]
+                        };
+                        walkforward_risk_diagnostics(
+                            slice_close,
+                            slice_high,
+                            slice_low,
+                            slice_sig,
+                            slice_days,
+                            slice_ts,
+                            settings_ref,
+                            max_daily_dd,
+                            max_daily_loss_pct,
+                            max_daily_profit_pct,
+                            min_trading_days,
+                            max_trades_per_day,
+                            initial_balance,
+                        )
+                    }
                 };
 
                 WalkforwardSplitResult {
