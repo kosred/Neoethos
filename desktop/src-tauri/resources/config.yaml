@@ -36,6 +36,11 @@ risk:
   prop_firm_rules: true
   kill_zones_enabled: true
   max_trades_per_day: 8
+  # Arms the cap above (default OFF). Armed, the cap counts entries for the
+  # WHOLE ACCOUNT per UTC day — shared across every running engine, not 8
+  # each. Refusals log the rule, count and cap; resets at UTC midnight and on
+  # app restart; cap 0 disables.
+  max_trades_per_day_enabled: false
   high_quality_confidence: 0.65
   atr_period: 14
   atr_stop_multiplier: 1.5
