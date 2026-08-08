@@ -11,6 +11,11 @@ members = [
   "crates/neoethos-trader",
   "crates/neoethos-gpu-contracts",
   "crates/neoethos-gpu-cuda",
+  # Codex control plane: MCP *server* over the localhost HTTP API (stdio
+  # transport, demo-guarded trading tools). NOT the same thing as the
+  # excluded top-level `mcp/` dir, which is the outbound MCP *client*
+  # aggregator sidecar with its own isolated workspace.
+  "crates/neoethos-mcp",
   # Tauri desktop shell (single-process replacement for the Flutter+HTTP
   # split). Shares target/ so it links the already-built neoethos-* rlibs
   # instead of recompiling the whole dep tree. Deliberately NOT in
@@ -28,6 +33,7 @@ default-members = [
   "crates/neoethos-codex",
   "crates/neoethos-trader",
   "crates/neoethos-gpu-contracts",
+  "crates/neoethos-mcp",
 ]
 # The P2P mesh sidecar (Federation Phase 1+) is DELIBERATELY isolated: its own
 # workspace + Cargo.lock under mesh/, so its bleeding-edge iroh/QUIC dependency

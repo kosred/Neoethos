@@ -1,6 +1,7 @@
 # Codex Control Plane — MCP Server Design
 
-Status: DESIGN (committed decisions, no open options)
+Status: IMPLEMENTED — `crates/neoethos-mcp` (binary `neoethos-mcp`), tier-1
+tests green; operator setup steps in §8
 Date: 2026-08-08
 Scope: give OpenAI Codex CLI (and any MCP-speaking agent runtime) full operational
 control of the NeoEthos backend — open/close/modify trades, autopilot, discovery,
@@ -423,11 +424,110 @@ approve → position opens → guard messages visible in the transcript).
 ## 7. Build and rollout order
 
 1. Scaffold `crates/neoethos-mcp` + workspace membership; `Backend`, HTTP
-   helper, `DemoProof`, error mapping.
+   helper, `DemoProof`, error mapping. — DONE
 2. Read-only tool group + tests 6.1.1/6.1.4 — ship value immediately
-   (journal analytics, status, charts).
-3. Demo guard + mock tests 6.1.2/6.1.3.
-4. Trade tools + confirm-queue + autopilot.
-5. Discovery/training/promotion/settings/data groups.
+   (journal analytics, status, charts). — DONE
+3. Demo guard + mock tests 6.1.2/6.1.3. — DONE
+4. Trade tools + confirm-queue + autopilot. — DONE
+5. Discovery/training/promotion/settings/data groups. — DONE
 6. `scripts/mcp-smoke.ps1` against the real app on the demo account (6.2).
-7. Operator pastes §4 config; 6.3 walkthrough; done.
+   — script shipped; run it with the app open (see §8.3)
+7. Operator pastes §4 config; 6.3 walkthrough; done. — see §8
+
+---
+
+## 8. Operator setup (the implemented plane)
+
+Implementation map: `crates/neoethos-mcp/` — `src/backend.rs` (HTTP client +
+`DemoProof` choke point), `src/ops.rs` (one method per tool: validation,
+guard, wire conversion), `src/params.rs` (typed schemas), `src/server.rs`
+(the 59 `#[tool]` handlers + annotations), `src/main.rs` (stdio entry,
+stderr-only logging). Tests: `tests/catalog.rs` (catalog snapshot +
+guard-coverage), `tests/demo_guard.rs` (mock-backend guard behavior,
+`risky:false`, lots→wire-unit conversion), `tests/stdout_hygiene.rs`
+(spawns the real binary, asserts stdout is JSON-RPC only).
+
+### 8.1 Build the binary
+
+```powershell
+cd C:\Users\konst\development\forex-ai
+cargo build --release -p neoethos-mcp
+# → target\release\neoethos-mcp.exe  (small, starts instantly — it links
+#   no engine crates, only the HTTP client)
+```
+
+Verify it runs (help prints to STDERR — stdout is reserved for JSON-RPC):
+
+```powershell
+.\target\release\neoethos-mcp.exe --help
+```
+
+### 8.2 Register the server in Codex CLI
+
+Either paste the §4 TOML into `~/.codex/config.toml` (user-global), or:
+
+```powershell
+codex mcp add neoethos -- C:/Users/konst/development/forex-ai/target/release/neoethos-mcp.exe --base-url http://127.0.0.1:7423
+codex mcp list          # must show `neoethos`
+```
+
+Then, if you used `codex mcp add`, still edit `~/.codex/config.toml` to add
+the per-tool `approval_mode = "approve"` blocks and `tool_timeout_sec = 600`
+from §4 — `codex mcp add` registers the command only; the approval routing
+and the long-call budget come from the TOML.
+
+If the backend runs with `NEOETHOS_API_TOKEN` set, append
+`--token <the same value>` to the `args`.
+
+Verify inside an interactive Codex session: `/mcp` must list `neoethos`
+with 59 tools.
+
+### 8.3 Smoke checklist (run with the app OPEN on the demo account)
+
+Prereq: desktop app running (or `neoethos-app --server`), demo cTrader
+account connected — the script aborts loudly on anything else.
+
+```powershell
+pwsh -File scripts\mcp-smoke.ps1                # everything (6.2 steps 1–7)
+pwsh -File scripts\mcp-smoke.ps1 -SkipLong     # skip discovery + replay
+pwsh -File scripts\mcp-smoke.ps1 -SkipTrade    # reads + jobs only
+```
+
+Manual checklist mirror (what the script asserts, tick these if driving
+Codex by hand instead):
+
+- [ ] `codex mcp list` shows `neoethos`; `/mcp` in the TUI shows 59 tools.
+- [ ] Ask Codex "what is the broker status?" → `broker_status` auto-runs
+      (read-only), reports `environment=Demo`, `connected=true`.
+- [ ] `account_snapshot`, `journal_stats`, `journal_analytics`,
+      `get_chart` (EURUSD M5) all return data.
+- [ ] Ask Codex to open a 0.01-lot EURUSD demo position with SL 20 / TP 20
+      → approval prompt appears → approve → `open_position` executes →
+      position visible via `list_positions`.
+- [ ] `modify_position_protection` (widen the SL) → `close_position` (full)
+      → the round trip appears in `journal_trades`.
+- [ ] Far-from-market limit via `place_pending_order` →
+      `list_pending_orders` shows it → `cancel_pending_order` removes it.
+- [ ] `discovery_start` (population 64, generations 1) → `engine_status`
+      polls to Running → `discovery_stop` returns idempotently.
+- [ ] `replay_backtest` completes within the 600 s budget (or fails loudly
+      with the no-history message if the symbol has no on-disk data).
+- [ ] Stop the backend, ask for anything → every tool returns the fixed
+      "NeoEthos backend is not reachable…" message. Start it again → tools
+      recover with no restart of Codex.
+
+The Live-refusal path is NEVER exercised against the real system; it is
+covered by `cargo test -p neoethos-mcp` (mock backend, exact messages).
+
+### 8.4 Everyday use
+
+- The backend must be running first; the plane never starts engines of its
+  own and never falls back to acting on its own.
+- Read-only tools auto-run (with the §4 config); every trade-affecting
+  tool prompts in Codex AND re-verifies the demo account server-side on
+  every call — the prompt is UX, the guard is the security boundary.
+- Long work is job-shaped: `discovery_start`/`training_start`, poll
+  `engine_status`, stop with the matching `*_stop`. Only `replay_backtest`
+  (and deep `fetch_history` windows) block the call itself.
+- `autopilot_stop` always works — including while the guard is refusing —
+  it halts engines and never touches the broker.
