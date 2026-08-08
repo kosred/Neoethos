@@ -409,10 +409,14 @@ at the bottom.
   distance of **zero**. Measured on EURUSD M5 (`data.vortex`,
   1 054 320 bars): **300 000 bars gives a median base stop of 18.09
   pips; 300 001 bars gives 5.81 pips.** One extra bar, 3.11x.
-  Discovery scoring passes the full series (over the cap), while
-  walk-forward passes ~70 k-bar windows and the live loop a 1 000-bar
-  buffer (both under it) — so a gene was ranked on one stop and
-  traded on another.
+  The lanes that crossed the cap were the **Monte-Carlo and
+  sensitivity quality screens** (843k-bar in-sample slice → ~6.6-pip
+  stops); GA scoring passes the 210k stage-1 window, walk-forward
+  ~42k windows and the live loop a 1 000-bar buffer — all under it
+  (~13-23 pips). So every candidate was quality-screened against a
+  stop roughly one third of the one it was scored and traded on.
+  (An earlier version of this note named scoring as the divergent
+  lane; an adversarial review measured every span and corrected it.)
 - **Now:** a series longer than a non-zero cap is a **hard, named
   error** carrying both numbers. It is never silently a zero tail.
   Leave at `0` unless you are deliberately bounding cost.

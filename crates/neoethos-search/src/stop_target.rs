@@ -87,15 +87,17 @@ impl StopTargetRuntimeOverrides {
 
 static STOP_TARGET_RUNTIME_OVERRIDES: OnceLock<StopTargetRuntimeOverrides> = OnceLock::new();
 
-/// Install process-wide adaptive-stop caps. First install wins.
-pub fn install_stop_target_runtime_overrides(
-    overrides: StopTargetRuntimeOverrides,
-) -> Result<(), StopTargetRuntimeOverrides> {
-    STOP_TARGET_RUNTIME_OVERRIDES.set(overrides)
-}
+// REMOVED 2026-08-08: a raw `install_stop_target_runtime_overrides(overrides)`
+// that took the struct directly. It had ZERO callers — the `_from_settings`
+// variant below set the OnceLock itself — which made it the seventh instance
+// of "mechanism exists, no production caller" in this workspace, created by
+// the very commit whose purpose was to close that pattern. Caught by an
+// adversarial review. One installer now; a second path does not exist to be
+// skipped.
 
 /// Config-driven install. Idempotent — called once at startup from
-/// `install_search_runtime_overrides_from_settings`.
+/// `install_search_runtime_overrides_from_settings`. This is the ONLY way the
+/// caps get installed.
 pub fn install_stop_target_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
     let _ = STOP_TARGET_RUNTIME_OVERRIDES.set(StopTargetRuntimeOverrides::from_settings(s));
 }
@@ -1163,7 +1165,17 @@ pub fn adaptive_sl_tp_pips_series(
             return Err(StopDistanceError::InvalidScalar { name, value });
         }
     }
-    let dist = compute_stop_distance_series(open, high, low, close, settings)?;
+    // Apply the SAME process-wide caps the shared base builder applies. This
+    // function has zero production callers today, but the day it gets one,
+    // reading only the caller's `settings` would let its tail_max_bars /
+    // tail_step diverge from `adaptive_base_pips_series` — the exact
+    // caller-by-caller divergence the runtime override exists to prevent.
+    // Found unwired by an adversarial review before it could bite.
+    let overrides = current_stop_target_runtime_overrides();
+    let mut settings = settings.clone();
+    settings.tail_max_bars = overrides.tail_max_bars;
+    settings.tail_step = overrides.tail_step;
+    let dist = compute_stop_distance_series(open, high, low, close, &settings)?;
     let mut sl_pips = Vec::with_capacity(dist.len());
     let mut tp_pips = Vec::with_capacity(dist.len());
     for d in dist {
@@ -1187,8 +1199,12 @@ pub fn adaptive_sl_tp_pips_series(
 /// This is the ONE production entry point for the shared base, so it is also
 /// where the process-wide cost cap is read — every caller therefore sees the
 /// same `tail_max_bars`. That is precisely the property the old hardcoded
-/// `300_000` broke: the cap fired for the scoring path (full series) and not
-/// for the walk-forward or live paths (windows), silently.
+/// `300_000` broke: the cap fired for the two QUALITY-SCREEN lanes (the
+/// Monte-Carlo and sensitivity screens pass the 843k-bar in-sample slice)
+/// and not for GA scoring (210k stage-1 window), walk-forward (~42k) or live
+/// (1k buffer) — silently, so candidates were screened on ~6.6-pip stops and
+/// scored/traded on ~13-23. An earlier version of this comment inverted that
+/// map; the spans above are measured, not inferred.
 pub fn adaptive_base_pips_series(
     high: &[f64],
     low: &[f64],

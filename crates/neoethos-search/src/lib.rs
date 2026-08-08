@@ -138,7 +138,7 @@ pub use stop_target::{
     StopDistanceError, StopTargetRuntimeOverrides, StopTargetSettings, adaptive_base_pips_series,
     adaptive_sl_tp_pips_series, adaptive_stops_enabled, adaptive_stops_rr,
     compute_stop_distance_series, current_stop_target_runtime_overrides, infer_stop_target_pips,
-    install_stop_target_runtime_overrides, install_stop_target_runtime_overrides_from_settings,
+    install_stop_target_runtime_overrides_from_settings,
 };
 pub use validation::{
     CANONICAL_BACKTEST_ARTIFACT_KIND, CANONICAL_BACKTEST_SCHEMA_VERSION,

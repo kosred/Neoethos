@@ -927,7 +927,7 @@ fn build_catalog() -> Vec<KnobEntry> {
                 neoethos_search::current_stop_target_runtime_overrides().tail_max_bars
             ),
             help_short: "0 = no cap. Bars the adaptive stop's tail (expected-shortfall) term is computed over.",
-            help_long: "The adaptive stop is max(1.0 x volatility, 1.25 x tail). Until 2026-08-04 this was hardcoded at 300 000 and a longer series silently dropped the tail term: on EURUSD M5, 300 000 bars gave a median base stop of 18.09 pips and 300 001 gave 5.81 pips. Discovery scoring passes the full series and walk-forward and live pass windows, so a gene was ranked on one stop and traded on another. 0 (no cap) makes all three agree. A non-zero cap now FAILS the run by name instead of quietly changing the stop.",
+            help_long: "The adaptive stop is max(1.0 x volatility, 1.25 x tail). Until 2026-08-04 this was hardcoded at 300 000 and a longer series silently dropped the tail term: on EURUSD M5, 300 000 bars gave a median base stop of 18.09 pips and 300 001 gave 5.81 pips. The lanes that crossed that cap were the MONTE-CARLO and SENSITIVITY quality screens (843k-bar in-sample slice, ~6.6 pips); GA scoring (210k stage-1 window), walk-forward and live were all under it (~13-23 pips). So every candidate was quality-screened against a stop one third of the one it was scored and traded on. 0 (no cap) makes every lane agree — it moves ONLY the two screen lanes. A non-zero cap now FAILS the run by name instead of quietly changing the stop.",
             preset_conservative: "0",
             preset_balanced: "0",
             preset_aggressive: "0",

@@ -1203,11 +1203,36 @@ impl Default for QualityRuntimeConfig {
 /// M5 (`data.vortex`, 1 054 320 bars): 300 000 bars ⇒ median base stop
 /// 18.09 pips, 300 001 bars ⇒ 5.81 pips. One extra bar, 3.11×.
 ///
-/// That made the three production callers of the same function disagree:
-/// discovery scoring passes the full series (over the cap ⇒ no tail term),
-/// while walk-forward passes ~70 k-bar windows and the live loop a 1 000-bar
-/// buffer (both under it ⇒ tail term present). A gene was ranked on one stop
-/// and traded on another, under a doc comment promising they were identical.
+/// That made the production callers of the same function disagree — and the
+/// first write-up of WHICH callers was itself wrong, so here is the measured
+/// map (EURUSD M5, operator's own file, at the spans the code actually
+/// produces; an adversarial review re-derived every number):
+///
+///   GA scoring     stage-1 window   210 864 bars  tail ON   21.68 pips
+///   MC screen      in-sample slice  843 456 bars  tail OFF   6.57 → 20.00
+///   sensitivity    in-sample slice  843 456 bars  tail OFF   6.57 → 20.00
+///   walk-forward   window slice      42 172 bars  tail ON   23.35
+///   live loop      rolling buffer     1 000 bars  tail ON   12.96
+///
+/// So scoring was NOT the odd one out (the GA never sees the full series —
+/// the funnel slices it to the earliest 25 % of the 80 % in-sample). The
+/// divergent lanes were the MONTE-CARLO ROBUSTNESS SCREEN and the SENSITIVITY
+/// SCREEN: every candidate was quality-screened against a ~6.6-pip stop while
+/// being scored on ~21.7 and traded on ~13-23. Removing the cap moves ONLY
+/// those two lanes (6.57 → 20.00, 3.04×); scoring, walk-forward and live move
+/// by under 0.1 %.
+///
+/// Cost of `tail_step = 1`, honestly: the base series is rebuilt once per GA
+/// GENERATION (nothing caches it), once per MC chunk, once per sensitivity
+/// chunk, per walk-forward split and per CPCV fold — measured +78 ms per
+/// generation at the stage-1 span and ~533 ms per MC/sensitivity chunk. Not
+/// "once per combo" as an earlier note claimed.
+///
+/// One behaviour change beyond the cap: a DEGENERATE slice (non-finite or
+/// non-positive median distance — e.g. a run of corrupt equal-price bars) now
+/// aborts discovery with a named error instead of silently continuing on the
+/// gene's fixed pips. Fail-loud is deliberate; the old silence is how 14 240
+/// zero-price bars once produced a £77 211 phantom move without a whisper.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct StopTargetRuntimeConfig {
