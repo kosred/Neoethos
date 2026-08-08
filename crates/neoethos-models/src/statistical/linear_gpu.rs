@@ -325,7 +325,9 @@ fn read_f32_buffer(
     client: &ComputeClient<CudaRuntime>,
     handle: cubecl::server::Handle,
 ) -> Vec<f32> {
-    let bytes = client.read_one(handle);
+    let bytes = client
+        .read_one(handle)
+        .expect("reading a device buffer this function just wrote must succeed");
     f32::from_bytes(&bytes).to_vec()
 }
 
@@ -394,16 +396,16 @@ pub(crate) fn try_fit_linear_softmax_cuda(
             &client,
             CubeCount::Static(grad_cubes, 1, 1),
             CubeDim::new_1d(units),
-            unsafe { ArrayArg::from_raw_parts::<f32>(&features_handle, features_flat.len(), 1) },
-            unsafe { ArrayArg::from_raw_parts::<i32>(&labels_handle, labels_flat.len(), 1) },
-            unsafe { ArrayArg::from_raw_parts::<f32>(&weights_handle, weight_len, 1) },
-            unsafe { ArrayArg::from_raw_parts::<f32>(&bias_handle, CLASS_COUNT, 1) },
-            unsafe { ArrayArg::from_raw_parts::<f32>(&grad_weights_handle, weight_len, 1) },
-            unsafe { ArrayArg::from_raw_parts::<f32>(&grad_bias_handle, CLASS_COUNT, 1) },
-            ScalarArg::new(rows as u32),
-            ScalarArg::new(cols as u32),
-            ScalarArg::new(alpha),
-            ScalarArg::new(l1_ratio),
+            unsafe { ArrayArg::from_raw_parts(features_handle.clone(), features_flat.len()) },
+            unsafe { ArrayArg::from_raw_parts(labels_handle.clone(), labels_flat.len()) },
+            unsafe { ArrayArg::from_raw_parts(weights_handle.clone(), weight_len) },
+            unsafe { ArrayArg::from_raw_parts(bias_handle.clone(), CLASS_COUNT) },
+            unsafe { ArrayArg::from_raw_parts(grad_weights_handle.clone(), weight_len) },
+            unsafe { ArrayArg::from_raw_parts(grad_bias_handle.clone(), CLASS_COUNT) },
+            rows as u32,
+            cols as u32,
+            alpha,
+            l1_ratio,
         )
         .context("launch statistical cuda softmax gradient kernel")?;
 
@@ -411,12 +413,12 @@ pub(crate) fn try_fit_linear_softmax_cuda(
             &client,
             CubeCount::Static(grad_cubes, 1, 1),
             CubeDim::new_1d(units),
-            unsafe { ArrayArg::from_raw_parts::<f32>(&weights_handle, weight_len, 1) },
-            unsafe { ArrayArg::from_raw_parts::<f32>(&bias_handle, CLASS_COUNT, 1) },
-            unsafe { ArrayArg::from_raw_parts::<f32>(&grad_weights_handle, weight_len, 1) },
-            unsafe { ArrayArg::from_raw_parts::<f32>(&grad_bias_handle, CLASS_COUNT, 1) },
-            ScalarArg::new(learning_rate),
-            ScalarArg::new(weight_len as u32),
+            unsafe { ArrayArg::from_raw_parts(weights_handle.clone(), weight_len) },
+            unsafe { ArrayArg::from_raw_parts(bias_handle.clone(), CLASS_COUNT) },
+            unsafe { ArrayArg::from_raw_parts(grad_weights_handle.clone(), weight_len) },
+            unsafe { ArrayArg::from_raw_parts(grad_bias_handle.clone(), CLASS_COUNT) },
+            learning_rate,
+            weight_len as u32,
         )
         .context("launch statistical cuda softmax apply kernel")?;
 
@@ -426,18 +428,17 @@ pub(crate) fn try_fit_linear_softmax_cuda(
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_1d(1),
                 unsafe {
-                    ArrayArg::from_raw_parts::<f32>(
-                        val_features_handle,
+                    ArrayArg::from_raw_parts(
+                        val_features_handle.clone(),
                         val_rows.saturating_mul(cols),
-                        1,
                     )
                 },
-                unsafe { ArrayArg::from_raw_parts::<i32>(val_labels_handle, *val_rows, 1) },
-                unsafe { ArrayArg::from_raw_parts::<f32>(&weights_handle, weight_len, 1) },
-                unsafe { ArrayArg::from_raw_parts::<f32>(&bias_handle, CLASS_COUNT, 1) },
-                unsafe { ArrayArg::from_raw_parts::<f32>(&loss_handle, 1, 1) },
-                ScalarArg::new(*val_rows as u32),
-                ScalarArg::new(cols as u32),
+                unsafe { ArrayArg::from_raw_parts(val_labels_handle.clone(), *val_rows) },
+                unsafe { ArrayArg::from_raw_parts(weights_handle.clone(), weight_len) },
+                unsafe { ArrayArg::from_raw_parts(bias_handle.clone(), CLASS_COUNT) },
+                unsafe { ArrayArg::from_raw_parts(loss_handle.clone(), 1) },
+                *val_rows as u32,
+                cols as u32,
             )
             .context("launch statistical cuda softmax validation loss kernel")?;
             let loss = read_f32_buffer(&client, loss_handle.clone())
@@ -520,12 +521,12 @@ pub(crate) fn try_predict_linear_softmax_cuda(
         &client,
         CubeCount::Static(cubes, 1, 1),
         CubeDim::new_1d(units),
-        unsafe { ArrayArg::from_raw_parts::<f32>(&features_handle, features_flat.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<f32>(&weights_handle, weights_flat.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<f32>(&bias_handle, bias_flat.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<f32>(&output_handle, output_len, 1) },
-        ScalarArg::new(rows as u32),
-        ScalarArg::new(cols as u32),
+        unsafe { ArrayArg::from_raw_parts(features_handle.clone(), features_flat.len()) },
+        unsafe { ArrayArg::from_raw_parts(weights_handle.clone(), weights_flat.len()) },
+        unsafe { ArrayArg::from_raw_parts(bias_handle.clone(), bias_flat.len()) },
+        unsafe { ArrayArg::from_raw_parts(output_handle.clone(), output_len) },
+        rows as u32,
+        cols as u32,
     )
     .context("launch statistical cuda softmax prediction kernel")?;
 
