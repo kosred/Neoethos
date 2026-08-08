@@ -160,6 +160,14 @@ risk:
   prop_firm_rules: false
   kill_zones_enabled: true
   max_trades_per_day: 8
+  # Arms the cap above. OFF by default — nothing changes until you set it
+  # true. When armed the cap is ACCOUNT-WIDE per UTC day: one shared counter
+  # across every running engine, so 4 engines do NOT get 8 each — the account
+  # gets 8 total. Every refusal is logged with the rule, the day's count and
+  # the cap. Counter resets at UTC midnight and on app restart; the cap value
+  # 0 disables. (Measured on the real journal: armed at 8 this would have
+  # refused 68.1 % of historical entries — arm it deliberately.)
+  max_trades_per_day_enabled: false
   recovery_mode_enabled: true
   feature_drift_threshold: 0.3
   high_quality_confidence: 0.65

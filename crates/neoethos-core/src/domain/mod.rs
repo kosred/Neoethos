@@ -1,4 +1,5 @@
 pub mod consistency;
+pub mod daily_entry_cap;
 pub mod demo_gate;
 pub mod errors;
 pub mod events;

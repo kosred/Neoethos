@@ -22,6 +22,17 @@ use crate::app_services::broker_api::{
     fetch_recent_chart_bars_blocking, submit_market_order_blocking,
 };
 
+/// Account-wide per-UTC-day entry counter behind `risk.max_trades_per_day`.
+///
+/// ONE `static`, so every engine in the process shares it — engines are
+/// per-portfolio but they all trade the SAME broker account, and a per-engine
+/// counter would quietly turn a cap of "8" into `8 × engines` (the known
+/// weakness of the unmerged 715058fe draft, deliberately not reproduced).
+/// Only refuses entries when `risk.max_trades_per_day_enabled` arms it;
+/// disarmed it still counts, so logs can always say where the day stands.
+static ACCOUNT_DAILY_ENTRIES: neoethos_core::domain::daily_entry_cap::AccountDailyEntryCap =
+    neoethos_core::domain::daily_entry_cap::AccountDailyEntryCap::new();
+
 // ── Public request type ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -614,6 +625,29 @@ async fn run(
         .map(|s| s.risk.initial_balance)
         .filter(|b| b.is_finite() && *b > 0.0)
         .unwrap_or(account_balance);
+    // Account-wide daily entry cap (2026-08-08): `risk.max_trades_per_day`
+    // sat in the operator config with NOTHING on the entry path reading it —
+    // his engines took 20-47 entries/day each against a configured 8. Armed
+    // only by `risk.max_trades_per_day_enabled` (default false ⇒ `None` here
+    // ⇒ behaviour unchanged); `max_trades_per_day: 0` disables like the other
+    // caps. The counter is the process-wide `ACCOUNT_DAILY_ENTRIES` static —
+    // per ACCOUNT, shared across every running engine, NOT per engine.
+    let daily_entry_cap: Option<u32> = sizing
+        .as_ref()
+        .filter(|s| s.risk.max_trades_per_day_enabled)
+        .map(|s| s.risk.max_trades_per_day)
+        .filter(|&cap| cap > 0)
+        .map(|cap| u32::try_from(cap).unwrap_or(u32::MAX));
+    if let Some(cap) = daily_entry_cap {
+        tracing::warn!(
+            target: "neoethos_app::live_trading",
+            %symbol, cap,
+            "DAILY ENTRY CAP ARMED (risk.max_trades_per_day_enabled) — at most \
+             this many entries per UTC day on the WHOLE account, shared across \
+             every running engine; counter resets at UTC midnight and on app \
+             restart"
+        );
+    }
     // (UTC date id, balance at first entry-consideration of that day).
     let mut day_start: Option<(u32, f64)> = None;
     // Log-once latches so a tripped breaker doesn't flood the log every bar.
@@ -1194,6 +1228,38 @@ async fn run(
                         continue;
                     }
                 }
+                // ── Daily entry cap (risk.max_trades_per_day) — same block as
+                // the breakers above so the entry rules live together. The slot
+                // is RESERVED here, before the order exists, so two engines
+                // racing at count = cap−1 cannot both pass; every skip/failure
+                // path between here and a filled order gives the slot back.
+                // Disarmed (`daily_entry_cap = None`) this only counts.
+                match ACCOUNT_DAILY_ENTRIES.try_reserve(today, daily_entry_cap) {
+                    Ok(_) => {}
+                    Err(refusal) => {
+                        // Say WHICH rule fired and WHAT it compared — a refusal
+                        // the operator cannot explain is a control he disables.
+                        tracing::warn!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            rule = "risk.max_trades_per_day",
+                            entries_today = refusal.count,
+                            cap = refusal.cap,
+                            utc_day = today,
+                            "entry refused — account-wide daily trade cap \
+                             reached (count is shared across every running \
+                             engine; resumes next UTC day, exits continue)"
+                        );
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal = Some(format!(
+                                "blocked: max_trades_per_day {}/{} account-wide \
+                                 (resumes next UTC day)",
+                                refusal.count, refusal.cap
+                            ));
+                        }
+                        continue;
+                    }
+                }
 
                 // Base per-trade risk. In Risky Mode we size off the bankroll-
                 // stage ladder (30 %→50 % by stage, resolved from the account's
@@ -1254,6 +1320,10 @@ async fn run(
                                         d.regime_gate, d.anomaly_scale
                                     ));
                                 }
+                                // No entry happened — give the reserved daily
+                                // entry slot back (the cap counts entries, not
+                                // attempts).
+                                ACCOUNT_DAILY_ENTRIES.release(today);
                                 continue;
                             }
                             tracing::info!(
@@ -1300,6 +1370,8 @@ async fn run(
                             s.last_signal =
                                 Some("blocked: portfolio risk budget spent".to_string());
                         }
+                        // No entry happened — release the daily entry slot.
+                        ACCOUNT_DAILY_ENTRIES.release(today);
                         continue;
                     }
                     effective_risk = base_risk.min(remaining);
@@ -1339,7 +1411,7 @@ async fn run(
                 );
                 let sym = symbol.clone();
 
-                let result = tokio::task::spawn_blocking(move || {
+                let result = match tokio::task::spawn_blocking(move || {
                     submit_market_order_blocking(
                         &sym,
                         side,
@@ -1349,7 +1421,17 @@ async fn run(
                         Some("NeoEthos-Auto".to_string()),
                     )
                 })
-                .await?;
+                .await
+                {
+                    Ok(r) => r,
+                    Err(join_err) => {
+                        // The submit task panicked/was cancelled — no entry
+                        // happened, so free the daily entry slot before the
+                        // engine dies with the error.
+                        ACCOUNT_DAILY_ENTRIES.release(today);
+                        return Err(join_err.into());
+                    }
+                };
 
                 match result {
                     Ok(outcome) => {
@@ -1428,6 +1510,10 @@ async fn run(
                             side = ?side,
                             "order placement failed"
                         );
+                        // The broker refused the order — no entry happened, so
+                        // the daily entry slot goes back (the cap counts
+                        // ENTRIES on the account, not attempts).
+                        ACCOUNT_DAILY_ENTRIES.release(today);
                     }
                 }
             }

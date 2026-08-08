@@ -371,7 +371,20 @@ pub struct RiskConfig {
     pub challenge_phase: String,
     pub prop_firm_rules: bool,
     pub kill_zones_enabled: bool,
+    /// Daily entry cap, counted per ACCOUNT — see the arming flag below.
     pub max_trades_per_day: usize,
+    /// Arms live enforcement of `max_trades_per_day`. Default `false`, so
+    /// today's behaviour is unchanged until the operator flips it.
+    ///
+    /// When `true`, the cap binds ACCOUNT-WIDE per UTC day: one counter
+    /// (`domain::daily_entry_cap`, held in a `static` by
+    /// `live_trading.rs`) is shared by EVERY running engine — four engines do
+    /// NOT get 8 each; the account gets 8 total, which is what an operator
+    /// reading "8" expects. Every refusal logs the rule, the day's count and
+    /// the cap. The counter resets at UTC midnight and on app restart, and
+    /// `max_trades_per_day: 0` disables the cap like the other risk caps.
+    #[serde(default)]
+    pub max_trades_per_day_enabled: bool,
     /// ⚠ UNWIRED — nothing reads this field; setting it `false` does NOT
     /// disable recovery mode.
     ///
@@ -469,6 +482,10 @@ impl Default for RiskConfig {
             // tighter; "own money" raises it. Operators can override
             // via YAML when their style demands a different cap.
             max_trades_per_day: runtime.max_trades_per_day,
+            // OFF: arming the account-wide daily entry cap is a deliberate
+            // operator act, never a default — measured on the real journal a
+            // cap of 8 would have refused 68.1 % of historical entries.
+            max_trades_per_day_enabled: false,
             recovery_mode_enabled: true,
             feature_drift_threshold: 0.30,
             high_quality_confidence: 0.65,
