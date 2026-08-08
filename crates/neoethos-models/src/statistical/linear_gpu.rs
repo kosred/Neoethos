@@ -406,8 +406,7 @@ pub(crate) fn try_fit_linear_softmax_cuda(
             cols as u32,
             alpha,
             l1_ratio,
-        )
-        .context("launch statistical cuda softmax gradient kernel")?;
+        );
 
         softmax_apply_kernel::launch::<CudaRuntime>(
             &client,
@@ -419,8 +418,7 @@ pub(crate) fn try_fit_linear_softmax_cuda(
             unsafe { ArrayArg::from_raw_parts(grad_bias_handle.clone(), CLASS_COUNT) },
             learning_rate,
             weight_len as u32,
-        )
-        .context("launch statistical cuda softmax apply kernel")?;
+        );
 
         if let Some((val_rows, val_features_handle, val_labels_handle)) = validation.as_ref() {
             softmax_loss_kernel::launch::<CudaRuntime>(
@@ -439,8 +437,7 @@ pub(crate) fn try_fit_linear_softmax_cuda(
                 unsafe { ArrayArg::from_raw_parts(loss_handle.clone(), 1) },
                 *val_rows as u32,
                 cols as u32,
-            )
-            .context("launch statistical cuda softmax validation loss kernel")?;
+            );
             let loss = read_f32_buffer(&client, loss_handle.clone())
                 .into_iter()
                 .next()
@@ -527,8 +524,7 @@ pub(crate) fn try_predict_linear_softmax_cuda(
         unsafe { ArrayArg::from_raw_parts(output_handle.clone(), output_len) },
         rows as u32,
         cols as u32,
-    )
-    .context("launch statistical cuda softmax prediction kernel")?;
+    );
 
     let probabilities = read_f32_buffer(&client, output_handle);
     if probabilities.len() != output_len {
