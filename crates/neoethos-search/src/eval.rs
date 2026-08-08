@@ -4097,7 +4097,7 @@ mod gpu_cpu_parity_tests {
             None,
         ) {
             if crate::gpu_fallback::require_gpu() {
-                panic!("NEOETHOS_REQUIRE_GPU set but GPU CPCV eval failed: {e}");
+                panic!("NEOETHOS_REQUIRE_GPU set but GPU CPCV eval failed: {e:#}");
             }
             eprintln!("GPU CPCV parity test SKIPPED (no usable GPU device): {e}");
             return;
@@ -4381,7 +4381,7 @@ mod gpu_cpu_parity_tests {
             None,
         ) {
             if crate::gpu_fallback::require_gpu() {
-                panic!("NEOETHOS_REQUIRE_GPU set but GPU walk-forward eval failed: {e}");
+                panic!("NEOETHOS_REQUIRE_GPU set but GPU walk-forward eval failed: {e:#}");
             }
             eprintln!("GPU walk-forward parity test SKIPPED (no usable GPU device): {e}");
             return;
