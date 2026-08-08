@@ -137,6 +137,13 @@ fn build_training_profile_provenance(
             "effective_label_horizon_bars": profile.effective_label_horizon_bars,
             "meta_label_max_hold_bars": profile.meta_label_max_hold_bars,
             "label_use_triple_barrier": profile.label_use_triple_barrier,
+            // The resolved bracket geometry is part of label identity: the
+            // same bars under `symmetric` and `asymmetric` produce labels
+            // answering DIFFERENT questions, so they must hash differently.
+            "label_geometry": profile.label_geometry.as_str(),
+            "label_fixed_stop": profile.label_fixed_stop,
+            "label_fixed_target": profile.label_fixed_target,
+            "label_rr_floor": profile.label_rr_floor,
             "label_histogram": training_label_histogram(payload.labels.as_slice()),
         }))?,
         stable_json_hash(&serde_json::json!({

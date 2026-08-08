@@ -708,6 +708,26 @@ pub struct ModelsConfig {
     pub global_train_ratio: f64,
     pub train_holdout_pct: f64,
     pub label_use_triple_barrier: bool,
+    /// Bracket geometry for training-label derivation (2026-08-08).
+    ///
+    /// * `"symmetric"` (default) — target distance == stop distance and the
+    ///   round-trip cost is charged the same way in both directions, so the
+    ///   label is a fair direction race. Real EURUSD M15 bars measure a
+    ///   0.49/0.51 class prior here — a coin flip, which is what a label with
+    ///   no manufactured bias looks like on noise.
+    /// * `"asymmetric"` — the pre-2026-08-08 geometry, kept for comparison
+    ///   runs: `risk.meta_label_fixed_tp` (0.0040) against
+    ///   `risk.meta_label_fixed_sl` (0.0020) with `risk.min_risk_reward`
+    ///   flooring the target at 2× the stop. On M15 those floors bind on
+    ///   88.4 % of bars — a 40-pip target racing a 20-pip stop — and
+    ///   MANUFACTURE a 66/34 class prior. 14 models recorded validation
+    ///   accuracy bit-identical to that prior: constant predictors trained on
+    ///   a label whose skew was geometry, not signal.
+    ///
+    /// Any other value fails label derivation loudly. The resolved geometry is
+    /// recorded in each model's training profile/artifact so a model can name
+    /// the labels it was trained on.
+    pub label_geometry: String,
     pub label_horizon_bars: usize,
     pub label_neutral_band_atr_fraction: f64,
     pub label_stop_atr_multiplier: f64,
@@ -1713,6 +1733,10 @@ impl Default for ModelsConfig {
             global_train_ratio: 0.8,
             train_holdout_pct: 0.2,
             label_use_triple_barrier: true,
+            // Symmetric by default: the asymmetric bracket manufactured a
+            // 66/34 class prior and 14 constant-predictor models. See the
+            // field docs; the old geometry stays reachable via "asymmetric".
+            label_geometry: "symmetric".to_string(),
             label_horizon_bars: 0,
             label_neutral_band_atr_fraction: 0.25,
             label_stop_atr_multiplier: 0.0,

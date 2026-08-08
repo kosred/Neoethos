@@ -2215,6 +2215,48 @@ impl TrainingOrchestrator {
         }
     }
 
+    /// Derive per-bar training labels from a barrier race on future bars.
+    ///
+    /// The bracket geometry is a config choice — `models.label_geometry`,
+    /// resolved by [`resolve_label_geometry`] and recorded in every training
+    /// profile/artifact:
+    ///
+    /// * `symmetric` (default): target distance == stop distance, and the
+    ///   round-trip cost pushes BOTH barriers outward, so the label is a fair
+    ///   direction race net of costs. This matches how the horizon fallback
+    ///   below has always charged the cost. Real EURUSD M15 bars measure a
+    ///   ~0.49/0.51 class prior.
+    /// * `asymmetric`: the pre-2026-08-08 long-bracket geometry (40-pip
+    ///   target vs 20-pip stop via the `risk.meta_label_fixed_*` floors, rr
+    ///   floored at `risk.min_risk_reward`, both barriers shifted UP by the
+    ///   cost). It manufactures a ~66/34 prior on M15 — kept only for
+    ///   comparison runs against old artifacts.
+    ///
+    /// # KNOWN LIMITATION — label semantics vs the Sell mapping
+    ///
+    /// Do not rediscover this: in `asymmetric` mode `-1` means "a LONG got
+    /// stopped out", NOT "a short would have won" — the stop is 20 pips away
+    /// while a short's own target would be 40 pips away, and both barriers
+    /// are shifted by a LONG's costs. Yet the artifact maps `-1` to Sell, so
+    /// every asymmetric Sell signal was trained on "longs lost here", a
+    /// strictly weaker claim. `symmetric` mode narrows this defect — the race
+    /// is equidistant and cost is charged both ways, so `-1` at least means
+    /// "the down-move cleared a short's distance-plus-cost" — but it does NOT
+    /// eliminate it:
+    ///
+    /// * there is still no abstain class: `0` conflates "no barrier reached"
+    ///   with "genuinely flat", and models treat it as a third direction
+    ///   rather than "stay out";
+    /// * a single label still serves both directions; a correct label set
+    ///   would derive LONG and SHORT outcomes independently (each side with
+    ///   its own entry price, spread charge, and bracket), plus an explicit
+    ///   abstain when neither side clears its costs, and the artifact would
+    ///   map model outputs to {Buy, Sell, Abstain} trained on exactly those
+    ///   three outcomes.
+    ///
+    /// Changing the label cardinality/semantics is a training-format break
+    /// across every consumer (recorded 2026-08-08, deliberately deferred);
+    /// the geometry fix above is what could land safely tonight.
     fn derive_labels(&self, ohlcv: &Ohlcv, symbol: &str) -> Result<Vec<i32>> {
         let n = ohlcv.close.len();
         if n == 0 {
@@ -2284,14 +2326,10 @@ impl TrainingOrchestrator {
             .label_stop_atr_multiplier
             .max(self.settings.risk.atr_stop_multiplier)
             .max(0.1);
-        let base_rr = self
-            .settings
-            .models
-            .label_take_profit_rr
-            .max(self.settings.risk.min_risk_reward)
-            .max(1.0);
-        let fixed_sl = self.settings.risk.meta_label_fixed_sl.max(min_distance);
-        let fixed_tp = self.settings.risk.meta_label_fixed_tp.max(min_distance);
+        let geometry = resolve_label_geometry(&self.settings)?;
+        let base_rr = geometry.rr_floor;
+        let fixed_sl = geometry.fixed_stop;
+        let fixed_tp = geometry.fixed_target;
         let true_ranges = compute_true_ranges(ohlcv);
         let use_triple_barrier = self.settings.models.label_use_triple_barrier;
         let neutral_band_fraction = self
@@ -2311,8 +2349,25 @@ impl TrainingOrchestrator {
             let take_profit_distance = fixed_tp.max(stop_distance * base_rr).max(min_distance);
             let horizon_end = (i + hold_bars).min(n - 1);
             if use_triple_barrier {
-                let upper_barrier = entry + take_profit_distance + round_trip_cost;
-                let lower_barrier = entry - stop_distance + round_trip_cost;
+                // Where the cost sits depends on what the label claims.
+                //
+                // Symmetric mode is a direction race: EACH side must clear
+                // its own distance PLUS the round trip, so both barriers move
+                // outward — the same both-ways charge the horizon fallback
+                // below has always applied. Asymmetric (legacy) mode is a
+                // long bracket: the long is behind by the spread from the
+                // first tick, so both barriers shift UP — which also means
+                // its `-1` is "the long got stopped", see the doc comment.
+                let (upper_barrier, lower_barrier) = match geometry.mode {
+                    LabelGeometryMode::Symmetric => (
+                        entry + take_profit_distance + round_trip_cost,
+                        entry - stop_distance - round_trip_cost,
+                    ),
+                    LabelGeometryMode::Asymmetric => (
+                        entry + take_profit_distance + round_trip_cost,
+                        entry - stop_distance + round_trip_cost,
+                    ),
+                };
 
                 for forward_idx in (i + 1)..=horizon_end {
                     let high = ohlcv.high[forward_idx];
@@ -2375,6 +2430,75 @@ impl TrainingOrchestrator {
 
         Ok(labels)
     }
+}
+
+/// Which bracket geometry `models.label_geometry` resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LabelGeometryMode {
+    Symmetric,
+    Asymmetric,
+}
+
+impl LabelGeometryMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LabelGeometryMode::Symmetric => "symmetric",
+            LabelGeometryMode::Asymmetric => "asymmetric",
+        }
+    }
+}
+
+/// The label bracket geometry after every floor and clamp has been applied —
+/// the numbers `derive_labels` actually races, and the numbers the training
+/// profile records so a model can name the labels it was trained on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ResolvedLabelGeometry {
+    pub mode: LabelGeometryMode,
+    /// Fixed floor for the stop-side distance, in price.
+    pub fixed_stop: f64,
+    /// Fixed floor for the target-side distance, in price. Equals
+    /// `fixed_stop` in symmetric mode.
+    pub fixed_target: f64,
+    /// Multiplier flooring the target at `rr_floor ×` the per-bar stop.
+    /// Exactly 1.0 in symmetric mode — no rr floor pushes the target out.
+    pub rr_floor: f64,
+}
+
+/// Resolve `models.label_geometry` + the `risk.meta_label_*` floors into the
+/// bracket `derive_labels` uses. Fails loudly on an unknown geometry name —
+/// a typo must stop training, not silently fall back to either geometry.
+pub(crate) fn resolve_label_geometry(
+    settings: &neoethos_core::Settings,
+) -> Result<ResolvedLabelGeometry> {
+    let raw = settings.models.label_geometry.trim();
+    let mode = match raw.to_ascii_lowercase().as_str() {
+        "symmetric" => LabelGeometryMode::Symmetric,
+        "asymmetric" => LabelGeometryMode::Asymmetric,
+        other => anyhow::bail!(
+            "models.label_geometry = `{other}` is not a label geometry; valid values are \
+             `symmetric` (default — equal bracket distances, cost charged both ways) and \
+             `asymmetric` (legacy 2:1 long bracket, kept for comparison runs)"
+        ),
+    };
+    let min_distance = settings.risk.meta_label_min_dist.max(1e-6);
+    let fixed_stop = settings.risk.meta_label_fixed_sl.max(min_distance);
+    let (fixed_target, rr_floor) = match mode {
+        LabelGeometryMode::Symmetric => (fixed_stop, 1.0),
+        LabelGeometryMode::Asymmetric => (
+            settings.risk.meta_label_fixed_tp.max(min_distance),
+            settings
+                .models
+                .label_take_profit_rr
+                .max(settings.risk.min_risk_reward)
+                .max(1.0),
+        ),
+    };
+    Ok(ResolvedLabelGeometry {
+        mode,
+        fixed_stop,
+        fixed_target,
+        rr_floor,
+    })
 }
 
 fn compute_true_ranges(ohlcv: &Ohlcv) -> Vec<f64> {
@@ -2608,6 +2732,7 @@ fn training_runtime_profile(
     payload: &TrainingPayload,
     row_budget_applied: Option<usize>,
     higher_timeframes: Vec<String>,
+    label_geometry: &ResolvedLabelGeometry,
 ) -> TrainingRuntimeProfile {
     let effective_label_horizon_bars = if settings.models.label_horizon_bars > 0 {
         settings.models.label_horizon_bars
@@ -2686,6 +2811,10 @@ fn training_runtime_profile(
         effective_label_horizon_bars,
         meta_label_max_hold_bars: settings.risk.meta_label_max_hold_bars.max(1),
         label_use_triple_barrier: settings.models.label_use_triple_barrier,
+        label_geometry: label_geometry.mode.as_str().to_string(),
+        label_fixed_stop: label_geometry.fixed_stop,
+        label_fixed_target: label_geometry.fixed_target,
+        label_rr_floor: label_geometry.rr_floor,
         higher_timeframes,
         multi_resolution_enabled: settings.system.multi_resolution_enabled,
         base_features_prefixed: settings.system.multi_resolution_prefix_base,
@@ -2762,6 +2891,10 @@ fn write_training_profile_sidecar(
     payload: &TrainingPayload,
     row_budget_applied: Option<usize>,
 ) -> Result<TrainingRuntimeProfile> {
+    // Resolves the same geometry `derive_labels` used at the top of the run —
+    // an invalid geometry name has already failed the run loudly before any
+    // model trains, so this is re-derivation for the record, not a re-check.
+    let label_geometry = resolve_label_geometry(settings)?;
     let profile = training_runtime_profile(
         settings,
         config,
@@ -2770,6 +2903,7 @@ fn write_training_profile_sidecar(
         payload,
         row_budget_applied,
         training_profile_higher_timeframes(settings, base_tf),
+        &label_geometry,
     );
     write_training_runtime_profile(
         &artifact_dir.join(TRAINING_RUNTIME_PROFILE_FILE_NAME),
@@ -5150,6 +5284,181 @@ mod tests {
         );
     }
 
+    /// 8 192 real EURUSD M15 bars, 2024-07-01 → 2024-10-28 UTC, exported from
+    /// the operator's parquet store (corrupt zero-price bars filtered at
+    /// export). The slice was chosen for near-zero drift (+43 pips over four
+    /// months) so the class prior measures the GEOMETRY, not the period's
+    /// trend.
+    fn real_eurusd_m15_fixture() -> Ohlcv {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/eurusd_m15_real.csv"
+        );
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("real-bar fixture {path} must be readable: {error}"));
+        let mut timestamp = Vec::new();
+        let mut open = Vec::new();
+        let mut high = Vec::new();
+        let mut low = Vec::new();
+        let mut close = Vec::new();
+        for (line_no, line) in raw.lines().enumerate().skip(1) {
+            let mut fields = line.split(',');
+            let mut next = |name: &str| {
+                fields
+                    .next()
+                    .unwrap_or_else(|| panic!("fixture line {line_no} is missing {name}"))
+            };
+            timestamp.push(
+                next("timestamp_ms")
+                    .parse::<i64>()
+                    .unwrap_or_else(|e| panic!("fixture line {line_no} timestamp: {e}")),
+            );
+            for (name, series) in [
+                ("open", &mut open),
+                ("high", &mut high),
+                ("low", &mut low),
+                ("close", &mut close),
+            ] {
+                series.push(
+                    next(name)
+                        .parse::<f64>()
+                        .unwrap_or_else(|e| panic!("fixture line {line_no} {name}: {e}")),
+                );
+            }
+        }
+        assert_eq!(close.len(), 8192, "fixture must carry all 8 192 bars");
+        Ohlcv {
+            timestamp: Some(timestamp),
+            open,
+            high,
+            low,
+            close,
+            volume: None,
+        }
+    }
+
+    /// THE class-balance guard. The default label geometry must produce a
+    /// coin-flip class prior on real bars.
+    ///
+    /// The asymmetric bracket (40-pip target vs 20-pip stop, rr floored at
+    /// 2.0) MANUFACTURED a ~66/34 prior on M15 — the floors bind on 88.4 % of
+    /// bars, so the nearer stop simply gets hit first more often. 14 models
+    /// recorded validation accuracy bit-identical to that prior: constant
+    /// predictors faithfully answering a rigged question. Symmetric geometry
+    /// on these same bars measures ~0.49 — a coin flip, which is what an
+    /// unbiased label looks like on noise.
+    ///
+    /// If this fails after a label change, the geometry has drifted back to
+    /// manufacturing a directional prior. Do NOT widen the band — fix the
+    /// geometry.
+    #[test]
+    fn default_label_geometry_yields_a_coin_flip_class_prior_on_real_bars() {
+        let ohlcv = real_eurusd_m15_fixture();
+        let share_of_longs = |orchestrator: &TrainingOrchestrator| {
+            let labels = orchestrator
+                .derive_labels(&ohlcv, "EURUSD")
+                .expect("real fixture bars must derive labels");
+            let longs = labels.iter().filter(|&&label| label == 1).count();
+            let shorts = labels.iter().filter(|&&label| label == -1).count();
+            assert!(
+                longs + shorts > 4000,
+                "fixture must produce a meaningful number of directional labels, got {}",
+                longs + shorts
+            );
+            longs as f64 / (longs + shorts) as f64
+        };
+
+        // DEFAULT config — nothing set, exactly what a fresh operator gets.
+        let orchestrator = orchestrator_with_models(&["lightgbm"]);
+        assert_eq!(
+            orchestrator.settings.models.label_geometry, "symmetric",
+            "the DEFAULT geometry must be symmetric"
+        );
+        let symmetric_share = share_of_longs(&orchestrator);
+        assert!(
+            (0.45..=0.55).contains(&symmetric_share),
+            "default (symmetric) geometry must yield a coin-flip class prior on real bars; \
+             measured +1 share {symmetric_share:.4} outside 50±5 % — the label is \
+             manufacturing a directional prior again"
+        );
+
+        // Guard the guard: the legacy asymmetric geometry on the SAME bars
+        // must show the manufactured skew, proving this fixture genuinely
+        // discriminates geometry rather than passing vacuously.
+        let mut legacy = orchestrator_with_models(&["lightgbm"]);
+        legacy.settings.models.label_geometry = "asymmetric".to_string();
+        let asymmetric_share = share_of_longs(&legacy);
+        assert!(
+            asymmetric_share < 0.45,
+            "legacy asymmetric geometry should manufacture a skewed prior on these bars \
+             (historically ~0.30-0.37); measured {asymmetric_share:.4} — if this is now \
+             balanced the fixture no longer exercises the geometry switch"
+        );
+    }
+
+    /// Identical bars, opposite verdicts — the geometry switch, isolated.
+    ///
+    /// The series dips 19 pips (through the legacy 18-pip cost-shifted stop,
+    /// NOT through the symmetric 22-pip lower barrier) then rallies 25 pips
+    /// (through the symmetric 22-pip upper barrier, far short of the legacy
+    /// 42-pip target). Asymmetric labels it -1 — "the long got stopped";
+    /// symmetric labels it +1 — the up-move won the fair race.
+    #[test]
+    fn symmetric_and_asymmetric_geometry_disagree_by_construction() {
+        let entry = 1.1000;
+        let ohlcv = Ohlcv {
+            timestamp: Some(vec![0, 1, 2, 3]),
+            open: vec![entry, entry, 1.0985, 1.1024],
+            high: vec![entry, entry, 1.1025, 1.1024],
+            low: vec![entry, 1.0981, 1.0985, 1.1024],
+            close: vec![entry, 1.0985, 1.1024, 1.1024],
+            volume: None,
+        };
+
+        let orchestrator = orchestrator_with_models(&["lightgbm"]);
+        let symmetric = orchestrator
+            .derive_labels(&ohlcv, "EURUSD")
+            .expect("labels derive");
+        assert_eq!(
+            symmetric[0], 1,
+            "symmetric race: +25 pips clears the 20-pip distance plus 2-pip cost, and the \
+             19-pip dip never reaches the 22-pip lower barrier"
+        );
+
+        let mut legacy = orchestrator_with_models(&["lightgbm"]);
+        legacy.settings.models.label_geometry = "asymmetric".to_string();
+        let asymmetric = legacy
+            .derive_labels(&ohlcv, "EURUSD")
+            .expect("labels derive");
+        assert_eq!(
+            asymmetric[0], -1,
+            "legacy bracket: the 19-pip dip goes through the cost-shifted 18-pip stop before \
+             the rally, and the 42-pip target is never reached"
+        );
+    }
+
+    #[test]
+    fn unknown_label_geometry_fails_loudly() {
+        let mut orchestrator = orchestrator_with_models(&["lightgbm"]);
+        orchestrator.settings.models.label_geometry = "symetric".to_string();
+        let ohlcv = Ohlcv {
+            timestamp: Some(vec![0, 1]),
+            open: vec![1.0, 1.0],
+            high: vec![1.0, 1.0],
+            low: vec![1.0, 1.0],
+            close: vec![1.0, 1.0],
+            volume: None,
+        };
+        let err = orchestrator
+            .derive_labels(&ohlcv, "EURUSD")
+            .expect_err("a typo in label_geometry must stop training, not pick a side silently");
+        let message = err.to_string();
+        assert!(
+            message.contains("symetric") && message.contains("symmetric"),
+            "error must quote the bad value and name the valid ones, got: {message}"
+        );
+    }
+
     #[test]
     fn preferred_burn_device_policy_rejects_unknown_gpu_token() {
         let mut orchestrator = orchestrator_with_models(&["mlp"]);
@@ -5199,6 +5508,8 @@ mod tests {
             TrainingPayload::from_dense(ndarray::Array2::<f32>::zeros((4, 1)), vec![0, 0, 0, 0])
                 .expect("build payload");
 
+        let geometry = resolve_label_geometry(&orchestrator.settings)
+            .expect("default settings resolve a label geometry");
         let profile = training_runtime_profile(
             &orchestrator.settings,
             config,
@@ -5207,6 +5518,7 @@ mod tests {
             &payload,
             Some(4),
             vec!["H1".to_string()],
+            &geometry,
         );
 
         assert_eq!(
@@ -5218,6 +5530,12 @@ mod tests {
         assert_eq!(profile.effective_label_horizon_bars, 3);
         assert_eq!(profile.meta_label_max_hold_bars, 3);
         assert!(!profile.label_use_triple_barrier);
+        // The artifact names the labels it was trained on: default geometry is
+        // symmetric — equal fixed floors, no rr push.
+        assert_eq!(profile.label_geometry, "symmetric");
+        assert_eq!(profile.label_fixed_stop, 0.0020);
+        assert_eq!(profile.label_fixed_target, 0.0020);
+        assert_eq!(profile.label_rr_floor, 1.0);
         assert!(profile.planned_cpu_threads.is_some());
         assert!(profile.planned_batch_size.is_some());
         assert!(profile.planned_memory_budget_gb.is_some());
@@ -5269,6 +5587,8 @@ mod tests {
             TrainingPayload::from_dense(ndarray::Array2::<f32>::zeros((4, 1)), vec![0, 0, 0, 0])
                 .expect("build payload");
 
+        let geometry = resolve_label_geometry(&orchestrator.settings)
+            .expect("default settings resolve a label geometry");
         let profile = training_runtime_profile(
             &orchestrator.settings,
             &config,
@@ -5277,6 +5597,7 @@ mod tests {
             &payload,
             Some(4),
             Vec::new(),
+            &geometry,
         );
 
         // The effective/requested backend recorded is the honest rlkit, not rllib.

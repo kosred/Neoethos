@@ -220,6 +220,11 @@ models:
   global_max_rows: 0
   global_max_rows_per_symbol: 0
   label_use_triple_barrier: true
+  # Label bracket geometry: "symmetric" (default — equal target/stop
+  # distances, cost charged both ways, ~50/50 class prior on real bars) or
+  # "asymmetric" (legacy 40-pip target vs 20-pip stop; manufactures a 66/34
+  # prior — comparison runs only).
+  label_geometry: symmetric
   # 0 = fall back to risk.meta_label_max_hold_bars
   label_horizon_bars: 0
   label_neutral_band_atr_fraction: 0.25
