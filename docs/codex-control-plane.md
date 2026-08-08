@@ -264,7 +264,7 @@ required). `open_world_hint=false` on everything except `news_briefing`
 | # | Tool | Params | Class | Wraps |
 |---|---|---|---|---|
 | 48 | `get_settings` | `{}` | RO | `GET /settings` (typed DTO) |
-| 49 | `update_settings` | partial mirror of the `POST /settings` DTO: `{trading_mode?, compute_mode?, risk_per_trade?, search_population?, search_generations?, search_max_hours?, max_indicators?, portfolio_size?, corr_threshold?, max_rows?, prefilter_top_k?, convergence_patience?, stagnation_patience?, novelty_weight?, disable_smc_gate?, max_portfolio_risk?, live_ml_gate?, risky_*?, news_*?}` — typed fields only, no passthrough | MUT (several knobs alter live sizing → `destructive_hint=true` as the honest hint, but classed MUT: it executes no trade) | `POST /settings` |
+| 49 | `update_settings` | partial mirror of the `POST /settings` DTO: `{trading_mode?, compute_mode?, risk_per_trade?, search_population?, search_generations?, search_max_hours?, search_max_indicators?, search_portfolio_size?, search_corr_threshold?, search_max_rows?, prefilter_top_k?, convergence_patience?, stagnation_patience?, novelty_weight?, disable_smc_gate?, max_portfolio_risk?, live_ml_gate?, risky_*?, news_*?}` — typed fields only, no passthrough. The `search_*` prefix matches the backend DTO verbatim | MUT (several knobs alter live sizing → `destructive_hint=true` as the honest hint, but classed MUT: it executes no trade) | `POST /settings` |
 | 50 | `knob_catalog` | `{}` | RO | `GET /settings/knob-catalog` + `GET /settings/presets` — the machine-readable help Codex reads before touching `update_settings` |
 | 51 | `get_risk` | `{}` | RO | `GET /risk` |
 | 52 | `apply_risk_preset` | `{**preset**: str}` | TRADE (rewrites live sizing config) | `POST /risk/preset` |
@@ -393,7 +393,7 @@ sandbox and MUST NOT be used or documented as a workaround.
 `scripts/mcp-smoke.ps1` — requires the desktop app or `neoethos-app --server`
 up with the demo cTrader account connected; drives the binary over stdio:
 
-1. `initialize`, `tools/list` (assert 59 tools).
+1. `initialize`, `tools/list` (assert 62 tools).
 2. `system_health`, `broker_status` — **assert environment=Demo, connected**;
    abort the script loudly otherwise.
 3. `account_snapshot`, `journal_stats`, `journal_analytics`, `get_chart`
@@ -441,7 +441,7 @@ approve → position opens → guard messages visible in the transcript).
 Implementation map: `crates/neoethos-mcp/` — `src/backend.rs` (HTTP client +
 `DemoProof` choke point), `src/ops.rs` (one method per tool: validation,
 guard, wire conversion), `src/params.rs` (typed schemas), `src/server.rs`
-(the 59 `#[tool]` handlers + annotations), `src/main.rs` (stdio entry,
+(the 62 `#[tool]` handlers + annotations), `src/main.rs` (stdio entry,
 stderr-only logging). Tests: `tests/catalog.rs` (catalog snapshot +
 guard-coverage), `tests/demo_guard.rs` (mock-backend guard behavior,
 `risky:false`, lots→wire-unit conversion), `tests/stdout_hygiene.rs`
@@ -480,7 +480,7 @@ If the backend runs with `NEOETHOS_API_TOKEN` set, append
 `--token <the same value>` to the `args`.
 
 Verify inside an interactive Codex session: `/mcp` must list `neoethos`
-with 59 tools.
+with 62 tools.
 
 ### 8.3 Smoke checklist (run with the app OPEN on the demo account)
 
@@ -496,7 +496,7 @@ pwsh -File scripts\mcp-smoke.ps1 -SkipTrade    # reads + jobs only
 Manual checklist mirror (what the script asserts, tick these if driving
 Codex by hand instead):
 
-- [ ] `codex mcp list` shows `neoethos`; `/mcp` in the TUI shows 59 tools.
+- [ ] `codex mcp list` shows `neoethos`; `/mcp` in the TUI shows 62 tools.
 - [ ] Ask Codex "what is the broker status?" → `broker_status` auto-runs
       (read-only), reports `environment=Demo`, `connected=true`.
 - [ ] `account_snapshot`, `journal_stats`, `journal_analytics`,

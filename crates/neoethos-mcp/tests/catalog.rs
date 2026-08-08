@@ -33,12 +33,15 @@ const EXPECTED: &[(&str, Class)] = &[
     ("account_snapshot", Class::Ro),
     ("list_positions", Class::Ro),
     ("broker_symbols", Class::Ro),
+    ("broker_timeframes", Class::Ro),
     ("order_history", Class::Ro),
     ("cashflow", Class::Ro),
     ("expected_margin", Class::Ro),
     // Market data
     ("get_chart", Class::Ro),
+    ("chart_history", Class::Ro),
     ("get_indicator", Class::Ro),
+    ("intelligence", Class::Ro),
     ("live_spots", Class::Ro),
     ("spread_stats", Class::Ro),
     ("news_briefing", Class::RoOpenWorld),
@@ -102,14 +105,14 @@ fn listed_tools() -> Vec<rmcp::model::Tool> {
 fn catalog_has_exactly_the_59_designed_tools() {
     assert_eq!(
         EXPECTED.len(),
-        59,
-        "the expected table itself must list 59 tools"
+        62,
+        "the expected table itself must list 62 tools"
     );
     let tools = listed_tools();
     assert_eq!(
         tools.len(),
-        59,
-        "tools/list must expose exactly the 59 designed tools, got: {:?}",
+        62,
+        "tools/list must expose exactly the 62 designed tools, got: {:?}",
         tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>()
     );
     for (name, _) in EXPECTED {

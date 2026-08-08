@@ -21,11 +21,15 @@ const USAGE: &str = "neoethos-mcp — NeoEthos Codex control plane (MCP server o
                      \x20 --base-url <url>   Backend API base URL (default http://127.0.0.1:7423)\n\
                      \x20 --token <bearer>   Forwarded as Authorization: Bearer when the operator\n\
                      \x20                    enabled NEOETHOS_API_TOKEN on the backend\n\
+                     \x20 --allow-remote     Permit a non-loopback --base-url (default: refuse).\n\
+                     \x20                    The demo guard trusts the backend it talks to and the\n\
+                     \x20                    bearer token is sent to it, so a remote host is opt-in\n\
                      \x20 -h, --help         Print this help (to stderr) and exit";
 
 fn parse_args() -> anyhow::Result<Option<(String, Option<String>)>> {
     let mut base_url = DEFAULT_BASE_URL.to_string();
     let mut token: Option<String> = None;
+    let mut allow_remote = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -40,6 +44,9 @@ fn parse_args() -> anyhow::Result<Option<(String, Option<String>)>> {
                         .ok_or_else(|| anyhow::anyhow!("--token requires a value"))?,
                 );
             }
+            "--allow-remote" => {
+                allow_remote = true;
+            }
             "-h" | "--help" => {
                 // Help goes to STDERR — stdout is reserved for JSON-RPC.
                 eprintln!("{USAGE}");
@@ -50,6 +57,7 @@ fn parse_args() -> anyhow::Result<Option<(String, Option<String>)>> {
             }
         }
     }
+    neoethos_mcp::enforce_loopback(&base_url, allow_remote)?;
     Ok(Some((base_url, token)))
 }
 

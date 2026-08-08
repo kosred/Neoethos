@@ -30,6 +30,34 @@ fn require_positive(name: &str, v: f64) -> Result<(), ToolError> {
     }
 }
 
+/// A broker/action id that is safe to interpolate into a URL path segment.
+///
+/// The demo guard decides trade-vs-non-trade by inspecting the *path string*
+/// (`Backend::is_trade_route`), so an id carrying `/`, `?`, `#`, `%` or
+/// whitespace could reshape the effective URL after the guard has classified
+/// it: `reject_pending_action` (unguarded) with `action_id =
+/// "<realId>/confirm?x="` produces a string ending in `/reject` — classified
+/// non-trade — that reqwest then resolves onto `POST /actions/<realId>/confirm`,
+/// the guarded route, with no `DemoProof`. Restricting the id to an opaque
+/// token charset closes that path injection at the only place ids enter a path.
+fn validate_id(name: &str, raw: &str) -> Result<String, ToolError> {
+    let id = raw.trim();
+    if id.is_empty() {
+        return Err(ToolError(format!("{name} must be non-empty")));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ToolError(format!(
+            "{name} must contain only letters, digits, '-' or '_' (got {id:?}); \
+             a value with '/', '?', '#', '%' or spaces is refused because it \
+             could redirect the request onto a different, trade-affecting route"
+        )));
+    }
+    Ok(id.to_string())
+}
+
 impl Backend {
     // ── System and health ─────────────────────────────────────────────────
 
@@ -102,6 +130,28 @@ impl Backend {
 
     pub async fn op_broker_symbols(&self) -> Result<Value, ToolError> {
         self.get_json("/broker/symbols", &[]).await
+    }
+
+    pub async fn op_broker_timeframes(&self) -> Result<Value, ToolError> {
+        self.get_json("/broker/timeframes", &[]).await
+    }
+
+    pub async fn op_chart_history(&self, p: ChartHistoryParams) -> Result<Value, ToolError> {
+        let mut query = vec![("before_ms", p.before_ms.to_string())];
+        if let Some(symbol) = p.symbol {
+            query.push(("symbol", symbol.trim().to_uppercase()));
+        }
+        if let Some(timeframe) = p.timeframe {
+            query.push(("timeframe", timeframe.trim().to_uppercase()));
+        }
+        if let Some(limit) = p.limit {
+            query.push(("limit", limit.to_string()));
+        }
+        self.get_json("/chart/history", &query).await
+    }
+
+    pub async fn op_intelligence(&self) -> Result<Value, ToolError> {
+        self.get_json("/intelligence", &[]).await
     }
 
     pub async fn op_order_history(&self, p: OrderHistoryParams) -> Result<Value, ToolError> {
@@ -428,10 +478,7 @@ impl Backend {
         &self,
         p: ConfirmPendingActionParams,
     ) -> Result<Value, ToolError> {
-        let id = p.action_id.trim();
-        if id.is_empty() {
-            return Err(ToolError("action_id must be non-empty".to_string()));
-        }
+        let id = validate_id("action_id", &p.action_id)?;
         // Confirm EXECUTES the queued broker call — demo-guarded.
         let proof = self.ensure_demo().await?;
         let body = match p.volume_units_override {
@@ -451,10 +498,7 @@ impl Backend {
         &self,
         p: RejectPendingActionParams,
     ) -> Result<Value, ToolError> {
-        let id = p.action_id.trim();
-        if id.is_empty() {
-            return Err(ToolError("action_id must be non-empty".to_string()));
-        }
+        let id = validate_id("action_id", &p.action_id)?;
         let body = match p.reason {
             Some(reason) => json!({ "reason": reason }),
             None => json!({}),

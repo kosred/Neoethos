@@ -89,8 +89,8 @@ fn stdout_carries_json_rpc_exclusively() {
                 .unwrap_or_else(|| panic!("tools/list must return a tools array, got: {line:?}"));
             assert_eq!(
                 tools.len(),
-                59,
-                "tools/list over the wire must expose 59 tools"
+                62,
+                "tools/list over the wire must expose 62 tools"
             );
         }
     }

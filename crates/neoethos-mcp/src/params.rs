@@ -82,6 +82,21 @@ pub struct GetChartParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ChartHistoryParams {
+    /// Symbol name, e.g. "EURUSD". Defaults to the backend's active chart symbol.
+    pub symbol: Option<String>,
+    /// Canonical timeframe label, e.g. "M5", "H1". Defaults to the active timeframe.
+    pub timeframe: Option<String>,
+    /// Cursor: return candles STRICTLY OLDER than this Unix-ms timestamp — the
+    /// time of the oldest candle you currently hold. Page back by passing the
+    /// oldest returned candle's time here.
+    pub before_ms: i64,
+    /// Candles to return in this page (backend default/cap apply).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetIndicatorParams {
     /// Symbol name, e.g. "EURUSD".
     pub symbol: String,

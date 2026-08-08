@@ -1,4 +1,4 @@
-//! The MCP tool surface: 59 tools over the NeoEthos backend HTTP API.
+//! The MCP tool surface: 62 tools over the NeoEthos backend HTTP API.
 //!
 //! Every handler is a thin shim over a `Backend::op_*` method (`ops.rs`) —
 //! all behavior (validation, demo guard, wire conversion) lives there where
@@ -153,6 +153,37 @@ impl ControlPlane {
     )]
     pub async fn broker_symbols(&self) -> CallToolResult {
         done(self.backend.op_broker_symbols().await)
+    }
+
+    #[tool(
+        description = "The canonical timeframe labels this broker accepts (M1..MN1). Call this \
+                       instead of guessing the timeframe string for get_chart / get_indicator.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub async fn broker_timeframes(&self) -> CallToolResult {
+        done(self.backend.op_broker_timeframes().await)
+    }
+
+    #[tool(
+        description = "Scroll-back page of chart candles STRICTLY OLDER than before_ms (Unix ms) \
+                       — the pagination companion to get_chart, which returns only the trailing \
+                       window. Page back by passing the oldest candle's time as the next before_ms.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub async fn chart_history(
+        &self,
+        Parameters(p): Parameters<ChartHistoryParams>,
+    ) -> CallToolResult {
+        done(self.backend.op_chart_history(p).await)
+    }
+
+    #[tool(
+        description = "What the model swarm currently knows: the discovery-targets scan and \
+                       intelligence summary the desktop surfaces.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub async fn intelligence(&self) -> CallToolResult {
+        done(self.backend.op_intelligence().await)
     }
 
     #[tool(

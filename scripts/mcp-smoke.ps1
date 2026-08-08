@@ -9,7 +9,7 @@
 #     target/release/neoethos-mcp.exe.
 #
 # What it does, over real stdio MCP:
-#   1. initialize + tools/list (asserts 59 tools)
+#   1. initialize + tools/list (asserts 62 tools)
 #   2. broker_status — ABORTS LOUDLY unless environment=Demo + connected
 #   3. read-path sanity: account_snapshot, journal_stats, journal_analytics,
 #      get_chart EURUSD M5
@@ -108,8 +108,8 @@ try {
     Send-Notification "notifications/initialized"
     Write-Host "  server: $($init.serverInfo.name) $($init.serverInfo.version)"
     $tools = (Send-Rpc "tools/list" $null).tools
-    if ($tools.Count -ne 59) { throw "expected 59 tools, got $($tools.Count)" }
-    Write-Host "  59 tools listed."
+    if ($tools.Count -ne 62) { throw "expected 62 tools, got $($tools.Count)" }
+    Write-Host "  62 tools listed."
 
     # ── 2. broker_status gate ───────────────────────────────────────────────
     Step "broker_status (demo gate)"
