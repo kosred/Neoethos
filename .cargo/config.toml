@@ -29,23 +29,26 @@ rustflags = ["-C", "target-cpu=x86-64-v3", "-Z", "threads=8"]
 # Same microarch level (Intel Haswell 2013+ / AMD Zen 2017+), portable across all
 # post-2013 CPUs. CPU-instruction-level only; no effect on the Vulkan/CUDA GPU lane.
 [target.x86_64-unknown-linux-gnu]
-# AVX2 + mold linker (parallel, ~5-10x faster link of the 100MB+ binary) +
-# -Zthreads=8 (parallel rustc frontend across cores). mold needs `apt install
-# mold`; -Zthreads needs the nightly toolchain pinned in rust-toolchain.toml.
+# AVX2 + -Zthreads=8 (parallel rustc frontend). -Zthreads needs the nightly
+# toolchain pinned in rust-toolchain.toml.
 #
-# WARNING: never use mold for a build that links native CUDA device code.
-# Measured on a rented RTX 3060 Ti (2026-07-27, mold 1.0.3, CUDA 12.2): mold
-# emits TWO `.init_array` sections while the `DT_INIT_ARRAYSZ` dynamic tag
-# covers only 8 bytes of them, so nvcc's `__sti____cudaRegisterAllv`
-# constructors never run. The fatbin is present in the binary, the build and
-# the link both succeed, and then every kernel launch fails at runtime with
-# "invalid device function". The same build passes unchanged with the default
-# linker.
+# MOLD IS DELIBERATELY NOT HERE — twice burned, once by each failure mode:
 #
-# Any `--features gpu-cuda` / `gpu-b-native` build must override the linker,
-# exactly as scripts/gpu-bench/remote_bootstrap.sh does:
+# 1. CORRECTNESS: never link native CUDA device code with mold. Measured on a
+#    rented RTX 3060 Ti (2026-07-27, mold 1.0.3, CUDA 12.2): mold emits TWO
+#    `.init_array` sections while `DT_INIT_ARRAYSZ` covers only 8 bytes, so
+#    nvcc's `__sti____cudaRegisterAllv` constructors never run. Build and link
+#    both SUCCEED; every kernel launch then dies at runtime with "invalid
+#    device function". The same build passes with the default linker.
 #
-#   RUSTFLAGS="-C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=bfd"
+# 2. AVAILABILITY: this file used to hardcode `-fuse-ld=mold` here with a
+#    comment warning GPU builds to override it via RUSTFLAGS. On the first
+#    rented box (2026-08-08, fresh nvidia/cuda image, no mold installed) the
+#    override was forgotten and EVERY crate failed at link with
+#    "collect2: fatal error: cannot find 'ld'" — phases 1a/1b/2 of the card
+#    session all died on it. A comment asking future editors to remember is
+#    not a mechanism; a default that needs remembering to be safe is wrong.
 #
-# RUSTFLAGS replaces this whole list, so restate target-cpu when you use it.
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "link-arg=-fuse-ld=mold", "-Z", "threads=8"]
+# Want mold for fast local CPU-only iteration? Put it in your OWN
+# ~/.cargo/config.toml, where it cannot follow the repo onto a GPU box.
+rustflags = ["-C", "target-cpu=x86-64-v3", "-Z", "threads=8"]
