@@ -3470,6 +3470,29 @@ fn fused_eval_enabled() -> bool {
 }
 
 fn resolve_fused_eval_enabled() -> bool {
+    // Native prototype B, when present, is the population engine on THIS build:
+    // `try_evaluate_population_cuda` returns B's result before any cubecl code
+    // runs, for every lane (GA, MC quality screen, walk-forward, CPCV). So the
+    // fused cubecl path has nothing to accelerate here — and standing up its
+    // CUDA client would allocate a memory pool sized from `vram_budget_mb`
+    // (~60% of the card) that B never gets back. Measured 2026-08-09 on a 3090:
+    // the fused probe held ~17 GB of 24, prototype B then read only ~7 GB free,
+    // its `event_capacity` reported "no room for events", and every validation
+    // batch fell back to the CPU — the card sat at 0% for a 96-minute run.
+    // Skip the probe (and therefore the pool) entirely when B is available.
+    // This wins over the env override below: forcing the fused path on cannot
+    // make it reachable while B short-circuits, so honouring the override would
+    // only re-introduce the starvation for a path that never executes.
+    #[cfg(feature = "gpu-b-adapter")]
+    {
+        if crate::gpu_native::prototype_b_population_eval::prototype_b_available() {
+            tracing::info!(
+                target: "neoethos_search::cubecl_eval",
+                "fused VRAM-resident eval left OFF — native prototype B is the population engine on this build; not creating a cubecl client whose VRAM pool would starve it (measured: B saw only ~7 GB of 24, ran the whole validation on the CPU)"
+            );
+            return false;
+        }
+    }
     if let Ok(raw) = std::env::var("NEOETHOS_GPU_FUSED_EVAL") {
         let v = raw.trim();
         let on = v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on");
