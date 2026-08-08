@@ -363,6 +363,11 @@ models:
   global_train_ratio: 0.8
   train_holdout_pct: 0.2
   label_use_triple_barrier: true
+  # Label bracket geometry: "symmetric" (default — equal target/stop
+  # distances, cost charged both ways, ~50/50 class prior on real bars) or
+  # "asymmetric" (legacy 40-pip target vs 20-pip stop; manufactures a 66/34
+  # prior — comparison runs only).
+  label_geometry: symmetric
   label_horizon_bars: 0
   label_neutral_band_atr_fraction: 0.25
   label_stop_atr_multiplier: 0.0

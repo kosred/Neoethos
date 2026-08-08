@@ -23,6 +23,25 @@ pub struct TrainingRuntimeProfile {
     pub effective_label_horizon_bars: usize,
     pub meta_label_max_hold_bars: usize,
     pub label_use_triple_barrier: bool,
+    /// Resolved bracket geometry the labels were derived under (2026-08-08):
+    /// `"symmetric"` (equal distances, cost charged both ways) or
+    /// `"asymmetric"` (legacy 2:1 long bracket). Together with the resolved
+    /// distances below, this lets a model NAME the labels it was trained on —
+    /// artifacts from the two geometries answer different questions and must
+    /// never be compared as if they answered the same one. Old profiles
+    /// predate the field and deserialize as `"unrecorded"`, which is itself
+    /// information: their labels were the asymmetric 66/34 geometry.
+    #[serde(default = "unrecorded_label_geometry")]
+    pub label_geometry: String,
+    /// Fixed floor for the stop-side distance, in price, after clamps.
+    #[serde(default)]
+    pub label_fixed_stop: f64,
+    /// Fixed floor for the target-side distance, in price, after clamps.
+    #[serde(default)]
+    pub label_fixed_target: f64,
+    /// Target floor as a multiple of the per-bar stop (1.0 = no rr push).
+    #[serde(default)]
+    pub label_rr_floor: f64,
     pub higher_timeframes: Vec<String>,
     pub multi_resolution_enabled: bool,
     pub base_features_prefixed: bool,
@@ -59,6 +78,10 @@ pub struct TrainingRuntimeProfile {
     pub notes: Vec<String>,
 }
 
+fn unrecorded_label_geometry() -> String {
+    "unrecorded".to_string()
+}
+
 fn validate_training_runtime_profile(profile: &TrainingRuntimeProfile) -> Result<()> {
     if profile.model_name.trim().is_empty() {
         anyhow::bail!("training runtime profile model_name must not be empty");
@@ -88,6 +111,30 @@ fn validate_training_runtime_profile(profile: &TrainingRuntimeProfile) -> Result
     if profile.effective_label_horizon_bars < profile.label_horizon_bars {
         anyhow::bail!(
             "training runtime profile effective_label_horizon_bars must be >= label_horizon_bars"
+        );
+    }
+    // "unrecorded" is only legal when READING pre-2026-08-08 profiles; every
+    // newly written profile must name the geometry its labels used.
+    if !matches!(profile.label_geometry.as_str(), "symmetric" | "asymmetric") {
+        anyhow::bail!(
+            "training runtime profile label_geometry must be `symmetric` or `asymmetric`, got `{}`",
+            profile.label_geometry
+        );
+    }
+    for (field_name, value) in [
+        ("label_fixed_stop", profile.label_fixed_stop),
+        ("label_fixed_target", profile.label_fixed_target),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            anyhow::bail!(
+                "training runtime profile {field_name} must be finite and positive, got {value}"
+            );
+        }
+    }
+    if !profile.label_rr_floor.is_finite() || profile.label_rr_floor < 1.0 {
+        anyhow::bail!(
+            "training runtime profile label_rr_floor must be finite and >= 1.0, got {}",
+            profile.label_rr_floor
         );
     }
     if !(0.0..1.0).contains(&profile.holdout_pct) {
@@ -208,6 +255,10 @@ mod tests {
             effective_label_horizon_bars: 12,
             meta_label_max_hold_bars: 12,
             label_use_triple_barrier: true,
+            label_geometry: "symmetric".to_string(),
+            label_fixed_stop: 0.0020,
+            label_fixed_target: 0.0020,
+            label_rr_floor: 1.0,
             higher_timeframes: vec!["H1".to_string()],
             multi_resolution_enabled: true,
             base_features_prefixed: true,
