@@ -716,6 +716,21 @@ fn evaluate_population_b_batch(
     let stop_vol_fallback = crate::eval::normalized_stop_vol_mult(stop_vol_mult, n_genes);
     let stop_vol_mult = stop_vol_fallback.as_deref().unwrap_or(stop_vol_mult);
 
+    // And the same contract for timestamps: the CPU reference treats an empty
+    // slice as "no timestamps" (session spread profile off, gap detection off,
+    // entry/exit stamps zero — `use_timestamps` in `fast_evaluate_strategy_core`),
+    // and the CPCV gathered-fold lane passes exactly that. The device dataset has
+    // no empty-slice notion — `PopulationDatasetView::validate` demands one stamp
+    // per bar — so zeros go up instead. That is bit-identical, not approximate:
+    // the kernel's `timestamp_ms <= 0` guard resolves spread to the scalar, the
+    // gap kernel's `current > previous` never fires on equal stamps, and the
+    // trade stamps come back 0 exactly as the CPU's disabled path writes them.
+    // Before this shim every production CPCV fold eval was refused at upload and
+    // silently recomputed on the CPU — the card never saw the CPCV gate at all.
+    let timestamps_fallback: Option<Vec<i64>> =
+        if timestamps.is_empty() { Some(vec![0; bars]) } else { None };
+    let timestamps = timestamps_fallback.as_deref().unwrap_or(timestamps);
+
     // Identity is decided from the caller's slices, before anything is copied,
     // so a repeat call over the same bars costs a sampled hash instead of a
     // full rebuild of the dataset.
