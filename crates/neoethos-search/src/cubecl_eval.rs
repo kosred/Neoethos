@@ -3464,9 +3464,56 @@ fn fused_path_parity_holds<R: Runtime>(client: &ComputeClient<R>) -> Result<bool
 /// acceleration must happen automatically" — the probe reuses the same check the
 /// parity test asserts, so the fast path turns itself on wherever it is proven
 /// safe (e.g. the A6000) with zero tuning. Memoised: the probe runs once.
+/// The memoised fused-eval decision. Module-scope (not function-local) so the
+/// run profile can PEEK the decision that was actually made without forcing
+/// the probe — see [`fused_eval_decision_peek`].
+static FUSED_EVAL_DECISION: OnceLock<bool> = OnceLock::new();
+
 fn fused_eval_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(resolve_fused_eval_enabled)
+    *FUSED_EVAL_DECISION.get_or_init(resolve_fused_eval_enabled)
+}
+
+/// Non-forcing read of the fused-eval decision for the discovery run profile.
+/// `Some(x)` = the decision this process made (env override or auto-probe);
+/// `None` = the fused-eval path was never consulted, so it cannot have
+/// influenced the run. Deliberately does NOT call the resolver: profile
+/// capture must never launch GPU work as a side effect.
+pub(crate) fn fused_eval_decision_peek() -> Option<bool> {
+    FUSED_EVAL_DECISION.get().copied()
+}
+
+/// Serializable snapshot of the CUDA env-knob registry for the discovery run
+/// profile. Values come from the SAME memoised [`cuda_env_knobs`] the kernels
+/// read — the profile can therefore not disagree with the engine.
+#[derive(Debug, Clone)]
+pub(crate) struct CudaKnobsForProfile {
+    pub precision: String,
+    pub eval_kernel_enabled: bool,
+    pub backtest_kernel_enabled: bool,
+    pub eval_kernel_units: Option<u32>,
+    pub backtest_kernel_units: Option<u32>,
+    pub cuda_device_id: usize,
+}
+
+pub(crate) fn cuda_knobs_for_profile() -> CudaKnobsForProfile {
+    let knobs = cuda_env_knobs();
+    CudaKnobsForProfile {
+        precision: format!("{:?}", knobs.requested_precision),
+        eval_kernel_enabled: knobs.eval_kernel_enabled,
+        backtest_kernel_enabled: knobs.backtest_kernel_enabled,
+        eval_kernel_units: knobs.eval_kernel_units_override,
+        backtest_kernel_units: knobs.backtest_kernel_units_override,
+        cuda_device_id: knobs.cuda_device_id,
+    }
+}
+
+/// Non-forcing read of the installed hardware memory budgets for the run
+/// profile: `(host_budget_mb, vram_budget_mb, gpu_buffer_mb)`. `None` = the
+/// auto-tuner never ran in this process (budgets could not have shaped any
+/// windowing decision). Peek only — capturing a profile must not trigger the
+/// hardware probe.
+pub(crate) fn memory_budgets_for_profile() -> Option<(u64, u64, usize)> {
+    installed_memory_budgets().map(|b| (b.host_budget_mb, b.vram_budget_mb, b.gpu_buffer_mb))
 }
 
 fn resolve_fused_eval_enabled() -> bool {

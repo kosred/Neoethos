@@ -3,7 +3,7 @@ use neoethos_data::{FeatureFrame, Ohlcv};
 use rand::Rng;
 use std::sync::OnceLock;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct SmcSearchConfig {
     pub force_ratio: f64,
     pub min_flags: usize,
