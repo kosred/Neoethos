@@ -31,7 +31,6 @@ license = "AGPL-3.0-or-later"
 # the password check on auth.openai.com and hands us back a code.
 
 [dependencies]
-anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -44,7 +43,6 @@ reqwest.workspace = true
 # compiles standalone. `base64` 0.22 is the current stable major.
 sha2 = "0.10"
 base64 = "0.22"
-url = "2.5"
 # Loopback HTTP listener for the OAuth callback. We can't reuse axum
 # from neoethos-app (cyclic dep), so use a hand-rolled tiny listener
 # on a fresh tokio TcpListener. Total code is ~100 LOC.

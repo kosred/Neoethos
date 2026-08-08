@@ -43,12 +43,10 @@ gpu-apple = ["neoethos-app/gpu-apple"]
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
-anyhow = "1"
 # Native OS file picker for the Data Import "Browse…" button.
 rfd = "0.17"
 
@@ -61,4 +59,3 @@ rfd = "0.17"
 neoethos-data = { path = "../../crates/neoethos-data" }
 neoethos-core = { path = "../../crates/neoethos-core" }
 neoethos-app = { path = "../../crates/neoethos-app", default-features = false }
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }

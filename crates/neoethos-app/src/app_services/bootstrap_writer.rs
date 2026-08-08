@@ -90,4 +90,20 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
+
+    // Moved here from ctrader_bootstrap.rs in the 2026-08-08 dead-code purge:
+    // it pins THIS module's `bootstrap_vortex_path` layout, not the deleted
+    // chunked-bootstrap lane.
+    #[test]
+    fn target_path_uses_expected_layout() {
+        let path = bootstrap_vortex_path(Path::new("data"), "eurusd", "m15");
+
+        assert_eq!(
+            path,
+            PathBuf::from("data")
+                .join("symbol=EURUSD")
+                .join("timeframe=M15")
+                .join("data.vortex")
+        );
+    }
 }

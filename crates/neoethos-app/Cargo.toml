@@ -53,14 +53,8 @@ gpu-apple = ["gpu-vulkan"]
 [dependencies]
 tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
 tracing = "0.1.42"  # aligned with workspace.dependencies (2026-05-26)
-tracing-subscriber = "0.3.22"  # aligned with workspace.dependencies (2026-05-26)
 anyhow = "1.0.100"
 chrono = "0.4"
-# chrono-tz 0.10 — IANA zoneinfo tables for "America/New_York" / "US/Eastern"
-# so the ForexFactory parser can fold ET → UTC across DST without hand-rolling
-# "spring forward / fall back" logic. See `news_sources/forex_factory.rs`
-# `ff_date_time_to_unix_ms` for the call site.
-chrono-tz = "0.10"
 # keyring 3.6.3 — backend is OPT-IN per platform feature flag. Without these
 # features the crate falls back to an in-memory MockCredential that does not
 # persist anything (verified 2026-05-20 via --api-test on Windows: tokens
@@ -99,10 +93,8 @@ serde_yaml_ng = "0.10.0"
 # deserialize EVERY response. serde_repr round-trips u8/u16/u32
 # discriminants directly, matching the wire format.
 serde_repr = "0.1"
-toml = "0.8.20"
 dirs = "5.0.1"
 tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
-tokio-tungstenite = { version = "0.26.1", features = ["rustls-tls-native-roots"] }
 futures = "0.3.31"
 # **2026-05-25 — SSE push channel**: `BroadcastStream` adapter so
 # the `/live/spots/stream` SSE endpoint can wrap a
@@ -120,9 +112,6 @@ base64 = "0.22"
 # /diagnostics/bundle route to package log + config + sysinfo into a single
 # .zip that end users attach to support emails.
 zip = "7.2"
-# audit-fix F8: SecretString is the safe wrapper for string-shaped
-# secrets — see neoethos-core/Cargo.toml for the rationale.
-secrecy = "0.10"
 # rustls is already pulled in transitively by reqwest / tungstenite.
 # Keep a direct edge so cTrader code can install the process-level
 # CryptoProvider before tungstenite builds a ClientConfig; without this,
@@ -145,10 +134,6 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 # start reporting numbers from different code. See the long note there for why
 # 0.39 (windows 0.62 family + the Windows refresh_cpu_specifics perf fix).
 sysinfo = "0.39.6"
-
-
-
-polars = { version = "0.52.0", features = ["lazy", "dtype-full", "temporal", "timezones"] }
 
 # Our internal core engines
 neoethos-core = { path = "../neoethos-core" }
@@ -185,7 +170,6 @@ neoethos-models = { path = "../neoethos-models", default-features = true, featur
 # HTTP + crypto); the AI Helper proxies chat requests through the
 # operator's ChatGPT Plus/Pro subscription.
 neoethos-codex = { path = "../neoethos-codex" }
-ndarray = "0.17.2"
 clap = { version = "4.6.0", features = ["derive"] }
 num_cpus = "1.17.0"
 # Native folder-picker for the "Browse..." button on the data-bootstrap
@@ -193,19 +177,8 @@ num_cpus = "1.17.0"
 # this file (each platform gets the minimum feature set it needs, so
 # a Linux build never pulls libgtk-3-dev and a Windows build never
 # pulls the GTK glue).
-# Risk-state signatures use SHA-256. RustCrypto `sha2` is the canonical
-# pure-Rust implementation; `hex` is the minimal lowercase-hex encoder.
-sha2 = "0.10"
+# `hex` is the minimal lowercase-hex encoder.
 hex = "0.4"
-# Bounded multi-producer/multi-consumer channel used to bridge the
-# cTrader streaming worker thread and server-side broker-control sinks.
-# Crossbeam (vs. `std::sync::mpsc`) gives us a `Sender` that is
-# `Send + Sync + Clone` without a `Mutex` wrapper, which is what the
-# `OnceLock`-backed global broker-control sink in `broker_control.rs`
-# needs so the streaming worker can write without contending on a mutex.
-# Version 0.5.15 matches the transitive resolution already present in
-# `Cargo.lock` - no version drift.
-crossbeam-channel = "0.5.15"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

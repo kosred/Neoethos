@@ -2691,20 +2691,6 @@ where
     ))
 }
 
-// Signal-only GPU path: kept for a future "GPU signals + CPU backtest" hybrid
-// lane. The current hybrid uses the full-eval kernel, so these are unused today.
-#[allow(dead_code)]
-fn materialize_i8_rows(flat: &[i32], n_genes: usize, n_samples: usize) -> Vec<Vec<i8>> {
-    flat.chunks(n_samples)
-        .take(n_genes)
-        .map(|row| {
-            row.iter()
-                .map(|value| (*value).clamp(-1, 1) as i8)
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
 fn try_generate_signal_flat_cuda(
     indicators: ArrayView2<'_, f32>,
     gene_offsets: &[i32],
@@ -2812,37 +2798,6 @@ fn try_generate_signal_flat_cuda(
         gate_threshold,
     )
     .context("launch fp32 cuda evaluator signal kernel")
-}
-
-#[allow(dead_code)] // signal-only GPU path; see materialize_i8_rows note above
-pub(crate) fn try_generate_signal_rows_cuda(
-    indicators: ArrayView2<'_, f32>,
-    gene_offsets: &[i32],
-    gene_indices: &[i32],
-    gene_weights: &[f32],
-    long_thr: &[f32],
-    short_thr: &[f32],
-    smc_data: &[SmcRow],
-    gene_smc_flags: &[SmcRow],
-    gate_threshold: f32,
-    smc_weights: &[f32; SMC_WIDTH],
-) -> Result<Vec<Vec<i8>>> {
-    let n_genes = long_thr.len();
-    let n_samples = indicators.ncols();
-    let (flat, _conf) = try_generate_signal_flat_cuda(
-        indicators,
-        gene_offsets,
-        gene_indices,
-        gene_weights,
-        long_thr,
-        short_thr,
-        smc_data,
-        gene_smc_flags,
-        gate_threshold,
-        smc_weights,
-        None,
-    )?;
-    Ok(materialize_i8_rows(&flat, n_genes, n_samples))
 }
 
 fn saturating_i32(value: i64) -> i32 {

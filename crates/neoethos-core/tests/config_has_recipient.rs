@@ -72,11 +72,18 @@ const UNWIRED: &[(&str, &str)] = &[
 const TEST_FIXTURE_ONLY: &[(&str, &str)] = &[
     (
         "perplexity_enabled",
-        "read only by AppState::new, which app_state.rs documents as \"the \
-         legacy egui state struct retained as the wide test fixture\"",
+        "last reader (the legacy egui AppState::new test fixture) was deleted \
+         in the 2026-08-08 dead-code purge; with it, core NewsFilter lost its \
+         only non-core-test constructor — DELETE-or-WIRE candidate",
     ),
-    ("news_lookahead_minutes", "same AppState::new test fixture"),
-    ("news_kill_window_min", "same AppState::new test fixture"),
+    (
+        "news_lookahead_minutes",
+        "same — reader deleted with the AppState fixture (2026-08-08 purge)",
+    ),
+    (
+        "news_kill_window_min",
+        "same — reader deleted with the AppState fixture (2026-08-08 purge)",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {

@@ -785,7 +785,7 @@ dependencies = [
  "sha1",
  "sync_wrapper",
  "tokio",
- "tokio-tungstenite 0.29.0",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -1248,7 +1248,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "tokio",
- "tokio-tungstenite 0.29.0",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "tracing-core",
@@ -1522,7 +1522,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "tokio",
- "tokio-tungstenite 0.29.0",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing-core",
  "tracing-subscriber",
@@ -7089,15 +7089,12 @@ dependencies = [
  "base64 0.22.1",
  "cc",
  "chrono",
- "chrono-tz",
  "clap",
- "crossbeam-channel",
  "dirs 5.0.1",
  "feed-rs",
  "futures",
  "hex",
  "keyring",
- "ndarray 0.17.2",
  "neoethos-codex",
  "neoethos-core",
  "neoethos-data",
@@ -7106,28 +7103,22 @@ dependencies = [
  "neoethos-trader",
  "num_cpus",
  "open",
- "polars",
  "protobuf",
  "protoc-bin-vendored",
  "rand 0.9.4",
  "reqwest 0.13.4",
  "rfd",
  "rustls",
- "secrecy",
  "serde",
  "serde_json",
  "serde_repr",
  "serde_yaml_ng",
- "sha2",
  "sysinfo 0.39.6",
  "tokio",
  "tokio-stream",
- "tokio-tungstenite 0.26.2",
- "toml 0.8.23",
  "tower",
  "tower-http",
  "tracing",
- "tracing-subscriber",
  "tungstenite 0.28.0",
  "url",
  "zip 7.2.0",
@@ -7157,7 +7148,6 @@ dependencies = [
 name = "neoethos-codex"
 version = "0.5.6"
 dependencies = [
- "anyhow",
  "base64 0.22.1",
  "chrono",
  "directories",
@@ -7169,7 +7159,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -7228,18 +7217,15 @@ dependencies = [
 name = "neoethos-desktop"
 version = "0.5.6"
 dependencies = [
- "anyhow",
  "log",
  "neoethos-app",
  "neoethos-core",
  "neoethos-data",
  "rfd",
  "serde",
- "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-log",
- "tokio",
 ]
 
 [[package]]
@@ -7332,14 +7318,12 @@ name = "neoethos-trader"
 version = "0.5.6"
 dependencies = [
  "anyhow",
- "chrono",
  "ndarray 0.17.2",
  "neoethos-data",
  "neoethos-models",
  "neoethos-search",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -12859,22 +12843,6 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
-version = "0.26.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
-dependencies = [
- "futures-util",
- "log",
- "rustls",
- "rustls-native-certs",
- "rustls-pki-types",
- "tokio",
- "tokio-rustls",
- "tungstenite 0.26.2",
-]
-
-[[package]]
-name = "tokio-tungstenite"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
@@ -13292,25 +13260,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "tungstenite"
-version = "0.26.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.9.4",
- "rustls",
- "rustls-pki-types",
- "sha1",
- "thiserror 2.0.18",
- "utf-8",
-]
 
 [[package]]
 name = "tungstenite"

@@ -384,16 +384,6 @@ impl AppApiState {
         self.inner.read().await.account.clone()
     }
 
-    /// Blocking-thread variant of [`account`] for callers that run
-    /// inside `tokio::task::spawn_blocking` and cannot `.await`.
-    /// Safe to call only from a thread that does NOT hold a tokio
-    /// reactor — calling this on the reactor thread would deadlock
-    /// the RwLock.
-    #[allow(dead_code)]
-    pub fn account_blocking(&self) -> Option<AccountSnapshotPayload> {
-        self.inner.blocking_read().account.clone()
-    }
-
     /// Overwrite the cached snapshot AND publish to the broadcast
     /// channel so any subscribed SSE clients receive the new state
     /// immediately. Called from the bridge polling loop on every
@@ -470,7 +460,6 @@ impl AppApiState {
         match kind {
             JobKind::Discovery => inner.discovery.state,
             JobKind::Training => inner.training.state,
-            JobKind::Bootstrap => EngineRunState::Idle,
         }
     }
 
@@ -480,20 +469,18 @@ impl AppApiState {
         match kind {
             JobKind::Discovery => inner.discovery.summary.clone(),
             JobKind::Training => inner.training.summary.clone(),
-            JobKind::Bootstrap => String::new(),
         }
     }
 
     /// F-340 (Feature #14): read the live progress triple
     /// `(stage, percent, counters)` for the given engine. Returns
-    /// `("", 0.0, [])` for the Bootstrap variant (it has no slot) and
-    /// for any engine that is idle / has been reset on terminal.
+    /// `("", 0.0, [])` for any engine that is idle / has been reset
+    /// on terminal.
     pub async fn engine_progress(&self, kind: JobKind) -> (String, f64, Vec<(String, u64)>) {
         let inner = self.inner.read().await;
         let slot = match kind {
             JobKind::Discovery => &inner.discovery,
             JobKind::Training => &inner.training,
-            JobKind::Bootstrap => return (String::new(), 0.0, Vec::new()),
         };
         (slot.stage.clone(), slot.percent, slot.counters.clone())
     }
@@ -506,7 +493,6 @@ impl AppApiState {
         let slot = match kind {
             JobKind::Discovery => &mut inner.discovery,
             JobKind::Training => &mut inner.training,
-            JobKind::Bootstrap => return,
         };
         slot.state = EngineRunState::Running;
         slot.cancel = Some(cancel);
@@ -520,7 +506,6 @@ impl AppApiState {
         let slot = match kind {
             JobKind::Discovery => &mut inner.discovery,
             JobKind::Training => &mut inner.training,
-            JobKind::Bootstrap => return,
         };
         slot.state = state;
         if !summary.is_empty() {
@@ -559,7 +544,6 @@ impl AppApiState {
         let slot = match kind {
             JobKind::Discovery => &mut inner.discovery,
             JobKind::Training => &mut inner.training,
-            JobKind::Bootstrap => return,
         };
         slot.stage = stage;
         slot.percent = percent.clamp(0.0, 1.0);
@@ -574,7 +558,6 @@ impl AppApiState {
         let slot = match kind {
             JobKind::Discovery => &mut inner.discovery,
             JobKind::Training => &mut inner.training,
-            JobKind::Bootstrap => return,
         };
         if matches!(slot.state, EngineRunState::Running) {
             slot.state = EngineRunState::Idle;
@@ -590,7 +573,6 @@ impl AppApiState {
         let slot = match kind {
             JobKind::Discovery => &inner.discovery,
             JobKind::Training => &inner.training,
-            JobKind::Bootstrap => return false,
         };
         if let Some(cancel) = &slot.cancel {
             cancel.request();

@@ -21,8 +21,6 @@ pub mod ctrader_live_auth;
 pub mod ctrader_messages;
 pub mod ctrader_money;
 pub mod ctrader_openapi;
-pub mod ctrader_proto_messages;
-pub mod ctrader_state_machine;
 pub mod ctrader_tls;
 pub mod discovery;
 pub mod broker_api;
@@ -66,36 +64,12 @@ pub mod validation;
 
 use crate::app_services::jobs::JobSnapshot;
 
+// 2026-08-08 dead-code purge: the CTraderConnectUpdated / BootstrapUpdated /
+// ConnectOutcome / ChartDataUpdated / BackgroundTaskPanic variants (all
+// #[allow(dead_code)] leftovers of the removed legacy TradingSession event
+// bus) had zero construct and zero match sites repo-wide and were deleted.
 #[derive(Debug, Clone)]
 pub enum ServiceEvent {
     DiscoveryUpdated(JobSnapshot),
     TrainingUpdated(JobSnapshot),
-    // Was sent by the now-removed legacy TradingSession connect path; retained
-    // as the event-bus shape pending Flutter live-status wiring.
-    #[allow(dead_code)]
-    CTraderConnectUpdated(crate::app_services::ctrader_account::CTraderAccountRuntimeSnapshot),
-    // Was sent by the now-removed legacy TradingSession bootstrap path; retained
-    // as the event-bus shape for the future bootstrap-progress UI.
-    #[allow(dead_code)]
-    BootstrapUpdated(JobSnapshot),
-    // Was sent by the now-removed legacy TradingSession connect path; retained
-    // as the event-bus shape until the Flutter UI subscribes for live status.
-    #[allow(dead_code)]
-    ConnectOutcome(Result<String, String>),
-    /// Background chart-data fetch completed. The UI should refresh the
-    /// chart panel without blocking the render thread on WebSocket I/O.
-    // Was constructed by the now-removed legacy TradingSession chart fetcher;
-    // retained as the event-bus shape until the Flutter chart panel reads it.
-    #[allow(dead_code)]
-    ChartDataUpdated(Box<crate::app_services::trading_types::MarketChartSnapshot>),
-    /// A background OS thread panicked, caught inside the worker so the
-    /// process is not killed — but the operator MUST see it rather than have
-    /// the join handle silently discarded (which once left the UI showing
-    /// "Running…" forever). Retained as the event-bus shape from the
-    /// now-removed legacy background-task spawner.
-    #[allow(dead_code)]
-    BackgroundTaskPanic {
-        task: String,
-        message: String,
-    },
 }

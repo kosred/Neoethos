@@ -656,58 +656,12 @@ fn auth_token_error_classifier_rejects_unrelated_codes() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// cTrader native Protobuf wire-codec + transport-selector tests.
+// cTrader transport-selector tests. No network calls.
 //
-// Covers the length-prefix framing codec (ctrader_proto_messages) + the
-// transport-selector env-var contract. No network calls.
-// See `docs/audits/research/ctrader_api_full_reference.md` §10 item #3
-// for the migration scope (reconcile + historical bars).
+// (2026-08-08 dead-code purge: the ctrader_proto_messages length-prefix
+// framing codec and its pinning test were deleted — the module had no
+// non-test consumer; the live transport is JSON-WSS.)
 // ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn protobuf_transport_length_prefix_round_trips_for_reconcile_request() {
-    use crate::app_services::ctrader_proto_messages::{
-        build_reconcile_req_proto, parse_proto_message, read_length_prefixed_frame,
-    };
-
-    // Build a framed reconcile request through the public Protobuf
-    // length-prefix codec (the 4-byte big-endian prefix + serialised
-    // ProtoMessage envelope on the wire).
-    let framed = build_reconcile_req_proto(
-        9_999_001,
-        true,
-        Some("reconcile-codec-roundtrip-1".to_string()),
-    )
-    .expect("framed reconcile request must build");
-
-    // The wire format is 4-byte big-endian length prefix + serialised
-    // ProtoMessage envelope (spec §1.5). Round-trip through the reader
-    // codec to recover the envelope.
-    let mut cursor = std::io::Cursor::new(framed.clone());
-    let envelope_bytes =
-        read_length_prefixed_frame(&mut cursor).expect("frame reader must decode the prefix");
-
-    // The length prefix is 4 bytes — payload size = total - 4.
-    assert_eq!(
-        envelope_bytes.len(),
-        framed.len() - 4,
-        "decoded envelope size must equal framed size minus the 4-byte length prefix"
-    );
-
-    // Parse the envelope and verify the payloadType is reconcile-request
-    // (2124) and the client_msg_id round-trips.
-    let envelope =
-        parse_proto_message(&envelope_bytes).expect("envelope bytes must parse as ProtoMessage");
-    let view = envelope.as_view();
-    assert_eq!(
-        view.payloadType(),
-        CTRADER_OA_RECONCILE_REQUEST_PAYLOAD_TYPE
-    );
-    assert_eq!(
-        view.clientMsgId().to_string(),
-        "reconcile-codec-roundtrip-1"
-    );
-}
 
 #[test]
 fn transport_selector_picks_json_wss_by_default() {
