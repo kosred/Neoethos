@@ -475,6 +475,9 @@ export type SettingsUpdate = {
   riskyHorizonDays?: number;
   // Discovery search knobs (models.prop_search_*)
   searchPopulation?: number;
+  // SEARCH-MORE knob: true + CUDA card raises the GA population to the card's
+  // fits ceiling (max 16384) at run start. Changes what is searched.
+  searchPopulationAuto?: boolean;
   searchGenerations?: number;
   searchMaxHours?: number;
   searchMaxIndicators?: number;

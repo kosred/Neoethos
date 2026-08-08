@@ -69,6 +69,10 @@ pub struct SettingsDto {
     // Surfaced (2026-06-01) so the UI/CLI can tune search depth — the
     // operator's L40 VPS vs local budget — without hand-editing raw YAML.
     pub search_population: usize,
+    /// SEARCH-MORE knob: `true` + CUDA card raises the GA population to the
+    /// card's fits ceiling (≤16384) at run start, loudly logged. Changes what
+    /// is searched, not just how fast.
+    pub search_population_auto: bool,
     pub search_generations: usize,
     pub search_max_hours: f64,
     pub search_max_indicators: usize,
@@ -112,6 +116,7 @@ pub struct SettingsUpdateDto {
     pub news_trading_mode: Option<String>,
     // Discovery search knobs (models.prop_search_*) — all optional.
     pub search_population: Option<usize>,
+    pub search_population_auto: Option<bool>,
     pub search_generations: Option<usize>,
     pub search_max_hours: Option<f64>,
     pub search_max_indicators: Option<usize>,
@@ -502,6 +507,9 @@ pub async fn update_settings(
     if let Some(v) = payload.search_population {
         settings.models.prop_search_population = v.max(10);
     }
+    if let Some(b) = payload.search_population_auto {
+        settings.models.prop_search_population_auto = b;
+    }
     if let Some(v) = payload.search_generations {
         settings.models.prop_search_generations = v.max(1);
     }
@@ -584,6 +592,7 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         news_trading_mode: mode.as_str().to_string(),
         news_trading_mode_display_name: mode.display_name().to_string(),
         search_population: settings.models.prop_search_population,
+        search_population_auto: settings.models.prop_search_population_auto,
         search_generations: settings.models.prop_search_generations,
         search_max_hours: settings.models.prop_search_max_hours,
         search_max_indicators: settings.models.prop_search_max_indicators,

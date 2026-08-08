@@ -116,6 +116,7 @@ models:
     prefilter_insample_frac: 0.80   # automatic 80/20 in-sample/out-of-sample validation split
     prefilter_min_per_timeframe: 6
   prop_search_population: 200  # 2026-06-06 operator: 100->200 per-island (200 × 8 islands = 1600 total) — MORE breadth/diversity per generation → finds more of the rare low-DD regime-specialist genes (the deep experiment found maxDD 2.7-4.5% vs 7-9.5% shallow).
+  prop_search_population_auto: false  # SEARCH-MORE knob (2026-08-08): true + CUDA card => GA population is raised to the card's fits ceiling (min prop_search_population, max 16384), loudly logged. Changes what is searched — flip only after scripts/population-experiment.sh has settled that bigger finds better.
   prop_search_generations: 20000  # 2026-06-06 operator: 1000->20000 — deep GA. Time-bounded by max_hours (binds first on big TFs); on small/fast TFs lets the GA search far deeper than the old 1000 cap.
   prop_search_max_hours: 1.0  # 2026-06-06 operator: 0.5->1.0 — a full hour of deep search per combo (the experiment used 1h and found notably better genes). NOTE: a full 126-combo library run at 1h/combo exceeds current VPS credit — for the full library, add credit or lower this. Re-read per combo.
   prop_search_max_rows: 0  # operator 2026-06-05: NO cap — use ALL data per file (400k cut M1 to ~9mo -> "not enough history" + capped depth). 0=full history. Per-TF override via prop_search_max_rows_by_tf (not hardcoded).

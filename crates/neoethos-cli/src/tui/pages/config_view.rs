@@ -58,6 +58,11 @@ pub fn make_config_form() -> FormState {
             "GA population per generation",
         ),
         Field::new(
+            "Population auto",
+            s.models.prop_search_population_auto.to_string(),
+            "true/false — true + CUDA card: raise population to the card's fits ceiling (max 16384). SEARCHES MORE; results differ",
+        ),
+        Field::new(
             "Generations",
             s.models.prop_search_generations.to_string(),
             "GA generations (also time-bounded by Max hours)",
@@ -172,6 +177,13 @@ pub fn save_config_form(form: &FormState) -> String {
         &mut changed,
         &mut rejected,
     );
+    apply_bool(
+        form,
+        "Population auto",
+        &mut s.models.prop_search_population_auto,
+        &mut changed,
+        &mut rejected,
+    );
     apply_usize(
         form,
         "Generations",
@@ -260,6 +272,31 @@ fn apply_usize(
             return;
         }
         match raw.parse::<usize>() {
+            Ok(v) if v != *dst => {
+                *dst = v;
+                *changed += 1;
+            }
+            Ok(_) => {}
+            Err(_) => rejected.push(label),
+        }
+    }
+}
+
+fn apply_bool(
+    form: &FormState,
+    label: &'static str,
+    dst: &mut bool,
+    changed: &mut usize,
+    rejected: &mut Vec<&'static str>,
+) {
+    if let Some(raw) = form.value_for(label) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return;
+        }
+        // Only the two words the field displays — a typo must be rejected, not
+        // silently coerced to false.
+        match raw.to_ascii_lowercase().parse::<bool>() {
             Ok(v) if v != *dst => {
                 *dst = v;
                 *changed += 1;

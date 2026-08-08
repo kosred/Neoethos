@@ -211,6 +211,7 @@ const GROUPS: Group[] = [
     title: "Discovery search",
     fields: [
       { key: "searchPopulation", label: "Population", kind: "num", help: "GA population size per generation. Bigger = wider search, slower." },
+      { key: "searchPopulationAuto", label: "Population auto (GPU)", kind: "bool", help: "ON + NVIDIA card: raise the GA population to what the card fits in one launch (max 16384), logged at run start. SEARCHES MORE — different candidates, different results. Leave OFF until the population experiment settles that bigger finds better." },
       { key: "searchGenerations", label: "Generations", kind: "num", help: "Max GA generations (early-stop applies). Bigger = deeper search." },
       { key: "searchMaxHours", label: "Max hours", kind: "num", step: 0.5, help: "Wall-clock cap per (symbol, timeframe) unit before it advances to the next." },
       { key: "searchMaxIndicators", label: "Max indicators", kind: "num", help: "Max indicators a single gene may combine." },

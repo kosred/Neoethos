@@ -81,6 +81,27 @@ fn candidates_that_fit(device: usize, bars: usize, feature_count: usize) -> Opti
     )
 }
 
+/// The largest candidate count worth putting in ONE submission to this engine,
+/// for callers that pick their own chunk size before calling the evaluator.
+///
+/// This is a BATCHING number, never a search number: genes are independent, so
+/// any chunking of a population produces bit-identical per-gene metrics — the
+/// only thing a caller changes by consulting this is how many launches the work
+/// takes. The quality screen used a constant 256 here, which ran the card at
+/// ~42 M candidate-bars/s where a launch sized to this ceiling sustains
+/// 843-966 M (measured 2026-08, RTX 3090, populations 16 384 / 131 072).
+///
+/// `None` means "no card, or its free memory cannot be read" — the caller keeps
+/// whatever conservative constant it had, and nothing about the run changes.
+/// The evaluator below still re-checks and splits on its own, so a stale answer
+/// here costs one split, never an OOM.
+pub(crate) fn submission_ceiling(device: usize, bars: usize, feature_count: usize) -> Option<usize> {
+    if !prototype_b_available() {
+        return None;
+    }
+    candidates_that_fit(device, bars, feature_count)
+}
+
 /// The arithmetic, separated from the device query so it can be checked without
 /// a card. The numbers it produces decide whether a run uses the GPU at all.
 fn candidates_for_free_memory(free: u64, bars: usize, feature_count: usize) -> Option<usize> {

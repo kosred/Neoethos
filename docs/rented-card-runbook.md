@@ -89,6 +89,12 @@ Compare candidate counts, GPU utilisation (`nvidia-smi dmon -s u` in a second
 shell, logged), and wall time. Run 2 SEARCHES MORE — it is not just faster;
 its results are expected to differ.
 
+For the CONTROLLED version of this comparison — three arms (pop 100 seed A /
+pop 4096 seed A / pop 100 seed B), deterministic GA seeds, config backup and
+restore, per-arm artifact snapshots, and a pre-registered verdict rule for
+"was population ever the constraint" — use `scripts/population-experiment.sh`.
+It refuses to start while anything else occupies the card.
+
 ## Phase 4 — model training with the fixed libraries (1-2 h)
 
 Everything is on master now — LightGBM CUDA learner + OpenMP,
