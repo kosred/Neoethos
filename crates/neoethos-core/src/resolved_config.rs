@@ -83,6 +83,12 @@ pub struct ResolvedSearchConfig {
     pub candidate_count_raw: usize,
     pub candidate_count_resolved: usize,
     pub population: usize,
+    /// The SEARCH-MORE knob. `true` + CUDA card: discovery raises the GA
+    /// population to the card's fits ceiling (≤ 16 384, never below
+    /// `population`) at run start and logs the resolved value. The ceiling
+    /// depends on the device and dataset, so it cannot be shown here — the
+    /// run's own log line is the record of what actually searched.
+    pub population_auto: bool,
     pub generations: usize,
     pub portfolio_size: usize,
     pub min_trades_per_day_raw: f64,
@@ -283,7 +289,16 @@ impl ResolvedConfig {
             s.models.prop_search_population.to_string(),
             s.models.prop_search_population.max(10).to_string(),
             ResolvedSource::Config,
-            None,
+            Some("floor 10; population_auto=true raises it at run start"),
+        );
+        push_field(
+            &mut display_fields,
+            "search",
+            "population_auto",
+            s.models.prop_search_population_auto.to_string(),
+            s.models.prop_search_population_auto.to_string(),
+            ResolvedSource::Config,
+            Some("true + CUDA card: GA population raised to the card's fits ceiling (≤16384) — SEARCHES MORE, results differ; run log records the resolved value"),
         );
         push_field(
             &mut display_fields,
@@ -415,6 +430,7 @@ impl ResolvedConfig {
                 candidate_count_raw,
                 candidate_count_resolved,
                 population: s.models.prop_search_population.max(10),
+                population_auto: s.models.prop_search_population_auto,
                 generations: s.models.prop_search_generations.max(1),
                 portfolio_size: s.models.prop_search_portfolio_size.max(1),
                 min_trades_per_day_raw,

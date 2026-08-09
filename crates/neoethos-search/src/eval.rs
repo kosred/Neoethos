@@ -1753,6 +1753,55 @@ fn eval_gpu_devices() -> Vec<usize> {
         .unwrap_or_default()
 }
 
+/// The largest population worth submitting to [`validation_backtest_population`]
+/// in ONE call, derived from the card's free memory — or `None` when no card
+/// will take the work (no device, kernels disabled, integrated-only, or the
+/// build has no native engine).
+///
+/// This is the batching/search separation made callable. A SUBMISSION size is
+/// free to change: genes are independent, chunk boundaries do not appear in any
+/// per-gene metric, and the evaluator re-checks and splits internally anyway.
+/// A POPULATION (the GA's) is not free to change: it decides which candidates
+/// exist at all. Callers of this function are only ever choosing a submission
+/// size; the GA population must come from config
+/// (`models.prop_search_population` / `prop_search_population_auto`), where
+/// raising it is a deliberate, logged, selection-changing act.
+#[cfg(feature = "gpu")]
+pub fn gpu_submission_ceiling(bars: usize, feature_count: usize) -> Option<usize> {
+    // Same gate as the dispatch path below: when the gate is closed every
+    // population runs on the CPU, where chunk size only bounds host memory —
+    // report None so callers keep their conservative constants.
+    if !cuda_eval_signal_kernel_enabled()
+        || !cuda_eval_backtest_kernel_enabled()
+        || integrated_gpu_eval_disabled()
+    {
+        return None;
+    }
+    #[cfg(feature = "gpu-b-adapter")]
+    {
+        let device = eval_gpu_devices().first().copied().unwrap_or(0);
+        crate::gpu_native::prototype_b_population_eval::submission_ceiling(
+            device,
+            bars,
+            feature_count,
+        )
+    }
+    #[cfg(not(feature = "gpu-b-adapter"))]
+    {
+        // The CubeCL lane has no published fits arithmetic; a wrong guess here
+        // would be worse than the callers' existing constants.
+        let _ = (bars, feature_count);
+        None
+    }
+}
+
+/// Non-GPU build: there is no card, so there is no ceiling — callers keep their
+/// CPU-sized constants and the build compiles the same call sites unchanged.
+#[cfg(not(feature = "gpu"))]
+pub fn gpu_submission_ceiling(_bars: usize, _feature_count: usize) -> Option<usize> {
+    None
+}
+
 /// Materialise the optional `stop_vol_mult` contract into a full-length slice.
 ///
 /// The field is documented as optional: an empty slice means every gene uses

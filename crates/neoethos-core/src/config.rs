@@ -562,6 +562,21 @@ pub struct ModelsConfig {
     pub evo_sigma: f64,
     pub prop_search_enabled: bool,
     pub prop_search_population: usize,
+    /// Size the GA population from the card instead of from
+    /// `prop_search_population`.
+    ///
+    /// This is the SEARCH-MORE knob, and it is the opposite of a batching
+    /// knob: a bigger GA population evaluates DIFFERENT candidates and
+    /// selects different survivors — it changes results on purpose. When
+    /// `true` and a CUDA card is present, discovery raises the population to
+    /// the card's fits ceiling (never above 16 384, never below
+    /// `prop_search_population`) and logs the resolved value. When no card
+    /// ceiling is readable, the configured population is kept and a warning
+    /// says so. Default `false`: exactly today's behaviour, because whether
+    /// a bigger search finds better strategies (rather than more of the
+    /// same) is an experiment, not an assumption — see
+    /// `scripts/population-experiment.sh`.
+    pub prop_search_population_auto: bool,
     pub prop_search_generations: usize,
     pub prop_search_max_hours: f64,
     pub prop_search_max_rows: usize,
@@ -1623,6 +1638,7 @@ impl Default for ModelsConfig {
             evo_sigma: 0.25,
             prop_search_enabled: false,
             prop_search_population: 100,
+            prop_search_population_auto: false,
             prop_search_generations: 50,
             prop_search_max_hours: 0.5, // 2026-06-05: sane default (was 8.0=absurd 8h/combo); config-overridable (VPS budget run uses 0.25)
             prop_search_max_rows: 0,

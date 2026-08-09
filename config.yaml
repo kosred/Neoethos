@@ -247,6 +247,13 @@ models:
   evo_sigma: 0.25
   prop_search_enabled: true
   prop_search_population: 200
+  # SEARCH-MORE knob (2026-08-08, default false = today's behaviour). When true
+  # and a CUDA card is present, discovery raises the GA population to the
+  # card's fits ceiling (min prop_search_population, max 16384) and logs the
+  # resolved value. This changes WHAT IS SEARCHED, not just how fast — flip it
+  # only after scripts/population-experiment.sh settles whether a bigger
+  # population finds better strategies or more of the same.
+  prop_search_population_auto: false
   prop_search_generations: 20000
   prop_search_max_hours: 1.0
   prop_search_max_rows: 0

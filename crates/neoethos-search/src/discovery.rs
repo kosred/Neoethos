@@ -226,6 +226,11 @@ pub struct DiscoveryConfig {
     pub evaluation_spread_pips: f64,
     pub evaluation_commission_per_trade: f64,
     pub population: usize,
+    /// When `true`, `run_search` raises the GA population to the card's fits
+    /// ceiling (bounded to 16 384, never below `population`) and logs the
+    /// resolved value as a selection-changing decision. `false` keeps
+    /// `population` exactly. From `models.prop_search_population_auto`.
+    pub population_auto: bool,
     pub generations: usize,
     pub max_indicators: usize,
     pub candidate_count: usize,
@@ -389,6 +394,7 @@ impl Default for DiscoveryConfig {
             evaluation_spread_pips: f64::NAN,
             evaluation_commission_per_trade: f64::NAN,
             population: 1000,
+            population_auto: false,
             generations: 10,
             max_indicators: 5,
             candidate_count: 5000,
@@ -524,6 +530,7 @@ impl DiscoveryConfig {
                 + settings.risk.slippage_pips.max(0.0),
             evaluation_commission_per_trade: settings.risk.commission_per_lot.max(0.0),
             population: model_settings.prop_search_population.max(10),
+            population_auto: model_settings.prop_search_population_auto,
             generations: model_settings.prop_search_generations.max(1),
             // P2 fix: `0` now means "use ALL available enabled features"
             // (sentinel value `usize::MAX` so downstream `min(n_features)`
@@ -3370,8 +3377,69 @@ where
             features.sample_window(stage1_start, stage1_end),
         ),
     };
+    // ── The search-more knob, resolved here and nowhere else ────────────────
+    //
+    // Population is NOT a batching parameter: a bigger one creates different
+    // candidates and selects different survivors. So it may only grow when the
+    // operator asked (`population_auto`), it is logged with both the configured
+    // and the resolved value, and it never shrinks below what was configured.
+    // The 16 384 bound is where the measured throughput curve flattens
+    // (843 M cand-bars/s at 16 384 vs 966 M at 131 072) and roughly the card's
+    // own fits ceiling at H1 bar counts — beyond it a generation splits into
+    // multiple launches for ~14 % more rate while multiplying the downstream
+    // validation funnel's work linearly.
+    let ga_population = if config.population_auto {
+        match crate::eval::gpu_submission_ceiling(
+            ohlcv_stage1.close.len(),
+            features_stage1.n_features(),
+        ) {
+            Some(fits) => {
+                let resolved = fits.min(16_384).max(config.population);
+                tracing::warn!(
+                    target: "neoethos_search::funnel",
+                    configured = config.population,
+                    card_fits = fits,
+                    resolved,
+                    "population_auto is ON — GA population sized from the card. \
+                     This SEARCHES MORE than the configured population: different \
+                     candidates, different survivors, different exports."
+                );
+                resolved
+            }
+            None => {
+                tracing::warn!(
+                    target: "neoethos_search::funnel",
+                    configured = config.population,
+                    "population_auto is ON but no card ceiling is readable \
+                     (no CUDA device, kernels disabled, or CPU build) — \
+                     keeping the configured population"
+                );
+                config.population
+            }
+        }
+    } else {
+        config.population
+    };
+    // Everything downstream of this point must see the RESOLVED population, or
+    // the artifacts this run writes from `config` (the search ledger at the
+    // end of this function records `config.population`) would describe a
+    // different search than the one that ran — the exact defect class this
+    // campaign exists to remove. `candidate_count` deliberately stays as
+    // configured: auto widens the SEARCH, not the validation funnel's budget.
+    // (The run profile written by callers still holds the caller's config;
+    // when auto engages, the log line above and the ledger are the record.)
+    let resolved_config_storage;
+    let config: &DiscoveryConfig = if ga_population != config.population {
+        resolved_config_storage = DiscoveryConfig {
+            population: ga_population,
+            ..config.clone()
+        };
+        &resolved_config_storage
+    } else {
+        config
+    };
     progress_fn(DiscoveryProgress::SearchStarted {
-        population: config.population,
+        population: ga_population,
         generations: config.generations,
         max_indicators: config.max_indicators,
     });
@@ -3385,7 +3453,7 @@ where
     let search = evolve_search_with_progress_and_limits(
         &features_stage1,
         &ohlcv_stage1,
-        config.population,
+        ga_population,
         config.generations,
         config.max_indicators,
         max_runtime,
@@ -4465,10 +4533,45 @@ where
         // `None` marks a candidate whose batch failed to evaluate: a real bug,
         // reported as such below, never silently counted as "zero profitable".
         const MC_CANDIDATES_PER_BATCH: usize = 256;
+        // Verbatim, NOT `.max(1)`-ed: `mc_runs == 0` is a degenerate config
+        // whose behaviour (zero perturbation runs per candidate) must not be
+        // changed by a batching edit. Only the chunk-size division guards it.
+        let mc_runs = config.mc_runs as usize;
+        // Size the submissions to the card instead of to the constant. The 256
+        // was a host-memory guess, and it half-loads the device: a 256-gene
+        // launch measured 42 M candidate-bars/s where a launch at the card's
+        // own fits ceiling (~17 k at H1 bar counts on 24 GB) sustains
+        // 843-966 M. This changes ONLY launch geometry: the MC perturbations
+        // are seeded per (combo, candidate, run) and genes are independent, so
+        // every per-candidate result is bit-identical for any chunking — the
+        // engine's internal splitter still guards a stale ceiling.
+        //
+        // The clamps are host-memory bounds: a chunk is `candidates × mc_runs`
+        // cloned genes (~1.3 KB each measured), so 1 024 candidates × 100 runs
+        // ≈ 130 MB of host clones is the most this will stage at once. No
+        // ceiling (no card / gate closed / CPU build) keeps the old constant,
+        // where chunking only bounds host memory.
+        let gpu_ceiling =
+            crate::eval::gpu_submission_ceiling(ohlcv.close.len(), features.n_features());
+        let mc_chunk_candidates = gpu_ceiling
+            .map(|fits| (fits / mc_runs.max(1)).clamp(1, 1_024))
+            .unwrap_or(MC_CANDIDATES_PER_BATCH);
+        let sensitivity_chunk = gpu_ceiling
+            .map(|fits| fits.clamp(MC_CANDIDATES_PER_BATCH, 65_536))
+            .unwrap_or(MC_CANDIDATES_PER_BATCH);
+        tracing::info!(
+            target: "neoethos_search::discovery",
+            candidates = pairs.len(),
+            mc_runs,
+            gpu_ceiling = gpu_ceiling.unwrap_or(0),
+            mc_chunk_candidates,
+            sensitivity_chunk,
+            "quality-screen submission sizes — batching only; per-candidate \
+             results are chunk-invariant"
+        );
         let mc_profitable_runs: Vec<Option<usize>> = {
-            let mc_runs = config.mc_runs as usize;
             let mut out: Vec<Option<usize>> = Vec::with_capacity(pairs.len());
-            for chunk in pairs.chunks(MC_CANDIDATES_PER_BATCH) {
+            for chunk in pairs.chunks(mc_chunk_candidates) {
                 // Building the perturbed clones is CPU work — every core does
                 // it while the device is busy with the previous chunk. Only the
                 // launch itself is serialized, because there is one card.
@@ -4577,7 +4680,7 @@ where
         // rejected as an error rather than read as "did not survive".
         let sensitivity_net_profit: Vec<Option<f64>> = {
             let mut out: Vec<Option<f64>> = Vec::with_capacity(pairs.len());
-            for chunk in pairs.chunks(MC_CANDIDATES_PER_BATCH) {
+            for chunk in pairs.chunks(sensitivity_chunk) {
                 let genes: Vec<Gene> = chunk.iter().map(|((_, gene), _)| gene.clone()).collect();
                 let mut settings = discovery_backtest_settings(
                     config,
