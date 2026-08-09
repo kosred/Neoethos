@@ -178,7 +178,23 @@ impl EvaluationBackend {
         if matches!(normalize(selected).as_str(), "cpu_forced" | "cpu-forced") {
             Ok(base)
         } else {
-            Ok(Self::GPU_REQUIRED)
+            // GPU_PREFERRED, deliberately NOT GPU_REQUIRED.
+            //
+            // `ForbidCpu` is a WHOLE-PIPELINE contract: `gpu_pipeline_preflight`
+            // demands every requested stage be strict-GPU capable, and 15 of
+            // them legitimately are not (GA selection/mutation/crossover,
+            // correlation pruning, survivor ranking, feature prep...). A real
+            // 3090 run with `ForbidCpu` therefore aborts before the first
+            // generation instead of using the card — measured on box 47260276.
+            //
+            // The population-eval guarantee does not come from this policy: it
+            // comes from `evaluate_population_core`, whose GPU lane returns Err
+            // on any fault and whose CPU tail refuses to run at all while
+            // prototype B is available. That guard covers the dispatch arm AND
+            // the callers that bypass dispatch (evaluate_genes -> regime_labels),
+            // so `Gpu + AllowCpu` here still cannot produce a silent CPU run —
+            // it just stops claiming the CPU-side stages must vanish.
+            Ok(Self::GPU_PREFERRED)
         }
     }
 
@@ -655,9 +671,20 @@ mod tests {
         for value in ["", "auto", "cpu", "off", "false", "gpu", "cuda"] {
             let backend =
                 EvaluationBackend::resolve_with_probe(value, "", None, card).expect("resolves");
+            assert_eq!(
+                backend.device,
+                DevicePreference::Gpu,
+                "on a card, `{value}` must resolve to a GPU device, not a silent CPU run"
+            );
+            // ...but NOT ForbidCpu: that is a whole-pipeline strict-GPU contract
+            // and `gpu_pipeline_preflight` rejects the 15 stages that are
+            // legitimately CPU-side (GA mutation/crossover, correlation pruning,
+            // survivor ranking), aborting a real card run before its first
+            // generation. The population-eval guarantee lives in
+            // `evaluate_population_core`'s tail guard instead.
             assert!(
-                backend.gpu_required(),
-                "on a card, `{value}` must resolve to GPU-required, not a silent CPU run"
+                backend.cpu_fallback_allowed(),
+                "escalation must not claim the whole pipeline is strict-GPU (`{value}`)"
             );
         }
 
@@ -673,10 +700,11 @@ mod tests {
 
         // The discovery-specific field also escalates on a card (it wins when
         // non-empty), and its `cpu_forced` escape is honored there too.
-        assert!(
+        assert_eq!(
             EvaluationBackend::resolve_with_probe("auto", "cpu", None, card)
                 .unwrap()
-                .gpu_required(),
+                .device,
+            DevicePreference::Gpu,
             "a shipped `models.prop_search_device: cpu` must not defeat the card"
         );
         assert_eq!(

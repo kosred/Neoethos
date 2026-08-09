@@ -2059,8 +2059,15 @@ pub fn evaluate_population_core(
     // slower. This closes the seam for EVERY caller of evaluate_population_core,
     // including the ones that bypass the backend dispatch (evaluate_genes ->
     // regime_labels), which the match arms cannot reach.
+    // The one exception is the deliberate `cpu_forced` escape: when the operator
+    // installed a CPU backend by name, running on the CPU is what was asked for,
+    // so the guard must not override it (this is also the only way a
+    // dispatch-bypassing caller can honour the escape at all).
     #[cfg(feature = "gpu-b-adapter")]
-    if crate::gpu_native::prototype_b_population_eval::prototype_b_available() {
+    if crate::gpu_native::prototype_b_population_eval::prototype_b_available()
+        && crate::backend::current_evaluation_backend().device
+            != crate::backend::DevicePreference::Cpu
+    {
         return Err(
             "a CUDA card + prototype B are present but the GPU population lane gate was \
              closed (kernel kill-switch / integrated-GPU verdict); refusing the silent CPU \
