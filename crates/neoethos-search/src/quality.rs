@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 /// and `NEOETHOS_BOT_TRADING_DAYS_PER_MONTH` env vars. Previously read inline
 /// inside monthly metric aggregation, both knobs change canonical strategy
 /// quality scoring, so they belong in typed runtime config.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct QualityRuntimeOverrides {
     /// Minimum number of trades a calendar month must contain to count
     /// toward `monthly_win_rate` / `avg_return_pct`.

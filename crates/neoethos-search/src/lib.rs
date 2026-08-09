@@ -31,6 +31,10 @@ pub mod discovery_ledger;
 pub mod backend;
 pub mod eval;
 pub mod eval_telemetry;
+// SLICE 5 (2026-08-08): ambient execution-environment snapshot for the
+// discovery run profile — every process-wide knob that can change what the
+// search selects, captured through the same accessors the engine reads.
+pub mod execution_profile;
 pub mod export_state;
 pub mod fx_rates;
 pub mod funnel_profile;
@@ -94,6 +98,8 @@ pub use discovery_ledger::{
     DiscoverySearchLedger, GeneRecord, SearchMetadata, ledger_path, load_prior_ledger,
     save_discovery_ledger, seed_seen_from_ledger,
 };
+pub use execution_profile::{ExecutionEnvironmentProfile, GpuLaneProfile};
+
 pub use eval::{
     BacktestMetrics, BacktestRuntimeOverrides, BacktestSettings,
     current_backtest_runtime_overrides, evaluate_population_core, fast_evaluate_strategy_core,

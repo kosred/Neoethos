@@ -36,7 +36,7 @@ use std::path::Path;
 /// and resolved by [`DiscoveryRuntimeOverrides::from_settings`]; the legacy
 /// [`DiscoveryRuntimeOverrides::from_env`] reader is retained for reference
 /// only — the discovery cycle no longer reads the environment for them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Stage1Window {
     /// Slice from the most recent rows. Captures the latest regime but is
     /// catastrophic if the caller passed full data including the held-out
@@ -58,7 +58,7 @@ impl Stage1Window {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct DiscoveryRuntimeOverrides {
     /// Maximum number of features to keep after the in-sample correlation
     /// prefilter. `0` disables the prefilter entirely.
@@ -353,7 +353,7 @@ pub struct DiscoveryConfig {
 }
 
 /// Configuration for the prop-firm window-pass gate.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PropFirmGateOverrides {
     pub rules: PropFirmRiskRules,
     pub n_windows: usize,
@@ -927,6 +927,15 @@ pub struct DiscoveryFilterProfile {
     pub opportunistic_max_dd: f64,
     pub log_trades: bool,
     pub trade_log_max: usize,
+    /// SLICE 5 (2026-08-08): the three `FilteringConfig` fields the profile
+    /// silently dropped before. `opportunistic_enabled` above remains the
+    /// legacy MERGED flag (`use_opportunistic_candidates && opportunistic_enabled`)
+    /// for consumers that already read it; the two raw flags are now also
+    /// recorded so the merge itself is auditable.
+    pub use_opportunistic_candidates_raw: bool,
+    pub opportunistic_enabled_raw: bool,
+    pub anomaly_guard: bool,
+    pub elite_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1066,6 +1075,65 @@ pub struct DiscoveryRunProfile {
     /// `LivePromotionGate::PromotionRejectedDeterminism` failures can
     /// be diagnosed without re-running.
     pub determinism_policy: DeterminismPolicy,
+    // ── SLICE 5 (2026-08-08): the config fields the profile silently ──────
+    // dropped before. `build_discovery_profile` now destructures
+    // `DiscoveryConfig` WITHOUT `..`, so adding a config field that skips
+    // this profile is a compile error, not a silent omission.
+    /// Cost basis the whole search was evaluated on. A profile without the
+    /// symbol/spread/commission cannot be compared across runs.
+    pub evaluation_symbol: String,
+    pub evaluation_account_currency: String,
+    pub evaluation_spread_pips: f64,
+    pub evaluation_commission_per_trade: f64,
+    /// Discovery regime (Strict / PropFirm / Risky) — changes filter floors,
+    /// ranking, and gates. Was NOT recorded before slice 5.
+    pub mode: DiscoveryMode,
+    /// Operator strategy-shape preference applied during candidate ranking.
+    pub target_profile: TargetProfile,
+    pub max_pbo: f64,
+    pub cpcv_max_rows: usize,
+    /// Resolved prop-firm window gate (None = gate off), and the raw config
+    /// params it was derived from.
+    pub prop_firm_gate: Option<PropFirmGateOverrides>,
+    pub prop_firm_gate_params: neoethos_core::config::PropFirmGateConfig,
+    pub require_walkforward_for_export: bool,
+    pub prop_firm_min_pass_rate: f64,
+    /// Sizing basis of the backtests the selection ran on.
+    pub initial_balance: f64,
+    pub risk_per_trade_min: f64,
+    pub risk_per_trade_max: f64,
+    pub risky_risk_band: Option<(f64, f64)>,
+    pub prop_firm_risk_band: Option<(f64, f64)>,
+    pub max_regime_loss_pct: f64,
+    /// Robustness screens (Monte-Carlo / sensitivity) parameters.
+    pub mc_runs: u32,
+    pub mc_min_profitable: u32,
+    pub sensitivity_spread_pips: f64,
+    pub sensitivity_commission_per_lot: f64,
+    /// Search-space shaping.
+    pub adaptive_thresholds: bool,
+    pub higher_timeframes: Vec<String>,
+    /// Sorted (BTreeMap) so two identical runs serialize byte-identically —
+    /// a HashMap here would make the profile JSON itself non-reproducible.
+    pub max_rows_by_timeframe: std::collections::BTreeMap<String, usize>,
+    pub stage1_window: Stage1Window,
+    pub min_history_years: u32,
+    /// Risky-mode compounding goal (ignored unless `mode == Risky`).
+    pub risky_start_balance: f64,
+    pub risky_target_balance: f64,
+    pub risky_horizon_days: f64,
+    /// Discovery ledger — CROSS-RUN search memory. When enabled, this run's
+    /// candidate generation was seeded by prior runs' seen-signatures, so an
+    /// identical-config re-run may legitimately explore differently unless
+    /// the ledger dir is cleared or pinned.
+    pub discovery_ledger_enabled: bool,
+    pub discovery_ledger_cache_dir: String,
+    pub discovery_ledger_archive_top_n: usize,
+    /// Ambient process-wide execution state (seed/selection policy, cost +
+    /// SMC overrides, threads, adaptive stops, seen-memory, GPU lane) —
+    /// captured through the same accessors the engine reads. See
+    /// [`crate::execution_profile::ExecutionEnvironmentProfile`].
+    pub execution: crate::execution_profile::ExecutionEnvironmentProfile,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1565,7 +1633,7 @@ fn min_trades_per_month_scale_for_tf(tf: &str) -> f64 {
 /// it is just not the one being looked for. Every field `0.0` means "no
 /// preference", which is the default, so a run says nothing about shape unless
 /// the operator asked it to.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct TargetProfile {
     /// Lowest acceptable win rate, as a fraction.
     pub min_win_rate: f64,
@@ -3659,7 +3727,7 @@ fn validate_regime_robustness(
 /// Discovery search modes. The default is `PropFirm`; `Strict` is opted into
 /// via `models.discovery_mode = "strict"` in config (mapped by
 /// `discovery_mode_from_config`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DiscoveryMode {
     /// Production-grade strict pipeline (legacy walkforward + CPCV +
     /// MC-perturbation gates). Use only when looking for unicorn
@@ -6138,43 +6206,143 @@ pub fn build_discovery_profile(
                 live_execution_simulation: None,
             }
         });
+    let resolved_max_rows = row_cap_for_config(config);
+    // SLICE 5 COMPLETENESS GATE (2026-08-08): destructure the config WITHOUT
+    // `..`. Every field that can change what the search selects must appear
+    // in the profile; a new `DiscoveryConfig` field therefore FAILS TO
+    // COMPILE here until someone decides where it is recorded (or explicitly
+    // binds it to `_name` with a written justification). Sixteen months of
+    // "two runs differ and nobody can say why" is the cost of the old `..`.
+    let DiscoveryConfig {
+        timeframe_label,
+        evaluation_symbol,
+        evaluation_account_currency,
+        evaluation_spread_pips,
+        evaluation_commission_per_trade,
+        population,
+        generations,
+        max_indicators,
+        candidate_count,
+        portfolio_size,
+        // Raw knob; the profile records the RESOLVED row cap
+        // (`row_cap_for_config`, which folds in `max_rows_by_timeframe`)
+        // as `max_rows`, plus the per-timeframe table itself below.
+        max_rows: _,
+        max_rows_by_timeframe,
+        max_hours,
+        corr_threshold,
+        min_trades_per_day,
+        target_profile,
+        walkforward_splits,
+        embargo_minutes,
+        enable_cpcv,
+        cpcv_n_splits,
+        cpcv_n_test_groups,
+        cpcv_embargo_pct,
+        cpcv_purge_pct,
+        cpcv_min_phi,
+        cpcv_max_rows,
+        max_pbo,
+        filtering,
+        initial_balance,
+        risk_per_trade_min,
+        risk_per_trade_max,
+        risky_risk_band,
+        prop_firm_risk_band,
+        max_regime_loss_pct,
+        higher_timeframes,
+        runtime_overrides,
+        prop_firm_gate,
+        mc_runs,
+        mc_min_profitable,
+        sensitivity_spread_pips,
+        sensitivity_commission_per_lot,
+        adaptive_thresholds,
+        mode,
+        prop_firm_gate_params,
+        risky_start_balance,
+        risky_target_balance,
+        risky_horizon_days,
+        require_walkforward_for_export,
+        prop_firm_min_pass_rate,
+        discovery_ledger_enabled,
+        discovery_ledger_cache_dir,
+        discovery_ledger_archive_top_n,
+    } = config;
+    // Same completeness gate for the filter floors: `FilteringConfig` grew
+    // `anomaly_guard` / `elite_mode` without the profile noticing — never
+    // again.
+    let crate::genetic::FilteringConfig {
+        max_dd,
+        min_profit,
+        min_trades,
+        min_sharpe,
+        min_win_rate,
+        min_profit_factor,
+        min_positive_months,
+        min_trades_per_month,
+        min_monthly_return_pct,
+        log_trades,
+        trade_log_max,
+        opportunistic_enabled,
+        use_opportunistic_candidates,
+        opportunistic_min_positive_months,
+        opportunistic_min_trades_per_month,
+        opportunistic_min_trade_return_pct,
+        opportunistic_max_dd,
+        anomaly_guard,
+        elite_mode,
+    } = filtering;
+    // And for the runtime overrides: `stage1_window` + `min_history_years`
+    // were silently absent from the profile before slice 5.
+    let DiscoveryRuntimeOverrides {
+        prefilter_top_k,
+        prefilter_insample_frac: _, // recorded resolved below
+        prefilter_min_per_timeframe,
+        funnel_stage1_pct: _, // recorded resolved below
+        stage1_window,
+        min_history_years,
+    } = runtime_overrides;
     DiscoveryRunProfile {
-        timeframe_label: config.timeframe_label.clone(),
-        population: config.population,
-        generations: config.generations,
-        max_indicators: config.max_indicators,
-        candidate_count_target: config.candidate_count,
-        portfolio_size_target: config.portfolio_size,
-        max_rows: row_cap_for_config(config),
-        max_runtime_hours: config.max_hours,
-        corr_threshold: config.corr_threshold,
-        min_trades_per_day: config.min_trades_per_day,
-        walkforward_splits: config.walkforward_splits,
-        embargo_minutes: config.embargo_minutes,
-        enable_cpcv: config.enable_cpcv,
-        cpcv_n_splits: config.cpcv_n_splits,
-        cpcv_n_test_groups: config.cpcv_n_test_groups,
-        cpcv_embargo_pct: config.cpcv_embargo_pct,
-        cpcv_purge_pct: config.cpcv_purge_pct,
-        cpcv_min_phi: config.cpcv_min_phi,
+        timeframe_label: timeframe_label.clone(),
+        population: *population,
+        generations: *generations,
+        max_indicators: *max_indicators,
+        candidate_count_target: *candidate_count,
+        portfolio_size_target: *portfolio_size,
+        max_rows: resolved_max_rows,
+        max_runtime_hours: *max_hours,
+        corr_threshold: *corr_threshold,
+        min_trades_per_day: *min_trades_per_day,
+        walkforward_splits: *walkforward_splits,
+        embargo_minutes: *embargo_minutes,
+        enable_cpcv: *enable_cpcv,
+        cpcv_n_splits: *cpcv_n_splits,
+        cpcv_n_test_groups: *cpcv_n_test_groups,
+        cpcv_embargo_pct: *cpcv_embargo_pct,
+        cpcv_purge_pct: *cpcv_purge_pct,
+        cpcv_min_phi: *cpcv_min_phi,
         filters: DiscoveryFilterProfile {
-            max_dd: config.filtering.max_dd,
-            min_profit: config.filtering.min_profit,
-            min_trades: config.filtering.min_trades,
-            min_sharpe: config.filtering.min_sharpe,
-            min_win_rate: config.filtering.min_win_rate,
-            min_profit_factor: config.filtering.min_profit_factor,
-            min_positive_months: config.filtering.min_positive_months,
-            min_trades_per_month: config.filtering.min_trades_per_month,
-            min_monthly_return_pct: config.filtering.min_monthly_return_pct,
-            opportunistic_enabled: config.filtering.use_opportunistic_candidates
-                && config.filtering.opportunistic_enabled,
-            opportunistic_min_positive_months: config.filtering.opportunistic_min_positive_months,
-            opportunistic_min_trades_per_month: config.filtering.opportunistic_min_trades_per_month,
-            opportunistic_min_trade_return_pct: config.filtering.opportunistic_min_trade_return_pct,
-            opportunistic_max_dd: config.filtering.opportunistic_max_dd,
-            log_trades: config.filtering.log_trades,
-            trade_log_max: config.filtering.trade_log_max,
+            max_dd: *max_dd,
+            min_profit: *min_profit,
+            min_trades: *min_trades,
+            min_sharpe: *min_sharpe,
+            min_win_rate: *min_win_rate,
+            min_profit_factor: *min_profit_factor,
+            min_positive_months: *min_positive_months,
+            min_trades_per_month: *min_trades_per_month,
+            min_monthly_return_pct: *min_monthly_return_pct,
+            opportunistic_enabled: *use_opportunistic_candidates && *opportunistic_enabled,
+            opportunistic_min_positive_months: *opportunistic_min_positive_months,
+            opportunistic_min_trades_per_month: *opportunistic_min_trades_per_month,
+            opportunistic_min_trade_return_pct: *opportunistic_min_trade_return_pct,
+            opportunistic_max_dd: *opportunistic_max_dd,
+            log_trades: *log_trades,
+            trade_log_max: *trade_log_max,
+            use_opportunistic_candidates_raw: *use_opportunistic_candidates,
+            opportunistic_enabled_raw: *opportunistic_enabled,
+            anomaly_guard: *anomaly_guard,
+            elite_mode: *elite_mode,
         },
         candidates_observed: result.candidates.len(),
         portfolio_observed: result.portfolio.len(),
@@ -6191,10 +6359,10 @@ pub fn build_discovery_profile(
         cpcv_fold_count: result.validation_gates.cpcv_fold_count,
         cpcv_profitable_fold_ratio: result.validation_gates.cpcv_profitable_fold_ratio,
         validation_temporal_contract_hash: result.validation_gates.temporal_contract_hash.clone(),
-        prefilter_top_k: config.runtime_overrides.prefilter_top_k,
-        prefilter_insample_frac: config.runtime_overrides.resolved_prefilter_insample_frac(),
-        prefilter_min_per_timeframe: config.runtime_overrides.prefilter_min_per_timeframe,
-        funnel_stage1_pct: config.runtime_overrides.resolved_funnel_stage1_pct(),
+        prefilter_top_k: *prefilter_top_k,
+        prefilter_insample_frac: runtime_overrides.resolved_prefilter_insample_frac(),
+        prefilter_min_per_timeframe: *prefilter_min_per_timeframe,
+        funnel_stage1_pct: runtime_overrides.resolved_funnel_stage1_pct(),
         validation_evidence_hashes: validation_evidence_hashes.clone(),
         validation_evidence_complete: validation_evidence_hashes.all_present(),
         validation_evidence_missing_kinds: validation_evidence_hashes
@@ -6203,6 +6371,43 @@ pub fn build_discovery_profile(
             .map(str::to_string)
             .collect(),
         determinism_policy: crate::genetic::current_determinism_policy(),
+        evaluation_symbol: evaluation_symbol.clone(),
+        evaluation_account_currency: evaluation_account_currency.clone(),
+        evaluation_spread_pips: *evaluation_spread_pips,
+        evaluation_commission_per_trade: *evaluation_commission_per_trade,
+        mode: *mode,
+        target_profile: *target_profile,
+        max_pbo: *max_pbo,
+        cpcv_max_rows: *cpcv_max_rows,
+        prop_firm_gate: prop_firm_gate.clone(),
+        prop_firm_gate_params: prop_firm_gate_params.clone(),
+        require_walkforward_for_export: *require_walkforward_for_export,
+        prop_firm_min_pass_rate: *prop_firm_min_pass_rate,
+        initial_balance: *initial_balance,
+        risk_per_trade_min: *risk_per_trade_min,
+        risk_per_trade_max: *risk_per_trade_max,
+        risky_risk_band: *risky_risk_band,
+        prop_firm_risk_band: *prop_firm_risk_band,
+        max_regime_loss_pct: *max_regime_loss_pct,
+        mc_runs: *mc_runs,
+        mc_min_profitable: *mc_min_profitable,
+        sensitivity_spread_pips: *sensitivity_spread_pips,
+        sensitivity_commission_per_lot: *sensitivity_commission_per_lot,
+        adaptive_thresholds: *adaptive_thresholds,
+        higher_timeframes: higher_timeframes.clone(),
+        max_rows_by_timeframe: max_rows_by_timeframe
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect(),
+        stage1_window: *stage1_window,
+        min_history_years: *min_history_years,
+        risky_start_balance: *risky_start_balance,
+        risky_target_balance: *risky_target_balance,
+        risky_horizon_days: *risky_horizon_days,
+        discovery_ledger_enabled: *discovery_ledger_enabled,
+        discovery_ledger_cache_dir: discovery_ledger_cache_dir.clone(),
+        discovery_ledger_archive_top_n: *discovery_ledger_archive_top_n,
+        execution: crate::execution_profile::ExecutionEnvironmentProfile::capture(),
     }
 }
 

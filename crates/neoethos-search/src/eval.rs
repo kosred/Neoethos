@@ -457,7 +457,7 @@ impl BacktestSettings {
 /// place these values live; production callers install them once via
 /// [`install_backtest_runtime_overrides`] (or
 /// [`install_backtest_runtime_overrides_from_env`] for backward compat).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct BacktestRuntimeOverrides {
     /// Starting equity used for canonical backtest PnL accounting. Must be
     /// strictly positive.

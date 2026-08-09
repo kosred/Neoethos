@@ -2592,3 +2592,323 @@ fn walkforward_export_defaults_are_not_a_hand_copy_that_can_drift() {
     );
     assert_eq!(cfg.prop_firm_min_pass_rate, models.prop_firm_min_pass_rate);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SLICE 5 (2026-08-08): the env-knob census — "can a run name its own
+// arithmetic?"
+//
+// Scans every `.rs` file in this crate for env-var names, then requires each
+// discovered name to be CLASSIFIED: either it is recorded in the serialized
+// `DiscoveryRunProfile` (with a JSON pointer this test VERIFIES resolves), or
+// it is explicitly declared diagnostic-only with a written justification.
+// A new knob that skips the profile fails this test with instructions.
+// NEOETHOS_GPU_F64 (chose the GPU kernel precision, absent from the profile)
+// is the proven failure mode this ratchet exists to prevent.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// How a discovered env knob is accounted for.
+enum KnobClass {
+    /// The knob's resolved value (or raw ambient value, for GPU env
+    /// overrides whose resolvers are cfg-gated) appears at this JSON
+    /// pointer in the serialized `DiscoveryRunProfile`.
+    Profile(&'static str),
+    /// The knob cannot change what the search selects — logging/timing only.
+    /// The string is the justification, kept next to the exemption (read by
+    /// humans reviewing the exemption, not by the assertions).
+    DiagnosticOnly(#[allow(dead_code)] &'static str),
+}
+
+fn collect_env_knob_names_in_crate_sources() -> std::collections::BTreeSet<String> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir).expect("crate src dir must be readable");
+        for entry in entries {
+            let path = entry.expect("dir entry must be readable").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    // Tokens that do not carry the NEOETHOS_ prefix but are real env knobs
+    // read by this crate. Extend when a new foreign-prefix knob appears.
+    const FOREIGN_PREFIX_KNOBS: [&str; 2] = ["RAYON_NUM_THREADS", "FOREX_TRAIN_PRECISION"];
+
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&src_root, &mut files);
+    assert!(
+        files.len() > 20,
+        "source walk found only {} files — the census is scanning the wrong directory",
+        files.len()
+    );
+
+    let mut names = std::collections::BTreeSet::new();
+    // Built via concat so the needle itself does not end up in the census
+    // (it would register as a stray prefix fragment otherwise).
+    let needle = concat!("NEO", "ETHOS_");
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("census cannot read {}: {e}", file.display()));
+        for (start, _) in text.match_indices(needle) {
+            let tail = &text[start..];
+            let token: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                .collect();
+            // Fragments like `NEOETHOS_BOT_` (doc-comment prefixes) end with
+            // an underscore and are not knob names.
+            if !token.ends_with('_') {
+                names.insert(token);
+            }
+        }
+        for foreign in FOREIGN_PREFIX_KNOBS {
+            if text.contains(foreign) {
+                names.insert(foreign.to_string());
+            }
+        }
+    }
+    names
+}
+
+#[test]
+fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
+    use KnobClass::{DiagnosticOnly, Profile};
+
+    // The complete classification. ORDER: alphabetical within each group.
+    // To add a knob: give it a profile field (preferred) and point at it, or
+    // justify why it cannot change selection.
+    let table: &[(&str, KnobClass)] = &[
+        // ── GA selection knobs (genetic::runtime_overrides) ──
+        ("NEOETHOS_BOT_DISABLE_SMC_GATE", Profile("/execution/genetic_search/smc_gate/disable_gate")),
+        ("NEOETHOS_BOT_NOVELTY_WEIGHT", Profile("/execution/genetic_search/novelty_weight")),
+        ("NEOETHOS_BOT_PROP_ARCHIVE_CAP", Profile("/execution/genetic_search/archive_cap_override")),
+        ("NEOETHOS_BOT_PROP_ARCHIVE_MIN_NET", Profile("/execution/genetic_search/archive_scoring/min_net")),
+        ("NEOETHOS_BOT_PROP_ARCHIVE_MIN_PF", Profile("/execution/genetic_search/archive_scoring/min_pf")),
+        ("NEOETHOS_BOT_PROP_ARCHIVE_MIN_SHARPE", Profile("/execution/genetic_search/archive_scoring/min_sharpe")),
+        ("NEOETHOS_BOT_PROP_ARCHIVE_MODE", Profile("/execution/genetic_search/archive_scoring/mode")),
+        ("NEOETHOS_BOT_PROP_CONVERGENCE_GENS", Profile("/execution/genetic_search/convergence_patience")),
+        ("NEOETHOS_BOT_PROP_CONVERGENCE_MIN_ELAPSED_FRAC", Profile("/execution/genetic_search/convergence_min_elapsed_fraction")),
+        ("NEOETHOS_BOT_PROP_ELITE_FRACTION", Profile("/execution/genetic_search/selection/survivor_fraction")),
+        ("NEOETHOS_BOT_PROP_MIN_IMPROVEMENT", Profile("/execution/genetic_search/min_improvement")),
+        ("NEOETHOS_BOT_PROP_PARENT_SELECTION", Profile("/execution/genetic_search/selection/parent")),
+        ("NEOETHOS_BOT_PROP_RANDOM_IMMIGRANTS", Profile("/execution/genetic_search/selection/immigrant_ratio")),
+        ("NEOETHOS_BOT_PROP_SEEN_RETRY", Profile("/execution/genetic_search/seen_retry_attempts")),
+        ("NEOETHOS_BOT_PROP_SELECTION_TEMPERATURE", Profile("/execution/genetic_search/selection/temperature")),
+        ("NEOETHOS_BOT_PROP_SMC_GATE_CURVE", Profile("/execution/genetic_search/smc_gate/curve")),
+        ("NEOETHOS_BOT_PROP_SMC_GATE_END", Profile("/execution/genetic_search/smc_gate/end")),
+        ("NEOETHOS_BOT_PROP_SMC_GATE_STAGNATION_STEP", Profile("/execution/genetic_search/smc_gate/stagnation_step")),
+        ("NEOETHOS_BOT_PROP_SMC_GATE_START", Profile("/execution/genetic_search/smc_gate/start")),
+        ("NEOETHOS_BOT_PROP_STAGNATION_GENS", Profile("/execution/genetic_search/stagnation_patience")),
+        ("NEOETHOS_BOT_PROP_SURVIVOR_FRACTION", Profile("/execution/genetic_search/selection/survivor_fraction")),
+        ("NEOETHOS_BOT_PROP_SURVIVOR_SELECTION", Profile("/execution/genetic_search/selection/survivor")),
+        ("NEOETHOS_BOT_PROP_TOURNAMENT_SIZE", Profile("/execution/genetic_search/tournament_size_override")),
+        ("NEOETHOS_BOT_SEARCH_SEED", Profile("/execution/genetic_search/seed")),
+        // ── Evaluation cost profile + SMC weights ──
+        ("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY", Profile("/execution/strategy_eval/cost_profile/account_currency")),
+        ("NEOETHOS_BOT_PROP_COMMISSION", Profile("/execution/strategy_eval/cost_profile/commission_per_trade")),
+        ("NEOETHOS_BOT_PROP_PIP_VALUE", Profile("/execution/strategy_eval/cost_profile/pip_value")),
+        ("NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT", Profile("/execution/strategy_eval/cost_profile/pip_value_per_lot")),
+        ("NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE", Profile("/execution/strategy_eval/cost_profile/quote_to_account_rate")),
+        ("NEOETHOS_BOT_PROP_SPREAD_PIPS", Profile("/execution/strategy_eval/cost_profile/spread_pips")),
+        ("NEOETHOS_BOT_PROP_SMC_GATE", Profile("/execution/strategy_eval/smc_weights/gate_threshold")),
+        ("NEOETHOS_BOT_PROP_SMC_W_BOS", Profile("/execution/strategy_eval/smc_weights/w_bos")),
+        ("NEOETHOS_BOT_PROP_SMC_W_CHOCH", Profile("/execution/strategy_eval/smc_weights/w_choch")),
+        ("NEOETHOS_BOT_PROP_SMC_W_DISPLACEMENT", Profile("/execution/strategy_eval/smc_weights/w_displacement")),
+        ("NEOETHOS_BOT_PROP_SMC_W_EQH", Profile("/execution/strategy_eval/smc_weights/w_eqh")),
+        ("NEOETHOS_BOT_PROP_SMC_W_EQL", Profile("/execution/strategy_eval/smc_weights/w_eql")),
+        ("NEOETHOS_BOT_PROP_SMC_W_FVG", Profile("/execution/strategy_eval/smc_weights/w_fvg")),
+        ("NEOETHOS_BOT_PROP_SMC_W_INDUCEMENT", Profile("/execution/strategy_eval/smc_weights/w_inducement")),
+        ("NEOETHOS_BOT_PROP_SMC_W_LIQ", Profile("/execution/strategy_eval/smc_weights/w_liq")),
+        ("NEOETHOS_BOT_PROP_SMC_W_MTF", Profile("/execution/strategy_eval/smc_weights/w_mtf")),
+        ("NEOETHOS_BOT_PROP_SMC_W_OB", Profile("/execution/strategy_eval/smc_weights/w_ob")),
+        ("NEOETHOS_BOT_PROP_SMC_W_PREMIUM", Profile("/execution/strategy_eval/smc_weights/w_premium")),
+        ("NEOETHOS_BOT_PROP_SYMBOL", Profile("/execution/strategy_eval/cost_profile/symbol")),
+        ("NEOETHOS_BOT_REJECT_PIP_FALLBACK", Profile("/execution/strategy_eval/cost_profile/reject_pip_fallback")),
+        // ── Backtest arithmetic + threads ──
+        ("NEOETHOS_BOT_BACKTEST_INITIAL_EQUITY", Profile("/execution/backtest/initial_equity")),
+        ("NEOETHOS_BOT_BACKTEST_MAX_MONTH_BUCKETS", Profile("/execution/backtest/month_capacity")),
+        ("NEOETHOS_BOT_RUST_THREADS", Profile("/execution/backtest/rayon_threads")),
+        ("RAYON_NUM_THREADS", Profile("/execution/backtest/rayon_threads")),
+        // ── Quality screen ──
+        ("NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH", Profile("/execution/quality/min_trades_per_month")),
+        ("NEOETHOS_BOT_TRADING_DAYS_PER_MONTH", Profile("/execution/quality/trading_days_per_month")),
+        // ── Seen-signature memory (CROSS-RUN state) ──
+        ("NEOETHOS_BOT_PROP_SEEN_FILE", Profile("/execution/seen_memory/file_path")),
+        ("NEOETHOS_BOT_PROP_SEEN_FLUSH_EVERY", Profile("/execution/seen_memory/flush_every")),
+        ("NEOETHOS_BOT_PROP_SEEN_LOAD_MAX", Profile("/execution/seen_memory/load_max")),
+        ("NEOETHOS_BOT_PROP_SEEN_MAX_ENTRIES", Profile("/execution/seen_memory/max_entries")),
+        // ── SMC gene-injection probabilities ──
+        // ENABLE_P is the umbrella default for every p_* field and
+        // FORCE_ENABLED=false zeroes force_ratio+min_flags; the profile
+        // records the RESOLVED per-field values, so both umbrellas are
+        // covered by the fields they feed.
+        ("NEOETHOS_BOT_PROP_SMC_ENABLE_P", Profile("/execution/smc_search/p_ob")),
+        ("NEOETHOS_BOT_PROP_SMC_FORCE_ENABLED", Profile("/execution/smc_search/force_ratio")),
+        ("NEOETHOS_BOT_PROP_SMC_FORCE_RATIO", Profile("/execution/smc_search/force_ratio")),
+        ("NEOETHOS_BOT_PROP_SMC_MIN_FLAGS", Profile("/execution/smc_search/min_flags")),
+        ("NEOETHOS_BOT_PROP_SMC_P_BOS", Profile("/execution/smc_search/p_bos")),
+        ("NEOETHOS_BOT_PROP_SMC_P_CHOCH", Profile("/execution/smc_search/p_choch")),
+        ("NEOETHOS_BOT_PROP_SMC_P_DISPLACEMENT", Profile("/execution/smc_search/p_displacement")),
+        ("NEOETHOS_BOT_PROP_SMC_P_EQH", Profile("/execution/smc_search/p_eqh")),
+        ("NEOETHOS_BOT_PROP_SMC_P_EQL", Profile("/execution/smc_search/p_eql")),
+        ("NEOETHOS_BOT_PROP_SMC_P_FVG", Profile("/execution/smc_search/p_fvg")),
+        ("NEOETHOS_BOT_PROP_SMC_P_INDUCEMENT", Profile("/execution/smc_search/p_inducement")),
+        ("NEOETHOS_BOT_PROP_SMC_P_LIQ", Profile("/execution/smc_search/p_liq")),
+        ("NEOETHOS_BOT_PROP_SMC_P_MTF", Profile("/execution/smc_search/p_mtf")),
+        ("NEOETHOS_BOT_PROP_SMC_P_OB", Profile("/execution/smc_search/p_ob")),
+        ("NEOETHOS_BOT_PROP_SMC_P_PREMIUM", Profile("/execution/smc_search/p_premium")),
+        // ── Adaptive stops ──
+        ("NEOETHOS_ADAPTIVE_STOPS", Profile("/execution/adaptive_stops_enabled")),
+        ("NEOETHOS_ADAPTIVE_STOP_RR", Profile("/execution/adaptive_stops_rr")),
+        // ── GPU lane ──
+        ("NEOETHOS_BOT_SEARCH_BACKTEST_CUDA_KERNEL", Profile("/execution/gpu/cuda_backtest_kernel_enabled")),
+        ("NEOETHOS_BOT_SEARCH_BACKTEST_KERNEL_UNITS", Profile("/execution/gpu/cuda_backtest_kernel_units")),
+        ("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE", Profile("/execution/gpu/cuda_device_id")),
+        ("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICES", Profile("/execution/gpu/multi_cuda_devices_env")),
+        ("NEOETHOS_BOT_SEARCH_EVAL_CUDA_KERNEL", Profile("/execution/gpu/cuda_eval_kernel_enabled")),
+        ("NEOETHOS_BOT_SEARCH_EVAL_KERNEL_UNITS", Profile("/execution/gpu/cuda_eval_kernel_units")),
+        ("NEOETHOS_BOT_SEARCH_EVAL_PRECISION", Profile("/execution/gpu/cuda_precision")),
+        ("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE", Profile("/execution/gpu/wgpu_device_env")),
+        ("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES", Profile("/execution/gpu/multi_wgpu_devices_env")),
+        ("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB", Profile("/execution/gpu/gpu_buffer_mb_env")),
+        ("NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB", Profile("/execution/gpu/host_budget_mb_env")),
+        ("NEOETHOS_BOT_SEARCH_USE_IGPU", Profile("/execution/gpu/use_igpu_env")),
+        ("NEOETHOS_BOT_SEARCH_VRAM_BUDGET_MB", Profile("/execution/gpu/vram_budget_mb_env")),
+        ("NEOETHOS_BOT_TRAIN_PRECISION", Profile("/execution/gpu/cuda_precision")),
+        ("FOREX_TRAIN_PRECISION", Profile("/execution/gpu/cuda_precision")),
+        ("NEOETHOS_GPU_F64", Profile("/execution/gpu/gpu_f64_backtest")),
+        ("NEOETHOS_GPU_FUSED_EVAL", Profile("/execution/gpu/fused_eval_decision")),
+        ("NEOETHOS_REQUIRE_GPU", Profile("/execution/gpu/require_gpu_env")),
+        (
+            "NEOETHOS_BOT_SEARCH_VRAM_LOG",
+            DiagnosticOnly(
+                "emits VRAM telemetry lines only; never touches a kernel input, \
+                 launch dimension, or fallback decision",
+            ),
+        ),
+        (
+            "NEOETHOS_GPU_TIMING",
+            DiagnosticOnly(
+                "accumulates per-phase Durations into a thread-local and logs them; \
+                 the gpu_timing module runs the wrapped work byte-identically when off \
+                 and never touches kernel inputs when on",
+            ),
+        ),
+        // ── Discovery config knobs (legacy env names; config-driven now, the
+        //    profile records the RESOLVED config value) ──
+        ("NEOETHOS_BOT_DISCOVERY_MIN_TRADES_PER_DAY", Profile("/min_trades_per_day")),
+        ("NEOETHOS_BOT_DISCOVERY_MODE", Profile("/mode")),
+        ("NEOETHOS_BOT_DISCOVERY_PERMISSIVE", Profile("/mode")),
+        ("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_GATE", Profile("/prop_firm_gate_params")),
+        ("NEOETHOS_BOT_FUNNEL_STAGE1_PCT", Profile("/funnel_stage1_pct")),
+        ("NEOETHOS_BOT_FUNNEL_STAGE1_WINDOW", Profile("/stage1_window")),
+        ("NEOETHOS_BOT_MIN_HISTORY_YEARS", Profile("/min_history_years")),
+        ("NEOETHOS_BOT_PREFILTER_INSAMPLE", Profile("/prefilter_insample_frac")),
+        ("NEOETHOS_BOT_PREFILTER_MIN_PER_TF", Profile("/prefilter_min_per_timeframe")),
+        ("NEOETHOS_BOT_PREFILTER_TOP_K", Profile("/prefilter_top_k")),
+        ("NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS", Profile("/adaptive_thresholds")),
+    ];
+
+    // 1. The profile the classification is checked against: default config +
+    //    empty result. Field EXISTENCE is what is asserted (a null value
+    //    resolves fine), so the fixture's emptiness does not weaken the test.
+    let empty_result = DiscoveryResult {
+        portfolio: Vec::new(),
+        candidates: Vec::new(),
+        quality_metrics: Vec::new(),
+        logged_trades: Vec::new(),
+        effective_feature_names: Vec::new(),
+        validation_gates: DiscoveryValidationGates::pending(),
+        canonical_backtest_artifacts: Vec::new(),
+        walkforward_validation_artifacts: Vec::new(),
+        forward_test_validation_artifacts: Vec::new(),
+        prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
+        effective_smc_gate_threshold: f32::NAN,
+    };
+    let profile = build_discovery_profile(&DiscoveryConfig::default(), &empty_result);
+    let json = serde_json::to_value(&profile).expect("run profile must serialize");
+
+    // 2. Every classified-as-recorded knob must actually resolve in the JSON.
+    for (name, class) in table {
+        if let KnobClass::Profile(pointer) = class {
+            assert!(
+                json.pointer(pointer).is_some(),
+                "census table maps env knob {name} to profile pointer {pointer}, \
+                 but the serialized DiscoveryRunProfile has no such field — \
+                 the table is lying; fix the pointer or add the field"
+            );
+        }
+    }
+
+    // 3. Every env name in the sources must be classified…
+    let discovered = collect_env_knob_names_in_crate_sources();
+    let classified: std::collections::BTreeSet<&str> =
+        table.iter().map(|(name, _)| *name).collect();
+    let unclassified: Vec<&String> = discovered
+        .iter()
+        .filter(|name| !classified.contains(name.as_str()))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "New env knob(s) found in neoethos-search sources that are NOT \
+         accounted for in the discovery run profile: {unclassified:?}.\n\
+         A knob that can change what the search selects but is absent from \
+         the profile makes runs unreproducible-by-inspection (the \
+         NEOETHOS_GPU_F64 failure mode). Fix: capture the knob's RESOLVED \
+         value in ExecutionEnvironmentProfile (crates/neoethos-search/src/\
+         execution_profile.rs) or the DiscoveryRunProfile, then add a \
+         (name, Profile(\"/json/pointer\")) row to the census table in this \
+         test. Only if the knob provably cannot alter selection (pure \
+         logging), add a DiagnosticOnly row with the justification."
+    );
+
+    // 4. …and every classified name must still exist in the sources, so the
+    //    table cannot accrete stale rows that hide future collisions.
+    let stale: Vec<&&str> = classified
+        .iter()
+        .filter(|name| !discovered.contains(**name))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "census table rows with no matching source occurrence (knob was \
+         removed or renamed — delete or update the row): {stale:?}"
+    );
+}
+
+#[test]
+fn identical_configs_produce_identical_profile_json_apart_from_ambient_state() {
+    // The serialized profile itself must be deterministic for a fixed config
+    // + environment — otherwise diffing two run profiles (the whole point of
+    // slice 5) reports phantom differences. This guards, e.g., HashMap
+    // iteration order leaking into the JSON (max_rows_by_timeframe is a
+    // BTreeMap in the profile for exactly this reason).
+    let mut config = DiscoveryConfig::default();
+    config
+        .max_rows_by_timeframe
+        .extend([("M1".to_string(), 100), ("M5".to_string(), 200), ("H1".to_string(), 50)]);
+    let result = DiscoveryResult {
+        portfolio: Vec::new(),
+        candidates: Vec::new(),
+        quality_metrics: Vec::new(),
+        logged_trades: Vec::new(),
+        effective_feature_names: Vec::new(),
+        validation_gates: DiscoveryValidationGates::pending(),
+        canonical_backtest_artifacts: Vec::new(),
+        walkforward_validation_artifacts: Vec::new(),
+        forward_test_validation_artifacts: Vec::new(),
+        prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
+        effective_smc_gate_threshold: f32::NAN,
+    };
+    let a = serde_json::to_string(&build_discovery_profile(&config, &result))
+        .expect("profile must serialize");
+    let b = serde_json::to_string(&build_discovery_profile(&config, &result))
+        .expect("profile must serialize");
+    assert_eq!(
+        a, b,
+        "two profile builds from the same config+environment serialized \
+         differently — the profile artifact itself is non-deterministic"
+    );
+}

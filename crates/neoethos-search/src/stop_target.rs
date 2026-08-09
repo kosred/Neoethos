@@ -53,7 +53,7 @@ impl std::error::Error for StopDistanceError {}
 
 /// Process-wide adaptive-stop cost caps — the typed mirror of
 /// `neoethos_core::config::StopTargetRuntimeConfig`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct StopTargetRuntimeOverrides {
     /// `0` = no cap. See [`StopDistanceError::TailCapExceeded`].
     pub tail_max_bars: usize,

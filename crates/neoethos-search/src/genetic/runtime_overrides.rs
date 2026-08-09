@@ -11,6 +11,7 @@
 
 use super::evolution_math::{ParentSelectionPolicy, SurvivorSelectionPolicy};
 use neoethos_core::contracts::DeterminismPolicy;
+use serde::Serialize;
 use std::sync::OnceLock;
 
 /// SMC gate curve knobs. The gate threshold starts at `start`, eases to
@@ -24,7 +25,7 @@ use std::sync::OnceLock;
 /// SMC sum forced to 0) so the raw signal passes through. Lets operators
 /// isolate "SMC indicators don't trigger on this symbol" from genuine
 /// signal-generation issues without recompiling.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct SmcGateOverrides {
     pub start: f32,
     pub end: f32,
@@ -66,7 +67,7 @@ impl SmcGateOverrides {
 /// Archive scoring thresholds. `mode` selects which metric is used to gate
 /// archive admission ("net", "pf", "sharpe"); the corresponding `min_*`
 /// floors must be cleared before a candidate is archived.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ArchiveScoringOverrides {
     pub mode: String,
     pub min_net: f64,
@@ -89,7 +90,7 @@ impl Default for ArchiveScoringOverrides {
 /// `NEOETHOS_BOT_PROP_PARENT_SELECTION` / `SURVIVOR_SELECTION` /
 /// `RANDOM_IMMIGRANTS` / `SURVIVOR_FRACTION` (or `ELITE_FRACTION`) /
 /// `SELECTION_TEMPERATURE`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct SelectionPolicyOverrides {
     pub parent: ParentSelectionPolicy,
     pub survivor: SurvivorSelectionPolicy,
@@ -138,7 +139,7 @@ impl SelectionPolicyOverrides {
 
 /// Typed replacement for the search-engine's most production-affecting
 /// `NEOETHOS_BOT_*` env vars.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GeneticSearchRuntimeOverrides {
     /// Optional deterministic RNG seed for the genetic search. `None`
     /// means "seed from the OS RNG" (non-deterministic).
@@ -467,7 +468,7 @@ impl GeneticSearchRuntimeOverrides {
 /// quote-currency pip value. Previously read inline inside
 /// `reject_cross_pair_fallback()` (strategy_gene.rs); now consolidated
 /// at this typed boundary so the env is hit at most once per process.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CostProfileRuntimeOverrides {
     pub symbol: Option<String>,
     pub account_currency: Option<String>,
@@ -536,7 +537,7 @@ impl CostProfileRuntimeOverrides {
 /// SMC weight knobs that previously lived in the
 /// `NEOETHOS_BOT_PROP_SMC_W_*` env vars and the `NEOETHOS_BOT_PROP_SMC_GATE`
 /// fallback used by `EvaluationConfig::default`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct SmcWeightRuntimeOverrides {
     pub gate_threshold: f32,
     pub w_ob: f32,
@@ -619,7 +620,7 @@ impl SmcWeightRuntimeOverrides {
 /// `COMMISSION` env vars; SMC weight knobs replace the
 /// `NEOETHOS_BOT_PROP_SMC_W_*` and `NEOETHOS_BOT_PROP_SMC_GATE` env vars used
 /// at evaluation-config construction time.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct StrategyEvaluationRuntimeOverrides {
     pub cost_profile: CostProfileRuntimeOverrides,
     pub smc_weights: SmcWeightRuntimeOverrides,

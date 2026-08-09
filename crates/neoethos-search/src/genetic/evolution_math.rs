@@ -311,7 +311,7 @@ pub struct SeenSignatureMemory {
 /// `NEOETHOS_BOT_PROP_SEEN_*` env vars. The seen-signature memory consults
 /// the cached overrides each time it is constructed, but the env vars
 /// themselves are read at most once per process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SeenSignatureMemoryRuntimeOverrides {
     pub flush_every: usize,
     pub load_max: usize,
