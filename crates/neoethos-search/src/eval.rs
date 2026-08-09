@@ -1815,6 +1815,23 @@ pub(crate) fn normalized_stop_vol_mult(stop_vol_mult: &[f64], n_genes: usize) ->
     stop_vol_mult.is_empty().then(|| vec![0.0; n_genes])
 }
 
+/// Is a usable CUDA card + the native f64 prototype-B lane present? The ONLY
+/// true hardware check. False on builds without prototype B (Vulkan/ROCm/CPU),
+/// so the GPU-mandatory guards below compile to nothing there and those builds
+/// keep their existing CPU behaviour.
+#[cfg(feature = "gpu")]
+#[inline]
+fn prototype_b_card_present() -> bool {
+    #[cfg(feature = "gpu-b-adapter")]
+    {
+        crate::gpu_native::prototype_b_population_eval::prototype_b_available()
+    }
+    #[cfg(not(feature = "gpu-b-adapter"))]
+    {
+        false
+    }
+}
+
 pub fn evaluate_population_core(
     inputs: PopulationEvalInputs<'_>,
 ) -> Result<Vec<[f64; 11]>, String> {
@@ -1951,7 +1968,10 @@ pub fn evaluate_population_core(
             // bus) — skip the GPU lane and run pure-CPU. Override with
             // NEOETHOS_BOT_SEARCH_USE_IGPU=1. See `integrated_gpu_eval_disabled`.
             && !integrated_gpu_eval_disabled()
-            && n_genes >= 4
+            // A card is present: send even small (<4-gene) elite/tail batches to
+            // the GPU (a small launch is cheap and correct) instead of the
+            // silent CPU tail below. The >=4 floor stays for card-less builds.
+            && (n_genes >= 4 || prototype_b_card_present())
         {
             let devices = eval_gpu_devices();
 
@@ -2008,6 +2028,11 @@ pub fn evaluate_population_core(
                         "population evaluated on the GPU (whole population, no CPU lane)"
                     );
                     });
+                    crate::eval_telemetry::record_device(
+                        "population_eval",
+                        crate::eval_telemetry::Device::Gpu,
+                        started.elapsed(),
+                    );
                     return Ok(rows);
                 }
                 Ok(rows) => {
@@ -2027,8 +2052,32 @@ pub fn evaluate_population_core(
         }
     }
 
-    // Full-CPU path: no GPU feature, GPU disabled, or a degenerate split.
+    // A card + the native f64 lane are present but the GPU gate above was closed
+    // (a kernel kill-switch or an integrated-GPU verdict). Refuse the silent CPU
+    // tail — this is one of the seams that hid `prop_search_device: cpu`: a run
+    // that puts nothing on the card looks identical to a healthy one, only
+    // slower. This closes the seam for EVERY caller of evaluate_population_core,
+    // including the ones that bypass the backend dispatch (evaluate_genes ->
+    // regime_labels), which the match arms cannot reach.
+    #[cfg(feature = "gpu-b-adapter")]
+    if crate::gpu_native::prototype_b_population_eval::prototype_b_available() {
+        return Err(
+            "a CUDA card + prototype B are present but the GPU population lane gate was \
+             closed (kernel kill-switch / integrated-GPU verdict); refusing the silent CPU \
+             tail — fix the fault or set models.prop_search_device: cpu_forced"
+                .to_string(),
+        );
+    }
+
+    // Full-CPU path: no GPU feature, GPU disabled (card-less build), or a
+    // degenerate split. Time the WALL and attribute it to the CPU device.
+    let cpu_started = std::time::Instant::now();
     let results: Vec<[f64; 11]> = (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect();
+    crate::eval_telemetry::record_device(
+        "population_eval",
+        crate::eval_telemetry::Device::Cpu,
+        cpu_started.elapsed(),
+    );
     Ok(results)
 }
 
@@ -2188,6 +2237,7 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         }
     });
     if signal_ok && backtest_ok && !integrated {
+        let gpu_started = std::time::Instant::now();
         let device_override = eval_gpu_devices().first().copied();
         // catch_unwind is the ONLY mitigation for cubecl #243 pool-panics
         // (no Result-returning launch in cubecl 0.10). `AssertUnwindSafe` is
@@ -2279,7 +2329,14 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         // loud instead of silently draining a rented card's hours on the CPU.
         use crate::gpu_fallback::{FallbackDecision, GpuFailure, decide_env};
         let failure = match gpu {
-            Ok(Ok(v)) if v.len() == n_genes => return v,
+            Ok(Ok(v)) if v.len() == n_genes => {
+                crate::eval_telemetry::record_device(
+                    "validation_eval",
+                    crate::eval_telemetry::Device::Gpu,
+                    gpu_started.elapsed(),
+                );
+                return v;
+            }
             Ok(Ok(rows)) => {
                 tracing::warn!(
                     target: "neoethos_search::eval",
@@ -2318,16 +2375,31 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
                  ({failure:?}); refusing to run the whole validation on the CPU. \
                  Unset NEOETHOS_REQUIRE_GPU to allow the CPU fallback."
             ),
-            FallbackDecision::RecomputeOnCpu => tracing::warn!(
-                target: "neoethos_search::eval",
-                ?failure,
-                "validation GPU lane unusable — recomputing on CPU"
-            ),
+            FallbackDecision::RecomputeOnCpu => {
+                // A card-present fallback is the bad kind; count it so
+                // `device_summary` can surface a starved card at run end. On a
+                // card-less host this is a no-op and reports 0.
+                crate::eval_telemetry::note_cpu_fallback("validation_eval");
+                tracing::warn!(
+                    target: "neoethos_search::eval",
+                    ?failure,
+                    "validation GPU lane unusable — recomputing on CPU"
+                );
+            }
         }
     }
 
     // CPU fallback — full-population re-evaluation (fail-loud already logged).
-    (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect()
+    // Reached after a gate-closed skip or a GPU-lane fallback; time the WALL and
+    // attribute it to the CPU device so the run-end summary is honest.
+    let cpu_started = std::time::Instant::now();
+    let out: Vec<[f64; 11]> = (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect();
+    crate::eval_telemetry::record_device(
+        "validation_eval",
+        crate::eval_telemetry::Device::Cpu,
+        cpu_started.elapsed(),
+    );
+    out
 }
 
 /// Pure-CPU population evaluation — the canonical semantic reference for the

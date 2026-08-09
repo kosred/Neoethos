@@ -5920,6 +5920,13 @@ where
     };
     funnel.finalize(outcome);
 
+    // GPU-vs-CPU proof on the same surface as the goal report: what fraction of
+    // population-eval WALL time ran on the card, and how many times it fell back
+    // to the CPU while a card was present. Prints even when empty, so a real GPU
+    // run and a silent-CPU run can never again produce identical end-of-run
+    // output — the exact indistinguishability that hid the starved card.
+    crate::eval_telemetry::device_summary();
+
     // Honest goal projection (Risky only): "reach the target, when, at what
     // risk?" from the selected portfolio's REAL per-trade R-multiples. Logged
     // here, before the result is moved, while config and the trades coexist.

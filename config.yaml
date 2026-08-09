@@ -470,7 +470,11 @@ models:
     pip_value_per_lot: null
     spread_pips: null
     commission_per_trade: null
-    reject_pip_fallback: false
+    # true (matches the Rust default): a cross-pair whose quote->account FX rate
+    # cannot be resolved returns NaN and the strategy is rejected, rather than
+    # emitting money figures knowingly off by the FX rate into the goal report.
+    # Set false only to run with knowingly-wrong currency conversion.
+    reject_pip_fallback: true
     smc_gate_threshold: 0.75
     smc_w_ob: 1.0
     smc_w_fvg: 1.0

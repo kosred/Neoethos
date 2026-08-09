@@ -77,6 +77,11 @@ impl EvaluationBackend {
         let normalized = normalize(raw);
         let parsed = match normalized.as_str() {
             "" | "auto" => Self::AUTO,
+            // The single deliberate "run on the CPU even though a card is
+            // present" escape. Plain `cpu`/`off`/`false` are treated as "use the
+            // card" by `resolve_with_probe` and escalated on a card box; only
+            // this token opts out. See `resolve_with_probe`.
+            "cpu_forced" | "cpu-forced" => Self::CPU_CANONICAL,
             "cpu" | "off" | "false" => Self::CPU_CANONICAL,
             "gpu" | "on" | "true" => Self::GPU_PREFERRED,
             "gpu_required" | "gpu-required" => Self::GPU_REQUIRED,
@@ -136,14 +141,56 @@ impl EvaluationBackend {
         Ok(backend)
     }
 
+    /// Hardware-conditional resolution — the single point where the device
+    /// string becomes a policy that knows whether a card is actually present.
+    ///
+    /// The recurring eight-month bug was that `auto`/`cpu`/`gpu` mapped to a
+    /// backend with NO knowledge of the card, so a stray `prop_search_device:
+    /// cpu` (or the desktop config's shipped `cpu`, or a leftover env var)
+    /// silently ran the whole GA on the CPU with a 3090 idle. Here, when a
+    /// usable card + the native f64 lane are present, EVERY value except the
+    /// explicit `cpu_forced` escape resolves to GPU-required (GPU or a loud
+    /// error) — so the only way to run on the CPU with a card is to ask for it
+    /// by name. A card-less host is unchanged: `auto`/`cpu` resolve to CPU and
+    /// the run proceeds normally.
+    ///
+    /// `resolve_for_discovery` stays pure (no probe) so the existing unit tests
+    /// that pin the string→backend mapping keep passing.
+    pub fn resolve_with_probe(
+        global_preference: &str,
+        discovery_preference: &str,
+        require_gpu_env: Option<&str>,
+        probe: HardwareProbe,
+    ) -> Result<Self, BackendConfigError> {
+        let base =
+            Self::resolve_for_discovery(global_preference, discovery_preference, require_gpu_env)?;
+        if !probe.card_present {
+            return Ok(base);
+        }
+        // A card is present. Honor exactly one deliberate CPU escape; every
+        // other value means "use the card" and is escalated to GPU-required so a
+        // fault is loud rather than a silent CPU run.
+        let selected = if discovery_preference.trim().is_empty() {
+            global_preference
+        } else {
+            discovery_preference
+        };
+        if matches!(normalize(selected).as_str(), "cpu_forced" | "cpu-forced") {
+            Ok(base)
+        } else {
+            Ok(Self::GPU_REQUIRED)
+        }
+    }
+
     pub fn from_settings(
         settings: &Settings,
         require_gpu_env: Option<&str>,
     ) -> Result<Self, BackendConfigError> {
-        Self::resolve_for_discovery(
+        Self::resolve_with_probe(
             &settings.system.enable_gpu_preference,
             &settings.models.prop_search_device,
             require_gpu_env,
+            HardwareProbe::detect(),
         )
     }
 
@@ -175,6 +222,36 @@ impl EvaluationBackend {
             device: DevicePreference::Gpu,
             fallback,
             accelerator_hint: hint,
+        }
+    }
+}
+
+/// A snapshot of whether this machine can actually run the native f64 GPU lane.
+///
+/// Constructed once at backend install and carried into resolution so "a card
+/// is present" is a structural input to the device decision instead of an
+/// after-the-fact warning. `detect()` is false on every build without the
+/// prototype-B lane compiled in (Vulkan/ROCm/CPU/default), so those builds are
+/// never escalated to GPU-required with no engine to run.
+#[derive(Debug, Clone, Copy)]
+pub struct HardwareProbe {
+    pub card_present: bool,
+}
+
+impl HardwareProbe {
+    pub fn detect() -> Self {
+        #[cfg(feature = "gpu-b-adapter")]
+        {
+            Self {
+                card_present:
+                    crate::gpu_native::prototype_b_population_eval::prototype_b_available(),
+            }
+        }
+        #[cfg(not(feature = "gpu-b-adapter"))]
+        {
+            Self {
+                card_present: false,
+            }
         }
     }
 }
@@ -249,38 +326,46 @@ pub fn evaluate_population_core_with_backend_and_audit(
             );
         });
     }
-    // Fail-loud guard (task #35, 2026-08-09): running the GA population eval on
-    // the CPU WHILE a usable CUDA card is present is almost always a
-    // misconfiguration (a stray `prop_search_device: cpu`), and it silently
-    // costs ~97% of a run's wall time. That went unnoticed for eight months
-    // because it looked like a healthy-but-slow run. Warn ONCE, loudly, so it
-    // can never hide again.
-    #[cfg(feature = "gpu-b-adapter")]
-    if backend.device == DevicePreference::Cpu
-        && crate::gpu_native::prototype_b_population_eval::prototype_b_available()
-    {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!(
-                target: "neoethos_search::backend",
-                "population eval is on the CPU but a CUDA card is available — the GA is \
-                 leaving ~97% of the card idle. This is almost certainly a stray \
-                 `models.prop_search_device: cpu`; set it to `auto` to route the GA to \
-                 the native f64 prototype-B lane."
-            );
-        });
-    }
+    // Record the realized device at this single, sequential, once-per-generation
+    // dispatch (WALL time — not the summed rayon-thread nanos the eval_telemetry
+    // doc warns about), so `device_summary` at run end can prove the population
+    // eval stayed on the card. The AUTO / GPU-preferred arm's device is decided
+    // INSIDE `evaluate_population_core` (its gate / n_genes), so that arm
+    // self-records there; recording it here too would double-count.
+    //
+    // The old warn-once "CPU while a card is present" guard is gone:
+    // `resolve_with_probe` now escalates every non-`cpu_forced` value to
+    // GPU-required on a card, so a plain Cpu backend can only reach this dispatch
+    // on a card-less host (normal) or via the explicit `cpu_forced` escape — in
+    // neither case is a warning warranted.
+    let dispatch_started = std::time::Instant::now();
     match (backend.device, backend.fallback) {
-        (DevicePreference::Cpu, _) => cpu_strategy::run(
-            backend,
-            audit,
-            CpuStrategyCategory::PopulationEvaluation,
-            "backend::cpu_canonical_population",
-            || crate::eval::validation_backtest_population_cpu(inputs),
-        )
-        .map_err(|error| error.to_string()),
+        (DevicePreference::Cpu, _) => {
+            let out = cpu_strategy::run(
+                backend,
+                audit,
+                CpuStrategyCategory::PopulationEvaluation,
+                "backend::cpu_canonical_population",
+                || crate::eval::validation_backtest_population_cpu(inputs),
+            )
+            .map_err(|error| error.to_string());
+            crate::eval_telemetry::record_device(
+                "population_eval",
+                crate::eval_telemetry::Device::Cpu,
+                dispatch_started.elapsed(),
+            );
+            out
+        }
         (DevicePreference::Gpu, FallbackPolicy::ForbidCpu) => {
-            evaluate_gpu_required_population(inputs, backend, audit)
+            let out = evaluate_gpu_required_population(inputs, backend, audit);
+            if out.is_ok() {
+                crate::eval_telemetry::record_device(
+                    "population_eval",
+                    crate::eval_telemetry::Device::Gpu,
+                    dispatch_started.elapsed(),
+                );
+            }
+            out
         }
         _ => crate::eval::evaluate_population_core(inputs),
     }
@@ -552,6 +637,64 @@ fn parse_optional_bool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The permanent invariant, provable without a real GPU: drive
+    /// `resolve_with_probe` with an EXPLICIT probe. On a card, every device
+    /// string any config surface can ship must resolve to GPU-required — the
+    /// sole exception being the deliberate `cpu_forced` escape — and a card-less
+    /// host must still resolve `auto`/`cpu` to a CPU-allowing backend. This test
+    /// reopens-fails if the resolver ever stops escalating a plain `cpu` on a
+    /// card (the eight-month trap), or if the `cpu_forced` escape is removed.
+    #[test]
+    fn card_present_forbids_silent_cpu_population_eval() {
+        let card = HardwareProbe { card_present: true };
+        let no_card = HardwareProbe {
+            card_present: false,
+        };
+
+        for value in ["", "auto", "cpu", "off", "false", "gpu", "cuda"] {
+            let backend =
+                EvaluationBackend::resolve_with_probe(value, "", None, card).expect("resolves");
+            assert!(
+                backend.gpu_required(),
+                "on a card, `{value}` must resolve to GPU-required, not a silent CPU run"
+            );
+        }
+
+        for forced in ["cpu_forced", "cpu-forced"] {
+            let backend =
+                EvaluationBackend::resolve_with_probe(forced, "", None, card).expect("resolves");
+            assert_eq!(
+                backend,
+                EvaluationBackend::CPU_CANONICAL,
+                "`{forced}` is the one deliberate CPU-on-a-card escape"
+            );
+        }
+
+        // The discovery-specific field also escalates on a card (it wins when
+        // non-empty), and its `cpu_forced` escape is honored there too.
+        assert!(
+            EvaluationBackend::resolve_with_probe("auto", "cpu", None, card)
+                .unwrap()
+                .gpu_required(),
+            "a shipped `models.prop_search_device: cpu` must not defeat the card"
+        );
+        assert_eq!(
+            EvaluationBackend::resolve_with_probe("auto", "cpu_forced", None, card).unwrap(),
+            EvaluationBackend::CPU_CANONICAL
+        );
+
+        // Card-less host: unchanged — auto/cpu resolve to a CPU-allowing backend
+        // and the run proceeds normally, never a hard failure.
+        for value in ["auto", "cpu", ""] {
+            let backend =
+                EvaluationBackend::resolve_with_probe(value, "", None, no_card).expect("resolves");
+            assert!(
+                backend.cpu_fallback_allowed(),
+                "no card: `{value}` must allow CPU (normal), not fail loud"
+            );
+        }
+    }
 
     #[test]
     fn legacy_values_keep_their_meaning() {

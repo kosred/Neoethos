@@ -134,7 +134,10 @@ models:
   prop_search_selection_temperature: 0.75
   prop_search_tournament_size: 10
   prop_search_checkpoint: models/strategy_evo_checkpoint.json
-  prop_search_device: cpu
+  # `auto` (not `cpu`): resolve_with_probe escalates any non-`cpu_forced` value
+  # to GPU-required when a card is present, so this must not ship `cpu` (the
+  # eight-month drift). On a card-less desktop it resolves to CPU normally.
+  prop_search_device: auto
   prop_search_train_years: 8
   prop_search_val_years: 1
   prop_search_val_candidates: 0

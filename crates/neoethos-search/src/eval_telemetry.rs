@@ -214,6 +214,151 @@ pub fn reset() {
     if let Ok(mut registry) = registry().lock() {
         registry.clear();
     }
+    if let Ok(mut devices) = device_registry().lock() {
+        devices.clear();
+    }
+}
+
+// ── Device axis (task #35, 2026-08-09) ────────────────────────────────────
+//
+// The name@caller registry above answers "which evaluator ran, for how long",
+// but NOT "did it run on the GPU or silently fall back to the CPU". A run that
+// spent 100% on a 3090 and one that silently ran the whole GA on the CPU
+// produced byte-identical end-of-run output — the exact indistinguishability
+// that let `prop_search_device: cpu` waste rented cards for eight months.
+//
+// This sibling registry attributes WALL time (never the summed rayon-thread
+// nanos the `Tally::nanos` note above warns about — a 128-way CPU eval would
+// otherwise swamp the single-stream GPU number and read as ~1% GPU on a genuine
+// GPU run) to a device, counts card-present CPU fallbacks, and prints one line
+// next to the goal report so the two can never look alike again.
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum Device {
+    #[default]
+    Cpu,
+    Gpu,
+}
+
+#[derive(Default, Clone, Copy)]
+struct DeviceMetrics {
+    gpu_nanos: u128,
+    cpu_nanos: u128,
+    /// CPU fallbacks that happened WHILE a usable CUDA card was present — the
+    /// bad kind. A card-less host records 0 here by construction.
+    cpu_fallback_calls: u64,
+}
+
+fn device_registry() -> &'static Mutex<BTreeMap<&'static str, DeviceMetrics>> {
+    static REGISTRY: OnceLock<Mutex<BTreeMap<&'static str, DeviceMetrics>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Is a usable CUDA card + the native f64 prototype-B lane actually present?
+/// The ONLY true hardware check — a mere feature/env flag is not enough. False
+/// on every build without prototype B compiled in (Vulkan/ROCm/CPU), so those
+/// hosts report "no card" as the normal, expected state.
+fn card_present() -> bool {
+    #[cfg(feature = "gpu-b-adapter")]
+    {
+        crate::gpu_native::prototype_b_population_eval::prototype_b_available()
+    }
+    #[cfg(not(feature = "gpu-b-adapter"))]
+    {
+        false
+    }
+}
+
+/// Attribute one population-eval's WALL duration to the device it ran on.
+pub fn record_device(lane: &'static str, device: Device, wall: Duration) {
+    if let Ok(mut registry) = device_registry().lock() {
+        let metrics = registry.entry(lane).or_default();
+        match device {
+            Device::Gpu => metrics.gpu_nanos += wall.as_nanos(),
+            Device::Cpu => metrics.cpu_nanos += wall.as_nanos(),
+        }
+    }
+}
+
+/// Count a CPU fallback that happened while a card was present. No-op on a
+/// card-less host, so "0 fallbacks" always means "nothing bad happened".
+pub fn note_cpu_fallback(lane: &'static str) {
+    if !card_present() {
+        return;
+    }
+    if let Ok(mut registry) = device_registry().lock() {
+        registry.entry(lane).or_default().cpu_fallback_calls += 1;
+    }
+}
+
+/// Print the GPU-vs-CPU split next to the goal report.
+///
+/// Unlike `log_summary`, this prints EVEN WHEN EMPTY: a run that recorded no
+/// device rows still states whether a card was present, so "0% GPU" can always
+/// be read as either "no card (normal)" or "card present, everything fell back
+/// (bad)" — never left as an inference.
+pub fn device_summary() {
+    let card = card_present();
+    let rows: Vec<(&'static str, DeviceMetrics)> = device_registry()
+        .lock()
+        .map(|registry| registry.iter().map(|(lane, m)| (*lane, *m)).collect())
+        .unwrap_or_default();
+
+    let mut gpu_total: u128 = 0;
+    let mut cpu_total: u128 = 0;
+    let mut fallbacks: u64 = 0;
+    for (lane, m) in &rows {
+        gpu_total += m.gpu_nanos;
+        cpu_total += m.cpu_nanos;
+        fallbacks += m.cpu_fallback_calls;
+        let denom = (m.gpu_nanos + m.cpu_nanos) as f64;
+        let gpu_pct = if denom > 0.0 {
+            100.0 * m.gpu_nanos as f64 / denom
+        } else {
+            0.0
+        };
+        tracing::info!(
+            target: "neoethos_search::eval_telemetry",
+            lane,
+            gpu_pct = format!("{gpu_pct:.1}"),
+            gpu_s = format!("{:.1}", m.gpu_nanos as f64 / 1e9),
+            cpu_s = format!("{:.1}", m.cpu_nanos as f64 / 1e9),
+            cpu_fallbacks = m.cpu_fallback_calls,
+            "population-eval device split (per lane)"
+        );
+    }
+
+    let denom = (gpu_total + cpu_total) as f64;
+    let gpu_pct = if denom > 0.0 {
+        100.0 * gpu_total as f64 / denom
+    } else {
+        0.0
+    };
+
+    if card && (gpu_pct < 95.0 || fallbacks > 0) {
+        // The card was there and the population eval did NOT stay on it. This is
+        // the exact failure the operator asked to be impossible to miss: a low
+        // average GPU load means the card is starved, and any fallback at all
+        // means work silently leaked to the CPU.
+        tracing::warn!(
+            target: "neoethos_search::eval_telemetry",
+            card_present = card,
+            gpu_pct = format!("{gpu_pct:.1}"),
+            cpu_fallbacks = fallbacks,
+            "population eval did NOT stay on the GPU — a CUDA card is present but \
+             most eval WALL time ran on the CPU. Low average GPU load means the \
+             card is starved; investigate before trusting the run's throughput."
+        );
+    } else {
+        tracing::info!(
+            target: "neoethos_search::eval_telemetry",
+            card_present = card,
+            gpu_pct = format!("{gpu_pct:.1}"),
+            cpu_fallbacks = fallbacks,
+            "population-eval device summary (100% GPU on a card is the goal; \
+             0% with no card present is normal)"
+        );
+    }
 }
 
 #[cfg(test)]
