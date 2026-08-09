@@ -451,8 +451,17 @@ impl Default for RiskConfig {
             risk_per_trade: 0.030,
             // Unset by default: each mode inherits the shared band until the
             // operator gives it its own.
+            //
+            // Operator decision (2026-08-09): Risky mode chases 100 -> 50k in
+            // ~6 months, so its risk CEILING is 30% per trade (the "20-pip
+            // challenge" style, stop 10-30 pips, target 2RR). This is a CEILING,
+            // not a fixed size: the log-growth objective sizes each gene toward
+            // its own growth-optimal fraction and only approaches 30% when the
+            // edge justifies it — below ~43% win rate at 2RR, 30% is geometric
+            // ruin, and the objective correctly declines it. The honest report
+            // surfaces P(ruin) so this stays a visible bet, not a hidden one.
             risky_min_risk_per_trade: None,
-            risky_max_risk_per_trade: None,
+            risky_max_risk_per_trade: Some(0.30),
             prop_firm_min_risk_per_trade: None,
             prop_firm_max_risk_per_trade: None,
             // Portfolio-level concurrent-risk cap: 0 = disabled (per-engine
@@ -1656,7 +1665,14 @@ impl Default for ModelsConfig {
             // Off by default: these express one operator's target, not a
             // universal truth about what a good strategy looks like.
             prop_search_min_win_rate: 0.0,
-            prop_search_min_payoff_ratio: 0.0,
+            // Operator decision A (2026-08-09): the search must select for
+            // payoff ratio, not trade volume. 2.0 = only strategies whose
+            // average win is at least 2x their average loss (the operator's
+            // "ideally 2RR"). Enforced at discovery.rs (`TargetProfile`); an
+            // empty portfolio at 2.0 is the honest "2RR is rare here" signal,
+            // never silently relaxed. Was 0.0 (gate off) — the single reason
+            // 16 months of runs kept selecting one-point-of-margin systems.
+            prop_search_min_payoff_ratio: 2.0,
             prop_search_max_in_market: 0.0,
             prop_search_val_min_monthly_profit_pct: 0.0,
             prop_search_val_log_trades: false,

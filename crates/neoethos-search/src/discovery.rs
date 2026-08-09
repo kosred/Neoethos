@@ -4452,13 +4452,18 @@ where
             let p = gene.win_rate.clamp(0.0, 1.0);
             let pf = gene.profit_factor.max(0.0);
             // Kelly fraction f* = p·(pf−1)/pf (0 when no edge); half-Kelly,
-            // capped at 25% so a single loss never wipes the bankroll.
+            // capped at the Risky risk ceiling (30% per operator decision
+            // 2026-08-09) so the growth projection matches what the sim is
+            // allowed to bet. Half-Kelly is deliberately conservative vs full
+            // Kelly: it keeps the projected growth ruin-aware, so a strategy
+            // whose full-Kelly size would be ruinous does not score as if it
+            // compounds cleanly.
             let f_star = if pf > 1.0 && p > 0.0 {
                 p * (pf - 1.0) / pf
             } else {
                 0.0
             };
-            let f = (f_star * 0.5).clamp(0.0, 0.25);
+            let f = (f_star * 0.5).clamp(0.0, 0.30);
             // Reward-to-risk implied by (pf, p): avg_win / avg_loss.
             let rr = if p > 0.0 && p < 1.0 {
                 pf * (1.0 - p) / p

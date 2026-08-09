@@ -149,6 +149,11 @@ risk:
   min_risk_per_trade: 0.0
   max_risk_per_trade: 0.03
   risk_per_trade: 0.03
+  # Decision (2026-08-09): Risky mode chases 100 -> 50k in ~6 months, so its
+  # risk CEILING is 30% per trade. This is a ceiling the growth objective sizes
+  # UP TO only when the edge justifies it (below ~43% WR at 2RR, 30% is
+  # geometric ruin and the objective declines it). PropFirm keeps the 3% band.
+  risky_max_risk_per_trade: 0.30
   max_portfolio_risk: 0.34
   daily_drawdown_limit: 0.10000000149011612
   total_drawdown_limit: 0.20000000298023224
@@ -270,6 +275,12 @@ models:
   prop_search_val_min_trades_per_day: 1.0
   prop_search_val_min_monthly_profit_pct: 0.0
   prop_search_val_log_trades: true
+  # Decision A (2026-08-09): reject any strategy whose realized average win is
+  # under 2x its average loss. This is the REALIZED payoff (avg_win/avg_loss),
+  # distinct from risk.min_risk_reward=2.0 which is the SETUP ratio (TP vs SL).
+  # 0.0 = off (the pre-2026-08-09 state that let the search buy volume with no
+  # payoff margin). An empty portfolio at 2.0 is the honest "2RR is rare" answer.
+  prop_search_min_payoff_ratio: 2.0
   prop_search_val_trade_log_max: 50
   prop_search_async: true
   prop_search_async_wait: false
