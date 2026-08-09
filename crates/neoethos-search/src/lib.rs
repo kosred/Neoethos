@@ -38,6 +38,7 @@ pub mod execution_profile;
 pub mod export_state;
 pub mod fx_rates;
 pub mod funnel_profile;
+pub mod goal_report;
 pub mod gpu_fallback;
 pub mod gpu_native;
 // `pub mod gauntlet;` — DELETED 2026-05-26 (operator directive: dual-mode product).
