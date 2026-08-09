@@ -47,6 +47,7 @@ pub use runtime_overrides::{
     install_strategy_evaluation_runtime_overrides_from_env,
     install_strategy_evaluation_runtime_overrides_from_settings, smc_gate_disabled,
 };
+pub(crate) use search_engine::{adaptive_pip_size, calendar_day_key_ms};
 pub use search_engine::{
     SmcGateArrays, WalkforwardPopulationGenePack, evaluate_genes, evolve_search,
     evolve_search_with_progress, evolve_search_with_progress_and_limits, month_day_indices,
