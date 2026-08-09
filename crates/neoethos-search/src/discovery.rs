@@ -5920,6 +5920,11 @@ where
     };
     funnel.finalize(outcome);
 
+    // Honest goal projection (Risky only): "reach the target, when, at what
+    // risk?" from the selected portfolio's REAL per-trade R-multiples. Logged
+    // here, before the result is moved, while config and the trades coexist.
+    log_goal_report(config, &portfolio, &quality_metrics, &logged_trades);
+
     Ok(DiscoveryResult {
         portfolio,
         candidates: ranked_candidate_genes,
@@ -6234,6 +6239,61 @@ pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult
 /// portfolio, overstating the result by roughly the portfolio size. Returns are
 /// therefore reported as a distribution, and only trade frequency is aggregated,
 /// because the strategies really do trade in parallel on one account.
+/// Honest goal projection for a Risky run — the "no fake results" output.
+///
+/// Monte-Carlos the SELECTED portfolio's real, cost-charged per-trade
+/// R-multiples (Decision D) across a risk sweep and logs P(reach target),
+/// P(ruin), median/mean terminal, median time-to-target, and the risk that
+/// maximises P(reach). No-op for non-Risky modes, where the target/horizon are
+/// meaningless. See [`crate::goal_report`].
+fn log_goal_report(
+    config: &DiscoveryConfig,
+    portfolio: &[Gene],
+    quality_metrics: &[StrategyMetrics],
+    logged_trades: &[LoggedStrategyTrades],
+) {
+    if !matches!(config.mode, DiscoveryMode::Risky) {
+        return;
+    }
+    let ids: std::collections::HashSet<&str> =
+        portfolio.iter().map(|g| g.strategy_id.as_str()).collect();
+    // Pool the exported strategies' real per-trade R-multiples (size-independent,
+    // net of the broker costs Decision D charges).
+    let r_multiples: Vec<f64> = logged_trades
+        .iter()
+        .filter(|lt| ids.contains(lt.strategy_id.as_str()))
+        .flat_map(|lt| lt.trades.iter().map(|t| t.r_multiple))
+        .filter(|r| r.is_finite())
+        .collect();
+    // Combined cadence: the strategies hold positions at the same time on the
+    // one account, so their per-day trade rates add.
+    let trades_per_day: f64 = quality_metrics
+        .iter()
+        .filter(|q| ids.contains(q.strategy_id.as_str()))
+        .map(|q| q.trades_per_month / 21.0)
+        .sum();
+    if r_multiples.is_empty() || trades_per_day <= 0.0 {
+        tracing::info!(
+            target: "neoethos_search::discovery",
+            "GOAL REPORT — skipped: the Risky portfolio produced no usable trades to project."
+        );
+        return;
+    }
+    let report = crate::goal_report::build_report(
+        &r_multiples,
+        config.risky_start_balance,
+        config.risky_target_balance,
+        config.risky_horizon_days,
+        trades_per_day,
+        crate::goal_report::DEFAULT_RISK_LEVELS,
+        // Fixed seed: the projection is reproducible for the same portfolio.
+        0x00C0_FFEE_u64,
+    );
+    for line in report.render().lines() {
+        tracing::info!(target: "neoethos_search::discovery", "{line}");
+    }
+}
+
 fn log_exported_money_summary(
     result: &DiscoveryResult,
     exported: &std::collections::HashSet<&str>,
