@@ -220,8 +220,18 @@ pub fn reset() {
 mod tests {
     use super::*;
 
+    /// Both tests drive the SAME process-global registry and `reset()` it, so
+    /// running them concurrently races: one test's `reset()` can wipe the other's
+    /// just-recorded entry before its assert. Serialize them on a shared lock so
+    /// the outcome is deterministic under `cargo test`'s default threading (this
+    /// was a latent flake that surfaced when unrelated timing shifted).
+    static TELEMETRY_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn totals_accumulate_per_evaluator_and_reset_clears_them() {
+        let _guard = TELEMETRY_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         reset();
         measure("test::alpha", 10, || std::thread::sleep(Duration::from_millis(2)));
         measure("test::alpha", 5, || ());
@@ -242,6 +252,9 @@ mod tests {
     /// missing from the table is the finding, not an omission.
     #[test]
     fn an_unused_evaluator_leaves_no_trace() {
+        let _guard = TELEMETRY_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         reset();
         measure("test::used", 1, || ());
         let registry = registry().lock().expect("registry");

@@ -225,6 +225,13 @@ pub struct DiscoveryConfig {
     pub evaluation_account_currency: String,
     pub evaluation_spread_pips: f64,
     pub evaluation_commission_per_trade: f64,
+    /// Broker overnight financing, pips/night, from the symbol's metadata
+    /// (`daily_swap_long_pips` / `daily_swap_short_pips`). Decision D
+    /// (2026-08-09): a zero-swap backtest silently overstates every held
+    /// position's edge — the search was buying carry it will never earn live.
+    /// 0.0 only when the symbol has no swap metadata (logged loudly).
+    pub swap_long_pips_per_day: f64,
+    pub swap_short_pips_per_day: f64,
     pub population: usize,
     /// When `true`, `run_search` raises the GA population to the card's fits
     /// ceiling (bounded to 16 384, never below `population`) and logs the
@@ -393,6 +400,8 @@ impl Default for DiscoveryConfig {
             evaluation_account_currency: String::new(),
             evaluation_spread_pips: f64::NAN,
             evaluation_commission_per_trade: f64::NAN,
+            swap_long_pips_per_day: 0.0,
+            swap_short_pips_per_day: 0.0,
             population: 1000,
             population_auto: false,
             generations: 10,
@@ -404,7 +413,15 @@ impl Default for DiscoveryConfig {
             max_hours: 0.0,
             corr_threshold: 0.85,
             min_trades_per_day: 0.2,
-            target_profile: TargetProfile::default(),
+            // Decision A default (2026-08-09): the 2RR payoff floor is the
+            // operator's intent, so the config-less fallback must embody it too
+            // — a run that lands here because config.yaml failed to load must
+            // NOT silently drop the floor to 0. Kept in lockstep with
+            // `models.prop_search_min_payoff_ratio`'s default (divergence test).
+            target_profile: TargetProfile {
+                min_payoff_ratio: 2.0,
+                ..TargetProfile::default()
+            },
             walkforward_splits: 20,
             embargo_minutes: 120,
             enable_cpcv: true,
@@ -421,7 +438,11 @@ impl Default for DiscoveryConfig {
             // DiscoveryConfig::default() behaves exactly as before.
             risk_per_trade_min: 0.005,
             risk_per_trade_max: 0.03,
-            risky_risk_band: None,
+            // Decision default (2026-08-09): the Risky 30% ceiling is operator
+            // intent, so the config-less fallback carries the same band as
+            // `from_settings` derives from `risk.risky_max_risk_per_trade`
+            // (min inherits 0.0). Kept in lockstep (divergence test).
+            risky_risk_band: Some((0.0, 0.30)),
             prop_firm_risk_band: None,
             max_regime_loss_pct: 3.0,
             higher_timeframes: Vec::new(),
@@ -505,6 +526,51 @@ impl DiscoveryConfig {
             model_settings.prop_search_val_candidates.max(1)
         };
 
+        // Decision D (2026-08-09): charge the broker's REAL costs. Every held
+        // position pays overnight financing, and the broker charges its own
+        // per-lot commission; a zero-swap / config-flat backtest overstates
+        // edge, and the search then buys carry and volume it will never earn
+        // live. Resolve both once here from the symbol's broker-authoritative
+        // metadata so the CPU and GPU kernels charge identical numbers. Swap is
+        // signed as the broker stores it (negative = the account pays).
+        let symbol = settings.system.symbol.clone();
+        let meta = neoethos_core::symbol_metadata::global_table().lookup(&symbol);
+        let (swap_long, swap_short) = match meta {
+            Some(m) => (
+                m.daily_swap_long_pips.unwrap_or(0.0),
+                m.daily_swap_short_pips.unwrap_or(0.0),
+            ),
+            None => (0.0, 0.0),
+        };
+        let config_commission = settings.risk.commission_per_lot.max(0.0);
+        let resolved_commission = meta
+            .and_then(|m| m.commission_per_lot)
+            .filter(|c| *c > 0.0)
+            .unwrap_or(config_commission);
+        if meta.is_none() || (swap_long == 0.0 && swap_short == 0.0) {
+            tracing::warn!(
+                target: "neoethos_search::discovery",
+                symbol = %symbol,
+                has_metadata = meta.is_some(),
+                swap_long,
+                swap_short,
+                resolved_commission,
+                config_commission,
+                "Decision D: swap resolved to ZERO — held positions pay no \
+                 overnight financing in the backtest. Reconcile the broker symbol \
+                 table (data/symbol_metadata.json) so carry is charged honestly."
+            );
+        } else {
+            tracing::info!(
+                target: "neoethos_search::discovery",
+                symbol = %symbol,
+                swap_long,
+                swap_short,
+                resolved_commission,
+                "Decision D: charging broker-authoritative swap + commission"
+            );
+        }
+
         Self {
             timeframe_label: settings.system.base_timeframe.clone(),
             evaluation_symbol: settings.system.symbol.clone(),
@@ -528,7 +594,9 @@ impl DiscoveryConfig {
             // kernels charge it identically with zero kernel changes.
             evaluation_spread_pips: settings.risk.backtest_spread_pips.max(0.0)
                 + settings.risk.slippage_pips.max(0.0),
-            evaluation_commission_per_trade: settings.risk.commission_per_lot.max(0.0),
+            evaluation_commission_per_trade: resolved_commission,
+            swap_long_pips_per_day: swap_long,
+            swap_short_pips_per_day: swap_short,
             population: model_settings.prop_search_population.max(10),
             population_auto: model_settings.prop_search_population_auto,
             generations: model_settings.prop_search_generations.max(1),
@@ -1097,6 +1165,10 @@ pub struct DiscoveryRunProfile {
     pub evaluation_account_currency: String,
     pub evaluation_spread_pips: f64,
     pub evaluation_commission_per_trade: f64,
+    /// Broker overnight financing charged in the backtest (Decision D). Part of
+    /// the cost basis: two runs at different swap are not comparable.
+    pub swap_long_pips_per_day: f64,
+    pub swap_short_pips_per_day: f64,
     /// Discovery regime (Strict / PropFirm / Risky) — changes filter floors,
     /// ranking, and gates. Was NOT recorded before slice 5.
     pub mode: DiscoveryMode,
@@ -1455,6 +1527,10 @@ fn discovery_backtest_settings(
         spread_pips: evaluation.spread_pips,
         commission_per_trade: evaluation.commission_per_trade,
         pip_value_per_lot: evaluation.pip_value_per_lot,
+        // Decision D: charge overnight financing (the engine applies it in both
+        // the CPU path and the CUDA kernel; it was silently 0 here before).
+        swap_long_pips_per_day: config.swap_long_pips_per_day,
+        swap_short_pips_per_day: config.swap_short_pips_per_day,
         kill_zones_enabled: true,
         risk_per_trade_min: config.risk_per_trade_min,
         risk_per_trade_max: config.risk_per_trade_max,
@@ -6649,6 +6725,8 @@ pub fn build_discovery_profile(
         evaluation_account_currency,
         evaluation_spread_pips,
         evaluation_commission_per_trade,
+        swap_long_pips_per_day,
+        swap_short_pips_per_day,
         population,
         generations,
         max_indicators,
@@ -6807,6 +6885,8 @@ pub fn build_discovery_profile(
         evaluation_account_currency: evaluation_account_currency.clone(),
         evaluation_spread_pips: *evaluation_spread_pips,
         evaluation_commission_per_trade: *evaluation_commission_per_trade,
+        swap_long_pips_per_day: *swap_long_pips_per_day,
+        swap_short_pips_per_day: *swap_short_pips_per_day,
         mode: *mode,
         target_profile: *target_profile,
         max_pbo: *max_pbo,

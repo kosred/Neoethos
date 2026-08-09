@@ -1901,11 +1901,17 @@ fn each_mode_keeps_its_own_risk_band() {
 
 #[test]
 fn unset_mode_band_inherits_the_shared_one() {
-    // Every pre-existing config has no per-mode values — behaviour must not move.
+    // Behaviour when NO per-mode band is set must be pure inheritance of the
+    // shared band. The Risky 30% ceiling is now a default (operator decision
+    // 2026-08-09), so clear the per-mode bands explicitly to exercise the
+    // inheritance path rather than relying on the default being None.
     let mut settings = neoethos_core::Settings::default();
     settings.risk.min_risk_per_trade = 0.002;
     settings.risk.max_risk_per_trade = 0.05;
-    assert_eq!(settings.risk.risky_max_risk_per_trade, None);
+    settings.risk.risky_min_risk_per_trade = None;
+    settings.risk.risky_max_risk_per_trade = None;
+    settings.risk.prop_firm_min_risk_per_trade = None;
+    settings.risk.prop_firm_max_risk_per_trade = None;
 
     for mode in [
         DiscoveryMode::Risky,
