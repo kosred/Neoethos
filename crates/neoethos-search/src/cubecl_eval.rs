@@ -2135,6 +2135,15 @@ fn install_gpu_buffer_cap(probed: u64) {
 ///
 /// Unknown VRAM (wgpu/ROCm report 0) keeps the conservative 2 GB so the pool
 /// trim still bounds usage.
+/// The cubecl pool budget (MiB) to allow when native prototype B owns
+/// population eval and cubecl is only a co-tenant doing windowed signal
+/// synthesis. Large enough for a windowed synth buffer set (one window ×
+/// population, read back per window), small enough to leave the bulk of a
+/// 24 GB card to prototype B's resident dataset + outcome workspace. Anything
+/// that will not fit falls back to the CPU (never-OOM), it does not crash.
+#[cfg(feature = "gpu-b-adapter")]
+const PROTOTYPE_B_COTENANT_VRAM_MB: u64 = 2048;
+
 fn vram_budget_mb_for(min_vram_gb: f64) -> u64 {
     if !min_vram_gb.is_finite() || min_vram_gb <= 0.0 {
         return 2048;
@@ -2192,7 +2201,29 @@ pub fn auto_tune_memory_budgets() {
         // Discrete card with real dedicated VRAM: pool-trim from the card, and
         // leave the per-buffer cap at 0 so it's probed from the device at client
         // build (the true `max_storage_buffer_binding_size`).
-        (vram_budget_mb_for(min_vram_gb), 0usize)
+        //
+        // BUT when the native prototype-B engine owns population eval (gpu-cuda
+        // + a CUDA card), cubecl is NOT the population engine here — B is. cubecl
+        // only ever does light per-gene signal synthesis on the windowed path
+        // (the fused path is disabled in that configuration, see
+        // `resolve_fused_eval_enabled`), which reads each window back to host so
+        // its peak is one window, not the whole matrix. Yet a cubecl client's
+        // memory pool reserves this whole budget on first build regardless of how
+        // little it uses — measured 2026-08-09 on a 3090: the signal-synth client
+        // reserved ~14.7 GB (0% GPU utilisation) and prototype B then saw only
+        // ~7 GB of 24, so every validation batch fell back to the CPU. Cap the
+        // cubecl pool low so B keeps the card; cubecl falls back to the CPU for
+        // anything that will not fit, which is the never-OOM invariant, not a
+        // regression. Vulkan/ROCm (where cubecl IS the engine and B is absent)
+        // keep the full budget.
+        let budget = vram_budget_mb_for(min_vram_gb);
+        #[cfg(feature = "gpu-b-adapter")]
+        let budget = if crate::gpu_native::prototype_b_population_eval::prototype_b_available() {
+            budget.min(PROTOTYPE_B_COTENANT_VRAM_MB)
+        } else {
+            budget
+        };
+        (budget, 0usize)
     } else {
         // Shared-memory GPU (integrated graphics — the probe reports no dedicated
         // VRAM). Its buffers come out of SYSTEM RAM, so the usable budget is
