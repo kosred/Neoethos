@@ -11,32 +11,45 @@ use super::*;
 fn authorize_url_uses_selected_callback_port() {
     let config = CTraderLoopbackConfig::new(43001, vec![43002, 43003], "/callback");
 
-    let authorize_url = build_authorize_url(
+    let authorize_url = build_authorize_url_with_state(
         "client-id",
         "http://127.0.0.1:43001/callback",
         43002,
         "trading",
+        "state-token-1",
     )
     .expect("authorize url should build");
 
     assert!(authorize_url.contains("client_id=client-id"));
     assert!(authorize_url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A43002%2Fcallback"));
+    assert!(authorize_url.contains("state=state-token-1"));
     assert_eq!(config.allowed_ports(), &[43001, 43002, 43003]);
 }
 
 #[test]
 fn authorize_url_rejects_malformed_redirect_uri() {
-    let err = build_authorize_url("client-id", "not-a-valid-redirect", 43002, "trading")
-        .expect_err("malformed redirect must fail");
+    let err = build_authorize_url_with_state(
+        "client-id",
+        "not-a-valid-redirect",
+        43002,
+        "trading",
+        "state-token-1",
+    )
+    .expect_err("malformed redirect must fail");
 
     assert!(err.to_string().contains("redirect URI"));
 }
 
 #[test]
 fn authorize_url_rewrites_ipv6_loopback_port() {
-    let authorize_url =
-        build_authorize_url("client-id", "http://[::1]:43001/callback", 43002, "trading")
-            .expect("IPv6 authorize url should build");
+    let authorize_url = build_authorize_url_with_state(
+        "client-id",
+        "http://[::1]:43001/callback",
+        43002,
+        "trading",
+        "state-token-1",
+    )
+    .expect("IPv6 authorize url should build");
 
     assert!(authorize_url.contains("redirect_uri=http%3A%2F%2F%5B%3A%3A1%5D%3A43002%2Fcallback"));
 }

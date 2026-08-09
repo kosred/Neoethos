@@ -188,27 +188,11 @@ impl ProductionCTraderLiveAuthBackend {
         Err(anyhow!("failed to bind any cTrader callback port"))
     }
 
-    /// Back-compat entry point: same as `capture_authorization_code_with_timeout`
-    /// but uses the default `CTRADER_CALLBACK_TIMEOUT`. Kept for
-    /// pre-F2 unit tests that don't exercise the state-validation
-    /// path. Production `run()` always uses `..._with_state` below.
-    #[allow(dead_code)] // see comment — used by historical unit tests
-    fn capture_authorization_code(
-        &self,
-        listener: TcpListener,
-        expected_path: &str,
-    ) -> Result<String> {
-        self.capture_authorization_code_with_timeout(
-            listener,
-            expected_path,
-            CTRADER_CALLBACK_TIMEOUT,
-        )
-    }
-
     /// Back-compat: keep the pre-F2 entrypoint working for unit tests
-    /// that don't exercise the state-validation path. Production
-    /// `run()` always uses `..._with_state` below.
-    #[allow(dead_code)] // see capture_authorization_code above
+    /// that don't exercise the state-validation path (see
+    /// `callback_capture_times_out_when_browser_never_redirects`).
+    /// Production `run()` always uses `..._with_state` below.
+    #[allow(dead_code)] // test-only entry point — see doc comment
     fn capture_authorization_code_with_timeout(
         &self,
         listener: TcpListener,
@@ -675,25 +659,6 @@ impl CTraderLiveAuthBackend for StubCTraderLiveAuthBackend {
             Err(message) => Err(anyhow!(message)),
         }
     }
-}
-
-#[allow(dead_code)] // back-compat shim — see comment below
-pub fn build_authorize_url(
-    client_id: &str,
-    redirect_uri: &str,
-    callback_port: u16,
-    scope: &str,
-) -> Result<String> {
-    // Back-compat shim for callers/tests that don't supply state. Real
-    // production code must use `build_authorize_url_with_state` and verify
-    // the echoed `state` on the callback. See audit-fix F2.
-    let redirect_uri = rewrite_redirect_uri_port(redirect_uri, callback_port)?;
-    Ok(format!(
-        "https://id.ctrader.com/my/settings/openapi/grantingaccess/?client_id={}&redirect_uri={}&scope={}&product=web",
-        percent_encode(client_id),
-        percent_encode(&redirect_uri),
-        percent_encode(scope),
-    ))
 }
 
 /// Build the cTrader authorize URL with a CSRF `state` parameter.

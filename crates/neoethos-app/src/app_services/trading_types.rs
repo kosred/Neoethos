@@ -17,8 +17,11 @@
 //!
 //! - [`TradingAdapterKind`] — broker capability flags read by
 //!   `broker_config` (and, in time, the Flutter order/position screens).
-//! - [`MarketChartSnapshot`] — payload type of the live
-//!   [`crate::app_services::ServiceEvent::ChartDataUpdated`] variant.
+//! - [`MarketChartSnapshot`] — chart payload shape. Its former carrier,
+//!   `ServiceEvent::ChartDataUpdated`, was deleted in the 2026-08-08
+//!   dead-code purge (zero construct/match sites), so this type currently
+//!   has no consumer outside this module — follow-up WIRE-or-DELETE
+//!   candidate when the chart panel gets its live push channel.
 //! - [`ChartCandle`] / [`ChartOverlay`] — the candle + overlay rows that
 //!   make up a [`MarketChartSnapshot`].
 //!
@@ -94,8 +97,9 @@ pub struct ChartOverlay {
 }
 
 /// Snapshot of a symbol's chart state — candles, overlay markers and the
-/// derived price/headline metadata. Payload of the live
-/// [`crate::app_services::ServiceEvent::ChartDataUpdated`] variant.
+/// derived price/headline metadata. Its former event-bus carrier
+/// (`ServiceEvent::ChartDataUpdated`) was deleted in the 2026-08-08
+/// dead-code purge; see the module header.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MarketChartSnapshot {
     pub symbol: String,

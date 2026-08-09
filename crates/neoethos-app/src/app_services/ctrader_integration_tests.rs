@@ -13,7 +13,7 @@
 mod ctrader_integration_tests {
     use crate::app_services::ctrader_data::{
         CTraderChartHistoryRequest, CTraderSymbolInfo, CTraderSymbolLookupRequest,
-        load_chart_history_with_transport, load_historical_bars_only_with_transport,
+        load_historical_bars_only_with_transport,
         parse_trendbars_response, resolve_symbol_with_transport,
     };
     use crate::app_services::ctrader_live_auth::{
@@ -118,12 +118,6 @@ mod ctrader_integration_tests {
     fn trendbars_ok(symbol_id: i64, period: &str) -> String {
         format!(
             r#"{{"clientMsgId":"trendbars-1","payloadType":2138,"payload":{{"period":"{period}","symbolId":{symbol_id},"trendbar":[{{"volume":10,"low":110000,"deltaOpen":30,"deltaClose":80,"deltaHigh":150,"utcTimestampInMinutes":28500000}}],"hasMore":false}}}}"#
-        )
-    }
-
-    fn ticks_ok(symbol_id: i64) -> String {
-        format!(
-            r#"{{"clientMsgId":"ticks-1","payloadType":2146,"payload":{{"symbolId":{symbol_id},"hasMore":false,"tickData":[{{"timestamp":1710000000000,"tick":110020}},{{"timestamp":300,"tick":109980}}]}}}}"#
         )
     }
 
@@ -311,56 +305,6 @@ mod ctrader_integration_tests {
         assert!(!result.has_more);
         assert!((result.bars[0].low - 1.10000).abs() < 1e-9);
         assert!((result.bars[0].close - 1.10080).abs() < 1e-9);
-    }
-
-    #[test]
-    fn full_chart_history_flow_sends_7_messages_and_returns_bars_and_ticks() {
-        // v0.5.1.1: resolve_symbol uses two send_sequence calls (re-auth on
-        // each, 6 messages), plus 3 data messages = 9 total.
-        let transport = SequenceTransport::with(vec![
-            Ok(app_auth_ok()),
-            Ok(account_auth_ok(712345)),
-            Ok(symbols_list_ok(712345, &[("EURUSD", 14)])),
-            Ok(app_auth_ok()),
-            Ok(account_auth_ok(712345)),
-            Ok(symbol_by_id_ok(14, 5)),
-            Ok(trendbars_ok(14, "M5")),
-            Ok(ticks_ok(14)),
-            Ok(ticks_ok(14)),
-        ]);
-
-        let result = load_chart_history_with_transport(
-            &transport,
-            &CTraderChartHistoryRequest {
-                client_id: "cid".into(),
-                client_secret: "csec".into(),
-                access_token: "tok".into(),
-                environment: CTraderEnvironment::Demo,
-                account_id: "712345".into(),
-                symbol_name: "EURUSD".into(),
-                timeframe: "M5".into(),
-                from_timestamp_ms: 1_709_000_000_000,
-                to_timestamp_ms: 1_710_000_000_000,
-                count: Some(96),
-            },
-        )
-        .expect("full chart history should succeed");
-
-        assert_eq!(transport.sent_count(), 9);
-        assert_eq!(result.bars.len(), 1);
-        assert_eq!(result.bid_ticks.len(), 2);
-        assert_eq!(result.ask_ticks.len(), 2);
-        assert_eq!(
-            result.live_subscription_plan.subscribe_spots.payload_type,
-            2127
-        );
-        assert_eq!(
-            result
-                .live_subscription_plan
-                .subscribe_trendbars
-                .payload_type,
-            2135
-        );
     }
 
     // ─── Account discovery flow ─────────────────────────────────────────────

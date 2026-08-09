@@ -4,12 +4,9 @@ use crate::app_services::ctrader_messages::{
     CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_QUOTE_TYPE_ASK, CTRADER_QUOTE_TYPE_BID, CTraderOpenApiJsonMessage,
     CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, build_account_auth_request,
-    build_application_auth_request, build_get_tick_data_request, build_get_trendbars_request,
-    build_subscribe_live_trendbar_request, build_subscribe_spots_request,
+    build_application_auth_request, build_get_trendbars_request,
     build_symbol_by_id_request, build_symbols_list_request,
-    build_unsubscribe_live_trendbar_request, build_unsubscribe_spots_request,
     parse_ctrader_error_payload, parse_open_api_envelope, trendbar_period_value,
 };
 use anyhow::{Context, Result, anyhow};
@@ -511,35 +508,15 @@ pub struct CTraderChartHistoryRequest {
     pub count: Option<u32>,
 }
 
-// The full chart-history result + its live-subscription plan are produced by
-// `load_chart_history` (below), the live charting path that isn't wired into the
-// production server yet (it uses the bars-only fetch). `dead_code` until Phase
-// 2-5 wires live charting; the bars-only result above stays live.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq)]
-pub struct CTraderChartHistoryResult {
-    pub symbol: CTraderSymbolInfo,
-    pub bars: Vec<HistoricalBar>,
-    pub has_more: bool,
-    pub bid_ticks: Vec<HistoricalTick>,
-    pub ask_ticks: Vec<HistoricalTick>,
-    pub live_subscription_plan: CTraderLiveSubscriptionPlan,
-}
-
+// 2026-08-08 dead-code purge: CTraderChartHistoryResult and
+// CTraderLiveSubscriptionPlan (the full bars+ticks+subscription-plan chart
+// lane produced by the deleted load_chart_history/-_with_transport) were
+// removed — production always used the bars-only fetch below.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CTraderHistoricalBarsFetchResult {
     pub symbol: CTraderSymbolInfo,
     pub bars: Vec<HistoricalBar>,
     pub has_more: bool,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CTraderLiveSubscriptionPlan {
-    pub subscribe_spots: CTraderOpenApiJsonMessage,
-    pub subscribe_trendbars: CTraderOpenApiJsonMessage,
-    pub unsubscribe_spots: CTraderOpenApiJsonMessage,
-    pub unsubscribe_trendbars: CTraderOpenApiJsonMessage,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1179,111 +1156,6 @@ pub fn parse_tick_data_response(
     })
 }
 
-// Full chart-history loader (bars + bid/ask ticks + a live-subscription plan).
-// `dead_code` until the live charting path is wired (Phase 2-5); production data
-// fetch uses `load_historical_bars_only` today.
-#[allow(dead_code)]
-pub fn load_chart_history_with_transport<T: CTraderOpenApiTransport>(
-    transport: &T,
-    request: &CTraderChartHistoryRequest,
-) -> Result<CTraderChartHistoryResult> {
-    let resolved = resolve_symbol_with_transport(
-        transport,
-        &CTraderSymbolLookupRequest {
-            client_id: request.client_id.clone(),
-            client_secret: request.client_secret.clone(),
-            access_token: request.access_token.clone(),
-            environment: request.environment,
-            account_id: request.account_id.clone(),
-            symbol_name: request.symbol_name.clone(),
-        },
-    )?;
-    let account_id = resolved.account_id;
-    let light_symbol = &resolved.light_symbol;
-    let symbol = &resolved.symbol;
-
-    let trendbar_period = trendbar_period_value(&request.timeframe)?;
-    let live_subscription_plan = CTraderLiveSubscriptionPlan {
-        subscribe_spots: build_subscribe_spots_request(
-            account_id,
-            &[light_symbol.symbol_id],
-            true,
-            "subscribe-spots-1",
-        ),
-        subscribe_trendbars: build_subscribe_live_trendbar_request(
-            account_id,
-            light_symbol.symbol_id,
-            trendbar_period,
-            "subscribe-live-trendbar-1",
-        ),
-        unsubscribe_spots: build_unsubscribe_spots_request(
-            account_id,
-            &[light_symbol.symbol_id],
-            "unsubscribe-spots-1",
-        ),
-        unsubscribe_trendbars: build_unsubscribe_live_trendbar_request(
-            account_id,
-            light_symbol.symbol_id,
-            trendbar_period,
-            "unsubscribe-live-trendbar-1",
-        ),
-    };
-
-    let detail_responses = transport.send_sequence(&[
-        build_get_trendbars_request(
-            account_id,
-            light_symbol.symbol_id,
-            trendbar_period,
-            request.from_timestamp_ms,
-            request.to_timestamp_ms,
-            request.count,
-            "trendbars-1",
-        ),
-        build_get_tick_data_request(
-            account_id,
-            light_symbol.symbol_id,
-            CTRADER_QUOTE_TYPE_BID,
-            request.from_timestamp_ms,
-            request.to_timestamp_ms,
-            "ticks-bid-1",
-        ),
-        build_get_tick_data_request(
-            account_id,
-            light_symbol.symbol_id,
-            CTRADER_QUOTE_TYPE_ASK,
-            request.from_timestamp_ms,
-            request.to_timestamp_ms,
-            "ticks-ask-1",
-        ),
-    ])?;
-
-    if detail_responses.len() != 3 {
-        return Err(anyhow!(
-            "expected 3 cTrader detail responses, received {}",
-            detail_responses.len()
-        ));
-    }
-    let trendbars = parse_trendbars_response(&detail_responses[0], symbol)?;
-    let bid_ticks = parse_tick_data_response(&detail_responses[1], symbol)?;
-    let ask_ticks = parse_tick_data_response(&detail_responses[2], symbol)?;
-    Ok(CTraderChartHistoryResult {
-        symbol: resolved.symbol.clone(),
-        bars: trendbars.bars,
-        has_more: trendbars.has_more,
-        bid_ticks: bid_ticks.ticks,
-        ask_ticks: ask_ticks.ticks,
-        live_subscription_plan,
-    })
-}
-
-#[allow(dead_code)]
-pub fn load_chart_history(
-    request: &CTraderChartHistoryRequest,
-) -> Result<CTraderChartHistoryResult> {
-    let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
-    load_chart_history_with_transport(&transport, request)
-}
-
 pub fn load_historical_bars_only_with_transport<T: CTraderOpenApiTransport>(
     transport: &T,
     request: &CTraderChartHistoryRequest,
@@ -1350,7 +1222,6 @@ pub fn load_historical_bars_only_with_transport<T: CTraderOpenApiTransport>(
     })
 }
 
-#[allow(dead_code)]
 pub fn load_historical_bars_only(
     request: &CTraderChartHistoryRequest,
 ) -> Result<CTraderHistoricalBarsFetchResult> {
@@ -1955,99 +1826,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn chart_history_backend_loads_symbol_metadata_then_historical_bars_and_ticks() {
-        // After symbol resolution the v0.5.1.1 fix re-auths before fetching
-        // symbol-by-id and trendbars (fresh WSS connection per call), so the
-        // full sequence is 9 messages: initial auth (2) + symbols-list (1) +
-        // re-auth (2) + symbol-by-id (1) + trendbars (1) + ticks×2 (2).
-        let transport = StubTransport::with_responses(vec![
-            Ok(r#"{"clientMsgId":"app-auth-1","payloadType":2101,"payload":{}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"account-auth-1","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"symbols-1","payloadType":2115,"payload":{"ctidTraderAccountId":712345,"symbol":[{"symbolId":14,"symbolName":"EURUSD","enabled":true,"description":"Euro vs Dollar"}]}}"#.to_string()),
-            // Re-auth on the second WSS connection (before symbol-by-id):
-            Ok(r#"{"clientMsgId":"app-auth-2","payloadType":2101,"payload":{}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"account-auth-2","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{"symbol":[{"symbolId":14,"digits":5,"pipPosition":4,"tradingMode":0}]}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"trendbars-1","payloadType":2138,"payload":{"period":"M5","symbolId":14,"trendbar":[{"volume":9,"low":109950,"deltaOpen":50,"deltaClose":125,"deltaHigh":225,"utcTimestampInMinutes":28500000}],"hasMore":false}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"ticks-bid-1","payloadType":2146,"payload":{"symbolId":14,"hasMore":false,"tickData":[{"timestamp":1710000000000,"tick":109990},{"timestamp":200,"tick":109970}]}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"ticks-ask-1","payloadType":2146,"payload":{"symbolId":14,"hasMore":false,"tickData":[{"timestamp":1710000000000,"tick":110010},{"timestamp":200,"tick":109990}]}}"#.to_string()),
-        ]);
-
-        let result = load_chart_history_with_transport(
-            &transport,
-            &CTraderChartHistoryRequest {
-                client_id: "client".to_string(),
-                client_secret: "secret".to_string(),
-                access_token: "token".to_string(),
-                environment: CTraderEnvironment::Demo,
-                account_id: "712345".to_string(),
-                symbol_name: "EURUSD".to_string(),
-                timeframe: "M5".to_string(),
-                from_timestamp_ms: 1_709_000_000_000,
-                to_timestamp_ms: 1_710_000_000_000,
-                count: Some(96),
-            },
-        )
-        .expect("chart history");
-
-        assert_eq!(result.symbol.symbol_name, "EURUSD");
-        assert_eq!(result.symbol.symbol_id, 14);
-        assert_eq!(result.symbol.digits, 5);
-        assert_eq!(result.bars.len(), 1);
-        assert_eq!(result.bars[0].open, 1.1);
-        assert_eq!(result.bars[0].close, 1.10075);
-        assert_eq!(result.bid_ticks.len(), 2);
-        assert_eq!(result.ask_ticks.len(), 2);
-        assert_eq!(
-            result.live_subscription_plan.subscribe_spots.payload_type,
-            crate::app_services::ctrader_messages::CTRADER_OA_SUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE
-        );
-        assert_eq!(
-            result.live_subscription_plan.subscribe_trendbars.payload_type,
-            crate::app_services::ctrader_messages::CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE
-        );
-        assert_eq!(
-            result.live_subscription_plan.unsubscribe_spots.payload_type,
-            crate::app_services::ctrader_messages::CTRADER_OA_UNSUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE
-        );
-        assert_eq!(
-            result.live_subscription_plan.unsubscribe_trendbars.payload_type,
-            crate::app_services::ctrader_messages::CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE
-        );
-        assert_eq!(transport.sent_len(), 9);
-    }
-
-    #[test]
-    fn chart_history_backend_rejects_unknown_symbol_name() {
-        let transport = StubTransport::with_responses(vec![
-            Ok(r#"{"clientMsgId":"app-auth-1","payloadType":2101,"payload":{}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"account-auth-1","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
-            Ok(
-                r#"{"clientMsgId":"symbols-1","payloadType":2115,"payload":{"ctidTraderAccountId":712345,"symbol":[{"symbolId":14,"symbolName":"GBPUSD","enabled":true,"description":"Cable"}]}}"#
-                    .to_string(),
-            ),
-        ]);
-
-        let err = load_chart_history_with_transport(
-            &transport,
-            &CTraderChartHistoryRequest {
-                client_id: "client".to_string(),
-                client_secret: "secret".to_string(),
-                access_token: "token".to_string(),
-                environment: CTraderEnvironment::Demo,
-                account_id: "712345".to_string(),
-                symbol_name: "EURUSD".to_string(),
-                timeframe: "M5".to_string(),
-                from_timestamp_ms: 1_709_000_000_000,
-                to_timestamp_ms: 1_710_000_000_000,
-                count: Some(96),
-            },
-        )
-        .expect_err("unknown symbol must fail");
-
-        assert!(err.to_string().contains("EURUSD"));
-    }
 
     #[test]
     fn bars_only_backend_loads_symbol_metadata_then_trendbars_without_ticks() {

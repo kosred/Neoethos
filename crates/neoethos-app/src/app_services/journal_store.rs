@@ -207,20 +207,6 @@ pub fn record_closed_trade(data_dir: &Path, trade: &ClosedTrade) -> Result<bool>
     Ok(true)
 }
 
-/// Fire-and-forget variant for the trading/refresh hot path — logs a
-/// warning instead of propagating, so a journal failure never aborts a
-/// trade or stalls the account-refresh loop.
-#[allow(dead_code)] // wired into reconcile hot-path shortly
-pub fn record_closed_trade_best_effort(data_dir: &Path, trade: &ClosedTrade) {
-    if let Err(e) = record_closed_trade(data_dir, trade) {
-        tracing::warn!(
-            target: "neoethos_app::journal_store",
-            error = %e,
-            "failed to record closed trade (continuing)"
-        );
-    }
-}
-
 pub fn append_equity_sample_best_effort(data_dir: &Path, sample: &EquitySample) {
     let line = match serde_json::to_string(sample) {
         Ok(l) => l,
@@ -317,9 +303,9 @@ mod tests {
     fn query_filters_by_time_and_sorts() -> Result<()> {
         let dir = tmp_dir("time");
         std::fs::create_dir_all(&dir)?;
-        record_closed_trade_best_effort(&dir, &trade(10, 1.0, 3000));
-        record_closed_trade_best_effort(&dir, &trade(11, 2.0, 1000));
-        record_closed_trade_best_effort(&dir, &trade(12, 3.0, 2000));
+        assert!(record_closed_trade(&dir, &trade(10, 1.0, 3000))?);
+        assert!(record_closed_trade(&dir, &trade(11, 2.0, 1000))?);
+        assert!(record_closed_trade(&dir, &trade(12, 3.0, 2000))?);
         let in_window = query_closed_trades(&dir, Some(1500), Some(3500));
         assert_eq!(in_window.len(), 2);
         assert_eq!(in_window[0].position_id, 12); // ts=2000 sorts before ts=3000

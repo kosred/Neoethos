@@ -3,16 +3,15 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+// 2026-08-08 dead-code purge: the `Bootstrap` variant was deleted. Its claimed
+// constructor (start_ctrader_bootstrap_batch in snapshots.rs/session.rs) was
+// removed in e31625a8; no construction site remained anywhere (incl. tests),
+// the enum derives no serde, and every server/state.rs match arm for it was an
+// early-return/empty-value stub. Production /data/bootstrap is a filesystem scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
     Discovery,
     Training,
-    // Constructed by start_ctrader_bootstrap_batch (snapshots.rs:469, session.rs:278); matched
-    // exhaustively in server/state.rs to forward bootstrap status into the engine-state map.
-    // Trigger path is the test harness today (production /data/bootstrap is a filesystem scan),
-    // but the variant ships with the JobSnapshot wire format and the state.rs match arms.
-    #[allow(dead_code)]
-    Bootstrap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
