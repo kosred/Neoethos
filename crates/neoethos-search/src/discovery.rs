@@ -1035,6 +1035,11 @@ impl DiscoveryValidationGates {
 pub struct DiscoveryRunProfile {
     pub timeframe_label: String,
     pub population: usize,
+    /// Whether `run_search` was allowed to raise `population` to the card's
+    /// fits ceiling. Profiled because it is selection-changing: two runs with
+    /// the same `population` but different `population_auto` can search
+    /// different candidate counts. From `models.prop_search_population_auto`.
+    pub population_auto: bool,
     pub generations: usize,
     pub max_indicators: usize,
     pub candidate_count_target: usize,
@@ -6688,6 +6693,7 @@ pub fn build_discovery_profile(
         discovery_ledger_enabled,
         discovery_ledger_cache_dir,
         discovery_ledger_archive_top_n,
+        population_auto,
     } = config;
     // Same completeness gate for the filter floors: `FilteringConfig` grew
     // `anomaly_guard` / `elite_mode` without the profile noticing — never
@@ -6726,6 +6732,7 @@ pub fn build_discovery_profile(
     DiscoveryRunProfile {
         timeframe_label: timeframe_label.clone(),
         population: *population,
+        population_auto: *population_auto,
         generations: *generations,
         max_indicators: *max_indicators,
         candidate_count_target: *candidate_count,
