@@ -266,7 +266,14 @@ models:
   prop_search_portfolio_size: 50
   prop_search_max_indicators: 16
   prop_search_checkpoint: models/strategy_evo_checkpoint.json
-  prop_search_device: cpu
+  # Task #35 fix (2026-08-09): the GA's per-generation population eval routes
+  # through the backend selector, which OBEYS this value. `cpu` forced the
+  # whole GA — ~97% of a discovery run — onto the CPU while the validation tail
+  # (which bypasses the selector and calls the card directly) ran on the GPU.
+  # That asymmetry was the 8-month "GA never touches the card" bug. `auto`
+  # routes the GA to the native f64 prototype-B population lane when a CUDA card
+  # is present, and still falls back to CPU when there is none.
+  prop_search_device: auto
   prop_search_train_years: 8
   prop_search_val_years: 1
   prop_search_val_candidates: 0

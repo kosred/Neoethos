@@ -249,6 +249,27 @@ pub fn evaluate_population_core_with_backend_and_audit(
             );
         });
     }
+    // Fail-loud guard (task #35, 2026-08-09): running the GA population eval on
+    // the CPU WHILE a usable CUDA card is present is almost always a
+    // misconfiguration (a stray `prop_search_device: cpu`), and it silently
+    // costs ~97% of a run's wall time. That went unnoticed for eight months
+    // because it looked like a healthy-but-slow run. Warn ONCE, loudly, so it
+    // can never hide again.
+    #[cfg(feature = "gpu-b-adapter")]
+    if backend.device == DevicePreference::Cpu
+        && crate::gpu_native::prototype_b_population_eval::prototype_b_available()
+    {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                target: "neoethos_search::backend",
+                "population eval is on the CPU but a CUDA card is available — the GA is \
+                 leaving ~97% of the card idle. This is almost certainly a stray \
+                 `models.prop_search_device: cpu`; set it to `auto` to route the GA to \
+                 the native f64 prototype-B lane."
+            );
+        });
+    }
     match (backend.device, backend.fallback) {
         (DevicePreference::Cpu, _) => cpu_strategy::run(
             backend,

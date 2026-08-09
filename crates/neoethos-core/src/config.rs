@@ -1655,7 +1655,11 @@ impl Default for ModelsConfig {
             prop_search_portfolio_size: 3000,
             prop_search_max_indicators: 12,
             prop_search_checkpoint: PathBuf::from("models/strategy_evo_checkpoint.json"),
-            prop_search_device: "cpu".to_string(),
+            // Task #35 (2026-08-09): `auto` so the GA population eval uses the
+            // GPU population lane (prototype B) when a card is present — `cpu`
+            // pinned the whole GA (~97% of a run) to the CPU while validation
+            // used the card, the 8-month asymmetry. Falls back to CPU with no card.
+            prop_search_device: "auto".to_string(),
             prop_search_train_years: 0,
             prop_search_val_years: 0,
             prop_search_val_candidates: 0,
