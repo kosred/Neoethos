@@ -471,3 +471,54 @@ fn the_env_override_layer_is_gone() {
          order"
     );
 }
+
+/// `save` must persist OVERRIDES, not the whole document.
+///
+/// It used to write `serde_yaml_ng::to_string(self)` — every field, whatever
+/// its value. That defeated the scheme this wave installed on the first UI
+/// click: a two-line store became a 482-line one after a single unrelated
+/// mutation, freezing every default into the operator's file as though he had
+/// chosen it, and leaving `risk.preset` unable to move the money numbers
+/// afterwards because the six fields `reconcile_preset` seeds now looked
+/// operator-set.
+#[test]
+fn save_writes_only_overrides_and_never_prunes_a_money_key() {
+    let dir = std::env::temp_dir().join(format!(
+        "neoethos-save-overrides-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("config.yaml");
+
+    let settings = neoethos_core::config::Settings::default();
+    settings.save(&path).expect("save defaults");
+    let written = std::fs::read_to_string(&path).expect("read back");
+
+    // A pure-default Settings carries no overrides at all, so the only thing
+    // that may appear is the money allowlist. The old behaviour wrote the whole
+    // struct; anything near that size means the prune is not running.
+    let lines = written.lines().filter(|l| !l.trim().is_empty()).count();
+    assert!(
+        lines < 60,
+        "save wrote {lines} lines for a default Settings — the override prune is \
+         not running, and every default is being frozen into the operator's file \
+         as though he had chosen it:\n{written}"
+    );
+
+    // The money keys survive even though they equal the default, because a
+    // limit must not move the day a default moves underneath the operator.
+    for key in [
+        "daily_drawdown_limit",
+        "total_drawdown_limit",
+        "max_portfolio_risk",
+        "risk_per_trade",
+    ] {
+        assert!(
+            written.contains(key),
+            "money key `{key}` was pruned. Pruning it is identical today and \
+             silently moves real money the day its default changes:\n{written}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
