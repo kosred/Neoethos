@@ -110,3 +110,4 @@ dist/
 # fixtures under crates/neoethos-app/tests/fixtures/ stay committed
 # as parser regression guards — those are the universal ones.
 /data/broker_symbols/
+old_config.rs.tmp
